@@ -8392,6 +8392,120 @@ static bool temp_admin_command_held(const add_command_t *command)
     return false;
 }
 
+#if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
+/* Only the terminal gateway owns this pending action. One bounded descriptor
+ * covers the cleanup-to-restart handoff; there is no additional command queue. */
+static zhr_attempt_t g_hil_reboot;
+static bool g_hil_reboot_pending;
+
+static bool hil_reboot_report(const zhr_attempt_t *attempt, bool recovery)
+{
+    char image[65] = {0};
+    zhr_checkpoint_t checkpoint = {0};
+    const char *boot = add_connector_boot_id();
+    bool witnessed = recovery && ota_manager_running_image(image) &&
+        zhr_witness_recovered(attempt, boot, image, esp_reset_reason() == ESP_RST_SW, &checkpoint);
+    char result[1024];
+    int size = snprintf(result, sizeof(result),
+        "{\"schema_version\":1,\"kind\":\"ESP_REBOOT\",\"command_id\":\"%s\",\"run_id\":\"%s\","
+        "\"boot_before\":\"%s\",\"boot_after\":\"%s\",\"application_sha256\":\"%s\","
+        "\"terminal_serial\":\"%s\",\"expires_at\":%lld,\"attempted\":true,\"intent_persisted\":true,"
+        "\"safe_checkpoint\":%s,\"recovered\":%s,\"reset_reason\":%d,"
+        "\"safe_checkpoint_epoch\":%lld,\"safe_checkpoint_uptime_ms\":%llu,\"outcome\":\"%s\"}",
+        attempt->command_id, attempt->binding.run_id, attempt->binding.boot_id, recovery ? boot : "",
+        attempt->binding.application_sha256, attempt->terminal_serial, (long long)attempt->binding.expires_at,
+        witnessed ? "true" : "false", witnessed ? "true" : "false", (int)esp_reset_reason(),
+        (long long)checkpoint.epoch, (unsigned long long)checkpoint.uptime_ms,
+        witnessed ? "RECOVERED" : recovery ? "NOT_OBSERVED" : "INTENT_PERSISTED");
+    return size > 0 && (size_t)size < sizeof(result) &&
+        add_connector_command_update_acknowledged(attempt->command_id, result);
+}
+
+static void process_hil_reboot(const add_command_t *command)
+{
+    zhr_attempt_t attempt = {.binding = command->reboot};
+    strlcpy(attempt.command_id, command->command_id, sizeof(attempt.command_id));
+    strlcpy(attempt.terminal_serial, command->expected_serial, sizeof(attempt.terminal_serial));
+    char image[65] = {0};
+    if (!zhr_valid(&attempt) || !ota_manager_hil_reboot_capable() || !ota_manager_running_image(image)) {
+        (void)add_connector_command_update(command->command_id, "FAILED", "ESP_REBOOT_UNSUPPORTED",
+            "Controlled reboot requires the signed experimental journal writer.", "{}");
+        (void)add_connector_command_complete(command->command_id);
+        return;
+    }
+    rel_id_result_t processed = command_was_processed(command->command_id);
+    if (processed == REL_ID_ERROR) {
+        (void)add_connector_command_update(command->command_id, "RETRYING", "COMMAND_RECEIPT_READ_FAILED",
+            "Controlled reboot intent could not be inspected.", "{}");
+        add_connector_command_retry(command->command_id);
+        return;
+    }
+    if (processed == REL_ID_PRESENT) {
+        /* An intent consumes this attempt, even if reset or timeout preceded
+         * the safe point. Only the RTC witness proves the controlled path. */
+        if (hil_reboot_report(&attempt, true) && add_connector_command_complete(command->command_id))
+            zhr_witness_clear();
+        else add_connector_command_retry(command->command_id);
+        return;
+    }
+    int64_t now = epoch_now();
+    if (!zhr_deadline(&attempt, add_connector_boot_id(), image, g_device_serial,
+                      now, (uint64_t)esp_timer_get_time())) {
+        (void)add_connector_command_update(command->command_id, "EXPIRED", "ESP_REBOOT_SCOPE_OR_DEADLINE",
+            "Controlled reboot no longer matches this boot, image, terminal or deadline.", "{}");
+        (void)add_connector_command_complete(command->command_id);
+        return;
+    }
+    if (!temp_admin_evidence_ready() || g_temp_admin_active || !zj_runtime_writer_ready() ||
+        !ota_manager_hil_reboot_reserve()) {
+        (void)add_connector_command_update(command->command_id, "RETRYING", "ESP_REBOOT_NOT_SAFE",
+            "Controlled reboot is held by a lease, writer recovery or another controller.", "{}");
+        add_connector_command_retry(command->command_id);
+        return;
+    }
+    /* No possible reset is reached unless the exact inbox row and this intent
+     * are durable. A timed-out write can complete late; replay consumes it. */
+    if (!mark_command_processed(command->command_id) ||
+        !zhr_before_deadline(&attempt, epoch_now(), (uint64_t)esp_timer_get_time()) ||
+        !hil_reboot_report(&attempt, false) ||
+        !zhr_before_deadline(&attempt, epoch_now(), (uint64_t)esp_timer_get_time())) {
+        ota_manager_hil_reboot_release();
+        add_connector_command_retry(command->command_id);
+        return;
+    }
+    g_hil_reboot = attempt;
+    g_hil_reboot_pending = true;
+}
+
+static void finish_hil_reboot_after_session(void)
+{
+    if (!g_hil_reboot_pending) return;
+    /* The gateway has completed unregister/disconnect/close and released its
+     * session. It cannot admit another capture or terminal command here. */
+    while (zhr_before_deadline(&g_hil_reboot, epoch_now(), (uint64_t)esp_timer_get_time())) {
+        if (!temp_admin_evidence_ready() || g_temp_admin_active || !zj_runtime_writer_ready() ||
+            setup_portal_active() || command_was_cancelled(g_hil_reboot.command_id) != REL_ID_ABSENT) break;
+        int64_t checkpoint_epoch = epoch_now();
+        uint64_t checkpoint_us = (uint64_t)esp_timer_get_time();
+        if (!zhr_before_deadline(&g_hil_reboot, checkpoint_epoch, checkpoint_us)) break;
+        if (zj_owner_try_quiesce_before(g_hil_reboot.deadline_us, g_hil_reboot.binding.expires_at,
+                                        &checkpoint_epoch, &checkpoint_us)) {
+            /* Idle gate is the point of no return. All I/O and controller
+             * waits are finished; the RTC store and reset are RAM-only. */
+            zhr_witness_arm(&g_hil_reboot, checkpoint_epoch, checkpoint_us);
+            esp_restart();
+            return;
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    g_hil_reboot_pending = false;
+    ota_manager_hil_reboot_release();
+    (void)hil_reboot_report(&g_hil_reboot, true);
+    add_connector_command_retry(g_hil_reboot.command_id);
+    add_connector_set_activity("ONLINE");
+}
+#endif
+
 static bool process_add_commands(
     int sock,
     zk_context_t *ctx,
@@ -8415,6 +8529,9 @@ static bool process_add_commands(
             continue;
         }
         if (cancelled == REL_ID_PRESENT) {
+#if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
+            if (!strcmp(command.command_type, "ESP_REBOOT")) zhr_witness_cancel(command.command_id);
+#endif
             (void)add_connector_command_update(
                 command.command_id,
                 "CANCELLED",
@@ -8424,6 +8541,13 @@ static bool process_add_commands(
             (void)add_connector_command_complete(command.command_id);
             continue;
         }
+#if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
+        if (!strcmp(command.command_type, "ESP_REBOOT")) {
+            process_hil_reboot(&command);
+            if (g_hil_reboot_pending) break;
+            continue;
+        }
+#endif
         int64_t command_now = epoch_now();
         if (command.expires_epoch > 0 && command_now >= ZONE_LITE_MIN_VALID_UNIX_TIME &&
             command_now >= command.expires_epoch) {
@@ -8826,6 +8950,9 @@ static int64_t gateway_run(uint32_t host_order_ip)
     /* The session's capture and cleanup calls have returned. Lock contention
      * cannot silently skip the handoff to the OTA controller. */
     while (!add_connector_terminal_session_end()) vTaskDelay(pdMS_TO_TICKS(10));
+#if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
+    finish_hil_reboot_after_session();
+#endif
     return duration;
 }
 
@@ -9048,6 +9175,9 @@ static int64_t gateway_run_session(uint32_t host_order_ip)
                 restarted = true;
                 break;
             }
+#if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
+            if (g_hil_reboot_pending) break;
+#endif
             add_connector_set_activity("LIVE_CAPTURE");
         }
         add_source_coverage_t authoritative_coverage;

@@ -1,4 +1,4 @@
-param([ValidateSet("2.6.16", "2.6.17", "2.6.18", "2.6.19")][string]$BridgeVersion = "2.6.16")
+param([ValidateSet("2.6.16", "2.6.17", "2.6.18", "2.6.19", "2.6.20")][string]$BridgeVersion = "2.6.16")
 $ErrorActionPreference = 'Stop'
 $root = Join-Path ([IO.Path]::GetTempPath()) ('hil-publication-' + [guid]::NewGuid().ToString('N'))
 $source = Join-Path $root 'package'

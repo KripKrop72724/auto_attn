@@ -1829,7 +1829,36 @@ static bool parse_command_object(cJSON *root, add_command_t *command)
     strlcpy(command->command_id, command_id->valuestring, sizeof(command->command_id));
     strlcpy(command->command_type, command_type->valuestring, sizeof(command->command_type));
     cJSON *expires = cJSON_GetObjectItemCaseSensitive(root, "expires_epoch");
-    if (cJSON_IsNumber(expires)) command->expires_epoch = (int64_t)expires->valuedouble;
+    if (cJSON_IsNumber(expires) && expires->valuedouble >= 0 && expires->valuedouble <= 9007199254740991.0)
+        command->expires_epoch = (int64_t)expires->valuedouble;
+#if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
+    if (!strcmp(command_type->valuestring, "ESP_REBOOT")) {
+        const char *keys[] = {"run_id", "boot_id", "application_sha256", "terminal_serial"};
+        char *outputs[] = {command->reboot.run_id, command->reboot.boot_id,
+                          command->reboot.application_sha256, command->expected_serial};
+        const size_t capacities[] = {sizeof(command->reboot.run_id), sizeof(command->reboot.boot_id),
+                                    sizeof(command->reboot.application_sha256), 80};
+        for (unsigned i = 0; i < 4; ++i) {
+            cJSON *field = cJSON_GetObjectItemCaseSensitive(payload, keys[i]);
+            if (!cJSON_IsString(field) || !field->valuestring[0] || strlen(field->valuestring) >= capacities[i]) return false;
+            strcpy(outputs[i], field->valuestring);
+        }
+        cJSON *deadline = cJSON_GetObjectItemCaseSensitive(payload, "expires_at");
+        cJSON *serial = cJSON_GetObjectItemCaseSensitive(expected, "serial");
+        if (!cJSON_IsNumber(deadline) || !(deadline->valuedouble > 1700000000.0 &&
+            deadline->valuedouble < 9007199254740991.0) ||
+            (double)(int64_t)deadline->valuedouble != deadline->valuedouble ||
+            !cJSON_IsNumber(expires) || expires->valuedouble != deadline->valuedouble ||
+            !cJSON_IsString(serial) || strcmp(serial->valuestring, command->expected_serial)) return false;
+        command->reboot.expires_at = (int64_t)deadline->valuedouble;
+        zhr_attempt_t check = {.binding = command->reboot};
+        strcpy(check.command_id, command->command_id);
+        strcpy(check.terminal_serial, command->expected_serial);
+        return zhr_valid(&check);
+    }
+#else
+    if (!strcmp(command_type->valuestring, "ESP_REBOOT")) return false;
+#endif
     cJSON *value = cJSON_GetObjectItemCaseSensitive(payload, "uid");
     if (cJSON_IsString(value)) strlcpy(command->uid, value->valuestring, sizeof(command->uid));
     value = cJSON_GetObjectItemCaseSensitive(payload, "user_id");
@@ -2691,6 +2720,12 @@ static void parse_inbound(const char *data, size_t len)
     // full SPIFFS partition must never prevent a safe command or lease from
     // reaching the serialized ZKT executor.
     bool journaled = command_journal_append(root, command.command_id);
+    if (!journaled && !strcmp(command.command_type, "ESP_REBOOT")) {
+        (void)add_connector_command_update(command.command_id, "RETRYING", "REBOOT_INBOX_NOT_DURABLE",
+            "Controlled reboot requires the exact command in the durable inbox.", "{}");
+        cJSON_Delete(root);
+        return;
+    }
     if (!journaled) {
         ESP_LOGW(
             TAG,
@@ -2894,6 +2929,7 @@ static void append_firmware_diagnostics(cJSON *payload, const add_zkt_telemetry_
     cJSON *queues = cJSON_AddArrayToObject(diagnostics, "queues");
     if (!storage || !memory || !workers || !queues || !cJSON_AddNumberToObject(diagnostics, "schema_version", 2) ||
         !cJSON_AddStringToObject(diagnostics, "boot_id", s_boot_id) ||
+        !cJSON_AddBoolToObject(diagnostics, "controlled_esp_reboot_v1", ota_manager_hil_reboot_capable()) ||
         !cJSON_AddNumberToObject(diagnostics, "sampled_uptime_ms", (double)monotonic_ms()) ||
 #if defined(ZONE_LITE_HIKVISION) && ZONE_LITE_HIKVISION
         !cJSON_AddStringToObject(diagnostics, "runtime_profile", "HIKVISION_V1") ||
@@ -5390,6 +5426,27 @@ bool add_connector_command_update(
     char *json = cJSON_PrintUnformatted(payload);
     cJSON_Delete(payload);
     bool ok = json && add_connector_send_payload("command_update", json);
+    free(json);
+    return ok;
+}
+
+const char *add_connector_boot_id(void) { return s_boot_id; }
+
+bool add_connector_command_update_acknowledged(const char *command_id, const char *result_json)
+{
+    cJSON *payload = cJSON_CreateObject();
+    cJSON *result = result_json ? cJSON_Parse(result_json) : NULL;
+    if (!payload || !cJSON_IsObject(result) ||
+        !cJSON_AddStringToObject(payload, "command_id", command_id) ||
+        !cJSON_AddStringToObject(payload, "status", "RUNNING")) {
+        cJSON_Delete(payload); cJSON_Delete(result); return false;
+    }
+    if (!cJSON_AddItemToObject(payload, "result", result)) {
+        cJSON_Delete(result); cJSON_Delete(payload); return false;
+    }
+    char *json = cJSON_PrintUnformatted(payload);
+    cJSON_Delete(payload);
+    bool ok = json && add_connector_send_payload_acknowledged("command_update", json, 1000);
     free(json);
     return ok;
 }

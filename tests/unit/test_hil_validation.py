@@ -5,6 +5,7 @@ import pytest
 from zk_add.hil_scope import HilTarget
 from zk_add.hil_validation import (
     AttendanceProof,
+    RebootStartupTransition,
     RecoveryTest,
     ReleaseIdentity,
     SmokeEvidence,
@@ -118,6 +119,87 @@ def test_complete_smoke_never_claims_endurance_or_promotion(evidence):
     assert result.outcome == "PASS" and result.reasons == ()
     assert result.physical_power_cut == result.hardware_endurance == "NOT_PERFORMED"
     assert evidence.release_state == "HIL_ONLY"
+
+
+def startup_evidence(evidence):
+    tests = (evidence.recovery_tests[0], evidence.recovery_tests[1].model_copy(
+        update={"recovered_at": evidence.samples[14].recorded_at}))
+    transition = RebootStartupTransition(command_id=tests[1].command_id,
+        recovery_telemetry_id=evidence.samples[14].telemetry_id, phase="NOT_STARTED",
+        pending_checks=("storage_healthy", "persistence_verified", "recovery_complete",
+                        "workers_healthy", "counts_known", "terminal_certified"),
+        unobserved_fields=("write_failures", "read_failures", "source_generation", "committed_cursor", "source_count"))
+    result = evidence.model_copy(update={"recovery_tests": tests})
+    return replace_sample(result, 13, storage_healthy=None, persistence_verified=False,
+        recovery_complete=False, workers_healthy=None, counts_known=None, terminal_certified=None,
+        source_generation=None, committed_cursor=None, source_count=0, write_failures=None,
+        read_failures=None, reboot_startup=transition)
+
+
+def test_bound_startup_is_retained_without_health_substitution(evidence):
+    startup = startup_evidence(evidence)
+    assert verdict(startup).outcome == "PASS"
+    sample = startup.samples[13]
+    assert sample.persistence_verified is False and sample.storage_healthy is None
+    assert sample.source_count == 0 and sample.write_failures is None
+
+
+@pytest.mark.parametrize("case,reason", [
+    ("command", "INVALID_REBOOT_STARTUP_TRANSITION"),
+    ("recovery-row", "INVALID_REBOOT_STARTUP_TRANSITION"),
+    ("recovery-unhealthy", "INVALID_REBOOT_STARTUP_TRANSITION"),
+    ("boot", "INVALID_REBOOT_STARTUP_TRANSITION"),
+    ("source-generation", "SOURCE_GENERATION_CHANGED"),
+    ("source-cursor", "SOURCE_CURSOR_REGRESSED"),
+    ("source-count", "SOURCE_COUNT_REGRESSED"),
+    ("first-counter", "NEW_WRITE_FAILURES"),
+    ("restart", "NEW_WORKER_RESTARTS"),
+    ("no-control", "INVALID_REBOOT_STARTUP_TRANSITION"),
+    ("reopen", "INVALID_REBOOT_STARTUP_TRANSITION"),
+])
+def test_startup_cannot_hide_missing_binding_or_observed_regression(evidence, case, reason):
+    startup = startup_evidence(evidence)
+    sample, transition = startup.samples[13], startup.samples[13].reboot_startup
+    if case in {"command", "recovery-row"}:
+        transition = transition.model_copy(update={"command_id": "unrelated"} if case == "command"
+            else {"recovery_telemetry_id": startup.samples[15].telemetry_id})
+        startup = replace_sample(startup, 13, reboot_startup=transition)
+    elif case == "recovery-unhealthy":
+        startup = replace_sample(startup, 14, persistence_verified=False)
+    elif case == "boot":
+        startup = replace_sample(startup, 13, boot_id="unrelated")
+    elif case.startswith("source-"):
+        field = {"source-generation": "source_generation", "source-cursor": "committed_cursor",
+                 "source-count": "source_count"}[case]
+        startup = replace_sample(startup, 14, **{field: 0})
+    elif case == "first-counter":
+        startup = replace_sample(startup, 14, write_failures=1)
+    elif case == "restart":
+        startup = replace_sample(startup, 13, worker_restarts=1)
+    elif case == "no-control":
+        startup = startup.model_copy(update={"recovery_tests": ()})
+    else:
+        # A second incomplete snapshot cannot restart the recovery prefix.
+        row = sample.model_copy(update={"telemetry_id": startup.samples[15].telemetry_id,
+            "recorded_at": startup.samples[15].recorded_at, "diagnostics_at": startup.samples[15].diagnostics_at})
+        rows = list(startup.samples)
+        rows[15] = row
+        startup = startup.model_copy(update={"samples": tuple(rows)})
+    result = verdict(startup)
+    assert result.outcome == "FAILED" and reason in result.reasons
+
+
+def test_started_boot_checks_cannot_become_unobserved_again(evidence):
+    startup = startup_evidence(evidence)
+    initial = startup.samples[13]
+    initial_transition = initial.reboot_startup.model_copy(update={"unobserved_fields":
+        ("source_generation", "committed_cursor", "source_count")})
+    startup = replace_sample(startup, 13, write_failures=0, read_failures=0, reboot_startup=initial_transition)
+    later = initial.model_copy(update={"telemetry_id": 100,
+        "recorded_at": initial.recorded_at + timedelta(seconds=15),
+        "diagnostics_at": initial.diagnostics_at + timedelta(seconds=15)})
+    startup = startup.model_copy(update={"samples": (*startup.samples[:14], later, *startup.samples[14:])})
+    assert "INVALID_REBOOT_STARTUP_TRANSITION" in verdict(startup).reasons
 
 
 @pytest.mark.parametrize(

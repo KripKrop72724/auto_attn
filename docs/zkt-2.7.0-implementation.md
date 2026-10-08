@@ -16,6 +16,30 @@ restarts from failed attempts. This source repair does not certify a signed
 bridge or enable the 2.7.0 writer; installed-image and recovery evidence remain
 required.
 
+The signed 2.6.19 canary also returned to 2.6.15 on 8 October before any
+2.6.19 heartbeat reached ADD. ADD recorded `BOOTLOADER_ROLLBACK`; its campaign
+is paused and the exact candidate is revoked from further offers. No console
+capture covers that attempt, so neither a firmware fault nor a power
+interruption is established as the reset cause. The earlier 2.6.18 memory
+finding cannot be assigned to this attempt without evidence. Reader
+qualification and the writer's artifact pins remain unresolved.
+
+The next diagnostic bridge has the separate immutable version **2.6.20**.
+USB console capture is prepared for a bounded 3FL canary, but no 2.6.20 boot,
+reset cause, field readiness or recovery result is claimed by this role addition.
+It retains the same exact predecessor images, signed nationwide scope, HIL-only
+publication and stored bridge-readiness requirements. The revoked 2.6.17,
+2.6.18 and 2.6.19 artifacts remain historical evidence. The 2.7.0 writer still
+requires its pinned 2.6.17 image; replacing that pin requires actual qualified
+reader evidence and a separately reviewed contract update.
+
+The 2.6.20 build must include a fresh internal-memory and startup-stack review.
+Controlled ESP reboot is unsupported on a bridge, but shared ZKT code retains
+its RTC witness and pending-action storage. These costs must be measured in the
+exact ELF/map along with the reserved journal worker stacks. They do not identify
+the cause of the previous 2.6.19 rollback. This candidate must not be described as
+fixing that cause without reproduction and evidence.
+
 The [5 October experimental HIL direction](zkt-2.7.0-experimental-hil.md)
 permits remote HIL using ADD and automated evidence without waiting for external
 Oracle/bench resources. Those tests remain unperformed; unfinished software,
@@ -33,6 +57,10 @@ evidence still required. They are procedures, not passing qualification results.
 
 | Issue | Change | Verification | Status |
 |---|---|---|---|
+| An acceptance event can advance the writer without a completed observation | 2.7.0 ordered scope requires the matching stored full-run verdict, exact target/release/signing identity, completed observation interval, successful latest deployment and active/completed campaign | Orphan acceptance reproduced before repair; mismatched, incomplete, short, future, bridge-only and superseded run cases | Server-owned scope binding and sealed collection/finalization implemented; actual field acceptance remains open |
+| A generic reboot acknowledgement can be mistaken for safe ESP recovery | Exact-writer command expires within 60 seconds; durable intent consumes one attempt; terminal cleanup and an idle storage gate precede an image/boot-bound RTC witness; ADD requires authenticated post-reset evidence and healthy telemetry | Actual owner thread, failed sync then recovery, cancellation/deadline/replay/allocation faults, SQLite/PostgreSQL command dispatch and authenticated heartbeat integration | Controlled reboot component implemented; no field reboot or local-journal preservation pass is created by these tests |
+| A manual verdict or untyped receipt can create false HIL acceptance | Server-only 15-minute finalizer binds immutable baseline/source chains, exact typed Oracle receipts, both expiring controls, fresh telemetry and current release/campaign scope; sealed evidence is required to advance writer scope | Real raw-source ingress, derived attendance and typed receipts; malformed/replayed evidence; PostgreSQL concurrent finalizers and cancellation/revocation races | Experimental remote control/source custody collector implemented; journal residence during outage, seven-day capacity, physical and independent model qualification remain unasserted |
+| A later source-epoch change can retarget an earlier observation | Full writer observation pins both database and public epoch identities after checking its completed job, device, generation and active coverage | Missing, changed, inactive and superseded epoch tests | Immutable baseline binding implemented; older unpinned runs cannot retroactively acquire evidence |
 | Fresh APIs with stale screens | Canonical browser topics, reconnect/overflow resync, 30-second polling, focus refresh, shared device snapshots and old-response rejection | `test_browser_reliability.py`, `realtime.test.tsx`, existing drawer/App tests | Deployed in `bd395cc`; authenticated fleet API returns snapshot identity |
 | Successful login can precede session persistence and produce an immediate 401 | Commit the session and audit before issuing the cookie; commit logout revocation before reporting success | Real ASGI response boundaries with separate database connections, blocked commits and failed login/logout commits | Implemented authentication component; no change to firmware qualification |
 | A new signed package can reach the store before ADD understands its contract | HIL publication checks the running backend's signature trust root, family and storage admission before exposing the package; shares the deployment lock | Real signed-manifest/CLI validation, unsupported deployed validators, changed artifacts, bounded metadata, and Windows execution/cleanup failure tests | Publication-ordering guard implemented; does not qualify the firmware |

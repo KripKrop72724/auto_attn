@@ -41,7 +41,7 @@ bool add_source_epoch_required(const char *version, bool zkt)
     if (!zkt || !version) return false;
     if (!strncmp(version, "zone-lite-", 10)) version += 10;
     /* These are the exact bridge/writer versions eligible for this release. */
-    return !strcmp(version, "2.6.16") || !strcmp(version, "2.6.17") || !strcmp(version, "2.6.18") || !strcmp(version, "2.6.19") || !strcmp(version, "2.7.0");
+    return !strcmp(version, "2.6.16") || !strcmp(version, "2.6.17") || !strcmp(version, "2.6.18") || !strcmp(version, "2.6.19") || !strcmp(version, "2.6.20") || !strcmp(version, "2.7.0");
 }
 
 bool add_source_epoch_read(const cJSON *root, char epoch[37], bool required)

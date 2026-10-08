@@ -155,7 +155,9 @@ def test_raw_source_custody_is_not_legacy_reconciliation_acceptance(ready):
         start(ready)
 
 
-def test_signed_writer_can_observe_raw_custody_without_claiming_oracle_delivery(ready):
+@pytest.mark.parametrize("epoch_fault", [None, "missing", "job", "device", "generation", "inactive", "superseded", "nonempty"])
+def test_signed_writer_can_observe_raw_custody_without_claiming_oracle_delivery(ready, epoch_fault):
+    from zk_add.models import TerminalSourceEpoch
     from zk_add.zkt_bridge_contract import signed_hil_targets
     from zk_add.zkt_writer_contract import writer_contract
 
@@ -183,10 +185,40 @@ def test_signed_writer_can_observe_raw_custody_without_claiming_oracle_delivery(
     diagnostics["queues"] = [{"name": name, "count_known": True, "records": 0}
                              for name in ("journal", "legacy_migration")]
     coverage.capture_state, coverage.oracle_state = "SOURCE_CAPTURE_CERTIFIED_RAW_PENDING", "PENDING"
+    epoch = TerminalSourceEpoch(zkt_device_id=device.zkt_device.id, terminal_generation=1,
+                                sequence=1, state="ACTIVE")
+    session.add(epoch)
+    session.flush()
+    job.source_epoch_id = coverage.source_epoch_id = epoch.id
+    if epoch_fault == "missing":
+        coverage.source_epoch_id = None
+    elif epoch_fault == "job":
+        job.source_epoch_id = None
+    elif epoch_fault == "device":
+        epoch.zkt_device_id += 100
+    elif epoch_fault == "generation":
+        epoch.terminal_generation += 1
+    elif epoch_fault == "inactive":
+        epoch.state = "PENDING"
+    elif epoch_fault == "superseded":
+        epoch.superseded_at = utc_now()
+    elif epoch_fault == "nonempty":
+        diagnostics["queues"][0]["records"] = 1
+    if epoch_fault:
+        with pytest.raises(ValueError, match="empty queue baseline" if epoch_fault == "nonempty" else "source epoch"):
+            start(ready, exact=exact)
+        assert not list(session.scalars(select(FirmwareHilRun)))
+        return
     run = start(ready, exact=exact)
     assert run.status == "OBSERVING" and run.result == {}
     assert run.baseline["source_capture_state"] == "SOURCE_CAPTURE_CERTIFIED_RAW_PENDING"
     assert run.baseline["oracle_state"] == "PENDING"
+    assert run.baseline["source_epoch_id"] == epoch.id
+    assert run.baseline["source_epoch"] == epoch.epoch_id
+    assert run.baseline["queue_inventory"] == {"schema_version": 1,
+        "basis": "VERIFIED_EMPTY_REQUIRED_QUEUES", "telemetry_id": telemetry.id,
+        "queues": {"journal": 0, "legacy_migration": 0}}
+    assert len(run.baseline["capture_certificate_sha256"]) == 64
     assert not list(session.scalars(select(FirmwareEvent)))
 
 

@@ -174,7 +174,7 @@ int main(void)
     unit.write_text(harness)
     cases = [(mode, hikvision, direct, 0, "2.6.16") for mode, hikvision, direct in
              ((0, 0, 0), (1, 0, 0), (0, 1, 0), (0, 0, 1))]
-    cases.extend((0, 0, 0, 1, version) for version in ("2.6.16", "2.6.17", "2.6.18", "2.6.19"))
+    cases.extend((0, 0, 0, 1, version) for version in ("2.6.16", "2.6.17", "2.6.18", "2.6.19", "2.6.20"))
     for mode, hikvision, direct, bridge, version in cases:
         executable = tmp_path / f"upgrade-{mode}-{hikvision}-{direct}-{bridge}-{version}"
         subprocess.run(

@@ -36,6 +36,10 @@
 #endif
 
 #define OTA_NAMESPACE "zone_ota"
+
+#include <stdatomic.h>
+static atomic_flag s_control_owner = ATOMIC_FLAG_INIT;
+static atomic_bool s_hil_reboot_reserved;
 #define OTA_POLL_MS 60000
 #define OTA_BOOT_CONFIRM_SECONDS 900
 #define OTA_BOOT_HEALTH_REPORT_SECONDS 30
@@ -869,17 +873,26 @@ static void ota_task(void *argument)
     bool boot_checked = false;
     bool capability_reported = false;
     while (true) {
+        if (atomic_flag_test_and_set_explicit(&s_control_owner, memory_order_acquire)) {
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
         if (!s_journal_ready && !load_journal()) {
+            atomic_flag_clear_explicit(&s_control_owner, memory_order_release);
             vTaskDelay(pdMS_TO_TICKS(OTA_POLL_MS));
             continue;
         }
         if (!advance_failed_boot_rollback() || !advance_reader_rollback()) {
+            atomic_flag_clear_explicit(&s_control_owner, memory_order_release);
             vTaskDelay(pdMS_TO_TICKS(5000));
             continue;
         }
         if (!boot_checked) {
             boot_checked = confirm_or_report_rollback();
-            if (!boot_checked) { vTaskDelay(pdMS_TO_TICKS(OTA_POLL_MS)); continue; }
+            if (!boot_checked) {
+                atomic_flag_clear_explicit(&s_control_owner, memory_order_release);
+                vTaskDelay(pdMS_TO_TICKS(OTA_POLL_MS)); continue;
+            }
         }
         if (add_connector_is_connected()) {
             if (!capability_reported) {
@@ -892,6 +905,7 @@ static void ota_task(void *argument)
             }
             if (capability_reported && !s_busy) {
                 if (!acknowledge_pending_success()) {
+                    atomic_flag_clear_explicit(&s_control_owner, memory_order_release);
                     vTaskDelay(pdMS_TO_TICKS(OTA_POLL_MS));
                     continue;
                 }
@@ -905,6 +919,7 @@ static void ota_task(void *argument)
                 }
             }
         }
+        atomic_flag_clear_explicit(&s_control_owner, memory_order_release);
         vTaskDelay(pdMS_TO_TICKS(OTA_POLL_MS));
     }
 }
@@ -926,7 +941,41 @@ void ota_manager_start(void)
 
 bool ota_manager_busy(void)
 {
-    return s_busy;
+    return s_busy || atomic_load_explicit(&s_hil_reboot_reserved, memory_order_acquire);
+}
+
+bool ota_manager_hil_reboot_capable(void)
+{
+#if defined(ZONE_LITE_JOURNAL_WRITER_IMAGE) && !defined(ZONE_LITE_HIKVISION) && CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE
+    const esp_app_desc_t *app = esp_app_get_description();
+    return app && !strcmp(app->project_name, "zone_lite") && !strcmp(app->version, "2.7.0") &&
+        esp_secure_boot_enabled() && s_running_image_digest[0];
+#else
+    return false;
+#endif
+}
+bool ota_manager_running_image(char output[65])
+{
+    if (!output || !s_running_image_digest[0]) return false;
+    memcpy(output, s_running_image_digest, 65);
+    return true;
+}
+bool ota_manager_hil_reboot_reserve(void)
+{
+    if (!ota_manager_hil_reboot_capable() ||
+        atomic_flag_test_and_set_explicit(&s_control_owner, memory_order_acquire)) return false;
+    atomic_store_explicit(&s_hil_reboot_reserved, true, memory_order_release);
+    if (s_busy || setup_portal_active()) {
+        atomic_store_explicit(&s_hil_reboot_reserved, false, memory_order_release);
+        atomic_flag_clear_explicit(&s_control_owner, memory_order_release);
+        return false;
+    }
+    return true;
+}
+void ota_manager_hil_reboot_release(void)
+{
+    atomic_store_explicit(&s_hil_reboot_reserved, false, memory_order_release);
+    atomic_flag_clear_explicit(&s_control_owner, memory_order_release);
 }
 
 void ota_manager_append_telemetry(cJSON *heartbeat)

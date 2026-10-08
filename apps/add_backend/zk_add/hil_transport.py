@@ -86,11 +86,13 @@ def _control(run):
     return value, start, end
 
 
-def _healthy(session, connector, run, release, now):
-    telemetry = session.scalar(select(DeviceTelemetry)
-        .where(DeviceTelemetry.connector_id == connector.id)
-        .order_by(DeviceTelemetry.id.desc()).limit(1))
+def _healthy(session, connector, run, release, now, *, telemetry=None):
+    if telemetry is None:
+        telemetry = session.scalar(select(DeviceTelemetry)
+            .where(DeviceTelemetry.connector_id == connector.id)
+            .order_by(DeviceTelemetry.id.desc()).limit(1))
     if (telemetry is None or not connector.connected
+            or telemetry.connector_id != connector.id
             or telemetry.boot_id != connector.boot_id or telemetry.boot_id != run.baseline["boot_id"]
             or not 0 <= (now - ensure_utc(telemetry.created_at)).total_seconds() <= 45):
         raise ValueError("Fresh unchanged-boot telemetry is required")

@@ -38,6 +38,7 @@ typedef enum {ADD_WORKER_IDLE,ADD_WORKER_READING,ADD_WORKER_NETWORK,ADD_WORKER_C
 typedef int *SemaphoreHandle_t;
 ''' + outbox_type + r'''
 static bool owned_legacy=true;
+static bool ota_manager_hil_reboot_capable(void){return true;}
 static bool add_legacy_owner_required(void){return owned_legacy;}
 static int held;
 static add_outbox_t s_live_outbox={.lock=&held,.depth_known=true,.depth=3,.path="absent-live",.owner_bytes_known=true,.owner_bytes=123};

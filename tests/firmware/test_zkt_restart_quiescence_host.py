@@ -62,6 +62,7 @@ static bool maybe_reboot_zkt_for_recovery_session(uint32_t failures,int64_t *las
 static bool daily_zkt_reboot_try_target_session(uint32_t ip,int day);
 static bool discover_zkt_session(uint32_t *ip,uint32_t skip);
 static bool process_pending_comm_key_command_session(void);
+static void finish_hil_reboot_after_session(void){assert(body_finished&&!s_terminal_session_active);}
 /* PRODUCTION */
 static void session(void)
 {

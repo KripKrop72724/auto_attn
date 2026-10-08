@@ -27,6 +27,30 @@ class ReleaseIdentity(EvidenceModel):
     signing_key_id: str = Field(min_length=1, max_length=80)
 
 
+HEALTH_FIELDS = ("storage_healthy", "persistence_verified", "recovery_complete",
+                 "workers_healthy", "counts_known", "terminal_certified")
+COUNTER_FIELDS = ("write_failures", "read_failures", "worker_restarts", "message_rejections")
+SOURCE_FIELDS = ("source_generation", "committed_cursor", "source_count")
+
+
+class RebootStartupTransition(EvidenceModel):
+    """Server classification of unfinished checks, never a healthy snapshot.
+
+    The collector checks the complete firmware diagnostic shape and fault
+    fields before constructing this object. The evaluator independently binds
+    it to the controlled reset and the exact stored healthy recovery sample.
+    """
+    kind: Literal["CONTROLLED_REBOOT_STARTUP"] = "CONTROLLED_REBOOT_STARTUP"
+    command_id: str = Field(min_length=1, max_length=100)
+    recovery_telemetry_id: int = Field(gt=0)
+    phase: Literal["NOT_STARTED", "STORAGE_WAIT", "OWNER_START", "RECOVERING",
+                   "TRANSPORT_START", "CHECKING_READER", "CAPTURE_START", "READY"]
+    pending_checks: tuple[Literal["storage_healthy", "persistence_verified", "recovery_complete",
+        "workers_healthy", "counts_known", "terminal_certified"], ...]
+    unobserved_fields: tuple[Literal["write_failures", "read_failures", "source_generation",
+        "committed_cursor", "source_count"], ...] = ()
+
+
 class SmokeSample(EvidenceModel):
     telemetry_id: int = Field(gt=0)
     recorded_at: AwareDatetime
@@ -47,6 +71,7 @@ class SmokeSample(EvidenceModel):
     read_failures: int | None = Field(default=None, ge=0)
     worker_restarts: int | None = Field(default=None, ge=0)
     message_rejections: int | None = Field(default=None, ge=0)
+    reboot_startup: RebootStartupTransition | None = None
 
 
 class RecoveryTest(EvidenceModel):
@@ -196,6 +221,11 @@ def evaluate_smoke(evidence: SmokeEvidence, *, now: datetime) -> SmokeVerdict:
         or samples[-1].recorded_at < end - timedelta(seconds=45)
     ):
         missing.append("OBSERVATION_TELEMETRY_INCOMPLETE")
+    by_id = {sample.telemetry_id: sample for sample in samples}
+    transitions = set()
+    finished_boots: set[str] = set()
+    completed_checks: dict[str, set[str]] = {}
+    observed_fields: dict[str, set[str]] = {}
     for sample in samples:
         if sample.target != evidence.target or sample.release != evidence.release:
             failed.append("DEVICE_OR_ARTIFACT_MISMATCH")
@@ -203,27 +233,48 @@ def evaluate_smoke(evidence: SmokeEvidence, *, now: datetime) -> SmokeVerdict:
             failed.append("TELEMETRY_OUTSIDE_OBSERVATION")
         if not timedelta(0) <= sample.recorded_at - sample.diagnostics_at <= timedelta(seconds=45):
             missing.append("STALE_DIAGNOSTICS")
-        for name in (
-            "storage_healthy",
-            "persistence_verified",
-            "recovery_complete",
-            "workers_healthy",
-            "counts_known",
-            "terminal_certified",
-        ):
+        transition = sample.reboot_startup
+        pending, unobserved = set(), set()
+        if transition is not None:
+            recovered = by_id.get(transition.recovery_telemetry_id)
+            matches = [test for test in valid_tests if test.kind == "ESP_REBOOT"
+                and test.command_id == transition.command_id and test.boot_after == sample.boot_id
+                and test.started_at <= sample.recorded_at < test.recovered_at]
+            pending, unobserved = set(transition.pending_checks), set(transition.unobserved_fields)
+            valid = (len(matches) == 1 and recovered is not None
+                and sample.recorded_at < recovered.recorded_at <= matches[0].recovered_at
+                and recovered.boot_id == sample.boot_id and recovered.reboot_startup is None
+                and recovered.target == evidence.target and recovered.release == evidence.release
+                and all(getattr(recovered, name) is True for name in HEALTH_FIELDS)
+                and all(getattr(recovered, name) is not None for name in SOURCE_FIELDS + COUNTER_FIELDS)
+                and sample.boot_id not in finished_boots and bool(pending)
+                and len(pending) == len(transition.pending_checks)
+                and len(unobserved) == len(transition.unobserved_fields)
+                and pending == {name for name in HEALTH_FIELDS if getattr(sample, name) is not True}
+                and not pending.intersection(completed_checks.get(sample.boot_id, set()))
+                and not unobserved.intersection(observed_fields.get(sample.boot_id, set()))
+                and all(getattr(sample, name) is None
+                    or (name == "source_count" and sample.source_count == 0) for name in unobserved)
+                and all(getattr(sample, name) in (None, 0) for name in COUNTER_FIELDS))
+            if valid:
+                transitions.add(sample.telemetry_id)
+            else:
+                failed.append("INVALID_REBOOT_STARTUP_TRANSITION")
+                pending, unobserved = set(), set()
+        else:
+            # A prefix cannot reopen after even one normal new-boot sample.
+            finished_boots.add(sample.boot_id)
+        completed_checks.setdefault(sample.boot_id, set()).update(
+            name for name in HEALTH_FIELDS if getattr(sample, name) is True)
+        observed_fields.setdefault(sample.boot_id, set()).update(
+            name for name in SOURCE_FIELDS + COUNTER_FIELDS
+            if getattr(sample, name) is not None and name not in unobserved)
+        for name in HEALTH_FIELDS:
             value = getattr(sample, name)
-            if value is not True:
+            if value is not True and name not in pending:
                 (failed if value is False else missing).append(name.upper())
-        for name in (
-            "source_generation",
-            "committed_cursor",
-            "source_count",
-            "write_failures",
-            "read_failures",
-            "worker_restarts",
-            "message_rejections",
-        ):
-            if getattr(sample, name) is None:
+        for name in SOURCE_FIELDS + COUNTER_FIELDS:
+            if getattr(sample, name) is None and name not in unobserved:
                 missing.append(name.upper() + "_MISSING")
     boot_changes = 0
     for previous, sample in zip(samples, samples[1:]):
@@ -248,33 +299,35 @@ def evaluate_smoke(evidence: SmokeEvidence, *, now: datetime) -> SmokeVerdict:
                 for test in valid_tests
             ):
                 failed.append("UNPLANNED_RESET")
-        if (
-            sample.source_generation is not None
-            and previous.source_generation is not None
-            and sample.source_generation != previous.source_generation
-        ):
-            failed.append("SOURCE_GENERATION_CHANGED")
-        if (
-            sample.committed_cursor is not None
-            and previous.committed_cursor is not None
-            and sample.committed_cursor < previous.committed_cursor
-        ):
-            failed.append("SOURCE_CURSOR_REGRESSED")
-        for name in ("write_failures", "read_failures", "worker_restarts", "message_rejections"):
-            before, after = getattr(previous, name), getattr(sample, name)
-            if (
-                before is not None
-                and after is not None
-                and sample.boot_id == previous.boot_id
-                and after < before
-            ):
+    # Keep the last *observed* values across the unfinished boot prefix. A
+    # missing first post-reset counter must not hide a later nonzero counter;
+    # a source cursor must not regress through a run of unknown snapshots.
+    known_source, known_counters = {}, {}
+    initial_boot = samples[0].boot_id if samples else None
+    for sample in samples:
+        unobserved = (set(sample.reboot_startup.unobserved_fields)
+                      if sample.telemetry_id in transitions else set())
+        for name in SOURCE_FIELDS:
+            value = getattr(sample, name)
+            if value is None or name in unobserved:
+                continue
+            before = known_source.get(name)
+            if before is not None and (value != before if name == "source_generation" else value < before):
+                failed.append({"source_generation": "SOURCE_GENERATION_CHANGED",
+                    "committed_cursor": "SOURCE_CURSOR_REGRESSED", "source_count": "SOURCE_COUNT_REGRESSED"}[name])
+            known_source[name] = value
+        for name in COUNTER_FIELDS:
+            value = getattr(sample, name)
+            if value is None:
+                continue
+            key = (sample.boot_id, name)
+            before = known_counters.get(key)
+            if before is not None and value < before:
                 failed.append("COUNTER_REGRESSED_" + name.upper())
-            if (
-                before is not None
-                and after is not None
-                and (after > before if sample.boot_id == previous.boot_id else after > 0)
-            ):
+            if (before is not None and value > before) or (
+                    before is None and sample.boot_id != initial_boot and value > 0):
                 failed.append("NEW_" + name.upper())
+            known_counters[key] = value
     if boot_changes != 1:
         missing.append("EXACTLY_ONE_CONTROLLED_REBOOT_REQUIRED")
     if samples and samples[-1].committed_cursor != samples[-1].source_count:

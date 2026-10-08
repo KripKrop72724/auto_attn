@@ -26,7 +26,7 @@ from zk_add.zkt_bridge_contract import (
 )
 
 
-@pytest.fixture(params=["2.6.16", "2.6.17", "2.6.18", "2.6.19"], autouse=True)
+@pytest.fixture(params=["2.6.16", "2.6.17", "2.6.18", "2.6.19", "2.6.20"], autouse=True)
 def bridge_version(request, monkeypatch):
     monkeypatch.setattr(sys.modules[__name__], "BRIDGE_VERSION", request.param)
     monkeypatch.setattr(sys.modules[__name__], "BRIDGE_MARKER", bridge_marker(request.param))

@@ -29,8 +29,8 @@ def test_lease_identity_generation_corruption_and_retained_owner_reply(tmp_path)
 
 def test_gateway_lease_restores_identity_without_trusting_runtime_or_reused_uid(tmp_path):
     source = (ROOT / "firmware/zone_lite/main/zone_lite.c").read_text()
-    adapters = source[source.index("static bool temp_admin_evidence_ready(void)"):
-                      source.index("static bool process_add_commands(")]
+    end = source.index("\n}\n", source.index("static bool temp_admin_command_held(")) + 3
+    adapters = source[source.index("static bool temp_admin_evidence_ready(void)"):end]
     program = r'''
 #define ZL_GATEWAY_TEST
 #include "zkt_lease_store_host.c"

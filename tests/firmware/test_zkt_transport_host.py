@@ -12,6 +12,8 @@ def test_prepared_transport_rejects_wrong_session_truncation_and_oversized_frame
     stream = source[source.index("static bool zk_recv_data_stream("):source.index("static bool zk_send_command(")]
     command = source[source.index("static bool zk_send_command("):
                      source.index("static bool zk_send_ack_only(int sock, uint16_t session_id, int64_t deadline)\n{")]
+    bounded_range = source[source.index("static bool zk_read_bounded_range("):
+                           source.index("static bool zk_close_bounded_buffer(")]
     harness = r'''
 #include <assert.h>
 #include <stdbool.h>
@@ -19,10 +21,13 @@ def test_prepared_transport_rejects_wrong_session_truncation_and_oversized_frame
 #include <stdlib.h>
 #include <string.h>
 #include "zkt_socket_io.h"
+#include "zkt_record.h"
 #define ZKT_IO_TIMEOUT_SEC 90
 #define MACHINE_PREPARE_DATA_1 0x5050
 #define MACHINE_PREPARE_DATA_2 0x7d82
 #define CMD_DATA 1501
+#define CMD_PREPARE_DATA 1500
+#define CMD_READ_BUFFER_CHUNK 1504
 #define CMD_ACK_OK 2000
 #define CMD_REG_EVENT 500
 #define CMD_CONNECT 1000
@@ -35,6 +40,9 @@ typedef struct {uint16_t command,checksum,session_id,reply_id;} zk_header_t;
 typedef struct {uint16_t marker_1,marker_2;uint32_t length;} zk_tcp_header_t;
 typedef struct {uint16_t session_id,reply_id;} zk_context_t;
 typedef struct {uint16_t code,session_id,reply_id;uint8_t *data;size_t data_len;} zk_response_t;
+typedef struct {bool prepared;uint32_t size;uint8_t *direct_data;} zk_bounded_buffer_t;
+static void write_le32(uint8_t *p,uint32_t value)
+{for(unsigned i=0;i<4;++i)p[i]=(uint8_t)(value>>(8*i));}
 static uint8_t input[2048];
 static size_t total,position,fragment=1;
 static unsigned acknowledgements;
@@ -87,6 +95,13 @@ static void frame(uint16_t command,uint16_t session,const char *body,size_t size
  memcpy(input+total,&top,sizeof(top));total+=sizeof(top);
  memcpy(input+total,&header,sizeof(header));total+=sizeof(header);
  if(size){memcpy(input+total,body,size);total+=size;}}
+static void synthetic_record(uint8_t raw[40],unsigned index)
+{
+ memset(raw,0,40);raw[0]=(uint8_t)index;raw[2]=(uint8_t)('0'+index);
+ raw[26]=1;write_le32(raw+27,26U*12U*31U*86400U+index); /* January 1, 2026. */
+ zkt_record_t decoded;assert(zkt_record_decode(raw,40,&decoded));
+ assert(decoded.user_id[0]==(char)('0'+index));
+}
 int main(void){
  char out[16];size_t actual=0;
  for(fragment=1;fragment<=1024;fragment*=2){
@@ -110,6 +125,29 @@ int main(void){
  assert(position==sizeof(zk_tcp_header_t)); /* No drain of untrusted body. */
  assert(!zk_send_command(1,&ctx,1,(const uint8_t*)"x",SIZE_MAX,(uint8_t*)out,sizeof(out),&response));
  assert(!zk_send_command(1,&ctx,1,NULL,1,(uint8_t*)out,sizeof(out),&response));
+ /* Synthetic mechanism, not a claim about any field incident: an otherwise
+  * correct prefix must not certify a stale final record when more data follows. */
+ uint8_t records[160],range_out[120];
+ for(unsigned i=0;i<4;++i)synthetic_record(records+40*i,i+1);
+ for(fragment=1;fragment<=1024;fragment*=2){
+  total=position=0;frame(CMD_DATA,12,(char*)records,80);
+  frame(CMD_DATA,12,(char*)records+120,40);frame(CMD_ACK_OK,12,NULL,0);
+  assert(zk_recv_data_stream(1,12,range_out,120,&actual));
+  assert(actual==120&&!memcmp(range_out,records,80)&&!memcmp(range_out+80,records+120,40));
+  total=position=0;frame(CMD_DATA,12,(char*)records,80);
+  frame(CMD_DATA,12,(char*)records+80,40); /* Stale, but individually valid. */
+  frame(CMD_DATA,12,(char*)records+120,40);frame(CMD_ACK_OK,12,NULL,0);
+  assert(!zk_recv_data_stream(1,12,range_out,120,&actual));
+  total=position=0;frame(CMD_DATA,12,(char*)records,80);
+  frame(CMD_DATA,99,(char*)records+80,40);frame(CMD_ACK_OK,12,NULL,0);
+  assert(!zk_recv_data_stream(1,12,range_out,120,&actual));
+  zk_bounded_buffer_t prepared={.prepared=true,.size=4000};
+  total=position=0;frame(CMD_DATA,12,(char*)records,160);
+  assert(!zk_read_bounded_range(1,&ctx,&prepared,284,range_out,120));
+  total=position=0;frame(CMD_DATA,12,(char*)records,120);
+  assert(zk_read_bounded_range(1,&ctx,&prepared,284,range_out,120));
+  assert(!memcmp(range_out,records,120));
+ }
  total=position=0;frame(CMD_REG_EVENT,12,"x",1);frame(CMD_DATA,12,"abcd",4);frame(CMD_ACK_OK,12,NULL,0);
  assert(zk_recv_data_stream(1,12,(uint8_t*)out,4,&actual));
  assert(captures==1 && acknowledgements==1);
@@ -138,9 +176,10 @@ int main(void){
 }
 '''
     unit = tmp_path / "transport.c"
-    unit.write_text(harness.replace("/* PRODUCTION */", reads + stream + command))
+    unit.write_text(harness.replace("/* PRODUCTION */", reads + stream + command + bounded_range))
     executable = tmp_path / "transport"
     subprocess.run([shutil.which("cc"), "-std=c11", "-g", "-O1", "-Wall", "-Wextra", "-Werror",
                     "-fsanitize=address,undefined", "-I", str(ROOT / "firmware/zone_lite/main"),
-                    str(unit), "-o", str(executable)], check=True)
+                    str(unit), str(ROOT / "firmware/zone_lite/main/zkt_record.c"),
+                    "-o", str(executable)], check=True)
     subprocess.run([str(executable)], check=True)

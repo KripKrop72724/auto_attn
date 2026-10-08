@@ -21,6 +21,13 @@ static atomic_bool refuse_compatibility, stale_transport;
 static atomic_bool bridge_image, cutover_readback_failure;
 static atomic_int cutover_failure;
 static atomic_int persistence_failure;
+static atomic_bool fail_next_sync;
+#undef fsync
+int zkt_owner_test_fsync(int descriptor)
+{
+    if (atomic_exchange(&fail_next_sync, false)) { errno = EIO; return -1; }
+    return fsync(descriptor);
+}
 static pthread_t thread;
 static atomic_bool start_waiting, owner_announced;
 static pthread_mutex_t budget = PTHREAD_MUTEX_INITIALIZER;
@@ -287,6 +294,13 @@ qs_health_t qs_local_health_locked(void)
     return (qs_health_t){.observed = failure != 1, .available = failure != 2,
         .recovery_complete = failure != 3, .persistence_verified = failure != 4,
         .last_error = failure == 5 ? EIO : 0, .persistence_probe_error = failure == 6 ? EIO : 0};
+}
+qs_health_t qs_health(void)
+{
+    if (pthread_mutex_trylock(&budget)) return (qs_health_t){0};
+    qs_health_t snapshot = qs_local_health_locked();
+    assert(!pthread_mutex_unlock(&budget));
+    return snapshot;
 }
 /* Existing queue format with real files/checkpoints. Every operation invoked
  * by the copied client must execute on the storage thread. */
@@ -566,7 +580,8 @@ int main(int argc, char **argv)
     failed_rollback_test = argc == 2 && !strcmp(argv[1], "--failed-boot-full");
     bool rollback_test = failed_rollback_test || (argc == 2 && !strcmp(argv[1], "--rollback-full"));
     bool boundary_test = argc == 2 && !strcmp(argv[1], "--source-boundary");
-    bool recovering_checkpoint = argc == 2 && !corrupt_journal && !authority_test && !rollback_test && !boundary_test;
+    bool hil_idle_test = argc == 2 && !strncmp(argv[1], "--hil-", 6);
+    bool recovering_checkpoint = argc == 2 && !corrupt_journal && !authority_test && !rollback_test && !boundary_test && !hil_idle_test;
     uint8_t damaged[ZJ_CHECKPOINT_BYTES];
     if (recovering_checkpoint) {
         /* A retained encrypted-NVS root is intact; only its retirement blob
@@ -747,6 +762,58 @@ int main(int argc, char **argv)
     assert(zj_owner_submit(&compatibility, &ticket));
     assert(wait_reply(ticket).compatibility == ZJ_COMPAT_OK);
     assert(zj_owner_health(&health) && health.writer_allowed && health.delivery_authority == ZJ_AUTHORITY_ADD);
+    if (hil_idle_test) {
+        int64_t accepted_epoch = 0;
+        uint64_t accepted_us = 0, second;
+        int64_t epoch = (int64_t)time(NULL);
+        uint64_t deadline = (uint64_t)esp_timer_get_time() + 5000000;
+        if (strstr(argv[1], "incident")) {
+            /* A write failure finishes just before an otherwise idle gate.
+             * Later success/readiness cannot disguise this boot's incident. */
+            bool io_failure = !strcmp(argv[1], "--hil-io-incident");
+            atomic_store(&full, !io_failure);
+            atomic_store(&fail_next_sync, io_failure);
+            assert(zj_owner_submit(&request, &ticket));
+            assert(wait_reply(ticket).result == (io_failure ? ZJ_UNCERTAIN : ZJ_FULL));
+            atomic_store(&full, false);
+            assert(zj_owner_submit(&request, &ticket)); assert(wait_reply(ticket).result == ZJ_OK);
+            assert(zj_owner_health(&health) && health.ready && health.writer_allowed &&
+                health.last_append_result == ZJ_OK && health.hil_reboot_persistence_incident);
+            assert(!zj_owner_try_quiesce_before(deadline, epoch + 60, &accepted_epoch, &accepted_us));
+            assert(zj_owner_health(&health) && !health.quiescing && health.writer_allowed);
+            atomic_store(&stop, true); assert(!pthread_join(thread, NULL)); return 0;
+        }
+        for (int failure = 1; failure <= 6; ++failure) {
+            atomic_store(&persistence_failure, failure);
+            assert(!zj_owner_try_quiesce_before(deadline, epoch + 60, &accepted_epoch, &accepted_us));
+            assert(zj_owner_health(&health) && !health.quiescing && health.writer_allowed);
+        }
+        atomic_store(&persistence_failure, 0);
+        assert(!zj_owner_try_quiesce_before(1, epoch + 60, &accepted_epoch, &accepted_us));
+        assert(!zj_owner_try_quiesce_before(deadline, epoch, &accepted_epoch, &accepted_us));
+        assert(zj_owner_health(&health) && !health.quiescing && health.writer_allowed);
+        atomic_store(&pause_write, true);
+        assert(zj_owner_submit(&request, &ticket));
+        for (unsigned i = 0; i < 2000 && !atomic_load(&write_waiting); ++i) vTaskDelay(1);
+        assert(atomic_load(&write_waiting));
+        assert(!zj_owner_try_quiesce_before(deadline, epoch + 60, &accepted_epoch, &accepted_us));
+        assert(zj_owner_submit(&request, &second));
+        assert(!zj_owner_try_quiesce_before(deadline, epoch + 60, &accepted_epoch, &accepted_us));
+        assert(zj_owner_health(&health) && !health.quiescing && health.writer_allowed);
+        atomic_store(&pause_write, false);
+        assert(wait_reply(ticket).result == ZJ_OK);
+        /* The second completed reply may remain; it cannot represent I/O. */
+        bool closed = false;
+        for (unsigned i = 0; i < 2000 && !closed; ++i) {
+            closed = zj_owner_try_quiesce_before(deadline, epoch + 60, &accepted_epoch, &accepted_us);
+            if (!closed) vTaskDelay(1);
+        }
+        assert(closed && accepted_epoch >= epoch && accepted_us < deadline);
+        assert(wait_reply(second).result == ZJ_OK);
+        assert(!zj_owner_submit(&request, &ticket));
+        assert(zj_owner_health(&health) && health.quiesced && !health.operation_running && !health.writer_allowed);
+        atomic_store(&stop, true); assert(!pthread_join(thread, NULL)); return 0;
+    }
     zj_request_t update = {.operation = ZJ_OTA_CHECK, .input.ota = {
         .address = 0x2a0000, .size = 0x280000, .version = ZJ_WRITER_VERSION}};
     assert(zj_owner_submit(&update, &ticket));
