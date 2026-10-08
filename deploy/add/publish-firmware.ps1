@@ -22,14 +22,17 @@ if ($LASTEXITCODE -ne 0) { throw 'Firmware manifest is not in ADD canonical sign
 
 $manifest = Get-Content (Join-Path $source 'manifest.json') -Raw | ConvertFrom-Json
 if ($manifest.version -ne $Version) { throw 'Manifest version does not match requested version' }
-$journalBridge = $Version -in @('2.6.16', '2.6.17', '2.6.18', '2.6.19', '2.6.20', '2.6.21', '2.7.0')
+$journalBridge = $Version -in @('2.6.16', '2.6.17', '2.6.18', '2.6.19', '2.6.20', '2.6.21', '2.6.22', '2.6.23', '2.7.0')
 if ($journalBridge -and $manifest.release_channel -cne 'EXPERIMENTAL_HIL_ONLY') {
     throw 'Journal releases require the experimental HIL channel'
 }
 if ($journalBridge) {
     . (Join-Path $PSScriptRoot 'journal-hil-scope.ps1')
     Assert-JournalHilScope -TargetsJson (ConvertTo-Json -InputObject $manifest.hil_targets -Depth 5 -Compress) -Complete
-    Assert-JournalHilScope -TargetsJson $HilTargetsJson
+    if ($Version -eq '2.6.22') {
+        & python (Join-Path $PSScriptRoot '../../scripts/build_zkt_factory_contract.py') --manifest (Join-Path $source 'manifest.json') --exposure $HilTargetsJson
+        if ($LASTEXITCODE -ne 0) { throw 'Factory trial contract or exposure is invalid' }
+    } else { Assert-JournalHilScope -TargetsJson $HilTargetsJson }
 }
 $expectedImage = $(if ($manifest.firmware_family -eq 'hikvision') { "zone-lite-hikvision-$Version.bin" } else { "zone-lite-$Version.bin" })
 if ($manifest.image_name -ne $expectedImage) { throw 'Manifest image name is invalid' }
@@ -37,6 +40,12 @@ $image = Join-Path $source $manifest.image_name
 $actualHash = (Get-FileHash $image -Algorithm SHA256).Hash.ToLowerInvariant()
 if ($actualHash -ne $manifest.image_sha256) { throw 'Firmware image SHA-256 does not match manifest' }
 if ((Get-Item $image).Length -ne $manifest.image_size) { throw 'Firmware image size does not match manifest' }
+if ($Version -eq '2.7.0') {
+    . (Join-Path $PSScriptRoot 'firmware-storage-contract.ps1')
+    Get-FirmwareStorageContract -ImagePath $image -Version $Version -ForSigning | Out-Null
+    & python (Join-Path $PSScriptRoot '../../scripts/build_zkt_reader_matrix.py') --validate-manifest (Join-Path $source 'manifest.json')
+    if ($LASTEXITCODE -ne 0) { throw 'Writer publication requires the exact populated reader matrix' }
+}
 $targets = @()
 if (-not [string]::IsNullOrWhiteSpace($HilTargetsJson)) {
     if (-not [string]::IsNullOrWhiteSpace($HilTargetMac)) { throw 'Choose legacy MAC or ordered targets, not both' }

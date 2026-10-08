@@ -1,6 +1,6 @@
 param(
     [Parameter(Mandatory = $true)][string]$StoreDirectory,
-    [Parameter(Mandatory = $true)][ValidateSet('2.5.4', '2.6.0', '2.6.15', '2.6.16', '2.6.17', '2.6.18', '2.6.19', '2.6.20', '2.6.21', '2.7.0')][string]$Version,
+    [Parameter(Mandatory = $true)][ValidateSet('2.5.4', '2.6.0', '2.6.15', '2.6.16', '2.6.17', '2.6.18', '2.6.19', '2.6.20', '2.6.21', '2.6.22', '2.6.23', '2.7.0')][string]$Version,
     [Parameter(Mandatory = $true)][string]$ExpectedGitSha,
     [Parameter(Mandatory = $true)][string]$ExpectedImageSha256,
     [Parameter(Mandatory = $true)][string]$ExpectedApplicationSha256,
@@ -16,7 +16,7 @@ function Read-ExactTargets([string]$Json) {
     if (-not $Json.Trim().StartsWith('[')) { throw 'HIL targets must be a JSON array' }
     $parsed = ConvertFrom-Json -InputObject $Json
     $parsed = @($parsed)
-    $limit = if ($Version -in @('2.6.16', '2.6.17', '2.6.18', '2.6.19', '2.6.20', '2.6.21', '2.7.0')) { 17 } elseif ($Version -eq '2.6.15' -and $Scope2615 -eq 'Cities') { 14 } else { 8 }
+    $limit = if ($Version -in @('2.6.16', '2.6.17', '2.6.18', '2.6.19', '2.6.20', '2.6.21', '2.6.22', '2.6.23', '2.7.0')) { 17 } elseif ($Version -eq '2.6.15' -and $Scope2615 -eq 'Cities') { 14 } else { 8 }
     if ($parsed.Count -lt 1 -or $parsed.Count -gt $limit) { throw 'HIL target count exceeds its exact reviewed scope' }
     $targets = @()
     foreach ($row in $parsed) {
@@ -63,10 +63,17 @@ function Assert-SameTargets($Actual, $Expected) {
 
 $existingTargets = Read-ExactTargets $ExistingTargetsJson
 $extendedTargets = Read-ExactTargets $ExtendedTargetsJson
-if ($Version -in @('2.6.16', '2.6.17', '2.6.18', '2.6.19', '2.6.20', '2.6.21', '2.7.0')) {
+if ($Version -in @('2.6.16', '2.6.17', '2.6.18', '2.6.19', '2.6.20', '2.6.21', '2.6.22', '2.6.23', '2.7.0')) {
     . (Join-Path $PSScriptRoot 'journal-hil-scope.ps1')
-    Assert-JournalHilScope -TargetsJson $ExistingTargetsJson
-    Assert-JournalHilScope -TargetsJson $ExtendedTargetsJson
+    if ($Version -eq '2.6.22') {
+        foreach ($scope in @($ExistingTargetsJson, $ExtendedTargetsJson)) {
+            & python (Join-Path $PSScriptRoot '../../scripts/build_zkt_factory_contract.py') --exposure $scope | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw 'Factory trial expansion requires an exact three-target prefix' }
+        }
+    } else {
+        Assert-JournalHilScope -TargetsJson $ExistingTargetsJson
+        Assert-JournalHilScope -TargetsJson $ExtendedTargetsJson
+    }
 }
 if ($Version -eq '2.6.15') {
     $scopeArguments = @{
@@ -104,9 +111,17 @@ foreach ($path in @($manifestPath, $signaturePath, $markerPath)) {
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Missing published release file: $path" }
 }
 $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
-if ($Version -in @('2.6.16', '2.6.17', '2.6.18', '2.6.19', '2.6.20', '2.6.21', '2.7.0')) {
+if ($Version -in @('2.6.16', '2.6.17', '2.6.18', '2.6.19', '2.6.20', '2.6.21', '2.6.22', '2.6.23', '2.7.0')) {
     if ($manifest.release_channel -cne 'EXPERIMENTAL_HIL_ONLY') { throw 'Journal HIL release channel changed' }
     Assert-JournalHilScope -TargetsJson (ConvertTo-Json -InputObject $manifest.hil_targets -Depth 5 -Compress) -Complete
+}
+if ($Version -eq '2.7.0') {
+    & python (Join-Path $PSScriptRoot '../../scripts/build_zkt_reader_matrix.py') --validate-manifest $manifestPath
+    if ($LASTEXITCODE -ne 0) { throw 'Writer expansion requires the exact populated reader matrix' }
+}
+if ($Version -eq '2.6.22') {
+    & python (Join-Path $PSScriptRoot '../../scripts/build_zkt_factory_contract.py') --manifest $manifestPath --exposure $ExtendedTargetsJson
+    if ($LASTEXITCODE -ne 0) { throw 'Factory trial manifest or expansion is invalid' }
 }
 $marker = Get-Content -LiteralPath $markerPath -Raw | ConvertFrom-Json
 if ($manifest.version -cne $Version -or $manifest.firmware_family -eq 'hikvision' -or

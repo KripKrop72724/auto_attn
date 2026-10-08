@@ -11,6 +11,7 @@ from cryptography.hazmat.primitives.asymmetric import padding, rsa
 import pytest
 from sqlalchemy import event, func, select
 
+from reader_matrix_fixtures import admit, pinned, proof  # noqa: F401
 import test_zkt_handoff as boundary
 from test_zkt_source_load import store as store
 from zk_add.crypto import decrypt_json
@@ -29,7 +30,7 @@ from zk_add.service import apply_firmware_diagnostics
 from zk_add.settings import settings
 from zk_add.time_utils import utc_now
 from zk_add.zkt_handoff_commit import commit_handoff, wake_source_page
-from zk_add.zkt_writer_contract import writer_contract
+from zk_add.zkt_reader_matrix import writer_matrix_contract
 from zk_add import zkt_bridge_contract, zkt_handoff_commit
 
 source_store = boundary.source_store
@@ -48,7 +49,7 @@ def inventory():
 
 
 @pytest.fixture
-def prepared(source_store, monkeypatch):
+def prepared(source_store, monkeypatch, pinned):  # noqa: F811
     monkeypatch.setattr(settings, "pii_lookup_key", "isolated-handoff-test-key")
     with source_store() as db:
         connector, now = boundary.prepared(db)
@@ -79,10 +80,10 @@ def prepared(source_store, monkeypatch):
             firmware_family="zkt",
             project_name="zone_lite",
             release_channel="EXPERIMENTAL_HIL_ONLY",
-            minimum_bootstrap_version="2.6.17",
+            minimum_bootstrap_version="2.6.21",
             runtime_profile="ZKT_JOURNAL_V1",
             hil_targets=[target.identity.model_dump()],
-            queue_storage=writer_contract(),
+            queue_storage=writer_matrix_contract(),
             application_sha256="b" * 64,
             image_sha256="c" * 64,
             git_sha="d" * 40,
@@ -131,7 +132,11 @@ def prepared(source_store, monkeypatch):
                 target_version="2.7.0",
             )
         )
+        db.flush()
+        deployment = db.scalar(select(FirmwareDeployment))
+        selection = admit(db, release, deployment, pinned)
         diagnostics = deepcopy(connector.firmware_diagnostics)
+        diagnostics["qualified_reader"] = proof(selection)
         diagnostics.update(
             legacy_inventory=inventory(),
             journal_runtime=dict(
@@ -228,6 +233,32 @@ def issue(db, connector, now, **changes):
             **changes,
         ),
     )
+
+
+@pytest.mark.parametrize("fault", ["rolled_back", "cancelled_campaign", "changed_reader_sample"])
+def test_cached_install_or_sample_cannot_grant_custody(prepared, fault):
+    factory, connector, now = prepared
+    with factory() as db:
+        install = db.scalar(select(FirmwareDeployment))
+        campaign = db.get(FirmwareCampaign, install.campaign_id)
+        sample = db.scalar(select(DeviceTelemetry).order_by(DeviceTelemetry.id.desc()).limit(1))
+        before = (install.status, campaign.status, deepcopy(sample.payload))
+        with factory() as peer:
+            if fault == "rolled_back":
+                peer.get(FirmwareDeployment, install.id).status = "ROLLED_BACK"
+            elif fault == "cancelled_campaign":
+                peer.get(FirmwareCampaign, campaign.id).status = "CANCELLED"
+            else:
+                row = peer.get(DeviceTelemetry, sample.id)
+                payload = deepcopy(row.payload)
+                payload["diagnostics"]["qualified_reader"]["verified"] = False
+                row.payload = payload
+            peer.commit()
+        assert (install.status, campaign.status, sample.payload) == before
+        with pytest.raises(ValueError):
+            issue(db, connector, now)
+        assert db.scalar(select(func.count()).select_from(ZktLegacyHandoff)) == 0
+        assert db.scalar(select(func.count()).select_from(ZktSourceCutover)) == 0
 
 
 def test_actual_signed_custody_handoff_replays_receipt_without_minting_attendance(prepared):
@@ -565,3 +596,34 @@ def test_changed_retained_proof_is_held_without_disclosing_raw_data(prepared, ch
         }
         with pytest.raises(ValueError, match="HANDOFF_RETAINED_EVIDENCE_CHANGED"):
             issue(db, connector, now)
+
+
+@pytest.mark.parametrize("fault", ["admission_missing", "admission_other", "missing", "image", "matrix", "slot", "generation"])
+def test_handoff_requires_two_matching_selected_reader_proofs(prepared, fault):
+    from zk_add.ota import FirmwareEvent
+    factory, connector, now = prepared
+    with factory() as db:
+        if fault.startswith("admission"):
+            event = db.scalar(select(FirmwareEvent).where(FirmwareEvent.state == "OFFERED"))
+            if fault == "admission_missing":
+                db.delete(event)
+            else:
+                value = deepcopy(event.details)
+                value["reader_admission"]["reader"]["version"] = "2.6.22"
+                event.details = value
+        else:
+            sample = db.scalar(select(DeviceTelemetry).order_by(DeviceTelemetry.id.asc()))
+            payload = deepcopy(sample.payload)
+            if fault == "missing":
+                payload["diagnostics"].pop("qualified_reader")
+            else:
+                field, value = {"image": ("application_sha256", "e" * 64),
+                    "matrix": ("matrix_sha256", "e" * 64), "slot": ("slot_address", 0x520000),
+                    "generation": ("proof_generation", "8")}[fault]
+                payload["diagnostics"]["qualified_reader"][field] = value
+            sample.payload = payload
+        db.commit()
+        with pytest.raises(ValueError):
+            issue(db, connector, now)
+        assert db.scalar(select(func.count()).select_from(ZktSourceCutover)) == 0
+        assert db.scalar(select(func.count()).select_from(ZktLegacyHandoff)) == 0

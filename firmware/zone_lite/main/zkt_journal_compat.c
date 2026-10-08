@@ -90,28 +90,29 @@ bool zj_reader_proof_decode(const uint8_t bytes[ZJ_READER_PROOF_BYTES],
     /* A replacement reader may inspect the old proof only to renew it after
      * checking the unchanged terminal/epoch/layout. Writer/update admission
      * below still requires the exact current reader version and image. */
+    static const char *const history[] = {
+        "2.6.16", "2.6.17", "2.6.18", "2.6.19", "2.6.20", "2.6.21", "2.6.22", "2.6.23"
+    };
     const char *version = NULL;
-    if (!memcmp(bytes + 168, ZJ_BRIDGE_VERSION, sizeof(ZJ_BRIDGE_VERSION)))
-        version = ZJ_BRIDGE_VERSION;
-    else if ((!strcmp(ZJ_BRIDGE_VERSION, "2.6.17") || !strcmp(ZJ_BRIDGE_VERSION, "2.6.18") ||
-              !strcmp(ZJ_BRIDGE_VERSION, "2.6.19") || !strcmp(ZJ_BRIDGE_VERSION, "2.6.20") ||
-              !strcmp(ZJ_BRIDGE_VERSION, "2.6.21")) &&
-             !memcmp(bytes + 168, "2.6.16", sizeof("2.6.16")))
-        version = "2.6.16";
-    else if ((!strcmp(ZJ_BRIDGE_VERSION, "2.6.18") || !strcmp(ZJ_BRIDGE_VERSION, "2.6.19") ||
-              !strcmp(ZJ_BRIDGE_VERSION, "2.6.20") || !strcmp(ZJ_BRIDGE_VERSION, "2.6.21")) &&
-             !memcmp(bytes + 168, "2.6.17", sizeof("2.6.17")))
-        version = "2.6.17";
-    else if ((!strcmp(ZJ_BRIDGE_VERSION, "2.6.19") || !strcmp(ZJ_BRIDGE_VERSION, "2.6.20") ||
-              !strcmp(ZJ_BRIDGE_VERSION, "2.6.21")) &&
-             !memcmp(bytes + 168, "2.6.18", sizeof("2.6.18")))
-        version = "2.6.18";
-    else if ((!strcmp(ZJ_BRIDGE_VERSION, "2.6.20") || !strcmp(ZJ_BRIDGE_VERSION, "2.6.21")) &&
-             !memcmp(bytes + 168, "2.6.19", sizeof("2.6.19")))
-        version = "2.6.19";
-    else if (!strcmp(ZJ_BRIDGE_VERSION, "2.6.21") &&
-             !memcmp(bytes + 168, "2.6.20", sizeof("2.6.20")))
-        version = "2.6.20";
+    unsigned limit = 0;
+#if defined(ZONE_LITE_QUALIFIED_READER_MATRIX) && ZONE_LITE_QUALIFIED_READER_MATRIX
+    /* Decoding historical proof is not admission. Exact current-slot/version
+     * policy is checked below before permission or rollback selection. */
+    limit = sizeof(history) / sizeof(history[0]);
+#else
+    const bool factory_reader = !strcmp(ZJ_BRIDGE_VERSION, "2.6.22");
+    for (unsigned i = 0; i < sizeof(history) / sizeof(history[0]); ++i)
+        if (!strcmp(history[i], ZJ_BRIDGE_VERSION)) limit = i + 1;
+#endif
+    for (unsigned i = 0; i < limit; ++i) {
+#if !defined(ZONE_LITE_QUALIFIED_READER_MATRIX) || !ZONE_LITE_QUALIFIED_READER_MATRIX
+        /* Factory22 is a separate branch, never a general predecessor for an
+         * ordinary bridge. Its own reader and the exact matrix writer can
+         * inspect that proof without granting a factory-to-bridge transition. */
+        if (!factory_reader && !strcmp(history[i], "2.6.22")) continue;
+#endif
+        if (!memcmp(bytes + 168, history[i], strlen(history[i]) + 1)) version = history[i];
+    }
     if (!version) return false;
     encode(&decoded, revision, version, canonical);
     if (!revision || !identity_valid(&decoded) || memcmp(bytes, canonical, sizeof(canonical))) return false;
@@ -168,7 +169,9 @@ static zj_compat_result_t check_retained_bridge(zj_reader_proof_port_t port,
     if (!identity_valid(current) || !identity_valid(previous)) return ZJ_COMPAT_INVALID;
     zj_compat_result_t result = environment(writer, ZJ_WRITER_VERSION, false, true);
     if (result != ZJ_COMPAT_OK) return result;
-    result = environment(rollback, ZJ_BRIDGE_VERSION, require_validated_state, false);
+    if (!rollback || !zj_reader_policy_image(rollback->version, previous->image_digest))
+        return ZJ_COMPAT_VERSION;
+    result = environment(rollback, rollback->version, require_validated_state, false);
     if (result != ZJ_COMPAT_OK) return result;
     if (!separate_slots(current, previous)) return ZJ_COMPAT_ROLLBACK;
     uint8_t proof[ZJ_READER_PROOF_BYTES];
@@ -176,7 +179,7 @@ static zj_compat_result_t check_retained_bridge(zj_reader_proof_port_t port,
     uint64_t generation;
     result = load(port, proof, &attested, &generation);
     if (result != ZJ_COMPAT_OK) return result;
-    if (memcmp(proof + 168, ZJ_BRIDGE_VERSION, sizeof(ZJ_BRIDGE_VERSION))) return ZJ_COMPAT_VERSION;
+    if (memcmp(proof + 168, rollback->version, strlen(rollback->version) + 1)) return ZJ_COMPAT_VERSION;
     if (!binding_equal(current, previous) || !binding_equal(current, &attested)) return ZJ_COMPAT_BINDING;
     return image_equal(previous, &attested) ? ZJ_COMPAT_OK : ZJ_COMPAT_ROLLBACK;
 }

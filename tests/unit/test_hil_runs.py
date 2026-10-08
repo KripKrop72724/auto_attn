@@ -4,6 +4,7 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
+from reader_matrix_fixtures import admit, pinned, proof  # noqa: F401
 from test_hil_scope import hil_session, target  # noqa: F401
 from zk_add.hil_scope import HilTarget
 from zk_add.hil_runs import cancel_run, start_run
@@ -156,10 +157,10 @@ def test_raw_source_custody_is_not_legacy_reconciliation_acceptance(ready):
 
 
 @pytest.mark.parametrize("epoch_fault", [None, "missing", "job", "device", "generation", "inactive", "superseded", "nonempty"])
-def test_signed_writer_can_observe_raw_custody_without_claiming_oracle_delivery(ready, epoch_fault):
+def test_signed_writer_can_observe_raw_custody_without_claiming_oracle_delivery(ready, epoch_fault, pinned):  # noqa: F811
     from zk_add.models import TerminalSourceEpoch
     from zk_add.zkt_bridge_contract import signed_hil_targets
-    from zk_add.zkt_writer_contract import writer_contract
+    from zk_add.zkt_reader_matrix import writer_matrix_contract
 
     session, release, device, deployment, job, coverage, telemetry = ready
     exact = signed_hil_targets()[0]
@@ -168,15 +169,16 @@ def test_signed_writer_can_observe_raw_custody_without_claiming_oracle_delivery(
         setattr(device.zkt_device, field, exact["terminal_serial"])
     job.terminal_serial = coverage.terminal_serial = exact["terminal_serial"]
     release.release_id, release.version = "zone-lite-2.7.0", "2.7.0"
-    contract = writer_contract()
+    contract = writer_matrix_contract()
     release.manifest = {**release.manifest, "release_id": release.release_id, "version": release.version,
         "firmware_family": "zkt", "project_name": "zone_lite", "release_channel": "EXPERIMENTAL_HIL_ONLY",
-        "minimum_bootstrap_version": contract["compatibility_version"], "runtime_profile": "ZKT_JOURNAL_V1",
+        "minimum_bootstrap_version": contract["allowed_bootstrap_versions"][0], "runtime_profile": "ZKT_JOURNAL_V1",
         "queue_storage": contract, "hil_targets": signed_hil_targets(), "_hil_targets": [exact]}
     deployment.target_version = release.version
     telemetry.payload["ota"]["running_version"] = release.version
     telemetry.payload["zkt"]["serial"] = exact["terminal_serial"]
     diagnostics = telemetry.payload["diagnostics"]
+    diagnostics["qualified_reader"] = proof(admit(session, release, deployment, pinned))
     diagnostics.update(schema_version=2, runtime_profile="ZKT_JOURNAL_V1", journal_format=1, delivery_authority="ADD",
         journal_storage={"observed": True, "fresh": True, "ready": True, "durability": "HEALTHY",
                          "checkpoint_recovery_pending": False, "sampled_uptime_ms": 99000})
@@ -219,7 +221,7 @@ def test_signed_writer_can_observe_raw_custody_without_claiming_oracle_delivery(
         "basis": "VERIFIED_EMPTY_REQUIRED_QUEUES", "telemetry_id": telemetry.id,
         "queues": {"journal": 0, "legacy_migration": 0}}
     assert len(run.baseline["capture_certificate_sha256"]) == 64
-    assert not list(session.scalars(select(FirmwareEvent)))
+    assert not list(session.scalars(select(FirmwareEvent).where(FirmwareEvent.state != "OFFERED")))
 
 
 @pytest.mark.parametrize("value", [None, True, -1, "0"])

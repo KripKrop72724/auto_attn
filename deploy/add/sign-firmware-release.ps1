@@ -5,7 +5,8 @@ param(
     [Parameter(Mandatory = $true)][ValidatePattern('^[0-9]+\.[0-9]+\.[0-9]+$')][string]$Version,
     [Parameter(Mandatory = $true)][ValidatePattern('^[0-9a-f]{40}$')][string]$GitSha,
     [ValidateSet('zkt', 'hikvision')][string]$FirmwareFamily = 'zkt',
-    [string]$HilTargetsJson = ''
+    [string]$HilTargetsJson = '',
+    [ValidatePattern('^[a-zA-Z0-9][a-zA-Z0-9_.-]+$')][string]$AddContainer = 'attendance-device-dashboard-add-api-1'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -94,12 +95,23 @@ $sourceImage = Join-Path $unsigned "$projectName.bin"
 if ($LASTEXITCODE -ne 0) { throw 'Application identity does not match release metadata' }
 if (-not (Test-Path -LiteralPath $sourceImage -PathType Leaf)) { throw 'Unsigned Zone Lite image is missing' }
 . (Join-Path $PSScriptRoot 'firmware-storage-contract.ps1')
-$storageContract = Get-FirmwareStorageContract -ImagePath $sourceImage -Version $Version
+$storageContract = Get-FirmwareStorageContract -ImagePath $sourceImage -Version $Version -ForSigning
+if ($FirmwareFamily -eq 'zkt' -and $Version -eq '2.7.0') {
+    # Public policy/compiled marker checks alone are insufficient: prove both
+    # exact signed reader packages against the configured live ADD trust/store
+    # and read-only revocation catalog before decrypting any vault material.
+    & (Join-Path $PSScriptRoot 'check-deployed-reader-packages.ps1') -MatrixSha256 $storageContract.reader_matrix_sha256 -AddContainer $AddContainer
+}
 $journalHilTargets = $null
-if ($Version -in @('2.6.16', '2.6.17', '2.6.18', '2.6.19', '2.6.20', '2.6.21', '2.7.0')) {
+$factoryTrial = $null
+if ($Version -in @('2.6.16', '2.6.17', '2.6.18', '2.6.19', '2.6.20', '2.6.21', '2.6.22', '2.6.23', '2.7.0')) {
     if ($FirmwareFamily -ne 'zkt') { throw 'The journal bridge is ZKT-only' }
     . (Join-Path $PSScriptRoot 'journal-hil-scope.ps1')
-    Assert-JournalHilScope -TargetsJson $HilTargetsJson
+    if ($Version -eq '2.6.22') {
+        $factoryJson = & python (Join-Path $PSScriptRoot '../../scripts/build_zkt_factory_contract.py') --exposure $HilTargetsJson
+        if ($LASTEXITCODE -ne 0) { throw 'Factory trial contract or exposure is invalid' }
+        $factoryTrial = ($factoryJson -join [Environment]::NewLine) | ConvertFrom-Json
+    } else { Assert-JournalHilScope -TargetsJson $HilTargetsJson }
     $journalHilTargets = Get-JournalHilScope
 }
 if ($FirmwareFamily -eq 'zkt' -and $Version -eq '2.6.1') {
@@ -213,7 +225,7 @@ try {
         image_name = $imageName
         image_sha256 = $imageHash
         image_size = $size
-        minimum_bootstrap_version = $(if ($Version -eq '2.7.0') { '2.6.17' } elseif ($Version -eq '2.6.0') { '2.5.4' } elseif ($Version -in @('2.6.1', '2.6.2', '2.6.3', '2.6.4', '2.6.5', '2.6.6', '2.6.7', '2.6.8', '2.6.9', '2.6.10', '2.6.11', '2.6.12', '2.6.13', '2.6.14', '2.6.15', '2.6.16', '2.6.17', '2.6.18', '2.6.19', '2.6.20', '2.6.21')) { '2.4.12' } else { '2.2.0' })
+        minimum_bootstrap_version = $(if ($Version -eq '2.7.0') { Get-WriterBootstrapMinimum -StorageContract $storageContract } elseif ($Version -eq '2.6.22') { '2.5.2' } elseif ($Version -eq '2.6.0') { '2.5.4' } elseif ($Version -in @('2.6.1', '2.6.2', '2.6.3', '2.6.4', '2.6.5', '2.6.6', '2.6.7', '2.6.8', '2.6.9', '2.6.10', '2.6.11', '2.6.12', '2.6.13', '2.6.14', '2.6.15', '2.6.16', '2.6.17', '2.6.18', '2.6.19', '2.6.20', '2.6.21', '2.6.23')) { '2.4.12' } else { '2.2.0' })
         partition_layout = 'zone-lite-ota-v1'
         project_name = $projectName
         release_id = $(if ($FirmwareFamily -eq 'hikvision') { "zone-lite-hikvision-$Version" } else { "zone-lite-$Version" })
@@ -226,14 +238,15 @@ try {
         # Keep canonical lexical key order used by ADD signature verification.
         $sortedManifest = [ordered]@{}
         $additionalKeys = @('queue_storage')
-        if ($Version -in @('2.6.16', '2.6.17', '2.6.18', '2.6.19', '2.6.20', '2.6.21', '2.7.0')) { $additionalKeys += @('hil_targets', 'release_channel') }
+        if ($Version -in @('2.6.16', '2.6.17', '2.6.18', '2.6.19', '2.6.20', '2.6.21', '2.6.22', '2.6.23', '2.7.0')) { $additionalKeys += @('hil_targets', 'release_channel') }
         if ($Version -eq '2.7.0') { $manifest['runtime_profile'] = 'ZKT_JOURNAL_V1' }
+        if ($Version -eq '2.6.22') { $manifest['factory_trial'] = $factoryTrial }
         foreach ($key in @($manifest.Keys + $additionalKeys | Sort-Object)) {
             $sortedManifest[$key] = $(if ($key -eq 'queue_storage') { $storageContract } elseif ($key -eq 'hil_targets') { $journalHilTargets } elseif ($key -eq 'release_channel') { 'EXPERIMENTAL_HIL_ONLY' } else { $manifest[$key] })
         }
         $manifest = $sortedManifest
     }
-    $manifestJson = $manifest | ConvertTo-Json -Depth 5 -Compress
+    $manifestJson = $manifest | ConvertTo-Json -Depth 10 -Compress
     [IO.File]::WriteAllText(
         (Join-Path $output 'manifest.json'),
         $manifestJson,

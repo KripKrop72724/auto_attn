@@ -5,12 +5,17 @@
 
 #define ZJ_READER_PROOF_BYTES 192U
 #ifndef ZJ_BRIDGE_VERSION
-/* The writer requires the replacement reader. Legacy bridge builds explicitly
- * override this to retain their original proof and marker contracts. */
+/* Historical builds retain their original proof contract. The new matrix
+ * writer has no implicit fallback reader; bridge images define their own. */
+#if defined(ZONE_LITE_QUALIFIED_READER_MATRIX) && ZONE_LITE_QUALIFIED_READER_MATRIX
+#define ZJ_BRIDGE_VERSION "UNQUALIFIED"
+#else
 #define ZJ_BRIDGE_VERSION "2.6.17"
+#endif
 #endif
 #define ZJ_WRITER_VERSION "2.7.0"
 #define ZJ_READER_MASK 0x3fU /* Includes persisted ADD authority and bridge capture. */
+#include "zkt_reader_policy.h"
 
 /* This is local reader capability, not model, HIL or production qualification.
  * The storage owner supplies the verified key epoch and reader state. The ESP
@@ -21,6 +26,14 @@ typedef struct {
     uint8_t image_digest[32], terminal_digest[32], capture_epoch[16], layout_digest[32];
     uint32_t slot_address, slot_size;
 } zj_reader_identity_t;
+
+typedef struct {
+    bool verified;
+    char version[20];
+    uint8_t image_digest[32];
+    uint32_t slot_address, slot_size;
+    uint64_t proof_generation;
+} zj_reader_selection_t;
 
 typedef struct {
     const char *application, *version;

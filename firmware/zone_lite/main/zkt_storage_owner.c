@@ -47,6 +47,9 @@ typedef struct {
     int nvs_error;
     bool opening_store;
     bool writer_allowed, compatibility_checked;
+#if defined(ZONE_LITE_QUALIFIED_READER_MATRIX) && ZONE_LITE_QUALIFIED_READER_MATRIX
+    zj_reader_selection_t selected_reader;
+#endif
     zj_compat_result_t compatibility;
     uint64_t retry_at_us;
     uint64_t io_revision;
@@ -395,9 +398,15 @@ static void execute(owner_t *o, const zj_request_t *request, zj_reply_t *reply)
                     request->input.ota.address, request->input.ota.size, request->input.ota.version);
             } else {
                 bool writer_image = false;
+#if defined(ZONE_LITE_QUALIFIED_READER_MATRIX) && ZONE_LITE_QUALIFIED_READER_MATRIX
+                o->compatibility = zj_reader_platform_check_evidence(o->metadata.terminal_serial,
+                    o->metadata.capture_epoch, o->store.ready && o->state.ready, delivery_ready,
+                    persistence, o->store.checkpoint_recovery_pending, &writer_image, &o->selected_reader);
+#else
                 o->compatibility = zj_reader_platform_check(o->metadata.terminal_serial,
                     o->metadata.capture_epoch, o->store.ready && o->state.ready, delivery_ready,
                     persistence, o->store.checkpoint_recovery_pending, &writer_image);
+#endif
                 o->compatibility_checked = true;
                 o->writer_allowed = false;
                 if (o->compatibility == ZJ_COMPAT_OK && writer_image &&
@@ -559,6 +568,11 @@ static void task(void *context)
         o->health.checkpoint_recovery_pending = o->store.checkpoint_recovery_pending;
         o->health.compatibility_checked = o->compatibility_checked;
         o->health.writer_allowed = o->writer_allowed;
+#if defined(ZONE_LITE_QUALIFIED_READER_MATRIX) && ZONE_LITE_QUALIFIED_READER_MATRIX
+        o->health.selected_reader = o->selected_reader;
+        if (!o->writer_allowed || !o->compatibility_checked)
+            memset(&o->health.selected_reader, 0, sizeof(o->health.selected_reader));
+#endif
         o->health.delivery_authority = zj_state_authority(&o->state);
         o->health.compatibility = o->compatibility;
         o->health.last_result = reply.result;

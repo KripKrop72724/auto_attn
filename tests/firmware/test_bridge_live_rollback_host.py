@@ -10,7 +10,7 @@ MAIN = ROOT / "firmware/zone_lite/main"
 FIXTURES = ROOT / "tests/firmware"
 
 
-@pytest.mark.parametrize("bridge_version", ["2.6.20", "2.6.21"])
+@pytest.mark.parametrize("bridge_version", ["2.6.20", "2.6.21", "2.6.23"])
 def test_valid_reader_captures_during_terminal_stability_window(tmp_path, bridge_version):
     for header in ("esp_app_desc.h", "esp_ota_ops.h", "esp_secure_boot.h", "esp_err.h", "sdkconfig.h"):
         (tmp_path / header).write_text('#include "zkt_reader_platform_host.h"\n')

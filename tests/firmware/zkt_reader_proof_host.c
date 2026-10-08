@@ -86,12 +86,14 @@ int main(void)
     assert(zj_reader_check_writer(port(), &w, &current, &b, &previous) == ZJ_COMPAT_OK);
     assert(zj_reader_attest(port(), &b, &previous) == ZJ_COMPAT_OK && !storage.writes);
 
-    const char *historical[] = {"2.6.16", "2.6.17", "2.6.18", "2.6.19", "2.6.20", "2.6.21"};
+    const char *historical[] = {"2.6.16", "2.6.17", "2.6.18", "2.6.19", "2.6.20", "2.6.21", "2.6.22", "2.6.23"};
+    const bool factory_reader = !strcmp(ZJ_BRIDGE_VERSION, "2.6.22");
     for (size_t i = 0; i < sizeof(historical) / sizeof(*historical); ++i) {
         if (!strcmp(historical[i], ZJ_BRIDGE_VERSION)) continue;
         memcpy(storage.bytes + 168, historical[i], strlen(historical[i]) + 1);
         crc();
-        if (strcmp(historical[i], ZJ_BRIDGE_VERSION) > 0) {
+        if (strcmp(historical[i], ZJ_BRIDGE_VERSION) > 0 ||
+            (!factory_reader && !strcmp(historical[i], "2.6.22"))) {
             assert(!zj_reader_proof_decode(storage.bytes, &decoded, &generation));
             assert(zj_reader_attest(port(), &b, &previous) == ZJ_COMPAT_CORRUPT && !storage.writes);
             memcpy(storage.bytes, original, sizeof(original));
@@ -108,6 +110,14 @@ int main(void)
         assert(!memcmp(storage.bytes + 168, ZJ_BRIDGE_VERSION, sizeof(ZJ_BRIDGE_VERSION)));
         assert(zj_reader_check_writer(port(), &w, &current, &b, &previous) == ZJ_COMPAT_OK);
         memcpy(storage.bytes, original, sizeof(original)); storage.writes = 0;
+    }
+    /* The separate factory22 role is not an ordinary bridge predecessor. */
+    if (!factory_reader) {
+        memcpy(storage.bytes + 168, "2.6.22", sizeof("2.6.22"));
+        crc();
+        assert(!zj_reader_proof_decode(storage.bytes, &decoded, &generation));
+        assert(zj_reader_attest(port(), &b, &previous) == ZJ_COMPAT_CORRUPT && !storage.writes);
+        memcpy(storage.bytes, original, sizeof(original));
     }
     for (unsigned byte = 0; byte < ZJ_READER_PROOF_BYTES; ++byte) {
         storage.bytes[byte] ^= 1;

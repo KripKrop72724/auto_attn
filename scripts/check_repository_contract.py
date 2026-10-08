@@ -144,6 +144,7 @@ def main() -> int:
         ".github/workflows/firmware-release.yml",
         ".github/workflows/factory-firmware-hil-candidate.yml",
         ".github/workflows/factory-firmware-promote.yml",
+        ".github/workflows/factory-provenance-audit.yml",
         ".github/workflows/provisioning-companion-release.yml",
         ".github/workflows/zone-lite-device-provisioning.yml",
     }

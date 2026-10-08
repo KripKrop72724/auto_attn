@@ -234,9 +234,20 @@ def test_known_storage_fault_never_becomes_an_unknown_experimental_obligation(fa
 
 
 def test_trial_dependency_cannot_silently_fall_back_to_legacy_writer_contract(factory, monkeypatch):
+    from test_zkt_writer_contract import manifest as historical_manifest
+    from zk_add.ota import FirmwareRelease
     monkeypatch.undo()
-    with pytest.raises(ValueError, match="MATRIX_UNAVAILABLE"):
-        trial.dependencies(factory[0], factory[1])
+    session, factory_reader, *_ = factory
+    with pytest.raises(ValueError, match="FACTORY_FINAL_WRITER_REQUIRED"):
+        trial.dependencies(session, factory_reader)
+    session.add(FirmwareRelease(release_id="zone-lite-2.7.0", version="2.7.0",
+        git_sha="a" * 40, image_sha256="d" * 64, image_size=1024,
+        signing_key_id="test-historical-key", partition_layout=factory_reader.partition_layout,
+        storage_name="unused-historical-writer.bin", manifest_signature="test-signature",
+        state="HIL_ONLY", manifest=historical_manifest()))
+    session.flush()
+    with pytest.raises(ValueError, match="Historical writer contracts cannot authorize"):
+        trial.dependencies(session, factory_reader)
 
 
 def test_factory_dependency_requires_replacement23_and_never_substitutes_historical21(hil_session, monkeypatch):  # noqa: F811

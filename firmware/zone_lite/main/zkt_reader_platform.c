@@ -149,6 +149,15 @@ zj_compat_result_t zj_reader_platform_check(const char *terminal_serial,
     const uint8_t capture_epoch[16], bool reader_ready, bool delivery_ready,
     bool persistence_verified, bool recovery_pending, bool *writer_allowed)
 {
+    return zj_reader_platform_check_evidence(terminal_serial, capture_epoch, reader_ready,
+        delivery_ready, persistence_verified, recovery_pending, writer_allowed, NULL);
+}
+zj_compat_result_t zj_reader_platform_check_evidence(const char *terminal_serial,
+    const uint8_t capture_epoch[16], bool reader_ready, bool delivery_ready,
+    bool persistence_verified, bool recovery_pending, bool *writer_allowed,
+    zj_reader_selection_t *selection)
+{
+    if (selection) memset(selection, 0, sizeof(*selection));
     if (!writer_allowed) return ZJ_COMPAT_INVALID;
     *writer_allowed = false;
     zj_reader_environment_t env;
@@ -168,6 +177,24 @@ zj_compat_result_t zj_reader_platform_check(const char *terminal_serial,
         .secure_boot = env.secure_boot, .encrypted_nvs = env.encrypted_nvs,
         .ota_slot = ota(previous), .image_validated = validated(previous)};
     result = zj_reader_check_writer(port, &env, &current_id, &rollback, &previous_id);
+    if (result == ZJ_COMPAT_OK && selection) {
+        uint8_t proof[ZJ_READER_PROOF_BYTES];
+        zj_reader_identity_t decoded;
+        uint64_t generation;
+        if (read_proof(NULL, proof) != 1 || !zj_reader_proof_decode(proof, &decoded, &generation))
+            result = ZJ_COMPAT_IO;
+        else if (memcmp(&decoded, &previous_id, sizeof(decoded)) ||
+                 strcmp((const char *)proof + 168, previous_app.version))
+            result = ZJ_COMPAT_ROLLBACK;
+        else {
+            selection->verified = true;
+            memcpy(selection->version, proof + 168, sizeof(selection->version));
+            memcpy(selection->image_digest, previous_id.image_digest, 32);
+            selection->slot_address = previous_id.slot_address;
+            selection->slot_size = previous_id.slot_size;
+            selection->proof_generation = generation;
+        }
+    }
     *writer_allowed = result == ZJ_COMPAT_OK;
     return result;
 }

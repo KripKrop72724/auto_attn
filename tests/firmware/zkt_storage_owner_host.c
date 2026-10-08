@@ -400,8 +400,9 @@ zj_compat_result_t zj_reader_platform_writer_identity(const char *serial, const 
     *out=(zj_reader_identity_t){.terminal_digest={2}, .image_digest={3}};
     memcpy(out->capture_epoch, epoch, 16); return ZJ_COMPAT_OK;
 }
-zj_compat_result_t zj_reader_platform_check(const char *serial, const uint8_t epoch[16],
-    bool ready, bool delivery, bool persistence, bool recovering, bool *writer_allowed)
+zj_compat_result_t zj_reader_platform_check_evidence(const char *serial, const uint8_t epoch[16],
+    bool ready, bool delivery, bool persistence, bool recovering, bool *writer_allowed,
+    zj_reader_selection_t *selection)
 {
     assert(!strcmp(serial, "TEST-TERMINAL") && epoch[0]);
     assert(ready && persistence);
@@ -409,7 +410,13 @@ zj_compat_result_t zj_reader_platform_check(const char *serial, const uint8_t ep
      * This spy verifies owner locking, gating and recovery transitions. */
     bool compatible = delivery && !recovering && !atomic_load(&refuse_compatibility);
     *writer_allowed = compatible && !atomic_load(&bridge_image);
+    if (selection) memset(selection, 0, sizeof(*selection));
     return compatible ? ZJ_COMPAT_OK : ZJ_COMPAT_NOT_READY;
+}
+zj_compat_result_t zj_reader_platform_check(const char *serial, const uint8_t epoch[16],
+    bool ready, bool delivery, bool persistence, bool recovering, bool *writer_allowed)
+{
+    return zj_reader_platform_check_evidence(serial, epoch, ready, delivery, persistence, recovering, writer_allowed, NULL);
 }
 zj_compat_result_t zj_reader_platform_update(const char *serial, const uint8_t epoch[16],
     bool ready, bool delivery, bool persistence, bool recovering, uint32_t address, uint32_t size, const char *version)

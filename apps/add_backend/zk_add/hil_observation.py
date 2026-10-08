@@ -131,6 +131,23 @@ def _sample(row, run, target, identity, logs):
         errors.append("SIGNED_WRITER_APPLICATION_MISMATCH")
     if diagnostics.get("delivery_authority") != "ADD":
         errors.append("DELIVERY_AUTHORITY_UNVERIFIED")
+    reader_proof = None
+    reader_pending = False
+    if "reader_admission" in run.baseline:
+        from zk_add.zkt_reader_evidence import qualified_reader_proof
+        try:
+            reader_proof = qualified_reader_proof(diagnostics, run.baseline["reader_admission"], row.uptime_seconds)
+            if reader_proof != run.baseline.get("qualified_reader"):
+                errors.append("QUALIFIED_READER_CHANGED")
+        except (ValueError, TypeError):
+            raw = diagnostics.get("qualified_reader")
+            minimal = {key: value for key, value in raw.items() if value is not None} if isinstance(raw, dict) else {}
+            reader_pending = (minimal == {"schema_version": 1, "verified": False,
+                "matrix_sha256": run.baseline["reader_admission"].get("matrix_sha256")}
+                and type(minimal.get("schema_version")) is int
+                and isinstance(diagnostics.get("journal_runtime"), dict)
+                and diagnostics["journal_runtime"].get("writer_ready") is False)
+            errors.append("QUALIFIED_READER_PROOF_PENDING" if reader_pending else "QUALIFIED_READER_UNVERIFIED")
     workers = diagnostics.get("workers") or []
     if not isinstance(workers, list) or not all(isinstance(item, dict)
             and isinstance(item.get("name"), str) for item in workers):
@@ -188,6 +205,7 @@ def _sample(row, run, target, identity, logs):
         message_rejections=sum(log.code == "DEVICE_MESSAGE_REJECTED" and log.boot_id == row.boot_id
                                and ensure_utc(log.received_at) <= recorded for log in logs))
     details = {"sequence": row.sequence, "uptime_seconds": row.uptime_seconds, "queues": queues,
+               "qualified_reader": reader_proof, "qualified_reader_pending": reader_pending,
                "worker_restart_counts": {item["name"]: item.get("restart_count") for item in workers},
                "errors": errors, **sample.model_dump(mode="json")}
     return sample, details
@@ -411,6 +429,14 @@ def complete_full_run(session, run_id, *, actor):
     deployment = session.get(FirmwareDeployment, run.deployment_id)
     campaign = session.get(FirmwareCampaign, deployment.campaign_id) if deployment else None
     errors = []
+    reader_selection = None
+    try:
+        from zk_add.zkt_reader_evidence import admitted_reader
+        reader_selection = admitted_reader(session, deployment, release)
+        if reader_selection != run.baseline.get("reader_admission"):
+            errors.append("READER_ADMISSION_CHANGED")
+    except (ValueError, AttributeError, TypeError):
+        errors.append("READER_ADMISSION_UNVERIFIED")
     if (release is None or release.version != "2.7.0" or release.state != "HIL_ONLY" or release.revoked_at is not None
             or release.manifest.get("runtime_profile") != "ZKT_JOURNAL_V1"
             or _release_identity(release).model_dump(mode="json") != run.release_identity):
@@ -461,7 +487,8 @@ def complete_full_run(session, run_id, *, actor):
         # strictly classified unfinished boot can have UNKNOWN authority; the
         # shared evaluator still independently validates that classification.
         errors.extend(error for error in item["errors"] if not
-            (item.get("reboot_startup") and error == "DELIVERY_AUTHORITY_UNVERIFIED"))
+            (item.get("reboot_startup") and error in {
+                "DELIVERY_AUTHORITY_UNVERIFIED", "QUALIFIED_READER_PROOF_PENDING"}))
     baseline = session.get(DeviceTelemetry, run.baseline.get("telemetry_id")) if run.baseline.get("telemetry_id") else None
     if (baseline is None or baseline.connector_id != run.connector_id or baseline.boot_id != run.baseline.get("boot_id")
             or not start - timedelta(seconds=45) <= ensure_utc(baseline.created_at) <= start):
@@ -568,6 +595,7 @@ def complete_full_run(session, run_id, *, actor):
     reasons = sorted(set(errors + list(verdict.reasons)))
     outcome = "FAILED" if verdict.outcome == "FAILED" else "INCOMPLETE" if reasons else "PASS"
     sealed = {"collector_version": COLLECTOR_VERSION, "window_start": start.isoformat(), "window_end": end.isoformat(),
+        "reader_admission": reader_selection, "qualified_reader": run.baseline.get("qualified_reader"),
         "scope": {"run_id": run.run_id, "deployment_id": run.deployment_id, "target": run.target,
                   "release_identity": run.release_identity}, "baseline_sha256": evidence_digest(run.baseline),
         "samples": details, "current_sample": current_details, "source": source, "attendance": writer,

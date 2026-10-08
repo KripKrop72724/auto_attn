@@ -48,6 +48,27 @@ until its exact signed image supplies field evidence. The 2.7.0 writer still
 requires its pinned 2.6.17 image; replacing that pin requires actual qualified
 reader evidence and a separately reviewed contract update.
 
+The subsequent 2.6.21 field trial reported a failed 1,024-byte DMA allocation
+with limited internal free memory. No 21 bridge-readiness qualification is
+claimed. **2.6.23** is the new immutable normal-reader role for the pending
+allocation corrections; **2.6.22** remains a separate factory-trial role. The
+23 package uses the existing V3 format with `:VERSION=2.6.23`, preserves the
+exact legacy predecessor images and all 17 signed targets, and remains HIL-only.
+Historical 21 packages and evidence remain valid audit records. Ordinary 23
+proof renewal may inspect an older ordinary reader's bound proof, but does not
+authorize factory22 or move the writer's signed artifact pins. Software tests,
+exact build inspection and fresh field qualification remain separate gates.
+
+The 23 allocation corrections move two identified 8 KiB buffers (queue-audit
+scratch and the volatile UID occupancy bitmap) from static internal RAM into
+bounded PSRAM allocations. Hikvision retains its existing occupancy storage.
+An exact ESP-IDF 5.5.3 source check also applies a build-local AES cleanup fix:
+if the output bounce-buffer allocation fails, the already allocated input
+buffer must be released. Tests reproduce this conditional leak; they do not
+establish it as the initiating cause of the field failure. The SDK file's
+expected source hash and sole compiled replacement are checked rather than
+silently patching a different SDK or falling back to the unfixed source.
+
 The new build requires an exact-ELF internal-memory and startup-stack review.
 Controlled ESP reboot is unsupported on bridges, but shared ZKT code retains
 its RTC witness and pending-action storage. The allocation-failure callback

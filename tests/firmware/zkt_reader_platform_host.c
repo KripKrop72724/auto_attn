@@ -16,7 +16,7 @@ static esp_partition_t partitions[] = {
 static unsigned running = 3, other = 2, fault, reads, writes, opens, closes, commits, released;
 static bool secure = true, exists, current_valid = true, previous_valid = true, reverse;
 static bool writer_allowed;
-static unsigned boot_slot = 2, selections;
+static unsigned boot_slot = 2, selections, check_reads;
 static unsigned invalidations;
 static unsigned ota_count = 2;
 static bool rollback_possible = true;
@@ -89,10 +89,11 @@ void nvs_close(int handle) { assert(handle == 1); ++closes; }
 int nvs_get_blob(int handle, const char *name, void *out, size_t *length)
 {
     assert(handle == 1 && !strcmp(name, "reader_v1") && *length == sizeof(durable));
-    ++reads;
+    ++reads; ++check_reads;
     if (fault == 12) return -1;
     if (!exists) return ESP_ERR_NVS_NOT_FOUND;
     memcpy(out, durable, sizeof(durable));
+    if (fault == 35 && check_reads == 2) ((uint8_t *)out)[0] ^= 1;
     if (fault == 13) --*length;
     if (fault == 17 && writes) ((uint8_t *)out)[0] ^= 1;
     return 0;
@@ -115,9 +116,22 @@ int nvs_commit(int handle)
 }
 static zj_compat_result_t check(void)
 {
-    zj_compat_result_t result = zj_reader_platform_check("TEST-TERMINAL", epoch, true, true, true, false, &writer_allowed);
+    zj_reader_selection_t selected;
+    memset(&selected, 0xa5, sizeof(selected));
+    check_reads = 0;
+    zj_compat_result_t result = zj_reader_platform_check_evidence("TEST-TERMINAL", epoch, true, true, true, false,
+        &writer_allowed, &selected);
     assert(opens == closes);
     assert(writer_allowed == (result == ZJ_COMPAT_OK && !strcmp(app.version, ZJ_WRITER_VERSION)));
+    assert(selected.verified == writer_allowed);
+    if (writer_allowed) {
+        assert(!strcmp(selected.version, prior.version));
+        assert(selected.slot_address == partitions[other].address && selected.slot_size == partitions[other].size);
+        assert(selected.proof_generation > 0);
+        for (unsigned i = 0; i < 32; ++i) assert(selected.image_digest[i] == partitions[other].subtype);
+    } else {
+        for (unsigned i = 0; i < sizeof(selected); ++i) assert(!((uint8_t *)&selected)[i]);
+    }
     return result;
 }
 static zj_compat_result_t update(void)
@@ -200,6 +214,9 @@ int main(void)
     fault=0;
     assert(update() == ZJ_COMPAT_PROTECTED_SLOT);
     assert(check() == ZJ_COMPAT_OK && writes == initial_writes);
+    fault = 35;
+    assert(check() == ZJ_COMPAT_IO && !writer_allowed && writes == initial_writes);
+    fault = 0;
 #if CONFIG_BOOTLOADER_APP_ANTI_ROLLBACK
     assert(select_reader() == ZJ_COMPAT_ANTI_ROLLBACK && !selections);
     assert(failed_boot() == ZJ_COMPAT_ANTI_ROLLBACK && !invalidations);

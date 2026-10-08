@@ -584,7 +584,7 @@ static bool advance_reader_rollback(void)
     const esp_app_desc_t *app = esp_app_get_description();
     bool intent = !strcmp(s_journal.state, "READER_INTENT");
     bool writer = app && !strcmp(app->project_name, "zone_lite") && !strcmp(app->version, ZJ_WRITER_VERSION);
-    bool offered = writer && !strcmp(s_journal.target_version, ZJ_BRIDGE_VERSION) &&
+    bool offered = writer && zj_reader_policy_target(s_journal.target_version, s_journal.image_sha256) &&
         !strcmp(s_journal.state, "DOWNLOADING");
     if (!intent && !offered && !s_reader_ticket) return true;
     s_busy = true;

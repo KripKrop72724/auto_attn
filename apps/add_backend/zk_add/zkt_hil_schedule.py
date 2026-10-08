@@ -19,7 +19,7 @@ RESERVATION_LIMIT = 128
 
 
 def applies(release):
-    return release.state == "HIL_ONLY" and release.version in {"2.6.20", "2.6.21", "2.6.22", "2.7.0"}
+    return release.state == "HIL_ONLY" and release.version in {"2.6.20", "2.6.21", "2.6.22", "2.6.23", "2.7.0"}
 
 
 def digest(value):
