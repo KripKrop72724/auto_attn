@@ -86,9 +86,10 @@ correction, but recovered field headroom remains untested until the new trial.
 
 CI builds and checks the exact 23 descriptor and reader marker, while retaining
 publication and reader-proof regressions for earlier bridge versions. The
-writer's active artifact pins remain unchanged and the proposed final reader
-matrix remains blocked until actual signed artifacts and per-target evidence
-exist. Any allocation repair still requires an exact ESP-IDF build, actual ELF
+final V5 reader matrix remains BLOCKED until both actual signed reader packages
+are independently verified and their exact identities enter a reviewed source
+change. PINNED permits package checks; each device still needs its own stored
+reader qualification and fresh runtime evidence before writer admission. Any allocation repair still requires an exact ESP-IDF build, actual ELF
 memory/stack inspection, and field observation before the next promotion.
 
 Explicit writer rollback must retain the proved bridge's `VALID` state. Making

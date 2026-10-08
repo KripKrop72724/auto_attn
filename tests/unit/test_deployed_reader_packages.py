@@ -65,7 +65,7 @@ def packages(tmp_path, key, monkeypatch):
     pem = key.public_key().public_bytes(serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo)
     entries, records = [], []
     # Exercise both actual role validators with isolated signed packages.
-    # The deployment policy remains empty and BLOCKED.
+    # The checked-in deployment policy is not modified.
     for version in policy.VERSIONS:
         image = signed_image(version, key)
         entry = dict(version=version, release_id='zone-lite-' + version,

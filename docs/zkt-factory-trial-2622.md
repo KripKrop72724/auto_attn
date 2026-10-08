@@ -22,9 +22,9 @@ stored 3FL `BRIDGE_READY`, and the same writer's completed, sealed 3FL full HIL
 verdict with the exact retained reader evidence. The current implementation
 binds that nonfactory entry to 2.6.23. Historical 21 evidence cannot substitute
 for exact 23 readiness or the writer's retained 23 proof. A failed, unsigned or
-revoked 23 cannot satisfy it. The reader matrix remains blocked until separately
-reviewed exact artifact pins are installed; these changes populate no matrix
-and assume no field readiness.
+revoked 23 cannot satisfy it. The reader matrix can become PINNED only through a separate reviewed source
+change after both signed packages are verified. That package binding does not
+replace the stored per-device readiness and first-writer HIL prerequisites.
 
 ADD checks the exact registered connector/terminal/generation, current factory
 image and partition, fresh connectivity, stable terminal, security capability,

@@ -1,4 +1,4 @@
-"""Synthetic reader identities never populate the checked-in blocked matrix."""
+"""Synthetic reader identities never modify the checked-in release matrix."""
 from copy import deepcopy
 import hashlib
 import json
@@ -19,6 +19,10 @@ from zk_add.zkt_writer_contract import validate_writer_image, validate_writer_ma
 from zk_add.zkt_bridge_contract import signed_hil_targets
 
 ROOT = Path(__file__).resolve().parents[2]
+
+
+def blocked_matrix():
+    return {"schema_version": 1, "matrix_id": matrix.MATRIX_ID, "state": "BLOCKED", "readers": []}
 
 
 def synthetic_matrix():
@@ -46,15 +50,46 @@ def writer_manifest(value):
             "hil_targets": signed_hil_targets(), "queue_storage": matrix.writer_matrix_contract(value)}
 
 
-def test_checked_in_matrix_is_blocked_and_signing_refuses(tmp_path):
-    policy = matrix.load_matrix()
-    assert policy["state"] == "BLOCKED" and policy["readers"] == []
-    assert "#define ZJ_READER_MATRIX_COUNT 0U" in render_header(policy)
-    with pytest.raises(ValueError):
-        matrix.writer_matrix_contract()
-    result = subprocess.run([sys.executable, str(ROOT / "scripts/build_zkt_reader_matrix.py"),
-                             "--signing-contract"], capture_output=True, text=True)
-    assert result.returncode == 1 and not result.stdout
+def assert_cli_contract(root, policy):
+    result = subprocess.run([sys.executable, str(root / "scripts/build_zkt_reader_matrix.py"),
+                             "--signing-contract"], capture_output=True, text=True, timeout=30)
+    assert f"#define ZJ_READER_MATRIX_COUNT {len(policy['readers'])}U" in render_header(policy)
+    if policy["state"] == "BLOCKED":
+        with pytest.raises(ValueError):
+            matrix.writer_matrix_contract(policy)
+        assert result.returncode == 1 and not result.stdout
+    else:
+        expected = matrix.writer_matrix_contract(policy)
+        assert result.returncode == 0 and not result.stderr
+        assert result.stdout == matrix.canonical(expected).decode() + "\n"
+        assert expected["reader_matrix_sha256"] == matrix.matrix_hash(policy)
+        assert matrix.matrix_marker(policy).endswith(expected["reader_matrix_sha256"])
+
+
+def test_checked_in_matrix_matches_its_signing_contract():
+    assert_cli_contract(ROOT, matrix.load_matrix())
+
+
+@pytest.mark.parametrize("populated", [False, True])
+def test_cli_blocked_and_pinned_states_are_isolated(tmp_path, populated, monkeypatch):
+    # Exercise the real CLI's fixed policy path without adding a runtime override
+    # or depending on the current release policy's activation state.
+    for relative in ("scripts/build_zkt_reader_matrix.py", "apps/add_backend/zk_add/zkt_reader_matrix.py",
+                     "apps/add_backend/zk_add/__init__.py"):
+        destination = tmp_path / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(ROOT / relative, destination)
+    path = tmp_path / "apps/add_backend/zk_add/zkt_reader_matrix.json"
+    policy = synthetic_matrix() if populated else blocked_matrix()
+    path.write_text(json.dumps(policy))
+    monkeypatch.setattr(matrix, "MATRIX_PATH", path)
+    assert matrix.load_matrix() == policy
+    if not populated:
+        with pytest.raises(ValueError):
+            matrix.load_matrix(require_pinned=True)
+        with pytest.raises(ValueError):
+            matrix.writer_matrix_contract()
+    assert_cli_contract(tmp_path, policy)
 
 
 @pytest.mark.parametrize("change", ["schema_bool", "extra", "missing", "blocked_rows", "empty_pinned",
@@ -181,7 +216,7 @@ def test_typed_reader_proof_binds_image_slot_generation_and_freshness(pinned):
 
 @pytest.mark.parametrize("populated", [False, True])
 def test_reader_target_is_bounded_portable_c11(tmp_path, populated):
-    policy = synthetic_matrix() if populated else matrix.load_matrix()
+    policy = synthetic_matrix() if populated else blocked_matrix()
     (tmp_path / "zkt_qualified_reader_matrix.h").write_text(render_header(policy))
     program = r'''
 #include "zkt_reader_policy.h"
@@ -225,7 +260,7 @@ int main(void) {
 
 @pytest.mark.parametrize("populated", [False, True])
 def test_actual_c_guard_accepts_only_pinned_exact_proof_and_empty_matrix_blocks(tmp_path, populated):
-    policy = synthetic_matrix() if populated else matrix.load_matrix()
+    policy = synthetic_matrix() if populated else blocked_matrix()
     (tmp_path / "zkt_qualified_reader_matrix.h").write_text(render_header(policy))
     for index, version in enumerate(matrix.VERSIONS):
         proof = bytearray(192)
