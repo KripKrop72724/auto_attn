@@ -12,6 +12,9 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "nvs.h"
+#if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
+#include "esp_heap_caps.h"
+#endif
 #if defined(ZONE_LITE_QUEUE_OWNER) && ZONE_LITE_QUEUE_OWNER
 #include "zkt_segmented_owner.h"
 #include "zkt_storage_owner.h"
@@ -28,7 +31,9 @@ static char storage_generation[33];
 static const char *names[] = {"ql", "qb", "qo", "qi", "qr", "qe", "qh"};
 #if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
 static dq_audit_t recovery_audits[QS_COUNT];
-static uint8_t recovery_buffer[DQ_MAX_RECORD_BYTES];
+/* CPU-only fread/CRC scratch. The budget lock owns its one bounded allocation
+ * and every use; never consume scarce internal/DMA memory as a fallback. */
+static uint8_t *recovery_buffer;
 #endif
 static bool ensure_storage_generation(void)
 {
@@ -277,12 +282,22 @@ bool qs_recover_step(void)
         if (!budget_lock || xSemaphoreTake(budget_lock, pdMS_TO_TICKS(1000)) != pdTRUE) {
             xSemaphoreGive(lanes[i].mutex); return false;
         }
+        if (!recovery_buffer)
+            recovery_buffer = heap_caps_malloc(DQ_MAX_RECORD_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!recovery_buffer) {
+            /* Unperformed verification is unknown, not an empty queue or a
+             * failed persistence operation. A later owner pass may retry. */
+            health.recovery_complete = false;
+            xSemaphoreGive(budget_lock);
+            xSemaphoreGive(lanes[i].mutex);
+            return false;
+        }
         errno = 0;
         dq_result_t result = reopen(&lanes[i]);
         if (result == DQ_OK && (!recovery_audits[i].complete ||
             recovery_audits[i].generation != lanes[i].queue.checkpoint.generation))
             result = dq_audit_step(&lanes[i].queue, &recovery_audits[i],
-                recovery_buffer, sizeof(recovery_buffer));
+                recovery_buffer, DQ_MAX_RECORD_BYTES);
         if (result != DQ_OK) complete = false;
         if (result != DQ_PENDING) record_queue_result(result, "segment_verify", false);
         xSemaphoreGive(budget_lock);

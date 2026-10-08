@@ -83,7 +83,7 @@ jobs:
           if mac and not re.fullmatch(r'(?:[0-9a-f]{2}:){5}[0-9a-f]{2}', mac):
               raise SystemExit('Invalid HIL MAC')
           targets = json.loads(raw) if raw else None
-          journal_bridge = os.environ['INPUT_VERSION'] in {'2.6.16', '2.6.17', '2.6.18', '2.6.19', '2.6.20', '2.6.21', '2.7.0'}
+          journal_bridge = os.environ['INPUT_VERSION'] in {'2.6.16', '2.6.17', '2.6.18', '2.6.19', '2.6.20', '2.6.21', '2.6.23', '2.7.0'}
           target_limit = 17 if journal_bridge else 8
           if journal_bridge:
               expected = json.load(open('deploy/add/hil-targets-zkt-270.json'))
@@ -157,7 +157,7 @@ jobs:
           if [[ "$FIRMWARE_FAMILY" == "hikvision" ]]; then project=zone_lite_hikvision; fi
           actual="$(sed -n "s/^project($project VERSION \([^ )]*\).*/\1/p" CMakeLists.txt)"
           journal_mode=OFF
-          if [[ "$FIRMWARE_FAMILY" == "zkt" && ( "$EXPECTED_VERSION" == "2.6.16" || "$EXPECTED_VERSION" == "2.6.17" || "$EXPECTED_VERSION" == "2.6.18" || "$EXPECTED_VERSION" == "2.6.19" || "$EXPECTED_VERSION" == "2.6.20" || "$EXPECTED_VERSION" == "2.6.21" || "$EXPECTED_VERSION" == "2.7.0" ) ]]; then
+          if [[ "$FIRMWARE_FAMILY" == "zkt" && ( "$EXPECTED_VERSION" == "2.6.16" || "$EXPECTED_VERSION" == "2.6.17" || "$EXPECTED_VERSION" == "2.6.18" || "$EXPECTED_VERSION" == "2.6.19" || "$EXPECTED_VERSION" == "2.6.20" || "$EXPECTED_VERSION" == "2.6.21" || "$EXPECTED_VERSION" == "2.6.23" || "$EXPECTED_VERSION" == "2.7.0" ) ]]; then
             journal_mode=ON
           else
             test "$actual" = "$EXPECTED_VERSION"

@@ -15,7 +15,7 @@ from zk_add.time_utils import ensure_utc
 from zk_add.zkt_bridge_contract import bridge_contract, signed_hil_targets
 
 
-@pytest.fixture(params=["2.6.17", "2.6.18", "2.6.19", "2.6.20", "2.6.21"])
+@pytest.fixture(params=["2.6.17", "2.6.18", "2.6.19", "2.6.20", "2.6.21", "2.6.23"])
 def bridge(ready, monkeypatch, request):  # noqa: F811
     session, release, device, deployment, job, coverage, telemetry = ready
     target = signed_hil_targets()[0]

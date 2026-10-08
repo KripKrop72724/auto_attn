@@ -96,7 +96,7 @@ if (-not (Test-Path -LiteralPath $sourceImage -PathType Leaf)) { throw 'Unsigned
 . (Join-Path $PSScriptRoot 'firmware-storage-contract.ps1')
 $storageContract = Get-FirmwareStorageContract -ImagePath $sourceImage -Version $Version
 $journalHilTargets = $null
-if ($Version -in @('2.6.16', '2.6.17', '2.6.18', '2.6.19', '2.6.20', '2.6.21', '2.7.0')) {
+if ($Version -in @('2.6.16', '2.6.17', '2.6.18', '2.6.19', '2.6.20', '2.6.21', '2.6.23', '2.7.0')) {
     if ($FirmwareFamily -ne 'zkt') { throw 'The journal bridge is ZKT-only' }
     . (Join-Path $PSScriptRoot 'journal-hil-scope.ps1')
     Assert-JournalHilScope -TargetsJson $HilTargetsJson
@@ -213,7 +213,7 @@ try {
         image_name = $imageName
         image_sha256 = $imageHash
         image_size = $size
-        minimum_bootstrap_version = $(if ($Version -eq '2.7.0') { '2.6.17' } elseif ($Version -eq '2.6.0') { '2.5.4' } elseif ($Version -in @('2.6.1', '2.6.2', '2.6.3', '2.6.4', '2.6.5', '2.6.6', '2.6.7', '2.6.8', '2.6.9', '2.6.10', '2.6.11', '2.6.12', '2.6.13', '2.6.14', '2.6.15', '2.6.16', '2.6.17', '2.6.18', '2.6.19', '2.6.20', '2.6.21')) { '2.4.12' } else { '2.2.0' })
+        minimum_bootstrap_version = $(if ($Version -eq '2.7.0') { '2.6.17' } elseif ($Version -eq '2.6.0') { '2.5.4' } elseif ($Version -in @('2.6.1', '2.6.2', '2.6.3', '2.6.4', '2.6.5', '2.6.6', '2.6.7', '2.6.8', '2.6.9', '2.6.10', '2.6.11', '2.6.12', '2.6.13', '2.6.14', '2.6.15', '2.6.16', '2.6.17', '2.6.18', '2.6.19', '2.6.20', '2.6.21', '2.6.23')) { '2.4.12' } else { '2.2.0' })
         partition_layout = 'zone-lite-ota-v1'
         project_name = $projectName
         release_id = $(if ($FirmwareFamily -eq 'hikvision') { "zone-lite-hikvision-$Version" } else { "zone-lite-$Version" })
@@ -226,7 +226,7 @@ try {
         # Keep canonical lexical key order used by ADD signature verification.
         $sortedManifest = [ordered]@{}
         $additionalKeys = @('queue_storage')
-        if ($Version -in @('2.6.16', '2.6.17', '2.6.18', '2.6.19', '2.6.20', '2.6.21', '2.7.0')) { $additionalKeys += @('hil_targets', 'release_channel') }
+        if ($Version -in @('2.6.16', '2.6.17', '2.6.18', '2.6.19', '2.6.20', '2.6.21', '2.6.23', '2.7.0')) { $additionalKeys += @('hil_targets', 'release_channel') }
         if ($Version -eq '2.7.0') { $manifest['runtime_profile'] = 'ZKT_JOURNAL_V1' }
         foreach ($key in @($manifest.Keys + $additionalKeys | Sort-Object)) {
             $sortedManifest[$key] = $(if ($key -eq 'queue_storage') { $storageContract } elseif ($key -eq 'hil_targets') { $journalHilTargets } elseif ($key -eq 'release_channel') { 'EXPERIMENTAL_HIL_ONLY' } else { $manifest[$key] })

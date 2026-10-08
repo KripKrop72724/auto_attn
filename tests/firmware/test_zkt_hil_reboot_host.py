@@ -170,6 +170,7 @@ int main(void){
  strcpy(app.version,"2.6.19");assert(!ota_manager_hil_reboot_capable()&&!ota_manager_hil_reboot_reserve());
  strcpy(app.version,"2.6.20");assert(!ota_manager_hil_reboot_capable()&&!ota_manager_hil_reboot_reserve());
  strcpy(app.version,"2.6.21");assert(!ota_manager_hil_reboot_capable()&&!ota_manager_hil_reboot_reserve());
+ strcpy(app.version,"2.6.23");assert(!ota_manager_hil_reboot_capable()&&!ota_manager_hil_reboot_reserve());
  strcpy(app.version,"2.7.0");secure=false;assert(!ota_manager_hil_reboot_capable());secure=true;
  strcpy(app.project_name,"other");assert(!ota_manager_hil_reboot_capable());strcpy(app.project_name,"zone_lite");
  assert(!ota_manager_busy()&&ota_manager_hil_reboot_reserve()&&ota_manager_busy());

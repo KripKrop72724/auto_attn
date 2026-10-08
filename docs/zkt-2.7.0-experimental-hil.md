@@ -64,6 +64,33 @@ writer's 2.6.17 version and digest pins unchanged until a replacement reader
 actually qualifies. No 2.6.21 field pass, recovered health or physical stack
 watermark is implied by the new role or successful automated tests.
 
+The exact signed 2.6.21 field trial then reported a failed 1,024-byte DMA
+allocation while internal DMA memory was constrained. Its earlier watchdog
+correction does not establish sufficient internal-memory headroom or a bridge
+readiness pass. The next normal compatibility reader has the separate immutable
+version **2.6.23**; 2.6.22 remains reserved for the separate factory-device trial.
+23 retains the normal V3 bridge role, exact predecessor-image pins, signed
+17-device scope, HIL quarantine, and all existing boot/readiness gates. Its role
+and successful automated tests confer no field qualification. Preserve the 21
+package and its field evidence; do not relabel it or transfer a success verdict.
+
+23 moves the CPU-only queue audit scratch and volatile UID occupancy bitmap
+to bounded PSRAM allocations. Refused scratch allocation leaves recovery
+unverified; an unavailable UID cache permits replay of the same durable event
+identity. It also applies a build-local, source-hash-pinned ESP-IDF 5.5.3 AES
+cleanup correction: free the input bounce buffer if output allocation fails.
+The original SDK branch's leak is reproduced in a host test; its occurrence in
+the field trace is not established. TLS allocation policy and task stack sizes
+are unchanged. Actual target compilation and instruction review verify the
+correction, but recovered field headroom remains untested until the new trial.
+
+CI builds and checks the exact 23 descriptor and reader marker, while retaining
+publication and reader-proof regressions for earlier bridge versions. The
+writer's active artifact pins remain unchanged and the proposed final reader
+matrix remains blocked until actual signed artifacts and per-target evidence
+exist. Any allocation repair still requires an exact ESP-IDF build, actual ELF
+memory/stack inspection, and field observation before the next promotion.
+
 Explicit writer rollback must retain the proved bridge's `VALID` state. Making
 that image `NEW` creates a pending bridge with retained ADD authority: capture
 cannot start until validation, and repeated live punches can prevent the
