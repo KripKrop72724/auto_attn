@@ -4318,6 +4318,139 @@ static void release_reconciliation_credit(
     free(json);
 }
 
+/* A failed read supplies no evidence of source mutation. Keep the durable
+ * assignment unchanged; ADD's existing release/backoff owns the next attempt. */
+typedef enum {
+    SOURCE_SNAPSHOT_READY,
+    SOURCE_SNAPSHOT_RETRY,
+    SOURCE_SNAPSHOT_HOLD,
+} source_snapshot_result_t;
+
+static bool zk_release_source_snapshot(
+    int sock, zk_context_t *ctx, zk_bounded_buffer_t *source)
+{
+    if (zk_close_bounded_buffer(sock, ctx, source)) return true;
+    /* FREE_DATA was not confirmed. Do not reuse uncertain terminal state or
+     * publish a record from it. The gateway remains the socket owner. */
+    (void)shutdown(sock, SHUT_RDWR);
+    add_connector_log("WARN", "reconcile", "SOURCE_RANGE_RELEASE_RETRY",
+        "Prepared source release was not confirmed; terminal session was abandoned with its checkpoint unchanged.");
+    return false;
+}
+
+static source_snapshot_result_t zk_validate_source_snapshot(
+    int sock, zk_context_t *ctx, zk_bounded_buffer_t *source,
+    int32_t latest_records, uint32_t cutoff,
+    const add_reconcile_assignment_t *assignment,
+    uint32_t *record_size_out, char first_digest[65])
+{
+    uint8_t header[4];
+    bool ok = zk_read_bounded_range(sock, ctx, source, 0, header, sizeof(header));
+    if (!ok) {
+        (void)zk_release_source_snapshot(sock, ctx, source);
+        add_connector_log("WARN", "reconcile", "SOURCE_RANGE_READ_RETRY",
+            "Source header was not read completely; no layout or source disposition was inferred.");
+        return SOURCE_SNAPSHOT_RETRY;
+    }
+    uint32_t total_size = read_le32(header);
+    static const uint32_t sizes[] = {40, 16, 8};
+    uint32_t record_size = latest_records == 0 && total_size == 0 ? 40 :
+        choose_zk_record_size(total_size, (uint32_t)latest_records,
+            sizes, sizeof(sizes) / sizeof(*sizes));
+    /* Subtraction avoids overflowing a malicious header's declared length. */
+    bool envelope_ok = source->size >= 4 && total_size <= source->size - 4;
+    bool count_matches = record_size && (uint64_t)total_size == (uint64_t)latest_records * record_size;
+    if (!envelope_ok || !count_matches) {
+        uint32_t prepared_size = source->size;
+        bool released = zk_release_source_snapshot(sock, ctx, source);
+        int32_t fresh_users = 0, fresh_records = -1;
+        if (envelope_ok && !count_matches) {
+            /* Exactly one fresh count, after FREE_DATA, can explain an append
+             * between count sampling and preparation. Even then, grant no
+             * record/anchor/receipt: a later assignment must reprepare and
+             * verify the original immutable cutoff and boundary digests. */
+            if (!released || !zk_get_counts(sock, ctx, &fresh_users, &fresh_records) || fresh_records < 0) {
+                add_connector_log("WARN", "reconcile", "SOURCE_RANGE_READ_RETRY",
+                    "A fresh source count could not be verified after releasing a changed snapshot; checkpoint retained.");
+                return SOURCE_SNAPSHOT_RETRY;
+            }
+            if (fresh_records < latest_records || (uint32_t)fresh_records < cutoff ||
+                (uint32_t)fresh_records < assignment->committed_next_ordinal) {
+                add_connector_log("ERROR", "reconcile", "SOURCE_RANGE_COUNT_REGRESSION",
+                    "A fresh terminal count regressed across the source snapshot or below its committed range.");
+                return SOURCE_SNAPSHOT_HOLD;
+            }
+            uint32_t fresh_size = 0;
+            unsigned candidates = 0;
+            for (size_t i = 0; i < sizeof(sizes) / sizeof(*sizes); ++i) {
+                if (!total_size || total_size % sizes[i]) continue;
+                uint32_t prepared_count = total_size / sizes[i];
+                if (prepared_count < (uint32_t)latest_records || prepared_count > (uint32_t)fresh_records ||
+                    prepared_count < cutoff || prepared_count < assignment->committed_next_ordinal) continue;
+                fresh_size = sizes[i];
+                ++candidates;
+            }
+            if (fresh_records > latest_records && candidates == 1) {
+                char message[176];
+                snprintf(message, sizeof(message),
+                    "Append snapshot changed count %ld to %ld (prepared=%lu payload=%lu width=%lu); no source records committed.",
+                    (long)latest_records, (long)fresh_records, (unsigned long)prepared_size,
+                    (unsigned long)total_size, (unsigned long)fresh_size);
+                add_connector_log("WARN", "reconcile", "SOURCE_RANGE_SNAPSHOT_RETRY", message);
+                return SOURCE_SNAPSHOT_RETRY;
+            }
+        }
+        char message[176];
+        snprintf(message, sizeof(message),
+            "Source layout rejected (read=complete prepared=%lu payload=%lu count_before=%ld count_after=%ld).",
+            (unsigned long)prepared_size, (unsigned long)total_size,
+            (long)latest_records, (long)fresh_records);
+        add_connector_log("ERROR", "reconcile", "SOURCE_RANGE_LAYOUT_INVALID", message);
+        return SOURCE_SNAPSHOT_HOLD;
+    }
+    if (cutoff > 0) {
+        uint8_t first_record[40];
+        ok = zk_read_bounded_range(sock, ctx, source, 4, first_record, record_size);
+        if (!ok) {
+            (void)zk_release_source_snapshot(sock, ctx, source);
+            add_connector_log("WARN", "reconcile", "SOURCE_RANGE_READ_RETRY",
+                "Source first anchor was not read completely; no anchor divergence was inferred.");
+            return SOURCE_SNAPSHOT_RETRY;
+        }
+        sha256_bytes_hex(first_record, record_size, first_digest);
+    } else {
+        sha256_bytes_hex((const uint8_t *)"", 0, first_digest);
+    }
+    if (assignment->first_anchor_digest[0] && strcmp(first_digest, assignment->first_anchor_digest)) {
+        (void)zk_release_source_snapshot(sock, ctx, source);
+        add_connector_log("ERROR", "reconcile", "SOURCE_FIRST_ANCHOR_DIVERGED",
+            "Prepared terminal source no longer matches the ADD first-record anchor.");
+        return SOURCE_SNAPSHOT_HOLD;
+    }
+    if (assignment->committed_next_ordinal > 0) {
+        uint8_t predecessor[40];
+        char predecessor_digest[65];
+        uint32_t predecessor_offset = 4 + (assignment->committed_next_ordinal - 1) * record_size;
+        ok = zk_read_bounded_range(sock, ctx, source, predecessor_offset, predecessor, record_size);
+        if (!ok) {
+            (void)zk_release_source_snapshot(sock, ctx, source);
+            add_connector_log("WARN", "reconcile", "SOURCE_RANGE_READ_RETRY",
+                "Committed source boundary was not read completely; no boundary divergence was inferred.");
+            return SOURCE_SNAPSHOT_RETRY;
+        }
+        sha256_bytes_hex(predecessor, record_size, predecessor_digest);
+        if (!assignment->committed_predecessor_digest[0] ||
+            strcmp(predecessor_digest, assignment->committed_predecessor_digest)) {
+            (void)zk_release_source_snapshot(sock, ctx, source);
+            add_connector_log("ERROR", "reconcile", "SOURCE_COMMITTED_BOUNDARY_DIVERGED",
+                "Terminal source changed at ADD's committed resume boundary; scanning stopped fail-closed.");
+            return SOURCE_SNAPSHOT_HOLD;
+        }
+    }
+    *record_size_out = record_size;
+    return SOURCE_SNAPSHOT_READY;
+}
+
 static bool process_add_reconciliation_assignment(
     int sock,
     zk_context_t *ctx,
@@ -4373,7 +4506,8 @@ static bool process_add_reconciliation_assignment(
         } else {
             probe_ok = false;
         }
-        zk_close_bounded_buffer(sock, ctx, &probe_source);
+        bool probe_released = zk_release_source_snapshot(sock, ctx, &probe_source);
+        probe_ok = probe_ok && probe_released;
         cJSON *records = probe_ok ? cJSON_CreateArray() : NULL;
         cJSON *canonical = probe_ok ? cJSON_CreateArray() : NULL;
         probe_ok = records && canonical && append_terminal_source_record(
@@ -4490,75 +4624,12 @@ static bool process_add_reconciliation_assignment(
             "Bounded terminal source preparation failed; ADD will resume from its durable checkpoint.");
         return false;
     }
-    uint8_t header[4];
-    bool ok = zk_read_bounded_range(sock, ctx, &source, 0, header, sizeof(header));
-    uint32_t total_size = ok ? read_le32(header) : 0;
-    static const uint32_t attendance_record_sizes[] = {40, 16, 8};
-    uint32_t record_size = latest_records == 0 && total_size == 0
-        ? 40
-        : choose_zk_record_size(
-              total_size,
-              (uint32_t)latest_records,
-              attendance_record_sizes,
-              sizeof(attendance_record_sizes) / sizeof(attendance_record_sizes[0]));
-    if (!ok || record_size == 0 || source.size < 4 + total_size ||
-        total_size != (uint32_t)latest_records * record_size) {
-        zk_close_bounded_buffer(sock, ctx, &source);
-        add_connector_log(
-            "ERROR",
-            "reconcile",
-            "SOURCE_RANGE_LAYOUT_INVALID",
-            "Prepared terminal attendance source did not match its reported record count.");
-        return false;
-    }
+    uint32_t record_size = 0;
     char first_digest[65];
-    if (cutoff > 0) {
-        uint8_t first_record[40];
-        ok = zk_read_bounded_range(
-            sock,
-            ctx,
-            &source,
-            4,
-            first_record,
-            record_size);
-        if (ok) sha256_bytes_hex(first_record, record_size, first_digest);
-    } else {
-        sha256_bytes_hex((const uint8_t *)"", 0, first_digest);
-    }
-    if (!ok || (assignment->first_anchor_digest[0] &&
-                strcmp(first_digest, assignment->first_anchor_digest) != 0)) {
-        zk_close_bounded_buffer(sock, ctx, &source);
-        add_connector_log(
-            "ERROR",
-            "reconcile",
-            "SOURCE_FIRST_ANCHOR_DIVERGED",
-            "Prepared terminal source no longer matches the ADD first-record anchor.");
-        return true;
-    }
-    if (assignment->committed_next_ordinal > 0) {
-        uint8_t predecessor[40];
-        char predecessor_digest[65];
-        uint32_t predecessor_offset = 4 +
-            (assignment->committed_next_ordinal - 1) * record_size;
-        ok = zk_read_bounded_range(
-            sock,
-            ctx,
-            &source,
-            predecessor_offset,
-            predecessor,
-            record_size);
-        if (ok) sha256_bytes_hex(predecessor, record_size, predecessor_digest);
-        if (!ok || assignment->committed_predecessor_digest[0] == '\0' ||
-            strcmp(predecessor_digest, assignment->committed_predecessor_digest) != 0) {
-            zk_close_bounded_buffer(sock, ctx, &source);
-            add_connector_log(
-                "ERROR",
-                "reconcile",
-                "SOURCE_COMMITTED_BOUNDARY_DIVERGED",
-                "Terminal source changed at ADD's committed resume boundary; scanning stopped fail-closed.");
-            return true;
-        }
-    }
+    source_snapshot_result_t snapshot = zk_validate_source_snapshot(
+        sock, ctx, &source, latest_records, cutoff, assignment, &record_size, first_digest);
+    if (snapshot != SOURCE_SNAPSHOT_READY) return snapshot == SOURCE_SNAPSHOT_HOLD;
+    bool ok = true;
 
     if (!assignment->has_cutoff) {
         cJSON *anchor = cJSON_CreateObject();
@@ -4573,8 +4644,8 @@ static bool process_add_reconciliation_assignment(
         cJSON_AddStringToObject(anchor, "first_anchor_digest", first_digest);
         char *json = add_source_epoch_write(anchor, assignment->source_epoch) ? cJSON_PrintUnformatted(anchor) : NULL;
         cJSON_Delete(anchor);
-        zk_close_bounded_buffer(sock, ctx, &source);
-        ok = json && add_connector_send_payload_acknowledged(
+        bool released = zk_release_source_snapshot(sock, ctx, &source);
+        ok = released && json && add_connector_send_payload_acknowledged(
             "reconcile_anchor",
             json,
             30000);
@@ -4608,8 +4679,8 @@ static bool process_add_reconciliation_assignment(
         4 + start * record_size,
         raw,
         raw_length);
-    zk_close_bounded_buffer(sock, ctx, &source);
-    if (!ok) {
+    bool released = zk_release_source_snapshot(sock, ctx, &source);
+    if (!ok || !released) {
         free(raw);
         return false;
     }
