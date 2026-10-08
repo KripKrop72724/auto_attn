@@ -148,6 +148,7 @@ MUTATING_COMMANDS = {
     "GRANT_TEMP_ADMIN",
     "REVOKE_TEMP_ADMIN",
     "RESTART_ZKT",
+    "ESP_REBOOT",
     "APPLY_CONFIG",
     "PIN_TERMINAL_SERIAL",
 }
@@ -1080,21 +1081,24 @@ def update_heartbeat(
         # The authenticated WebSocket envelope supplies a bounded clock sample
         # for legacy OTA clients whose ESP clock is skewed but still advancing.
         telemetry_payload["_trusted_envelope_sent_at"] = ensure_utc(device_sent_at).isoformat()
-    session.add(
-        DeviceTelemetry(
-            connector_id=connector.id,
-            boot_id=boot_id,
-            sequence=sequence,
-            created_at=now,
-            rssi=payload.rssi,
-            free_heap=payload.free_heap,
-            uptime_seconds=payload.uptime_seconds,
-            outbox_depth=payload.outbox_depth,
-            current_activity=payload.current_activity,
-            led_state=payload.led_state,
-            payload=telemetry_payload,
-        )
+    telemetry = DeviceTelemetry(
+        connector_id=connector.id,
+        boot_id=boot_id,
+        sequence=sequence,
+        created_at=now,
+        rssi=payload.rssi,
+        free_heap=payload.free_heap,
+        uptime_seconds=payload.uptime_seconds,
+        outbox_depth=payload.outbox_depth,
+        current_activity=payload.current_activity,
+        led_state=payload.led_state,
+        payload=telemetry_payload,
     )
+    session.add(telemetry)
+    if payload.diagnostics and payload.diagnostics.controlled_esp_reboot_v1 is True:
+        from zk_add.hil_reboot import observe_reboot_heartbeat
+
+        observe_reboot_heartbeat(session, connector, telemetry, now=now)
     if connector.comm_key_capable:
         try:
             from zk_add.comm_keys import (
@@ -4450,9 +4454,9 @@ def serialize_command(command: DeviceCommand) -> dict:
         "payload": decrypt_json(command.payload_encrypted),
         "expected_state": decrypt_json(command.expected_state_encrypted),
         "desired_state": decrypt_json(command.desired_state_encrypted),
-        "created_at": command.created_at.isoformat(),
-        "expires_at": command.expires_at.isoformat() if command.expires_at else None,
-        "expires_epoch": int(command.expires_at.timestamp()) if command.expires_at else 0,
+        "created_at": ensure_utc(command.created_at).isoformat(),
+        "expires_at": ensure_utc(command.expires_at).isoformat() if command.expires_at else None,
+        "expires_epoch": int(ensure_utc(command.expires_at).timestamp()) if command.expires_at else 0,
     }
 
 
@@ -5724,6 +5728,8 @@ def apply_command_update(
     result: dict,
     error_code: str | None,
     error_message: str | None,
+    envelope_boot_id: str | None = None,
+    envelope_sent_at: datetime | None = None,
 ) -> DeviceCommand:
     command = session.scalar(
         select(DeviceCommand).where(
@@ -5733,6 +5739,12 @@ def apply_command_update(
     )
     if command is None:
         raise ValueError("Unknown command ID.")
+    if command.command_type == "ESP_REBOOT":
+        from zk_add.hil_reboot import apply_reboot_update
+
+        return apply_reboot_update(session, connector=connector, command=command, status=status,
+            result=result, error_code=error_code, envelope_boot_id=envelope_boot_id,
+            envelope_sent_at=envelope_sent_at)
     if command.status in TERMINAL_COMMAND_STATES:
         return command
     hik_profile = connector.firmware_family == "hikvision" and command.command_type in {

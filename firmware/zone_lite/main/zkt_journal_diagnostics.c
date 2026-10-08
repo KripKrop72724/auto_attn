@@ -230,6 +230,7 @@ bool zj_diagnostics_append(cJSON *diagnostics, const zj_boot_t *boot,
         !cJSON_AddBoolToObject(journal, "ready", owner_ready) ||
         !cJSON_AddStringToObject(journal, "durability", durability) ||
         !cJSON_AddBoolToObject(journal, "checkpoint_recovery_pending", owner->checkpoint_recovery_pending) ||
+        !cJSON_AddBoolToObject(journal, "hil_reboot_persistence_incident", owner->hil_reboot_persistence_incident) ||
         !cJSON_AddNumberToObject(journal, "mailbox_capacity", ZJ_REQUEST_SLOTS) ||
         !cJSON_AddNumberToObject(journal, "mailbox_high_watermark", owner->high_watermark) ||
         !cJSON_AddNumberToObject(journal, "pending_appends", owner->pending_appends) ||

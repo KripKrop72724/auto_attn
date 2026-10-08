@@ -15,6 +15,7 @@ bool zj_owner_is_current_task(void);
 typedef struct {
     bool started, ready, operation_running, recovering, checkpoint_recovery_pending;
     bool quiescing, quiesced;
+    bool hil_reboot_persistence_incident; /* Boot-sticky experimental-test veto. */
     bool compatibility_checked, writer_allowed;
     zj_delivery_authority_t delivery_authority;
     zj_compat_result_t compatibility;
@@ -63,6 +64,11 @@ bool zj_owner_abandon(uint64_t ticket);
  * True means the owner acknowledged completion, not merely request admission.
  * No lock remains held; callers may continue polling retained replies. */
 bool zj_owner_quiesce(void);
+/* Experimental reboot only: fail without changing admission unless already
+ * idle before this monotonic deadline. A true result is immediately final;
+ * the caller must record its RAM witness and restart without further I/O. */
+bool zj_owner_try_quiesce_before(uint64_t deadline_us, int64_t expires_epoch,
+                                 int64_t *accepted_epoch, uint64_t *accepted_us);
 /* OTA-task-only exception after acknowledged quiescence. All earlier work
  * must have finished. A separate bounded control slot remains available when
  * ordinary completed replies occupy the mailbox. It commits/readbacks exact

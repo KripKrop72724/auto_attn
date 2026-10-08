@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from datetime import timedelta
+import hashlib
+import json
 from uuid import uuid4
 
 from sqlalchemy import select
@@ -10,7 +12,9 @@ from sqlalchemy.orm import Session
 
 from zk_add.hil_scope import HilTarget, target_matches
 from zk_add.hil_validation import ReleaseIdentity
-from zk_add.models import Connector, DeviceTelemetry, ReconciliationCoverage, ReconciliationJob
+from zk_add.models import (
+    Connector, DeviceTelemetry, ReconciliationCoverage, ReconciliationJob, TerminalSourceEpoch,
+)
 from zk_add.ota import (
     FirmwareCampaign,
     FirmwareDeployment,
@@ -43,18 +47,20 @@ def start_run(
         raise ValueError("Unknown observation profile")
     if not actor or len(actor) > 120 or not idempotency_key or len(idempotency_key) > 120:
         raise ValueError("HIL actor and idempotency key are required and bounded")
-    deployment = session.scalar(
-        select(FirmwareDeployment)
-        .where(FirmwareDeployment.deployment_id == deployment_id)
-        .with_for_update()
-    )
-    if deployment is None:
+    connector_id = session.scalar(select(FirmwareDeployment.connector_id).where(
+        FirmwareDeployment.deployment_id == deployment_id))
+    if connector_id is None:
         raise ValueError("HIL deployment was not found")
+    # Match ingestion, recovery controls and finalization: connector first.
+    # The initial lookup grants no scope and is rechecked under those locks.
+    connector = session.scalar(select(Connector).where(Connector.id == connector_id).with_for_update())
+    deployment = session.scalar(select(FirmwareDeployment).where(
+        FirmwareDeployment.deployment_id == deployment_id).with_for_update()
+        .execution_options(populate_existing=True))
+    if deployment is None or deployment.connector_id != connector_id:
+        raise ValueError("HIL deployment changed before observation")
     release = session.scalar(
         select(FirmwareRelease).where(FirmwareRelease.id == deployment.release_id).with_for_update()
-    )
-    connector = session.scalar(
-        select(Connector).where(Connector.id == deployment.connector_id).with_for_update()
     )
     if release is None or connector is None:
         raise ValueError("HIL release or device was not found")
@@ -181,9 +187,10 @@ def start_run(
     # observation at that boundary; its eventual HIL verdict must still prove
     # delivery separately. Legacy firmware cannot acquire this permission by
     # merely reporting a different runtime profile.
-    if (release.version == "2.7.0" and manifest_runtime == "ZKT_JOURNAL_V1"
-            and diagnostics.get("runtime_profile") == manifest_runtime
-            and runtime.delivery_authority == "ADD"):
+    writer = (release.version == "2.7.0" and manifest_runtime == "ZKT_JOURNAL_V1"
+              and diagnostics.get("runtime_profile") == manifest_runtime
+              and runtime.delivery_authority == "ADD")
+    if writer:
         capture_states.add("SOURCE_CAPTURE_CERTIFIED_RAW_PENDING")
     if (
         coverage is None
@@ -199,6 +206,30 @@ def start_run(
     job = session.get(ReconciliationJob, coverage.job_id)
     if job is None or job.status != "COMPLETED" or not job.capture_certificate:
         raise ValueError("Completed initial reconciliation evidence is required")
+    epoch_pin = {}
+    if writer and profile == FULL_PROFILE:
+        epoch = session.get(TerminalSourceEpoch, coverage.source_epoch_id) if coverage.source_epoch_id else None
+        if (epoch is None or not epoch.epoch_id or epoch.state != "ACTIVE" or epoch.superseded_at is not None
+                or epoch.zkt_device_id != connector.zkt_device.id
+                or epoch.terminal_generation != coverage.terminal_generation
+                or job.source_epoch_id != epoch.id or job.connector_id != connector.id
+                or job.zkt_device_id != connector.zkt_device.id
+                or job.terminal_serial != target.terminal_serial
+                or job.terminal_generation != coverage.terminal_generation):
+            raise ValueError("The writer source epoch must match its completed reconciliation")
+        # Coverage can later advance or be replaced. Preserve both immutable
+        # identities now so a collector never infers the old epoch from it.
+        epoch_pin = {"source_epoch_id": epoch.id, "source_epoch": epoch.epoch_id}
+        depths = {row["name"]: row["records"] for row in queues if row.get("name") in required}
+        if any(depths[name] != 0 for name in required):
+            raise ValueError("Full writer observation requires a verified empty queue baseline")
+        epoch_pin.update(
+            queue_inventory={"schema_version": 1, "basis": "VERIFIED_EMPTY_REQUIRED_QUEUES",
+                             "telemetry_id": telemetry.id, "queues": depths},
+            capture_certificate_sha256=hashlib.sha256(json.dumps(
+                job.capture_certificate, sort_keys=True, separators=(",", ":"),
+                ensure_ascii=True).encode()).hexdigest(),
+        )
     if profile == PROFILE:
         require_bridge_baseline(release, telemetry, target, identity)
     run = FirmwareHilRun(
@@ -214,6 +245,7 @@ def start_run(
         started_at=now,
         ends_at=now + timedelta(minutes=15),
         baseline={
+            **epoch_pin,
             "profile": profile,
             "telemetry_id": telemetry.id,
             "boot_id": telemetry.boot_id,
@@ -274,3 +306,43 @@ def serialize_run(run: FirmwareHilRun) -> dict:
         "completed_at": run.completed_at,
         "result": run.result,
     }
+
+
+def accepted_full_event_matches(session: Session, event, deployment, release) -> bool:
+    """A writer's rollout gate consumes its completed server-owned full run.
+
+    This cannot create acceptance or replace the evidence collector. A copied
+    event, bridge observation or superseded deployment never advances scope.
+    """
+    from zk_add.bridge_observation import FULL_PROFILE
+
+    details = event.details or {}
+    if (not isinstance(details, dict) or release.version != "2.7.0"
+            or release.state != "HIL_ONLY" or release.revoked_at is not None
+            or event.state != "HIL_ACCEPTED" or details.get("profile") != FULL_PROFILE
+            or details.get("outcome") != "PASS" or not details.get("run_id")
+            or deployment.status != "SUCCEEDED" or event.deployment_id != deployment.id):
+        return False
+    run = session.scalar(select(FirmwareHilRun).where(FirmwareHilRun.run_id == details["run_id"]))
+    if (run is None or not isinstance(run.baseline, dict) or not isinstance(run.result, dict)
+            or run.status != "HIL_ACCEPTED" or run.deployment_id != deployment.id
+            or run.connector_id != deployment.connector_id or run.release_id != release.id
+            or run.target != details.get("target") or run.baseline.get("profile") != FULL_PROFILE
+            or run.result.get("profile") != FULL_PROFILE or run.result.get("outcome") != "PASS"
+            or run.result.get("reasons") != [] or run.completed_at is None):
+        return False
+    identity = _release_identity(release).model_dump(mode="json")
+    if run.release_identity != identity or any(details.get(key) != value for key, value in identity.items()):
+        return False
+    if not (ensure_utc(run.started_at) + timedelta(minutes=15) <= ensure_utc(run.ends_at)
+            <= ensure_utc(run.completed_at) <= utc_now()):
+        return False
+    from zk_add.hil_observation import accepted_full_evidence_valid
+    if not accepted_full_evidence_valid(run, details):
+        return False
+    latest = session.scalar(select(FirmwareDeployment.id).where(
+        FirmwareDeployment.connector_id == deployment.connector_id)
+        .order_by(FirmwareDeployment.id.desc()).limit(1))
+    campaign = session.get(FirmwareCampaign, deployment.campaign_id)
+    return bool(latest == deployment.id and campaign is not None
+                and campaign.status in {"ACTIVE", "COMPLETED"})

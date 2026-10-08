@@ -62,6 +62,7 @@ def test_storage_task_retains_timed_out_capture_and_drains_at_capacity(tmp_path)
                     "-g", "-O1", "-Wall", "-Wextra", "-Werror", "-pthread",
                     "-fsanitize=address,undefined", "-fno-omit-frame-pointer",
                     "-I", str(tmp_path), "-I", str(fixture), "-I", str(main),
+                    "-include", str(fixture / "zkt_owner_fsync_fault.h"),
                     *(f'-DZC_{key}_PATH="catalog.{key.lower()}"' for key in ("ACTIVE", "COMMIT", "BACKUP", "TEMP", "STAGE")),
                     *(f'-DZC_COMMAND_{key}_PATH="commands.{key.lower()}"' for key in ("ACTIVE", "COMMIT", "BACKUP", "TEMP", "STAGE")),
                     '-DZI_PROCESSED_PATH="processed.txt"', '-DZI_CANCELLED_PATH="cancelled.txt"',
@@ -74,7 +75,7 @@ def test_storage_task_retains_timed_out_capture_and_drains_at_capacity(tmp_path)
     subprocess.run([str(binary)], cwd=tmp_path, check=True, timeout=30)
     for scenario in ["--checkpoint", "--recovery-full", "--runtime-corrupt-journal",
                      "--authority-before", "--authority-after", "--authority-readback", "--authority-bridge",
-                     "--rollback-full", "--failed-boot-full", "--source-boundary"]:
+                     "--rollback-full", "--failed-boot-full", "--source-boundary", "--hil-idle", "--hil-incident", "--hil-io-incident"]:
         directory = tmp_path / scenario.removeprefix("--")
         directory.mkdir()
         subprocess.run([str(binary), scenario], cwd=directory, check=True, timeout=30)

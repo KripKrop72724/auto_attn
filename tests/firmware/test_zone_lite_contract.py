@@ -1031,7 +1031,12 @@ def test_ota_boot_confirmation_waits_for_runtime_health_and_reports_stages():
     header = (FIRMWARE / "main" / "add_connector.h").read_text(encoding="utf-8")
     runtime = (FIRMWARE / "main" / "zone_lite.c").read_text(encoding="utf-8")
 
-    assert ota.count("esp_secure_boot_enabled()") == 2
+    # Capability/telemetry and the controlled experimental reboot each require
+    # hardware-backed boot evidence; another checked use is not a regression.
+    for name in ("static bool report_capability(", "void ota_manager_append_telemetry(",
+                 "bool ota_manager_hil_reboot_capable("):
+        start = ota.index(name)
+        assert "esp_secure_boot_enabled()" in ota[start:ota.index("\n}\n", start)]
     assert '"image_sha256"' in ota
     assert "esp_partition_get_sha256(running, digest)" in ota
     assert "OTA_BOOT_CONFIRM_SECONDS 900" in ota

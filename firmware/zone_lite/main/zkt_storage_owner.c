@@ -14,6 +14,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <string.h>
+#include <time.h>
 #include "esp_attr.h"
 #include "esp_heap_caps.h"
 #include "esp_app_desc.h"
@@ -43,6 +44,7 @@ typedef struct {
     bool writer_allowed, compatibility_checked;
     zj_compat_result_t compatibility;
     uint64_t retry_at_us;
+    uint64_t io_revision;
     char wire_scratch[ZJ_CUSTODY_PAYLOAD_MAX];
     /* One reserved shutdown control, independent of retained DONE replies.
      * Its immutable target and uncertain result survive caller timeouts. */
@@ -541,6 +543,22 @@ static void task(void *context)
         o->health.delivery_authority = zj_state_authority(&o->state);
         o->health.compatibility = o->compatibility;
         o->health.last_result = reply.result;
+        if (o->io_revision < UINT64_MAX) ++o->io_revision;
+        const char *failed = o->store.last_operation;
+        bool transient_lock = o->store.last_errno == EBUSY && !o->nvs_error && failed &&
+            (!strcmp(failed, "storage_lock") || !strcmp(failed, "storage_recovery_lock") ||
+             !strcmp(failed, "catalog_lock") || !strcmp(failed, "command_id_lock"));
+        bool persistence_fault = reply.result == ZJ_CORRUPT || reply.result == ZJ_UNCERTAIN ||
+            (reply.result == ZJ_IO && !transient_lock);
+        bool preservation_refused = work && request.operation == ZJ_APPEND && reply.result == ZJ_FULL;
+        bool legacy_fault = work && request.operation == ZJ_SEGMENTED_QUEUE &&
+            (reply.segmented.result == DQ_IO || reply.segmented.result == DQ_CORRUPT ||
+             (request.input.segmented.operation <= ZQ_APPEND_COMMIT && reply.segmented.result == DQ_FULL));
+        /* Successful reads/checkpoints and optional catalog capacity refusals
+         * cannot erase a preservation incident from this test's boot. Normal
+         * recovery/capture still proceed; only experimental reboot is vetoed. */
+        if (persistence_fault || preservation_refused || legacy_fault)
+            o->health.hil_reboot_persistence_incident = true;
         if (work && request.operation == ZJ_SEGMENTED_QUEUE)
             zq_inventory_complete(&o->legacy_inventory, &request.input.segmented, &reply.segmented);
         if (!o->health.ready || o->health.checkpoint_recovery_pending)
@@ -686,6 +704,44 @@ bool zj_owner_quiesce(void)
     xSemaphoreGive(mailbox_lock);
     xTaskNotifyGive(owner_task);
     return complete;
+}
+bool zj_owner_try_quiesce_before(uint64_t deadline_us, int64_t expires_epoch,
+                                 int64_t *accepted_epoch, uint64_t *accepted_us)
+{
+    if (!owner || !deadline_us || !accepted_epoch || !accepted_us || !enter()) return false;
+    uint64_t revision = owner->io_revision;
+    xSemaphoreGive(mailbox_lock);
+    /* Never invert mailbox -> filesystem-lock ordering. The revision check
+     * rejects a storage operation that completes across this health snapshot. */
+    qs_health_t persistence = qs_health();
+    if (!persistence.observed || !persistence.available || !persistence.recovery_complete ||
+        !persistence.persistence_verified || persistence.persistence_recheck_required ||
+        persistence.last_error || persistence.persistence_probe_error || persistence.legacy.error || !enter()) return false;
+    bool idle = revision != UINT64_MAX && revision == owner->io_revision &&
+        !owner->health.hil_reboot_persistence_incident &&
+        !owner->health.quiescing && !owner->health.operation_running &&
+        !owner->health.recovering && owner->store.ready && owner->state.ready &&
+        !owner->store.checkpoint_recovery_pending && owner->writer_allowed &&
+        owner->compatibility_checked && zj_state_authority(&owner->state) == ZJ_AUTHORITY_ADD &&
+        !owner->mailbox.running_ticket && !owner->mailbox.resume_ticket && !owner->reader_ticket &&
+        !owner->catalog.work_ticket && !owner->commands.work_ticket && !owner->command_ids.work_ticket &&
+        !owner->segmented.append_transfer && !owner->segmented.read_transfer;
+    for (unsigned i = 0; idle && i < ZJ_REQUEST_SLOTS; ++i)
+        if (owner->mailbox.slots[i].state == ZJ_SLOT_QUEUED ||
+            owner->mailbox.slots[i].state == ZJ_SLOT_RUNNING) idle = false;
+    /* Check after acquiring the lock and inspecting every accepted operation.
+     * Submission and the owner recovery loop use this same lock. */
+    int64_t epoch = (int64_t)time(NULL);
+    uint64_t now = (uint64_t)esp_timer_get_time();
+    if (idle && epoch >= 1700000000 && epoch < expires_epoch && now < deadline_us) {
+        owner->health.quiescing = owner->health.quiesced = true;
+        owner->writer_allowed = owner->health.writer_allowed = false;
+        owner->compatibility_checked = owner->health.compatibility_checked = false;
+        *accepted_epoch = epoch;
+        *accepted_us = now;
+    } else idle = false;
+    xSemaphoreGive(mailbox_lock);
+    return idle;
 }
 bool zj_owner_select_quiesced_reader(const ota_checkpoint_t *expected, uint64_t *ticket)
 {

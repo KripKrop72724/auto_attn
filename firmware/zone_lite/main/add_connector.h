@@ -3,6 +3,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include "zkt_hil_reboot.h"
 
 typedef struct {
     char command_id[48];
@@ -18,13 +19,18 @@ typedef struct {
     char expected_terminal_state_fingerprint[65];
     char tombstone_display_name[256];
     char tombstone_cnic[16];
-    char config_field[32];
-    char config_operation_id[40];
-    char config_mode[24];
-    char sealed_nonce[32];
-    char sealed_ciphertext[80];
-    uint32_t config_revision;
-    uint8_t sealed_version;
+    union {
+        struct {
+            char config_field[32];
+            char config_operation_id[40];
+            char config_mode[24];
+            char sealed_nonce[32];
+            char sealed_ciphertext[80];
+            uint32_t config_revision;
+            uint8_t sealed_version;
+        };
+        zhr_binding_t reboot;
+    };
     int privilege;
     int expected_privilege;
     int expected_version;
@@ -43,6 +49,10 @@ typedef struct {
     bool has_tombstone;
     bool tombstone_shift_worker;
 } add_command_t;
+_Static_assert(sizeof(zhr_binding_t) <= 208, "Reboot binding must fit the existing config command storage");
+
+const char *add_connector_boot_id(void);
+bool add_connector_command_update_acknowledged(const char *command_id, const char *result_json);
 
 typedef struct {
     char source_epoch[37];

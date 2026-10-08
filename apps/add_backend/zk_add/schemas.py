@@ -110,6 +110,7 @@ class JournalStorageDiagnostics(BaseModel):
     ready: bool
     durability: Literal["HEALTHY", "DEGRADED", "FULL", "UNKNOWN"]
     checkpoint_recovery_pending: bool
+    hil_reboot_persistence_incident: bool | None = Field(default=None, strict=True)
     mailbox_capacity: int = Field(ge=1, le=32)
     mailbox_high_watermark: int = Field(ge=0, le=32)
     pending_appends: int = Field(ge=0, le=32)
@@ -262,6 +263,7 @@ class FirmwareDiagnostics(BaseModel):
     runtime_profile: Literal["ZKT_LEGACY", "HIKVISION_V1", "ZKT_JOURNAL_V1"] | None = None
     delivery_authority: Literal["LEGACY_DUAL", "ADD", "UNKNOWN"] | None = None
     journal_format: Literal[1] | None = None
+    controlled_esp_reboot_v1: bool | None = Field(default=None, strict=True)
     boot_id: str | None = Field(default=None, max_length=100)
     sample_sequence: int | None = Field(default=None, ge=0)
     sampled_at: datetime | None = None

@@ -122,6 +122,137 @@ transport restoration alone does not prove durable capture, Oracle delivery,
 successful ESP reboot or a completed HIL run. Those require their own collected
 evidence. The component tests do not mean a field interruption was performed.
 
+## Experimental writer observation and its limits
+
+`FULL_REMOTE_HIL_V1` is the existing API profile name. Its implemented acceptance
+scope is recorded as `EXPERIMENTAL_REMOTE_CONTROL_AND_SOURCE_CUSTODY`; it is not
+a certificate for every requirement in the nationwide reliability plan. The
+server collector is `ZKT_WRITER_OBSERVATION_V1` in
+[`hil_observation.py`](../apps/add_backend/zk_add/hil_observation.py). Neither
+an administrator-supplied verdict nor a manually labelled firmware event can
+substitute for its committed evidence.
+
+Start an observation with `POST /api/v1/firmware/hil-runs`, the successful
+deployment ID, exact connector/MAC/terminal target, an idempotency key, and
+`profile: "FULL_REMOTE_HIL_V1"`. The signed 2.7.0 ADD-owned writer must be
+installed and healthy, with a pinned source epoch, certificate, cursor and
+chain. Both required runtime queues must have verified zero depths. Nonempty
+queues need item-level preservation evidence that this profile does not yet
+collect; unknown counts are never treated as zero. The server fixes the window
+at exactly 15 minutes and retains its baseline independently of later coverage
+updates.
+
+The authorized control schedule uses elapsed time from that stored start:
+
+| Elapsed time | Action and required evidence |
+| --- | --- |
+| 180–239 seconds | `POST /api/v1/firmware/hil-runs/{run_id}/interrupt-add`; one fixed 30-second interruption, an authenticated rejected request, automatic expiry, and healthy same-boot recovery by 300 seconds. |
+| 300–359 seconds | `POST /api/v1/firmware/hil-runs/{run_id}/reboot-esp`; one exact-image, exact-terminal `ESP_REBOOT` command, with an action deadline of at most 60 seconds and verified healthy recovery by 480 seconds. |
+| 480–900 seconds | A committed raw source-tail range must reach the terminal count, with every ordinal and chained digest accounted for. Fresh telemetry must agree with its cursor. A heartbeat count alone does not replace this raw-tail verification. |
+| After 900 seconds | `POST /api/v1/firmware/hil-runs/{run_id}/complete-full` reads and seals the completed window. Current same-image telemetry and target health must also remain fresh. |
+
+Both control endpoints require password step-up and a bounded idempotency key.
+The completion endpoint requires password step-up and accepts only that
+password field; submitted receipts, checkboxes, verdicts and other extra fields
+are rejected. Administrator mutation authentication and CSRF checks apply.
+The collector performs no Oracle write. `GET /api/v1/firmware/hil-runs/{run_id}`
+returns the stored run and its evidence.
+
+The ESP reboot is distinct from terminal `RESTART_ZKT`. A durable preboot
+intent, a matching post-idle-gate software-reset witness and authenticated new
+boot telemetry are all required. A changed boot ID, generic `SUCCEEDED` reply,
+or an intent written before reaching the safe gate is insufficient. Missing or
+true `journal_storage.hil_reboot_persistence_incident` cannot authorize the
+test; an observed persistence incident also prevents a healthy HIL verdict.
+Replays cannot request another reset or extend either deadline.
+
+Ordinary attendance must be preserved and delivered within the fixed window,
+with at least one typed Oracle receipt around each recovery test: source receipt
+time must fall between 60 seconds before the test starts and 60 seconds after
+its verified recovery. Source manifests, aliases, derived attendance, frozen
+Oracle intents and typed receipts must bind to the same occurrence. Distinct
+same-second source occurrences remain distinct. Source custody, intent
+preparation and Oracle verification arriving after the window remain explicit
+missing evidence for that run, even when the collector is invoked later. No
+ordinary punches, missing receipts or an unfinished final tail produce a pass.
+Low traffic therefore requires a new observation when suitable real attendance
+exists; the old result is not extended or rewritten.
+
+All stored telemetry in the interval is examined, including startup samples
+during the controlled reboot. Wrong images, unrelated resets, replayed sequence
+numbers, regressing source counts/cursors, per-worker restart changes and failed
+persistence cannot be hidden by selecting only healthy samples. Gaps over 45
+seconds require a matching successful control. The collector separately checks
+the latest sample and rejects stale or wrong-boot current evidence.
+
+Firmware deliberately publishes heartbeats before its journal, persistence
+probe and terminal session have finished starting. The collector can classify
+only the consecutive unfinished prefix of the **validated controlled new
+boot** as `CONTROLLED_REBOOT_STARTUP`. It binds each such sample to the exact
+reboot command, its safe checkpoint and the stored healthy recovery telemetry
+row before the minute-eight deadline. Sampled uptime must fit that reset, and
+the signed image, authenticated boot and diagnostic freshness remain required.
+The seal keeps the actual unknown/false health flags, missing pre-probe
+counters, zero placeholder terminal count and the reported diagnostic fields.
+They are not rewritten as healthy, zero failures or complete source evidence.
+
+This classification permits only documented unfinished startup phases and
+strictly zero reported worker/runtime fault counters. The sticky persistence
+incident must be explicitly false. I/O/probe/legacy faults, failed appends,
+damaged checkpoints, missing mandatory worker fault counters, retries,
+security/binding/reader/authority holds and stalled workers are not exempted.
+An owner reporting `DEGRADED` solely because it has not become ready can be
+classified while its real fault counters remain zero; a persistence error
+cannot. Once a check or source/counter field has been observed on the new boot,
+it cannot become unobserved again under this classification. A second startup
+after a healthy sample is invalid. Source generation and cursor/count
+continuity use the last observed values across the entire prefix, and the
+first reported post-reset failure counters must be zero. Missing, unrelated
+or late recovery evidence leaves startup unknown/failed under the normal
+rules; it never creates an assumed grace period.
+
+Log and alert review is bounded and retains record IDs without copying private
+messages. Errors, critical failures and message rejections are adverse. Unknown
+warnings require review. Only the actual source-checkpoint retry codes are
+classified as expected ADD interruption effects, and only with the matching
+boot, a timestamp inside the 30-second interval, receipt within 45 seconds,
+verified control recovery and independent source/queue/attendance proofs.
+The same warning outside that interval or persisting after recovery is not
+exempted. A resolved `ESP_OFFLINE` alert must fit the exact control and recovery
+interval. `IDENTITY_CATALOG_MEMORY_FALLBACK` is recorded separately as optional
+catalog persistence when independent attendance preservation remains verified;
+it is not classified as attendance loss or used to clear a storage incident.
+
+The default limits are 2,048 telemetry samples, 2,048 logs, 2,048 alerts, 512
+source occurrences and 512 source chunks per run. Typed attendance evidence
+also bounds observation links and receipts per occurrence. Exceeding a limit
+produces an explicit incomplete inventory, not silent sampling or an empty
+success. These limits qualify this short observation, not the release's load
+or seven-day backlog capacity.
+
+The sealed result distinguishes the following claims:
+
+| Claim | Scope of this observation |
+| --- | --- |
+| Remote recovery and source custody | May pass only from the collected controls, exact source chain, ordinary attendance, typed delivery receipts and healthy telemetry. |
+| Oracle UID membership | `ORACLE_UID_MEMBERSHIP_V1` proves the recorded UID membership response; raw content and daily times remain `NOT_ASSERTED`. A V2 content receipt is a separate typed proof. Receipt IDs from different tables cannot be interchanged. |
+| Queue inventory | `EXPLICIT_EMPTY_BASELINE_AND_ACCOUNTED_SOURCE_RANGE` checks the explicit empty baseline, recovered final queues and source dispositions. It does not establish where a punch resided during an outage. |
+| Local journal preservation during interruption | `NOT_ASSERTED`, with reason `NO_BOOT_BOUND_LOCAL_RESIDENCE_PROOF`. Current observation receipts have capture identities and raw bytes, but no independently bound local commit/residence proof. Source recovery from the terminal cannot silently substitute for that proof. |
+| Seven-day ESP capacity | `NOT_ASSERTED`; a 15-minute observation does not measure seven days of local retention. |
+| Independent terminal model/identity qualification | `NOT_ASSERTED`; ordinary evidence does not manufacture independently checked model fixtures or assign an ambiguous employee. |
+| Physical power cuts and flash endurance | `NOT_PERFORMED`. Software restart and network interruption do not test them. |
+| Production qualification and longer fleet soak | Not asserted by this result. Two working days, required punch traces, wave observation and fleet soak still require actual elapsed evidence. |
+
+The result, baseline digest, exact artifact and target, collector version and
+canonical evidence SHA-256 are linked to one immutable `FirmwareEvent`.
+Concurrent completion creates one verdict. A scope cancellation, newer
+deployment or revocation cannot turn a raced completion into rollout authority.
+Missing evidence closes as `HIL_INCOMPLETE`; demonstrated regressions close as
+`HIL_FAILED`. `HIL_ACCEPTED` permits only the documented experimental progression
+and leaves every unasserted requirement visible. It never promotes the release
+to general production availability. Waiving external prerequisites does not
+create an attendance trace, an elapsed observation period, or a hardware pass.
+
 ## Compatibility bridge package
 
 Two controlled 2.6.16 canary attempts on 5 October rolled back before ADD

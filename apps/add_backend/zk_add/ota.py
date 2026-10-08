@@ -359,6 +359,9 @@ def _permitted_hil_targets(session: Session, release: FirmwareRelease) -> list[H
         latest, deployment = evidence[-1]
         if release.version in {"2.6.17", "2.6.18", "2.6.19"}:
             return deployment.status == "SUCCEEDED" and ready_event_matches(session, latest, deployment, release)
+        if release.version == "2.7.0":
+            from zk_add.hil_runs import accepted_full_event_matches
+            return accepted_full_event_matches(session, latest, deployment, release)
         return (latest.state == "HIL_ACCEPTED" and latest.details.get("outcome") == "PASS"
                 and deployment.status == "SUCCEEDED")
 

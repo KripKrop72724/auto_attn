@@ -62,7 +62,7 @@ from zk_add.service import (
 )
 from zk_add.attendance_recovery import advance_attendance_recovery_jobs
 from zk_add.settings import settings
-from zk_add.time_utils import utc_now
+from zk_add.time_utils import ensure_utc, utc_now
 from zk_add.reconciliation import (
     assignment_rows,
     refresh_all_reconciliation_assurance,
@@ -539,6 +539,15 @@ def prepare_maintenance_tick(
             .order_by(DeviceCommand.created_at.asc())
         ):
             connector = session.get(Connector, command.connector_id)
+            if command.command_type == "ESP_REBOOT":
+                from zk_add.hil_reboot import advance_reboot_command, reboot_transport_allowed
+
+                advance_reboot_command(session, command, now=now)
+                if (connector is not None and reboot_transport_allowed(session, command, now=now)
+                        and (not command.dispatched_at or ensure_utc(command.dispatched_at)
+                             + timedelta(seconds=settings.command_redispatch_seconds) <= now)):
+                    dispatch.append((connector.connector_id, serialize_command(command)))
+                continue
             if command.expires_at and command.expires_at <= now:
                 command.status = "EXPIRED"
                 command.completed_at = now
@@ -643,6 +652,12 @@ def mark_command_dispatched(command_id: str) -> None:
         command = session.scalar(
             select(DeviceCommand).where(DeviceCommand.command_id == command_id)
         )
+        if command and command.command_type == "ESP_REBOOT":
+            from zk_add.hil_reboot import lock_reboot_command, reboot_transport_allowed
+
+            lock_reboot_command(session, command)
+            if not reboot_transport_allowed(session, command):
+                return
         if command and command.status in {
             "QUEUED",
             "WAITING_FOR_DEVICE",
@@ -694,6 +709,12 @@ async def maintenance_tick() -> None:
                 },
             )
     for connector_id, update in dispatch:
+        if update.get("command_type") == "ESP_REBOOT":
+            from zk_add.hil_reboot import refresh_reboot_dispatch
+
+            update = await asyncio.to_thread(refresh_reboot_dispatch, update["command_id"])
+            if update is None:
+                continue
         if await connector_hub.send(connector_id, update):
             await asyncio.to_thread(mark_command_dispatched, update["command_id"])
     for update in connector_updates:

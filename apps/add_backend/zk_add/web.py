@@ -3641,6 +3641,21 @@ async def cancel_command(
     row = db.scalar(select(DeviceCommand).where(DeviceCommand.command_id == command_id))
     if row is None:
         raise HTTPException(status_code=404, detail="Command not found.")
+    if row.command_type == "ESP_REBOOT":
+        from zk_add.hil_reboot import request_reboot_cancellation
+
+        try:
+            row = request_reboot_cancellation(db, row, actor=context.username)
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        connector = db.get(Connector, row.connector_id)
+        append_audit(db, actor=context.username, action="COMMAND_ESP_REBOOT_CANCEL_REQUESTED",
+            target_type="command", target_id=row.command_id, outcome=row.status)
+        db.commit()
+        if connector:
+            await connector_hub.send(connector.connector_id, serialize_command(row))
+        await browser_events.publish("command", command_response(row))
+        return command_response(row)
     if row.status == "CANCEL_REQUESTED":
         return command_response(row)
     if row.status in {"RUNNING", "SUCCEEDED", "FAILED", "CANCELLED", "EXPIRED"}:
@@ -3916,9 +3931,13 @@ def poll_commands(auth: tuple[Session, Connector] = Depends(require_connector)):
         select(DeviceCommand).where(
             DeviceCommand.connector_id == connector.id,
             DeviceCommand.status.in_(ACTIVE_COMMAND_STATES),
-            or_(DeviceCommand.expires_at == None, DeviceCommand.expires_at > utc_now()),  # noqa: E711
+            or_(DeviceCommand.expires_at == None, DeviceCommand.expires_at > utc_now(),  # noqa: E711
+                (DeviceCommand.command_type == "ESP_REBOOT") & (DeviceCommand.status == "CANCEL_REQUESTED")),
         ).order_by(DeviceCommand.created_at.asc()).limit(10)
     ).all()
+    from zk_add.hil_reboot import reboot_transport_allowed
+
+    rows = [row for row in rows if reboot_transport_allowed(db, row)]
     for row in rows:
         if row.status in {"QUEUED", "WAITING_FOR_DEVICE", "WAITING_FOR_ZKT", "RETRYING"}:
             row.status = "DISPATCHED"
@@ -4195,6 +4214,13 @@ def persist_envelope(connector_pk: int, envelope: Envelope) -> EnvelopeOutcome |
         # Custody ACKs must carry the original durable receipt on replay. A
         # generic transport ACK cannot authorize retiring preserved bytes.
         receipt_message = envelope.type in {"attendance_batch", "queue_evidence", "zkt_observation_batch"}
+        if envelope.type == "command_update":
+            update = CommandUpdate.model_validate(envelope.payload)
+            # A preboot intent ACK is an action authorization. Even a repeated
+            # sequence must recheck cancellation and the action deadline.
+            receipt_message = (update.result.get("kind") == "ESP_REBOOT" or bool(db.scalar(
+                select(DeviceCommand.id).where(DeviceCommand.connector_id == connector.id,
+                    DeviceCommand.command_id == update.command_id, DeviceCommand.command_type == "ESP_REBOOT"))))
         if sequence_replay and not receipt_message:
             return EnvelopeOutcome(
                 ack={"type": "ack", "message_id": envelope.message_id, "duplicate": True},
@@ -4240,6 +4266,8 @@ def persist_envelope(connector_pk: int, envelope: Envelope) -> EnvelopeOutcome |
                 result=update.result,
                 error_code=update.error_code,
                 error_message=update.error_message,
+                envelope_boot_id=envelope.boot_id,
+                envelope_sent_at=ensure_utc(envelope.sent_at),
             )
             from zk_add.attendance_sync_evidence import record_command
 
@@ -4549,21 +4577,40 @@ def pending_command_payloads(connector_id: str) -> list[dict]:
             select(DeviceCommand).where(
                 DeviceCommand.connector_id == connector.id,
                 DeviceCommand.status.in_(ACTIVE_COMMAND_STATES),
-                or_(DeviceCommand.expires_at == None, DeviceCommand.expires_at > utc_now()),  # noqa: E711
+                or_(DeviceCommand.expires_at == None, DeviceCommand.expires_at > utc_now(),  # noqa: E711
+                    (DeviceCommand.command_type == "ESP_REBOOT") & (DeviceCommand.status == "CANCEL_REQUESTED")),
             ).order_by(DeviceCommand.created_at.asc())
         ).all()
-        payloads = [serialize_command(row) for row in rows]
+        from zk_add.hil_reboot import reboot_transport_allowed
+
+        payloads = [serialize_command(row) for row in rows if reboot_transport_allowed(db, row)]
     return payloads
 
 
 async def send_pending_commands(connector_id: str) -> None:
     for payload in await asyncio.to_thread(pending_command_payloads, connector_id):
+        if payload.get("command_type") == "ESP_REBOOT":
+            from zk_add.hil_reboot import refresh_reboot_dispatch
+
+            payload = await asyncio.to_thread(refresh_reboot_dispatch, payload["command_id"])
+            if payload is None:
+                continue
         await connector_hub.send(connector_id, payload)
 
 
 def mark_command_dispatched(command_id: str) -> None:
     with session_scope() as db:
         row = db.scalar(select(DeviceCommand).where(DeviceCommand.command_id == command_id))
+        if row and row.command_type == "ESP_REBOOT":
+            from zk_add.hil_reboot import lock_reboot_command, reboot_transport_allowed
+
+            lock_reboot_command(db, row)
+            if not reboot_transport_allowed(db, row):
+                return
+            if row.status == "CANCEL_REQUESTED":
+                row.dispatched_at = utc_now()
+                row.attempt_count += 1
+                return
         if row and row.status in {"QUEUED", "WAITING_FOR_DEVICE", "WAITING_FOR_ZKT", "RETRYING"}:
             row.status = "DISPATCHED"
             row.dispatched_at = utc_now()
@@ -4572,7 +4619,14 @@ def mark_command_dispatched(command_id: str) -> None:
 
 async def dispatch_command(connector: Connector, command: DeviceCommand) -> None:
     command_id = command.command_id
-    if await connector_hub.send(connector.connector_id, serialize_command(command)):
+    payload = serialize_command(command)
+    if command.command_type == "ESP_REBOOT":
+        from zk_add.hil_reboot import refresh_reboot_dispatch
+
+        payload = await asyncio.to_thread(refresh_reboot_dispatch, command_id)
+        if payload is None:
+            return
+    if await connector_hub.send(connector.connector_id, payload):
         await asyncio.to_thread(mark_command_dispatched, command_id)
 
 
@@ -4896,6 +4950,11 @@ class _HilInterruptionIn(_BaseModel):
     idempotency_key: str = _Field(min_length=8, max_length=120)
 
 
+class _HilCompletionIn(_BaseModel):
+    model_config = _ConfigDict(extra="forbid")
+    password: _SecretStr = _Field(min_length=1, max_length=512)
+
+
 def _hil_interruption_socket_scope(run_id: str, control_id: str):
     from zk_add.hil_transport import pending_stream_close
     with session_scope() as db:
@@ -4933,6 +4992,32 @@ def interrupt_hil_add_transport(
     return {"control": control, "created": created}
 
 
+@app.post("/api/v1/firmware/hil-runs/{run_id}/reboot-esp")
+def reboot_hil_esp(
+    run_id: str, body: _HilInterruptionIn, background_tasks: BackgroundTasks,
+    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+):
+    from zk_add.hil_reboot import start_reboot
+
+    db, context = auth
+    require_step_up(body.password.get_secret_value(), db, context)
+    try:
+        control, created = start_reboot(db, run_id, actor=context.username,
+                                       idempotency_key=body.idempotency_key)
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    run = db.scalar(_select(_FirmwareHilRun).where(_FirmwareHilRun.run_id == run_id))
+    if created:
+        _append_audit(db, actor=context.username, action="FIRMWARE_HIL_ESP_REBOOT_REQUESTED",
+            target_type="connector", target_id=run.target["connector_id"], outcome="REQUESTED",
+            after={"run_id": run_id, "command_id": control["command_id"],
+                   "action_expires_at": control["action_expires_at"]})
+    db.commit()
+    if created:
+        background_tasks.add_task(send_pending_commands, run.target["connector_id"])
+    return {"control": control, "created": created}
+
+
 @app.post("/api/v1/firmware/hil-runs", status_code=201)
 def start_firmware_hil_run(
     body: _HilRunIn, auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
@@ -4963,6 +5048,31 @@ def complete_firmware_bridge_observation(
     _append_audit(db, actor=context.username, action="FIRMWARE_BRIDGE_OBSERVATION_COMPLETED",
                   target_type="connector", target_id=run.target["connector_id"],
                   outcome=run.status, after={"run_id": run.run_id, "profile": run.baseline["profile"]})
+    db.commit()
+    return _serialize_hil_run(run)
+
+
+@app.post("/api/v1/firmware/hil-runs/{run_id}/complete-full")
+def complete_firmware_full_observation(
+    run_id: str, body: _HilCompletionIn,
+    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+):
+    from zk_add.hil_observation import complete_full_run
+
+    db, context = auth
+    require_step_up(body.password.get_secret_value(), db, context)
+    # Authentication touches administrator session timestamps. Flush those
+    # before the collector's clean-session guard; commit only after sealing
+    # server-owned evidence and its audit in this same transaction.
+    db.flush()
+    try:
+        run = complete_full_run(db, run_id, actor=context.username)
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    _append_audit(db, actor=context.username, action="FIRMWARE_FULL_OBSERVATION_COMPLETED",
+        target_type="connector", target_id=run.target["connector_id"], outcome=run.status,
+        after={"run_id": run.run_id, "profile": run.baseline["profile"],
+               "evidence_sha256": run.result.get("evidence_sha256")})
     db.commit()
     return _serialize_hil_run(run)
 
