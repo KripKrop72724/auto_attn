@@ -64,6 +64,10 @@ bool zj_owner_abandon(uint64_t ticket);
  * True means the owner acknowledged completion, not merely request admission.
  * No lock remains held; callers may continue polling retained replies. */
 bool zj_owner_quiesce(void);
+/* Exact pending factory22 trial only. Close the owner-start race as well as
+ * ordinary admission. Refuse retained ADD/new-journal evidence. True returns
+ * with no task holding a storage lock and no accepted operation outstanding. */
+bool zj_owner_quiesce_factory(void);
 /* Experimental reboot only: fail without changing admission unless already
  * idle before this monotonic deadline. A true result is immediately final;
  * the caller must record its RAM witness and restart without further I/O. */

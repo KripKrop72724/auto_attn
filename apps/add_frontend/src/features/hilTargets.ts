@@ -53,8 +53,14 @@ export function hilDeviceMismatch(release: FirmwareRelease | null | undefined, d
 
 export function hilScopeLabel(release: FirmwareRelease): string {
   if (release.hil_schedule) {
-    const { counts, denominator, hold } = release.hil_schedule
-    return `${counts.PASSED}/${denominator} passed · ${counts.PENDING} pending · ${counts.DEFERRED_OFFLINE} deferred offline · ${counts.BLOCKED} blocked${hold ? ' · progression held' : ''}`
+    const { counts, denominator, hold, trial_target_count: trialTargetCount } = release.hil_schedule
+    const otherBridges = counts.NOT_APPLICABLE_TO_THIS_BRIDGE === undefined
+      ? 'other targets require another bridge'
+      : `${counts.NOT_APPLICABLE_TO_THIS_BRIDGE} require another bridge`
+    const scope = trialTargetCount === undefined
+      ? `${counts.PASSED}/${denominator} passed`
+      : `${counts.PASSED}/${trialTargetCount} factory bridge trials passed · ${denominator} nationwide targets · ${otherBridges}`
+    return `${scope} · ${counts.PENDING} pending · ${counts.DEFERRED_OFFLINE} deferred offline · ${counts.BLOCKED} blocked${hold ? ' · progression held' : ''}`
   }
   if (release.hil_targets) {
     const allowed = hilAllowedTargets(release)

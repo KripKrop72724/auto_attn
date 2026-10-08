@@ -5082,7 +5082,13 @@ bool add_connector_claim_failed_boot_restart(void)
     return false;
 #else
     const esp_app_desc_t *app = esp_app_get_description();
-    if (!app || strcmp(app->project_name, "zone_lite") || strcmp(app->version, ZJ_WRITER_VERSION) ||
+    bool allowed = app && !strcmp(app->version, ZJ_WRITER_VERSION);
+#if defined(ZONE_LITE_FACTORY_TRIAL_IMAGE)
+    /* Caller separately proves exact factory selection and pending state;
+     * this function only asks the existing terminal owner to finish cleanup. */
+    allowed = allowed || (app && !strcmp(app->version, "2.6.22"));
+#endif
+    if (!app || strcmp(app->project_name, "zone_lite") || !allowed ||
         !s_lock || xSemaphoreTake(s_lock, pdMS_TO_TICKS(100)) != pdTRUE) return false;
     s_ota_restart_claimed = true;
     strlcpy(s_activity, "OTA_RESTART", sizeof(s_activity));

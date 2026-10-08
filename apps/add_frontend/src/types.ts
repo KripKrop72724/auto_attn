@@ -840,14 +840,16 @@ export interface FirmwareRelease {
   hil_schedule?: {
     policy: string
     denominator: number
-    counts: Record<'PASSED' | 'PENDING' | 'DEFERRED_OFFLINE' | 'BLOCKED', number>
+    trial_target_count?: number
+    counts: Record<'PASSED' | 'PENDING' | 'DEFERRED_OFFLINE' | 'BLOCKED', number> &
+      Partial<Record<'NOT_APPLICABLE_TO_THIS_BRIDGE', number>>
     hold: string | null
     rows: {
       target: HilTarget
       name: string
       wave: string
       exposed: boolean
-      status: 'PASSED' | 'PENDING' | 'DEFERRED_OFFLINE' | 'BLOCKED'
+      status: 'PASSED' | 'PENDING' | 'DEFERRED_OFFLINE' | 'BLOCKED' | 'NOT_APPLICABLE_TO_THIS_BRIDGE'
       reason: string
       prerequisites: string[]
       current_hold: string | null

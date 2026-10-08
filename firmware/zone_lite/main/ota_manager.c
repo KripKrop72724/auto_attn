@@ -33,6 +33,7 @@
 #include "zkt_storage_owner.h"
 #include "zkt_rollback.h"
 #include "zkt_journal_runtime.h"
+#include "zkt_factory_platform.h"
 #endif
 
 #define OTA_NAMESPACE "zone_ota"
@@ -80,6 +81,9 @@ static uint64_t s_failed_boot_ticket;
 
 static void wait_for_capture_safepoint(void);
 static bool acknowledge_pending_success(void);
+#if defined(ZONE_LITE_FACTORY_TRIAL_IMAGE)
+static bool report_factory_trial(void);
+#endif
 
 static void hex_bytes(const unsigned char *input, size_t length, char *output)
 {
@@ -296,6 +300,64 @@ static bool cache_running_image_digest(void)
     return true;
 }
 
+#if defined(ZONE_LITE_FACTORY_TRIAL_IMAGE)
+static bool factory_reported;
+static const char *json_string(cJSON *root,const char *name)
+{
+    cJSON *item=cJSON_GetObjectItemCaseSensitive(root,name);
+    return cJSON_IsString(item) && item->valuestring ? item->valuestring:NULL;
+}
+static bool same_json(cJSON *left,cJSON *right,const char *name)
+{
+    const char *a=json_string(left,name),*b=json_string(right,name);
+    return a && b && !strcmp(a,b);
+}
+static bool report_factory_trial(void)
+{
+    if (factory_reported) return true;
+    zf_proof_t proof;
+    if (!zf_platform_proof(&proof) || proof.state!=ZF_REVOKED ||
+        strcmp(s_journal.target_version,"2.6.22") || strcmp(proof.deployment_id,s_journal.deployment_id)) return false;
+    char path[160];snprintf(path,sizeof(path),"/device/v2/firmware/deployments/%s/factory-trial",proof.deployment_id);
+    char *data=calloc(1,OTA_HTTP_RESPONSE_BYTES);
+    if(!data)return false;
+    ota_response_t response={.data=data,.capacity=OTA_HTTP_RESPONSE_BYTES};int status=0;
+    bool received=signed_request("GET",path,NULL,&response,&status) && status==200;
+    cJSON *context=received ? cJSON_Parse(data):NULL,*body=NULL,*receipt=NULL;
+    const char *trial=json_string(context,"trial_id"),*challenge=json_string(context,"challenge"),
+        *deployment=json_string(context,"deployment_id");
+    cJSON *generation=cJSON_GetObjectItemCaseSensitive(context,"onboarding_generation"),
+        *expiry=cJSON_GetObjectItemCaseSensitive(context,"expires_epoch");
+    const zf_target_t *target=zf_target(proof.target);
+    time_t now=time(NULL);
+    bool valid=trial && strlen(trial)==36 && strspn(trial,"0123456789abcdef-")==36 &&
+        challenge && strlen(challenge)==64 && strspn(challenge,"0123456789abcdef")==64 &&
+        deployment && !strcmp(deployment,proof.deployment_id) && target &&
+        cJSON_IsNumber(generation) && generation->valuedouble==target->onboarding_generation &&
+        cJSON_IsNumber(expiry) && now>=1700000000 && expiry->valuedouble>(double)now &&
+        expiry->valuedouble<=(double)now+3600;
+    if(valid){
+        body=cJSON_CreateObject();
+        valid=body && zf_platform_add_proof(body) &&
+            cJSON_AddStringToObject(body,"trial_id",trial) && cJSON_AddStringToObject(body,"challenge",challenge) &&
+            cJSON_AddStringToObject(body,"boot_id",add_connector_boot_id()) &&
+            cJSON_AddNumberToObject(body,"onboarding_generation",target->onboarding_generation);
+    }
+    char *encoded=valid ? cJSON_PrintUnformatted(body):NULL;
+    if(encoded){
+        response.length=0;data[0]=0;
+        received=signed_request("POST",path,encoded,&response,&status) && status==200;
+        receipt=received ? cJSON_Parse(data):NULL;
+        factory_reported=cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(receipt,"accepted")) &&
+            same_json(receipt,body,"trial_id") && same_json(receipt,body,"challenge") &&
+            same_json(receipt,body,"deployment_id") && same_json(receipt,body,"boot_id") &&
+            same_json(receipt,body,"checkpoint_sha256") && same_json(receipt,body,"proof_state");
+    }
+    free(encoded);cJSON_Delete(receipt);cJSON_Delete(body);cJSON_Delete(context);free(data);
+    return factory_reported;
+}
+#endif
+
 static bool add_running_image_evidence(cJSON *root)
 {
     const esp_app_desc_t *description = esp_app_get_description();
@@ -439,6 +501,27 @@ static bool advance_failed_boot_rollback(void)
         s_failed_boot_pending = s_busy = false;
         return true;
     }
+#if defined(ZONE_LITE_FACTORY_TRIAL_IMAGE)
+    if (zkt && !strcmp(app->version,"2.6.22") && s_failed_boot_pending) {
+        if (!zf_platform_pending_fallback()) {
+            strlcpy(s_last_error,zf_platform_error(),sizeof(s_last_error));
+            return false;
+        }
+        if (!add_connector_claim_failed_boot_restart()) {
+            strlcpy(s_last_error,"FACTORY_TRIAL_SESSION_CLEANUP",sizeof(s_last_error));
+            return false;
+        }
+        if (!zj_owner_quiesce_factory()) {
+            strlcpy(s_last_error,"FACTORY_TRIAL_STORAGE_DRAIN",sizeof(s_last_error));
+            return false;
+        }
+        /* Final local control only after every accepted storage/session
+         * operation finishes. A failed/uncertain selection stays quiescent. */
+        if (zf_platform_select_factory()) esp_restart();
+        strlcpy(s_last_error,zf_platform_error(),sizeof(s_last_error));
+        return false;
+    }
+#endif
     if (!zkt || strcmp(app->version, ZJ_WRITER_VERSION)) {
         /* No reader certificate exists for bridge -> legacy/factory or an
          * arbitrary image. Keep that failed boot explicit, never invalidate
@@ -748,6 +831,9 @@ static bool uses_local_boot_confirmation(void)
  * durable. A lost HTTP response or NVS commit repeats only an idempotent state. */
 static bool report_local_boot_confirmation(void)
 {
+#if defined(ZONE_LITE_FACTORY_TRIAL_IMAGE)
+    if (!report_factory_trial()) return false;
+#endif
     if (!strcmp(s_journal.state, "LOCAL_VALIDATED")) {
         if (!report_state("BOOTED_PENDING", "LOCAL_RUNTIME_HEALTHY")) return false;
         strlcpy(s_journal.state, "BOOT_REPORTED", sizeof(s_journal.state));
@@ -767,6 +853,9 @@ static bool confirm_local_boot(void)
     while ((esp_timer_get_time() / 1000000) < deadline) {
         s_boot_health_checks++;
         const char *local_error = add_connector_local_boot_health_error();
+#if defined(ZONE_LITE_FACTORY_TRIAL_IMAGE)
+        if (!zf_platform_startup_allowed()) local_error=zf_platform_error();
+#endif
         s_boot_health_last_ready = local_error == NULL;
         strlcpy(s_last_error, local_error ? local_error : "", sizeof(s_last_error));
         if (s_boot_health_last_ready) {
@@ -774,6 +863,12 @@ static bool confirm_local_boot(void)
                 strlcpy(s_last_error, "BOOT_LOCAL_MARK_VALID_FAILED", sizeof(s_last_error));
                 return false;
             }
+#if defined(ZONE_LITE_FACTORY_TRIAL_IMAGE)
+            if (!zf_platform_revoke()) {
+                strlcpy(s_last_error,zf_platform_error(),sizeof(s_last_error));
+                return false;
+            }
+#endif
             strlcpy(s_journal.state, "LOCAL_VALIDATED", sizeof(s_journal.state));
             if (!save_journal()) return false;
             /* Local validity is durable before the first network request.
@@ -929,6 +1024,9 @@ void ota_manager_init(void)
     if (!cache_running_image_digest())
         ESP_LOGW(TAG, "Running image digest unavailable at boot; OTA evidence will retry");
     load_journal();
+#if defined(ZONE_LITE_FACTORY_TRIAL_IMAGE)
+    zf_platform_prepare(s_journal_ready ? s_journal.deployment_id : "",s_running_image_digest);
+#endif
 }
 
 void ota_manager_start(void)

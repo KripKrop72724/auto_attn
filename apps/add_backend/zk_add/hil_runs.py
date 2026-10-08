@@ -230,6 +230,10 @@ def start_run(
                 job.capture_certificate, sort_keys=True, separators=(",", ":"),
                 ensure_ascii=True).encode()).hexdigest(),
         )
+    if release.version == "2.6.22":
+        from zk_add.zkt_factory_trial import revoked_evidence
+        epoch_pin["factory_fallback_revocation"] = revoked_evidence(
+            session, connector, deployment, release, current_boot=True)
     if profile == PROFILE:
         require_bridge_baseline(release, telemetry, target, identity)
     run = FirmwareHilRun(

@@ -25,6 +25,11 @@
 #include "freertos/task.h"
 #include "mbedtls/platform_util.h"
 #include "nvs.h"
+#if defined(ZONE_LITE_FACTORY_TRIAL_IMAGE)
+#include <stdatomic.h>
+static atomic_flag factory_start_gate = ATOMIC_FLAG_INIT;
+static bool factory_shutdown;
+#endif
 
 typedef struct {
     zj_mailbox_t mailbox;
@@ -613,7 +618,7 @@ static void task(void *context)
     }
 }
 
-bool zj_owner_start(const char *prefix, const zj_metadata_t *metadata)
+static bool owner_start_impl(const char *prefix, const zj_metadata_t *metadata)
 {
     if (owner || !prefix || !metadata || !strrchr(prefix, '/') || strlen(prefix) >= sizeof(owner->prefix)) return false;
     uint8_t validated[ZJ_META_BYTES];
@@ -665,6 +670,17 @@ bool zj_owner_start(const char *prefix, const zj_metadata_t *metadata)
     }
     xTaskNotifyGive(owner_task);
     return true;
+}
+bool zj_owner_start(const char *prefix, const zj_metadata_t *metadata)
+{
+#if defined(ZONE_LITE_FACTORY_TRIAL_IMAGE)
+    if (atomic_flag_test_and_set_explicit(&factory_start_gate,memory_order_acquire)) return false;
+    bool started = !factory_shutdown && owner_start_impl(prefix,metadata);
+    atomic_flag_clear_explicit(&factory_start_gate,memory_order_release);
+    return started;
+#else
+    return owner_start_impl(prefix,metadata);
+#endif
 }
 bool zj_owner_submit(const zj_request_t *request, uint64_t *ticket)
 {
@@ -718,6 +734,31 @@ bool zj_owner_quiesce(void)
     xSemaphoreGive(mailbox_lock);
     xTaskNotifyGive(owner_task);
     return complete;
+}
+bool zj_owner_quiesce_factory(void)
+{
+#if defined(ZONE_LITE_FACTORY_TRIAL_IMAGE)
+    if (atomic_flag_test_and_set_explicit(&factory_start_gate,memory_order_acquire)) return false;
+    factory_shutdown=true;
+    bool absent=owner==NULL;
+    atomic_flag_clear_explicit(&factory_start_gate,memory_order_release);
+    /* No owner could ever accept a capture before it starts. The start gate
+     * remains closed until reboot; a later startup retry cannot race selection. */
+    if (absent) return true;
+    if (!enter()) return false;
+    bool legacy=owner->state.ready && zj_state_authority(&owner->state)==ZJ_AUTHORITY_LEGACY &&
+        !owner->health.append_observed && owner->store.count==0 &&
+        !owner->store.checkpoint_recovery_pending;
+    if (legacy) owner->health.quiescing=true;
+    bool complete=legacy && owner->health.quiesced && !owner->health.operation_running &&
+        !owner->mailbox.running_ticket && !owner->mailbox.resume_ticket &&
+        !owner->segmented.append_transfer && !owner->segmented.read_transfer;
+    xSemaphoreGive(mailbox_lock);
+    if (legacy) xTaskNotifyGive(owner_task);
+    return complete;
+#else
+    return false;
+#endif
 }
 bool zj_owner_try_quiesce_before(uint64_t deadline_us, int64_t expires_epoch,
                                  int64_t *accepted_epoch, uint64_t *accepted_us)

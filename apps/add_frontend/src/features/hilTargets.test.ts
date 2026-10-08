@@ -17,6 +17,14 @@ describe('ordered HIL destination', () => {
     expect(hilAllowedTargets(scheduled)).toEqual([target])
     expect(hilAllowedTargets({ ...scheduled, hil_next_target: null, hil_allowed_targets: [] })).toEqual([])
   })
+  it('distinguishes three factory bridge trials from all seventeen nationwide targets', () => {
+    const scheduled = { ...release, hil_schedule: { policy: 'ZKT_FACTORY_TRIAL_V1', denominator: 17,
+      trial_target_count: 3,
+      counts: { PASSED: 1, PENDING: 1, DEFERRED_OFFLINE: 1, BLOCKED: 0, NOT_APPLICABLE_TO_THIS_BRIDGE: 14 },
+      hold: 'FACTORY_3FL_VERDICT_REQUIRED', rows: [] } }
+    expect(hilScopeLabel(scheduled)).toBe('1/3 factory bridge trials passed · 17 nationwide targets · 14 require another bridge · 1 pending · 1 deferred offline · 0 blocked · progression held')
+    expect(hilAllowedTargets({ ...scheduled, hil_next_target: null, hil_allowed_targets: [] })).toEqual([])
+  })
   it('uses the server-selected exact target, excluding the same-name spare', () => {
     const spare = { ...device, connector_id: 'spare', is_spare: true }
     expect(hilDevice(release, [spare, device])).toBe(device)

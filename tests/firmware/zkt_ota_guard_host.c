@@ -118,6 +118,8 @@ int main(void)
     assert(!submits && nvs_opens == original_reads);
 
     strcpy(app.version, ZJ_BRIDGE_VERSION);
+    /* Signed21 cannot be made into a22 trial by a backend allowlist change. */
+    assert(!strcmp(check("2.6.22"), "JOURNAL_OTA_TARGET_UNSUPPORTED"));
     assert(!strcmp(check("2.6.15"), "JOURNAL_OTA_TARGET_UNSUPPORTED"));
     assert(!strcmp(check("2.7.1"), "JOURNAL_OTA_TARGET_UNSUPPORTED"));
     assert(!check(ZJ_WRITER_VERSION) && submits == 1 && !live_ticket && !abandons);

@@ -5243,6 +5243,35 @@ async def firmware_assignment(
     return assignment
 
 
+from zk_add.zkt_factory_trial import FactoryTrialProof  # noqa: E402
+
+
+@app.get("/device/v2/firmware/deployments/{deployment_id}/factory-trial")
+async def factory_trial_context(deployment_id: str,
+    auth: tuple[Session, Connector] = Depends(_require_ota_connector)):
+    from zk_add.zkt_factory_trial import context
+    db, connector = auth
+    try:
+        result = context(db, connector, deployment_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    db.commit()
+    return JSONResponse(result, headers={"Cache-Control": "no-store"})
+
+
+@app.post("/device/v2/firmware/deployments/{deployment_id}/factory-trial")
+async def factory_trial_report(deployment_id: str, body: FactoryTrialProof,
+    auth: tuple[Session, Connector] = Depends(_require_ota_connector)):
+    from zk_add.zkt_factory_trial import accept_proof
+    db, connector = auth
+    try:
+        result = accept_proof(db, connector, deployment_id, body.model_dump())
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    db.commit()
+    return JSONResponse(result, headers={"Cache-Control": "no-store"})
+
+
 @app.post("/device/v2/firmware/deployments/{deployment_id}/progress")
 async def firmware_progress(
     deployment_id: str,
