@@ -674,3 +674,76 @@ class LauncherTests(unittest.TestCase):
                            cwd=root, check=True, capture_output=True, timeout=15)
             self.assertEqual(hashlib.sha256(target.read_bytes()).hexdigest(), launch.AUDITOR_SHA256)
             self.assertNotIn(b"\r\n", target.read_bytes())
+
+    @unittest.skipUnless(shutil.which("git"), "Git checkout is required")
+    def test_reused_windows_checkout_recreates_unchanged_blob_with_current_attributes(self):
+        """An attribute-only update can leave a clean, hash-wrong CRLF checkout."""
+        source_root = self.script.parent.parent
+        workflow = (source_root / ".github/workflows/factory-provenance-audit.yml").read_text()
+        expected_steps = [
+            "$head = git rev-parse --verify HEAD",
+            "$head -cne $env:GITHUB_SHA",
+            "git diff --cached --quiet -- scripts/audit_factory_bundle.py",
+            "git diff --quiet -- scripts/audit_factory_bundle.py",
+            "Remove-Item -LiteralPath scripts/audit_factory_bundle.py -Force",
+            "git checkout-index --force -- scripts/audit_factory_bundle.py",
+            "python scripts/invoke_factory_audit.py",
+        ]
+        positions = [workflow.index(step) for step in expected_steps]
+        self.assertEqual(positions, sorted(positions))
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / "scripts").mkdir()
+            (root / "empty-hooks").mkdir()
+            target = root / "scripts/audit_factory_bundle.py"
+            source = self.script.read_bytes()
+            target.write_bytes(source)
+            command = ["git", "-c", "core.autocrlf=true", "-c", "core.eol=crlf",
+                       "-c", "core.hooksPath=" + str(root / "empty-hooks"),
+                       "-c", "user.name=Synthetic Test", "-c", "user.email=test@example.invalid"]
+
+            def git(*arguments):
+                return subprocess.run(command + list(arguments), cwd=root, check=True,
+                                      capture_output=True, timeout=15).stdout.strip()
+
+            git("init", "-q")
+            git("add", "scripts/audit_factory_bundle.py")
+            git("commit", "-qm", "Original checkout without LF attribute")
+            old = git("rev-parse", "HEAD").decode()
+            (root / ".gitattributes").write_bytes((source_root / ".gitattributes").read_bytes())
+            git("add", ".gitattributes")
+            git("commit", "-qm", "Attribute-only update")
+            new = git("rev-parse", "HEAD").decode()
+            self.assertEqual(git("rev-parse", old + ":scripts/audit_factory_bundle.py"),
+                             git("rev-parse", new + ":scripts/audit_factory_bundle.py"))
+            git("checkout", "-q", old)
+            target.unlink()
+            git("checkout", "--", "scripts/audit_factory_bundle.py")
+            self.assertIn(b"\r\n", target.read_bytes())
+            git("checkout", "-q", new)
+            stale = target.read_bytes()
+            self.assertIn(b"\r\n", stale)
+            self.assertNotEqual(hashlib.sha256(target.read_bytes()).hexdigest(), launch.AUDITOR_SHA256)
+            self.assertEqual(git("status", "--porcelain"), b"")
+            self.assertEqual(git("rev-parse", "--verify", "HEAD").decode(), new)
+            git("diff", "--cached", "--quiet", "--", "scripts/audit_factory_bundle.py")
+            git("diff", "--quiet", "--", "scripts/audit_factory_bundle.py")
+            git("checkout-index", "--force", "--", "scripts/audit_factory_bundle.py")
+            self.assertEqual(target.read_bytes(), stale, "Force alone must reproduce the stale checkout")
+            target.unlink()  # The workflow removes this exact tracked leaf only.
+            git("checkout-index", "--force", "--", "scripts/audit_factory_bundle.py")
+            self.assertEqual(hashlib.sha256(target.read_bytes()).hexdigest(), launch.AUDITOR_SHA256)
+            self.assertEqual(target.read_bytes(), source)
+            git("diff", "--quiet", "--", "scripts/audit_factory_bundle.py")
+            git("diff", "--cached", "--quiet", "--", "scripts/audit_factory_bundle.py")
+            # The exact pre-removal guards reject meaningful working or staged
+            # edits, rather than silently discarding them as line-ending drift.
+            modified = source + b"\n# synthetic custom edit\n"
+            target.write_bytes(modified)
+            with self.assertRaises(subprocess.CalledProcessError):
+                git("diff", "--quiet", "--", "scripts/audit_factory_bundle.py")
+            self.assertEqual(target.read_bytes(), modified)
+            git("add", "scripts/audit_factory_bundle.py")
+            with self.assertRaises(subprocess.CalledProcessError):
+                git("diff", "--cached", "--quiet", "--", "scripts/audit_factory_bundle.py")
+            self.assertEqual(target.read_bytes(), modified)

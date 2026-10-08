@@ -20,6 +20,11 @@ output and execution time are also bounded; raw stderr is never exported.
 
 The verifier has a targeted Git attribute that preserves LF bytes on Windows,
 and Windows CI checks those actual checkout bytes against the same pinned hash.
+For a reused checkout, the workflow verifies its exact source commit and
+unchanged auditor index entry and normalized working contents, then recreates
+only that tracked file from Git. Custom edits cause refusal before removal.
+This reapplies the current attributes even when Git considers older CRLF
+working bytes clean after an attributes-only commit.
 The launcher does not normalize or accept modified bytes before verification.
 
 Verification covers the signed manifest and its exact source identity, all
