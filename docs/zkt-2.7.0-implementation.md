@@ -8,6 +8,12 @@ This register records implementation evidence. It is not a release certificate.
 No signed bridge or 2.7.0 candidate is qualified by the existence of code.
 Physical power interruption and endurance qualification: **NOT_PERFORMED**.
 
+The current [V5 package policy](zkt-qualified-reader-matrix.md) pins the actual
+signed 2.6.23 ordinary reader and 2.6.22 factory reader. Package verification,
+per-device reader qualification and writer HIL acceptance remain separate.
+The trial accounts below retain their historical observations and reader-pin
+requirements; current signing and admission use the V5 policy.
+
 The 3FL 2.6.18 canary failed journal transport startup on a fragmented internal
 heap and returned to 2.6.15 through its existing rollback slot. The immutable
 2.6.19 replacement reserves both full journal worker stacks, permits receipt-bound
@@ -45,8 +51,9 @@ artifact is not replaced or relabelled, and every older package remains auditabl
 2.6.21 retains the same exact predecessor images, signed nationwide scope,
 HIL-only publication and stored bridge-readiness requirements. It is unqualified
 until its exact signed image supplies field evidence. The 2.7.0 writer still
-requires its pinned 2.6.17 image; replacing that pin requires actual qualified
-reader evidence and a separately reviewed contract update.
+required its pinned 2.6.17 image at that stage. The later V5 contract separately
+binds verified packages and requires actual per-device reader qualification
+before writer admission.
 
 The subsequent 2.6.21 field trial reported a failed 1,024-byte DMA allocation
 with limited internal free memory. No 21 bridge-readiness qualification is
