@@ -58,7 +58,8 @@ static char *event_to_json(const attendance_event_t *event,const char *capture){
 }
 static bool append_line_policy(const char *path,const char *json,qs_admission_t policy){
  assert(!held && !strcmp(path,PENDING_PATH) && policy==QS_ADMIT_LIVE);
- if(refuse_append)return false;assert(preserved<2);memcpy(preserved_uids[preserved++],json,65);return true;
+ if(refuse_append){return false;}
+ assert(preserved<2);memcpy(preserved_uids[preserved++],json,65);return true;
 }
 static void led_status_fault(int code){assert(code==LED_STATUS_LOCAL_FAILURE || code==LED_STATUS_BLOCKED_IDENTITY);}
 static void led_status_set_backlog(bool value){assert(value);}
@@ -68,7 +69,8 @@ static void xSemaphoreGive(int mutex){assert(mutex==1 && held);held=0;}
 static void *heap_caps_calloc(size_t count,size_t bytes,unsigned caps){
  assert(!held && caps==(MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT));++calls;
  assert((count==8192 && bytes==1) || (count==65536 && bytes==32));
- if(FAIL==calls)return NULL;++allocations;return calloc(count,bytes);
+ if(FAIL==calls){return NULL;}
+ ++allocations;return calloc(count,bytes);
 }
 static void heap_caps_free(void *pointer){if(pointer){++frees;free(pointer);}}
 bool real_contains(const uid_cache_t *cache,const char *uid);
