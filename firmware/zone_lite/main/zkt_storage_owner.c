@@ -376,8 +376,8 @@ static void execute(owner_t *o, const zj_request_t *request, zj_reply_t *reply)
                     request->input.reader_selection.deadline_us);
                 if (reply->compatibility == ZJ_COMPAT_OK ||
                     reply->compatibility == ZJ_COMPAT_SELECTION_UNCERTAIN) {
-                    /* Boot selection may make the bridge NEW. A previous
-                     * cached writer permission cannot outlive that change. */
+                    /* Writer invalidation/reader selection may have committed.
+                     * Cached writer permission cannot outlive that change. */
                     o->writer_allowed = false;
                     o->compatibility_checked = false;
                 }
