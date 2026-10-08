@@ -53,8 +53,16 @@ try {
     $source = Join-Path $root 'package'
     $image = Join-Path $source 'zone-lite-2.7.0.bin'
     [IO.File]::WriteAllText($image, $marker + [char]0)
-    $all = Get-Content -LiteralPath (Join-Path $root 'deploy/add/hil-targets-zkt-270.json') -Raw | ConvertFrom-Json
+    # Preserve the array through the shared loader, as in the Windows 5.1
+    # publication tests; do not depend on pipeline JSON conversion semantics.
+    . (Join-Path $root 'deploy/add/journal-hil-scope.ps1')
+    $all = Get-JournalHilScope
     $targets = ConvertTo-Json -InputObject @($all[0]) -Depth 5 -Compress
+    $fullTargets = ConvertTo-Json -InputObject @($all) -Depth 5 -Compress
+    if ($all.Count -ne 17) { throw 'Synthetic writer manifest lost the nationwide denominator' }
+    Assert-JournalHilScope -TargetsJson $targets
+    Assert-JournalHilScope -TargetsJson $fullTargets -Complete
+    Assert-Refused { Assert-JournalHilScope -TargetsJson (ConvertTo-Json -InputObject $all[0] -Depth 5 -Compress) }
     $manifest = @{version='2.7.0';release_id='zone-lite-2.7.0';firmware_family='zkt';project_name='zone_lite';
         release_channel='EXPERIMENTAL_HIL_ONLY';image_name='zone-lite-2.7.0.bin';image_size=(Get-Item $image).Length;
         image_sha256=(Get-FileHash $image).Hash.ToLowerInvariant();application_sha256=('d'*64);git_sha=('a'*40);
@@ -67,7 +75,7 @@ try {
     [IO.File]::WriteAllText((Join-Path $source 'SHA256SUMS'), 'synthetic-test')
     $store = Join-Path $root 'store'
     & (Join-Path $root 'deploy/add/publish-firmware.ps1') -SourceDirectory $source -StoreDirectory $store -Version 2.7.0 -PublicationMode HIL_ONLY -HilTargetsJson $targets
-    & (Join-Path $root 'deploy/add/extend-ordered-hil-scope.ps1') -StoreDirectory $store -Version 2.7.0 -ExpectedGitSha $manifest.git_sha -ExpectedImageSha256 $manifest.image_sha256 -ExpectedApplicationSha256 $manifest.application_sha256 -ExistingTargetsJson $targets -ExtendedTargetsJson (ConvertTo-Json -InputObject @($all) -Depth 5 -Compress)
+    & (Join-Path $root 'deploy/add/extend-ordered-hil-scope.ps1') -StoreDirectory $store -Version 2.7.0 -ExpectedGitSha $manifest.git_sha -ExpectedImageSha256 $manifest.image_sha256 -ExpectedApplicationSha256 $manifest.application_sha256 -ExistingTargetsJson $targets -ExtendedTargetsJson $fullTargets
     if ((Get-Content (Join-Path $store '2.7.0/.hil-only.json') -Raw | ConvertFrom-Json).targets.Count -ne 17) { throw 'Writer denominator changed' }
     $manifest.queue_storage.reader_matrix.readers[0].signing_key_id = 'changed'
     [IO.File]::WriteAllText($manifestPath, ($manifest | ConvertTo-Json -Depth 12 -Compress))

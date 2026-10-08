@@ -27,7 +27,7 @@ static inline bool zj_reader_policy_image(const char *version, const uint8_t dig
 static inline bool zj_reader_policy_target(const char *version, const char *hex)
 {
     uint8_t digest[32];
-    if (!hex || strnlen(hex, 65) != 64) return false;
+    if (!hex) return false;
     for (unsigned i = 0; i < 32; ++i) {
         unsigned digits[2];
         for (unsigned j = 0; j < 2; ++j) {
@@ -38,5 +38,6 @@ static inline bool zj_reader_policy_target(const char *version, const char *hex)
         }
         digest[i] = (uint8_t)((digits[0] << 4) | digits[1]);
     }
+    if (hex[64] != '\0') return false;
     return zj_reader_policy_image(version, digest);
 }

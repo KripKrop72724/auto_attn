@@ -180,6 +180,50 @@ def test_typed_reader_proof_binds_image_slot_generation_and_freshness(pinned):
 
 
 @pytest.mark.parametrize("populated", [False, True])
+def test_reader_target_is_bounded_portable_c11(tmp_path, populated):
+    policy = synthetic_matrix() if populated else matrix.load_matrix()
+    (tmp_path / "zkt_qualified_reader_matrix.h").write_text(render_header(policy))
+    program = r'''
+#include "zkt_reader_policy.h"
+#include <assert.h>
+#include <stdlib.h>
+int main(void) {
+    const char *versions[] = {"2.6.23", "2.6.22"};
+    const char *digests[] = {
+        "0b00000000000000000000000000000000000000000000000000000000000000",
+        "0c00000000000000000000000000000000000000000000000000000000000000"};
+    assert(!zj_reader_policy_target(NULL, digests[0]));
+    assert(!zj_reader_policy_target(versions[0], NULL));
+    for (unsigned i = 0; i < 2; ++i) {
+        assert(zj_reader_policy_target(versions[i], digests[i]) == EXPECTED);
+        assert(!zj_reader_policy_target(versions[1 - i], digests[i]));
+        for (unsigned length = 0; length < 64; ++length) {
+            char *short_value = malloc(length + 1); assert(short_value);
+            memcpy(short_value, digests[i], length); short_value[length] = '\0';
+            assert(!zj_reader_policy_target(versions[i], short_value));
+            free(short_value);
+        }
+        char long_value[66]; memcpy(long_value, digests[i], 64);
+        long_value[64] = '0'; long_value[65] = '\0';
+        assert(!zj_reader_policy_target(versions[i], long_value));
+        for (unsigned offset = 0; offset < 64; ++offset) {
+            char invalid[65]; memcpy(invalid, digests[i], 65); invalid[offset] = 'A';
+            assert(!zj_reader_policy_target(versions[i], invalid));
+        }
+    }
+}
+'''
+    unit = tmp_path / "reader-target.c"
+    unit.write_text(program)
+    executable = tmp_path / "reader-target"
+    subprocess.run([shutil.which("cc"), "-std=c11", "-pedantic-errors", "-Wall", "-Wextra", "-Werror",
+        "-fsanitize=address,undefined", "-DZONE_LITE_QUALIFIED_READER_MATRIX=1", f"-DEXPECTED={int(populated)}",
+        "-I", str(tmp_path), "-I", str(ROOT / "firmware/zone_lite/main"),
+        str(unit), "-o", str(executable)], check=True)
+    subprocess.run([str(executable)], check=True, timeout=30)
+
+
+@pytest.mark.parametrize("populated", [False, True])
 def test_actual_c_guard_accepts_only_pinned_exact_proof_and_empty_matrix_blocks(tmp_path, populated):
     policy = synthetic_matrix() if populated else matrix.load_matrix()
     (tmp_path / "zkt_qualified_reader_matrix.h").write_text(render_header(policy))
