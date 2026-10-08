@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 
 import pytest
 
@@ -60,6 +61,59 @@ def test_sdk_fixture_matches_reviewed_source_and_build_copy(tmp_path):
         patch.generate(original, destination)
         assert destination.stat().st_mtime_ns == before
         assert original.read_bytes() == data
+
+
+def test_actual_cmake_source_scope_normalizes_generated_file_macro(tmp_path):
+    """Exercise the real target replacement with differing roots/output names."""
+    cmake = shutil.which("cmake")
+    if not cmake:
+        pytest.skip("CMake is required for the generated-source build regression")
+    results = []
+    for name in ("first-root", "second-root"):
+        project = tmp_path / name
+        sdk = project / "sdk"
+        original = sdk / "components/mbedtls/port/aes/dma/esp_aes_dma_core.c"
+        original.parent.mkdir(parents=True)
+        original.write_text("const char *source_name(void){return __FILE__;}\n")
+        (project / "crypto").mkdir()
+        (project / "cmake").mkdir()
+        (project / "crypto/CMakeLists.txt").write_text(
+            'add_library(mbedcrypto STATIC "$ENV{IDF_PATH}/components/'
+            'mbedtls/port/aes/dma/esp_aes_dma_core.c")\n'
+        )
+        # The patch's cryptographic-source pin is covered separately above. This
+        # synthetic input isolates real CMake target/source property scoping.
+        shutil.copyfile(
+            ROOT / "firmware/zone_lite/cmake/idf_aes_cleanup.cmake",
+            project / "cmake/idf_aes_cleanup.cmake",
+        )
+        (project / "cmake/patch_idf_aes.py").write_text(
+            "from pathlib import Path\nimport sys\n"
+            "out=Path(sys.argv[2]);out.parent.mkdir(parents=True,exist_ok=True)\n"
+            "out.write_bytes(Path(sys.argv[1]).read_bytes())\n"
+        )
+        (project / "main.c").write_text(
+            "#include <stdio.h>\nconst char *source_name(void);\n"
+            "int main(void){puts(source_name());return 0;}\n"
+        )
+        (project / "CMakeLists.txt").write_text(
+            "cmake_minimum_required(VERSION 3.18)\nproject(probe C)\n"
+            'add_compile_options("-fmacro-prefix-map=${CMAKE_SOURCE_DIR}=.")\n'
+            "add_subdirectory(crypto)\ninclude(cmake/idf_aes_cleanup.cmake)\n"
+            "add_executable(probe main.c)\ntarget_link_libraries(probe mbedcrypto)\n"
+        )
+        build = project / ("build-" + name)
+        env = dict(os.environ, IDF_PATH=str(sdk))
+        subprocess.run(
+            [cmake, "-S", str(project), "-B", str(build), f"-DPYTHON={sys.executable}"],
+            env=env, check=True, capture_output=True, timeout=30,
+        )
+        subprocess.run(
+            [cmake, "--build", str(build)], env=env, check=True,
+            capture_output=True, timeout=30,
+        )
+        results.append(subprocess.check_output([str(build / "probe")], timeout=10))
+    assert results == [b"/IDF_BUILD/generated/esp_aes_dma_core_cleanup.c\n"] * 2
 
 
 @pytest.mark.parametrize("corrected", [False, True])
