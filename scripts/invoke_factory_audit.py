@@ -25,15 +25,68 @@ TARGETS = {
     "a886e2d9-204d-425c-bc8f-ded85fc89874": "00dcc3514b997570fcdf7495f7b8a85302bcff6c2670120d13245f93c0424e8b",
 }
 SUCCESS_KEYS = set("schema_version status bundle_id source_sha manifest_sha256 public_key_pem_sha256 public_key_spki_sha256 manifest_signature application_signature_block bootloader_signature_block application images partitions initial_otadata_empty device_hash_comparisons installed_security_or_rollback_verified hil_qualification raw_firmware_exported".split())
+HOST_CODES = frozenset("""REPARSE_POINT_NOT_ALLOWED FILE_SIZE_OR_TYPE NATIVE_TIME_LIMIT
+NATIVE_OUTPUT_BOUND AUDIT_OUTPUT_BOUND AUDIT_OUTPUT_CONTRACT AUDIT_APPLICATION_DIGEST
+AUDIT_TARGET_SET AUDIT_TARGET_COMPARISON AUDITOR_SCRIPT_CHANGED PINNED_RUNTIME_NOT_CACHED
+WINDOWS_FIXED_CLI_REQUIRED REVIEWED_MAIN_REQUIRED GITHUB_IDENTITY_REQUIRED INPUT_MISSING
+INPUT_ACCESS_DENIED INPUT_IO_FAILURE NATIVE_EXECUTABLE_MISSING NATIVE_EXECUTION_FAILED
+AUDIT_OUTPUT_INVALID HOST_FAILURE_UNCLASSIFIED""".split())
+ARCHIVE_CODES = frozenset("""APPLICATION_CHECKSUM APPLICATION_CHIP APPLICATION_DESCRIPTOR
+APPLICATION_HEADER APPLICATION_IDENTITY APPLICATION_SEGMENT_BOUND APPLICATION_VALIDATION_DIGEST
+AUDIT_TIME_LIMIT BUNDLE_DIRECTORY_INVALID CLI_ARGUMENTS_NOT_ALLOWED DUPLICATE_JSON_KEY
+ESP_SIGNATURE_SIZE ESP_TRUST_ANCHOR_SIGNATURE_INVALID FILE_CHANGED_DURING_READ FILE_NOT_ALLOWED
+FILE_SIZE_OR_TYPE IMAGE_FILE_HASH INITIAL_OTADATA_NOT_EMPTY INVALID_OR_UNAVAILABLE_INPUT
+MANIFEST_CHANGED MANIFEST_IDENTITY MANIFEST_IMAGE_BOUNDS MANIFEST_IMAGE_INVENTORY MANIFEST_KEY_IDS
+PARTITION_LAYOUT_MISMATCH PARTITION_TABLE_MD5_OR_TAIL PARTITION_TABLE_SIZE PUBLIC_KEY_PEM_PIN
+PUBLIC_KEY_SPKI_PIN PUBLIC_KEY_TYPE""".split())
+STAGES = frozenset({"GITHUB_IDENTITY", "HOST_PRECONDITIONS", "BUNDLE_DIRECTORY",
+                    "AUDITOR_SCRIPT", "RUNTIME_INSPECT", "ARCHIVE_EXECUTION",
+                    "ARCHIVE_VERIFICATION", "OUTPUT_VALIDATION", "REPORT_PERSIST", "UNCLASSIFIED",
+                    *("BUNDLE_" + name.upper().replace("-", "_").replace(".", "_") for name in LIMITS)})
 
 
 class Refused(Exception):
-    pass
+    def __init__(self, code, stage="UNCLASSIFIED"):
+        self.code = code if type(code) is str and code in HOST_CODES else "HOST_FAILURE_UNCLASSIFIED"
+        self.stage = stage if type(stage) is str and stage in STAGES else "UNCLASSIFIED"
+        super().__init__(self.code)
 
 
 def require(value, code):
     if not value:
         raise Refused(code)
+
+
+def safe_refusal(error, stage):
+    """Export fixed classifications only, never exception text, paths or stderr."""
+    stage = stage if stage in STAGES else "UNCLASSIFIED"
+    if isinstance(error, Refused):
+        return Refused(error.code, error.stage if error.stage != "UNCLASSIFIED" else stage)
+    if isinstance(error, FileNotFoundError):
+        code = "NATIVE_EXECUTABLE_MISSING" if stage in {"RUNTIME_INSPECT", "ARCHIVE_EXECUTION"} else "INPUT_MISSING"
+    elif isinstance(error, PermissionError):
+        code = "INPUT_ACCESS_DENIED"
+    elif isinstance(error, OSError):
+        code = "INPUT_IO_FAILURE"
+    elif isinstance(error, (json.JSONDecodeError, UnicodeDecodeError)) and stage == "OUTPUT_VALIDATION":
+        code = "AUDIT_OUTPUT_INVALID"
+    else:
+        code = "HOST_FAILURE_UNCLASSIFIED"
+    return Refused(code, stage)
+
+
+def at_stage(stage, action):
+    try:
+        return action()
+    except Exception as error:
+        raise safe_refusal(error, stage) from None
+
+
+def refusal_report(error, stage):
+    refusal = safe_refusal(error, stage)
+    return {"schema_version": 1, "status": "HOST_AUDIT_REFUSED",
+            "error_code": refusal.code, "failure_stage": refusal.stage,
+            "raw_firmware_exported": False, "hil_qualification": "NOT_ASSERTED"}
 
 
 def validate_node(info, *, regular=False, limit=None):
@@ -99,8 +152,11 @@ def validate_report(code, raw):
             and report.get("hil_qualification") == "NOT_ASSERTED", "AUDIT_OUTPUT_CONTRACT")
     if report.get("status") == "REFUSED":
         require(code != 0 and set(report) == {"schema_version", "status", "error_code", "raw_firmware_exported", "hil_qualification"}, "AUDIT_OUTPUT_CONTRACT")
-        # Do not forward even the auditor's error text across the host boundary.
-        report["error_code"] = "ARCHIVE_VERIFIER_REFUSED"
+        # Only these fixed codes from the hash-pinned verifier may cross the
+        # host boundary. Unknown error text is never retained or printed.
+        code = report.get("error_code")
+        report["error_code"] = code if type(code) is str and code in ARCHIVE_CODES else "ARCHIVE_VERIFIER_REFUSED"
+        report["failure_stage"] = "ARCHIVE_VERIFICATION"
         return report
     require(code == 0 and set(report) == SUCCESS_KEYS and report.get("status") == "ARCHIVE_VERIFIED"
             and report.get("bundle_id") == BUNDLE_ID and report.get("source_sha") == BUNDLE_SOURCE
@@ -118,13 +174,14 @@ def validate_report(code, raw):
 
 
 def perform_audit(bundle, script, *, native_call=native):
-    preflight_path(bundle)
-    preflight_path(script, regular=True, limit=65536)
-    require(hashlib.sha256(script.read_bytes()).hexdigest() == AUDITOR_SHA256, "AUDITOR_SCRIPT_CHANGED")
+    at_stage("BUNDLE_DIRECTORY", lambda: preflight_path(bundle))
+    at_stage("AUDITOR_SCRIPT", lambda: preflight_path(script, regular=True, limit=65536))
+    at_stage("AUDITOR_SCRIPT", lambda: require(hashlib.sha256(script.read_bytes()).hexdigest() == AUDITOR_SHA256, "AUDITOR_SCRIPT_CHANGED"))
     for name, limit in LIMITS.items():
-        preflight_path(bundle / name, regular=True, limit=limit)
-    code, _, _ = native_call(["docker", "image", "inspect", RUNTIME, "--format", "{{.Id}}"], timeout=10)
-    require(code == 0, "PINNED_RUNTIME_NOT_CACHED")
+        at_stage("BUNDLE_" + name.upper().replace("-", "_").replace(".", "_"),
+                 lambda: preflight_path(bundle / name, regular=True, limit=limit))
+    code, _, _ = at_stage("RUNTIME_INSPECT", lambda: native_call(["docker", "image", "inspect", RUNTIME, "--format", "{{.Id}}"], timeout=10))
+    at_stage("RUNTIME_INSPECT", lambda: require(code == 0, "PINNED_RUNTIME_NOT_CACHED"))
     name = "factory-readonly-audit-" + uuid.uuid4().hex
     arguments = ["docker", "run", "--name", name, "--pull", "never", "--read-only", "--network", "none",
                  "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true", "--user", "65534:65534",
@@ -133,8 +190,9 @@ def perform_audit(bundle, script, *, native_call=native):
                  "--mount", f"type=bind,source={script},target=/audit.py,readonly",
                  "--entrypoint", "/opt/esp/python_env/idf5.5_py3.12_env/bin/python", RUNTIME, "-I", "-B", "/audit.py"]
     try:
-        code, output, _ = native_call(arguments, timeout=80)
-        return validate_report(code, output)
+        code, output, _ = at_stage("ARCHIVE_EXECUTION", lambda: native_call(arguments, timeout=80))
+        at_stage("ARCHIVE_EXECUTION", lambda: require(code not in {125, 126, 127}, "NATIVE_EXECUTION_FAILED"))
+        return at_stage("OUTPUT_VALIDATION", lambda: validate_report(code, output))
     finally:
         # Only our unique audit container is touched. Missing cleanup must not
         # mask a valid result or the primary refusal after a failed create.
@@ -146,28 +204,45 @@ def perform_audit(bundle, script, *, native_call=native):
             pass
 
 
+def validate_host():
+    require(os.name == "nt" and len(sys.argv) == 1, "WINDOWS_FIXED_CLI_REQUIRED")
+    require(os.environ.get("GITHUB_REF") == "refs/heads/main", "REVIEWED_MAIN_REQUIRED")
+
+
 def main():
+    identity = None
+    repo = None
+    stage = "GITHUB_IDENTITY"
     try:
-        require(os.name == "nt" and len(sys.argv) == 1, "WINDOWS_FIXED_CLI_REQUIRED")
-        require(os.environ.get("GITHUB_REF") == "refs/heads/main", "REVIEWED_MAIN_REQUIRED")
         source, run, attempt = (os.environ.get(k, "") for k in ("GITHUB_SHA", "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT"))
         require(re.fullmatch("[0-9a-f]{40}", source) and re.fullmatch("[0-9]{1,20}", run)
                 and re.fullmatch("[0-9]{1,6}", attempt), "GITHUB_IDENTITY_REQUIRED")
+        identity = (source, run, attempt)
         repo = Path(__file__).absolute().parent.parent
+        stage = "HOST_PRECONDITIONS"
+        validate_host()
         report = perform_audit(Path(BUNDLE), repo / "scripts" / "audit_factory_bundle.py")
+    except Exception as error:
+        report = refusal_report(error, stage)
+    if identity is not None and repo is not None:
+        source, run, attempt = identity
         envelope = {"schema_version": 1, "observed_at": datetime.now(timezone.utc).isoformat(),
                     "github_source_sha": source, "github_run_id": run, "github_run_attempt": attempt,
                     "auditor_sha256": AUDITOR_SHA256, "runtime": RUNTIME, "archive_report": report,
                     "qualification": "NOT_ASSERTED"}
         output = repo / f"factory-provenance-report-{run}-{attempt}.json"
-        fd = os.open(output, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as stream:
-            json.dump(envelope, stream, sort_keys=True, separators=(",", ":"))
-        print(json.dumps({"status": report["status"], "qualification": "NOT_ASSERTED"}))
-        return 0 if report["status"] == "ARCHIVE_VERIFIED" else 1
-    except Exception:
-        print('{"status":"HOST_AUDIT_REFUSED","qualification":"NOT_ASSERTED"}')
-        return 1
+        try:
+            fd = os.open(output, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                json.dump(envelope, stream, sort_keys=True, separators=(",", ":"))
+        except Exception as error:
+            report = refusal_report(error, "REPORT_PERSIST")
+    summary = {"status": report["status"], "qualification": "NOT_ASSERTED"}
+    for key in ("error_code", "failure_stage"):
+        if key in report:
+            summary[key] = report[key]
+    print(json.dumps(summary, sort_keys=True, separators=(",", ":")))
+    return 0 if report["status"] == "ARCHIVE_VERIFIED" else 1
 
 
 if __name__ == "__main__":

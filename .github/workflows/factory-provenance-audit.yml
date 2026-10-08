@@ -34,5 +34,5 @@ jobs:
         with:
           name: exact-factory-provenance-metadata
           path: factory-provenance-report-${{ github.run_id }}-${{ github.run_attempt }}.json
-          if-no-files-found: ignore
+          if-no-files-found: error
           retention-days: 7
