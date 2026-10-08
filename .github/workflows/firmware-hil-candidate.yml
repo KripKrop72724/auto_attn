@@ -60,6 +60,7 @@ jobs:
           INPUT_VERSION: ${{ inputs.version }}
           INPUT_MAC: ${{ inputs.device_mac }}
           INPUT_TARGETS: ${{ inputs.targets_json }}
+          INPUT_FAMILY: ${{ inputs.firmware_family }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
@@ -109,6 +110,11 @@ jobs:
                       raise SystemExit('Invalid target MAC')
               if any(len({row[key] for row in targets}) != len(targets) for key in targets[0]):
                   raise SystemExit('Duplicate target identity')
+          if os.environ['INPUT_VERSION'] == '2.6.24':
+              # One-shot storage recovery: exact reviewed Peshawar pair only.
+              expected = json.load(open('deploy/add/hil-targets-2.6.24.json'))
+              if os.environ['INPUT_FAMILY'] != 'zkt' or mac or targets != expected:
+                  raise SystemExit('Storage recovery requires the ZKT family and its exact Peshawar scope')
           with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
               output.write('mac=' + mac + '\n')
               output.write('targets=' + (json.dumps(targets, separators=(',', ':')) if targets else '') + '\n')
@@ -162,8 +168,12 @@ jobs:
           if [[ "$FIRMWARE_FAMILY" == "hikvision" ]]; then project=zone_lite_hikvision; fi
           actual="$(sed -n "s/^project($project VERSION \([^ )]*\).*/\1/p" CMakeLists.txt)"
           journal_mode=OFF
+          recovery_mode=OFF
           if [[ "$FIRMWARE_FAMILY" == "zkt" && ( "$EXPECTED_VERSION" == "2.6.16" || "$EXPECTED_VERSION" == "2.6.17" || "$EXPECTED_VERSION" == "2.6.18" || "$EXPECTED_VERSION" == "2.6.19" || "$EXPECTED_VERSION" == "2.6.20" || "$EXPECTED_VERSION" == "2.6.21" || "$EXPECTED_VERSION" == "2.6.22" || "$EXPECTED_VERSION" == "2.6.23" || "$EXPECTED_VERSION" == "2.7.0" ) ]]; then
             journal_mode=ON
+          elif [[ "$FIRMWARE_FAMILY" == "zkt" && "$EXPECTED_VERSION" == "2.6.24" ]]; then
+            # The exact role is selected by CMake; ordinary builds keep 2.6.15.
+            recovery_mode=ON
           else
             test "$actual" = "$EXPECTED_VERSION"
           fi
@@ -175,13 +185,14 @@ jobs:
             -e ZONE_LITE_SEGMENTED_WRITES="$storage_mode" \
             -e ZONE_LITE_DIRECT_LEGACY_UPGRADE="$direct_mode" \
             -e ZONE_LITE_JOURNAL_WRITES="$journal_mode" \
+            -e ZONE_LITE_STORAGE_RECOVERY="$recovery_mode" \
             -e EXPECTED_VERSION \
             -e FIRMWARE_FAMILY \
             -e ZONE_LITE_SETUP_PASSWORD \
             -v "$GITHUB_WORKSPACE:/project" \
             -w /project/firmware/zone_lite \
             espressif/idf:v5.5.3 \
-            bash -lc 'rm -rf build-hil-release && idf.py -B build-hil-release -D SDKCONFIG=/tmp/zone-lite-hil-release-sdkconfig -D PROJECT_VER="$EXPECTED_VERSION" -D ZONE_LITE_SEGMENTED_WRITES="$ZONE_LITE_SEGMENTED_WRITES" -D ZONE_LITE_DIRECT_LEGACY_UPGRADE="$ZONE_LITE_DIRECT_LEGACY_UPGRADE" -D ZONE_LITE_JOURNAL_WRITES="$ZONE_LITE_JOURNAL_WRITES" -D ZONE_LITE_FAMILY="$FIRMWARE_FAMILY" build'
+            bash -lc 'rm -rf build-hil-release && idf.py -B build-hil-release -D SDKCONFIG=/tmp/zone-lite-hil-release-sdkconfig -D PROJECT_VER="$EXPECTED_VERSION" -D ZONE_LITE_SEGMENTED_WRITES="$ZONE_LITE_SEGMENTED_WRITES" -D ZONE_LITE_DIRECT_LEGACY_UPGRADE="$ZONE_LITE_DIRECT_LEGACY_UPGRADE" -D ZONE_LITE_JOURNAL_WRITES="$ZONE_LITE_JOURNAL_WRITES" -D ZONE_LITE_STORAGE_RECOVERY="$ZONE_LITE_STORAGE_RECOVERY" -D ZONE_LITE_FAMILY="$FIRMWARE_FAMILY" build'
       - name: Verify built family and requested application version
         env:
           EXPECTED_VERSION: ${{ inputs.version }}

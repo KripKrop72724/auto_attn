@@ -15,6 +15,7 @@
 #include "evidence_receipt.h"
 #include "file_transaction.h"
 #include "ota_manager.h"
+#include "storage_recovery.h"
 
 #include <ctype.h>
 #include <stdatomic.h>
@@ -2755,6 +2756,30 @@ static void reset_inbound_payload(void)
     s_inbound_payload_received = 0;
 }
 
+/* The recovery image only needs acknowledgements for its own messages. ADD
+ * retains commands and reoffers them once the 2.5.2 executor is back. */
+static bool recovery_inbound_allowed(const char *data, size_t length)
+{
+    cJSON *root = data && length ? cJSON_ParseWithLength(data, length) : NULL;
+    cJSON *type = root ? cJSON_GetObjectItemCaseSensitive(root, "type") : NULL;
+    bool allowed = false;
+    static const char *const acknowledgements[] = {
+        "ack", "error", "queue_evidence_ack", "reconcile_anchor_ack", "reconcile_chunk_ack",
+        "reconcile_manifest_ack", "source_probe_ack", "source_tail_ack", "zkt_observation_ack",
+    };
+    for (size_t i = 0; cJSON_IsString(type) && i < sizeof(acknowledgements) / sizeof(acknowledgements[0]); ++i)
+        allowed = allowed || !strcmp(type->valuestring, acknowledgements[i]);
+    cJSON *command_id = root ? cJSON_GetObjectItemCaseSensitive(root, "command_id") : NULL;
+    if (!allowed && cJSON_IsString(type) && !strcmp(type->valuestring, "command") &&
+        cJSON_IsString(command_id) && command_id->valuestring[0] && strlen(command_id->valuestring) < 80) {
+        (void)add_connector_command_update(command_id->valuestring, "RETRYING", "STORAGE_RECOVERY_ACTIVE",
+            "The one-shot storage recovery image does not execute commands; ADD will reoffer this command.",
+            "{}");
+    }
+    cJSON_Delete(root);
+    return allowed;
+}
+
 static void inbound_message_task(void *argument)
 {
     (void)argument;
@@ -2763,7 +2788,8 @@ static void inbound_message_task(void *argument)
         if (xQueueReceive(s_inbound_messages, &message, portMAX_DELAY) != pdTRUE) {
             continue;
         }
-        parse_inbound(message.data, message.length);
+        if (!storage_recovery_image() || recovery_inbound_allowed(message.data, message.length))
+            parse_inbound(message.data, message.length);
         free(message.data);
         message.data = NULL;
         message.length = 0;
@@ -4559,7 +4585,10 @@ void add_connector_init(void)
                 s_reconcile_assignments &&
                 s_source_coverage &&
                 s_inbound_messages;
-    if (s_started && xTaskCreate(delivery_supervisor_task, "add_supervisor", 4096, NULL, 4, NULL) != pdPASS) {
+    // The one-shot recovery image runs no outbox, command or catalog worker;
+    // start_websocket() starts only its heartbeat.
+    if (s_started && !storage_recovery_image() &&
+        xTaskCreate(delivery_supervisor_task, "add_supervisor", 4096, NULL, 4, NULL) != pdPASS) {
         s_started = false;
         s_worker_start_failed = true;
         led_status_fault(LED_STATUS_LOCAL_FAILURE);
@@ -4761,6 +4790,17 @@ static void start_websocket(void)
         s_client = NULL;
         return;
     }
+    if (storage_recovery_image()) {
+        /* Heartbeats and logs only. ADD outbox files keep their 2.5.2 state. */
+        s_outboxes_initialized = true;
+        for (unsigned attempt = 0; attempt < 5 && !s_heartbeat_task_handle; ++attempt) {
+            if (xTaskCreate(heartbeat_task, "add_heartbeat", 8192, NULL, 4, &s_heartbeat_task_handle) != pdPASS) {
+                s_heartbeat_task_handle = NULL;
+                vTaskDelay(pdMS_TO_TICKS(1000));
+            }
+        }
+        return;
+    }
     if (!add_legacy_owner_required() && xSemaphoreTake(s_live_outbox.lock, pdMS_TO_TICKS(2000)) == pdTRUE) {
         restore_outbox_if_needed(&s_live_outbox);
         s_live_outbox.offset = load_outbox_cursor(&s_live_outbox);
@@ -4808,7 +4848,9 @@ static void onboarding_task(void *arg)
 void add_connector_start(void)
 {
     if (!s_started || s_client || s_onboarding_task_started) return;
-    restore_command_inbox();
+    // The one-shot recovery image executes no commands and leaves the 2.5.2
+    // inbox and catalog transactions exactly as the rollback image left them.
+    if (!storage_recovery_image()) restore_command_inbox();
     if (zone_config_needs_onboarding()) {
         s_onboarding_task_started = true;
         if (xTaskCreate(onboarding_task, "add_onboard", 10240, NULL, 4, NULL) != pdPASS) {
@@ -4817,7 +4859,7 @@ void add_connector_start(void)
         }
         return;
     }
-    recover_identity_catalog_backup_if_active_missing();
+    if (!storage_recovery_image()) recover_identity_catalog_backup_if_active_missing();
     start_websocket();
 }
 

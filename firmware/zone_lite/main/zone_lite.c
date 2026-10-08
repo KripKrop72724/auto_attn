@@ -67,6 +67,7 @@
 #include "led_status.h"
 #include "add_connector.h"
 #include "ota_manager.h"
+#include "storage_recovery.h"
 #include "setup_portal.h"
 #include "zone_config.h"
 #include "reliability.h"
@@ -10624,7 +10625,14 @@ void app_main(void)
     ota_manager_init();
     zkt_publish_state("BOOTING", "ESP32 firmware boot", false);
     ESP_LOGI(TAG, "Zone Lite starting zone=%s device_id=%s", ZONE_LITE_ZONE_ID, ZONE_LITE_ZONE_DEVICE_ID);
+#if defined(ZONE_LITE_STORAGE_RECOVERY_IMAGE) && ZONE_LITE_STORAGE_RECOVERY_IMAGE
+    /* No queue owner, capture or delivery worker starts in the one-shot
+     * recovery image; it only mounts the retained partition unchanged. */
+    (void)storage_init;
+    (void)storage_recovery_mount();
+#else
     storage_init();
+#endif
 #if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
     zkt_memory_diag_report(ZMD_STORAGE_INIT_RETURNED, 0);
 #endif
@@ -10644,6 +10652,12 @@ void app_main(void)
     bool worker_stacks_reserved = reserve_delivery_worker_stacks();
 #endif
     add_connector_start();
+#if defined(ZONE_LITE_STORAGE_RECOVERY_IMAGE) && ZONE_LITE_STORAGE_RECOVERY_IMAGE
+    /* The terminal retains new punches; 2.5.2 reconciles them after the
+     * rollback. The OTA task owns the outcome report and the return. */
+    storage_recovery_run();
+    for (;;) vTaskDelay(pdMS_TO_TICKS(60000));
+#endif
     // Retain handles and retry startup from the existing app task. Delivery
     // allocation failure must not reboot a healthy capture task repeatedly.
     TaskHandle_t gateway_handle = NULL;
