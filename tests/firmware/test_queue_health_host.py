@@ -7,13 +7,25 @@ import subprocess
 ROOT = Path(__file__).resolve().parents[2]
 
 
+def _function(source, signature):
+    begin = source.index(signature)
+    opening = source.index("{", begin)
+    depth, end = 1, opening + 1
+    while depth:
+        depth += (source[end] == "{") - (source[end] == "}")
+        end += 1
+    return source[begin:end] + "\n"
+
+
 def test_queue_read_and_settlement_failures_are_visible_and_retryable(tmp_path):
     firmware = ROOT / "firmware/zone_lite/main"
     source = (firmware / "queue_store.c").read_text()
-    report = source[
-        source.index("static void record_queue_result(") : source.index("bool qs_init(")
-    ]
-    operations = source[source.index("dq_result_t qs_peek(") : source.index("bool qs_snapshot(")]
+    # Extract only the exercised operations, independently of adjacent helpers.
+    # RAM snapshot audit semantics have their own production-function harness.
+    report = _function(source, "static void record_queue_result(")
+    operations = _function(source, "dq_result_t qs_peek(") + _function(
+        source, "dq_result_t qs_settle("
+    )
     harness = r"""
 #include "queue_store.h"
 #include <assert.h>

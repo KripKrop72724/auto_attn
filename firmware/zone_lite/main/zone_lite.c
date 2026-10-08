@@ -8,6 +8,7 @@
 #include "add_source_wire.h"
 #if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
 #include "zkt_journal_runtime.h"
+#include "zkt_memory_diagnostics.h"
 #endif
 #if defined(ZONE_LITE_JOURNAL_WRITES) && !defined(ZONE_LITE_HIKVISION)
 #include "zkt_capture_runtime.h"
@@ -6150,6 +6151,9 @@ static int http_post_json_with_tls_source(
     esp_http_client_set_header(client, "X-API-Password", ZONE_LITE_ORDS_PASSWORD);
     esp_http_client_set_post_field(client, json, strlen(json));
     esp_err_t err = esp_http_client_perform(client);
+#if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
+    if (err != ESP_OK) zkt_memory_diag_report(ZMD_ORDS_TRANSPORT_FAILURE, err);
+#endif
     int status = esp_http_client_get_status_code(client);
     if (status <= 0) {
         status = -1;
@@ -10449,6 +10453,7 @@ static StaticTask_t s_ords_tcb;
 
 static bool reserve_delivery_worker_stacks(void)
 {
+    zkt_memory_diag_report(ZMD_STACK_RESERVE_BEGIN, 0);
     // Xtensa FreeRTOS asserts 16-byte alignment for a caller-owned stack.
     s_gateway_stack = heap_caps_aligned_alloc(16, GATEWAY_STACK_BYTES,
         MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
@@ -10459,16 +10464,22 @@ static bool reserve_delivery_worker_stacks(void)
         heap_caps_free(s_ords_stack);
         s_gateway_stack = NULL;
         s_ords_stack = NULL;
+        zkt_memory_diag_report(ZMD_STACK_RESERVE_FAILED, ESP_ERR_NO_MEM);
         ESP_LOGE(TAG, "Could not reserve delivery worker stacks: largest internal block=%u",
             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
         return false;
     }
+    zkt_memory_diag_report(ZMD_STACK_RESERVE_OK, 0);
     return true;
 }
 #endif
 
 void app_main(void)
 {
+#if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
+    zkt_memory_diag_init();
+    zkt_memory_diag_report(ZMD_BOOT, 0);
+#endif
     setenv("TZ", "UTC0", 1);
     tzset();
     led_status_init();
@@ -10508,6 +10519,9 @@ void app_main(void)
     zkt_publish_state("BOOTING", "ESP32 firmware boot", false);
     ESP_LOGI(TAG, "Zone Lite starting zone=%s device_id=%s", ZONE_LITE_ZONE_ID, ZONE_LITE_ZONE_DEVICE_ID);
     storage_init();
+#if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
+    zkt_memory_diag_report(ZMD_STORAGE_INIT_RETURNED, 0);
+#endif
     wifi_init_sta();
     // An unconfirmed OTA image must enforce its rollback deadline even when
     // it cannot associate with Wi-Fi. Starting the OTA manager before the

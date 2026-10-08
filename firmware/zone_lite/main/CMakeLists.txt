@@ -28,7 +28,15 @@ if(NOT ZONE_LITE_FAMILY STREQUAL "hikvision")
         "zkt_segmented_store.c" "zkt_segmented_client.c" "zkt_legacy_attendance.c"
         "zkt_custody_wire.c" "zkt_custody_receipt.c" "zkt_journal_delivery.c" "zkt_journal_transport.c"
         "zkt_journal_capture.c" "zkt_capture_runtime.c" "zkt_journal_boot.c" "zkt_journal_runtime.c"
-        "zkt_journal_diagnostics.c" "zkt_source_boundary_client.c")
+        "zkt_journal_diagnostics.c" "zkt_source_boundary_client.c" "zkt_memory_diagnostics.c")
+    # IDF disables native atomics globally to protect PSRAM operands. The small
+    # diagnostic callback uses only explicit DRAM words and must not call the
+    # locking PSRAM fallback. Keep this exception scoped to this source; its
+    # target/static assertions and actual-build disassembly guard the contract.
+    if(CONFIG_IDF_TARGET_ESP32S3)
+        set_source_files_properties("zkt_memory_diagnostics.c" PROPERTIES
+            COMPILE_OPTIONS "-mno-disable-hardware-atomics")
+    endif()
 endif()
 
 # This compiles the journal runtime. Only the exact bridge role is admitted to
@@ -41,7 +49,7 @@ if(ZONE_LITE_JOURNAL_WRITES)
         message(FATAL_ERROR "Journal images cannot mix legacy storage upgrade modes")
     endif()
     target_compile_definitions(${COMPONENT_LIB} PRIVATE ZONE_LITE_JOURNAL_WRITES=1)
-    if(PROJECT_VER STREQUAL "2.6.16" OR PROJECT_VER STREQUAL "2.6.17" OR PROJECT_VER STREQUAL "2.6.18" OR PROJECT_VER STREQUAL "2.6.19" OR PROJECT_VER STREQUAL "2.6.20")
+    if(PROJECT_VER STREQUAL "2.6.16" OR PROJECT_VER STREQUAL "2.6.17" OR PROJECT_VER STREQUAL "2.6.18" OR PROJECT_VER STREQUAL "2.6.19" OR PROJECT_VER STREQUAL "2.6.20" OR PROJECT_VER STREQUAL "2.6.21")
         target_compile_definitions(${COMPONENT_LIB} PRIVATE ZONE_LITE_JOURNAL_BRIDGE_IMAGE=1 ZJ_BRIDGE_VERSION="${PROJECT_VER}")
         if(NOT PROJECT_VER STREQUAL "2.6.16")
             target_compile_definitions(${COMPONENT_LIB} PRIVATE ZONE_LITE_JOURNAL_REPLACEMENT_BRIDGE=1)

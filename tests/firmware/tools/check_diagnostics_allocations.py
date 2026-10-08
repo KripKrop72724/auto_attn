@@ -88,7 +88,7 @@ qs_health_t qs_health(void){return (qs_health_t){.observed=true,.available=true,
  .legacy={.observed=true,.read_faults=legacy_healthy?0:1,.append_faults=legacy_healthy?0:2,
  .retire_faults=legacy_healthy?0:3,.read_recoveries=7,.error=legacy_healthy?0:EIO,
  .queue="ords_pending",.operation="legacy_read"}};}
-bool qs_snapshot(qs_lane_t lane,uint32_t *depth){*depth=lane+1;return lane!=QS_BLOCKED;}
+bool qs_snapshot_ram(qs_lane_t lane,uint32_t *depth){*depth=lane+1;return lane!=QS_BLOCKED;}
 ''' + runtime_function + functions + r'''
 static cJSON *named(cJSON *array,const char *name){
  cJSON *item; cJSON_ArrayForEach(item,array){

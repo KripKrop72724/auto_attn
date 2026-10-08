@@ -46,6 +46,7 @@ int main(void)
  assert(add_source_epoch_required("zone-lite-2.6.18",true));
  assert(add_source_epoch_required("zone-lite-2.6.19",true));
  assert(add_source_epoch_required("zone-lite-2.6.20",true));
+ assert(add_source_epoch_required("zone-lite-2.6.21",true));
  assert(!add_source_epoch_required("2.7.0",false));
  assert(!add_source_epoch_required("2.6.15",true));
  add_reconcile_assignment_t a={0},before;
