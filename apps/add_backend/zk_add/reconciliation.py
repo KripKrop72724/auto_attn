@@ -463,6 +463,8 @@ def control_reconciliation_job(
             raise ValueError("Retry idempotency key has different expected state.")
         return job
     if expected_state is not None:
+        binding_serial = session.scalar(select(ZKTDevice.serial).where(
+            ZKTDevice.id == job.zkt_device_id, ZKTDevice.connector_id == job.connector_id))
         actual = {"status": job.status, "phase": job.phase, "error_code": job.error_code,
             "wait_reason": job.wait_reason, "source_epoch": source_epoch_uuid(session, job),
             "terminal_serial": job.terminal_serial, "terminal_generation": job.terminal_generation,
@@ -474,8 +476,8 @@ def control_reconciliation_job(
             "application_sha256": connector.ota_image_sha256 if connector else None,
             "diagnostics_sample_sequence": (connector.firmware_diagnostics or {}).get("sample_sequence") if connector else None,
             "diagnostics_at": ensure_utc(connector.firmware_diagnostics_at) if connector and connector.firmware_diagnostics_at else None}
-        if (actual != expected_state.model_dump() or connector is None or connector.zkt_device is None
-                or connector.zkt_device.serial != expected_state.terminal_serial
+        if (actual != expected_state.model_dump() or connector is None
+                or binding_serial != expected_state.terminal_serial
                 or connector.onboarding_generation != expected_state.terminal_generation):
             raise ValueError("Reconciliation retry evidence changed; refresh and review before retrying.")
     if job.status in TERMINAL_JOB_STATES:

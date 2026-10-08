@@ -553,7 +553,7 @@ def test_retry_precondition_is_optional_but_cannot_authorize_other_control_actio
             type(expected).model_validate(payload)
 
 
-@pytest.mark.parametrize("change", ["new_hold", "diagnostic_revision"])
+@pytest.mark.parametrize("change", ["new_hold", "diagnostic_revision", "terminal_binding"])
 def test_postgres_guarded_retry_rechecks_stale_session_after_locked_state_change(pg_scenario, change):
     from concurrent.futures import ThreadPoolExecutor
     from threading import Event
@@ -564,12 +564,14 @@ def test_postgres_guarded_retry_rechecks_stale_session_after_locked_state_change
     loaded, changed = Event(), Event()
     def retry_with_stale_rows():
         with factory() as db:
-            db.get(Connector, connector_id)
+            stale_connector = db.get(Connector, connector_id)
+            stale_binding = stale_connector.zkt_device
             stale_job = db.get(ReconciliationJob, job_id)
             loaded.set()
             assert changed.wait(3)
             with pytest.raises(ValueError, match="evidence changed"):
                 guarded_retry(db, stale_job, expected)
+            assert stale_binding is not None
             db.rollback()
     with factory() as first, ThreadPoolExecutor(max_workers=1) as pool:
         pending = pool.submit(retry_with_stale_rows)
@@ -578,8 +580,10 @@ def test_postgres_guarded_retry_rechecks_stale_session_after_locked_state_change
         job = first.scalar(select(ReconciliationJob).where(ReconciliationJob.id == job_id).with_for_update())
         if change == "new_hold":
             job.error_code = job.wait_reason = "SOURCE_MANIFEST_GAP"
-        else:
+        elif change == "diagnostic_revision":
             connector.firmware_diagnostics = {"sample_sequence": 8}
+        else:
+            connector.zkt_device.serial = "CHANGED-TERMINAL"
         first.flush()
         changed.set()
         first.commit()
