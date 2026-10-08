@@ -18,6 +18,7 @@ from sqlalchemy import create_engine, event, text
 from zk_add import db, zkt_reader_matrix as policy
 from zk_add.settings import settings
 from zk_add.zkt_bridge_contract import bridge_contract, bridge_marker, signed_hil_targets
+from zk_add.zkt_factory_contract import factory_trial_signing_contract, factory_trial_targets
 
 SCRIPT = Path(__file__).resolve().parents[2] / 'scripts/check_deployed_reader_packages.py'
 spec = importlib.util.spec_from_file_location('reader_packages', SCRIPT)
@@ -63,9 +64,8 @@ def signed_image(version, key, *, marker=None):
 def packages(tmp_path, key, monkeypatch):
     pem = key.public_key().public_bytes(serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo)
     entries, records = [], []
-    # Existing roles exercise the actual installed bridge validators. The
-    # production policy stays BLOCKED; exact 21/22 shape has separate tests.
-    monkeypatch.setattr(policy, 'VERSIONS', ('2.6.21', '2.6.20'))
+    # Exercise both actual role validators with isolated signed packages.
+    # The deployment policy remains empty and BLOCKED.
     for version in policy.VERSIONS:
         image = signed_image(version, key)
         entry = dict(version=version, release_id='zone-lite-' + version,
@@ -74,14 +74,17 @@ def packages(tmp_path, key, monkeypatch):
             artifact_sha256=hashlib.sha256(image).hexdigest(), signing_key_id=hashlib.sha256(pem).hexdigest())
         manifest = dict(schema_version=3, version=version, release_id=entry['release_id'],
             git_sha=entry['source_sha'], firmware_family='zkt', project_name='zone_lite',
-            release_channel='EXPERIMENTAL_HIL_ONLY', minimum_bootstrap_version='2.4.12',
+            release_channel='EXPERIMENTAL_HIL_ONLY',
+            minimum_bootstrap_version='2.5.2' if version == '2.6.22' else '2.4.12',
             partition_layout='zone-lite-ota-v1', image_name='zone-lite-' + version + '.bin',
             image_sha256=entry['artifact_sha256'], image_size=len(image),
             application_sha256=entry['application_sha256'], signing_key_id=entry['signing_key_id'],
             hil_targets=signed_hil_targets(), queue_storage=bridge_contract(version))
+        if version == '2.6.22':
+            manifest['factory_trial'] = factory_trial_signing_contract()
         marker = dict(schema_version=2, version=version, git_sha=entry['source_sha'],
                       image_sha256=entry['artifact_sha256'], application_sha256=entry['application_sha256'],
-                      targets=signed_hil_targets()[:1])
+                      targets=(factory_trial_targets() if version == '2.6.22' else signed_hil_targets())[:1])
         directory = tmp_path / version
         directory.mkdir()
         (directory / manifest['image_name']).write_bytes(image)
@@ -155,7 +158,7 @@ def test_invalid_or_incomplete_proof_is_refused(packages, key, fault):
         record['manifest_signature'] = 'cHJpdmF0ZQ=='
         (directory / 'manifest.sig').write_text(record['manifest_signature'])
     elif fault == 'duplicate_metadata':
-        (directory / 'manifest.json').write_text('{"version":"2.6.21","version":"private"}')
+        (directory / 'manifest.json').write_text('{"version":"2.6.23","version":"private"}')
     elif fault == 'catalog_drift':
         record['manifest']['application_sha256'] = 'e' * 64
     elif fault == 'scope_drift':

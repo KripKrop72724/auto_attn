@@ -29,7 +29,7 @@ try {
     Assert-Refused { Get-FirmwareStorageContract -ImagePath $image -Version 2.7.0 -ForSigning }
     # Pins exist only in this disposable test copy. No release policy is changed.
     $entries = @()
-    foreach ($item in @(@('2.6.21', '1'), @('2.6.22', '2'))) {
+    foreach ($item in @(@('2.6.23', '1'), @('2.6.22', '2'))) {
         $entries += @{version=$item[0];release_id=('zone-lite-' + $item[0]);application_sha256=($item[1] + ('a'*63));
             artifact_sha256=($item[1] + ('b'*63));source_sha=($item[1] + ('c'*39));signing_key_id='isolated-test'}
     }
@@ -58,7 +58,7 @@ try {
     $manifest = @{version='2.7.0';release_id='zone-lite-2.7.0';firmware_family='zkt';project_name='zone_lite';
         release_channel='EXPERIMENTAL_HIL_ONLY';image_name='zone-lite-2.7.0.bin';image_size=(Get-Item $image).Length;
         image_sha256=(Get-FileHash $image).Hash.ToLowerInvariant();application_sha256=('d'*64);git_sha=('a'*40);
-        minimum_bootstrap_version='2.6.21';runtime_profile='ZKT_JOURNAL_V1';queue_storage=$contract;hil_targets=$all}
+        minimum_bootstrap_version='2.6.22';runtime_profile='ZKT_JOURNAL_V1';queue_storage=$contract;hil_targets=$all}
     $manifestPath = Join-Path $source 'manifest.json'
     [IO.File]::WriteAllText($manifestPath, ($manifest | ConvertTo-Json -Depth 12 -Compress))
     & python (Join-Path $root 'scripts/canonicalize_firmware_manifest.py') $manifestPath

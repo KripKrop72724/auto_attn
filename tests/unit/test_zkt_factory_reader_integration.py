@@ -1,6 +1,6 @@
 """Combined factory/matrix gates use actual stored rows and seals.
 
-Synthetic future23/22 identities are isolated to this fixture; the deployment
+Synthetic23/22 identities are isolated to this fixture; the deployment
 policy remains empty and BLOCKED. Stored-verdict linkage is tested here; the
 collector tests separately establish how observation evidence earns a verdict.
 """
@@ -34,7 +34,7 @@ from zk_add.zkt_reader_matrix import writer_matrix_contract
 def pinned(tmp_path, monkeypatch):
     monkeypatch.setattr(matrix, "VERSIONS", ("2.6.23", "2.6.22"))
     value = synthetic_matrix()
-    path = tmp_path / "future-reader-policy.json"
+    path = tmp_path / "synthetic-reader-policy.json"
     path.write_text(json.dumps(value))
     monkeypatch.setattr(matrix, "MATRIX_PATH", path)
     return value

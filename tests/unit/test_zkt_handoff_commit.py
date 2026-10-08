@@ -80,7 +80,7 @@ def prepared(source_store, monkeypatch, pinned):  # noqa: F811
             firmware_family="zkt",
             project_name="zone_lite",
             release_channel="EXPERIMENTAL_HIL_ONLY",
-            minimum_bootstrap_version="2.6.21",
+            minimum_bootstrap_version="2.6.22",
             runtime_profile="ZKT_JOURNAL_V1",
             hil_targets=[target.identity.model_dump()],
             queue_storage=writer_matrix_contract(),

@@ -11,7 +11,7 @@ import json
 from pathlib import Path
 import re
 
-VERSIONS = ("2.6.21", "2.6.22")
+VERSIONS = ("2.6.23", "2.6.22")
 MATRIX_ID = "zkt-2.7.0-readers-v1"
 MATRIX_PATH = Path(__file__).with_suffix(".json")
 ENTRY_KEYS = frozenset(("version", "release_id", "application_sha256", "artifact_sha256",

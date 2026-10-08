@@ -13,7 +13,7 @@ def proof(admission, tick=100000):
             "proof_generation": "7", "sampled_uptime_ms": tick}
 
 
-def admit(session, release, deployment, policy, *, version="2.6.21"):
+def admit(session, release, deployment, policy, *, version="2.6.23"):
     from zk_add.ota import FirmwareEvent
     release.manifest = {**(release.manifest or {}), **writer_manifest(policy)}
     selection = reader_entry_for_manifest(release.manifest, version)

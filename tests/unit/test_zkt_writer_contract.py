@@ -160,8 +160,8 @@ def installed(session, pinned):  # noqa: F811
     reader = pinned["readers"][0]
     now = utc_now()
     bridge = FirmwareRelease(
-        release_id="zone-lite-2.6.21",
-        version="2.6.21",
+        release_id="zone-lite-2.6.23",
+        version="2.6.23",
         git_sha=reader["source_sha"],
         image_sha256=reader["artifact_sha256"],
         image_size=1380352,
@@ -180,7 +180,7 @@ def installed(session, pinned):  # noqa: F811
         zone_name="test",
         device_id="test",
         display_name="test",
-        firmware_version="zone-lite-2.6.21",
+        firmware_version="zone-lite-2.6.23",
         zkt_custody_enabled=True,
         ota_image_sha256=reader["application_sha256"],
         ota_running_partition="ota_1",
@@ -215,7 +215,7 @@ def installed(session, pinned):  # noqa: F811
         zone_id="test",
         actor="test",
         idempotency_key="test",
-        typed_confirmation="2.6.21",
+        typed_confirmation="2.6.23",
         reason="test",
     )
     session.add(campaign)
@@ -226,7 +226,7 @@ def installed(session, pinned):  # noqa: F811
         release_id=bridge.id,
         connector_id=connector.id,
         status="SUCCEEDED",
-        target_version="2.6.21",
+        target_version="2.6.23",
     )
     session.add(deployment)
     session.flush()
@@ -345,8 +345,8 @@ def test_actual_writer_campaign_assignment_and_download_require_stored_bridge_re
         monkeypatch.setattr(matrix, "VERSIONS", tuple(reversed(matrix.VERSIONS)))
         matrix.MATRIX_PATH.write_text(json.dumps(reversed_policy))
         release.manifest = {**release.manifest, **writer_manifest(reversed_policy)}
-        assert release.manifest["queue_storage"]["allowed_bootstrap_versions"] == ["2.6.22", "2.6.21"]
-        assert release.manifest["minimum_bootstrap_version"] == "2.6.21"
+        assert release.manifest["queue_storage"]["allowed_bootstrap_versions"] == ["2.6.22", "2.6.23"]
+        assert release.manifest["minimum_bootstrap_version"] == "2.6.22"
     monkeypatch.setattr(ota, "sync_release_store", lambda _session: None)
     monkeypatch.setattr(settings, "firmware_hil_enabled", True)
     monkeypatch.setattr(settings, "fleet_root_secret", "isolated-test-secret")
@@ -358,7 +358,7 @@ def test_actual_writer_campaign_assignment_and_download_require_stored_bridge_re
     release.release_id, release.git_sha, release.image_sha256 = "zone-lite-2.7.0", "b" * 40, "f" * 64
     release.image_size, release.signing_key_id, release.partition_layout = 4, "test", "zone-lite-ota-v1"
     release.storage_name, release.manifest_signature = "test.bin", "test"
-    release.minimum_bootstrap_version = "2.6.21"
+    release.minimum_bootstrap_version = "2.6.22"
     release.manifest = {**release.manifest, "_hil_targets": signed_hil_targets()[:1]}
     (tmp_path / release.storage_name).write_bytes(b"test")
     session.add(release)
@@ -468,6 +468,6 @@ def test_cached_identity_map_cannot_restore_revoked_reader_scope(installed, faul
     assert bridge.state == "HIL_ONLY" and campaign.status == "ACTIVE"
     assert terminal.confirmed_serial == signed_hil_targets()[0]["terminal_serial"]
     assert connector.ota_secure_boot and connector.ota_rollback_enabled
-    assert connector.ota_running_partition == "ota_1" and connector.firmware_version == "zone-lite-2.6.21"
+    assert connector.ota_running_partition == "ota_1" and connector.firmware_version == "zone-lite-2.6.23"
     assert readiness.status == "BRIDGE_READY"
     assert _storage_predecessor_exclusion(session, release, connector) is not None

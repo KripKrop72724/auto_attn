@@ -10,7 +10,7 @@ from zk_add.ota import FirmwareEvent
 from zk_add.zkt_reader_evidence import admitted_reader, stored_reader_evidence_matches
 
 
-@pytest.fixture(params=["2.6.21", "2.6.22"])
+@pytest.fixture(params=["2.6.23", "2.6.22"])
 def selected_attempt(attempt, pinned, request):  # noqa: F811
     session, connector, writer, bridge, event, releases, _ = attempt
     entry = next(row for row in pinned["readers"] if row["version"] == request.param)

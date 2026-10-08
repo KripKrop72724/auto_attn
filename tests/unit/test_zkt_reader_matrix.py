@@ -159,9 +159,9 @@ def test_semantic_minimum_is_not_the_preferred_reader_order(tmp_path, monkeypatc
 
 
 def test_typed_reader_proof_binds_image_slot_generation_and_freshness(pinned):
-    admission = reader_entry_for_manifest(writer_manifest(pinned), "2.6.21")
+    admission = reader_entry_for_manifest(writer_manifest(pinned), "2.6.23")
     proof = {"schema_version": 1, "verified": True, "matrix_sha256": admission["matrix_sha256"],
-             "version": "2.6.21", "application_sha256": pinned["readers"][0]["application_sha256"],
+             "version": "2.6.23", "application_sha256": pinned["readers"][0]["application_sha256"],
              "slot_address": 0x520000, "slot_size": 0x280000, "proof_generation": "1",
              "sampled_uptime_ms": 100000}
     assert qualified_reader_proof({"qualified_reader": proof}, admission, 100) == {
@@ -208,13 +208,13 @@ int main(void){
         zj_reader_identity_t prior;uint64_t generation;
         assert(zj_reader_proof_decode(bytes,&prior,&generation)&&generation==1);
         zj_reader_identity_t current=prior;current.slot_address=0x2a0000;current.image_digest[0]=99;
-        reader.version=i?"2.6.22":"2.6.21";
+        reader.version=i?"2.6.22":"2.6.23";
         assert((zj_reader_check_writer(port,&writer,&current,&reader,&prior)==ZJ_COMPAT_OK)==EXPECTED);
         prior.image_digest[0]^=1;
         assert(zj_reader_check_writer(port,&writer,&current,&reader,&prior)!=ZJ_COMPAT_OK);
-        prior.image_digest[0]^=1;reader.version=i?"2.6.21":"2.6.22";
+        prior.image_digest[0]^=1;reader.version=i?"2.6.23":"2.6.22";
         assert(zj_reader_check_writer(port,&writer,&current,&reader,&prior)!=ZJ_COMPAT_OK);
-        reader.version=i?"2.6.22":"2.6.21";current.capture_epoch[0]^=1;
+        reader.version=i?"2.6.22":"2.6.23";current.capture_epoch[0]^=1;
         assert(zj_reader_check_writer(port,&writer,&current,&reader,&prior)!=ZJ_COMPAT_OK);
         current.capture_epoch[0]^=1;bytes[188]^=1;
         assert(zj_reader_check_writer(port,&writer,&current,&reader,&prior)!=ZJ_COMPAT_OK);
