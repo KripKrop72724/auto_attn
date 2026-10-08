@@ -33,6 +33,11 @@ jobs:
           ./tests/firmware/test_hil_publication.ps1 -BridgeVersion 2.6.21
           ./tests/firmware/test_backup_restore.ps1
           ./tests/firmware/test_deployed_firmware_contract.ps1
+      - name: Verify pinned audit source after Windows checkout
+        shell: powershell
+        run: |
+          python -c "import hashlib,pathlib; from scripts.invoke_factory_audit import AUDITOR_SHA256; digest=hashlib.sha256(pathlib.Path('scripts/audit_factory_bundle.py').read_bytes()).hexdigest(); raise SystemExit(0 if digest == AUDITOR_SHA256 else 'AUDITOR_CHECKOUT_HASH_MISMATCH')"
+          if ($LASTEXITCODE -ne 0) { throw 'Pinned factory auditor checkout did not verify.' }
 
   repository-contract:
     runs-on: ubuntu-latest
