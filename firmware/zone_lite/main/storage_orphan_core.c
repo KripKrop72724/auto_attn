@@ -288,9 +288,10 @@ void so_complete_orphan(const so_flash_t *flash, const so_target_t *target, so_o
             goto done;
         }
         uint8_t flags = header[SO_PH_FLAGS];
-        if (le16(header) != id || le16(header + 2) != 0 || !valid_index_page(flags) || (flags & SO_FLAG_IXDELE) ||
-            memcmp(header + SO_IX_HDR_NAME_AT, target->name, strlen(target->name) + 1))
+        if (le16(header) != id || le16(header + 2) != 0 || !valid_index_page(flags) || (flags & SO_FLAG_IXDELE))
             continue;
+        outcome->hidden_headers++;
+        if (memcmp(header + SO_IX_HDR_NAME_AT, target->name, strlen(target->name) + 1)) continue;
         uint32_t size = le32(header + SO_IX_HDR_SIZE_AT);
         if (size > target->receipted_size || size + SO_SIZE_WINDOW < target->receipted_size) continue;
         outcome->candidates++;

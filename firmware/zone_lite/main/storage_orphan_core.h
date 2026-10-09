@@ -33,7 +33,7 @@ typedef struct {
 
 typedef struct {
     uint32_t partition_size, block_size, page_size;
-    const char *name;
+    const char *name;               /* SPIFFS object name; ESP-IDF's VFS keeps the leading '/' */
     uint32_t receipted_size;       /* Exact size of the receipted generation */
     const so_region_t *unreadable; /* Regions the receipted run could not read */
     size_t unreadable_count;
@@ -46,6 +46,7 @@ typedef enum { SO_NOTHING_TO_DO = 0, SO_COMPLETE, SO_REFUSED, SO_FAILED } so_res
 typedef struct {
     so_result_t result;
     char code[48];
+    uint32_t hidden_headers;   /* IXDELE headers of any name or size, for diagnostics */
     uint32_t candidates, header_size, object_pages, spans, readable_spans, rows, uids;
     uint32_t pages_freed, pages_skipped;
     uint64_t used_before, used_after; /* Allocated pages x data bytes, as SPIFFS_info */

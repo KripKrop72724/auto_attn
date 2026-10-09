@@ -55,6 +55,8 @@ def test_recovery_image_only_targets_the_two_peshawar_connectors() -> None:
     regions = source[source.index("k_p02_unreadable[] = {"):source.index("};", source.index("k_p02_unreadable[] = {"))]
     lengths = [int(length) for _offset, length in re.findall(r"\{(\d+), (\d+)\}", regions)]
     assert len(lengths) == 10 and sum(lengths) == 5824
+    # The SPIFFS object name is the VFS path below the mount point, '/' included.
+    assert ".name = SR_BLOCKED_PATH + strlen(ZONE_STORAGE_BASE)," in source
     assert 'ug_direct_predecessor_matches("2.5.2", digest)' in source
     assert "ESP_OTA_IMG_PENDING_VERIFY" in source and "ESP_OTA_IMG_VALID" in source
     assert ".format_if_mount_failed = false" in source

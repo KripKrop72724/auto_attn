@@ -189,7 +189,7 @@ if ($manifest.firmware_family -eq 'zkt' -and $Version -eq '2.6.15') {
     . (Join-Path $PSScriptRoot 'firmware-2-6-15-hil-scope.ps1')
     Assert-Zkt2615HilScope -HilTargetsJson $HilTargetsJson
 }
-if ($Version -in @('2.6.24', '2.6.25', '2.6.26')) {
+if ($Version -in @('2.6.24', '2.6.25', '2.6.26', '2.6.27')) {
     # One-shot storage recovery: exact signed Peshawar scope, never AVAILABLE.
     if ($manifest.firmware_family -cne 'zkt' -or $PublicationMode -ne 'HIL_ONLY' -or
         -not [string]::IsNullOrWhiteSpace($HilTargetMac) -or

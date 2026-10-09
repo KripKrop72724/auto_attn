@@ -1,10 +1,10 @@
-"""One-shot ZKT storage recovery releases (2.6.24-2.6.26) for the two Peshawar ESPs.
+"""One-shot ZKT storage recovery releases (2.6.24-2.6.27) for the two Peshawar ESPs.
 
 The image hands every retained blocked-identity row to ADD queue-evidence
 custody, retires the local copies only after every exact receipt, records the
 retired event UIDs for the rollback image, and always returns to the exact
 signed 2.5.2 application. 2.6.25 also skips flash regions SPIFFS cannot read,
-reporting each one to ADD, within an owner-approved 16 KiB bound. 2.6.26 also
+reporting each one to ADD, within an owner-approved 16 KiB bound. 2.6.27 also
 releases the pages SPIFFS kept when it hid Peshawar-02's receipted file. All
 are HIL_ONLY and never promotable. Each exact target may start independently: no
 run is ever accepted as an upgrade, so the ordinary ordered-acceptance gate
@@ -17,7 +17,7 @@ from typing import Any
 
 from zk_add.hil_scope import HilTarget, parse_hil_targets
 
-VERSIONS = ("2.6.24", "2.6.25", "2.6.26")
+VERSIONS = ("2.6.24", "2.6.25", "2.6.26", "2.6.27")
 RELEASE_IDS = {version: f"zone-lite-{version}" for version in VERSIONS}
 BASELINE_VERSION = "2.5.2"
 BASELINE_IMAGE = "4b4aa0697551f527b48b58e95229cd21e362f6ba25398a2d46263bdbf289146b"

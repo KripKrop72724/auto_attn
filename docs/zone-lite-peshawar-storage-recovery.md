@@ -1,4 +1,4 @@
-# Zone Lite 2.6.24-2.6.26: one-shot Peshawar storage recovery
+# Zone Lite 2.6.24-2.6.27: one-shot Peshawar storage recovery
 
 ## Evidence prompting this release
 
@@ -90,7 +90,7 @@ tail. It hid the file but freed only 753 bytes. Storage stayed at 5,058,152 of
 blocked and acked-UID files at boot, so without those UIDs a later full reconcile
 would queue the same punches again.
 
-2.6.26 finishes that one removal. At boot, before SPIFFS is mounted, it applies
+2.6.26 and 2.6.27 finish that one removal. At boot, before SPIFFS is mounted, it applies
 the exact-target and deployment checks, then:
 
 1. It finds the single IXDELE index header named `blocked_identity.jsonl` whose
@@ -119,11 +119,26 @@ created by `SPIFFS_remove()` on a file with Peshawar-02's kinds of damage. The
 result is then remounted and passed through `SPIFFS_check()`, which must find
 nothing to repair.
 
+### 2.6.26 on Peshawar-02 and the 2.6.27 fix
+
+2.6.26 ran on 9 October 2026 at 07:29-07:30 UTC. It reported
+`STORAGE_RECOVERY_NOTHING_TO_DO`, and storage and every file were unchanged. It
+had looked for the object name `blocked_identity.jsonl`, but ESP-IDF's VFS stores
+the path below the mount point, so the name on flash is `/blocked_identity.jsonl`.
+`readdir` strips the slash, which is why inventories never showed it. With no
+matching candidate the engine correctly changed nothing. The host tests had
+created files without the slash.
+
+2.6.27 derives the name from the image's own path (`SR_BLOCKED_PATH` without
+`ZONE_STORAGE_BASE`). The host tests now name every file as ESP-IDF does and
+prove that the slashless name finds nothing. The boot step's outcome is always
+logged, including the number of hidden headers seen, so a no-op is never silent.
+
 ## What the image does
 
-2.6.26 is a separately built ZKT role
-(`-D PROJECT_VER=2.6.26 -D ZONE_LITE_STORAGE_RECOVERY=ON`). 2.6.24, 2.6.25 and
-2.6.26 are all reserved for this role. It is never the operating firmware.
+2.6.27 is a separately built ZKT role
+(`-D PROJECT_VER=2.6.27 -D ZONE_LITE_STORAGE_RECOVERY=ON`). 2.6.24 through 2.6.27
+are all reserved for this role. It is never the operating firmware.
 
 1. It boots from its OTA slot in `ESP_OTA_IMG_PENDING_VERIFY` and never calls
    `esp_ota_mark_app_valid_cancel_rollback()`.
@@ -186,7 +201,7 @@ identities is also what prevents the queue from growing again.
 
 - Signed and published only as `HIL_ONLY`, release channel
   `EXPERIMENTAL_HIL_ONLY`, for exactly `deploy/add/hil-targets-storage-recovery.json`.
-  ADD keeps the published 2.6.24 and 2.6.25 releases valid next to 2.6.26.
+  ADD keeps the published 2.6.24-2.6.26 releases valid next to 2.6.27.
   It can never be promoted. `minimum_bootstrap_version` is 2.5.2, and the signed
   storage contract admits only the 2.5.2 application digest.
 - Each target can start independently, in either order. Nationwide admission
@@ -206,10 +221,10 @@ identities is also what prevents the queue from growing again.
 3. Confirm each connector reports 2.5.2, digest `4b4aa069…`, an OTA partition,
    is online, and its terminal binding is CONFIRMED.
 4. Dispatch `firmware-hil-candidate.yml` with:
-   - family `zkt`, version `2.6.26`, empty `device_mac`;
+   - family `zkt`, version `2.6.27`, empty `device_mac`;
    - `targets_json` equal to the scope file.
 5. Start one zone alone: preflight, then create the campaign with typed
-   confirmation `2.6.26`.
+   confirmation `2.6.27`.
 6. Watch the device logs for:
    - `STORAGE_RECOVERY_STARTED`, then `STORAGE_RECOVERY_INVENTORY_BEFORE`;
    - `STORAGE_RECOVERY_SCAN`, and any `STORAGE_RECOVERY_UNREADABLE_REGION`;
