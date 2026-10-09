@@ -1,4 +1,4 @@
-"""One-shot storage recovery (2.6.24-2.6.26): exact Peshawar scope, never re-offered or promoted."""
+"""One-shot storage recovery (2.6.24-2.6.27): exact Peshawar scope, never re-offered or promoted."""
 import json
 import re
 import secrets
@@ -48,7 +48,7 @@ def image(version=VERSIONS[-1].encode(), marker=MARKER.encode() + b"\0", project
 
 def test_published_and_current_recovery_roles():
     # 2.6.24 is already published and must stay valid in the release store.
-    assert VERSIONS == ("2.6.24", "2.6.25", "2.6.26")
+    assert VERSIONS == ("2.6.24", "2.6.25", "2.6.26", "2.6.27")
     assert RELEASE_IDS == {version: f"zone-lite-{version}" for version in VERSIONS}
 
 
@@ -58,7 +58,7 @@ def test_exact_recovery_contract_and_manifest(version):
     assert validate_recovery_manifest(signed_manifest(version), version) == CONTRACT
     assert validate_storage_contract(signed_manifest(version), version) == CONTRACT
     assert validate_storage_contract({}, "2.5.3") is None
-    for bad_version in (other, "2.6.27"):
+    for bad_version in (other, "2.6.28"):
         with pytest.raises(ValueError):
             validate_recovery_manifest(signed_manifest(version), bad_version)
     reordered = [TARGETS[1].model_dump(), TARGETS[0].model_dump()]
@@ -71,7 +71,7 @@ def test_exact_recovery_contract_and_manifest(version):
         signed_manifest(version, minimum_bootstrap_version=None), signed_manifest(version, release_channel=None),
         signed_manifest(version, hil_targets=reordered), signed_manifest(version, hil_targets=reordered[:1]),
         signed_manifest(version, release_id=f"zone-lite-{other}"), signed_manifest(other),
-        signed_manifest(version, release_id="zone-lite-2.6.27"), signed_manifest(version, firmware_family="hikvision"),
+        signed_manifest(version, release_id="zone-lite-2.6.28"), signed_manifest(version, firmware_family="hikvision"),
         signed_manifest(version, factory_trial={}), signed_manifest(version, runtime_profile="ZKT_JOURNAL_V1"),
     ):
         with pytest.raises(ValueError):
@@ -83,7 +83,7 @@ def test_compiled_role_and_descriptor_bind_the_image(version):
     other = next(candidate for candidate in VERSIONS if candidate != version)
     validate_recovery_image(image(version=version.encode()), version)
     with pytest.raises(ValueError):
-        validate_recovery_image(image(version=b"2.6.27"), "2.6.27")
+        validate_recovery_image(image(version=b"2.6.28"), "2.6.28")
     legacy = b"ZONE_STORAGE_CONTRACT_V2:LEGACY:READ=2:LANES=3F:BASE=2.4.12,2.5.2\0"
     for bad in (image(version=b"2.6.15"), image(version=other.encode()), image(project=b"zone_lite_hikvision"),
                 image(version=version.encode(), marker=b""),
@@ -102,8 +102,7 @@ def test_reviewed_scope_matches_release_tooling_and_firmware():
     assert f'#define STORAGE_RECOVERY_VERSION "{VERSIONS[-1]}"' in header
     cmake = (ROOT / "firmware/zone_lite/main/CMakeLists.txt").read_text()
     assert f'if(NOT PROJECT_VER STREQUAL "{VERSIONS[-1]}")' in cmake
-    assert ('elseif(PROJECT_VER STREQUAL "2.6.24" OR PROJECT_VER STREQUAL "2.6.25" OR '
-            'PROJECT_VER STREQUAL "2.6.26")') in cmake
+    assert 'elseif(PROJECT_VER MATCHES "^2\\\\.6\\\\.2[4-7]$")' in cmake
     firmware = (ROOT / "firmware/zone_lite/main/storage_recovery.c").read_text()
     pairs = re.findall(r'\{"([0-9a-f-]{36})", \{((?:0x[0-9a-f]{2}, ){5}0x[0-9a-f]{2})\}\}', firmware)
     assert [(connector, ":".join(byte[2:] for byte in mac.split(", "))) for connector, mac in pairs] == [

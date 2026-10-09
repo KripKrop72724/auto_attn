@@ -188,7 +188,8 @@ void storage_recovery_prepare(void)
                             .pace = partition_pace};
         so_target_t target = {
             .partition_size = partition->size, .block_size = 4096, .page_size = CONFIG_SPIFFS_PAGE_SIZE,
-            .name = "blocked_identity.jsonl", .receipted_size = k_hidden[i].receipted_size,
+            /* ESP-IDF's VFS stores the path below the mount point, leading '/' included. */
+            .name = SR_BLOCKED_PATH + strlen(ZONE_STORAGE_BASE), .receipted_size = k_hidden[i].receipted_size,
             .unreadable = k_hidden[i].unreadable, .unreadable_count = k_hidden[i].unreadable_count,
             .expected_uids = k_hidden[i].expected_uids, .uid_shortfall_limit = 8,
         };
@@ -227,16 +228,18 @@ void storage_recovery_record_seen(void)
 
 static const char *log_hidden_release(void)
 {
-    if (s_hidden.result == SO_NOTHING_TO_DO) return NULL;
     char message[240];
     snprintf(message, sizeof(message),
-             "Hidden blocked file %s: header size %lu, %lu object pages, %lu released, %lu skipped, %lu UIDs, "
-             "used %llu -> %llu bytes",
-             so_result_name(s_hidden.result), (unsigned long)s_hidden.header_size,
+             "Hidden blocked file %s: %lu hidden headers, %lu candidates, header size %lu, %lu object pages, "
+             "%lu released, %lu skipped, %lu UIDs, used %llu -> %llu bytes",
+             so_result_name(s_hidden.result), (unsigned long)s_hidden.hidden_headers,
+             (unsigned long)s_hidden.candidates, (unsigned long)s_hidden.header_size,
              (unsigned long)s_hidden.object_pages, (unsigned long)s_hidden.pages_freed,
              (unsigned long)s_hidden.pages_skipped, (unsigned long)s_hidden.uids,
              (unsigned long long)s_hidden.used_before, (unsigned long long)s_hidden.used_after);
-    log_line(NULL, s_hidden.result == SO_COMPLETE ? "INFO" : "ERROR", s_hidden.code, message);
+    bool quiet = s_hidden.result == SO_COMPLETE || s_hidden.result == SO_NOTHING_TO_DO;
+    log_line(NULL, quiet ? "INFO" : "ERROR", s_hidden.code, message);
+    if (s_hidden.result == SO_NOTHING_TO_DO) return NULL;
     if (s_hidden.result != SO_COMPLETE) return s_hidden.code;
     bool all = s_seen_ok && s_seen_appended == s_hidden.uids;
     snprintf(message, sizeof(message), "Recorded %lu of %lu released UIDs as seen for 2.5.2",

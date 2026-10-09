@@ -1,7 +1,8 @@
 #pragma once
-/* Dedicated one-shot ZKT storage recovery image (2.6.26). 2.6.24 stopped at the
+/* Dedicated one-shot ZKT storage recovery image (2.6.27). 2.6.24 stopped at the
  * first unreadable region; 2.6.25 skipped them, but SPIFFS kept the pages of
- * Peshawar-02's retired file, which 2.6.26 releases.
+ * Peshawar-02's retired file. 2.6.26 looked for that file without the leading
+ * '/' ESP-IDF stores and released nothing; 2.6.27 releases it.
  *
  * The image never confirms itself. After the exact Peshawar target transfers
  * its retained blocked-identity queue into ADD custody, the OTA manager reports
@@ -9,7 +10,7 @@
  * Every refusal or interruption leaves the legacy files unchanged. */
 #include <stdbool.h>
 
-#define STORAGE_RECOVERY_VERSION "2.6.26"
+#define STORAGE_RECOVERY_VERSION "2.6.27"
 
 /* Compile-time role as a constant expression, so shared code keeps every
  * ordinary path referenced while the recovery build skips it. */

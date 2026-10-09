@@ -75,7 +75,7 @@ function Get-FirmwareStorageContract {
     if ($journalMarkers.Count -gt 0) { throw 'Journal bridge marker cannot sign another firmware version' }
     $markers = [regex]::Matches($ascii, 'ZONE_STORAGE_CONTRACT_V[12]:[A-Z]+:READ=[0-9]+:LANES=[0-9A-F]+:(?:COMPAT=[0-9.]+|BASE=[0-9.,]+)')
     $recoveryMarker = 'ZONE_STORAGE_CONTRACT_V2:RECOVERY:READ=2:LANES=3F:BASE=2.5.2'
-    if ($Version -in @('2.6.24', '2.6.25', '2.6.26')) {
+    if ($Version -in @('2.6.24', '2.6.25', '2.6.26', '2.6.27')) {
         # The one-shot recovery role carries only its own compiled contract and
         # may return only to the exact signed 2.5.2 application.
         if ($markers.Count -ne 1 -or $markers[0].Value -cne $recoveryMarker -or

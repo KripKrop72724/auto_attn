@@ -18,7 +18,8 @@
 #define BLOCK 4096U
 #define PAGE 256U
 #define PAYLOAD (PAGE - 5U)
-#define BLOCKED "blocked_identity.jsonl"
+/* Names as ESP-IDF's VFS stores them: the path below the mount point. */
+#define BLOCKED "/blocked_identity.jsonl"
 #define MAX_ROWS 1200U
 
 /* The engine's fixed offsets must be ESP-IDF's layout. */
@@ -189,9 +190,9 @@ static void write_world(blocked_t *blocked, unsigned rows, unsigned seed, char *
             int written = snprintf(row, sizeof(row), "{\"pending\":%u,\"seed\":%u}\n", i, seed);
             memcpy(*pending + *pending_length, row, (size_t)written);
             *pending_length += (size_t)written;
-            append("pending.jsonl", row, (size_t)written);
+            append("/pending.jsonl", row, (size_t)written);
         }
-        if (i % 5 == 0) append("acked_uids.txt", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n", 65);
+        if (i % 5 == 0) append("/acked_uids.txt", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n", 65);
     }
     blocked->rows = rows;
 }
@@ -322,6 +323,7 @@ static void test_completes_the_hidden_file_and_nothing_else(void)
                 outcome.spans, outcome.readable_spans, outcome.rows, outcome.uids, world.receipted_uids);
     assert(outcome.result == SO_COMPLETE && !strcmp(outcome.code, "STORAGE_ORPHAN_COMPLETE"));
     /* The stopped removal may already have shortened the header's size. */
+    assert(outcome.hidden_headers == 1);
     assert(outcome.candidates == 1 && outcome.header_size <= world.blocked.length &&
            outcome.header_size + 4096 >= world.blocked.length);
     assert(outcome.pages_freed == outcome.object_pages && outcome.pages_skipped == 0);
@@ -342,7 +344,7 @@ static void test_completes_the_hidden_file_and_nothing_else(void)
     assert(used_bytes() == outcome.used_after);
     assert(world.used_after_remove - outcome.used_after >= (world.blocked.length / PAYLOAD) * PAYLOAD);
     size_t length = 0;
-    char *pending = read_file("pending.jsonl", &length);
+    char *pending = read_file("/pending.jsonl", &length);
     assert(pending && length == world.pending_length && !memcmp(pending, world.pending, length));
     free(pending);
     spiffs_stat st;
@@ -352,7 +354,7 @@ static void test_completes_the_hidden_file_and_nothing_else(void)
     char *chunk = calloc(1, 4096);
     assert(chunk);
     memset(chunk, 'x', 4096);
-    for (size_t written = 0; written < world.blocked.length; written += 4096) append("refill.bin", chunk, 4096);
+    for (size_t written = 0; written < world.blocked.length; written += 4096) append("/refill.bin", chunk, 4096);
     free(chunk);
     SPIFFS_unmount(&g_fs);
     free_world(&world);
@@ -406,7 +408,11 @@ static void test_mismatched_receipt_refuses_unchanged(void)
     target.receipted_size += 5000;                        /* Not the receipted generation */
     expect_refusal_unchanged(target, "STORAGE_ORPHAN_NONE", SO_NOTHING_TO_DO);
     target = target_for(&world);
-    target.name = "blocked_recovery.bak";
+    target.name = "/blocked_recovery.bak";
+    expect_refusal_unchanged(target, "STORAGE_ORPHAN_NONE", SO_NOTHING_TO_DO);
+    /* The name without ESP-IDF's leading '/' is a different object name. */
+    target = target_for(&world);
+    target.name = BLOCKED + 1;
     expect_refusal_unchanged(target, "STORAGE_ORPHAN_NONE", SO_NOTHING_TO_DO);
     free_world(&world);
 }
@@ -471,7 +477,7 @@ static void test_interrupted_release_keeps_the_filesystem_mountable(void)
     assert(!outcome.uid_bytes && outcome.uids == 0);
     mount();
     size_t length = 0;
-    char *pending = read_file("pending.jsonl", &length);
+    char *pending = read_file("/pending.jsonl", &length);
     assert(pending && length == world.pending_length && !memcmp(pending, world.pending, length));
     free(pending);
     SPIFFS_unmount(&g_fs);

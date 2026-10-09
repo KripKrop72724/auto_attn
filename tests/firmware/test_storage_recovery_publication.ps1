@@ -15,8 +15,8 @@ try {
     . (Join-Path $repo 'deploy/add/firmware-storage-contract.ps1')
     . (Join-Path $repo 'deploy/add/firmware-storage-recovery-hil-scope.ps1')
     $image = Join-Path $root 'contract.bin'
-    # 2.6.24 and 2.6.25 are published; 2.6.26 is the current role. All stay exact.
-    $versions = @('2.6.24', '2.6.25', '2.6.26')
+    # 2.6.24-2.6.26 are published; 2.6.27 is the current role. All stay exact.
+    $versions = @('2.6.24', '2.6.25', '2.6.26', '2.6.27')
 
     # Exact contract, including the single-element array under PowerShell 5.1.
     $expected = '{"allowed_bootstrap_images":{"2.5.2":"' + $baseline + '"},"allowed_bootstrap_versions":["2.5.2"],"read_format":2,"reader_mask":63,"schema_version":2,"write_format":1}'
@@ -33,8 +33,8 @@ try {
         }
     }
     [IO.File]::WriteAllText($image, 'prefix' + [char]0 + $marker + [char]0 + 'suffix')
-    $contract = Get-FirmwareStorageContract -ImagePath $image -Version '2.6.26' -ForSigning
-    foreach ($other in @('2.6.15', '2.6.23', '2.6.27', '2.7.0', '9.9.9')) {
+    $contract = Get-FirmwareStorageContract -ImagePath $image -Version '2.6.27' -ForSigning
+    foreach ($other in @('2.6.15', '2.6.23', '2.6.28', '2.7.0', '9.9.9')) {
         Assert-Rejected { Get-FirmwareStorageContract -ImagePath $image -Version $other -ForSigning } "Recovery marker signed as $other"
     }
 
