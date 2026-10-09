@@ -9,7 +9,6 @@
 #include <unistd.h>
 
 #define SR_READ_CHUNK 4096U
-#define SR_UID_BYTES 32U
 #define SR_SERIAL_MAX 120U
 
 typedef struct {
@@ -88,17 +87,34 @@ static const char *json_string_value(const char *text, size_t length, const char
     return NULL;
 }
 
-static bool remember_uid(sr_run_t *run, const char *row, size_t length)
+static bool parse_uid(const char *row, size_t length, uint8_t uid[SR_UID_BYTES])
 {
     size_t value_length = 0;
     const char *value = json_string_value(row, length, "event_uid", &value_length);
-    if (!value || value_length != SR_UID_BYTES * 2) return true;
-    uint8_t uid[SR_UID_BYTES];
+    if (!value || value_length != SR_UID_BYTES * 2) return false;
     for (size_t i = 0; i < SR_UID_BYTES; ++i) {
         int high = hex_value(value[i * 2]), low = hex_value(value[i * 2 + 1]);
-        if (high < 0 || low < 0) return true;
+        if (high < 0 || low < 0) return false;
         uid[i] = (uint8_t)((high << 4) | low);
     }
+    return true;
+}
+
+static bool row_valid(const char *row, size_t *json_length)
+{
+    if (*json_length && row[*json_length - 1] == '\r') (*json_length)--;
+    return *json_length > 0 && !memchr(row, 0, *json_length) && rel_json_syntax_valid(row, *json_length);
+}
+
+bool sr_row_event_uid(const char *row, size_t length, uint8_t uid[SR_UID_BYTES])
+{
+    return row && row_valid(row, &length) && parse_uid(row, length, uid);
+}
+
+static bool remember_uid(sr_run_t *run, const char *row, size_t length)
+{
+    uint8_t uid[SR_UID_BYTES];
+    if (!parse_uid(row, length, uid)) return true;
     if (run->outcome->uids == run->uid_capacity) {
         size_t next = run->uid_capacity ? run->uid_capacity * 2 : 4096;
         uint8_t *grown = realloc(run->uids, next * SR_UID_BYTES);
@@ -116,8 +132,7 @@ static bool remember_uid(sr_run_t *run, const char *row, size_t length)
 static int transfer_row(sr_run_t *run, const char *generation, uint64_t offset, const char *row, size_t length)
 {
     size_t json_length = length;
-    if (json_length && row[json_length - 1] == '\r') json_length--;
-    bool valid = json_length > 0 && !memchr(row, 0, json_length) && rel_json_syntax_valid(row, json_length);
+    bool valid = row_valid(row, &json_length);
     if (run->scan) {
         run->scan_rows++;
         return 1;
@@ -400,9 +415,10 @@ static bool transfer_source(sr_run_t *run, const char *path, unsigned index, off
     return ok;
 }
 
-static bool append_seen_uids(sr_run_t *run, const char *acked_path)
+bool sr_append_uids(const char *acked_path, const uint8_t *uids, uint32_t count, uint32_t *appended)
 {
-    if (!run->outcome->uids) return true;
+    *appended = 0;
+    if (!count) return true;
     errno = 0;
     FILE *file = rel_open_append(acked_path);
     bool terminate_torn_row = false;
@@ -415,8 +431,8 @@ static bool append_seen_uids(sr_run_t *run, const char *acked_path)
     bool ok = !terminate_torn_row || fputc('\n', file) != EOF;
     static const char alphabet[] = "0123456789abcdef";
     char line[SR_UID_BYTES * 2 + 2];
-    for (uint32_t i = 0; ok && i < run->outcome->uids; ++i) {
-        const uint8_t *uid = run->uids + (size_t)i * SR_UID_BYTES;
+    for (uint32_t i = 0; ok && i < count; ++i) {
+        const uint8_t *uid = uids + (size_t)i * SR_UID_BYTES;
         for (size_t b = 0; b < SR_UID_BYTES; ++b) {
             line[b * 2] = alphabet[uid[b] >> 4];
             line[b * 2 + 1] = alphabet[uid[b] & 0x0f];
@@ -425,15 +441,20 @@ static bool append_seen_uids(sr_run_t *run, const char *acked_path)
         line[SR_UID_BYTES * 2 + 1] = '\0';
         ok = fputs(line, file) >= 0;
         if (ok && (i + 1) % 256 == 0) ok = fflush(file) == 0 && fsync(fileno(file)) == 0;
-        if (ok) run->outcome->uids_appended = i + 1;
+        if (ok) *appended = i + 1;
     }
     if (ok) ok = fflush(file) == 0 && fsync(fileno(file)) == 0;
     if (fclose(file) != 0) ok = false;
-    if (!ok && run->outcome->uids_appended) {
+    if (!ok && *appended) {
         /* Only fully synced 256-row groups are counted as durable. */
-        run->outcome->uids_appended -= run->outcome->uids_appended % 256;
+        *appended -= *appended % 256;
     }
     return ok;
+}
+
+static bool append_seen_uids(sr_run_t *run, const char *acked_path)
+{
+    return sr_append_uids(acked_path, run->uids, run->outcome->uids, &run->outcome->uids_appended);
 }
 
 void sr_transfer_and_retire(const char *const *sources, size_t source_count,

@@ -10629,7 +10629,9 @@ void app_main(void)
     /* No queue owner, capture or delivery worker starts in the one-shot
      * recovery image; it only mounts the retained partition unchanged. */
     (void)storage_init;
+    storage_recovery_prepare();
     (void)storage_recovery_mount();
+    storage_recovery_record_seen();
 #else
     storage_init();
 #endif
