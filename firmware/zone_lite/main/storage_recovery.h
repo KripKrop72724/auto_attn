@@ -1,6 +1,7 @@
 #pragma once
-/* Dedicated one-shot ZKT storage recovery image (2.6.25; 2.6.24 is the
- * published predecessor that stopped at the first unreadable region).
+/* Dedicated one-shot ZKT storage recovery image (2.6.26). 2.6.24 stopped at the
+ * first unreadable region; 2.6.25 skipped them, but SPIFFS kept the pages of
+ * Peshawar-02's retired file, which 2.6.26 releases.
  *
  * The image never confirms itself. After the exact Peshawar target transfers
  * its retained blocked-identity queue into ADD custody, the OTA manager reports
@@ -8,7 +9,7 @@
  * Every refusal or interruption leaves the legacy files unchanged. */
 #include <stdbool.h>
 
-#define STORAGE_RECOVERY_VERSION "2.6.25"
+#define STORAGE_RECOVERY_VERSION "2.6.26"
 
 /* Compile-time role as a constant expression, so shared code keeps every
  * ordinary path referenced while the recovery build skips it. */
@@ -29,8 +30,13 @@ typedef enum {
 } storage_recovery_state_t;
 
 #if defined(ZONE_LITE_STORAGE_RECOVERY_IMAGE) && ZONE_LITE_STORAGE_RECOVERY_IMAGE
+/* Before the first mount: release Peshawar-02's hidden, receipted blocked
+ * file on the unmounted partition (exact target and deployment only). */
+void storage_recovery_prepare(void);
 /* Mount the existing partition without the normal queue owners. */
 bool storage_recovery_mount(void);
+/* After the mount: record the released rows' UIDs in the background. */
+void storage_recovery_record_seen(void);
 /* Blocking: exact preconditions, custody transfer, retirement, inventory. */
 void storage_recovery_run(void);
 storage_recovery_state_t storage_recovery_state(void);

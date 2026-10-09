@@ -1,4 +1,4 @@
-# Zone Lite 2.6.24 and 2.6.25: one-shot Peshawar storage recovery
+# Zone Lite 2.6.24-2.6.26: one-shot Peshawar storage recovery
 
 ## Evidence prompting this release
 
@@ -74,11 +74,56 @@ the recorded UIDs (65 bytes each). A much smaller drop means the start of the fi
 is still allocated. Reclaiming it needs a separately approved filesystem check,
 because that check also repairs or drops pages of any other damaged file.
 
+## Peshawar-02 result of 2.6.25 and the 2.6.26 change
+
+ZONE-PESHAWAR-02 ran 2.6.25 on 9 October 2026, 03:02-03:36 UTC. The scan found
+10 unreadable regions, 5,824 bytes in total: one page at offset 1,847,840 and the
+rest in the last 11 KB of the file. All 7,557 readable rows (2,762,531 bytes) and
+the 10 region records reached ADD custody under generation
+`storage-recovery-v1-0-2775901`. ADD's queue evidence holds exactly those 7,567
+records.
+
+The removal then hit the SPIFFS behaviour described below inside the damaged
+tail. It hid the file but freed only 753 bytes. Storage stayed at 5,058,152 of
+7,703,441 bytes, so the 7,537 UIDs could not be recorded. The outcome was
+`STORAGE_RECOVERY_RETIRE_PARTIAL`. 2.5.2 builds its seen set from the pending,
+blocked and acked-UID files at boot, so without those UIDs a later full reconcile
+would queue the same punches again.
+
+2.6.26 finishes that one removal. At boot, before SPIFFS is mounted, it applies
+the exact-target and deployment checks, then:
+
+1. It finds the single IXDELE index header named `blocked_identity.jsonl` whose
+   size is within 4 KiB below 2,775,901, the receipted generation. None found
+   means nothing to do; two or more refuse the run.
+2. It reads that object as SPIFFS reads a file, through its header and index
+   pages and with the same data-page checks. It keeps the event UIDs of complete,
+   valid rows outside the 10 receipted regions. Fewer than 7,529 or more than
+   7,537 UIDs refuse the run with nothing changed. The removal itself may already
+   have freed the last few rows.
+3. It frees only pages whose lookup entry and own header both name that object,
+   as `spiffs_page_delete` does. It frees the header last, so an interruption
+   leaves the object still identifiable.
+
+It then mounts SPIFFS, and a background task appends the UIDs to
+`acked_uids.txt`. This does not depend on Wi-Fi or ADD, and it stays inside the
+OTA rollback deadline. `storage_recovery_run()` reports
+`STORAGE_ORPHAN_*` and `STORAGE_RECOVERY_ORPHAN_SEEN`, handles any visible
+blocked file as 2.6.25 did, and ends with `STORAGE_RECOVERY_ORPHAN_COMPLETE`.
+Other outcomes are `STORAGE_RECOVERY_ORPHAN_SEEN_PARTIAL` or the refusal code.
+No other object is touched, and SPIFFS's own filesystem check is never run.
+
+`tests/firmware/tools/check_spiffs_orphan.py` runs this against ESP-IDF 5.5.3's
+own SPIFFS, built for the host with the Zone Lite configuration. Each orphan is
+created by `SPIFFS_remove()` on a file with Peshawar-02's kinds of damage. The
+result is then remounted and passed through `SPIFFS_check()`, which must find
+nothing to repair.
+
 ## What the image does
 
-2.6.25 is a separately built ZKT role
-(`-D PROJECT_VER=2.6.25 -D ZONE_LITE_STORAGE_RECOVERY=ON`). Both 2.6.24 and
-2.6.25 are reserved for this role. It is never the operating firmware.
+2.6.26 is a separately built ZKT role
+(`-D PROJECT_VER=2.6.26 -D ZONE_LITE_STORAGE_RECOVERY=ON`). 2.6.24, 2.6.25 and
+2.6.26 are all reserved for this role. It is never the operating firmware.
 
 1. It boots from its OTA slot in `ESP_OTA_IMG_PENDING_VERIFY` and never calls
    `esp_ota_mark_app_valid_cancel_rollback()`.
@@ -141,7 +186,7 @@ identities is also what prevents the queue from growing again.
 
 - Signed and published only as `HIL_ONLY`, release channel
   `EXPERIMENTAL_HIL_ONLY`, for exactly `deploy/add/hil-targets-storage-recovery.json`.
-  ADD keeps the published 2.6.24 release valid next to 2.6.25.
+  ADD keeps the published 2.6.24 and 2.6.25 releases valid next to 2.6.26.
   It can never be promoted. `minimum_bootstrap_version` is 2.5.2, and the signed
   storage contract admits only the 2.5.2 application digest.
 - Each target can start independently, in either order. Nationwide admission
@@ -161,10 +206,10 @@ identities is also what prevents the queue from growing again.
 3. Confirm each connector reports 2.5.2, digest `4b4aa069…`, an OTA partition,
    is online, and its terminal binding is CONFIRMED.
 4. Dispatch `firmware-hil-candidate.yml` with:
-   - family `zkt`, version `2.6.25`, empty `device_mac`;
+   - family `zkt`, version `2.6.26`, empty `device_mac`;
    - `targets_json` equal to the scope file.
 5. Start one zone alone: preflight, then create the campaign with typed
-   confirmation `2.6.25`.
+   confirmation `2.6.26`.
 6. Watch the device logs for:
    - `STORAGE_RECOVERY_STARTED`, then `STORAGE_RECOVERY_INVENTORY_BEFORE`;
    - `STORAGE_RECOVERY_SCAN`, and any `STORAGE_RECOVERY_UNREADABLE_REGION`;

@@ -1,6 +1,7 @@
 """Execute the one-shot storage recovery custody engine with sanitizers."""
 from pathlib import Path
 import os
+import re
 import shutil
 import subprocess
 
@@ -43,9 +44,17 @@ def test_recovery_image_never_confirms_itself_or_writes_an_ota_journal() -> None
 
 def test_recovery_image_only_targets_the_two_peshawar_connectors() -> None:
     source = (ROOT / "firmware/zone_lite/main/storage_recovery.c").read_text()
-    assert source.count('{"') == 2
-    assert '"bf4badc7-5f9c-42aa-8b3a-8a43f8daeb5e", {0xe0, 0x72, 0xa1, 0xd7, 0x05, 0xc4}' in source
-    assert '"233dac02-eb1b-4598-a876-e3a7b1ecfd54", {0xe0, 0x72, 0xa1, 0xd5, 0x08, 0xa0}' in source
+    targets = source[source.index("k_targets[] = {"):source.index("};", source.index("k_targets[] = {"))]
+    assert targets.count('{"') == 2
+    assert '"bf4badc7-5f9c-42aa-8b3a-8a43f8daeb5e", {0xe0, 0x72, 0xa1, 0xd7, 0x05, 0xc4}' in targets
+    assert '"233dac02-eb1b-4598-a876-e3a7b1ecfd54", {0xe0, 0x72, 0xa1, 0xd5, 0x08, 0xa0}' in targets
+    # Only Peshawar-02's receipted generation may be released, with its proof.
+    hidden = source[source.index("k_hidden[] = {"):source.index("};", source.index("k_hidden[] = {"))]
+    assert hidden.count('{"') == 1
+    assert '{"bf4badc7-5f9c-42aa-8b3a-8a43f8daeb5e", 2775901, 7537, k_p02_unreadable,' in hidden
+    regions = source[source.index("k_p02_unreadable[] = {"):source.index("};", source.index("k_p02_unreadable[] = {"))]
+    lengths = [int(length) for _offset, length in re.findall(r"\{(\d+), (\d+)\}", regions)]
+    assert len(lengths) == 10 and sum(lengths) == 5824
     assert 'ug_direct_predecessor_matches("2.5.2", digest)' in source
     assert "ESP_OTA_IMG_PENDING_VERIFY" in source and "ESP_OTA_IMG_VALID" in source
     assert ".format_if_mount_failed = false" in source

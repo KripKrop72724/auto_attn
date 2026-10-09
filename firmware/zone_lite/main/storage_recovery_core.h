@@ -16,6 +16,7 @@
 #include <stdint.h>
 
 #define SR_RECORD_MAX_BYTES 8192U /* ADD queue_evidence raw-byte limit */
+#define SR_UID_BYTES 32U
 #define SR_PROGRESS_INTERVAL 500U
 #define SR_PROBE_BYTES 32U /* Resolution of an unreadable region */
 /* Owner-approved (9 October 2026) maximum of unreadable bytes discarded by
@@ -62,3 +63,9 @@ void sr_transfer_and_retire(const char *const *sources, size_t source_count,
                             const char *acked_path, const sr_ports_t *ports,
                             sr_outcome_t *outcome);
 const char *sr_result_name(sr_result_t result);
+/* True when a row is one the transfer classifies LEGACY_RECOVERY and carries a
+ * 64-hex event_uid; that UID is what retirement records as seen. */
+bool sr_row_event_uid(const char *row, size_t length, uint8_t uid[SR_UID_BYTES]);
+/* Appends binary UIDs in the legacy acked-UID text format, syncing every 256
+ * rows; *appended counts only synced rows. */
+bool sr_append_uids(const char *acked_path, const uint8_t *uids, uint32_t count, uint32_t *appended);

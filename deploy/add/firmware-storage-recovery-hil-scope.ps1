@@ -4,7 +4,7 @@ function Get-ZktStorageRecoveryHilScope {
     return ,@($targets)
 }
 
-# The one-shot storage recovery images (2.6.24, 2.6.25) are signed and
+# The one-shot storage recovery images (2.6.24-2.6.26) are signed and
 # published only for the two exact Peshawar connectors, in this reviewed order.
 function Assert-ZktStorageRecoveryHilScope {
     param([string]$HilTargetsJson)
