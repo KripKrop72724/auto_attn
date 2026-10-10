@@ -298,10 +298,10 @@ export function DeviceDrawer({
             <p>Live polling continues during reconciliation. Slow terminal responses can extend the target interval. Full history and Oracle assurance are reported in Reconciliation.</p>
           </article> : <article className="detail-card">
             <p className="eyebrow">CAPTURE HEALTH</p>
-            <h3>{device.zkt?.attendance_count == null ? 'Punch count pending' : `${device.zkt.attendance_count.toLocaleString()} terminal punches`}</h3>
+            <h3>{device.zkt?.attendance_count == null ? 'Current terminal count pending' : `${device.zkt.attendance_count.toLocaleString()} records currently on terminal`}</h3>
             <p>{device.zkt?.user_count == null ? 'User count pending' : `${device.zkt.user_count.toLocaleString()} users`}{device.zkt?.capabilities.source_coverage_certified ? ' · Append-tail assurance' : device.zkt?.last_reconcile_at ? ` · Last full reconciliation ${relativeTime(device.zkt.last_reconcile_at)}` : ' · No full reconciliation yet'}</p>
             {device.zkt?.capabilities.source_coverage_certified ? <dl>
-              <div><dt>Source assurance</dt><dd>Certified source with append-tail verification</dd></div>
+              <div><dt>Current source assurance</dt><dd>Certified through the committed cursor with append-tail verification</dd></div>
               <div><dt>Committed source cursor</dt><dd>{device.firmware_diagnostics?.committed_source_cursor ?? device.zkt?.capabilities.source_coverage_cursor ?? 'Not reported'}</dd></div>
             </dl> : <dl>
               <div>
@@ -321,6 +321,7 @@ export function DeviceDrawer({
                 <dd>{Number(device.zkt?.capabilities.history_failed_windows || 0)}</dd>
               </div>
             </dl>}
+            <p>This count and certificate describe the current terminal source. They do not prove a person's complete monthly attendance. Review saved ADD attendance and earlier source epochs in Reconciliation for historical punches.</p>
           </article>}
           <FirmwareHealth diagnostics={device.firmware_diagnostics} observedAt={device.firmware_diagnostics_at} bootId={device.boot_id} imageDigest={device.ota_image_sha256} />
           {device.firmware_family !== 'hikvision' && <ZktCustodyStatus connectorId={device.connector_id} revision={custodyRevision} />}
