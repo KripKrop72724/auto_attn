@@ -19,7 +19,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from zk_add.hil_startup import PHASES as HIL_STARTUP_PHASES, STORAGE_COUNTERS, STORAGE_ERRORS
-from zk_add.models import Connector, DeviceAlert, ZKTDevice
+from zk_add.models import Connector, DeviceAlert, DeviceTelemetry, ZKTDevice
 from zk_add.settings import settings
 from zk_add.time_utils import ensure_utc, parse_datetime, utc_now
 
@@ -439,18 +439,49 @@ def classify_led_latch(led_state: str | None, evidence: dict | None, *, storage_
     return None
 
 
-def bind_unbound_row(row: DeviceAlert | None, connector: Connector, *, uptime_seconds: int | None,
-                     now: datetime) -> None:
-    """Attribute a legacy diagnostics alert to a boot without moving last_seen_at."""
+def _refreshing_heartbeat(session: Session, row: DeviceAlert) -> DeviceTelemetry | None:
+    """The heartbeat that last refreshed a diagnostics alert; it records the boot."""
+    seen = ensure_utc(row.last_seen_at)
+    return session.scalar(select(DeviceTelemetry).where(
+        DeviceTelemetry.connector_id == row.connector_id, DeviceTelemetry.created_at <= seen,
+        DeviceTelemetry.created_at >= seen - timedelta(seconds=300),
+    ).order_by(DeviceTelemetry.created_at.desc()).limit(1))
+
+
+def bind_unbound_row(session: Session, row: DeviceAlert | None, connector: Connector, *,
+                     uptime_seconds: int | None, now: datetime) -> None:
+    """Attribute a legacy diagnostics alert to a boot without moving last_seen_at.
+
+    The heartbeat that last refreshed the row names its boot exactly. Uptime
+    arithmetic is the fallback once telemetry has aged out; a fault refreshed
+    seconds before a rollback reboot is too close for it, so each uptime
+    inference is checked against telemetry once.
+    """
     details = (row.details or {}) if row is not None else {}
-    if row is None or uptime_seconds is None or details.get("binding") or row.last_seen_at is None:
+    if row is None or row.last_seen_at is None or details.get("binding") == "OBSERVED" or (
+            details.get("binding") and (details.get("inferred_from") == "TELEMETRY" or details.get("telemetry_checked"))):
+        return
+    heartbeat = _refreshing_heartbeat(session, row)
+    if heartbeat is not None and heartbeat.boot_id:
+        same = heartbeat.boot_id == connector.boot_id
+        row.details = {**details, "binding": "INFERRED_CURRENT" if same else "INFERRED_PREVIOUS",
+                       "boot_id": heartbeat.boot_id, "inferred_from": "TELEMETRY", "bound_at": now.isoformat(),
+                       "firmware_version": (heartbeat.payload or {}).get("firmware_version")
+                       or (connector.firmware_version if same else None)}
+        return
+    if details.get("binding"):
+        row.details = {**details, "telemetry_checked": True}
+        return
+    if uptime_seconds is None:
         return
     boot_started = now - timedelta(seconds=uptime_seconds)
     if ensure_utc(row.last_seen_at) < boot_started + timedelta(seconds=5):
-        row.details = {**details, "binding": "INFERRED_PREVIOUS", "bound_at": now.isoformat()}
+        row.details = {**details, "binding": "INFERRED_PREVIOUS", "inferred_from": "UPTIME",
+                       "telemetry_checked": True, "bound_at": now.isoformat()}
     else:
         row.details = {**details, "binding": "INFERRED_CURRENT", "boot_id": connector.boot_id,
-                       "firmware_version": connector.firmware_version, "bound_at": now.isoformat()}
+                       "firmware_version": connector.firmware_version, "inferred_from": "UPTIME",
+                       "telemetry_checked": True, "bound_at": now.isoformat()}
 
 
 def _rejection_entries(row: DeviceAlert) -> dict[str, dict]:
