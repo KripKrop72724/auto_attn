@@ -172,6 +172,14 @@ def latched_led_sources() -> frozenset[str]:
                      if part.strip())
 
 
+def plain_version(value: str | None) -> str | None:
+    """"zone-lite-2.6.15" and "2.6.15" are the same release; firmware reports the former."""
+    from zk_add.ota import semantic_version  # ota is a heavy module; keep this import lazy
+
+    version = semantic_version(value)
+    return ".".join(str(part) for part in version) if version else (value or "").strip() or None
+
+
 def diagnostics_reporting(connector: Connector) -> str:
     """Whether the running firmware can report storage and worker diagnostics."""
     from zk_add.ota import semantic_version  # ota is a heavy module; keep this import lazy
@@ -291,7 +299,7 @@ def storage_recovery_role(session: Session, connector: Connector, payload) -> bo
     from zk_add import storage_recovery
     from zk_add.ota import FirmwareRelease, _application_sha256
 
-    version = payload.firmware_version
+    version = plain_version(payload.firmware_version)
     if version not in storage_recovery.VERSIONS or not any(
             target.connector_id == connector.connector_id and target.mac == (connector.hardware_id or "").lower()
             for target in storage_recovery.TARGETS):
@@ -416,7 +424,7 @@ def classify_led_latch(led_state: str | None, evidence: dict | None, *, storage_
     if (led_state or "").strip().upper() != "LOCAL_FAILURE" or not isinstance(evidence, dict):
         return None
     storage = evidence.get("storage") if isinstance(evidence.get("storage"), dict) else {}
-    latch = {"source": storage.get("local_failure_source"), "firmware_version": firmware_version}
+    latch = {"source": storage.get("local_failure_source"), "firmware_version": plain_version(firmware_version)}
     if storage_verified and workers_verified:
         return {"kind": "LED_LATCH_STORAGE_VERIFIED", **latch}
     if (storage.get("durability") == "DEGRADED" and latch["source"]
@@ -496,7 +504,7 @@ def _latched_led_tier(details: dict) -> str | None:
     latch = details.get("latch") or {}
     if latch.get("kind") != "LED_LATCH_NO_IO_ERRORS":
         return None
-    if f"{latch.get('firmware_version')}:{latch.get('source')}" not in latched_led_sources():
+    if f"{plain_version(latch.get('firmware_version'))}:{latch.get('source')}" not in latched_led_sources():
         return DEGRADED
     return settings.device_health_latched_led_tier
 
@@ -789,7 +797,7 @@ def duplicate_serial_claimed(session: Session, connector: Connector) -> bool:
 def coverage(connector: Connector) -> list[dict]:
     """What ADD can verify about this connector from the firmware it runs."""
     reporting = diagnostics_reporting(connector)
-    version = connector.firmware_version or "unknown"
+    version = plain_version(connector.firmware_version) or "unknown"
     diagnostics = connector.firmware_diagnostics or {}
     storage = diagnostics.get("storage") if isinstance(diagnostics.get("storage"), dict) else {}
     workers = [row for row in diagnostics.get("workers") or [] if isinstance(row, dict)]

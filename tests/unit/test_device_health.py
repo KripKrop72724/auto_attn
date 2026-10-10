@@ -1530,3 +1530,24 @@ def test_fleet_counts_terminal_attention(db):
     counts = fleet_counts(db)
     assert counts["terminal_attention"] == 2
     assert counts["total"] == 3
+
+
+# Firmware reports its version as "zone-lite-X.Y.Z"; every rule compares the release.
+def test_reported_zone_lite_versions_match_release_rules(db, monkeypatch):
+    monkeypatch.setattr(settings, "device_health_latched_led_tier", "WARNING")
+    latched = connector_fixture(db)
+    sample = legacy_sample()
+    sample["storage"] = latch_storage()
+    heartbeat(db, latched, 1, firmware="zone-lite-2.6.15", led="LOCAL_FAILURE", diagnostics=sample)
+    assert alert_row(db, latched, "ESP_LOCAL_FAILURE").details["latch"]["firmware_version"] == "2.6.15"
+    assert latched.lifecycle_state == "ONLINE_WITH_WARNINGS"
+    recovery_release(db)
+    p02_connector = p02(db)
+    apply(db, p02_connector, {"workers": [worker("add_delivery", "STOPPED")]}, firmware="zone-lite-2.6.27",
+          image=RECOVERY_DIGEST)
+    assert alert_row(db, p02_connector, "ESP_DELIVERY_WORKER_FAULT") is None
+    legacy = live(db, second_connector(db, 3), firmware="zone-lite-2.5.2")
+    coverage = {item["key"]: item for item in device_health.coverage(legacy)}
+    assert coverage["storage"]["detail"] == "Not reported by firmware 2.5.2."
+    open_alert(db, legacy, "ESP_DURABILITY_FAULT", details={"binding": "INFERRED_PREVIOUS"})
+    assert evaluate_health(db, legacy).reasons[0].tier == "WARNING"
