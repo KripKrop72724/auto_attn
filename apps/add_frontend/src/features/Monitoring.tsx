@@ -1,15 +1,28 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { Suspense, lazy, useCallback, useEffect, useRef, useState } from 'react'
 import { api, queryString } from '../api'
 import {
-  Dialog, PageHeader, StatusBadge, dateTime, formatAlertDiagnostics, idempotency,
-  relativeTime, statusPattern, useToast,
+  Dialog, PageHeader, StatusBadge, idempotency,
+  relativeTime, useToast,
 } from '../App'
 import { Icon } from '../Icon'
-import { routePath } from '../routing'
 import type {
-  Alert, AlertQueueResponse, AttendanceQuarantineItem,
+  Alert, AlertQueueResponse, AlertQueueTotals, AttendanceQuarantineItem,
   AttendanceQuarantineResponse, AttendanceQuarantineReveal, Device,
 } from '../types'
+import { AlertCard } from './AlertCard'
+import { AlertResolveDialog, explainOperatorError } from './AlertResolveDialog'
+
+// Opened on demand; keeps the review tooling out of the Alerts route chunk.
+const HealthCleanupDialog = lazy(() => import('./HealthCleanupDialog').then((module) => ({ default: module.HealthCleanupDialog })))
+
+type AlertQueueView = 'NEEDS_ACTION' | 'ACKNOWLEDGED' | 'RESOLVED' | 'ALL'
+const queueTabs: Array<{ id: AlertQueueView; label: string; total: keyof AlertQueueTotals }> = [
+  { id: 'NEEDS_ACTION', label: 'Needs action', total: 'needs_action' },
+  { id: 'ACKNOWLEDGED', label: 'Acknowledged', total: 'acknowledged' },
+  { id: 'RESOLVED', label: 'Resolved', total: 'resolved' },
+  { id: 'ALL', label: 'All', total: 'all' },
+]
+type QueueRow = AlertQueueResponse['rows'][number]
 
 function AttendanceQuarantineDialog({
   row,
@@ -132,10 +145,13 @@ function AttendanceQuarantineDialog({
 
 export function AlertsView({ devices, toast, revision }: { devices: Device[]; toast: ReturnType<typeof useToast>; revision: number }) {
   const [rows, setRows] = useState<AlertQueueResponse['rows']>([])
-  const [queue, setQueue] = useState<'OPEN' | 'ACKNOWLEDGED' | 'RESOLVED' | 'ALL'>('OPEN')
+  const [queue, setQueue] = useState<AlertQueueView>('NEEDS_ACTION')
   const [severity, setSeverity] = useState('ALL')
   const [deviceId, setDeviceId] = useState('ALL')
-  const [totals, setTotals] = useState({ all: 0, open: 0, acknowledged: 0, resolved: 0 })
+  const [totals, setTotals] = useState<AlertQueueTotals>({ needs_action: 0, acknowledged: 0, resolved: 0, all: 0 })
+  const [resolving, setResolving] = useState<QueueRow | null>(null)
+  const [cleanupOpen, setCleanupOpen] = useState(false)
+  const [actionBusy, setActionBusy] = useState(false)
   const [nextCursor, setNextCursor] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
@@ -152,14 +168,20 @@ export function AlertsView({ devices, toast, revision }: { devices: Device[]; to
     setError('')
     try {
       const response = await api<AlertQueueResponse>(`/api/v1/alerts${queryString({
-        state: queue === 'ALL' ? undefined : queue,
+        queue,
         severity: severity === 'ALL' ? undefined : severity,
         connector_id: deviceId === 'ALL' ? undefined : deviceId,
         cursor,
         limit: 100,
       })}`, { signal: controller.signal })
       setRows((current) => append ? [...current, ...response.rows] : response.rows)
-      setTotals(response.totals)
+      // Older backends report only state totals, where OPEN still meant unacknowledged.
+      setTotals(response.queue_totals ?? {
+        needs_action: response.totals.open,
+        acknowledged: response.totals.acknowledged,
+        resolved: response.totals.resolved,
+        all: response.totals.all,
+      })
       setNextCursor(response.next_cursor)
     } catch (reason) {
       if (reason instanceof DOMException && reason.name === 'AbortError') return
@@ -199,23 +221,31 @@ export function AlertsView({ devices, toast, revision }: { devices: Device[]; to
   }, [loadQuarantine, revision])
   useEffect(() => setSelectedQuarantine(null), [deviceId])
   const acknowledge = async (row: Alert) => {
+    setActionBusy(true)
     try {
       await api(`/api/v1/alerts/${row.id}/acknowledge`, { method: 'POST', body: '{}' })
-      toast.notice('Alert acknowledged with an audit entry.')
+      toast.notice('Alert acknowledged with an audit entry. It stays active until its condition clears.')
       await load()
     } catch (reason) {
-      toast.error(reason instanceof Error ? reason.message : 'Unable to acknowledge alert.')
+      toast.error(explainOperatorError(reason, 'Unable to acknowledge alert.').summary)
+    } finally {
+      setActionBusy(false)
     }
   }
+  const unfiltered = severity === 'ALL' && deviceId === 'ALL'
   return (
     <>
-      <PageHeader title="Alerts" description="Open device conditions first, then acknowledged and resolved history." action={<button className="button secondary" onClick={() => void Promise.all([load(), loadQuarantine()])}><Icon name="refresh" /> Refresh</button>} />
+      <PageHeader
+        title="Alerts"
+        description="Alerts that need action first. Acknowledged alerts stay active until their condition clears."
+        action={<div className="page-actions">
+          <button className="button secondary" onClick={() => setCleanupOpen(true)}><Icon name="shield" /> Stranded alert review</button>
+          <button className="button secondary" onClick={() => void Promise.all([load(), loadQuarantine()])}><Icon name="refresh" /> Refresh</button>
+        </div>}
+      />
       <section className="queue-toolbar" aria-label="Alert filters">
         <div className="segmented-control" role="group" aria-label="Alert queue">
-          <button className={queue === 'OPEN' ? 'active' : ''} onClick={() => setQueue('OPEN')}>Open <span>{totals.open}</span></button>
-          <button className={queue === 'ACKNOWLEDGED' ? 'active' : ''} onClick={() => setQueue('ACKNOWLEDGED')}>Acknowledged <span>{totals.acknowledged}</span></button>
-          <button className={queue === 'RESOLVED' ? 'active' : ''} onClick={() => setQueue('RESOLVED')}>Resolved <span>{totals.resolved}</span></button>
-          <button className={queue === 'ALL' ? 'active' : ''} onClick={() => setQueue('ALL')}>All <span>{totals.all}</span></button>
+          {queueTabs.map((item) => <button key={item.id} type="button" className={queue === item.id ? 'active' : ''} aria-pressed={queue === item.id} onClick={() => setQueue(item.id)}>{item.label} <span>{totals[item.total]}</span></button>)}
         </div>
         <div className="queue-selects"><label><span>Severity</span><select value={severity} onChange={(event) => setSeverity(event.target.value)}><option value="ALL">All severities</option><option value="CRITICAL">Critical</option><option value="HIGH">High</option><option value="WARNING">Warning</option></select></label><label><span>Device</span><select value={deviceId} onChange={(event) => setDeviceId(event.target.value)}><option value="ALL">All devices</option>{devices.map((device) => <option key={device.connector_id} value={device.connector_id}>{device.display_name}</option>)}</select></label></div>
       </section>
@@ -223,11 +253,12 @@ export function AlertsView({ devices, toast, revision }: { devices: Device[]; to
         {error && <div className="panel message pattern-blocked operational-error" role="alert"><Icon name="alert" /><span>{error}</span><button className="button secondary" onClick={() => void load()}>Retry queue</button></div>}
         {loading && !rows.length && <div className="panel empty-state is-loading" role="status"><Icon name="refresh" /><h2>Loading alerts…</h2></div>}
         {rows.map((row) => {
-          const diagnostics = formatAlertDiagnostics(row.details)
           const inspectorPath = typeof row.details.inspector_path === 'string' && /^\/reconciliation\?tab=source-exceptions&device_id=[A-Za-z0-9-]{1,100}$/.test(row.details.inspector_path) ? row.details.inspector_path : null
-          return <article className={`alert-card pattern-${statusPattern(row.severity)}`} key={`${row.device.connector_id}-${row.id}`}><span className="alert-icon"><Icon name="alert" /></span><div><div className="alert-meta"><StatusBadge state={row.severity} /><a href={routePath('fleet', row.device.connector_id)}>{row.device.display_name} · {row.device.zone_id}</a></div><h2>{row.message}</h2><p>{row.code} · First {dateTime(row.first_seen_at)} · Last {relativeTime(row.last_seen_at)}</p>{diagnostics && <p className="alert-diagnostics" aria-label="Safe alert diagnostics">{diagnostics}</p>}</div><div className="alert-actions">{inspectorPath && <a className="button primary" href={inspectorPath}><Icon name="search" /> Inspect source rows</a>}{row.state === 'OPEN' ? <button className="button secondary" onClick={() => void acknowledge(row)}><Icon name="check" /> Acknowledge</button> : <StatusBadge state={row.state} />}</div></article>
+          return <AlertCard key={`${row.device.connector_id}-${row.id}`} alert={row} device={row.device} busy={actionBusy} onAcknowledge={(item) => void acknowledge(item)} onResolve={() => setResolving(row)}>
+            {inspectorPath && <a className="button primary" href={inspectorPath}><Icon name="search" /> Inspect source rows</a>}
+          </AlertCard>
         })}
-        {!loading && !error && !rows.length && <div className="panel empty-state"><Icon name={queue === 'OPEN' && severity === 'ALL' && deviceId === 'ALL' ? 'check' : 'search'} /><h2>{queue === 'OPEN' && severity === 'ALL' && deviceId === 'ALL' ? 'No open alerts' : 'No alerts in this view'}</h2><p>{queue === 'OPEN' && severity === 'ALL' && deviceId === 'ALL' ? 'Every device condition is clear. New alerts appear here as telemetry arrives.' : 'Change the queue or filters to see other alerts.'}</p></div>}
+        {!loading && !error && !rows.length && <div className="panel empty-state"><Icon name={queue === 'NEEDS_ACTION' && unfiltered ? 'check' : 'search'} /><h2>{queue === 'NEEDS_ACTION' && unfiltered ? 'No alerts need action' : 'No alerts in this view'}</h2><p>{queue === 'NEEDS_ACTION' && unfiltered ? 'New device conditions appear here as telemetry arrives. Acknowledged alerts stay in the Acknowledged queue until their condition clears.' : 'Change the queue or filters to see other alerts.'}</p></div>}
         {nextCursor && <div className="load-more"><button className="button secondary" disabled={loading} onClick={() => void load(nextCursor, true)}>{loading ? 'Loading…' : 'Load more alerts'}</button><small>{rows.length.toLocaleString()} alerts loaded</small></div>}
       </section>
       <section className="panel attendance-quarantine-panel" aria-labelledby="attendance-quarantine-title">
@@ -241,6 +272,8 @@ export function AlertsView({ devices, toast, revision }: { devices: Device[]; to
         {quarantine && !quarantine.rows.length && !quarantineError && <p className="quarantine-clear">No attendance rows are waiting for review in this scope.</p>}
       </section>
       {selectedQuarantine && <AttendanceQuarantineDialog row={selectedQuarantine} toast={toast} onClose={() => setSelectedQuarantine(null)} onChanged={async () => { await Promise.all([loadQuarantine(), load()]) }} />}
+      {resolving && <AlertResolveDialog alert={resolving} deviceName={resolving.device.display_name} toast={toast} onClose={() => setResolving(null)} onResolved={() => load()} />}
+      {cleanupOpen && <Suspense fallback={null}><HealthCleanupDialog devices={devices} toast={toast} onClose={() => setCleanupOpen(false)} onApplied={() => load()} /></Suspense>}
     </>
   )
 }

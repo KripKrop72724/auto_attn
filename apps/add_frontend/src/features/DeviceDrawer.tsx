@@ -1,20 +1,24 @@
 import { deviceActivity } from '../hikvisionHealth'
 import { useCallback, useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from 'react'
-import { api } from '../api'
+import { api, queryString } from '../api'
 import { deviceSnapshots, useDevice } from '../deviceData'
 import {
-  CommandProgress, Dialog, StatusBadge, dateTime, drawerTabs, idempotency,
+  CommandProgress, Dialog, StatusBadge, TerminalLinkBadge, dateTime, drawerTabs, idempotency,
   relativeTime, useToast, type DrawerTab,
 } from '../App'
 import { Icon } from '../Icon'
-import { firmwareLabel, humanizeStatus } from '../status'
+import { firmwareLabel, normalizedStatus } from '../status'
+import { AlertCard, alertNeedsAction } from './AlertCard'
+import { AlertResolveDialog, DeviceErrorClearDialog, explainOperatorError } from './AlertResolveDialog'
+import { DeviceHealthPanel, type HealthAlertTarget } from './DeviceHealthPanel'
 import { FirmwareHealth } from './FirmwareHealth'
 import { ZktCustodyStatus } from './ZktCustodyStatus'
 import type {
-  Command, CommKeyReveal, CommKeyState, ConnectionEvent, Device, DeviceLog,
+  Alert, Command, CommKeyReveal, CommKeyState, ConnectionEvent, Device, DeviceHealth, DeviceLog, HealthOperatorPolicy,
 } from '../types'
 
-const tabLabels: Record<DrawerTab, string> = { overview: 'Overview', logs: 'Live logs', control: 'Controls' }
+const tabLabels: Record<DrawerTab, string> = { overview: 'Overview', logs: 'Live logs', alerts: 'Alerts', control: 'Controls' }
+const isResolved = (alert: Alert) => normalizedStatus(alert.state).toUpperCase() === 'RESOLVED'
 const logClock = new Intl.DateTimeFormat('en-GB', { timeZone: 'Asia/Karachi', day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23' })
 const logTime = (value: string) => logClock.format(new Date(value)).replace(',', '')
 const logLevelPattern = (level: string) => /ERR|FATAL|CRIT/i.test(level) ? 'blocked' : /WARN/i.test(level) ? 'waiting' : 'notice'
@@ -59,22 +63,40 @@ export function DeviceDrawer({
   const [revealPassword, setRevealPassword] = useState('')
   const [revealedKey, setRevealedKey] = useState<CommKeyReveal | null>(null)
   const [busy, setBusy] = useState(false)
+  // The full health object comes only from the detail response; list refreshes
+  // carry the summary, so the panel keeps its own copy.
+  const [health, setHealth] = useState<DeviceHealth | null>(null)
+  const [activeAlerts, setActiveAlerts] = useState<Alert[]>([])
+  const [resolvedAlerts, setResolvedAlerts] = useState<Alert[]>([])
+  const [alertsLoaded, setAlertsLoaded] = useState(false)
+  const [resolveTarget, setResolveTarget] = useState<HealthAlertTarget | null>(null)
+  const [clearErrorOpen, setClearErrorOpen] = useState(false)
+  const [alertBusy, setAlertBusy] = useState(false)
   const load = useCallback(async () => {
     const request = ++requestNumber.current
-    const [detail, logResult, history, keyState] = await Promise.allSettled([
+    const alerts = (queue: 'ACTIVE' | 'RESOLVED', limit: number) =>
+      api<{ rows: Alert[] }>(`/api/v1/devices/${seed.connector_id}/alerts${queryString({ queue, limit })}`)
+    const [detail, logResult, history, keyState, active, resolved] = await Promise.allSettled([
       api<Device>(`/api/v1/devices/${seed.connector_id}`),
       api<{ rows: DeviceLog[] }>(`/api/v1/devices/${seed.connector_id}/logs?limit=250`),
       api<{ rows: ConnectionEvent[] }>(`/api/v1/devices/${seed.connector_id}/connectivity?limit=40`),
       seed.firmware_family === 'hikvision' ? Promise.resolve(null) : api<CommKeyState>(`/api/v1/devices/${seed.connector_id}/comm-key`),
+      alerts('ACTIVE', 200),
+      alerts('RESOLVED', 20),
     ])
     if (request !== requestNumber.current) return
     if (detail.status === 'fulfilled') {
       deviceSnapshots.put([detail.value])
+      setHealth(detail.value.health ?? null)
       setCommKeySerial((current) => current || detail.value.zkt?.confirmed_serial || detail.value.zkt?.expected_serial || detail.value.zkt?.serial || '')
     }
     if (logResult.status === 'fulfilled') setLogs(logResult.value.rows)
     if (history.status === 'fulfilled') setConnections(history.value.rows)
     if (keyState.status === 'fulfilled') setCommKeyState(keyState.value)
+    // Backends without queue filters return every row; split by state here too.
+    if (active.status === 'fulfilled') setActiveAlerts(active.value.rows.filter((row) => !isResolved(row)))
+    if (resolved.status === 'fulfilled') setResolvedAlerts(resolved.value.rows.filter(isResolved).slice(0, 20))
+    if (active.status === 'fulfilled' || resolved.status === 'fulfilled') setAlertsLoaded(true)
   }, [seed.connector_id, seed.firmware_family])
   useEffect(() => { void load(); return () => { ++requestNumber.current } }, [load, revision])
   // Install hiding handlers before the revealed value can be painted.
@@ -228,6 +250,21 @@ export function DeviceDrawer({
       setBusy(false)
     }
   }
+  const acknowledgeAlert = async (alertId: number) => {
+    setAlertBusy(true)
+    try {
+      await api<Alert>(`/api/v1/alerts/${alertId}/acknowledge`, { method: 'POST', body: '{}' })
+      toast.notice('Alert acknowledged with an audit entry. It stays active until its condition clears.')
+      await Promise.all([load(), onInventoryChanged()])
+    } catch (error) {
+      toast.error(explainOperatorError(error, 'Unable to acknowledge alert.').summary)
+    } finally {
+      setAlertBusy(false)
+    }
+  }
+  const afterOperatorAction = async () => {
+    await Promise.all([load(), onInventoryChanged()])
+  }
   const handleTabKey = (event: ReactKeyboardEvent<HTMLButtonElement>, index: number) => {
     let next = index
     if (event.key === 'ArrowRight') next = (index + 1) % drawerTabs.length
@@ -246,9 +283,21 @@ export function DeviceDrawer({
   const terminalReplacementNeeded = Boolean(
     currentBindingSerial && observedTerminalSerial && currentBindingSerial !== observedTerminalSerial,
   )
+  const terminalLink = device.terminal_link ?? health?.terminal_link
+  // Operator eligibility for alerts that drive (or sit beside) the health tier.
+  const operatorByAlert = new Map<number, HealthOperatorPolicy>()
+  ;[...(health?.reasons || []), ...(health?.other_active_alerts || [])].forEach((reason) => {
+    if (reason.alert_id != null && reason.operator) operatorByAlert.set(reason.alert_id, reason.operator)
+  })
+  const needsAction = activeAlerts.filter(alertNeedsAction)
+  const acknowledgedAlerts = activeAlerts.filter((row) => !alertNeedsAction(row))
+  const resolveAlert = (row: Alert) => setResolveTarget({ id: row.id, code: row.code, message: row.message })
+  const alertList = (rows: Alert[], empty: string) => rows.length
+    ? rows.map((row) => <AlertCard key={row.id} alert={row} headingLevel={4} operator={operatorByAlert.get(row.id)} busy={alertBusy} onAcknowledge={(item) => void acknowledgeAlert(item.id)} onResolve={resolveAlert} />)
+    : <p className="device-alerts-empty">{alertsLoaded ? empty : 'Loading alerts…'}</p>
   return (
     <Dialog titleId="device-drawer-title" title={device.display_name} description={`${device.zone_id} · ${device.hardware_id}`} onClose={onClose} className="device-drawer">
-      <div className={`drawer-status ${device.is_spare ? 'spare-drawer-status' : ''}`}><StatusBadge state={device.is_spare ? 'SPARE' : device.state} live={!device.is_spare && device.connected} /><span>{device.is_spare ? 'Reserve inventory · Excluded from fleet health and alerts' : `${deviceActivity(device)} · Last contact ${relativeTime(device.last_seen_at)}`}</span></div>
+      <div className={`drawer-status ${device.is_spare ? 'spare-drawer-status' : ''}`}><StatusBadge state={device.is_spare ? 'SPARE' : device.state} live={!device.is_spare && device.connected} />{!device.is_spare && terminalLink && <TerminalLinkBadge link={terminalLink} />}<span>{device.is_spare ? 'Reserve inventory · Excluded from fleet health and alerts' : `${deviceActivity(device)} · Last contact ${relativeTime(device.last_seen_at)}`}</span></div>
       <div className="tabs" role="tablist" aria-label="Device details">
         {drawerTabs.map((item, index) => (
           <button
@@ -263,6 +312,7 @@ export function DeviceDrawer({
             onKeyDown={(event) => handleTabKey(event, index)}
           >
             {tabLabels[item]}
+            {item === 'alerts' && needsAction.length > 0 && <span className="tab-count">{needsAction.length}</span>}
           </button>
         ))}
       </div>
@@ -273,7 +323,14 @@ export function DeviceDrawer({
         aria-labelledby={`device-tab-${tab}`}
       >
         {tab === 'overview' && <div className="overview-grid">
-          {!device.is_spare && device.last_error_code && <article className="detail-card wide pattern-blocked"><p className="eyebrow">ACTIVE PROBLEM</p><h3>{humanizeStatus(device.last_error_code)}</h3><p>{device.zkt?.writes_disabled_reason || 'Review live logs and connectivity history.'}</p></article>}
+          {!device.is_spare && <DeviceHealthPanel
+            device={device}
+            health={health ?? device.health}
+            busy={alertBusy}
+            onAcknowledge={(alertId) => void acknowledgeAlert(alertId)}
+            onResolve={setResolveTarget}
+            onClearError={() => setClearErrorOpen(true)}
+          />}
           <article className="detail-card"><p className="eyebrow">ESP CONNECTOR</p><h3>{device.connected ? 'Connected to ADD' : 'Not currently connected'}</h3><dl><div><dt>Firmware</dt><dd>{firmwareLabel(device.firmware_version)}</dd></div><div><dt>Wi-Fi MAC</dt><dd>{device.hardware_id}</dd></div><div><dt>Onboarding generation</dt><dd>{device.onboarding_generation}</dd></div><div><dt>Last onboarding</dt><dd>{dateTime(device.last_onboarded_at)}</dd></div></dl></article>
           <article className="detail-card"><p className="eyebrow">{device.firmware_family === 'hikvision' ? 'HIKVISION TERMINAL' : 'ZKT TERMINAL'}</p><h3>{device.zkt?.model || (device.firmware_family === 'hikvision' ? 'Hikvision terminal' : 'Awaiting terminal')}</h3><dl><div><dt>Serial</dt><dd>{device.zkt?.serial || '—'}</dd></div><div><dt>Address</dt><dd>{device.zkt?.ip_address || '—'}</dd></div><div><dt>Certification</dt><dd><StatusBadge state={device.zkt?.certification_state || 'UNKNOWN'} /></dd></div><div><dt>Snapshot</dt><dd>{device.zkt?.snapshot_complete ? 'Complete' : 'Incomplete'}</dd></div><div><dt>Terminal clock</dt><dd>{device.zkt?.device_time ? dateTime(device.zkt.device_time) : 'No live sample'}</dd></div><div><dt>Clock drift</dt><dd>{device.zkt?.device_time_sampled_at ? `${device.zkt.drift_seconds == null ? 'Unknown' : `${Math.round(device.zkt.drift_seconds)} s`} · sampled ${relativeTime(device.zkt.device_time_sampled_at)}` : 'Not sampled yet'}</dd></div></dl></article>
           {device.firmware_family === 'hikvision' ? <article className="detail-card">
@@ -331,6 +388,20 @@ export function DeviceDrawer({
             <button className="button secondary" disabled={busy} onClick={() => void updateSpareState()}>{busy ? 'Updating…' : device.is_spare ? 'Return to active fleet' : 'Move to spare inventory'}</button>
           </article>
         </div>}
+        {tab === 'alerts' && <div className="device-alerts">
+          <section aria-labelledby="device-alerts-needs-action">
+            <h3 id="device-alerts-needs-action">Needs action <span className="tab-count">{needsAction.length}</span></h3>
+            {alertList(needsAction, 'Nothing on this device needs action.')}
+          </section>
+          <section aria-labelledby="device-alerts-acknowledged">
+            <h3 id="device-alerts-acknowledged">Acknowledged <span className="tab-count">{acknowledgedAlerts.length}</span></h3>
+            {alertList(acknowledgedAlerts, 'No acknowledged alerts are active. Acknowledged alerts stay here until their condition clears.')}
+          </section>
+          <section aria-labelledby="device-alerts-resolved">
+            <h3 id="device-alerts-resolved">Recently resolved</h3>
+            {alertList(resolvedAlerts, 'No resolved alerts yet.')}
+          </section>
+        </div>}
         {tab === 'logs' && <section className="terminal-view" aria-label="Live ESP serial monitor"><header><span><i /><i /><i /></span><strong>{device.hardware_id} · live operations log</strong><button className="text-button" onClick={() => void load()}><Icon name="refresh" /> Refresh</button></header><div>{logs.map((row) => <p key={row.id} className={`log-pattern-${logLevelPattern(row.level)}`}><time dateTime={row.device_time || row.received_at} title={dateTime(row.device_time || row.received_at)}>{logTime(row.device_time || row.received_at)}</time><strong>{row.level}</strong><em>{row.subsystem}</em><span>{row.code ? `[${row.code}] ` : ''}{row.message}</span></p>)}{!logs.length && <div className="terminal-empty">Waiting for live Zone Lite logs…</div>}</div></section>}
         {tab === 'control' && <div className="control-stack">
           <article className="control-card"><span><Icon name="users" /></span><div><h3>Selected-terminal users</h3><p>{device.firmware_family === 'hikvision' ? 'Manage employee profiles and ADD identity mappings. Biometric enrollment takes place on the terminal.' : 'Create, edit, delete, or grant a 10-minute enrollment lease. Every write requires current certification and a full snapshot.'}</p></div><button className="button primary" onClick={() => onManageUsers(device)}>Open Users workspace</button></article>
@@ -384,6 +455,21 @@ export function DeviceDrawer({
           {device.active_command && <CommandProgress command={device.active_command} onCancel={cancelCommand} />}
         </div>}
       </div>
+      {resolveTarget && <AlertResolveDialog
+        alert={resolveTarget}
+        deviceName={device.display_name}
+        toast={toast}
+        onClose={() => setResolveTarget(null)}
+        onResolved={afterOperatorAction}
+      />}
+      {clearErrorOpen && health?.device_error?.code && <DeviceErrorClearDialog
+        connectorId={device.connector_id}
+        deviceName={device.display_name}
+        deviceError={health.device_error}
+        toast={toast}
+        onClose={() => setClearErrorOpen(false)}
+        onCleared={afterOperatorAction}
+      />}
     </Dialog>
   )
 }

@@ -61,7 +61,7 @@ import type {
 } from './types'
 
 type View = DashboardRoute
-export type DrawerTab = 'overview' | 'logs' | 'control'
+export type DrawerTab = 'overview' | 'logs' | 'alerts' | 'control'
 type ToastState = { kind: 'notice' | 'error'; text: string } | null
 export type UserDialogState =
   | { mode: 'create' }
@@ -82,7 +82,7 @@ export type ReconciliationDialogState =
   | null
 
 export const terminalCommandStates = new Set(['SUCCEEDED', 'FAILED', 'CANCELLED', 'EXPIRED'])
-export const drawerTabs: DrawerTab[] = ['overview', 'logs', 'control']
+export const drawerTabs: DrawerTab[] = ['overview', 'logs', 'alerts', 'control']
 export { statusPattern } from './status'
 
 export const dateTime = (value?: string | null) =>
@@ -328,6 +328,10 @@ function lockApplicationForModal() {
   }
 }
 
+// Open dialogs, innermost last: a dialog opened from another one (for example
+// an operator action inside the device drawer) owns Escape and the focus trap.
+const openDialogs: symbol[] = []
+
 export function Dialog({
   titleId,
   title,
@@ -351,6 +355,8 @@ export function Dialog({
   useEffect(() => {
     const previous = document.activeElement as HTMLElement | null
     const releaseModalLock = lockApplicationForModal()
+    const token = Symbol('dialog')
+    openDialogs.push(token)
     const node = panel.current
     const focusable = () =>
       Array.from(
@@ -360,6 +366,7 @@ export function Dialog({
       )
     const focusFrame = window.requestAnimationFrame(() => focusable()[0]?.focus())
     const handle = (event: KeyboardEvent) => {
+      if (openDialogs[openDialogs.length - 1] !== token) return
       if (event.key === 'Escape') {
         event.preventDefault()
         closeRef.current()
@@ -380,6 +387,8 @@ export function Dialog({
     }
     document.addEventListener('keydown', handle)
     return () => {
+      const position = openDialogs.indexOf(token)
+      if (position >= 0) openDialogs.splice(position, 1)
       window.cancelAnimationFrame(focusFrame)
       document.removeEventListener('keydown', handle)
       releaseModalLock()
@@ -981,7 +990,7 @@ function DashboardApp() {
         {view === 'firmware' && <Suspense fallback={<WorkspaceLoading label="Opening firmware" />}>{firmwareSection(location.search) === 'prepare' ? <FirmwareProvisioning revision={revisions.provisioning} toast={toast} username={username} onSection={(section) => navigate(`/firmware?tab=${section}`)} /> : <FirmwareView devices={devices} revision={revisions.firmware} toast={toast} section={firmwareSection(location.search)} onSection={(section) => navigate(`/firmware?tab=${section}`)} />}</Suspense>}
         {view === 'alerts' && <Suspense fallback={<WorkspaceLoading label="Opening alerts" />}><AlertsView devices={devices.filter((device) => !device.is_spare)} toast={toast} revision={revisions.alert} /></Suspense>}
       </AppShell>
-      {drawer && <Suspense fallback={null}><DeviceDrawer seed={drawer} revision={revisions.device + revisions.command + revisions.log} custodyRevision={revisions.attendance + revisions.reconciliation} onClose={closeDevice} onManageUsers={manageUsers} onInventoryChanged={refreshFleet} toast={toast} /></Suspense>}
+      {drawer && <Suspense fallback={null}><DeviceDrawer key={drawer.connector_id} seed={drawer} revision={revisions.device + revisions.command + revisions.log + revisions.alert} custodyRevision={revisions.attendance + revisions.reconciliation} onClose={closeDevice} onManageUsers={manageUsers} onInventoryChanged={refreshFleet} toast={toast} /></Suspense>}
       {toast.toast && createPortal(
         <div className={`toast pattern-${toast.toast.kind === 'error' ? 'blocked' : 'confirmed'}`} role={toast.toast.kind === 'error' ? 'alert' : 'status'} aria-live={toast.toast.kind === 'error' ? 'assertive' : 'polite'}>
           <Icon name={toast.toast.kind === 'error' ? 'alert' : 'check'} />
