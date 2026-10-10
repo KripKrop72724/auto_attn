@@ -18,7 +18,7 @@ from test_add_backend import queue_evidence_payload
 from zk_add import device_health, web as add_web
 from zk_add.device_health import POLICY, alert_currency, evaluate_health, gate_effect, shadow_report, terminal_link
 from zk_add.models import AuditEvent, DeviceAlert, DeviceConnectionEvent, DeviceLog, DeviceTelemetry
-from zk_add.ota import FirmwareRelease
+from zk_add.ota import FirmwareCampaign, FirmwareDeployment, FirmwareRelease
 from zk_add.schemas import Envelope, HeartbeatPayload, UserSnapshotRequest, UserSnapshotRow
 from zk_add.security import ADMIN_COOKIE, create_admin_session
 from zk_add.service import (
@@ -1137,3 +1137,46 @@ def test_rejected_heartbeat_never_refreshes_last_seen(db, envelopes):
     reject(connector, envelopes(connector, "heartbeat", {}), ValueError("DIAGNOSTICS_SAMPLE_MISMATCH"))
     db.refresh(connector)
     assert ensure_utc(connector.last_seen_at) == seen and connector.connected
+
+
+def deployment(db, connector, *, status="SUCCEEDED", completed_minutes_ago=10, index=1):
+    release = FirmwareRelease(
+        release_id=f"release-{index}", version=f"2.9.{index}", git_sha="a" * 40, image_sha256=f"{index:x}" * 64,
+        image_size=1024, signing_key_id="production-key", partition_layout="zone-lite-ota-v1",
+        storage_name=f"health/{index}.bin", manifest={}, manifest_signature="test-signature", state="AVAILABLE")
+    db.add(release)
+    db.flush()
+    campaign = FirmwareCampaign(
+        campaign_id=f"campaign-{index}", release_id=release.id, zone_id=f"zone-{index}", status="COMPLETED",
+        actor="StateHealthAdmin", idempotency_key=f"key-{index}", reason="Device health test",
+        typed_confirmation=release.version, eligible_count=1, legacy_skipped_count=0)
+    db.add(campaign)
+    db.flush()
+    row = FirmwareDeployment(
+        deployment_id=f"deployment-{index}", campaign_id=campaign.id, release_id=release.id,
+        connector_id=connector.id, status=status, target_version=release.version,
+        completed_at=utc_now() - timedelta(minutes=completed_minutes_ago))
+    db.add(row)
+    db.commit()
+    return row
+
+
+@pytest.mark.parametrize("code,details,error", [
+    ("OTA_DEVICE_REPORTED_FAILURE", {"error_code": "DOWNLOAD_BEGIN_FAILED"}, "OTA_DOWNLOAD_BEGIN_FAILED"),
+    ("OTA_DEVICE_ROLLED_BACK", {}, "OTA_PREVIOUS_FIRMWARE_OBSERVED"),
+])
+def test_ota_alerts_resolve_on_later_successful_deployment(db, code, details, error):
+    connector = connector_fixture(db)
+    connector.last_error_code = error
+    row = open_alert(db, connector, code, details=details, seen=utc_now() - timedelta(hours=2))
+    seen = ensure_utc(row.last_seen_at)
+    deployment(db, connector, completed_minutes_ago=180, index=1)  # finished before the failure
+    heartbeat(db, connector, 1)
+    assert row.state == "OPEN" and connector.last_error_code == error
+    later = deployment(db, connector, completed_minutes_ago=10, index=2)
+    deployment(db, connector, status="FAILED", completed_minutes_ago=5, index=3)
+    heartbeat(db, connector, 2)
+    assert row.state == "RESOLVED" and ensure_utc(row.last_seen_at) == seen
+    assert row.details["resolution"]["kind"] == "DEPLOYMENT_SUCCEEDED"
+    assert row.details["resolution"]["deployment_id"] == later.deployment_id
+    assert connector.last_error_code is None

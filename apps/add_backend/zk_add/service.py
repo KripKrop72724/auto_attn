@@ -807,6 +807,41 @@ def resolve_on_evidence(session: Session, connector: Connector, *, code: str,
     return resolved
 
 
+OTA_DEVICE_ALERT_CODES = ("OTA_DEVICE_ROLLED_BACK", "OTA_DEVICE_REPORTED_FAILURE")
+
+
+def resolve_superseded_ota_alerts(session: Session, connector: Connector) -> int:
+    """A later successful deployment supersedes earlier device-reported OTA failures.
+
+    This runs on the heartbeat, which already holds the connector lock. The
+    device progress endpoint locks the deployment before the connector, so
+    resolving there would invert the lock order.
+    """
+    rows = session.scalars(select(DeviceAlert).where(
+        DeviceAlert.connector_id == connector.id, DeviceAlert.code.in_(OTA_DEVICE_ALERT_CODES),
+        DeviceAlert.state == "OPEN")).all()
+    if not rows:
+        return 0
+    from zk_add.ota import FirmwareDeployment
+
+    deployment = session.scalar(
+        select(FirmwareDeployment).where(
+            FirmwareDeployment.connector_id == connector.id, FirmwareDeployment.status == "SUCCEEDED",
+            FirmwareDeployment.completed_at.is_not(None))
+        .order_by(FirmwareDeployment.completed_at.desc()).limit(1))
+    if deployment is None:
+        return 0
+    completed = ensure_utc(deployment.completed_at)
+    superseded = [row for row in rows if completed > ensure_utc(row.first_seen_at)]
+    for row in superseded:
+        close_alert_row(row, resolution={"kind": "DEPLOYMENT_SUCCEEDED", "deployment_id": deployment.deployment_id,
+                                         "target_version": deployment.target_version}, touch_last_seen=False)
+    if superseded and len(superseded) == len(rows) and (connector.last_error_code or "").startswith("OTA_"):
+        connector.last_error_code = None
+        connector.last_error_message = None
+    return len(superseded)
+
+
 def observe_restart_loop(session: Session, connector: Connector, *, uptime_seconds: int | None,
                          now: datetime) -> None:
     """Raise ESP_RESTART_LOOP for repeated boots; an ESP that stays up clears it."""
@@ -1252,6 +1287,7 @@ def update_heartbeat(
         connector=connector,
         payload=payload,
     )
+    resolve_superseded_ota_alerts(session, connector)
     observe_restart_loop(session, connector, uptime_seconds=payload.uptime_seconds, now=now)
     telemetry_payload = redact_context(payload.model_dump(mode="json"))
     if device_sent_at is not None:
