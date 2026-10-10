@@ -18,6 +18,7 @@ from zk_add.device_health import (
     classify_led_latch,
     diagnostics_evidence,
     diagnostics_reporting,
+    DEVICE_REJECTION_CATEGORIES,
     diagnostics_starting,
     hard_storage_evidence,
     health_summary,
@@ -5751,14 +5752,72 @@ def resolve_alert(
             DeviceAlert.state == "OPEN",
         )
     ).all():
-        row.state = "RESOLVED"
-        row.resolved_at = now
-        if touch_last_seen:
-            row.last_seen_at = now
-        if resolution is not None:
-            row.details = {**(row.details or {}), "resolution": {**resolution, "at": now.isoformat()}}
+        close_alert_row(row, resolution=resolution, touch_last_seen=touch_last_seen, now=now)
         resolved += 1
     return resolved
+
+
+def close_alert_row(row: DeviceAlert, *, resolution: dict | None = None, touch_last_seen: bool = True,
+                    now: datetime | None = None) -> None:
+    now = now or utc_now()
+    row.state = "RESOLVED"
+    row.resolved_at = now
+    if touch_last_seen:
+        row.last_seen_at = now
+    if resolution is not None:
+        row.details = {**(row.details or {}), "resolution": {**resolution, "at": now.isoformat()}}
+
+
+REJECTION_CODES = ("DEVICE_MESSAGE_REJECTED", "ADD_MESSAGE_PROCESSING_FAILED")
+MAX_REJECTION_TYPES = 16
+
+
+def record_message_rejection(
+    session: Session,
+    connector: Connector,
+    *,
+    message_type: str,
+    category: str,
+    error_type: str,
+    error_paths: list[str],
+    request_id: str,
+    boot_id: str | None,
+    now: datetime | None = None,
+) -> DeviceAlert:
+    """Track a rejected message per type; field paths only, never values.
+
+    A device-side rejection (the message itself is invalid) is
+    DEVICE_MESSAGE_REJECTED. A failure inside ADD is
+    ADD_MESSAGE_PROCESSING_FAILED, so the device is not blamed for it.
+    """
+    now = now or utc_now()
+    device_side = category in DEVICE_REJECTION_CATEGORIES
+    code = "DEVICE_MESSAGE_REJECTED" if device_side else "ADD_MESSAGE_PROCESSING_FAILED"
+    message = (f"{message_type} message was rejected ({category})." if device_side
+               else f"ADD could not process a {message_type} message ({category}).")
+    existing = open_alert_row(session, connector, code)
+    previous = (existing.details or {}) if existing is not None else {}
+    types = {name: dict(entry) for name, entry in (previous.get("types") or {}).items() if isinstance(entry, dict)}
+    if existing is not None and not types and previous.get("message_type"):
+        # A row written before per-type tracking holds one type at top level.
+        types[previous["message_type"]] = {
+            "category": previous.get("error_category"), "error_type": previous.get("error_type"), "count": 1,
+            "first_at": ensure_utc(existing.first_seen_at).isoformat() if existing.first_seen_at else now.isoformat(),
+            "last_at": ensure_utc(existing.last_seen_at).isoformat() if existing.last_seen_at else now.isoformat(),
+            "request_id": previous.get("request_id")}
+    entry = types.pop(message_type, None) or {"count": 0, "first_at": now.isoformat()}
+    types[message_type] = {
+        **entry, "category": category, "error_type": error_type, "error_paths": error_paths[:5],
+        "count": int(entry.get("count") or 0) + 1, "last_at": now.isoformat(), "boot_id": boot_id,
+        "firmware_version": connector.firmware_version, "request_id": request_id,
+    }
+    while len(types) > MAX_REJECTION_TYPES:
+        types.pop(min(types, key=lambda name: str(types[name].get("last_at") or "")))
+    return upsert_alert(
+        session, connector, code=code, severity="HIGH" if device_side else "WARNING", message=message,
+        details={"message_type": message_type, "error_type": error_type, "request_id": request_id,
+                 "error_category": category, "types": types},
+    )
 
 
 def resolve_message_rejection(
@@ -5767,28 +5826,40 @@ def resolve_message_rejection(
     *,
     message_type: str,
 ) -> bool:
-    """Resolve only the rejection proven healthy by the same message path."""
-
+    """An accepted message clears only the rejection entry for its own type."""
     now = utc_now()
-    resolved = False
+    changed = False
+    resolved_codes = set()
     for row in session.scalars(
         select(DeviceAlert).where(
             DeviceAlert.connector_id == connector.id,
-            DeviceAlert.code == "DEVICE_MESSAGE_REJECTED",
+            DeviceAlert.code.in_(REJECTION_CODES),
             DeviceAlert.state == "OPEN",
         )
     ).all():
-        if (row.details or {}).get("message_type") != message_type:
+        details = row.details or {}
+        types = details.get("types") if isinstance(details.get("types"), dict) else {}
+        if types:
+            if message_type not in types:
+                continue
+            remaining = {name: entry for name, entry in types.items() if name != message_type}
+        elif details.get("message_type") == message_type:
+            remaining = {}
+        else:
             continue
-        row.state = "RESOLVED"
-        row.resolved_at = now
-        row.last_seen_at = now
-        resolved = True
-    if resolved and connector.last_error_code == "DEVICE_MESSAGE_REJECTED":
+        changed = True
+        if remaining:
+            row.details = {**details, "types": remaining}
+        else:
+            row.details = {**details, "types": {}}
+            close_alert_row(row, resolution={"kind": "MESSAGE_ACCEPTED", "message_type": message_type},
+                            touch_last_seen=False, now=now)
+            resolved_codes.add(row.code)
+    if resolved_codes and connector.last_error_code in resolved_codes:
         connector.last_error_code = None
         connector.last_error_message = None
         connector.lifecycle_state = "ONLINE"
-    return resolved
+    return changed
 
 
 def fleet_counts(session: Session) -> dict:

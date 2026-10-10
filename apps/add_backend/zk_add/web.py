@@ -164,6 +164,7 @@ from zk_add.service import (
     reconcile_device_user_identity_conflicts,
     reconcile_admin_lease_command,
     resolve_historical_event_group_to_current_identity,
+    record_message_rejection,
     resolve_message_rejection,
     onboard_connector,
     serialize_command,
@@ -172,7 +173,6 @@ from zk_add.service import (
     terminal_fingerprint_preconditions,
     update_heartbeat,
     update_device_user_command,
-    upsert_alert,
 )
 from zk_add.device_health import evaluate_health, evaluate_health_batch, health_detail, shadow_report
 from zk_add.settings import settings
@@ -4225,20 +4225,27 @@ def stream_bootstrap(connector_pk: int) -> tuple[dict, dict | None]:
 
 
 def record_envelope_rejection(connector_pk: int, envelope: Envelope, error: Exception) -> None:
+    """Record a rejected envelope; it never refreshes last_seen_at or connected."""
     error_type = type(error).__name__[:80]
+    from pydantic import ValidationError
+
     from zk_add.rejection import rejection_category
 
     category = rejection_category(error)
-    message = f"{envelope.type} message was rejected ({category})."
-    context = {"message_type": envelope.type, "error_type": error_type,
-               "request_id": envelope.message_id, "error_category": category}
+    # Field locations only: rejected values can carry attendance or credentials.
+    error_paths = [".".join(str(part) for part in row.get("loc", ()))[:120]
+                   for row in error.errors(include_input=False, include_url=False)[:5]
+                   ] if isinstance(error, ValidationError) else []
     with session_scope() as db:
-        connector = db.get(Connector, connector_pk)
+        connector = db.scalar(select(Connector).where(Connector.id == connector_pk).with_for_update())
         if connector is None:
             return
+        alert = record_message_rejection(
+            db, connector, message_type=envelope.type, category=category, error_type=error_type,
+            error_paths=error_paths, request_id=envelope.message_id, boot_id=envelope.boot_id)
         connector.lifecycle_state = "DEGRADED"
-        connector.last_error_code = "DEVICE_MESSAGE_REJECTED"
-        connector.last_error_message = message
+        connector.last_error_code = alert.code
+        connector.last_error_message = alert.message
         ingest_logs(
             db,
             connector=connector,
@@ -4248,20 +4255,14 @@ def record_envelope_rejection(connector_pk: int, envelope: Envelope, error: Exce
                     sequence=envelope.seq,
                     level="ERROR",
                     subsystem="add_backend",
-                    code="DEVICE_MESSAGE_REJECTED",
-                    message=message,
-                    context=context,
+                    code=alert.code,
+                    message=alert.message,
+                    context={"message_type": envelope.type, "error_type": error_type,
+                             "request_id": envelope.message_id, "error_category": category,
+                             "error_paths": error_paths},
                     device_time=envelope.sent_at,
                 )
             ],
-        )
-        upsert_alert(
-            db,
-            connector,
-            code="DEVICE_MESSAGE_REJECTED",
-            severity="HIGH",
-            message=message,
-            details=context,
         )
 
 
@@ -4374,9 +4375,6 @@ def persist_envelope(connector_pk: int, envelope: Envelope) -> EnvelopeOutcome |
             from zk_add.attendance_sync_evidence import record_roster
 
             record_roster(db, connector, envelope)
-            resolve_message_rejection(
-                db, connector, message_type="user_snapshot"
-            )
             event_payload = {"connector_id": connector.connector_id, "count": count}
         elif envelope.type == "zkt_observation_batch":
             from zk_add.zkt_custody import settle_observations
@@ -4627,6 +4625,9 @@ def persist_envelope(connector_pk: int, envelope: Envelope) -> EnvelopeOutcome |
             }
         else:
             event_payload = {"connector_id": connector.connector_id, "type": envelope.type}
+        # The same transaction that accepted the message clears its type's
+        # rejection; a replayed duplicate returned above proves nothing new.
+        resolve_message_rejection(db, connector, message_type=envelope.type)
     return EnvelopeOutcome(
         ack=ack_payload or {"type": "ack", "message_id": envelope.message_id, "seq": envelope.seq},
         event=event_payload or {},

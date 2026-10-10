@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ast
+from contextlib import contextmanager
 from datetime import timedelta
 from pathlib import Path
 
@@ -10,11 +11,15 @@ from fastapi.testclient import TestClient
 from sqlalchemy import event, func, select
 
 from test_add_backend import SERIAL, connector_fixture, db as db
-from zk_add import device_health
+from pydantic import ValidationError
+from sqlalchemy.exc import OperationalError
+
+from test_add_backend import queue_evidence_payload
+from zk_add import device_health, web as add_web
 from zk_add.device_health import POLICY, alert_currency, evaluate_health, gate_effect, shadow_report, terminal_link
-from zk_add.models import AuditEvent, DeviceAlert, DeviceConnectionEvent, DeviceTelemetry
+from zk_add.models import AuditEvent, DeviceAlert, DeviceConnectionEvent, DeviceLog, DeviceTelemetry
 from zk_add.ota import FirmwareRelease
-from zk_add.schemas import HeartbeatPayload, UserSnapshotRequest, UserSnapshotRow
+from zk_add.schemas import Envelope, HeartbeatPayload, UserSnapshotRequest, UserSnapshotRow
 from zk_add.security import ADMIN_COOKIE, create_admin_session
 from zk_add.service import (
     apply_firmware_diagnostics,
@@ -22,6 +27,7 @@ from zk_add.service import (
     fleet_counts,
     replace_user_snapshot,
     resolve_alert,
+    resolve_message_rejection,
     update_heartbeat,
     upsert_alert,
     utc_now,
@@ -1009,3 +1015,125 @@ def test_no_terminal_link_down_for_hikvision(db):
     evaluate_terminal_link_down(db, connector, now=utc_now())
     db.flush()
     assert alert_row(db, connector, "TERMINAL_LINK_DOWN") is None
+
+
+@pytest.fixture()
+def envelopes(db, monkeypatch):
+    """Run the WebSocket envelope paths against the test session."""
+    @contextmanager
+    def scope():
+        try:
+            yield db
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+
+    monkeypatch.setattr(add_web, "session_scope", scope)
+    sequence = iter(range(1, 1000))
+
+    def envelope(connector, message_type, payload, *, boot="boot-e"):
+        return Envelope(message_id=f"message-{next(sequence)}", connector_id=connector.connector_id, boot_id=boot,
+                        seq=next(sequence), sent_at=utc_now(), type=message_type, payload=payload)
+    return envelope
+
+
+def reject(connector, envelope, error):
+    add_web.record_envelope_rejection(connector.id, envelope, error)
+
+
+def test_server_side_rejection_uses_add_message_processing_failed(db, envelopes):
+    connector = live(db, connector_fixture(db))
+    seen = ensure_utc(connector.last_seen_at)
+    reject(connector, envelopes(connector, "heartbeat", {}), OperationalError("SELECT 1", {}, Exception("down")))
+    db.refresh(connector)
+    row = alert_row(db, connector, "ADD_MESSAGE_PROCESSING_FAILED")
+    assert (row.state, row.severity) == ("OPEN", "WARNING")
+    assert row.message == "ADD could not process a heartbeat message (DATABASE_UNAVAILABLE)."
+    assert alert_row(db, connector, "DEVICE_MESSAGE_REJECTED") is None
+    assert ensure_utc(connector.last_seen_at) == seen
+    log = db.scalar(select(DeviceLog).where(DeviceLog.connector_id == connector.id))
+    assert log.code == "ADD_MESSAGE_PROCESSING_FAILED"
+    # One transient failure has no health effect and never gates.
+    health = evaluate_health(db, connector)
+    assert (health.reasons, health.last_error_code) == ([], None)
+
+
+def test_device_rejection_tracks_types_and_field_paths_without_values(db, envelopes):
+    connector = live(db, connector_fixture(db))
+    secret = "35202-1234567-1"
+    try:
+        HeartbeatPayload.model_validate({"uptime_seconds": secret, "zkt": {}})
+    except ValidationError as exc:
+        invalid = exc
+    for _ in range(2):
+        reject(connector, envelopes(connector, "heartbeat", {}), invalid)
+    reject(connector, envelopes(connector, "log", {}), ValueError("LOG_EVIDENCE_INVALID"))
+    row = alert_row(db, connector, "DEVICE_MESSAGE_REJECTED")
+    types = row.details["types"]
+    assert set(types) == {"heartbeat", "log"}
+    assert (types["heartbeat"]["count"], types["heartbeat"]["category"], types["heartbeat"]["error_paths"]) == (
+        2, "SCHEMA_INVALID", ["uptime_seconds"])
+    assert (types["log"]["category"], types["log"]["error_paths"]) == ("EVIDENCE_INVALID", [])
+    assert row.details["message_type"] == "log"  # legacy top-level keys follow the latest
+    stored = str(row.details) + str([log.context for log in db.scalars(select(DeviceLog)).all()])
+    assert secret not in stored
+    reason = evaluate_health(db, connector).reasons[0]
+    assert (reason.code, reason.tier, reason.currency) == ("DEVICE_MESSAGE_REJECTED", "DEGRADED", "CURRENT")
+
+
+def test_rejection_types_are_bounded(db, envelopes):
+    connector = live(db, connector_fixture(db))
+    for index in range(18):
+        reject(connector, envelopes(connector, f"type_{index:02d}", {}), ValueError("bad"))
+    types = alert_row(db, connector, "DEVICE_MESSAGE_REJECTED").details["types"]
+    assert len(types) == 16 and "type_00" not in types and "type_17" in types
+
+
+def test_accepted_message_resolves_only_its_type(db, envelopes):
+    connector = live(db, connector_fixture(db))
+    reject(connector, envelopes(connector, "heartbeat", {}), ValueError("bad"))
+    reject(connector, envelopes(connector, "log", {}), ValueError("bad"))
+    row = alert_row(db, connector, "DEVICE_MESSAGE_REJECTED")
+    seen = ensure_utc(row.last_seen_at)
+    assert resolve_message_rejection(db, connector, message_type="user_snapshot") is False
+    assert resolve_message_rejection(db, connector, message_type="log") is True
+    assert row.state == "OPEN" and set(row.details["types"]) == {"heartbeat"}
+    assert resolve_message_rejection(db, connector, message_type="heartbeat") is True
+    assert row.state == "RESOLVED" and row.details["resolution"]["kind"] == "MESSAGE_ACCEPTED"
+    assert ensure_utc(row.last_seen_at) == seen
+
+
+@pytest.mark.parametrize("message_type", ["heartbeat", "log", "queue_evidence", "unrecognized_probe"])
+def test_each_processed_envelope_type_resolves_its_rejection(db, envelopes, message_type):
+    connector = live(db, connector_fixture(db))
+    payloads = {
+        "heartbeat": {"zkt": {"online": True, "connection_state": "ONLINE", "serial": SERIAL}},
+        "log": {"level": "INFO", "message": "ok"},
+        "queue_evidence": queue_evidence_payload(connector),
+        "unrecognized_probe": {},
+    }
+    reject(connector, envelopes(connector, message_type, {}), ValueError("bad"))
+    reject(connector, envelopes(connector, "other_type", {}), ValueError("bad"))
+    add_web.persist_envelope(connector.id, envelopes(connector, message_type, payloads[message_type]))
+    row = alert_row(db, connector, "DEVICE_MESSAGE_REJECTED")
+    assert row.state == "OPEN" and set(row.details["types"]) == {"other_type"}
+
+
+def test_duplicate_replay_does_not_resolve_a_rejection(db, envelopes):
+    connector = live(db, connector_fixture(db))
+    accepted = envelopes(connector, "log", {"level": "INFO", "message": "ok"})
+    add_web.persist_envelope(connector.id, accepted)
+    reject(connector, envelopes(connector, "log", {}), ValueError("bad"))
+    add_web.persist_envelope(connector.id, accepted)  # same boot and sequence: a replay
+    assert alert_row(db, connector, "DEVICE_MESSAGE_REJECTED").state == "OPEN"
+
+
+def test_rejected_heartbeat_never_refreshes_last_seen(db, envelopes):
+    connector = live(db, connector_fixture(db))
+    connector.last_seen_at = utc_now() - timedelta(seconds=40)
+    db.commit()
+    seen = ensure_utc(connector.last_seen_at)
+    reject(connector, envelopes(connector, "heartbeat", {}), ValueError("DIAGNOSTICS_SAMPLE_MISMATCH"))
+    db.refresh(connector)
+    assert ensure_utc(connector.last_seen_at) == seen and connector.connected
