@@ -5485,6 +5485,10 @@ def serialize_connector(connector: Connector) -> dict:
     }
 
 
+# Operator acknowledgement annotates an active alert; refreshed evidence keeps it.
+ACKNOWLEDGEMENT_DETAIL_KEYS = ("acknowledged_by", "acknowledgement_note")
+
+
 def upsert_alert(
     session: Session,
     connector: Connector,
@@ -5526,12 +5530,31 @@ def upsert_alert(
     else:
         row.last_seen_at = utc_now()
         row.message = message
-        row.details = details or row.details
+        if details:
+            previous = row.details or {}
+            refreshed = dict(details)
+            for key in ACKNOWLEDGEMENT_DETAIL_KEYS:
+                if key in previous and key not in refreshed:
+                    refreshed[key] = previous[key]
+            row.details = refreshed
     return row
 
 
-def resolve_alert(session: Session, connector: Connector, *, code: str) -> None:
+def resolve_alert(
+    session: Session,
+    connector: Connector,
+    *,
+    code: str,
+    resolution: dict | None = None,
+    touch_last_seen: bool = True,
+) -> int:
+    """Resolve the OPEN alert for a code, optionally recording why.
+
+    Evidence-driven resolutions pass touch_last_seen=False so an old alert
+    is not mistaken for one observed inside a later HIL evidence window.
+    """
     now = utc_now()
+    resolved = 0
     for row in session.scalars(
         select(DeviceAlert).where(
             DeviceAlert.connector_id == connector.id,
@@ -5541,7 +5564,12 @@ def resolve_alert(session: Session, connector: Connector, *, code: str) -> None:
     ).all():
         row.state = "RESOLVED"
         row.resolved_at = now
-        row.last_seen_at = now
+        if touch_last_seen:
+            row.last_seen_at = now
+        if resolution is not None:
+            row.details = {**(row.details or {}), "resolution": {**resolution, "at": now.isoformat()}}
+        resolved += 1
+    return resolved
 
 
 def resolve_message_rejection(
@@ -5590,6 +5618,18 @@ def fleet_counts(session: Session) -> dict:
             select(func.count(DeviceAlert.id))
             .join(Connector, Connector.id == DeviceAlert.connector_id)
             .where(DeviceAlert.state == "OPEN", Connector.is_spare.is_(False))
+        )
+        or 0
+    )
+    counts["open_unacknowledged_alerts"] = (
+        session.scalar(
+            select(func.count(DeviceAlert.id))
+            .join(Connector, Connector.id == DeviceAlert.connector_id)
+            .where(
+                DeviceAlert.state == "OPEN",
+                DeviceAlert.acknowledged_at.is_(None),
+                Connector.is_spare.is_(False),
+            )
         )
         or 0
     )

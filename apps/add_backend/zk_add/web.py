@@ -3477,12 +3477,43 @@ def connectivity_history(
     }
 
 
+ALERT_QUEUE_PATTERN = "^(NEEDS_ACTION|ACKNOWLEDGED|ACTIVE|RESOLVED|ALL)$"
+
+
+def alert_queue_filters(queue: str | None) -> list:
+    """Operator queues over the alert lifecycle.
+
+    Acknowledgement annotates an OPEN alert. Rows acknowledged before that
+    change keep the legacy ACKNOWLEDGED state and stay in the acknowledged queue.
+    """
+    if queue is None or queue == "ALL":
+        return []
+    if queue == "NEEDS_ACTION":
+        return [DeviceAlert.state == "OPEN", DeviceAlert.acknowledged_at.is_(None)]
+    if queue == "ACKNOWLEDGED":
+        return [or_(
+            and_(DeviceAlert.state == "OPEN", DeviceAlert.acknowledged_at.is_not(None)),
+            DeviceAlert.state == "ACKNOWLEDGED",
+        )]
+    if queue == "ACTIVE":
+        return [DeviceAlert.state.in_(["OPEN", "ACKNOWLEDGED"])]
+    return [DeviceAlert.state == "RESOLVED"]
+
+
 @app.get("/api/v1/devices/{connector_id}/alerts")
-def alerts(connector_id: str, auth: tuple[Session, AdminContext] = Depends(require_admin)):
+def alerts(
+    connector_id: str,
+    queue: str | None = Query(default=None, pattern=ALERT_QUEUE_PATTERN),
+    limit: int = Query(default=200, ge=1, le=500),
+    auth: tuple[Session, AdminContext] = Depends(require_admin),
+):
     db, _context = auth
     connector = connector_or_404(db, connector_id)
     rows = db.scalars(
-        select(DeviceAlert).where(DeviceAlert.connector_id == connector.id).order_by(DeviceAlert.last_seen_at.desc())
+        select(DeviceAlert)
+        .where(DeviceAlert.connector_id == connector.id, *alert_queue_filters(queue))
+        .order_by(DeviceAlert.last_seen_at.desc(), DeviceAlert.id.desc())
+        .limit(limit)
     ).all()
     return {"rows": [serialize_alert(row) for row in rows]}
 
@@ -3493,13 +3524,14 @@ def global_alerts(
     severity: str | None = None,
     connector_id: str | None = None,
     zone_id: str | None = None,
+    queue: str | None = Query(default=None, pattern=ALERT_QUEUE_PATTERN),
     limit: int = Query(default=100, ge=1, le=500),
     cursor: str | None = None,
     auth: tuple[Session, AdminContext] = Depends(require_admin),
 ):
     db, _context = auth
     scope_filters = [Connector.is_spare.is_(False)]
-    state_filter = []
+    state_filter = alert_queue_filters(queue)
     if state:
         state_filter.append(DeviceAlert.state == state.strip().upper())
     if severity:
@@ -3545,17 +3577,19 @@ def global_alerts(
         .limit(limit + 1)
     ).all()
     page = rows[:limit]
-    def count_for(alert_state: str | None = None) -> int:
-        state_filter = [DeviceAlert.state == alert_state] if alert_state else []
+    def count_where(filters: list) -> int:
         return int(
             db.scalar(
                 select(func.count(DeviceAlert.id))
                 .select_from(DeviceAlert)
                 .join(Connector, Connector.id == DeviceAlert.connector_id)
-                .where(*scope_filters, *state_filter)
+                .where(*scope_filters, *filters)
             )
             or 0
         )
+
+    def count_for(alert_state: str | None = None) -> int:
+        return count_where([DeviceAlert.state == alert_state] if alert_state else [])
 
     next_cursor = None
     if len(rows) > limit and page:
@@ -3595,6 +3629,12 @@ def global_alerts(
             "acknowledged": count_for("ACKNOWLEDGED"),
             "resolved": count_for("RESOLVED"),
         },
+        "queue_totals": {
+            "needs_action": count_where(alert_queue_filters("NEEDS_ACTION")),
+            "acknowledged": count_where(alert_queue_filters("ACKNOWLEDGED")),
+            "resolved": count_where(alert_queue_filters("RESOLVED")),
+            "all": count_for(),
+        },
     }
 
 
@@ -3609,8 +3649,31 @@ def acknowledge_alert(
     row = db.get(DeviceAlert, alert_id)
     if row is None:
         raise HTTPException(status_code=404, detail="Alert not found.")
-    row.state = "ACKNOWLEDGED"
+    # Heartbeats lock the connector before its alerts; keep the same order.
+    db.scalar(select(Connector).where(Connector.id == row.connector_id).with_for_update())
+    row = db.scalar(
+        select(DeviceAlert)
+        .where(DeviceAlert.id == alert_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail="Alert not found.")
+    if row.state == "RESOLVED":
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "ALERT_NOT_ACTIVE", "message": "This alert is already resolved."},
+        )
+    if row.state == "ACKNOWLEDGED" or row.acknowledged_at is not None:
+        return serialize_alert(row)
+    # Acknowledgement is an annotation: the alert stays OPEN, keeps driving
+    # device health, and later evidence refreshes the same row.
     row.acknowledged_at = utc_now()
+    row.details = {
+        **(row.details or {}),
+        "acknowledged_by": context.username,
+        "acknowledgement_note": body.note,
+    }
     append_audit(
         db,
         actor=context.username,
@@ -3619,7 +3682,8 @@ def acknowledge_alert(
         target_id=str(alert_id),
         outcome="SUCCESS",
         ip_address=client_ip(request),
-        after={"note": body.note},
+        before={"state": "OPEN", "acknowledged_at": None},
+        after={"state": "OPEN", "acknowledged_at": row.acknowledged_at.isoformat(), "note": body.note},
     )
     return serialize_alert(row)
 
@@ -4891,7 +4955,9 @@ def serialize_alert(row: DeviceAlert) -> dict:
         "first_seen_at": row.first_seen_at,
         "last_seen_at": row.last_seen_at,
         "acknowledged_at": row.acknowledged_at,
+        "acknowledged_by": (row.details or {}).get("acknowledged_by"),
         "resolved_at": row.resolved_at,
+        "resolution": (row.details or {}).get("resolution"),
     }
 
 
