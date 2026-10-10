@@ -18,7 +18,7 @@ from sqlalchemy.exc import OperationalError
 from test_add_backend import queue_evidence_payload
 from test_hil_scope import hil_session  # noqa: F401
 from test_zkt_factory_trial import factory  # noqa: F401
-from zk_add import device_health, web as add_web
+from zk_add import device_health, web as add_web, worker as add_worker
 from zk_add import zkt_factory_trial
 from zk_add.device_health import (
     POLICY,
@@ -1409,3 +1409,83 @@ def test_factory_previous_boot_durability_on_252(factory):  # noqa: F811
     with pytest.raises(ValueError, match="FACTORY_EXISTING_SAFETY_HOLD"):
         zkt_factory_trial.predecessor_snapshot(session, release, device)
 
+
+@pytest.fixture()
+def sweep(db, monkeypatch):
+    @contextmanager
+    def scope():
+        try:
+            yield db
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+
+    monkeypatch.setattr(add_worker, "session_scope", scope)
+    monkeypatch.setattr(add_worker, "PROCESS_STARTED_AT", utc_now() - timedelta(hours=1))
+
+    def run(seconds_from_now=0):
+        updates = add_worker.mark_stale_connectors(utc_now() + timedelta(seconds=seconds_from_now))
+        db.expire_all()
+        return updates
+    return run
+
+
+def silent(db, connector, seconds, *, connected=True, lifecycle="ONLINE"):
+    connector.last_seen_at = utc_now() - timedelta(seconds=seconds)
+    connector.connected, connector.lifecycle_state = connected, lifecycle
+    db.commit()
+    return connector
+
+
+def test_sweep_respects_startup_grace(db, sweep, monkeypatch):
+    connector = silent(db, live(db, connector_fixture(db)), 60)
+    monkeypatch.setattr(add_worker, "PROCESS_STARTED_AT", utc_now() - timedelta(seconds=30))
+    assert sweep() == []
+    assert connector.connected and connector.lifecycle_state == "ONLINE"
+    assert sweep(61)[0]["connector_id"] == connector.connector_id
+    assert (connector.connected, connector.lifecycle_state) == (False, "OFFLINE")
+
+
+def test_sweep_marks_offline_at_45s_alerts_at_120s_once_and_does_not_realert_long_offline_devices(db, sweep):
+    recent = silent(db, live(db, connector_fixture(db)), 50)
+    long_gone = silent(db, live(db, second_connector(db)), 7200, connected=False, lifecycle="OFFLINE")
+    assert [update["connector_id"] for update in sweep()] == [recent.connector_id]
+    assert (recent.connected, recent.lifecycle_state) == (False, "OFFLINE")
+    assert alert_row(db, recent, "ESP_OFFLINE") is None  # silent for 50 s: no alert yet
+    sweep(80)
+    sweep(90)
+    rows = db.scalars(select(DeviceAlert).where(DeviceAlert.code == "ESP_OFFLINE")).all()
+    assert [(row.connector_id, row.state) for row in rows] == [(recent.id, "OPEN")]
+    assert alert_row(db, long_gone, "ESP_OFFLINE") is None
+    assert heartbeat(db, recent, 1)["state"] == "ONLINE"
+    assert alert_row(db, recent, "ESP_OFFLINE").state == "RESOLVED"
+
+
+@pytest.mark.parametrize("enabled,state", [(True, "QUARANTINED_DUPLICATE_SERIAL"), (False, "OFFLINE")])
+def test_sweep_keeps_quarantine_when_enforced(db, sweep, monkeypatch, enabled, state):
+    monkeypatch.setattr(settings, "device_health_derived_enabled", enabled)
+    connector = silent(db, live(db, connector_fixture(db)), 60, lifecycle="QUARANTINED_DUPLICATE_SERIAL")
+    sweep()
+    assert (connector.connected, connector.lifecycle_state) == (False, state)
+    assert sweep() == []  # nothing left to mark
+
+
+def test_heartbeat_stale_enforced(db, sweep):
+    connector = connector_fixture(db)
+    heartbeat(db, connector, 1)
+    db.commit()
+    connector.zkt_device.last_seen_at = utc_now() - timedelta(seconds=100)
+    connector.last_seen_at = utc_now()  # a log message keeps the transport fresh
+    db.commit()
+    assert sweep() == [{"connector_id": connector.connector_id, "state": "DEGRADED"}]
+    assert (connector.lifecycle_state, connector.last_error_code) == ("DEGRADED", None)
+    assert [reason.code for reason in evaluate_health(db, connector).reasons] == ["HEARTBEAT_STALE"]
+    assert heartbeat(db, connector, 2)["state"] == "ONLINE"
+
+
+def test_rejected_heartbeat_lets_sweep_mark_offline(db, envelopes, sweep):
+    connector = silent(db, live(db, connector_fixture(db)), 40)
+    reject(connector, envelopes(connector, "heartbeat", {}), ValueError("DIAGNOSTICS_SAMPLE_MISMATCH"))
+    sweep(10)
+    assert (connector.connected, connector.lifecycle_state) == (False, "OFFLINE")

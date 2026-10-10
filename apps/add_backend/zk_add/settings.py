@@ -42,6 +42,9 @@ class AddSettings(BaseSettings):
 
     heartbeat_interval_seconds: int = 15
     offline_after_seconds: int = 45
+    offline_startup_grace_seconds: int = Field(default=90, ge=0, le=15 * 60)
+    esp_offline_alert_after_seconds: int = Field(default=120, ge=45, le=60 * 60)
+    esp_offline_alert_window_seconds: int = Field(default=600, ge=60, le=24 * 60 * 60)
     # Derived device health (zk_add/device_health.py). The owner enforces the
     # derived lifecycle on deploy; false is the kill switch that hands
     # lifecycle and last_error back to the legacy writers on the next heartbeat.
