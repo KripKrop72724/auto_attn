@@ -105,6 +105,8 @@ from zk_add.schemas import (
     OnboardRequest,
     DeviceLogIn,
     DeviceErrorClearRequest,
+    HealthCleanupApplyRequest,
+    HealthCleanupPreviewRequest,
     DeviceSpareUpdateRequest,
     AttendanceRecoveryControlRequest,
     AttendanceRecoveryCreateRequest,
@@ -177,6 +179,7 @@ from zk_add.service import (
     update_device_user_command,
 )
 from zk_add.device_health_actions import HealthActionError, clear_device_error, resolve_alert_by_operator
+from zk_add.device_health_cleanup import CleanupError, apply_plan as apply_cleanup_plan, preview as cleanup_preview
 from zk_add.device_health import (
     apply_device_health,
     evaluate_health,
@@ -3740,6 +3743,41 @@ def resolve_alert_with_reason(
     if not result.get("replayed"):
         _publish_health_action(background_tasks, connector, alert)
     return {**result, "alert": serialize_alert(alert)}
+
+
+@app.post("/api/v1/device-health/cleanup/preview")
+def preview_device_health_cleanup(
+    body: HealthCleanupPreviewRequest,
+    auth: tuple[Session, AdminContext] = Depends(require_admin),
+):
+    """Read-only: stranded alerts and stale device errors, with a signed plan."""
+    db, context = auth
+    try:
+        return cleanup_preview(db, connector_ids=body.connector_ids, actor=context.username)
+    except CleanupError as error:
+        raise HTTPException(status_code=error.status, detail=error.detail) from error
+
+
+@app.post("/api/v1/device-health/cleanup/apply")
+def apply_device_health_cleanup(
+    request: Request,
+    body: HealthCleanupApplyRequest,
+    background_tasks: BackgroundTasks,
+    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+):
+    db, context = auth
+    require_step_up(body.password, db, context)
+    try:
+        result = apply_cleanup_plan(db, body=body, actor=context.username, ip_address=client_ip(request))
+    except CleanupError as error:
+        raise HTTPException(status_code=error.status, detail=error.detail) from error
+    connectors = db.scalars(select(Connector).where(
+        Connector.connector_id.in_(result["rederived_connector_ids"]))).all()
+    db.commit()
+    if not result.get("replayed"):
+        for connector in connectors:
+            _publish_health_action(background_tasks, connector)
+    return result
 
 
 @app.post("/api/v1/devices/{connector_id}/clear-error")

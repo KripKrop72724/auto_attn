@@ -497,6 +497,18 @@ if (-not [string]::IsNullOrWhiteSpace($env:ADD_DEPLOY_COMM_KEY_SECRET_FERNET_KEY
 if (-not [string]::IsNullOrWhiteSpace($env:ADD_DEPLOY_RECONCILIATION_ENABLED)) {
     $environment["ADD_RECONCILIATION_ENABLED"] = $env:ADD_DEPLOY_RECONCILIATION_ENABLED
 }
+# Derived device health is enforced by default; these repository variables
+# are its kill switch and the stranded-alert cleanup's apply switch.
+foreach ($healthFlag in @("DERIVED", "CLEANUP_APPLY")) {
+    $deployValue = [Environment]::GetEnvironmentVariable("ADD_DEPLOY_DEVICE_HEALTH_${healthFlag}_ENABLED")
+    if ([string]::IsNullOrWhiteSpace($deployValue)) {
+        continue
+    }
+    if ($deployValue -cnotin @("true", "false")) {
+        throw "ADD_DEPLOY_DEVICE_HEALTH_${healthFlag}_ENABLED must be true or false."
+    }
+    $environment["ADD_DEVICE_HEALTH_${healthFlag}_ENABLED"] = $deployValue
+}
 if (-not [string]::IsNullOrWhiteSpace($env:ADD_DEPLOY_RECONCILIATION_SELF_HEALING_ENABLED)) {
     $environment["ADD_RECONCILIATION_SELF_HEALING_ENABLED"] = $env:ADD_DEPLOY_RECONCILIATION_SELF_HEALING_ENABLED
 }

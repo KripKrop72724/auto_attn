@@ -163,3 +163,50 @@ def test_operator_resolve_serializes_with_heartbeat_without_deadlock(postgres, m
         row = db.get(DeviceAlert, alert_id)
         assert row.state == "RESOLVED" and row.details["resolution"]["kind"] == "OPERATOR"
         assert db.scalar(select(DeviceAlert).where(DeviceAlert.code == "ZKT_CLOCK_DRIFT")).state == "OPEN"
+
+
+@pytest.mark.parametrize("changes_scope", [False, True])
+def test_cleanup_apply_racing_heartbeat_serializes_or_reports_scope_changed(postgres, changes_scope):
+    from zk_add.device_health_cleanup import CleanupError, apply_plan, preview
+    from zk_add.schemas import HealthCleanupApplyRequest
+
+    sessions, connector_id = postgres
+    with sessions() as db:
+        connector = db.get(Connector, connector_id)
+        stranded = upsert_alert(db, connector, code="ESP_DELIVERY_WORKER_FAULT", severity="HIGH",
+                                message="worker", details={"binding": "INFERRED_PREVIOUS"})
+        connector.last_error_code = "ESP_DELIVERY_WORKER_FAULT"
+        db.commit()
+        scope, alert_id = [connector.connector_id], stranded.id
+        plan = preview(db, connector_ids=scope, actor="admin")
+    body = HealthCleanupApplyRequest(
+        connector_ids=scope, digest=plan["digest"], expires_at=plan["expires_at"], signature=plan["signature"],
+        alert_ids=[alert_id], error_fix_connector_ids=[], reason="Stranded recovery-run worker fault",
+        typed_confirmation="RESOLVE 1 ALERTS ON 1 DEVICES", password="unused", idempotency_key="postgres-cleanup")
+
+    def run():
+        with sessions() as db:
+            try:
+                result = apply_plan(db, body=body, actor="admin", ip_address=None)
+            except CleanupError as error:
+                return error.detail["code"]
+            db.commit()
+            return result
+
+    with sessions() as heartbeat, ThreadPoolExecutor(max_workers=1) as pool:
+        connector = heartbeat.scalar(select(Connector).where(Connector.id == connector_id).with_for_update())
+        connector.last_seen_at = utc_now()
+        if changes_scope:
+            connector.boot_id = "a-new-boot"
+        heartbeat.flush()
+        pending = pool.submit(run)
+        time.sleep(0.5)
+        assert not pending.done()  # apply locks the connector first and waits
+        heartbeat.commit()
+        outcome = pending.result(timeout=10)
+    with sessions() as db:
+        state = db.get(DeviceAlert, alert_id).state
+    if changes_scope:
+        assert (outcome, state) == ("SCOPE_CHANGED", "OPEN")
+    else:
+        assert outcome["resolved_alert_ids"] == [alert_id] and state == "RESOLVED"

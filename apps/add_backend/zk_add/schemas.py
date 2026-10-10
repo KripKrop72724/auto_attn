@@ -1108,6 +1108,23 @@ class AlertResolveRequest(BaseModel):
     idempotency_key: str = Field(min_length=8, max_length=120)
 
 
+class HealthCleanupPreviewRequest(BaseModel):
+    connector_ids: list[str] | None = Field(default=None, min_length=1, max_length=50)
+
+
+class HealthCleanupApplyRequest(BaseModel):
+    connector_ids: list[str] | None = Field(default=None, min_length=1, max_length=50)
+    digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    expires_at: datetime
+    signature: str = Field(pattern=r"^[0-9a-f]{64}$")
+    alert_ids: list[int] = Field(default_factory=list, max_length=200)
+    error_fix_connector_ids: list[str] = Field(default_factory=list, max_length=50)
+    reason: str = Field(min_length=10, max_length=500)
+    typed_confirmation: str = Field(min_length=1, max_length=120)
+    password: str = Field(min_length=1, max_length=512)
+    idempotency_key: str = Field(min_length=8, max_length=120)
+
+
 class DeviceErrorClearRequest(BaseModel):
     expected_code: str = Field(min_length=1, max_length=120)
     reason: str = Field(min_length=10, max_length=500)

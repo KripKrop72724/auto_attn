@@ -67,6 +67,10 @@ class AddSettings(BaseSettings):
     # The alert stays OPEN, HIGH and gating either way.
     device_health_latched_led_tier: Literal["DEGRADED", "WARNING"] = "WARNING"
     device_health_latched_led_sources: str = "2.6.15:add_connector.c:3764,2.6.15:add_connector.c:3787"
+    # The stranded-alert cleanup still needs a signed preview, a password
+    # step-up and a typed confirmation; false disables its apply step.
+    device_health_cleanup_apply_enabled: bool = True
+    device_health_cleanup_preview_seconds: int = Field(default=900, ge=60, le=900)
     connector_command_poll_seconds: int = 3
     reconcile_interval_seconds: int = 15 * 60
     user_integrity_interval_seconds: int = 30
