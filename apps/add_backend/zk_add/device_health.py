@@ -18,7 +18,7 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from zk_add.hil_startup import PHASES as HIL_STARTUP_PHASES
+from zk_add.hil_startup import PHASES as HIL_STARTUP_PHASES, STORAGE_COUNTERS, STORAGE_ERRORS
 from zk_add.models import Connector, DeviceAlert, ZKTDevice
 from zk_add.settings import settings
 from zk_add.time_utils import ensure_utc, parse_datetime, utc_now
@@ -275,6 +275,170 @@ def _hikvision_link(zkt: ZKTDevice, raw: str, now: datetime, uptime_seconds: flo
                  "The connector is reconnecting to the Hikvision terminal.")
 
 
+def storage_recovery_role(session: Session, connector: Connector, payload) -> bool:
+    """A registered one-shot storage recovery image running on its reviewed target.
+
+    Those images start no delivery workers by design. All three must hold: the
+    version, the connector, and the exact application digest of the HIL_ONLY
+    release; a device's own report can never waive required workers.
+    """
+    from zk_add import storage_recovery
+    from zk_add.ota import FirmwareRelease, _application_sha256
+
+    version = payload.firmware_version
+    if version not in storage_recovery.VERSIONS or not any(
+            target.connector_id == connector.connector_id and target.mac == (connector.hardware_id or "").lower()
+            for target in storage_recovery.TARGETS):
+        return False
+    release = session.scalar(select(FirmwareRelease).where(
+        FirmwareRelease.release_id == storage_recovery.RELEASE_IDS[version]))
+    digest = _application_sha256(release) if release is not None and release.state == "HIL_ONLY" else None
+    return digest is not None and payload.ota.image_sha256 == digest
+
+
+def diagnostics_starting(evidence: dict, uptime_seconds: int | None) -> bool:
+    """A journal image inside its startup grace, still choosing its delivery authority."""
+    if uptime_seconds is None or uptime_seconds >= settings.journal_startup_grace_seconds:
+        return False
+    runtime = evidence.get("journal_runtime")
+    phase = runtime.get("phase") if isinstance(runtime, dict) else None
+    return phase in STARTUP_PHASES or (
+        evidence.get("runtime_profile") == "ZKT_JOURNAL_V1" and evidence.get("delivery_authority") == "UNKNOWN")
+
+
+def soft_owner_not_ready(evidence: dict) -> bool:
+    journal = evidence.get("journal_storage")
+    return isinstance(journal, dict) and (
+        journal.get("ready") is False or journal.get("checkpoint_recovery_pending") is True)
+
+
+def _reported(value) -> bool:
+    return value not in (None, "", 0, False)
+
+
+def hard_storage_evidence(evidence: dict) -> bool:
+    """Storage faults that raise at once, even while the journal owner starts."""
+    storage = evidence.get("storage") if isinstance(evidence.get("storage"), dict) else {}
+    journal = evidence.get("journal_storage") if isinstance(evidence.get("journal_storage"), dict) else {}
+    return (any(_reported(storage.get(name)) for name in STORAGE_ERRORS)
+            or any(type(storage.get(name)) is int and storage[name] > 0 for name in STORAGE_COUNTERS)
+            or journal.get("last_append_result") not in {None, "OK", "EMPTY"}
+            or any(_reported(journal.get(name))
+                   for name in ("last_failure_operation", "last_filesystem_error", "last_nvs_error"))
+            or "FULL" in {storage.get("durability"), journal.get("durability")})
+
+
+STORAGE_EVIDENCE_FIELDS = (
+    "durability", "persistence_verified", "recovery_complete", "error_operation", "error_code",
+    "write_failures", "read_failures", "persistence_probe_failures", "persistence_probe_error",
+    "legacy_read_faults", "legacy_append_faults", "legacy_retire_faults", "legacy_error_code",
+    "legacy_error_operation", "local_failure_source", "fault_class", "upgrade_ready", "upgrade_error",
+)
+JOURNAL_EVIDENCE_FIELDS = ("ready", "durability", "last_append_result", "last_failure_operation",
+                           "last_filesystem_error")
+
+
+def _storage_summary(storage: dict, journal: dict, phase) -> str:
+    parts = [f"storage {storage.get('durability') or 'UNKNOWN'}"]
+    for name, label in (("write_failures", "write failures"), ("read_failures", "read failures"),
+                        ("persistence_probe_failures", "probe failures")):
+        if type(storage.get(name)) is int and storage[name]:
+            parts.append(f"{label} {storage[name]}")
+    if storage.get("error_operation") or _reported(storage.get("error_code")):
+        parts.append(f"{storage.get('error_operation') or 'operation'} error {storage.get('error_code')}")
+    if storage.get("legacy_error_operation") or _reported(storage.get("legacy_error_code")):
+        parts.append(f"{storage.get('legacy_error_operation') or 'legacy'} error {storage.get('legacy_error_code')}")
+    for flag, label in (("persistence_verified", "persistence not verified"),
+                        ("recovery_complete", "recovery incomplete")):
+        if storage and storage.get(flag) is False:
+            parts.append(label)
+    if storage.get("local_failure_source"):
+        parts.append(f"LED source {storage['local_failure_source']}")
+    if journal:
+        parts.append(f"journal {journal.get('durability') or 'UNKNOWN'}"
+                     + (f", last append {journal['last_append_result']}" if journal.get("last_append_result") else "")
+                     + ("" if journal.get("ready") is not False else ", owner not ready"))
+    if phase:
+        parts.append(f"phase {phase}")
+    if storage.get("used_percent") is not None:
+        parts.append(f"{storage['used_percent']}% used")
+    return "; ".join(parts)
+
+
+def diagnostics_evidence(code: str, evidence: dict, uptime_seconds: int | None,
+                         failing_workers: list[tuple[dict, str]]) -> dict:
+    """A bounded record of the sample that raised or refreshed a diagnostics alert."""
+    raw_storage = evidence.get("storage") if isinstance(evidence.get("storage"), dict) else {}
+    raw_journal = evidence.get("journal_storage") if isinstance(evidence.get("journal_storage"), dict) else {}
+    runtime = evidence.get("journal_runtime") if isinstance(evidence.get("journal_runtime"), dict) else {}
+    phase = runtime.get("phase")
+    record: dict = {}
+    if code == "ESP_DURABILITY_FAULT":
+        storage = {name: raw_storage[name] for name in STORAGE_EVIDENCE_FIELDS
+                   if raw_storage.get(name) is not None}
+        used, total = raw_storage.get("used_bytes"), raw_storage.get("total_bytes")
+        if type(used) is int and type(total) is int and total:
+            storage["used_percent"] = round(100 * used / total, 1)
+        journal = {name: raw_journal[name] for name in JOURNAL_EVIDENCE_FIELDS if raw_journal.get(name) is not None}
+        record = {"storage": storage, **({"journal": {**journal, "phase": phase}} if journal or phase else {})}
+        summary = _storage_summary(storage, journal, phase)
+    else:
+        now_ms = uptime_seconds * 1000 if uptime_seconds is not None else None
+        failing_names = {row.get("name") for row, _why in failing_workers}
+        workers = []
+        for row in [row for row, _why in failing_workers] + [
+                row for row in evidence.get("workers") or []
+                if isinstance(row, dict) and row.get("name") not in failing_names]:
+            tick = row.get("last_activity_uptime_ms")
+            workers.append({key: value for key, value in {
+                "name": row.get("name"), "state": row.get("state"), "operation": row.get("operation"),
+                "tick_age_ms": now_ms - tick if now_ms is not None and type(tick) is int else None,
+                "restart_count": row.get("restart_count")}.items() if value is not None})
+        record = {"workers": workers[:8], **({"journal": {"phase": phase}} if phase else {})}
+        summary = "; ".join(f"{row.get('name')} {why}" for row, why in failing_workers[:4]) or "no failing worker"
+    return {"summary": summary[:300], **record}
+
+
+def classify_led_latch(led_state: str | None, evidence: dict | None, *, storage_verified: bool,
+                       workers_verified: bool, firmware_version: str | None) -> dict | None:
+    """Explain a LOCAL_FAILURE LED that firmware latches until reboot.
+
+    Signed 2.6.15 forces durability DEGRADED whenever the LED latched, so a
+    sample with zero I/O counters and verified persistence shows a latch with
+    no storage error behind it. The alert stays OPEN, HIGH and gating.
+    """
+    if (led_state or "").strip().upper() != "LOCAL_FAILURE" or not isinstance(evidence, dict):
+        return None
+    storage = evidence.get("storage") if isinstance(evidence.get("storage"), dict) else {}
+    latch = {"source": storage.get("local_failure_source"), "firmware_version": firmware_version}
+    if storage_verified and workers_verified:
+        return {"kind": "LED_LATCH_STORAGE_VERIFIED", **latch}
+    if (storage.get("durability") == "DEGRADED" and latch["source"]
+            and not _reported(storage.get("error_code")) and not _reported(storage.get("persistence_probe_error"))
+            and storage.get("write_failures") == 0 and storage.get("read_failures") == 0
+            and not any(_reported(storage.get(name)) for name in (
+                "persistence_probe_failures", "persistence_probe_total_failures", "legacy_read_faults",
+                "legacy_append_faults", "legacy_retire_faults", "legacy_error_code"))
+            and storage.get("persistence_verified") is True and storage.get("recovery_complete") is True
+            and workers_verified):
+        return {"kind": "LED_LATCH_NO_IO_ERRORS", **latch}
+    return None
+
+
+def bind_unbound_row(row: DeviceAlert | None, connector: Connector, *, uptime_seconds: int | None,
+                     now: datetime) -> None:
+    """Attribute a legacy diagnostics alert to a boot without moving last_seen_at."""
+    details = (row.details or {}) if row is not None else {}
+    if row is None or uptime_seconds is None or details.get("binding") or row.last_seen_at is None:
+        return
+    boot_started = now - timedelta(seconds=uptime_seconds)
+    if ensure_utc(row.last_seen_at) < boot_started + timedelta(seconds=5):
+        row.details = {**details, "binding": "INFERRED_PREVIOUS", "bound_at": now.isoformat()}
+    else:
+        row.details = {**details, "binding": "INFERRED_CURRENT", "boot_id": connector.boot_id,
+                       "firmware_version": connector.firmware_version, "bound_at": now.isoformat()}
+
+
 def _rejection_entries(row: DeviceAlert) -> dict[str, dict]:
     details = row.details or {}
     types = details.get("types")
@@ -292,9 +456,10 @@ def _entry_current(entry: dict, now: datetime) -> bool:
 
 
 def _refreshed_by_last_heartbeat(row: DeviceAlert, connector: Connector) -> bool:
+    # A heartbeat stamps its marker before it refreshes any alert.
     zkt = connector.zkt_device
     marker = (zkt.last_seen_at if zkt is not None and zkt.last_seen_at else None) or connector.last_seen_at
-    return marker is None or ensure_utc(row.last_seen_at) >= ensure_utc(marker) - timedelta(seconds=2)
+    return marker is None or row.last_seen_at is None or ensure_utc(row.last_seen_at) >= ensure_utc(marker)
 
 
 def alert_currency(row: DeviceAlert, connector: Connector, *, now: datetime | None = None) -> str:

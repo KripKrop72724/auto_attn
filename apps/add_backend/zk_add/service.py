@@ -12,7 +12,18 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from zk_add.audit import append_audit
-from zk_add.device_health import Health, health_summary, terminal_link
+from zk_add.device_health import (
+    Health,
+    bind_unbound_row,
+    classify_led_latch,
+    diagnostics_evidence,
+    diagnostics_starting,
+    hard_storage_evidence,
+    health_summary,
+    soft_owner_not_ready,
+    storage_recovery_role,
+    terminal_link,
+)
 from zk_add.crypto import (
     cnic_lookup,
     decrypt_cnic,
@@ -655,8 +666,10 @@ def apply_firmware_diagnostics(session: Session, connector: Connector, payload: 
                                *, sampled_at: datetime | None = None) -> None:
     from zk_add.runtime_contract import journal_storage_status, runtime_contract, worker_snapshot_fresh
 
+    now = utc_now()
     diagnostics = payload.diagnostics
     evidence = diagnostics.model_dump(mode="json") if diagnostics else None
+    recovery_role = storage_recovery_role(session, connector, payload)
     if evidence is not None:
         # Bind runtime image/boot evidence to this authenticated sample. The
         # separately registered OTA capability can still belong to an older
@@ -664,14 +677,22 @@ def apply_firmware_diagnostics(session: Session, connector: Connector, payload: 
         evidence.update(boot_id=connector.boot_id, sample_sequence=connector.last_sequence,
                         sampled_at=ensure_utc(sampled_at).isoformat() if sampled_at else None,
                         ota_runtime=payload.ota.model_dump(mode="json"))
+        if recovery_role:
+            evidence["worker_contract"] = "NOT_APPLICABLE_STORAGE_RECOVERY"
     connector.firmware_diagnostics = evidence
-    connector.firmware_diagnostics_at = utc_now() if diagnostics else None
+    connector.firmware_diagnostics_at = now if diagnostics else None
     storage = diagnostics.storage if diagnostics else None
     journal_status = journal_storage_status(evidence or {}, payload.uptime_seconds)
-    storage_failed = (storage is not None and storage.durability in {"DEGRADED", "FULL"}) or journal_status in {"DEGRADED", "FULL"}
-    storage_verified = bool(storage and storage.durability == "HEALTHY"
-                            and storage.persistence_verified and storage.recovery_complete
-                            and journal_status in {None, "HEALTHY"})
+    starting = diagnostics_starting(evidence or {}, payload.uptime_seconds)
+    # A journal owner that is still starting is neither failed nor verified;
+    # hard storage evidence raises at once even then.
+    owner_starting = (starting and soft_owner_not_ready(evidence or {})
+                      and not hard_storage_evidence(evidence or {}))
+    storage_failed = not owner_starting and (
+        (storage is not None and storage.durability in {"DEGRADED", "FULL"}) or journal_status in {"DEGRADED", "FULL"})
+    storage_verified = not owner_starting and bool(
+        storage and storage.durability == "HEALTHY" and storage.persistence_verified
+        and storage.recovery_complete and journal_status in {None, "HEALTHY"})
     workers = diagnostics.workers if diagnostics else []
     try:
         runtime = runtime_contract(evidence or {}, connector.firmware_family or "zkt")
@@ -683,31 +704,75 @@ def apply_firmware_diagnostics(session: Session, connector: Connector, payload: 
     def activity_fresh(row) -> bool:
         return runtime is not None and worker_snapshot_fresh(row.model_dump(), payload.uptime_seconds, runtime)
 
-    workers_failed = any(
-        row.state in {"STOPPED", "FAULT", "WAITING_RESOURCE"}
-        or (row.last_activity_uptime_ms is not None and not activity_fresh(row))
-        for row in workers
-    )
+    if recovery_role:
+        failing_workers = []
+    elif runtime is None:
+        # Without a valid contract a stale tick proves nothing; explicit
+        # failure states still count once the device is past its startup.
+        failing_workers = [] if starting else [
+            (row.model_dump(mode="json"), row.state) for row in workers
+            if row.state in {"STOPPED", "FAULT", "WAITING_RESOURCE"}]
+    else:
+        failing_workers = [
+            (row.model_dump(mode="json"),
+             row.state if row.state in {"STOPPED", "FAULT", "WAITING_RESOURCE"} else f"{row.state} with a stale tick")
+            for row in workers
+            if row.state in {"STOPPED", "FAULT", "WAITING_RESOURCE"}
+            or (row.last_activity_uptime_ms is not None and not activity_fresh(row))]
+    workers_failed = bool(failing_workers)
     workers_verified = (
-        runtime is not None and {row.name for row in workers} >= runtime.workers
+        not recovery_role and runtime is not None and {row.name for row in workers} >= runtime.workers
         and {row.name for row in workers} <= runtime.workers | runtime.auxiliary_workers
         and len({row.name for row in workers}) == len(workers)
         and all(row.state in {"RUNNING", "WAITING_NETWORK"} and activity_fresh(row) for row in workers)
     )
+    if (runtime is None and (evidence or {}).get("runtime_profile") == "ZKT_JOURNAL_V1"
+            and payload.uptime_seconds is not None
+            and payload.uptime_seconds >= settings.journal_startup_grace_seconds):
+        upsert_alert(session, connector, code="DELIVERY_AUTHORITY_UNKNOWN", severity="WARNING",
+                     message=(f"Journal delivery authority is still {evidence.get('delivery_authority') or 'unknown'} "
+                              f"{payload.uptime_seconds} s after boot; worker faults cannot clear until it is ADD."),
+                     details={"boot_id": connector.boot_id, "firmware_version": connector.firmware_version,
+                              "delivery_authority": evidence.get("delivery_authority")})
+    elif runtime is not None:
+        resolve_alert(session, connector, code="DELIVERY_AUTHORITY_UNKNOWN",
+                      resolution={"kind": "CONDITION_CLEARED"}, touch_last_seen=False)
+    latch = classify_led_latch(payload.led_state, evidence, storage_verified=storage_verified,
+                               workers_verified=workers_verified, firmware_version=connector.firmware_version)
     for code, failed, verified, message in (
         ("ESP_DURABILITY_FAULT", storage_failed, storage_verified,
          "Attendance preservation needs recovery; connectivity alone does not confirm durable storage."),
         ("ESP_DELIVERY_WORKER_FAULT", workers_failed, workers_verified,
          "An attendance delivery worker is stopped or waiting for resources."),
     ):
+        existing = open_alert_row(session, connector, code)
         if failed:
-            upsert_alert(session, connector, code=code, severity="HIGH", message=message,
-                         details={"diagnostics_schema_version": diagnostics.schema_version})
+            record = diagnostics_evidence(code, evidence or {}, payload.uptime_seconds, failing_workers)
+            message = (f"Attendance preservation needs recovery: {record['summary']}."
+                       if code == "ESP_DURABILITY_FAULT" else
+                       f"Attendance delivery worker fault: {record['summary']}.")[:1000]
+            previous = (existing.details or {}) if existing is not None else {}
+            same_boot = previous.get("boot_id") == connector.boot_id and previous.get("boot_first_seen_at")
+            upsert_alert(session, connector, code=code, severity="HIGH", message=message, details={
+                "diagnostics_schema_version": diagnostics.schema_version,
+                "boot_id": connector.boot_id, "firmware_version": connector.firmware_version,
+                "binding": "OBSERVED",
+                "boot_first_seen_at": previous["boot_first_seen_at"] if same_boot else now.isoformat(),
+                "evidence": record,
+                **({"latch": latch} if latch and code == "ESP_DURABILITY_FAULT" else {}),
+            })
         elif verified:
-            resolve_alert(session, connector, code=code)
-            if connector.last_error_code == code:
+            resolve_alert(session, connector, code=code, resolution={"kind": "VERIFIED"})
+            resolved_codes = {code}
+            if code == "ESP_DURABILITY_FAULT":
+                resolve_alert(session, connector, code="ESP_PRESERVATION_UNVERIFIED",
+                              resolution={"kind": "VERIFIED"}, touch_last_seen=False)
+                resolved_codes.add("ESP_PRESERVATION_UNVERIFIED")
+            if connector.last_error_code in resolved_codes:
                 connector.last_error_code = None
                 connector.last_error_message = None
+        else:
+            bind_unbound_row(existing, connector, uptime_seconds=payload.uptime_seconds, now=now)
         unresolved = None if verified and not failed else session.scalar(select(DeviceAlert.id).where(
             DeviceAlert.connector_id == connector.id, DeviceAlert.code == code,
             DeviceAlert.state == "OPEN",
@@ -717,6 +782,10 @@ def apply_firmware_diagnostics(session: Session, connector: Connector, payload: 
                 connector.lifecycle_state = "DEGRADED"
             connector.last_error_code = code
             connector.last_error_message = message
+    led_row = open_alert_row(session, connector, "ESP_LOCAL_FAILURE")
+    if led_row is not None and (latch or "latch" in (led_row.details or {})):
+        details = {key: value for key, value in (led_row.details or {}).items() if key != "latch"}
+        led_row.details = {**details, "latch": latch} if latch else details
 
 
 def update_heartbeat(
@@ -5496,15 +5565,8 @@ def serialize_connector(connector: Connector, *, health: Health | None = None) -
 ACKNOWLEDGEMENT_DETAIL_KEYS = ("acknowledged_by", "acknowledgement_note")
 
 
-def upsert_alert(
-    session: Session,
-    connector: Connector,
-    *,
-    code: str,
-    severity: str,
-    message: str,
-    details: dict | None = None,
-) -> DeviceAlert:
+def open_alert_row(session: Session, connector: Connector, code: str) -> DeviceAlert | None:
+    """The connector's OPEN alert for a code, including one added but not yet flushed."""
     row = next(
         (
             candidate
@@ -5524,6 +5586,19 @@ def upsert_alert(
                 DeviceAlert.state == "OPEN",
             )
         )
+    return row
+
+
+def upsert_alert(
+    session: Session,
+    connector: Connector,
+    *,
+    code: str,
+    severity: str,
+    message: str,
+    details: dict | None = None,
+) -> DeviceAlert:
+    row = open_alert_row(session, connector, code)
     if row is None:
         row = DeviceAlert(
             connector_id=connector.id,

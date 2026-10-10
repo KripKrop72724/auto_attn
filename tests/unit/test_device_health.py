@@ -9,12 +9,22 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import event, select
 
-from test_add_backend import connector_fixture, db as db
+from test_add_backend import SERIAL, connector_fixture, db as db
 from zk_add import device_health
 from zk_add.device_health import POLICY, alert_currency, evaluate_health, gate_effect, shadow_report, terminal_link
 from zk_add.models import AuditEvent, DeviceAlert
+from zk_add.ota import FirmwareRelease
+from zk_add.schemas import HeartbeatPayload
 from zk_add.security import ADMIN_COOKIE, create_admin_session
-from zk_add.service import fleet_counts, resolve_alert, upsert_alert, utc_now
+from zk_add.service import (
+    apply_firmware_diagnostics,
+    fleet_counts,
+    resolve_alert,
+    update_heartbeat,
+    upsert_alert,
+    utc_now,
+)
+from zk_add.time_utils import ensure_utc
 from zk_add.settings import settings
 from zk_add.web import app, get_db
 
@@ -565,3 +575,272 @@ def test_quarantine_is_resolvable_only_without_another_claimant(db):
     db.commit()
     operator = client.get(path).json()["health"]["reasons"][0]["operator"]
     assert (operator["resolvable"], operator["refusal_code"]) == (False, "ALERT_CONDITION_CURRENT")
+
+
+P02 = ("bf4badc7-5f9c-42aa-8b3a-8a43f8daeb5e", "e0:72:a1:d7:05:c4")
+RECOVERY_DIGEST = "d" * 64
+
+
+def alert_row(db, connector, code):
+    return db.scalar(select(DeviceAlert).where(DeviceAlert.connector_id == connector.id, DeviceAlert.code == code)
+                     .order_by(DeviceAlert.id.desc()))
+
+
+def worker(name, state="RUNNING", tick=99_000, **fields):
+    return {"name": name, "state": state, "last_activity_uptime_ms": tick, **fields}
+
+
+def apply(db, connector, diagnostics=None, *, uptime=100, firmware=None, image=None, led=None):
+    connector.firmware_version = firmware or connector.firmware_version
+    payload = {"firmware_version": connector.firmware_version, "uptime_seconds": uptime, "led_state": led}
+    if diagnostics is not None:
+        payload["diagnostics"] = diagnostics
+    if image:
+        payload["ota"] = {"image_sha256": image}
+    apply_firmware_diagnostics(db, connector=connector, payload=HeartbeatPayload(**payload))
+    db.flush()
+
+
+def recovery_release(db, version="2.6.27"):
+    db.add(FirmwareRelease(
+        release_id=f"zone-lite-{version}", version=version, git_sha="a" * 40, image_sha256="e" * 64,
+        image_size=1024, signing_key_id="production-key", partition_layout="zone-lite-ota-v1",
+        minimum_bootstrap_version="2.5.2", storage_name=f"recovery/{version}.bin",
+        manifest={"application_sha256": RECOVERY_DIGEST}, manifest_signature="test-signature", state="HIL_ONLY"))
+    db.commit()
+
+
+def p02(db):
+    connector = live(db, connector_fixture(db, hardware_id=P02[1], expected_serial="CJH9211060009"))
+    connector.connector_id = P02[0]
+    db.commit()
+    return connector
+
+
+def test_recovery_image_worker_contract_not_applicable(db):
+    recovery_release(db)
+    stopped = {"workers": [worker("add_delivery", "STOPPED"), worker("ords_delivery", "STOPPED")]}
+    connector = p02(db)
+    apply(db, connector, stopped, firmware="2.6.27", image=RECOVERY_DIGEST)
+    assert alert_row(db, connector, "ESP_DELIVERY_WORKER_FAULT") is None
+    assert connector.firmware_diagnostics["worker_contract"] == "NOT_APPLICABLE_STORAGE_RECOVERY"
+    # A different application digest is evaluated like any other image.
+    apply(db, connector, stopped, firmware="2.6.27", image="f" * 64)
+    assert alert_row(db, connector, "ESP_DELIVERY_WORKER_FAULT").state == "OPEN"
+    assert "worker_contract" not in connector.firmware_diagnostics
+    # So is the exact image on a connector outside the reviewed Peshawar scope.
+    other = live(db, second_connector(db))
+    apply(db, other, stopped, firmware="2.6.27", image=RECOVERY_DIGEST)
+    assert alert_row(db, other, "ESP_DELIVERY_WORKER_FAULT").state == "OPEN"
+
+
+def test_p02_shaped_legacy_worker_row_binds_inferred_previous_on_252(db, monkeypatch):
+    monkeypatch.setattr(settings, "device_health_derived_enabled", False)
+    connector = connector_fixture(db)
+    row = open_alert(db, connector, "ESP_DELIVERY_WORKER_FAULT", details={"diagnostics_schema_version": 2},
+                     seen=utc_now() - timedelta(days=1))
+    seen = ensure_utc(row.last_seen_at)
+    update_heartbeat(db, connector=connector, boot_id="p02-252", sequence=1, payload=HeartbeatPayload(
+        firmware_version="2.5.2", uptime_seconds=600, led_state="HEALTHY",
+        zkt={"online": True, "connection_state": "ONLINE", "serial": SERIAL}))
+    db.flush()
+    assert row.state == "OPEN" and row.details["binding"] == "INFERRED_PREVIOUS"
+    assert ensure_utc(row.last_seen_at) == seen
+    # The legacy writer still holds the device DEGRADED in SHADOW mode.
+    assert connector.lifecycle_state == "DEGRADED"
+    reason = evaluate_health(db, connector).reasons[0]
+    assert (reason.code, reason.tier, reason.currency, reason.gating) == (
+        "ESP_DELIVERY_WORKER_FAULT", "WARNING", "PREVIOUS_BOOT", True)
+    assert evaluate_health(db, connector).derived_lifecycle == "ONLINE_WITH_WARNINGS"
+
+
+def test_row_raised_on_this_boot_binds_inferred_current(db):
+    connector = live(db, connector_fixture(db), firmware="2.5.2")
+    row = open_alert(db, connector, "ESP_DELIVERY_WORKER_FAULT", seen=utc_now() - timedelta(seconds=60))
+    apply(db, connector, uptime=600)
+    assert (row.details["binding"], row.details["boot_id"]) == ("INFERRED_CURRENT", "boot-b")
+    assert alert_currency(row, connector) == "HELD"
+
+
+def test_worker_fault_still_failing_on_new_boot_is_rebound(db):
+    connector = live(db, connector_fixture(db))
+    connector.boot_id = "boot-a"
+    apply(db, connector, {"workers": [worker("add_delivery", "STOPPED"), worker("ords_delivery")]})
+    row = alert_row(db, connector, "ESP_DELIVERY_WORKER_FAULT")
+    first = row.details["boot_first_seen_at"]
+    assert (row.details["binding"], row.details["boot_id"]) == ("OBSERVED", "boot-a")
+    apply(db, connector, {"workers": [worker("add_delivery", "STOPPED"), worker("ords_delivery")]})
+    assert row.details["boot_first_seen_at"] == first  # carried within the boot
+    connector.boot_id = "boot-b"
+    apply(db, connector, {"workers": [worker("add_delivery", "FAULT"), worker("ords_delivery")]})
+    assert alert_row(db, connector, "ESP_DELIVERY_WORKER_FAULT").id == row.id and row.state == "OPEN"
+    assert row.details["boot_id"] == "boot-b" and row.details["boot_first_seen_at"] != first
+    assert row.message == "Attendance delivery worker fault: add_delivery FAULT."
+
+
+def heartbeat(db, connector, sequence, *, boot="boot-b", firmware="2.6.15", uptime=1000, led="HEALTHY",
+              diagnostics=None):
+    update_heartbeat(db, connector=connector, boot_id=boot, sequence=sequence, payload=HeartbeatPayload(
+        firmware_version=firmware, uptime_seconds=uptime, led_state=led,
+        zkt={"online": True, "connection_state": "ONLINE", "serial": SERIAL},
+        **({"diagnostics": diagnostics} if diagnostics is not None else {})))
+    db.flush()
+
+
+def legacy_sample(uptime=1000, **storage):
+    return {"storage": {"durability": "HEALTHY", "persistence_verified": True, "recovery_complete": True,
+                        "write_failures": 0, "read_failures": 0, **storage},
+            "workers": [worker("add_delivery", tick=uptime * 1000 - 1000),
+                        worker("ords_delivery", tick=uptime * 1000 - 1000)]}
+
+
+def test_durability_on_capable_firmware_is_held_until_verified(db):
+    connector = connector_fixture(db)
+    heartbeat(db, connector, 1, diagnostics=legacy_sample(durability="DEGRADED", write_failures=3))
+    row = alert_row(db, connector, "ESP_DURABILITY_FAULT")
+    residual = open_alert(db, connector, "ESP_PRESERVATION_UNVERIFIED", severity="WARNING",
+                          seen=utc_now() - timedelta(days=2))
+    residual_seen = ensure_utc(residual.last_seen_at)
+    assert row.details["evidence"]["storage"]["write_failures"] == 3
+    assert evaluate_health(db, connector).reasons[0].currency == "CURRENT"
+    heartbeat(db, connector, 2)  # no diagnostics: indeterminate on the same boot
+    reason = evaluate_health(db, connector).reasons[0]
+    assert (reason.code, reason.currency, reason.tier) == ("ESP_DURABILITY_FAULT", "HELD", "DEGRADED")
+    heartbeat(db, connector, 3, diagnostics=legacy_sample())
+    assert row.state == "RESOLVED" and row.details["resolution"]["kind"] == "VERIFIED"
+    assert residual.state == "RESOLVED" and residual.details["resolution"]["kind"] == "VERIFIED"
+    assert ensure_utc(residual.last_seen_at) == residual_seen
+
+
+def journal_sample(authority="ADD", *, uptime=100, phase="READY", owner=None, workers=None, storage=None):
+    tick = uptime * 1000 - 1000
+    return {
+        "schema_version": 2, "runtime_profile": "ZKT_JOURNAL_V1", "journal_format": 1,
+        "delivery_authority": authority,
+        "journal_runtime": {"observed": True, "phase": phase, "reader_ready": True,
+                            "writer_ready": authority == "ADD", "start_attempts": 1, "storage_starts": 1,
+                            "delivery_starts": 1, "capture_starts": 1, "proof_attempts": 0, "failures": 0},
+        "journal_storage": {"observed": True, "fresh": True, "ready": True, "durability": "HEALTHY",
+                            "checkpoint_recovery_pending": False, "mailbox_capacity": 8,
+                            "mailbox_high_watermark": 1, "pending_appends": 0, "sampled_uptime_ms": tick,
+                            **(owner or {})},
+        "storage": storage or {"durability": "HEALTHY", "persistence_verified": True, "recovery_complete": True},
+        "workers": workers if workers is not None else [
+            worker("storage_owner", tick=tick), worker("add_delivery", tick=tick),
+            {"name": "capture", "state": "RUNNING", "execution_model": "ON_DEMAND", "sampled_uptime_ms": tick,
+             "last_activity_uptime_ms": 0, "pending_requests": 0}],
+    }
+
+
+def test_unknown_authority_rules(db):
+    connector = live(db, connector_fixture(db), firmware="2.7.1")
+    early = [worker("storage_owner", "STOPPED"), worker("add_delivery", tick=1000)]
+    apply(db, connector, journal_sample("UNKNOWN", uptime=100, workers=early), uptime=100)
+    assert alert_row(db, connector, "ESP_DELIVERY_WORKER_FAULT") is None
+    assert alert_row(db, connector, "DELIVERY_AUTHORITY_UNKNOWN") is None
+    stale = [worker("storage_owner", tick=1000), worker("add_delivery", tick=1000)]
+    apply(db, connector, journal_sample("UNKNOWN", uptime=700, workers=stale), uptime=700)
+    assert alert_row(db, connector, "ESP_DELIVERY_WORKER_FAULT") is None
+    unknown = alert_row(db, connector, "DELIVERY_AUTHORITY_UNKNOWN")
+    assert unknown.state == "OPEN" and unknown.severity == "WARNING"
+    reason = next(r for r in evaluate_health(db, connector).reasons if r.code == "DELIVERY_AUTHORITY_UNKNOWN")
+    assert (reason.tier, reason.gating) == ("WARNING", False)
+    faulted = [worker("storage_owner", "FAULT"), worker("add_delivery")]
+    apply(db, connector, journal_sample("UNKNOWN", uptime=700, workers=faulted), uptime=700)
+    assert alert_row(db, connector, "ESP_DELIVERY_WORKER_FAULT").message == (
+        "Attendance delivery worker fault: storage_owner FAULT.")
+    unknown_seen = ensure_utc(unknown.last_seen_at)
+    apply(db, connector, journal_sample("ADD", uptime=800), uptime=800)
+    assert unknown.state == "RESOLVED" and ensure_utc(unknown.last_seen_at) == unknown_seen
+    assert alert_row(db, connector, "ESP_DELIVERY_WORKER_FAULT").state == "RESOLVED"
+
+
+@pytest.mark.parametrize("uptime,owner,storage,raised", [
+    (60, {"ready": False}, None, False),
+    (60, {"ready": False, "last_append_result": "IO"}, None, True),
+    (60, {"ready": False}, {"durability": "HEALTHY", "error_code": 5, "error_operation": "journal_append"}, True),
+    (700, {"ready": False}, None, True),
+])
+def test_journal_soft_owner_not_ready_is_starting_but_hard_evidence_raises(db, uptime, owner, storage, raised):
+    connector = live(db, connector_fixture(db), firmware="2.7.1")
+    apply(db, connector, journal_sample(uptime=uptime, phase="OWNER_START", owner=owner, storage=storage),
+          uptime=uptime)
+    row = alert_row(db, connector, "ESP_DURABILITY_FAULT")
+    assert (row is not None) is raised
+    if raised:
+        assert row.details["evidence"]["summary"].startswith("storage ")
+
+
+def latch_storage(source="add_connector.c:3764", **fields):
+    return {"durability": "DEGRADED", "persistence_verified": True, "recovery_complete": True, "write_failures": 0,
+            "read_failures": 0, "persistence_probe_failures": 0, "local_failure_source": source,
+            "used_bytes": 148, "total_bytes": 1000, **fields}
+
+
+@pytest.mark.parametrize("setting,source,fields,latch,tier", [
+    ("WARNING", "add_connector.c:3764", {}, "LED_LATCH_NO_IO_ERRORS", "WARNING"),
+    ("WARNING", "add_connector.c:3787", {}, "LED_LATCH_NO_IO_ERRORS", "WARNING"),
+    ("DEGRADED", "add_connector.c:3764", {}, "LED_LATCH_NO_IO_ERRORS", "DEGRADED"),
+    ("WARNING", "zone_lite.c:7389", {}, "LED_LATCH_NO_IO_ERRORS", "DEGRADED"),
+    ("WARNING", "add_connector.c:3764", {"write_failures": 207}, None, "DEGRADED"),
+    ("WARNING", "add_connector.c:3764", {"persistence_verified": False}, None, "DEGRADED"),
+])
+def test_led_latch_classification_on_2615(db, monkeypatch, setting, source, fields, latch, tier):
+    monkeypatch.setattr(settings, "device_health_latched_led_tier", setting)
+    connector = connector_fixture(db)
+    sample = legacy_sample()
+    sample["storage"] = latch_storage(source, **fields)
+    heartbeat(db, connector, 1, led="LOCAL_FAILURE", diagnostics=sample)
+    led, durability = alert_row(db, connector, "ESP_LOCAL_FAILURE"), alert_row(db, connector, "ESP_DURABILITY_FAULT")
+    for row in (led, durability):
+        assert row.state == "OPEN" and row.severity == "HIGH"
+        assert (row.details.get("latch") or {}).get("kind") == latch
+    if latch:
+        assert led.details["latch"] == {"kind": latch, "source": source, "firmware_version": "2.6.15"}
+    health = evaluate_health(db, connector)
+    assert {reason.code: reason.tier for reason in health.reasons} == {
+        "ESP_DURABILITY_FAULT": tier, "ESP_LOCAL_FAILURE": tier}
+    assert health.last_error_code == "ESP_DURABILITY_FAULT"
+    assert health.derived_lifecycle == ("ONLINE_WITH_WARNINGS" if tier == "WARNING" else "DEGRADED")
+
+
+def test_led_latch_is_removed_when_the_predicate_fails(db):
+    connector = connector_fixture(db)
+    sample = legacy_sample()
+    sample["storage"] = latch_storage()
+    heartbeat(db, connector, 1, led="LOCAL_FAILURE", diagnostics=sample)
+    assert alert_row(db, connector, "ESP_LOCAL_FAILURE").details["latch"]["kind"] == "LED_LATCH_NO_IO_ERRORS"
+    sample["storage"] = latch_storage(read_failures=1)
+    heartbeat(db, connector, 2, led="LOCAL_FAILURE", diagnostics=sample)
+    assert "latch" not in alert_row(db, connector, "ESP_LOCAL_FAILURE").details
+    assert "latch" not in alert_row(db, connector, "ESP_DURABILITY_FAULT").details
+    assert evaluate_health(db, connector).derived_lifecycle == "DEGRADED"
+
+
+def test_led_latch_with_verified_storage_on_current_firmware_is_a_warning(db):
+    connector = connector_fixture(db)
+    heartbeat(db, connector, 1, firmware="2.7.1", led="LOCAL_FAILURE", diagnostics=legacy_sample())
+    led = alert_row(db, connector, "ESP_LOCAL_FAILURE")
+    assert led.details["latch"]["kind"] == "LED_LATCH_STORAGE_VERIFIED"
+    assert alert_row(db, connector, "ESP_DURABILITY_FAULT") is None
+    health = evaluate_health(db, connector)
+    assert (health.derived_lifecycle, health.last_error_code) == ("ONLINE_WITH_WARNINGS", "ESP_LOCAL_FAILURE")
+
+
+def test_alert_details_carry_bounded_evidence_summary(db):
+    connector = live(db, connector_fixture(db))
+    workers = [worker(f"worker_{index}_" + "x" * 30, "STOPPED", operation="o" * 80, restart_count=index)
+               for index in range(8)]
+    apply(db, connector, {"workers": workers}, uptime=200)
+    details = alert_row(db, connector, "ESP_DELIVERY_WORKER_FAULT").details
+    assert set(details) >= {"diagnostics_schema_version", "boot_id", "firmware_version", "binding",
+                            "boot_first_seen_at", "evidence"}
+    evidence = details["evidence"]
+    assert len(evidence["summary"]) <= 300 and len(evidence["workers"]) == 8
+    assert evidence["workers"][0] == {"name": workers[0]["name"], "state": "STOPPED", "operation": "o" * 80,
+                                      "tick_age_ms": 101_000, "restart_count": 0}
+    apply(db, connector, {"storage": {"durability": "FULL", "error_operation": "queue_append", "error_code": 28,
+                                      "used_bytes": 99, "total_bytes": 100}}, uptime=200)
+    row = alert_row(db, connector, "ESP_DURABILITY_FAULT")
+    assert row.details["evidence"]["storage"]["used_percent"] == 99.0
+    assert row.message.startswith("Attendance preservation needs recovery: storage FULL; queue_append error 28")
