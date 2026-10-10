@@ -125,6 +125,7 @@ Use these runbooks before operating production:
 
 - [Physical ESP32-S3 provisioning and companion](docs/esp32-physical-provisioning.md)
 - [Architecture and behavior](docs/attendance-device-dashboard.md)
+- [Device health, alerts and stranded-alert cleanup](docs/add-device-health.md)
 - [Zone Lite secure automatic onboarding](docs/zone-lite-secure-auto-onboarding.md)
 - [Security model](docs/security-model.md)
 - [Production deployment and rollback](docs/production-runbook.md)
