@@ -140,6 +140,9 @@ def test_resolve_durability_leaves_residual_preservation_unverified(db):
     connector.ota_secure_boot = connector.ota_rollback_enabled = True
     hold = _post_verdict_hold(db, connector, run_completed_at=(utc_now() - timedelta(hours=1)).isoformat())
     assert hold == "POST_VERDICT_PERSISTENCE_FAULT"
+    # The residual is not a second chance to skip verification.
+    refused = resolve(client, headers, residual.id, key="resolve-key-residual")
+    assert refused.status_code == 409 and refused.json()["detail"]["code"] == "ALERT_CONDITION_CURRENT"
     # Verified storage from capable firmware clears the residual.
     heartbeat(db, connector, 1, firmware="2.6.15", diagnostics=legacy_sample())
     assert residual.state == "RESOLVED" and residual.details["resolution"]["kind"] == "VERIFIED"

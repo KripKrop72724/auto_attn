@@ -495,33 +495,50 @@ def mark_stale_connectors(now: datetime) -> list[dict]:
                 connector.lifecycle_state = "OFFLINE"
             updates.append({"connector_id": connector.connector_id, "state": connector.lifecycle_state,
                             "connected": False})
-        alert_after = now - timedelta(seconds=settings.esp_offline_alert_after_seconds)
-        alert_window = alert_after - timedelta(seconds=settings.esp_offline_alert_window_seconds)
+        session.flush()  # the alert pass below reads the transitions just made
+        # Alert once a device has been silent for two minutes, counting from its
+        # disconnect, so a device that died while ADD was down is alerted too and
+        # one that has been offline for longer than the window is not re-alerted.
+        silent_for = now - timedelta(seconds=settings.esp_offline_alert_after_seconds)
+        disconnected_since = silent_for - timedelta(seconds=settings.esp_offline_alert_window_seconds)
         open_offline = select(DeviceAlert.connector_id).where(
             DeviceAlert.code == "ESP_OFFLINE", DeviceAlert.state == "OPEN")
         for connector in session.scalars(
             select(Connector).where(
                 Connector.active == True, Connector.connected == False,  # noqa: E712
-                Connector.last_seen_at.is_not(None), Connector.last_seen_at >= alert_window,
-                Connector.last_seen_at < alert_after, Connector.id.not_in(open_offline),
+                Connector.last_seen_at.is_not(None), Connector.last_seen_at < silent_for,
+                Connector.last_disconnect_at.is_not(None), Connector.last_disconnect_at >= disconnected_since,
+                Connector.id.not_in(open_offline),
             ).order_by(Connector.id).with_for_update(skip_locked=True)
         ).all():
             upsert_alert(session, connector, code="ESP_OFFLINE", severity="HIGH",
                          message="ESP heartbeat is stale.",
                          details={"last_seen_at": ensure_utc(connector.last_seen_at).isoformat()})
-        if enforced:
-            silent = now - timedelta(seconds=settings.heartbeat_stale_degraded_seconds)
-            for connector in session.scalars(
-                select(Connector).where(
-                    Connector.active == True, Connector.connected == True,  # noqa: E712
-                    Connector.last_seen_at >= stale,
-                    Connector.lifecycle_state.not_in(
-                        ["OFFLINE", "DEGRADED", "QUARANTINED_DUPLICATE_SERIAL", "ONBOARDING"]),
-                    Connector.id.in_(select(ZKTDevice.connector_id).where(ZKTDevice.last_seen_at < silent)),
-                ).order_by(Connector.id).with_for_update(skip_locked=True)
-            ).all():
-                health = apply_device_health(session, connector, source="SWEEP", now=now)
-                updates.append({"connector_id": connector.connector_id, "state": health.derived_lifecycle})
+    if enforced:
+        # Separate, so a failure here never undoes the offline marking above.
+        try:
+            updates.extend(_mark_stale_heartbeats(now, stale))
+        except Exception:
+            logger.exception("Stale heartbeat sweep failed")
+    return updates
+
+
+def _mark_stale_heartbeats(now: datetime, stale: datetime) -> list[dict]:
+    """A connected ESP whose heartbeats stopped while other messages continue."""
+    updates = []
+    silent = now - timedelta(seconds=settings.heartbeat_stale_degraded_seconds)
+    with session_scope() as session:
+        for connector in session.scalars(
+            select(Connector).where(
+                Connector.active == True, Connector.connected == True,  # noqa: E712
+                Connector.last_seen_at >= stale,
+                Connector.lifecycle_state.not_in(
+                    ["OFFLINE", "DEGRADED", "QUARANTINED_DUPLICATE_SERIAL", "ONBOARDING"]),
+                Connector.id.in_(select(ZKTDevice.connector_id).where(ZKTDevice.last_seen_at < silent)),
+            ).order_by(Connector.id).with_for_update(skip_locked=True)
+        ).all():
+            health = apply_device_health(session, connector, source="SWEEP", now=now)
+            updates.append({"connector_id": connector.connector_id, "state": health.derived_lifecycle})
     return updates
 
 

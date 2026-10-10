@@ -1489,3 +1489,44 @@ def test_rejected_heartbeat_lets_sweep_mark_offline(db, envelopes, sweep):
     reject(connector, envelopes(connector, "heartbeat", {}), ValueError("DIAGNOSTICS_SAMPLE_MISMATCH"))
     sweep(10)
     assert (connector.connected, connector.lifecycle_state) == (False, "OFFLINE")
+
+
+def test_hikvision_huge_poll_epoch_never_breaks_terminal_link(db):
+    connector = live(db, connector_fixture(db), state="ONLINE", family="hikvision", firmware="3.1.0", poll_error=2)
+    connector.zkt_device.capability_profile = {"hikvision_health": {
+        "poll_error": 2, "last_successful_poll_epoch": 10 ** 18}}
+    assert terminal_link(connector)["state"] in {"RECONNECTING", "STARTING", "DISCONNECTED"}
+
+
+def test_2615_latch_survives_a_heartbeat_without_diagnostics(db):
+    connector = connector_fixture(db)
+    sample = legacy_sample()
+    sample["storage"] = latch_storage()
+    heartbeat(db, connector, 1, led="LOCAL_FAILURE", diagnostics=sample)
+    assert evaluate_health(db, connector).derived_lifecycle == "ONLINE_WITH_WARNINGS"
+    # 2.6.15 drops the whole diagnostics object when an allocation fails.
+    heartbeat(db, connector, 2, led="LOCAL_FAILURE")
+    health = evaluate_health(db, connector)
+    assert {reason.code: reason.tier for reason in health.reasons} == {
+        "ESP_DURABILITY_FAULT": "WARNING", "ESP_LOCAL_FAILURE": "WARNING"}
+    assert connector.lifecycle_state == "ONLINE_WITH_WARNINGS"
+    # A new boot starts without the old classification.
+    heartbeat(db, connector, 1, boot="boot-c", led="LOCAL_FAILURE")
+    assert "latch" not in alert_row(db, connector, "ESP_LOCAL_FAILURE").details
+
+
+def test_sweep_alerts_a_device_that_died_during_a_long_backend_outage(db, sweep):
+    connector = silent(db, live(db, connector_fixture(db)), 1800)  # still marked connected
+    sweep()
+    sweep(5)  # the next tick
+    assert (connector.connected, connector.lifecycle_state) == (False, "OFFLINE")
+    assert alert_row(db, connector, "ESP_OFFLINE").state == "OPEN"
+
+
+def test_fleet_counts_terminal_attention(db):
+    live(db, connector_fixture(db), state="RETRY_WAIT", offline_age=400)
+    live(db, second_connector(db), state="FLAPPING")
+    live(db, second_connector(db, 2), state="RECOVERING")
+    counts = fleet_counts(db)
+    assert counts["terminal_attention"] == 2
+    assert counts["total"] == 3

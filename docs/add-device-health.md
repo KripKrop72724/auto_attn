@@ -77,7 +77,10 @@ last seen, evidence and the condition that clears it. Currency is one of:
 
 `ESP_OFFLINE`, `TERMINAL_LINK_DOWN`, clock drift, `USER_SNAPSHOT_TRUNCATED` and
 the attendance, Oracle and source data codes have no health effect. The drawer
-lists them under "Other open items".
+lists them under "Other open items". `ESP_OFFLINE` is raised once a device has
+been silent for 2 minutes, counted from its disconnect, so an ordinary reboot
+does not alert. It is not raised again for a device disconnected more than 12
+minutes earlier.
 
 ### Owner decisions (10 October 2026)
 
@@ -137,7 +140,8 @@ characters and an idempotency key. Both are audited with before and after.
   fault is held on the same boot, and for workflow-owned or unknown codes.
   Resolving `ESP_DURABILITY_FAULT` leaves `ESP_PRESERVATION_UNVERIFIED`, a
   gating warning that the factory trial and the HIL post-verdict hold also
-  refuse, until capable firmware verifies storage.
+  refuse, until capable firmware verifies storage. That warning cannot itself
+  be resolved by hand.
 - **Re-evaluate device error** (`POST /api/v1/devices/{id}/clear-error`). It
   sets the stored device error to the derived value. It is refused while an
   active alert still backs the code, or if the code changed since you looked.

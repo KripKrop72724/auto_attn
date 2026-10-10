@@ -24,6 +24,7 @@ from sqlalchemy.orm import Session
 
 from zk_add.audit import append_audit
 from zk_add.device_health import (
+    CURRENT,
     DIAGNOSTICS_CODES,
     POLICY,
     PREVIOUS_BOOT,
@@ -175,6 +176,8 @@ def _cleared(session: Session, connector: Connector, row: DeviceAlert, open_code
             return CLEARED, True, f"Deployment {success.deployment_id} ({success.target_version}) succeeded later."
         return REVIEW, False, _latest_deployment(session, connector)
     if code in {"DEVICE_MESSAGE_REJECTED", "ADD_MESSAGE_PROCESSING_FAILED"}:
+        if alert_currency(row, connector, now=now) == CURRENT:
+            return None
         entries = _rejection_entries(row).values()
         old = all(not _entry_current(entry, now) and (
             (entry.get("boot_id") and entry.get("boot_id") != connector.boot_id)
@@ -355,7 +358,8 @@ def apply_plan(session: Session, *, body, actor: str, ip_address: str | None) ->
         raise CleanupError("SCOPE_CHANGED", "Device health changed since the preview; review a new preview.")
     candidates = {item["alert_id"]: item for item in plan["rows"]}
     alert_ids, fixes = sorted(set(body.alert_ids)), sorted(set(body.error_fix_connector_ids))
-    if not set(alert_ids) <= set(candidates) or not set(fixes) <= set(plan["scope"]):
+    fixable = {item["connector_id"] for item in plan["connectors"] if item["error_fix"]}
+    if not set(alert_ids) <= set(candidates) or not set(fixes) <= fixable:
         raise CleanupError("SELECTION_OUT_OF_SCOPE", "The selection is outside the previewed plan.")
     devices = {candidates[alert_id]["connector_id"] for alert_id in alert_ids} | set(fixes)
     if body.typed_confirmation.strip() != confirmation(len(alert_ids), len(devices)):

@@ -190,6 +190,15 @@ def _estimated_uptime(connector: Connector, now: datetime) -> float | None:
     return sampled / 1000 + (_age(now, connector.firmware_diagnostics_at) or 0)
 
 
+def _epoch(value) -> datetime | None:
+    if type(value) is not int or value <= 0:
+        return None
+    try:
+        return datetime.fromtimestamp(value, timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return None  # a terminal-reported epoch never breaks the heartbeat
+
+
 def _link(state, raw, since, reason, message) -> dict:
     return {"state": state, "raw_state": raw, "since": ensure_utc(since) if since else None,
             "reason": reason, "message": message}
@@ -259,10 +268,7 @@ def _hikvision_link(zkt: ZKTDevice, raw: str, now: datetime, uptime_seconds: flo
                      f"The Hikvision terminal check is failing ({reason}).")
     if raw == "ONLINE" and error != 2:
         return _link("CONNECTED", raw, zkt.last_transition_at, "LINK_UP", "The terminal link is up.")
-    last_success = health.get("last_successful_poll_epoch")
-    since = zkt.offline_since or (
-        datetime.fromtimestamp(last_success, timezone.utc)
-        if type(last_success) is int and last_success > 0 else zkt.last_transition_at)
+    since = zkt.offline_since or _epoch(health.get("last_successful_poll_epoch")) or zkt.last_transition_at
     age = _age(now, since)
     reason = "HIK_NETWORK" if error == 2 else raw
     if age is not None and age > settings.terminal_disconnected_warning_seconds:
@@ -626,6 +632,9 @@ def operator_policy(reason: Reason, *, duplicate_claimed: bool | None = None) ->
         return refuse("ALERT_WORKFLOW_OWNED", "Its own review workflow resolves this alert.")
     if reason.code not in POLICY:
         return refuse("ALERT_WORKFLOW_OWNED", "This alert code has no reviewed operator resolution.")
+    if reason.code == "ESP_PRESERVATION_UNVERIFIED":
+        return refuse("ALERT_CONDITION_CURRENT",
+                      "Preservation stays unverified until firmware that reports storage verifies it.")
     if reason.code == "QUARANTINED_DUPLICATE_SERIAL":
         if duplicate_claimed is False:
             return {"resolvable": True, "refusal_code": None, "refusal": None}

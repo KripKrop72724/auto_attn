@@ -252,3 +252,25 @@ def test_health_switches_are_deployable_repository_variables():
                 f"${{{{ vars.ADD_DEVICE_HEALTH_{flag}_ENABLED }}}}") in workflow
     assert 'foreach ($healthFlag in @("DERIVED", "CLEANUP_APPLY"))' in deploy
     assert '$environment["ADD_DEVICE_HEALTH_${healthFlag}_ENABLED"] = $deployValue' in deploy
+
+
+def test_current_rejection_is_never_a_cleanup_candidate(db, fleet):
+    current = open_alert(db, fleet["p06"], "DEVICE_MESSAGE_REJECTED",
+                         details={"message_type": "attendance_batch", "error_category": "SCHEMA_INVALID"})
+    client, _headers = admin_client(db)
+    assert current.id not in {row["alert_id"] for row in preview(client)["rows"]}
+
+
+def test_error_fix_for_a_blocked_device_is_out_of_scope(db, fleet):
+    observed = deployment(db, fleet["p06"], status="BOOTED_PENDING", index=6)
+    db.add(FirmwareHilRun(run_id="hil-run-2", deployment_id=observed.id, connector_id=fleet["p06"].id,
+                          release_id=observed.release_id, actor="test", idempotency_key="hil", target={},
+                          release_identity={}, baseline={}, ends_at=utc_now() + timedelta(hours=1)))
+    db.commit()
+    client, headers = admin_client(db)
+    plan = preview(client)
+    assert plan["blocked"] == [{"connector_id": P06[0], "reason": "HIL_OBSERVING"}]
+    response = apply(client, headers, plan, alert_ids=[], fixes=[P06[0]], confirmation="RESOLVE 0 ALERTS ON 1 DEVICES")
+    assert response.status_code == 409 and response.json()["detail"]["code"] == "SELECTION_OUT_OF_SCOPE"
+    db.refresh(fleet["p06"])
+    assert fleet["p06"].last_error_code == "ESP_DELIVERY_WORKER_FAULT"

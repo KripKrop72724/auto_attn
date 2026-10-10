@@ -800,7 +800,7 @@ def apply_firmware_diagnostics(session: Session, connector: Connector, payload: 
                 connector.lifecycle_state = "DEGRADED"
             connector.last_error_code = code
             connector.last_error_message = message
-    led_row = open_alert_row(session, connector, "ESP_LOCAL_FAILURE")
+    led_row = open_alert_row(session, connector, "ESP_LOCAL_FAILURE") if evidence is not None else None
     if led_row is not None and (latch or "latch" in (led_row.details or {})):
         details = {key: value for key, value in (led_row.details or {}).items() if key != "latch"}
         led_row.details = {**details, "latch": latch} if latch else details
@@ -1252,8 +1252,8 @@ def update_heartbeat(
         connector.last_error_message = message
         existing = open_alert_row(session, connector, code)
         previous = (existing.details or {}) if existing is not None else {}
-        first_uptime = (previous.get("first_uptime_seconds") if previous.get("boot_id") == boot_id
-                        else payload.uptime_seconds)
+        same_boot = previous.get("boot_id") == boot_id
+        first_uptime = previous.get("first_uptime_seconds") if same_boot else payload.uptime_seconds
         upsert_alert(
             session,
             connector,
@@ -1269,6 +1269,9 @@ def update_heartbeat(
                     code == "ESP_LOCAL_FAILURE" and first_uptime is not None
                     and first_uptime <= settings.led_boot_time_hold_uptime_seconds
                     and diagnostics_reporting(connector) == "NOT_REPORTED_BY_FIRMWARE"),
+                # Diagnostics re-classify the latch below; a sample without
+                # them keeps this boot's classification, like the durability row.
+                **({"latch": previous["latch"]} if same_boot and previous.get("latch") else {}),
             },
         )
     elif reported_led_state and reported_led_state not in {"STATE_LOCK_BUSY", "UNAVAILABLE"}:
@@ -5923,6 +5926,16 @@ def resolve_message_rejection(
 
 
 def fleet_counts(session: Session) -> dict:
+    from sqlalchemy.orm import selectinload
+
+    now = utc_now()
+    terminal_attention = sum(
+        terminal_link(connector, now)["state"] in {"DISCONNECTED", "FLAPPING", "ERROR"}
+        for connector in session.scalars(
+            select(Connector).options(selectinload(Connector.zkt_device))
+            .where(Connector.active.is_(True), Connector.is_spare.is_(False))
+        ).all()
+    )
     rows = session.execute(
         select(Connector.lifecycle_state, func.count(Connector.id))
         .where(Connector.is_spare.is_(False))
@@ -5930,6 +5943,7 @@ def fleet_counts(session: Session) -> dict:
     ).all()
     counts = {state.lower(): count for state, count in rows}
     counts["total"] = sum(counts.values())
+    counts["terminal_attention"] = terminal_attention
     counts["spares"] = (
         session.scalar(select(func.count(Connector.id)).where(Connector.is_spare.is_(True))) or 0
     )
