@@ -124,7 +124,7 @@ export function AppShell({
               <Icon name={item.icon} />
               <span>{item.label}</span>
               {item.id === 'alerts' && openAlertCount > 0 && (
-                <span className="nav-count" aria-label={`${openAlertCount} open alerts`}>{openAlertCount > 99 ? '99+' : openAlertCount}</span>
+                <span className="nav-count" aria-label={`${openAlertCount} alert${openAlertCount === 1 ? '' : 's'} need${openAlertCount === 1 ? 's' : ''} action`}>{openAlertCount > 99 ? '99+' : openAlertCount}</span>
               )}
             </button>
           ))}

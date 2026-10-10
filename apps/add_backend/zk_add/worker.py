@@ -5,6 +5,7 @@ from collections import deque
 from datetime import datetime, timedelta
 import hashlib
 import json
+import logging
 import re
 import time
 
@@ -61,6 +62,7 @@ from zk_add.service import (
     upsert_alert,
 )
 from zk_add.attendance_recovery import advance_attendance_recovery_jobs
+from zk_add.device_health import apply_device_health
 from zk_add.settings import settings
 from zk_add.time_utils import ensure_utc, utc_now
 from zk_add.reconciliation import (
@@ -460,6 +462,86 @@ async def dispatch_reconciliation_assignments(
     )
 
 
+logger = logging.getLogger(__name__)
+# Heartbeats that arrived while this process was down were never seen; give
+# connectors time to reconnect before any of them is marked offline.
+PROCESS_STARTED_AT = utc_now()
+
+
+def mark_stale_connectors(now: datetime) -> list[dict]:
+    """Mark silent connectors OFFLINE in a short transaction of its own.
+
+    Rows a heartbeat holds are skipped and re-checked under their lock, so a
+    fresher heartbeat is never overwritten. ESP_OFFLINE waits until a device
+    has been silent for two minutes and is raised once per outage.
+    """
+    if now < PROCESS_STARTED_AT + timedelta(seconds=settings.offline_startup_grace_seconds):
+        return []
+    enforced = settings.device_health_derived_enabled
+    kept = {"OFFLINE", "QUARANTINED_DUPLICATE_SERIAL"} if enforced else {"OFFLINE"}
+    stale = now - timedelta(seconds=settings.offline_after_seconds)
+    updates = []
+    with session_scope() as session:
+        for connector in session.scalars(
+            select(Connector).where(
+                Connector.active == True,  # noqa: E712
+                Connector.last_seen_at.is_not(None), Connector.last_seen_at < stale,
+                or_(Connector.connected == True, Connector.lifecycle_state.not_in(kept)),  # noqa: E712
+            ).order_by(Connector.id).with_for_update(skip_locked=True)
+        ).all():
+            connector.connected = False
+            connector.last_disconnect_at = now
+            if connector.lifecycle_state not in kept:
+                connector.lifecycle_state = "OFFLINE"
+            updates.append({"connector_id": connector.connector_id, "state": connector.lifecycle_state,
+                            "connected": False})
+        session.flush()  # the alert pass below reads the transitions just made
+        # Alert once a device has been silent for two minutes, counting from its
+        # disconnect, so a device that died while ADD was down is alerted too and
+        # one that has been offline for longer than the window is not re-alerted.
+        silent_for = now - timedelta(seconds=settings.esp_offline_alert_after_seconds)
+        disconnected_since = silent_for - timedelta(seconds=settings.esp_offline_alert_window_seconds)
+        open_offline = select(DeviceAlert.connector_id).where(
+            DeviceAlert.code == "ESP_OFFLINE", DeviceAlert.state == "OPEN")
+        for connector in session.scalars(
+            select(Connector).where(
+                Connector.active == True, Connector.connected == False,  # noqa: E712
+                Connector.last_seen_at.is_not(None), Connector.last_seen_at < silent_for,
+                Connector.last_disconnect_at.is_not(None), Connector.last_disconnect_at >= disconnected_since,
+                Connector.id.not_in(open_offline),
+            ).order_by(Connector.id).with_for_update(skip_locked=True)
+        ).all():
+            upsert_alert(session, connector, code="ESP_OFFLINE", severity="HIGH",
+                         message="ESP heartbeat is stale.",
+                         details={"last_seen_at": ensure_utc(connector.last_seen_at).isoformat()})
+    if enforced:
+        # Separate, so a failure here never undoes the offline marking above.
+        try:
+            updates.extend(_mark_stale_heartbeats(now, stale))
+        except Exception:
+            logger.exception("Stale heartbeat sweep failed")
+    return updates
+
+
+def _mark_stale_heartbeats(now: datetime, stale: datetime) -> list[dict]:
+    """A connected ESP whose heartbeats stopped while other messages continue."""
+    updates = []
+    silent = now - timedelta(seconds=settings.heartbeat_stale_degraded_seconds)
+    with session_scope() as session:
+        for connector in session.scalars(
+            select(Connector).where(
+                Connector.active == True, Connector.connected == True,  # noqa: E712
+                Connector.last_seen_at >= stale,
+                Connector.lifecycle_state.not_in(
+                    ["OFFLINE", "DEGRADED", "QUARANTINED_DUPLICATE_SERIAL", "ONBOARDING"]),
+                Connector.id.in_(select(ZKTDevice.connector_id).where(ZKTDevice.last_seen_at < silent)),
+            ).order_by(Connector.id).with_for_update(skip_locked=True)
+        ).all():
+            health = apply_device_health(session, connector, source="SWEEP", now=now)
+            updates.append({"connector_id": connector.connector_id, "state": health.derived_lifecycle})
+    return updates
+
+
 def prepare_maintenance_tick(
     now: datetime,
 ) -> tuple[list[tuple[str, dict]], list[dict], list[dict], list[tuple[str, dict]], list[dict]]:
@@ -470,21 +552,12 @@ def prepare_maintenance_tick(
     reconciliation_updates: list[dict] = []
     reconciliation_dispatch: list[tuple[str, dict]] = []
     provisioning_updates: list[dict] = []
+    try:
+        connector_updates.extend(mark_stale_connectors(now))
+    except Exception:
+        # Offline marking must not starve deletion, delivery or recovery work.
+        logger.exception("Stale connector sweep failed")
     with session_scope() as session:
-        for connector in session.scalars(select(Connector).where(Connector.active == True)):  # noqa: E712
-            if connector.last_seen_at and connector.last_seen_at + timedelta(seconds=settings.offline_after_seconds) < now:
-                if connector.connected or connector.lifecycle_state != "OFFLINE":
-                    connector.connected = False
-                    connector.lifecycle_state = "OFFLINE"
-                    connector.last_disconnect_at = now
-                    upsert_alert(
-                        session,
-                        connector,
-                        code="ESP_OFFLINE",
-                        severity="HIGH",
-                        message="ESP heartbeat is stale.",
-                    )
-                    connector_updates.append({"connector_id": connector.connector_id, "state": "OFFLINE"})
         advance_user_deletion_jobs(session)
         repair_missing_terminal_provenance(session)
         repair_attendance_delivery_backlog(session, limit=ORDS_DELIVERY_BATCH_SIZE)

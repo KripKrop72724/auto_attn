@@ -1,11 +1,234 @@
 export type DeviceState =
   | 'ONLINE'
+  | 'ONLINE_WITH_WARNINGS'
   | 'OFFLINE'
   | 'DEGRADED'
   | 'FLAPPING'
   | 'ONBOARDING'
   | 'QUARANTINED_DUPLICATE_SERIAL'
   | string
+
+export type HealthMode = 'SHADOW' | 'ENFORCED' | string
+export type HealthCurrency = 'CURRENT' | 'HELD' | 'PREVIOUS_BOOT' | 'LATCHED' | string
+export type TerminalLinkState =
+  | 'CONNECTED'
+  | 'STABILIZING'
+  | 'MAINTENANCE'
+  | 'STARTING'
+  | 'RECONNECTING'
+  | 'DISCONNECTED'
+  | 'FLAPPING'
+  | 'ERROR'
+  | 'UNKNOWN'
+  | string
+
+// Terminal link status is derived separately from the ESP lifecycle tier.
+// reason is a short code (LINK_UP, STABILIZING_STALLED, ESP_DISCONNECTED, ... or
+// the raw firmware state); message is operator text.
+export interface TerminalLink {
+  state: TerminalLinkState
+  raw_state: string | null
+  since: string | null
+  reason: string | null
+  message: string | null
+}
+
+export interface HealthOperatorPolicy {
+  resolvable: boolean
+  refusal_code: 'DERIVED_REASON' | 'ALERT_WORKFLOW_OWNED' | 'ALERT_CONDITION_CURRENT' | string | null
+  refusal: string | null
+}
+
+export interface HealthLatch {
+  kind: 'LED_LATCH_NO_IO_ERRORS' | 'LED_LATCH_STORAGE_VERIFIED' | string
+  source: string | null
+  firmware_version: string | null
+}
+
+// One reason behind the derived tier: an OPEN alert mapped through the health
+// policy, or a derived condition (HEARTBEAT_STALE, TERMINAL_DISCONNECTED,
+// TERMINAL_STABILIZING_STALLED) without an alert_id. other_active_alerts use
+// the same shape with a null tier.
+export interface HealthReason {
+  code: string
+  error_code: string | null
+  tier: 'DEGRADED' | 'WARNING' | string | null
+  currency: HealthCurrency
+  gating: boolean
+  severity: string | null
+  message: string
+  since: string | null
+  last_seen_at: string | null
+  alert_id: number | null
+  alert_state: string | null
+  acknowledged_at: string | null
+  acknowledged_by: string | null
+  boot_id: string | null
+  firmware_version: string | null
+  binding: 'OBSERVED' | 'INFERRED_CURRENT' | 'INFERRED_PREVIOUS' | string | null
+  latch: HealthLatch | null
+  evidence_summary: string | null
+  // A full sentence, for example "Clears when the terminal link reconnects."
+  clear_condition: string | null
+  operator: HealthOperatorPolicy
+}
+
+// "What ADD can verify on this firmware".
+export interface Coverage {
+  key: 'storage' | 'workers' | 'preservation' | 'led' | string
+  label: string
+  status: 'REPORTED' | 'NOT_REPORTED_BY_FIRMWARE' | 'MISSING' | 'ACTIVE' | string
+  detail: string | null
+}
+
+// code is the stored last_error_code; derived_code is what the health model derives.
+export interface DeviceErrorState {
+  code: string | null
+  message: string | null
+  derived_code: string | null
+  backed: boolean
+  backing_alert_ids: number[]
+}
+
+export interface HealthPrimaryReason {
+  code: string
+  error_code: string | null
+  tier: string | null
+  message: string
+  since: string | null
+}
+
+// GET /api/v1/devices rows carry the summary; GET /api/v1/devices/{id} adds the
+// detail fields. Older backends omit health entirely.
+export interface DeviceHealth {
+  mode: HealthMode
+  tier: 'ONLINE' | 'ONLINE_WITH_WARNINGS' | 'DEGRADED' | 'OFFLINE' | string
+  derived_lifecycle: string
+  last_error_code: string | null
+  primary: HealthPrimaryReason | null
+  degraded_count: number
+  warning_count: number
+  evaluated_at?: string
+  lifecycle_state?: string
+  reasons?: HealthReason[]
+  other_active_alerts?: HealthReason[]
+  terminal_link?: TerminalLink | null
+  coverage?: Coverage[]
+  device_error?: DeviceErrorState | null
+}
+
+export interface AlertResolution {
+  kind: 'VERIFIED' | 'CONDITION_CLEARED' | 'MESSAGE_ACCEPTED' | 'DEPLOYMENT_SUCCEEDED' | 'BOOT_ENDED' | 'OPERATOR' | 'CLEANUP' | string
+  actor?: string | null
+  reason?: string | null
+  at?: string | null
+  [key: string]: unknown
+}
+
+export type AlertQueue = 'NEEDS_ACTION' | 'ACKNOWLEDGED' | 'ACTIVE' | 'RESOLVED' | 'ALL'
+
+export interface AlertQueueTotals {
+  needs_action: number
+  acknowledged: number
+  resolved: number
+  all: number
+}
+
+export interface AlertResolveResponse {
+  alert: Alert
+  device_state: string | null
+  device_error: Partial<DeviceErrorState> | null
+  residual_alert_id: number | null
+}
+
+export interface DeviceErrorClearResponse {
+  device_state: string | null
+  device_error: Partial<DeviceErrorState> | null
+}
+
+export type CleanupClass = 'STRANDED_DIAGNOSTICS' | 'CONDITION_CLEARED' | 'SUPERSEDED_ACK' | 'STALE_ERROR_CODE' | 'REVIEW' | string
+
+// One OPEN or legacy-ACKNOWLEDGED alert classified by the stranded-alert plan.
+// A STALE_ERROR_CODE row without an alert_id is a per-device error fix.
+export interface CleanupPreviewRow {
+  alert_id: number | null
+  connector_id: string
+  code: string
+  state: string
+  severity?: string | null
+  message?: string | null
+  class: CleanupClass
+  review?: boolean
+  default_selected: boolean
+  rationale: string | null
+  evidence: string | Record<string, unknown> | null
+  raising_firmware?: string | null
+  raising_boot_id?: string | null
+  current_firmware?: string | null
+  current_boot_id?: string | null
+  first_seen_at?: string | null
+  last_seen_at?: string | null
+  residual_code?: string | null
+}
+
+export interface CleanupConnectorEffect {
+  connector_id: string
+  display_name?: string | null
+  zone_id?: string | null
+  lifecycle_state?: string | null
+  derived_lifecycle_before?: string | null
+  derived_lifecycle_after?: string | null
+  last_error_before?: string | null
+  last_error_after?: string | null
+  // Class D (STALE_ERROR_CODE): a preselected SET_LAST_ERROR_CODE to the
+  // derived value, applied through error_fix_connector_ids.
+  error_fix?: boolean
+  hold_effects?: string[] | Array<Record<string, unknown>> | Record<string, unknown> | null
+  residuals?: string[] | null
+}
+
+export interface CleanupBlockedConnector {
+  connector_id: string
+  display_name?: string | null
+  reason: string
+}
+
+export interface CleanupSkippedRow {
+  alert_id?: number | null
+  connector_id: string
+  code?: string | null
+  reason: string
+}
+
+export interface CleanupScopeTarget {
+  connector_id: string
+  mac?: string | null
+  terminal_serial?: string | null
+}
+
+export interface CleanupPreview {
+  digest: string
+  expires_at: string
+  signature: string
+  typed_confirmation: string
+  suggested_first_scope: Array<string | CleanupScopeTarget>
+  rows: CleanupPreviewRow[]
+  connectors: CleanupConnectorEffect[]
+  blocked: CleanupBlockedConnector[]
+  skipped: CleanupSkippedRow[]
+  counts: Record<string, number>
+}
+
+// The stored DEVICE_HEALTH_CLEANUP_APPLIED summary; a replay returns the same body.
+export interface CleanupApply {
+  request_id?: string | null
+  digest?: string | null
+  counts?: Record<string, number>
+  resolved_alert_ids?: number[]
+  residual_alert_ids?: number[]
+  error_fix_connector_ids?: string[]
+  replayed?: boolean
+}
 
 export interface PaginatedResponse<T> {
   rows: T[]
@@ -38,6 +261,7 @@ export interface AlertQueueResponse {
   rows: Array<Alert & { device: Pick<Device, 'connector_id' | 'display_name' | 'zone_id' | 'hardware_id'> }>
   next_cursor: string | null
   totals: { all: number; open: number; acknowledged: number; resolved: number }
+  queue_totals?: AlertQueueTotals
 }
 
 export interface AttendanceQuarantineItem {
@@ -301,6 +525,8 @@ export interface Device {
   zkt: ZktDevice | null
   active_command?: Command | null
   active_lease?: Lease | null
+  terminal_link?: TerminalLink | null
+  health?: DeviceHealth | null
 }
 
 export interface CommKeyOperation {
@@ -347,12 +573,15 @@ export interface Overview {
   total: number
   spares?: number
   online?: number
+  online_with_warnings?: number
   offline?: number
   degraded?: number
   flapping?: number
   onboarding?: number
   quarantined_duplicate_serial?: number
   open_alerts: number
+  open_unacknowledged_alerts?: number
+  terminal_attention?: number
   active_leases: number
   ords_delivery?: {
     backlog: number
@@ -1509,7 +1738,9 @@ export interface Alert {
   first_seen_at: string
   last_seen_at: string
   acknowledged_at: string | null
+  acknowledged_by?: string | null
   resolved_at: string | null
+  resolution?: AlertResolution | null
 }
 
 export interface Lease {

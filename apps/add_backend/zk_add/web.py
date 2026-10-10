@@ -87,6 +87,7 @@ from zk_add.realtime import browser_events, connector_hub, sse_encode
 from zk_add.schemas import (
     AdminLeaseRequest,
     AlertAcknowledgeRequest,
+    AlertResolveRequest,
     BulkUserDeleteCancelRequest,
     BulkUserDeleteRequest,
     CommandUpdate,
@@ -103,6 +104,9 @@ from zk_add.schemas import (
     LoginRequest,
     OnboardRequest,
     DeviceLogIn,
+    DeviceErrorClearRequest,
+    HealthCleanupApplyRequest,
+    HealthCleanupPreviewRequest,
     DeviceSpareUpdateRequest,
     AttendanceRecoveryControlRequest,
     AttendanceRecoveryCreateRequest,
@@ -164,6 +168,7 @@ from zk_add.service import (
     reconcile_device_user_identity_conflicts,
     reconcile_admin_lease_command,
     resolve_historical_event_group_to_current_identity,
+    record_message_rejection,
     resolve_message_rejection,
     onboard_connector,
     serialize_command,
@@ -172,7 +177,15 @@ from zk_add.service import (
     terminal_fingerprint_preconditions,
     update_heartbeat,
     update_device_user_command,
-    upsert_alert,
+)
+from zk_add.device_health_actions import HealthActionError, clear_device_error, resolve_alert_by_operator
+from zk_add.device_health_cleanup import CleanupError, apply_plan as apply_cleanup_plan, preview as cleanup_preview
+from zk_add.device_health import (
+    apply_device_health,
+    evaluate_health,
+    evaluate_health_batch,
+    health_detail,
+    shadow_report,
 )
 from zk_add.settings import settings
 from zk_add.comm_keys import (
@@ -1070,7 +1083,9 @@ def list_devices(
                 Connector.hardware_id.ilike(like),
             )
         )
-    return {"rows": [serialize_connector(row) for row in db.scalars(statement).all()]}
+    rows = db.scalars(statement).all()
+    healths = evaluate_health_batch(db, rows)
+    return {"rows": [serialize_connector(row, health=healths[row.id]) for row in rows]}
 
 
 def connector_or_404(db: Session, connector_id: str) -> Connector:
@@ -1098,11 +1113,20 @@ def get_device(connector_id: str, auth: tuple[Session, AdminContext] = Depends(r
                 TemporaryAdminLease.state.in_(["GRANTING", "ACTIVE", "REVOKING", "OVERDUE"]),
             ).order_by(TemporaryAdminLease.requested_at.desc()).limit(1)
         )
+    health = evaluate_health(db, connector)
     return {
         **serialize_connector(connector),
+        "health": health_detail(db, connector, health),
         "active_command": command_response(active_command) if active_command else None,
         "active_lease": serialize_lease(active_lease) if active_lease else None,
     }
+
+
+@app.get("/api/v1/device-health/shadow")
+def device_health_shadow(auth: tuple[Session, AdminContext] = Depends(require_admin)):
+    """Read-only: where the derived lifecycle and error differ from the stored pair."""
+    db, _context = auth
+    return shadow_report(db)
 
 
 @app.patch("/api/v1/devices/{connector_id}/spare")
@@ -3477,12 +3501,43 @@ def connectivity_history(
     }
 
 
+ALERT_QUEUE_PATTERN = "^(NEEDS_ACTION|ACKNOWLEDGED|ACTIVE|RESOLVED|ALL)$"
+
+
+def alert_queue_filters(queue: str | None) -> list:
+    """Operator queues over the alert lifecycle.
+
+    Acknowledgement annotates an OPEN alert. Rows acknowledged before that
+    change keep the legacy ACKNOWLEDGED state and stay in the acknowledged queue.
+    """
+    if queue is None or queue == "ALL":
+        return []
+    if queue == "NEEDS_ACTION":
+        return [DeviceAlert.state == "OPEN", DeviceAlert.acknowledged_at.is_(None)]
+    if queue == "ACKNOWLEDGED":
+        return [or_(
+            and_(DeviceAlert.state == "OPEN", DeviceAlert.acknowledged_at.is_not(None)),
+            DeviceAlert.state == "ACKNOWLEDGED",
+        )]
+    if queue == "ACTIVE":
+        return [DeviceAlert.state.in_(["OPEN", "ACKNOWLEDGED"])]
+    return [DeviceAlert.state == "RESOLVED"]
+
+
 @app.get("/api/v1/devices/{connector_id}/alerts")
-def alerts(connector_id: str, auth: tuple[Session, AdminContext] = Depends(require_admin)):
+def alerts(
+    connector_id: str,
+    queue: str | None = Query(default=None, pattern=ALERT_QUEUE_PATTERN),
+    limit: int = Query(default=200, ge=1, le=500),
+    auth: tuple[Session, AdminContext] = Depends(require_admin),
+):
     db, _context = auth
     connector = connector_or_404(db, connector_id)
     rows = db.scalars(
-        select(DeviceAlert).where(DeviceAlert.connector_id == connector.id).order_by(DeviceAlert.last_seen_at.desc())
+        select(DeviceAlert)
+        .where(DeviceAlert.connector_id == connector.id, *alert_queue_filters(queue))
+        .order_by(DeviceAlert.last_seen_at.desc(), DeviceAlert.id.desc())
+        .limit(limit)
     ).all()
     return {"rows": [serialize_alert(row) for row in rows]}
 
@@ -3493,13 +3548,14 @@ def global_alerts(
     severity: str | None = None,
     connector_id: str | None = None,
     zone_id: str | None = None,
+    queue: str | None = Query(default=None, pattern=ALERT_QUEUE_PATTERN),
     limit: int = Query(default=100, ge=1, le=500),
     cursor: str | None = None,
     auth: tuple[Session, AdminContext] = Depends(require_admin),
 ):
     db, _context = auth
     scope_filters = [Connector.is_spare.is_(False)]
-    state_filter = []
+    state_filter = alert_queue_filters(queue)
     if state:
         state_filter.append(DeviceAlert.state == state.strip().upper())
     if severity:
@@ -3545,17 +3601,19 @@ def global_alerts(
         .limit(limit + 1)
     ).all()
     page = rows[:limit]
-    def count_for(alert_state: str | None = None) -> int:
-        state_filter = [DeviceAlert.state == alert_state] if alert_state else []
+    def count_where(filters: list) -> int:
         return int(
             db.scalar(
                 select(func.count(DeviceAlert.id))
                 .select_from(DeviceAlert)
                 .join(Connector, Connector.id == DeviceAlert.connector_id)
-                .where(*scope_filters, *state_filter)
+                .where(*scope_filters, *filters)
             )
             or 0
         )
+
+    def count_for(alert_state: str | None = None) -> int:
+        return count_where([DeviceAlert.state == alert_state] if alert_state else [])
 
     next_cursor = None
     if len(rows) > limit and page:
@@ -3595,6 +3653,12 @@ def global_alerts(
             "acknowledged": count_for("ACKNOWLEDGED"),
             "resolved": count_for("RESOLVED"),
         },
+        "queue_totals": {
+            "needs_action": count_where(alert_queue_filters("NEEDS_ACTION")),
+            "acknowledged": count_where(alert_queue_filters("ACKNOWLEDGED")),
+            "resolved": count_where(alert_queue_filters("RESOLVED")),
+            "all": count_for(),
+        },
     }
 
 
@@ -3609,8 +3673,31 @@ def acknowledge_alert(
     row = db.get(DeviceAlert, alert_id)
     if row is None:
         raise HTTPException(status_code=404, detail="Alert not found.")
-    row.state = "ACKNOWLEDGED"
+    # Heartbeats lock the connector before its alerts; keep the same order.
+    db.scalar(select(Connector).where(Connector.id == row.connector_id).with_for_update())
+    row = db.scalar(
+        select(DeviceAlert)
+        .where(DeviceAlert.id == alert_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail="Alert not found.")
+    if row.state == "RESOLVED":
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "ALERT_NOT_ACTIVE", "message": "This alert is already resolved."},
+        )
+    if row.state == "ACKNOWLEDGED" or row.acknowledged_at is not None:
+        return serialize_alert(row)
+    # Acknowledgement is an annotation: the alert stays OPEN, keeps driving
+    # device health, and later evidence refreshes the same row.
     row.acknowledged_at = utc_now()
+    row.details = {
+        **(row.details or {}),
+        "acknowledged_by": context.username,
+        "acknowledgement_note": body.note,
+    }
     append_audit(
         db,
         actor=context.username,
@@ -3619,9 +3706,102 @@ def acknowledge_alert(
         target_id=str(alert_id),
         outcome="SUCCESS",
         ip_address=client_ip(request),
-        after={"note": body.note},
+        before={"state": "OPEN", "acknowledged_at": None},
+        after={"state": "OPEN", "acknowledged_at": row.acknowledged_at.isoformat(), "note": body.note},
     )
     return serialize_alert(row)
+
+
+def _publish_health_action(background_tasks: BackgroundTasks, connector: Connector | None,
+                           alert: DeviceAlert | None = None) -> None:
+    if alert is not None:
+        background_tasks.add_task(browser_events.publish, "alert", serialize_alert(alert))
+    if connector is not None:
+        background_tasks.add_task(browser_events.publish, "device", serialize_connector(connector))
+
+
+@app.post("/api/v1/alerts/{alert_id}/resolve")
+def resolve_alert_with_reason(
+    request: Request,
+    alert_id: int,
+    body: AlertResolveRequest,
+    background_tasks: BackgroundTasks,
+    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+):
+    """Resolve an alert whose condition the latest evidence no longer asserts."""
+    db, context = auth
+    require_step_up(body.password, db, context)  # before any row lock
+    try:
+        result = resolve_alert_by_operator(
+            db, alert_id=alert_id, actor=context.username, reason=body.reason,
+            idempotency_key=body.idempotency_key, ip_address=client_ip(request))
+    except HealthActionError as error:
+        raise HTTPException(status_code=error.status, detail=error.detail) from error
+    alert = db.get(DeviceAlert, result["alert_id"])
+    connector = db.get(Connector, alert.connector_id)
+    db.commit()
+    if not result.get("replayed"):
+        _publish_health_action(background_tasks, connector, alert)
+    return {**result, "alert": serialize_alert(alert)}
+
+
+@app.post("/api/v1/device-health/cleanup/preview")
+def preview_device_health_cleanup(
+    body: HealthCleanupPreviewRequest,
+    auth: tuple[Session, AdminContext] = Depends(require_admin),
+):
+    """Read-only: stranded alerts and stale device errors, with a signed plan."""
+    db, context = auth
+    try:
+        return cleanup_preview(db, connector_ids=body.connector_ids, actor=context.username)
+    except CleanupError as error:
+        raise HTTPException(status_code=error.status, detail=error.detail) from error
+
+
+@app.post("/api/v1/device-health/cleanup/apply")
+def apply_device_health_cleanup(
+    request: Request,
+    body: HealthCleanupApplyRequest,
+    background_tasks: BackgroundTasks,
+    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+):
+    db, context = auth
+    require_step_up(body.password, db, context)
+    try:
+        result = apply_cleanup_plan(db, body=body, actor=context.username, ip_address=client_ip(request))
+    except CleanupError as error:
+        raise HTTPException(status_code=error.status, detail=error.detail) from error
+    connectors = db.scalars(select(Connector).where(
+        Connector.connector_id.in_(result["rederived_connector_ids"]))).all()
+    db.commit()
+    if not result.get("replayed"):
+        for connector in connectors:
+            _publish_health_action(background_tasks, connector)
+    return result
+
+
+@app.post("/api/v1/devices/{connector_id}/clear-error")
+def clear_device_error_with_reason(
+    request: Request,
+    connector_id: str,
+    body: DeviceErrorClearRequest,
+    background_tasks: BackgroundTasks,
+    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+):
+    """Re-derive a device error that no active alert backs any more."""
+    db, context = auth
+    require_step_up(body.password, db, context)
+    try:
+        result = clear_device_error(
+            db, connector_id=connector_id, expected_code=body.expected_code, actor=context.username,
+            reason=body.reason, idempotency_key=body.idempotency_key, ip_address=client_ip(request))
+    except HealthActionError as error:
+        raise HTTPException(status_code=error.status, detail=error.detail) from error
+    connector = db.scalar(select(Connector).where(Connector.connector_id == connector_id))
+    db.commit()
+    if not result.get("replayed"):
+        _publish_health_action(background_tasks, connector)
+    return result
 
 
 @app.get("/api/v1/commands/{command_id}")
@@ -4040,8 +4220,8 @@ async def device_stream(websocket: WebSocket):
         return
     await connector_hub.connect(connector_id, websocket)
     try:
-        await asyncio.to_thread(set_stream_connected, connector_pk, True)
-        await browser_events.publish("device", {"connector_id": connector_id, "state": "ONLINE"})
+        state = await asyncio.to_thread(set_stream_connected, connector_pk, True)
+        await browser_events.publish("device", {"connector_id": connector_id, "connected": True, "state": state})
         catalog, coverage_payload = await asyncio.to_thread(stream_bootstrap, connector_pk)
         if not await send_identity_catalog(connector_id, catalog):
             await websocket.close(code=1011, reason="Identity catalog delivery failed")
@@ -4108,16 +4288,20 @@ def authenticate_stream(connector_id: str, token: str) -> int:
         return connector.id
 
 
-def set_stream_connected(connector_pk: int, connected: bool) -> None:
+def set_stream_connected(connector_pk: int, connected: bool) -> str | None:
+    """Record the socket; derived health keeps OFFLINE until a heartbeat is accepted."""
     with session_scope() as db:
         connector = db.get(Connector, connector_pk)
-        if connector:
-            connector.connected = connected
-            if connected:
+        if connector is None:
+            return None
+        connector.connected = connected
+        if connected:
+            if not settings.device_health_derived_enabled:
                 connector.lifecycle_state = "ONLINE"
-                connector.last_seen_at = utc_now()
-            else:
-                connector.last_disconnect_at = utc_now()
+            connector.last_seen_at = utc_now()
+        else:
+            connector.last_disconnect_at = utc_now()
+        return connector.lifecycle_state
 
 
 def stream_bootstrap(connector_pk: int) -> tuple[dict, dict | None]:
@@ -4149,20 +4333,30 @@ def stream_bootstrap(connector_pk: int) -> tuple[dict, dict | None]:
 
 
 def record_envelope_rejection(connector_pk: int, envelope: Envelope, error: Exception) -> None:
+    """Record a rejected envelope; it never refreshes last_seen_at or connected."""
     error_type = type(error).__name__[:80]
+    from pydantic import ValidationError
+
     from zk_add.rejection import rejection_category
 
     category = rejection_category(error)
-    message = f"{envelope.type} message was rejected ({category})."
-    context = {"message_type": envelope.type, "error_type": error_type,
-               "request_id": envelope.message_id, "error_category": category}
+    # Field locations only: rejected values can carry attendance or credentials.
+    error_paths = [".".join(str(part) for part in row.get("loc", ()))[:120]
+                   for row in error.errors(include_input=False, include_url=False)[:5]
+                   ] if isinstance(error, ValidationError) else []
     with session_scope() as db:
-        connector = db.get(Connector, connector_pk)
+        connector = db.scalar(select(Connector).where(Connector.id == connector_pk).with_for_update())
         if connector is None:
             return
-        connector.lifecycle_state = "DEGRADED"
-        connector.last_error_code = "DEVICE_MESSAGE_REJECTED"
-        connector.last_error_message = message
+        alert = record_message_rejection(
+            db, connector, message_type=envelope.type, category=category, error_type=error_type,
+            error_paths=error_paths, request_id=envelope.message_id, boot_id=envelope.boot_id)
+        if settings.device_health_derived_enabled:
+            apply_device_health(db, connector, source="REJECTION")
+        else:
+            connector.lifecycle_state = "DEGRADED"
+            connector.last_error_code = alert.code
+            connector.last_error_message = alert.message
         ingest_logs(
             db,
             connector=connector,
@@ -4172,20 +4366,14 @@ def record_envelope_rejection(connector_pk: int, envelope: Envelope, error: Exce
                     sequence=envelope.seq,
                     level="ERROR",
                     subsystem="add_backend",
-                    code="DEVICE_MESSAGE_REJECTED",
-                    message=message,
-                    context=context,
+                    code=alert.code,
+                    message=alert.message,
+                    context={"message_type": envelope.type, "error_type": error_type,
+                             "request_id": envelope.message_id, "error_category": category,
+                             "error_paths": error_paths},
                     device_time=envelope.sent_at,
                 )
             ],
-        )
-        upsert_alert(
-            db,
-            connector,
-            code="DEVICE_MESSAGE_REJECTED",
-            severity="HIGH",
-            message=message,
-            details=context,
         )
 
 
@@ -4298,9 +4486,6 @@ def persist_envelope(connector_pk: int, envelope: Envelope) -> EnvelopeOutcome |
             from zk_add.attendance_sync_evidence import record_roster
 
             record_roster(db, connector, envelope)
-            resolve_message_rejection(
-                db, connector, message_type="user_snapshot"
-            )
             event_payload = {"connector_id": connector.connector_id, "count": count}
         elif envelope.type == "zkt_observation_batch":
             from zk_add.zkt_custody import settle_observations
@@ -4551,6 +4736,9 @@ def persist_envelope(connector_pk: int, envelope: Envelope) -> EnvelopeOutcome |
             }
         else:
             event_payload = {"connector_id": connector.connector_id, "type": envelope.type}
+        # The same transaction that accepted the message clears its type's
+        # rejection; a replayed duplicate returned above proves nothing new.
+        resolve_message_rejection(db, connector, message_type=envelope.type)
     return EnvelopeOutcome(
         ack=ack_payload or {"type": "ack", "message_id": envelope.message_id, "seq": envelope.seq},
         event=event_payload or {},
@@ -4891,7 +5079,9 @@ def serialize_alert(row: DeviceAlert) -> dict:
         "first_seen_at": row.first_seen_at,
         "last_seen_at": row.last_seen_at,
         "acknowledged_at": row.acknowledged_at,
+        "acknowledged_by": (row.details or {}).get("acknowledged_by"),
         "resolved_at": row.resolved_at,
+        "resolution": (row.details or {}).get("resolution"),
     }
 
 
