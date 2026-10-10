@@ -7,18 +7,20 @@ from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import event, select
+from sqlalchemy import event, func, select
 
 from test_add_backend import SERIAL, connector_fixture, db as db
 from zk_add import device_health
 from zk_add.device_health import POLICY, alert_currency, evaluate_health, gate_effect, shadow_report, terminal_link
-from zk_add.models import AuditEvent, DeviceAlert
+from zk_add.models import AuditEvent, DeviceAlert, DeviceConnectionEvent, DeviceTelemetry
 from zk_add.ota import FirmwareRelease
-from zk_add.schemas import HeartbeatPayload
+from zk_add.schemas import HeartbeatPayload, UserSnapshotRequest, UserSnapshotRow
 from zk_add.security import ADMIN_COOKIE, create_admin_session
 from zk_add.service import (
     apply_firmware_diagnostics,
+    evaluate_terminal_link_down,
     fleet_counts,
+    replace_user_snapshot,
     resolve_alert,
     update_heartbeat,
     upsert_alert,
@@ -679,12 +681,13 @@ def test_worker_fault_still_failing_on_new_boot_is_rebound(db):
 
 
 def heartbeat(db, connector, sequence, *, boot="boot-b", firmware="2.6.15", uptime=1000, led="HEALTHY",
-              diagnostics=None):
-    update_heartbeat(db, connector=connector, boot_id=boot, sequence=sequence, payload=HeartbeatPayload(
-        firmware_version=firmware, uptime_seconds=uptime, led_state=led,
-        zkt={"online": True, "connection_state": "ONLINE", "serial": SERIAL},
+              diagnostics=None, zkt=None, activity=None):
+    result = update_heartbeat(db, connector=connector, boot_id=boot, sequence=sequence, payload=HeartbeatPayload(
+        firmware_version=firmware, uptime_seconds=uptime, led_state=led, current_activity=activity,
+        zkt=zkt if zkt is not None else {"online": True, "connection_state": "ONLINE", "serial": SERIAL},
         **({"diagnostics": diagnostics} if diagnostics is not None else {})))
     db.flush()
+    return result
 
 
 def legacy_sample(uptime=1000, **storage):
@@ -844,3 +847,165 @@ def test_alert_details_carry_bounded_evidence_summary(db):
     row = alert_row(db, connector, "ESP_DURABILITY_FAULT")
     assert row.details["evidence"]["storage"]["used_percent"] == 99.0
     assert row.message.startswith("Attendance preservation needs recovery: storage FULL; queue_append error 28")
+
+
+def test_state_lock_busy_sample_is_ignored(db):
+    connector = connector_fixture(db)
+    heartbeat(db, connector, 1, zkt={"online": True, "connection_state": "ONLINE", "serial": SERIAL,
+                                     "user_count": 10, "attendance_count": 100})
+    zkt = connector.zkt_device
+    events = db.scalar(select(func.count(DeviceConnectionEvent.id)))
+    marker = zkt.last_seen_at
+    heartbeat(db, connector, 2, activity="STATE_LOCK_BUSY", led="STATE_LOCK_BUSY",
+              zkt={"online": False, "connection_state": "", "user_count": 0, "attendance_count": 0})
+    assert db.scalar(select(func.count(DeviceConnectionEvent.id))) == events
+    assert (zkt.user_count, zkt.attendance_count, zkt.connection_state, zkt.offline_since) == (
+        10, 100, "ONLINE", None)
+    assert zkt.last_seen_at > marker  # the heartbeat itself was accepted
+    assert evaluate_health(db, connector).derived_lifecycle == "ONLINE"
+
+
+def test_led_pseudo_states_neither_raise_nor_resolve(db):
+    connector = connector_fixture(db)
+    for sequence, state in enumerate(("STATE_LOCK_BUSY", "UNAVAILABLE", ""), start=1):
+        heartbeat(db, connector, sequence, led=state)
+    assert alert_row(db, connector, "ESP_LOCAL_FAILURE") is None
+    heartbeat(db, connector, 4, led="LOCAL_FAILURE")
+    row = alert_row(db, connector, "ESP_LOCAL_FAILURE")
+    seen = ensure_utc(row.last_seen_at)
+    for sequence, state in enumerate(("STATE_LOCK_BUSY", "UNAVAILABLE", ""), start=5):
+        heartbeat(db, connector, sequence, led=state)
+        assert row.state == "OPEN" and ensure_utc(row.last_seen_at) == seen
+    heartbeat(db, connector, 8, led="HEALTHY")
+    assert row.state == "RESOLVED" and row.details["resolution"]["kind"] == "CONDITION_CLEARED"
+
+
+def test_252_boot_time_local_failure_hold(db):
+    connector = connector_fixture(db)
+    heartbeat(db, connector, 1, boot="boot-1", firmware="2.5.2", uptime=60, led="LOCAL_FAILURE")
+    row = alert_row(db, connector, "ESP_LOCAL_FAILURE")
+    assert (row.details["boot_time"], row.details["first_uptime_seconds"], row.details["boot_id"]) == (
+        True, 60, "boot-1")
+    heartbeat(db, connector, 2, boot="boot-1", firmware="2.5.2", uptime=200, led="LOCAL_FAILURE")
+    assert row.details["first_uptime_seconds"] == 60  # carried within the boot
+    heartbeat(db, connector, 3, boot="boot-1", firmware="2.5.2", uptime=330, led="HEALTHY")
+    assert row.state == "OPEN" and row.details["led_clear_since"]
+    held_since, seen = row.details["led_clear_since"], ensure_utc(row.last_seen_at)
+    heartbeat(db, connector, 4, boot="boot-1", firmware="2.5.2", uptime=345, led="HEALTHY")
+    assert row.details["led_clear_since"] == held_since and ensure_utc(row.last_seen_at) == seen
+    health = evaluate_health(db, connector)
+    reason = health.reasons[0]
+    assert (reason.code, reason.currency, reason.tier, reason.gating) == ("ESP_LOCAL_FAILURE", "HELD", "WARNING", True)
+    assert (health.derived_lifecycle, health.last_error_code) == ("ONLINE_WITH_WARNINGS", "ESP_LOCAL_FAILURE")
+    heartbeat(db, connector, 1, boot="boot-2", firmware="2.5.2", uptime=20, led="HEALTHY")
+    assert row.state == "RESOLVED"
+    # Firmware that reports diagnostics clears on the next healthy LED.
+    other = second_connector(db)
+    heartbeat(db, other, 1, boot="boot-1", firmware="2.6.15", uptime=60, led="LOCAL_FAILURE")
+    assert alert_row(db, other, "ESP_LOCAL_FAILURE").details["boot_time"] is False
+    heartbeat(db, other, 2, boot="boot-1", firmware="2.6.15", uptime=75, led="HEALTHY")
+    assert alert_row(db, other, "ESP_LOCAL_FAILURE").state == "RESOLVED"
+
+
+def test_serial_mismatch_resolves_on_matching_serial_only(db):
+    connector = connector_fixture(db)
+    heartbeat(db, connector, 1, zkt={"online": True, "connection_state": "ONLINE", "serial": "WRONG"})
+    row = alert_row(db, connector, "ZKT_SERIAL_MISMATCH")
+    assert row.state == "OPEN" and connector.last_error_code == "ZKT_SERIAL_MISMATCH"
+    heartbeat(db, connector, 2, zkt={"online": True, "connection_state": "ONLINE"})
+    assert row.state == "OPEN"
+    seen = ensure_utc(row.last_seen_at)
+    heartbeat(db, connector, 3)
+    assert row.state == "RESOLVED" and row.details["resolution"]["kind"] == "CONDITION_CLEARED"
+    assert ensure_utc(row.last_seen_at) == seen
+    assert connector.last_error_code != "ZKT_SERIAL_MISMATCH"
+
+
+def test_quarantine_resolves_when_duplicate_claim_disappears(db):
+    first = connector_fixture(db)
+    first.zkt_device.serial, first.zkt_device.online = SERIAL, True
+    second = connector_fixture(db, hardware_id="e0:72:a1:d6:f3:29", expected_serial=SERIAL)
+    heartbeat(db, second, 1)
+    row = alert_row(db, second, "QUARANTINED_DUPLICATE_SERIAL")
+    assert row.state == "OPEN" and second.lifecycle_state == "QUARANTINED_DUPLICATE_SERIAL"
+    seen = ensure_utc(row.last_seen_at)
+    first.zkt_device.serial = "MOVED-ELSEWHERE"
+    db.flush()
+    heartbeat(db, second, 2)
+    assert row.state == "RESOLVED" and row.details["resolution"]["kind"] == "CONDITION_CLEARED"
+    assert ensure_utc(row.last_seen_at) == seen
+    assert second.last_error_code is None
+    assert alert_row(db, first, "QUARANTINED_DUPLICATE_SERIAL").state == "OPEN"
+
+
+def test_user_snapshot_truncated_resolves_on_complete_stable_28_byte_snapshot(db):
+    connector = connector_fixture(db)
+    connector.zkt_device.capability_profile = {"observed_user_record_bytes": 28}
+
+    def snapshot(snapshot_id, complete):
+        replace_user_snapshot(db, connector=connector, snapshot=UserSnapshotRequest(
+            snapshot_id=snapshot_id, complete=complete, observed_at=utc_now(),
+            users=[UserSnapshotRow(uid="1", user_id="1001", name="One")]))
+        db.flush()
+
+    snapshot("partial", False)
+    row = alert_row(db, connector, "USER_SNAPSHOT_TRUNCATED")
+    seen = ensure_utc(row.last_seen_at)
+    snapshot("complete", True)
+    assert row.state == "RESOLVED" and row.details["resolution"]["kind"] == "CONDITION_CLEARED"
+    assert ensure_utc(row.last_seen_at) == seen
+
+
+def telemetry(db, connector, boot, minutes_ago):
+    db.add(DeviceTelemetry(connector_id=connector.id, boot_id=boot, sequence=1, uptime_seconds=30,
+                           payload={}, created_at=utc_now() - timedelta(minutes=minutes_ago)))
+    db.flush()
+
+
+@pytest.mark.parametrize("earlier,raised", [(["b1", "b2", "b3"], True), (["b1", "b2"], False),
+                                            (["old", "b2", "b3"], False)])
+def test_restart_loop(db, earlier, raised):
+    connector = connector_fixture(db)
+    for index, boot in enumerate(earlier):
+        telemetry(db, connector, boot, 45 if boot == "old" else 20 - index * 5)
+    heartbeat(db, connector, 1, boot="b4", uptime=30)
+    row = alert_row(db, connector, "ESP_RESTART_LOOP")
+    assert (row is not None) is raised
+    if raised:
+        assert (row.severity, row.details["boots"]) == ("HIGH", ["b1", "b2", "b3", "b4"])
+        reason = evaluate_health(db, connector).reasons[0]
+        assert (reason.code, reason.tier, reason.gating) == ("ESP_RESTART_LOOP", "DEGRADED", True)
+        seen = ensure_utc(row.last_seen_at)
+        heartbeat(db, connector, 2, boot="b4", uptime=1800)
+        assert row.state == "RESOLVED" and ensure_utc(row.last_seen_at) == seen
+
+
+def test_terminal_link_down_after_15_minutes_and_resolves_on_online(db):
+    connector = connector_fixture(db)
+    down = {"online": False, "connection_state": "RETRY_WAIT", "serial": SERIAL,
+            "transition_reason": "terminal unreachable"}
+    heartbeat(db, connector, 1, zkt=down)
+    connector.zkt_device.offline_since = utc_now() - timedelta(minutes=14)
+    heartbeat(db, connector, 2, zkt=down)
+    assert alert_row(db, connector, "TERMINAL_LINK_DOWN") is None
+    connector.zkt_device.offline_since = utc_now() - timedelta(minutes=16)
+    heartbeat(db, connector, 3, zkt=down)
+    row = alert_row(db, connector, "TERMINAL_LINK_DOWN")
+    assert (row.state, row.severity, row.details["raw_state"], row.details["transition_reason"]) == (
+        "OPEN", "WARNING", "RETRY_WAIT", "terminal unreachable")
+    health = evaluate_health(db, connector)
+    assert [reason.code for reason in health.reasons] == ["TERMINAL_DISCONNECTED"]
+    assert [reason.code for reason in health.other_active_alerts] == ["TERMINAL_LINK_DOWN"]
+    assert health.last_error_code is None
+    seen = ensure_utc(row.last_seen_at)
+    heartbeat(db, connector, 4)
+    assert row.state == "RESOLVED" and ensure_utc(row.last_seen_at) == seen
+
+
+def test_no_terminal_link_down_for_hikvision(db):
+    connector = live(db, connector_fixture(db), family="hikvision", firmware="3.1.0", state="OFFLINE",
+                     offline_age=3600, poll_error=2)
+    assert terminal_link(connector)["state"] == "DISCONNECTED"
+    evaluate_terminal_link_down(db, connector, now=utc_now())
+    db.flush()
+    assert alert_row(db, connector, "TERMINAL_LINK_DOWN") is None

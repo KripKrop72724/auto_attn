@@ -17,6 +17,7 @@ from zk_add.device_health import (
     bind_unbound_row,
     classify_led_latch,
     diagnostics_evidence,
+    diagnostics_reporting,
     diagnostics_starting,
     hard_storage_evidence,
     health_summary,
@@ -545,6 +546,8 @@ def auto_certify_zkt(session: Session, connector: Connector, zkt: ZKTDevice) -> 
             ZKTDevice.id != zkt.id,
         )
     ).all()
+    if not duplicates:
+        resolve_on_evidence(session, connector, code="QUARANTINED_DUPLICATE_SERIAL")
     if duplicates:
         # A duplicate serial is ambiguous by definition. Quarantining only the
         # newest claimant would leave an older connector able to mutate the same
@@ -788,6 +791,72 @@ def apply_firmware_diagnostics(session: Session, connector: Connector, payload: 
         led_row.details = {**details, "latch": latch} if latch else details
 
 
+def resolve_on_evidence(session: Session, connector: Connector, *, code: str,
+                        kind: str = "CONDITION_CLEARED", **resolution) -> int:
+    """Close an alert that fresh evidence disproved.
+
+    last_seen_at stays put so the old alert never lands in a later HIL
+    evidence window, and a stale legacy device error for the code is cleared.
+    """
+    resolved = resolve_alert(session, connector, code=code, resolution={"kind": kind, **resolution},
+                             touch_last_seen=False)
+    if connector.last_error_code == code:
+        connector.last_error_code = None
+        connector.last_error_message = None
+    return resolved
+
+
+def observe_restart_loop(session: Session, connector: Connector, *, uptime_seconds: int | None,
+                         now: datetime) -> None:
+    """Raise ESP_RESTART_LOOP for repeated boots; an ESP that stays up clears it."""
+    if uptime_seconds is None:
+        return
+    window = settings.restart_loop_window_seconds
+    if uptime_seconds >= window:
+        resolve_on_evidence(session, connector, code="ESP_RESTART_LOOP")
+        return
+    if uptime_seconds >= 180:
+        return
+    rows = session.execute(
+        select(DeviceTelemetry.boot_id, DeviceTelemetry.created_at)
+        .where(DeviceTelemetry.connector_id == connector.id)
+        .order_by(DeviceTelemetry.id.desc()).limit(240)
+    ).all()
+    start = now - timedelta(seconds=window)
+    boots = []
+    for boot, created_at in reversed(rows):
+        if boot and boot not in boots and ensure_utc(created_at) >= start:
+            boots.append(boot)
+    if connector.boot_id and connector.boot_id not in boots:
+        boots.append(connector.boot_id)
+    if len(boots) >= settings.restart_loop_boots:
+        upsert_alert(
+            session, connector, code="ESP_RESTART_LOOP", severity="HIGH",
+            message=f"The ESP booted {len(boots)} times in {window // 60} minutes.",
+            details={"boots": boots[-20:], "window_seconds": window, "boot_id": connector.boot_id,
+                     "firmware_version": connector.firmware_version},
+        )
+
+
+def evaluate_terminal_link_down(session: Session, connector: Connector, *, now: datetime,
+                                transition_reason: str | None = None) -> None:
+    """Notify once a ZKT terminal has been unreachable for a long time."""
+    if (connector.firmware_family or "zkt") != "zkt" or connector.zkt_device is None:
+        return
+    link = terminal_link(connector, now)
+    since = link["since"]
+    if link["state"] == "DISCONNECTED" and since is not None and (
+            now - since).total_seconds() >= settings.terminal_link_down_alert_seconds:
+        upsert_alert(
+            session, connector, code="TERMINAL_LINK_DOWN", severity="WARNING",
+            message=f"The ZKT terminal has been unreachable since {since.isoformat()} ({link['raw_state']}).",
+            details={"raw_state": link["raw_state"], "since": since.isoformat(),
+                     "transition_reason": (transition_reason or "")[:160] or None},
+        )
+    elif link["state"] in {"CONNECTED", "STABILIZING"}:
+        resolve_on_evidence(session, connector, code="TERMINAL_LINK_DOWN")
+
+
 def update_heartbeat(
     session: Session,
     *,
@@ -816,13 +885,20 @@ def update_heartbeat(
     # stale, so resolve it immediately when the connector reports again.
     resolve_alert(session, connector, code="ESP_OFFLINE")
     zkt = connector.zkt_device
+    if zkt is not None:
+        # The accepted-heartbeat marker: a connector that stays connected but
+        # stops heartbeating is told apart from one that is merely quiet.
+        zkt.last_seen_at = now
     zkt_payload = (payload.terminal.model_dump(exclude_none=True)
                    if payload.firmware_family == "hikvision" and payload.terminal else payload.zkt)
     if zkt and payload.terminal:
         zkt.capability_profile = {**(zkt.capability_profile or {}),
                                   "source_protocol": "hikvision-isapi-v1",
                                   "hikvision_health": zkt_payload}
-    if zkt:
+    # When the connector's state lock is busy it sends a zeroed terminal
+    # snapshot; it says nothing about the terminal, so it must not move it.
+    lock_busy = payload.firmware_family == "zkt" and payload.current_activity == "STATE_LOCK_BUSY"
+    if zkt and not lock_busy:
         previous_terminal_serial = zkt.serial
         previous_attendance_count = zkt.attendance_count
         reported_state = str(
@@ -920,7 +996,6 @@ def update_heartbeat(
         zkt.device_time_drift_seconds = zkt_payload.get(
             "drift_seconds", zkt.device_time_drift_seconds
         )
-        zkt.last_seen_at = now
         zkt.updated_at = now
         if reported_state in {"ONLINE", "RECOVERING", "SESSION_REFRESH"}:
             zkt.last_online_at = now
@@ -1060,6 +1135,10 @@ def update_heartbeat(
                 severity="CRITICAL",
                 message=connector.last_error_message,
             )
+        elif zkt_payload.get("serial") and (
+            not zkt.expected_serial or zkt_payload.get("serial") == zkt.expected_serial
+        ):
+            resolve_on_evidence(session, connector, code="ZKT_SERIAL_MISMATCH")
         if connector.lifecycle_state != "QUARANTINED_DUPLICATE_SERIAL":
             auto_certify_zkt(session, connector, zkt)
         history = zkt_payload.get("history_backfill")
@@ -1107,6 +1186,8 @@ def update_heartbeat(
                 )
             elif history_state in {"RUNNING", "RETRYING", "COMPLETE"}:
                 resolve_alert(session, connector, code="HISTORY_BACKFILL_BLOCKED")
+        evaluate_terminal_link_down(session, connector, now=now,
+                                    transition_reason=zkt_payload.get("transition_reason"))
     reported_led_state = (payload.led_state or "").strip().upper()
     if reported_led_state in {"FATAL", "LOCAL_FAILURE"}:
         code = "ESP_FATAL" if reported_led_state == "FATAL" else "ESP_LOCAL_FAILURE"
@@ -1119,18 +1200,42 @@ def update_heartbeat(
             connector.lifecycle_state = "DEGRADED"
         connector.last_error_code = code
         connector.last_error_message = message
+        existing = open_alert_row(session, connector, code)
+        previous = (existing.details or {}) if existing is not None else {}
+        first_uptime = (previous.get("first_uptime_seconds") if previous.get("boot_id") == boot_id
+                        else payload.uptime_seconds)
         upsert_alert(
             session,
             connector,
             code=code,
             severity="CRITICAL" if reported_led_state == "FATAL" else "HIGH",
             message=message,
-            details={"led_state": reported_led_state},
+            details={
+                "led_state": reported_led_state, "boot_id": boot_id,
+                "firmware_version": connector.firmware_version, "first_uptime_seconds": first_uptime,
+                # 2.5.2 raises this at boot only for a SPIFFS mount or UID-cache
+                # allocation failure, which it never retries (e7fa651 zone_lite.c).
+                "boot_time": bool(
+                    code == "ESP_LOCAL_FAILURE" and first_uptime is not None
+                    and first_uptime <= settings.led_boot_time_hold_uptime_seconds
+                    and diagnostics_reporting(connector) == "NOT_REPORTED_BY_FIRMWARE"),
+            },
         )
-    else:
-        resolve_alert(session, connector, code="ESP_FATAL")
-        resolve_alert(session, connector, code="ESP_LOCAL_FAILURE")
-        if connector.last_error_code in {"ESP_FATAL", "ESP_LOCAL_FAILURE"}:
+    elif reported_led_state and reported_led_state not in {"STATE_LOCK_BUSY", "UNAVAILABLE"}:
+        # Busy, unavailable and missing LED states are not evidence either way.
+        resolve_alert(session, connector, code="ESP_FATAL", resolution={"kind": "CONDITION_CLEARED"})
+        local = open_alert_row(session, connector, "ESP_LOCAL_FAILURE")
+        local_details = (local.details or {}) if local is not None else {}
+        held = local is not None and local_details.get("boot_time") is True and local_details.get("boot_id") == boot_id
+        if held:
+            # The LED's two-minute latch expired, but the boot-time failure
+            # was never retried: keep it as a gating warning until reboot.
+            if not local_details.get("led_clear_since"):
+                local.details = {**local_details, "led_clear_since": now.isoformat()}
+        else:
+            resolve_alert(session, connector, code="ESP_LOCAL_FAILURE", resolution={"kind": "CONDITION_CLEARED"})
+        if connector.last_error_code == "ESP_FATAL" or (
+                connector.last_error_code == "ESP_LOCAL_FAILURE" and not held):
             connector.last_error_code = None
             connector.last_error_message = None
     if payload.diagnostics and payload.diagnostics.schema_version == 2:
@@ -1146,6 +1251,7 @@ def update_heartbeat(
         connector=connector,
         payload=payload,
     )
+    observe_restart_loop(session, connector, uptime_seconds=payload.uptime_seconds, now=now)
     telemetry_payload = redact_context(payload.model_dump(mode="json"))
     if device_sent_at is not None:
         # The authenticated WebSocket envelope supplies a bounded clock sample
@@ -1489,6 +1595,7 @@ def _replace_user_snapshot(
         zkt.last_identity_change_at = continuity_started_at or observed_at
         if zkt.writes_disabled_reason == "USER_SNAPSHOT_TRUNCATED":
             zkt.writes_disabled_reason = None
+        resolve_on_evidence(session, connector, code="USER_SNAPSHOT_TRUNCATED")
     else:
         for row in existing_rows:
             if row.uid not in seen and row.lifecycle_state == "STAGING":
