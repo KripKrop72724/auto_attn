@@ -3075,7 +3075,10 @@ def test_heartbeat_tracks_flapping_and_waits_without_mutating(db: Session):
     result = update_heartbeat(
         db, connector=connector, boot_id="boot-1", sequence=1, payload=payload
     )
-    assert result["state"] == "FLAPPING"
+    # Derived health: an unstable terminal link is a gating warning on a live ESP.
+    assert result["state"] == "ONLINE_WITH_WARNINGS"
+    assert result["terminal_link"]["state"] == "FLAPPING"
+    assert connector.last_error_code == "ZKT_CONNECTION_FLAPPING"
     transition = db.scalar(select(DeviceConnectionEvent))
     assert transition and transition.to_state == "FLAPPING"
     alert = db.scalar(select(DeviceAlert).where(DeviceAlert.code == "ZKT_CONNECTION_FLAPPING"))
@@ -4340,6 +4343,7 @@ def test_websocket_attendance_storage_failure_never_emits_ack(
 
 def test_successful_message_only_resolves_rejection_for_the_same_path(db: Session):
     connector = connector_fixture(db)
+    connector.connected, connector.last_seen_at = True, utc_now()
     connector.lifecycle_state = "DEGRADED"
     connector.last_error_code = "DEVICE_MESSAGE_REJECTED"
     connector.last_error_message = "attendance_batch message was rejected."

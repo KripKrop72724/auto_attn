@@ -19,9 +19,11 @@ from zk_add.device_health import (
     diagnostics_evidence,
     diagnostics_reporting,
     DEVICE_REJECTION_CATEGORIES,
+    apply_device_health,
     diagnostics_starting,
     hard_storage_evidence,
     health_summary,
+    health_telemetry,
     soft_owner_not_ready,
     storage_recovery_role,
     terminal_link,
@@ -776,7 +778,19 @@ def apply_firmware_diagnostics(session: Session, connector: Connector, payload: 
                 connector.last_error_code = None
                 connector.last_error_message = None
         else:
-            bind_unbound_row(existing, connector, uptime_seconds=payload.uptime_seconds, now=now)
+            details = (existing.details or {}) if existing is not None else {}
+            if (settings.device_health_derived_enabled and code == "ESP_DELIVERY_WORKER_FAULT"
+                    and existing is not None and details.get("binding") in {"OBSERVED", "INFERRED_CURRENT"}
+                    and details.get("boot_id") != connector.boot_id):
+                # Workers restart with every boot. The new boot's own evidence was
+                # evaluated first and did not fail, so the old boot's fault ended.
+                close_alert_row(existing, touch_last_seen=False, now=now, resolution={
+                    "kind": "BOOT_ENDED", "previous_boot_id": details.get("boot_id"),
+                    "current_boot_id": connector.boot_id, "current_firmware": connector.firmware_version})
+            else:
+                bind_unbound_row(existing, connector, uptime_seconds=payload.uptime_seconds, now=now)
+        if settings.device_health_derived_enabled:
+            continue  # the derived health owns lifecycle and the device error
         unresolved = None if verified and not failed else session.scalar(select(DeviceAlert.id).where(
             DeviceAlert.connector_id == connector.id, DeviceAlert.code == code,
             DeviceAlert.state == "OPEN",
@@ -1289,11 +1303,16 @@ def update_heartbeat(
     )
     resolve_superseded_ota_alerts(session, connector)
     observe_restart_loop(session, connector, uptime_seconds=payload.uptime_seconds, now=now)
+    # An accepted heartbeat proves its own message path; derive with that known.
+    resolve_message_rejection(session, connector, message_type="heartbeat", rederive=False)
+    health = apply_device_health(session, connector, source="HEARTBEAT", now=now,
+                                 uptime_seconds=payload.uptime_seconds)
     telemetry_payload = redact_context(payload.model_dump(mode="json"))
     if device_sent_at is not None:
         # The authenticated WebSocket envelope supplies a bounded clock sample
         # for legacy OTA clients whose ESP clock is skewed but still advancing.
         telemetry_payload["_trusted_envelope_sent_at"] = ensure_utc(device_sent_at).isoformat()
+    telemetry_payload["_add_health"] = health_telemetry(health, connector)
     telemetry = DeviceTelemetry(
         connector_id=connector.id,
         boot_id=boot_id,
@@ -1326,7 +1345,7 @@ def update_heartbeat(
             # pending operation remains durable and is retried on the next heartbeat;
             # an unavailable wrapping key never triggers an unsealed fallback.
             pass
-    return serialize_connector(connector)
+    return serialize_connector(connector, health=health)
 
 
 def replace_user_snapshot(
@@ -5861,6 +5880,7 @@ def resolve_message_rejection(
     connector: Connector,
     *,
     message_type: str,
+    rederive: bool = True,
 ) -> bool:
     """An accepted message clears only the rejection entry for its own type."""
     now = utc_now()
@@ -5891,10 +5911,14 @@ def resolve_message_rejection(
             close_alert_row(row, resolution={"kind": "MESSAGE_ACCEPTED", "message_type": message_type},
                             touch_last_seen=False, now=now)
             resolved_codes.add(row.code)
-    if resolved_codes and connector.last_error_code in resolved_codes:
+    if settings.device_health_derived_enabled:
+        if changed and rederive:
+            apply_device_health(session, connector, source="MESSAGE_ACCEPTED", now=now)
+    elif resolved_codes and connector.last_error_code in resolved_codes:
         connector.last_error_code = None
         connector.last_error_message = None
-        connector.lifecycle_state = "ONLINE"
+        if message_type != "heartbeat":  # the legacy heartbeat writers set its own lifecycle
+            connector.lifecycle_state = "ONLINE"
     return changed
 
 

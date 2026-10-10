@@ -745,6 +745,30 @@ def evaluate_health_batch(session: Session, connectors, *, now: datetime | None 
             for connector in connectors}
 
 
+def apply_device_health(session: Session, connector: Connector, *, source: str, now: datetime | None = None,
+                        uptime_seconds: float | None = None) -> Health:
+    """Evaluate, and in ENFORCED mode write lifecycle and the device error when they differ."""
+    health = evaluate_health(session, connector, now=now, source=source, uptime_seconds=uptime_seconds)
+    if health.mode == "ENFORCED":
+        if connector.lifecycle_state != health.derived_lifecycle:
+            connector.lifecycle_state = health.derived_lifecycle
+        if (connector.last_error_code, connector.last_error_message) != (
+                health.last_error_code, health.last_error_message):
+            connector.last_error_code = health.last_error_code
+            connector.last_error_message = health.last_error_message
+    return health
+
+
+def health_telemetry(health: Health, connector: Connector) -> dict:
+    """The per-heartbeat record that lets every DEGRADED or WARNING minute be attributed later."""
+    return {
+        "v": 1, "mode": health.mode, "lifecycle": connector.lifecycle_state,
+        "derived_lifecycle": health.derived_lifecycle, "tier": health.tier,
+        "reasons": [f"{reason.code}:{reason.tier}:{reason.currency}" for reason in health.reasons[:12]],
+        "terminal": health.terminal_link["state"],
+    }
+
+
 def duplicate_serial_claimed(session: Session, connector: Connector) -> bool:
     zkt = connector.zkt_device
     if zkt is None or not zkt.serial:

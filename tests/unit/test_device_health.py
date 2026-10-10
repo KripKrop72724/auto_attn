@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import ast
 from contextlib import contextmanager
+from copy import deepcopy
 from datetime import timedelta
 from pathlib import Path
 
@@ -15,8 +16,19 @@ from pydantic import ValidationError
 from sqlalchemy.exc import OperationalError
 
 from test_add_backend import queue_evidence_payload
+from test_hil_scope import hil_session  # noqa: F401
+from test_zkt_factory_trial import factory  # noqa: F401
 from zk_add import device_health, web as add_web
-from zk_add.device_health import POLICY, alert_currency, evaluate_health, gate_effect, shadow_report, terminal_link
+from zk_add import zkt_factory_trial
+from zk_add.device_health import (
+    POLICY,
+    alert_currency,
+    apply_device_health,
+    evaluate_health,
+    gate_effect,
+    shadow_report,
+    terminal_link,
+)
 from zk_add.models import AuditEvent, DeviceAlert, DeviceConnectionEvent, DeviceLog, DeviceTelemetry
 from zk_add.ota import FirmwareCampaign, FirmwareDeployment, FirmwareRelease
 from zk_add.schemas import Envelope, HeartbeatPayload, UserSnapshotRequest, UserSnapshotRow
@@ -33,6 +45,7 @@ from zk_add.service import (
     utc_now,
 )
 from zk_add.time_utils import ensure_utc
+from zk_add.zkt_hil_schedule import _known_hold
 from zk_add.settings import settings
 from zk_add.web import app, get_db
 
@@ -1180,3 +1193,219 @@ def test_ota_alerts_resolve_on_later_successful_deployment(db, code, details, er
     assert row.details["resolution"]["kind"] == "DEPLOYMENT_SUCCEEDED"
     assert row.details["resolution"]["deployment_id"] == later.deployment_id
     assert connector.last_error_code is None
+
+
+def explained(health):
+    """Every non-ONLINE tier and every device error is backed by a visible reason."""
+    tiers = {reason.tier for reason in health.reasons}
+    if health.tier == "DEGRADED":
+        assert "DEGRADED" in tiers
+    if health.tier == "ONLINE_WITH_WARNINGS":
+        assert tiers == {"WARNING"}
+    if health.last_error_code:
+        assert any(reason.gating and reason.error_code == health.last_error_code for reason in health.reasons)
+    assert all(reason.message and reason.clear_condition for reason in health.reasons)
+    return health
+
+
+def test_p02_scenario_enforced(db):
+    recovery_release(db)
+    connector = p02(db)
+    terminal = {"online": True, "connection_state": "ONLINE", "serial": "CJH9211060009"}
+    update_heartbeat(db, connector=connector, boot_id="recovery-boot", sequence=1, payload=HeartbeatPayload(
+        firmware_version="2.6.27", uptime_seconds=60, led_state="HEALTHY", zkt=terminal,
+        ota={"image_sha256": RECOVERY_DIGEST},
+        diagnostics={"workers": [worker("add_delivery", "STOPPED"), worker("ords_delivery", "STOPPED")]}))
+    db.flush()
+    assert alert_row(db, connector, "ESP_DELIVERY_WORKER_FAULT") is None
+    assert connector.lifecycle_state == "ONLINE"
+    # A worker row an earlier recovery run raised before this release, then 2.5.2 boots.
+    row = open_alert(db, connector, "ESP_DELIVERY_WORKER_FAULT", details={"diagnostics_schema_version": 2},
+                     seen=utc_now() - timedelta(hours=20))
+    result = heartbeat(db, connector, 1, boot="p02-252", firmware="2.5.2", uptime=600, zkt=terminal)
+    assert row.state == "OPEN" and row.details["binding"] == "INFERRED_PREVIOUS"
+    assert (connector.lifecycle_state, result["state"]) == ("ONLINE_WITH_WARNINGS", "ONLINE_WITH_WARNINGS")
+    assert connector.last_error_code == "ESP_DELIVERY_WORKER_FAULT"
+    assert result["health"]["primary"]["code"] == "ESP_DELIVERY_WORKER_FAULT"
+    reason = explained(evaluate_health(db, connector)).reasons[0]
+    assert (reason.tier, reason.currency) == ("WARNING", "PREVIOUS_BOOT")
+    assert reason.message and reason.clear_condition.startswith("Clears when every required delivery worker")
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_bound_worker_fault_boot_ended_only_when_enforced(db, monkeypatch, enabled):
+    monkeypatch.setattr(settings, "device_health_derived_enabled", enabled)
+    connector = connector_fixture(db)
+    heartbeat(db, connector, 1, boot="boot-a", diagnostics={
+        "workers": [worker("add_delivery", "STOPPED", tick=999_000), worker("ords_delivery", tick=999_000)]})
+    row = alert_row(db, connector, "ESP_DELIVERY_WORKER_FAULT")
+    seen = ensure_utc(row.last_seen_at)
+    heartbeat(db, connector, 1, boot="boot-b", uptime=30)
+    if enabled:
+        assert row.state == "RESOLVED" and ensure_utc(row.last_seen_at) == seen
+        assert row.details["resolution"] | {"at": None} == {
+            "kind": "BOOT_ENDED", "previous_boot_id": "boot-a", "current_boot_id": "boot-b",
+            "current_firmware": "2.6.15", "at": None}
+        assert (connector.lifecycle_state, connector.last_error_code) == ("ONLINE", None)
+    else:
+        assert row.state == "OPEN" and connector.lifecycle_state == "DEGRADED"
+
+
+@pytest.mark.parametrize("state,offline_minutes,lifecycle,link", [
+    ("RECOVERING", None, "ONLINE", "STABILIZING"),
+    ("SUSPECT", 1, "ONLINE", "RECONNECTING"),
+    ("CONNECTING", 1, "ONLINE", "RECONNECTING"),
+    ("RETRY_WAIT", 1, "ONLINE", "RECONNECTING"),
+    ("DISCOVERING", 1, "ONLINE", "RECONNECTING"),
+    ("BOOTING", 1, "ONLINE", "STARTING"),
+    ("RETRY_WAIT", 6, "ONLINE_WITH_WARNINGS", "DISCONNECTED"),
+    ("SESSION_REFRESH", None, "ONLINE", "MAINTENANCE"),
+    ("RESTARTING", 1, "ONLINE", "MAINTENANCE"),
+])
+def test_zkt_link_states_enforced(db, state, offline_minutes, lifecycle, link):
+    connector = connector_fixture(db)
+    heartbeat(db, connector, 1)
+    if offline_minutes:
+        connector.zkt_device.offline_since = utc_now() - timedelta(minutes=offline_minutes)
+    result = heartbeat(db, connector, 2, zkt={"online": state == "RECOVERING", "connection_state": state,
+                                              "serial": SERIAL})
+    assert (result["state"], result["terminal_link"]["state"], connector.last_error_code) == (lifecycle, link, None)
+    explained(evaluate_health(db, connector))
+
+
+def test_flapping_is_a_gating_warning_until_the_link_proves_stable(db):
+    connector = connector_fixture(db)
+    result = heartbeat(db, connector, 1, zkt={"online": False, "connection_state": "FLAPPING", "serial": SERIAL,
+                                              "flap_count_15m": 4})
+    assert (result["state"], connector.last_error_code) == ("ONLINE_WITH_WARNINGS", "ZKT_CONNECTION_FLAPPING")
+    result = heartbeat(db, connector, 2, zkt={"online": True, "connection_state": "ONLINE", "serial": SERIAL,
+                                              "consecutive_successes": 3})
+    assert (result["state"], connector.last_error_code) == ("ONLINE", None)
+
+
+def hik_heartbeat(db, connector, sequence, *, state="ONLINE", poll_error=0, uptime=1000):
+    result = update_heartbeat(db, connector=connector, boot_id="hik-boot", sequence=sequence, payload=HeartbeatPayload(
+        firmware_family="hikvision", firmware_version="3.1.0", uptime_seconds=uptime, led_state="HEALTHY",
+        terminal=dict(schema_version=2, vendor="hikvision", protocol="isapi", serial=SERIAL, ip_address="192.0.2.1",
+                      capability_profile="pilot", qualification_state="NOT_QUALIFIED", online=state == "ONLINE",
+                      connection_state=state, stream_open=False, stream_error=0, current_event_count=0,
+                      replay_event_count=0, last_stream_message_epoch=0, source_storage_failures=0,
+                      source_queue_depth=0, capture_mode="poll", poll_interval_seconds=2, poll_error=poll_error)))
+    db.flush()
+    return result
+
+
+def test_hikvision_enforced(db):
+    connector = connector_fixture(db)
+    connector.firmware_family = "hikvision"
+    db.commit()
+    result = hik_heartbeat(db, connector, 1, poll_error=8)
+    assert (result["state"], connector.last_error_code) == ("DEGRADED", "HIK_STORAGE")
+    result = hik_heartbeat(db, connector, 2, state="OFFLINE", poll_error=2)
+    assert (result["state"], connector.last_error_code) == ("ONLINE", None)
+    connector.zkt_device.offline_since = utc_now() - timedelta(minutes=6)
+    result = hik_heartbeat(db, connector, 3, state="OFFLINE", poll_error=2)
+    assert (result["state"], connector.last_error_code) == ("ONLINE_WITH_WARNINGS", "HIK_NETWORK")
+    explained(evaluate_health(db, connector))
+    result = hik_heartbeat(db, connector, 4, poll_error=3)
+    assert (result["state"], connector.last_error_code) == ("ONLINE_WITH_WARNINGS", "HIK_AUTH")
+    result = hik_heartbeat(db, connector, 5)
+    assert (result["state"], connector.last_error_code) == ("ONLINE", None)
+
+
+def test_quarantine_persists_across_terminal_offline_heartbeat_and_stream_connect(db, envelopes):
+    first = connector_fixture(db)
+    first.zkt_device.serial, first.zkt_device.online = SERIAL, True
+    second = connector_fixture(db, hardware_id="e0:72:a1:d6:f3:29", expected_serial=SERIAL)
+    heartbeat(db, second, 1)
+    assert second.lifecycle_state == "QUARANTINED_DUPLICATE_SERIAL"
+    heartbeat(db, second, 2, zkt={"online": False, "connection_state": "RETRY_WAIT", "serial": SERIAL})
+    assert second.lifecycle_state == "QUARANTINED_DUPLICATE_SERIAL"
+    assert second.last_error_code == "QUARANTINED_DUPLICATE_SERIAL"
+    db.commit()
+    assert add_web.set_stream_connected(second.id, True) == "QUARANTINED_DUPLICATE_SERIAL"
+    db.refresh(second)
+    assert second.lifecycle_state == "QUARANTINED_DUPLICATE_SERIAL"
+
+
+@pytest.mark.parametrize("enabled,state", [(True, "OFFLINE"), (False, "ONLINE")])
+def test_stream_connect_keeps_lifecycle_until_a_heartbeat(db, envelopes, monkeypatch, enabled, state):
+    monkeypatch.setattr(settings, "device_health_derived_enabled", enabled)
+    connector = connector_fixture(db)
+    connector.lifecycle_state, connector.connected = "OFFLINE", False
+    db.commit()
+    assert add_web.set_stream_connected(connector.id, True) == state
+    db.refresh(connector)
+    assert connector.connected and connector.lifecycle_state == state
+    assert evaluate_health(db, connector).derived_lifecycle == state
+    assert heartbeat(db, connector, 1)["state"] == "ONLINE"
+
+
+def test_rejection_derivation_enforced(db, envelopes):
+    custody = live(db, connector_fixture(db))
+    reject(custody, envelopes(custody, "queue_evidence", {}), ValueError("bad"))
+    db.refresh(custody)
+    assert (custody.lifecycle_state, custody.last_error_code) == ("DEGRADED", "DEVICE_MESSAGE_REJECTED")
+    log = live(db, second_connector(db))
+    reject(log, envelopes(log, "log", {}), ValueError("bad"))
+    db.refresh(log)
+    assert (log.lifecycle_state, log.last_error_code) == ("ONLINE_WITH_WARNINGS", "DEVICE_MESSAGE_REJECTED")
+    server = live(db, second_connector(db, 2))
+    outage = OperationalError("SELECT 1", {}, Exception("down"))
+    reject(server, envelopes(server, "heartbeat", {}), outage)
+    db.refresh(server)
+    assert (server.lifecycle_state, server.last_error_code) == ("ONLINE", None)
+    row = alert_row(db, server, "ADD_MESSAGE_PROCESSING_FAILED")
+    details = deepcopy(row.details)
+    details["types"]["heartbeat"]["first_at"] = (utc_now() - timedelta(seconds=130)).isoformat()
+    row.details = details
+    db.commit()
+    reject(server, envelopes(server, "heartbeat", {}), outage)
+    db.refresh(server)
+    assert (server.lifecycle_state, server.last_error_code) == ("DEGRADED", None)
+    for connector in (custody, log, server):
+        explained(evaluate_health(db, connector))
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_telemetry_carries_add_health_in_both_modes(db, monkeypatch, enabled):
+    monkeypatch.setattr(settings, "device_health_derived_enabled", enabled)
+    connector = connector_fixture(db)
+    heartbeat(db, connector, 1, led="LOCAL_FAILURE")
+    row = db.scalar(select(DeviceTelemetry).where(DeviceTelemetry.connector_id == connector.id))
+    assert row.payload["_add_health"] == {
+        "v": 1, "mode": "ENFORCED" if enabled else "SHADOW", "lifecycle": "DEGRADED",
+        "derived_lifecycle": "DEGRADED", "tier": "DEGRADED", "reasons": ["ESP_LOCAL_FAILURE:DEGRADED:CURRENT"],
+        "terminal": "CONNECTED"}
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_hil_known_hold_unchanged_for_current_faults(factory, monkeypatch, enabled):  # noqa: F811
+    monkeypatch.setattr(settings, "device_health_derived_enabled", enabled)
+    session, _release, devices, _ = factory
+    device = devices[0]
+    serial = device.zkt_device.serial
+    update_heartbeat(session, connector=device, boot_id="hold-boot", sequence=1, payload=HeartbeatPayload(
+        firmware_version="2.6.15", uptime_seconds=1000, led_state="LOCAL_FAILURE",
+        zkt={"online": True, "connection_state": "ONLINE", "serial": serial},
+        diagnostics={"storage": latch_storage("zone_lite.c:7389"), "workers": legacy_sample()["workers"]}))
+    session.flush()
+    assert device.last_error_code == "ESP_DURABILITY_FAULT"
+    assert _known_hold(session, device) == "CONNECTOR_ERROR_REQUIRES_REVIEW"
+
+
+def test_factory_previous_boot_durability_on_252(factory):  # noqa: F811
+    session, release, devices, _ = factory
+    device = devices[0]
+    open_alert(session, device, "ESP_DURABILITY_FAULT", details={
+        "binding": "OBSERVED", "boot_id": "earlier-2615-boot", "firmware_version": "2.6.15"},
+        seen=utc_now() - timedelta(days=1))
+    health = explained(apply_device_health(session, device, source="READ"))
+    assert (health.reasons[0].tier, health.reasons[0].currency) == ("WARNING", "PREVIOUS_BOOT")
+    assert device.last_error_code == "ESP_DURABILITY_FAULT"
+    with pytest.raises(ValueError, match="FACTORY_TERMINAL_NOT_READY"):
+        zkt_factory_trial.predecessor_snapshot(session, release, device)
+    device.last_error_code = None
+    with pytest.raises(ValueError, match="FACTORY_EXISTING_SAFETY_HOLD"):
+        zkt_factory_trial.predecessor_snapshot(session, release, device)
+

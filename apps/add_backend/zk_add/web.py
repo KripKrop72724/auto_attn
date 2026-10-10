@@ -174,7 +174,13 @@ from zk_add.service import (
     update_heartbeat,
     update_device_user_command,
 )
-from zk_add.device_health import evaluate_health, evaluate_health_batch, health_detail, shadow_report
+from zk_add.device_health import (
+    apply_device_health,
+    evaluate_health,
+    evaluate_health_batch,
+    health_detail,
+    shadow_report,
+)
 from zk_add.settings import settings
 from zk_add.comm_keys import (
     cancel_comm_key_operation,
@@ -4116,8 +4122,8 @@ async def device_stream(websocket: WebSocket):
         return
     await connector_hub.connect(connector_id, websocket)
     try:
-        await asyncio.to_thread(set_stream_connected, connector_pk, True)
-        await browser_events.publish("device", {"connector_id": connector_id, "state": "ONLINE"})
+        state = await asyncio.to_thread(set_stream_connected, connector_pk, True)
+        await browser_events.publish("device", {"connector_id": connector_id, "connected": True, "state": state})
         catalog, coverage_payload = await asyncio.to_thread(stream_bootstrap, connector_pk)
         if not await send_identity_catalog(connector_id, catalog):
             await websocket.close(code=1011, reason="Identity catalog delivery failed")
@@ -4184,16 +4190,20 @@ def authenticate_stream(connector_id: str, token: str) -> int:
         return connector.id
 
 
-def set_stream_connected(connector_pk: int, connected: bool) -> None:
+def set_stream_connected(connector_pk: int, connected: bool) -> str | None:
+    """Record the socket; derived health keeps OFFLINE until a heartbeat is accepted."""
     with session_scope() as db:
         connector = db.get(Connector, connector_pk)
-        if connector:
-            connector.connected = connected
-            if connected:
+        if connector is None:
+            return None
+        connector.connected = connected
+        if connected:
+            if not settings.device_health_derived_enabled:
                 connector.lifecycle_state = "ONLINE"
-                connector.last_seen_at = utc_now()
-            else:
-                connector.last_disconnect_at = utc_now()
+            connector.last_seen_at = utc_now()
+        else:
+            connector.last_disconnect_at = utc_now()
+        return connector.lifecycle_state
 
 
 def stream_bootstrap(connector_pk: int) -> tuple[dict, dict | None]:
@@ -4243,9 +4253,12 @@ def record_envelope_rejection(connector_pk: int, envelope: Envelope, error: Exce
         alert = record_message_rejection(
             db, connector, message_type=envelope.type, category=category, error_type=error_type,
             error_paths=error_paths, request_id=envelope.message_id, boot_id=envelope.boot_id)
-        connector.lifecycle_state = "DEGRADED"
-        connector.last_error_code = alert.code
-        connector.last_error_message = alert.message
+        if settings.device_health_derived_enabled:
+            apply_device_health(db, connector, source="REJECTION")
+        else:
+            connector.lifecycle_state = "DEGRADED"
+            connector.last_error_code = alert.code
+            connector.last_error_message = alert.message
         ingest_logs(
             db,
             connector=connector,

@@ -88,19 +88,27 @@ def test_hikvision_recovery_clears_fault_only_after_proof_and_clock_expires(db):
     update(heartbeat(dict(device_epoch=now-10,sampled_epoch=now)),6)
     assert session.scalar(select(DeviceAlert).where(DeviceAlert.code=='HIK_CLOCK_DRIFT')).state=='RESOLVED'
 
-@pytest.mark.parametrize('error,code', [(1,'HIK_CONFIGURATION'), (2,'HIK_NETWORK'), (3,'HIK_AUTH'),
- (4,'HIK_HTTP_STATUS'), (5,'HIK_OVERSIZED'), (6,'HIK_SOURCE_CHANGED'), (7,'HIK_INVALID_RESPONSE'), (8,'HIK_STORAGE')])
-def test_hik_terminal_failure_explained_despite_live_heartbeat(db,error,code):
+# A terminal fault is explained on a live ESP: storage failures degrade it, other
+# checks warn, and an unreachable terminal warns once it has been down for 5 min.
+@pytest.mark.parametrize('error,code,state', [(1,'HIK_CONFIGURATION','ONLINE_WITH_WARNINGS'),
+ (2,'HIK_NETWORK','ONLINE'), (3,'HIK_AUTH','ONLINE_WITH_WARNINGS'), (4,'HIK_HTTP_STATUS','ONLINE_WITH_WARNINGS'),
+ (5,'HIK_OVERSIZED','ONLINE_WITH_WARNINGS'), (6,'HIK_SOURCE_CHANGED','ONLINE_WITH_WARNINGS'),
+ (7,'HIK_INVALID_RESPONSE','ONLINE_WITH_WARNINGS'), (8,'HIK_STORAGE','DEGRADED')])
+def test_hik_terminal_failure_explained_despite_live_heartbeat(db,error,code,state):
     session,connector=db
     p=heartbeat()
     p.terminal.online=False
     p.terminal.connection_state='OFFLINE'
     p.terminal.poll_error=error
-    update_heartbeat(session,connector=connector,boot_id='terminal-fault',sequence=1,payload=p)
+    result=update_heartbeat(session,connector=connector,boot_id='terminal-fault',sequence=1,payload=p)
     assert connector.connected
-    assert connector.lifecycle_state=='DEGRADED'
-    assert connector.last_error_code==code
-    assert connector.last_error_message
+    assert connector.lifecycle_state==state
+    alert=session.scalar(select(DeviceAlert).where(DeviceAlert.code=='HIK_CAPTURE_UNHEALTHY'))
+    assert alert.details['reason']==code and alert.message
+    if state=='ONLINE':
+        assert connector.last_error_code is None and result['terminal_link']['state']=='RECONNECTING'
+    else:
+        assert connector.last_error_code==code and connector.last_error_message
     p.terminal.online=True
     p.terminal.connection_state='ONLINE'
     p.terminal.poll_error=0
