@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Literal
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -41,6 +42,28 @@ class AddSettings(BaseSettings):
 
     heartbeat_interval_seconds: int = 15
     offline_after_seconds: int = 45
+    # Derived device health (zk_add/device_health.py). The owner enforces the
+    # derived lifecycle on deploy; false is the kill switch that hands
+    # lifecycle and last_error back to the legacy writers on the next heartbeat.
+    device_health_derived_enabled: bool = True
+    journal_startup_grace_seconds: int = Field(default=600, ge=60, le=60 * 60)
+    terminal_disconnected_warning_seconds: int = Field(default=300, ge=60, le=60 * 60)
+    terminal_stabilizing_warning_seconds: int = Field(default=600, ge=60, le=60 * 60)
+    terminal_maintenance_budget_seconds: int = Field(default=600, ge=60, le=60 * 60)
+    terminal_link_down_alert_seconds: int = Field(default=900, ge=300, le=24 * 60 * 60)
+    message_rejection_current_seconds: int = Field(default=300, ge=30, le=60 * 60)
+    message_failure_warning_count: int = Field(default=3, ge=1, le=100)
+    message_failure_warning_seconds: int = Field(default=300, ge=30, le=60 * 60)
+    heartbeat_failure_degraded_seconds: int = Field(default=120, ge=30, le=60 * 60)
+    heartbeat_stale_degraded_seconds: int = Field(default=90, ge=45, le=60 * 60)
+    led_boot_time_hold_uptime_seconds: int = Field(default=180, ge=30, le=60 * 60)
+    restart_loop_window_seconds: int = Field(default=1800, ge=300, le=24 * 60 * 60)
+    restart_loop_boots: int = Field(default=4, ge=3, le=50)
+    # A 2.6.15 LED latch from these lock-contention sources, with zero I/O
+    # errors and verified storage in the same sample, is shown at this tier.
+    # The alert stays OPEN, HIGH and gating either way.
+    device_health_latched_led_tier: Literal["DEGRADED", "WARNING"] = "WARNING"
+    device_health_latched_led_sources: str = "2.6.15:add_connector.c:3764,2.6.15:add_connector.c:3787"
     connector_command_poll_seconds: int = 3
     reconcile_interval_seconds: int = 15 * 60
     user_integrity_interval_seconds: int = 30

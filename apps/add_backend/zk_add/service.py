@@ -12,6 +12,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from zk_add.audit import append_audit
+from zk_add.device_health import Health, health_summary, terminal_link
 from zk_add.crypto import (
     cnic_lookup,
     decrypt_cnic,
@@ -5403,10 +5404,12 @@ def serialize_user_deletion_job(session: Session, job: UserDeletionJob) -> dict:
     }
 
 
-def serialize_connector(connector: Connector) -> dict:
+def serialize_connector(connector: Connector, *, health: Health | None = None) -> dict:
+    """Runs at the end of every heartbeat, so it must never query."""
     zkt = connector.zkt_device
-    return {
-        "snapshot_at": utc_now(),
+    now = utc_now()
+    row = {
+        "snapshot_at": now,
         "boot_id": connector.boot_id,
         "connector_id": connector.connector_id,
         "hardware_id": connector.hardware_id,
@@ -5482,7 +5485,11 @@ def serialize_connector(connector: Connector) -> dict:
             "last_reconcile_at": zkt.last_reconcile_at,
             "next_restart_at": zkt.next_restart_at,
         },
+        "terminal_link": terminal_link(connector, now),
     }
+    if health is not None:
+        row["health"] = health_summary(health)
+    return row
 
 
 # Operator acknowledgement annotates an active alert; refreshed evidence keeps it.

@@ -174,6 +174,7 @@ from zk_add.service import (
     update_device_user_command,
     upsert_alert,
 )
+from zk_add.device_health import evaluate_health, evaluate_health_batch, health_detail, shadow_report
 from zk_add.settings import settings
 from zk_add.comm_keys import (
     cancel_comm_key_operation,
@@ -1070,7 +1071,9 @@ def list_devices(
                 Connector.hardware_id.ilike(like),
             )
         )
-    return {"rows": [serialize_connector(row) for row in db.scalars(statement).all()]}
+    rows = db.scalars(statement).all()
+    healths = evaluate_health_batch(db, rows)
+    return {"rows": [serialize_connector(row, health=healths[row.id]) for row in rows]}
 
 
 def connector_or_404(db: Session, connector_id: str) -> Connector:
@@ -1098,11 +1101,20 @@ def get_device(connector_id: str, auth: tuple[Session, AdminContext] = Depends(r
                 TemporaryAdminLease.state.in_(["GRANTING", "ACTIVE", "REVOKING", "OVERDUE"]),
             ).order_by(TemporaryAdminLease.requested_at.desc()).limit(1)
         )
+    health = evaluate_health(db, connector)
     return {
         **serialize_connector(connector),
+        "health": health_detail(db, connector, health),
         "active_command": command_response(active_command) if active_command else None,
         "active_lease": serialize_lease(active_lease) if active_lease else None,
     }
+
+
+@app.get("/api/v1/device-health/shadow")
+def device_health_shadow(auth: tuple[Session, AdminContext] = Depends(require_admin)):
+    """Read-only: where the derived lifecycle and error differ from the stored pair."""
+    db, _context = auth
+    return shadow_report(db)
 
 
 @app.patch("/api/v1/devices/{connector_id}/spare")
