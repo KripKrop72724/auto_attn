@@ -205,7 +205,8 @@ def _post_verdict_hold(session, connector, *, run_completed_at):
     if connector.ota_secure_boot is False or connector.ota_rollback_enabled is False:
         return "SECURITY_CAPABILITY_REGRESSED"
     if session.scalar(select(DeviceAlert.id).where(DeviceAlert.connector_id == connector.id,
-            DeviceAlert.code == "ESP_DURABILITY_FAULT", DeviceAlert.resolved_at.is_(None),
+            DeviceAlert.code.in_(["ESP_DURABILITY_FAULT", "ESP_PRESERVATION_UNVERIFIED"]),
+            DeviceAlert.resolved_at.is_(None),
             DeviceAlert.state != "RESOLVED", DeviceAlert.last_seen_at >= completed).limit(1)):
         return "POST_VERDICT_PERSISTENCE_FAULT"
     diagnostics = connector.firmware_diagnostics or {}

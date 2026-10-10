@@ -33,6 +33,13 @@ def main() -> None:
             "post",
         )
     )
+    assert {"reason", "password", "idempotency_key"}.issubset(
+        request_properties(spec, "/api/v1/alerts/{alert_id}/resolve", "post")
+    )
+    assert {"expected_code", "reason", "password", "idempotency_key"}.issubset(
+        request_properties(spec, "/api/v1/devices/{connector_id}/clear-error", "post")
+    )
+    assert "get" in paths["/api/v1/device-health/shadow"]
     print("Frontend OpenAPI safety contracts are synchronized.")
 
 

@@ -87,6 +87,7 @@ from zk_add.realtime import browser_events, connector_hub, sse_encode
 from zk_add.schemas import (
     AdminLeaseRequest,
     AlertAcknowledgeRequest,
+    AlertResolveRequest,
     BulkUserDeleteCancelRequest,
     BulkUserDeleteRequest,
     CommandUpdate,
@@ -103,6 +104,7 @@ from zk_add.schemas import (
     LoginRequest,
     OnboardRequest,
     DeviceLogIn,
+    DeviceErrorClearRequest,
     DeviceSpareUpdateRequest,
     AttendanceRecoveryControlRequest,
     AttendanceRecoveryCreateRequest,
@@ -174,6 +176,7 @@ from zk_add.service import (
     update_heartbeat,
     update_device_user_command,
 )
+from zk_add.device_health_actions import HealthActionError, clear_device_error, resolve_alert_by_operator
 from zk_add.device_health import (
     apply_device_health,
     evaluate_health,
@@ -3704,6 +3707,63 @@ def acknowledge_alert(
         after={"state": "OPEN", "acknowledged_at": row.acknowledged_at.isoformat(), "note": body.note},
     )
     return serialize_alert(row)
+
+
+def _publish_health_action(background_tasks: BackgroundTasks, connector: Connector | None,
+                           alert: DeviceAlert | None = None) -> None:
+    if alert is not None:
+        background_tasks.add_task(browser_events.publish, "alert", serialize_alert(alert))
+    if connector is not None:
+        background_tasks.add_task(browser_events.publish, "device", serialize_connector(connector))
+
+
+@app.post("/api/v1/alerts/{alert_id}/resolve")
+def resolve_alert_with_reason(
+    request: Request,
+    alert_id: int,
+    body: AlertResolveRequest,
+    background_tasks: BackgroundTasks,
+    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+):
+    """Resolve an alert whose condition the latest evidence no longer asserts."""
+    db, context = auth
+    require_step_up(body.password, db, context)  # before any row lock
+    try:
+        result = resolve_alert_by_operator(
+            db, alert_id=alert_id, actor=context.username, reason=body.reason,
+            idempotency_key=body.idempotency_key, ip_address=client_ip(request))
+    except HealthActionError as error:
+        raise HTTPException(status_code=error.status, detail=error.detail) from error
+    alert = db.get(DeviceAlert, result["alert_id"])
+    connector = db.get(Connector, alert.connector_id)
+    db.commit()
+    if not result.get("replayed"):
+        _publish_health_action(background_tasks, connector, alert)
+    return {**result, "alert": serialize_alert(alert)}
+
+
+@app.post("/api/v1/devices/{connector_id}/clear-error")
+def clear_device_error_with_reason(
+    request: Request,
+    connector_id: str,
+    body: DeviceErrorClearRequest,
+    background_tasks: BackgroundTasks,
+    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+):
+    """Re-derive a device error that no active alert backs any more."""
+    db, context = auth
+    require_step_up(body.password, db, context)
+    try:
+        result = clear_device_error(
+            db, connector_id=connector_id, expected_code=body.expected_code, actor=context.username,
+            reason=body.reason, idempotency_key=body.idempotency_key, ip_address=client_ip(request))
+    except HealthActionError as error:
+        raise HTTPException(status_code=error.status, detail=error.detail) from error
+    connector = db.scalar(select(Connector).where(Connector.connector_id == connector_id))
+    db.commit()
+    if not result.get("replayed"):
+        _publish_health_action(background_tasks, connector)
+    return result
 
 
 @app.get("/api/v1/commands/{command_id}")

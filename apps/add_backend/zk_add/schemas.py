@@ -1102,6 +1102,19 @@ class AlertAcknowledgeRequest(BaseModel):
     note: str | None = Field(default=None, max_length=500)
 
 
+class AlertResolveRequest(BaseModel):
+    reason: str = Field(min_length=10, max_length=500)
+    password: str = Field(min_length=1, max_length=512)
+    idempotency_key: str = Field(min_length=8, max_length=120)
+
+
+class DeviceErrorClearRequest(BaseModel):
+    expected_code: str = Field(min_length=1, max_length=120)
+    reason: str = Field(min_length=10, max_length=500)
+    password: str = Field(min_length=1, max_length=512)
+    idempotency_key: str = Field(min_length=8, max_length=120)
+
+
 class HikvisionPolicyRequest(BaseModel):
     terminal_serial: str = Field(min_length=1, max_length=120)
     source_epoch: str = Field(min_length=1, max_length=64)

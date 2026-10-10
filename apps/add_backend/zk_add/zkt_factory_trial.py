@@ -219,7 +219,7 @@ def predecessor_snapshot(session, release, connector, *, own_deployment_id=None)
         (ReconciliationJob, [ReconciliationJob.connector_id == connector.id,
             ReconciliationJob.status.not_in(["COMPLETED", "CANCELLED", "FAILED", "INVALIDATED"])]),
         (DeviceAlert, [DeviceAlert.connector_id == connector.id, DeviceAlert.state != "RESOLVED",
-            DeviceAlert.code.in_(["ESP_DURABILITY_FAULT", "TERMINAL_IDENTITY_MISMATCH"])])
+            DeviceAlert.code.in_(["ESP_DURABILITY_FAULT", "ESP_PRESERVATION_UNVERIFIED", "TERMINAL_IDENTITY_MISMATCH"])])
     ):
         _require(not session.scalar(select(model.id).where(*clauses).limit(1)), "FACTORY_EXISTING_SAFETY_HOLD")
     prior = session.scalar(select(FirmwareDeployment).where(FirmwareDeployment.connector_id == connector.id,

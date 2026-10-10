@@ -118,3 +118,48 @@ def test_acknowledge_waits_for_heartbeat_lock_and_keeps_acknowledged_by(postgres
         assert row.state == "OPEN" and row.details["boot_id"] == "refreshed"
         assert row.details["acknowledged_by"] == settings.admin_username
         assert row.details["acknowledgement_note"] == "on site"
+
+
+def test_operator_resolve_serializes_with_heartbeat_without_deadlock(postgres, monkeypatch):
+    from zk_add.security import hash_admin_password
+
+    sessions, connector_id = postgres
+    monkeypatch.setattr(settings, "admin_password_hash", hash_admin_password("correct-password"))
+    with sessions() as db:
+        connector = db.get(Connector, connector_id)
+        alert = upsert_alert(db, connector, code="ESP_DELIVERY_WORKER_FAULT", severity="HIGH", message="worker",
+                             details={"binding": "INFERRED_PREVIOUS"})
+        raw_session, admin = create_admin_session(db, username=settings.admin_username, ip_address="127.0.0.1",
+                                                  user_agent="pytest")
+        db.commit()
+        alert_id, csrf = alert.id, admin.csrf_token
+
+    def request_session():
+        with sessions() as db:
+            try:
+                yield db
+                db.commit()
+            except Exception:
+                db.rollback()
+                raise
+
+    app.dependency_overrides[get_db] = request_session
+    client = TestClient(app)
+    client.cookies.set(ADMIN_COOKIE, raw_session)
+    with sessions() as heartbeat, ThreadPoolExecutor(max_workers=1) as pool:
+        connector = heartbeat.scalar(select(Connector).where(Connector.id == connector_id).with_for_update())
+        upsert_alert(heartbeat, connector, code="ZKT_CLOCK_DRIFT", severity="WARNING", message="drift")
+        connector.last_seen_at = utc_now()
+        heartbeat.flush()
+        pending = pool.submit(client.post, f"/api/v1/alerts/{alert_id}/resolve", headers={"X-CSRF-Token": csrf},
+                              json={"reason": "Raised on an ended recovery boot", "password": "correct-password",
+                                    "idempotency_key": "postgres-resolve-1"})
+        time.sleep(0.5)
+        assert not pending.done()  # the operator waits for the heartbeat's connector lock
+        heartbeat.commit()
+        response = pending.result(timeout=10)
+    assert response.status_code == 200, response.text
+    with sessions() as db:
+        row = db.get(DeviceAlert, alert_id)
+        assert row.state == "RESOLVED" and row.details["resolution"]["kind"] == "OPERATOR"
+        assert db.scalar(select(DeviceAlert).where(DeviceAlert.code == "ZKT_CLOCK_DRIFT")).state == "OPEN"
