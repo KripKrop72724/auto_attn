@@ -22,7 +22,10 @@ import { AppShell } from './AppShell'
 import { Icon } from './Icon'
 import { dashboardRoute, firmwareSection, routeDeviceId, routePath } from './routing'
 import { useRealtime, type RealtimeTopic } from './realtime'
-import { firmwareLabel, humanizeStatus, normalizedStatus, statusPattern } from './status'
+import {
+  firmwareLabel, humanizeStatus, isOnlineState, normalizedStatus, statusPattern, terminalLinkNeedsAttention,
+  terminalLinkPattern, type StatusPattern,
+} from './status'
 import type {
   Alert,
   AlertQueueResponse,
@@ -30,6 +33,7 @@ import type {
   Command,
   ConnectionEvent,
   Device,
+  DeviceHealth,
   DeviceLog,
   DeviceUser,
   FirmwareCampaign,
@@ -50,6 +54,7 @@ import type {
   SourceExceptionList,
   SourceExceptionReveal,
   SourceExceptionTotals,
+  TerminalLink,
   UserCommandResponse,
   UserDeletionJob,
   DashboardRoute,
@@ -198,6 +203,78 @@ export function StatusBadge({
       {live && <i aria-hidden="true" />}
     </span>
   )
+}
+
+const terminalLinkLabels: Record<string, string> = {
+  CONNECTED: 'Terminal connected',
+  STABILIZING: 'Terminal stabilizing',
+  MAINTENANCE: 'Terminal maintenance',
+  STARTING: 'Terminal starting',
+  RECONNECTING: 'Terminal reconnecting',
+  DISCONNECTED: 'Terminal disconnected',
+  FLAPPING: 'Terminal flapping',
+  ERROR: 'Terminal error',
+  UNKNOWN: 'Terminal unknown',
+}
+
+export const terminalLinkLabel = (state: unknown) => {
+  const status = normalizedStatus(state).toUpperCase()
+  return terminalLinkLabels[status] || `Terminal ${humanizeStatus(status).toLowerCase()}`
+}
+
+// The ESP lifecycle badge and this terminal-link badge are deliberately separate.
+export function TerminalLinkBadge({ link }: { link: TerminalLink }) {
+  const pattern = terminalLinkPattern(link.state)
+  const label = terminalLinkLabel(link.state)
+  return (
+    <span className={`status-badge terminal-link-badge pattern-${pattern}`} data-pattern={pattern} aria-label={`Terminal link: ${humanizeStatus(link.state)}`} title={link.message || label}>
+      <Icon name={statusIcon[pattern]} />
+      <span>{label}</span>
+    </span>
+  )
+}
+
+export const showsTerminalLinkBadge = (link?: TerminalLink | null): link is TerminalLink =>
+  Boolean(link && !['CONNECTED', 'UNKNOWN'].includes(normalizedStatus(link.state).toUpperCase()))
+
+// Compact elapsed time for reason lines: '37 min', '5 h 12 min', '3 d'.
+export function elapsedSince(value?: string | null, now = Date.now()) {
+  const started = value ? Date.parse(value) : NaN
+  if (!Number.isFinite(started)) return ''
+  const minutes = Math.floor(Math.max(0, now - started) / 60_000)
+  if (minutes < 1) return 'under 1 min'
+  if (minutes < 60) return `${minutes} min`
+  const hours = Math.floor(minutes / 60)
+  if (hours < 48) return minutes % 60 ? `${hours} h ${minutes % 60} min` : `${hours} h`
+  return `${Math.floor(hours / 24)} d`
+}
+
+export const healthTierPattern = (tier: unknown): StatusPattern => {
+  const value = normalizedStatus(tier).toUpperCase()
+  return value === 'DEGRADED' ? 'waiting' : value === 'WARNING' ? 'notice' : statusPattern(value)
+}
+
+const tierWords: Record<string, string> = { DEGRADED: 'Degraded', WARNING: 'Warning' }
+
+// The list carries a compact primary reason; the detail response carries the
+// ordered reasons, so fall back to the first one with the worst tier.
+export function primaryHealthReason(health?: DeviceHealth | null) {
+  if (!health) return null
+  if (health.primary) return health.primary
+  const reasons = health.reasons || []
+  return reasons.find((reason) => normalizedStatus(reason.tier).toUpperCase() === 'DEGRADED')
+    || reasons.find((reason) => normalizedStatus(reason.tier).toUpperCase() === 'WARNING')
+    || null
+}
+
+export function healthReasonLine(
+  reason: { code: string; tier: string | null; message: string; since: string | null },
+  now = Date.now(),
+) {
+  const tier = normalizedStatus(reason.tier).toUpperCase()
+  const prefix = tierWords[tier] || (reason.tier ? humanizeStatus(reason.tier) : '')
+  const elapsed = elapsedSince(reason.since, now)
+  return `${prefix ? `${prefix}: ` : ''}${reason.message || humanizeStatus(reason.code)}${elapsed ? ` · ${elapsed}` : ''}`
 }
 
 export function useToast() {
@@ -401,8 +478,13 @@ function FleetView({
   const spareDevices = devices.filter((device) => device.is_spare)
   const inventoryDevices = inventory === 'fleet' ? activeDevices : spareDevices
   const needle = query.trim().toLowerCase()
+  // Online with warnings is still online. A terminal link that is down needs
+  // attention even while the ESP itself is online.
+  const terminalDown = (device: Device) => terminalLinkNeedsAttention(device.terminal_link?.state)
   const matchesState = (device: Device) => inventory === 'spares' || filter === 'ALL'
-    || (filter === 'ATTENTION' ? statusPattern(device.state) !== 'confirmed' : device.state === filter)
+    || (filter === 'ATTENTION' ? !isOnlineState(device.state) || terminalDown(device)
+      : filter === 'TERMINAL_LINK_DOWN' ? terminalDown(device)
+        : device.state === filter)
   const shown = inventoryDevices.filter(
     (device) =>
       matchesState(device) &&
@@ -414,13 +496,17 @@ function FleetView({
     : sort === 'state'
       ? left.state.localeCompare(right.state) || left.display_name.localeCompare(right.display_name)
       : +new Date(right.last_seen_at || 0) - +new Date(left.last_seen_at || 0))
-  const online = overview.online || 0
+  const withWarnings = overview.online_with_warnings || 0
+  const online = (overview.online || 0) + withWarnings
   const availability = overview.total ? Math.round((online / overview.total) * 100) : 0
   const attention =
     (overview.offline || 0) +
     (overview.degraded || 0) +
     (overview.flapping || 0) +
     (overview.quarantined_duplicate_serial || 0)
+  const terminalAttention = overview.terminal_attention || 0
+  // Acknowledged alerts stay OPEN; the queue counts only those still needing action.
+  const needsAction = overview.open_unacknowledged_alerts ?? overview.open_alerts
   const delivery = overview.ords_delivery
   const recovery = overview.attendance_recovery?.delivery
   const backlogStale = Boolean(delivery?.oldest_backlog_at && Date.now() - +new Date(delivery.oldest_backlog_at) > 15 * 60_000)
@@ -440,8 +526,8 @@ function FleetView({
         <button role="tab" aria-selected={inventory === 'spares'} className={inventory === 'spares' ? 'active' : ''} onClick={() => setInventory('spares')}><Icon name="server" /> Spares <span className="tab-count">{spareDevices.length}</span></button>
       </div>
       {inventory === 'fleet' ? <section className="metric-grid" aria-label="Fleet key indicators">
-        <Metric label="Fleet availability" value={`${availability}%`} detail={`${online} of ${overview.total} connectors online`} icon="pulse" tone={availabilityTone(availability, overview.total)} onClick={attention || online < overview.total ? showAttention : undefined} />
-        <Metric label="Operations queue" value={overview.open_alerts} detail={`${attention} device${attention === 1 ? '' : 's'} degraded or offline`} icon="alert" tone={overview.open_alerts ? 'warning' : 'neutral'} onClick={onNavigateAlerts} />
+        <Metric label="Fleet availability" value={`${availability}%`} detail={`${online} of ${overview.total} online${withWarnings ? ` (${withWarnings} with warnings)` : ''}`} icon="pulse" tone={availabilityTone(availability, overview.total)} onClick={attention || terminalAttention || online < overview.total ? showAttention : undefined} />
+        <Metric label="Operations queue" value={needsAction} detail={`${attention} device${attention === 1 ? '' : 's'} degraded or offline${terminalAttention ? ` · ${terminalAttention} terminal link${terminalAttention === 1 ? '' : 's'} down` : ''}`} icon="alert" tone={needsAction ? 'warning' : 'neutral'} onClick={onNavigateAlerts} />
         <Metric
           label="ORDS delivery queue"
           value={delivery?.backlog ?? 0}
@@ -494,11 +580,12 @@ function FleetView({
               <option value="ALL">All states</option>
               <option value="ATTENTION">Needs attention</option>
               <option value="ONLINE">Online</option>
+              <option value="ONLINE_WITH_WARNINGS">Online with warnings</option>
               <option value="DEGRADED">Degraded</option>
-              <option value="FLAPPING">Flapping</option>
               <option value="OFFLINE">Offline</option>
               <option value="ONBOARDING">Onboarding</option>
               <option value="QUARANTINED_DUPLICATE_SERIAL">Quarantined</option>
+              <option value="TERMINAL_LINK_DOWN">Terminal link down</option>
             </select>
           </label>}
           <label><span className="sr-only">Sort fleet</span><select value={sort} onChange={(event) => setSort(event.target.value as typeof sort)}><option value="last-contact">Newest contact first</option><option value="name">Device name</option><option value="state">Operational state</option></select></label>
@@ -517,21 +604,26 @@ function FleetView({
           <div className="device-list" aria-busy={loading}>
             {loading && !shown.length && <div className="empty-state is-loading" role="status"><Icon name="refresh" /><h3>Loading live fleet…</h3></div>}
             {shown.length > 0 && <div className="device-list-head" aria-hidden="true"><span>Device</span><span>Terminal</span><span>Activity</span><span>Firmware</span><span>Status</span></div>}
-            {shown.map((device) => (
-              <article className={`device-card ${device.is_spare ? 'spare-device-card pattern-notice' : `pattern-${statusPattern(device.state)}`}`} key={device.connector_id}>
+            {shown.map((device) => {
+              const primary = !device.is_spare && device.health?.mode === 'ENFORCED' ? primaryHealthReason(device.health) : null
+              return <article className={`device-card ${device.is_spare ? 'spare-device-card pattern-notice' : `pattern-${statusPattern(device.state)}`}`} key={device.connector_id}>
                 <button className="device-card-main" onClick={() => onInspect(device)} aria-label={`Inspect ${device.display_name}`}>
                   <span className="device-identity"><strong>{device.display_name}</strong><small>{device.zone_id} · {device.hardware_id}</small></span>
                   <span className="device-terminal"><strong>{device.zkt?.model || (device.firmware_family === 'hikvision' ? 'Hikvision terminal' : 'Awaiting terminal')}</strong><small>{[device.zkt?.ip_address, device.zkt?.serial].filter(Boolean).join(' · ') || 'Identity pending'}</small></span>
                   <span className="device-activity"><strong>{device.is_spare ? 'Reserve inventory' : deviceActivity(device)}</strong><small>{relativeTime(device.last_seen_at)}</small></span>
                   <span className="device-firmware"><strong>{device.firmware_version ? firmwareLabel(device.firmware_version) : 'Firmware unknown'}</strong><small>{device.ota_capable ? humanizeStatus(device.ota_state || 'OTA_READY') : 'Manual updates'}</small></span>
-                  <StatusBadge state={device.is_spare ? 'SPARE' : device.state} live={!device.is_spare && device.connected} />
+                  <span className="device-status-stack">
+                    <StatusBadge state={device.is_spare ? 'SPARE' : device.state} live={!device.is_spare && device.connected} />
+                    {!device.is_spare && showsTerminalLinkBadge(device.terminal_link) && <TerminalLinkBadge link={device.terminal_link} />}
+                  </span>
                   <Icon name="chevron" />
+                  {primary && <span className={`device-health-line pattern-${healthTierPattern(primary.tier)}`}>{healthReasonLine(primary)}</span>}
                 </button>
                 <div className="device-card-actions">
                   <button className="icon-button" onClick={() => onManageUsers(device)} aria-label={`Manage users on ${device.display_name}`} title="Manage users"><Icon name="users" /></button>
                 </div>
               </article>
-            ))}
+            })}
             {!loading && !shown.length && (
               <div className="empty-state">
                 <Icon name={filtered ? 'search' : 'server'} />
@@ -598,7 +690,58 @@ export function formatAlertDiagnostics(details: Record<string, unknown>): string
   if (typeof affectedUsers === 'number' && Number.isInteger(affectedUsers) && affectedUsers >= 0) {
     facts.push(`${affectedUsers} affected users`)
   }
+  const evidence = record(details.evidence)
+  if (typeof evidence?.summary === 'string' && evidence.summary.trim()) {
+    facts.push(`Evidence: ${evidence.summary.trim().slice(0, 300)}`)
+  }
+  const firmware = token(details.firmware_version, /^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$/)
+  const boot = token(details.boot_id, /^[A-Za-z0-9-]{1,64}$/)
+  if (firmware || boot) facts.push([firmware && `Firmware ${firmware}`, boot && `boot ${boot.slice(0, 8)}`].filter(Boolean).join(' · '))
+  const binding = token(details.binding, /^[A-Z_]{1,40}$/)
+  if (binding) facts.push(bindingLabels[binding] || `Binding ${binding}`)
+  const latch = token(record(details.latch)?.kind, /^[A-Z_]{1,60}$/)
+  if (latch) facts.push(latchLabels[latch] || `Latch ${latch}`)
+  // Rejection alerts keep one entry per message type; legacy rows carry one type.
+  const types = record(details.types)
+  const legacyRejection = typeof details.error_category === 'string' || typeof details.error_type === 'string'
+  const candidates: unknown[] = types ? Object.keys(types) : legacyRejection ? [details.message_type] : []
+  const messageTypes = candidates
+    .filter((value): value is string => typeof value === 'string' && /^[a-z][a-z0-9_]{0,63}$/.test(value))
+    .slice(0, 16)
+  if (messageTypes.length) facts.push(`Rejected ${messageTypes.join(', ')}`)
+  const resolution = record(details.resolution)
+  const kind = token(resolution?.kind, /^[A-Z_]{1,40}$/)
+  if (kind) facts.push(resolutionSummary(kind, token(resolution?.actor, /^[\w.@-]{1,80}$/)))
   return facts.join(' · ')
+}
+
+const record = (value: unknown) =>
+  value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null
+const token = (value: unknown, pattern: RegExp) => typeof value === 'string' && pattern.test(value) ? value : null
+const bindingLabels: Record<string, string> = {
+  OBSERVED: 'Observed on its boot',
+  INFERRED_CURRENT: 'Inferred on the current boot',
+  INFERRED_PREVIOUS: 'Inferred on an earlier boot',
+}
+const latchLabels: Record<string, string> = {
+  LED_LATCH_NO_IO_ERRORS: 'LED latch: no I/O errors this boot',
+  LED_LATCH_STORAGE_VERIFIED: 'LED latch: storage verified this boot',
+}
+const resolutionLabels: Record<string, string> = {
+  VERIFIED: 'Resolved on verified evidence',
+  CONDITION_CLEARED: 'Resolved: condition cleared',
+  MESSAGE_ACCEPTED: 'Resolved: message accepted',
+  DEPLOYMENT_SUCCEEDED: 'Resolved: later deployment succeeded',
+  BOOT_ENDED: 'Resolved: its boot ended',
+  OPERATOR: 'Resolved by an operator',
+  CLEANUP: 'Resolved by stranded-alert cleanup',
+}
+
+// Resolution kinds come from alert details.resolution.kind.
+export function resolutionSummary(kind: string, actor?: string | null) {
+  if (kind === 'OPERATOR' && actor) return `Resolved by ${actor}`
+  const label = resolutionLabels[kind] || `Resolved: ${humanizeStatus(kind).toLowerCase()}`
+  return actor ? `${label} (${actor})` : label
 }
 
 const DeviceDrawer = lazy(() => import('./features/DeviceDrawer').then((module) => ({ default: module.DeviceDrawer })))
@@ -830,7 +973,7 @@ function DashboardApp() {
 
   return (
     <>
-      <AppShell workspaceRef={workspaceRef} username={username} route={view} openAlertCount={overview.open_alerts} onNavigate={setView} onLogout={() => void logout()} realtimeState={realtime.state} lastSyncAt={realtime.lastSyncAt}>
+      <AppShell workspaceRef={workspaceRef} username={username} route={view} openAlertCount={overview.open_unacknowledged_alerts ?? overview.open_alerts} onNavigate={setView} onLogout={() => void logout()} realtimeState={realtime.state} lastSyncAt={realtime.lastSyncAt}>
         {view === 'fleet' && <FleetView devices={devices} overview={overview} loading={loading} onInspect={inspectDevice} onManageUsers={manageUsers} onNavigateAlerts={() => navigate('/alerts')} onNavigateReconciliation={() => navigate('/reconciliation?tab=recovery')} />}
         {view === 'users' && <Suspense fallback={<WorkspaceLoading label="Opening users" />}><UsersView devices={devices} selectedDeviceId={selectedDeviceId} onSelectDevice={selectUserDevice} revision={revisions.users + revisions.identity + revisions.command} toast={toast} refreshFleet={refreshFleet} /></Suspense>}
         {view === 'attendance' && <Suspense fallback={<WorkspaceLoading label="Opening attendance" />}><AttendanceView devices={devices} revision={revisions.attendance} realtimeState={realtime.state} realtimeLastSyncAt={realtime.lastSyncAt} toast={toast} /></Suspense>}

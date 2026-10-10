@@ -94,6 +94,19 @@ describe('fleet location aggregation', () => {
     expect(quetta).toMatchObject({ total: 1, online: 1, attention: 0, pattern: 'confirmed' })
   })
 
+  it('counts online with warnings as online, never as attention', () => {
+    const result = groupFleetLocations([
+      device({ connector_id: 'peshawar-two', zone_id: 'ZONE-PESHAWAR-02', zone_name: 'Peshawar', display_name: 'Peshawar 02', state: 'ONLINE_WITH_WARNINGS' }),
+      device({ connector_id: 'peshawar-six', zone_id: 'ZONE-PESHAWAR-06', zone_name: 'Peshawar', display_name: 'Peshawar 06', state: 'ONLINE' }),
+      device({ connector_id: 'tower-13', zone_id: 'ZONE-SLICTOWER-13FL', state: 'ONLINE_WITH_WARNINGS' }),
+      device({ connector_id: 'tower-3', zone_id: 'ZONE-SLICTOWER-3FL', state: 'DEGRADED' }),
+    ])
+    const peshawar = result.groups.find((group) => group.definition.id === 'peshawar')
+    const islamabad = result.groups.find((group) => group.definition.id === 'islamabad')
+    expect(peshawar).toMatchObject({ total: 2, online: 2, warnings: 1, attention: 0, pattern: 'notice' })
+    expect(islamabad).toMatchObject({ total: 2, online: 1, warnings: 1, attention: 1, pattern: 'waiting' })
+  })
+
   it('preserves unknown and nullable device data without inventing a pin', () => {
     const result = groupFleetLocations([
       device({ connector_id: 'unknown', zone_id: 'ZONE-UNKNOWN', zone_name: '', display_name: 'New branch', state: 'UNEXPECTED', last_seen_at: null }),

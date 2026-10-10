@@ -22,6 +22,13 @@ const patternLabel: Record<StatusPattern, string> = {
   notice: 'Status pending',
 }
 
+// Warnings rank as 'notice'; a location whose devices are all online says so
+// instead of the generic pending label used for onboarding or unknown states.
+const groupLabel = (group: FleetLocationGroup) =>
+  group.pattern === 'notice' && group.warnings > 0 && group.online === group.total
+    ? 'Online with warnings'
+    : patternLabel[group.pattern]
+
 const patternIcon: Record<StatusPattern, Parameters<typeof Icon>[0]['name']> = {
   confirmed: 'check',
   waiting: 'clock',
@@ -67,7 +74,7 @@ function LocationSummary({ group, onSelect, selected = false }: { group: FleetLo
     onClick={onSelect}
     aria-label={`Open ${group.definition.city} location, ${group.total} device${group.total === 1 ? '' : 's'}`}
     aria-pressed={selected}
-    title={`${group.definition.region} · ${patternLabel[group.pattern]}`}
+    title={`${group.definition.region} · ${groupLabel(group)}`}
   >
     <Icon name={patternIcon[group.pattern]} />
     <strong>{group.definition.city}</strong>
@@ -107,13 +114,13 @@ export function FleetMap({ devices, loading, onInspect, onManageUsers, formatRel
               className={`fleet-map-marker location-${group.definition.id} label-${group.definition.labelSide} pattern-${group.pattern} ${selectedMarker ? 'selected' : ''}`}
               style={markerStyle(group)}
               onClick={() => setSelectedId(group.definition.id)}
-              aria-label={`${group.definition.city}, ${group.total} device${group.total === 1 ? '' : 's'}, ${patternLabel[group.pattern]}`}
+              aria-label={`${group.definition.city}, ${group.total} device${group.total === 1 ? '' : 's'}, ${groupLabel(group)}`}
               aria-pressed={selectedMarker}
               aria-controls={selectedMarker ? 'fleet-location-panel' : undefined}
             >
               <span className="fleet-map-marker-ripple" aria-hidden="true" />
               <span className="fleet-map-marker-core" aria-hidden="true"><i /><strong>{group.total}</strong></span>
-              <span className="fleet-map-marker-label" aria-hidden="true"><strong>{group.definition.city}</strong><small>{patternLabel[group.pattern]}</small></span>
+              <span className="fleet-map-marker-label" aria-hidden="true"><strong>{group.definition.city}</strong><small>{groupLabel(group)}</small></span>
             </button>
           })}
         </div>

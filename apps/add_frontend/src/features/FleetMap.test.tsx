@@ -90,6 +90,28 @@ describe('FleetMap', () => {
     expect(screen.queryByRole('heading', { name: 'Islamabad' })).toBeNull()
   })
 
+  it('ranks online-with-warnings locations as notices without counting attention', () => {
+    render(
+      <FleetMap
+        devices={[
+          makeDevice({ connector_id: 'peshawar-two', zone_id: 'ZONE-PESHAWAR-02', zone_name: 'Peshawar', display_name: 'Peshawar 02', state: 'ONLINE_WITH_WARNINGS' }),
+          makeDevice({ connector_id: 'peshawar-six', zone_id: 'ZONE-PESHAWAR-06', zone_name: 'Peshawar', display_name: 'Peshawar 06' }),
+        ]}
+        loading={false}
+        onInspect={vi.fn()}
+        onManageUsers={vi.fn()}
+        formatRelativeTime={() => 'just now'}
+      />,
+    )
+    const marker = screen.getByRole('button', { name: 'Peshawar, 2 devices, Online with warnings' })
+    expect(marker.classList.contains('pattern-notice')).toBe(true)
+    expect(screen.getByText('Network healthy')).toBeTruthy()
+    fireEvent.click(marker)
+    expect(screen.getByText('Attention', { selector: 'small' }).previousElementSibling?.textContent).toBe('0')
+    expect(screen.getByText('Online', { selector: 'small' }).previousElementSibling?.textContent).toBe('2')
+    expect(screen.getByText('Online with warnings', { selector: '.fleet-map-status' })).toBeTruthy()
+  })
+
   it('renders safe loading and empty states', () => {
     const props = {
       devices: [] as Device[],

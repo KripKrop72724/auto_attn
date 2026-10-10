@@ -1,4 +1,4 @@
-import { statusPattern, type StatusPattern } from './status'
+import { isOnlineState, normalizedStatus, statusPattern, type StatusPattern } from './status'
 import type { Device } from './types'
 
 export type FleetLocationId =
@@ -28,6 +28,8 @@ export interface FleetLocationGroup {
   pattern: StatusPattern
   total: number
   online: number
+  // Online devices whose tier is ONLINE_WITH_WARNINGS (also counted as online).
+  warnings: number
   attention: number
   lastSeenAt: string | null
 }
@@ -140,7 +142,9 @@ export function groupFleetLocations(devices: Device[]): FleetLocationResult {
       devices: rows,
       pattern,
       total: rows.length,
-      online: rows.filter((device) => statusPattern(device.state) === 'confirmed').length,
+      online: rows.filter((device) => isOnlineState(device.state)).length,
+      warnings: rows.filter((device) => normalizedStatus(device.state).toUpperCase() === 'ONLINE_WITH_WARNINGS').length,
+      // Warnings rank as 'notice', so they never count as attention.
       attention: rows.filter((device) => statusPattern(device.state) === 'blocked' || statusPattern(device.state) === 'waiting').length,
       lastSeenAt: newestContact(rows),
     }]

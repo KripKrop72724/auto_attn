@@ -13,7 +13,7 @@ import App, {
   validateUserDraft,
 } from './App'
 import { api } from './api'
-import type { Device, DeviceUser } from './types'
+import type { Device, DeviceUser, Overview } from './types'
 
 const maskedCnic = '*****-****567-1'
 const fullCnic = '3520212345671'
@@ -135,6 +135,7 @@ const fetchStub = (
   includeActiveEnrichment = false,
   includeCurrentIdentity = false,
   fleetDevices: Device[] = [device],
+  overviewOverrides: Partial<Overview> = {},
 ) =>
   vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const path = String(input)
@@ -164,6 +165,7 @@ const fetchStub = (
           oldest_backlog_at: '2026-07-13T12:00:00Z',
           last_attempt_at: '2026-07-13T12:05:00Z',
         },
+        ...overviewOverrides,
       })
     }
     if (path.startsWith('/api/v1/firmware/releases')) {
@@ -570,6 +572,108 @@ describe('State Life ADD interface', () => {
     expect(screen.getByText('Spare')).toBeTruthy()
   })
 
+  it('counts warnings as online and keeps terminal outages in the attention filter', async () => {
+    const minutesAgo = (minutes: number) => new Date(Date.now() - minutes * 60_000 - 5_000).toISOString()
+    const warningDevice: Device = {
+      ...device,
+      connector_id: 'connector-warning',
+      hardware_id: 'e0:72:a1:d7:05:c4',
+      zone_id: 'ZONE-PESHAWAR-02',
+      zone_name: 'Peshawar',
+      display_name: 'Peshawar 02',
+      state: 'ONLINE_WITH_WARNINGS',
+      terminal_link: { state: 'CONNECTED', raw_state: 'ONLINE', since: minutesAgo(90), reason: 'LINK_UP', message: 'The terminal link is up.' },
+      health: {
+        mode: 'ENFORCED',
+        tier: 'ONLINE_WITH_WARNINGS',
+        derived_lifecycle: 'ONLINE_WITH_WARNINGS',
+        last_error_code: 'ESP_DELIVERY_WORKER_FAULT',
+        primary: {
+          code: 'ESP_DELIVERY_WORKER_FAULT',
+          error_code: 'ESP_DELIVERY_WORKER_FAULT',
+          tier: 'WARNING',
+          message: 'add_delivery STOPPED',
+          since: minutesAgo(37),
+        },
+        degraded_count: 0,
+        warning_count: 1,
+      },
+    }
+    const terminalDownDevice: Device = {
+      ...device,
+      connector_id: 'connector-terminal-down',
+      hardware_id: 'e0:72:a1:d5:08:a0',
+      zone_id: 'ZONE-MULTAN-01',
+      zone_name: 'Multan',
+      display_name: 'Multan 01',
+      state: 'ONLINE',
+      terminal_link: { state: 'DISCONNECTED', raw_state: 'RETRY_WAIT', since: minutesAgo(6), reason: 'RETRY_WAIT', message: 'The terminal has been unreachable for 6 minutes (RETRY_WAIT).' },
+    }
+    const degradedDevice: Device = {
+      ...device,
+      connector_id: 'connector-degraded',
+      hardware_id: 'e0:72:a1:d6:f3:31',
+      zone_id: 'ZONE-SWAT-01',
+      zone_name: 'Swat',
+      display_name: 'Swat 01',
+      state: 'DEGRADED',
+      terminal_link: { state: 'CONNECTED', raw_state: 'ONLINE', since: minutesAgo(90), reason: 'LINK_UP', message: 'The terminal link is up.' },
+    }
+    vi.stubGlobal('fetch', fetchStub([user], false, false, false, false, [device, warningDevice, terminalDownDevice, degradedDevice], {
+      total: 4,
+      online: 2,
+      online_with_warnings: 1,
+      degraded: 1,
+      open_alerts: 5,
+      open_unacknowledged_alerts: 2,
+      terminal_attention: 1,
+    }))
+    render(<App />)
+    await screen.findByRole('heading', { name: 'Fleet', level: 1 })
+
+    expect(await screen.findByText('3 of 4 online (1 with warnings)')).toBeTruthy()
+    expect(screen.getByText('75%')).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Operations queue: 2. 1 device degraded or offline · 1 terminal link down' })).toBeTruthy()
+    expect(screen.getByLabelText('2 alerts need action')).toBeTruthy()
+
+    const filter = screen.getByRole('combobox', { name: 'Filter by state' }) as HTMLSelectElement
+    expect(Array.from(filter.options).map((option) => [option.value, option.textContent])).toEqual([
+      ['ALL', 'All states'],
+      ['ATTENTION', 'Needs attention'],
+      ['ONLINE', 'Online'],
+      ['ONLINE_WITH_WARNINGS', 'Online with warnings'],
+      ['DEGRADED', 'Degraded'],
+      ['OFFLINE', 'Offline'],
+      ['ONBOARDING', 'Onboarding'],
+      ['QUARANTINED_DUPLICATE_SERIAL', 'Quarantined'],
+      ['TERMINAL_LINK_DOWN', 'Terminal link down'],
+    ])
+
+    fireEvent.click(screen.getByRole('button', { name: 'List' }))
+    expect(await screen.findByRole('button', { name: 'Inspect Peshawar 02' })).toBeTruthy()
+    expect(screen.getByText('Warning: add_delivery STOPPED · 37 min')).toBeTruthy()
+    const terminalBadge = screen.getByLabelText('Terminal link: Disconnected')
+    expect(terminalBadge.getAttribute('data-pattern')).toBe('blocked')
+    expect(terminalBadge.textContent).toBe('Terminal disconnected')
+    expect(terminalBadge.closest('button')?.getAttribute('aria-label')).toBe('Inspect Multan 01')
+    expect(screen.queryByLabelText('Terminal link: Connected')).toBeNull()
+    expect(screen.getByLabelText('Status: ONLINE WITH WARNINGS').getAttribute('data-pattern')).toBe('notice')
+
+    fireEvent.change(filter, { target: { value: 'ATTENTION' } })
+    expect(screen.getByRole('button', { name: 'Inspect Multan 01' })).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Inspect Swat 01' })).toBeTruthy()
+    expect(screen.queryByRole('button', { name: 'Inspect Peshawar 02' })).toBeNull()
+    expect(screen.queryByRole('button', { name: `Inspect ${device.display_name}` })).toBeNull()
+
+    fireEvent.change(filter, { target: { value: 'TERMINAL_LINK_DOWN' } })
+    expect(screen.getByRole('button', { name: 'Inspect Multan 01' })).toBeTruthy()
+    expect(screen.queryByRole('button', { name: 'Inspect Swat 01' })).toBeNull()
+
+    fireEvent.change(filter, { target: { value: 'ONLINE_WITH_WARNINGS' } })
+    expect(screen.getByRole('button', { name: 'Inspect Peshawar 02' })).toBeTruthy()
+    expect(screen.queryByRole('button', { name: 'Inspect Multan 01' })).toBeNull()
+  })
+
   it('renders only masked CNIC in the selected-terminal users workspace', async () => {
     render(<App />)
     await screen.findByRole('heading', { name: 'Fleet', level: 1 })
@@ -912,6 +1016,32 @@ describe('State Life ADD interface', () => {
     expect(document.body.textContent).not.toContain('must-not-render')
     expect(document.body.textContent).not.toContain(fullCnic)
     expect(formatAlertDiagnostics({ failure_category: 'unsafe detail!', secret: 'x' })).toBe('')
+  })
+
+  it('renders bounded device-health evidence, binding, latch, rejection types, and resolution', () => {
+    expect(formatAlertDiagnostics({
+      diagnostics_schema_version: 2,
+      boot_id: '1a2b3c4d-5e6f-4a1b-8c2d-0123456789ab',
+      firmware_version: '2.5.2',
+      binding: 'INFERRED_PREVIOUS',
+      evidence: { summary: 'add_delivery STOPPED · restarts 3', workers: [{ name: 'add_delivery', state: 'STOPPED' }] },
+      latch: { kind: 'LED_LATCH_NO_IO_ERRORS', source: 'add_connector.c:3764', firmware_version: '2.6.15' },
+      resolution: { kind: 'OPERATOR', actor: 'StateHealthAdmin', reason: 'Stranded by the recovery image.', at: '2026-10-10T08:00:00Z' },
+    })).toBe(
+      'Evidence: add_delivery STOPPED · restarts 3 · Firmware 2.5.2 · boot 1a2b3c4d · Inferred on an earlier boot · '
+      + 'LED latch: no I/O errors this boot · Resolved by StateHealthAdmin',
+    )
+    expect(formatAlertDiagnostics({
+      message_type: 'log',
+      error_type: 'ValidationError',
+      error_category: 'SCHEMA_INVALID',
+      types: { heartbeat: { count: 2 }, queue_evidence: { count: 1 }, 'not a type!': {} },
+      resolution: { kind: 'MESSAGE_ACCEPTED', at: '2026-10-10T08:00:00Z' },
+    })).toBe('Rejected heartbeat, queue_evidence · Resolved: message accepted')
+    expect(formatAlertDiagnostics({ message_type: 'heartbeat', error_category: 'DATABASE_UNAVAILABLE' })).toBe('Rejected heartbeat')
+    expect(formatAlertDiagnostics({ message_type: 'heartbeat' })).toBe('')
+    expect(formatAlertDiagnostics({ evidence: { summary: 'x'.repeat(400) } })).toBe(`Evidence: ${'x'.repeat(300)}`)
+    expect(formatAlertDiagnostics({ firmware_version: '<script>', boot_id: 'bad boot', binding: 'lower', latch: 'LED' })).toBe('')
   })
 
   it('requires audited step-up to reveal and review attendance quarantine', async () => {
