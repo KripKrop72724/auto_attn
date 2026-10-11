@@ -788,7 +788,7 @@ def apply_firmware_diagnostics(session: Session, connector: Connector, payload: 
                     "kind": "BOOT_ENDED", "previous_boot_id": details.get("boot_id"),
                     "current_boot_id": connector.boot_id, "current_firmware": connector.firmware_version})
             else:
-                bind_unbound_row(existing, connector, uptime_seconds=payload.uptime_seconds, now=now)
+                bind_unbound_row(session, existing, connector, uptime_seconds=payload.uptime_seconds, now=now)
         if settings.device_health_derived_enabled:
             continue  # the derived health owns lifecycle and the device error
         unresolved = None if verified and not failed else session.scalar(select(DeviceAlert.id).where(

@@ -1530,3 +1530,64 @@ def test_fleet_counts_terminal_attention(db):
     counts = fleet_counts(db)
     assert counts["terminal_attention"] == 2
     assert counts["total"] == 3
+
+
+# Firmware reports its version as "zone-lite-X.Y.Z"; every rule compares the release.
+def test_reported_zone_lite_versions_match_release_rules(db, monkeypatch):
+    monkeypatch.setattr(settings, "device_health_latched_led_tier", "WARNING")
+    latched = connector_fixture(db)
+    sample = legacy_sample()
+    sample["storage"] = latch_storage()
+    heartbeat(db, latched, 1, firmware="zone-lite-2.6.15", led="LOCAL_FAILURE", diagnostics=sample)
+    assert alert_row(db, latched, "ESP_LOCAL_FAILURE").details["latch"]["firmware_version"] == "2.6.15"
+    assert latched.lifecycle_state == "ONLINE_WITH_WARNINGS"
+    recovery_release(db)
+    p02_connector = p02(db)
+    apply(db, p02_connector, {"workers": [worker("add_delivery", "STOPPED")]}, firmware="zone-lite-2.6.27",
+          image=RECOVERY_DIGEST)
+    assert alert_row(db, p02_connector, "ESP_DELIVERY_WORKER_FAULT") is None
+    legacy = live(db, second_connector(db, 3), firmware="zone-lite-2.5.2")
+    coverage = {item["key"]: item for item in device_health.coverage(legacy)}
+    assert coverage["storage"]["detail"] == "Not reported by firmware 2.5.2."
+    open_alert(db, legacy, "ESP_DURABILITY_FAULT", details={"binding": "INFERRED_PREVIOUS"})
+    assert evaluate_health(db, legacy).reasons[0].tier == "WARNING"
+
+
+def refreshing_heartbeat(db, connector, boot, at, firmware):
+    db.add(DeviceTelemetry(connector_id=connector.id, boot_id=boot, sequence=7, uptime_seconds=900,
+                           created_at=at, payload={"firmware_version": firmware}))
+    db.commit()
+
+
+def test_binding_uses_the_heartbeat_that_refreshed_the_alert_near_a_rollback(db):
+    # SLICTOWER-13FL on 10 Oct: a 2.6.x attempt raised the fault, failed boot health
+    # and rolled back to 2.4.12 within seconds; uptime arithmetic called it current.
+    connector = live(db, connector_fixture(db), firmware="zone-lite-2.4.12")
+    refreshed = utc_now() - timedelta(days=8)
+    row = open_alert(db, connector, "ESP_DURABILITY_FAULT", seen=refreshed, details={"diagnostics_schema_version": 1})
+    refreshing_heartbeat(db, connector, "attempt-boot", refreshed - timedelta(seconds=1), "zone-lite-2.6.15")
+    uptime = int((utc_now() - refreshed).total_seconds()) + 10  # boot "started" 10 s before the refresh
+    apply(db, connector, uptime=uptime)
+    assert (row.details["binding"], row.details["boot_id"], row.details["inferred_from"]) == (
+        "INFERRED_PREVIOUS", "attempt-boot", "TELEMETRY")
+    assert row.details["firmware_version"] == "zone-lite-2.6.15"
+    reason = evaluate_health(db, connector).reasons[0]
+    assert (reason.currency, reason.tier, reason.gating) == ("PREVIOUS_BOOT", "WARNING", True)
+
+
+def test_uptime_inference_is_checked_against_telemetry_once(db):
+    connector = live(db, connector_fixture(db), firmware="zone-lite-2.4.12")
+    refreshed = utc_now() - timedelta(days=8)
+    row = open_alert(db, connector, "ESP_DURABILITY_FAULT", seen=refreshed, details={
+        "diagnostics_schema_version": 1, "binding": "INFERRED_CURRENT", "boot_id": "boot-b"})
+    apply(db, connector, uptime=900_000)  # no telemetry yet: the uptime inference stays, checked
+    assert (row.details["binding"], row.details["telemetry_checked"]) == ("INFERRED_CURRENT", True)
+    refreshing_heartbeat(db, connector, "attempt-boot", refreshed - timedelta(seconds=1), "zone-lite-2.6.15")
+    apply(db, connector, uptime=900_000)
+    assert row.details["binding"] == "INFERRED_CURRENT"  # checked once only
+    other = live(db, second_connector(db), firmware="zone-lite-2.5.2")
+    stranded = open_alert(db, other, "ESP_DELIVERY_WORKER_FAULT", seen=refreshed, details={
+        "binding": "INFERRED_CURRENT", "boot_id": "boot-b"})
+    refreshing_heartbeat(db, other, "recovery-boot", refreshed - timedelta(seconds=2), "zone-lite-2.6.27")
+    apply(db, other, uptime=900_000)
+    assert (stranded.details["binding"], stranded.details["boot_id"]) == ("INFERRED_PREVIOUS", "recovery-boot")

@@ -22,6 +22,7 @@ from datetime import datetime, timedelta
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from zk_add import storage_recovery
 from zk_add.audit import append_audit
 from zk_add.device_health import (
     CURRENT,
@@ -36,6 +37,7 @@ from zk_add.device_health import (
     derive_health,
     duplicate_serial_claimed,
     gate_effect,
+    plain_version,
 )
 from zk_add.device_health_actions import HealthActionError, _rederive
 from zk_add.models import AuditEvent, Connector, DeviceAlert, DeviceTelemetry
@@ -247,7 +249,7 @@ def build_plan(session: Session, connector_ids=None, *, now: datetime | None = N
                 durability = row.code == "ESP_DURABILITY_FAULT"
                 rationale = (f"Raised on boot {item['raising_boot_id'] or 'unknown'} of firmware "
                              f"{item['raising_firmware'] or 'unknown'}; that boot has ended.")
-                if (item["raising_firmware"] or "") in {"2.6.24", "2.6.25", "2.6.26", "2.6.27"} and not durability:
+                if plain_version(item["raising_firmware"]) in storage_recovery.VERSIONS and not durability:
                     rationale += " " + RECOVERY_NOTE
                 if durability:
                     rationale += (" Storage evidence: resolving leaves ESP_PRESERVATION_UNVERIFIED, which keeps the "
@@ -317,8 +319,6 @@ def confirmation(alerts: int, devices: int) -> str:
 
 
 def preview(session: Session, *, connector_ids, actor: str) -> dict:
-    from zk_add import storage_recovery
-
     now = utc_now()
     plan = build_plan(session, connector_ids, now=now)
     expires_at = now + timedelta(seconds=settings.device_health_cleanup_preview_seconds)

@@ -41,7 +41,7 @@ def fleet(db):
     worker = open_alert(db, p02, "ESP_DELIVERY_WORKER_FAULT", seen=raised, details={"diagnostics_schema_version": 2})
     db.add(DeviceTelemetry(connector_id=p02.id, boot_id="recovery-boot", sequence=9, uptime_seconds=600,
                            created_at=raised - timedelta(seconds=10), payload={
-                               "firmware_version": "2.6.27", "diagnostics": {"workers": [
+                               "firmware_version": "zone-lite-2.6.27", "diagnostics": {"workers": [
                                    {"name": "add_delivery", "state": "STOPPED"},
                                    {"name": "ords_delivery", "state": "STOPPED"}]}}))
     durability = open_alert(db, p02, "ESP_DURABILITY_FAULT", seen=raised, details={
@@ -90,7 +90,7 @@ def test_preview_p02_p06_lists_stranded_rows_with_evidence(db, fleet):
     rows = {row["alert_id"]: row for row in plan["rows"]}
     worker = rows[fleet["worker"].id]
     assert (worker["class"], worker["default_selected"]) == ("STRANDED_DIAGNOSTICS", True)
-    assert (worker["raising_firmware"], worker["raising_boot_id"]) == ("2.6.27", "recovery-boot")
+    assert (worker["raising_firmware"], worker["raising_boot_id"]) == ("zone-lite-2.6.27", "recovery-boot")
     assert worker["raising_diagnostics"] == "add_delivery STOPPED; ords_delivery STOPPED"
     assert "start no delivery workers by design" in worker["rationale"]
     durability = rows[fleet["durability"].id]

@@ -19,7 +19,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from zk_add.hil_startup import PHASES as HIL_STARTUP_PHASES, STORAGE_COUNTERS, STORAGE_ERRORS
-from zk_add.models import Connector, DeviceAlert, ZKTDevice
+from zk_add.models import Connector, DeviceAlert, DeviceTelemetry, ZKTDevice
 from zk_add.settings import settings
 from zk_add.time_utils import ensure_utc, parse_datetime, utc_now
 
@@ -172,6 +172,14 @@ def latched_led_sources() -> frozenset[str]:
                      if part.strip())
 
 
+def plain_version(value: str | None) -> str | None:
+    """"zone-lite-2.6.15" and "2.6.15" are the same release; firmware reports the former."""
+    from zk_add.ota import semantic_version  # ota is a heavy module; keep this import lazy
+
+    version = semantic_version(value)
+    return ".".join(str(part) for part in version) if version else (value or "").strip() or None
+
+
 def diagnostics_reporting(connector: Connector) -> str:
     """Whether the running firmware can report storage and worker diagnostics."""
     from zk_add.ota import semantic_version  # ota is a heavy module; keep this import lazy
@@ -291,7 +299,7 @@ def storage_recovery_role(session: Session, connector: Connector, payload) -> bo
     from zk_add import storage_recovery
     from zk_add.ota import FirmwareRelease, _application_sha256
 
-    version = payload.firmware_version
+    version = plain_version(payload.firmware_version)
     if version not in storage_recovery.VERSIONS or not any(
             target.connector_id == connector.connector_id and target.mac == (connector.hardware_id or "").lower()
             for target in storage_recovery.TARGETS):
@@ -416,7 +424,7 @@ def classify_led_latch(led_state: str | None, evidence: dict | None, *, storage_
     if (led_state or "").strip().upper() != "LOCAL_FAILURE" or not isinstance(evidence, dict):
         return None
     storage = evidence.get("storage") if isinstance(evidence.get("storage"), dict) else {}
-    latch = {"source": storage.get("local_failure_source"), "firmware_version": firmware_version}
+    latch = {"source": storage.get("local_failure_source"), "firmware_version": plain_version(firmware_version)}
     if storage_verified and workers_verified:
         return {"kind": "LED_LATCH_STORAGE_VERIFIED", **latch}
     if (storage.get("durability") == "DEGRADED" and latch["source"]
@@ -431,18 +439,49 @@ def classify_led_latch(led_state: str | None, evidence: dict | None, *, storage_
     return None
 
 
-def bind_unbound_row(row: DeviceAlert | None, connector: Connector, *, uptime_seconds: int | None,
-                     now: datetime) -> None:
-    """Attribute a legacy diagnostics alert to a boot without moving last_seen_at."""
+def _refreshing_heartbeat(session: Session, row: DeviceAlert) -> DeviceTelemetry | None:
+    """The heartbeat that last refreshed a diagnostics alert; it records the boot."""
+    seen = ensure_utc(row.last_seen_at)
+    return session.scalar(select(DeviceTelemetry).where(
+        DeviceTelemetry.connector_id == row.connector_id, DeviceTelemetry.created_at <= seen,
+        DeviceTelemetry.created_at >= seen - timedelta(seconds=300),
+    ).order_by(DeviceTelemetry.created_at.desc()).limit(1))
+
+
+def bind_unbound_row(session: Session, row: DeviceAlert | None, connector: Connector, *,
+                     uptime_seconds: int | None, now: datetime) -> None:
+    """Attribute a legacy diagnostics alert to a boot without moving last_seen_at.
+
+    The heartbeat that last refreshed the row names its boot exactly. Uptime
+    arithmetic is the fallback once telemetry has aged out; a fault refreshed
+    seconds before a rollback reboot is too close for it, so each uptime
+    inference is checked against telemetry once.
+    """
     details = (row.details or {}) if row is not None else {}
-    if row is None or uptime_seconds is None or details.get("binding") or row.last_seen_at is None:
+    if row is None or row.last_seen_at is None or details.get("binding") == "OBSERVED" or (
+            details.get("binding") and (details.get("inferred_from") == "TELEMETRY" or details.get("telemetry_checked"))):
+        return
+    heartbeat = _refreshing_heartbeat(session, row)
+    if heartbeat is not None and heartbeat.boot_id:
+        same = heartbeat.boot_id == connector.boot_id
+        row.details = {**details, "binding": "INFERRED_CURRENT" if same else "INFERRED_PREVIOUS",
+                       "boot_id": heartbeat.boot_id, "inferred_from": "TELEMETRY", "bound_at": now.isoformat(),
+                       "firmware_version": (heartbeat.payload or {}).get("firmware_version")
+                       or (connector.firmware_version if same else None)}
+        return
+    if details.get("binding"):
+        row.details = {**details, "telemetry_checked": True}
+        return
+    if uptime_seconds is None:
         return
     boot_started = now - timedelta(seconds=uptime_seconds)
     if ensure_utc(row.last_seen_at) < boot_started + timedelta(seconds=5):
-        row.details = {**details, "binding": "INFERRED_PREVIOUS", "bound_at": now.isoformat()}
+        row.details = {**details, "binding": "INFERRED_PREVIOUS", "inferred_from": "UPTIME",
+                       "telemetry_checked": True, "bound_at": now.isoformat()}
     else:
         row.details = {**details, "binding": "INFERRED_CURRENT", "boot_id": connector.boot_id,
-                       "firmware_version": connector.firmware_version, "bound_at": now.isoformat()}
+                       "firmware_version": connector.firmware_version, "inferred_from": "UPTIME",
+                       "telemetry_checked": True, "bound_at": now.isoformat()}
 
 
 def _rejection_entries(row: DeviceAlert) -> dict[str, dict]:
@@ -496,7 +535,7 @@ def _latched_led_tier(details: dict) -> str | None:
     latch = details.get("latch") or {}
     if latch.get("kind") != "LED_LATCH_NO_IO_ERRORS":
         return None
-    if f"{latch.get('firmware_version')}:{latch.get('source')}" not in latched_led_sources():
+    if f"{plain_version(latch.get('firmware_version'))}:{latch.get('source')}" not in latched_led_sources():
         return DEGRADED
     return settings.device_health_latched_led_tier
 
@@ -789,7 +828,7 @@ def duplicate_serial_claimed(session: Session, connector: Connector) -> bool:
 def coverage(connector: Connector) -> list[dict]:
     """What ADD can verify about this connector from the firmware it runs."""
     reporting = diagnostics_reporting(connector)
-    version = connector.firmware_version or "unknown"
+    version = plain_version(connector.firmware_version) or "unknown"
     diagnostics = connector.firmware_diagnostics or {}
     storage = diagnostics.get("storage") if isinstance(diagnostics.get("storage"), dict) else {}
     workers = [row for row in diagnostics.get("workers") or [] if isinstance(row, dict)]
