@@ -123,19 +123,22 @@ def test_ota_waits_for_owner_drain_only_after_terminal_handoff(tmp_path, family)
     source = (MAIN / "ota_manager.c").read_text()
     start = source.index("static void wait_for_capture_safepoint(void)\n{")
     production = source[start:source.index("static bool uses_local_boot_confirmation(void)\n{", start)]
-    harness = r'''
+    bound = next(line for line in source.splitlines() if line.startswith("#define OTA_SAFEPOINT_MAX_SECONDS"))
+    harness = bound + r'''
 #include <assert.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
 #define OTA_SAFEPOINT_REPORT_SECONDS 30
 #define pdMS_TO_TICKS(x) (x)
-static unsigned claims,waits,reports,owner_calls;
+static unsigned claims,waits,reports,owner_calls,relaxed_claims;
 static uint64_t elapsed;
-static bool handed_off;
+static bool handed_off,terminal_offline;
 static int64_t esp_timer_get_time(void){return elapsed;}
 static void vTaskDelay(unsigned ms){++waits;elapsed+=(uint64_t)ms*1000;}
-static bool add_connector_claim_ota_restart(void){if(++claims>=3)handed_off=true;return handed_off;}
+static bool add_connector_claim_ota_restart(void){if(++claims>=3 && !terminal_offline)handed_off=true;return handed_off;}
+static bool add_connector_claim_ota_restart_after_wait(void)
+{assert(elapsed>=(uint64_t)OTA_SAFEPOINT_MAX_SECONDS*1000000U);++relaxed_claims;handed_off=true;return true;}
 static bool report_state(const char *state,const char *error)
 {assert(!handed_off&&!owner_calls&&!strcmp(state,"READY_TO_BOOT")&&error[0]);++reports;return false;}
 #ifndef ZONE_LITE_HIKVISION
@@ -157,6 +160,17 @@ int main(void)
 #else
     assert(!owner_calls && waits==2);
 #endif
+    assert(!relaxed_claims);
+    /* An offline terminal never offers the normal safepoint. After the
+     * bounded wait new sessions stop and the current one finishes, instead
+     * of the old image running on with the new one already selected. */
+    claims=waits=reports=0;handed_off=false;terminal_offline=true;elapsed=1000000;
+#ifndef ZONE_LITE_HIKVISION
+    local=false;
+#endif
+    wait_for_capture_safepoint();
+    assert(handed_off && relaxed_claims==1 && claims==OTA_SAFEPOINT_MAX_SECONDS && waits==OTA_SAFEPOINT_MAX_SECONDS);
+    assert(reports==OTA_SAFEPOINT_MAX_SECONDS/OTA_SAFEPOINT_REPORT_SECONDS);
 }
 '''
     run(tmp_path, harness.replace("/* PRODUCTION */", production), family=family)

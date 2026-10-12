@@ -5535,6 +5535,42 @@ bool add_connector_delivery_healthy(void)
         (uint32_t)((uint32_t)monotonic_ms() - s_outbox_tick_ms) <= 90000U;
 }
 
+bool add_connector_claim_ota_restart_after_wait(void)
+{
+#ifdef ZONE_LITE_HIKVISION
+    return add_connector_claim_ota_restart();
+#else
+    if (!s_lock || xSemaphoreTake(s_lock, pdMS_TO_TICKS(100)) != pdTRUE) return false;
+    s_ota_restart_claimed = true;
+    strlcpy(s_activity, "OTA_RESTART", sizeof(s_activity));
+    bool claimed = !s_terminal_session_active;
+    xSemaphoreGive(s_lock);
+    return claimed;
+#endif
+}
+
+bool add_connector_boot_environment_ready(void)
+{
+    bool ready = false;
+    if (s_lock && xSemaphoreTake(s_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
+#ifdef ZONE_LITE_HIKVISION
+        ready = s_connected;
+#else
+        ready = s_connected && s_zkt.online;
+#endif
+        xSemaphoreGive(s_lock);
+    }
+    return ready;
+}
+
+bool add_connector_boot_local_failure(void)
+{
+    const char *led = led_status_current_name();
+    if (!strcmp(led, "LOCAL_FAILURE") || !strcmp(led, "FATAL") || s_worker_start_failed) return true;
+    qs_health_t storage = qs_health();
+    return storage.observed && (storage.last_error || storage.persistence_probe_error);
+}
+
 bool add_connector_log(
     const char *level,
     const char *subsystem,

@@ -27,6 +27,7 @@
 #include "nvs.h"
 
 #include "add_connector.h"
+#include "boot_confirm.h"
 #include "storage_recovery.h"
 #include "zone_config.h"
 #if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
@@ -46,6 +47,9 @@ static atomic_bool s_hil_reboot_reserved;
 #define OTA_BOOT_CONFIRM_SECONDS 900
 #define OTA_BOOT_HEALTH_REPORT_SECONDS 30
 #define OTA_SAFEPOINT_REPORT_SECONDS 30
+/* The boot partition is already switched while the restart waits for a
+ * capture safepoint; an offline or busy terminal may hold it only this long. */
+#define OTA_SAFEPOINT_MAX_SECONDS (30 * 60)
 #define OTA_RESUME_CHECKPOINT_BYTES (64 * 1024)
 #define OTA_HTTP_RESPONSE_BYTES 8192
 #define OTA_HTTP_TRANSPORT_BUFFER_BYTES 4096
@@ -68,6 +72,8 @@ static bool s_failed_boot_pending;
 static char s_last_error[64];
 static volatile uint32_t s_boot_health_checks;
 static volatile bool s_boot_health_last_ready;
+/* The running new-image confirmation, for heartbeats; zero when none ran. */
+static boot_confirm_t s_boot_confirm;
 static volatile uint32_t s_progress_attempts;
 static volatile uint32_t s_progress_successes;
 static volatile int s_progress_last_http_status;
@@ -793,8 +799,14 @@ static bool perform_update(void)
 static void wait_for_capture_safepoint(void)
 {
     int64_t last_report = 0;
-    while (!add_connector_claim_ota_restart()) {
+    int64_t started = esp_timer_get_time() / 1000000;
+    for (;;) {
         int64_t now = esp_timer_get_time() / 1000000;
+        /* After the bounded wait an offline or busy terminal no longer keeps
+         * the old image running: new sessions stop and the current one
+         * finishes its normal cleanup. */
+        if (now - started < OTA_SAFEPOINT_MAX_SECONDS ? add_connector_claim_ota_restart()
+                                                      : add_connector_claim_ota_restart_after_wait()) break;
         if (last_report == 0 || now - last_report >= OTA_SAFEPOINT_REPORT_SECONDS) {
 #ifdef ZONE_LITE_HIKVISION
             (void)report_state("READY_TO_BOOT", "WAITING_FOR_HIK_SAFEPOINT");
@@ -898,10 +910,15 @@ static bool confirm_or_report_rollback(void)
     }
     if (local_pending) return report_local_boot_confirmation();
     if (uses_local_boot_confirmation()) return confirm_local_boot();
-    int64_t deadline = (esp_timer_get_time() / 1000000) + OTA_BOOT_CONFIRM_SECONDS;
+    /* OTA_BOOT_CONFIRM_SECONDS of accountable time, paused while a healthy-
+     * looking image only waits on the site, within a hard cap. */
+    _Static_assert(BOOT_CONFIRM_ACTIVE_SECONDS == OTA_BOOT_CONFIRM_SECONDS, "one confirmation budget");
+    boot_confirm_t progress = {0};
+    boot_confirm_verdict_t verdict = BOOT_CONFIRM_WAIT;
+    int64_t last_step = esp_timer_get_time() / 1000000;
     int64_t last_health_report = 0;
     bool add_acknowledged = false;
-    while ((esp_timer_get_time() / 1000000) < deadline) {
+    for (;;) {
         int64_t now = esp_timer_get_time() / 1000000;
         if (!add_acknowledged) {
             add_acknowledged = report_state(
@@ -912,7 +929,16 @@ static bool confirm_or_report_rollback(void)
         bool boot_health_ready = add_acknowledged && add_connector_boot_health_ready();
         s_boot_health_checks++;
         s_boot_health_last_ready = boot_health_ready;
-        if (boot_health_ready) {
+        boot_confirm_input_t input = {
+            .healthy = boot_health_ready,
+            .local_failure = add_connector_boot_local_failure(),
+            .environment_ready = add_connector_boot_environment_ready(),
+        };
+        verdict = boot_confirm_step(&progress, now > last_step ? (uint32_t)(now - last_step) : 0U, &input);
+        last_step = now;
+        s_boot_confirm = progress;
+        if (verdict == BOOT_CONFIRM_EXPIRED || verdict == BOOT_CONFIRM_CAPPED) break;
+        if (verdict == BOOT_CONFIRM_ACCEPT) {
             if (!report_state("BOOTED_PENDING", "RUNTIME_HEALTHY")) {
                 vTaskDelay(pdMS_TO_TICKS(5000));
                 continue;
@@ -936,7 +962,10 @@ static bool confirm_or_report_rollback(void)
         }
         vTaskDelay(pdMS_TO_TICKS(5000));
     }
-    (void)report_state("FAILED", "BOOT_HEALTH_TIMEOUT");
+    ESP_LOGE(TAG, "New image not confirmed (%s): %lu s accountable, %lu s waiting on the site",
+             boot_confirm_verdict_name(verdict), (unsigned long)progress.active_seconds,
+             (unsigned long)progress.paused_seconds);
+    (void)report_state("FAILED", verdict == BOOT_CONFIRM_CAPPED ? "BOOT_CONFIRM_CAP" : "BOOT_HEALTH_TIMEOUT");
     (void)esp_ota_mark_app_invalid_rollback_and_reboot();
     return false;
 }
@@ -1135,6 +1164,15 @@ void ota_manager_start(void)
     s_started = xTaskCreate(ota_task, "ota_manager", 12288, NULL, OTA_TASK_PRIORITY, NULL) == pdPASS;
 }
 
+bool ota_manager_owns_boot_rollback(void)
+{
+#if defined(ZONE_LITE_STORAGE_RECOVERY_IMAGE) && ZONE_LITE_STORAGE_RECOVERY_IMAGE
+    return false;
+#else
+    return !uses_local_boot_confirmation();
+#endif
+}
+
 bool ota_manager_busy(void)
 {
     return s_busy || atomic_load_explicit(&s_hil_reboot_reserved, memory_order_acquire);
@@ -1193,6 +1231,11 @@ void ota_manager_append_telemetry(cJSON *heartbeat)
         cJSON_AddNumberToObject(ota, "progress_successes", s_progress_successes) &&
         cJSON_AddNumberToObject(ota, "progress_last_http_status", s_progress_last_http_status);
     if (valid && s_last_error[0]) valid = cJSON_AddStringToObject(ota, "last_error", s_last_error) != NULL;
+    if (valid && s_boot_confirm.elapsed_seconds) {
+        valid = cJSON_AddNumberToObject(ota, "boot_confirm_active_seconds", s_boot_confirm.active_seconds) &&
+            cJSON_AddNumberToObject(ota, "boot_confirm_paused_seconds", s_boot_confirm.paused_seconds) &&
+            cJSON_AddNumberToObject(ota, "boot_confirm_elapsed_seconds", s_boot_confirm.elapsed_seconds);
+    }
     if (valid && cJSON_AddItemToObject(heartbeat, "ota", ota)) return;
     cJSON_Delete(ota);
 }

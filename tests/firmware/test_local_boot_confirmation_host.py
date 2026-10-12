@@ -30,8 +30,12 @@ def test_boot_confirmation_network_loss_and_checkpoint_boundaries(tmp_path, fami
 #include <assert.h>
 #include <stdio.h>
 #define ESP_OK 0
-#define OTA_BOOT_CONFIRM_SECONDS 30
+#define OTA_BOOT_CONFIRM_SECONDS 900
 #define OTA_BOOT_HEALTH_REPORT_SECONDS 5
+#define ESP_LOGE(tag, ...) ((void)(tag))
+static const char *TAG = "ota";
+#include "boot_confirm.c"
+static boot_confirm_t s_boot_confirm;
 #define pdMS_TO_TICKS(x) (x)
 typedef struct {char project_name[32],version[32];} esp_app_desc_t;
 static esp_app_desc_t app={"zone_lite","2.7.0"};
@@ -41,12 +45,20 @@ static unsigned s_boot_health_checks,reports,saves,marked,rollbacks,remote_state
 static bool s_boot_health_last_ready,local_ready=true,network,legacy_ready=true,lost_response,actual_valid,fail_mark;
 static bool s_failed_boot_pending;
 static uint64_t now_us;
+/* Legacy confirmation: the site (ADD and the terminal) can come back at
+ * site_back_us; the image can be healthy once it does, or fail locally. */
+static uint64_t site_back_us;
+static bool environment,local_failure,healthy_when_back;
+static char failed_error[64];
+static bool site_back(void){return site_back_us && now_us>=site_back_us;}
+static bool add_connector_boot_environment_ready(void){return environment || site_back();}
+static bool add_connector_boot_local_failure(void){return local_failure;}
 static const esp_app_desc_t *esp_app_get_description(void){return &app;}
 static int64_t esp_timer_get_time(void){return now_us;}
 static void vTaskDelay(unsigned ms){now_us+=(uint64_t)ms*1000;}
 static size_t strlcpy(char *out,const char *in,size_t n){size_t len=strlen(in);if(n){size_t k=len<n-1?len:n-1;memcpy(out,in,k);out[k]=0;}return len;}
 static const char *add_connector_local_boot_health_error(void){return local_ready?NULL:"BOOT_LOCAL_TEST";}
-static bool add_connector_boot_health_ready(void){return legacy_ready;}
+static bool add_connector_boot_health_ready(void){return legacy_ready || (healthy_when_back && site_back());}
 static int esp_ota_mark_app_valid_cancel_rollback(void){assert(local_ready || legacy_ready);++marked;if(fail_mark)return -1;actual_valid=true;return ESP_OK;}
 static int esp_ota_mark_app_invalid_rollback_and_reboot(void){++rollbacks;return ESP_OK;}
 static bool save_journal(void){if(++saves==fail_save){s_journal=durable;return false;}durable=s_journal;return true;}
@@ -54,7 +66,9 @@ static bool clear_journal(void){memset(&s_journal,0,sizeof(s_journal));return sa
 static bool acknowledge_pending_success(void){return false;}
 static bool report_state(const char *state,const char *error)
 {
-    (void)error;++reports;if(!network)return false;
+    ++reports;
+    if(!strcmp(state,"FAILED"))strlcpy(failed_error,error?error:"",sizeof(failed_error));
+    if(!network && !site_back())return false;
     bool fail=reports==fail_report;if(fail && !lost_response)return false;
     if(!strcmp(state,"BOOTED_PENDING")){assert(remote_state<=1);remote_state=1;}
     else if(!strcmp(state,"RECONCILING")){assert(remote_state==1 || remote_state==2);remote_state=2;}
@@ -69,6 +83,8 @@ static void reset(void)
     reports=saves=marked=rollbacks=remote_state=fail_save=fail_report=s_boot_health_checks=0;
     local_ready=legacy_ready=true;network=false;lost_response=actual_valid=fail_mark=false;now_us=0;
     s_failed_boot_pending=false;
+    site_back_us=0;environment=local_failure=healthy_when_back=false;failed_error[0]=0;
+    memset(&s_boot_confirm,0,sizeof(s_boot_confirm));
     strcpy(app.project_name,"zone_lite");strcpy(app.version,"2.7.0");
 }
 int main(void)
@@ -111,6 +127,29 @@ int main(void)
     reset();strcpy(app.version,"2.6.15");strcpy(s_journal.target_version,"2.6.15");durable=s_journal;
     assert(!uses_local_boot_confirmation());network=true;
     assert(confirm_or_report_rollback() && marked==1 && remote_state==2);
+    /* Legacy images: a site outage during the OTA pauses the budget, and the
+     * image confirms once the site is back... */
+    reset();strcpy(app.version,"2.6.15");strcpy(s_journal.target_version,"2.6.15");durable=s_journal;
+    legacy_ready=false;healthy_when_back=true;site_back_us=3ULL*3600*1000000;
+    assert(confirm_or_report_rollback() && marked==1 && !rollbacks && remote_state==2);
+    assert(s_boot_confirm.paused_seconds>=3*3600-5 && s_boot_confirm.active_seconds<=10);
+    /* ...an unhealthy image with ADD and the terminal reachable spends the
+     * whole budget and rolls back... */
+    reset();strcpy(app.version,"2.6.15");strcpy(s_journal.target_version,"2.6.15");durable=s_journal;
+    legacy_ready=false;network=environment=true;
+    assert(!confirm_or_report_rollback() && !marked && rollbacks==1 && !strcmp(failed_error,"BOOT_HEALTH_TIMEOUT"));
+    assert(s_boot_confirm.active_seconds>=BOOT_CONFIRM_ACTIVE_SECONDS && s_boot_confirm.active_seconds<BOOT_CONFIRM_ACTIVE_SECONDS+10);
+    assert(!s_boot_confirm.paused_seconds);
+    /* ...a local failure cannot hide behind an outage... */
+    reset();strcpy(app.version,"2.6.15");strcpy(s_journal.target_version,"2.6.15");durable=s_journal;
+    legacy_ready=false;local_failure=true;
+    assert(!confirm_or_report_rollback() && rollbacks==1 && !strcmp(failed_error,"BOOT_HEALTH_TIMEOUT"));
+    assert(s_boot_confirm.active_seconds<BOOT_CONFIRM_ACTIVE_SECONDS+10 && !s_boot_confirm.paused_seconds);
+    /* ...and an image that never reaches the site rolls back at the cap. */
+    reset();strcpy(app.version,"2.6.15");strcpy(s_journal.target_version,"2.6.15");durable=s_journal;
+    legacy_ready=false;
+    assert(!confirm_or_report_rollback() && rollbacks==1 && !strcmp(failed_error,"BOOT_CONFIRM_CAP"));
+    assert(s_boot_confirm.elapsed_seconds>=BOOT_CONFIRM_MAX_SECONDS && !s_boot_confirm.active_seconds);
     puts("Local boot proof, legacy behavior, lost replies and checkpoint boundaries passed");
 }
 '''

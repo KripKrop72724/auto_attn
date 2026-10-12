@@ -196,6 +196,8 @@ static volatile bool s_boot_health_last_ready;
 static volatile uint32_t s_progress_attempts;
 static volatile uint32_t s_progress_successes;
 static volatile int s_progress_last_http_status;
+typedef struct { uint32_t active_seconds, paused_seconds, elapsed_seconds; } boot_confirm_t;
+static boot_confirm_t s_boot_confirm={.active_seconds=120,.paused_seconds=3600,.elapsed_seconds=3720};
 static const esp_app_desc_t *esp_app_get_description(void) { return missing_description?NULL:&description; }
 static const esp_partition_t *esp_ota_get_running_partition(void) { return missing_partition?NULL:&partition; }
 static bool esp_secure_boot_enabled(void) { return true; }
@@ -237,6 +239,7 @@ int main(void)
     cJSON *evidence=cJSON_GetObjectItemCaseSensitive(heartbeat,"ota");assert(evidence);
     assert(!strcmp(cJSON_GetObjectItemCaseSensitive(evidence,"running_version")->valuestring,"2.6.0"));
     assert(strlen(cJSON_GetObjectItemCaseSensitive(evidence,"image_sha256")->valuestring)==64);
+    assert(cJSON_GetObjectItemCaseSensitive(evidence,"boot_confirm_paused_seconds")->valueint==3600);
     cJSON_Delete(heartbeat);
     for(size_t i=1;i<=total;i++){
         fail_at=0;heartbeat=cJSON_CreateObject();calls=0;fail_at=i;

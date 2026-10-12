@@ -163,6 +163,17 @@ bool add_connector_terminal_session_begin(void);
 bool add_connector_terminal_session_end(void);
 bool add_connector_terminal_restart_pending(void);
 bool add_connector_claim_ota_restart(void);
+/* After the bounded OTA safepoint wait: block new sessions even if the
+ * terminal is offline or busy, then wait for the current session's normal
+ * bounded cleanup. Hikvision keeps its own safepoint. */
+bool add_connector_claim_ota_restart_after_wait(void);
+/* New-image confirmation: ADD and the terminal are reachable, so the image is
+ * accountable for its health (Hikvision: ADD is reachable). */
+bool add_connector_boot_environment_ready(void);
+/* New-image confirmation: positive evidence that the image fails locally, a
+ * latched LED fault, an unrecovered storage fault or a failed worker start.
+ * Unverified-but-unfailed storage is not a failure. */
+bool add_connector_boot_local_failure(void);
 /* Failed writer boot: block new sessions even if the terminal is offline,
  * then wait for the current session's normal bounded cleanup. This grants no
  * storage or rollback authority; the drained owner verifies the reader. */

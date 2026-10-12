@@ -316,6 +316,10 @@ def test_recovery_and_manual_activation_windows_match_the_operating_contract() -
     assert "esp_wifi_connect()" in PORTAL
     assert "esp_ota_mark_app_invalid_rollback_and_reboot()" in PORTAL
     assert "running_app_pending_verify()" in PORTAL
+    # Images whose own confirmation rolls back (time waiting on Wi-Fi excluded,
+    # with a hard cap) own that decision; the raw Wi-Fi-loss rollback remains
+    # only for the frozen journal roles.
+    assert "!ota_manager_owns_boot_rollback() && running_app_pending_verify()" in PORTAL
     assert "GPIO_NUM_0" in PORTAL
     assert "ota_manager_busy()" in PORTAL
 

@@ -69,6 +69,12 @@ class OtaHeartbeatPayload(BaseModel):
     progress_attempts: int = Field(default=0, ge=0, le=2**32 - 1)
     progress_successes: int = Field(default=0, ge=0, le=2**32 - 1)
     progress_last_http_status: int = Field(default=0, ge=-1, le=599)
+    # ZKT 2.7.1 and later: new-image confirmation progress. Accountable time
+    # counts toward the 900 s budget; paused time is a healthy-looking image
+    # waiting on the site; elapsed is bounded by a hard cap.
+    boot_confirm_active_seconds: int | None = Field(default=None, ge=0, le=2**32 - 1)
+    boot_confirm_paused_seconds: int | None = Field(default=None, ge=0, le=2**32 - 1)
+    boot_confirm_elapsed_seconds: int | None = Field(default=None, ge=0, le=2**32 - 1)
 
 
 class QueueDiagnostics(BaseModel):
