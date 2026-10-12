@@ -93,7 +93,10 @@ def test_normal_check_constructs_current_proved_identity_without_writing(diagnos
     assert check["items"][0]["immutable_facts"]["device_serial"] == SERIAL
     assert check["items"][0]["immutable_facts"]["punch"] == "255"
     from zk_add.attendance_identity_evidence import source_evidence
-    assert source_evidence(db, row, connector) is None
+    # The saved 40-byte dump record is a source proof of its own; its record
+    # UID still requires a retained identity interval at punch time.
+    proof = source_evidence(db, row, connector)
+    assert proof["kind"] == "SAVED_TERMINAL_RECORD" and proof["requires_retained_identity"]
     assert guards["bound_source_proven"] is True
     assert (row.ords_status, row.oracle_confirmed_at, row.device_serial, row.cnic_encrypted) == before
     assert not db.new and not db.dirty and not db.deleted

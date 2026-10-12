@@ -39,6 +39,7 @@ from zk_add.crypto import (
     mask_cnic,
     normalize_cnic,
 )
+from zk_add.attendance_identity_evidence import TERMINAL_RECONCILE_SOURCES
 from zk_add.identity import build_machine_name, parse_machine_name
 from zk_add.identity_conflicts import (
     valid_identity_resolutions,
@@ -3244,9 +3245,7 @@ def synced_cnic_identity_proven(
     # that the same CNIC covered the punch time. A later roster observation
     # alone cannot attribute a historical punch to this employee.
     if (
-        row.source not in {
-            "CURRENT_RECONCILE", "DUMP_RECONNECT", "DUMP_STARTUP", "RECONCILE_15M"
-        }
+        row.source not in TERMINAL_RECONCILE_SOURCES
         or not row.uid or row.uid != user.uid or row.connector_id != connector.id
     ):
         return False

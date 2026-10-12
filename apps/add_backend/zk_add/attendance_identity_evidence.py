@@ -161,6 +161,13 @@ def near_live_reconcile_capture(event: AttendanceEvent) -> bool:
     )
 
 
+# Punches read back from the terminal's own attendance log, each with a saved
+# terminal record. They differ only in what prompted the read.
+TERMINAL_RECONCILE_SOURCES = frozenset({
+    "CURRENT_RECONCILE", "DUMP_RECONNECT", "DUMP_STARTUP", "RECONCILE_15M", "FULL_HISTORY",
+})
+
+
 def manifest_identity_matches_event(manifest, event: AttendanceEvent) -> bool:
     if manifest.observed_user_id and manifest.observed_user_id != event.user_id:
         return False
@@ -168,6 +175,8 @@ def manifest_identity_matches_event(manifest, event: AttendanceEvent) -> bool:
         return True
     # On some 40-byte ZKT records the first two bytes identify the attendance
     # record, not the enrolled person. The firmware retains both namespaces.
+    # Outside the near-live window, source_evidence requires a retained,
+    # fingerprint-bound identity interval at punch time for every such record.
     return bool(
         manifest.record_size == 40
         and (event.raw_event or {}).get("attendance_record_uid") == manifest.observed_uid
@@ -175,7 +184,7 @@ def manifest_identity_matches_event(manifest, event: AttendanceEvent) -> bool:
         and (
             near_live_reconcile_capture(event)
             or (
-                event.source == "CURRENT_RECONCILE"
+                event.source in TERMINAL_RECONCILE_SOURCES
                 and manifest.observed_user_id is not None
                 and manifest.observed_user_id == event.user_id
                 and plausible_reconcile_receipt(event)
