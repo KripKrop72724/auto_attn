@@ -55,6 +55,7 @@ static void refresh_capacity_deadline_on_progress(const add_outbox_t *outbox,uin
 static bool compact_outbox_locked(add_outbox_t *outbox,bool force) { (void)outbox;(void)force;assert(held);return true; }
 bool qs_local_begin(qs_admission_t policy,size_t bytes) { assert(held && (unsigned)policy<=QS_ADMIT_RECOVERY && bytes);return true; }
 void qs_local_end(bool ok,int error) { assert(held && ok && !error); }
+void qs_local_end_file(bool ok,int error,const char *file) { assert(file && file[0]); qs_local_end(ok,error); }
 static bool read_outbox_row_locked(add_outbox_t *outbox,char *line,off_t *end)
 {
     assert(held);++direct_reads;memcpy(line,"old\n",5);

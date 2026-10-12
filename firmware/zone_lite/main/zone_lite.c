@@ -3100,7 +3100,7 @@ static bool append_line_policy(const char *path, const char *line, qs_admission_
     if (ok && fsync(fileno(f)) != 0) ok = false;
     int error = ok ? 0 : errno;
     if (f && fclose(f) != 0) { ok = false; if (!error) error = errno; }
-    qs_local_end(ok, error);
+    qs_local_end_file(ok, error, path);
     if (!ok) ESP_LOGE(TAG, "Durable append failed for %s errno=%d", path, error);
     return ok;
 }

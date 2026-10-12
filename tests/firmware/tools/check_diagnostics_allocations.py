@@ -99,6 +99,7 @@ static bool legacy_healthy;
 qs_health_t qs_health(void){return (qs_health_t){.observed=true,.available=true,.write_failures=2,.read_failures=3,
  .recovery_complete=legacy_healthy,.persistence_verified=legacy_healthy,
  .admission_reserve_bytes=1048576,.last_error=legacy_healthy?0:EIO,.last_operation="local_write_commit",
+ .last_file="pending.jsonl",
  .legacy={.observed=true,.read_faults=legacy_healthy?0:1,.append_faults=legacy_healthy?0:2,
  .retire_faults=legacy_healthy?0:3,.read_recoveries=7,.error=legacy_healthy?0:EIO,
  .queue="ords_pending",.operation="legacy_read"}};}

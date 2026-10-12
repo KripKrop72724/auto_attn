@@ -933,7 +933,7 @@ static FILE *create_catalog_stage(const char *path)
     }
     FILE *file = fopen(path, "w");
     int captured = file ? 0 : errno;
-    qs_local_end(file != NULL, captured);
+    qs_local_end_file(file != NULL, captured, path);
     if (!file) {
         s_catalog_writer_failure_reason = "stage_open_failed";
         led_status_fault(LED_STATUS_LOCAL_FAILURE);
@@ -962,7 +962,7 @@ static bool write_encrypted_json_line(FILE *file, cJSON *value)
     bool ok = admitted && fprintf(file, "%s\n", encrypted) == (int)bytes &&
         fflush(file) == 0 && fsync(fileno(file)) == 0;
     if (admitted && !ok) s_catalog_writer_failure_reason = "stage_write_failed";
-    if (admitted) qs_local_end(ok, ok ? 0 : errno);
+    if (admitted) qs_local_end_file(ok, ok ? 0 : errno, "identity_catalog_stage");
     if (!ok && (!bounded || admitted || (errno != ENOSPC && errno != EBUSY)))
         led_status_fault(LED_STATUS_LOCAL_FAILURE);
     free(plain);
@@ -2270,7 +2270,7 @@ static bool command_journal_append(cJSON *root, const char *command_id)
     bool ok = file && fprintf(file, "%s\n", line) > 0 && fflush(file) == 0 &&
               fsync(fileno(file)) == 0;
     if (file && fclose(file) != 0) ok = false;
-    if (admitted) qs_local_end(ok, ok ? 0 : errno);
+    if (admitted) qs_local_end_file(ok, ok ? 0 : errno, ADD_COMMAND_INBOX_PATH);
     if (!ok) led_status_fault(LED_STATUS_LOCAL_FAILURE);
     free(line);
     free(plain);
@@ -3010,12 +3010,16 @@ static void append_firmware_diagnostics(cJSON *payload, const add_zkt_telemetry_
              !cJSON_AddNumberToObject(storage, "persistence_probe_error", measured_health.persistence_probe_error))) goto failed;
         if (measured == ESP_OK && measured_health.last_error &&
             (!cJSON_AddStringToObject(storage, "error_operation", measured_health.last_operation ? measured_health.last_operation : "storage_operation") ||
-             !cJSON_AddNumberToObject(storage, "error_code", measured_health.last_error))) goto failed;
+             !cJSON_AddNumberToObject(storage, "error_code", measured_health.last_error) ||
+             (measured_health.last_file[0] &&
+              !cJSON_AddStringToObject(storage, "error_file", measured_health.last_file)))) goto failed;
         if (measured_health.recoveries &&
             (!cJSON_AddNumberToObject(storage, "recoveries", measured_health.recoveries) ||
              !cJSON_AddStringToObject(storage, "recovered_error_operation", measured_health.recovered_operation ? measured_health.recovered_operation : "storage_operation") ||
              !cJSON_AddNumberToObject(storage, "recovered_error_code", measured_health.recovered_error) ||
-             !cJSON_AddNumberToObject(storage, "recovered_uptime_ms", (double)measured_health.recovered_uptime_ms))) goto failed;
+             !cJSON_AddNumberToObject(storage, "recovered_uptime_ms", (double)measured_health.recovered_uptime_ms) ||
+             (measured_health.recovered_file[0] &&
+              !cJSON_AddStringToObject(storage, "recovered_error_file", measured_health.recovered_file)))) goto failed;
     }
     // A connected heartbeat does not prove persistence. Until a checked
     // recovery/write result is available, report UNKNOWN rather than healthy.
@@ -3995,7 +3999,7 @@ static bool add_connector_enqueue_validated_line_with_policy(const char *line, b
                         if (!ok) error = errno;
                         if (fclose(file) != 0) { ok = false; if (!error) error = errno; }
                     }
-                    qs_local_end(ok, error);
+                    qs_local_end_file(ok, error, outbox->path);
                     if (ok) outbox->depth++;
                     else outbox->depth_known = false;
                 }
@@ -4306,7 +4310,7 @@ bool add_connector_enqueue_attendance_bulk(const char *const *payloads, size_t c
             if (fclose(file) != 0) ok = false;
         }
         int captured_error = errno;
-        if (admitted) qs_local_end(ok, captured_error);
+        if (admitted) qs_local_end_file(ok, captured_error, s_bulk_outbox.path);
         if (ok) s_bulk_outbox.depth += written;
         else {
             s_bulk_outbox.depth_known = false;
@@ -5305,7 +5309,7 @@ bool add_connector_command_complete(const char *command_id)
     if (ok) ok = ft_replace(ADD_COMMAND_INBOX_PATH, ADD_COMMAND_INBOX_TMP_PATH,
         ADD_COMMAND_INBOX_BACKUP_PATH, ADD_COMMAND_INBOX_MAX_BYTES, command_transaction_port);
     // Never remove a staged generation after an uncertain NVS commit.
-    if (admitted) qs_local_end(ok, ok ? 0 : errno);
+    if (admitted) qs_local_end_file(ok, ok ? 0 : errno, ADD_COMMAND_INBOX_PATH);
     if (ok) {
         if (strcmp(s_running_command_id, command_id) == 0) s_running_command_id[0] = '\0';
         command_unmark_queued_locked(command_id);

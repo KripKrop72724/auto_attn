@@ -129,6 +129,9 @@ class JournalStorageDiagnostics(BaseModel):
     last_nvs_error: int | None = None
 
 
+PRINTABLE_TEXT = r"^[\x20-\x7e]+$"
+
+
 class StorageDiagnostics(BaseModel):
     local_failure_source: str | None = Field(default=None, max_length=80)
     # ZKT 2.7.1 and later: the latest incident of a latched LOCAL_FAILURE, and
@@ -167,12 +170,15 @@ class StorageDiagnostics(BaseModel):
     recovery_complete: bool = False
     error_operation: str | None = Field(default=None, max_length=80)
     error_code: int | None = None
+    # ZKT 2.7.1 and later: the file a failed local write was for.
+    error_file: str | None = Field(default=None, max_length=32, pattern=PRINTABLE_TEXT)
     # ZKT 2.7.1 and later: faults recovered this boot after a fresh audit of
     # every queue, room for live attendance and a passing persistence probe.
     recoveries: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
     recovered_error_operation: str | None = Field(default=None, max_length=80)
     recovered_error_code: int | None = None
     recovered_uptime_ms: int | None = Field(default=None, ge=0)
+    recovered_error_file: str | None = Field(default=None, max_length=32, pattern=PRINTABLE_TEXT)
 
     @model_validator(mode="after")
     def retain_legacy_recovery_hold(self) -> "StorageDiagnostics":
@@ -211,9 +217,6 @@ class MemoryDiagnostics(BaseModel):
     alloc_failures_dropped: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
     recent_alloc_failures: list[AllocationFailure] = Field(default_factory=list, max_length=4)
     stacks: list[StackHeadroom] = Field(default_factory=list, max_length=32)
-
-
-PRINTABLE_TEXT = r"^[\x20-\x7e]+$"
 
 
 class BootPanic(BaseModel):

@@ -49,7 +49,7 @@ static int xSemaphoreTake(void *m,int timeout){(void)m;(void)timeout;assert(!hel
 static void xSemaphoreGive(void *m){(void)m;assert(held);held=false;}
 static void led_status_fault(int state){assert(state==1);}
 static bool qs_local_begin(int policy,size_t bytes){assert(held && policy==2 && bytes<=65536);admitted=!deny_budget;return admitted;}
-static void qs_local_end(bool ok,int error){(void)ok;(void)error;assert(admitted);admitted=false;}
+static void qs_local_end_file(bool ok,int error,const char *file){(void)ok;(void)error;assert(file&&file[0]);assert(admitted);admitted=false;}
 static void command_unmark_queued_locked(const char *id){assert(held && id[0]);}
 static char *copy(const char *s){if(!s)return NULL;char *r=malloc(strlen(s)+1);if(r)strcpy(r,s);return r;}
 static char *decrypt_storage_line(const char *s){return copy(s);}

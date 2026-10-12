@@ -39,7 +39,7 @@ static unsigned led_faults;
 static void *allocate(size_t n){if(++calls==fail_at)return NULL;return malloc(n);}
 #define malloc allocate
 static bool qs_local_begin(int policy,size_t bytes){assert(policy==3 && !held);held=storage_budget_admit(&budget,8U*1024U*1024U,used,bytes,SB_HISTORICAL);return held;}
-static void qs_local_end(bool ok,int error){(void)ok;(void)error;assert(held);held=false;}
+static void qs_local_end_file(bool ok,int error,const char *file){(void)ok;(void)error;assert(file&&file[0]);assert(held);held=false;}
 static void led_status_fault(int state){assert(state==1);++led_faults;}
 static char *encrypt_storage_json(const char *plain){if(!plain)return NULL;char *out=malloc(strlen(plain)+1);if(out)strcpy(out,plain);return out;}
 ''' + functions + persist + r'''
