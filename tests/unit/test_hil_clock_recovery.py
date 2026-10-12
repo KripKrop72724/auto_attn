@@ -25,7 +25,9 @@ from zk_add.storage_contract import LIVE_FRAME_BASELINES, LIVE_FRAME_BASELINE_IM
 from zk_add.time_utils import utc_now
 
 
-@pytest.fixture(params=DIRECT_VERSIONS)
+# 2.7.1 carries its own exact nationwide scope instead of the shared single
+# target used here; tests/unit/test_platform_271_release.py covers it.
+@pytest.fixture(params=[version for version in DIRECT_VERSIONS if version != "2.7.1"])
 def clock_hil(monkeypatch, request):
     version = request.param
     baselines = LOCK_BASELINES if version == "2.6.15" else DELIVERY_BASELINES if version == "2.6.14" else LIVE_FRAME_BASELINES if version == "2.6.13" else PROBE_BASELINES if version in {"2.6.11", "2.6.12"} else PRESSURE_BASELINES if version == "2.6.10" else CONTENTION_BASELINES if version == "2.6.9" else DIAGNOSTIC_BASELINES if version == "2.6.8" else RETRY_BASELINES if version == "2.6.7" else DIRECT_BASELINES
