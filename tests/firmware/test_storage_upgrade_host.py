@@ -73,6 +73,8 @@ int esp_partition_get_sha256(const esp_partition_t *p,uint8_t *out){
         "c7be4171153333563f9ed6e43f91376d42dfb9d3ca2faefda2ca6d1ac87b2def":
         !strcmp(previous_app.version,"2.6.14")?
         "7d0381fc68a01b34ab6989dfed2b5a1a93f39c293bfd0b7db1734b0871fa6469":
+        !strcmp(previous_app.version,"2.6.15")?
+        "832c0c3d8dac6e41d7cd0a9d4fbe4508e4f66982fa5ddeceaca4dc5adcbd80d6":
         "4b4aa0697551f527b48b58e95229cd21e362f6ba25398a2d46263bdbf289146b";
     for(unsigned i=0;i<32;++i){unsigned value=0;assert(sscanf(hex+2*i,"%2x",&value)==1);out[i]=(uint8_t)value;}
     if(failure==7)out[0]^=1;
@@ -124,6 +126,9 @@ int main(void)
     strcpy(previous_app.version,"2.6.12");assert(storage_upgrade_init());
     strcpy(previous_app.version,"2.6.13");assert(storage_upgrade_init());
     strcpy(previous_app.version,"2.6.14");assert(storage_upgrade_init());
+    /* 2.7.1 rolls back to the fleet's exact signed 2.6.15. */
+    strcpy(previous_app.version,"2.6.15");assert(storage_upgrade_init());
+    assert(!strcmp(UG_DIRECT_VERSION,"2.7.1") && strstr(storage_upgrade_contract(),",2.6.14,2.6.15"));
     failure=7;assert(!storage_upgrade_init());failure=0;
     failure=6;assert(!storage_upgrade_init());failure=7;assert(!storage_upgrade_init());failure=0;
     strcpy(previous_app.version,UG_COMPAT_VERSION);assert(!storage_upgrade_init());

@@ -4,7 +4,9 @@ COMPAT_VERSION = "2.5.4"
 CANDIDATE_VERSION = "2.6.0"
 COMPAT_MARKER = "ZONE_STORAGE_CONTRACT_V1:LEGACY:READ=2:LANES=3F:COMPAT=2.5.4"
 DIRECT_VERSION = "2.6.1"
-DIRECT_VERSIONS = (DIRECT_VERSION, "2.6.2", "2.6.3", "2.6.4", "2.6.5", "2.6.6", "2.6.7", "2.6.8", "2.6.9", "2.6.10", "2.6.11", "2.6.12", "2.6.13", "2.6.14", "2.6.15")
+# 2.7.1 is the 2.7 platform image in the legacy authority of the 2.6.15 fleet.
+FLEET_PLATFORM_VERSION = "2.7.1"
+DIRECT_VERSIONS = (DIRECT_VERSION, "2.6.2", "2.6.3", "2.6.4", "2.6.5", "2.6.6", "2.6.7", "2.6.8", "2.6.9", "2.6.10", "2.6.11", "2.6.12", "2.6.13", "2.6.14", "2.6.15", FLEET_PLATFORM_VERSION)
 DIRECT_BASELINES = ("2.4.12", "2.5.2")
 DIRECT_BASELINE_IMAGES = {
     "2.4.12": "cf9e6e2deff0a237b0bb007fe95e2468fab2503fbceccc8d91c7834f0a6ba589",
@@ -64,6 +66,12 @@ LOCK_BASELINE_IMAGES = {
     "2.6.14": "7d0381fc68a01b34ab6989dfed2b5a1a93f39c293bfd0b7db1734b0871fa6469",
 }
 LOCK_MARKER = DELIVERY_MARKER + ",2.6.14"
+FLEET_BASELINES = (*LOCK_BASELINES, "2.6.15")
+FLEET_BASELINE_IMAGES = {
+    **LOCK_BASELINE_IMAGES,
+    "2.6.15": "832c0c3d8dac6e41d7cd0a9d4fbe4508e4f66982fa5ddeceaca4dc5adcbd80d6",
+}
+FLEET_MARKER = LOCK_MARKER + ",2.6.15"
 
 
 def validate_storage_contract(manifest: dict, version: str) -> dict | None:
@@ -85,7 +93,8 @@ def validate_storage_contract(manifest: dict, version: str) -> dict | None:
     required = version in {COMPAT_VERSION, CANDIDATE_VERSION, *DIRECT_VERSIONS}
     if contract is None and not required:
         return None
-    direct_baselines = (LOCK_BASELINES if version == "2.6.15" else
+    direct_baselines = (FLEET_BASELINES if version == FLEET_PLATFORM_VERSION else
+                        LOCK_BASELINES if version == "2.6.15" else
                         DELIVERY_BASELINES if version == "2.6.14" else
                         LIVE_FRAME_BASELINES if version == "2.6.13" else
                         PROBE_BASELINES if version in {PROBE_VERSION, "2.6.12"} else
@@ -93,7 +102,8 @@ def validate_storage_contract(manifest: dict, version: str) -> dict | None:
                         CONTENTION_BASELINES if version == CONTENTION_VERSION else
                         DIAGNOSTIC_BASELINES if version == DIAGNOSTIC_VERSION else
                         RETRY_BASELINES if version == RETRY_VERSION else DIRECT_BASELINES)
-    direct_images = (LOCK_BASELINE_IMAGES if version == "2.6.15" else
+    direct_images = (FLEET_BASELINE_IMAGES if version == FLEET_PLATFORM_VERSION else
+                     LOCK_BASELINE_IMAGES if version == "2.6.15" else
                      DELIVERY_BASELINE_IMAGES if version == "2.6.14" else
                      LIVE_FRAME_BASELINE_IMAGES if version == "2.6.13" else
                      PROBE_BASELINE_IMAGES if version in {PROBE_VERSION, "2.6.12"} else

@@ -46,7 +46,7 @@ from zk_add.settings import settings
 from zk_add.terminal_families import require_family_match, release_family, require_production_qualification
 from zk_add.time_utils import ensure_utc, utc_now
 from zk_add.storage_contract import (
-    CANDIDATE_VERSION, COMPAT_MARKER, COMPAT_VERSION, DIRECT_BASELINE_IMAGES,
+    CANDIDATE_VERSION, COMPAT_MARKER, COMPAT_VERSION, DIRECT_BASELINE_IMAGES, FLEET_PLATFORM_VERSION,
     validate_storage_contract,
 )
 
@@ -316,6 +316,9 @@ def _parse_release_hil_targets(identity: tuple, raw: Any) -> list[HilTarget]:
         return bridge_hil_targets(raw)
     if identity[1] in RECOVERY_RELEASE_IDS and identity[0] == RECOVERY_RELEASE_IDS[identity[1]]:
         return recovery_hil_targets(raw)
+    if identity[:2] == (f"zone-lite-{FLEET_PLATFORM_VERSION}", FLEET_PLATFORM_VERSION):
+        from zk_add.zkt_bridge_contract import bridge_hil_targets
+        return bridge_hil_targets(raw)
     # The general parser retains its eight-device limit. Only the exact
     # already signed image and reviewed fourteen-device scope can exceed it.
     if identity == HIL_2615_BLD5_IDENTITY and raw == [target.model_dump() for target in HIL_2615_CITY_TARGETS]:
@@ -338,6 +341,19 @@ def _permitted_hil_targets(session: Session, release: FirmwareRelease) -> list[H
         if release.state != "HIL_ONLY" or release.release_id != RECOVERY_RELEASE_IDS[release.version]:
             raise ValueError("Storage recovery is restricted to its exact HIL-only release.")
         return recovery_hil_targets(raw)
+    if release.version == FLEET_PLATFORM_VERSION:
+        # The 2.7 platform in the 2.6.15 fleet's legacy authority. Its exact
+        # nationwide prefix starts each target independently, like the
+        # recovery image: the fleet reservation guard (at most two unsettled
+        # upgrades, one per location) and one-zone campaigns set the pace.
+        # The shared ordered HIL configuration is untouched.
+        if not settings.firmware_hil_enabled:
+            raise ValueError("Ordered firmware HIL quarantine is disabled.")
+        validate_storage_contract(release.manifest or {}, release.version)
+        if release.state != "HIL_ONLY" or release.release_id != f"zone-lite-{FLEET_PLATFORM_VERSION}":
+            raise ValueError("The 2.7 platform is restricted to its exact HIL-only release.")
+        from zk_add.zkt_bridge_contract import bridge_hil_targets
+        return bridge_hil_targets(raw)
     bridge = release.version in {"2.6.16", "2.6.17", "2.6.18", "2.6.19", "2.6.20", "2.6.21", "2.6.22", "2.6.23", "2.7.0"}
     if not settings.firmware_hil_enabled or (not bridge and not settings.firmware_hil_targets_json):
         raise ValueError("Ordered firmware HIL quarantine is disabled.")
@@ -604,7 +620,10 @@ def _storage_predecessor_exclusion(session: Session, release: FirmwareRelease, c
             release.version in {"2.6.13", "2.6.14", "2.6.15"} and qualified_version == "2.6.12") or (
             release.version in {"2.6.14", "2.6.15"} and qualified_version == "2.6.13") or (
             release.version == "2.6.15" and qualified_version == "2.6.14") or (
-            release.version in {"2.6.16", "2.6.17", "2.6.18", "2.6.19", "2.6.20", "2.6.21", "2.6.23"} and qualified_version == "2.6.15")
+            release.version in {"2.6.16", "2.6.17", "2.6.18", "2.6.19", "2.6.20", "2.6.21", "2.6.23"} and qualified_version == "2.6.15") or (
+            # The fleet's 2.6.15 and its HIL predecessors were never promoted.
+            release.version == FLEET_PLATFORM_VERSION and qualified_version in {
+                "2.6.6", "2.6.7", "2.6.8", "2.6.9", "2.6.10", "2.6.12", "2.6.13", "2.6.14", "2.6.15"})
         allowed_state = {"AVAILABLE", "HIL_ONLY"} if hil_retry else {"AVAILABLE"}
         predecessor = session.scalar(select(FirmwareRelease).where(
             FirmwareRelease.release_id == f"zone-lite-{qualified_version}",

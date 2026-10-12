@@ -131,6 +131,28 @@ foreach ($version in @('2.5.4', '2.6.0', '2.6.1', '2.6.2', '2.6.3', '2.6.4', '2.
     try { Get-FirmwareStorageContract -ImagePath $contractImage -Version $version | Out-Null } catch { $rejected = $true }
     if (-not $rejected) { throw 'Ambiguous contract accepted' }
 }
+# 2.7.1 is the 2.7 platform in legacy authority; the fleet's exact 2.6.15
+# joins its qualified rollback targets and no other contract can sign it.
+$fleetMarker = 'ZONE_STORAGE_CONTRACT_V2:LEGACY:READ=2:LANES=3F:BASE=2.4.12,2.5.2,2.6.6,2.6.7,2.6.8,2.6.9,2.6.10,2.6.12,2.6.13,2.6.14,2.6.15'
+[IO.File]::WriteAllText($contractImage, $fleetMarker + [char]0)
+$fleetContract = Get-FirmwareStorageContract -ImagePath $contractImage -Version '2.7.1'
+if ($fleetContract.allowed_bootstrap_versions.Count -ne 11 -or $fleetContract.allowed_bootstrap_versions[10] -ne '2.6.15' -or
+    $fleetContract.allowed_bootstrap_images['2.6.15'] -ne '832c0c3d8dac6e41d7cd0a9d4fbe4508e4f66982fa5ddeceaca4dc5adcbd80d6' -or
+    $fleetContract.allowed_bootstrap_images['2.6.14'] -ne '7d0381fc68a01b34ab6989dfed2b5a1a93f39c293bfd0b7db1734b0871fa6469' -or
+    $fleetContract.allowed_bootstrap_images['2.4.12'] -ne 'cf9e6e2deff0a237b0bb007fe95e2468fab2503fbceccc8d91c7834f0a6ba589') {
+    throw '2.7.1 rollback targets changed'
+}
+foreach ($wrong in @('ZONE_STORAGE_CONTRACT_V2:LEGACY:READ=2:LANES=3F:BASE=2.4.12,2.5.2,2.6.6,2.6.7,2.6.8,2.6.9,2.6.10,2.6.12,2.6.13,2.6.14',
+                     'ZONE_STORAGE_CONTRACT_V1:LEGACY:READ=2:LANES=3F:COMPAT=2.5.4', ($fleetMarker + [char]0 + $fleetMarker))) {
+    [IO.File]::WriteAllText($contractImage, $wrong + [char]0)
+    $rejected = $false
+    try { Get-FirmwareStorageContract -ImagePath $contractImage -Version '2.7.1' | Out-Null } catch { $rejected = $true }
+    if (-not $rejected) { throw '2.7.1 accepted another storage contract' }
+}
+[IO.File]::WriteAllText($contractImage, $fleetMarker + [char]0)
+$rejected = $false
+try { Get-FirmwareStorageContract -ImagePath $contractImage -Version '2.6.15' | Out-Null } catch { $rejected = $true }
+if (-not $rejected) { throw 'The 2.7.1 contract signed 2.6.15' }
 [IO.File]::WriteAllText($contractImage, 'old-application')
 if ($null -ne (Get-FirmwareStorageContract -ImagePath $contractImage -Version '2.5.3')) { throw 'Old signing changed' }
 $rejected = $false
@@ -572,6 +594,27 @@ if (-not $rejected) { throw 'Partial 2.6.15 HIL scope accepted' }
 & $publish -SourceDirectory $source -StoreDirectory $store -Version 2.6.15 -PublicationMode HIL_ONLY -HilTargetsJson $exact2615
 $zkt2615Marker = Get-Content -LiteralPath (Join-Path $store '2.6.15/.hil-only.json') -Raw | ConvertFrom-Json
 if ($zkt2615Marker.targets.Count -ne 5 -or $zkt2615Marker.application_sha256 -cne ('e'*64)) { throw '2.6.15 HIL marker is incomplete' }
+# 2.7.1 publishes only HIL_ONLY, to an exact prefix of the signed nationwide scope.
+$nationwide = Get-Content -LiteralPath (Join-Path $repo 'deploy/add/hil-targets-zkt-270.json') -Raw
+$zkt271Image = Join-Path $source 'zone-lite-2.7.1.bin'
+[IO.File]::WriteAllText($zkt271Image, 'ZKT 2.7.1 fixture, not deployable firmware')
+$manifest.version='2.7.1'
+$manifest.release_id='zone-lite-2.7.1'
+$manifest.image_name='zone-lite-2.7.1.bin'
+$manifest.image_sha256=(Get-FileHash $zkt271Image).Hash.ToLowerInvariant()
+$manifest.image_size=(Get-Item $zkt271Image).Length
+Write-TestManifest
+foreach ($arguments in @(@{ PublicationMode = 'AVAILABLE' }, @{ PublicationMode = 'HIL_ONLY'; HilTargetsJson = $targets },
+                         @{ PublicationMode = 'HIL_ONLY'; HilTargetMac = 'a4:cb:8f:d4:66:64' })) {
+    $rejected = $false
+    try { & $publish -SourceDirectory $source -StoreDirectory $store -Version 2.7.1 @arguments } catch { $rejected = $true }
+    if (-not $rejected) { throw 'Unscoped 2.7.1 publication accepted' }
+}
+& $publish -SourceDirectory $source -StoreDirectory $store -Version 2.7.1 -PublicationMode HIL_ONLY -HilTargetsJson $nationwide
+$zkt271Marker = Get-Content -LiteralPath (Join-Path $store '2.7.1/.hil-only.json') -Raw | ConvertFrom-Json
+if ($zkt271Marker.targets.Count -ne 17 -or $zkt271Marker.targets[0].connector_id -cne '2ca9a4c2-5ae4-4330-8d14-840223672897') {
+    throw '2.7.1 HIL marker is incomplete'
+}
 # The later BLD5 extension changes only the quarantine marker of the exact
 # already published image; it cannot authorize another image or device.
 . (Join-Path $repo 'deploy/add/firmware-2-6-15-bld5-hil-scope.ps1')
