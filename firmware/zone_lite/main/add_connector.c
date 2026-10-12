@@ -12,6 +12,7 @@
 #include "zkt_runtime_checkpoint.h"
 #include "zkt_memory_diagnostics.h"
 #endif
+#include "platform_memory.h"
 #include "evidence_receipt.h"
 #include "file_transaction.h"
 #include "ota_manager.h"
@@ -42,6 +43,7 @@
 #include "esp_websocket_client.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/idf_additions.h"
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -197,6 +199,14 @@ static QueueHandle_t s_hikvision_assignments;
 #endif
 static QueueHandle_t s_source_coverage;
 static QueueHandle_t s_inbound_messages;
+
+static QueueHandle_t psram_queue(UBaseType_t depth, UBaseType_t item_size)
+{
+    QueueHandle_t queue = xQueueCreateWithCaps(depth, item_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    /* Internal RAM is the fallback; running without the queue is not. */
+    return queue ? queue : xQueueCreate(depth, item_size);
+}
+
 static SemaphoreHandle_t s_lock;
 static SemaphoreHandle_t s_send_lock;
 static SemaphoreHandle_t s_ack_sem;
@@ -2966,8 +2976,7 @@ static void append_firmware_diagnostics(cJSON *payload, const add_zkt_telemetry_
         !cJSON_AddStringToObject(diagnostics, "runtime_profile", "HIKVISION_V1") ||
         !cJSON_AddStringToObject(diagnostics, "delivery_authority", "ADD") ||
 #endif
-        !cJSON_AddNumberToObject(memory, "internal_free_bytes", (double)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)) ||
-        !cJSON_AddNumberToObject(memory, "internal_largest_block_bytes", (double)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT))) goto failed;
+        !platform_memory_append(memory)) goto failed;
     size_t total = 0, used = 0;
     esp_err_t measured = esp_spiffs_info(NULL, &total, &used);
     if (measured == ESP_OK) {
@@ -4559,16 +4568,16 @@ void add_connector_init(void)
     s_ack_wait_lock = xSemaphoreCreateMutex();
     s_command_lock = xSemaphoreCreateMutex();
     s_catalog_lock = xSemaphoreCreateMutex();
-    s_commands = xQueueCreate(ADD_COMMAND_QUEUE_DEPTH, sizeof(add_command_t));
-    s_config_commands = xQueueCreate(
-        ADD_CONFIG_COMMAND_QUEUE_DEPTH,
-        sizeof(add_command_t));
-    s_reconcile_assignments = xQueueCreate(1, sizeof(add_reconcile_assignment_t));
+    /* The command queue alone is 32 x 1,632 B. None of these queues is used
+     * from an ISR, so their storage belongs in PSRAM, not internal RAM. */
+    s_commands = psram_queue(ADD_COMMAND_QUEUE_DEPTH, sizeof(add_command_t));
+    s_config_commands = psram_queue(ADD_CONFIG_COMMAND_QUEUE_DEPTH, sizeof(add_command_t));
+    s_reconcile_assignments = psram_queue(1, sizeof(add_reconcile_assignment_t));
 #ifdef ZONE_LITE_HIKVISION
-    s_hikvision_assignments = xQueueCreate(1, 2048);
+    s_hikvision_assignments = psram_queue(1, 2048);
 #endif
-    s_source_coverage = xQueueCreate(1, sizeof(add_source_coverage_t));
-    s_inbound_messages = xQueueCreate(ADD_INBOUND_QUEUE_DEPTH, sizeof(add_inbound_message_t));
+    s_source_coverage = psram_queue(1, sizeof(add_source_coverage_t));
+    s_inbound_messages = psram_queue(ADD_INBOUND_QUEUE_DEPTH, sizeof(add_inbound_message_t));
     uint8_t mac[6] = {0};
     esp_read_mac(mac, ESP_MAC_WIFI_STA);
     snprintf(

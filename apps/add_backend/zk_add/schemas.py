@@ -167,9 +167,32 @@ class StorageDiagnostics(BaseModel):
         return self
 
 
+class AllocationFailure(BaseModel):
+    bytes: int = Field(ge=0, le=0xFFFFFFFF)
+    caps: int = Field(ge=0, le=0xFFFFFFFF)
+
+
+class StackHeadroom(BaseModel):
+    name: str = Field(min_length=1, max_length=32)
+    free_bytes: int = Field(ge=0)
+
+
 class MemoryDiagnostics(BaseModel):
     internal_free_bytes: int = Field(ge=0)
     internal_largest_block_bytes: int = Field(ge=0)
+    # ZKT 2.7.1 and later: every capability pool, its minimum since boot, the
+    # allocation failures and the tasks with the least stack headroom.
+    internal_min_free_bytes: int | None = Field(default=None, ge=0)
+    dma_free_bytes: int | None = Field(default=None, ge=0)
+    dma_largest_block_bytes: int | None = Field(default=None, ge=0)
+    dma_min_free_bytes: int | None = Field(default=None, ge=0)
+    psram_free_bytes: int | None = Field(default=None, ge=0)
+    psram_largest_block_bytes: int | None = Field(default=None, ge=0)
+    psram_min_free_bytes: int | None = Field(default=None, ge=0)
+    alloc_failures: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    alloc_failures_dropped: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    recent_alloc_failures: list[AllocationFailure] = Field(default_factory=list, max_length=4)
+    stacks: list[StackHeadroom] = Field(default_factory=list, max_length=32)
 
 
 class JournalRuntimeDiagnostics(BaseModel):

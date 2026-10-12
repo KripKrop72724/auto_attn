@@ -10,6 +10,7 @@
 #include "zkt_journal_runtime.h"
 #include "zkt_memory_diagnostics.h"
 #endif
+#include "platform_memory.h"
 #if defined(ZONE_LITE_JOURNAL_WRITES) && !defined(ZONE_LITE_HIKVISION)
 #include "zkt_capture_runtime.h"
 #include "zkt_source_boundary_client.h"
@@ -10583,6 +10584,7 @@ static bool reserve_delivery_worker_stacks(void)
 
 void app_main(void)
 {
+    platform_memory_init();
 #if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
     zkt_memory_diag_init();
     zkt_memory_diag_report(ZMD_BOOT, 0);

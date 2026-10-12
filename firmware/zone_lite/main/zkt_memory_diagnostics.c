@@ -92,6 +92,33 @@ void zkt_memory_diag_init(void)
     atomic_store_explicit(&init_state, 2U, memory_order_release);
 }
 
+bool zkt_memory_diag_counts(zmd_counts_t *counts)
+{
+    if (atomic_load_explicit(&init_state, memory_order_acquire) != 2U) return false;
+    counts->failures = atomic_load_explicit(&failures_mod32, memory_order_relaxed);
+    counts->dropped = atomic_load_explicit(&dropped_mod32, memory_order_relaxed);
+    counts->incomplete = atomic_load_explicit(&count_incomplete, memory_order_relaxed) != 0U;
+    return true;
+}
+
+unsigned zkt_memory_diag_take(zmd_sample_t *samples, unsigned max)
+{
+    unsigned taken = 0;
+    if (atomic_load_explicit(&init_state, memory_order_acquire) != 2U) return 0;
+    /* The same slot protocol as the UART reporter: claim a ready slot, copy
+     * it, free it. Whichever reader claims a sample first reports it. */
+    for (unsigned index = 0; index < ZMD_SLOTS && taken < max; ++index) {
+        unsigned ready = 2U;
+        if (!atomic_compare_exchange_strong_explicit(&slots[index].state, &ready, 3U,
+                memory_order_acquire, memory_order_relaxed)) continue;
+        samples[taken].bytes = slots[index].value.bytes;
+        samples[taken].caps = slots[index].value.caps;
+        ++taken;
+        atomic_store_explicit(&slots[index].state, 0U, memory_order_release);
+    }
+    return taken;
+}
+
 void zkt_memory_diag_report(zmd_stage_t stage, int error)
 {
     if ((unsigned)stage >= ZMD_STAGE_COUNT ||

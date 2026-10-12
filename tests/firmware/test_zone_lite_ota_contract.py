@@ -80,7 +80,8 @@ def test_direct_ota_tls_buffers_can_use_psram_after_worker_startup() -> None:
     component = (FIRMWARE / "main" / "CMakeLists.txt").read_text(encoding="utf-8")
     assert "CONFIG_MBEDTLS_DEFAULT_MEM_ALLOC=y" in defaults
     assert "CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096" in defaults
-    assert "if(NOT CONFIG_MBEDTLS_DEFAULT_MEM_ALLOC OR NOT CONFIG_SPIRAM_USE_MALLOC)" in component
+    assert ("if(NOT (CONFIG_MBEDTLS_DEFAULT_MEM_ALLOC OR CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC) "
+            "OR NOT CONFIG_SPIRAM_USE_MALLOC)") in component
 
 
 def test_ota_capability_is_retried_until_add_acknowledges_it() -> None:

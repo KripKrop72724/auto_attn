@@ -1,6 +1,9 @@
 build*/
 sdkconfig
 sdkconfig.*
+# Reviewed configuration inputs; generated sdkconfig files stay ignored.
+!sdkconfig.defaults
+!sdkconfig.*.defaults
 *.bin
 *.elf
 *.map
