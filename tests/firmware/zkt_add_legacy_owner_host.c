@@ -204,7 +204,9 @@ int main(void)
     assert(zq_legacy_append(0,maximum,sizeof(maximum),QS_ADMIT_LIVE)==DQ_OK);
     assert(health.legacy.read_faults==1); /* A producer is not a complete read proof. */
     assert(peek(0)==DQ_OK && copied_length==8191 && copied[8190]=='\n' && !memcmp(copied,maximum,sizeof(maximum)));
-    assert(!health.legacy.read_faults && health.legacy.read_recoveries==1 && health.legacy.append_faults==1 && health.legacy.retire_faults==1);
+    /* Later successes on this lane resolved its failed appends and retirements. */
+    assert(!health.legacy.read_faults && health.legacy.read_recoveries==1 && !health.legacy.append_faults &&
+           !health.legacy.retire_faults && health.legacy.write_recoveries==3);
     settle(0,false);
     /* Lost append and retirement replies never authorize a different item. */
     lose_operation=ZQ_APPEND_COMMIT;
@@ -232,7 +234,8 @@ int main(void)
     nvs_fault=1;assert(peek(1)==DQ_IO);
     assert(health.legacy.read_faults==1 && legacy_health.errors[LF_ADD_BULK][LF_READ]==EIO);
     nvs_fault=0;assert(peek(1)==DQ_EMPTY);
-    assert(!health.legacy.read_faults && health.legacy.read_recoveries==2 && health.legacy.retire_faults==1);
+    assert(!health.legacy.read_faults && health.legacy.read_recoveries==2 && !health.legacy.retire_faults &&
+           health.legacy.write_recoveries==3);
     /* A corrupt cursor is returned as opaque evidence, never as a row. A
      * receipt resets only that cursor; the first original row remains. */
     write_bytes("bulk.jsonl","kept\n",5);

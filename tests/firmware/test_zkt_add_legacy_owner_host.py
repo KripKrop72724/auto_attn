@@ -23,7 +23,9 @@ def test_add_legacy_owner_preserves_generations_and_custody_under_faults(tmp_pat
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text('#include "zkt_storage_owner_platform.h"\n')
     health_source = (main / "queue_store.c").read_text()
-    report = health_source[health_source.index("void qs_local_end_legacy("):health_source.index("static bool lock(")]
+    report = health_source[health_source.index("static void restart_verification("):
+                           health_source.index("bool qs_local_admit_locked(")]
+    report += health_source[health_source.index("void qs_local_end_legacy("):health_source.index("static bool lock(")]
     (tmp_path / "legacy_health_actual.inc").write_text(report.replace("xSemaphoreGive(budget_lock);", "qs_local_end(true, 0);"))
     binary = tmp_path / "add-legacy-owner"
     subprocess.run([shutil.which("cc"), "-std=c11", "-D_POSIX_C_SOURCE=200809L", "-g", "-O1",

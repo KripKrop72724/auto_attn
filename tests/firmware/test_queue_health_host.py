@@ -22,7 +22,9 @@ def test_queue_read_and_settlement_failures_are_visible_and_retryable(tmp_path):
     source = (firmware / "queue_store.c").read_text()
     # Extract only the exercised operations, independently of adjacent helpers.
     # RAM snapshot audit semantics have their own production-function harness.
-    report = _function(source, "static void record_queue_result(")
+    report = _function(source, "static void restart_verification(") + _function(
+        source, "static void record_queue_result("
+    )
     operations = _function(source, "dq_result_t qs_peek(") + _function(
         source, "dq_result_t qs_settle("
     )

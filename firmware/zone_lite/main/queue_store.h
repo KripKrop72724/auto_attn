@@ -18,12 +18,27 @@ typedef struct {
     int last_error;
     const char *last_operation;
     lf_health_t legacy;
+    /* ZKT: a fault is recovered, never forgotten, once every lane has been
+     * re-audited since it, live attendance has room and a fresh persistence
+     * probe passes. The most recent recovered fault is kept. */
+    uint32_t recoveries;
+    int recovered_error;
+    const char *recovered_operation;
+    int64_t recovered_uptime_ms;
+    /* Each fault or request restarts verification; verified_through is the
+     * latest request a passing verification covered. */
+    uint32_t verification_requests, verified_through;
 } qs_health_t;
 bool qs_init(void);
 /* ZKT supervisor: bounded verification of pending segmented records. */
 bool qs_recover_step(void);
-/* Boot recovery must have succeeded; proves filesystem and encrypted NVS writes. */
+/* Boot recovery must have succeeded; proves filesystem and encrypted NVS writes.
+ * With a fault pending it is also the recovery check. */
 bool qs_verify_persistence(void);
+/* ZKT: restart verification after a fault seen outside the queue store, such
+ * as a latched LED incident. Returns the request number to compare with
+ * verified_through, or 0 if the store was busy and nothing was requested. */
+uint32_t qs_request_verification(void);
 bool qs_generation(char output[33]);
 dq_result_t qs_append(qs_lane_t lane, const void *data, size_t length);
 dq_result_t qs_append_with_policy(qs_lane_t lane, const void *data, size_t length, qs_admission_t policy);

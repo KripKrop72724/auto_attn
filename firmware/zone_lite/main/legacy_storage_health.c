@@ -8,9 +8,10 @@ void lf_record(lf_state_t *state, lf_lane_t lane, lf_operation_t operation,
     state->observed = true;
     if (result == DQ_IO || result == DQ_CORRUPT)
         state->errors[lane][operation] = result == DQ_CORRUPT ? EBADMSG : error ? error : EIO;
-    else if (operation == LF_READ && (result == DQ_OK || result == DQ_EMPTY) && state->errors[lane][LF_READ]) {
-        state->errors[lane][LF_READ] = 0;
-        if (state->read_recoveries < UINT32_MAX) ++state->read_recoveries;
+    else if ((result == DQ_OK || (operation == LF_READ && result == DQ_EMPTY)) && state->errors[lane][operation]) {
+        state->errors[lane][operation] = 0;
+        uint32_t *recoveries = operation == LF_READ ? &state->read_recoveries : &state->write_recoveries;
+        if (*recoveries < UINT32_MAX) ++*recoveries;
     }
 }
 
@@ -23,6 +24,7 @@ lf_health_t lf_health(const lf_state_t *state)
     static const char *operations[] = {"legacy_read", "legacy_append", "legacy_retire"};
     health.observed = state->observed;
     health.read_recoveries = state->read_recoveries;
+    health.write_recoveries = state->write_recoveries;
     for (unsigned lane = 0; lane < LF_LANES; ++lane) {
         health.read_faults += state->errors[lane][LF_READ] != 0;
         health.append_faults += state->errors[lane][LF_APPEND] != 0;

@@ -768,7 +768,15 @@ def apply_firmware_diagnostics(session: Session, connector: Connector, payload: 
                 **({"latch": latch} if latch and code == "ESP_DURABILITY_FAULT" else {}),
             })
         elif verified:
-            resolve_alert(session, connector, code=code, resolution={"kind": "VERIFIED"})
+            resolution = {"kind": "VERIFIED"}
+            if code == "ESP_DURABILITY_FAULT" and storage is not None and storage.recoveries:
+                # ZKT 2.7.1 recovers a fault only after a fresh audit of every
+                # queue and a passing probe; keep which fault that was.
+                resolution["recovered"] = {
+                    "recoveries": storage.recoveries, "error_code": storage.recovered_error_code,
+                    "error_operation": storage.recovered_error_operation,
+                    "uptime_ms": storage.recovered_uptime_ms}
+            resolve_alert(session, connector, code=code, resolution=resolution)
             resolved_codes = {code}
             if code == "ESP_DURABILITY_FAULT":
                 resolve_alert(session, connector, code="ESP_PRESERVATION_UNVERIFIED",

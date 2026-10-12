@@ -44,13 +44,17 @@ int main(void)
     assert(out.last_error == EBADMSG && out.write_failures == 2 * LF_LANES);
     for (unsigned lane = 0; lane < LF_LANES; ++lane) {
         report((lf_lane_t)lane, LF_READ, DQ_EMPTY, 0);
-        report((lf_lane_t)lane, LF_APPEND, DQ_OK, 0);
+        if (lane != LF_ORDS_PENDING) report((lf_lane_t)lane, LF_APPEND, DQ_OK, 0);
         report((lf_lane_t)lane, LF_RETIRE, DQ_OK, 0);
     }
     out = snapshot();
     assert(!out.legacy.read_faults && out.legacy.read_recoveries == 1 + LF_LANES);
-    assert(out.legacy.append_faults == LF_LANES && out.legacy.retire_faults == LF_LANES);
+    /* A later success on the same lane and operation resolves a write fault;
+     * the lane that has not appended again keeps its own. */
+    assert(out.legacy.append_faults == 1 && !out.legacy.retire_faults);
+    assert(out.legacy.write_recoveries == 2 * LF_LANES - 1);
     assert(out.last_error == ENOSPC && !strcmp(out.last_operation, "legacy_append"));
+    assert(!strcmp(out.legacy.queue, "ords_pending"));
     health.recovery_complete = health.persistence_verified = true;
     out = snapshot(); /* A cached global success cannot hide a scoped failure. */
     assert(!out.recovery_complete && !out.persistence_verified);

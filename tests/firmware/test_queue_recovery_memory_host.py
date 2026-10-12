@@ -38,6 +38,7 @@ static lane_t lanes[QS_COUNT];
 static int lane_lock,budget_mutex;
 static int *budget_lock=&budget_mutex;
 static qs_health_t health;
+static uint32_t audit_request,audited_request;
 static dq_audit_t recovery_audits[QS_COUNT];
 static uint8_t *recovery_buffer;
 static bool refuse=true;

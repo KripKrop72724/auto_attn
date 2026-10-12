@@ -2999,7 +2999,8 @@ static void append_firmware_diagnostics(cJSON *payload, const add_zkt_telemetry_
             (!cJSON_AddNumberToObject(storage, "legacy_read_faults", measured_health.legacy.read_faults) ||
              !cJSON_AddNumberToObject(storage, "legacy_append_faults", measured_health.legacy.append_faults) ||
              !cJSON_AddNumberToObject(storage, "legacy_retire_faults", measured_health.legacy.retire_faults) ||
-             !cJSON_AddNumberToObject(storage, "legacy_read_recoveries", measured_health.legacy.read_recoveries))) goto failed;
+             !cJSON_AddNumberToObject(storage, "legacy_read_recoveries", measured_health.legacy.read_recoveries) ||
+             !cJSON_AddNumberToObject(storage, "legacy_write_recoveries", measured_health.legacy.write_recoveries))) goto failed;
         if (measured_health.legacy.error &&
             (!cJSON_AddStringToObject(storage, "legacy_error_queue", measured_health.legacy.queue) ||
              !cJSON_AddStringToObject(storage, "legacy_error_operation", measured_health.legacy.operation) ||
@@ -3010,11 +3011,16 @@ static void append_firmware_diagnostics(cJSON *payload, const add_zkt_telemetry_
         if (measured == ESP_OK && measured_health.last_error &&
             (!cJSON_AddStringToObject(storage, "error_operation", measured_health.last_operation ? measured_health.last_operation : "storage_operation") ||
              !cJSON_AddNumberToObject(storage, "error_code", measured_health.last_error))) goto failed;
+        if (measured_health.recoveries &&
+            (!cJSON_AddNumberToObject(storage, "recoveries", measured_health.recoveries) ||
+             !cJSON_AddStringToObject(storage, "recovered_error_operation", measured_health.recovered_operation ? measured_health.recovered_operation : "storage_operation") ||
+             !cJSON_AddNumberToObject(storage, "recovered_error_code", measured_health.recovered_error) ||
+             !cJSON_AddNumberToObject(storage, "recovered_uptime_ms", (double)measured_health.recovered_uptime_ms))) goto failed;
     }
     // A connected heartbeat does not prove persistence. Until a checked
     // recovery/write result is available, report UNKNOWN rather than healthy.
-    char local_failure_source[80];
-    led_status_local_failure_source(local_failure_source, sizeof(local_failure_source));
+    led_local_failure_t local_failure;
+    led_status_local_failure_report(&local_failure);
     const char *durability = measured != ESP_OK || measured_health.last_error || measured_health.persistence_probe_error
         ? "DEGRADED" : measured_health.recovery_complete && measured_health.persistence_verified
         ? "HEALTHY" : "UNKNOWN";
@@ -3024,7 +3030,12 @@ static void append_firmware_diagnostics(cJSON *payload, const add_zkt_telemetry_
         !cJSON_AddStringToObject(storage, "upgrade_contract", storage_upgrade_contract()) ||
         !cJSON_AddStringToObject(storage, "upgrade_error", storage_upgrade_error()) ||
         !cJSON_AddBoolToObject(storage, "upgrade_ready", storage_upgrade_ready()) ||
-        (local_failure_source[0] && !cJSON_AddStringToObject(storage, "local_failure_source", local_failure_source))) goto failed;
+        !cJSON_AddNumberToObject(storage, "local_failures", local_failure.incidents) ||
+        !cJSON_AddNumberToObject(storage, "local_failure_recoveries", local_failure.recoveries) ||
+        (local_failure.active && local_failure.first_source[0] &&
+         !cJSON_AddStringToObject(storage, "local_failure_source", local_failure.first_source)) ||
+        (local_failure.active && local_failure.last_source[0] &&
+         !cJSON_AddStringToObject(storage, "local_failure_last_source", local_failure.last_source))) goto failed;
     if (!append_worker_diagnostic(workers, "add_delivery", s_outbox_task_handle != NULL,
             s_outbox_tick_ms, s_outbox_buffer_ready ? s_add_worker_operation : ADD_WORKER_RESOURCE)) goto failed;
 #if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION

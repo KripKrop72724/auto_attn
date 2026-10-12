@@ -40,6 +40,28 @@ int main(void) {
     assert(select_status(&s_state,900000,&flash)==LED_STATUS_LOCAL_FAILURE);
     led_status_clear_fault(LED_STATUS_LOCAL_FAILURE);
     assert(select_status(&s_state,900000,&flash)==LED_STATUS_HEALTHY);
+    /* Incidents are counted with their first and latest sources. The
+     * supervisor's clear refuses to drop an incident raised after the
+     * verification it relied on. */
+    bool active;
+    uint32_t seen=led_status_local_failures(&active);
+    assert(!active && seen==1);
+    led_status_fault(LED_STATUS_LOCAL_FAILURE);
+    led_status_fault(LED_STATUS_LOCAL_FAILURE);
+    seen=led_status_local_failures(&active);
+    assert(active && seen==3);
+    led_local_failure_t report;
+    led_status_local_failure_report(&report);
+    assert(report.active && report.incidents==3 && !report.recoveries);
+    assert(strstr(report.first_source,"led.c:") && strcmp(report.first_source,report.last_source));
+    expire_recoverable_fault(&s_state,9000000);
+    assert(select_status(&s_state,9000000,&flash)==LED_STATUS_LOCAL_FAILURE);
+    assert(!led_status_clear_local_failure(seen-1));
+    assert(led_status_clear_local_failure(seen));
+    led_status_local_failure_report(&report);
+    assert(!report.active && report.recoveries==1 && !report.first_source[0] && report.last_source[0]);
+    assert(select_status(&s_state,9000000,&flash)==LED_STATUS_HEALTHY);
+    assert(!led_status_clear_local_failure(seen));
     return 0;
 }
 '''
