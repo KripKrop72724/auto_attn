@@ -39,6 +39,19 @@ def test_power_on_report_carries_only_the_counts(db):
     assert stored["reset_reason"] == "POWERON" and stored["previous_stage"] is None and stored["panic"] is None
 
 
+@pytest.mark.parametrize("core,stored", [
+    (4294967295, None), (-1, None), (8, None), ("1", None), (True, None), (1.0, 1), (0, 0),
+])
+def test_unknown_panic_core_keeps_the_heartbeat(db, core, stored):
+    """3FL (12 Oct) panicked on 2.7.2; its panic core rejected every heartbeat."""
+    connector = connector_fixture(db)
+    report = {**BOOT_REPORT, "panic": {**PANIC, "core": core}}
+    update_heartbeat(db, connector=connector, boot_id="panic-boot", sequence=1, payload=heartbeat(report))
+    db.flush()
+    panic = connector.firmware_diagnostics["boot_report"]["panic"]
+    assert panic["core"] == stored and panic["exception"] == "ABORT" and panic["task"] == "add_ws"
+
+
 @pytest.mark.parametrize("change", [
     {"reset_reason": "panic"},
     {"boot_count": -1},
