@@ -11,6 +11,7 @@
 #include "zkt_memory_diagnostics.h"
 #endif
 #include "platform_memory.h"
+#include "boot_report.h"
 #if defined(ZONE_LITE_JOURNAL_WRITES) && !defined(ZONE_LITE_HIKVISION)
 #include "zkt_capture_runtime.h"
 #include "zkt_source_boundary_client.h"
@@ -10584,6 +10585,7 @@ static bool reserve_delivery_worker_stacks(void)
 
 void app_main(void)
 {
+    boot_report_init();
     platform_memory_init();
 #if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
     zkt_memory_diag_init();
@@ -10602,6 +10604,7 @@ void app_main(void)
         led_status_fault(LED_STATUS_FATAL);
         return;
     }
+    boot_report_stage(BOOT_STAGE_NVS_READY);
     ESP_ERROR_CHECK(zone_config_init());
     if (!zone_config_get()->provisioned) {
         ESP_LOGE(TAG, "Encrypted per-device provisioning is required; network startup is blocked");
@@ -10637,6 +10640,7 @@ void app_main(void)
 #else
     storage_init();
 #endif
+    boot_report_stage(BOOT_STAGE_STORAGE_INIT_RETURNED);
 #if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
     zkt_memory_diag_report(ZMD_STORAGE_INIT_RETURNED, 0);
 #endif
@@ -10649,6 +10653,7 @@ void app_main(void)
     if (!wait_for_wifi()) {
         return;
     }
+    boot_report_stage(BOOT_STAGE_NETWORK_READY);
     (void)ensure_system_time_synced();
     g_add_zkt.next_restart_epoch = daily_zkt_reboot_next_epoch();
     add_connector_set_zkt(&g_add_zkt);
