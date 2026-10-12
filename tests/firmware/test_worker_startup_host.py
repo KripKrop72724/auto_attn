@@ -158,6 +158,8 @@ bool qs_verify_persistence(void){return true;}
 #if !ZONE_LITE_HIKVISION
 typedef struct {int last_error;} qs_health_t;
 static qs_health_t qs_health(void){return (qs_health_t){.last_error=0};}
+static unsigned recovery_steps;
+static void local_failure_recovery_step(void){++recovery_steps;}
 #endif
 static void led_status_fault(int state){assert(state>=1 && state<=3);++faults;if(state==LED_STATUS_LOCAL_FAILURE)++local_faults;}
 static void vTaskDelay(unsigned ms){if(gateway_created)++capture_ticks;now+=ms;if(now>=stop_at)longjmp(done,1);}
@@ -173,7 +175,7 @@ int main(void)
     assert(journal_ticks==0);
 #else
     assert(gateway_attempts==1 && ords_attempts==3 && capture_ticks==600 && reported_attempts==3 && faults==600 && local_faults==0);
-    assert(journal_ticks==600);
+    assert(journal_ticks==600 && recovery_steps==600); /* the LED recovery step runs every pass */
 #endif
     journal_ticks=0;
     now=gateway_attempts=ords_attempts=capture_ticks=faults=local_faults=reported_attempts=0;

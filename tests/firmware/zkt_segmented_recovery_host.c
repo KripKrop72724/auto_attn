@@ -13,6 +13,7 @@ static int *budget_lock = &budget_mutex;
 static lane_t lanes[QS_COUNT];
 static qs_health_t health;
 static dq_audit_t recovery_audits[QS_COUNT];
+static uint32_t audit_request, audited_request;
 static uint8_t scratch[DQ_MAX_RECORD_BYTES];
 static uint8_t *recovery_buffer;
 static bool required, started, owner_context;

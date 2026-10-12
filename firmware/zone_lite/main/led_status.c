@@ -40,8 +40,13 @@ typedef struct {
     led_status_t latched_fault;
     int64_t latched_until_ms;
     bool has_latched_fault;
-    bool local_failure; /* Cleared only by verified storage recovery, never a timer. */
-    char local_failure_source[80];
+    /* Cleared only once storage is verified after the latest incident, never
+     * by a timer. */
+    bool local_failure;
+    char local_failure_source[80];      /* first incident of the current latch */
+    char local_failure_last_source[80]; /* most recent incident */
+    uint32_t local_failures;            /* incidents this boot; wraps */
+    uint32_t local_failure_recoveries;  /* latches cleared after verification */
     bool has_backlog;
     bool live_flash;
     int64_t live_flash_until_ms;
@@ -310,13 +315,16 @@ void led_status_fault_at(led_status_t status, const char *file, int line)
     }
     if (xSemaphoreTake(s_led_lock, pdMS_TO_TICKS(50)) == pdTRUE) {
         if (status == LED_STATUS_LOCAL_FAILURE) {
+            const char *basename = file ? strrchr(file, '/') : NULL;
+            basename = basename ? basename + 1 : file;
+            snprintf(s_state.local_failure_last_source, sizeof(s_state.local_failure_last_source),
+                "%s:%d", basename ? basename : "unknown", line);
             if (!s_state.local_failure) {
-                const char *basename = file ? strrchr(file, '/') : NULL;
-                basename = basename ? basename + 1 : file;
-                snprintf(s_state.local_failure_source, sizeof(s_state.local_failure_source),
-                    "%s:%d", basename ? basename : "unknown", line);
+                memcpy(s_state.local_failure_source, s_state.local_failure_last_source,
+                    sizeof(s_state.local_failure_source));
             }
             s_state.local_failure = true;
+            ++s_state.local_failures;
         }
         s_state.latched_fault = status;
         s_state.has_latched_fault = true;
@@ -345,12 +353,46 @@ void led_status_clear_fault(led_status_t status)
     }
 }
 
-void led_status_local_failure_source(char *destination, size_t capacity)
+uint32_t led_status_local_failures(bool *active)
 {
-    if (!destination || !capacity) return;
-    destination[0] = '\0';
+    uint32_t incidents = 0;
+    bool latched = true; /* an unread latch is never reported as clear */
     if (s_led_lock && xSemaphoreTake(s_led_lock, pdMS_TO_TICKS(50)) == pdTRUE) {
-        snprintf(destination, capacity, "%s", s_state.local_failure_source);
+        incidents = s_state.local_failures;
+        latched = s_state.local_failure;
+        xSemaphoreGive(s_led_lock);
+    }
+    if (active) *active = latched;
+    return incidents;
+}
+
+bool led_status_clear_local_failure(uint32_t seen)
+{
+    bool cleared = false;
+    if (s_led_lock && xSemaphoreTake(s_led_lock, pdMS_TO_TICKS(50)) == pdTRUE) {
+        if (s_state.local_failure && s_state.local_failures == seen) {
+            s_state.local_failure = false;
+            s_state.local_failure_source[0] = '\0';
+            if (s_state.has_latched_fault && s_state.latched_fault == LED_STATUS_LOCAL_FAILURE)
+                s_state.has_latched_fault = false;
+            if (s_state.local_failure_recoveries < UINT32_MAX) ++s_state.local_failure_recoveries;
+            cleared = true;
+        }
+        xSemaphoreGive(s_led_lock);
+    }
+    return cleared;
+}
+
+void led_status_local_failure_report(led_local_failure_t *report)
+{
+    if (!report) return;
+    memset(report, 0, sizeof(*report));
+    if (s_led_lock && xSemaphoreTake(s_led_lock, pdMS_TO_TICKS(50)) == pdTRUE) {
+        report->active = s_state.local_failure;
+        report->incidents = s_state.local_failures;
+        report->recoveries = s_state.local_failure_recoveries;
+        snprintf(report->first_source, sizeof(report->first_source), "%s", s_state.local_failure_source);
+        snprintf(report->last_source, sizeof(report->last_source), "%s", s_state.local_failure_last_source);
         xSemaphoreGive(s_led_lock);
     }
 }

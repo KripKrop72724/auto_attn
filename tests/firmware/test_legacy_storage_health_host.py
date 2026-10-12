@@ -6,10 +6,11 @@ import subprocess
 ROOT = Path(__file__).resolve().parents[2]
 
 
-def test_scoped_legacy_incidents_require_the_affected_read_and_keep_write_holds(tmp_path):
+def test_scoped_legacy_incidents_clear_only_on_the_affected_lane_and_operation(tmp_path):
     main = ROOT / "firmware/zone_lite/main"
     source = (main / "queue_store.c").read_text()
-    actual = source[source.index("void qs_local_end_legacy("):source.index("static bool lock(")]
+    actual = source[source.index("static void restart_verification("):source.index("bool qs_local_admit_locked(")]
+    actual += source[source.index("void qs_local_end_legacy("):source.index("static bool lock(")]
     actual += source[source.index("qs_health_t qs_local_health_locked("):]
     (tmp_path / "legacy_health_actual.inc").write_text(actual)
     binary = tmp_path / "health"

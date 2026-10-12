@@ -31,6 +31,10 @@ static char storage_generation[33];
 static const char *names[] = {"ql", "qb", "qo", "qi", "qr", "qe", "qh"};
 #if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
 static dq_audit_t recovery_audits[QS_COUNT];
+/* Budget lock: the verification request the running audit pass serves, and
+ * the latest request a complete pass of every lane covered. Requests start
+ * at 1, so 0 never counts as audited. */
+static uint32_t audit_request, audited_request;
 /* CPU-only fread/CRC scratch. The budget lock owns its one bounded allocation
  * and every use; never consume scarce internal/DMA memory as a fallback. */
 static uint8_t *recovery_buffer;
@@ -150,6 +154,18 @@ bool qs_local_begin(qs_admission_t policy, size_t bytes)
     if (!admitted) xSemaphoreGive(budget_lock);
     return admitted;
 }
+/* Caller owns the budget lock. Every fault and every request restarts
+ * verification: the next recovery pass re-audits each lane from its head,
+ * and a fresh probe must pass before storage is verified again or a fault is
+ * recovered. Hikvision keeps its independent recovery path. */
+static void restart_verification(void)
+{
+#if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
+    if (++health.verification_requests == 0) health.verification_requests = 1;
+    health.recovery_complete = false;
+    health.persistence_recheck_required = true;
+#endif
+}
 bool qs_local_admit_locked(qs_admission_t policy, size_t bytes)
 {
     if ((unsigned)policy > QS_ADMIT_OPTIONAL_HISTORICAL) { errno = EINVAL; return false; }
@@ -168,6 +184,7 @@ bool qs_local_admit_locked(qs_admission_t policy, size_t bytes)
         if (!measured || policy != QS_ADMIT_OPTIONAL_HISTORICAL) {
             health.last_error = error;
             health.last_operation = measured ? "capacity_admission" : "filesystem_info";
+            restart_verification();
         }
         errno = error;
     }
@@ -181,6 +198,7 @@ void qs_local_end(bool persisted, int captured_error)
         health.write_failures++;
         health.last_operation = "local_write_commit";
         health.last_error = captured_error ? captured_error : EIO;
+        restart_verification();
     }
     xSemaphoreGive(budget_lock);
 }
@@ -196,6 +214,7 @@ void qs_local_end_legacy(lf_lane_t lane, lf_operation_t operation, dq_result_t r
         health.recovery_complete = false;
         health.persistence_verified = false;
         health.persistence_recheck_required = true;
+        restart_verification();
     }
     xSemaphoreGive(budget_lock);
 }
@@ -225,6 +244,7 @@ static void record_queue_result(dq_result_t result, const char *operation, bool 
     else health.read_failures++;
     health.last_operation = result == DQ_FULL ? "capacity_admission" : operation;
     health.last_error = result == DQ_FULL ? ENOSPC : result == DQ_CORRUPT ? EBADMSG : (errno ? errno : EIO);
+    restart_verification();
 }
 bool qs_init(void)
 {
@@ -256,6 +276,20 @@ bool qs_init(void)
     } else ok = false;
     return ok;
 }
+#if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
+/* Caller owns the budget lock. Every lane has been re-audited since the fault,
+ * live attendance has room and the persistence probe just passed. */
+static void recover_fault(void)
+{
+    if (health.recoveries < UINT32_MAX) ++health.recoveries;
+    health.recovered_error = health.last_error;
+    health.recovered_operation = health.last_operation;
+    health.recovered_uptime_ms = esp_timer_get_time() / 1000;
+    health.last_error = 0;
+    health.last_operation = NULL;
+    health.recovery_complete = true;
+}
+#endif
 bool qs_recover_step(void)
 {
 #if defined(ZONE_LITE_QUEUE_OWNER) && ZONE_LITE_QUEUE_OWNER
@@ -292,6 +326,12 @@ bool qs_recover_step(void)
             xSemaphoreGive(lanes[i].mutex);
             return false;
         }
+        if (audit_request != health.verification_requests) {
+            /* A fault or request restarted verification: audit every lane
+             * again from its head. */
+            memset(recovery_audits, 0, sizeof(recovery_audits));
+            audit_request = health.verification_requests;
+        }
         errno = 0;
         dq_result_t result = reopen(&lanes[i]);
         if (result == DQ_OK && (!recovery_audits[i].complete ||
@@ -313,6 +353,11 @@ bool qs_recover_step(void)
     }
 #endif
     if (budget_lock && xSemaphoreTake(budget_lock, pdMS_TO_TICKS(1000)) == pdTRUE) {
+        for (unsigned i = 0; i < QS_COUNT; ++i)
+            if (!recovery_audits[i].complete ||
+                recovery_audits[i].generation != lanes[i].queue.checkpoint.generation) complete = false;
+        /* A pass that a later fault restarted covers only the earlier request. */
+        if (complete && audit_request == health.verification_requests) audited_request = audit_request;
         health.recovery_complete = complete && !health.last_error && !health.legacy.error;
         complete = health.recovery_complete;
         xSemaphoreGive(budget_lock);
@@ -327,20 +372,44 @@ bool qs_verify_persistence(void)
 #endif
     if (!storage_upgrade_ready() || !budget_lock ||
         xSemaphoreTake(budget_lock, pdMS_TO_TICKS(1000)) != pdTRUE) return false;
-    /* A probe can only resolve its own failure. Queue corruption, refused
-     * attendance and failed local writes need their own recovery evidence. */
-    if (!health.recovery_complete || health.last_error || health.legacy.error) {
+    /* A probe alone resolves only its own failure. Queue corruption, refused
+     * attendance and failed local writes are recovered once every lane has
+     * been re-audited since the fault; legacy lanes first need their own next
+     * successful operation. */
+#if defined(ZONE_LITE_HIKVISION) && ZONE_LITE_HIKVISION
+    bool recovering = false;
+#else
+    bool recovering = health.last_error && audited_request && audited_request == health.verification_requests &&
+        !health.legacy.error;
+#endif
+    if ((!health.recovery_complete && !recovering) || (health.last_error && !recovering) || health.legacy.error) {
         xSemaphoreGive(budget_lock); return false;
     }
-    if (health.persistence_verified && !health.persistence_probe_error && !health.persistence_recheck_required) {
+    if (!recovering && health.persistence_verified && !health.persistence_probe_error &&
+        !health.persistence_recheck_required) {
         xSemaphoreGive(budget_lock); return true;
     }
 #if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
-    static int64_t retry_at_us;
+    /* Refused attendance waits for room for live attendance before any probe
+     * writes flash, so a full store is not probed every second. */
+    if (recovering && (!measure() || !storage_budget_admit(&budget, health.total_bytes, health.used_bytes,
+                                                           DQ_MAX_RECORD_BYTES, SB_LIVE))) {
+        xSemaphoreGive(budget_lock); return false;
+    }
+    /* Each probe writes a file and NVS: at most one per interval, however
+     * often faults or requests restart verification. */
+#define QS_PROBE_INTERVAL_US (30LL * 1000LL * 1000LL)
+    static int64_t retry_at_us, probed_at_us;
+    static bool probed;
     int64_t now_us = esp_timer_get_time();
     if (health.persistence_probe_error && now_us < retry_at_us) {
         xSemaphoreGive(budget_lock); return false;
     }
+    if (probed && now_us - probed_at_us < QS_PROBE_INTERVAL_US) {
+        xSemaphoreGive(budget_lock); return false;
+    }
+    probed = true;
+    probed_at_us = now_us;
 #endif
     unsigned char expected[32], actual[32];
     esp_fill_random(expected, sizeof(expected));
@@ -437,6 +506,10 @@ bool qs_verify_persistence(void)
         health.persistence_probe_failures = 0;
         health.persistence_probe_error = 0;
         health.persistence_probe_operation = NULL;
+#if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
+        if (recovering) recover_fault();
+        health.verified_through = health.verification_requests;
+#endif
     }
     else {
         if (health.persistence_probe_total_failures < UINT32_MAX) health.persistence_probe_total_failures++;
@@ -464,6 +537,16 @@ bool qs_verify_persistence(void)
     }
     xSemaphoreGive(budget_lock);
     return ok;
+}
+uint32_t qs_request_verification(void)
+{
+    uint32_t request = 0;
+    if (budget_lock && xSemaphoreTake(budget_lock, pdMS_TO_TICKS(1000)) == pdTRUE) {
+        restart_verification();
+        request = health.verification_requests;
+        xSemaphoreGive(budget_lock);
+    }
+    return request;
 }
 dq_result_t qs_append(qs_lane_t lane, const void *data, size_t length)
 {

@@ -347,6 +347,8 @@ STORAGE_EVIDENCE_FIELDS = (
     "write_failures", "read_failures", "persistence_probe_failures", "persistence_probe_error",
     "legacy_read_faults", "legacy_append_faults", "legacy_retire_faults", "legacy_error_code",
     "legacy_error_operation", "local_failure_source", "fault_class", "upgrade_ready", "upgrade_error",
+    "recoveries", "recovered_error_operation", "recovered_error_code", "local_failure_last_source",
+    "local_failures",
 )
 JOURNAL_EVIDENCE_FIELDS = ("ready", "durability", "last_append_result", "last_failure_operation",
                            "last_filesystem_error")
@@ -368,6 +370,11 @@ def _storage_summary(storage: dict, journal: dict, phase) -> str:
             parts.append(label)
     if storage.get("local_failure_source"):
         parts.append(f"LED source {storage['local_failure_source']}")
+        if storage.get("local_failure_last_source") not in (None, storage["local_failure_source"]):
+            parts.append(f"latest {storage['local_failure_last_source']}")
+    if type(storage.get("recoveries")) is int and storage["recoveries"]:
+        parts.append(f"recovered {storage['recoveries']} earlier fault(s), last "
+                     f"{storage.get('recovered_error_operation') or 'operation'} error {storage.get('recovered_error_code')}")
     if journal:
         parts.append(f"journal {journal.get('durability') or 'UNKNOWN'}"
                      + (f", last append {journal['last_append_result']}" if journal.get("last_append_result") else "")

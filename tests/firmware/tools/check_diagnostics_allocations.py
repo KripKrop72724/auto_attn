@@ -24,6 +24,7 @@ program = r'''
 #include <sys/stat.h>
 #include <errno.h>
 #include "cJSON.h"
+#include "led_status.h"
 #include "queue_store.h"
 #include "zkt_journal_boot.h"
 #include "zkt_journal_diagnostics.h"
@@ -81,7 +82,8 @@ static bool platform_memory_append(cJSON *memory){
 static bool boot_report_append(cJSON *diagnostics){
  cJSON *report=cJSON_AddObjectToObject(diagnostics,"boot_report");
  return report&&cJSON_AddStringToObject(report,"reset_reason","SOFTWARE");}
-static void led_status_local_failure_source(char *out,size_t size){assert(size>0);out[0]=0;}
+void led_status_local_failure_report(led_local_failure_t *report){
+ memset(report,0,sizeof(*report));report->incidents=2;report->recoveries=1;}
 static bool storage_upgrade_ready(void){return true;}
 static const char *storage_upgrade_error(void){return "";}
 static const char *storage_upgrade_contract(void){return "contract";}

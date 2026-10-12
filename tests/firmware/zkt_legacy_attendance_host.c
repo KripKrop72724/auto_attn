@@ -248,7 +248,8 @@ int main(void)
     }
     assert(peek_lane(0,bytes,&length,&token)==DQ_OK && length==5 && !memcmp(bytes,"tail\n",5));
     assert(!health.legacy.read_faults && health.legacy.read_recoveries==recovered+1);
-    assert(health.legacy.append_faults==1 && health.legacy.retire_faults==2); /* Distinct unresolved writes survive. */
+    /* Each failed write was resolved by a later success on its own lane. */
+    assert(!health.legacy.append_faults && !health.legacy.retire_faults && health.legacy.write_recoveries==4);
     assert(zq_attendance_legacy_settle(0,&token,false)==DQ_OK);
     /* Execute the actual gateway adapter and Oracle delivery slice. A good
      * Oracle response alone cannot retire before its durable ADD receipt. */

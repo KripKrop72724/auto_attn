@@ -12,6 +12,7 @@
 #endif
 #include "platform_memory.h"
 #include "boot_report.h"
+#include "local_recovery.h"
 #if defined(ZONE_LITE_JOURNAL_WRITES) && !defined(ZONE_LITE_HIKVISION)
 #include "zkt_capture_runtime.h"
 #include "zkt_source_boundary_client.h"
@@ -10583,6 +10584,38 @@ static bool reserve_delivery_worker_stacks(void)
 }
 #endif
 
+#if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
+/* Clears a latched LOCAL_FAILURE once storage has passed a verification that
+ * started after its latest incident and the delivery workers are healthy.
+ * Until then boot health, and with it OTA confirmation, stays withheld. */
+static void local_failure_recovery_step(void)
+{
+    static local_recovery_t state;
+    bool active = false;
+    uint32_t incidents = led_status_local_failures(&active);
+    qs_health_t storage = qs_health();
+    local_recovery_input_t input = {
+        .active = active,
+        .incidents = incidents,
+        .verified_through = storage.verified_through,
+        .storage_healthy = storage.observed && storage.available && storage.recovery_complete &&
+            storage.persistence_verified && !storage.last_error && !storage.persistence_probe_error,
+        .workers_healthy = add_connector_delivery_healthy(),
+    };
+    switch (local_recovery_step(&state, &input)) {
+    case LOCAL_RECOVERY_REQUEST:
+        local_recovery_requested(&state, qs_request_verification());
+        break;
+    case LOCAL_RECOVERY_CLEAR:
+        if (led_status_clear_local_failure(incidents))
+            ESP_LOGW(TAG, "LOCAL_FAILURE cleared: storage verified after the latest incident");
+        break;
+    default:
+        break;
+    }
+}
+#endif
+
 void app_main(void)
 {
     boot_report_init();
@@ -10736,9 +10769,16 @@ void app_main(void)
         // only durable storage failures may latch LOCAL_FAILURE permanently.
         if (!gateway_handle) led_status_fault(LED_STATUS_ZKT_FAILURE);
         if (!ords_handle) led_status_fault(LED_STATUS_ORDS_FAILURE);
-        if (g_queue_store_ready && qs_recover_step() && !qs_verify_persistence() &&
-            qs_health().last_error)
-            led_status_fault(LED_STATUS_LOCAL_FAILURE);
+        if (g_queue_store_ready) {
+            bool recovered = qs_recover_step();
+            if (recovered) {
+                if (!qs_verify_persistence() && qs_health().last_error) led_status_fault(LED_STATUS_LOCAL_FAILURE);
+            } else if (qs_health().last_error) {
+                /* With a fault pending, verification is the recovery check. */
+                (void)qs_verify_persistence();
+            }
+            local_failure_recovery_step();
+        }
         zj_runtime_step();
 #endif
         vTaskDelay(pdMS_TO_TICKS(1000));

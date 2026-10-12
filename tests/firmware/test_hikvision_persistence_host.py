@@ -11,7 +11,7 @@ def test_idle_boot_proves_both_stores_without_clearing_existing_fault(tmp_path, 
     main = ROOT / 'firmware/zone_lite/main'
     source = (main / 'queue_store.c').read_text()
     start = source.index('bool qs_verify_persistence(void)')
-    body = source[start:source.index('dq_result_t qs_append(', start)]
+    body = source[start:source.index('uint32_t qs_request_verification(', start)]
     body = body.replace('"/storage/persistence-probe"', '"' + str(tmp_path / 'probe') + '"')
     harness = r'''
 #include "queue_store.h"
@@ -48,6 +48,10 @@ static void record_queue_result(dq_result_t r,const char *op,bool writing){asser
 #else
 static int64_t now_us;
 static int64_t esp_timer_get_time(void){return now_us;}
+#define SB_LIVE 0
+static uint32_t audited_request; /* latest restart a complete audit pass covered */
+static void recover_fault(void){health.recoveries++;health.recovered_error=health.last_error;
+ health.last_error=0;health.recovery_complete=true;}
 #endif
 /* PRODUCTION */
 static bool attempt_probe(void){
@@ -98,8 +102,12 @@ int main(void){
  assert(!strcmp(health.persistence_probe_operation,"persistence_nvs_commit"));
  health.last_error=EBADMSG;health.last_operation="segment_verify";
  int before=writes;fail_nvs=0;
- assert(!attempt_probe() && writes==before); /* An unrelated incident is not cleared. */
+ assert(!attempt_probe() && writes==before); /* An unrelated incident is not cleared by a probe alone. */
  assert(health.last_error==EBADMSG && health.persistence_probe_error==-1);
+ health.verification_requests=2;audited_request=2; /* Once every lane has been audited since, a passing probe recovers it. */
+ assert(attempt_probe() && writes==before+1 && !health.last_error && health.recoveries==1);
+ assert(health.recovered_error==EBADMSG && health.verified_through==health.verification_requests);
+ audited_request=0;
 #endif
  health=(qs_health_t){.recovery_complete=true};fail_nvs=0;corrupt_nvs=1;
  for(int i=0;i<3;i++)assert(!attempt_probe());

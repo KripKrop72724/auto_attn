@@ -198,9 +198,10 @@ int main(void)
     for(unsigned i=0;i<100;++i)slice(0);
     assert(peeks==before && reclaims==before_reclaim && receipts==before_receipts);
     peek_fault=true;slice(1);assert(!peek_fault && exists(1));
-    if(ZONE_LITE_QUEUE_OWNER)assert(health.legacy.read_faults==1 && health.legacy.retire_faults==1);
+    /* The earlier failed retirement on lane 0 was resolved by its later success there. */
+    if(ZONE_LITE_QUEUE_OWNER)assert(health.legacy.read_faults==1 && !health.legacy.retire_faults && health.legacy.write_recoveries==1);
     slice(1);assert(!exists(1));
-    if(ZONE_LITE_QUEUE_OWNER)assert(!health.legacy.read_faults && health.legacy.read_recoveries==1 && health.legacy.retire_faults==1);
+    if(ZONE_LITE_QUEUE_OWNER)assert(!health.legacy.read_faults && health.legacy.read_recoveries==1 && !health.legacy.retire_faults);
     seed(1,"repeat\nrepeat\n",14);nvs_fault=3;slice(1);
     assert(!nvs_fault && committed[1].offset==7 && exists(1));
     slice(1);assert(!exists(1)); /* Uncertain checkpoint is recovered, never a fabricated receipt. */

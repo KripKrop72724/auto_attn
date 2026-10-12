@@ -125,6 +125,11 @@ class JournalStorageDiagnostics(BaseModel):
 
 class StorageDiagnostics(BaseModel):
     local_failure_source: str | None = Field(default=None, max_length=80)
+    # ZKT 2.7.1 and later: the latest incident of a latched LOCAL_FAILURE, and
+    # incidents and verified recoveries counted since boot.
+    local_failure_last_source: str | None = Field(default=None, max_length=80)
+    local_failures: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    local_failure_recoveries: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
     upgrade_contract: str | None = Field(default=None, max_length=160)
     upgrade_error: str | None = Field(default=None, max_length=80)
     upgrade_ready: bool | None = None
@@ -137,6 +142,7 @@ class StorageDiagnostics(BaseModel):
     legacy_append_faults: int | None = Field(default=None, ge=0, le=7)
     legacy_retire_faults: int | None = Field(default=None, ge=0, le=7)
     legacy_read_recoveries: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    legacy_write_recoveries: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
     legacy_error_queue: Literal["add_live", "add_bulk", "ords_pending", "identity_blocked",
                                 "ords_quarantine", "add_quarantine", "add_quarantine_backup"] | None = None
     legacy_error_operation: Literal["legacy_read", "legacy_append", "legacy_retire"] | None = None
@@ -155,6 +161,12 @@ class StorageDiagnostics(BaseModel):
     recovery_complete: bool = False
     error_operation: str | None = Field(default=None, max_length=80)
     error_code: int | None = None
+    # ZKT 2.7.1 and later: faults recovered this boot after a fresh audit of
+    # every queue, room for live attendance and a passing persistence probe.
+    recoveries: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    recovered_error_operation: str | None = Field(default=None, max_length=80)
+    recovered_error_code: int | None = None
+    recovered_uptime_ms: int | None = Field(default=None, ge=0)
 
     @model_validator(mode="after")
     def retain_legacy_recovery_hold(self) -> "StorageDiagnostics":
