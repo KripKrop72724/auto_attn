@@ -17,9 +17,10 @@ def test_platform_memory_evidence_and_json_allocation(tmp_path: Path) -> None:
     subprocess.run([
         compiler, "-std=c11", "-g", "-O1", "-Wall", "-Wextra", "-Werror",
         "-fsanitize=address,undefined", "-fno-omit-frame-pointer",
-        "-I", str(ROOT / "tests/firmware/platform_memory_host"), "-I", str(FIRMWARE / "main"),
+        "-I", str(ROOT / "tests/firmware/platform_memory_host"), "-I", str(ROOT / "tests/firmware/cjson_subset"),
+        "-I", str(FIRMWARE / "main"),
         str(FIRMWARE / "main/platform_memory.c"), str(ROOT / "tests/firmware/platform_memory_host.c"),
-        "-o", str(executable),
+        str(ROOT / "tests/firmware/cjson_subset/cJSON.c"), "-o", str(executable),
     ], check=True)
     result = subprocess.run([str(executable)], capture_output=True, text=True)
     assert result.returncode == 0, result.stdout + result.stderr
@@ -59,8 +60,9 @@ def test_no_zero_tick_waits_and_queues_live_in_psram() -> None:
     for queue in ("s_commands", "s_config_commands", "s_reconcile_assignments", "s_source_coverage",
                   "s_inbound_messages"):
         assert re.search(rf"{queue} = psram_queue\(", connector), queue
-    assert "!platform_memory_append(memory)) goto failed;" in connector
+    assert "!platform_memory_append(memory) || !boot_report_append(diagnostics)) goto failed;" in connector
     app = (FIRMWARE / "main/zone_lite.c").read_text()
     body = app[app.index("void app_main(void)"):]
     assert body.index("platform_memory_init();") < body.index("cJSON") if "cJSON" in body else True
-    assert body.split("{", 1)[1].lstrip().startswith("platform_memory_init();")
+    # Only the boot report, which reads why the last boot ended, comes first.
+    assert body.split("{", 1)[1].lstrip().startswith("boot_report_init();\n    platform_memory_init();")

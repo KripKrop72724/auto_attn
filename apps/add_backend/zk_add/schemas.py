@@ -195,6 +195,36 @@ class MemoryDiagnostics(BaseModel):
     stacks: list[StackHeadroom] = Field(default_factory=list, max_length=32)
 
 
+PRINTABLE_TEXT = r"^[\x20-\x7e]+$"
+
+
+class BootPanic(BaseModel):
+    # Present only when the previous boot ended in a panic or a failed
+    # ESP_ERROR_CHECK whose abort never reached the panic handler.
+    exception: str | None = Field(default=None, pattern=r"^[A-Z_]{1,32}$")
+    address: str | None = Field(default=None, pattern=r"^0x[0-9a-f]{8}$")
+    core: int | None = Field(default=None, ge=0, le=7)
+    task: str | None = Field(default=None, max_length=32, pattern=PRINTABLE_TEXT)
+    detail: str | None = Field(default=None, max_length=128, pattern=PRINTABLE_TEXT)
+
+
+class BootReport(BaseModel):
+    # ZKT 2.7.1 and later: why the ESP last reset and how the previous boot
+    # ended. Counts run from the last power-on; previous_* and panic are
+    # absent when RTC memory kept nothing trustworthy from the previous boot.
+    reset_reason: str = Field(pattern=r"^[A-Z_]{1,32}$")
+    boot_count: int = Field(ge=0, le=0xFFFFFFFF)
+    panic_count: int = Field(ge=0, le=0xFFFFFFFF)
+    task_wdt_count: int = Field(ge=0, le=0xFFFFFFFF)
+    int_wdt_count: int = Field(ge=0, le=0xFFFFFFFF)
+    other_wdt_count: int = Field(ge=0, le=0xFFFFFFFF)
+    brownout_count: int = Field(ge=0, le=0xFFFFFFFF)
+    last_invalid_partition: str | None = Field(default=None, max_length=16, pattern=PRINTABLE_TEXT)
+    previous_uptime_seconds: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    previous_stage: str | None = Field(default=None, pattern=r"^[A-Z_]{1,32}$")
+    panic: BootPanic | None = None
+
+
 class JournalRuntimeDiagnostics(BaseModel):
     observed: bool
     phase: Literal["NOT_STARTED", "DISABLED", "SECURITY_HOLD", "BINDING_HOLD", "STORAGE_WAIT",
@@ -306,6 +336,7 @@ class FirmwareDiagnostics(BaseModel):
     sampled_uptime_ms: int | None = Field(default=None, ge=0)
     storage: StorageDiagnostics | None = None
     memory: MemoryDiagnostics | None = None
+    boot_report: BootReport | None = None
     journal_runtime: JournalRuntimeDiagnostics | None = None
     qualified_reader: QualifiedReaderDiagnostics | None = None
     journal_storage: JournalStorageDiagnostics | None = None

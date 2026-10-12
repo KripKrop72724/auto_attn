@@ -13,6 +13,7 @@
 #include "zkt_memory_diagnostics.h"
 #endif
 #include "platform_memory.h"
+#include "boot_report.h"
 #include "evidence_receipt.h"
 #include "file_transaction.h"
 #include "ota_manager.h"
@@ -2864,6 +2865,7 @@ static void websocket_event(void *arg, esp_event_base_t base, int32_t event_id, 
     esp_websocket_event_data_t *event = event_data;
     switch (event_id) {
     case WEBSOCKET_EVENT_CONNECTED:
+        boot_report_stage(BOOT_STAGE_ADD_CONNECTED);
         if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
             s_connected = true;
             s_connected_edge = true;
@@ -2976,7 +2978,7 @@ static void append_firmware_diagnostics(cJSON *payload, const add_zkt_telemetry_
         !cJSON_AddStringToObject(diagnostics, "runtime_profile", "HIKVISION_V1") ||
         !cJSON_AddStringToObject(diagnostics, "delivery_authority", "ADD") ||
 #endif
-        !platform_memory_append(memory)) goto failed;
+        !platform_memory_append(memory) || !boot_report_append(diagnostics)) goto failed;
     size_t total = 0, used = 0;
     esp_err_t measured = esp_spiffs_info(NULL, &total, &used);
     if (measured == ESP_OK) {

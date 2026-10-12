@@ -76,6 +76,11 @@ static bool platform_memory_append(cJSON *memory){
   (double)heap_caps_get_free_size(MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT))&&
   cJSON_AddNumberToObject(memory,"internal_largest_block_bytes",
   (double)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT));}
+/* boot_report.c has its own host test; one allocating field keeps its
+ * failure path inside this fault sweep. */
+static bool boot_report_append(cJSON *diagnostics){
+ cJSON *report=cJSON_AddObjectToObject(diagnostics,"boot_report");
+ return report&&cJSON_AddStringToObject(report,"reset_reason","SOFTWARE");}
 static void led_status_local_failure_source(char *out,size_t size){assert(size>0);out[0]=0;}
 static bool storage_upgrade_ready(void){return true;}
 static const char *storage_upgrade_error(void){return "";}
