@@ -21,13 +21,13 @@ from zk_add.storage_contract import (DIRECT_BASELINE_IMAGES, DIRECT_BASELINES, D
                                      CONTENTION_BASELINE_IMAGES, CONTENTION_BASELINES,
                                      PRESSURE_BASELINE_IMAGES, PRESSURE_BASELINES,
                                      PROBE_BASELINE_IMAGES, PROBE_BASELINES)
-from zk_add.storage_contract import LIVE_FRAME_BASELINES, LIVE_FRAME_BASELINE_IMAGES, DELIVERY_BASELINES, DELIVERY_BASELINE_IMAGES, LOCK_BASELINES, LOCK_BASELINE_IMAGES
+from zk_add.storage_contract import LIVE_FRAME_BASELINES, LIVE_FRAME_BASELINE_IMAGES, DELIVERY_BASELINES, DELIVERY_BASELINE_IMAGES, LOCK_BASELINES, LOCK_BASELINE_IMAGES, FLEET_PLATFORM_VERSIONS
 from zk_add.time_utils import utc_now
 
 
-# 2.7.1 carries its own exact nationwide scope instead of the shared single
-# target used here; tests/unit/test_platform_271_release.py covers it.
-@pytest.fixture(params=[version for version in DIRECT_VERSIONS if version != "2.7.1"])
+# The 2.7 platform carries its own exact nationwide scope instead of the shared
+# single target used here; tests/unit/test_platform_27_release.py covers it.
+@pytest.fixture(params=[version for version in DIRECT_VERSIONS if version not in FLEET_PLATFORM_VERSIONS])
 def clock_hil(monkeypatch, request):
     version = request.param
     baselines = LOCK_BASELINES if version == "2.6.15" else DELIVERY_BASELINES if version == "2.6.14" else LIVE_FRAME_BASELINES if version == "2.6.13" else PROBE_BASELINES if version in {"2.6.11", "2.6.12"} else PRESSURE_BASELINES if version == "2.6.10" else CONTENTION_BASELINES if version == "2.6.9" else DIAGNOSTIC_BASELINES if version == "2.6.8" else RETRY_BASELINES if version == "2.6.7" else DIRECT_BASELINES

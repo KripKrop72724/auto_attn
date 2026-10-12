@@ -47,6 +47,7 @@ from zk_add.schemas import (
     SourceTailChunkRequest,
 )
 from zk_add.settings import settings
+from zk_add.storage_contract import FLEET_PLATFORM_VERSIONS
 from zk_add.time_utils import ensure_utc, utc_now
 
 
@@ -113,8 +114,11 @@ def _require_source_epoch(
     row: ReconciliationJob | ReconciliationCoverage, supplied: str | None,
 ) -> None:
     version = _version_tuple(connector.firmware_version)
+    # The 2.7 platform images keep 2.6.15's legacy authority: like 2.6.15 they
+    # echo an epoch only when ADD supplied one, and a supplied one is checked.
+    legacy_platform = ".".join(map(str, version)) in FLEET_PLATFORM_VERSIONS
     required = connector.firmware_family == "zkt" and (
-        connector.zkt_custody_enabled or version == (2, 6, 16) or version >= (2, 7, 0)
+        connector.zkt_custody_enabled or version == (2, 6, 16) or (version >= (2, 7, 0) and not legacy_platform)
     )
     if supplied is None and not required:
         return

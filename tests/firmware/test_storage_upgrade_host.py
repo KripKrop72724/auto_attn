@@ -126,9 +126,9 @@ int main(void)
     strcpy(previous_app.version,"2.6.12");assert(storage_upgrade_init());
     strcpy(previous_app.version,"2.6.13");assert(storage_upgrade_init());
     strcpy(previous_app.version,"2.6.14");assert(storage_upgrade_init());
-    /* 2.7.1 rolls back to the fleet's exact signed 2.6.15. */
+    /* The 2.7 platform rolls back to the fleet's exact signed 2.6.15. */
     strcpy(previous_app.version,"2.6.15");assert(storage_upgrade_init());
-    assert(!strcmp(UG_DIRECT_VERSION,"2.7.1") && strstr(storage_upgrade_contract(),",2.6.14,2.6.15"));
+    assert(!strcmp(UG_DIRECT_VERSION,"2.7.2") && strstr(storage_upgrade_contract(),",2.6.14,2.6.15"));
     failure=7;assert(!storage_upgrade_init());failure=0;
     failure=6;assert(!storage_upgrade_init());failure=7;assert(!storage_upgrade_init());failure=0;
     strcpy(previous_app.version,UG_COMPAT_VERSION);assert(!storage_upgrade_init());

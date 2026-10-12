@@ -5089,7 +5089,9 @@ bool add_connector_begin_exclusive_activity(const char *activity)
 
 bool add_connector_terminal_session_begin(void)
 {
-    if (!s_lock || xSemaphoreTake(s_lock, pdMS_TO_TICKS(100)) != pdTRUE) return false;
+    /* Starting a session is not latency-critical. A briefly busy lock must not
+     * send the gateway into a full network discovery of the terminal. */
+    if (!s_lock || xSemaphoreTake(s_lock, pdMS_TO_TICKS(1000)) != pdTRUE) return false;
     bool allowed = !s_ota_restart_claimed && !s_terminal_session_active;
     if (allowed) s_terminal_session_active = true;
     xSemaphoreGive(s_lock);

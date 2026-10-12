@@ -1053,6 +1053,18 @@ static bool recv_exact_until(int sock, uint8_t *buf, size_t len, int64_t deadlin
 {
     return zk_io_read_until(sock, buf, len, deadline, esp_timer_get_time);
 }
+/* Discards a frame body that is already bounded by the caller, keeping the
+ * stream aligned on the next frame. */
+static bool zk_drain_until(int sock, size_t len, int64_t deadline)
+{
+    uint8_t scratch[256];
+    while (len > 0) {
+        size_t step = len < sizeof(scratch) ? len : sizeof(scratch);
+        if (!recv_exact_until(sock, scratch, step, deadline)) return false;
+        len -= step;
+    }
+    return true;
+}
 static bool send_all(int sock, const uint8_t *buf, size_t len)
 {
     return zk_io_write_until(sock, buf, len, zk_io_deadline(), esp_timer_get_time);
@@ -1081,6 +1093,65 @@ static void configure_zkt_socket(int sock)
 }
 
 static bool zk_send_ack_only(int sock, uint16_t session_id, int64_t deadline);
+static bool zkt_legacy_capture_allowed(void);
+
+/* Legacy authority keeps the terminal framing that 2.6.15 accepted. On the
+ * SLICTOWER 3FL G3 every prepared user read failed the journal roles' strict
+ * frame checks, while 2.6.15 read the same table (12 October 2026). Journal
+ * roles keep the strict checks. The first deviation of each kind per boot is
+ * reported, so the journal phase can be built against the actual frames. */
+typedef enum { ZK_FRAME_SESSION, ZK_FRAME_OVERSIZE, ZK_FRAME_RECORD_SIZE, ZK_FRAME_KINDS } zk_frame_deviation_t;
+static const char *s_zk_stream_failure = "";
+
+static bool zk_legacy_framing(void)
+{
+    return zkt_legacy_capture_allowed();
+}
+
+/* SESSION: command, expected and observed session IDs. OVERSIZE: command,
+ * requested and delivered bytes. RECORD_SIZE: selected size, reported
+ * records and buffer bytes. */
+static void zk_note_framing(zk_frame_deviation_t kind, uint16_t value, uint32_t expected, uint32_t observed)
+{
+    static const char *const codes[ZK_FRAME_KINDS] = {
+        "ZKT_FRAME_SESSION_MISMATCH", "ZKT_FRAME_OVERSIZE", "ZKT_RECORD_SIZE_FALLBACK"};
+    static bool reported[ZK_FRAME_KINDS];
+    if (kind >= ZK_FRAME_KINDS || reported[kind]) return;
+    reported[kind] = true;
+    char message[128];
+    snprintf(message, sizeof(message), "%s=%u expected=%lu observed=%lu; accepted as 2.6.15 did",
+             kind == ZK_FRAME_RECORD_SIZE ? "size" : "command", value,
+             (unsigned long)expected, (unsigned long)observed);
+    ESP_LOGW(TAG, "%s %s", codes[kind], message);
+    add_connector_log("WARN", "zkt", codes[kind], message);
+}
+
+static bool zk_stream_reject(const char *reason)
+{
+    s_zk_stream_failure = reason;
+    return false;
+}
+
+/* A failed terminal read ends its session or tail step. Each distinct cause
+ * is reported once per boot, so a terminal's frame problem is visible in ADD
+ * without a UART capture. */
+static void zk_report_read_failure(const char *read, uint16_t command, uint32_t offset, uint32_t want,
+                                   uint16_t code, const char *reason)
+{
+    static struct { const char *read, *reason; } reported[12];
+    static size_t reported_count;
+    for (size_t i = 0; i < reported_count; i++) {
+        if (reported[i].read == read && reported[i].reason == reason) return;
+    }
+    if (reported_count == sizeof(reported) / sizeof(reported[0])) return;
+    reported[reported_count].read = read;
+    reported[reported_count++].reason = reason;
+    char message[176];
+    snprintf(message, sizeof(message), "%s read command=%u at %lu want=%lu failed: %s (code=%u)",
+             read, command, (unsigned long)offset, (unsigned long)want, reason, code);
+    ESP_LOGW(TAG, "%s", message);
+    add_connector_log("WARN", "zkt", "ZKT_PREPARED_READ_FAILED", message);
+}
 
 typedef enum { ZK_LIVE_HELD, ZK_LIVE_LEGACY, ZK_LIVE_JOURNAL } zk_live_path_t;
 
@@ -1117,34 +1188,47 @@ static bool zk_recv_data_stream(int sock, uint16_t session_id, uint8_t *out, siz
     int64_t deadline = zk_io_deadline();
     size_t written = 0;
     bool saw_ack = false;
+    s_zk_stream_failure = "";
     while (!saw_ack) {
         zk_tcp_header_t top;
         if (!recv_exact_until(sock, (uint8_t *)&top, sizeof(top), deadline)) {
-            return false;
+            return zk_stream_reject("frame header not received");
         }
         if (top.marker_1 != MACHINE_PREPARE_DATA_1 || top.marker_2 != MACHINE_PREPARE_DATA_2 ||
             top.length < sizeof(zk_header_t) || top.length > ZKT_BUFFER_CHUNK_BYTES + sizeof(zk_header_t)) {
-            return false;
+            return zk_stream_reject("invalid frame header");
         }
         uint8_t *packet = malloc(top.length);
         if (packet == NULL) {
             /* This session is abandoned on failure. Do not spend another
              * unbounded body-drain interval after allocation has failed. */
-            return false;
+            return zk_stream_reject("frame allocation failed");
         }
         if (!recv_exact_until(sock, packet, top.length, deadline)) {
             free(packet);
-            return false;
+            return zk_stream_reject("frame body not received");
         }
         zk_header_t *header = (zk_header_t *)packet;
-        if (header->session_id != session_id) { free(packet); return false; }
+        if (header->session_id != session_id) {
+            if (!zk_legacy_framing()) {
+                free(packet);
+                return zk_stream_reject("frame session mismatch");
+            }
+            zk_note_framing(ZK_FRAME_SESSION, header->command, session_id, header->session_id);
+        }
         size_t data_len = top.length - sizeof(zk_header_t);
         uint8_t *data = packet + sizeof(zk_header_t);
         if (header->command == CMD_DATA) {
             size_t copy_len = data_len;
             if (copy_len > out_len - written) {
-                free(packet);
-                return false; /* Never silently truncate an oversized frame. */
+                /* Journal roles never truncate an oversized frame. */
+                if (!zk_legacy_framing()) {
+                    free(packet);
+                    return zk_stream_reject("oversized frame");
+                }
+                zk_note_framing(ZK_FRAME_OVERSIZE, header->command, (uint32_t)out_len,
+                                (uint32_t)(written + copy_len));
+                copy_len = out_len - written;
             }
             if (copy_len > 0) {
                 memcpy(out + written, data, copy_len);
@@ -1158,17 +1242,17 @@ static bool zk_recv_data_stream(int sock, uint16_t session_id, uint8_t *out, siz
             bool acknowledged = zk_preserve_live_packet(packet, top.length) &&
                 zk_send_ack_only(sock, header->session_id, deadline);
             free(packet);
-            if (!acknowledged) return false;
+            if (!acknowledged) return zk_stream_reject("interleaved event not preserved");
             continue;
         } else {
             ESP_LOGW(TAG, "Unexpected ZKT stream command %u", header->command);
             free(packet);
-            return false;
+            return zk_stream_reject("unexpected frame command");
         }
         free(packet);
     }
     *actual_len = written;
-    return written == out_len && saw_ack;
+    return written == out_len && saw_ack ? true : zk_stream_reject("short transfer");
 }
 
 static bool zk_send_command(
@@ -1234,8 +1318,12 @@ static bool zk_send_command(
         }
         if (reply_top.length > rx_cap) {
             ESP_LOGW(TAG, "ZKT reply too large for buffer: %lu", (unsigned long)reply_top.length);
-            // The advertised length is untrusted. Abort this session's
-            // operation instead of draining an arbitrary multi-gigabyte body.
+            // The advertised length is untrusted: never drain an arbitrary
+            // multi-gigabyte body. Legacy authority drains a frame within the
+            // stream's frame limit, as 2.6.15 did, so the session stays framed.
+            if (zk_legacy_framing() && reply_top.length <= ZKT_BUFFER_CHUNK_BYTES + sizeof(zk_header_t)) {
+                (void)zk_drain_until(sock, reply_top.length, deadline);
+            }
             return false;
         }
         if (!recv_exact_until(sock, rx, reply_top.length, deadline)) {
@@ -1243,9 +1331,12 @@ static bool zk_send_command(
         }
 
         zk_header_t *reply = (zk_header_t *)rx;
-        if (command != CMD_CONNECT && reply->session_id != ctx->session_id) return false;
+        if (command != CMD_CONNECT && reply->session_id != ctx->session_id) {
+            if (!zk_legacy_framing()) return false;
+            zk_note_framing(ZK_FRAME_SESSION, reply->command, ctx->session_id, reply->session_id);
+        }
         if (CMD_REG_EVENT == reply->command) {
-            if (!ctx->session_id || reply->session_id != ctx->session_id) return false;
+            if (!ctx->session_id || (reply->session_id != ctx->session_id && !zk_legacy_framing())) return false;
             if (!zk_preserve_live_packet(rx, reply_top.length) ||
                 !zk_send_ack_only(sock, reply->session_id, deadline)) return false;
             continue;
@@ -1646,6 +1737,10 @@ static bool zk_read_buffer(
                 chunk_response.code,
                 (unsigned)chunk_response.data_len,
                 (unsigned long)want);
+            zk_report_read_failure("Prepared", command, offset, want, chunk_response.code,
+                !ok && chunk_response.code == CMD_PREPARE_DATA ? s_zk_stream_failure :
+                !ok ? "chunk command failed" :
+                chunk_response.code != CMD_DATA ? "unexpected chunk reply" : "short chunk");
             free(chunk_rx);
             // A prepared ZKT read is terminal-side state. Always release it
             // before abandoning a partial transfer so subsequent sessions do
@@ -1752,9 +1847,12 @@ static bool zk_read_bounded_range(
     write_le32(payload, offset);
     write_le32(payload + 4, length);
     uint8_t *rx = malloc(length + 64);
-    if (!rx) return false;
+    if (!rx) {
+        zk_report_read_failure("Bounded", CMD_READ_BUFFER_CHUNK, offset, length, 0, "range allocation failed");
+        return false;
+    }
     zk_response_t response = {0};
-    bool ok = zk_send_command(
+    bool sent = zk_send_command(
         sock,
         ctx,
         CMD_READ_BUFFER_CHUNK,
@@ -1763,6 +1861,7 @@ static bool zk_read_bounded_range(
         rx,
         length + 64,
         &response);
+    bool ok = sent;
     if (ok && response.code == CMD_PREPARE_DATA) {
         size_t actual = 0;
         ok = zk_recv_data_stream(sock, ctx->session_id, rx, length, &actual);
@@ -1770,10 +1869,18 @@ static bool zk_read_bounded_range(
         response.data_len = actual;
         response.code = ok ? CMD_DATA : response.code;
     }
-    ok = ok && response.code == CMD_DATA && response.data_len == length;
-    if (ok) memcpy(output, response.data, length);
+    const char *reason = !ok ? (sent ? s_zk_stream_failure : "chunk command failed") :
+        response.code != CMD_DATA ? "unexpected chunk reply" :
+        response.data_len < length ? "short chunk" : NULL;
+    if (!reason && response.data_len > length) {
+        /* Journal roles require the exact range; 2.6.15 used its prefix. */
+        if (!zk_legacy_framing()) reason = "oversized chunk";
+        else zk_note_framing(ZK_FRAME_OVERSIZE, response.code, length, (uint32_t)response.data_len);
+    }
+    if (reason) zk_report_read_failure("Bounded", CMD_READ_BUFFER_CHUNK, offset, length, response.code, reason);
+    else memcpy(output, response.data, length);
     free(rx);
-    return ok;
+    return !reason;
 }
 
 static bool zk_close_bounded_buffer(
@@ -2321,7 +2428,20 @@ static uint32_t choose_zk_record_size(
     const uint32_t *preferred_sizes,
     size_t preferred_count)
 {
-    return zkt_record_size(total_size, reported_count, preferred_sizes, preferred_count);
+    uint32_t size = zkt_record_size(total_size, reported_count, preferred_sizes, preferred_count);
+    if (size || !zk_legacy_framing()) return size;
+    /* 2.6.15 selection: the reported count's exact size, otherwise the first
+     * preferred size that divides the table. */
+    if (reported_count > 0 && total_size % reported_count == 0) {
+        for (size_t i = 0; i < preferred_count && !size; i++) {
+            if (total_size / reported_count == preferred_sizes[i]) size = preferred_sizes[i];
+        }
+    }
+    for (size_t i = 0; i < preferred_count && !size; i++) {
+        if (preferred_sizes[i] > 0 && total_size % preferred_sizes[i] == 0) size = preferred_sizes[i];
+    }
+    if (size) zk_note_framing(ZK_FRAME_RECORD_SIZE, (uint16_t)size, reported_count, total_size);
+    return size;
 }
 
 static bool zk_load_users(int sock, zk_context_t *ctx, user_table_t *users, int32_t user_count)
@@ -9209,7 +9329,10 @@ static int64_t gateway_run_session(uint32_t host_order_ip)
                 free(packet); ESP_LOGW(TAG, "Could not read complete ZKT live packet"); break;
             }
             zk_header_t *header = (zk_header_t *)packet;
-            if (header->session_id != ctx.session_id) { free(packet); break; }
+            if (header->session_id != ctx.session_id) {
+                if (!zk_legacy_framing()) { free(packet); break; }
+                zk_note_framing(ZK_FRAME_SESSION, header->command, ctx.session_id, header->session_id);
+            }
             if (header->command == CMD_REG_EVENT && top.length > sizeof(zk_header_t)) {
                 zk_live_path_t captured_path = zk_preserve_live_packet(packet, top.length);
                 if (captured_path == ZK_LIVE_HELD ||

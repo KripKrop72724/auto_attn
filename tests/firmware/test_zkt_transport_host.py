@@ -69,8 +69,21 @@ static int recv(int sock,void *out,size_t count,int flags)
     position += count;
     return (int)count;
 }
+typedef enum { ZK_FRAME_SESSION, ZK_FRAME_OVERSIZE, ZK_FRAME_RECORD_SIZE, ZK_FRAME_KINDS } zk_frame_deviation_t;
+static const char *s_zk_stream_failure = "";
+static bool legacy_framing;
+static unsigned framing_notes[ZK_FRAME_KINDS];
+static bool zk_legacy_framing(void) { return legacy_framing; }
+static void zk_note_framing(zk_frame_deviation_t kind,uint16_t value,uint32_t expected,uint32_t observed)
+{(void)value;(void)expected;(void)observed;assert(legacy_framing);++framing_notes[kind];}
+static bool zk_stream_reject(const char *reason) { s_zk_stream_failure = reason; return false; }
+static const char *read_failure = "";
+static unsigned read_failures;
+static void zk_report_read_failure(const char *read,uint16_t command,uint32_t offset,uint32_t want,
+                                   uint16_t code,const char *reason)
+{(void)read;(void)command;(void)offset;(void)want;(void)code;read_failure=reason;++read_failures;}
 static bool zk_send_ack_only(int sock,uint16_t session,int64_t deadline)
-{(void)sock;assert(session==12 && preserved);if(now>=deadline)return false;preserved=false;++acknowledgements;return true;}
+{(void)sock;assert((session==12 || legacy_framing) && preserved);if(now>=deadline)return false;preserved=false;++acknowledgements;return true;}
 bool zk_io_read_until(int sock,void *data,size_t count,int64_t deadline,zk_io_clock_t clock)
 {
  size_t offset=0;
@@ -110,8 +123,10 @@ int main(void){
  }
  total=position=0;frame(CMD_DATA,99,"abcd",4);frame(CMD_ACK_OK,12,NULL,0);
  assert(!zk_recv_data_stream(1,12,(uint8_t*)out,4,&actual));
+ assert(!strcmp(s_zk_stream_failure,"frame session mismatch"));
  total=position=0;frame(CMD_DATA,12,"abcde",5);frame(CMD_ACK_OK,12,NULL,0);
  assert(!zk_recv_data_stream(1,12,(uint8_t*)out,4,&actual));
+ assert(!strcmp(s_zk_stream_failure,"oversized frame"));
  total=position=0;frame(CMD_DATA,12,"abc",3);frame(CMD_ACK_OK,12,NULL,0);
  assert(!zk_recv_data_stream(1,12,(uint8_t*)out,4,&actual));
  total=position=0;frame(CMD_DATA,12,"abcd",4);total--;
@@ -144,6 +159,7 @@ int main(void){
   zk_bounded_buffer_t prepared={.prepared=true,.size=4000};
   total=position=0;frame(CMD_DATA,12,(char*)records,160);
   assert(!zk_read_bounded_range(1,&ctx,&prepared,284,range_out,120));
+  assert(!strcmp(read_failure,"oversized chunk"));
   total=position=0;frame(CMD_DATA,12,(char*)records,120);
   assert(zk_read_bounded_range(1,&ctx,&prepared,284,range_out,120));
   assert(!memcmp(range_out,records,120));
@@ -185,6 +201,47 @@ int main(void){
  frame(CMD_REG_EVENT,12,"x",1);frame(CMD_DATA,12,"\x28\0\0\0",4);
  assert(zk_read_bounded_range(1,&ctx,&header_source,0,header_bytes,4));
  assert(header_bytes[0]==40 && captures==prior_captures+2 && acknowledgements==prior_acks+1);
+ /* Legacy authority accepts what 2.6.15 accepted, as the 3FL G3 needs, and
+  * notes each deviation. A short transfer still fails. */
+ assert(!framing_notes[ZK_FRAME_SESSION] && !framing_notes[ZK_FRAME_OVERSIZE]);
+ legacy_framing=true;now=0;fragment_delay=0;preservation_delay=0;preserve_ok=true;
+ for(fragment=1;fragment<=1024;fragment*=2){
+  total=position=0;frame(CMD_DATA,0,"ab",2);frame(CMD_DATA,0,"cd",2);frame(CMD_ACK_OK,0,NULL,0);
+  assert(zk_recv_data_stream(1,12,(uint8_t*)out,4,&actual)&&actual==4&&!memcmp(out,"abcd",4));
+ }
+ assert(framing_notes[ZK_FRAME_SESSION]==33);
+ total=position=0;frame(CMD_DATA,12,"abcde",5);frame(CMD_ACK_OK,12,NULL,0);
+ assert(zk_recv_data_stream(1,12,(uint8_t*)out,4,&actual)&&actual==4&&!memcmp(out,"abcd",4));
+ assert(framing_notes[ZK_FRAME_OVERSIZE]==1);
+ total=position=0;frame(CMD_DATA,12,"ab",2);frame(CMD_DATA,12,"cdef",4);frame(CMD_ACK_OK,12,NULL,0);
+ assert(zk_recv_data_stream(1,12,(uint8_t*)out,4,&actual)&&actual==4&&!memcmp(out,"abcd",4));
+ assert(framing_notes[ZK_FRAME_OVERSIZE]==2);
+ total=position=0;frame(CMD_DATA,12,"abc",3);frame(CMD_ACK_OK,12,NULL,0);
+ assert(!zk_recv_data_stream(1,12,(uint8_t*)out,4,&actual));
+ assert(!strcmp(s_zk_stream_failure,"short transfer"));
+ total=position=0;frame(CMD_ACK_OK,7,NULL,0);
+ assert(zk_send_command(1,&ctx,1,NULL,0,(uint8_t*)out,sizeof(out),&response));
+ assert(response.code==CMD_ACK_OK && framing_notes[ZK_FRAME_SESSION]==34);
+ prior_captures=captures;prior_acks=acknowledgements;
+ total=position=0;frame(CMD_REG_EVENT,7,"x",1);frame(CMD_ACK_OK,12,NULL,0);
+ assert(zk_send_command(1,&ctx,1,NULL,0,(uint8_t*)out,sizeof(out),&response));
+ assert(response.code==CMD_ACK_OK && captures==prior_captures+1 && acknowledgements==prior_acks+1);
+ /* A tail range read uses the requested prefix of an over-long reply. */
+ zk_bounded_buffer_t legacy_range={.prepared=true,.size=4000};
+ total=position=0;frame(CMD_DATA,12,(char*)records,160);
+ assert(zk_read_bounded_range(1,&ctx,&legacy_range,284,range_out,120)&&!memcmp(range_out,records,120));
+ assert(framing_notes[ZK_FRAME_OVERSIZE]==3);
+ total=position=0;frame(CMD_DATA,12,(char*)records,80);
+ assert(!zk_read_bounded_range(1,&ctx,&legacy_range,284,range_out,120)&&!strcmp(read_failure,"short chunk"));
+ /* An oversized reply within the frame limit is drained, keeping the stream framed. */
+ char big[24]={0};
+ total=position=0;frame(CMD_DATA,12,big,sizeof(big));frame(CMD_ACK_OK,12,NULL,0);
+ assert(!zk_send_command(1,&ctx,1,NULL,0,(uint8_t*)out,sizeof(out),&response));
+ assert(position==sizeof(zk_tcp_header_t)+sizeof(zk_header_t)+sizeof(big));
+ assert(zk_send_command(1,&ctx,1,NULL,0,(uint8_t*)out,sizeof(out),&response)&&response.code==CMD_ACK_OK);
+ total=position=0;frame(CMD_DATA,12,"abcd",4);((zk_tcp_header_t*)input)->length=UINT32_MAX;
+ assert(!zk_send_command(1,&ctx,1,NULL,0,(uint8_t*)out,sizeof(out),&response));
+ assert(position==sizeof(zk_tcp_header_t)); /* Never drain an unbounded body. */
  return 0;
 }
 '''
