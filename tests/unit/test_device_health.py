@@ -1484,6 +1484,19 @@ def test_heartbeat_stale_enforced(db, sweep):
     assert heartbeat(db, connector, 2)["state"] == "ONLINE"
 
 
+def test_reconnected_device_has_no_stale_reasons_until_its_first_heartbeat(db, sweep):
+    connector = silent(db, live(db, connector_fixture(db), state="RETRY_WAIT", offline_age=900), 60)
+    sweep()
+    assert connector.lifecycle_state == "OFFLINE"
+    # The stream reconnects: the transport is fresh, the last heartbeat is not.
+    connector.connected, connector.last_seen_at = True, utc_now()
+    connector.zkt_device.last_seen_at = utc_now() - timedelta(minutes=30)
+    db.commit()
+    health = evaluate_health(db, connector)
+    assert (health.derived_lifecycle, health.reasons) == ("OFFLINE", [])
+    assert heartbeat(db, connector, 2)["state"] == "ONLINE"
+
+
 def test_rejected_heartbeat_lets_sweep_mark_offline(db, envelopes, sweep):
     connector = silent(db, live(db, connector_fixture(db)), 40)
     reject(connector, envelopes(connector, "heartbeat", {}), ValueError("DIAGNOSTICS_SAMPLE_MISMATCH"))

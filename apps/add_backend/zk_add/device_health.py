@@ -736,11 +736,15 @@ def derive_health(connector: Connector, alerts, *, now: datetime, source: str = 
     for row in alerts:
         reason = alert_reason(row, connector, now=now, link=link)
         (reasons if reason.tier else others).append(reason)
-    reasons.extend(derived_reasons(connector, now=now, link=link))
-    reasons.sort(key=_sort_key)
-    others.sort(key=_sort_key)
     stored = connector.lifecycle_state
     held_offline = source != "HEARTBEAT" and stored == "OFFLINE"
+    # A reconnected ESP stays OFFLINE until its first heartbeat. Until then its
+    # last heartbeat and terminal state are from before the outage, so they
+    # are not current reasons.
+    if not held_offline:
+        reasons.extend(derived_reasons(connector, now=now, link=link))
+    reasons.sort(key=_sort_key)
+    others.sort(key=_sort_key)
     if held_offline or not connector_fresh(connector, now):
         tier = "OFFLINE"  # only the sweep sets OFFLINE and only a heartbeat clears it
     elif any(reason.tier == DEGRADED for reason in reasons):
