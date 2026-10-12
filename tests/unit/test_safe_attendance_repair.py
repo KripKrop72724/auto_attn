@@ -385,7 +385,17 @@ def test_40_byte_record_uid_and_equivalent_history_release_unknown_identity(stor
         assert evidence and evidence.proof["kind"] == "RETAINED_INTERVAL"
         assert evidence.proof["source"]["kind"] == "SAVED_TERMINAL_RECORD"
 
-        event.source = "FULL_HISTORY"
+        # Full-history and dump reads return the same saved terminal record as
+        # current reconciliation (3FL, 12 Oct). Outside the near-live window
+        # each needs the retained, fingerprint-bound interval at punch time.
+        for source in ("FULL_HISTORY", "DUMP_RECONNECT", "DUMP_STARTUP", "RECONCILE_15M"):
+            event.source = source
+            db.flush()
+            evidence = identity_evidence(db, event, connector)
+            assert evidence and evidence.proof["kind"] == "RETAINED_INTERVAL"
+            assert evidence.proof["source"]["requires_retained_identity"]
+            assert synced_cnic_identity_proven(db, connector, connector.zkt_device, user, event)
+        event.source = "UNSUPPORTED_SOURCE"
         db.flush()
         assert identity_evidence(db, event, connector) is None
         event.source = "CURRENT_RECONCILE"
