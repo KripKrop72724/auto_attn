@@ -1,6 +1,6 @@
-"""ZKT 2.7.1: the 2.7 platform in the 2.6.15 fleet's legacy authority.
+"""ZKT 2.7 platform images (2.7.1, 2.7.2) in the 2.6.15 fleet's legacy authority.
 
-Its HIL scope is an exact prefix of the signed nationwide list. Each target
+Their HIL scope is an exact prefix of the signed nationwide list. Each target
 starts independently; the fleet reservation guard paces the offers."""
 import json
 import secrets
@@ -9,7 +9,7 @@ import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
-from zk_add.storage_contract import (FLEET_BASELINE_IMAGES, FLEET_BASELINES, FLEET_PLATFORM_VERSION,
+from zk_add.storage_contract import (FLEET_BASELINE_IMAGES, FLEET_BASELINES, FLEET_PLATFORM_VERSIONS,
                                      validate_storage_contract)
 from zk_add.zkt_bridge_contract import signed_hil_targets
 from zk_add.zkt270_scope import TARGETS
@@ -24,21 +24,22 @@ DEVICES = (
 )
 
 
-def manifest(**changes):
+def manifest(version, **changes):
     value = {
         "application_sha256": APPLICATION, "firmware_family": "zkt", "git_sha": "a" * 40,
         "minimum_bootstrap_version": "2.4.12", "partition_layout": "zone-lite-ota-v1",
         "queue_storage": {"schema_version": 2, "read_format": 2, "reader_mask": 63, "write_format": 1,
                           "allowed_bootstrap_versions": list(FLEET_BASELINES),
                           "allowed_bootstrap_images": dict(FLEET_BASELINE_IMAGES)},
-        "release_id": f"zone-lite-{FLEET_PLATFORM_VERSION}", "version": FLEET_PLATFORM_VERSION,
+        "release_id": f"zone-lite-{version}", "version": version,
     }
     value.update(changes)
     return value
 
 
-@pytest.fixture
-def platform(monkeypatch, tmp_path):
+@pytest.fixture(params=FLEET_PLATFORM_VERSIONS)
+def platform(monkeypatch, tmp_path, request):
+    platform_version = request.param
     from zk_add import ota
     from zk_add.models import Base, Connector, ZKTDevice
     from zk_add.ota import HIL_269_EXACT_TARGETS
@@ -63,9 +64,9 @@ def platform(monkeypatch, tmp_path):
                 minimum_bootstrap_version="2.2.0", storage_name=f"hil/{version}.bin",
                 manifest_signature="test-signature", state=state,
                 manifest={"application_sha256": FLEET_BASELINE_IMAGES[version]}))
-        signed = manifest()
+        signed = manifest(platform_version)
         release = ota.FirmwareRelease(
-            release_id=signed["release_id"], version=FLEET_PLATFORM_VERSION, git_sha="a" * 40,
+            release_id=signed["release_id"], version=platform_version, git_sha="a" * 40,
             image_sha256="b" * 64, image_size=1024, signing_key_id="production-key",
             partition_layout=ota.OTA_LAYOUT, minimum_bootstrap_version="2.4.12",
             storage_name="hil/platform.bin", manifest_signature="test-signature", state="HIL_ONLY",
@@ -96,7 +97,7 @@ def start(session, release, zone):
     from zk_add.ota import create_campaign, preview_campaign_scope
     scope = preview_campaign_scope(session, release_public_id=release.release_id, zone_id=zone)
     run = create_campaign(session, release_public_id=release.release_id, zone_id=zone,
-                          reason="2.7.1 HIL", typed_confirmation=release.version, actor="test-admin",
+                          reason=f"{release.version} HIL", typed_confirmation=release.version, actor="test-admin",
                           scope_token=scope["scope_token"], idempotency_key=f"platform-{zone}")
     return scope, run
 
@@ -106,17 +107,18 @@ def offer(session, device):
     return assignment_for_connector(session, connector=device, public_base="https://test.invalid")
 
 
-def test_contract_admits_the_fleet_image_as_a_rollback_target():
-    contract = validate_storage_contract(manifest(), FLEET_PLATFORM_VERSION)
+@pytest.mark.parametrize("version", FLEET_PLATFORM_VERSIONS)
+def test_contract_admits_the_fleet_image_as_a_rollback_target(version):
+    contract = validate_storage_contract(manifest(version), version)
     assert contract["allowed_bootstrap_versions"][-1] == "2.6.15"
     assert contract["allowed_bootstrap_images"]["2.6.15"] == FLEET_2615
     with pytest.raises(ValueError):
-        validate_storage_contract(manifest(minimum_bootstrap_version="2.2.0"), FLEET_PLATFORM_VERSION)
-    without_fleet = manifest()
+        validate_storage_contract(manifest(version, minimum_bootstrap_version="2.2.0"), version)
+    without_fleet = manifest(version)
     del without_fleet["queue_storage"]["allowed_bootstrap_images"]["2.6.15"]
     without_fleet["queue_storage"]["allowed_bootstrap_versions"].remove("2.6.15")
     with pytest.raises(ValueError):
-        validate_storage_contract(without_fleet, FLEET_PLATFORM_VERSION)
+        validate_storage_contract(without_fleet, version)
 
 
 def test_targets_start_independently_from_either_predecessor(platform):
@@ -126,7 +128,7 @@ def test_targets_start_independently_from_either_predecessor(platform):
         scope, run = start(session, release, device.zone_id)
         assert [row["connector_id"] for row in scope["eligible"]] == [device.connector_id]
         assert run.eligible_count == 1
-        assert offer(session, device)["version"] == FLEET_PLATFORM_VERSION
+        assert offer(session, device)["version"] == release.version
 
 
 def test_fleet_guard_paces_offers_once_journal_releases_exist(platform):
@@ -140,8 +142,8 @@ def test_fleet_guard_paces_offers_once_journal_releases_exist(platform):
     session.flush()
     for device in devices:
         start(session, release, device.zone_id)
-    assert offer(session, devices[0])["version"] == FLEET_PLATFORM_VERSION
-    assert offer(session, devices[2])["version"] == FLEET_PLATFORM_VERSION
+    assert offer(session, devices[0])["version"] == release.version
+    assert offer(session, devices[2])["version"] == release.version
     # A third unsettled upgrade waits for one of the first two to settle.
     assert offer(session, devices[1]) is None
 
@@ -178,3 +180,23 @@ def test_scope_is_an_exact_nationwide_prefix_and_needs_hil(platform, monkeypatch
     monkeypatch.setattr(settings, "firmware_hil_enabled", False)
     with pytest.raises(ValueError, match="disabled"):
         _permitted_hil_targets(session, release)
+
+
+@pytest.mark.parametrize("firmware,custody,required", [
+    ("zone-lite-2.6.15", False, False), ("zone-lite-2.7.1", False, False), ("zone-lite-2.7.2", False, False),
+    ("zone-lite-2.7.2", True, True), ("zone-lite-2.7.0", False, True), ("zone-lite-2.6.16", False, True),
+])
+def test_platform_follows_the_legacy_source_epoch_rule(firmware, custody, required):
+    """Like 2.6.15, a 2.7 platform tail without an epoch is admitted, and a
+    supplied epoch is still checked."""
+    from types import SimpleNamespace
+    from zk_add.reconciliation import _require_source_epoch
+    connector = SimpleNamespace(firmware_family="zkt", zkt_custody_enabled=custody, firmware_version=firmware)
+    row = SimpleNamespace(source_epoch_id=None)
+    if required:
+        with pytest.raises(ValueError, match="Source epoch"):
+            _require_source_epoch(None, connector, row, None)
+    else:
+        _require_source_epoch(None, connector, row, None)
+    with pytest.raises(ValueError, match="Source epoch"):
+        _require_source_epoch(None, connector, row, "stale-epoch")

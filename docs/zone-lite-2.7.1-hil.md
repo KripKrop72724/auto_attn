@@ -1,5 +1,10 @@
 # Zone Lite 2.7.1: ZKT platform HIL
 
+> **Superseded by [2.7.2](zone-lite-2.7.2-hil.md).** On 12 October 2026, 2.7.1
+> could not keep a terminal session on the SLICTOWER 3FL G3 and was rolled
+> back. Revoke it and never offer it again. The publication, campaign,
+> acceptance and rollback guidance below applies to 2.7.2.
+
 ## What 2.7.1 is
 
 2.7.1 is the 2.7 platform image in phase L: it keeps the legacy delivery
