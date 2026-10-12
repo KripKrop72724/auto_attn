@@ -17,6 +17,8 @@ typedef struct {
     const char *persistence_probe_operation;
     int last_error;
     const char *last_operation;
+    /* The file a failed local write was for, when the writer named it. */
+    char last_file[32];
     lf_health_t legacy;
     /* ZKT: a fault is recovered, never forgotten, once every lane has been
      * re-audited since it, live attendance has room and a fresh persistence
@@ -24,6 +26,7 @@ typedef struct {
     uint32_t recoveries;
     int recovered_error;
     const char *recovered_operation;
+    char recovered_file[32];
     int64_t recovered_uptime_ms;
     /* Each fault or request restarts verification; verified_through is the
      * latest request a passing verification covered. */
@@ -67,6 +70,9 @@ bool qs_local_admit_locked(qs_admission_t policy, size_t bytes);
  * Caller must hold a successful qs_local_*_begin until qs_local_end. */
 qs_health_t qs_local_health_locked(void);
 void qs_local_end(bool persisted, int captured_error);
+/* As qs_local_end, naming the file a failed write was for (its basename is
+ * reported with the error). */
+void qs_local_end_file(bool persisted, int captured_error, const char *file);
 /* Owner-only legacy adapters: reports the exact lane/operation before releasing
  * the local lock. Refusals and contention are not failed persistence. */
 void qs_local_end_legacy(lf_lane_t lane, lf_operation_t operation, dq_result_t result, int captured_error);

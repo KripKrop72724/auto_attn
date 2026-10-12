@@ -184,6 +184,7 @@ bool qs_local_admit_locked(qs_admission_t policy, size_t bytes)
         if (!measured || policy != QS_ADMIT_OPTIONAL_HISTORICAL) {
             health.last_error = error;
             health.last_operation = measured ? "capacity_admission" : "filesystem_info";
+            health.last_file[0] = '\0';
             restart_verification();
         }
         errno = error;
@@ -191,16 +192,26 @@ bool qs_local_admit_locked(qs_admission_t policy, size_t bytes)
     return admitted;
 }
 
-void qs_local_end(bool persisted, int captured_error)
+static void name_file(char out[32], const char *file)
+{
+    const char *base = file ? strrchr(file, '/') : NULL;
+    snprintf(out, 32, "%s", base ? base + 1 : file ? file : "");
+}
+void qs_local_end_file(bool persisted, int captured_error, const char *file)
 {
     if (!persisted) {
         health.failures++;
         health.write_failures++;
         health.last_operation = "local_write_commit";
         health.last_error = captured_error ? captured_error : EIO;
+        name_file(health.last_file, file);
         restart_verification();
     }
     xSemaphoreGive(budget_lock);
+}
+void qs_local_end(bool persisted, int captured_error)
+{
+    qs_local_end_file(persisted, captured_error, NULL);
 }
 
 void qs_local_end_legacy(lf_lane_t lane, lf_operation_t operation, dq_result_t result, int captured_error)
@@ -244,6 +255,7 @@ static void record_queue_result(dq_result_t result, const char *operation, bool 
     else health.read_failures++;
     health.last_operation = result == DQ_FULL ? "capacity_admission" : operation;
     health.last_error = result == DQ_FULL ? ENOSPC : result == DQ_CORRUPT ? EBADMSG : (errno ? errno : EIO);
+    health.last_file[0] = '\0';
     restart_verification();
 }
 bool qs_init(void)
@@ -284,6 +296,8 @@ static void recover_fault(void)
     if (health.recoveries < UINT32_MAX) ++health.recoveries;
     health.recovered_error = health.last_error;
     health.recovered_operation = health.last_operation;
+    memcpy(health.recovered_file, health.last_file, sizeof(health.recovered_file));
+    health.last_file[0] = '\0';
     health.recovered_uptime_ms = esp_timer_get_time() / 1000;
     health.last_error = 0;
     health.last_operation = NULL;

@@ -775,7 +775,7 @@ def apply_firmware_diagnostics(session: Session, connector: Connector, payload: 
                 resolution["recovered"] = {
                     "recoveries": storage.recoveries, "error_code": storage.recovered_error_code,
                     "error_operation": storage.recovered_error_operation,
-                    "uptime_ms": storage.recovered_uptime_ms}
+                    "error_file": storage.recovered_error_file, "uptime_ms": storage.recovered_uptime_ms}
             resolve_alert(session, connector, code=code, resolution=resolution)
             resolved_codes = {code}
             if code == "ESP_DURABILITY_FAULT":

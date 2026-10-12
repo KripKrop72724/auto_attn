@@ -39,6 +39,7 @@ bool qs_local_read_begin(void) { assert(held && !budget); budget = 1; return tru
 bool qs_local_admit_locked(qs_admission_t policy, size_t bytes)
 { assert(budget && (unsigned)policy <= QS_ADMIT_RECOVERY && bytes); if (admission_full) errno = ENOSPC; return !admission_full; }
 void qs_local_end(bool ok, int error) { assert(budget); if (!ok) { assert(error); ++failed_writes; } budget = 0; }
+void qs_local_end_file(bool ok, int error, const char *file) { assert(file && file[0]); qs_local_end(ok, error); }
 static void led_status_fault(int code) { assert(code == LED_STATUS_LOCAL_FAILURE); ++faults; }
 static esp_err_t nvs_open(const char *name, int mode, nvs_handle_t *handle)
 { assert(owner_task && budget && !strcmp(name, "add_legacy")); *handle = (unsigned)mode + 1; return nvs_fault == 1 ? 9 : ESP_OK; }

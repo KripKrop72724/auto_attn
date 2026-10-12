@@ -256,10 +256,13 @@ int main(int argc, char **argv)
     assert(qs_request_verification());
     assert(audit_all() == 4);
     assert(qs_local_begin(QS_ADMIT_LIVE, 100));
-    qs_local_end(false, EIO);
+    qs_local_end_file(false, ENOENT, "/storage/pending.jsonl");
     assert(!audited() && !verify());
+    assert(!strcmp(current().last_file, "pending.jsonl"));
     audit_all();
     assert(verify() && current().recoveries == 2);
+    seen = current();
+    assert(!strcmp(seen.recovered_file, "pending.jsonl") && !seen.last_file[0] && seen.recovered_error == ENOENT);
 
     /* Refused live attendance: no probe writes flash while the store is
      * full, and the fault recovers once live attendance has room. */

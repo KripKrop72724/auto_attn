@@ -348,7 +348,7 @@ STORAGE_EVIDENCE_FIELDS = (
     "legacy_read_faults", "legacy_append_faults", "legacy_retire_faults", "legacy_error_code",
     "legacy_error_operation", "local_failure_source", "fault_class", "upgrade_ready", "upgrade_error",
     "recoveries", "recovered_error_operation", "recovered_error_code", "local_failure_last_source",
-    "local_failures",
+    "local_failures", "error_file", "recovered_error_file",
 )
 JOURNAL_EVIDENCE_FIELDS = ("ready", "durability", "last_append_result", "last_failure_operation",
                            "last_filesystem_error")
@@ -361,7 +361,8 @@ def _storage_summary(storage: dict, journal: dict, phase) -> str:
         if type(storage.get(name)) is int and storage[name]:
             parts.append(f"{label} {storage[name]}")
     if storage.get("error_operation") or _reported(storage.get("error_code")):
-        parts.append(f"{storage.get('error_operation') or 'operation'} error {storage.get('error_code')}")
+        parts.append(f"{storage.get('error_operation') or 'operation'} error {storage.get('error_code')}"
+                     + (f" on {storage['error_file']}" if storage.get("error_file") else ""))
     if storage.get("legacy_error_operation") or _reported(storage.get("legacy_error_code")):
         parts.append(f"{storage.get('legacy_error_operation') or 'legacy'} error {storage.get('legacy_error_code')}")
     for flag, label in (("persistence_verified", "persistence not verified"),
@@ -374,7 +375,8 @@ def _storage_summary(storage: dict, journal: dict, phase) -> str:
             parts.append(f"latest {storage['local_failure_last_source']}")
     if type(storage.get("recoveries")) is int and storage["recoveries"]:
         parts.append(f"recovered {storage['recoveries']} earlier fault(s), last "
-                     f"{storage.get('recovered_error_operation') or 'operation'} error {storage.get('recovered_error_code')}")
+                     f"{storage.get('recovered_error_operation') or 'operation'} error {storage.get('recovered_error_code')}"
+                     + (f" on {storage['recovered_error_file']}" if storage.get("recovered_error_file") else ""))
     if journal:
         parts.append(f"journal {journal.get('durability') or 'UNKNOWN'}"
                      + (f", last append {journal['last_append_result']}" if journal.get("last_append_result") else "")
