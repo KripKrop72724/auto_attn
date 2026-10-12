@@ -727,10 +727,12 @@ static void controller_task(void *argument)
                 ESP_LOGW(TAG, "Bounded station retry failed: %s", esp_err_to_name(retry));
             }
         }
+        /* Only images whose own confirmation cannot roll back (the frozen
+         * journal roles) still fall back to this raw Wi-Fi-loss rollback. */
         if (!s_station_owned && !s_pending_rollback_attempted &&
             s_disconnected_since_ms &&
             current - s_disconnected_since_ms >= PORTAL_PENDING_ROLLBACK_MS &&
-            running_app_pending_verify()) {
+            !ota_manager_owns_boot_rollback() && running_app_pending_verify()) {
             s_pending_rollback_attempted = true;
             ESP_LOGE(TAG, "Pending OTA image could not restore Wi-Fi; rolling back safely");
             esp_err_t rollback = esp_ota_mark_app_invalid_rollback_and_reboot();

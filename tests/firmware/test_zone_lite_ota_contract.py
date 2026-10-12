@@ -40,7 +40,8 @@ def test_ota_restart_waits_for_an_atomic_zkt_safepoint() -> None:
         ota.index("static bool perform_update(void)") :
         ota.index("static bool confirm_or_report_rollback(void)")
     ]
-    assert "while (!add_connector_claim_ota_restart())" in update
+    assert "now - started < OTA_SAFEPOINT_MAX_SECONDS ? add_connector_claim_ota_restart()" in update
+    assert ": add_connector_claim_ota_restart_after_wait()) break;" in update
     assert 'report_state("READY_TO_BOOT", "WAITING_FOR_ZKT_SAFEPOINT")' in update
     assert update.index("wait_for_capture_safepoint();") < update.index("esp_restart();")
     assert "static bool s_ota_restart_claimed;" in connector
