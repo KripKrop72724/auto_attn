@@ -28,11 +28,7 @@ def test_comm_key_command_is_isolated_and_bound_to_aead_context() -> None:
 
 def test_comm_key_recovery_reuses_the_proven_gateway_task_stack() -> None:
     assert "#define ADD_CONFIG_COMMAND_QUEUE_DEPTH 2" in CONNECTOR
-    assert (
-        "s_config_commands = xQueueCreate(\n"
-        "        ADD_CONFIG_COMMAND_QUEUE_DEPTH,\n"
-        "        sizeof(add_command_t));"
-    ) in CONNECTOR
+    assert "s_config_commands = psram_queue(ADD_CONFIG_COMMAND_QUEUE_DEPTH, sizeof(add_command_t));" in CONNECTOR
     app_main = RUNTIME[RUNTIME.index("void app_main(void)") :]
     uploader = app_main.index('xTaskCreate(ords_uploader_task, "ords_uploader"')
     gateway = app_main.index('xTaskCreate(gateway_task, "zone_gateway"')

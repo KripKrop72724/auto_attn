@@ -69,6 +69,13 @@ static const char s_boot_id[]="allocation-test-boot";
 #define MALLOC_CAP_8BIT 2
 static size_t heap_caps_get_free_size(unsigned caps){assert(caps==3);return 100000;}
 static size_t heap_caps_get_largest_free_block(unsigned caps){assert(caps==3);return 64000;}
+/* platform_memory.c owns the full memory evidence and has its own host test;
+ * the two fields it shares with older firmware keep exercising allocation. */
+static bool platform_memory_append(cJSON *memory){
+ return cJSON_AddNumberToObject(memory,"internal_free_bytes",
+  (double)heap_caps_get_free_size(MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT))&&
+  cJSON_AddNumberToObject(memory,"internal_largest_block_bytes",
+  (double)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT));}
 static void led_status_local_failure_source(char *out,size_t size){assert(size>0);out[0]=0;}
 static bool storage_upgrade_ready(void){return true;}
 static const char *storage_upgrade_error(void){return "";}
