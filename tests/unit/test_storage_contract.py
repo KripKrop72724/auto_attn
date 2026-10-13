@@ -18,7 +18,7 @@ from zk_add.storage_contract import (COMPAT_MARKER, DIRECT_BASELINES, DIRECT_MAR
                                      LIVE_FRAME_BASELINES, LIVE_FRAME_BASELINE_IMAGES, LIVE_FRAME_MARKER,
                                      DELIVERY_BASELINES, DELIVERY_BASELINE_IMAGES, DELIVERY_MARKER,
                                      LOCK_BASELINES, LOCK_BASELINE_IMAGES, LOCK_MARKER,
-                                     FLEET_BASELINES, FLEET_BASELINE_IMAGES, FLEET_MARKER,
+                                     FLEET_MARKER,
                                      PLATFORM_BASELINE_IMAGES, PLATFORM_MARKER, platform_baselines,
                                      validate_storage_contract)
 from zk_add.time_utils import utc_now
