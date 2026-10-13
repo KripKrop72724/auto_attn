@@ -228,6 +228,18 @@ class BootPanic(BaseModel):
     task: str | None = Field(default=None, max_length=32, pattern=PRINTABLE_TEXT)
     detail: str | None = Field(default=None, max_length=128, pattern=PRINTABLE_TEXT)
 
+    @field_validator("core", mode="before")
+    @classmethod
+    def unknown_core(cls, value):
+        # The firmware stores the panic's core as an unsigned word. A value no
+        # core can have is unknown; it must not reject the heartbeat carrying
+        # the rest of the crash report (3FL, 12 Oct: 560 heartbeats rejected).
+        if isinstance(value, float) and value.is_integer():
+            value = int(value)
+        if isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= 7:
+            return value
+        return None
+
 
 class BootReport(BaseModel):
     # ZKT 2.7.1 and later: why the ESP last reset and how the previous boot
