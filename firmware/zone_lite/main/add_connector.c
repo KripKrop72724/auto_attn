@@ -17,6 +17,7 @@
 #include "evidence_receipt.h"
 #include "file_transaction.h"
 #include "ota_manager.h"
+#include "storage_inventory.h"
 #include "storage_recovery.h"
 
 #include <ctype.h>
@@ -3010,6 +3011,7 @@ static void append_firmware_diagnostics(cJSON *payload, const add_zkt_telemetry_
     qs_health_t measured_health = qs_health();
     if (measured_health.observed) {
         if (!cJSON_AddNumberToObject(storage, "write_failures", measured_health.write_failures) ||
+            !cJSON_AddNumberToObject(storage, "persistence_probe_repairs", measured_health.persistence_probe_repairs) ||
             !cJSON_AddNumberToObject(storage, "read_failures", measured_health.read_failures) ||
             !cJSON_AddNumberToObject(storage, "persistence_probe_failures", measured_health.persistence_probe_failures) ||
             !cJSON_AddNumberToObject(storage, "persistence_probe_total_failures", measured_health.persistence_probe_total_failures) ||
@@ -3058,7 +3060,8 @@ static void append_firmware_diagnostics(cJSON *payload, const add_zkt_telemetry_
         (local_failure.active && local_failure.first_source[0] &&
          !cJSON_AddStringToObject(storage, "local_failure_source", local_failure.first_source)) ||
         (local_failure.active && local_failure.last_source[0] &&
-         !cJSON_AddStringToObject(storage, "local_failure_last_source", local_failure.last_source))) goto failed;
+         !cJSON_AddStringToObject(storage, "local_failure_last_source", local_failure.last_source)) ||
+        !storage_inventory_append(storage)) goto failed;
     if (!append_worker_diagnostic(workers, "add_delivery", s_outbox_task_handle != NULL,
             s_outbox_tick_ms, s_outbox_buffer_ready ? s_add_worker_operation : ADD_WORKER_RESOURCE)) goto failed;
 #if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION

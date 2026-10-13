@@ -135,6 +135,30 @@ class JournalStorageDiagnostics(BaseModel):
 PRINTABLE_TEXT = r"^[\x20-\x7e]+$"
 
 
+class StorageInventoryFile(BaseModel):
+    # One file of the store and the bytes the filesystem could not read back,
+    # with the first failing offset and errno; the read-error fields are only
+    # present for a file with unreadable bytes.
+    name: str = Field(max_length=32, pattern=PRINTABLE_TEXT)
+    bytes: int = Field(ge=0, le=0xFFFFFFFF)
+    unreadable_bytes: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    first_error: int | None = None
+    first_error_offset: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+
+
+class StorageInventory(BaseModel):
+    # ZKT 2.7.4 and later: a read-only scan of the store, once per boot
+    # (13FL could not confirm 2.7.3 and nothing said which file was damaged).
+    # Unreadable files are listed first, then the largest, at most 16.
+    complete: bool
+    files: int = Field(ge=0, le=0xFFFFFFFF)
+    bytes: int = Field(ge=0)
+    unreadable_files: int = Field(ge=0, le=0xFFFFFFFF)
+    unreadable_bytes: int = Field(ge=0)
+    error: int | None = None
+    entries: list[StorageInventoryFile] = Field(default_factory=list, max_length=16)
+
+
 class StorageDiagnostics(BaseModel):
     local_failure_source: str | None = Field(default=None, max_length=80)
     # ZKT 2.7.1 and later: the latest incident of a latched LOCAL_FAILURE, and
@@ -163,6 +187,11 @@ class StorageDiagnostics(BaseModel):
     persistence_probe_total_failures: int | None = Field(default=None, ge=0)
     persistence_probe_error: int | None = None
     persistence_probe_operation: str | None = Field(default=None, max_length=80)
+    # ZKT 2.7.4 and later: probe files replaced because they could not be
+    # reopened for writing, and the store inventory. An unreadable inventory
+    # is dropped rather than rejecting the heartbeat that carries it.
+    persistence_probe_repairs: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    inventory: StorageInventory | None = None
     fault_class: Literal["NONE", "LOCK_CONTENTION", "CAPACITY", "MISSING_FILE", "CORRUPTION",
                          "ALLOCATION", "PERSISTENCE", "RECOVERY"] | None = None
     rejected_optional_writes: int | None = Field(default=None, ge=0)
@@ -182,6 +211,14 @@ class StorageDiagnostics(BaseModel):
     recovered_error_code: int | None = None
     recovered_uptime_ms: int | None = Field(default=None, ge=0)
     recovered_error_file: str | None = Field(default=None, max_length=32, pattern=PRINTABLE_TEXT)
+
+    @field_validator("inventory", mode="before")
+    @classmethod
+    def readable_inventory(cls, value: Any) -> StorageInventory | None:
+        try:
+            return StorageInventory.model_validate(value) if value is not None else None
+        except ValidationError:
+            return None
 
     @model_validator(mode="after")
     def retain_legacy_recovery_hold(self) -> "StorageDiagnostics":

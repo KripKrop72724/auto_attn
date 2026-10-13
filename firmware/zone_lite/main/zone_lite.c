@@ -70,6 +70,7 @@
 #include "led_status.h"
 #include "add_connector.h"
 #include "ota_manager.h"
+#include "storage_inventory.h"
 #include "storage_recovery.h"
 #include "setup_portal.h"
 #include "zone_config.h"
@@ -3345,24 +3346,37 @@ static bool restore_blocked_backup_if_needed(void)
 static int legacy_pending_load(void *context, lq_checkpoint_t *checkpoint);
 static bool legacy_pending_commit(void *context, const lq_checkpoint_t *checkpoint);
 
+/* The step and errno of the last failed blocked-queue read, for its report. */
+static const char *g_blocked_read_stage = "";
+static int g_blocked_read_error;
+
+static dq_result_t blocked_read_failed(const char *stage, dq_result_t result)
+{
+    g_blocked_read_error = errno;
+    g_blocked_read_stage = stage;
+    return result;
+}
+
 static dq_result_t read_blocked_locked(char *line, size_t capacity, lq_token_t *token)
 {
     if (g_legacy_blocked.ready && g_legacy_blocked.empty_cached) return DQ_EMPTY;
-    if (!restore_blocked_backup_if_needed()) return DQ_IO;
+    errno = 0; /* a failure that sets no errno reports 0, not a stale value */
+    if (!restore_blocked_backup_if_needed()) return blocked_read_failed("restore", DQ_IO);
     if (!g_legacy_blocked.ready) {
         lq_port_t port = {legacy_pending_load, legacy_pending_commit, "blocked"};
         dq_result_t open = lq_open_step(&g_legacy_blocked, BLOCKED_PATH, port);
-        if (open != DQ_OK) return open;
+        if (open != DQ_OK) return open == DQ_PENDING ? open : blocked_read_failed("open", open);
     }
     dq_result_t result = lq_peek(&g_legacy_blocked, line, capacity, token);
     if (result == DQ_EMPTY) {
         dq_result_t retired = lq_reclaim(&g_legacy_blocked);
         if (retired == DQ_OK) {
-            if (!restore_blocked_backup_if_needed()) return DQ_IO;
+            if (!restore_blocked_backup_if_needed()) return blocked_read_failed("restore", DQ_IO);
             result = lq_peek(&g_legacy_blocked, line, capacity, token);
-        } else if (retired != DQ_EMPTY) return retired;
+        } else if (retired != DQ_EMPTY) return blocked_read_failed("reclaim", retired);
     }
     if (result == DQ_EMPTY) g_legacy_blocked.empty_cached = true;
+    else if (result != DQ_OK) return blocked_read_failed("peek", result);
     return result;
 }
 
@@ -7884,6 +7898,35 @@ static void oracle_drain_pending(bool live_first)
 static char *g_blocked_drain_buffer;
 static bool g_prefer_segmented_blocked;
 
+/* 2.7.3 only raised LOCAL_FAILURE when 13FL's blocked queue could not be
+ * read (13 October 2026), which told ADD nothing about the cause. Each
+ * distinct queue read failure is reported once per boot with its step and
+ * errno. */
+static void report_queue_read_failure(const char *queue, const char *stage, dq_result_t result, int error,
+                                      long cursor, const char *path)
+{
+    static const char *const results[] = {"OK", "EMPTY", "FULL", "IO", "CORRUPT", "STALE", "BUFFER_SMALL", "PENDING"};
+    static struct { const char *queue, *stage; dq_result_t result; int error; } seen[12];
+    static unsigned count;
+    for (unsigned i = 0; i < count; ++i) {
+        if (seen[i].queue == queue && seen[i].stage == stage && seen[i].result == result && seen[i].error == error)
+            return;
+    }
+    if (count == sizeof(seen) / sizeof(seen[0])) return;
+    seen[count].queue = queue;
+    seen[count].stage = stage;
+    seen[count].result = result;
+    seen[count++].error = error;
+    struct stat status;
+    long size = path && stat(path, &status) == 0 ? (long)status.st_size : -1L;
+    char message[192];
+    snprintf(message, sizeof(message), "%s %s failed: %s, errno %d; cursor %ld of %ld bytes", queue, stage,
+             (unsigned)result < sizeof(results) / sizeof(results[0]) ? results[result] : "UNKNOWN", error, cursor,
+             size);
+    ESP_LOGW(TAG, "%s", message);
+    (void)add_connector_log("WARN", "storage", "LEGACY_QUEUE_READ_FAILED", message);
+}
+
 static void blocked_evidence_slice(void)
 {
     if (!add_connector_is_connected()) return;
@@ -7899,9 +7942,11 @@ static void blocked_evidence_slice(void)
     if (read == DQ_EMPTY) {
         segmented = false;
 #if defined(ZONE_LITE_QUEUE_OWNER) && ZONE_LITE_QUEUE_OWNER
-        if (legacy_attendance_owner_required())
+        if (legacy_attendance_owner_required()) {
             read = zq_attendance_legacy_peek(ZOL_BLOCKED, line, DQ_MAX_RECORD_BYTES, &length, &legacy_token);
-        else
+            g_blocked_read_stage = "owner_peek";
+            g_blocked_read_error = 0; /* the owner reports through its own diagnostics */
+        } else
 #endif
         {
             if (!g_storage_lock || xSemaphoreTake(g_storage_lock, pdMS_TO_TICKS(200)) != pdTRUE) return;
@@ -7911,7 +7956,12 @@ static void blocked_evidence_slice(void)
         }
     }
     if (read != DQ_OK) {
-        if (read != DQ_EMPTY && read != DQ_PENDING) led_status_fault(LED_STATUS_LOCAL_FAILURE);
+        if (read != DQ_EMPTY && read != DQ_PENDING) {
+            led_status_fault(LED_STATUS_LOCAL_FAILURE);
+            if (segmented) report_queue_read_failure("segmented_blocked", "peek", read, errno, -1L, NULL);
+            else report_queue_read_failure("identity_blocked", g_blocked_read_stage, read, g_blocked_read_error,
+                                           (long)g_legacy_blocked.checkpoint.offset, BLOCKED_PATH);
+        }
         return;
     }
     line[length] = 0;
@@ -8056,7 +8106,11 @@ static void legacy_quarantine_slice(void)
     size_t length = 0;
     dq_result_t read = read_quarantine_delivery(lane, g_blocked_drain_buffer, DQ_MAX_RECORD_BYTES + 1, &length, &token);
     if (read != DQ_OK) {
-        if (read != DQ_EMPTY && read != DQ_PENDING) led_status_fault(LED_STATUS_LOCAL_FAILURE);
+        if (read != DQ_EMPTY && read != DQ_PENDING) {
+            int error = errno;
+            led_status_fault(LED_STATUS_LOCAL_FAILURE);
+            report_queue_read_failure(names[lane], "read", read, error, -1L, NULL);
+        }
         return;
     }
     char instance[33], generation[80], record_id[80];
@@ -10801,6 +10855,9 @@ void app_main(void)
     boot_report_stage(BOOT_STAGE_STORAGE_INIT_RETURNED);
 #if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
     zkt_memory_diag_report(ZMD_STORAGE_INIT_RETURNED, 0);
+#endif
+#if !defined(ZONE_LITE_STORAGE_RECOVERY_IMAGE) || !ZONE_LITE_STORAGE_RECOVERY_IMAGE
+    storage_inventory_start();
 #endif
     wifi_init_sta();
     // An unconfirmed OTA image must enforce its rollback deadline even when

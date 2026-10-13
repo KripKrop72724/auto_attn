@@ -19,6 +19,7 @@ def test_idle_boot_proves_both_stores_without_clearing_existing_fault(tmp_path, 
 #include <errno.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #define pdTRUE 1
 #define pdMS_TO_TICKS(x) (x)
@@ -121,10 +122,27 @@ int main(void){
  int previous=writes;assert(attempt_probe() && writes==previous+1);
  assert(!health.persistence_probe_error && !health.persistence_probe_operation);
 #endif
+ /* A probe file that cannot be reopened for writing is replaced, once; the
+  * probe then proves a freshly created file (13FL, 13 October 2026). */
+ health=(qs_health_t){.recovery_complete=true};corrupt_nvs=0;
+ remove(PROBE_PATH);assert(mkdir(PROBE_PATH,0700)==0);
+ int repaired=writes;assert(attempt_probe() && health.persistence_verified && writes==repaired+1);
+ assert(health.persistence_probe_repairs==1 && !health.persistence_probe_error);
+ /* A filesystem that cannot create the probe still fails it. */
+ health=(qs_health_t){.recovery_complete=true};
+ remove(PROBE_PATH);assert(mkdir(PROBE_PATH,0700)==0);assert(mkdir(PROBE_PATH "/keep",0700)==0);
+ for(int i=0;i<3;i++)assert(!attempt_probe());
+ assert(!health.persistence_verified && health.persistence_probe_failures>=1 && health.persistence_probe_repairs==0);
+#if ZONE_LITE_HIKVISION
+ assert(!strcmp(health.last_operation,"persistence_open_write"));
+#else
+ assert(!strcmp(health.persistence_probe_operation,"persistence_open_write") && health.persistence_probe_error);
+#endif
  return 0;
 }
 '''
     unit = tmp_path / 'proof.c'
+    harness = harness.replace('#define pdTRUE 1', '#define PROBE_PATH "' + str(tmp_path / 'probe') + '"\n#define pdTRUE 1')
     unit.write_text(harness.replace('/* PRODUCTION */', body))
     exe = tmp_path / 'proof'
     subprocess.run([shutil.which('cc'), '-std=c11', '-D_POSIX_C_SOURCE=200809L', '-Wall', '-Wextra', '-Werror',

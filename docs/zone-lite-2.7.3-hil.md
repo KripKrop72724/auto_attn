@@ -1,5 +1,10 @@
 # Zone Lite 2.7.3: ZKT platform HIL
 
+> **Superseded by [2.7.4](zone-lite-2.7.4-hil.md).** On 13 October 2026,
+> 2.7.3 confirmed on Swat 01, Quetta 01 and Peshawar 06, and rolled back on
+> SLICTOWER 13FL, whose store could not be proven. 2.7.4 adds the storage
+> diagnosis; keep 2.7.3 published while devices run it.
+
 2.7.3 replaces 2.7.2. It is the same 2.7 platform image in phase L (legacy
 delivery authority) with the same terminal framing. It records the panic
 trace that 2.7.2 could not, closes the defects found while reviewing 3FL's

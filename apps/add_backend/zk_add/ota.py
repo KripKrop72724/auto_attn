@@ -624,8 +624,9 @@ def _storage_predecessor_exclusion(session: Session, release: FirmwareRelease, c
             # The fleet's 2.6.15 and its HIL predecessors were never promoted.
             release.version in FLEET_PLATFORM_VERSIONS and qualified_version in {
                 "2.6.6", "2.6.7", "2.6.8", "2.6.9", "2.6.10", "2.6.12", "2.6.13", "2.6.14", "2.6.15"}) or (
-            # Neither was 2.7.2, which 3FL runs while 2.7.3 is on HIL.
-            release.version == "2.7.3" and qualified_version == "2.7.2")
+            # Neither were 2.7.2 and 2.7.3, the HIL-only 2.7 platform images.
+            release.version in {"2.7.3", "2.7.4"} and qualified_version == "2.7.2") or (
+            release.version == "2.7.4" and qualified_version == "2.7.3")
         allowed_state = {"AVAILABLE", "HIL_ONLY"} if hil_retry else {"AVAILABLE"}
         predecessor = session.scalar(select(FirmwareRelease).where(
             FirmwareRelease.release_id == f"zone-lite-{qualified_version}",
