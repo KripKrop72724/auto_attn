@@ -29,6 +29,9 @@ bool ug_direct_predecessor_matches(const char *version, const uint8_t digest[32]
     /* 2.7.2: the image SLICTOWER-3FL runs, so 3FL upgrades in place. */
     static const char platform_272[] =
         "e908496e0695d8c29e96a6f2db3840060eeab526c4012e29a3deef826f7c8eea";
+    /* 2.7.3: the panic-trace HIL image, so its devices upgrade in place. */
+    static const char platform_273[] =
+        "98855248bb4325103b5253ab4b15f4e939adf3ace89c208d463b09ec9ca21a6a";
     const char *expected = !strcmp(version, "2.4.12") ? baseline_2412 :
         !strcmp(version, "2.5.2") ? baseline_252 :
         !strcmp(version, "2.6.6") ? hil_266 :
@@ -40,7 +43,8 @@ bool ug_direct_predecessor_matches(const char *version, const uint8_t digest[32]
         !strcmp(version, "2.6.13") ? hil_2613 :
         !strcmp(version, "2.6.14") ? hil_2614 :
         !strcmp(version, "2.6.15") ? fleet_2615 :
-        !strcmp(version, "2.7.2") ? platform_272 : NULL;
+        !strcmp(version, "2.7.2") ? platform_272 :
+        !strcmp(version, "2.7.3") ? platform_273 : NULL;
     if (!expected) return false;
     static const char hex[] = "0123456789abcdef";
     for (unsigned i = 0; i < 32; ++i) {

@@ -2,9 +2,11 @@
 #include "reliability.h"
 #include "cJSON.h"
 #include <assert.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 #define MAX_USERS 4
 #define MAX_EVENT_JSON 1024
@@ -18,6 +20,22 @@
 #define ADD_WORKER_COMMITTING 4
 #define MALLOC_CAP_SPIRAM 1
 #define MALLOC_CAP_8BIT 2
+#define TAG "test"
+#define ESP_LOGW(...) ((void)0)
+#define BLOCKED_PATH "blocked.jsonl"
+/* The failing step and errno, as read_blocked_locked records them. */
+static const char *g_blocked_read_stage="";
+static int g_blocked_read_error;
+static struct { struct { uint32_t offset; } checkpoint; } g_legacy_blocked={{.offset=11}};
+static unsigned queue_failure_logs;
+static char last_failure[192];
+static dq_result_t blocked_read_failed(const char *stage,dq_result_t result)
+{ g_blocked_read_error=errno;g_blocked_read_stage=stage;return result; }
+static bool add_connector_log(const char *level,const char *subsystem,const char *code,const char *message)
+{
+    assert(!strcmp(level,"WARN") && !strcmp(subsystem,"storage") && !strcmp(code,"LEGACY_QUEUE_READ_FAILED"));
+    ++queue_failure_logs;snprintf(last_failure,sizeof(last_failure),"%s",message);return true;
+}
 static int g_storage_lock=1,held;
 static bool required=ZONE_LITE_QUEUE_OWNER,append_ok=true,settle_ok=true,custody_ok,with_fingerprint=true;
 static bool session_active,generation_ok=true;
@@ -55,7 +73,11 @@ static bool commit_source(const lq_token_t *token,bool custody)
     ++settles;last_custody=custody;return settle_ok;
 }
 static dq_result_t read_blocked_locked(char *bytes,size_t capacity,lq_token_t *token)
-{ assert(held);++direct_reads;size_t length;return read_source(bytes,capacity,&length,token); }
+{
+    assert(held);++direct_reads;size_t length;dq_result_t result=read_source(bytes,capacity,&length,token);
+    if(result!=DQ_OK && result!=DQ_EMPTY && result!=DQ_PENDING){errno=EIO;return blocked_read_failed("peek",result);}
+    return result;
+}
 static bool settle_blocked_locked(const lq_token_t *token,bool custody) { assert(held);return commit_source(token,custody); }
 dq_result_t zq_attendance_legacy_peek(unsigned lane,void *bytes,size_t capacity,size_t *length,lq_token_t *token)
 { assert(required && !held && lane==ZOL_BLOCKED);++owner_reads;return read_source(bytes,capacity,length,token); }
@@ -145,6 +167,14 @@ int main(void)
     settle_ok=true;blocked_evidence_slice();assert(evidence_calls==3 && settles==2 && last_custody && !held && !appends);
     assert(required ? owner_reads==3 && !direct_reads : direct_reads==3 && !owner_reads);
     reset();generation_ok=false;blocked_evidence_slice();assert(!evidence_calls && !settles && !appends && !held);
+    /* An unreadable blocked queue names its step and errno once per boot,
+     * however often the slice retries it. */
+    reset();read_result=DQ_IO;
+    for(int i=0;i<4;i++)blocked_evidence_slice();
+    assert(queue_failure_logs==1 && !evidence_calls && !settles && !held);
+    assert(strstr(last_failure, required ? "identity_blocked owner_peek failed: IO, errno 0" : "identity_blocked peek failed: IO, errno 5"));
+    read_result=DQ_CORRUPT;blocked_evidence_slice();blocked_evidence_slice();
+    assert(queue_failure_logs==2 && strstr(last_failure,"CORRUPT"));
     required=false;reset();assert(recover_blocked_events_from_snapshot(&users,&recovered) && recovered==1 && !held);
     puts("actual blocked identity, exact custody, owner/family routing and allocation faults passed");
 }

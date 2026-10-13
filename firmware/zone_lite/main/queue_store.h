@@ -13,6 +13,8 @@ typedef struct {
     uint32_t failures, write_failures, read_failures, admission_rejections;
     uint32_t persistence_probe_failures;
     uint32_t persistence_probe_total_failures;
+    /* Probe files replaced because they could not be reopened for writing. */
+    uint32_t persistence_probe_repairs;
     int persistence_probe_error;
     const char *persistence_probe_operation;
     int last_error;

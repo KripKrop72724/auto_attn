@@ -23,7 +23,7 @@ idf_component_register(
 target_link_libraries(${COMPONENT_LIB} INTERFACE "-Wl,--wrap=esp_panic_handler"
                       "-Wl,--wrap=_esp_error_check_failed")
 target_sources(${COMPONENT_LIB} PRIVATE "zkt_record.c" "zkt_socket_io.c" "add_source_wire.c" "ota_progress_receipt.c" "legacy_storage_health.c"
-    "storage_recovery_core.c" "storage_orphan_core.c" "storage_recovery.c")
+    "storage_recovery_core.c" "storage_orphan_core.c" "storage_recovery.c" "storage_inventory_core.c" "storage_inventory.c")
 # The one-shot recovery image is its own exact role. It never confirms itself
 # and always returns to the signed 2.5.2 predecessor; no other version may
 # claim it and it cannot be combined with another storage mode.

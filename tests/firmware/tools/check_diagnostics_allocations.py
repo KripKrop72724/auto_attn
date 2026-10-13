@@ -82,6 +82,11 @@ static bool platform_memory_append(cJSON *memory){
 static bool boot_report_append(cJSON *diagnostics){
  cJSON *report=cJSON_AddObjectToObject(diagnostics,"boot_report");
  return report&&cJSON_AddStringToObject(report,"reset_reason","SOFTWARE");}
+/* storage_inventory.c has its own host test; one allocating field keeps its
+ * failure path inside this fault sweep. */
+static bool storage_inventory_append(cJSON *storage){
+ cJSON *inventory=cJSON_AddObjectToObject(storage,"inventory");
+ return inventory&&cJSON_AddBoolToObject(inventory,"complete",true);}
 void led_status_local_failure_report(led_local_failure_t *report){
  memset(report,0,sizeof(*report));report->incidents=2;report->recoveries=1;}
 static bool storage_upgrade_ready(void){return true;}
@@ -98,7 +103,7 @@ static add_worker_operation_t s_add_worker_operation=ADD_WORKER_IDLE,s_ords_work
 static bool legacy_healthy;
 qs_health_t qs_health(void){return (qs_health_t){.observed=true,.available=true,.write_failures=2,.read_failures=3,
  .recovery_complete=legacy_healthy,.persistence_verified=legacy_healthy,
- .admission_reserve_bytes=1048576,.last_error=legacy_healthy?0:EIO,.last_operation="local_write_commit",
+ .admission_reserve_bytes=1048576,.persistence_probe_repairs=4,.last_error=legacy_healthy?0:EIO,.last_operation="local_write_commit",
  .last_file="pending.jsonl",
  .legacy={.observed=true,.read_faults=legacy_healthy?0:1,.append_faults=legacy_healthy?0:2,
  .retire_faults=legacy_healthy?0:3,.read_recoveries=7,.error=legacy_healthy?0:EIO,
@@ -156,6 +161,8 @@ int main(void){
  assert(!strcmp(cJSON_GetObjectItemCaseSensitive(storage,"durability")->valuestring,"DEGRADED"));
  assert(cJSON_GetObjectItemCaseSensitive(storage,"write_failures")->valueint==2);
  assert(cJSON_GetObjectItemCaseSensitive(storage,"read_failures")->valueint==3);
+ assert(cJSON_GetObjectItemCaseSensitive(storage,"persistence_probe_repairs")->valueint==4);
+ assert(cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(cJSON_GetObjectItemCaseSensitive(storage,"inventory"),"complete")));
  assert(cJSON_GetObjectItemCaseSensitive(storage,"legacy_read_faults")->valueint==1);
  assert(cJSON_GetObjectItemCaseSensitive(storage,"legacy_append_faults")->valueint==2);
  assert(cJSON_GetObjectItemCaseSensitive(storage,"legacy_retire_faults")->valueint==3);
