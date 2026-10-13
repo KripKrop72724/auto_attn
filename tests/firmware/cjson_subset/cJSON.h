@@ -7,7 +7,7 @@
 typedef int cJSON_bool;
 typedef struct cJSON {
     struct cJSON *next, *child;
-    int is_object, is_array, is_string;
+    int is_object, is_array, is_string, is_bool;
     char *key, *text;
     double number;
 } cJSON;
@@ -21,6 +21,8 @@ cJSON *cJSON_AddObjectToObject(cJSON *object, const char *key);
 cJSON *cJSON_AddArrayToObject(cJSON *object, const char *key);
 cJSON *cJSON_AddNumberToObject(cJSON *object, const char *key, double number);
 cJSON *cJSON_AddStringToObject(cJSON *object, const char *key, const char *text);
+cJSON *cJSON_AddBoolToObject(cJSON *object, const char *key, cJSON_bool value);
+cJSON *cJSON_CreateString(const char *text);
 cJSON_bool cJSON_AddItemToArray(cJSON *array, cJSON *item);
 void cJSON_Delete(cJSON *item);
 /* Unlike cJSON, strings are printed unescaped and the result is plain

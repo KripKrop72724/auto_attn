@@ -75,6 +75,8 @@ int esp_partition_get_sha256(const esp_partition_t *p,uint8_t *out){
         "7d0381fc68a01b34ab6989dfed2b5a1a93f39c293bfd0b7db1734b0871fa6469":
         !strcmp(previous_app.version,"2.6.15")?
         "832c0c3d8dac6e41d7cd0a9d4fbe4508e4f66982fa5ddeceaca4dc5adcbd80d6":
+        !strcmp(previous_app.version,"2.7.2") || !strcmp(previous_app.version,"2.7.1")?
+        "e908496e0695d8c29e96a6f2db3840060eeab526c4012e29a3deef826f7c8eea":
         "4b4aa0697551f527b48b58e95229cd21e362f6ba25398a2d46263bdbf289146b";
     for(unsigned i=0;i<32;++i){unsigned value=0;assert(sscanf(hex+2*i,"%2x",&value)==1);out[i]=(uint8_t)value;}
     if(failure==7)out[0]^=1;
@@ -128,7 +130,12 @@ int main(void)
     strcpy(previous_app.version,"2.6.14");assert(storage_upgrade_init());
     /* The 2.7 platform rolls back to the fleet's exact signed 2.6.15. */
     strcpy(previous_app.version,"2.6.15");assert(storage_upgrade_init());
-    assert(!strcmp(UG_DIRECT_VERSION,"2.7.2") && strstr(storage_upgrade_contract(),",2.6.14,2.6.15"));
+    assert(!strcmp(UG_DIRECT_VERSION,"2.7.3") && strstr(storage_upgrade_contract(),",2.6.14,2.6.15,2.7.2"));
+    /* 2.7.3 also rolls back to 2.7.2, the image 3FL runs, and to no other
+     * 2.7 image: 2.7.1 with 2.7.2's digest is still refused. */
+    strcpy(previous_app.version,"2.7.2");assert(storage_upgrade_init());
+    strcpy(previous_app.version,"2.7.1");assert(!storage_upgrade_init());
+    strcpy(previous_app.version,"2.6.15");
     failure=7;assert(!storage_upgrade_init());failure=0;
     failure=6;assert(!storage_upgrade_init());failure=7;assert(!storage_upgrade_init());failure=0;
     strcpy(previous_app.version,UG_COMPAT_VERSION);assert(!storage_upgrade_init());

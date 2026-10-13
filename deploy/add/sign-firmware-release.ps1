@@ -177,7 +177,7 @@ if ($FirmwareFamily -eq 'zkt' -and $Version -eq '2.6.15') {
     . (Join-Path $PSScriptRoot 'firmware-2-6-15-hil-scope.ps1')
     Assert-Zkt2615HilScope -HilTargetsJson $HilTargetsJson
 }
-if ($Version -in @('2.7.1', '2.7.2')) {
+if ($Version -in @('2.7.1', '2.7.2', '2.7.3')) {
     # Legacy authority like 2.6.15; HIL may reach only an exact prefix of the
     # signed nationwide scope, never an ad hoc device list.
     if ($FirmwareFamily -ne 'zkt') { throw "ZKT $Version is ZKT-only" }
@@ -239,7 +239,7 @@ try {
         image_name = $imageName
         image_sha256 = $imageHash
         image_size = $size
-        minimum_bootstrap_version = $(if ($Version -eq '2.7.0') { Get-WriterBootstrapMinimum -StorageContract $storageContract } elseif ($Version -in @('2.6.22', '2.6.24', '2.6.25', '2.6.26', '2.6.27')) { '2.5.2' } elseif ($Version -eq '2.6.0') { '2.5.4' } elseif ($Version -in @('2.6.1', '2.6.2', '2.6.3', '2.6.4', '2.6.5', '2.6.6', '2.6.7', '2.6.8', '2.6.9', '2.6.10', '2.6.11', '2.6.12', '2.6.13', '2.6.14', '2.6.15', '2.6.16', '2.6.17', '2.6.18', '2.6.19', '2.6.20', '2.6.21', '2.6.23', '2.7.1', '2.7.2')) { '2.4.12' } else { '2.2.0' })
+        minimum_bootstrap_version = $(if ($Version -eq '2.7.0') { Get-WriterBootstrapMinimum -StorageContract $storageContract } elseif ($Version -in @('2.6.22', '2.6.24', '2.6.25', '2.6.26', '2.6.27')) { '2.5.2' } elseif ($Version -eq '2.6.0') { '2.5.4' } elseif ($Version -in @('2.6.1', '2.6.2', '2.6.3', '2.6.4', '2.6.5', '2.6.6', '2.6.7', '2.6.8', '2.6.9', '2.6.10', '2.6.11', '2.6.12', '2.6.13', '2.6.14', '2.6.15', '2.6.16', '2.6.17', '2.6.18', '2.6.19', '2.6.20', '2.6.21', '2.6.23', '2.7.1', '2.7.2', '2.7.3')) { '2.4.12' } else { '2.2.0' })
         partition_layout = 'zone-lite-ota-v1'
         project_name = $projectName
         release_id = $(if ($FirmwareFamily -eq 'hikvision') { "zone-lite-hikvision-$Version" } else { "zone-lite-$Version" })

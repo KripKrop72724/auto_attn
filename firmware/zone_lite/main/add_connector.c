@@ -413,6 +413,23 @@ static void mark_transport_disconnected(void)
     }
 }
 
+/* esp_websocket_client 1.7.0 closes the TLS transport on stop without its
+ * client lock and frees the transport on start, so no send may be in flight.
+ * Every send holds s_send_lock across esp_websocket_client_send_text. A busy
+ * sender defers the restart to a later heartbeat. */
+static void restart_transport(int64_t now_ms)
+{
+    if (xSemaphoreTake(s_send_lock, pdMS_TO_TICKS(ADD_SEND_TIMEOUT_MS)) != pdTRUE) return;
+    s_last_transport_restart_ms = now_ms;
+    ESP_LOGW(TAG, "ADD transport remained offline; restarting WebSocket client");
+    (void)esp_websocket_client_stop(s_client);
+    vTaskDelay(pdMS_TO_TICKS(250));
+    if (esp_websocket_client_start(s_client) != ESP_OK) {
+        ESP_LOGE(TAG, "ADD WebSocket client restart failed");
+    }
+    xSemaphoreGive(s_send_lock);
+}
+
 static void iso_utc(time_t value, char out[32])
 {
     struct tm tm_value = {0};
@@ -2866,7 +2883,9 @@ static void websocket_event(void *arg, esp_event_base_t base, int32_t event_id, 
     switch (event_id) {
     case WEBSOCKET_EVENT_CONNECTED:
         boot_report_stage(BOOT_STAGE_ADD_CONNECTED);
-        if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
+        /* A missed edge leaves a live channel marked down until
+         * restart_transport tears it down 45 s later. */
+        if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(1000)) == pdTRUE) {
             s_connected = true;
             s_connected_edge = true;
             s_disconnected_since_ms = 0;
@@ -3225,20 +3244,19 @@ static void heartbeat_task(void *arg)
             int64_t now_ms = monotonic_ms();
             int64_t disconnected_since = 0;
             if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
-                if (s_disconnected_since_ms == 0) s_disconnected_since_ms = now_ms;
-                disconnected_since = s_disconnected_since_ms;
+                /* The channel may have come back since the check above. A
+                 * timestamp taken while connected would make the next
+                 * disconnect restart the client at once. */
+                if (!s_connected) {
+                    if (s_disconnected_since_ms == 0) s_disconnected_since_ms = now_ms;
+                    disconnected_since = s_disconnected_since_ms;
+                }
                 xSemaphoreGive(s_lock);
             }
             if (disconnected_since > 0 &&
                 now_ms - disconnected_since >= ADD_TRANSPORT_RECOVERY_MS &&
                 now_ms - s_last_transport_restart_ms >= ADD_TRANSPORT_RESTART_GUARD_MS) {
-                s_last_transport_restart_ms = now_ms;
-                ESP_LOGW(TAG, "ADD transport remained offline; restarting WebSocket client");
-                (void)esp_websocket_client_stop(s_client);
-                vTaskDelay(pdMS_TO_TICKS(250));
-                if (esp_websocket_client_start(s_client) != ESP_OK) {
-                    ESP_LOGE(TAG, "ADD WebSocket client restart failed");
-                }
+                restart_transport(now_ms);
             }
         }
         vTaskDelay(pdMS_TO_TICKS(ZONE_LITE_ADD_HEARTBEAT_SECONDS * 1000));
@@ -4802,6 +4820,11 @@ static void start_websocket(void)
         .reconnect_timeout_ms = ZONE_LITE_ADD_RECONNECT_MS,
         .ping_interval_sec = 20,
         .disable_auto_reconnect = false,
+        /* Without this, a close from ADD ends the client task, which closes
+         * TLS without the client lock while a send may be writing, and the
+         * channel stays down until restart_transport. With it the client
+         * closes under its lock and reconnects itself. */
+        .enable_close_reconnect = true,
         .crt_bundle_attach = esp_crt_bundle_attach,
     };
     s_client = esp_websocket_client_init(&config);

@@ -7,7 +7,11 @@ typedef enum {
 typedef struct {
     int core;
     panic_exception_t exception;
+    const char *reason;
     const void *addr;
+    const void *frame;
+    bool pseudo_excause;
 } panic_info_t;
 extern bool g_panic_abort;
 extern char *g_panic_abort_details;
+extern void *g_exc_frames[2];

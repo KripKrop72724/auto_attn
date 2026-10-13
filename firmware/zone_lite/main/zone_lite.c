@@ -6349,9 +6349,11 @@ static int http_post_json_with_tls_source(
         diagnostics->attempts++;
         diagnostics->trust_source = tls_source;
     }
+    /* A failed allocation captures nothing rather than writing near NULL. */
+    char *body = response_body ? calloc(1, 8192) : NULL;
     http_response_buffer_t captured = {
-        .data = response_body ? calloc(1, 8192) : NULL,
-        .capacity = response_body ? 8192 : 0,
+        .data = body,
+        .capacity = body ? 8192 : 0,
     };
     esp_http_client_config_t cfg = {
         .url = url,

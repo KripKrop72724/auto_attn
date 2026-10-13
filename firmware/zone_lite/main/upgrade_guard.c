@@ -26,6 +26,9 @@ bool ug_direct_predecessor_matches(const char *version, const uint8_t digest[32]
         "7d0381fc68a01b34ab6989dfed2b5a1a93f39c293bfd0b7db1734b0871fa6469";
     static const char fleet_2615[] =
         "832c0c3d8dac6e41d7cd0a9d4fbe4508e4f66982fa5ddeceaca4dc5adcbd80d6";
+    /* 2.7.2: the image SLICTOWER-3FL runs, so 3FL upgrades in place. */
+    static const char platform_272[] =
+        "e908496e0695d8c29e96a6f2db3840060eeab526c4012e29a3deef826f7c8eea";
     const char *expected = !strcmp(version, "2.4.12") ? baseline_2412 :
         !strcmp(version, "2.5.2") ? baseline_252 :
         !strcmp(version, "2.6.6") ? hil_266 :
@@ -36,7 +39,8 @@ bool ug_direct_predecessor_matches(const char *version, const uint8_t digest[32]
         !strcmp(version, "2.6.12") ? hil_2612 :
         !strcmp(version, "2.6.13") ? hil_2613 :
         !strcmp(version, "2.6.14") ? hil_2614 :
-        !strcmp(version, "2.6.15") ? fleet_2615 : NULL;
+        !strcmp(version, "2.6.15") ? fleet_2615 :
+        !strcmp(version, "2.7.2") ? platform_272 : NULL;
     if (!expected) return false;
     static const char hex[] = "0123456789abcdef";
     for (unsigned i = 0; i < 32; ++i) {
