@@ -77,6 +77,14 @@ static void xSemaphoreGive(SemaphoreHandle_t lock) { assert(held==(unsigned)lock
 bool qs_local_read_begin(void) { assert(owner_task && held && !budget);budget=1;return true; }
 void qs_local_end(bool ok,int error) { assert(owner_task && budget);if(!ok){assert(error);++failed_writes;}budget=0; }
 static void led_status_fault(int code) { assert(code==LED_STATUS_LOCAL_FAILURE);++faults; }
+static unsigned failure_reports;
+static void report_queue_read_failure(const char *queue,const char *stage,dq_result_t result,int error,long cursor,
+    const char *path)
+{
+    (void)error;(void)cursor;(void)path;
+    assert(strstr(queue,"quarantine") && !strcmp(stage,"read") && result!=DQ_OK && result!=DQ_EMPTY && result!=DQ_PENDING);
+    ++failure_reports;
+}
 static unsigned lane_for_key(const char *key)
 { if(!strcmp(key,"old_qo"))return 0;if(!strcmp(key,"old_qa"))return 1;assert(!strcmp(key,"old_qb"));return 2; }
 static esp_err_t nvs_open(const char *name,int mode,nvs_handle_t *handle)
@@ -266,6 +274,6 @@ int main(void)
     /* Legacy/Hikvision compilation and older ZKT retain their direct path. */
     required=false;seed(0,"old\n",4);slice(0);assert(!exists(0));
     if(!ZONE_LITE_QUEUE_OWNER)assert(!health.legacy.observed && !health.read_failures && !health.write_failures);
-    assert(checkpoint_writes && faults && !held && !budget && !ticket);
+    assert(checkpoint_writes && faults && failure_reports<=faults && !held && !budget && !ticket);
     puts("actual quarantine custody, owner routing, faults, empty cache and family paths passed");
 }

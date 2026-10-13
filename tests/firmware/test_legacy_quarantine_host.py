@@ -15,6 +15,7 @@ def test_legacy_quarantine_requires_exact_durable_custody(tmp_path):
 #include "legacy_queue.h"
 #include "legacy_storage_health.h"
 #include <assert.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -40,6 +41,10 @@ static bool legacy_pending_commit(void *context,const lq_checkpoint_t *cp){asser
 static int xSemaphoreTake(int *m,int timeout){(void)timeout;assert(!*m);*m=1;return 1;}
 static void xSemaphoreGive(int *m){assert(*m);*m=0;}
 static void led_status_fault(int status){assert(status==1);faults++;}
+static unsigned failure_reports;
+static void report_queue_read_failure(const char *queue,const char *stage,dq_result_t result,int error,long cursor,
+ const char *path){(void)error;(void)cursor;(void)path;assert(strstr(queue,"quarantine") && !strcmp(stage,"read"));
+ assert(result!=DQ_OK && result!=DQ_EMPTY && result!=DQ_PENDING);failure_reports++;}
 static bool add_connector_is_connected(void){return true;}
 static void add_connector_report_ords_worker(int state){assert(state==1 || state==2);}
 static bool qs_generation(char out[33]){memset(out,'a',32);out[32]=0;return true;}
@@ -59,7 +64,7 @@ int main(void){
  fail_commit=false;g_legacy_quarantine[0].ready=false;g_quarantine_lane=0;legacy_quarantine_slice();assert(receipts==3 && access("./corrupt_ords.jsonl",F_OK)!=0);
  for(unsigned i=0;i<9;i++){legacy_quarantine_slice();memset(g_legacy_quarantine,0,sizeof(g_legacy_quarantine));}
  assert(access("./add_corrupt.jsonl",F_OK)!=0 && access("./add_corrupt.bak",F_OK)!=0);
- assert(bytes==8+8+7+9000 && faults==1 && !lock);
+ assert(bytes==8+8+7+9000 && faults==1 && failure_reports<=faults && !lock);
  return 0;
 }
 '''

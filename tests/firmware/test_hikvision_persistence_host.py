@@ -122,13 +122,15 @@ int main(void){
  int previous=writes;assert(attempt_probe() && writes==previous+1);
  assert(!health.persistence_probe_error && !health.persistence_probe_operation);
 #endif
- /* A probe file that cannot be reopened for writing is replaced, once; the
-  * probe then proves a freshly created file (13FL, 13 October 2026). */
+ /* A probe file that cannot be reopened for writing (ENOENT, here a link to a
+  * missing directory) is replaced, once; the probe then proves a freshly
+  * created file (13FL, 13 October 2026). */
  health=(qs_health_t){.recovery_complete=true};corrupt_nvs=0;
- remove(PROBE_PATH);assert(mkdir(PROBE_PATH,0700)==0);
+ remove(PROBE_PATH);assert(symlink("/nonexistent-zone-lite/probe",PROBE_PATH)==0);
  int repaired=writes;assert(attempt_probe() && health.persistence_verified && writes==repaired+1);
  assert(health.persistence_probe_repairs==1 && !health.persistence_probe_error);
- /* A filesystem that cannot create the probe still fails it. */
+ /* Any other open failure, and a store that cannot create the probe, still
+  * fail it. */
  health=(qs_health_t){.recovery_complete=true};
  remove(PROBE_PATH);assert(mkdir(PROBE_PATH,0700)==0);assert(mkdir(PROBE_PATH "/keep",0700)==0);
  for(int i=0;i<3;i++)assert(!attempt_probe());
