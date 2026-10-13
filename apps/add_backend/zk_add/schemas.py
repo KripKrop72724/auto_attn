@@ -8,7 +8,10 @@ from typing import Any, Literal
 from zk_add.hikvision_clock import HikvisionClockSample
 from zk_add.capture_latency import CaptureLatencyHistogram
 
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, StrictInt, field_validator, model_validator
+from pydantic import (
+    BaseModel, ConfigDict, Field, SecretStr, StrictInt, ValidationError, ValidationInfo, field_validator,
+    model_validator,
+)
 
 
 class LoginRequest(BaseModel):
@@ -219,14 +222,71 @@ class MemoryDiagnostics(BaseModel):
     stacks: list[StackHeadroom] = Field(default_factory=list, max_length=32)
 
 
+HEX_WORD = r"^0x[0-9a-f]{8}$"
+
+
+class BootPanicCore(BaseModel):
+    # ZKT 2.7.3 and later: a core's task at the panic and, when the core
+    # entered the panic handler itself, its PC and the backtrace ESP-IDF
+    # printed (at most eight entries; corrupted when the walk stopped early).
+    core: int = Field(ge=0, le=7)
+    task: str | None = Field(default=None, max_length=32, pattern=PRINTABLE_TEXT)
+    pc: str | None = Field(default=None, pattern=HEX_WORD)
+    backtrace: list[str] = Field(default_factory=list, max_length=8)
+    corrupted: bool = False
+
+    @field_validator("backtrace")
+    @classmethod
+    def backtrace_addresses(cls, value: list[str]) -> list[str]:
+        if any(not re.fullmatch(HEX_WORD, entry) for entry in value):
+            raise ValueError("backtrace entries are 32-bit hex addresses")
+        return value
+
+
 class BootPanic(BaseModel):
     # Present only when the previous boot ended in a panic or a failed
     # ESP_ERROR_CHECK whose abort never reached the panic handler.
     exception: str | None = Field(default=None, pattern=r"^[A-Z_]{1,32}$")
-    address: str | None = Field(default=None, pattern=r"^0x[0-9a-f]{8}$")
+    address: str | None = Field(default=None, pattern=HEX_WORD)
     core: int | None = Field(default=None, ge=0, le=7)
     task: str | None = Field(default=None, max_length=32, pattern=PRINTABLE_TEXT)
     detail: str | None = Field(default=None, max_length=128, pattern=PRINTABLE_TEXT)
+    # ZKT 2.7.3 and later: ESP-IDF's panic reason ("Cache error",
+    # "LoadProhibited"), the cache error's first line, the address a load,
+    # store, fetch or cache access failed on, and each core's trace.
+    reason: str | None = Field(default=None, max_length=40)
+    cache_error: str | None = Field(default=None, max_length=80)
+    fault_address: str | None = None
+    cores: list[BootPanicCore] | None = None
+
+    # The 2.7.3 trace explains a crash; it must never cost the heartbeat that
+    # carries it (3FL, 12 Oct: 560 heartbeats rejected over one panic field).
+    # An unreadable part is dropped instead.
+    @field_validator("reason", "cache_error", mode="before")
+    @classmethod
+    def readable_text(cls, value: Any, info: ValidationInfo) -> str | None:
+        limit = 40 if info.field_name == "reason" else 80
+        if isinstance(value, str) and len(value) <= limit and re.fullmatch(PRINTABLE_TEXT, value):
+            return value
+        return None
+
+    @field_validator("fault_address", mode="before")
+    @classmethod
+    def readable_address(cls, value: Any) -> str | None:
+        return value if isinstance(value, str) and re.fullmatch(HEX_WORD, value) else None
+
+    @field_validator("cores", mode="before")
+    @classmethod
+    def readable_cores(cls, value: Any) -> list[BootPanicCore] | None:
+        if not isinstance(value, list):
+            return None
+        cores = []
+        for row in value[:8]:
+            try:
+                cores.append(BootPanicCore.model_validate(row))
+            except ValidationError:
+                continue
+        return cores or None
 
     @field_validator("core", mode="before")
     @classmethod

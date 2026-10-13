@@ -116,6 +116,23 @@ int main(void)
     assert(strstr(text, "\"task04\"") && !strstr(text, "\"task03\""));
     free(text);
 
+    /* A task deleted after the snapshot: its name pointer reads a freed TCB.
+     * At most a name's length is read and only printable text is sent. */
+    static char freed[2][24];
+    memset(freed[0], 0xa5, sizeof(freed[0]));
+    memcpy(freed[1], "\0stale", 6);
+    task_table[0] = (TaskStatus_t){freed[0], 10};
+    task_table[1] = (TaskStatus_t){freed[1], 20};
+    task_count = 2;
+    text = memory_json();
+    assert(strstr(text, "\"stacks\":[{\"name\":\"????????????????\",\"free_bytes\":10},"
+                        "{\"name\":\"?\",\"free_bytes\":20}]"));
+    free(text);
+    task_count = 20;
+    for (unsigned index = 0; index < 2; ++index) {
+        task_table[index] = (TaskStatus_t){names[index], 4000 - 100 * index};
+    }
+
     /* Samples are reported once; a family without the failure hook omits
      * the counters instead of reporting false zeros. */
     failure_hook_ready = 0;

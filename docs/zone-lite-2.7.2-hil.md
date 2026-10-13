@@ -1,5 +1,11 @@
 # Zone Lite 2.7.2: ZKT platform HIL
 
+> **Superseded by [2.7.3](zone-lite-2.7.3-hil.md).** On 12 October 2026, 2.7.2
+> on SLICTOWER 3FL panicked with a cache error after 2 h 35 m, and its boot
+> report could not say which code caused it. Keep 2.7.2 published until 3FL
+> runs 2.7.3, which accepts it as a rollback predecessor. Its framing changes
+> below carry into 2.7.3 unchanged.
+
 2.7.2 replaces 2.7.1. It is the same 2.7 platform image in phase L (legacy
 delivery authority), with the terminal framing that 2.6.15 accepted. The
 [2.7.1 runbook](zone-lite-2.7.1-hil.md) still applies to publication,

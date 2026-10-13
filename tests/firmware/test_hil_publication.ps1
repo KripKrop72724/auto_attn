@@ -151,7 +151,26 @@ foreach ($platformVersion in @('2.7.1', '2.7.2')) {
         if (-not $rejected) { throw "$platformVersion accepted another storage contract" }
     }
 }
+# 2.7.3 also rolls back to 2.7.2, the image SLICTOWER-3FL runs; the two
+# platform contracts never sign each other's versions.
+$platformMarker = $fleetMarker + ',2.7.2'
+[IO.File]::WriteAllText($contractImage, $platformMarker + [char]0)
+$platformContract = Get-FirmwareStorageContract -ImagePath $contractImage -Version '2.7.3'
+if ($platformContract.allowed_bootstrap_versions.Count -ne 12 -or $platformContract.allowed_bootstrap_versions[10] -ne '2.6.15' -or
+    $platformContract.allowed_bootstrap_versions[11] -ne '2.7.2' -or
+    $platformContract.allowed_bootstrap_images['2.7.2'] -ne 'e908496e0695d8c29e96a6f2db3840060eeab526c4012e29a3deef826f7c8eea' -or
+    $platformContract.allowed_bootstrap_images['2.6.15'] -ne '832c0c3d8dac6e41d7cd0a9d4fbe4508e4f66982fa5ddeceaca4dc5adcbd80d6') {
+    throw '2.7.3 rollback targets changed'
+}
+foreach ($platformVersion in @('2.7.1', '2.7.2')) {
+    $rejected = $false
+    try { Get-FirmwareStorageContract -ImagePath $contractImage -Version $platformVersion | Out-Null } catch { $rejected = $true }
+    if (-not $rejected) { throw "$platformVersion accepted the 2.7.3 storage contract" }
+}
 [IO.File]::WriteAllText($contractImage, $fleetMarker + [char]0)
+$rejected = $false
+try { Get-FirmwareStorageContract -ImagePath $contractImage -Version '2.7.3' | Out-Null } catch { $rejected = $true }
+if (-not $rejected) { throw '2.7.3 accepted the 2.7.1 storage contract' }
 $rejected = $false
 try { Get-FirmwareStorageContract -ImagePath $contractImage -Version '2.6.15' | Out-Null } catch { $rejected = $true }
 if (-not $rejected) { throw 'The 2.7 platform contract signed 2.6.15' }
@@ -599,7 +618,7 @@ if ($zkt2615Marker.targets.Count -ne 5 -or $zkt2615Marker.application_sha256 -cn
 # The 2.7 platform publishes only HIL_ONLY, to an exact prefix of the signed
 # nationwide scope. 2.7.1 is published last, as before this loop existed.
 $nationwide = Get-Content -LiteralPath (Join-Path $repo 'deploy/add/hil-targets-zkt-270.json') -Raw
-foreach ($platformVersion in @('2.7.2', '2.7.1')) {
+foreach ($platformVersion in @('2.7.3', '2.7.2', '2.7.1')) {
     $platformImage = Join-Path $source "zone-lite-$platformVersion.bin"
     [IO.File]::WriteAllText($platformImage, "ZKT $platformVersion fixture, not deployable firmware")
     $manifest.version=$platformVersion

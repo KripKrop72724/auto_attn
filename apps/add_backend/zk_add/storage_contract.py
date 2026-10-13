@@ -5,8 +5,9 @@ CANDIDATE_VERSION = "2.6.0"
 COMPAT_MARKER = "ZONE_STORAGE_CONTRACT_V1:LEGACY:READ=2:LANES=3F:COMPAT=2.5.4"
 DIRECT_VERSION = "2.6.1"
 # The 2.7 platform images in the legacy authority of the 2.6.15 fleet. 2.7.2
-# replaces 2.7.1, whose terminal framing failed on the 3FL G3.
-FLEET_PLATFORM_VERSIONS = ("2.7.1", "2.7.2")
+# replaces 2.7.1, whose terminal framing failed on the 3FL G3; 2.7.3 records
+# the panic trace 3FL's 2.7.2 cache error lacked.
+FLEET_PLATFORM_VERSIONS = ("2.7.1", "2.7.2", "2.7.3")
 FLEET_PLATFORM_VERSION = FLEET_PLATFORM_VERSIONS[-1]
 DIRECT_VERSIONS = (DIRECT_VERSION, "2.6.2", "2.6.3", "2.6.4", "2.6.5", "2.6.6", "2.6.7", "2.6.8", "2.6.9", "2.6.10", "2.6.11", "2.6.12", "2.6.13", "2.6.14", "2.6.15", *FLEET_PLATFORM_VERSIONS)
 DIRECT_BASELINES = ("2.4.12", "2.5.2")
@@ -74,6 +75,21 @@ FLEET_BASELINE_IMAGES = {
     "2.6.15": "832c0c3d8dac6e41d7cd0a9d4fbe4508e4f66982fa5ddeceaca4dc5adcbd80d6",
 }
 FLEET_MARKER = LOCK_MARKER + ",2.6.15"
+# 2.7.3 also accepts 2.7.2, the image SLICTOWER-3FL runs, as its rollback
+# predecessor, so 3FL upgrades in place.
+PLATFORM_BASELINES = (*FLEET_BASELINES, "2.7.2")
+PLATFORM_BASELINE_IMAGES = {
+    **FLEET_BASELINE_IMAGES,
+    "2.7.2": "e908496e0695d8c29e96a6f2db3840060eeab526c4012e29a3deef826f7c8eea",
+}
+PLATFORM_MARKER = FLEET_MARKER + ",2.7.2"
+
+
+def platform_baselines(version: str) -> tuple[tuple[str, ...], dict[str, str]]:
+    """The rollback predecessors a 2.7 platform image accepts."""
+    if version == "2.7.3":
+        return PLATFORM_BASELINES, PLATFORM_BASELINE_IMAGES
+    return FLEET_BASELINES, FLEET_BASELINE_IMAGES
 
 
 def validate_storage_contract(manifest: dict, version: str) -> dict | None:
@@ -95,7 +111,7 @@ def validate_storage_contract(manifest: dict, version: str) -> dict | None:
     required = version in {COMPAT_VERSION, CANDIDATE_VERSION, *DIRECT_VERSIONS}
     if contract is None and not required:
         return None
-    direct_baselines = (FLEET_BASELINES if version in FLEET_PLATFORM_VERSIONS else
+    direct_baselines = (platform_baselines(version)[0] if version in FLEET_PLATFORM_VERSIONS else
                         LOCK_BASELINES if version == "2.6.15" else
                         DELIVERY_BASELINES if version == "2.6.14" else
                         LIVE_FRAME_BASELINES if version == "2.6.13" else
@@ -104,7 +120,7 @@ def validate_storage_contract(manifest: dict, version: str) -> dict | None:
                         CONTENTION_BASELINES if version == CONTENTION_VERSION else
                         DIAGNOSTIC_BASELINES if version == DIAGNOSTIC_VERSION else
                         RETRY_BASELINES if version == RETRY_VERSION else DIRECT_BASELINES)
-    direct_images = (FLEET_BASELINE_IMAGES if version in FLEET_PLATFORM_VERSIONS else
+    direct_images = (platform_baselines(version)[1] if version in FLEET_PLATFORM_VERSIONS else
                      LOCK_BASELINE_IMAGES if version == "2.6.15" else
                      DELIVERY_BASELINE_IMAGES if version == "2.6.14" else
                      LIVE_FRAME_BASELINE_IMAGES if version == "2.6.13" else

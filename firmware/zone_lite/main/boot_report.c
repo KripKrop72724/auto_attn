@@ -7,18 +7,34 @@
 
 #include "esp_attr.h"
 #include "esp_cpu.h"
+#include "esp_cpu_utils.h"
+#include "esp_debug_helpers.h"
 #include "esp_err.h"
 #include "esp_memory_utils.h"
 #include "esp_ota_ops.h"
 #include "esp_private/cache_utils.h"
 #include "esp_private/panic_internal.h"
+#include "esp_private/panic_reason.h"
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "sdkconfig.h"
+#include "xtensa/corebits.h"
+#include "xtensa_context.h"
 
 #define BOOT_TOUCH_PERIOD_US (10LL * 1000LL * 1000LL)
+#define BOOT_TRACE_CORES 2U
+#define BOOT_TRACE_DEPTH 8U
+
+/* ESP-IDF 5.5 declares this in esp_system's private esp_private/cache_err_int.h,
+ * which other components cannot include. The layout is ESP-IDF's. */
+typedef struct {
+    const char *err_str;
+    uint32_t vaddr;
+    uint32_t size;
+} esp_cache_err_info_t;
+void esp_cache_err_get_panic_info(esp_cache_err_info_t *err_info);
 
 /* The panic hook is placed like ESP-IDF's own esp_panic_handler: in IRAM
  * only when CONFIG_ESP_PANIC_HANDLER_IRAM asks for it. Either way ESP-IDF
@@ -45,14 +61,49 @@ typedef struct {
 /* A record written with another layout is never misread as this one. */
 #define BOOT_RTC_MAGIC (UINT32_C(0x5A4C4252) ^ (uint32_t)sizeof(boot_rtc_t))
 
+/* What ESP-IDF prints on the console at a panic, kept for the next boot: the
+ * panic reason, the cache error and fault address, and each core's task and
+ * backtrace. 3FL's 2.7.2 cache error (12 October 2026) left only "FAULT at
+ * 0x00000000": ESP-IDF fills no address for a cache error and could not tell
+ * which core caused it. It follows boot_rtc_t, whose 2.7.1 layout an older
+ * image still reads after a rollback. */
+typedef struct {
+    uint32_t magic;
+    uint32_t boot_count; /* the boot this describes */
+    uint32_t fault_address;
+    uint8_t fault_address_valid;
+    uint8_t corrupted; /* bit per core: the backtrace stopped at an insane frame */
+    uint8_t depth[BOOT_TRACE_CORES]; /* backtrace entries; 0 when the core left no frame */
+    char reason[40];
+    char cache_error[72];
+    char task[BOOT_TRACE_CORES][16];
+    uint32_t pc[BOOT_TRACE_CORES];
+    uint32_t backtrace[BOOT_TRACE_CORES][BOOT_TRACE_DEPTH];
+    uint32_t checksum;
+} boot_rtc_trace_t;
+
+#define BOOT_TRACE_MAGIC (UINT32_C(0x5A4C4254) ^ (uint32_t)sizeof(boot_rtc_trace_t))
+
 typedef struct {
     esp_reset_reason_t reason;
     bool rtc_valid; /* the previous boot's record survived */
+    bool trace_valid; /* and so did its panic trace */
     boot_rtc_t previous;
+    boot_rtc_trace_t trace;
     char last_invalid_partition[17];
 } boot_report_t;
 
-static RTC_NOINIT_ATTR boot_rtc_t s_rtc;
+/* One RTC object, the 2.7.1 record first: an image that only knows that
+ * record finds it at the same address after a rollback, whatever order the
+ * compiler emits variables in. */
+typedef struct {
+    boot_rtc_t rtc;
+    boot_rtc_trace_t trace;
+} boot_retained_t;
+
+static RTC_NOINIT_ATTR boot_retained_t s_retained;
+#define s_rtc (s_retained.rtc)
+#define s_trace (s_retained.trace)
 static boot_report_t s_report;
 /* Zeroed at every boot: whether this boot has started its part of s_rtc. */
 static bool s_started;
@@ -60,14 +111,24 @@ static bool s_started;
  * never takes this lock. */
 static portMUX_TYPE s_lock = portMUX_INITIALIZER_UNLOCKED;
 
-static uint32_t PANIC_ATTR checksum(const boot_rtc_t *rtc)
+static uint32_t PANIC_ATTR fnv1a(const void *data, size_t length)
 {
-    const unsigned char *bytes = (const unsigned char *)rtc;
-    uint32_t sum = UINT32_C(2166136261); /* FNV-1a */
-    for (size_t index = 0; index < offsetof(boot_rtc_t, checksum); ++index) {
+    const unsigned char *bytes = data;
+    uint32_t sum = UINT32_C(2166136261);
+    for (size_t index = 0; index < length; ++index) {
         sum = (sum ^ bytes[index]) * UINT32_C(16777619);
     }
     return sum;
+}
+
+static uint32_t PANIC_ATTR checksum(const boot_rtc_t *rtc)
+{
+    return fnv1a(rtc, offsetof(boot_rtc_t, checksum));
+}
+
+static uint32_t PANIC_ATTR trace_checksum(const boot_rtc_trace_t *trace)
+{
+    return fnv1a(trace, offsetof(boot_rtc_trace_t, checksum));
 }
 
 static void PANIC_ATTR seal(void)
@@ -131,10 +192,77 @@ static void PANIC_ATTR copy_text(char *out, size_t size, const char *text)
     out[length] = '\0';
 }
 
+/* One line of ESP-IDF's panic text. */
+static void PANIC_ATTR copy_line(char *out, size_t size, const char *text)
+{
+    copy_text(out, size, text);
+    for (; *out; ++out) {
+        if (*out == '\r' || *out == '\n') {
+            *out = '\0';
+            break;
+        }
+    }
+}
+
 static uint32_t PANIC_ATTR uptime_seconds(void)
 {
     int64_t now = esp_timer_get_time();
     return now > 0 ? (uint32_t)(now / 1000000) : 0;
+}
+
+/* The backtrace ESP-IDF prints for a core's exception frame, cut at
+ * BOOT_TRACE_DEPTH entries. Only a core that entered the panic handler
+ * itself left a frame. */
+static void PANIC_ATTR trace_core(unsigned core, const XtExcFrame *frame)
+{
+    s_trace.depth[core] = 0;
+    s_trace.pc[core] = 0;
+    if (!frame) return;
+    s_trace.pc[core] = (uint32_t)frame->pc;
+    esp_backtrace_frame_t walk = {.pc = (uint32_t)frame->pc, .sp = (uint32_t)frame->a1,
+                                  .next_pc = (uint32_t)frame->a0, .exc_frame = frame};
+    s_trace.backtrace[core][s_trace.depth[core]++] = esp_cpu_process_stack_pc(walk.pc);
+    /* As in ESP-IDF's output, a fetch from a bad PC still has a caller to
+     * walk to. */
+    bool sane = esp_stack_ptr_is_sane(walk.sp) &&
+                (esp_ptr_executable((void *)(uintptr_t)esp_cpu_process_stack_pc(walk.pc)) ||
+                 (uint32_t)frame->exccause == EXCCAUSE_INSTR_PROHIBITED);
+    while (sane && walk.next_pc && s_trace.depth[core] < BOOT_TRACE_DEPTH) {
+        sane = esp_backtrace_get_next_frame(&walk);
+        s_trace.backtrace[core][s_trace.depth[core]++] = esp_cpu_process_stack_pc(walk.pc);
+    }
+    if (!sane) s_trace.corrupted |= (uint8_t)(1U << core);
+}
+
+static void PANIC_ATTR record_trace(const panic_info_t *info)
+{
+    const XtExcFrame *frame = info->frame;
+    s_trace.boot_count = s_rtc.boot_count;
+    s_trace.fault_address = 0;
+    s_trace.fault_address_valid = 0;
+    s_trace.corrupted = 0;
+    s_trace.cache_error[0] = '\0';
+    /* abort() reaches the handler as a store to address 0, so its reason and
+     * fault address describe abort() itself. */
+    copy_line(s_trace.reason, sizeof(s_trace.reason), g_panic_abort ? NULL : info->reason);
+    if (frame && info->pseudo_excause && (uint32_t)frame->exccause == PANIC_RSN_CACHEERR) {
+        esp_cache_err_info_t error = {0};
+        esp_cache_err_get_panic_info(&error);
+        copy_line(s_trace.cache_error, sizeof(s_trace.cache_error), error.err_str);
+        s_trace.fault_address = error.vaddr;
+        s_trace.fault_address_valid = error.vaddr != 0;
+    } else if (frame && !info->pseudo_excause && !g_panic_abort) {
+        /* EXCVADDR: the address a failed load, store or fetch named. */
+        s_trace.fault_address = (uint32_t)frame->excvaddr;
+        s_trace.fault_address_valid = 1;
+    }
+    for (unsigned core = 0; core < BOOT_TRACE_CORES; ++core) {
+        TaskHandle_t task = xTaskGetCurrentTaskHandleForCore((BaseType_t)core);
+        copy_text(s_trace.task[core], sizeof(s_trace.task[core]), task ? pcTaskGetName(task) : NULL);
+        trace_core(core, g_exc_frames[core]);
+    }
+    s_trace.magic = BOOT_TRACE_MAGIC;
+    s_trace.checksum = trace_checksum(&s_trace);
 }
 
 /* Linked with -Wl,--wrap=esp_panic_handler. Only plain stores to RTC memory:
@@ -158,6 +286,7 @@ void PANIC_ATTR __wrap_esp_panic_handler(panic_info_t *info)
         }
         s_rtc.uptime_seconds = uptime_seconds();
         seal();
+        record_trace(info);
     }
     __real_esp_panic_handler(info);
 }
@@ -256,6 +385,18 @@ static void printable(char *text, size_t size)
     }
 }
 
+/* A trace describes the previous boot only if that boot panicked and the
+ * trace carries its boot count. */
+static bool trace_describes(const boot_rtc_t *previous)
+{
+    if (!previous->panic_recorded || s_trace.magic != BOOT_TRACE_MAGIC ||
+        s_trace.checksum != trace_checksum(&s_trace) || s_trace.boot_count != previous->boot_count) return false;
+    for (unsigned core = 0; core < BOOT_TRACE_CORES; ++core) {
+        if (s_trace.depth[core] > BOOT_TRACE_DEPTH) return false;
+    }
+    return true;
+}
+
 void boot_report_init(void)
 {
     memset(&s_report, 0, sizeof(s_report));
@@ -264,9 +405,12 @@ void boot_report_init(void)
     s_report.rtc_valid = s_report.reason != ESP_RST_POWERON && record_valid();
     if (s_report.rtc_valid) {
         s_report.previous = s_rtc;
+        s_report.trace_valid = trace_describes(&s_rtc);
+        if (s_report.trace_valid) s_report.trace = s_trace;
     } else {
         reset_record();
     }
+    s_trace.magic = 0;
     ++s_rtc.boot_count;
     count_reset(s_report.reason);
     clear_boot_fields();
@@ -276,6 +420,11 @@ void boot_report_init(void)
     portEXIT_CRITICAL(&s_lock);
     printable(s_report.previous.panic_task, sizeof(s_report.previous.panic_task));
     printable(s_report.previous.panic_detail, sizeof(s_report.previous.panic_detail));
+    printable(s_report.trace.reason, sizeof(s_report.trace.reason));
+    printable(s_report.trace.cache_error, sizeof(s_report.trace.cache_error));
+    for (unsigned core = 0; core < BOOT_TRACE_CORES; ++core) {
+        printable(s_report.trace.task[core], sizeof(s_report.trace.task[core]));
+    }
     const esp_partition_t *invalid = esp_ota_get_last_invalid_partition();
     if (invalid) {
         snprintf(s_report.last_invalid_partition, sizeof(s_report.last_invalid_partition), "%s", invalid->label);
@@ -343,6 +492,51 @@ static const char *exception_name(uint32_t exception)
     }
 }
 
+static void hex_word(char out[11], uint32_t value)
+{
+    snprintf(out, 11, "0x%08lx", (unsigned long)value);
+}
+
+static bool append_core(cJSON *cores, const boot_rtc_trace_t *trace, unsigned core)
+{
+    cJSON *row = cJSON_CreateObject();
+    if (!row) return false;
+    char text[11];
+    bool ok = cJSON_AddNumberToObject(row, "core", core) &&
+              (!trace->task[core][0] || cJSON_AddStringToObject(row, "task", trace->task[core]));
+    if (ok && trace->depth[core]) {
+        hex_word(text, trace->pc[core]);
+        cJSON *backtrace = cJSON_AddStringToObject(row, "pc", text) ? cJSON_AddArrayToObject(row, "backtrace") : NULL;
+        ok = backtrace != NULL;
+        for (unsigned index = 0; ok && index < trace->depth[core]; ++index) {
+            hex_word(text, trace->backtrace[core][index]);
+            cJSON *entry = cJSON_CreateString(text);
+            ok = entry && cJSON_AddItemToArray(backtrace, entry);
+            if (!ok) cJSON_Delete(entry);
+        }
+        ok = ok && (!(trace->corrupted & (1U << core)) || cJSON_AddBoolToObject(row, "corrupted", true));
+    }
+    if (ok && cJSON_AddItemToArray(cores, row)) return true;
+    cJSON_Delete(row);
+    return false;
+}
+
+static bool append_trace(cJSON *panic, const boot_rtc_trace_t *trace)
+{
+    char address[11];
+    hex_word(address, trace->fault_address);
+    if ((trace->reason[0] && !cJSON_AddStringToObject(panic, "reason", trace->reason)) ||
+        (trace->cache_error[0] && !cJSON_AddStringToObject(panic, "cache_error", trace->cache_error)) ||
+        (trace->fault_address_valid && !cJSON_AddStringToObject(panic, "fault_address", address))) return false;
+    cJSON *cores = NULL;
+    for (unsigned core = 0; core < BOOT_TRACE_CORES; ++core) {
+        if (!trace->task[core][0] && !trace->depth[core]) continue;
+        if (!cores && !(cores = cJSON_AddArrayToObject(panic, "cores"))) return false;
+        if (!append_core(cores, trace, core)) return false;
+    }
+    return true;
+}
+
 static bool append_panic(cJSON *report, const boot_rtc_t *previous)
 {
     cJSON *panic = cJSON_AddObjectToObject(report, "panic");
@@ -351,13 +545,14 @@ static bool append_panic(cJSON *report, const boot_rtc_t *previous)
      * panic handler, for example because a watchdog reset it first. */
     if (previous->panic_recorded) {
         char address[11];
-        snprintf(address, sizeof(address), "0x%08lx", (unsigned long)previous->panic_address);
+        hex_word(address, previous->panic_address);
         if (!cJSON_AddStringToObject(panic, "exception", exception_name(previous->panic_exception)) ||
             !cJSON_AddStringToObject(panic, "address", address) ||
             !cJSON_AddNumberToObject(panic, "core", previous->panic_core)) return false;
         if (previous->panic_task[0] && !cJSON_AddStringToObject(panic, "task", previous->panic_task)) return false;
     }
-    return !previous->panic_detail[0] || cJSON_AddStringToObject(panic, "detail", previous->panic_detail);
+    if (previous->panic_detail[0] && !cJSON_AddStringToObject(panic, "detail", previous->panic_detail)) return false;
+    return !s_report.trace_valid || append_trace(panic, &s_report.trace);
 }
 
 bool boot_report_append(cJSON *diagnostics)

@@ -76,6 +76,20 @@ static bool add_failures(cJSON *memory)
 }
 
 #if configUSE_TRACE_FACILITY
+/* A task deleted after the snapshot leaves its name pointer in a freed TCB:
+ * read at most a name's length from it and send only printable ASCII, so a
+ * stale name can never cost the heartbeat (ADD requires a non-empty name). */
+static void task_name(char out[configMAX_TASK_NAME_LEN + 1], const char *name)
+{
+    size_t length = 0;
+    for (; name && length < configMAX_TASK_NAME_LEN && name[length]; ++length) {
+        unsigned char value = (unsigned char)name[length];
+        out[length] = value < 0x20 || value > 0x7e ? '?' : (char)value;
+    }
+    if (!length) out[length++] = '?';
+    out[length] = '\0';
+}
+
 static int least_headroom_first(const void *left, const void *right)
 {
     const TaskStatus_t *a = left, *b = right;
@@ -95,8 +109,10 @@ static bool add_stacks(cJSON *memory)
     bool ok = stacks != NULL;
     for (UBaseType_t index = 0; ok && index < count && index < PLATFORM_STACK_REPORT_MAX; ++index) {
         cJSON *row = cJSON_CreateObject();
+        char name[configMAX_TASK_NAME_LEN + 1];
+        task_name(name, tasks[index].pcTaskName);
         /* ESP-IDF reports stack high-water marks in bytes. */
-        ok = row && cJSON_AddStringToObject(row, "name", tasks[index].pcTaskName) &&
+        ok = row && cJSON_AddStringToObject(row, "name", name) &&
              cJSON_AddNumberToObject(row, "free_bytes", (double)tasks[index].usStackHighWaterMark) &&
              cJSON_AddItemToArray(stacks, row);
         if (!ok) cJSON_Delete(row);

@@ -77,6 +77,28 @@ cJSON *cJSON_AddStringToObject(cJSON *object, const char *key, const char *text)
     item->text = value;
     return item;
 }
+cJSON *cJSON_AddBoolToObject(cJSON *object, const char *key, cJSON_bool value)
+{
+    cJSON *item = add(object, key);
+    if (item) {
+        item->is_bool = 1;
+        item->number = value ? 1 : 0;
+    }
+    return item;
+}
+cJSON *cJSON_CreateString(const char *text)
+{
+    char *value = copy(text);
+    if (!value) return NULL;
+    cJSON *item = node(NULL);
+    if (!item) {
+        hooks.free_fn(value);
+        return NULL;
+    }
+    item->is_string = 1;
+    item->text = value;
+    return item;
+}
 cJSON_bool cJSON_AddItemToArray(cJSON *array, cJSON *item)
 {
     if (!array || !item) return 0;
@@ -109,6 +131,8 @@ static void print(const cJSON *item, char *out, size_t size, int in_array)
             if (child->next) strncat(out, ",", size - strlen(out) - 1);
         }
         strncat(out, array ? "]" : "}", size - strlen(out) - 1);
+    } else if (item->is_bool) {
+        snprintf(out + length, size - length, "%s", item->number ? "true" : "false");
     } else {
         snprintf(out + length, size - length, "%.0f", item->number);
     }

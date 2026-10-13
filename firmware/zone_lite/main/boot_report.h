@@ -23,7 +23,9 @@ typedef enum {
  * and at a panic, so the next boot can say how long this one ran. A panic or
  * a failed ESP_ERROR_CHECK also records the exception, faulting address,
  * running task and abort message (the main component links with
- * -Wl,--wrap for esp_panic_handler and _esp_error_check_failed). */
+ * -Wl,--wrap for esp_panic_handler and _esp_error_check_failed). A panic
+ * also keeps what ESP-IDF prints on the console: the panic reason, the cache
+ * error and fault address, and each core's task, PC and backtrace. */
 void boot_report_init(void);
 void boot_report_stage(boot_stage_t stage);
 /* Add diagnostics.boot_report to a heartbeat. */
