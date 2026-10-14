@@ -443,18 +443,18 @@ bool qs_verify_persistence(void)
     if (ok) {
         stage = "persistence_open_write";
         f = fopen(path, "wb");
-        if (!f) {
+        if (!f && errno == ENOENT) {
             /* A probe file damaged by an interrupted write can refuse to
-             * reopen: 13FL failed every probe with ENOENT (13 October 2026).
-             * It holds nothing, so it is replaced, and only a filesystem that
-             * cannot create a fresh file fails the probe. SPIFFS can report
-             * a failed removal after it has already dropped the name. */
-            int refused = errno;
+             * reopen with ENOENT: 13FL failed every probe so (13 October
+             * 2026). It holds nothing, so it is replaced, and only a store
+             * that cannot create a fresh file fails the probe. SPIFFS can
+             * report a failed removal after it has already dropped the name.
+             * Any other open failure still fails this probe. */
             (void)remove(path);
             errno = 0;
             f = fopen(path, "wb");
             if (f && health.persistence_probe_repairs < UINT32_MAX) health.persistence_probe_repairs++;
-            if (!f && !errno) errno = refused;
+            if (!f && !errno) errno = ENOENT;
         }
         ok = f != NULL;
         if (!ok) file_error = errno;
