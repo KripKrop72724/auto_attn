@@ -28,9 +28,11 @@ def target(monkeypatch):
 
 
 def grant(session, connector, **changes):
-    return exception.configure(session, connector, **dict(
+    values = dict(
         terminal_serial=exception.SERIAL, enabled=True, reason="Owner requested urgent single-terminal exception",
-        idempotency_key="bld1-exception-test", actor="test", **changes))
+        idempotency_key="test-0001", actor="test")
+    values.update(changes)
+    return exception.configure(session, connector, **values)
 
 
 def test_exception_requires_approval_and_keeps_identity_checks(target):
@@ -109,7 +111,7 @@ def test_revocation_does_not_change_attendance_policy_or_qualification(target):
     session, connector, terminal = target
     grant(session, connector)
     exception.configure(session, connector, terminal_serial=exception.SERIAL, enabled=False,
-        reason="Operator revoked temporary exception", idempotency_key="bld1-revoke", actor="test")
+        reason="Operator revoked temporary exception", idempotency_key="test-0002", actor="test")
     auto_certify_zkt(session, connector, terminal)
     assert terminal.certification_state == "READ_ONLY"
     assert not terminal.capability_profile["user_write"]
