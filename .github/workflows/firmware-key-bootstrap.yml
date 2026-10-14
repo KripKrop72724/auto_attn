@@ -25,7 +25,7 @@ jobs:
     runs-on: ubuntu-latest
     environment: firmware-signing
     env:
-      ZONE_LITE_SETUP_PASSWORD: ${{ secrets.ZONE_LITE_SETUP_PASSWORD }}
+      ZONE_LITE_SETUP_PASSWORD: ${{ secrets.BLD1_HIK_SETUP_PASSWORD }}
     timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
@@ -41,12 +41,12 @@ jobs:
             -v "$GITHUB_WORKSPACE:/project" \
             -w /project/firmware/zone_lite \
             espressif/idf:v5.5.3 \
-            bash -lc 'rm -rf build-bootstrap && idf.py -B build-bootstrap -D SDKCONFIG=/tmp/zone-lite-bootstrap-sdkconfig build'
+            bash -lc 'rm -rf build-bootstrap && idf.py -B build-bootstrap -D ZONE_LITE_FAMILY=hikvision -D SDKCONFIG=/tmp/zone-lite-bootstrap-sdkconfig build'
           python - <<'PY'
           import os
           from pathlib import Path
 
-          image = Path("firmware/zone_lite/build-bootstrap/zone_lite.bin").read_bytes()
+          image = Path("firmware/zone_lite/build-bootstrap/zone_lite_hikvision.bin").read_bytes()
           configured = os.environ["ZONE_LITE_SETUP_PASSWORD"].encode()
           if configured not in image or b"SLIC-CI-ONLY" in image:
               raise SystemExit("Protected setup-password build provenance is invalid")
@@ -60,7 +60,7 @@ jobs:
             firmware/zone_lite/build-bootstrap/bootloader/bootloader.bin
             firmware/zone_lite/build-bootstrap/partition_table/partition-table.bin
             firmware/zone_lite/build-bootstrap/ota_data_initial.bin
-            firmware/zone_lite/build-bootstrap/zone_lite.bin
+            firmware/zone_lite/build-bootstrap/zone_lite_hikvision.bin
             firmware/zone_lite/build-bootstrap/flasher_args.json
 
   generate-and-sign:
@@ -87,9 +87,10 @@ jobs:
           New-Item -ItemType Directory -Path $unsigned -Force | Out-Null
           Copy-Item -LiteralPath (Join-Path $artifact 'bootloader\bootloader.bin') -Destination (Join-Path $unsigned 'bootloader.bin')
           Copy-Item -LiteralPath (Join-Path $artifact 'partition_table\partition-table.bin') -Destination (Join-Path $unsigned 'partition-table.bin')
-          foreach ($name in @('ota_data_initial.bin', 'zone_lite.bin', 'flasher_args.json')) {
+          foreach ($name in @('ota_data_initial.bin', 'zone_lite_hikvision.bin', 'flasher_args.json')) {
             Copy-Item -LiteralPath (Join-Path $artifact $name) -Destination (Join-Path $unsigned $name)
           }
+          Copy-Item -LiteralPath (Join-Path $unsigned 'zone_lite_hikvision.bin') -Destination (Join-Path $unsigned 'zone_lite.bin')
           $output = Join-Path $PWD 'signed-bootstrap'
           $vault = Join-Path $env:ProgramData 'StateLife\AttendanceDeviceDashboard\firmware-signing'
           ./deploy/add/bootstrap-firmware-signing.ps1 `
@@ -97,7 +98,8 @@ jobs:
             -UnsignedDirectory $unsigned `
             -OutputDirectory $output `
             -DeviceMac '${{ inputs.device_mac }}' `
-            -GitSha '${{ github.sha }}'
+            -GitSha '${{ github.sha }}' `
+            -FirmwareFamily 'hikvision'
       - uses: actions/upload-artifact@v4
         with:
           name: zone-lite-signed-bootstrap-${{ github.sha }}
