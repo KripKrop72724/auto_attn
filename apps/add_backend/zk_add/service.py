@@ -591,8 +591,13 @@ def auto_certify_zkt(session: Session, connector: Connector, zkt: ZKTDevice) -> 
                    if key not in {"delete_face_qualified", "delete_fingerprint_card_qualified"}}
         approval = profile.get("hikvision_profile_approval") or {}
         health = profile.get("hikvision_health") or {}
-        from zk_add.hikvision_write_exception import active as write_exception_active
+        from zk_add.hikvision_write_exception import (
+            active as write_exception_active, permanent_active as permanent_write_active,
+        )
         temporary_exception = write_exception_active(connector, zkt)
+        permanent_exception = permanent_write_active(connector, zkt)
+        grant = profile.get("hikvision_write_exception") or {}
+        permanent_requested = grant.get("enabled") is True and grant.get("permanent") is True
         writable = (
             approval.get("enabled") is True
             and approval.get("terminal_serial") == zkt.serial == zkt.confirmed_serial
@@ -610,7 +615,9 @@ def auto_certify_zkt(session: Session, connector: Connector, zkt: ZKTDevice) -> 
             **profile,
             "user_write": bool(writable), "create_user": bool(writable), "delete_user": bool(writable),
             "user_role_write": bool(writable and not temporary_exception),
-            "write_exception_expires_at": "2026-10-15T16:00:00Z" if temporary_exception else "",
+            "write_exception_expires_at": None if permanent_exception else "2026-10-15T16:00:00Z" if temporary_exception else "",
+            "write_exception_permanent": permanent_exception,
+            "write_exception_pending_firmware": permanent_requested and not permanent_exception,
             "delete_all_credentials": bool(writable and (health.get("profile_command_version") == 2 or temporary_exception)),
             "name_bytes": 128,
             "admin_lease": False, "protocol_restart": False, "telnet_recovery": False,
@@ -4322,7 +4329,7 @@ def ingest_attendance(
                 session, connector=connector, command_type="REFRESH_USERS",
                 payload={}, expected_state={}, desired_state={},
                 idempotency_key=f"auto-identity-sync:{connector.id}:{int(now.timestamp()) // 300}",
-                actor="system:attendance-identity", expires_in_seconds=120,
+                actor="system:attendance-identity", expires_in_seconds=user_refresh_timeout_seconds(connector),
             )
     return accepted, duplicates
 
@@ -4597,6 +4604,15 @@ def redact_text(value: str) -> str:
 
     value = re.sub(r"\b\d{5}-?\d{7}-?\d\b", "[CNIC-REDACTED]", value)
     return value
+
+
+def user_refresh_timeout_seconds(connector: Connector) -> int:
+    """Allow two serialized HIK inventory scans plus polling/transport overhead."""
+    if connector.firmware_family != "hikvision":
+        return 120
+    count = connector.zkt_device.user_count if connector.zkt_device else 0
+    pages = (max(0, count or 0) + 19) // 20
+    return max(600, min(3600, pages * 2 * 15 + 120))
 
 
 def create_command(

@@ -2855,6 +2855,7 @@ def refresh_users(
 ):
     db, context = auth
     connector = connector_or_404(db, connector_id)
+    from zk_add.service import user_refresh_timeout_seconds
     try:
         command = create_command(
             db,
@@ -2865,7 +2866,7 @@ def refresh_users(
             desired_state={},
             idempotency_key="refresh:" + force_release._digest([connector_id, body.idempotency_key if body and body.idempotency_key else str(uuid4())]),
             actor=context.username,
-            expires_in_seconds=120,
+            expires_in_seconds=user_refresh_timeout_seconds(connector),
         )
         db.commit()
         # The durable command dispatcher sends this after commit. Keeping this
