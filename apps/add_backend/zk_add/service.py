@@ -591,6 +591,8 @@ def auto_certify_zkt(session: Session, connector: Connector, zkt: ZKTDevice) -> 
                    if key not in {"delete_face_qualified", "delete_fingerprint_card_qualified"}}
         approval = profile.get("hikvision_profile_approval") or {}
         health = profile.get("hikvision_health") or {}
+        from zk_add.hikvision_write_exception import active as write_exception_active
+        temporary_exception = write_exception_active(connector, zkt)
         writable = (
             approval.get("enabled") is True
             and approval.get("terminal_serial") == zkt.serial == zkt.confirmed_serial
@@ -601,13 +603,15 @@ def auto_certify_zkt(session: Session, connector: Connector, zkt: ZKTDevice) -> 
             and zkt.snapshot_complete and zkt.identity_snapshot_stable
         )
         # Limited profile pilot capability is not full attendance/OTA certification.
-        zkt.certification_state = "PROFILE_PILOT" if writable else "READ_ONLY"
+        writable = writable or temporary_exception
+        zkt.certification_state = "PROFILE_EXCEPTION" if temporary_exception else "PROFILE_PILOT" if writable else "READ_ONLY"
         zkt.writes_disabled_reason = None if writable else "HIKVISION_WRITE_QUALIFICATION_PENDING"
         zkt.capability_profile = {
             **profile,
             "user_write": bool(writable), "create_user": bool(writable), "delete_user": bool(writable),
-            "user_role_write": bool(writable),
-            "delete_all_credentials": bool(writable and health.get("profile_command_version") == 2),
+            "user_role_write": bool(writable and not temporary_exception),
+            "write_exception_expires_at": "2026-10-15T16:00:00Z" if temporary_exception else "",
+            "delete_all_credentials": bool(writable and (health.get("profile_command_version") == 2 or temporary_exception)),
             "name_bytes": 128,
             "admin_lease": False, "protocol_restart": False, "telnet_recovery": False,
         }
@@ -4709,6 +4713,9 @@ def command_payload_summary(payload: dict) -> dict:
 
 
 def user_profile_is_writable(connector: Connector, zkt: ZKTDevice) -> bool:
+    if connector.firmware_family == "hikvision" and zkt.certification_state == "PROFILE_EXCEPTION":
+        from zk_add.hikvision_write_exception import active
+        return active(connector, zkt)
     return zkt.certification_state == "CERTIFIED" or (
         connector.firmware_family == "hikvision" and zkt.certification_state == "PROFILE_PILOT"
     )

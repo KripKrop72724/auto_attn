@@ -1316,6 +1316,14 @@ class DeviceErrorClearRequest(BaseModel):
     idempotency_key: str = Field(min_length=8, max_length=120)
 
 
+class HikvisionWriteExceptionRequest(BaseModel):
+    terminal_serial: str = Field(min_length=1, max_length=120)
+    enabled: bool = False
+    reason: str = Field(min_length=10, max_length=500)
+    password: SecretStr
+    idempotency_key: str = Field(min_length=8, max_length=120)
+
+
 class HikvisionPolicyRequest(BaseModel):
     terminal_serial: str = Field(min_length=1, max_length=120)
     source_epoch: str = Field(min_length=1, max_length=64)
