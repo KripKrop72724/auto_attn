@@ -1,4 +1,4 @@
-"""Operator-authorized, expiring BLD1 exception. Never model qualification."""
+"""Operator-authorized BLD1 grants, bound to one connector and terminal."""
 from datetime import datetime, timezone
 
 from sqlalchemy import select
@@ -35,26 +35,55 @@ def active(connector, terminal):
     profile = terminal.capability_profile or {}
     grant = profile.get("hikvision_write_exception") or {}
     health = profile.get("hikvision_health") or {}
-    return (
+    approved = (
         scope_matches(connector, terminal)
-        and grant.get("enabled") is True and grant.get("expires_epoch") == EXPIRES
+        and grant.get("enabled") is True
         and grant.get("terminal_serial") == SERIAL and grant.get("connector_id") == CONNECTOR
-        and 1791990000 <= now_epoch() < EXPIRES
+        and terminal.snapshot_complete and terminal.identity_snapshot_stable
+    )
+    if not approved:
+        return False
+    if permanent_active(connector, terminal):
+        return True
+    # While the new image is being installed, fix4 retains its original expiry.
+    # A permanent approval must not claim to remove fix4's firmware time limit.
+    legacy_grant = grant.get("expires_epoch") == EXPIRES or (
+        grant.get("permanent") is True and grant.get("expires_epoch") is None
+    )
+    return (
+        legacy_grant and 1791990000 <= now_epoch() < EXPIRES
         and health.get("profile_command_version") == 3
         and connector.firmware_version in {"3.1.1-bld1fix4", "zone-lite-3.1.1-bld1fix4"}
+    )
+
+
+def permanent_active(connector, terminal):
+    profile = terminal.capability_profile or {}
+    grant = profile.get("hikvision_write_exception") or {}
+    health = profile.get("hikvision_health") or {}
+    return (
+        scope_matches(connector, terminal)
+        and grant.get("enabled") is True and grant.get("permanent") is True
+        and grant.get("expires_epoch") is None
+        and grant.get("terminal_serial") == SERIAL and grant.get("connector_id") == CONNECTOR
+        and health.get("profile_command_version") == 4
+        and connector.firmware_version in {"3.1.1-bld1fix5", "zone-lite-3.1.1-bld1fix5"}
         and terminal.snapshot_complete and terminal.identity_snapshot_stable
     )
 
 
-def configure(session, connector, *, terminal_serial, enabled, reason, idempotency_key, actor):
+def configure(session, connector, *, terminal_serial, enabled, reason, idempotency_key, actor,
+              permanent=False):
     terminal = connector.zkt_device
     if not terminal or terminal_serial != SERIAL or not scope_matches(connector, terminal):
         raise ValueError("BLD1_WRITE_EXCEPTION_IDENTITY_MISMATCH")
-    if enabled and not 1791990000 <= now_epoch() < EXPIRES:
+    if enabled and not permanent and not 1791990000 <= now_epoch() < EXPIRES:
         raise ValueError("BLD1_WRITE_EXCEPTION_EXPIRED")
     request = dict(enabled=enabled, terminal_serial=SERIAL, connector_id=CONNECTOR,
-                   expires_epoch=EXPIRES, profile_id=PROFILE, reason=reason,
+                   expires_epoch=None if permanent else EXPIRES, profile_id=PROFILE, reason=reason,
                    qualification_state="NOT_QUALIFIED", administrator_role_changes=False)
+    if permanent:
+        request["permanent"] = True
     prior = session.scalar(select(AuditEvent).where(
         AuditEvent.action == "HIKVISION_WRITE_EXCEPTION_CONFIGURED",
         AuditEvent.target_id == CONNECTOR, AuditEvent.request_id == idempotency_key))

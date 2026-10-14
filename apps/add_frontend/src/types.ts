@@ -323,7 +323,7 @@ export interface ZktDevice {
   probe_latency_ms: number | null
   certification_state: string
   certification_observations: number
-  capabilities: Record<string, boolean | number | string>
+  capabilities: Record<string, boolean | number | string | null>
   snapshot_complete: boolean
   identity_snapshot_revision?: number
   identity_snapshot_state_hash?: string | null

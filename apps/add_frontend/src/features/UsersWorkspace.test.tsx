@@ -116,15 +116,27 @@ describe('Selected-terminal users workspace', () => {
     expect(screen.getByText(/Hikvision terminal/)).toBeTruthy()
   })
 
-  it('shows the expiring exception without claiming model qualification', async () => {
+  it.each([
+    { permanent: false, pending: false, title: 'Temporary write exception' },
+    { permanent: false, pending: true, title: 'Permanent write approval · firmware update pending' },
+    { permanent: true, pending: false, title: 'Permanent device write exception' },
+  ])('shows the actual exception lifetime without claiming qualification: $title', async ({ permanent, pending, title }) => {
     const hik: Device = { ...device, firmware_family: 'hikvision', zkt: {
       ...device.zkt!, terminal_binding_state: 'CONFIRMED',
       certification_state: 'PROFILE_EXCEPTION', writes_disabled_reason: null,
-      capabilities: { user_write: true, create_user: true, delete_user: true, user_role_write: false, admin_lease: false, write_exception_expires_at: '2026-10-15T16:00:00Z' },
+      capabilities: { user_write: true, create_user: true, delete_user: true, user_role_write: false, admin_lease: false, write_exception_expires_at: permanent ? null : '2026-10-15T16:00:00Z', write_exception_permanent: permanent, write_exception_pending_firmware: pending },
     } }
     vi.stubGlobal('fetch', workspaceFetch({ selectedDevice: hik }))
     render(<UsersHarness selectedDevice={hik} />)
-    expect(await screen.findByRole('region', { name: 'Temporary terminal write exception' })).toBeTruthy()
+    const banner = await screen.findByRole('region', { name: 'Terminal write exception' })
+    expect(within(banner).getByText(title)).toBeTruthy()
+    if (permanent) {
+      expect(banner.textContent).toContain('No automatic expiry')
+      expect(banner.textContent).not.toContain('Expires')
+    } else {
+      expect(banner.textContent).toContain('Expires')
+    }
+    if (pending) expect(banner.textContent).toContain('Install BLD1 permanent firmware')
     expect(screen.getByText(/This model is not qualified/)).toBeTruthy()
     expect((screen.getByRole('button', { name: /Add user/i }) as HTMLButtonElement).disabled).toBe(false)
   })
