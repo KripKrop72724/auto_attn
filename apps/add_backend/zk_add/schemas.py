@@ -521,7 +521,7 @@ class HikvisionTerminalPayload(BaseModel):
     consecutive_poll_failures: int | None = Field(default=None, ge=0)
     durable_poll_cursor: int | None = Field(default=None, ge=0, le=3_000_000_000)
     full_history_required: bool = True
-    profile_command_version: Literal[1, 2] | None = None
+    profile_command_version: Literal[1, 2, 3] | None = None
     light_reconcile: HikvisionLightReconcile | None = None
 
 

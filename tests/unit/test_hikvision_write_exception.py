@@ -115,3 +115,25 @@ def test_revocation_does_not_change_attendance_policy_or_qualification(target):
     auto_certify_zkt(session, connector, terminal)
     assert terminal.certification_state == "READ_ONLY"
     assert not terminal.capability_profile["user_write"]
+
+
+def test_signed_repair_heartbeat_is_accepted_and_keeps_approval(target):
+    from test_hikvision_clock import heartbeat
+    from zk_add.schemas import HeartbeatPayload
+    from zk_add.service import update_heartbeat
+
+    session, connector, terminal = target
+    grant(session, connector)
+    data = heartbeat().model_dump()
+    data["firmware_version"] = "zone-lite-3.1.1-bld1fix4"
+    data["terminal"].update(serial=exception.SERIAL, capability_profile=exception.PROFILE,
+                            profile_command_version=3)
+    update_heartbeat(session, connector=connector, boot_id="test-boot", sequence=1,
+                     payload=HeartbeatPayload.model_validate(data))
+    assert terminal.capability_profile["hikvision_write_exception"]["enabled"]
+    assert terminal.certification_state == "PROFILE_EXCEPTION"
+    assert require_writable_user_profile(connector, "user_write") is terminal
+    assert terminal.capability_profile["hikvision_health"]["qualification_state"] == "NOT_QUALIFIED"
+    data["terminal"]["profile_command_version"] = 4
+    with pytest.raises(ValueError):
+        HeartbeatPayload.model_validate(data)
