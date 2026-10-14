@@ -129,6 +129,19 @@ describe('Selected-terminal users workspace', () => {
     expect((screen.getByRole('button', { name: /Add user/i }) as HTMLButtonElement).disabled).toBe(false)
   })
 
+  it('disables role changes while allowing exception profile edits', () => {
+    const hik: Device = { ...device, firmware_family: 'hikvision', zkt: {
+      ...device.zkt!, certification_state: 'PROFILE_EXCEPTION',
+      capabilities: { user_write: true, user_role_write: false },
+    } }
+    function DialogHarness() {
+      const toast = useToast()
+      return <UserOperationDialog state={{ mode: 'edit', user: user() }} device={hik} onClose={() => {}} onCommand={() => {}} toast={toast} />
+    }
+    render(<DialogHarness />)
+    expect((screen.getByLabelText(/Terminal role/) as HTMLSelectElement).disabled).toBe(true)
+  })
+
   it('opens the exact missing-CNIC employee from an attendance review deep link', async () => {
     const missingCnic = user({
       id: 10,
