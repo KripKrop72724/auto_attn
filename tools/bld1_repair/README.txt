@@ -1,21 +1,24 @@
 BLD1 ESP LOGIN REPAIR — Windows 10/11 x64
 
-Utility version 1.0.1 replaces the original EXE. This version skips unsupported
+Utility version 1.0.2 replaces the original EXE. This version skips unsupported
 read-mac in Secure Download Mode and contains SDK errors without popup crashes.
-Check that the window title says BLD1 ESP Repair 1.0.1.
+It reports the specific failed configuration checks. A mismatch refuses the
+username change without aborting startup on the verified, provisioned ESP.
+Check that the window title says BLD1 ESP Repair 1.0.2.
 
 For ONE device only: AC:27:6E:A3:0A:58 / LF-ZONE-BLD1-01.
 Terminal: DS-K1T341AMF, serial G04600476, address 192.168.1.200.
 
-1. Connect only this ESP to the Windows PC using a USB DATA cable.
+1. Connect only this ESP to the Windows PC using a USB DATA cable, in the ESP's
+   socket labelled USB, NOT its COM socket. Unplug the other socket.
 2. Close other programs using the ESP's COM port.
 3. Run BLD1-ESP-Repair.exe and click Repair this ESP.
 4. Keep it connected. Follow BOOT/RESET instructions only if displayed.
 5. Wait for the final result and send a screenshot to IT.
 
 No Python, terminal commands, ADD login, or administrative password is required.
-Native Espressif USB is preferred. A USB-UART bridge may need its manufacturer's
-driver installed by IT. This EXE is not Authenticode-signed; verify the supplied
+Native Espressif USB is required for identification in Secure Download Mode.
+This EXE is not Authenticode-signed; verify the supplied
 SHA256 with IT. Do not disable antivirus or other security protection.
 
 RESULTS
@@ -25,6 +28,9 @@ USERNAME REPAIR VERIFIED — SITE CHECK PENDING: local correction succeeded but
 the terminal/network/password still needs checking. This is NOT site completion.
 Error or missing boot evidence: do not report success; contact IT. Same-device
 retries are idempotent. Keep the same EXE if a power/USB interruption occurs.
+CONFIGURATION CHECK REQUIRED: no username change was made. Send the screenshot
+including "Configuration checks that do NOT match" to IT. Do not keep retrying.
+This result diagnoses the mismatch; it does NOT mean terminal login is repaired.
 
 PRESERVED: all encrypted NVS (except hik_user Admin -> admin), site Wi-Fi,
 terminal password and serial, connector identity, eFuses/security keys, bootloader,
@@ -33,10 +39,12 @@ boot selector are replaced. Previous OTA application bytes are left untouched.
 No HMAC key, signing private key, ADD administrator secret, or terminal password
 is embedded in the utility. Secure Boot is not disabled or re-burned.
 
-The firmware is a targeted derivative of HIK 3.1.1: 3.1.1-bld1fix1. It is not a
+The firmware is a targeted derivative of HIK 3.1.1: 3.1.1-bld1fix2. It is not a
 general production release and must not be used for other ESPs. The device checks
 its hardware MAC, family, zone, device ID, expected serial and old/new username
-before touching the single configuration key. Unknown configurations fail closed.
+before touching the single configuration key. Unknown configurations cannot be
+modified. On the verified physical ESP, existing provisioned configuration can
+still run unchanged; an unverified physical target stays inert.
 
 Build and packaged Windows smoke tests do not replace a physical site test.
 This repair is not claimed to have been physically tested until the onsite run.

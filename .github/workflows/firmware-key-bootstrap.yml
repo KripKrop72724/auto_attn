@@ -60,7 +60,7 @@ jobs:
             -w /project/firmware/zone_lite \
             espressif/idf:v5.5.3 \
             bash -lc 'idf.py -B build-bootstrap -D ZONE_LITE_FAMILY=hikvision -D ZONE_LITE_BLD1_REPAIR=ON -D SDKCONFIG=/tmp/zone-lite-bootstrap-sdkconfig build'
-          python scripts/check_firmware_identity.py firmware/zone_lite/build-bootstrap/zone_lite_hikvision.bin --family hikvision --version 3.1.1-bld1fix1
+          python scripts/check_firmware_identity.py firmware/zone_lite/build-bootstrap/zone_lite_hikvision.bin --family hikvision --version 3.1.1-bld1fix2
           python - <<'PY'
           import os
           from pathlib import Path

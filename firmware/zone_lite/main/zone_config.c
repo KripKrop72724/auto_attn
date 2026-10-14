@@ -249,13 +249,27 @@ esp_err_t zone_config_init(void)
     nvs_close(handle);
     ESP_LOGI(TAG, "Loaded per-device provisioning for zone=%s", s_config.zone_id);
 #ifdef ZONE_LITE_BLD1_REPAIR
-    uint8_t mac[6];
-    if (!s_config.provisioned || esp_read_mac(mac, ESP_MAC_WIFI_STA) != ESP_OK ||
+    uint8_t mac[6] = {0};
+    const uint8_t repair_target[6] = {0xac, 0x27, 0x6e, 0xa3, 0x0a, 0x58};
+    esp_err_t mac_err = esp_read_mac(mac, ESP_MAC_WIFI_STA);
+    bool physical_match = mac_err == ESP_OK && !memcmp(mac, repair_target, sizeof(mac));
+    if (!s_config.provisioned || !physical_match ||
         !bld1_repair_matches(mac, s_config.firmware_family, s_config.zone_id,
             s_config.zone_device_id, s_config.hik_expected_serial, s_config.hik_username)) {
-        s_config.provisioned = false;
-        ESP_LOGE(TAG, "BLD1_REPAIR_REFUSED: physical identity or provisioning does not match");
-        return ESP_ERR_INVALID_STATE;
+        /* Only booleans are emitted: no passwords, tokens or arbitrary NVS values.
+         * Refuse the repair, not the previously provisioned connector's startup.
+         * An unverified physical target remains inert. No NVS writes occur here. */
+        ESP_LOGW(TAG, "BLD1_REPAIR_DIAG r2 provisioned=%u mac_read=%u mac=%u family=%u zone=%u device=%u serial=%u user=%u",
+            (unsigned)s_config.provisioned, (unsigned)(mac_err == ESP_OK),
+            (unsigned)physical_match,
+            (unsigned)!strcmp(s_config.firmware_family, "hikvision"),
+            (unsigned)!strcmp(s_config.zone_id, "LF-ZONE-BLD1-01"),
+            (unsigned)!strcmp(s_config.zone_device_id, "1"),
+            (unsigned)!strcmp(s_config.hik_expected_serial, "G04600476"),
+            (unsigned)(!strcmp(s_config.hik_username, "Admin") || !strcmp(s_config.hik_username, "admin")));
+        if (!physical_match) s_config.provisioned = false;
+        ESP_LOGW(TAG, "BLD1_REPAIR_REFUSED r2: no NVS changes; original configuration retained");
+        return ESP_OK;
     }
     /* This single-key commit preserves all Wi-Fi, tokens, serial and queue data.
      * Repeating after interruption is safe: both old and corrected values qualify. */
@@ -275,7 +289,7 @@ esp_err_t zone_config_init(void)
     nvs_close(handle);
     if (err != ESP_OK || strcmp(verified_user, "admin")) return ESP_ERR_INVALID_STATE;
     copy_default(s_config.hik_username, sizeof(s_config.hik_username), verified_user);
-    ESP_LOGI(TAG, "BLD1_REPAIR_VERIFIED r1 mac=ac:27:6e:a3:0a:58 zone=LF-ZONE-BLD1-01 serial=G04600476 user=admin");
+    ESP_LOGI(TAG, "BLD1_REPAIR_VERIFIED r2 mac=ac:27:6e:a3:0a:58 zone=LF-ZONE-BLD1-01 serial=G04600476 user=admin");
 #endif
     return ESP_OK;
 }

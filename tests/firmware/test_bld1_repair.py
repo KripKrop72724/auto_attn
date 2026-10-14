@@ -45,7 +45,8 @@ def test_rom_flags():
         repair.secure_download("unknown")
 
 
-def test_complete_secure_rom_flow(monkeypatch):
+@pytest.mark.parametrize("diagnostic_refusal", [False, True])
+def test_complete_secure_rom_flow(monkeypatch, diagnostic_refusal):
     import serial
     from serial.tools import list_ports
     commands, messages = [], []
@@ -53,7 +54,10 @@ def test_complete_secure_rom_flow(monkeypatch):
     monkeypatch.setattr(list_ports, "comports", lambda: [port()])
     class Connection:
         def __init__(self):
-            self.lines = iter([repair.MARKER.encode(), b"Poll OK; reason=none; stage=checkpoint_commit"])
+            self.lines = iter([
+                b"BLD1_REPAIR_DIAG r2 provisioned=1 mac_read=1 mac=1 family=1 zone=1 device=1 serial=0 user=1",
+                b"BLD1_REPAIR_REFUSED r2: no NVS changes; original configuration retained"
+            ] if diagnostic_refusal else [repair.MARKER.encode(), b"Poll OK; reason=none; stage=checkpoint_commit"])
         def open(self): pass
         def __enter__(self): return self
         def __exit__(self, *_): pass
@@ -66,13 +70,37 @@ def test_complete_secure_rom_flow(monkeypatch):
         assert args[-1] != "read-mac", "Secure ROM must never receive read-mac"
         return 0, ""
     monkeypatch.setattr(repair.Repair, "tool", tool)
-    repair.Repair(lambda k, v: messages.append((k, v))).run()
+    runner = repair.Repair(lambda k, v: messages.append((k, v)))
+    if diagnostic_refusal:
+        with pytest.raises(RuntimeError, match="CONFIGURATION CHECK REQUIRED"):
+            runner.run()
+        assert messages[-1] == ("log", "Configuration checks that do NOT match: serial.")
+        assert not any(k == "done" for k, v in messages)
+    else:
+        runner.run()
+        assert messages[-1][0] == "done"
     writes = [c for c in commands if "write-flash" in c]
     assert len(writes) == 2
     assert writes[0][-2] == "0x20000"
     assert writes[1][-2] == "0x17000"
     assert not any("verify-flash" in c or "read-flash" in c or "read-mac" in c for c in commands)
-    assert messages[-1][0] == "done"
+
+
+def test_diagnostics_never_echo_arbitrary_serial_data():
+    line = "BLD1_REPAIR_DIAG r2 provisioned=1 mac_read=1 mac=1 family=1 zone=0 device=1 serial=1 user=0"
+    assert repair.repair_diagnostic(line + " secret=never-display") == "Configuration checks that do NOT match: zone, user."
+    assert repair.repair_diagnostic(line.replace("user=0", "user=secret")) is None
+    assert repair.repair_diagnostic("wifi password=never-display") is None
+
+
+def test_refused_mutation_does_not_abort_valid_existing_connector():
+    source = (ROOT / "firmware/zone_lite/main/zone_config.c").read_text()
+    branch = source.split("if (!s_config.provisioned || !physical_match ||", 1)[1].split("/* This single-key commit", 1)[0]
+    assert "BLD1_REPAIR_DIAG r2" in branch
+    assert "return ESP_OK;" in branch
+    assert "return ESP_ERR_INVALID_STATE" not in branch
+    assert "if (!physical_match) s_config.provisioned = false;" in branch
+    assert "nvs_set" not in branch and "nvs_commit" not in branch
 
 
 def test_tool_fatal_error_becomes_exit_code(monkeypatch, tmp_path):
