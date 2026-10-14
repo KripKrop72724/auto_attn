@@ -1,10 +1,13 @@
 BLD1 ESP LOGIN REPAIR — Windows 10/11 x64
 
-Utility version 1.0.2 replaces the original EXE. This version skips unsupported
+Utility version 1.0.3 replaces earlier EXEs. This version skips unsupported
 read-mac in Secure Download Mode and contains SDK errors without popup crashes.
 It reports the specific failed configuration checks. A mismatch refuses the
 username change without aborting startup on the verified, provisioned ESP.
-Check that the window title says BLD1 ESP Repair 1.0.2.
+The onsite 1.0.2 diagnostic confirmed that only the stored username differed.
+This revision sets that single field to admin after all identity guards pass;
+it does not require the incorrect old username to equal Admin.
+Check that the window title says BLD1 ESP Repair 1.0.3.
 
 For ONE device only: AC:27:6E:A3:0A:58 / LF-ZONE-BLD1-01.
 Terminal: DS-K1T341AMF, serial G04600476, address 192.168.1.200.
@@ -32,17 +35,17 @@ CONFIGURATION CHECK REQUIRED: no username change was made. Send the screenshot
 including "Configuration checks that do NOT match" to IT. Do not keep retrying.
 This result diagnoses the mismatch; it does NOT mean terminal login is repaired.
 
-PRESERVED: all encrypted NVS (except hik_user Admin -> admin), site Wi-Fi,
+PRESERVED: all encrypted NVS (except hik_user corrected to admin), site Wi-Fi,
 terminal password and serial, connector identity, eFuses/security keys, bootloader,
 partition table and attendance storage. The signed factory application and OTA
 boot selector are replaced. Previous OTA application bytes are left untouched.
 No HMAC key, signing private key, ADD administrator secret, or terminal password
 is embedded in the utility. Secure Boot is not disabled or re-burned.
 
-The firmware is a targeted derivative of HIK 3.1.1: 3.1.1-bld1fix2. It is not a
+The firmware is a targeted derivative of HIK 3.1.1: 3.1.1-bld1fix3. It is not a
 general production release and must not be used for other ESPs. The device checks
-its hardware MAC, family, zone, device ID, expected serial and old/new username
-before touching the single configuration key. Unknown configurations cannot be
+its hardware MAC, provisioning flag, family, zone, device ID and expected serial
+before touching the single username key. Mismatched identities cannot be
 modified. On the verified physical ESP, existing provisioned configuration can
 still run unchanged; an unverified physical target stays inert.
 

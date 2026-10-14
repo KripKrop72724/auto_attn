@@ -32,7 +32,7 @@ def main():
     if hashes["zone-lite-signed.bin"] != current["application_sha256"]:
         raise SystemExit("Repair application manifest hash mismatch")
     meta = {"target_mac": "ac:27:6e:a3:0a:58", "zone": "LF-ZONE-BLD1-01",
-            "version": "3.1.1-bld1fix2", "git_sha": current["git_sha"], "files": hashes}
+            "version": "3.1.1-bld1fix3", "git_sha": current["git_sha"], "files": hashes}
     (args.output / "repair.json").write_text(json.dumps(meta, indent=2) + "\n")
 
 if __name__ == "__main__":
