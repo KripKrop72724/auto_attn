@@ -47,7 +47,7 @@ jobs:
           python-version: "3.12"
       - name: Test targeted repair guards and HIK transport
         run: |
-          python -m pip install pytest==9.0.2
+          python -m pip install pytest==9.0.2 esptool==5.1.0
           python -m pytest -q tests/firmware/test_bld1_repair.py tests/firmware/test_hikvision_http_host.py
       - name: Build exact unsigned Secure Boot candidate
         shell: bash

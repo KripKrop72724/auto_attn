@@ -1,5 +1,9 @@
 BLD1 ESP LOGIN REPAIR — Windows 10/11 x64
 
+Utility version 1.0.1 replaces the original EXE. This version skips unsupported
+read-mac in Secure Download Mode and contains SDK errors without popup crashes.
+Check that the window title says BLD1 ESP Repair 1.0.1.
+
 For ONE device only: AC:27:6E:A3:0A:58 / LF-ZONE-BLD1-01.
 Terminal: DS-K1T341AMF, serial G04600476, address 192.168.1.200.
 

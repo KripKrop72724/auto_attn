@@ -63,8 +63,7 @@ def test_complete_secure_rom_flow(monkeypatch):
         commands.append([module, *map(str, args)])
         if args[-1] == "get-security-info":
             return 0, "Flags: 0x00000005\nSecure Boot: Enabled\nFlash Encryption: Disabled\nBLOCK_KEY0 - HMAC_UP"
-        if args[-1] == "read-mac":
-            return 2, "Unavailable in Secure Download Mode"
+        assert args[-1] != "read-mac", "Secure ROM must never receive read-mac"
         return 0, ""
     monkeypatch.setattr(repair.Repair, "tool", tool)
     repair.Repair(lambda k, v: messages.append((k, v))).run()
@@ -72,8 +71,41 @@ def test_complete_secure_rom_flow(monkeypatch):
     assert len(writes) == 2
     assert writes[0][-2] == "0x20000"
     assert writes[1][-2] == "0x17000"
-    assert not any("verify-flash" in c or "read-flash" in c for c in commands)
+    assert not any("verify-flash" in c or "read-flash" in c or "read-mac" in c for c in commands)
     assert messages[-1][0] == "done"
+
+
+def test_tool_fatal_error_becomes_exit_code(monkeypatch, tmp_path):
+    import importlib
+    from esptool.util import FatalError
+    def fail(args):
+        raise FatalError("The read-mac command is not available in Secure Download Mode.")
+    monkeypatch.setattr(importlib, "import_module", lambda name: SimpleNamespace(main=fail))
+    output = tmp_path / "tool.txt"
+    assert repair.tool_entry("esptool", output, ["read-mac"]) == 1
+    assert "TOOL_FAILURE: FatalError" in output.read_text()
+
+
+def test_tool_system_exit_becomes_exit_code(monkeypatch, tmp_path):
+    import importlib
+    def fail(args):
+        raise SystemExit(2)
+    monkeypatch.setattr(importlib, "import_module", lambda name: SimpleNamespace(main=fail))
+    assert repair.tool_entry("esptool", tmp_path / "tool.txt", []) == 2
+
+
+def test_secure_rom_with_bridge_never_writes(monkeypatch):
+    from serial.tools import list_ports
+    monkeypatch.setattr(repair, "validate_payload", lambda: {})
+    monkeypatch.setattr(list_ports, "comports", lambda: [port(vid=0x10C4)])
+    calls = []
+    def tool(self, module, args, *a, **kw):
+        calls.append(args)
+        return 0, "Flags: 0x00000005\nSecure Boot: Enabled\nFlash Encryption: Disabled\nBLOCK_KEY0 - HMAC_UP"
+    monkeypatch.setattr(repair.Repair, "tool", tool)
+    with pytest.raises(RuntimeError, match="exact native USB identity"):
+        repair.Repair(lambda *_: None).run()
+    assert not any("write-flash" in c or "read-mac" in c for c in calls)
 
 
 def test_wrong_device_never_writes(monkeypatch):

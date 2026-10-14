@@ -15,6 +15,7 @@ import threading
 import time
 
 TARGET = "ac:27:6e:a3:0a:58"
+UTILITY_VERSION = "1.0.1"
 ZONE = "LF-ZONE-BLD1-01"
 MARKER = f"BLD1_REPAIR_VERIFIED r1 mac={TARGET} zone={ZONE} serial=G04600476 user=admin"
 APP_OFFSET = 0x20000
@@ -159,14 +160,17 @@ class Repair:
             base = ["--chip", "esp32s3", "--port", port.device, "--baud", "115200", "--no-stub", "--before", "default-reset", "--after", "no-reset"]
             _, security = self.tool("esptool", base + ["get-security-info"], work)
             check_security(security)
-            _, identity = self.tool("esptool", base + ["read-mac"], work, allow_failure=True)
-            check_mac(identity, port)
             # A secured ROM may deny reads. Only the exact native factory USB MAC
             # can qualify that path; no generic adapter/typed MAC override exists.
             secure_rom = secure_download(security)
-            if secure_rom and usb_mac(port) != TARGET:
-                raise RuntimeError("Secure ROM requires the exact native USB identity. No writes performed.")
-            if not secure_rom:
+            if secure_rom:
+                if usb_mac(port) != TARGET:
+                    raise RuntimeError("Secure ROM requires the exact native USB identity. No writes performed.")
+                check_mac("", port)
+                self.emit("log", "Secure Download Mode detected; exact native USB identity verified. Unsupported ROM read commands are skipped.")
+            else:
+                _, identity = self.tool("esptool", base + ["read-mac"], work)
+                check_mac(identity, port)
                 self.tool("esptool", base + ["read-flash", "0x10000", "0x1000", work / "partitions.bin"], work)
                 table = (work / "partitions.bin").read_bytes()
                 expected = (PAYLOAD / "partition-table.bin").read_bytes()
@@ -240,7 +244,7 @@ def main():
     import tkinter as tk
     from tkinter import ttk, messagebox
     root = tk.Tk()
-    root.title("BLD1 ESP Repair — State Life")
+    root.title(f"BLD1 ESP Repair {UTILITY_VERSION} — State Life")
     root.geometry("760x570")
     root.minsize(700, 540)
     messages = queue.Queue()
@@ -304,15 +308,34 @@ def main():
     root.mainloop()
 
 
+def tool_entry(module, output, arguments):
+    """Normalize SDK/Click exceptions into child exit codes, never OS dialogs.
+
+    A windowed PyInstaller child otherwise opens a modal traceback and stalls the
+    parent even when an expected failure is explicitly permitted by the caller.
+    """
+    try:
+        if module not in {"esptool", "espsecure"}:
+            return 2
+        with open(output, "w", encoding="utf-8", buffering=1) as stream:
+            with contextlib.redirect_stdout(stream), contextlib.redirect_stderr(stream):
+                try:
+                    import importlib
+                    importlib.import_module(module).main(arguments)
+                except SystemExit as exc:
+                    return exc.code if isinstance(exc.code, int) else (0 if exc.code is None else 1)
+                except Exception as exc:
+                    print(f"TOOL_FAILURE: {type(exc).__name__}", flush=True)
+                    return 1
+        return 0
+    except Exception:
+        return 1
+
+
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "--tool":
         module, output, *arguments = sys.argv[2:]
-        if module not in {"esptool", "espsecure"}:
-            raise SystemExit(2)
-        with open(output, "w", encoding="utf-8", buffering=1) as stream:
-            with contextlib.redirect_stdout(stream), contextlib.redirect_stderr(stream):
-                import importlib
-                importlib.import_module(module).main(arguments)
+        raise SystemExit(tool_entry(module, output, arguments))
     elif "--self-test" in sys.argv:
         report = Path(sys.argv[sys.argv.index("--self-test") + 1])
         validate_payload()
@@ -320,8 +343,15 @@ if __name__ == "__main__":
             worker = Repair(lambda *_: None)
             worker.tool("espsecure", ["verify_signature", "--version", "2", "--keyfile", PAYLOAD / "key-1-public.pem", PAYLOAD / "zone-lite-signed.bin"], Path(temp))
             worker.tool("esptool", ["version"], Path(temp))
+            # Exercise a REAL SDK FatalError in the packaged windowed child.
+            # It must exit nonzero promptly, not show a modal exception dialog.
+            invalid = Path(temp) / "invalid-image.bin"
+            invalid.write_bytes(b"not an ESP image")
+            code, text = worker.tool("esptool", ["--chip", "esp32s3", "image-info", str(invalid)], Path(temp), timeout=30, allow_failure=True)
+            if code == 0 or "TOOL_FAILURE:" not in text:
+                raise RuntimeError("Packaged tool-error containment failed")
         import serial.tools.list_ports
         import tkinter
-        report.write_text(json.dumps({"package": "verified", "signature": "verified", "esptool": "bundled", "gui": "imported", "hardware_tested": False}))
+        report.write_text(json.dumps({"utility_version": UTILITY_VERSION, "package": "verified", "signature": "verified", "esptool": "bundled", "gui": "imported", "child_fatal_error": "contained", "hardware_tested": False}))
     else:
         main()
