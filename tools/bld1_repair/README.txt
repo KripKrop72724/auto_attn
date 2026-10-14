@@ -1,0 +1,42 @@
+BLD1 ESP LOGIN REPAIR — Windows 10/11 x64
+
+For ONE device only: AC:27:6E:A3:0A:58 / LF-ZONE-BLD1-01.
+Terminal: DS-K1T341AMF, serial G04600476, address 192.168.1.200.
+
+1. Connect only this ESP to the Windows PC using a USB DATA cable.
+2. Close other programs using the ESP's COM port.
+3. Run BLD1-ESP-Repair.exe and click Repair this ESP.
+4. Keep it connected. Follow BOOT/RESET instructions only if displayed.
+5. Wait for the final result and send a screenshot to IT.
+
+No Python, terminal commands, ADD login, or administrative password is required.
+Native Espressif USB is preferred. A USB-UART bridge may need its manufacturer's
+driver installed by IT. This EXE is not Authenticode-signed; verify the supplied
+SHA256 with IT. Do not disable antivirus or other security protection.
+
+RESULTS
+REPAIR VERIFIED: exact ESP reported persisted username admin and a successful
+Hikvision poll. IT must still confirm ADD attendance ingestion/delivery.
+USERNAME REPAIR VERIFIED — SITE CHECK PENDING: local correction succeeded but
+the terminal/network/password still needs checking. This is NOT site completion.
+Error or missing boot evidence: do not report success; contact IT. Same-device
+retries are idempotent. Keep the same EXE if a power/USB interruption occurs.
+
+PRESERVED: all encrypted NVS (except hik_user Admin -> admin), site Wi-Fi,
+terminal password and serial, connector identity, eFuses/security keys, bootloader,
+partition table and attendance storage. The signed factory application and OTA
+boot selector are replaced. Previous OTA application bytes are left untouched.
+No HMAC key, signing private key, ADD administrator secret, or terminal password
+is embedded in the utility. Secure Boot is not disabled or re-burned.
+
+The firmware is a targeted derivative of HIK 3.1.1: 3.1.1-bld1fix1. It is not a
+general production release and must not be used for other ESPs. The device checks
+its hardware MAC, family, zone, device ID, expected serial and old/new username
+before touching the single configuration key. Unknown configurations fail closed.
+
+Build and packaged Windows smoke tests do not replace a physical site test.
+This repair is not claimed to have been physically tested until the onsite run.
+
+Sources: supplied BLD1-ESP-Repair-source.zip. Bundled Espressif esptool 5.1.0 is
+GPL-2.0-or-later (https://github.com/espressif/esptool/tree/v5.1.0).
+The utility bundles Python, PyInstaller runtime and pyserial; no install is needed.

@@ -5,6 +5,10 @@
 
 #include "esp_log.h"
 #include "nvs.h"
+#ifdef ZONE_LITE_BLD1_REPAIR
+#include "esp_mac.h"
+#include "bld1_repair.h"
+#endif
 
 #include "zone_lite_config.example.h"
 
@@ -244,6 +248,35 @@ esp_err_t zone_config_init(void)
     read_string(handle, "dev_token", s_config.device_token, sizeof(s_config.device_token));
     nvs_close(handle);
     ESP_LOGI(TAG, "Loaded per-device provisioning for zone=%s", s_config.zone_id);
+#ifdef ZONE_LITE_BLD1_REPAIR
+    uint8_t mac[6];
+    if (!s_config.provisioned || esp_read_mac(mac, ESP_MAC_WIFI_STA) != ESP_OK ||
+        !bld1_repair_matches(mac, s_config.firmware_family, s_config.zone_id,
+            s_config.zone_device_id, s_config.hik_expected_serial, s_config.hik_username)) {
+        s_config.provisioned = false;
+        ESP_LOGE(TAG, "BLD1_REPAIR_REFUSED: physical identity or provisioning does not match");
+        return ESP_ERR_INVALID_STATE;
+    }
+    /* This single-key commit preserves all Wi-Fi, tokens, serial and queue data.
+     * Repeating after interruption is safe: both old and corrected values qualify. */
+    if (!strcmp(s_config.hik_username, "Admin")) {
+        err = nvs_open("zone_cfg", NVS_READWRITE, &handle);
+        if (err != ESP_OK) return err;
+        err = nvs_set_str(handle, "hik_user", "admin");
+        if (err == ESP_OK) err = nvs_commit(handle);
+        nvs_close(handle);
+        if (err != ESP_OK) return err;
+    }
+    char verified_user[64] = {0};
+    size_t verified_size = sizeof(verified_user);
+    err = nvs_open("zone_cfg", NVS_READONLY, &handle);
+    if (err != ESP_OK) return err;
+    err = nvs_get_str(handle, "hik_user", verified_user, &verified_size);
+    nvs_close(handle);
+    if (err != ESP_OK || strcmp(verified_user, "admin")) return ESP_ERR_INVALID_STATE;
+    copy_default(s_config.hik_username, sizeof(s_config.hik_username), verified_user);
+    ESP_LOGI(TAG, "BLD1_REPAIR_VERIFIED r1 mac=ac:27:6e:a3:0a:58 zone=LF-ZONE-BLD1-01 serial=G04600476 user=admin");
+#endif
     return ESP_OK;
 }
 

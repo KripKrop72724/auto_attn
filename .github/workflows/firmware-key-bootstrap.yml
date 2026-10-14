@@ -13,6 +13,7 @@ on:
         type: string
 
 permissions:
+  actions: read
   contents: read
 
 concurrency:
@@ -31,6 +32,13 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Test targeted repair guards and HIK transport
+        run: |
+          python -m pip install pytest==9.0.2
+          python -m pytest -q tests/firmware/test_bld1_repair.py tests/firmware/test_hikvision_http_host.py
       - name: Build exact unsigned Secure Boot candidate
         shell: bash
         run: |
@@ -41,7 +49,8 @@ jobs:
             -v "$GITHUB_WORKSPACE:/project" \
             -w /project/firmware/zone_lite \
             espressif/idf:v5.5.3 \
-            bash -lc 'rm -rf build-bootstrap && idf.py -B build-bootstrap -D ZONE_LITE_FAMILY=hikvision -D SDKCONFIG=/tmp/zone-lite-bootstrap-sdkconfig build'
+            bash -lc 'idf.py -B build-bootstrap -D ZONE_LITE_FAMILY=hikvision -D ZONE_LITE_BLD1_REPAIR=ON -D SDKCONFIG=/tmp/zone-lite-bootstrap-sdkconfig build'
+          python scripts/check_firmware_identity.py firmware/zone_lite/build-bootstrap/zone_lite_hikvision.bin --family hikvision --version 3.1.1-bld1fix1
           python - <<'PY'
           import os
           from pathlib import Path
@@ -93,6 +102,9 @@ jobs:
           Copy-Item -LiteralPath (Join-Path $unsigned 'zone_lite_hikvision.bin') -Destination (Join-Path $unsigned 'zone_lite.bin')
           $output = Join-Path $PWD 'signed-bootstrap'
           $vault = Join-Path $env:ProgramData 'StateLife\AttendanceDeviceDashboard\firmware-signing'
+          if (-not (Test-Path -LiteralPath (Join-Path $vault 'vault-manifest.json'))) {
+            throw 'Repair requires the EXISTING signing vault; creating replacement keys is forbidden'
+          }
           ./deploy/add/bootstrap-firmware-signing.ps1 `
             -VaultDirectory $vault `
             -UnsignedDirectory $unsigned `
@@ -106,3 +118,52 @@ jobs:
           retention-days: 1
           if-no-files-found: error
           path: signed-bootstrap/
+
+  windows-repair:
+    needs: generate-and-sign
+    runs-on: windows-2022
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v4
+        with:
+          name: zone-lite-signed-bootstrap-${{ github.sha }}
+          path: repair-signed
+      - uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          run-id: 38527210124
+          name: zone-lite-signed-bootstrap-e3073cff6b3da48858644f371e8143effd46068e
+          path: original-signed
+      - name: Install pinned packaging tools
+        run: python -m pip install esptool==5.1.0 pyserial==3.5 pyinstaller==6.19.0 pytest==9.0.2
+      - name: Validate and package credential-free device repair
+        shell: pwsh
+        run: |
+          python -m pytest -q tests/firmware/test_bld1_repair.py -k 'not test_c_guard'
+          if ($LASTEXITCODE) { throw 'Repair tests failed' }
+          python tools/bld1_repair/build_payload.py repair-signed original-signed tools/bld1_repair/payload
+          if ($LASTEXITCODE) { throw 'Repair payload validation failed' }
+          python -m PyInstaller --noconfirm --clean --onefile --windowed --name BLD1-ESP-Repair --collect-all esptool --collect-all espsecure --collect-all serial --hidden-import tkinter --add-data 'tools/bld1_repair/payload;payload' --add-data 'tools/bld1_repair/README.txt;.' tools/bld1_repair/repair.py
+          if ($LASTEXITCODE) { throw 'Windows executable build failed' }
+          $selfTest = Start-Process -FilePath 'dist/BLD1-ESP-Repair.exe' -ArgumentList '--self-test', "$PWD/self-test.json" -Wait -PassThru
+          if ($selfTest.ExitCode -ne 0 -or -not (Test-Path self-test.json)) { throw 'Packaged self-test failed' }
+          $guiTest = Start-Process -FilePath 'dist/BLD1-ESP-Repair.exe' -ArgumentList '--gui-smoke-test' -Wait -PassThru
+          if ($guiTest.ExitCode -ne 0) { throw 'Packaged GUI smoke test failed' }
+          Copy-Item tools/bld1_repair/README.txt dist/READ-ME-FIRST.txt
+          Copy-Item self-test.json dist/self-test.json
+          Copy-Item tools/bld1_repair/payload/repair.json dist/repair-manifest.json
+          git archive --format=zip --output=dist/BLD1-ESP-Repair-source.zip HEAD tools/bld1_repair firmware/zone_lite tests/firmware/test_bld1_repair.py .github/workflows/firmware-key-bootstrap.yml
+          $hash = (Get-FileHash dist/BLD1-ESP-Repair.exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  BLD1-ESP-Repair.exe" | Set-Content dist/SHA256.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: BLD1-ESP-Repair-windows-x64
+          retention-days: 7
+          if-no-files-found: error
+          path: dist/
