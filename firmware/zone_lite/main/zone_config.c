@@ -259,7 +259,7 @@ esp_err_t zone_config_init(void)
         /* Only booleans are emitted: no passwords, tokens or arbitrary NVS values.
          * Refuse the repair, not the previously provisioned connector's startup.
          * An unverified physical target remains inert. No NVS writes occur here. */
-        ESP_LOGW(TAG, "BLD1_REPAIR_DIAG r3 provisioned=%u mac_read=%u mac=%u family=%u zone=%u device=%u serial=%u",
+        ESP_LOGW(TAG, "BLD1_REPAIR_DIAG r4 provisioned=%u mac_read=%u mac=%u family=%u zone=%u device=%u serial=%u",
             (unsigned)s_config.provisioned, (unsigned)(mac_err == ESP_OK),
             (unsigned)physical_match,
             (unsigned)!strcmp(s_config.firmware_family, "hikvision"),
@@ -267,7 +267,7 @@ esp_err_t zone_config_init(void)
             (unsigned)!strcmp(s_config.zone_device_id, "1"),
             (unsigned)!strcmp(s_config.hik_expected_serial, "G04600476"));
         if (!physical_match) s_config.provisioned = false;
-        ESP_LOGW(TAG, "BLD1_REPAIR_REFUSED r3: no NVS changes; original configuration retained");
+        ESP_LOGW(TAG, "BLD1_REPAIR_REFUSED r4: no NVS changes; original configuration retained");
         return ESP_OK;
     }
     /* This single-key commit preserves all Wi-Fi, tokens, serial and queue data.
@@ -289,7 +289,7 @@ esp_err_t zone_config_init(void)
     nvs_close(handle);
     if (err != ESP_OK || strcmp(verified_user, "admin")) return ESP_ERR_INVALID_STATE;
     copy_default(s_config.hik_username, sizeof(s_config.hik_username), verified_user);
-    ESP_LOGI(TAG, "BLD1_REPAIR_VERIFIED r3 mac=ac:27:6e:a3:0a:58 zone=LF-ZONE-BLD1-01 serial=G04600476 user=admin");
+    ESP_LOGI(TAG, "BLD1_REPAIR_VERIFIED r4 mac=ac:27:6e:a3:0a:58 zone=LF-ZONE-BLD1-01 serial=G04600476 user=admin");
 #endif
     return ESP_OK;
 }
