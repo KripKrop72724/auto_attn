@@ -81,6 +81,15 @@ def check_security(text):
         raise RuntimeError("Expected HMAC key purpose is missing. No flash changes were made.")
 
 
+def secure_download(text):
+    flags = re.search(r"Flags:\s*(0x[0-9a-f]+)", text, re.I)
+    if flags:
+        return bool(int(flags.group(1), 16) & (1 << 2))
+    if re.search(r"ESP32-S3 in Secure Download Mode", text):
+        return True
+    raise RuntimeError("Cannot determine ROM security mode. No writes performed.")
+
+
 def site_result(line):
     if "Poll OK;" in line:
         return "online"
@@ -154,7 +163,7 @@ class Repair:
             check_mac(identity, port)
             # A secured ROM may deny reads. Only the exact native factory USB MAC
             # can qualify that path; no generic adapter/typed MAC override exists.
-            secure_rom = bool(re.search(r"Secure Download (?:Mode)?\s*(?:is|:)?\s*Enabled", security, re.I))
+            secure_rom = secure_download(security)
             if secure_rom and usb_mac(port) != TARGET:
                 raise RuntimeError("Secure ROM requires the exact native USB identity. No writes performed.")
             if not secure_rom:

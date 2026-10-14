@@ -11,6 +11,16 @@ on:
         description: Type CREATE ADD FIRMWARE VAULT
         required: true
         type: string
+      signed_run_id:
+        description: Optional successful signing run to package without rebuilding firmware
+        required: false
+        default: ""
+        type: string
+      signed_commit:
+        description: Exact signed firmware commit when reusing a signing run
+        required: false
+        default: ""
+        type: string
 
 permissions:
   actions: read
@@ -22,7 +32,7 @@ concurrency:
 
 jobs:
   build:
-    if: ${{ inputs.confirmation == 'CREATE ADD FIRMWARE VAULT' }}
+    if: ${{ inputs.confirmation == 'CREATE ADD FIRMWARE VAULT' && inputs.signed_run_id == '' }}
     runs-on: ubuntu-latest
     environment: firmware-signing
     env:
@@ -121,6 +131,7 @@ jobs:
 
   windows-repair:
     needs: generate-and-sign
+    if: ${{ always() && (needs.generate-and-sign.result == 'success' || (inputs.confirmation == 'CREATE ADD FIRMWARE VAULT' && inputs.signed_run_id != '' && inputs.signed_commit != '')) }}
     runs-on: windows-2022
     timeout-minutes: 20
     steps:
@@ -132,7 +143,9 @@ jobs:
           python-version: "3.12"
       - uses: actions/download-artifact@v4
         with:
-          name: zone-lite-signed-bootstrap-${{ github.sha }}
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.signed_run_id || github.run_id }}
+          name: zone-lite-signed-bootstrap-${{ inputs.signed_commit || github.sha }}
           path: repair-signed
       - uses: actions/download-artifact@v4
         with:

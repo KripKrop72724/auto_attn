@@ -37,6 +37,56 @@ def test_security_fail_closed():
             repair.check_security(bad)
 
 
+def test_rom_flags():
+    assert repair.secure_download("Flags: 0x00000005 (0b101)")
+    assert not repair.secure_download("Flags: 0x00000001 (0b1)")
+    assert repair.secure_download("Chip type: ESP32-S3 in Secure Download Mode")
+    with pytest.raises(RuntimeError):
+        repair.secure_download("unknown")
+
+
+def test_complete_secure_rom_flow(monkeypatch):
+    import serial
+    from serial.tools import list_ports
+    commands, messages = [], []
+    monkeypatch.setattr(repair, "validate_payload", lambda: {})
+    monkeypatch.setattr(list_ports, "comports", lambda: [port()])
+    class Connection:
+        def __init__(self):
+            self.lines = iter([repair.MARKER.encode(), b"Poll OK; reason=none; stage=checkpoint_commit"])
+        def open(self): pass
+        def __enter__(self): return self
+        def __exit__(self, *_): pass
+        def readline(self, *_): return next(self.lines)
+    monkeypatch.setattr(serial, "Serial", Connection)
+    def tool(self, module, args, work, **kwargs):
+        commands.append([module, *map(str, args)])
+        if args[-1] == "get-security-info":
+            return 0, "Flags: 0x00000005\nSecure Boot: Enabled\nFlash Encryption: Disabled\nBLOCK_KEY0 - HMAC_UP"
+        if args[-1] == "read-mac":
+            return 2, "Unavailable in Secure Download Mode"
+        return 0, ""
+    monkeypatch.setattr(repair.Repair, "tool", tool)
+    repair.Repair(lambda k, v: messages.append((k, v))).run()
+    writes = [c for c in commands if "write-flash" in c]
+    assert len(writes) == 2
+    assert writes[0][-2] == "0x20000"
+    assert writes[1][-2] == "0x17000"
+    assert not any("verify-flash" in c or "read-flash" in c for c in commands)
+    assert messages[-1][0] == "done"
+
+
+def test_wrong_device_never_writes(monkeypatch):
+    from serial.tools import list_ports
+    monkeypatch.setattr(repair, "validate_payload", lambda: {})
+    monkeypatch.setattr(list_ports, "comports", lambda: [port(serial="ac:27:6e:a3:0a:59")])
+    calls = []
+    monkeypatch.setattr(repair.Repair, "tool", lambda self, module, args, *a, **kw: calls.append(module) or (0, ""))
+    with pytest.raises(RuntimeError, match="Wrong ESP"):
+        repair.Repair(lambda *_: None).run()
+    assert calls == ["espsecure"]
+
+
 def test_success_requires_actual_poll():
     assert repair.site_result("Poll OK; reason=none; stage=checkpoint_commit") == "online"
     assert repair.site_result("Poll retrying; reason=authentication_rejected") == "auth"
