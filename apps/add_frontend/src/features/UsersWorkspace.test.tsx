@@ -116,6 +116,32 @@ describe('Selected-terminal users workspace', () => {
     expect(screen.getByText(/Hikvision terminal/)).toBeTruthy()
   })
 
+  it('shows the expiring exception without claiming model qualification', async () => {
+    const hik: Device = { ...device, firmware_family: 'hikvision', zkt: {
+      ...device.zkt!, terminal_binding_state: 'CONFIRMED',
+      certification_state: 'PROFILE_EXCEPTION', writes_disabled_reason: null,
+      capabilities: { user_write: true, create_user: true, delete_user: true, user_role_write: false, admin_lease: false, write_exception_expires_at: '2026-10-15T16:00:00Z' },
+    } }
+    vi.stubGlobal('fetch', workspaceFetch({ selectedDevice: hik }))
+    render(<UsersHarness selectedDevice={hik} />)
+    expect(await screen.findByRole('region', { name: 'Temporary terminal write exception' })).toBeTruthy()
+    expect(screen.getByText(/This model is not qualified/)).toBeTruthy()
+    expect((screen.getByRole('button', { name: /Add user/i }) as HTMLButtonElement).disabled).toBe(false)
+  })
+
+  it('disables role changes while allowing exception profile edits', () => {
+    const hik: Device = { ...device, firmware_family: 'hikvision', zkt: {
+      ...device.zkt!, certification_state: 'PROFILE_EXCEPTION',
+      capabilities: { user_write: true, user_role_write: false },
+    } }
+    function DialogHarness() {
+      const toast = useToast()
+      return <UserOperationDialog state={{ mode: 'edit', user: user() }} device={hik} onClose={() => {}} onCommand={() => {}} toast={toast} />
+    }
+    render(<DialogHarness />)
+    expect((screen.getByLabelText(/Terminal role/) as HTMLSelectElement).disabled).toBe(true)
+  })
+
   it('opens the exact missing-CNIC employee from an attendance review deep link', async () => {
     const missingCnic = user({
       id: 10,

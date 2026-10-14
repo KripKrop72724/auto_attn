@@ -521,7 +521,7 @@ class HikvisionTerminalPayload(BaseModel):
     consecutive_poll_failures: int | None = Field(default=None, ge=0)
     durable_poll_cursor: int | None = Field(default=None, ge=0, le=3_000_000_000)
     full_history_required: bool = True
-    profile_command_version: Literal[1, 2] | None = None
+    profile_command_version: Literal[1, 2, 3] | None = None
     light_reconcile: HikvisionLightReconcile | None = None
 
 
@@ -1313,6 +1313,14 @@ class DeviceErrorClearRequest(BaseModel):
     expected_code: str = Field(min_length=1, max_length=120)
     reason: str = Field(min_length=10, max_length=500)
     password: str = Field(min_length=1, max_length=512)
+    idempotency_key: str = Field(min_length=8, max_length=120)
+
+
+class HikvisionWriteExceptionRequest(BaseModel):
+    terminal_serial: str = Field(min_length=1, max_length=120)
+    enabled: bool = False
+    reason: str = Field(min_length=10, max_length=500)
+    password: SecretStr
     idempotency_key: str = Field(min_length=8, max_length=120)
 
 

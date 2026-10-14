@@ -42,7 +42,7 @@ from zk_add.attendance_force_schemas import ForceCheckRequest, ForceStartRequest
 from zk_add.attendance_direct_ords_schemas import DirectOrdsRecheckRequest, DirectOrdsStartRequest
 from zk_add.audit import append_audit
 from zk_add.hikvision_evidence import ObservationIn, preserve_observation
-from zk_add.schemas import HikvisionPolicyRequest
+from zk_add.schemas import HikvisionPolicyRequest, HikvisionWriteExceptionRequest
 from zk_add.attendance_batches import (
     attendance_quarantine_item,
     attendance_quarantine_summary,
@@ -1580,6 +1580,26 @@ def reconciliation_or_404(db: Session, job_id: str) -> ReconciliationJob:
     if row is None:
         raise HTTPException(status_code=404, detail="Reconciliation job not found.")
     return row
+
+
+@app.put("/api/v1/devices/{connector_id}/hikvision-write-exception")
+def configure_hikvision_write_exception(
+    connector_id: str, body: HikvisionWriteExceptionRequest,
+    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+):
+    from zk_add.hikvision_write_exception import configure
+    from zk_add.service import auto_certify_zkt
+    db, context = auth
+    require_step_up(body.password.get_secret_value(), db, context)
+    connector = connector_or_404(db, connector_id)
+    try:
+        result = configure(db, connector, actor=context.username,
+                           **body.model_dump(exclude={"password"}))
+        auto_certify_zkt(db, connector, connector.zkt_device)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    db.commit()
+    return result
 
 
 @app.put("/api/v1/devices/{connector_id}/hikvision-policy")
@@ -4915,6 +4935,8 @@ def serialize_user(
     identity_conflict_members: list[dict[str, str]] | None = None,
     identity_resolution: IdentityConflictResolution | None = None,
 ) -> dict:
+    from zk_add.service import user_profile_is_writable
+
     cnic = decrypt_cnic(row.cnic_encrypted)
     machine_name = decrypt_text(row.machine_name_encrypted) or ""
     if cnic and machine_name:
@@ -4946,10 +4968,7 @@ def serialize_user(
         "observed_at": row.observed_at,
         "machine_name_preview": machine_name or None,
         "current_command_state": "PENDING" if row.current_command_id else None,
-        "read_only": bool(zkt and not (
-            zkt.certification_state == "CERTIFIED" or
-            (zkt.connector.firmware_family == "hikvision" and zkt.certification_state == "PROFILE_PILOT")
-        )),
+        "read_only": bool(zkt and not user_profile_is_writable(zkt.connector, zkt)),
     }
 
 
