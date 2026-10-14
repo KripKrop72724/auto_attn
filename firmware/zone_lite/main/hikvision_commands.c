@@ -58,15 +58,15 @@ hik_result_t hik_profile_command(const add_command_t *command, cJSON **receipt)
 {
     *receipt = NULL;
     const zone_config_t *cfg = zone_config_get();
-    bool temporary_exception = false;
+    bool device_exception = false;
 #ifdef ZONE_LITE_BLD1_REPAIR
     uint8_t mac[6];
-    temporary_exception = cfg->provisioned && esp_read_mac(mac, ESP_MAC_WIFI_STA) == ESP_OK &&
+    device_exception = cfg->provisioned && esp_read_mac(mac, ESP_MAC_WIFI_STA) == ESP_OK &&
         bld1_write_exception(mac, cfg->firmware_family, cfg->zone_id, cfg->zone_device_id,
             cfg->hik_expected_serial, cfg->hik_profile, time(NULL));
 #endif
-    if (!temporary_exception && strcmp(cfg->hik_profile, "ds-k1t342efwx-v3.3.5-220310-poll5-pilot-v1")) return HIK_CONFIGURATION;
-    if (temporary_exception && !strcmp(command->command_type, "UPDATE_USER") &&
+    if (!device_exception && strcmp(cfg->hik_profile, "ds-k1t342efwx-v3.3.5-220310-poll5-pilot-v1")) return HIK_CONFIGURATION;
+    if (device_exception && !strcmp(command->command_type, "UPDATE_USER") &&
         (!command->has_privilege || !command->has_expected_privilege ||
             command->privilege != command->expected_privilege)) return HIK_CONFIGURATION;
     bool create = !strcmp(command->command_type, "CREATE_USER");

@@ -618,8 +618,8 @@ void hikvision_append_telemetry(cJSON *payload)
     }
     cJSON_AddNumberToObject(terminal, "profile_command_version", 2);
 #ifdef ZONE_LITE_BLD1_REPAIR
-    /* Version 3 signals the narrowly bound exception implementation, not qualification. */
-    cJSON_ReplaceItemInObjectCaseSensitive(terminal, "profile_command_version", cJSON_CreateNumber(3));
+    /* Version 4 signals permanent support on the exact BLD1 device, not qualification. */
+    cJSON_ReplaceItemInObjectCaseSensitive(terminal, "profile_command_version", cJSON_CreateNumber(4));
 #endif
     cJSON_AddNumberToObject(terminal, "last_successful_poll_epoch", atomic_load(&last_poll));
     cJSON_AddNumberToObject(terminal, "poll_error", atomic_load(&poll_error));

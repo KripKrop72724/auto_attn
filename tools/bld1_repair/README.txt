@@ -1,19 +1,20 @@
 BLD1 ESP LOGIN REPAIR — Windows 10/11 x64
 
-VERSION 1.0.4: adds the operator-requested, exact-device profile-write exception.
-Expires 15 October 2026 at 21:00 PKT / 16:00 UTC. ADD must separately approve it.
+VERSION 1.0.5: permanent, owner-requested profile-write support for this device.
+No automatic expiry. ADD must separately approve the permanent device grant.
+The grant remains revocable by an authorized administrator.
 The terminal's true unverified model profile is retained; this is NOT qualification.
 No terminal user is created, edited or deleted by running this EXE. Administrator
 role changes are excluded. Normal serial/fingerprint/readback guards remain.
 
-Utility version 1.0.4 replaces earlier EXEs. This version skips unsupported
+Utility version 1.0.5 replaces earlier EXEs. This version skips unsupported
 read-mac in Secure Download Mode and contains SDK errors without popup crashes.
 It reports the specific failed configuration checks. A mismatch refuses the
 username change without aborting startup on the verified, provisioned ESP.
 The onsite 1.0.2 diagnostic confirmed that only the stored username differed.
 This revision sets that single field to admin after all identity guards pass;
 it does not require the incorrect old username to equal Admin.
-Check that the window title says BLD1 ESP Repair 1.0.4.
+Check that the window title says BLD1 ESP Repair 1.0.5.
 
 For ONE device only: AC:27:6E:A3:0A:58 / LF-ZONE-BLD1-01.
 Terminal: DS-K1T341AMF, serial G04600476, address 192.168.1.200.
@@ -48,7 +49,7 @@ boot selector are replaced. Previous OTA application bytes are left untouched.
 No HMAC key, signing private key, ADD administrator secret, or terminal password
 is embedded in the utility. Secure Boot is not disabled or re-burned.
 
-The firmware is a targeted derivative of HIK 3.1.1: 3.1.1-bld1fix4. It is not a
+The firmware is a targeted derivative of HIK 3.1.1: 3.1.1-bld1fix5. It is not a
 general production release and must not be used for other ESPs. The device checks
 its hardware MAC, provisioning flag, family, zone, device ID and expected serial
 before touching the single username key. Mismatched identities cannot be

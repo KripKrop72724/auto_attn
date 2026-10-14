@@ -15,9 +15,9 @@ import threading
 import time
 
 TARGET = "ac:27:6e:a3:0a:58"
-UTILITY_VERSION = "1.0.4"
+UTILITY_VERSION = "1.0.5"
 ZONE = "LF-ZONE-BLD1-01"
-MARKER = f"BLD1_REPAIR_VERIFIED r4 mac={TARGET} zone={ZONE} serial=G04600476 user=admin"
+MARKER = f"BLD1_REPAIR_VERIFIED r5 mac={TARGET} zone={ZONE} serial=G04600476 user=admin"
 APP_OFFSET = 0x20000
 APP_SIZE = 0x280000
 OTA_OFFSET = 0x17000
@@ -44,7 +44,7 @@ def usb_mac(port):
 
 def validate_payload(folder=PAYLOAD):
     meta = json.loads((folder / "repair.json").read_text())
-    if meta["target_mac"] != TARGET or meta["zone"] != ZONE or meta["version"] != "3.1.1-bld1fix4":
+    if meta["target_mac"] != TARGET or meta["zone"] != ZONE or meta["version"] != "3.1.1-bld1fix5":
         raise RuntimeError("This repair package is not for this device.")
     required = {"zone-lite-signed.bin", "partition-table.bin", "ota_data_initial.bin", "key-1-public.pem"}
     if set(meta["files"]) != required:
@@ -55,7 +55,7 @@ def validate_payload(folder=PAYLOAD):
     image = (folder / "zone-lite-signed.bin").read_bytes()
     if not 4096 < len(image) <= APP_SIZE or len(image) % 4096:
         raise RuntimeError("Unexpected signed firmware size.")
-    if image[0] != 0xE9 or image[48:80].split(b"\0")[0] != b"3.1.1-bld1fix4" or image[80:112].split(b"\0")[0] != b"zone_lite_hikvision":
+    if image[0] != 0xE9 or image[48:80].split(b"\0")[0] != b"3.1.1-bld1fix5" or image[80:112].split(b"\0")[0] != b"zone_lite_hikvision":
         raise RuntimeError("Unexpected firmware identity.")
     if (folder / "ota_data_initial.bin").read_bytes() != b"\xff" * 8192:
         raise RuntimeError("Unexpected factory boot selection.")
@@ -106,7 +106,7 @@ def site_result(line):
 def repair_diagnostic(line):
     """Decode only fixed boolean fields, never arbitrary serial log contents."""
     keys = ("provisioned", "mac_read", "mac", "family", "zone", "device", "serial")
-    pattern = r"BLD1_REPAIR_DIAG r4 " + " ".join(key + r"=([01])" for key in keys) + r"(?:\s|$)"
+    pattern = r"BLD1_REPAIR_DIAG r5 " + " ".join(key + r"=([01])" for key in keys) + r"(?:\s|$)"
     match = re.search(pattern, clean(line))
     if not match:
         return None
@@ -240,7 +240,7 @@ class Repair:
                             if event:
                                 result = event
                             if verified and result == "online":
-                                self.emit("done", "UPDATE VERIFIED — Hikvision polling succeeded. Ask IT to confirm the device-specific ADD write exception. It expires 15 Oct 2026, 9 PM PKT. No terminal users were modified by this installer.")
+                                self.emit("done", "UPDATE VERIFIED — Permanent device write support installed; Hikvision polling succeeded. The device-specific ADD approval is required. No terminal users were modified by this installer.")
                                 return
                             if not verified and not prompted and time.monotonic() - started > 12:
                                 self.emit("status", "Press RESET once (do not hold BOOT). Keep USB connected while the tool verifies the repair.")
@@ -264,8 +264,8 @@ def main():
     messages = queue.Queue()
     busy = False
     status = tk.StringVar(value="Connect the cable to the ESP socket labelled USB (not COM), then click Repair.")
-    ttk.Label(root, text="LF-ZONE-BLD1-01 • Temporary write support", font=("Segoe UI", 17, "bold")).pack(pady=(20, 8))
-    ttk.Label(root, text="Only ESP AC:27:6E:A3:0A:58 • HIK 3.1.1-bld1fix4\nKeeps Wi-Fi, saved password, serial, security keys and attendance storage.", justify="center").pack()
+    ttk.Label(root, text="LF-ZONE-BLD1-01 • Permanent write support", font=("Segoe UI", 17, "bold")).pack(pady=(20, 8))
+    ttk.Label(root, text="Only ESP AC:27:6E:A3:0A:58 • HIK 3.1.1-bld1fix5\nKeeps Wi-Fi, saved password, serial, security keys and attendance storage.", justify="center").pack()
     ttk.Label(root, textvariable=status, wraplength=700, font=("Segoe UI", 11)).pack(fill="x", padx=25, pady=20)
     progress = ttk.Progressbar(root, mode="indeterminate")
     progress.pack(fill="x", padx=25)
