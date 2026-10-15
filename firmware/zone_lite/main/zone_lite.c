@@ -9332,7 +9332,12 @@ void app_main(void)
     for (;;) {
         uint32_t now = (uint32_t)uptime_ms();
         if (!gateway_handle && worker_retry_allow(&gateway_retry, now)) {
-            if (xTaskCreate(gateway_task, "zone_gateway", 24576, NULL, 5, &gateway_handle) != pdPASS) {
+#if defined(ZONE_LITE_HIKVISION) && ZONE_LITE_HIKVISION
+            const unsigned gateway_stack_bytes = 8192;
+#else
+            const unsigned gateway_stack_bytes = 24576;
+#endif
+            if (xTaskCreate(gateway_task, "zone_gateway", gateway_stack_bytes, NULL, 5, &gateway_handle) != pdPASS) {
                 gateway_handle = NULL;
                 ESP_LOGE(TAG, "Capture worker startup deferred: largest internal block=%u",
                     (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));

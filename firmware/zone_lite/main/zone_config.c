@@ -5,9 +5,13 @@
 
 #include "esp_log.h"
 #include "nvs.h"
+#include "freertos/FreeRTOS.h"
 #ifdef ZONE_LITE_BLD1_REPAIR
 #include "esp_mac.h"
 #include "bld1_repair.h"
+#endif
+#if defined(ZONE_LITE_HIKVISION) && ZONE_LITE_HIKVISION
+#include "hikvision_discovery.h"
 #endif
 
 #include "zone_lite_config.example.h"
@@ -125,6 +129,40 @@ static void copy_default(char *target, size_t size, const char *value)
 {
     strlcpy(target, value ? value : "", size);
 }
+
+static portMUX_TYPE hik_host_lock = portMUX_INITIALIZER_UNLOCKED;
+void zone_config_copy_hik_host(char *host, size_t capacity)
+{
+    if (!host || !capacity) return;
+    portENTER_CRITICAL(&hik_host_lock);
+    strlcpy(host, s_config.hik_host, capacity);
+    portEXIT_CRITICAL(&hik_host_lock);
+}
+#if defined(ZONE_LITE_HIKVISION) && ZONE_LITE_HIKVISION
+esp_err_t zone_config_save_hik_host(const char *verified_host)
+{
+    uint32_t ip;
+    if (!s_config.provisioned || strcmp(s_config.firmware_family, "hikvision") ||
+        !hik_discovery_ipv4(verified_host, &ip)) return ESP_ERR_INVALID_ARG;
+    char previous[64]; zone_config_copy_hik_host(previous, sizeof(previous));
+    if (!strcmp(previous, verified_host)) return ESP_OK;
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open("zone_cfg", NVS_READWRITE, &handle);
+    if (err != ESP_OK) return err;
+    err = nvs_set_str(handle, "hik_host", verified_host);
+    if (err == ESP_OK) err = nvs_commit(handle);
+    char readback[16] = {0}; size_t length = sizeof(readback);
+    if (err == ESP_OK) err = nvs_get_str(handle, "hik_host", readback, &length);
+    nvs_close(handle);
+    if (err == ESP_OK && strcmp(readback, verified_host)) err = ESP_FAIL;
+    if (err == ESP_OK) {
+        portENTER_CRITICAL(&hik_host_lock);
+        copy_default(s_config.hik_host, sizeof(s_config.hik_host), verified_host);
+        portEXIT_CRITICAL(&hik_host_lock);
+    }
+    return err;
+}
+#endif
 
 static void read_string(nvs_handle_t handle, const char *key, char *target, size_t size)
 {
