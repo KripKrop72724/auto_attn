@@ -67,7 +67,10 @@ def permanent_active(connector, terminal):
         and grant.get("expires_epoch") is None
         and grant.get("terminal_serial") == SERIAL and grant.get("connector_id") == CONNECTOR
         and health.get("profile_command_version") == 4
-        and connector.firmware_version in {"3.1.1-bld1fix5", "zone-lite-3.1.1-bld1fix5"}
+        and connector.firmware_version in {
+            "3.1.1-bld1fix5", "zone-lite-3.1.1-bld1fix5",
+            "3.1.1-bld1fix6", "zone-lite-3.1.1-bld1fix6",
+        }
         and terminal.snapshot_complete and terminal.identity_snapshot_stable
     )
 
