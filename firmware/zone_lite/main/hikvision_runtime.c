@@ -2,6 +2,11 @@
 #include "hikvision_http.h"
 #include "hikvision_api.h"
 #include "hikvision_clock.h"
+#include "hikvision_anchor.h"
+#ifdef ZONE_LITE_BLD1_REPAIR
+#include "esp_mac.h"
+#include "bld1_anchor_proof.h"
+#endif
 #include "hikvision_commands.h"
 #include "hikvision_discovery.h"
 #include "nvs.h"
@@ -120,7 +125,7 @@ static bool checkpoint_load(poll_checkpoint_t *state, bool *present)
     char binding[256];
     int n = snprintf(binding, sizeof(binding), "%s\n%s", cfg->hik_expected_serial, cfg->hik_source_epoch);
     if (n < 0 || (size_t)n >= sizeof(binding)) return false;
-    memset(state, 0, sizeof(*state)); state->version = 1;
+    memset(state, 0, sizeof(*state)); state->version = 2;
     mbedtls_sha256((unsigned char *)binding, (size_t)n, state->binding, 0);
     *present = false;
     nvs_handle_t h;
@@ -130,7 +135,7 @@ static bool checkpoint_load(poll_checkpoint_t *state, bool *present)
     poll_checkpoint_t stored; size_t size = sizeof(stored);
     err = nvs_get_blob(h, "checkpoint", &stored, &size); nvs_close(h);
     if (err == ESP_ERR_NVS_NOT_FOUND) return true;
-    if (err != ESP_OK || size != sizeof(stored) || stored.version != 1 ||
+    if (err != ESP_OK || size != sizeof(stored) || (stored.version != 1 && stored.version != 2) ||
         stored.serial > 3000000000U || memcmp(stored.binding, state->binding, 32)) return false;
     *state = stored; *present = true; return true;
 }
@@ -141,6 +146,33 @@ static bool checkpoint_save(const poll_checkpoint_t *state)
     esp_err_t err = nvs_set_blob(h, "checkpoint", state, sizeof(*state));
     if (err == ESP_OK) err = nvs_commit(h);
     nvs_close(h); return err == ESP_OK;
+}
+static bool checkpoint_backup(const poll_checkpoint_t *state)
+{
+    nvs_handle_t h;
+    if (nvs_open("hik_poll",NVS_READWRITE,&h)!=ESP_OK) return false;
+    poll_checkpoint_t previous;size_t size=sizeof(previous);
+    esp_err_t err=nvs_get_blob(h,"legacy_v1",&previous,&size);
+    if(err==ESP_ERR_NVS_NOT_FOUND) {
+        err=nvs_set_blob(h,"legacy_v1",state,sizeof(*state));
+        if(err==ESP_OK)err=nvs_commit(h);
+    } else if(err==ESP_OK && (size!=sizeof(previous) || previous.version!=1 ||
+        memcmp(previous.binding,state->binding,32)))err=ESP_FAIL;
+    nvs_close(h);return err==ESP_OK;
+}
+static const unsigned char *checkpoint_approved_anchor(const poll_checkpoint_t *state)
+{
+#ifdef ZONE_LITE_BLD1_REPAIR
+    uint8_t mac[6];
+    const zone_config_t *cfg=zone_config_get();
+    if(cfg->provisioned && !strcmp(cfg->firmware_family,"hikvision") &&
+        esp_read_mac(mac,ESP_MAC_WIFI_STA)==ESP_OK)
+        return bld1_anchor_proof(mac,cfg->zone_id,cfg->zone_device_id,cfg->hik_expected_serial,
+            cfg->hik_source_epoch,state->serial,state->version,state->anchor);
+#else
+    (void)state;
+#endif
+    return NULL;
 }
 static bool preserve(void *context, const char *body, size_t length)
 {
@@ -226,22 +258,36 @@ typedef struct {
     unsigned char observed_anchor[32];
     const char *channel;
     const unsigned char *expected_anchor;
+    const unsigned char *approved_anchor;
+    bool (*digest_record)(const char *,size_t,unsigned char *);
+    bool legacy_anchor, legacy_upgraded;
     unsigned count;
     bool anchor_seen, anchor_conflict;
 } page_context_t;
 static bool poll_record(void *context, const char *body, size_t length)
 {
     page_context_t *page = context;
+    unsigned char stable[32];
+    if(page->digest_record && !page->digest_record(body,length,stable))return false;
     if (page->expected_anchor && !page->anchor_seen) {
         unsigned char digest[32];
         mbedtls_sha256((const unsigned char *)body, length, digest, 0);
         memcpy(page->observed_anchor, digest, sizeof(digest));
-        page->anchor_conflict = memcmp(digest, page->expected_anchor, 32) != 0;
+        bool match=page->legacy_anchor ? !memcmp(digest,page->expected_anchor,32) :
+            !memcmp(page->digest_record?stable:digest,page->expected_anchor,32);
+        if(!match && page->legacy_anchor && page->approved_anchor && page->digest_record)
+            match=!memcmp(stable,page->approved_anchor,32);
+        page->anchor_conflict = !match;
         page->anchor_seen = !page->anchor_conflict;
+        if(match && page->legacy_anchor && page->digest_record) {
+            if(!preserve(page->channel?page->channel:"POLL",body,length))return false;
+            memcpy(page->digest,stable,32);page->legacy_upgraded=true;
+        }
         return page->anchor_seen;
     }
     if (!preserve(page->channel ? page->channel : "POLL", body, length)) return false;
-    mbedtls_sha256((const unsigned char *)body, length, page->digest, 0);
+    if(page->digest_record)memcpy(page->digest,stable,32);
+    else mbedtls_sha256((const unsigned char *)body, length, page->digest, 0);
     page->count++;
     return true;
 }
@@ -295,6 +341,8 @@ static void poll_task(void *arg)
             hik_search_t search; hik_search_init(&search, begin, 3000000000U);
             page_context_t page = {
                 .expected_anchor = present && cursor.serial ? cursor.anchor : NULL,
+                .digest_record = hik_anchor_digest, .legacy_anchor = cursor.version == 1,
+                .approved_anchor = checkpoint_approved_anchor(&cursor),
             };
             stage = 3;
             result = hik_history_page(&search, poll_record, &page);
@@ -312,14 +360,16 @@ static void poll_task(void *arg)
                 (void)add_connector_log("WARN", "hikvision", "HIK_ANCHOR_MISMATCH", message);
                 last_anchor_report_us = started;
             }
-            if (result == HIK_OK && (page.count || !present)) {
+            if (result == HIK_OK && (page.count || !present || page.legacy_upgraded)) {
                 poll_checkpoint_t next = cursor;
+                next.version = 2;
                 if (page.count) {
                     next.serial = search.previous_serial;
                     memcpy(next.anchor, page.digest, sizeof(next.anchor));
                 }
+                else if(page.legacy_upgraded)memcpy(next.anchor,page.digest,32);
                 stage = 4;
-                if (!checkpoint_save(&next)) result = HIK_CUSTODY;
+                if ((present && cursor.version==1 && !checkpoint_backup(&cursor)) || !checkpoint_save(&next)) result = HIK_CUSTODY;
                 else { cursor = next; present = true; }
             }
         } else if (result == HIK_OK) result = HIK_BINDING;
@@ -390,7 +440,7 @@ static bool light_load(void)
 {
     poll_checkpoint_t live; bool present;
     if (!checkpoint_load(&live, &present)) return false;
-    light_checkpoint_t state = {.version = 1};
+    light_checkpoint_t state = {.version = 2};
     memcpy(state.binding, live.binding, 32);
     nvs_handle_t h;
     esp_err_t err = nvs_open("hik_light", NVS_READONLY, &h);
@@ -399,7 +449,7 @@ static bool light_load(void)
         light_checkpoint_t stored; size_t size = sizeof(stored);
         err = nvs_get_blob(h, "checkpoint", &stored, &size); nvs_close(h);
         if (err != ESP_ERR_NVS_NOT_FOUND) {
-            if (err != ESP_OK || size != sizeof(stored) || stored.version != 1 ||
+            if (err != ESP_OK || size != sizeof(stored) || (stored.version != 1 && stored.version != 2) ||
                 memcmp(stored.binding, state.binding, 32) || stored.last > 3000000000U ||
                 stored.cursor > stored.last || (stored.last && (!stored.first || stored.first > stored.last))) return false;
             state = stored;
@@ -462,11 +512,14 @@ static void light_step(void)
         return;
     }
     hik_search_t search; hik_search_init(&search, next.cursor ? next.cursor : next.first, next.last);
-    page_context_t page = {.channel = "HISTORY", .expected_anchor = next.cursor ? next.anchor : NULL};
+    page_context_t page = {.channel = "HISTORY", .expected_anchor = next.cursor ? next.anchor : NULL,
+        .digest_record=hik_anchor_digest,.legacy_anchor=next.version==1};
     hik_result_t result = hik_history_page(&search, poll_record, &page);
     if (page.anchor_conflict || (result == HIK_OK && page.expected_anchor && !page.anchor_seen)) result = HIK_BINDING;
     if (result != HIK_OK) { light_report(result == HIK_BINDING ? LIGHT_BLOCKED : LIGHT_RETRY, result); return; }
     if (page.count) { next.cursor = search.previous_serial; memcpy(next.anchor, page.digest, 32); next.scanned += page.count; }
+    else if(page.legacy_upgraded)memcpy(next.anchor,page.digest,32);
+    next.version=2;
     if (search.complete) { next.first = next.last = next.cursor = 0; next.completed_epoch = epoch; }
     if (!light_store(&next)) { light_report(LIGHT_RETRY, HIK_CUSTODY); return; }
     light_checkpoint = next;

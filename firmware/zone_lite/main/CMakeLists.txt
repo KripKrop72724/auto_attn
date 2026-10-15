@@ -25,7 +25,7 @@ if(ZONE_LITE_FAMILY STREQUAL "hikvision")
     if(NOT CONFIG_ESP_HTTP_CLIENT_ENABLE_DIGEST_AUTH OR NOT CONFIG_MBEDTLS_DEFAULT_MEM_ALLOC)
         message(FATAL_ERROR "Hikvision requires Digest authentication and PSRAM-capable TLS allocation; regenerate sdkconfig with sdkconfig.hikvision.defaults")
     endif()
-    target_sources(${COMPONENT_LIB} PRIVATE "hikvision_clock.c" "hikvision_stream.c" "hikvision_http.c" "hikvision_api.c" "hikvision_commands.c" "hikvision_runtime.c" "hikvision_discovery.c" "hikvision_discovery_net.c")
+    target_sources(${COMPONENT_LIB} PRIVATE "hikvision_clock.c" "hikvision_anchor.c" "hikvision_stream.c" "hikvision_http.c" "hikvision_api.c" "hikvision_commands.c" "hikvision_runtime.c" "hikvision_discovery.c" "hikvision_discovery_net.c")
     target_compile_definitions(${COMPONENT_LIB} PRIVATE ZONE_LITE_HIKVISION=1)
 endif()
 
