@@ -1,6 +1,7 @@
 """Fixed-device, database-enforced read-only attendance diagnostics. No raw PII output."""
 import hashlib
 import json
+from datetime import datetime
 
 from sqlalchemy import func, select, text
 
@@ -42,9 +43,14 @@ with SessionLocal() as session:
         event = root.get("AccessControllerEvent", root)
         allowed = ("serialNo", "major", "minor", "majorEventType", "subEventType",
                    "time", "currentEvent", "currentVerifyMode", "attendanceStatus")
+        stable = None
+        if "time" in event and all(key in event for key in ("serialNo", "major", "minor")):
+            instant = int(datetime.fromisoformat(event["time"]).timestamp())
+            stable = hashlib.sha256((f'HIK_ANCHOR_V2\n{event["serialNo"]}\n{event["major"]}\n{event["minor"]}\n{event.get("employeeNoString") or ""}\n{instant}').encode()).hexdigest()
         print(json.dumps({"evidence_id": evidence.id, "source_epoch": evidence.source_epoch,
             "channel": evidence.channel, "disposition": evidence.disposition,
             "observation_sha256": evidence.observation_sha256,
+            "stable_anchor_v2": stable,
             "raw_sha256_matches": hashlib.sha256(raw.encode()).hexdigest() == evidence.observation_sha256,
             "root_time": root.get("dateTime"), "fields": sorted(event),
             "metadata": {key: event[key] for key in allowed if key in event}}))
