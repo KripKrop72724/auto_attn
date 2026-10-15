@@ -117,6 +117,10 @@ hik_result_t hik_history_page(hik_search_t *s, hik_record_fn fn, void *context)
     /* Search positions belong to a short-lived terminal session. Resume from
      * the durable source serial, with a fresh session and position zero. */
     for (unsigned i = 0; i < 4; i++) snprintf(s->search_id + i * 8, 9, "%08lx", (unsigned long)esp_random());
+    uint32_t wanted=s->previous_serial?s->previous_serial+1:s->first_serial;
+    /* One-record overlap supports terminals that interpret beginSerialNo as
+     * inclusive or exclusive. Only the exact predecessor may be discarded. */
+    uint32_t request_begin=wanted-1;
     cJSON *body = cJSON_CreateObject();
     cJSON *cond = body ? cJSON_AddObjectToObject(body, "AcsEventCond") : NULL;
     bool valid = cond && cJSON_AddStringToObject(cond, "searchID", s->search_id) &&
@@ -124,7 +128,7 @@ hik_result_t hik_history_page(hik_search_t *s, hik_record_fn fn, void *context)
         cJSON_AddNumberToObject(cond, "maxResults", 20) &&
         cJSON_AddNumberToObject(cond, "major", 0) && cJSON_AddNumberToObject(cond, "minor", 0) &&
         cJSON_AddBoolToObject(cond, "picEnable", false) &&
-        cJSON_AddNumberToObject(cond, "beginSerialNo", s->previous_serial ? s->previous_serial + 1 : s->first_serial) &&
+        cJSON_AddNumberToObject(cond, "beginSerialNo", request_begin) &&
         cJSON_AddNumberToObject(cond, "endSerialNo", s->last_serial);
     cJSON *response = NULL;
     hik_result_t result = valid ? request_json(HTTP_METHOD_POST,
@@ -139,23 +143,32 @@ hik_result_t hik_history_page(hik_search_t *s, hik_record_fn fn, void *context)
     valid = id && !strcmp(id, s->search_id) && status &&
         integer(cJSON_GetObjectItemCaseSensitive(page, "numOfMatches"), &count) &&
         integer(cJSON_GetObjectItemCaseSensitive(page, "totalMatches"), &total) &&
-        count <= 20 && s->position <= 150000 && total <= 150000 - s->position && count <= total &&
+        count <= 20 && s->position <= 150000 && count <= total &&
         (cJSON_IsArray(rows) || (!count && !rows)) &&
-        (uint32_t)cJSON_GetArraySize(rows) == count && (!s->total_known || s->total == total + s->position);
+        (uint32_t)cJSON_GetArraySize(rows) == count;
+    uint32_t overlap=0,first_returned=0;
+    if(valid && count && integer(cJSON_GetObjectItemCaseSensitive(cJSON_GetArrayItem(rows,0),"serialNo"),&first_returned)
+        && first_returned==request_begin)overlap=1;
+    count-=overlap;total-=overlap;
+    valid=valid && total<=150000-s->position && (!s->total_known || s->total==total+s->position);
     bool end = valid && count == total &&
         (!strcmp(status, "OK") || (!strcmp(status, "NO MATCH") && !count && !total));
     valid = valid && (end || (count && !strcmp(status, "MORE") && count < total));
     uint32_t previous = s->previous_serial;
+    unsigned index=0;
     cJSON *row;
     cJSON_ArrayForEach(row, rows) {
         uint32_t serial;
+        if(index++<overlap)continue;
         if (!integer(cJSON_GetObjectItemCaseSensitive(row, "serialNo"), &serial) ||
             serial < s->first_serial || serial > s->last_serial || serial <= previous) { valid = false; break; }
         previous = serial;
     }
     if (!valid) result = HIK_PARSE;
     else {
+        index=0;
         cJSON_ArrayForEach(row, rows) {
+            if(index++<overlap)continue;
             char *raw = cJSON_PrintUnformatted(row);
             bool saved = raw && fn(context, raw, strlen(raw));
             free(raw);

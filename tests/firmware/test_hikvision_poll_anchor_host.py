@@ -24,6 +24,10 @@ static void mbedtls_sha256(const unsigned char *body,size_t n,unsigned char *out
 static bool preserve(const char *channel,const char *body,size_t n){
  assert(!strcmp(channel,"POLL"));assert(body && n);++writes;return custody_ok;
 }
+static bool immutable(const char *body,size_t n,unsigned char out[32]){
+ (void)n;const char *facts=strncmp(body,"committed source record",23)?"different facts":"immutable facts";
+ mbedtls_sha256((const unsigned char*)facts,strlen(facts),out,0);return true;
+}
 /* PRODUCTION */
 int main(void){
  const char *anchor="committed source record", *fresh="new source record";
@@ -46,6 +50,18 @@ int main(void){
  p=(page_context_t){.expected_anchor=expected};
  assert(poll_record(&p,anchor,strlen(anchor)));custody_ok=false;
  assert(!poll_record(&p,fresh,strlen(fresh)));assert(!p.count);
+ custody_ok=true;writes=0;
+ unsigned char fixed[32];immutable(anchor,strlen(anchor),fixed);
+ const char *presentation="committed source record changed picture URL";
+ p=(page_context_t){.expected_anchor=expected,.legacy_anchor=true,.digest_record=immutable};
+ assert(!poll_record(&p,presentation,strlen(presentation))&&!writes); /* no unproved upgrade */
+ p=(page_context_t){.expected_anchor=expected,.approved_anchor=fixed,.legacy_anchor=true,.digest_record=immutable};
+ assert(poll_record(&p,presentation,strlen(presentation))&&p.legacy_upgraded&&writes==1&&!p.count);
+ assert(!memcmp(p.digest,fixed,32)); /* new checkpoint can commit without a new punch */
+ p=(page_context_t){.expected_anchor=expected,.approved_anchor=fixed,.legacy_anchor=true,.digest_record=immutable};writes=0;
+ assert(!poll_record(&p,fresh,strlen(fresh))&&!writes); /* changed facts remain blocked */
+ p=(page_context_t){.expected_anchor=fixed,.digest_record=immutable};
+ assert(poll_record(&p,presentation,strlen(presentation))&&!p.legacy_upgraded&&!writes);
  return 0;
 }
 '''

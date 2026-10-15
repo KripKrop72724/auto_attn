@@ -47,6 +47,7 @@ static bool qs_snapshot(int lane,uint32_t*n){assert(lane==7);*n=depth;return tru
 static const char*hik_reason(hik_result_t r){(void)r;return "reason";}
 static bool add_connector_log(const char*a,const char*b,const char*c,const char*d){(void)a;(void)b;(void)c;assert(d);return true;}
 static void mbedtls_sha256(const unsigned char*p,size_t n,unsigned char*out,int mode){(void)mode;memset(out,0,32);for(size_t i=0;i<n;i++)out[i%32]^=p[i];}
+static bool hik_anchor_digest(const char*p,size_t n,unsigned char*out){mbedtls_sha256((const unsigned char*)p,n,out,0);return true;}
 static bool preserve(const char*channel,const char*body,size_t n){assert(!strcmp(channel,"HISTORY"));assert(body&&n);if(fail_queue)return false;++writes;return true;}
 typedef struct {uint32_t first_serial,last_serial,previous_serial;bool complete;} hik_search_t;
 static void hik_search_init(hik_search_t*s,uint32_t first,uint32_t end){*s=(hik_search_t){.first_serial=first,.last_serial=end};}
