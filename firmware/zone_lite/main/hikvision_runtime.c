@@ -36,6 +36,10 @@ static atomic_bool profiles_active;
 static atomic_bool uploader_started, uploader_waiting, uploader_buffer_ready;
 static atomic_uint uploader_tick, poll_tick, history_tick;
 static atomic_bool checkpoint_ready, runtime_workers_started;
+static bool terminal_reachable(void)
+{
+    return atomic_load(&reachable) || atomic_load(&stream_open);
+}
 typedef struct { int64_t device_epoch, sampled_epoch, sampled_us; bool valid; } clock_sample_t;
 static clock_sample_t clock_sample;
 static portMUX_TYPE clock_mux = portMUX_INITIALIZER_UNLOCKED;
@@ -188,8 +192,39 @@ static const char *hik_reason(hik_result_t result)
         "invalid_response", "durable_storage_failed"};
     return (unsigned)result < sizeof(reasons) / sizeof(reasons[0]) ? reasons[result] : "unknown";
 }
+#ifdef ZONE_LITE_BLD1_REPAIR
+/* The retained-history guard remains intact. Live capture owns an independent,
+ * serial-authenticated read-only connection and uses the existing durable queue. */
+static void live_stream_state(bool open)
+{
+    atomic_store(&stream_open, open);
+    if (open) {
+        ESP_LOGI(TAG, "HIK_LIVE_STREAM_CONNECTED serial=G04600476; history verification remains separate");
+        (void)add_connector_log("INFO", "hikvision", "HIK_LIVE_STREAM_CONNECTED",
+            "Serial-authenticated live stream connected; retained-history verification remains outstanding");
+    }
+}
+static void live_stream_task(void *argument)
+{
+    (void)argument;
+    for (;;) {
+        if (atomic_load(&poll_error) != HIK_BINDING || atomic_load(&poll_stage) != 3 ||
+            atomic_load(&poll_failures) < 2 || !add_connector_is_connected()) {
+            vTaskDelay(pdMS_TO_TICKS(5000)); continue;
+        }
+        hik_result_t result = hik_http_stream_with_state(preserve, "STREAM", live_stream_state);
+        atomic_store(&stream_error, result);
+        char message[128];
+        snprintf(message, sizeof(message), "Live stream retrying; reason=%s; durable records retained", hik_reason(result));
+        ESP_LOGW(TAG, "%s", message);
+        (void)add_connector_log("WARN", "hikvision", "HIK_LIVE_STREAM_RETRY", message);
+        vTaskDelay(pdMS_TO_TICKS(5000));
+    }
+}
+#endif
 typedef struct {
     unsigned char digest[32];
+    unsigned char observed_anchor[32];
     const char *channel;
     const unsigned char *expected_anchor;
     unsigned count;
@@ -201,6 +236,7 @@ static bool poll_record(void *context, const char *body, size_t length)
     if (page->expected_anchor && !page->anchor_seen) {
         unsigned char digest[32];
         mbedtls_sha256((const unsigned char *)body, length, digest, 0);
+        memcpy(page->observed_anchor, digest, sizeof(digest));
         page->anchor_conflict = memcmp(digest, page->expected_anchor, 32) != 0;
         page->anchor_seen = !page->anchor_conflict;
         return page->anchor_seen;
@@ -216,6 +252,7 @@ static void poll_task(void *arg)
     poll_checkpoint_t cursor = {0};
     bool loaded = false, present = false;
     int64_t clock_checked_us = -60000000, last_report_us = -60000000, last_start_us = 0;
+    int64_t last_anchor_report_us = -60000000;
     hik_result_t previous_result = HIK_CONFIGURATION;
     led_status_t previous_led = LED_STATUS_BOOTING;
     for (;;) {
@@ -264,6 +301,18 @@ static void poll_task(void *arg)
             result = hik_history_page(&search, poll_record, &page);
             if (page.anchor_conflict || (result == HIK_OK && page.expected_anchor && !page.anchor_seen))
                 result = HIK_BINDING;
+            if (page.anchor_conflict && started - last_anchor_report_us >= 60000000) {
+                char expected[65], observed[65], message[224];
+                for (unsigned i = 0; i < 32; i++) {
+                    snprintf(expected + i * 2, 3, "%02x", cursor.anchor[i]);
+                    snprintf(observed + i * 2, 3, "%02x", page.observed_anchor[i]);
+                }
+                snprintf(message, sizeof(message), "HIK_ANCHOR_MISMATCH cursor=%lu expected_sha256=%s observed_sha256=%s; original checkpoint retained",
+                    (unsigned long)cursor.serial, expected, observed);
+                ESP_LOGW(TAG, "%s", message);
+                (void)add_connector_log("WARN", "hikvision", "HIK_ANCHOR_MISMATCH", message);
+                last_anchor_report_us = started;
+            }
             if (result == HIK_OK && (page.count || !present)) {
                 poll_checkpoint_t next = cursor;
                 if (page.count) {
@@ -609,9 +658,9 @@ void hikvision_append_telemetry(cJSON *payload)
     cJSON_AddStringToObject(terminal, "ip_address", host);
     cJSON_AddStringToObject(terminal, "capability_profile", cfg->hik_profile);
     cJSON_AddStringToObject(terminal, "qualification_state", "NOT_QUALIFIED");
-    cJSON_AddBoolToObject(terminal, "online", atomic_load(&reachable));
-    cJSON_AddStringToObject(terminal, "connection_state", atomic_load(&reachable) ? "ONLINE" : "OFFLINE");
-    cJSON_AddStringToObject(terminal, "capture_mode", "poll");
+    cJSON_AddBoolToObject(terminal, "online", terminal_reachable());
+    cJSON_AddStringToObject(terminal, "connection_state", terminal_reachable() ? "ONLINE" : "OFFLINE");
+    cJSON_AddStringToObject(terminal, "capture_mode", atomic_load(&stream_open) ? "stream" : "poll");
     cJSON_AddNumberToObject(terminal, "poll_interval_seconds", 2);
     cJSON_AddNumberToObject(terminal, "poll_count", atomic_load(&poll_count));
     cJSON_AddNumberToObject(terminal, "last_poll_interval_ms", atomic_load(&last_poll_interval_ms));
@@ -678,6 +727,9 @@ void hikvision_gateway_task(void *argument)
 {
     (void)argument;
     TaskHandle_t stream = NULL, uploader = NULL, history = NULL, profiles = NULL;
+#ifdef ZONE_LITE_BLD1_REPAIR
+    TaskHandle_t live = NULL;
+#endif
     while (!request_lock || !source_upload_lock || !profile_commands) {
         if (!request_lock) request_lock = xSemaphoreCreateMutex();
         if (!source_upload_lock) source_upload_lock = xSemaphoreCreateMutex();
@@ -695,6 +747,10 @@ void hikvision_gateway_task(void *argument)
         if (!stream && xTaskCreate(poll_task, "hik_poll", 8192, NULL, 5, &stream) != pdPASS) stream = NULL;
         if (!history && xTaskCreate(history_task, "hik_history", 8192, NULL, 3, &history) != pdPASS) history = NULL;
         if (!profiles && xTaskCreate(profile_task, "hik_profiles", 8192, NULL, 2, &profiles) != pdPASS) profiles = NULL;
+#ifdef ZONE_LITE_BLD1_REPAIR
+        if (uploader && stream && history && profiles && !live &&
+            xTaskCreate(live_stream_task, "hik_live", 8192, NULL, 4, &live) != pdPASS) live = NULL;
+#endif
         atomic_store(&runtime_workers_started, stream && history && profiles && uploader);
         if (!stream || !history || !profiles || !uploader) {
             led_status_fault(LED_STATUS_LOCAL_FAILURE);
