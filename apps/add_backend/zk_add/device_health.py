@@ -264,12 +264,26 @@ def terminal_link(connector: Connector, now: datetime | None = None, *,
     return _link("UNKNOWN", raw, zkt.last_transition_at, raw, "The terminal link state was not reported.")
 
 
+def hikvision_live_capture_ready(health: dict, now: datetime) -> bool:
+    message_time = _epoch(health.get("last_stream_message_epoch"))
+    age = _age(now, message_time)
+    return (
+        health.get("capture_mode") == "stream" and health.get("stream_open") is True
+        and health.get("stream_error") == 0 and health.get("source_storage_failures") == 0
+        and age is not None and 0 <= age <= 90
+    )
+
+
 def _hikvision_link(zkt: ZKTDevice, raw: str, now: datetime, uptime_seconds: float | None) -> dict:
     health = (zkt.capability_profile or {}).get("hikvision_health") or {}
     try:
         error = int(health.get("poll_error") or 0)
     except (TypeError, ValueError):
         error = 0
+    if (raw == "ONLINE" and error == 6 and health.get("poll_stage") == "events"
+            and hikvision_live_capture_ready(health, now)):
+        return _link("CONNECTED", raw, zkt.last_transition_at, "HIK_LIVE_CAPTURE",
+                     "Live Hikvision capture is connected; retained-history verification requires review.")
     if error not in {0, 2, 8}:
         reason = HIK_POLL_ERRORS.get(error, "HIK_POLL_ERROR")
         return _link("ERROR", raw, zkt.last_transition_at, reason,

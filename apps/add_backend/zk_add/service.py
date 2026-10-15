@@ -1138,6 +1138,10 @@ def update_heartbeat(
             healthy = reported_state == "ONLINE" and error == 0
             if not healthy:
                 suffix, message = reasons.get(error, ("WAITING", "ESP is connected; waiting for the first successful Hikvision terminal check."))
+                from zk_add.device_health import hikvision_live_capture_ready
+                if (reported_state == "ONLINE" and error == 6 and zkt_payload.get("poll_stage") == "events"
+                        and hikvision_live_capture_ready(zkt_payload, now)):
+                    message = "Live Hikvision capture is connected; retained-history verification requires review."
                 code = "HIK_" + suffix
                 connector.lifecycle_state = "DEGRADED"
                 connector.last_error_code, connector.last_error_message = code, message
