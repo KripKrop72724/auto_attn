@@ -27,7 +27,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: zone-lite-firmware-signing-vault
+  group: ${{ inputs.confirmation == 'READ BLD1 ATTENDANCE DIAGNOSTICS' && 'bld1-read-only-attendance-diagnostics' || 'zone-lite-firmware-signing-vault' }}
   cancel-in-progress: false
 
 jobs:
