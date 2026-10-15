@@ -150,9 +150,6 @@ static bool preserve(void *context, const char *body, size_t length)
     cJSON *raw = cJSON_ParseWithLength(body, length);
     cJSON *event = cJSON_GetObjectItemCaseSensitive(raw, "AccessControllerEvent");
     if (event && !strcmp(channel, "STREAM")) {
-        atomic_store(&reachable, true);
-        atomic_store(&stream_open, true);
-        atomic_store(&last_message, time(NULL));
         cJSON *current = cJSON_GetObjectItemCaseSensitive(event, "currentEvent");
         if (cJSON_IsTrue(current)) atomic_fetch_add(&current_events, 1);
         if (cJSON_IsFalse(current)) atomic_fetch_add(&replay_events, 1);
@@ -183,6 +180,7 @@ static bool preserve(void *context, const char *body, size_t length)
             (!strcmp(channel, "STREAM") || !strcmp(channel, "POLL")) ? QS_ADMIT_LIVE : QS_ADMIT_HISTORICAL) == DQ_OK;
     free(payload);
     if (!ok) atomic_fetch_add(&source_failures, 1);
+    else if (!strcmp(channel, "STREAM")) atomic_store(&last_message, time(NULL));
     return ok;
 }
 static const char *hik_reason(hik_result_t result)
@@ -199,6 +197,7 @@ static void live_stream_state(bool open)
 {
     atomic_store(&stream_open, open);
     if (open) {
+        atomic_store(&stream_error, HIK_OK);
         ESP_LOGI(TAG, "HIK_LIVE_STREAM_CONNECTED serial=G04600476; history verification remains separate");
         (void)add_connector_log("INFO", "hikvision", "HIK_LIVE_STREAM_CONNECTED",
             "Serial-authenticated live stream connected; retained-history verification remains outstanding");

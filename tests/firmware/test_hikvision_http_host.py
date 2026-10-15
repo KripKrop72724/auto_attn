@@ -24,6 +24,7 @@ typedef struct {const char *url, *username, *password, *cert_pem; esp_http_clien
  int (*crt_bundle_attach)(void *);} esp_http_client_config_t;
 esp_http_client_handle_t esp_http_client_init(const esp_http_client_config_t *);
 int esp_http_client_set_header(esp_http_client_handle_t,const char *,const char *);
+int esp_http_client_set_timeout_ms(esp_http_client_handle_t,int);
 int esp_http_client_open(esp_http_client_handle_t,int);
 int esp_http_client_write(esp_http_client_handle_t,const char *,int);
 int esp_http_client_fetch_headers(esp_http_client_handle_t);
