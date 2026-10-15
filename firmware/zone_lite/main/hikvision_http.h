@@ -11,6 +11,8 @@ typedef enum {
 hik_result_t hik_http_request(esp_http_client_method_t method, const char *path,
     const char *body, char *response, size_t capacity, size_t *length);
 hik_result_t hik_http_verify_identity(void);
+/* Discovery can authenticate a candidate without changing the active host. */
+hik_result_t hik_http_verify_identity_at(const char *host, int timeout_ms);
 hik_result_t hik_http_stream(hik_message_fn callback, void *context);
 
 /* Read only while holding the serialized terminal-request lock. */

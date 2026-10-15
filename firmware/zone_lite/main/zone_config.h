@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #include "esp_err.h"
@@ -51,6 +52,8 @@ typedef struct {
 
 esp_err_t zone_config_init(void);
 const zone_config_t *zone_config_get(void);
+void zone_config_copy_hik_host(char *host, size_t capacity);
+esp_err_t zone_config_save_hik_host(const char *verified_host);
 bool zone_config_needs_onboarding(void);
 esp_err_t zone_config_save_connector(
     const char *connector_id,

@@ -10900,7 +10900,8 @@ void app_main(void)
 #endif
         if (gateway_admitted && !gateway_handle && worker_retry_allow(&gateway_retry, now)) {
 #if defined(ZONE_LITE_HIKVISION) && ZONE_LITE_HIKVISION
-            if (xTaskCreate(gateway_task, "zone_gateway", 24576, NULL, 5, &gateway_handle) != pdPASS)
+            /* HIK supervises separate workers; it does not run the ZKT parser. */
+            if (xTaskCreate(gateway_task, "zone_gateway", 8192, NULL, 5, &gateway_handle) != pdPASS)
                 gateway_handle = NULL;
 #else
             gateway_handle = worker_stacks_reserved
