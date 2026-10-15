@@ -49,13 +49,15 @@ hik_result_t hik_http_request(esp_http_client_method_t method, const char *path,
         assert(cJSON_GetObjectItem(cond, "searchResultPosition")->valuedouble == 0);
         unsigned begin = (unsigned)cJSON_GetObjectItem(cond, "beginSerialNo")->valuedouble;
         unsigned offset = (begin - 30001 + 1) / 2;
+        if(mode==3 && begin>=30001 && (begin-30001)%2==0)offset++; /* Exclusive lower bound. */
+        unsigned count=150000-offset<20?150000-offset:20;
         cJSON *page = cJSON_AddObjectToObject(out, "AcsEvent");
         cJSON_AddStringToObject(page, "searchID", cJSON_GetObjectItem(cond, "searchID")->valuestring);
-        cJSON_AddNumberToObject(page, "numOfMatches", 20);
+        cJSON_AddNumberToObject(page, "numOfMatches", count);
         cJSON_AddNumberToObject(page, "totalMatches", (mode == 2 && offset ? 150001 : 150000) - offset);
-        cJSON_AddStringToObject(page, "responseStatusStrg", offset + 20 == 150000 ? "OK" : "MORE");
+        cJSON_AddStringToObject(page, "responseStatusStrg", offset + count == 150000 ? "OK" : "MORE");
         cJSON *list = cJSON_AddArrayToObject(page, "InfoList");
-        for (unsigned i = 0; i < 20; i++) {
+        for (unsigned i = 0; i < count; i++) {
             cJSON *r = cJSON_CreateObject();
             cJSON_AddNumberToObject(r, "serialNo", 30001 + (mode == 1 ? i : offset + i) * 2);
             cJSON_AddItemToArray(list, r);
@@ -138,9 +140,11 @@ int main(void)
 {
     test_user_pages();
     hik_search_t s;
-    hik_search_init(&s, 30001, 330000);
-    while (!s.complete) assert(hik_history_page(&s, saved, NULL) == HIK_OK);
-    assert(received == 150000 && s.position == 150000);
+    for(unsigned semantics=0;semantics<2;semantics++){
+        mode=semantics?3:0;received=0;hik_search_init(&s,30001,330000);
+        while(!s.complete)assert(hik_history_page(&s,saved,NULL)==HIK_OK);
+        assert(received==150000 && s.position==150000);
+    }
     for (mode = 1; mode <= 2; mode++) {
         received = 0; hik_search_init(&s, 30001, 330000);
         assert(hik_history_page(&s, saved, NULL) == HIK_OK);
