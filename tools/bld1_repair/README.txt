@@ -1,6 +1,12 @@
 BLD1 ESP LOGIN REPAIR — Windows 10/11 x64
 
 VERSION 1.0.7: attendance recovery, automatic IP recovery and permanent writes.
+History checkpoints now compare event serial, major/minor code, employee number
+and timestamp, excluding mutable display names and picture URLs. Serial searches
+overlap one predecessor to handle inclusive and exclusive device behavior.
+The original BLD1 checkpoint can migrate only when its exact saved raw hash and
+the current record's immutable facts match independently verified ADD evidence.
+The old checkpoint is backed up before migration. Changed facts remain blocked.
 If retained-history verification blocks polling, the exact BLD1 image opens an
 independent, serial-authenticated read-only live stream. Incoming events enter
 the same durable queue and ADD delivery path. The original history checkpoint is
