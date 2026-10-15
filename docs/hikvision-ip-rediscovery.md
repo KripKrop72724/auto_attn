@@ -57,3 +57,24 @@ durably captured stream metadata, an open error-free stream, and healthy source
 storage provide evidence. The history warning stays visible. A stream connection
 is not proof of an attendance row or Oracle delivery; verify one real punch after
 installation. This fallback is compiled only into the targeted BLD1 repair image.
+
+## Stable history anchors
+
+Checkpoint version 2 hashes event serial, major/minor code, exact employee number
+and offset-normalized time. Changes to display names, pictures and JSON field
+order do not change this hash; changes to attendance facts still block the source.
+One predecessor is requested and excluded from delivery to accommodate inclusive
+and exclusive `beginSerialNo` implementations without dropping the saved anchor.
+
+A legacy checkpoint migrates only when its original raw hash still matches the
+returned record, or an exact BLD1 proof matches both the saved raw hash and the
+returned immutable facts. That proof is bound to the physical ESP MAC, zone,
+device, terminal, source epoch and cursor 593441. It was derived from independently
+read ADD evidence 35557; it contains hashes, never employee text. The original
+checkpoint is backed up in encrypted NVS before committing its replacement. A
+failed backup, append or commit leaves the original poll checkpoint active.
+
+Native checks use the pinned cJSON and mbedTLS implementation against independent
+Python hash vectors. They cover metadata changes, changed facts, timezone
+equivalence, leading zeros, malformed fields, exact proof scope, failed backups
+and both serial-search conventions across 150,000 records each.
