@@ -119,7 +119,7 @@ def test_revocation_does_not_change_attendance_policy_or_qualification(target):
     assert not terminal.capability_profile["user_write"]
 
 
-@pytest.mark.parametrize("version,capability", [("3.1.1-bld1fix4", 3), ("3.1.1-bld1fix5", 4), ("3.1.1-bld1fix6", 4)])
+@pytest.mark.parametrize("version,capability", [("3.1.1-bld1fix4", 3), ("3.1.1-bld1fix5", 4), ("3.1.1-bld1fix6", 4), ("3.1.1-bld1fix7", 4)])
 def test_signed_repair_heartbeat_is_accepted_and_keeps_approval(target, version, capability):
     from test_hikvision_clock import heartbeat
     from zk_add.schemas import HeartbeatPayload
@@ -142,7 +142,7 @@ def test_signed_repair_heartbeat_is_accepted_and_keeps_approval(target, version,
         HeartbeatPayload.model_validate(data)
 
 
-@pytest.mark.parametrize("version", ["3.1.1-bld1fix5", "3.1.1-bld1fix6"])
+@pytest.mark.parametrize("version", ["3.1.1-bld1fix5", "3.1.1-bld1fix6", "3.1.1-bld1fix7"])
 def test_permanent_grant_has_no_date_limit_on_verified_permanent_firmware(target, monkeypatch, version):
     session, connector, terminal = target
     request = grant(session, connector, permanent=True)
@@ -167,7 +167,7 @@ def test_permanent_grant_has_no_date_limit_on_verified_permanent_firmware(target
     assert terminal.capability_profile["hikvision_health"]["qualification_state"] == "NOT_QUALIFIED"
 
 
-@pytest.mark.parametrize("version", ["3.1.1-bld1fix5", "3.1.1-bld1fix6"])
+@pytest.mark.parametrize("version", ["3.1.1-bld1fix5", "3.1.1-bld1fix6", "3.1.1-bld1fix7"])
 def test_permanent_grant_can_be_created_and_revoked_after_old_expiry(target, monkeypatch, version):
     session, connector, terminal = target
     monkeypatch.setattr(exception, "now_epoch", lambda: exception.EXPIRES + 86400)

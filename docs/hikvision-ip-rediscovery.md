@@ -37,3 +37,23 @@ Validation includes sanitized native C tests for malformed/spoofed packets,
 authenticated candidate requests, simulated IP changes, failed NVS operations,
 rate limiting and socket cleanup. The packaged Windows executable runs signature,
 payload and GUI smoke tests. Physical recovery must be verified after USB install.
+
+## BLD1 attendance recovery 1.0.7
+
+The exact BLD1 repair image (`3.1.1-bld1fix7`) can open an independent, read-only
+ISAPI alert stream when its retained-history anchor blocks polling. It verifies
+the saved serial with Digest authentication before subscribing. The stream owns
+its client, does not overwrite poll HTTP diagnostics, and allows 45 seconds for
+idle heartbeats. It reconnects indefinitely without a trial expiry.
+
+Live metadata enters the existing durable source queue and ADD receipt path.
+Original history checkpoints, source bindings and all attendance storage remain
+intact. New anchor diagnostics log only cursor and hashes, never event identities.
+ADD still requires an operator-approved event mapping, valid identity/time and
+durable custody before attendance can be released. A source conflict remains held.
+
+ADD reports a live connection while history requires review only when recent
+durably captured stream metadata, an open error-free stream, and healthy source
+storage provide evidence. The history warning stays visible. A stream connection
+is not proof of an attendance row or Oracle delivery; verify one real punch after
+installation. This fallback is compiled only into the targeted BLD1 repair image.

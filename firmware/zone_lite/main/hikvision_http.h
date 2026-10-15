@@ -14,6 +14,9 @@ hik_result_t hik_http_verify_identity(void);
 /* Discovery can authenticate a candidate without changing the active host. */
 hik_result_t hik_http_verify_identity_at(const char *host, int timeout_ms);
 hik_result_t hik_http_stream(hik_message_fn callback, void *context);
+/* State reports a serial-verified, valid MIME connection and every close. */
+hik_result_t hik_http_stream_with_state(hik_message_fn callback, void *context,
+    void (*state)(bool open));
 
 /* Read only while holding the serialized terminal-request lock. */
 int hik_http_last_status(void);

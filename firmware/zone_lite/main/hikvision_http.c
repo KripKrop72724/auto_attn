@@ -32,10 +32,10 @@ static bool config_valid(void)
     return true;
 }
 static hik_result_t open_request_at(esp_http_client_method_t method, const char *path,
-    const char *body, const char *host, int timeout_ms, bool require_digest, headers_t *headers, esp_http_client_handle_t *out)
+    const char *body, const char *host, int timeout_ms, bool require_digest, bool report_status, headers_t *headers, esp_http_client_handle_t *out)
 {
     *out = NULL;
-    last_http_status = 0;
+    if (report_status) last_http_status = 0;
     if (!config_valid() || !host || !*host || strlen(host) >= 64 ||
         strspn(host, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-") != strlen(host) ||
         timeout_ms < 1000 || timeout_ms > 10000 || !path ||
@@ -61,7 +61,7 @@ static hik_result_t open_request_at(esp_http_client_method_t method, const char 
     for (unsigned attempt = 0; attempt < 3; attempt++) {
         /* A transport failure during Digest retry is not a rejected password. */
         result = HIK_NETWORK;
-        last_http_status = 0;
+        if (report_status) last_http_status = 0;
         memset(headers, 0, sizeof(*headers));
         size_t size = body ? strlen(body) : 0;
         if (size > 32768 || esp_http_client_open(client, (int)size) != ESP_OK) break;
@@ -73,7 +73,7 @@ static hik_result_t open_request_at(esp_http_client_method_t method, const char 
         }
         if (sent != size || esp_http_client_fetch_headers(client) < 0) break;
         int status = esp_http_client_get_status_code(client);
-        last_http_status = status;
+        if (report_status) last_http_status = status;
         if (status == 200) {
             if (require_digest && !authenticated) { result = HIK_AUTH; break; }
             *out = client; return HIK_OK;
@@ -103,20 +103,14 @@ static hik_result_t open_request_at(esp_http_client_method_t method, const char 
     esp_http_client_cleanup(client);
     return result;
 }
-static hik_result_t open_request(esp_http_client_method_t method, const char *path,
-    const char *body, headers_t *headers, esp_http_client_handle_t *out)
-{
-    char host[64]; zone_config_copy_hik_host(host, sizeof(host));
-    return open_request_at(method, path, body, host, 10000, false, headers, out);
-}
 static hik_result_t request_at(esp_http_client_method_t method, const char *path,
-    const char *body, const char *host, int timeout_ms, bool require_digest, char *response, size_t capacity, size_t *length)
+    const char *body, const char *host, int timeout_ms, bool require_digest, bool report_status, char *response, size_t capacity, size_t *length)
 {
     if (!response || capacity < 2 || !length) return HIK_CONFIGURATION;
     *length = 0;
     headers_t headers = {0};
     esp_http_client_handle_t client;
-    hik_result_t result = open_request_at(method, path, body, host, timeout_ms, require_digest, &headers, &client);
+    hik_result_t result = open_request_at(method, path, body, host, timeout_ms, require_digest, report_status, &headers, &client);
     if (result != HIK_OK) return result;
     int64_t deadline = esp_timer_get_time() + (int64_t)timeout_ms * 1000;
     for (;;) {
@@ -139,14 +133,14 @@ hik_result_t hik_http_request(esp_http_client_method_t method, const char *path,
     const char *body, char *response, size_t capacity, size_t *length)
 {
     char host[64]; zone_config_copy_hik_host(host, sizeof(host));
-    return request_at(method, path, body, host, 10000, false, response, capacity, length);
+    return request_at(method, path, body, host, 10000, false, true, response, capacity, length);
 }
-static hik_result_t verify_identity_at(const char *host, int timeout_ms, bool require_digest)
+static hik_result_t verify_identity_at(const char *host, int timeout_ms, bool require_digest, bool report_status)
 {
     char *body = malloc(8192);
     if (!body) return HIK_NETWORK;
     size_t length;
-    hik_result_t result = request_at(HTTP_METHOD_GET, "/ISAPI/System/deviceInfo", NULL, host, timeout_ms, require_digest, body, 8192, &length);
+    hik_result_t result = request_at(HTTP_METHOD_GET, "/ISAPI/System/deviceInfo", NULL, host, timeout_ms, require_digest, report_status, body, 8192, &length);
     if (result == HIK_OK) {
         const char *start = strstr(body, "<serialNumber>");
         const char *end = start ? strstr(start + 14, "</serialNumber>") : NULL;
@@ -160,33 +154,51 @@ static hik_result_t verify_identity_at(const char *host, int timeout_ms, bool re
 }
 hik_result_t hik_http_verify_identity_at(const char *host, int timeout_ms)
 {
-    return verify_identity_at(host, timeout_ms, true);
+    return verify_identity_at(host, timeout_ms, true, true);
 }
 hik_result_t hik_http_verify_identity(void)
 {
     char host[64]; zone_config_copy_hik_host(host, sizeof(host));
-    return verify_identity_at(host, 10000, false);
+    return verify_identity_at(host, 10000, false, true);
 }
-hik_result_t hik_http_stream(hik_message_fn callback, void *context)
+hik_result_t hik_http_stream_with_state(hik_message_fn callback, void *context, void (*state)(bool))
 {
-    hik_result_t result = hik_http_verify_identity();
+    if (state) state(false);
+    char host[64]; zone_config_copy_hik_host(host, sizeof(host));
+    /* A long-lived stream owns its client and cannot overwrite poll diagnostics.
+     * Identity and stream use the same copied address even during rediscovery. */
+    hik_result_t result = verify_identity_at(host, 10000, true, false);
     if (result != HIK_OK) return result;
     headers_t headers = {0};
     esp_http_client_handle_t client;
-    result = open_request(HTTP_METHOD_GET, "/ISAPI/Event/notification/alertStream", NULL, &headers, &client);
+    result = open_request_at(HTTP_METHOD_GET, "/ISAPI/Event/notification/alertStream", NULL, host, 10000, true, false, &headers, &client);
     if (result != HIK_OK) return result;
+    /* Some terminal firmwares send idle heartbeats every 30 seconds. Keep the
+     * established read bounded without reconnecting between those heartbeats. */
+    if (esp_http_client_set_timeout_ms(client, 45000) != ESP_OK) {
+        esp_http_client_cleanup(client);
+        return HIK_NETWORK;
+    }
     char boundary[HIK_BOUNDARY_MAX + 1];
     hik_stream_t *parser = malloc(sizeof(*parser));
     if (!parser || !hik_stream_boundary(headers.content_type, boundary) ||
         !hik_stream_init(parser, boundary, callback, context)) result = HIK_PARSE;
-    else for (;;) {
+    else {
+        if (state) state(true);
+        for (;;) {
         char chunk[1024];
         int n = esp_http_client_read(client, chunk, sizeof(chunk));
         if (n <= 0) { result = HIK_NETWORK; break; }
         if (!hik_stream_feed(parser, chunk, n)) { result = HIK_CUSTODY; break; }
         if (parser->oversized) { result = HIK_OVERSIZED; break; }
+        }
     }
+    if (state) state(false);
     free(parser);
     esp_http_client_cleanup(client);
     return result;
+}
+hik_result_t hik_http_stream(hik_message_fn callback, void *context)
+{
+    return hik_http_stream_with_state(callback, context, NULL);
 }

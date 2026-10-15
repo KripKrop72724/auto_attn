@@ -115,3 +115,43 @@ def test_hik_terminal_failure_explained_despite_live_heartbeat(db,error,code,sta
     update_heartbeat(session,connector=connector,boot_id='terminal-fault',sequence=2,payload=p)
     assert connector.lifecycle_state=='ONLINE'
     assert connector.last_error_code is None
+
+
+@pytest.mark.parametrize("fresh", [True, False])
+def test_live_capture_can_connect_while_history_remains_under_review(db, fresh):
+    session, connector = db
+    now = int(datetime.now(timezone.utc).timestamp())
+    p = heartbeat()
+    p.terminal.poll_error = 6
+    p.terminal.poll_stage = "events"
+    p.terminal.stream_open = True
+    p.terminal.capture_mode = "stream"
+    p.terminal.last_stream_message_epoch = now - (5 if fresh else 200)
+    result = update_heartbeat(session, connector=connector, boot_id="live-recovery", sequence=1, payload=p)
+    assert result["terminal_link"]["state"] == ("CONNECTED" if fresh else "ERROR")
+    assert connector.lifecycle_state == "ONLINE_WITH_WARNINGS"
+    assert connector.last_error_code == "HIK_SOURCE_CHANGED"
+    alert = session.scalar(select(DeviceAlert).where(DeviceAlert.code == "HIK_CAPTURE_UNHEALTHY"))
+    assert alert.state == "OPEN"
+    if fresh:
+        assert "Live Hikvision capture is connected" in alert.message
+
+
+@pytest.mark.parametrize("overrides", [
+    {"stream_open": False}, {"stream_error": 2}, {"source_storage_failures": 1},
+    {"capture_mode": "poll"}, {"poll_stage": "identity"}, {"future": True},
+])
+def test_live_capture_does_not_hide_failed_or_unverified_capture(db, overrides):
+    session, connector = db
+    now = int(datetime.now(timezone.utc).timestamp())
+    p = heartbeat()
+    data = p.terminal.model_dump()
+    data.update(poll_error=6, poll_stage="events", capture_mode="stream", stream_open=True,
+                last_stream_message_epoch=now)
+    overrides = dict(overrides)
+    if overrides.pop("future", False):
+        data["last_stream_message_epoch"] = now + 10
+    data.update(overrides)
+    p.terminal = type(p.terminal).model_validate(data)
+    result = update_heartbeat(session, connector=connector, boot_id="failed-live", sequence=1, payload=p)
+    assert result["terminal_link"]["state"] == "ERROR"
