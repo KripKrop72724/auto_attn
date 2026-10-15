@@ -31,6 +31,25 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  bld1-read-only-diagnostics:
+    if: ${{ inputs.confirmation == 'READ BLD1 ATTENDANCE DIAGNOSTICS' && inputs.device_mac == 'ac:27:6e:a3:0a:58' }}
+    runs-on: [self-hosted, Windows, X64]
+    environment: add-production
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Read fixed BLD1 attendance metadata without modifying data
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $script = Get-Content -LiteralPath 'tools/bld1_repair/read_attendance_diagnostics.py' -Raw
+          $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($script))
+          $launcher = "import base64;exec(base64.b64decode('$encoded'))"
+          & docker exec attendance-device-dashboard-add-api-1 python -c $launcher
+          if ($LASTEXITCODE -ne 0) { throw 'Read-only BLD1 diagnostics failed' }
+
   build:
     if: ${{ inputs.confirmation == 'CREATE ADD FIRMWARE VAULT' && inputs.signed_run_id == '' }}
     runs-on: ubuntu-latest
@@ -60,7 +79,7 @@ jobs:
             -w /project/firmware/zone_lite \
             espressif/idf:v5.5.3 \
             bash -lc 'idf.py -B build-bootstrap -D ZONE_LITE_FAMILY=hikvision -D ZONE_LITE_BLD1_REPAIR=ON -D SDKCONFIG=/tmp/zone-lite-bootstrap-sdkconfig build'
-          python scripts/check_firmware_identity.py firmware/zone_lite/build-bootstrap/zone_lite_hikvision.bin --family hikvision --version 3.1.1-bld1fix6
+          python scripts/check_firmware_identity.py firmware/zone_lite/build-bootstrap/zone_lite_hikvision.bin --family hikvision --version 3.1.1-bld1fix7
           python - <<'PY'
           import os
           from pathlib import Path

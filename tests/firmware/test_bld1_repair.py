@@ -55,8 +55,8 @@ def test_complete_secure_rom_flow(monkeypatch, diagnostic_refusal):
     class Connection:
         def __init__(self):
             self.lines = iter([
-                b"BLD1_REPAIR_DIAG r6 provisioned=1 mac_read=1 mac=1 family=1 zone=1 device=1 serial=0",
-                b"BLD1_REPAIR_REFUSED r6: no NVS changes; original configuration retained"
+                b"BLD1_REPAIR_DIAG r7 provisioned=1 mac_read=1 mac=1 family=1 zone=1 device=1 serial=0",
+                b"BLD1_REPAIR_REFUSED r7: no NVS changes; original configuration retained"
             ] if diagnostic_refusal else [repair.MARKER.encode(), b"Poll OK; reason=none; stage=checkpoint_commit"])
         def open(self): pass
         def __enter__(self): return self
@@ -87,7 +87,7 @@ def test_complete_secure_rom_flow(monkeypatch, diagnostic_refusal):
 
 
 def test_diagnostics_never_echo_arbitrary_serial_data():
-    line = "BLD1_REPAIR_DIAG r6 provisioned=1 mac_read=1 mac=1 family=1 zone=0 device=1 serial=1"
+    line = "BLD1_REPAIR_DIAG r7 provisioned=1 mac_read=1 mac=1 family=1 zone=0 device=1 serial=1"
     assert repair.repair_diagnostic(line + " secret=never-display") == "Configuration checks that do NOT match: zone."
     assert repair.repair_diagnostic(line.replace("serial=1", "serial=secret")) is None
     assert repair.repair_diagnostic("wifi password=never-display") is None
@@ -96,7 +96,7 @@ def test_diagnostics_never_echo_arbitrary_serial_data():
 def test_refused_mutation_does_not_abort_valid_existing_connector():
     source = (ROOT / "firmware/zone_lite/main/zone_config.c").read_text()
     branch = source.split("if (!s_config.provisioned || !physical_match ||", 1)[1].split("/* This single-key commit", 1)[0]
-    assert "BLD1_REPAIR_DIAG r6" in branch
+    assert "BLD1_REPAIR_DIAG r7" in branch
     assert "return ESP_OK;" in branch
     assert "return ESP_ERR_INVALID_STATE" not in branch
     assert "if (!physical_match) s_config.provisioned = false;" in branch
@@ -148,6 +148,7 @@ def test_wrong_device_never_writes(monkeypatch):
 
 
 def test_success_requires_actual_poll():
+    assert repair.site_result("HIK_LIVE_STREAM_CONNECTED serial=G04600476; history verification remains separate") == "live"
     assert repair.site_result("Poll OK; reason=none; stage=checkpoint_commit") == "online"
     assert repair.site_result("Poll retrying; reason=authentication_rejected") == "auth"
     assert repair.site_result("Poll retrying; reason=identity_mismatch") == "binding"
@@ -204,4 +205,4 @@ def test_repair_writes_only_username_after_identity_guard_and_reads_back():
     assert 'nvs_set_str(handle, "hik_user", "admin")' in repair_branch
     assert 'nvs_get_str(handle, "hik_user", verified_user, &verified_size)' in repair_branch
     assert repair_branch.index("bld1_repair_matches") < repair_branch.index("bld1_repair_user_needs_update") < repair_branch.index("nvs_set_str")
-    assert repair_branch.index("nvs_get_str") < repair_branch.index("BLD1_REPAIR_VERIFIED r6")
+    assert repair_branch.index("nvs_get_str") < repair_branch.index("BLD1_REPAIR_VERIFIED r7")

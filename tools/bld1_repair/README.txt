@@ -1,6 +1,13 @@
 BLD1 ESP LOGIN REPAIR — Windows 10/11 x64
 
-VERSION 1.0.6: automatic IP recovery and permanent profile-write support.
+VERSION 1.0.7: attendance recovery, automatic IP recovery and permanent writes.
+If retained-history verification blocks polling, the exact BLD1 image opens an
+independent, serial-authenticated read-only live stream. Incoming events enter
+the same durable queue and ADD delivery path. The original history checkpoint is
+preserved; history verification remains pending. ADD still validates event codes,
+identity and time before releasing attendance. A connected stream alone does not
+prove that a punch reached ADD: make one successful punch and have IT verify it.
+Capture and reconnection retries have no automatic expiry or trial time limit.
 When identity checks repeatedly fail, the ESP sends a read-only Hikvision SADP
 inquiry on its active local subnet. A fresh serial-matching reply must pass
 authenticated ISAPI serial verification using the saved credentials and port.
@@ -15,14 +22,14 @@ The terminal's true unverified model profile is retained; this is NOT qualificat
 No terminal user is created, edited or deleted by running this EXE. Administrator
 role changes are excluded. Normal serial/fingerprint/readback guards remain.
 
-Utility version 1.0.6 replaces earlier EXEs. This version skips unsupported
+Utility version 1.0.7 replaces earlier EXEs. This version skips unsupported
 read-mac in Secure Download Mode and contains SDK errors without popup crashes.
 It reports the specific failed configuration checks. A mismatch refuses the
 username change without aborting startup on the verified, provisioned ESP.
 The onsite 1.0.2 diagnostic confirmed that only the stored username differed.
 This revision sets that single field to admin after all identity guards pass;
 it does not require the incorrect old username to equal Admin.
-Check that the window title says BLD1 ESP Repair 1.0.6.
+Check that the window title says BLD1 ESP Repair 1.0.7.
 
 For ONE device only: AC:27:6E:A3:0A:58 / LF-ZONE-BLD1-01.
 Terminal: DS-K1T341AMF, serial G04600476; its verified IP can now change.
@@ -58,7 +65,7 @@ boot selector are replaced. Previous OTA application bytes are left untouched.
 No HMAC key, signing private key, ADD administrator secret, or terminal password
 is embedded in the utility. Secure Boot is not disabled or re-burned.
 
-The firmware is a targeted derivative of HIK 3.1.1: 3.1.1-bld1fix6. It is not a
+The firmware is a targeted derivative of HIK 3.1.1: 3.1.1-bld1fix7. It is not a
 general production release and must not be used for other ESPs. The device checks
 its hardware MAC, provisioning flag, family, zone, device ID and expected serial
 before touching the single username key. Mismatched identities cannot be
