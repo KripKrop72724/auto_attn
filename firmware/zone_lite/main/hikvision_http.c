@@ -173,6 +173,12 @@ hik_result_t hik_http_stream_with_state(hik_message_fn callback, void *context, 
     esp_http_client_handle_t client;
     result = open_request_at(HTTP_METHOD_GET, "/ISAPI/Event/notification/alertStream", NULL, host, 10000, true, false, &headers, &client);
     if (result != HIK_OK) return result;
+    /* Some terminal firmwares send idle heartbeats every 30 seconds. Keep the
+     * established read bounded without reconnecting between those heartbeats. */
+    if (esp_http_client_set_timeout_ms(client, 45000) != ESP_OK) {
+        esp_http_client_cleanup(client);
+        return HIK_NETWORK;
+    }
     char boundary[HIK_BOUNDARY_MAX + 1];
     hik_stream_t *parser = malloc(sizeof(*parser));
     if (!parser || !hik_stream_boundary(headers.content_type, boundary) ||

@@ -29,6 +29,7 @@ esp_http_client_handle_t esp_http_client_init(const esp_http_client_config_t *cf
  assert(!strcmp(cfg->username,config.hik_username)&&!strcmp(cfg->password,config.hik_password));
  assert(cfg->auth_type==HTTP_AUTH_TYPE_DIGEST&&cfg->disable_auto_redirect);return c;}
 int esp_http_client_set_header(esp_http_client_handle_t c,const char*k,const char*v){(void)c;(void)k;(void)v;return 0;}
+int esp_http_client_set_timeout_ms(esp_http_client_handle_t c,int timeout){assert(c->stream&&timeout==45000);c->cfg.timeout_ms=timeout;return 0;}
 int esp_http_client_open(esp_http_client_handle_t c,int n){(void)n;c->attempt++;return retry_transport_failure&&c->attempt>1?-1:0;}
 int esp_http_client_write(esp_http_client_handle_t c,const char*b,int n){(void)c;(void)b;return n;}
 int esp_http_client_fetch_headers(esp_http_client_handle_t c){
