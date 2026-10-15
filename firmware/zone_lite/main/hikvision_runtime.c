@@ -3,6 +3,7 @@
 #include "hikvision_api.h"
 #include "hikvision_clock.h"
 #include "hikvision_commands.h"
+#include "hikvision_discovery.h"
 #include "nvs.h"
 #include "zone_config.h"
 #include "queue_store.h"
@@ -10,6 +11,7 @@
 #include "led_status.h"
 #include "cJSON.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -230,7 +232,12 @@ static void poll_task(void *arg)
             if (!loaded) result = HIK_CUSTODY;
             else { atomic_store(&poll_cursor, cursor.serial); atomic_store(&checkpoint_ready, true); }
         }
-        if (result == HIK_OK) { stage = 1; result = hik_http_verify_identity(); }
+        if (result == HIK_OK) {
+            stage = 1; result = hik_http_verify_identity();
+            if ((result == HIK_NETWORK || result == HIK_AUTH || result == HIK_HTTP_STATUS || result == HIK_BINDING) &&
+                atomic_load(&poll_failures) >= 2 && hikvision_discovery_step())
+                result = hik_http_verify_identity();
+        }
         if (result == HIK_OK && started - clock_checked_us >= 60000000) {
             sample_terminal_clock();
             clock_checked_us = started;
@@ -291,10 +298,11 @@ static void poll_task(void *arg)
         } else ESP_LOGW(TAG, "Poll incomplete, reason=%u", (unsigned)result);
         led_status_set(status);
         if (result != previous_result || status != previous_led || started - last_report_us >= 60000000) {
+            char host[64]; zone_config_copy_hik_host(host, sizeof(host));
             char message[384];
             snprintf(message, sizeof(message), "Poll %s; reason=%s; stage=%s; http=%u; failures=%u; terminal=%s; duration_ms=%lu; cursor=%lu; queued=%lu; storage=%s; source_worker=%s",
                 result == HIK_OK ? "OK" : "retrying", hik_reason(result), poll_stages[stage], atomic_load(&poll_http_status),
-                atomic_load(&poll_failures), zone_config_get()->hik_host,
+                atomic_load(&poll_failures), host,
                 (unsigned long)((esp_timer_get_time() - started) / 1000), (unsigned long)cursor.serial,
                 (unsigned long)depth, storage.persistence_verified && !storage.last_error ? "verified" : "unverified",
                 workers_ready ? "running" : "waiting");
@@ -597,7 +605,8 @@ void hikvision_append_telemetry(cJSON *payload)
     cJSON_AddStringToObject(terminal, "vendor", "hikvision");
     cJSON_AddStringToObject(terminal, "protocol", "isapi");
     cJSON_AddStringToObject(terminal, "serial", cfg->hik_expected_serial);
-    cJSON_AddStringToObject(terminal, "ip_address", cfg->hik_host);
+    char host[64]; zone_config_copy_hik_host(host, sizeof(host));
+    cJSON_AddStringToObject(terminal, "ip_address", host);
     cJSON_AddStringToObject(terminal, "capability_profile", cfg->hik_profile);
     cJSON_AddStringToObject(terminal, "qualification_state", "NOT_QUALIFIED");
     cJSON_AddBoolToObject(terminal, "online", atomic_load(&reachable));
@@ -669,17 +678,37 @@ void hikvision_gateway_task(void *argument)
 {
     (void)argument;
     TaskHandle_t stream = NULL, uploader = NULL, history = NULL, profiles = NULL;
-    request_lock = xSemaphoreCreateMutex();
-    source_upload_lock = xSemaphoreCreateMutex();
-    profile_commands = xQueueCreate(1, sizeof(add_command_t));
-    if (!request_lock || !source_upload_lock || !profile_commands) { ESP_LOGE(TAG, "Request worker allocation failed"); vTaskDelete(NULL); return; }
+    while (!request_lock || !source_upload_lock || !profile_commands) {
+        if (!request_lock) request_lock = xSemaphoreCreateMutex();
+        if (!source_upload_lock) source_upload_lock = xSemaphoreCreateMutex();
+        if (!profile_commands) profile_commands = xQueueCreate(1, sizeof(add_command_t));
+        if (!request_lock || !source_upload_lock || !profile_commands) {
+            ESP_LOGE(TAG, "Request worker allocation deferred; retrying");
+            led_status_fault(LED_STATUS_LOCAL_FAILURE);
+            vTaskDelay(pdMS_TO_TICKS(5000));
+        }
+    }
+    int64_t next_worker_warning = 0;
     for (;;) {
+        /* Start evidence delivery before optional scans can consume heap. */
+        if (!uploader && xTaskCreate(source_uploader, "hik_evidence", 8192, NULL, 4, &uploader) != pdPASS) uploader = NULL;
         if (!stream && xTaskCreate(poll_task, "hik_poll", 8192, NULL, 5, &stream) != pdPASS) stream = NULL;
         if (!history && xTaskCreate(history_task, "hik_history", 8192, NULL, 3, &history) != pdPASS) history = NULL;
         if (!profiles && xTaskCreate(profile_task, "hik_profiles", 8192, NULL, 2, &profiles) != pdPASS) profiles = NULL;
-        if (!uploader && xTaskCreate(source_uploader, "hik_evidence", 8192, NULL, 4, &uploader) != pdPASS) uploader = NULL;
         atomic_store(&runtime_workers_started, stream && history && profiles && uploader);
-        if (!stream || !history || !profiles || !uploader) led_status_fault(LED_STATUS_LOCAL_FAILURE);
+        if (!stream || !history || !profiles || !uploader) {
+            led_status_fault(LED_STATUS_LOCAL_FAILURE);
+            if (esp_timer_get_time() >= next_worker_warning) {
+                next_worker_warning = esp_timer_get_time() + 60000000;
+                char message[192];
+                snprintf(message, sizeof(message), "Worker startup pending: poll=%u history=%u profiles=%u delivery=%u internal_free=%u largest_block=%u; retrying",
+                    stream != NULL, history != NULL, profiles != NULL, uploader != NULL,
+                    (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                    (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+                ESP_LOGW(TAG, "%s", message);
+                (void)add_connector_log("WARN", "hikvision", "HIK_WORKER_START_PENDING", message);
+            }
+        }
         if (profiles && uxQueueSpacesAvailable(profile_commands)) {
             add_command_t command;
             if (add_connector_take_command(&command)) {

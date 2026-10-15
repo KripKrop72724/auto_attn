@@ -119,7 +119,7 @@ def test_revocation_does_not_change_attendance_policy_or_qualification(target):
     assert not terminal.capability_profile["user_write"]
 
 
-@pytest.mark.parametrize("version,capability", [("3.1.1-bld1fix4", 3), ("3.1.1-bld1fix5", 4)])
+@pytest.mark.parametrize("version,capability", [("3.1.1-bld1fix4", 3), ("3.1.1-bld1fix5", 4), ("3.1.1-bld1fix6", 4)])
 def test_signed_repair_heartbeat_is_accepted_and_keeps_approval(target, version, capability):
     from test_hikvision_clock import heartbeat
     from zk_add.schemas import HeartbeatPayload
@@ -142,7 +142,8 @@ def test_signed_repair_heartbeat_is_accepted_and_keeps_approval(target, version,
         HeartbeatPayload.model_validate(data)
 
 
-def test_permanent_grant_has_no_date_limit_on_verified_permanent_firmware(target, monkeypatch):
+@pytest.mark.parametrize("version", ["3.1.1-bld1fix5", "3.1.1-bld1fix6"])
+def test_permanent_grant_has_no_date_limit_on_verified_permanent_firmware(target, monkeypatch, version):
     session, connector, terminal = target
     request = grant(session, connector, permanent=True)
     assert request["permanent"] and request["expires_epoch"] is None
@@ -153,7 +154,7 @@ def test_permanent_grant_has_no_date_limit_on_verified_permanent_firmware(target
     assert terminal.capability_profile["write_exception_expires_at"]
     monkeypatch.setattr(exception, "now_epoch", lambda: 4102444800)
     assert not exception.active(connector, terminal)
-    connector.firmware_version = "zone-lite-3.1.1-bld1fix5"
+    connector.firmware_version = "zone-lite-" + version
     terminal.capability_profile["hikvision_health"]["profile_command_version"] = 4
     auto_certify_zkt(session, connector, terminal)
     assert exception.permanent_active(connector, terminal)
@@ -166,10 +167,11 @@ def test_permanent_grant_has_no_date_limit_on_verified_permanent_firmware(target
     assert terminal.capability_profile["hikvision_health"]["qualification_state"] == "NOT_QUALIFIED"
 
 
-def test_permanent_grant_can_be_created_and_revoked_after_old_expiry(target, monkeypatch):
+@pytest.mark.parametrize("version", ["3.1.1-bld1fix5", "3.1.1-bld1fix6"])
+def test_permanent_grant_can_be_created_and_revoked_after_old_expiry(target, monkeypatch, version):
     session, connector, terminal = target
     monkeypatch.setattr(exception, "now_epoch", lambda: exception.EXPIRES + 86400)
-    connector.firmware_version = "zone-lite-3.1.1-bld1fix5"
+    connector.firmware_version = "zone-lite-" + version
     terminal.capability_profile["hikvision_health"]["profile_command_version"] = 4
     grant(session, connector, permanent=True)
     assert exception.active(connector, terminal)
@@ -178,6 +180,26 @@ def test_permanent_grant_can_be_created_and_revoked_after_old_expiry(target, mon
     assert not exception.active(connector, terminal)
     assert not terminal.capability_profile["user_write"]
     assert not terminal.capability_profile["write_exception_pending_firmware"]
+
+
+def test_rediscovered_ip_updates_existing_terminal_without_rebinding(target):
+    from test_hikvision_clock import heartbeat
+    from zk_add.schemas import HeartbeatPayload
+    from zk_add.service import update_heartbeat
+
+    session, connector, terminal = target
+    grant(session, connector, permanent=True)
+    data = heartbeat().model_dump()
+    data["firmware_version"] = "zone-lite-3.1.1-bld1fix6"
+    data["terminal"].update(serial=exception.SERIAL, ip_address="192.168.1.201",
+                            capability_profile=exception.PROFILE, profile_command_version=4)
+    previous_id = terminal.id
+    update_heartbeat(session, connector=connector, boot_id="rediscovery", sequence=1,
+                     payload=HeartbeatPayload.model_validate(data))
+    assert terminal.id == previous_id
+    assert terminal.ip_address == "192.168.1.201"
+    assert terminal.serial == terminal.expected_serial == terminal.confirmed_serial == exception.SERIAL
+    assert exception.permanent_active(connector, terminal)
 
 
 @pytest.mark.parametrize("family,count,expected", [
