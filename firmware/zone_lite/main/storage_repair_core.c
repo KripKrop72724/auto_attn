@@ -1399,10 +1399,25 @@ static bool any_mislabeled(const run_t *r)
 static bool lookup_hygiene(run_t *r)
 {
     uint8_t *needed = zalloc(r, r->total_pages);
-    if (!needed) return fail(r, "hygiene_memory", SPIFFS_ERR_INTERNAL);
+    uint8_t *hidden = zalloc(r, SR_IDS / 8U);
+    if (!needed || !hidden) {
+        release(r, needed);
+        release(r, hidden);
+        return fail(r, "hygiene_memory", SPIFFS_ERR_INTERNAL);
+    }
     for (uint32_t i = 0; i < r->obj_count; ++i) {
         obj_t *o = &r->objs[i];
         if (o->header == SR_NO_PAGE || !o->plausible) continue;
+        /* A hidden object (a removal in progress) matters only when an
+         * unsettled manifest entry names it: then every page whose header
+         * names it stays, for the resume to rebuild from. Any other is
+         * garbage the check frees, and a mislabeled page of it would set
+         * off the check's torn-lookup handling (1.2 item 7). */
+        if (o->hidden) {
+            srp_manifest_file_t *f = manifest_entry(r, o->name);
+            if (!f || f->object_id != o->obj || (f->flags & SRP_MANIFEST_SETTLED)) continue;
+            set_bit(hidden, o->obj & (SR_IDS - 1));
+        }
         needed[o->header] = 1;
         for (uint32_t j = 0; o->mapped && j < o->ix_spans; ++j)
             if (o->ix[j] != SR_NO_PAGE) needed[o->ix[j]] = 1;
@@ -1411,6 +1426,10 @@ static bool lookup_hygiene(run_t *r)
         for (uint32_t k = 0; k < o->patches; ++k)
             if (page_ok(r, o->patch[k].from)) needed[o->patch[k].from] = 1;
     }
+    for (uint32_t pix = 0; pix < r->total_pages; ++pix)
+        if (pix % r->ppb && r->pages[pix].obj != SPIFFS_OBJ_ID_FREE && bit(hidden, r->pages[pix].obj & (SR_IDS - 1)))
+            needed[pix] = 1;
+    release(r, hidden);
     bool ok = true;
     for (uint32_t pix = 0; ok && pix < r->total_pages; ++pix) {
         if (pix % r->ppb == 0) continue;
@@ -1675,6 +1694,8 @@ static bool purge_name(run_t *r, const char *name)
     return !any || survey(r);
 }
 
+static bool rename_rebuild(run_t *r, obj_t *rebuilt, const char *temp, const char *name);
+
 /* Probe leftovers and the repair's own leftover rebuilds (once no manifest
  * names their files) always; transient cursor stages only when the store
  * needs room. */
@@ -1695,6 +1716,21 @@ static void remove_expendables(run_t *r, bool for_room)
         }
         if (!live(o) || o->kind.cls != SRP_CLASS_EXPENDABLE) continue;
         if (!strstr(o->name, "probe") && !rebuild && !for_room) continue;
+        if (rebuild) {
+            /* Custody bytes the repair wrote: when the file they were for
+             * is missing, they go into place rather than away. */
+            char name[SRP_NAME_BYTES];
+            size_t length = strlen(o->name) - (sizeof(SRP_RESTORE_SUFFIX) - 1U);
+            memcpy(name, o->name, length);
+            name[length] = '\0';
+            if (!find_live(r, name) && rename_rebuild(r, o, o->name, name)) {
+                char message[160];
+                snprintf(message, sizeof(message), "%s: a leftover rebuild went into place", name);
+                logf_line(r, "WARN", "STORAGE_REPAIR_REBUILT", message);
+                continue;
+            }
+            r->failed = false;
+        }
         if (remove_name(r, o->name)) {
             r->report->expendables_removed++;
             o->actions |= SRR_FILE_REMOVED;
@@ -2139,37 +2175,49 @@ static void supersede(run_t *r, const srp_manifest_file_t *f, obj_t *now, const 
     }
 }
 
+/* Renames a whole rebuild into place. SPIFFS_rename takes the first header
+ * of that name it meets, so a duplicate header (a reset during the rebuild's
+ * last header update leaves the old and the new one) goes first. */
+static bool rename_rebuild(run_t *r, obj_t *rebuilt, const char *temp, const char *name)
+{
+    if (rebuilt->needs_work && !normalize_object(r, rebuilt)) return false;
+    r->wrote = true;
+    s32_t res = SPIFFS_rename(r->fs, temp, name);
+    SPIFFS_clearerr(r->fs);
+    return res == SPIFFS_OK;
+}
+
+enum { RESUME_FAILED = -1, RESUME_SETTLED = 0, RESUME_VERIFY = 1 };
+
 /* One file of a manifest an interrupted run left. Its bytes are back when
  * the live file still starts with them; otherwise the check had begun
  * deleting it (hidden header, pages intact until the next check) and it is
  * rebuilt from its own pages, or a finished rebuild under its temporary name
- * is renamed into place. A file its owner replaced since (its queue cursor's
- * generation moved, or the manifest is a rolled-back image's: that image ran
- * in between) is superseded. Anything else is reported with its exact range.
- * Returns false on a failed write. */
-static bool resume_file(run_t *r, srp_manifest_file_t *f, bool stale, srp_gap_cause_t cause)
+ * is renamed into place (RESUME_VERIFY: the caller checks the result). A file
+ * its owner replaced since (its queue cursor's generation moved, or the
+ * manifest is a rolled-back image's: that image ran in between) is
+ * superseded. Anything else is reported with its exact range. */
+static int resume_file(run_t *r, srp_manifest_file_t *f, bool stale, srp_gap_cause_t cause)
 {
     obj_t *now = find_live(r, f->name);
-    if (matches(r, now, f)) return true;
+    if (matches(r, now, f)) return RESUME_SETTLED;
     /* A rebuild under the temporary name: renamed into place when whole,
      * otherwise purged (an interrupted one; its size may be torn). */
     char temp[SRP_NAME_BYTES];
     bool named = restore_name(f->name, temp);
     obj_t *rebuilt = named ? find_live(r, temp) : NULL;
     if (!now && rebuilt && rebuilt->size == f->size && matches(r, rebuilt, f)) {
-        r->wrote = true;
-        s32_t res = SPIFFS_rename(r->fs, temp, f->name);
-        SPIFFS_clearerr(r->fs);
-        if (res == SPIFFS_OK) {
+        if (rename_rebuild(r, rebuilt, temp, f->name)) {
             r->report->files_rebuilt++;
-            return true;
+            return RESUME_VERIFY;
         }
+        if (r->failed) return RESUME_FAILED;
     }
     bool leftover = false;
     for (uint32_t k = 0; named && k < r->obj_count; ++k)
         leftover |= r->objs[k].header != SR_NO_PAGE && !strcmp(r->objs[k].name, temp);
     if (leftover) {
-        if (!purge_name(r, temp)) return false;
+        if (!purge_name(r, temp)) return RESUME_FAILED;
         now = find_live(r, f->name);
     }
     obj_t *hidden = NULL;
@@ -2179,15 +2227,17 @@ static bool resume_file(run_t *r, srp_manifest_file_t *f, bool stale, srp_gap_ca
             hidden = o;
     }
     if (hidden && !hidden->mapped && (!map_object(r, hidden) || !fill_gaps(r, hidden))) {
-        if (r->failed) return false;
+        if (r->failed) return RESUME_FAILED;
         hidden = NULL;
     }
     if (hidden && hidden->size == f->size && matches(r, hidden, f) && take_hold(r, hidden)) {
         uint32_t done = 0;
+        int outcome = RESUME_SETTLED;
         if (!now) {
             if (rebuild_from_hold(r, hidden, f->name, &done)) {
                 hidden->actions |= SRR_FILE_REBUILT;
                 r->report->files_rebuilt++;
+                outcome = RESUME_VERIFY;
             } else report_unrestored(r, hidden, f->name, done, hidden->hold_size, SPIFFS_ERR_FULL);
         } else if (text_fill(hidden)) {
             /* A new file took the name meanwhile (a rolled-back image created
@@ -2219,18 +2269,18 @@ static bool resume_file(run_t *r, srp_manifest_file_t *f, bool stale, srp_gap_ca
         /* What did not go back is a gap record now: the entry settles. */
         r->restore_failed = false;
         r->failed = false;
-        return true;
+        return outcome;
     }
-    if (r->failed) return false;
+    if (r->failed) return RESUME_FAILED;
     srp_kind_t kind = srp_classify(f->name);
     uint32_t generation = 0;
     bool cursor_moved = (f->flags & SRP_MANIFEST_CURSOR) &&
         (!cursor_generation(r, &kind, &generation) || generation != f->cursor_generation);
     if (stale || cursor_moved || (now && now->obj != f->object_id)) {
         supersede(r, f, now, stale ? "another image ran" : cursor_moved ? "its queue was retired" : "a new file");
-        return true;
+        return RESUME_SETTLED;
     }
-    if (f->flags & SRP_MANIFEST_REPORTED) return true;
+    if (f->flags & SRP_MANIFEST_REPORTED) return RESUME_SETTLED;
     obj_t placeholder;
     memset(&placeholder, 0, sizeof(placeholder));
     memcpy(placeholder.name, f->name, sizeof(placeholder.name));
@@ -2240,7 +2290,7 @@ static bool resume_file(run_t *r, srp_manifest_file_t *f, bool stale, srp_gap_ca
     (void)record_gap(r, target, 0, f->size, 0, now ? SRP_GAP_CONTENT_UNVERIFIED : cause);
     r->report->interrupted_losses++;
     note_file(r, target);
-    return save_records(r) || fail(r, "journal_records", SPIFFS_ERR_INTERNAL);
+    return save_records(r) ? RESUME_SETTLED : (fail(r, "journal_records", SPIFFS_ERR_INTERNAL), RESUME_FAILED);
 }
 
 /* A manifest left by an interrupted run (SRP_STATE_MANIFEST): every entry is
@@ -2261,8 +2311,26 @@ static bool resume_manifest(run_t *r)
     for (uint32_t i = 0; i < m->count; ++i) {
         srp_manifest_file_t *f = &m->file[i];
         if (f->flags & SRP_MANIFEST_SETTLED) continue;
-        if (!survey(r)) return false;
-        if (!resume_file(r, f, stale, cause)) return false;
+        /* A rebuilt or renamed file settles only once a fresh survey reads
+         * the manifest's bytes under its name. */
+        int outcome = RESUME_VERIFY;
+        for (int attempt = 0; outcome == RESUME_VERIFY; ++attempt) {
+            if (!survey(r)) return false;
+            if (attempt && matches(r, find_live(r, f->name), f)) break;
+            if (attempt == 3) {
+                obj_t *now = find_live(r, f->name), placeholder;
+                memset(&placeholder, 0, sizeof(placeholder));
+                memcpy(placeholder.name, f->name, sizeof(placeholder.name));
+                placeholder.kind = srp_classify(f->name);
+                placeholder.size = f->size;
+                (void)record_gap(r, now ? now : &placeholder, 0, f->size, 0, SRP_GAP_RESTORE_INTERRUPTED);
+                r->report->interrupted_losses++;
+                if (!save_records(r)) return fail(r, "journal_records", SPIFFS_ERR_INTERNAL);
+                break;
+            }
+            outcome = resume_file(r, f, stale, cause);
+            if (outcome == RESUME_FAILED) return false;
+        }
         f->flags |= SRP_MANIFEST_SETTLED;
         if (!manifest_save(r)) return fail(r, "journal_manifest", SPIFFS_ERR_INTERNAL);
     }
@@ -2761,7 +2829,11 @@ static bool custody_ready(run_t *r, bool *ready)
         if (deferred) return true;
         if (!survey(r)) return false;
     }
-    *ready = custody_consistent(r);
+    /* No mislabeled page either: the check's handling of one deletes live
+     * pages and then whole files (1.2 item 7). */
+    if (any_mislabeled(r) && !(lookup_hygiene(r) && survey(r))) return false;
+    *ready = custody_consistent(r) && !any_mislabeled(r);
+    if (!*ready) logf_line(r, "WARN", "STORAGE_REPAIR_NOT_READY", "a custody file or a lookup entry is not consistent");
     return true;
 }
 
@@ -2879,7 +2951,8 @@ static bool run_checks(run_t *r, bool *catalog_drop, bool *last_failed, bool *cu
         r->state.phase = SRP_PHASE_RESTORE;
         bool ok = save_state(r) || fail(r, "journal", SPIFFS_ERR_INTERNAL);
         bool changed = false;
-        if (ok) ok = survey(r) && ensure_room(r) && restore_held(r, &changed);
+        if (ok) ok = survey(r) && ensure_room(r) && (!any_mislabeled(r) || (lookup_hygiene(r) && survey(r))) &&
+            restore_held(r, &changed);
         if (ok && changed) ok = survey(r);
         r->finishing = false;
         if (!ok || r->restore_failed) return false;
@@ -3037,15 +3110,17 @@ void srr_run(spiffs *fs, const srr_config_t *config, const srr_ports_t *ports, s
     bool deferred = false, catalog_drop = false, check_failed = false, checked = false, cut_short = false;
     bool ok = survey(r);
     if (ok) report_torn_headers(r);
+    if (ok && any_mislabeled(r)) {
+        /* Before the first allocation (the resume's rebuilds included): no
+         * used page may look free. The phase stays RESTORE while a manifest
+         * is to be settled. */
+        set_phase(r, SRP_PHASE_NORMALIZE, 0, true);
+        if (!manifest_active(r)) r->state.phase = SRP_PHASE_NORMALIZE;
+        ok = (save_state(r) || fail(r, "journal", SPIFFS_ERR_INTERNAL)) && lookup_hygiene(r) && survey(r);
+    }
     if (ok && manifest_active(r)) {
         set_phase(r, SRP_PHASE_RESTORE, 0, true);
         ok = resume_manifest(r);
-    }
-    if (ok && any_mislabeled(r)) {
-        /* Before the first allocation: no used page may look free. */
-        set_phase(r, SRP_PHASE_NORMALIZE, 0, true);
-        r->state.phase = SRP_PHASE_NORMALIZE;
-        ok = (save_state(r) || fail(r, "journal", SPIFFS_ERR_INTERNAL)) && lookup_hygiene(r) && survey(r);
     }
     if (ok) ok = plan_damage(r);
     if (ok) hold_custody(r);
