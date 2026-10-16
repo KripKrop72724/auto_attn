@@ -436,6 +436,13 @@ jobs:
           -w /project
           espressif/idf:v5.5.3
           python tests/firmware/tools/check_spiffs_orphan.py
+      - name: Repair power-cut damage against ESP-IDF's own SPIFFS
+        run: >-
+          docker run --rm
+          -v "$GITHUB_WORKSPACE:/project:ro"
+          -w /project
+          espressif/idf:v5.5.3
+          python tests/firmware/tools/check_spiffs_repair.py
       - name: Verify journal AEAD with pinned mbedTLS and independent vectors
         run: >-
           docker run --rm
