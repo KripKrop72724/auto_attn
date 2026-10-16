@@ -13,8 +13,11 @@
  * yields to every storage user and stops at its budget. */
 #define SI_START_DELAY_MS (60 * 1000)
 #define SI_BUDGET_US (180LL * 1000LL * 1000LL)
-#define SI_YIELD_EVERY_READS 32U
+/* A yield per 32 pages that read back, as in 2.7.4, where a read was a page;
+ * a read is now a chunk, and only a failed chunk is read again by page. */
+#define SI_YIELD_EVERY_READS (32U / SI_CHUNK_PAGES)
 #define SI_LOGGED_FILES 4U
+_Static_assert(SI_YIELD_EVERY_READS * SI_CHUNK_PAGES == 32U, "one yield per 32 pages read back");
 
 static si_report_t s_report;
 static bool s_ready;

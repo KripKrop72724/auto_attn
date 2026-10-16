@@ -25,9 +25,9 @@ static struct {
     long start, end;
 } bad[8];
 static unsigned bad_count;
-static const char *unopenable, *shrunk, *resized, *regrown;
-static long long resized_bytes;
-static unsigned budget_reads, reads, resized_opens, regrown_stats;
+static const char *unopenable, *shrunk, *resized, *changed;
+static long long resized_bytes, changed_by;
+static unsigned budget_reads, reads, resized_opens, changed_stats;
 
 static int slot_of(FILE *stream)
 {
@@ -109,8 +109,8 @@ int si_test_fclose(FILE *stream)
 
 long long si_test_size(const char *path, long long bytes)
 {
-    /* The regrown file is appended to after its first stat. */
-    if (regrown && strstr(path, regrown) && regrown_stats++) return bytes + SI_PAGE_BYTES;
+    /* The changed file's size moves by changed_by after its first stat. */
+    if (changed && strstr(path, changed) && changed_stats++) return bytes + changed_by;
     return resized && strstr(path, resized) ? resized_bytes : bytes;
 }
 
@@ -170,7 +170,8 @@ int main(int argc, char **argv)
     assert(!strcmp(report.file[3].name, "empty.txt") && report.file[3].bytes == 0);
     for (size_t i = 0; i < report.count; ++i) assert(!report.file[i].first_error && !report.file[i].unreadable_bytes);
     /* A file that reads back is read a chunk at a time, not a page at a time:
-     * 6 reads here instead of 66, so the scan fits its budget. */
+     * 6 reads and budget checks here instead of 66. (newlib on the device
+     * still fills an unbuffered stream one byte per read() underneath.) */
     assert(reads == 1 + 1 + 4);
 
     write_file(directory, "blocked_identity.jsonl", 4000);
@@ -273,11 +274,21 @@ int main(int argc, char **argv)
         const si_file_t *queue = find(&report, queues[i]);
         assert(queue && queue->first_error_offset == CHUNK_BYTES && queue->unreadable_bytes == 63 * CHUNK_BYTES);
     }
-    /* A file that changed in between keeps what its first read found. */
-    regrown = "q2.jsonl";
+    /* A segment appended to in between still holds the bytes its first read
+     * was sized at: the rest is mapped as one read would have mapped it. */
+    changed = "q2.jsonl";
+    changed_by = SI_PAGE_BYTES;
+    changed_stats = 0;
     si_scan(survey, NULL, &report);
-    regrown = NULL;
-    assert(report.complete && report.unreadable_bytes == 3ULL * 63 * CHUNK_BYTES + CHUNK_BYTES);
+    assert(report.complete && report.unreadable_bytes == 4ULL * 63 * CHUNK_BYTES);
+    assert(find(&report, "q2.jsonl")->unreadable_bytes == 63 * CHUNK_BYTES);
+    /* One that shrank cannot be mapped: incomplete, never complete with the
+     * rest of a damaged file left unexamined. */
+    changed_by = -(long long)CHUNK_BYTES;
+    changed_stats = 0;
+    si_scan(survey, NULL, &report);
+    changed = NULL;
+    assert(!report.complete && report.unreadable_bytes == 3ULL * 63 * CHUNK_BYTES + CHUNK_BYTES);
     assert(find(&report, "q2.jsonl")->unreadable_bytes == CHUNK_BYTES);
     for (int i = 0; i < 8; ++i) assert(!open_files[i].stream);
 

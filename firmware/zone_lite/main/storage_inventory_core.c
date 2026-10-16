@@ -199,9 +199,14 @@ void si_scan(const char *directory, const si_ports_t *ports, si_report_t *report
         }
         snprintf(path, sizeof(path), "%s/%s", directory, names[index]);
         struct stat status;
-        /* A file replaced since keeps what its first read found. */
-        if (stat(path, &status) != 0 || status.st_size < 0) continue;
-        if ((uintmax_t)status.st_size != damaged[index].bytes) continue;
+        /* A queue segment appended to since still holds the bytes its first
+         * read was sized at, and those are mapped as one read would have. A
+         * file that shrank or went cannot be: the scan is then incomplete. */
+        if (stat(path, &status) != 0 || status.st_size < 0 ||
+            (uintmax_t)status.st_size < damaged[index].bytes) {
+            report->complete = false;
+            continue;
+        }
         si_file_t rest = {0};
         stopped = !scan_file(path, damaged[index].resume, damaged[index].bytes, chunk, &rest, ports, NULL);
         report->unreadable_bytes += rest.unreadable_bytes;
