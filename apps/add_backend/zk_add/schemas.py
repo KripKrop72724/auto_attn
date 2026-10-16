@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 import math
 import re
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from zk_add.hikvision_clock import HikvisionClockSample
 from zk_add.capture_latency import CaptureLatencyHistogram
@@ -159,6 +159,91 @@ class StorageInventory(BaseModel):
     entries: list[StorageInventoryFile] = Field(default_factory=list, max_length=16)
 
 
+UPPER_CODE = r"^[A-Z_]{1,40}$"
+
+
+class StorageRepairCheck(BaseModel):
+    # What SPIFFS_check reported over every pass of the boot repair.
+    passes: int | None = Field(default=None, ge=0, le=64)
+    fix_index: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    fix_lookup: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    delete_orphaned_index: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    delete_page: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    delete_bad_file: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    deleted_live_files: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    errors: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    last_error: int | None = Field(default=None, ge=-(2**31), le=2**31 - 1)
+
+
+class StorageRepairFile(BaseModel):
+    name: str = Field(max_length=32, pattern=PRINTABLE_TEXT)
+    class_: str | None = Field(default=None, alias="class", max_length=16, pattern=r"^[a-z_]{1,16}$")
+    size: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    gaps: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    unreadable_bytes: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    spans_rewritten: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    actions: list[Annotated[str, Field(pattern=UPPER_CODE)]] = Field(default_factory=list, max_length=8)
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class StorageRepairDiagnostics(BaseModel):
+    # ZKT 2.7.5 and later: the custody-first SPIFFS repair that runs at every
+    # boot before the store is mounted. Codes are text, not literals, so a
+    # later firmware state never fails validation; an unreadable object is
+    # dropped rather than rejecting the heartbeat that carries it.
+    result: str | None = Field(default=None, pattern=UPPER_CODE)
+    mode: str | None = Field(default=None, pattern=UPPER_CODE)
+    phase: str | None = Field(default=None, pattern=UPPER_CODE)
+    previous_phase: str | None = Field(default=None, pattern=UPPER_CODE)
+    previous_boot_phase: str | None = Field(default=None, pattern=UPPER_CODE)
+    previous_boot_deadline: bool | None = None
+    generation: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    incomplete: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    failures: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    level: int | None = Field(default=None, ge=0, le=8)
+    check_skipped: bool | None = None
+    mirror: bool | None = None
+    commands_damaged: bool | None = None
+    duration_ms: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    check_ms: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    budget_bytes: int | None = Field(default=None, ge=0, le=2**40)
+    files: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    files_held: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    bytes_held: int | None = Field(default=None, ge=0, le=2**40)
+    files_unheld_custody: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    gaps: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    unreadable_bytes: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    records_reported: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    records_pending: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    records_dropped: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    spans_rewritten: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    index_rewritten: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    duplicates_removed: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    orphan_index_removed: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    lookup_fixed: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    tails_terminated: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    files_restored: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    files_rebuilt: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    cursors_reset: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    expendables_removed: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    settled_removed: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    interrupted_losses: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    used_before: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    used_after: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    total_bytes: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    nvs_free_entries_before: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    nvs_free_entries_after: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    internal_largest_before: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    internal_largest_after: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    stack_free_bytes: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    log_lines_dropped: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    error_stage: str | None = Field(default=None, max_length=24, pattern=r"^[a-z_]{1,24}$")
+    error_code: int | None = Field(default=None, ge=-(2**31), le=2**31 - 1)
+    check: StorageRepairCheck | None = None
+    entries: list[StorageRepairFile] = Field(default_factory=list, max_length=8)
+
+
 class StorageDiagnostics(BaseModel):
     local_failure_source: str | None = Field(default=None, max_length=80)
     # ZKT 2.7.1 and later: the latest incident of a latched LOCAL_FAILURE, and
@@ -192,6 +277,8 @@ class StorageDiagnostics(BaseModel):
     # is dropped rather than rejecting the heartbeat that carries it.
     persistence_probe_repairs: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
     inventory: StorageInventory | None = None
+    # ZKT 2.7.5 and later: the boot storage repair; dropped when unreadable.
+    repair: StorageRepairDiagnostics | None = None
     fault_class: Literal["NONE", "LOCK_CONTENTION", "CAPACITY", "MISSING_FILE", "CORRUPTION",
                          "ALLOCATION", "PERSISTENCE", "RECOVERY"] | None = None
     rejected_optional_writes: int | None = Field(default=None, ge=0)
@@ -217,6 +304,14 @@ class StorageDiagnostics(BaseModel):
     def readable_inventory(cls, value: Any) -> StorageInventory | None:
         try:
             return StorageInventory.model_validate(value) if value is not None else None
+        except ValidationError:
+            return None
+
+    @field_validator("repair", mode="before")
+    @classmethod
+    def readable_repair(cls, value: Any) -> StorageRepairDiagnostics | None:
+        try:
+            return StorageRepairDiagnostics.model_validate(value) if value is not None else None
         except ValidationError:
             return None
 
