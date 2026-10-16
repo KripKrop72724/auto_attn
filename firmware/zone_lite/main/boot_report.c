@@ -91,6 +91,7 @@ typedef struct {
     uint32_t magic;
     uint32_t boot_count; /* the boot this describes */
     uint32_t phase, pass, deadline;
+    uint32_t returned;   /* storage_repair_boot returned: a later crash is not the repair's */
     uint32_t checksum;
 } boot_rtc_repair_t;
 
@@ -474,16 +475,28 @@ void boot_report_repair(unsigned phase, unsigned pass, bool deadline)
     s_repair.phase = phase;
     s_repair.pass = pass;
     s_repair.deadline = deadline ? 1U : 0U;
+    s_repair.returned = 0;
     s_repair.checksum = repair_checksum(&s_repair);
     portEXIT_CRITICAL_SAFE(&s_lock);
 }
 
-bool boot_report_previous_repair(unsigned *phase, unsigned *pass, bool *deadline)
+void boot_report_repair_returned(void)
+{
+    portENTER_CRITICAL_SAFE(&s_lock);
+    if (s_repair.magic == BOOT_REPAIR_MAGIC && s_repair.boot_count == s_rtc.boot_count) {
+        s_repair.returned = 1;
+        s_repair.checksum = repair_checksum(&s_repair);
+    }
+    portEXIT_CRITICAL_SAFE(&s_lock);
+}
+
+bool boot_report_previous_repair(unsigned *phase, unsigned *pass, bool *deadline, bool *returned)
 {
     if (!s_report.repair_valid) return false;
     if (phase) *phase = s_report.repair.phase;
     if (pass) *pass = s_report.repair.pass;
     if (deadline) *deadline = s_report.repair.deadline != 0;
+    if (returned) *returned = s_report.repair.returned != 0;
     return true;
 }
 

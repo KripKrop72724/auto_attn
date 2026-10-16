@@ -4452,13 +4452,6 @@ static void outbox_task(void *arg)
             vTaskDelay(pdMS_TO_TICKS(1000));
             continue;
         }
-#if defined(ZONE_LITE_STORAGE_REPAIR) && ZONE_LITE_STORAGE_REPAIR
-        /* The boot storage repair's logs and evidence, a little per pass:
-         * this task already sends acknowledged queue evidence on its 8 KiB
-         * stack, so the repair needs no task of its own. */
-        storage_repair_report_step();
-        s_outbox_tick_ms = (uint32_t)monotonic_ms();
-#endif
         bool background_due = false;
         if (priority_delivery_hold_active()) {
             if (!priority_started) priority_started = now;
@@ -4469,6 +4462,15 @@ static void outbox_task(void *arg)
             background_due = true;
         }
         priority_started = 0;
+#if defined(ZONE_LITE_STORAGE_REPAIR) && ZONE_LITE_STORAGE_REPAIR
+        /* The boot storage repair's logs and evidence, a little per pass
+         * and only outside a priority hold (an evidence send makes direct
+         * priority senders wait): this task already sends acknowledged queue
+         * evidence on its 8 KiB stack, so the repair needs no task of its
+         * own. With nothing pending it reads no NVS. */
+        storage_repair_report_step();
+        s_outbox_tick_ms = (uint32_t)monotonic_ms();
+#endif
         unsigned ready = 0;
         for (unsigned i = 0; i < 6; i++) {
             uint32_t depth = 0;

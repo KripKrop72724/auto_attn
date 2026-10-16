@@ -43,13 +43,18 @@ static const char *TAG = "storage_repair";
 #define SR_ENGINE_BYTES (640U * 1024U)
 #define SR_HOLD_CAP (7U * 1024U * 1024U)
 #define SR_LOG_LINES 24U
+/* SPIFFS_check's expected time per MiB of store before a pass is measured
+ * (the engine starts a pass only when this and the restore fit before the
+ * soft deadline): with the metadata mirror, and reading flash. */
+#define SR_CHECK_MS_PER_MIB_MIRROR 4000U
+#define SR_CHECK_MS_PER_MIB_FLASH 8000U
 
 typedef struct {
     char level[6], code[40], message[200];
 } sr_line_t;
 
 static srr_report_t s_report;
-static bool s_ran, s_mount_failed, s_mirror, s_previous_deadline, s_previous_known;
+static bool s_ran, s_mount_failed, s_mirror, s_previous_deadline, s_previous_known, s_previous_returned;
 static unsigned s_previous_phase, s_previous_pass;
 static int32_t s_mount_error;
 static uint64_t s_budget;
@@ -57,6 +62,10 @@ static uint32_t s_nvs_free_before, s_nvs_free_after, s_internal_before, s_intern
 static sr_line_t *s_lines;
 static atomic_uint s_lines_count, s_lines_sent, s_lines_dropped;
 static atomic_uint s_records_sent;
+/* Gap and cursor-reset records awaiting, and holding, ADD's acknowledgement:
+ * counted from NVS once after the run and kept here, so the outbox task and
+ * the heartbeat never read NVS when nothing is pending. */
+static atomic_uint s_records_pending, s_records_acked;
 static atomic_bool s_damage_noted;
 
 static const esp_partition_t *s_partition;
@@ -65,6 +74,8 @@ static srm_mirror_t s_mirror_state;
 static int64_t s_last_yield_us, s_soft_deadline_us;
 static esp_timer_handle_t s_deadline_timer;
 static volatile unsigned s_phase, s_pass;
+
+static void count_records(void);
 
 /* ---- flash, through one internal bounce buffer ------------------------ */
 /* esp_flash allocates a temporary internal buffer of up to 16 KiB for every
@@ -152,6 +163,12 @@ static bool port_keep_going(void *context)
     (void)context;
     return esp_timer_get_time() < s_soft_deadline_us;
 }
+static uint64_t port_remaining(void *context)
+{
+    (void)context;
+    int64_t left = s_soft_deadline_us - esp_timer_get_time();
+    return left > 0 ? (uint64_t)(left / 1000) : 0;
+}
 static void port_yield(void *context)
 {
     (void)context;
@@ -237,6 +254,7 @@ static const srr_ports_t PORTS = {
     .alloc = port_alloc,
     .release = port_release,
     .keep_going = port_keep_going,
+    .remaining_ms = port_remaining,
     .yield = port_yield,
     .now_ms = port_now,
     .log = port_log,
@@ -292,10 +310,14 @@ static srr_config_t boot_config(void)
     config.pending_verify = running && esp_ota_get_state_partition(running, &state) == ESP_OK &&
         state == ESP_OTA_IMG_PENDING_VERIFY;
     esp_reset_reason_t reason = boot_report_reset_reason();
-    s_previous_known = boot_report_previous_repair(&s_previous_phase, &s_previous_pass, &s_previous_deadline);
-    config.previous_failed = reason == ESP_RST_PANIC || reason == ESP_RST_INT_WDT || reason == ESP_RST_TASK_WDT ||
-        reason == ESP_RST_WDT || reason == ESP_RST_CPU_LOCKUP ||
-        (reason == ESP_RST_SW && s_previous_known && s_previous_deadline);
+    s_previous_known = boot_report_previous_repair(&s_previous_phase, &s_previous_pass, &s_previous_deadline,
+                                                   &s_previous_returned);
+    /* A failure is the repair's only when the previous boot's breadcrumb
+     * shows it had not returned when the crash or watchdog came, or that its
+     * deadline fired: an unrelated crash after a stopped run is not. */
+    bool crash = reason == ESP_RST_PANIC || reason == ESP_RST_INT_WDT || reason == ESP_RST_TASK_WDT ||
+        reason == ESP_RST_WDT || reason == ESP_RST_CPU_LOCKUP;
+    config.previous_failed = s_previous_known && (s_previous_deadline || (crash && !s_previous_returned));
     const esp_app_desc_t *app = esp_app_get_description();
     if (app) memcpy(&config.image_tag, app->app_elf_sha256, sizeof(config.image_tag));
     config.damage_seen = damage_flag_take();
@@ -370,6 +392,13 @@ void storage_repair_boot(void)
     uint64_t room = free_psram > SR_PSRAM_RESERVE + SR_ENGINE_BYTES ? free_psram - SR_PSRAM_RESERVE - SR_ENGINE_BYTES : 0;
     s_budget = room < SR_HOLD_CAP ? room : SR_HOLD_CAP;
     config.hold_budget = s_budget;
+    /* The journal's NVS peak is checked before anything is written. */
+    nvs_stats_t nvs_stats;
+    config.nvs_known = nvs_get_stats(NULL, &nvs_stats) == ESP_OK;
+    config.nvs_free_entries = config.nvs_known ? (uint32_t)nvs_stats.free_entries : 0;
+    /* Until a pass is measured: the mirror serves the check's header reads
+     * from PSRAM; without it every one is a flash read. */
+    config.check_ms_per_mib = s_mirror ? SR_CHECK_MS_PER_MIB_MIRROR : SR_CHECK_MS_PER_MIB_FLASH;
     if (ready) {
         efs.cfg.hal_read_f = hal_read;
         efs.cfg.hal_write_f = hal_write;
@@ -410,6 +439,8 @@ void storage_repair_boot(void)
     s_stack_free = (uint32_t)uxTaskGetStackHighWaterMark(NULL);
     s_internal_after = (uint32_t)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
     s_nvs_free_after = nvs_free_entries();
+    count_records();
+    boot_report_repair_returned();
 }
 
 /* After the VFS mount: the command inbox, when the run filled a span of it
@@ -432,7 +463,6 @@ void storage_repair_after_mount(void)
 }
 
 /* ---- reporting -------------------------------------------------------- */
-static uint32_t unacked_records(uint32_t *acked);
 static bool queue_generation(char *out, size_t size)
 {
     char instance[33];
@@ -441,57 +471,84 @@ static bool queue_generation(char *out, size_t size)
     return n > 0 && (size_t)n < size;
 }
 
-static bool send_gap_evidence(void)
+/* One PSRAM block per send: the records and the rendered evidence stay off
+ * the ADD outbox task's stack. */
+typedef struct {
+    srp_gaps_t gaps;
+    srp_resets_t resets;
+    char generation[80], record[120], raw[512];
+} sr_send_t;
+
+static void count_records(void)
 {
-    srp_gaps_t *gaps = heap_caps_malloc(sizeof(*gaps), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!gaps) return false;
-    bool sent = false;
-    if (port_nvs_load(NULL, SRR_NVS_NAMESPACE, "gaps", gaps, sizeof(*gaps)) == 1 && gaps->count <= SRP_MAX_GAPS) {
-        for (uint32_t i = 0; i < gaps->count && !sent; ++i) {
-            if (gaps->gap[i].flags & SRP_RECORD_ACKED) continue;
-            char generation[80], record[120], raw[512];
-            size_t length = srp_gap_evidence(&gaps->gap[i], raw, sizeof(raw));
-            if (!length || !srp_gap_record_id(&gaps->gap[i], record, sizeof(record)) ||
-                !queue_generation(generation, sizeof(generation)))
-                break;
-            if (!add_connector_transfer_queue_evidence("storage_repair", generation, record, raw, length, NULL,
-                                                       "MALFORMED"))
-                break;
-            gaps->gap[i].flags |= SRP_RECORD_ACKED;
-            (void)port_nvs_store(NULL, SRR_NVS_NAMESPACE, "gaps", gaps, sizeof(*gaps));
-            atomic_fetch_add(&s_records_sent, 1);
-            sent = true;
-        }
+    sr_send_t *work = heap_caps_malloc(sizeof(*work), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!work) return;
+    uint32_t pending = 0, acked = 0;
+    if (port_nvs_load(NULL, SRR_NVS_NAMESPACE, "gaps", &work->gaps, sizeof(work->gaps)) == 1 &&
+        work->gaps.count <= SRP_MAX_GAPS) {
+        pending += srp_gaps_unacked(&work->gaps);
+        acked += work->gaps.count - srp_gaps_unacked(&work->gaps);
     }
-    heap_caps_free(gaps);
-    return sent;
+    if (port_nvs_load(NULL, SRR_NVS_NAMESPACE, "resets", &work->resets, sizeof(work->resets)) == 1 &&
+        work->resets.count <= SRP_MAX_RESETS) {
+        pending += srp_resets_unacked(&work->resets);
+        acked += work->resets.count - srp_resets_unacked(&work->resets);
+    }
+    heap_caps_free(work);
+    atomic_store(&s_records_pending, pending);
+    atomic_store(&s_records_acked, acked);
 }
 
-static bool send_reset_evidence(void)
+static void record_acked(void)
 {
-    srp_resets_t *resets = heap_caps_malloc(sizeof(*resets), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!resets) return false;
-    bool sent = false;
-    if (port_nvs_load(NULL, SRR_NVS_NAMESPACE, "resets", resets, sizeof(*resets)) == 1 &&
-        resets->count <= SRP_MAX_RESETS) {
-        for (uint32_t i = 0; i < resets->count && !sent; ++i) {
-            if (resets->reset[i].flags & SRP_RECORD_ACKED) continue;
-            char generation[80], record[120], raw[512];
-            size_t length = srp_reset_evidence(&resets->reset[i], raw, sizeof(raw));
-            if (!length || !srp_reset_record_id(&resets->reset[i], record, sizeof(record)) ||
-                !queue_generation(generation, sizeof(generation)))
-                break;
-            if (!add_connector_transfer_queue_evidence("storage_repair", generation, record, raw, length, NULL,
-                                                       "LEGACY_RECOVERY"))
-                break;
-            resets->reset[i].flags |= SRP_RECORD_ACKED;
-            (void)port_nvs_store(NULL, SRR_NVS_NAMESPACE, "resets", resets, sizeof(*resets));
-            atomic_fetch_add(&s_records_sent, 1);
-            sent = true;
-        }
+    atomic_fetch_add(&s_records_sent, 1);
+    atomic_fetch_add(&s_records_acked, 1);
+    unsigned pending = atomic_load(&s_records_pending);
+    if (pending) atomic_store(&s_records_pending, pending - 1);
+}
+
+static bool send_gap_evidence(sr_send_t *work)
+{
+    if (port_nvs_load(NULL, SRR_NVS_NAMESPACE, "gaps", &work->gaps, sizeof(work->gaps)) != 1 ||
+        work->gaps.count > SRP_MAX_GAPS)
+        return false;
+    for (uint32_t i = 0; i < work->gaps.count; ++i) {
+        srp_gap_t *gap = &work->gaps.gap[i];
+        if (gap->flags & SRP_RECORD_ACKED) continue;
+        size_t length = srp_gap_evidence(gap, work->raw, sizeof(work->raw));
+        if (!length || !srp_gap_record_id(gap, work->record, sizeof(work->record)) ||
+            !queue_generation(work->generation, sizeof(work->generation)) ||
+            !add_connector_transfer_queue_evidence("storage_repair", work->generation, work->record, work->raw, length,
+                                                   NULL, "MALFORMED"))
+            return false;
+        gap->flags |= SRP_RECORD_ACKED;
+        (void)port_nvs_store(NULL, SRR_NVS_NAMESPACE, "gaps", &work->gaps, sizeof(work->gaps));
+        record_acked();
+        return true;
     }
-    heap_caps_free(resets);
-    return sent;
+    return false;
+}
+
+static bool send_reset_evidence(sr_send_t *work)
+{
+    if (port_nvs_load(NULL, SRR_NVS_NAMESPACE, "resets", &work->resets, sizeof(work->resets)) != 1 ||
+        work->resets.count > SRP_MAX_RESETS)
+        return false;
+    for (uint32_t i = 0; i < work->resets.count; ++i) {
+        srp_reset_t *reset = &work->resets.reset[i];
+        if (reset->flags & SRP_RECORD_ACKED) continue;
+        size_t length = srp_reset_evidence(reset, work->raw, sizeof(work->raw));
+        if (!length || !srp_reset_record_id(reset, work->record, sizeof(work->record)) ||
+            !queue_generation(work->generation, sizeof(work->generation)) ||
+            !add_connector_transfer_queue_evidence("storage_repair", work->generation, work->record, work->raw, length,
+                                                   NULL, "LEGACY_RECOVERY"))
+            return false;
+        reset->flags |= SRP_RECORD_ACKED;
+        (void)port_nvs_store(NULL, SRR_NVS_NAMESPACE, "resets", &work->resets, sizeof(work->resets));
+        record_acked();
+        return true;
+    }
+    return false;
 }
 
 void storage_repair_report_step(void)
@@ -507,47 +564,36 @@ void storage_repair_report_step(void)
         if (!add_connector_log(line->level, "storage", line->code, line->message)) return;
         atomic_store(&s_lines_sent, next + 1);
     }
+    if (!atomic_load(&s_records_pending)) return;
     int64_t now = esp_timer_get_time();
     if (now < retry_at_us) return;
-    uint32_t acked = 0;
-    if (!unacked_records(&acked)) return;
+    sr_send_t *work = heap_caps_malloc(sizeof(*work), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     /* Gaps first: each is ADD's only record of bytes nobody can read. */
-    if (!send_gap_evidence() && !send_reset_evidence()) retry_at_us = now + 60LL * 1000000LL;
+    bool sent = work && (send_gap_evidence(work) || send_reset_evidence(work));
+    heap_caps_free(work);
+    if (!sent) {
+        retry_at_us = now + 60LL * 1000000LL;
+        /* Nothing left to send (or NVS changed under us): recount. */
+        count_records();
+    }
 }
 
 /* ---- heartbeat --------------------------------------------------------- */
-static uint32_t unacked_records(uint32_t *acked)
-{
-    uint32_t pending = 0;
-    *acked = 0;
-    srp_gaps_t *gaps = heap_caps_malloc(sizeof(*gaps), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    srp_resets_t *resets = heap_caps_malloc(sizeof(*resets), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (gaps && port_nvs_load(NULL, SRR_NVS_NAMESPACE, "gaps", gaps, sizeof(*gaps)) == 1 && gaps->count <= SRP_MAX_GAPS) {
-        pending += srp_gaps_unacked(gaps);
-        *acked += gaps->count - srp_gaps_unacked(gaps);
-    }
-    if (resets && port_nvs_load(NULL, SRR_NVS_NAMESPACE, "resets", resets, sizeof(*resets)) == 1 &&
-        resets->count <= SRP_MAX_RESETS) {
-        pending += srp_resets_unacked(resets);
-        *acked += resets->count - srp_resets_unacked(resets);
-    }
-    heap_caps_free(gaps);
-    heap_caps_free(resets);
-    return pending;
-}
-
-static bool add_actions(cJSON *row, uint8_t actions)
+static bool add_actions(cJSON *row, uint16_t actions)
 {
     static const struct {
-        uint8_t bit;
+        uint16_t bit;
         const char *name;
     } names[] = {{SRR_FILE_NORMALIZED, "NORMALIZED"}, {SRR_FILE_GAPS, "GAPS"}, {SRR_FILE_RESTORED, "RESTORED"},
                  {SRR_FILE_REBUILT, "REBUILT"}, {SRR_FILE_TAIL, "TAIL_TERMINATED"},
-                 {SRR_FILE_CURSOR_RESET, "CURSOR_RESET"}, {SRR_FILE_REMOVED, "REMOVED"}, {SRR_FILE_UNHELD, "UNHELD"}};
+                 {SRR_FILE_CURSOR_RESET, "CURSOR_RESET"}, {SRR_FILE_REMOVED, "REMOVED"}, {SRR_FILE_UNHELD, "UNHELD"},
+                 {SRR_FILE_SIZE_RECOVERED, "SIZE_RECOVERED"}, {SRR_FILE_SUPERSEDED, "SUPERSEDED"}};
     cJSON *list = cJSON_AddArrayToObject(row, "actions");
     if (!list) return false;
-    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); ++i) {
+    unsigned listed = 0;
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]) && listed < 8; ++i) {
         if (!(actions & names[i].bit)) continue;
+        ++listed;
         cJSON *item = cJSON_CreateString(names[i].name);
         if (!item || !cJSON_AddItemToArray(list, item)) {
             cJSON_Delete(item);
@@ -568,7 +614,7 @@ bool storage_repair_append(cJSON *storage)
 {
     if (!s_ran) return true;
     const srr_report_t *r = &s_report;
-    uint32_t acked = 0, pending = unacked_records(&acked);
+    uint32_t acked = atomic_load(&s_records_acked), pending = atomic_load(&s_records_pending);
     cJSON *repair = cJSON_AddObjectToObject(storage, "repair");
     if (!repair) return false;
     const char *result = s_mount_failed ? "MOUNT_FAILED" : srr_result_name(r->result);
@@ -600,6 +646,9 @@ bool storage_repair_append(cJSON *storage)
         cJSON_AddNumberToObject(repair, "orphan_index_removed", r->orphan_index_removed) &&
         cJSON_AddNumberToObject(repair, "blocks_compacted", r->blocks_compacted) &&
         cJSON_AddNumberToObject(repair, "reserve_pages", r->reserve_pages) &&
+        cJSON_AddNumberToObject(repair, "sizes_recovered", r->sizes_recovered) &&
+        cJSON_AddNumberToObject(repair, "strays_removed", r->strays_removed) &&
+        cJSON_AddNumberToObject(repair, "files_superseded", r->files_superseded) &&
         cJSON_AddNumberToObject(repair, "lookup_fixed", r->lookup_fixed) &&
         cJSON_AddNumberToObject(repair, "tails_terminated", r->tails_terminated) &&
         cJSON_AddNumberToObject(repair, "files_restored", r->files_restored) &&
@@ -620,7 +669,8 @@ bool storage_repair_append(cJSON *storage)
         cJSON_AddNumberToObject(repair, "log_lines_dropped", atomic_load(&s_lines_dropped));
     if (ok && s_previous_known)
         ok = cJSON_AddStringToObject(repair, "previous_boot_phase", srp_phase_name((srp_phase_t)s_previous_phase)) &&
-            cJSON_AddBoolToObject(repair, "previous_boot_deadline", s_previous_deadline);
+            cJSON_AddBoolToObject(repair, "previous_boot_deadline", s_previous_deadline) &&
+            cJSON_AddBoolToObject(repair, "previous_boot_returned", s_previous_returned);
     if (ok && (r->error_stage[0] || s_mount_failed))
         ok = cJSON_AddStringToObject(repair, "error_stage", s_mount_failed ? "mount" : r->error_stage) &&
             cJSON_AddNumberToObject(repair, "error_code", s_mount_failed ? s_mount_error : r->error_code);

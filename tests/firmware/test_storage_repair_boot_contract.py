@@ -80,4 +80,12 @@ def test_command_inbox_waits_for_storage_and_reports_go_through_the_outbox_task(
         < merge.index("ft_replace(")
     outbox = _body(connector, "static void outbox_task(void *arg)\n{")
     assert outbox.index("if (!add_connector_is_connected()) {") < outbox.index("storage_repair_report_step();")
+    # Evidence sends make direct priority senders wait: never inside a hold.
+    assert outbox.index("if (priority_delivery_hold_active()) {") < outbox.index("storage_repair_report_step();")
+    glue = (MAIN / "storage_repair.c").read_text()
+    step = _body(glue, "void storage_repair_report_step(void)")
+    # Nothing pending: no NVS read, no allocation.
+    assert step.index("if (!atomic_load(&s_records_pending)) return;") < step.index("heap_caps_malloc(")
+    # The evidence buffers live in PSRAM, not on the outbox task's stack.
+    assert "char generation[80], record[120], raw[512];" not in glue.replace("    char generation[80], record[120], raw[512];\n} sr_send_t;", "")
     assert "if (!storage_repair_append(storage)) goto failed;" in connector
