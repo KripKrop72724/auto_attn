@@ -6,7 +6,7 @@ import json
 import shlex
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from sqlalchemy.exc import OperationalError
@@ -45,6 +45,7 @@ class FakeWebSocket:
         self.closes: list[tuple[int, str | None]] = []
         self.send_error: Exception | None = None
         self.accepted: str | None = None
+        self.closed_by_app = False
 
     async def accept(self, subprotocol: str | None = None) -> None:
         self.accepted = subprotocol
@@ -53,7 +54,11 @@ class FakeWebSocket:
         return await self.incoming.get()
 
     async def send(self, message: dict) -> None:
+        if self.closed_by_app:
+            # Starlette refuses every send once the application sent a close.
+            raise RuntimeError('Cannot call "send" once a close message has been sent.')
         if message["type"] == "websocket.close":
+            self.closed_by_app = True
             self.closes.append((message["code"], message.get("reason")))
             # uvicorn queues the app's own close code as the final receive event.
             self.incoming.put_nowait({"type": "websocket.disconnect", "code": message["code"]})
@@ -115,6 +120,9 @@ class Backend:
         self.bootstrap_rows: list[dict] = []
         self.bootstrap_errors: list[Exception] = []
         self.bootstrap_attempts = 0
+        self.bootstrap_entered = 0
+        self.commands: list[dict] = []
+        self.events_for: set[int] = set()
         self.connected_error: Exception | None = None
         self.reject_error: Exception | None = None
         self.commands_error: Exception | None = None
@@ -140,6 +148,7 @@ class Backend:
             self.persisted.append(envelope_value.seq)
         return add_web.EnvelopeOutcome(
             ack={"type": "ack", "message_id": envelope_value.message_id, "seq": envelope_value.seq},
+            event={"seq": envelope_value.seq} if envelope_value.seq in self.events_for else None,
             commands_for=CONNECTOR if envelope_value.seq in self.follow_up_for else None,
         )
 
@@ -151,6 +160,8 @@ class Backend:
         return "ONLINE"
 
     def bootstrap(self, connector_pk: int):
+        with self.lock:
+            self.bootstrap_entered += 1
         if self.bootstrap_gate is not None:
             assert self.bootstrap_gate.wait(5), "test never released the bootstrap"
         self.bootstrap_attempts += 1
@@ -168,7 +179,7 @@ class Backend:
     def pending_commands(self, connector_id: str) -> list[dict]:
         if self.commands_error is not None:
             raise self.commands_error
-        return []
+        return list(self.commands)
 
 
 def database_down() -> OperationalError:
@@ -397,8 +408,9 @@ def test_peer_disconnect_mid_transaction_still_commits_received_messages_in_orde
         await until(lambda: websocket.incoming.empty())
         first.set()
         await asyncio.wait_for(stream, 3)
-        # Everything fully received is processed, as the single receive loop
-        # did; nothing is written to the closed socket and nothing is rejected.
+        # After an abrupt drop, and while no newer session exists, everything
+        # fully received is processed, as the former loop drained uvicorn's
+        # buffer; nothing is written to the closed socket and nothing rejected.
         assert backend.persisted == [1, 2]
         assert acked(websocket) == []
         assert backend.rejections == []
@@ -419,10 +431,13 @@ def test_ack_to_a_socket_closed_by_keepalive_is_not_reported_as_a_rejected_messa
         # uvicorn 0.51 raises this for any send after a keepalive close.
         websocket.send_error = RuntimeError("Unexpected ASGI message 'websocket.send', after sending 'websocket.close'.")
         first.set()
-        await until(lambda: backend.persisted == [1, 2])
-        assert backend.rejections == []
-        websocket.disconnect()
         await asyncio.wait_for(stream, 3)
+        # The committed message is not reported as rejected, and, as the former
+        # loop's failing ACK did, the failed send ends intake: message 2 stays
+        # unACKed for the device to replay.
+        assert backend.persisted == [1]
+        assert backend.rejections == []
+        assert websocket.sent_of("error") == []
 
     asyncio.run(scenario())
 
@@ -500,6 +515,215 @@ def test_controlled_interruption_closes_with_1013_and_stops(backend):
         assert backend.rejections == []
 
     asyncio.run(scenario())
+
+
+# --- once a socket is closed or replaced, nothing new starts ----------------
+
+
+def test_hub_send_only_to_never_reaches_a_newer_socket():
+    async def scenario():
+        hub = ConnectorHub()
+        old, new = FakeWebSocket(), FakeWebSocket()
+        await hub.connect(CONNECTOR, old)
+        await hub.connect(CONNECTOR, new)
+        assert old.closes == [(4001, "Superseded by a newer connector session")]
+        assert hub.current(CONNECTOR) is new
+        assert await hub.send(CONNECTOR, {"type": "command"}, only_to=old) is False
+        assert await hub.send_many(CONNECTOR, [{"type": "command"}], only_to=old) is False
+        assert new.sent == []
+        assert await hub.send(CONNECTOR, {"type": "command"}, only_to=new) is True
+        assert await hub.send(CONNECTOR, {"type": "command"}) is True
+        assert len(new.sent) == 2
+        await hub.disconnect(CONNECTOR, new)
+        assert hub.current(CONNECTOR) is None
+
+    asyncio.run(scenario())
+
+
+def test_superseded_session_starts_nothing_after_4001(backend, caplog):
+    async def scenario():
+        old = FakeWebSocket()
+        first = backend.gate(1)
+        old_stream = asyncio.create_task(add_web.device_stream(old))
+        old.feed(1)
+        old.feed(2)
+        old.feed(3)
+        await until(lambda: backend.started == [1])
+        await until(lambda: old.incoming.empty())
+        # The device reconnects while message 1's transaction is still open.
+        new = FakeWebSocket()
+        new_stream = asyncio.create_task(add_web.device_stream(new))
+        await until(lambda: old.closes == [(4001, "Superseded by a newer connector session")])
+        new.feed(10)
+        await until(lambda: acked(new) == [10])
+        first.set()
+        await asyncio.wait_for(old_stream, 3)
+        # Message 1 was in flight and commits; 2 and 3 never start. They stay
+        # unACKed on the old socket and the device replays them on the new one.
+        assert backend.started == [1, 10]
+        assert backend.persisted == [10, 1]
+        assert acked(old) == []
+        assert [message["type"] for message in new.sent] == [
+            "identity_catalog_begin", "identity_catalog_commit", "ack",
+        ]
+        new.disconnect()
+        await asyncio.wait_for(new_stream, 3)
+
+    asyncio.run(scenario())
+    old_end, new_end = session_ends(caplog)
+    assert (old_end["end"], old_end["close_code"], old_end["in_flight_type"]) == (
+        "superseded", "4001", "heartbeat",
+    )
+    assert (old_end["processed"], old_end["unprocessed"], old_end["undelivered"]) == ("1", "2", "1")
+    assert (new_end["end"], new_end["processed"], new_end["unprocessed"]) == ("connection_lost", "1", "0")
+
+
+def test_superseded_session_sends_no_follow_ups_to_the_newer_socket(backend, monkeypatch):
+    command = {"type": "command", "command_id": "command-1", "command_type": "SYNC_TIME"}
+    backend.commands = [command]
+    backend.follow_up_for = {1}
+    backend.events_for = {1}
+    published = []
+    publish = add_web.browser_events.publish
+
+    async def record(event_type, data):
+        published.append((event_type, data))
+        return await publish(event_type, data)
+
+    monkeypatch.setattr(add_web.browser_events, "publish", record)
+
+    async def scenario():
+        old = FakeWebSocket()
+        first = backend.gate(1)
+        old_stream = asyncio.create_task(add_web.device_stream(old))
+        old.feed(1)
+        await until(lambda: backend.started == [1])
+        new = FakeWebSocket()
+        new_stream = asyncio.create_task(add_web.device_stream(new))
+        # The new session's own bootstrap delivers the pending command once.
+        await until(lambda: new.sent_of("command") == [command])
+        first.set()
+        await asyncio.wait_for(old_stream, 3)
+        await asyncio.sleep(0.05)
+        # The old session's committed heartbeat flushes nothing through the hub.
+        assert new.sent_of("command") == [command]
+        assert backend.persisted == [1]
+        new.disconnect()
+        await asyncio.wait_for(new_stream, 3)
+
+    asyncio.run(scenario())
+    # The message is committed, so browsers still hear about it.
+    assert ("heartbeat", {"seq": 1}) in published
+
+
+def test_session_superseded_during_its_bootstrap_pushes_nothing(backend, caplog):
+    async def scenario():
+        old = FakeWebSocket()
+        held = threading.Event()
+        backend.bootstrap_gate = held
+        old_stream = asyncio.create_task(add_web.device_stream(old))
+        old.feed(1, message_type="user_snapshot")
+        await until(lambda: backend.bootstrap_entered == 1)
+        backend.bootstrap_gate = None
+        new = FakeWebSocket()
+        new_stream = asyncio.create_task(add_web.device_stream(new))
+        await until(lambda: [message["type"] for message in new.sent] == [
+            "identity_catalog_begin", "identity_catalog_commit",
+        ])
+        held.set()
+        await asyncio.wait_for(old_stream, 3)
+        await asyncio.sleep(0.05)
+        # The old bootstrap finished after it was superseded: its catalog and
+        # commands went nowhere, and its queued snapshot was never processed.
+        assert [message["type"] for message in new.sent] == [
+            "identity_catalog_begin", "identity_catalog_commit",
+        ]
+        assert old.sent == []
+        assert backend.started == []
+        new.disconnect()
+        await asyncio.wait_for(new_stream, 3)
+
+    asyncio.run(scenario())
+    old_end = session_ends(caplog)[0]
+    assert (old_end["end"], old_end["close_code"], old_end["startup_seconds"]) == ("superseded", "4001", "-")
+    assert (old_end["processed"], old_end["unprocessed"]) == ("0", "1")
+
+
+@pytest.mark.parametrize(
+    ("close", "kind", "code"),
+    [
+        ("keepalive", "keepalive_timeout", "1005"),
+        ("shutdown_frame", "server_shutdown", "1012"),
+        ("shutdown_hook", "server_shutdown", "1012"),
+        ("device_close_frame", "closed", "1000"),
+        ("hil_interruption", "closed", "1013"),
+    ],
+)
+def test_orderly_close_finishes_the_message_in_flight_and_starts_no_other(backend, caplog, close, kind, code):
+    facts = WebSocketTransportFacts()
+
+    async def scenario():
+        websocket = FakeWebSocket()
+        websocket.scope["extensions"][TRANSPORT_EXTENSION] = facts
+        first = backend.gate(1)
+        stream = asyncio.create_task(add_web.device_stream(websocket))
+        websocket.feed(1)
+        websocket.feed(2)
+        websocket.feed(3)
+        await until(lambda: backend.started == [1])
+        await until(lambda: websocket.incoming.empty())
+        if close == "keepalive":
+            facts.keepalive_timed_out = True
+            websocket.disconnect(1005)
+        elif close == "shutdown_frame":
+            websocket.disconnect(1012)
+        elif close == "shutdown_hook":
+            # uvicorn's shutdown, seen by the protocol before the reader gets it.
+            facts.server_shutdown = True
+        elif close == "device_close_frame":
+            websocket.disconnect(1000)
+        else:
+            expires = add_web.utc_now() + timedelta(seconds=30)
+            assert await add_web.connector_hub.interrupt_until(CONNECTOR, expires) is True
+        await asyncio.sleep(0.05)
+        first.set()
+        await asyncio.wait_for(stream, 3)
+        assert backend.persisted == [1]
+        assert acked(websocket) == []
+
+    asyncio.run(scenario())
+    end = session_end(caplog)
+    assert (end["end"], end["close_code"]) == (kind, code)
+    assert (end["processed"], end["unprocessed"], end["undelivered"]) == ("1", "2", "1")
+
+
+def test_abrupt_drop_drains_only_until_a_newer_session_registers(backend, caplog):
+    async def scenario():
+        old = FakeWebSocket()
+        first, second = backend.gate(1), backend.gate(2)
+        old_stream = asyncio.create_task(add_web.device_stream(old))
+        old.feed(1)
+        old.feed(2)
+        old.feed(3)
+        old.disconnect(1005)
+        await until(lambda: backend.started == [1])
+        first.set()
+        # No newer session yet: the received backlog is still drained.
+        await until(lambda: backend.started == [1, 2])
+        new = FakeWebSocket()
+        new_stream = asyncio.create_task(add_web.device_stream(new))
+        await until(lambda: len(new.sent) == 2)
+        second.set()
+        await asyncio.wait_for(old_stream, 3)
+        # Once the device is back, the old session starts nothing more.
+        assert backend.persisted == [1, 2]
+        new.disconnect()
+        await asyncio.wait_for(new_stream, 3)
+
+    asyncio.run(scenario())
+    old_end = session_ends(caplog)[0]
+    assert (old_end["end"], old_end["close_code"]) == ("connection_lost", "1005")
+    assert (old_end["processed"], old_end["unprocessed"], old_end["undelivered"]) == ("2", "1", "2")
 
 
 # --- ADD-side faults never drop the socket ----------------------------------
@@ -644,11 +868,18 @@ def test_unexpected_session_fault_closes_with_a_frame(backend, monkeypatch):
 # --- why a session ended ----------------------------------------------------
 
 
+def session_ends(caplog) -> list[dict[str, str]]:
+    return [
+        dict(field.split("=", 1) for field in shlex.split(
+            record.getMessage().removeprefix("ADD device session ended ")))
+        for record in caplog.records if record.getMessage().startswith("ADD device session ended ")
+    ]
+
+
 def session_end(caplog) -> dict[str, str]:
-    lines = [record.getMessage() for record in caplog.records
-             if record.getMessage().startswith("ADD device session ended ")]
-    assert len(lines) == 1, lines
-    return dict(field.split("=", 1) for field in shlex.split(lines[0].removeprefix("ADD device session ended ")))
+    ends = session_ends(caplog)
+    assert len(ends) == 1, ends
+    return ends[0]
 
 
 def test_session_end_reports_the_message_in_flight_when_the_peer_vanished(backend, caplog):

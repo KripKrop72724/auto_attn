@@ -307,6 +307,21 @@ only pauses reading until processing catches up, and `queue_full` in the session
 how often that happened. Before this, uvicorn stopped reading whenever a message arrived while ADD
 was busy, so pongs went unread and a long transaction looked like a dead device.
 
+When a socket closes, the message being processed always finishes (its ACK can no longer be
+delivered). What happens to messages still queued depends on how it closed:
+
+- After an orderly close, nothing else starts: ADD superseded the socket (`4001`) or interrupted it
+  for a HIL run (`1013`), uvicorn shut down (`1012`) or timed out the keepalive, or the device sent
+  a close frame. This is what the former receive loop did, because its next receive or ACK failed.
+- After an abrupt drop (no close frame either way), the queue is still processed, as the former loop
+  processed what uvicorn had buffered, but only until a newer session registers for the connector.
+  A device that reconnects never has its old session's backlog committed alongside its new one.
+
+Messages left unprocessed stay unACKed and the device replays them; replays are recognised by
+sequence and receipt. A replaced session also never sends anything through the connector hub to
+its successor's socket: not its bootstrap catalog, coverage or commands, and not the command flush
+after its last committed heartbeat.
+
 uvicorn runs with `--ws-ping-interval 20 --ws-ping-timeout 60`. A device that is uploading its full
 user snapshot cannot answer pings until the upload ends, so the pong deadline must outlast a slow
 upload; a peer that really is gone is now noticed after at most about 80 s, and a device that
@@ -321,6 +336,15 @@ with `1013` (a session never runs without its identity catalog); a failure to re
 message still answers the device with `MESSAGE_REJECTED`; and a failure after a committed message's
 ACK is logged without reporting that message as rejected. Look for `ADD device stream ...`,
 `ADD could not record a rejected envelope` and `ADD follow-up after a committed envelope failed`.
+
+These fault paths now end with a close frame (`1013` when the database stays unavailable through
+the bootstrap retries, `1011` for any other bootstrap or internal failure) where an escaping
+exception used to drop the TCP connection without one. Firmware 2.7.3 and later reconnects after
+either in 30 s. Earlier firmware (2.4.12, 2.5.2, 2.6.15 and 2.7.2) has no reconnect on a close
+frame: its WebSocket task ends, and the heartbeat task restarts the transport after
+`ADD_TRANSPORT_RECOVERY_MS` (45 s, checked every 15 s), so those devices need 45-60 s instead of
+30 s to come back after one of these faults. Close frames ADD already sent before this change
+(deploy `1012`, keepalive `1011`, HIL `1013`) behave the same way on that firmware.
 
 Every session end emits one `ADD device session ended` line, for example:
 

@@ -283,10 +283,11 @@ def identity_catalog_payload(db: Session, connector: Connector) -> dict:
     return {"schema_version": "2", "type": "identity_catalog", "rows": rows}
 
 
-async def send_identity_catalog(connector_id: str, catalog: dict) -> bool:
+async def send_identity_catalog(connector_id: str, catalog: dict, *, only_to: WebSocket | None = None) -> bool:
     return await connector_hub.send_many(
         connector_id,
         identity_catalog_messages(catalog),
+        only_to=only_to,
     )
 
 
@@ -4254,7 +4255,8 @@ async def device_stream(websocket: WebSocket):
     # Read from the moment the socket is accepted, through the bootstrap push
     # and every message's transaction, so pongs and uploads keep flowing.
     session = DeviceStreamSession(
-        websocket, connector_id, slow_message_seconds=settings.slow_request_seconds
+        websocket, connector_id, slow_message_seconds=settings.slow_request_seconds,
+        is_current=lambda: connector_hub.current(connector_id) is websocket,
     )
     session.start()
     try:
@@ -4310,7 +4312,12 @@ async def open_device_stream(session: DeviceStreamSession, connector_pk: int, co
             "ADD device stream bootstrap failed connector_id=%s error_type=%s",
             connector_id, type(exc).__name__,
         )
-        await session.close(1011, "ADD bootstrap failed")
+        if not session.should_stop():
+            await session.close(1011, "ADD bootstrap failed")
+        return False
+    if session.should_stop():
+        # Superseded or closed while the bootstrap was being built: nothing of
+        # it may reach the newer session's socket through the hub.
         return False
     if bootstrap is None:
         # Never run a session without its identity catalog: the device's
@@ -4318,18 +4325,23 @@ async def open_device_stream(session: DeviceStreamSession, connector_pk: int, co
         await session.close(1013, "ADD database unavailable; retry")
         return False
     catalog, coverage_payload = bootstrap
-    if not await send_identity_catalog(connector_id, catalog):
-        await session.close(1011, "Identity catalog delivery failed")
+    # Every bootstrap send goes only to this session's own socket, never to a
+    # session that superseded it meanwhile.
+    if not await send_identity_catalog(connector_id, catalog, only_to=session.websocket):
+        if not session.should_stop():
+            await session.close(1011, "Identity catalog delivery failed")
         return False
     if coverage_payload is not None:
         if not await connector_hub.send(
             connector_id,
             {"type": "source_coverage", **coverage_payload},
+            only_to=session.websocket,
         ):
-            await session.close(1011, "Source coverage delivery failed")
+            if not session.should_stop():
+                await session.close(1011, "Source coverage delivery failed")
             return False
     try:
-        await send_pending_commands(connector_id)
+        await send_pending_commands(connector_id, only_to=session.websocket)
     except Exception as exc:
         # Active commands are flushed again after every accepted heartbeat.
         logger.warning(
@@ -4346,7 +4358,8 @@ async def load_stream_bootstrap(
 
     The reader keeps the socket alive meanwhile, so a short database stall no
     longer costs the device a reconnect and another full user snapshot.
-    None means the database stayed unavailable or the device already left.
+    None means the database stayed unavailable, the device already left or a
+    newer session replaced this one.
     """
     for attempt, delay in enumerate((*STREAM_BOOTSTRAP_RETRY_SECONDS, None), start=1):
         try:
@@ -4356,7 +4369,7 @@ async def load_stream_bootstrap(
                 "ADD device stream bootstrap database fault connector_id=%s attempt=%d error_type=%s",
                 connector_id, attempt, type(exc).__name__,
             )
-            if delay is None or session.transport_closed:
+            if delay is None or session.transport_closed or not session.is_current():
                 return None
             await asyncio.sleep(delay)
     return None
@@ -4429,7 +4442,14 @@ async def handle_device_envelope(
     if outcome is None:
         return True
     try:
-        await send_envelope_follow_ups(envelope, outcome, session)
+        if session.attached:
+            await send_envelope_follow_ups(envelope, outcome, session, only_to=session.websocket)
+        else:
+            # The ACK found the socket closed or replaced. Commands sent through
+            # the hub would reach a newer session's socket ahead of its own
+            # bootstrap, which sends them itself; coverage has no socket left.
+            # The message is committed, so browsers still hear about it.
+            await publish_envelope_events(envelope, outcome)
     except TransportInterrupted:
         await session.close(1013, "Controlled ADD interruption")
         return False
@@ -4939,13 +4959,21 @@ async def accept_envelope(
 
 
 async def send_envelope_follow_ups(
-    envelope: Envelope, outcome: EnvelopeOutcome, websocket: WebSocket | DeviceStreamSession
+    envelope: Envelope,
+    outcome: EnvelopeOutcome,
+    websocket: WebSocket | DeviceStreamSession,
+    *,
+    only_to: WebSocket | None = None,
 ) -> None:
     """Work after a committed message's ACK. Its failure never un-accepts the message."""
     if outcome.commands_for:
-        await send_pending_commands(outcome.commands_for)
+        await send_pending_commands(outcome.commands_for, only_to=only_to)
     if outcome.coverage is not None:
         await websocket.send_json(outcome.coverage)
+    await publish_envelope_events(envelope, outcome)
+
+
+async def publish_envelope_events(envelope: Envelope, outcome: EnvelopeOutcome) -> None:
     if outcome.provisioning is not None:
         await browser_events.publish("provisioning", outcome.provisioning)
     if outcome.event is not None:
@@ -4969,7 +4997,7 @@ def pending_command_payloads(connector_id: str) -> list[dict]:
     return payloads
 
 
-async def send_pending_commands(connector_id: str) -> None:
+async def send_pending_commands(connector_id: str, *, only_to: WebSocket | None = None) -> None:
     for payload in await asyncio.to_thread(pending_command_payloads, connector_id):
         if payload.get("command_type") == "ESP_REBOOT":
             from zk_add.hil_reboot import refresh_reboot_dispatch
@@ -4977,7 +5005,7 @@ async def send_pending_commands(connector_id: str) -> None:
             payload = await asyncio.to_thread(refresh_reboot_dispatch, payload["command_id"])
             if payload is None:
                 continue
-        await connector_hub.send(connector_id, payload)
+        await connector_hub.send(connector_id, payload, only_to=only_to)
 
 
 def mark_command_dispatched(command_id: str) -> None:

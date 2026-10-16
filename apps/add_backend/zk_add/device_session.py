@@ -10,10 +10,16 @@ upload could not drain aborted its own session.
 
 A session runs one reader task from the moment the socket is accepted. It
 drains the socket into a bounded FIFO while the endpoint processes messages
-one at a time, strictly in arrival order, exactly like the former single
-receive loop. The FIFO never drops a message: when it is full the reader
-simply stops asking for more, which is the old behaviour, until the worker
-catches up.
+one at a time, strictly in arrival order, like the former single receive loop.
+The FIFO never drops a message: when it is full the reader simply stops asking
+for more, which is the old behaviour, until the worker catches up.
+
+When the socket closes, messages still queued are handed over only where the
+former loop would also have gone on: after an abrupt drop, and only while no
+newer session is registered for the connector. After an orderly close (this
+server superseding, interrupting, shutting down or timing out the socket, or a
+close frame from the device) the message in flight finishes and nothing else
+starts; the device replays everything it has not had ACKed.
 
 Each session also records why and how it ended (one log line per session,
 plus one per slow message) so reconnect storms can be attributed to the
@@ -57,6 +63,8 @@ INBOUND_QUEUE_MAX_BYTES = 2 * 1024 * 1024
 TRANSPORT_EXTENSION = "zk_add.ws_transport"
 
 END_OF_STREAM: Any = object()
+# Disconnect codes uvicorn reports when no close frame was exchanged.
+ABRUPT_CLOSE_CODES = frozenset({1005, 1006})
 _SAFE_LABEL = re.compile(r"^[A-Za-z0-9._:/-]{1,100}$")
 
 
@@ -80,13 +88,14 @@ class WebSocketTransportFacts:
     """Payload-free facts a uvicorn protocol records about one connection."""
 
     __slots__ = (
-        "connector_id", "keepalive_timed_out", "last_ping_rtt", "pings_sent",
+        "connector_id", "keepalive_timed_out", "server_shutdown", "last_ping_rtt", "pings_sent",
         "pongs_received", "bytes_received", "last_data_at",
     )
 
     def __init__(self) -> None:
         self.connector_id: str | None = None
         self.keepalive_timed_out = False
+        self.server_shutdown = False
         self.last_ping_rtt: float | None = None
         self.pings_sent = 0
         self.pongs_received = 0
@@ -192,9 +201,13 @@ class DeviceStreamSession:
         max_bytes: int | None = None,
         slow_message_seconds: float = 2.0,
         clock: Callable[[], float] = time.monotonic,
+        is_current: Callable[[], bool] | None = None,
     ) -> None:
         self.websocket = websocket
         self.connector_id = connector_id
+        # Whether this socket is still the one registered for the connector;
+        # once a newer session exists this one must not start anything new.
+        self._is_current = is_current
         self.queue = InboundQueue(
             max_messages=max_messages or INBOUND_QUEUE_MAX_MESSAGES,
             max_bytes=max_bytes or INBOUND_QUEUE_MAX_BYTES,
@@ -208,6 +221,10 @@ class DeviceStreamSession:
         self._reader: asyncio.Task[None] | None = None
         self._in_flight: _InFlight | None = None
         self._transport_closed = False
+        # First close code exchanged on this socket: sent by this server (the
+        # session or the connector hub) or received in the device's close frame.
+        self._close_code: int | None = None
+        self._send_failed = False
         self.messages_in = 0
         self.bytes_in = 0
         self.messages_out = 0
@@ -224,18 +241,80 @@ class DeviceStreamSession:
 
     @property
     def transport_closed(self) -> bool:
-        return self._transport_closed
+        facts = self.transport
+        return self._transport_closed or (
+            facts is not None and (facts.keepalive_timed_out or facts.server_shutdown)
+        )
+
+    def is_current(self) -> bool:
+        return self._is_current is None or bool(self._is_current())
+
+    @property
+    def attached(self) -> bool:
+        """The socket is open and still the connector's registered socket."""
+        return not self.transport_closed and self.is_current()
+
+    def stop_reason(self) -> tuple[str, int | None] | None:
+        """Why no further queued message may be handed over, or None.
+
+        Every orderly close ends intake at once, as the former loop's failing
+        receive or ACK did: a close sent by this server (the hub superseding or
+        interrupting the socket, or the session itself), uvicorn's shutdown or
+        keepalive close, a close frame from the device, or any send that found
+        the socket closed. After an abrupt drop the queue is still drained, as
+        the former loop drained uvicorn's buffer, but never once a newer
+        session is registered: its messages would race the newer session's.
+        """
+        if self._close_code is not None:
+            return self._disconnect_kind(self._close_code), self._close_code
+        facts = self.transport
+        if facts is not None and facts.server_shutdown:
+            return "server_shutdown", 1012
+        if facts is not None and facts.keepalive_timed_out:
+            return "keepalive_timeout", None
+        if self._send_failed:
+            return "connection_lost", None
+        if not self.is_current():
+            return "superseded", None
+        return None
+
+    def should_stop(self) -> bool:
+        """True once intake has ended; the first call records why the session ended."""
+        reason = self.stop_reason()
+        if reason is None:
+            return False
+        self.mark_end(*reason)
+        return True
 
     def _meter_sends(self) -> None:
         # Every send to this socket (ACKs here, catalog, coverage and commands
-        # through the connector hub) goes through the instance's send method.
+        # through the connector hub, and the hub's own 4001 or 1013 close) goes
+        # through the instance's send method.
         send = getattr(self.websocket, "send", None)
         if not callable(send):
             return
 
         async def metered_send(message: dict) -> None:
-            await send(message)
-            if message.get("type") == "websocket.send":
+            kind = message.get("type")
+            if kind == "websocket.close":
+                # Whoever closes the socket, intake ends at once, before the
+                # close is even written.
+                self._transport_closed = True
+                if self._close_code is None:
+                    self._close_code = int(message.get("code") or 1000)
+            try:
+                await send(message)
+            except Exception:
+                if kind == "websocket.send":
+                    # The pinned uvicorn (0.51) writes into an abruptly lost
+                    # connection silently, so there a failed send means a close
+                    # frame went one way or the other. Later uvicorn also fails
+                    # sends after an abrupt loss; ending intake then only leaves
+                    # more for the device to replay.
+                    self._transport_closed = True
+                    self._send_failed = True
+                raise
+            if kind == "websocket.send":
                 data = message.get("text")
                 self.messages_out += 1
                 self.bytes_out += message_size(data if data is not None else message.get("bytes") or b"")
@@ -255,9 +334,12 @@ class DeviceStreamSession:
             while True:
                 message = await self.websocket.receive()
                 if message["type"] == "websocket.disconnect":
-                    self.disconnect_code = int(message.get("code") or 1005)
+                    code = int(message.get("code") or 1005)
+                    self.disconnect_code = code
                     self._transport_closed = True
-                    self.mark_end(self._disconnect_kind(self.disconnect_code), self.disconnect_code)
+                    if code not in ABRUPT_CLOSE_CODES and self._close_code is None:
+                        self._close_code = code
+                    self.mark_end(self._disconnect_kind(code), code)
                     return
                 data = message.get("text")
                 if data is None:
@@ -279,7 +361,7 @@ class DeviceStreamSession:
             self.queue.finish()
 
     def _disconnect_kind(self, code: int) -> str:
-        if code in {1005, 1006}:
+        if code in ABRUPT_CLOSE_CODES:
             # uvicorn reports its own keepalive close to the app as 1005 too;
             # only the protocol hook can tell the two apart.
             if self.transport is not None and self.transport.keepalive_timed_out:
@@ -292,9 +374,13 @@ class DeviceStreamSession:
         return "closed"
 
     async def next_message(self) -> str | bytes | None:
-        """Next complete message in arrival order; None once the stream ended."""
+        """Next complete message in arrival order; None once intake has ended.
+
+        A message refused because intake ended stays unACKed (it is counted as
+        unprocessed) and the device replays it.
+        """
         item = await self.queue.get()
-        if item is END_OF_STREAM:
+        if item is END_OF_STREAM or self.should_stop():
             return None
         self.handed_over += 1
         return item
@@ -368,15 +454,16 @@ class DeviceStreamSession:
         payload that cannot be encoded still fails as a processing error.
         """
         text = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
-        if self._transport_closed:
+        if self.transport_closed:
             self.undelivered += 1
             return False
         try:
             await self.websocket.send_text(text)
         except (WebSocketDisconnect, RuntimeError, OSError):
             # Starlette and uvicorn report a socket closed by the peer, by
-            # keepalive or by this server as one of these. The worker still
-            # finishes the queued messages; the device replays unACKed ones.
+            # keepalive or by this server as one of these. The message being
+            # processed still finishes, no queued one starts after it (see
+            # stop_reason) and the device replays whatever was not ACKed.
             self._transport_closed = True
             self.undelivered += 1
             return False

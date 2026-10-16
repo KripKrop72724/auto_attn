@@ -34,19 +34,25 @@ PING_INTERVAL = 0.2
 PING_TIMEOUT = 0.5
 
 
-async def reader_stream(websocket):
-    await websocket.accept()
-    session = DeviceStreamSession(websocket, "ZL-KEEPALIVE")
-    session.start()
-    try:
-        while (raw := await session.next_message()) is not None:
-            async def work(raw=raw):
-                await asyncio.sleep(PROCESSING_SECONDS)
-                await session.send_json({"type": "ack", "message": raw})
-            await session.process("heartbeat", work())
-    finally:
-        await session.stop()
-        session.log_end()
+def make_reader_stream(processing_seconds: float):
+    async def stream(websocket):
+        await websocket.accept()
+        session = DeviceStreamSession(websocket, "ZL-KEEPALIVE")
+        session.start()
+        try:
+            while (raw := await session.next_message()) is not None:
+                async def work(raw=raw):
+                    await asyncio.sleep(processing_seconds)
+                    await session.send_json({"type": "ack", "message": raw})
+                await session.process("heartbeat", work())
+        finally:
+            await session.stop()
+            session.log_end()
+
+    return stream
+
+
+reader_stream = make_reader_stream(PROCESSING_SECONDS)
 
 
 async def receive_then_process_stream(websocket):
@@ -191,13 +197,37 @@ def test_diagnostic_protocol_extends_the_protocol_uvicorn_selects_by_default():
     assert issubclass(DiagnosticWebSocketProtocol, AutoWebSocketsProtocol)
     # A uvicorn upgrade that renames a hooked method must fail here, not
     # silently stop reporting keepalive closes.
-    for name in ("handle_connect", "data_received", "send_keepalive_ping", "handle_pong",
-                 "keepalive_timeout"):
+    for name in ("handle_connect", "shutdown", "data_received", "send_keepalive_ping",
+                 "handle_pong", "keepalive_timeout"):
         assert name in vars(WebSocketsSansIOProtocol), name
         assert name in vars(DiagnosticWebSocketProtocol), name
     for attribute in ("pending_ping_payload", "last_ping_rtt", "ping_sent_at", "read_paused",
                       "close_sent", "ping_timeout"):
         assert attribute in WebSocketsSansIOProtocol.__init__.__code__.co_names, attribute
+
+
+def test_server_shutdown_finishes_the_message_in_flight_and_starts_no_other(caplog):
+    app = Starlette(routes=[WebSocketRoute("/reader", reader_stream)])
+
+    async def scenario():
+        server, task, port = await serve(app, ws=DiagnosticWebSocketProtocol)
+        client = await connect(f"ws://127.0.0.1:{port}/reader", ping_interval=None)
+        try:
+            for index in range(3):
+                await client.send(f"message-{index}")
+            await asyncio.sleep(0.3)
+            # Deploy: uvicorn closes every socket with 1012 and waits for the app.
+            started = asyncio.get_running_loop().time()
+            await stop(server, task)
+            # Only the message in flight delays the shutdown, not the backlog.
+            assert asyncio.get_running_loop().time() - started < 2 * PROCESSING_SECONDS
+        finally:
+            await client.close()
+
+    asyncio.run(scenario())
+    end = session_end(caplog)
+    assert (end["end"], end["close_code"]) == ("server_shutdown", "1012")
+    assert (end["processed"], end["unprocessed"], end["undelivered"]) == ("1", "2", "1")
 
 
 def _api_service(compose_file: Path) -> dict:
