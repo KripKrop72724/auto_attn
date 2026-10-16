@@ -244,11 +244,11 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  backend:
-    # This exact required check cannot succeed until EVERY isolated test shard
-    # and their complete coverage proof succeed. Signing still requires it.
-    needs: [backend-tests]
-    if: always()
+  backend-static:
+    # Lint, contracts, migrations and packaging need no test results, so they
+    # start immediately and a lint failure is visible within minutes instead
+    # of after the test shards. The exact `backend` check below still cannot
+    # succeed unless this job succeeds.
     runs-on: ubuntu-latest
     timeout-minutes: 45
     services:
@@ -277,10 +277,6 @@ jobs:
       ADD_REDIS_URL: redis://127.0.0.1:6379/0
       ADD_ADMIN_COOKIE_SECURE: "false"
     steps:
-      - name: Require every test shard to succeed
-        env:
-          SHARD_RESULT: ${{ needs.backend-tests.result }}
-        run: test "$SHARD_RESULT" = success
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
@@ -300,13 +296,6 @@ jobs:
         run: python -m ruff check apps/add_backend apps/add_provisioner apps/provisioning_companion tests scripts firmware/zone_lite/tools/provision_zone_lite.py
       - name: Verify frontend OpenAPI safety contracts
         run: python scripts/check_frontend_openapi_contract.py
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: backend-test-plan-*
-          path: .ci
-          merge-multiple: true
-      - name: Verify every collected test belongs to exactly one successful shard
-        run: python scripts/run_ci_tests.py --verify-plans .ci --shard-count 8 --weights scripts/ci_test_durations.json
       - name: Validate a fresh PostgreSQL migration and schema drift
         run: |
           alembic -c apps/add_backend/alembic.ini upgrade head
@@ -340,6 +329,36 @@ jobs:
           alembic -c apps/add_backend/alembic.ini check
       - name: Build Python distribution
         run: python -m build
+
+  backend:
+    # This exact required check cannot succeed until EVERY isolated test shard,
+    # their complete coverage proof, and every lint, contract, migration and
+    # packaging gate in backend-static succeed. Signing still requires it.
+    needs: [backend-tests, backend-static]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Require every test shard and every static gate to succeed
+        env:
+          SHARD_RESULT: ${{ needs.backend-tests.result }}
+          STATIC_RESULT: ${{ needs.backend-static.result }}
+        run: |
+          test "$SHARD_RESULT" = success
+          test "$STATIC_RESULT" = success
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: backend-test-plan-*
+          path: .ci
+          merge-multiple: true
+      - name: Verify every collected test belongs to exactly one successful shard
+        run: python scripts/run_ci_tests.py --verify-plans .ci --shard-count 8 --weights scripts/ci_test_durations.json
 
   frontend:
     runs-on: ubuntu-latest
