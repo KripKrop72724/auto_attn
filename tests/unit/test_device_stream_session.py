@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import shlex
 import threading
+import time
 from datetime import datetime, timezone
 
 import pytest
@@ -11,7 +13,13 @@ from sqlalchemy.exc import OperationalError
 
 import zk_add.device_session as device_session
 import zk_add.web as add_web
-from zk_add.device_session import END_OF_STREAM, DeviceStreamSession, InboundQueue
+from zk_add.device_session import (
+    END_OF_STREAM,
+    TRANSPORT_EXTENSION,
+    DeviceStreamSession,
+    InboundQueue,
+    WebSocketTransportFacts,
+)
 from zk_add.realtime import BrowserEventHub, ConnectorHub
 
 CONNECTOR = "ZL-STREAM-TEST"
@@ -44,21 +52,32 @@ class FakeWebSocket:
     async def receive(self) -> dict:
         return await self.incoming.get()
 
-    async def send_text(self, text: str) -> None:
+    async def send(self, message: dict) -> None:
+        if message["type"] == "websocket.close":
+            self.closes.append((message["code"], message.get("reason")))
+            # uvicorn queues the app's own close code as the final receive event.
+            self.incoming.put_nowait({"type": "websocket.disconnect", "code": message["code"]})
+            return
         if self.send_error is not None:
             raise self.send_error
-        self.sent.append(json.loads(text))
+        self.sent.append(json.loads(message["text"]))
+
+    # Starlette routes both through send(), which the session meters.
+    async def send_text(self, text: str) -> None:
+        await self.send({"type": "websocket.send", "text": text})
 
     async def close(self, code: int = 1000, reason: str | None = None) -> None:
-        self.closes.append((code, reason))
-        # uvicorn queues the app's own close code as the final receive event.
-        self.incoming.put_nowait({"type": "websocket.disconnect", "code": code})
+        await self.send({"type": "websocket.close", "code": code, "reason": reason})
 
     def feed_text(self, text: str) -> None:
         self.incoming.put_nowait({"type": "websocket.receive", "text": text})
 
-    def feed(self, seq: int, *, message_type: str = "heartbeat", connector_id: str = CONNECTOR) -> None:
-        self.feed_text(json.dumps(envelope(seq, message_type=message_type, connector_id=connector_id)))
+    def feed(self, seq: int, *, message_type: str = "heartbeat", connector_id: str = CONNECTOR,
+             payload: dict | None = None) -> str:
+        text = json.dumps(envelope(seq, message_type=message_type, connector_id=connector_id,
+                                   payload=payload))
+        self.feed_text(text)
+        return text
 
     def disconnect(self, code: int = 1005) -> None:
         self.incoming.put_nowait({"type": "websocket.disconnect", "code": code})
@@ -67,7 +86,8 @@ class FakeWebSocket:
         return [message for message in self.sent if message.get("type") == kind]
 
 
-def envelope(seq: int, *, message_type: str = "heartbeat", connector_id: str = CONNECTOR) -> dict:
+def envelope(seq: int, *, message_type: str = "heartbeat", connector_id: str = CONNECTOR,
+             payload: dict | None = None) -> dict:
     return {
         "schema_version": "2",
         "message_id": f"message-{seq}",
@@ -76,7 +96,7 @@ def envelope(seq: int, *, message_type: str = "heartbeat", connector_id: str = C
         "seq": seq,
         "sent_at": datetime(2026, 10, 16, tzinfo=timezone.utc).isoformat(),
         "type": message_type,
-        "payload": {},
+        "payload": payload or {},
     }
 
 
@@ -99,6 +119,7 @@ class Backend:
         self.reject_error: Exception | None = None
         self.commands_error: Exception | None = None
         self.follow_up_for: set[int] = set()
+        self.delays: dict[int, float] = {}
 
     def gate(self, seq: int) -> threading.Event:
         self.gates[seq] = threading.Event()
@@ -111,6 +132,8 @@ class Backend:
         gate = self.gates.get(envelope_value.seq)
         if gate is not None:
             assert gate.wait(5), "test never released the transaction"
+        if envelope_value.seq in self.delays:
+            time.sleep(self.delays[envelope_value.seq])
         if envelope_value.seq in self.failures:
             raise self.failures[envelope_value.seq]
         with self.lock:
@@ -616,3 +639,190 @@ def test_unexpected_session_fault_closes_with_a_frame(backend, monkeypatch):
         assert backend.connected[-1] == (False, [])
 
     asyncio.run(scenario())
+
+
+# --- why a session ended ----------------------------------------------------
+
+
+def session_end(caplog) -> dict[str, str]:
+    lines = [record.getMessage() for record in caplog.records
+             if record.getMessage().startswith("ADD device session ended ")]
+    assert len(lines) == 1, lines
+    return dict(field.split("=", 1) for field in shlex.split(lines[0].removeprefix("ADD device session ended ")))
+
+
+def test_session_end_reports_the_message_in_flight_when_the_peer_vanished(backend, caplog):
+    async def scenario():
+        websocket = FakeWebSocket()
+        first = backend.gate(1)
+        stream = asyncio.create_task(add_web.device_stream(websocket))
+        sizes = [len(websocket.feed(1, message_type="user_snapshot", payload={"rows": ["x" * 2000]})),
+                 len(websocket.feed(2))]
+        await until(lambda: backend.started == [1])
+        await until(lambda: websocket.incoming.empty())
+        await asyncio.sleep(0.2)
+        websocket.disconnect(1005)
+        await asyncio.sleep(0.05)
+        first.set()
+        await asyncio.wait_for(stream, 3)
+        return sizes, websocket
+
+    sizes, websocket = asyncio.run(scenario())
+    end = session_end(caplog)
+    assert end["connector_id"] == CONNECTOR
+    assert (end["end"], end["close_code"], end["reason"]) == ("connection_lost", "1005", "-")
+    assert end["in_flight_type"] == "user_snapshot"
+    assert float(end["in_flight_seconds"]) >= 0.2
+    assert float(end["since_last_message_seconds"]) >= 0.2
+    assert end["startup_seconds"] != "-"
+    assert (end["messages_in"], end["bytes_in"]) == ("2", str(sum(sizes)))
+    # The catalog begin/commit went out; both ACKs found the socket gone.
+    assert end["messages_out"] == "2"
+    assert int(end["bytes_out"]) == sum(len(json.dumps(message, separators=(",", ":")))
+                                         for message in websocket.sent)
+    assert (end["processed"], end["unprocessed"], end["undelivered"]) == ("2", "0", "2")
+    # Both arrived while the bootstrap was still being pushed.
+    assert end["queue_peak_messages"] == "2"
+    assert end["slowest_type"] == "user_snapshot"
+    # Without the uvicorn protocol hook the keepalive state is unknown, not false.
+    assert (end["keepalive_timeout"], end["ping_rtt_seconds"]) == ("-", "-")
+
+
+@pytest.mark.parametrize(
+    ("code", "keepalive", "kind"),
+    [
+        (1005, True, "keepalive_timeout"),
+        (1005, False, "connection_lost"),
+        (4001, False, "superseded"),
+        (1012, False, "server_shutdown"),
+        (1000, False, "closed"),
+    ],
+)
+def test_session_end_classifies_how_the_socket_closed(backend, caplog, code, keepalive, kind):
+    facts = WebSocketTransportFacts()
+
+    async def scenario():
+        websocket = FakeWebSocket()
+        websocket.scope["extensions"][TRANSPORT_EXTENSION] = facts
+        stream = asyncio.create_task(add_web.device_stream(websocket))
+        websocket.feed(1)
+        await until(lambda: acked(websocket) == [1])
+        facts.keepalive_timed_out = keepalive
+        facts.last_ping_rtt = 0.25
+        websocket.disconnect(code)
+        await asyncio.wait_for(stream, 3)
+
+    asyncio.run(scenario())
+    end = session_end(caplog)
+    assert facts.connector_id == CONNECTOR
+    assert (end["end"], end["close_code"]) == (kind, str(code))
+    assert end["keepalive_timeout"] == str(keepalive).lower()
+    assert end["ping_rtt_seconds"] == "0.250"
+    assert end["in_flight_type"] == "-"
+
+
+def test_session_end_names_this_servers_own_close(backend, caplog):
+    async def scenario():
+        websocket = FakeWebSocket()
+        stream = asyncio.create_task(add_web.device_stream(websocket))
+        websocket.feed(1)
+        await until(lambda: acked(websocket) == [1])
+        websocket.feed_text("x" * (512 * 1024 + 1))
+        websocket.feed(3)
+        await asyncio.wait_for(stream, 3)
+
+    asyncio.run(scenario())
+    end = session_end(caplog)
+    assert (end["end"], end["close_code"], end["reason"]) == ("server_close", "4400", "Message too large")
+    assert (end["messages_in"], end["processed"], end["unprocessed"]) == ("3", "2", "1")
+
+
+def test_failed_bootstrap_has_no_startup_duration(backend, caplog):
+    backend.bootstrap_errors = [database_down(), database_down(), database_down()]
+
+    async def scenario():
+        await asyncio.wait_for(add_web.device_stream(FakeWebSocket()), 3)
+
+    asyncio.run(scenario())
+    end = session_end(caplog)
+    assert (end["end"], end["close_code"], end["startup_seconds"]) == ("server_close", "1013", "-")
+
+
+def test_cancelled_session_end_names_the_message_it_waited_for(backend, caplog):
+    async def scenario():
+        websocket = FakeWebSocket()
+        first = backend.gate(1)
+        stream = asyncio.create_task(add_web.device_stream(websocket))
+        websocket.feed(1)
+        await until(lambda: backend.started == [1])
+        stream.cancel()
+        await asyncio.sleep(0.05)
+        first.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(stream, 3)
+
+    asyncio.run(scenario())
+    end = session_end(caplog)
+    assert (end["end"], end["in_flight_type"]) == ("cancelled", "heartbeat")
+
+
+def test_unexpected_fault_is_named_in_the_session_end(backend, monkeypatch, caplog):
+    async def broken(*_args):
+        raise LookupError("plumbing bug")
+
+    monkeypatch.setattr(add_web, "process_device_message", broken)
+
+    async def scenario():
+        websocket = FakeWebSocket()
+        stream = asyncio.create_task(add_web.device_stream(websocket))
+        websocket.feed(1)
+        with pytest.raises(LookupError):
+            await asyncio.wait_for(stream, 3)
+
+    asyncio.run(scenario())
+    end = session_end(caplog)
+    assert (end["end"], end["close_code"], end["reason"]) == ("error", "1011", "LookupError")
+
+
+def test_slow_message_log_splits_executor_wait_from_transaction_time(backend, monkeypatch, caplog):
+    monkeypatch.setattr(add_web.settings, "slow_request_seconds", 0.1)
+    backend.delays[2] = 0.2
+
+    async def scenario():
+        websocket = FakeWebSocket()
+        stream = asyncio.create_task(add_web.device_stream(websocket))
+        websocket.feed(1)
+        websocket.feed(2, message_type="user_snapshot")
+        await until(lambda: acked(websocket) == [1, 2])
+        websocket.disconnect()
+        await asyncio.wait_for(stream, 3)
+
+    asyncio.run(scenario())
+    slow = [record.getMessage() for record in caplog.records
+            if record.getMessage().startswith("ADD slow device message ")]
+    assert len(slow) == 1
+    fields = dict(field.split("=", 1) for field in slow[0].removeprefix("ADD slow device message ").split())
+    assert (fields["connector_id"], fields["type"]) == (CONNECTOR, "user_snapshot")
+    assert float(fields["transaction_seconds"]) >= 0.2
+    assert float(fields["executor_wait_seconds"]) >= 0
+    assert float(fields["duration_seconds"]) >= float(fields["transaction_seconds"])
+    assert session_end(caplog)["slowest_type"] == "user_snapshot"
+
+
+def test_session_logs_never_carry_tokens_payloads_or_peer_close_reasons(backend, caplog):
+    async def scenario():
+        websocket = FakeWebSocket()
+        backend.failures[1] = ValueError("CNIC 35202-1234567-1 is not valid")
+        stream = asyncio.create_task(add_web.device_stream(websocket))
+        websocket.feed(1, message_type="attendance_batch", payload={"cnic": "35202-1234567-1"})
+        websocket.feed(2, payload={"name": "PAYLOAD-NAME-MARKER"})
+        await until(lambda: acked(websocket) == [2])
+        websocket.incoming.put_nowait({"type": "websocket.disconnect", "code": 1000,
+                                       "reason": "PEER-REASON-MARKER"})
+        await asyncio.wait_for(stream, 3)
+
+    asyncio.run(scenario())
+    text = caplog.text
+    assert "ADD device session ended" in text
+    for secret in ("device-token", "35202", "PAYLOAD-NAME-MARKER", "PEER-REASON-MARKER"):
+        assert secret not in text

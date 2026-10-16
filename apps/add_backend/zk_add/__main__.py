@@ -4,7 +4,7 @@ import argparse
 
 import uvicorn
 
-from zk_add.device_session import WS_PING_INTERVAL_SECONDS, WS_PING_TIMEOUT_SECONDS
+from zk_add.device_session import WS_PING_INTERVAL_SECONDS, WS_PING_TIMEOUT_SECONDS, WS_PROTOCOL
 from zk_add.settings import settings
 
 
@@ -19,6 +19,7 @@ def main() -> None:
         host=args.host,
         port=args.port,
         reload=args.reload,
+        ws=WS_PROTOCOL,
         ws_ping_interval=WS_PING_INTERVAL_SECONDS,
         ws_ping_timeout=WS_PING_TIMEOUT_SECONDS,
     )

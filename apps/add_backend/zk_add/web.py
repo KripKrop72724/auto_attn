@@ -4253,30 +4253,41 @@ async def device_stream(websocket: WebSocket):
     await connector_hub.connect(connector_id, websocket)
     # Read from the moment the socket is accepted, through the bootstrap push
     # and every message's transaction, so pongs and uploads keep flowing.
-    session = DeviceStreamSession(websocket, connector_id)
+    session = DeviceStreamSession(
+        websocket, connector_id, slow_message_seconds=settings.slow_request_seconds
+    )
     session.start()
     try:
         if await open_device_stream(session, connector_pk, connector_id):
+            session.startup_complete()
             while (raw := await session.next_message()) is not None:
                 if not await process_device_message(session, connector_pk, connector_id, raw):
                     break
-    except WebSocketDisconnect:
-        pass
-    except Exception:
+    except WebSocketDisconnect as exc:
+        session.mark_end("connection_lost", exc.code)
+    except asyncio.CancelledError:
+        session.mark_end("cancelled")
+        raise
+    except Exception as exc:
         # Close with a frame rather than a bare TCP reset, then let uvicorn log it.
+        session.mark_end("error", 1011, type(exc).__name__)
         await session.close(1011, "ADD internal error")
         raise
     finally:
-        await session.stop()
-        await connector_hub.disconnect(connector_id, websocket)
         try:
-            await asyncio.to_thread(set_stream_connected, connector_pk, False)
-        except Exception as exc:
-            logger.warning(
-                "ADD device stream could not record its disconnection connector_id=%s error_type=%s",
-                connector_id, type(exc).__name__,
-            )
-        await browser_events.publish("device", {"connector_id": connector_id, "connected": False})
+            await session.stop()
+            await connector_hub.disconnect(connector_id, websocket)
+            try:
+                await asyncio.to_thread(set_stream_connected, connector_pk, False)
+            except Exception as exc:
+                logger.warning(
+                    "ADD device stream could not record its disconnection connector_id=%s error_type=%s",
+                    connector_id, type(exc).__name__,
+                )
+            await browser_events.publish("device", {"connector_id": connector_id, "connected": False})
+        finally:
+            # Even a cleanup cut short by cancellation reports the session.
+            session.log_end()
 
 
 async def open_device_stream(session: DeviceStreamSession, connector_pk: int, connector_id: str) -> bool:
@@ -4377,7 +4388,9 @@ async def handle_device_envelope(
     session: DeviceStreamSession, connector_pk: int, connector_id: str, envelope: Envelope
 ) -> bool:
     try:
-        outcome = await accept_envelope(connector_pk, envelope, session)
+        outcome = await accept_envelope(
+            connector_pk, envelope, session, in_thread=session.run_in_thread
+        )
     except TransportInterrupted:
         await session.close(1013, "Controlled ADD interruption")
         return False
@@ -4909,10 +4922,14 @@ async def handle_envelope(
 
 
 async def accept_envelope(
-    connector_pk: int, envelope: Envelope, websocket: WebSocket | DeviceStreamSession
+    connector_pk: int,
+    envelope: Envelope,
+    websocket: WebSocket | DeviceStreamSession,
+    *,
+    in_thread=asyncio.to_thread,
 ) -> EnvelopeOutcome | None:
     """Commit one device message, then ACK it; anything raised is answered as a rejection."""
-    outcome = await asyncio.to_thread(persist_envelope, connector_pk, envelope)
+    outcome = await in_thread(persist_envelope, connector_pk, envelope)
     if outcome is None:
         return None
     # The worker returns only after commit. No acknowledgement or browser success

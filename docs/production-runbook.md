@@ -296,6 +296,72 @@ Interpret deployment probe results in this order:
 - HTTP `400`/`413`/`422` applies to individual payloads; ADD quarantines those rows and continues with
   newer attendance.
 
+### Device WebSocket channel
+
+Each Zone Lite device holds one WebSocket to `/device/v2/stream`. On connect ADD pushes the
+identity catalog, source coverage and active commands, then processes the device's messages one at
+a time, in arrival order, sending each ACK only after its transaction commits. A reader task keeps
+reading the socket from the moment it is accepted, through that push and through every
+transaction, into a queue bounded at 32 messages or 2 MiB. Nothing is ever dropped: a full queue
+only pauses reading until processing catches up, and `queue_full` in the session line below counts
+how often that happened. Before this, uvicorn stopped reading whenever a message arrived while ADD
+was busy, so pongs went unread and a long transaction looked like a dead device.
+
+uvicorn runs with `--ws-ping-interval 20 --ws-ping-timeout 60`. A device that is uploading its full
+user snapshot cannot answer pings until the upload ends, so the pong deadline must outlast a slow
+upload; a peer that really is gone is now noticed after at most about 80 s, and a device that
+reconnects earlier simply supersedes its old session. `docker-compose.add.yml` and the image CMD
+also pass `--ws zk_add.ws_protocol:DiagnosticWebSocketProtocol`, which only adds logging. The
+rollback override repeats the ping flags but deliberately not `--ws`, because an older image does
+not contain that module. Keep the three launch commands in sync; a unit test enforces it.
+
+A database fault never drops a device socket. During authentication the handshake is refused for
+the device to retry; the connect bootstrap is retried twice within the session and otherwise closed
+with `1013` (a session never runs without its identity catalog); a failure to record a rejected
+message still answers the device with `MESSAGE_REJECTED`; and a failure after a committed message's
+ACK is logged without reporting that message as rejected. Look for `ADD device stream ...`,
+`ADD could not record a rejected envelope` and `ADD follow-up after a committed envelope failed`.
+
+Every session end emits one `ADD device session ended` line, for example:
+
+```text
+ADD device session ended connector_id=... end=keepalive_timeout close_code=1005 reason=-
+duration_seconds=81.6 startup_seconds=3.1 in_flight_type=- in_flight_seconds=-
+since_last_message_seconds=62.0 since_wire_data_seconds=0.4 messages_in=2 bytes_in=9311
+messages_out=17 bytes_out=81240 processed=2 unprocessed=0 undelivered=0 queue_peak_messages=1
+queue_peak_bytes=8702 queue_full=0 slowest_type=heartbeat slowest_seconds=0.2
+keepalive_timeout=true ping_rtt_seconds=0.412 reader_error=-
+```
+
+It is one line in the log; this example is a device that was still uploading a large message
+when its pong deadline expired. `in_flight_*` names the message being processed when the session ended
+and how long it had run; `since_last_message_seconds` is the time since the last complete message;
+`since_wire_data_seconds` is the time since any bytes arrived, including part of an unfinished
+upload; `unprocessed` messages were received but abandoned unACKed (the device replays them);
+`undelivered` counts replies that found the socket already closed. `ping_rtt_seconds` is the last
+server ping round trip. Fields read `-` when unknown, for example `keepalive_timeout` under the
+rollback image. No line ever carries a token, a payload or a reason sent by the device.
+
+When uvicorn closes a socket because no pong arrived, the protocol also logs
+`ADD WebSocket keepalive timeout` with `read_paused`, `bytes_since_ping` and
+`seconds_since_data`. Messages that take at least `ADD_SLOW_REQUEST_SECONDS` (default 2 s) log
+`ADD slow device message` with the executor wait and the transaction time separately.
+
+Reading a reconnect storm (correlate with the device's `ADD_RECONNECTED` logs and its heartbeat
+RSSI; `read_paused` and `bytes_since_ping` come from the matching keepalive line):
+
+| Session end | Meaning |
+| --- | --- |
+| `end=keepalive_timeout`, `read_paused=true` | ADD was not reading: check `queue_full` and `ADD slow device message`. |
+| `end=keepalive_timeout`, `bytes_since_ping` above 0 | The device was sending, usually its full user snapshot, and could not answer pings for 60 s: a slow or lossy path to that site. |
+| `end=keepalive_timeout`, `bytes_since_ping=0` | Nothing arrived for the whole deadline: the device or its path went silent, often after an abort whose TCP close never reached ADD. |
+| `end=connection_lost` | The TCP connection dropped. Zone Lite drops a failed send without a close frame, so its 5 s send-stall abort looks like this. |
+| `end=superseded` (`4001`) | The device reconnected before ADD noticed the old socket had died: a device-side abort. |
+| `end=server_close` | ADD closed it; `close_code` and `reason` say why (`4400` too large, `4403` wrong connector, `1013` HIL interruption or database unavailable, `1011` delivery or internal failure). |
+| `end=closed` | Any other close code: a close frame from the device, or an operator-started HIL interruption (`1013`). |
+| `end=server_shutdown` (`1012`) | API restart or deploy. |
+| `in_flight_seconds` of 20 s or more at any end | ADD itself was slow; check the matching `ADD slow device message` line. |
+
 ## Alert response
 
 | Alert/state | Immediate action | Do not do |

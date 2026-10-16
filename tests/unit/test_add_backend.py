@@ -5,6 +5,7 @@ import base64
 from contextlib import contextmanager, nullcontext
 import hashlib
 import json
+import time
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -4342,7 +4343,7 @@ def test_websocket_attendance_storage_failure_never_emits_ack(
 
 
 def test_device_stream_end_to_end_bootstraps_then_acks_each_message_in_order(
-    db: Session, monkeypatch: pytest.MonkeyPatch
+    db: Session, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ):
     connector, token, _created = onboard_connector(
         db, hardware_id=MAC, zone_id="ZONE-SLICTOWER-3FL", zone_name="ZONE-SLICTOWER-3FL",
@@ -4362,18 +4363,6 @@ def test_device_stream_end_to_end_bootstraps_then_acks_each_message_in_order(
             raise
 
     monkeypatch.setattr(add_web, "session_scope", shared_scope)
-    import threading
-
-    disconnected = threading.Event()
-    record_connection = add_web.set_stream_connected
-
-    def recorded_connection(pk: int, connected: bool):
-        state = record_connection(pk, connected)
-        if not connected:
-            disconnected.set()
-        return state
-
-    monkeypatch.setattr(add_web, "set_stream_connected", recorded_connection)
 
     def log_envelope(seq: int) -> str:
         return Envelope(
@@ -4394,15 +4383,24 @@ def test_device_stream_end_to_end_bootstraps_then_acks_each_message_in_order(
         stream.send_text("{not an envelope")
         stream.send_text(log_envelope(2))
         replies = [stream.receive_json() for _ in range(3)]
-        # Leaving the block cancels the app at once; let its cleanup finish first.
+        # Leaving the block cancels the app at once; let the session end first.
         stream.close(1000)
-        assert disconnected.wait(5), "the device session never recorded its end"
+        deadline = time.monotonic() + 5
+        while not any(record.getMessage().startswith("ADD device session ended ")
+                      for record in caplog.records):
+            assert time.monotonic() < deadline, "the device session never ended"
+            time.sleep(0.01)
     assert [(reply["type"], reply.get("seq", reply.get("code"))) for reply in replies] == [
         ("ack", 1), ("error", "INVALID_ENVELOPE"), ("ack", 2),
     ]
     stored = db.get(Connector, connector_pk)
     db.refresh(stored)
     assert (stored.boot_id, stored.last_sequence, stored.connected) == ("stream-boot", 2, False)
+    [ended] = [record.getMessage() for record in caplog.records
+               if record.getMessage().startswith("ADD device session ended ")]
+    assert f"connector_id={connector.connector_id} end=closed close_code=1000 " in ended
+    assert " messages_in=3 " in ended and " processed=3 " in ended and " messages_out=6 " in ended
+    assert token not in caplog.text
 
 
 def test_successful_message_only_resolves_rejection_for_the_same_path(db: Session):

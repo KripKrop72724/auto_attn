@@ -111,7 +111,9 @@ services:
     # A device sending its full user snapshot cannot answer pings until the
     # upload ends, so the pong deadline outlasts slow uploads (keep in sync with
     # deploy/add/docker-compose.rollback.yml and apps/add_backend/Dockerfile).
-    command: ["/bin/sh", "-c", "alembic -c apps/add_backend/alembic.ini upgrade head && exec uvicorn zk_add.web:app --host 0.0.0.0 --port 8096 --proxy-headers --workers 1 --timeout-keep-alive 10 --ws-ping-interval 20 --ws-ping-timeout 60"]
+    # --ws logs keepalive closes; the rollback override must not name it because
+    # an older image does not contain zk_add/ws_protocol.py.
+    command: ["/bin/sh", "-c", "alembic -c apps/add_backend/alembic.ini upgrade head && exec uvicorn zk_add.web:app --host 0.0.0.0 --port 8096 --proxy-headers --workers 1 --timeout-keep-alive 10 --ws-ping-interval 20 --ws-ping-timeout 60 --ws zk_add.ws_protocol:DiagnosticWebSocketProtocol"]
     ports:
       - "0.0.0.0:8096:8096"
     depends_on:
