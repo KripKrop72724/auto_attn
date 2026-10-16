@@ -5,18 +5,24 @@ import os
 import shutil
 import subprocess
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[2]
 FIRMWARE = ROOT / "firmware/zone_lite"
 
 
-def test_inventory_maps_unreadable_bytes_without_writing(tmp_path: Path) -> None:
+# newlib on the ESP32-S3 has a 32-bit signed off_t and st_size; the host's are
+# 64-bit. 2.7.4 clamped st_size against (off_t)UINT32_MAX, -1 on the device, so
+# every file there reported 4294967295 bytes while this host build passed.
+@pytest.mark.parametrize("width", [[], ["-DSI_DEVICE_OFF_T"]], ids=["host-off_t", "esp32s3-off_t"])
+def test_inventory_maps_unreadable_bytes_without_writing(tmp_path: Path, width: list[str]) -> None:
     compiler = shutil.which(os.environ.get("CC", "cc"))
     assert compiler, "A C compiler is required for the firmware regression gate"
     executable = tmp_path / "storage-inventory"
     store = tmp_path / "store"
     store.mkdir()
     subprocess.run([
-        compiler, "-std=gnu11", "-g", "-O1", "-Wall", "-Wextra", "-Werror",
+        compiler, "-std=gnu11", "-g", "-O1", "-Wall", "-Wextra", "-Werror", *width,
         "-fsanitize=address,undefined", "-fno-omit-frame-pointer",
         "-I", str(ROOT / "tests/firmware/cjson_subset"), "-I", str(FIRMWARE / "main"),
         "-include", str(ROOT / "tests/firmware/storage_inventory_host/fault.h"),
@@ -24,7 +30,7 @@ def test_inventory_maps_unreadable_bytes_without_writing(tmp_path: Path) -> None
         "-o", str(tmp_path / "core.o"), "-c",
     ], check=True)
     subprocess.run([
-        compiler, "-std=gnu11", "-g", "-O1", "-Wall", "-Wextra", "-Werror",
+        compiler, "-std=gnu11", "-g", "-O1", "-Wall", "-Wextra", "-Werror", *width,
         "-fsanitize=address,undefined", "-fno-omit-frame-pointer",
         "-I", str(ROOT / "tests/firmware/cjson_subset"), "-I", str(FIRMWARE / "main"),
         str(ROOT / "tests/firmware/storage_inventory_host.c"), str(tmp_path / "core.o"),

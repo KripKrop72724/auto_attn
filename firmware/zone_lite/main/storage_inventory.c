@@ -13,18 +13,18 @@
  * yields to every storage user and stops at its budget. */
 #define SI_START_DELAY_MS (60 * 1000)
 #define SI_BUDGET_US (180LL * 1000LL * 1000LL)
-#define SI_YIELD_EVERY_PAGES 32U
+#define SI_YIELD_EVERY_READS 32U
 #define SI_LOGGED_FILES 4U
 
 static si_report_t s_report;
 static bool s_ready;
 static int64_t s_deadline_us;
-static uint32_t s_pages;
+static uint32_t s_reads;
 
 static bool keep_going(void *context)
 {
     (void)context;
-    if (++s_pages % SI_YIELD_EVERY_PAGES == 0) vTaskDelay(pdMS_TO_TICKS(2));
+    if (++s_reads % SI_YIELD_EVERY_READS == 0) vTaskDelay(pdMS_TO_TICKS(2));
     return esp_timer_get_time() < s_deadline_us;
 }
 

@@ -16,6 +16,7 @@
 #define SI_MAX_FILES 16U   /* reported files: unreadable ones first, then the largest */
 #define SI_MAX_NAMES 256U  /* directory entries examined */
 #define SI_PAGE_BYTES 256U /* SPIFFS page: an unreadable region is skipped to the next page */
+#define SI_CHUNK_PAGES 16U /* pages per read while a file reads back; a failed chunk is read by page */
 
 typedef struct {
     char name[33];
