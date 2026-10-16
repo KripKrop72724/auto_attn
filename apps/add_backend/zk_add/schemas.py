@@ -221,6 +221,8 @@ class StorageRepairDiagnostics(BaseModel):
     index_rewritten: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
     duplicates_removed: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
     orphan_index_removed: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    blocks_compacted: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    reserve_pages: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
     lookup_fixed: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
     tails_terminated: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
     files_restored: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)

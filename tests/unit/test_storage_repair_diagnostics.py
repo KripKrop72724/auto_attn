@@ -15,6 +15,7 @@ REPAIR = {
     "files": 9, "files_held": 6, "bytes_held": 4612345, "files_unheld_custody": 0,
     "gaps": 1, "unreadable_bytes": 251, "records_reported": 0, "records_pending": 1, "records_dropped": 0,
     "spans_rewritten": 2, "index_rewritten": 1, "duplicates_removed": 1, "orphan_index_removed": 5,
+    "blocks_compacted": 3, "reserve_pages": 4,
     "lookup_fixed": 0, "tails_terminated": 1, "files_restored": 0, "files_rebuilt": 0, "cursors_reset": 1,
     "expendables_removed": 1, "settled_removed": 0, "interrupted_losses": 0,
     "used_before": 4930000, "used_after": 3540000, "total_bytes": 7700000,
@@ -44,6 +45,7 @@ def test_a_repair_report_is_kept_with_the_heartbeat(db):
     stored = connector.firmware_diagnostics["storage"]["repair"]
     assert stored["result"] == "REPAIRED_WITH_GAPS" and stored["gaps"] == 1
     assert stored["check"]["delete_page"] == 5512
+    assert stored["blocks_compacted"] == 3 and stored["reserve_pages"] == 4
     entry = stored["entries"][0]
     assert entry["name"] == "/blocked_identity.jsonl" and entry["actions"] == ["NORMALIZED", "GAPS"]
     assert entry.get("class", entry.get("class_")) == "attendance"
@@ -60,6 +62,7 @@ def test_later_codes_are_text_and_older_firmware_sends_none():
 
 def test_an_unreadable_report_is_dropped_and_the_heartbeat_accepted():
     for field, value in [("result", "lower"), ("gaps", -1), ("level", 99), ("error_stage", "Has Space"),
+                         ("blocks_compacted", -3),
                          ("unreadable_bytes", 2**33), ("entries", [{"name": "bad\u0001"}] )]:
         broken = copy.deepcopy(REPAIR)
         broken[field] = value
