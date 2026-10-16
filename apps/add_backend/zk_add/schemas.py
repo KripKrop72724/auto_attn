@@ -198,6 +198,7 @@ class StorageRepairDiagnostics(BaseModel):
     previous_phase: str | None = Field(default=None, pattern=UPPER_CODE)
     previous_boot_phase: str | None = Field(default=None, pattern=UPPER_CODE)
     previous_boot_deadline: bool | None = None
+    previous_boot_returned: bool | None = None
     generation: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
     incomplete: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
     failures: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
@@ -223,6 +224,9 @@ class StorageRepairDiagnostics(BaseModel):
     orphan_index_removed: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
     blocks_compacted: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
     reserve_pages: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    sizes_recovered: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    strays_removed: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    files_superseded: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
     lookup_fixed: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
     tails_terminated: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
     files_restored: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)

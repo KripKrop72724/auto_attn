@@ -9,13 +9,13 @@ from zk_add.service import update_heartbeat
 
 REPAIR = {
     "result": "REPAIRED_WITH_GAPS", "mode": "FULL", "phase": "IDLE", "previous_phase": "IDLE",
-    "previous_boot_phase": "CHECK", "previous_boot_deadline": False,
+    "previous_boot_phase": "CHECK", "previous_boot_deadline": False, "previous_boot_returned": False,
     "generation": 7, "incomplete": 0, "failures": 0, "level": 0, "check_skipped": False, "mirror": True,
     "commands_damaged": False, "duration_ms": 4120, "check_ms": 2210, "budget_bytes": 6291456,
     "files": 9, "files_held": 6, "bytes_held": 4612345, "files_unheld_custody": 0,
     "gaps": 1, "unreadable_bytes": 251, "records_reported": 0, "records_pending": 1, "records_dropped": 0,
     "spans_rewritten": 2, "index_rewritten": 1, "duplicates_removed": 1, "orphan_index_removed": 5,
-    "blocks_compacted": 3, "reserve_pages": 4,
+    "blocks_compacted": 3, "reserve_pages": 4, "sizes_recovered": 1, "strays_removed": 2, "files_superseded": 0,
     "lookup_fixed": 0, "tails_terminated": 1, "files_restored": 0, "files_rebuilt": 0, "cursors_reset": 1,
     "expendables_removed": 1, "settled_removed": 0, "interrupted_losses": 0,
     "used_before": 4930000, "used_after": 3540000, "total_bytes": 7700000,
@@ -25,7 +25,9 @@ REPAIR = {
     "check": {"passes": 1, "fix_index": 0, "fix_lookup": 3, "delete_orphaned_index": 2, "delete_page": 5512,
               "delete_bad_file": 1, "deleted_live_files": 0, "errors": 0, "last_error": 0},
     "entries": [{"name": "/blocked_identity.jsonl", "class": "attendance", "size": 3826949, "gaps": 1,
-                 "unreadable_bytes": 251, "spans_rewritten": 1, "actions": ["NORMALIZED", "GAPS"]}],
+                 "unreadable_bytes": 251, "spans_rewritten": 1, "actions": ["NORMALIZED", "GAPS"]},
+                {"name": "/pending.jsonl", "class": "attendance", "size": 516, "gaps": 0,
+                 "unreadable_bytes": 0, "spans_rewritten": 0, "actions": ["NORMALIZED", "SIZE_RECOVERED"]}],
 }
 
 
@@ -46,6 +48,9 @@ def test_a_repair_report_is_kept_with_the_heartbeat(db):
     assert stored["result"] == "REPAIRED_WITH_GAPS" and stored["gaps"] == 1
     assert stored["check"]["delete_page"] == 5512
     assert stored["blocks_compacted"] == 3 and stored["reserve_pages"] == 4
+    assert stored["sizes_recovered"] == 1 and stored["strays_removed"] == 2 and stored["files_superseded"] == 0
+    assert stored["previous_boot_returned"] is False
+    assert stored["entries"][1]["actions"] == ["NORMALIZED", "SIZE_RECOVERED"]
     entry = stored["entries"][0]
     assert entry["name"] == "/blocked_identity.jsonl" and entry["actions"] == ["NORMALIZED", "GAPS"]
     assert entry.get("class", entry.get("class_")) == "attendance"
@@ -62,13 +67,13 @@ def test_later_codes_are_text_and_older_firmware_sends_none():
 
 def test_an_unreadable_report_is_dropped_and_the_heartbeat_accepted():
     for field, value in [("result", "lower"), ("gaps", -1), ("level", 99), ("error_stage", "Has Space"),
-                         ("blocks_compacted", -3),
+                         ("blocks_compacted", -3), ("sizes_recovered", -1),
                          ("unreadable_bytes", 2**33), ("entries", [{"name": "bad\u0001"}] )]:
         broken = copy.deepcopy(REPAIR)
         broken[field] = value
         storage = StorageDiagnostics(durability="HEALTHY", repair=broken)
         assert storage.repair is None and storage.durability == "HEALTHY"
     too_many = copy.deepcopy(REPAIR)
-    too_many["entries"] = too_many["entries"] * 9
+    too_many["entries"] = too_many["entries"] * 5
     assert StorageDiagnostics(repair=too_many).repair is None
     assert heartbeat({"repair": "not an object"}).diagnostics.storage.repair is None
