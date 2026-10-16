@@ -288,7 +288,9 @@ static add_outbox_t s_live_outbox = {
 };
 static int64_t s_disconnected_since_ms;
 static int64_t s_last_transport_restart_ms;
-static volatile uint32_t s_priority_delivery_until_ms;
+/* Milliseconds of uptime, 64-bit: in 32 bits the unset deadline read as a hold
+ * from 24.9 to 49.7 days of uptime, and a past one again 24.9 days after it. */
+static atomic_int_least64_t s_priority_delivery_until_ms;
 
 static TaskHandle_t s_outbox_task_handle;
 static atomic_bool s_background_ack_waiting;
@@ -318,8 +320,7 @@ static int64_t monotonic_ms(void)
 
 static bool priority_delivery_hold_active(void)
 {
-    uint32_t now = (uint32_t)monotonic_ms();
-    return (int32_t)(s_priority_delivery_until_ms - now) > 0;
+    return monotonic_ms() < atomic_load(&s_priority_delivery_until_ms);
 }
 
 static const char *firmware_version(void)
@@ -3898,8 +3899,8 @@ static bool deliver_attendance_payloads_acknowledged(
     // cannot accept more bytes, and every batch is acknowledged by ADD before
     // success.  Event UIDs make a later terminal retry or old-outbox drain
     // idempotent.
-    s_priority_delivery_until_ms = (uint32_t)monotonic_ms() +
-        ADD_PRIORITY_ACK_LOCK_TIMEOUT_MS + ADD_PRIORITY_ACK_TIMEOUT_MS;
+    atomic_store(&s_priority_delivery_until_ms, monotonic_ms() +
+        ADD_PRIORITY_ACK_LOCK_TIMEOUT_MS + ADD_PRIORITY_ACK_TIMEOUT_MS);
     bool ok = true;
     for (size_t i = 0; i < count; i++) {
         bool inferred_live = false;
@@ -3922,11 +3923,10 @@ static bool deliver_attendance_payloads_acknowledged(
             ok = false;
             break;
         }
-        s_priority_delivery_until_ms = (uint32_t)monotonic_ms() +
-            ADD_PRIORITY_ACK_LOCK_TIMEOUT_MS + ADD_PRIORITY_ACK_TIMEOUT_MS;
+        atomic_store(&s_priority_delivery_until_ms, monotonic_ms() +
+            ADD_PRIORITY_ACK_LOCK_TIMEOUT_MS + ADD_PRIORITY_ACK_TIMEOUT_MS);
     }
-    s_priority_delivery_until_ms =
-        (uint32_t)monotonic_ms() + ADD_PRIORITY_HOLD_MS;
+    atomic_store(&s_priority_delivery_until_ms, monotonic_ms() + ADD_PRIORITY_HOLD_MS);
     ESP_LOGW(
         TAG,
         "ADD reconcile outbox unavailable; acknowledged direct delivery %s batches=%lu",
