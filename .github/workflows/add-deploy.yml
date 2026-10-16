@@ -630,6 +630,15 @@ jobs:
                 jq -r '.results[] |
                   "probe=\(.probe.country)/\(.probe.city) status=\(.result.statusCode // "none")"' \
                   <<<"$result" >&2
+                # Diagnostics only; the gate above has already failed. Without an
+                # HTTP status, rawOutput is the probe's connection error, never a
+                # response body.
+                echo "Globalping measurement id=$measurement_id" >&2
+                jq -r '.results[] |
+                  "probe_asn=\(.probe.asn // "unknown") probe_result=\(.result.status // "unknown") timings=\(.result.timings // {} | tojson)",
+                  (select(.result.statusCode == null) |
+                    "probe_error=\((.result.rawOutput // "") | .[0:300] | gsub("[\\r\\n]+"; " "))")' \
+                  <<<"$result" >&2 || true
                 return 1
               fi
               jq -r '.results[] |
