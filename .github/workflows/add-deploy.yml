@@ -308,6 +308,31 @@ jobs:
       - name: Transactionally deploy ports 8095 and 8096
         run: .\deploy\add\deploy.ps1 -ExpectedSha $env:DEPLOY_SHA
 
+      - name: Show bounded container state on failure
+        if: failure()
+        run: |
+          if (Test-Path -LiteralPath '.env.add') {
+            # deploy.ps1 already emits the only bounded, secret-redacted log
+            # sample before rollback. Never bypass that sanitizer here.
+            docker compose --env-file .env.add -f docker-compose.add.yml ps -a
+          }
+
+      - name: Remove workspace secret copy
+        if: always()
+        run: Remove-Item -LiteralPath '.env.add' -Force -ErrorAction SilentlyContinue
+
+  oracle-egress-diagnostics:
+    # Operational evidence only, never a release gate (the step has always
+    # been continue-on-error). It runs beside verify-public instead of
+    # delaying public verification and the deployment status by ~45-50 s.
+    if: needs.deploy.result == 'success'
+    needs: deploy
+    runs-on: [self-hosted, Windows, X64]
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: powershell
+    steps:
       - name: Record credential-free Oracle egress diagnostics
         continue-on-error: true
         run: |
@@ -488,9 +513,10 @@ jobs:
           # ASCII argument without exposing credentials or response data.
           $probeEncoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($probe))
           $probeLauncher = "import base64;exec(base64.b64decode('$probeEncoded'))"
+          # This job has no checkout or environment file; probe the API container
+          # that deploy.ps1 has just started and verified.
           $arguments = @(
-            'compose', '--env-file', '.env.add', '-f', 'docker-compose.add.yml',
-            'exec', '-T', 'add-api', 'python', '-c', $probeLauncher
+            'exec', 'attendance-device-dashboard-add-api-1', 'python', '-c', $probeLauncher
           )
           $previousPreference = $ErrorActionPreference
           try {
@@ -543,19 +569,6 @@ jobs:
           # outbox is durable and the dashboard carries the degraded-route alert.
           $global:LASTEXITCODE = 0
           exit 0
-
-      - name: Show bounded container state on failure
-        if: failure()
-        run: |
-          if (Test-Path -LiteralPath '.env.add') {
-            # deploy.ps1 already emits the only bounded, secret-redacted log
-            # sample before rollback. Never bypass that sanitizer here.
-            docker compose --env-file .env.add -f docker-compose.add.yml ps -a
-          }
-
-      - name: Remove workspace secret copy
-        if: always()
-        run: Remove-Item -LiteralPath '.env.add' -Force -ErrorAction SilentlyContinue
 
   verify-public:
     if: needs.deploy.result == 'success'
