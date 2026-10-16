@@ -76,6 +76,22 @@ def test_ota_http_response_buffers_do_not_consume_task_stack() -> None:
     assert ".buffer_size = OTA_HTTP_TRANSPORT_BUFFER_BYTES" in text
 
 
+def test_signed_ota_requests_fit_their_headers_in_the_transmit_buffer() -> None:
+    # 2.7.4 logged "HTTP_HEADER: Buffer length is small to fit all the
+    # headers" on every 60 s poll: the signed request line and its bearer,
+    # timestamp, nonce, body digest and signature headers exceed the 512-byte
+    # default transmit buffer.
+    text = (FIRMWARE / "main" / "ota_manager.c").read_text(encoding="utf-8")
+    assert "#define OTA_HTTP_REQUEST_HEADER_BYTES 1024" in text
+    signed = text[text.index("static bool signed_request("):]
+    config = signed[signed.index("esp_http_client_config_t http = {"):signed.index("esp_http_client_init(&http)")]
+    assert ".buffer_size_tx = OTA_HTTP_REQUEST_HEADER_BYTES," in config
+    headers = signed[signed.index("esp_http_client_init(&http)"):signed.index("esp_http_client_perform(client)")]
+    for header in ("Authorization", "X-ADD-Connector-Id", "X-ADD-Timestamp", "X-ADD-Nonce",
+                   "X-ADD-Body-SHA256", "X-ADD-Signature"):
+        assert f'"{header}"' in headers
+
+
 def test_direct_ota_tls_buffers_can_use_psram_after_worker_startup() -> None:
     defaults = (FIRMWARE / "sdkconfig.defaults").read_text(encoding="utf-8")
     component = (FIRMWARE / "main" / "CMakeLists.txt").read_text(encoding="utf-8")
