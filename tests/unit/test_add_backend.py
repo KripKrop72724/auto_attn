@@ -4351,7 +4351,9 @@ def test_device_stream_end_to_end_bootstraps_then_acks_each_message_in_order(
         ip_address="127.0.0.1",
     )
     db.commit()
-    connector_pk = connector.id
+    # The app's worker threads use this same Session while the stream is open,
+    # so the test thread must not touch ORM state until the session has ended.
+    connector_pk, connector_id = connector.id, connector.connector_id
 
     @contextmanager
     def shared_scope():
@@ -4366,12 +4368,12 @@ def test_device_stream_end_to_end_bootstraps_then_acks_each_message_in_order(
 
     def log_envelope(seq: int) -> str:
         return Envelope(
-            schema_version="2", message_id=f"stream-log-{seq}", connector_id=connector.connector_id,
+            schema_version="2", message_id=f"stream-log-{seq}", connector_id=connector_id,
             boot_id="stream-boot", seq=seq, sent_at=utc_now(), type="log",
             payload={"level": "INFO", "subsystem": "firmware", "code": "STREAM_TEST", "message": "ok"},
         ).model_dump_json()
 
-    headers = {"Authorization": f"Bearer {token}", "X-ADD-Connector-Id": connector.connector_id}
+    headers = {"Authorization": f"Bearer {token}", "X-ADD-Connector-Id": connector_id}
     with TestClient(app).websocket_connect("/device/v2/stream", headers=headers) as stream:
         bootstrap = [stream.receive_json(), stream.receive_json()]
         assert [message["type"] for message in bootstrap] == [
@@ -4398,7 +4400,7 @@ def test_device_stream_end_to_end_bootstraps_then_acks_each_message_in_order(
     assert (stored.boot_id, stored.last_sequence, stored.connected) == ("stream-boot", 2, False)
     [ended] = [record.getMessage() for record in caplog.records
                if record.getMessage().startswith("ADD device session ended ")]
-    assert f"connector_id={connector.connector_id} end=closed close_code=1000 " in ended
+    assert f"connector_id={connector_id} end=closed close_code=1000 " in ended
     assert " messages_in=3 " in ended and " processed=3 " in ended and " messages_out=6 " in ended
     assert token not in caplog.text
 
