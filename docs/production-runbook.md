@@ -350,7 +350,7 @@ Every session end emits one `ADD device session ended` line, for example:
 
 ```text
 ADD device session ended connector_id=... end=keepalive_timeout close_code=1005 reason=-
-duration_seconds=81.6 startup_seconds=3.1 in_flight_type=- in_flight_seconds=-
+duration_seconds=81.6 drain_seconds=0.0 startup_seconds=3.1 in_flight_type=- in_flight_seconds=-
 since_last_message_seconds=62.0 since_wire_data_seconds=0.4 messages_in=2 bytes_in=9311
 messages_out=17 bytes_out=81240 processed=2 unprocessed=0 undelivered=0 queue_peak_messages=1
 queue_peak_bytes=8702 queue_full=0 slowest_type=heartbeat slowest_seconds=0.2
@@ -358,7 +358,13 @@ keepalive_timeout=true ping_rtt_seconds=0.412 reader_error=-
 ```
 
 It is one line in the log; this example is a device that was still uploading a large message
-when its pong deadline expired. `in_flight_*` names the message being processed when the session ended
+when its pong deadline expired. `duration_seconds` runs from accept to the end of the session: the
+moment the TCP connection was lost (as uvicorn saw it), or else the moment ADD learned the session
+was over. `drain_seconds` is the time from that end to the log line: the message in flight
+finishing, any backlog processed after an abrupt drop, and cleanup, which waits for the database.
+The session therefore ended at the line's timestamp minus `drain_seconds`; use that, not the
+timestamp itself, for reconnect gaps. `in_flight_seconds` and the `since_*` fields are measured
+at that end too. `in_flight_*` names the message being processed when the session ended
 and how long it had run; `since_last_message_seconds` is the time since the last complete message;
 `since_wire_data_seconds` is the time since any bytes arrived, including part of an unfinished
 upload; `unprocessed` messages were received but abandoned unACKed (the device replays them);

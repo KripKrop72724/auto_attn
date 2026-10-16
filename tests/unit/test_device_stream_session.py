@@ -952,6 +952,46 @@ def test_session_end_classifies_how_the_socket_closed(backend, caplog, code, kee
     assert end["in_flight_type"] == "-"
 
 
+def test_session_duration_ends_at_the_disconnect_and_later_work_is_drain_time(backend, caplog):
+    backend.delays = {1: 0.4, 2: 0.4}
+
+    async def scenario():
+        websocket = FakeWebSocket()
+        stream = asyncio.create_task(add_web.device_stream(websocket))
+        websocket.feed(1)
+        websocket.feed(2)
+        websocket.disconnect(1005)
+        await asyncio.wait_for(stream, 3)
+
+    asyncio.run(scenario())
+    end = session_end(caplog)
+    assert end["end"] == "connection_lost"
+    assert end["processed"] == "2"
+    # The device left at once; draining its two messages took 0.8 s more.
+    assert float(end["duration_seconds"]) < 0.3
+    assert float(end["drain_seconds"]) >= 0.7
+
+
+def test_session_duration_uses_the_transport_close_the_reader_learns_late(backend, caplog):
+    facts = WebSocketTransportFacts()
+
+    async def scenario():
+        websocket = FakeWebSocket()
+        websocket.scope["extensions"][TRANSPORT_EXTENSION] = facts
+        stream = asyncio.create_task(add_web.device_stream(websocket))
+        websocket.feed(1)
+        await until(lambda: acked(websocket) == [1])
+        facts.closed_at = time.monotonic()
+        await asyncio.sleep(1.0)
+        websocket.disconnect(1005)
+        await asyncio.wait_for(stream, 3)
+
+    asyncio.run(scenario())
+    end = session_end(caplog)
+    assert float(end["duration_seconds"]) + 0.5 < float(end["drain_seconds"])
+    assert float(end["drain_seconds"]) >= 0.9
+
+
 def test_session_end_names_this_servers_own_close(backend, caplog):
     async def scenario():
         websocket = FakeWebSocket()

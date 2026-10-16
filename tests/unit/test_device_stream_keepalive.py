@@ -197,13 +197,20 @@ def test_diagnostic_protocol_extends_the_protocol_uvicorn_selects_by_default():
     assert issubclass(DiagnosticWebSocketProtocol, AutoWebSocketsProtocol)
     # A uvicorn upgrade that renames a hooked method must fail here, not
     # silently stop reporting keepalive closes.
-    for name in ("handle_connect", "shutdown", "data_received", "send_keepalive_ping",
-                 "handle_pong", "keepalive_timeout"):
+    for name in ("handle_connect", "connection_lost", "shutdown", "data_received",
+                 "send_keepalive_ping", "handle_pong", "keepalive_timeout"):
         assert name in vars(WebSocketsSansIOProtocol), name
         assert name in vars(DiagnosticWebSocketProtocol), name
     for attribute in ("pending_ping_payload", "last_ping_rtt", "ping_sent_at", "read_paused",
                       "close_sent", "ping_timeout"):
         assert attribute in WebSocketsSansIOProtocol.__init__.__code__.co_names, attribute
+
+
+async def wait_for_session_end(caplog, timeout: float = 5.0) -> None:
+    deadline = asyncio.get_running_loop().time() + timeout
+    while not any(r.getMessage().startswith("ADD device session ended") for r in caplog.records):
+        assert asyncio.get_running_loop().time() < deadline, "the session never ended"
+        await asyncio.sleep(0.02)
 
 
 def test_server_shutdown_finishes_the_message_in_flight_and_starts_no_other(caplog):
@@ -228,6 +235,31 @@ def test_server_shutdown_finishes_the_message_in_flight_and_starts_no_other(capl
     end = session_end(caplog)
     assert (end["end"], end["close_code"]) == ("server_shutdown", "1012")
     assert (end["processed"], end["unprocessed"], end["undelivered"]) == ("1", "2", "1")
+
+
+def test_abrupt_drop_reports_duration_to_the_drop_and_the_drain_separately(caplog):
+    app = Starlette(routes=[WebSocketRoute("/reader", make_reader_stream(0.3))])
+
+    async def scenario():
+        server, task, port = await serve(app, ws=DiagnosticWebSocketProtocol)
+        try:
+            client = await connect(f"ws://127.0.0.1:{port}/reader", ping_interval=None)
+            for index in range(3):
+                await client.send(f"message-{index}")
+            await asyncio.sleep(0.1)
+            client.transport.abort()
+            await wait_for_session_end(caplog)
+        finally:
+            await stop(server, task)
+
+    asyncio.run(scenario())
+    end = session_end(caplog)
+    assert (end["end"], end["close_code"]) == ("connection_lost", "1005")
+    # No newer session exists, so the received backlog is still processed;
+    # none of its ACKs can be delivered.
+    assert (end["processed"], end["unprocessed"], end["undelivered"]) == ("3", "0", "3")
+    assert float(end["duration_seconds"]) < 0.5
+    assert float(end["drain_seconds"]) >= 0.5
 
 
 def _api_service(compose_file: Path) -> dict:

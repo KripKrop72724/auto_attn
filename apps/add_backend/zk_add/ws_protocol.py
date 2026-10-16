@@ -5,9 +5,9 @@ When a peer misses uvicorn's pong deadline, uvicorn closes the socket with
 "connection lost" as for any abrupt drop. This subclass of the protocol that
 uvicorn selects by default (websockets-sansio) adds one warning per keepalive
 close and shares payload-free transport facts with the endpoint through the
-ASGI scope, so a device session's end line can say what really happened,
-and a session stops starting queued messages as soon as uvicorn has closed
-its socket for shutdown or keepalive.
+ASGI scope, so a device session's end line can say what really happened and
+when, and a session stops starting queued messages as soon as uvicorn has
+closed its socket for shutdown or keepalive.
 
 Launch with ``--ws zk_add.ws_protocol:DiagnosticWebSocketProtocol``. Every
 override calls the original implementation unchanged.
@@ -38,6 +38,11 @@ class DiagnosticWebSocketProtocol(WebSocketsSansIOProtocol):
         scope = self.__dict__.get("scope")
         if isinstance(scope, dict):
             scope.setdefault("extensions", {})[TRANSPORT_EXTENSION] = self.add_facts
+
+    def connection_lost(self, exc: Exception | None) -> None:
+        # The real end of the session, however late the application notices.
+        self.add_facts.closed_at = time.monotonic()
+        super().connection_lost(exc)
 
     def shutdown(self) -> None:
         self.add_facts.server_shutdown = True

@@ -88,14 +88,16 @@ class WebSocketTransportFacts:
     """Payload-free facts a uvicorn protocol records about one connection."""
 
     __slots__ = (
-        "connector_id", "keepalive_timed_out", "server_shutdown", "last_ping_rtt", "pings_sent",
-        "pongs_received", "bytes_received", "last_data_at",
+        "connector_id", "keepalive_timed_out", "server_shutdown", "closed_at", "last_ping_rtt",
+        "pings_sent", "pongs_received", "bytes_received", "last_data_at",
     )
 
     def __init__(self) -> None:
         self.connector_id: str | None = None
         self.keepalive_timed_out = False
         self.server_shutdown = False
+        # time.monotonic() when the TCP connection was lost, however it closed.
+        self.closed_at: float | None = None
         self.last_ping_rtt: float | None = None
         self.pings_sent = 0
         self.pongs_received = 0
@@ -179,11 +181,13 @@ class InboundQueue:
 
 
 class _InFlight:
-    __slots__ = ("message_type", "started", "thread_queued", "thread_started", "thread_finished")
+    __slots__ = ("message_type", "started", "finished", "thread_queued", "thread_started",
+                 "thread_finished")
 
     def __init__(self, message_type: str, started: float) -> None:
         self.message_type = message_type
         self.started = started
+        self.finished: float | None = None
         self.thread_queued: float | None = None
         self.thread_started: float | None = None
         self.thread_finished: float | None = None
@@ -220,11 +224,13 @@ class DeviceStreamSession:
         self.reader_error: str | None = None
         self._reader: asyncio.Task[None] | None = None
         self._in_flight: _InFlight | None = None
+        self._last_finished: _InFlight | None = None
         self._transport_closed = False
         # First close code exchanged on this socket: sent by this server (the
         # session or the connector hub) or received in the device's close frame.
         self._close_code: int | None = None
         self._send_failed = False
+        self.ended_at: float | None = None
         self.messages_in = 0
         self.bytes_in = 0
         self.messages_out = 0
@@ -243,7 +249,8 @@ class DeviceStreamSession:
     def transport_closed(self) -> bool:
         facts = self.transport
         return self._transport_closed or (
-            facts is not None and (facts.keepalive_timed_out or facts.server_shutdown)
+            facts is not None
+            and (facts.closed_at is not None or facts.keepalive_timed_out or facts.server_shutdown)
         )
 
     def is_current(self) -> bool:
@@ -430,7 +437,9 @@ class DeviceStreamSession:
             self._finish_message(record)
 
     def _finish_message(self, record: _InFlight) -> None:
-        duration = self._clock() - record.started
+        record.finished = self._clock()
+        self._last_finished = record
+        duration = record.finished - record.started
         if self.slowest is None or duration > self.slowest[1]:
             self.slowest = (record.message_type, duration)
         if duration < self.slow_message_seconds:
@@ -478,34 +487,56 @@ class DeviceStreamSession:
             pass
 
     def mark_end(self, kind: str, code: int | None = None, reason: str = "") -> None:
-        """Record how the session ended. The first cause wins."""
+        """Record how and when the session ended. The first cause wins.
+
+        The end is when the connection was lost if the uvicorn protocol saw
+        that earlier, otherwise now; work done after it (draining, cleanup) is
+        reported separately as drain time.
+        """
         if self.end is not None:
             return
-        now = self._clock()
-        record = self._in_flight
+        ended = self._clock()
+        facts = self.transport
+        if facts is not None and facts.closed_at is not None and facts.closed_at < ended:
+            ended = max(self.started_at, facts.closed_at)
+        self.ended_at = ended
+        record = self._running_at(ended)
         self.end = {
             "kind": kind,
             "code": code,
             # Only this server's own close reasons are logged, never a peer's.
             "reason": reason if kind in {"server_close", "error"} else "",
             "in_flight_type": record.message_type if record is not None else None,
-            "in_flight_seconds": now - record.started if record is not None else None,
-            "since_last_message": now - self.last_message_at if self.last_message_at is not None else None,
+            "in_flight_seconds": ended - record.started if record is not None else None,
+            "since_last_message": (
+                max(0.0, ended - self.last_message_at) if self.last_message_at is not None else None
+            ),
             "since_wire_data": (
-                now - self.transport.last_data_at
-                if self.transport is not None and self.transport.last_data_at is not None else None
+                max(0.0, ended - facts.last_data_at)
+                if facts is not None and facts.last_data_at is not None else None
             ),
             "queued": len(self.queue),
         }
+
+    def _running_at(self, moment: float) -> _InFlight | None:
+        """The message that was being processed at a moment, if it is known."""
+        for record in (self._in_flight, self._last_finished):
+            if (record is not None and record.started <= moment
+                    and (record.finished is None or record.finished >= moment)):
+                return record
+        return None
 
     def end_summary(self) -> dict[str, Any]:
         end = self.end or {"kind": "unknown", "code": None, "reason": "", "in_flight_type": None,
                            "in_flight_seconds": None, "since_last_message": None,
                            "since_wire_data": None, "queued": len(self.queue)}
         transport = self.transport
+        now = self._clock()
+        ended = self.ended_at if self.ended_at is not None else now
         return {
             **end,
-            "duration": self._clock() - self.started_at,
+            "duration": ended - self.started_at,
+            "drain": max(0.0, now - ended),
             "startup": self.startup_seconds,
             "messages_in": self.messages_in,
             "bytes_in": self.bytes_in,
@@ -528,7 +559,8 @@ class DeviceStreamSession:
         summary = self.end_summary()
         logger.warning(
             "ADD device session ended connector_id=%s end=%s close_code=%s reason=%s "
-            "duration_seconds=%.1f startup_seconds=%s in_flight_type=%s in_flight_seconds=%s "
+            "duration_seconds=%.1f drain_seconds=%.1f startup_seconds=%s in_flight_type=%s "
+            "in_flight_seconds=%s "
             "since_last_message_seconds=%s since_wire_data_seconds=%s messages_in=%d bytes_in=%d "
             "messages_out=%d bytes_out=%d processed=%d unprocessed=%d undelivered=%d "
             "queue_peak_messages=%d queue_peak_bytes=%d queue_full=%d slowest_type=%s "
@@ -536,7 +568,7 @@ class DeviceStreamSession:
             safe_label(self.connector_id), summary["kind"],
             "-" if summary["code"] is None else summary["code"],
             json.dumps(summary["reason"]) if summary["reason"] else "-",
-            summary["duration"], _seconds(summary["startup"]),
+            summary["duration"], summary["drain"], _seconds(summary["startup"]),
             summary["in_flight_type"] or "-", _seconds(summary["in_flight_seconds"]),
             _seconds(summary["since_last_message"]), _seconds(summary["since_wire_data"]),
             summary["messages_in"], summary["bytes_in"], summary["messages_out"], summary["bytes_out"],
