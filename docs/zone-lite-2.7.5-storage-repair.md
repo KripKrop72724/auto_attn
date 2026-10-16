@@ -2,8 +2,9 @@
 
 Status: implemented on `release/zkt-2.7.5` (not yet versioned, not on HIL).
 This document describes what was built. It replaces the first design
-(`94136b3`), which two adversarial reviews found unsafe as written; section
-11 lists every review point and what became of it.
+(`94136b3`), which two adversarial reviews found unsafe as written, and the
+first implementation, which two more reviews found unsafe in eleven and five
+places; section 11 lists every review point and what became of it.
 
 Owner decision, 16 October 2026: save every readable unsettled row first,
 run the SPIFFS check at boot, restore what the check removed, report fixes,
@@ -86,12 +87,32 @@ flash. It showed why a bare check deletes files, and more hazards:
    path keeps appending after a failure. The repair cannot recover those
    bytes; it terminates and delivers what is on flash. Section 12 proposes
    the runtime fix.
-10. **A torn header size.** The first append to a new file rewrites its
-    header in place (the size was 0xFFFFFFFF); a reset there leaves a size
-    such as 0xFFFFFFFB. SPIFFS can neither truncate nor remove the file, the
-    check keeps it, and every later create of that name fails: 13FL's and
-    P02's probe ENOENT. The survey does not take such a header as a live
-    file.
+10. **A torn header size.** The first append to a new or truncated file
+    (pending.jsonl after every `lq_reclaim`, every durable-queue segment
+    opened with "wb") programs its header in place over size 0xFFFFFFFF; a
+    reset there leaves some of the bits the real size clears still set, in
+    any byte (0xFFFF0204, 0x00370204, or 0xFFFFFFFF with the index entries
+    programmed). SPIFFS can then neither read, append to, truncate nor
+    remove the file, the check keeps it, and every later create of that name
+    fails: 13FL's and P02's probe ENOENT, a queue that refuses every punch, a
+    segment lane that refuses "wb". Section 5.1 recovers the real size.
+11. **Stray pages.** A header program torn on SPIFFS's append path leaves a
+    page flagged finalized but still unused (0xFD) with the file's lookup
+    entry. The check ignores it; SPIFFS's GC moves every page whose lookup
+    entry names the file and points that span's index entry at the copy, so
+    a span reads as erased after the next GC (seed 512).
+12. **SPIFFS's page counters drift.** Deleting a page whose lookup entry
+    said free (item 6) counts it out of the allocated pages it was never
+    counted in, so `stats_p_allocated` and `stats_p_deleted` overstate the
+    erased pages. Room estimated from them sent a block cleaning into a store
+    with one page too few (seed 618).
+13. **A half-deleted hidden header.** `spiffs_page_delete` clears the lookup
+    entry first; a reset in that write can leave a removed probe's hidden
+    header with an entry of 0x0007 for 0x8007 (it now names a data object).
+    The check's handling of it is item 7's: it deleted the live pages that
+    followed in the block and then a consistent 662 KB pending queue (seed
+    832). Lookup hygiene must remove it, and the check must never run while
+    any mislabeled page remains.
 
 `SPIFFS_check` also returns only the result of its final lookup scan, so a
 failed lookup, index or page pass (FULL included) reaches only the check
@@ -109,10 +130,13 @@ these; the run's report names the exact SPIFFS cause per span.
 ## 2. Rules
 
 - **R1 Custody.** No byte that any page on flash still holds for a file is
-  replaced. A span whose referenced page is bad takes its bytes from its own
-  page when the header still names it, from another finalized copy, or from
-  a page flagged deleted but not yet erased. Only a span with no source is a
-  gap.
+  replaced, and no byte is taken from a page that may belong to another file
+  or another version of it. A span whose referenced page is bad takes its
+  bytes from that page when it is this file's finalized page of the span
+  (deleted or with a wrong lookup entry) and from finalized copies whose
+  lookup entry names the file; where they differ, the more programmed byte
+  wins, and a byte two of them program differently is a gap. Only a byte with
+  no source is a gap.
 - **R2 Gaps are explicit.** Every unreadable range is recorded in NVS with
   its file, offset, length and SPIFFS cause before any byte is written, and
   sent to ADD as queue evidence.
@@ -166,21 +190,35 @@ returns to the old image.
 - **Deadline**: a one-shot `esp_timer` armed before the mount: 5 min on an
   unconfirmed image (a reset there rolls back), 15 min otherwise. Its
   callback records the phase in RTC memory and calls `esp_restart()`. The
-  engine stops itself at its next safe point 45 s earlier (`STOPPED`).
-- **RTC breadcrumb**: phase, check pass and whether the deadline fired, in a
-  record appended after the boot report's trace (the 2.7.1 and 2.7.3 layouts
-  are unchanged).
+  engine stops itself at its next safe point 45 s earlier (`STOPPED`), except
+  in the restore after a check pass, and tells the engine how much time is
+  left (`remaining_ms`), so a check pass starts only when it and its restore
+  fit.
+- **NVS headroom**: `nvs_get_stats` before the run. The run starts only with
+  room to create each journal blob that does not exist yet, to rewrite the
+  largest once, and a page (126 entries) for NVS's own GC; otherwise it only
+  reports (`REPORT_ONLY`, `error_stage` `nvs_full`), so it never takes the
+  room the runtime's checkpoint commits need. A run whose first journal save
+  fails stops before any write (`FAILED`, `journal`).
+- **RTC breadcrumb**: phase, check pass, whether the deadline fired, and
+  whether `storage_repair_boot` returned, in a record appended after the boot
+  report's trace (the 2.7.1 and 2.7.3 layouts are unchanged).
 - **LED**: `STORAGE_REPAIR` (fast white/blue) while the run writes.
 - **No task**: the ADD outbox task, which already sends acknowledged queue
   evidence on its 8 KiB stack, sends the log lines and one evidence record
-  per pass, backing off a minute after a failed transfer.
+  per pass, outside a priority-delivery hold, backing off a minute after a
+  failed transfer. The pending and acknowledged record counts are kept in RAM
+  (counted after the run and on each acknowledgement), so with nothing
+  pending the task reads no NVS; the records and the rendered evidence go in
+  one PSRAM block, not on the task's stack.
 
 ### 4.1 Policy (`srp_policy`)
 
 Every boot runs the repair. A run that starts and does not finish counts as
-incomplete; it counts as a failure only when the boot after it reports a
-panic, a watchdog, a CPU lockup or the repair's own deadline (never a power
-cut, which is what the repair is for).
+incomplete; it counts as a failure only when the previous boot's breadcrumb
+shows the repair's own deadline fired, or a panic, watchdog or CPU lockup
+came before the repair had returned (never a power cut, which is what the
+repair is for, and never an unrelated crash after a stopped run).
 
 - 3 consecutive failures: repairs stop for the running image (report only:
   mount and `SPIFFS_info`, no file read, nothing written) until ADD installs
@@ -191,6 +229,19 @@ cut, which is what the repair is for).
 
 ### 5.1 Survey (read only)
 
+Torn sizes first (1.2 item 10). A header size that claims spans nothing
+traces (no finalized data page of the object and no index entry naming one),
+or that cannot fit the partition, or 0xFFFFFFFF in a header whose own entries
+are programmed, is the tear of a first append when the real size is still
+inside it bitwise: the real size is where the last traced page's bytes end
+(text files hold no 0xFF), or for binary files the smallest size at or after
+the last programmed byte whose bits the torn size contains. The header is
+rewritten with that size (`STORAGE_REPAIR_SIZE_RECOVERED`, file action
+`SIZE_RECOVERED`). A size no page traces and no bit pattern explains is
+left (`STORAGE_REPAIR_SIZE_TORN`). Expendables with a torn size go by object
+id as before.
+
+
 One pass reads every block: lookup entries, page headers, and whether each
 lookup-free page is really erased. Objects are built from valid index
 headers; each object is mapped span by span as SPIFFS reads it. A span is
@@ -200,18 +251,30 @@ no erased (0xFF) byte. `SPIFFS_VALIDATE_DATA` does not check the object id;
 the survey does, so a page of another file is never read as this file's
 bytes.
 
-An imperfect span is resolved (R1): its own page if the header still names
-it (unfinalized, or a wrong lookup entry); else the first acceptable
-finalized copy (an interrupted GC move or modify), referenced directly when
-it is perfect; else a page flagged deleted but not erased (13FL's head);
-else a gap. A text page whose only fault is erased bytes keeps every other
-byte; only those bytes are a gap.
+An imperfect span is resolved (R1) from two kinds of source: the page the
+index names, when it is this object's *finalized* data page of the span
+(flagged deleted, as on 13FL's head, or with a wrong lookup entry), and
+finalized copies whose lookup entry names the object (an interrupted GC move
+or page move). Their bytes are merged: a byte one source holds and another
+reads erased (a copy taken before later appends) is the programmed one; two
+different programmed values are a gap (`SR_ERR_SOURCES_DISAGREE`). Never a
+source: an unfinalized page (its write did not finish; when the index names
+one, the page it named was erased and its place reused), a page flagged
+deleted that the index does not name (SPIFFS reuses a removed file's object
+id, so it may be the earlier file's), a copy whose lookup entry was deleted
+(a page caught mid-delete). A text byte no source holds programmed is a gap.
+A merged result equal to a perfect copy is referenced as it is.
 
 The survey also chooses one header per object (duplicates: most perfect
-references, then larger size, then the non-temporary name) and one index
-page per index span, and marks for removal: the other copies, index pages
-past the end, index entries past the end, data pages past the end, and index
-pages of no live file (1.2).
+references, then larger recovered size, then the non-temporary name) and one
+index page per index span, and marks for removal: the other copies, index
+pages past the end, index entries past the end, index pages of no live file,
+and every *stray* page (1.2 item 11): a page whose lookup entry and header
+name a live file and that is none of its header, chosen index pages or
+referenced data pages, whatever its flags (data pages past the end
+included). Pages of a span not yet rewritten stay until it is, since they may
+be its bytes; normalization runs up to three rounds so the strays of spans it
+rewrote go too.
 
 ### 5.2 Normalize
 
@@ -219,11 +282,13 @@ Before any write, every gap range is recorded in NVS, and the catalog and
 command-inbox obligations are journaled (a run that fails after normalizing
 must not leave the next one unaware). Then:
 
-1. Lookup hygiene, before the first allocation and again after
-   normalization: a needed page with a free lookup entry gets its entry; any
-   other used page there is deleted; a page whose lookup entry names another
-   object (1.2 item 7) is deleted unless the survey needs it, and then its
-   bytes move to a new page and it is deleted after.
+1. Lookup hygiene, before the first allocation (the resume's included),
+   before the restore after a check, and again after normalization: a needed
+   page with a free lookup entry gets its entry; any other used page there
+   is deleted; a page whose lookup entry names another object (1.2 items 7
+   and 13) is deleted unless the survey needs it, and then its bytes move to
+   a new page and it is deleted after. A hidden object's pages are needed
+   only while an unsettled manifest entry names it.
 2. Stale headers, duplicate and orphaned index pages, and data pages past
    the end are deleted.
 3. Each imperfect span gets a new data page (written unfinalized,
@@ -247,8 +312,12 @@ on blocks where it is safe: every page erased, deleted and no byte source of
 a damaged file, or the referenced page of a consistent file every one of
 whose lookup entries is a referenced page. Blocks are taken by net gain
 (deleted pages plus the group index pages the block holds, less one index
-write per group of data pages) and only when their moves fit in the erased
-pages elsewhere, so a cleaning never stops half way for want of room.
+write per group of data pages) and only when their moves, plus one index
+rewrite per group and two pages, fit in the erased pages elsewhere, counted
+from the survey (1.2 item 12). A cleaning that stops half way anyway (data
+pages moved, the index naming the deleted originals) is surveyed again
+before anything else, and normalization points the index at the moved pages
+from the room the margin kept.
 
 When the damaged files have pages in every block, nothing can be compacted
 around them. If their work fits in the erased pages SPIFFS keeps for its GC,
@@ -263,11 +332,19 @@ where it can, so SPIFFS's GC in those writes has its reserve.
 
 ### 5.3 Check
 
-The survey runs again. If any custody file is still inconsistent, the run
-is `DEFERRED`: no check this boot. Otherwise a manifest of the held custody
-files (name, object id, size, CRC) is committed and `SPIFFS_check` runs with
-the engine's callback (counts reports, yields; never calls SPIFFS: the check
-holds the lock). A pass that reported an error makes room and runs again:
+Just before the manifest, and again before every later pass, the store is
+surveyed afresh (compaction or a restore may have moved pages since),
+whatever that shows is normalized, every custody file must be consistent
+(R3) and no lookup entry may be mislabeled (1.2 item 13); otherwise the run
+is `DEFERRED`: no check this boot. A pass
+also starts only when the time left before the soft deadline covers it and
+the restore after it: the measured duration of the last pass (plus a
+quarter), or 4 s per MiB with the metadata mirror and 8 s without, plus 15 s
+and the held bytes at 64 KiB/s (`error_stage` `time` when it does not). Then
+a manifest of the held custody files (name, object id, size, CRC, the queue
+cursor's generation, the image and whether it was unconfirmed) is committed
+and `SPIFFS_check` runs with the engine's callback (counts reports, yields;
+never calls SPIFFS: the check holds the lock). A pass that reported an error makes room and runs again:
 level 1 removes probe leftovers, cursor stages and the identity catalog;
 level 2 retires fully settled queue files (cursor cleared first, as
 `lq_reclaim` does). After a pass that ran out of room the store is
@@ -277,21 +354,40 @@ something is followed by another, which must fix nothing.
 ### 5.4 Restore
 
 Custody files are held in PSRAM as far as the budget allows (class
-priority, whole files). After a pass that changed something, each held file
-is compared span by span and differing spans are rewritten from the hold;
-a file the check removed or resized is rebuilt (after compaction, so
-SPIFFS's GC in the writes has its reserve; a rebuild that still fails records
-what did not go back as a `CHECK_CHANGED` gap before the run fails). With
-normalization the check
-is not expected to change a custody file; the hold is the net under that
-expectation. Files the budget could not hold are protected by R3 alone (the
-harness runs every scenario with no holds).
+priority, whole files). After a pass that changed something, the held files
+are compared and put back before anything else, whatever the soft deadline
+says (the copies die with the boot; only the hard deadline ends it). A live
+file is never removed: differing spans get new pages with the held bytes,
+held bytes past its end are appended. A file the check removed is rebuilt
+under `<name>.rpr`, read back, and renamed into place, so a reset never
+leaves a partial file under the real name. What cannot go back is recorded
+(`CHECK_CHANGED`, exact range) before the run fails, and the manifest stays.
+A file the repair itself retires (a settled queue at level 2) loses its hold
+and its manifest entry first, so neither the restore nor a resume brings it
+back. With normalization the check is not expected to change a custody
+file; the hold is the net under that expectation. Files the budget could not
+hold are protected by R3 alone (the harness runs every scenario with no
+holds).
 
-A reset during the check or the restore: the next boot reads the manifest.
-A file whose object the check had begun deleting (hidden header, pages
-intact) is rebuilt from its own pages when they match the manifest's size
-and CRC; anything else is reported with its exact range
-(`CHECK_INTERRUPTED`, `RESTORE_INTERRUPTED`, `CONTENT_UNVERIFIED`).
+A reset during the check or the restore: the manifest stays in NVS
+(`SRP_STATE_MANIFEST`, phase `RESTORE`) until every entry is settled, and
+every boot that finds it resumes, whatever phase a reset left; no check runs
+while it is active. Entries settle one by one, each saved as it settles, and
+an entry that was rebuilt or renamed settles only once a fresh survey reads
+the manifest's bytes under its name (three tries, then a gap). Per file: the
+live file still starts with the manifest's bytes (intact); a whole rebuild
+under the temporary name is renamed into place, after a duplicate header of
+it is removed (`SPIFFS_rename` takes the first header of the name it meets,
+and a reset during the rebuild's last header update leaves two); a hidden
+original (the check had begun deleting it, pages intact) is rebuilt from its
+own pages when they match the manifest's size and CRC, and when a new file
+took the name meanwhile, a text file's intact rows are appended after the new
+rows (`STORAGE_REPAIR_MERGED`); a file whose owner replaced it since is
+superseded, no gap (`STORAGE_REPAIR_SUPERSEDED`): its queue cursor's
+generation moved (`lq_reclaim` or level 2 retired it), or the manifest is an
+unconfirmed image's or another image's (a reset there rolled back, so the
+old image ran in between); anything else is reported with its exact range
+(`CHECK_INTERRUPTED`, `RESTORE_INTERRUPTED`, `CONTENT_UNVERIFIED`), once.
 
 ### 5.5 Finish
 
@@ -310,7 +406,8 @@ and CRC; anything else is reported with its exact range
   failed repair.
 - **Expendables with a torn header size** (1.2 item 10; probe files and
   cursor stages) are removed page by page by object id, since SPIFFS cannot
-  remove them.
+  remove them. A leftover `<name>.rpr` rebuild is removed once no manifest
+  names its file, or renamed into place when that file is missing.
 
 ## 6. Fills
 
@@ -348,15 +445,22 @@ unreadable NVS entry is never overwritten.
   reason MALFORMED (gaps) or LEGACY_RECOVERY (cursor resets). Bounded at 24
   gaps and 8 resets: a full list widens that file's own unacknowledged record
   of the same run (flagged merged, bounds still covering every unreadable
-  byte) and never drops one; acknowledged records are reused.
+  byte) and never drops one; acknowledged records are reused. Unreadable runs
+  less than a page apart (bytes a torn program left scattered) are one record
+  flagged merged from the start. A file whose ranges cannot all be recorded
+  (24 unacknowledged records of earlier runs) is left as it is and no check
+  runs until ADD has acknowledged some (R3).
 - **Logs**: `STORAGE_REPAIR_STARTED`, `_GAP`, `_CHECKED`, `_CURSOR_RESET`,
-  `_TAIL_TERMINATED`, `_CATALOG_DROPPED`, `_COMPACTED`, `_RESERVE`, `_FULL`,
-  `_PROBE_ALTERNATE`, `_SIZE_TORN`,
-  `_DEFERRED`, `_CHECK_DELETED`,
+  `_TAIL_TERMINATED`, `_CATALOG_DROPPED`, `_COMPACTED`, `_COMPACT_STOPPED`,
+  `_RESERVE`, `_FULL`, `_PROBE_ALTERNATE`, `_SIZE_TORN`, `_SIZE_RECOVERED`,
+  `_DEFERRED`, `_NO_TIME`, `_CHECK_DELETED`, `_SUPERSEDED`, `_MERGED`,
+  `_MANIFEST_UNREADABLE`, `_NVS_FULL`, `_JOURNAL_FAILED`,
   `_DISABLED`, `_COMMANDS_MERGED`, `_DONE`, up to 24 lines per boot.
 - **Heartbeat** `diagnostics.storage.repair`: result, mode, phases (this run,
-  the previous run, the previous boot's breadcrumb and whether its deadline
-  fired), counters, the check's reports (including `deleted_live_files`),
+  the previous run, the previous boot's breadcrumb, whether its deadline
+  fired and whether the repair had returned), counters (sizes recovered,
+  stray pages removed and files superseded included), the check's reports
+  (including `deleted_live_files`),
   bytes held and the budget, blocks compacted and GC reserve pages used,
   NVS free entries before and after, the largest
   internal block before and after, the stack left on app_main, records
@@ -376,25 +480,64 @@ unreadable NVS entry is never overwritten.
   ESP-IDF sources are). NOR flash with torn programs and erases, NVS blobs
   that survive cuts, the engine through the firmware's ports, and the
   firmware's own `legacy_queue.c`, `file_transaction.c` and `reliability.c`
-  through a stdio shim. Nineteen scenarios: 13FL's deleted head with and
+  through a stdio shim. A cut tears the write it lands in either as a clean
+  prefix or bit by bit across the whole write (NOR programs a page's cells
+  in parallel: any byte fully, partly or not programmed). Twenty-eight
+  scenarios: 13FL's deleted head with and
   without a surviving copy, P02's erased and foreign pages, span mismatch,
   duplicate header and index pages, a missing index page, entries and dirty
   bytes past the end, torn tails, a free lookup entry under a used page,
   erased bytes in a text page, a stopped removal with a damaged probe, stale
   cursors, a damaged catalog, a torn lookup entry ahead of another file's
   pages, a store with one free block whose damaged queue sits in every
-  block (normalization from the GC reserve), and a probe file with a torn
-  header size. Oracles: custody byte for byte; exactly the
-  unreadable bytes reported; the real drain reads every queue to its end;
-  appends accepted and a probe file works; a second check fixes nothing and
-  a second repair is clean; a whole-file line reader still reads every
-  undamaged row; the mirror leaves identical flash and report; a cap on HAL
-  operations per repair. Also: every scenario with no holds and with
-  allocation failing at four levels; the boot policy; a power cut at a random
-  write inside the repair (sometimes two) until a run finishes; and the
-  simulator's workload with about 120 cuts per seed: no committed row lost.
+  block (normalization from the GC reserve), a probe file with a torn
+  header size, a recreated pending queue and a "wb" segment whose first
+  append tore the size (five bit patterns), a recreated queue that reuses the
+  old object id with a lost page and the old file's page caught mid-delete,
+  a binary span whose stale copy and deleted referenced page differ, two
+  copies that disagree on one byte, stray pages (0xFD, 0xFE, 0xFF, past the
+  end, an index page), a referenced place reused by an unfinalized page, and
+  scattered erased bytes, a hidden probe header with a half-cleared lookup
+  entry ahead of a queue's pages. Oracles: custody byte for byte; exactly the
+  unreadable bytes reported (a merged record may cover readable bytes
+  between them); the real drain reads every queue to its end;
+  appends accepted and a probe file works; no stray page of a live file;
+  SPIFFS's own GC on every third block moves nothing a live file reads; a
+  second check fixes nothing and a second repair is clean; a whole-file line
+  reader still reads every undamaged row; a queue segment takes its next
+  "wb"; the mirror leaves identical flash and report; a cap on HAL
+  operations per repair. Special runs: a resume from a hidden header with a
+  cut at every one of its writes, torn both ways, after which the file must
+  be whole with no gap; the check deleting one held file and
+  altering another (a test-only hook after each pass), alone, with the soft
+  deadline passing during the check, on a store too full to rebuild
+  (`CHECK_CHANGED`, manifest kept, settled once next boot) and with cuts
+  after it; manifests superseded by a rolled-back image (queue and non-queue
+  files) or by this image's level 2, a hidden original whose name a new file
+  took, and a file changed in place; a settled queue retired at level 2 that
+  must stay retired through a restore; no check while a custody file's gap
+  cannot be recorded; the NVS headroom, journal and check-time guards. Also:
+  every scenario with no holds and with allocation failing at four levels;
+  the boot policy; a power cut at a random write inside the repair
+  (sometimes two) until a run finishes, with every readable byte back at its
+  offset or named by a gap record, missing or truncated files included; and
+  the simulator's workload to a crammed store: odd seeds also retire and
+  recreate the pending queue whenever its drain catches up while a blocked
+  queue fills the store, and a "wb" segment lane is rewritten; a committed
+  row missing after a repair must lie under a gap record created after it
+  was committed, the queues must take appends and the segment its next "wb".
   Rows committed after a failed append in the same boot are counted apart
-  (1.2 item 9: SPIFFS ANDed them before any repair ran).
+  (1.2 item 9: SPIFFS ANDed them before any repair ran). CI runs about 6,000
+  power cuts over seven workload seeds of 2,500 ticks (66 to 76% live data;
+  seed 832 is the regression of 1.2 item 13), about 400 cut runs inside the
+  repair, and the scenarios on the 8 MB store, in parallel (about a minute).
+  A mutation check of the engine (dev tool,
+  not in CI) confirms the harness fails without the restore, the resume, a
+  whole rebuild, the manifest, holds, compaction's pins, R3, the resume's
+  CRC check, the source rules, stray removal, size recovery, the merge,
+  the time, NVS and journal guards, stale-manifest handling, the restore
+  past the soft deadline, the retired-file rule, gap merging and
+  compaction's margin.
   Longer soaks (not in CI) ran the workload to 76% live data with a cut
   every 900 and 2,500 flash operations, where the store runs crammed with
   deleted pages: they found 1.2 items 7 to 9, and cuts inside the repair's
@@ -404,7 +547,8 @@ unreadable NVS entry is never overwritten.
   their scenarios fail.
 - **Contracts** (`test_storage_repair_boot_contract.py`): boot order, CMake
   scope, no format call, the check callback, deadline before mount, no new
-  task, PSRAM-only holds, the storage-ready gate.
+  task, PSRAM-only holds, the storage-ready gate, the reporter outside a
+  priority hold and reading no NVS with nothing pending.
 
 ## 10. Rollback
 
@@ -449,7 +593,7 @@ Boot review (D1-D15):
 | D4 | Deferred states keep 13FL's blocker | Accepted: alternate probe name; 64 KiB chunks; mirror counted first; a budget shortfall no longer defers the check (harness: no holds). |
 | D5 | First-boot PSRAM-only window | Accepted in substance (R3); `.rp` copies not needed. No `gc_quick` or SPIFFS GC from the engine: compaction only (5.2). |
 | D6 | GC probe proves nothing | Accepted: no GC probe; a second pass must fix nothing. |
-| D7 | NVS footprint | Partly: about 2.3 KB peak (state, manifest of 12 files, 24 gaps, 8 resets), manifest erased when a run finishes, free entries reported before and after. No pre-write headroom check: HIL must confirm. |
+| D7 | NVS footprint | Accepted (second round, B2): about 2.3 KB peak (state, manifest of 12 files, 24 gaps, 8 resets), manifest erased once settled, free entries reported before and after, and a headroom check before any write (section 4). |
 | D8 | Reporter task | Accepted: none. |
 | D9 | Internal RAM | Accepted. |
 | D10 | Stack | Accepted: no large stack buffers (largest frame `srr_run` 1,168 B by `-fstack-usage`); high-water mark reported; HIL gate 1.5 KiB. |
@@ -458,6 +602,44 @@ Boot review (D1-D15):
 | D13 | Stale mirror after failure | Accepted. |
 | D14 | Every-boot probe | Accepted. |
 | D15 | Invisible repair | Accepted: LED state and RTC breadcrumb. |
+
+Second custody review of the implementation (A1-A11):
+
+| # | Point | Disposition |
+|---|---|---|
+| A1 | A torn first-append size left the file broken and reported CLEAN; a plausible torn size filled megabytes and spliced old bytes | Accepted: section 5.1 recovers the size from the pages and rewrites the header (also a size left 0xFFFFFFFF over programmed entries, found by the bit-level tear model); no span past the last traced page is filled. Scenarios `torn_size` (five bit patterns, 1 and 8 MB) and `torn_segment`; the workload retires and recreates its queue. |
+| A2 | An earlier file's deleted pages spliced in with no gap | Accepted: only the page the index names may be a deleted source; a copy must be finalized with the file's own lookup entry (not mid-delete); erased bytes are filled only from agreeing sources. Scenario `reincarnation` (object id reused, sometimes a mid-delete page of the earlier file). |
+| A3 | Binary files took a stale copy | Accepted: the referenced page is a source even when deleted, and sources merge byte by byte (more programmed wins; disagreement is a gap). Scenarios `binary_stale` and `copies_disagree`. |
+| A4 | 0xFD pages left for SPIFFS's GC to point an index at | Accepted: every stray page of a live file is deleted before the check and SPIFFS's own writes (section 5.1). Scenario `strays` plus two oracles on every scenario: no stray page of a live file, and SPIFFS's GC over the store moves nothing a live file reads. |
+| A5 | A block cleaning that stopped half way was ignored and the check ran on an inconsistent file; restore failure unreported | Accepted: any cleaning that started is surveyed again; the store is surveyed, normalized and checked consistent just before the manifest and before every pass; a restore failure records `CHECK_CHANGED` and keeps the manifest. The cleaning in the reviewer's seeds stopped because SPIFFS's page counters had drifted (1.2 item 12): room now comes from the survey, with a margin to re-point a stopped cleaning's index pages. |
+| A6 | A reset during the resume lost the file | Accepted: the manifest flag (not the phase) drives the resume, the phase stays `RESTORE` until it is retired, entries settle one by one and only once verified, and rebuilds go to `<name>.rpr`, lose any duplicate header, and are renamed into place; a live file is never removed for a restore; lookup hygiene runs before the resume. The reviewer's own resume-cut scenario, rerun on this engine, first still lost the file at writes 411 and 412 (the duplicate-header rename) and reported ten whole-file gaps (an allocation over a used page whose lookup said free); both are fixed, and it now ends with all 677 cut points intact. Special run: a cut at every write of the resume, torn both ways, must leave the file whole. |
+| A7 | The restore resurrected a file the repair retired | Accepted: the hold and the manifest entry go before the file. Special run with a check that changed something. |
+| A8 | A stale manifest produced false gaps | Accepted: the manifest records the image, whether it was unconfirmed, and each queue file's cursor generation; a file replaced by its owner is superseded, not a gap. A hidden original whose name a new file took keeps its rows (appended for text files). Five manifest cases. |
+| A9 | The harness missed custody-critical mutations | Accepted: the strict oracle for cuts inside the repair, the per-row oracle for the workload (a gap must lie over the row and postdate it), a workload that retires and recreates its queue and rewrites a "wb" segment, a bit-level tear model, the special runs above, and CI to crammed stores. A mutation check confirms each listed mutation now fails the harness; two remain uncaught by design (removing the `!deferred` term or one of two source filters is masked by the defence that repeats it). |
+| A10 | Held files kept a stale "gaps recorded" shortcut | Accepted: a re-plan fills bytes readable when the hold was taken from the hold and records any range not yet recorded this run. Not reachable deterministically in the harness (a source erased between surveys); covered by reasoning. |
+| A11 | A check pass started with no time check | Accepted with B1. |
+
+Second boot review of the implementation (B1-B5):
+
+| # | Point | Disposition |
+|---|---|---|
+| B1 | The soft deadline dropped the holds after a pass; no time check before one | Accepted: the restore after a pass ignores the soft deadline (only the hard one ends it); a pass starts only when its expected duration and the restore fit (section 5.3). Special runs: the soft deadline passing during the check, and a check that would not fit. |
+| B2 | No NVS headroom check; a failed first journal save ignored | Accepted: section 4; guards tested. |
+| B3 | The reporter read NVS every outbox pass and ignored the priority hold | Accepted: counts in RAM, the call after the hold; contract test. |
+| B4 | An unrelated crash after a stopped run counted as a repair failure | Accepted: the breadcrumb records that the repair returned. |
+| B5 | 784 B of buffers on the outbox task's stack | Accepted: one PSRAM block per send. |
+| - | Version gates (`UG_DIRECT_VERSION`, the 2.7.4 digest) and the HIL reboot window | Outside this change: they belong to tagging 2.7.5 (section 12). |
+
+Found by the strengthened harness while proving the fixes:
+
+| Finding | Fix |
+|---|---|
+| The repair's own new page, torn and unfinalized at the place an erased referenced page had, was read as that span's bytes (cuts inside the repair, bit-level tears) | Unfinalized pages are never sources (5.1); scenario `reused_ref`. |
+| Scattered unreadable bytes filled the 24-record gap list across runs and wedged a file | Runs less than a page apart are one merged record (8); scenario `scattered_bytes`. |
+| A first append's header torn with the size still 0xFFFFFFFF but entries programmed lost its row | Recovered like any torn size (5.1). |
+| SPIFFS's page counters drift (1.2 item 12); a block cleaning ran out of pages half way (seed 618) | Room counted from the survey, with a margin (5.2). |
+| A half-deleted hidden header made the check delete a consistent queue (1.2 item 13, seed 832) | Hidden objects are protected only for the manifest; no check over a mislabeled page; seed 832 in CI. |
+| The resume renamed a stale duplicate header, and allocated over a used page whose lookup said free | Section 5.4 and A6. |
 
 ## 12. Open decisions and residual risks
 
@@ -490,13 +672,30 @@ Residual risks:
 
 - None of this has run on a device. HIL must measure duration (clean,
   cloned 13FL and P02 images), stack high-water mark, NVS free entries and
-  the largest internal block, all in the heartbeat.
+  the largest internal block, all in the heartbeat. The every-boot repair
+  must fit the controlled-reboot test's recovery window (`hil_reboot.py`).
+- Before tagging: the direct-legacy role checks `UG_DIRECT_VERSION "2.7.4"`
+  (`upgrade_guard.h`); the fleet's 2.7.4 digest must be added to
+  `ug_direct_predecessor_matches` and the CI contract marker, or a 2.7.5
+  direct-legacy image fails its storage upgrade check and rolls back.
 - A reset during the first 2.7.5 boot returns to the old image, which keeps
-  writing; the next 2.7.5 run repairs what it finds. A manifest from an
-  interrupted run compared after a rollback image changed files over-reports
-  (`CONTENT_UNVERIFIED`).
+  writing. A manifest that boot left is an unconfirmed image's: what no
+  longer matches is superseded, not reported, unless the original is still
+  intact in a hidden object. A file that only changed in place after an
+  interrupted run on a confirmed image is reported whole
+  (`CONTENT_UNVERIFIED`): the manifest keeps one CRC per file.
 - Holds do not survive the boot: if the check unexpectedly altered a held
-  file and the restore failed, those bytes are reported, not kept.
+  file and the restore failed, those bytes are reported, not kept; a later
+  boot puts them back only if the store still holds them (a hidden original).
+- The torn-size recovery picks, for a binary file, the smallest size at or
+  after its last programmed byte that the torn size contains: a first append
+  whose data ended in 0xFF bytes past such a size loses them. Text files
+  (every queue) end where their bytes end.
+- A gap list of 24 records ADD has not acknowledged blocks recording new
+  damage; such a file stays as it is (and the check waits) until ADD
+  acknowledges some.
+- The time estimate for a check pass is a constant per MiB until a pass is
+  measured; HIL should confirm 4 s/MiB with the mirror and 8 s without.
 - Damaged durable-queue or journal segment records still hold their lane
   with DQ_CORRUPT (unchanged behaviour).
 - SPIFFS's own GC in the application's writes can still stop half way on a
@@ -509,12 +708,6 @@ Residual risks:
   two outside the reserve path; it can erase a block of deleted pages that
   were byte sources. The plan already holds those bytes in RAM, so only a
   reset in that window turns them into a recorded gap.
-- A custody file whose header has a torn size (1.2 item 10: a queue file
-  created and cut during its first append) is not taken as a live file: it
-  is neither held nor normalized, and its first row stays unreadable to the
-  application. Not seen in the harness for custody files (they are created
-  rarely); the run logs `STORAGE_REPAIR_SIZE_TORN` and lists the file with
-  that size.
-- A truncated or removed file's deleted pages can be read back as its
-  content when the header still names them (an interrupted truncate keeps
-  the old bytes); duplicates replay idempotently at ORDS and ADD.
+- A truncated file's deleted pages are read back as its content when its
+  header still names them (an interrupted truncate keeps the old bytes);
+  duplicates replay idempotently at ORDS and ADD.
