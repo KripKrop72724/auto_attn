@@ -172,9 +172,16 @@ jobs:
           Write-Host 'Existing ADD API and UI containers are serving locally.'
 
   announce:
+    # workflow_run's branch filter matches the triggering run's head branch
+    # name, which a pull request from a fork can also call `main`. Deploy only
+    # a successful ADD CI run of this repository's own main branch.
     if: >-
       (github.event_name == 'workflow_dispatch' && inputs.recover_core != true && inputs.runner_capacity_mode == 'none') ||
-      github.event.workflow_run.conclusion == 'success'
+      (github.event_name == 'workflow_run' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.head_repository.full_name == github.repository &&
+      (github.event.workflow_run.event == 'push' || github.event.workflow_run.event == 'workflow_dispatch'))
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -200,9 +207,16 @@ jobs:
             --data "$payload"
 
   deploy:
+    # workflow_run's branch filter matches the triggering run's head branch
+    # name, which a pull request from a fork can also call `main`. Deploy only
+    # a successful ADD CI run of this repository's own main branch.
     if: >-
       (github.event_name == 'workflow_dispatch' && inputs.recover_core != true && inputs.runner_capacity_mode == 'none') ||
-      github.event.workflow_run.conclusion == 'success'
+      (github.event_name == 'workflow_run' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.head_repository.full_name == github.repository &&
+      (github.event.workflow_run.event == 'push' || github.event.workflow_run.event == 'workflow_dispatch'))
     needs: announce
     runs-on: [self-hosted, Windows, X64]
     environment: add-production
