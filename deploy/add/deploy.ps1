@@ -174,12 +174,12 @@ function Assert-DockerCapacity {
 function Write-DeployTiming {
     param(
         [Parameter(Mandatory = $true)][string] $Phase,
-        [Parameter(Mandatory = $true)][System.Diagnostics.Stopwatch] $Clock,
-        [string] $Detail = ""
+        [Parameter(Mandatory = $true)][System.Diagnostics.Stopwatch] $Clock
     )
-    # Phase names, durations and byte counts only; never data or settings.
+    # Phase names and durations only; never data, sizes or settings (the
+    # repository and its workflow logs are public).
     $seconds = $Clock.Elapsed.TotalSeconds.ToString("0.0", [Globalization.CultureInfo]::InvariantCulture)
-    Write-Host ("Deploy timing: phase=$Phase seconds=$seconds $Detail").TrimEnd()
+    Write-Host "Deploy timing: phase=$Phase seconds=$seconds"
 }
 
 function Get-PostgresContainer {
@@ -805,8 +805,7 @@ try {
     if (-not (Test-Path -LiteralPath $databaseBackup) -or (Get-Item $databaseBackup).Length -lt 100) {
         throw "The pre-deployment PostgreSQL backup is missing or invalid."
     }
-    Write-DeployTiming -Phase "backup_copy_to_host" -Clock $phaseClock `
-        -Detail "bytes=$((Get-Item -LiteralPath $databaseBackup).Length)"
+    Write-DeployTiming -Phase "backup_copy_to_host" -Clock $phaseClock
     $phaseClock.Restart()
     $backupSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $databaseBackup).Hash
     $containerBackupHash = Invoke-Docker -Arguments @(
