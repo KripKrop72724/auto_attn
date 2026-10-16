@@ -61,6 +61,7 @@ int shim_fclose(shim_file_t *file);
 #define FD_COUNT 4U
 
 static int verbose;
+static void dump_write(void);
 #define CHECK(condition, ...)                                                       \
     do {                                                                           \
         if (!(condition)) {                                                        \
@@ -374,6 +375,7 @@ static void repair_boot(srr_report_t *report, const srr_config_t *config)
     CHECK(memory_in_use == 0, "repair leaked %" PRIu64 " bytes", memory_in_use);
     uint64_t used = (flash_ops - start_ops) + (flash_reads - start_reads);
     if (used > hal_max) hal_max = used;
+    if (hal_cap && used > hal_cap) dump_write();
     if (hal_cap) CHECK(used <= hal_cap, "repair used %" PRIu64 " HAL operations (cap %" PRIu64 ")", used, hal_cap);
     if (verbose)
         printf("  repair %s: gaps %u spans %u checks %u hal %" PRIu64 " peak %" PRIu64 " KiB\n",
@@ -1580,6 +1582,30 @@ static void damage_scattered_bytes(void)
     SPIFFS_unmount(&fs);
 }
 
+/* A probe file's removal stopped inside its header's delete: the header
+ * hidden, its lookup entry half cleared (0x8007 left 0x0007: it now names a
+ * data object). Pending's pages follow in the same block. SPIFFS_check's
+ * handling of such an entry reads the rest of the block through another
+ * block's lookup page and deletes live pages, then the file they belong to;
+ * nothing claims the hidden probe, so its page goes before the check. */
+static void damage_torn_hidden_lookup(void)
+{
+    build_store(60000);
+    static const uint8_t probe[32] = {5};
+    write_file("/persistence-probe", probe, sizeof(probe));
+    uint32_t header = header_of("/persistence-probe");
+    model_file_t *m = model_of("/pending.jsonl");
+    char row[600];
+    for (int i = 0; i < 12; ++i) {
+        size_t n = json_row(row, sizeof(row));
+        model_append(m, row, (uint32_t)n);
+    }
+    SPIFFS_unmount(&fs);
+    uint16_t obj = rd16(header * PAGE);
+    flash[header * PAGE + 4] &= (uint8_t)~SPIFFS_PH_FLAG_IXDELE;
+    wr16(lookup_address(header), (uint16_t)(obj & 0x7FFF));
+}
+
 static const char *const appendable[] = {"/pending.jsonl", "/blocked_identity.jsonl", "/add_pending.jsonl",
                                          "/acked_uids.txt", "/processed_commands.txt"};
 
@@ -1698,6 +1724,7 @@ static const scenario_t scenarios[] = {
     {"strays", damage_strays, false},
     {"reused_ref", damage_reused_ref, true},
     {"scattered_bytes", damage_scattered_bytes, true},
+    {"torn_hidden_lookup", damage_torn_hidden_lookup, false},
 };
 
 static void run_scenario(const scenario_t *s, uint64_t seed_value, uint32_t kib)
@@ -2025,8 +2052,10 @@ static void boot_until_done(const char *what)
 
 /* A reset during the check left the held pending queue hidden (the check had
  * begun deleting it). The next boot rebuilds it from its own pages under a
- * temporary name and renames it into place; a cut at any write of that
- * resume loses nothing no gap record names, and a later boot finishes it. */
+ * temporary name and renames it into place. The hidden pages stay until a
+ * check runs, and none runs while the manifest is active, so a cut at any
+ * write of that resume (each torn both ways) loses nothing at all: a later
+ * boot finishes it and the file is whole, with no gap. */
 static void run_resume_cuts(uint32_t kib)
 {
     seed(9004);
@@ -2056,24 +2085,30 @@ static void run_resume_cuts(uint32_t kib)
     check_custody(m, 4, false);
     CHECK(!exists("/pending.jsonl" SRP_RESTORE_SUFFIX), "resume: the rebuild was left under its temporary name");
     SPIFFS_unmount(&fs);
-    uint64_t step = writes > 300 ? writes / 300 : 1;
     uint32_t runs = 0;
-    for (uint64_t k = 1; k <= writes; k += step) {
-        memcpy(flash, image, flash_size);
-        memcpy(nvs, saved, sizeof(nvs));
-        volatile bool cut = false;
-        cut_at = flash_ops + k;
-        if (setjmp(cut_point)) {
-            cut = true;
-            drop_all_memory();
-        } else {
-            repair_boot(&report, &config);
+    for (uint64_t k = 1; k <= writes; ++k) {
+        for (int tear = 0; tear < 2; ++tear) {
+            memcpy(flash, image, flash_size);
+            memcpy(nvs, saved, sizeof(nvs));
+            seed(9004 + k * 2 + (uint64_t)tear);
+            volatile bool cut = false;
+            cut_at = flash_ops + k;
+            if (setjmp(cut_point)) {
+                cut = true;
+                drop_all_memory();
+            } else {
+                repair_boot(&report, &config);
+            }
+            cut_at = 0;
+            if (!cut) continue;
+            runs++;
+            boot_until_done("resume after a cut");
+            mount_plain();
+            check_custody(m, 4, false);
+            CHECK(!exists("/pending.jsonl" SRP_RESTORE_SUFFIX), "resume after a cut at write %" PRIu64
+                  ": the rebuild was left under its temporary name", k);
+            SPIFFS_unmount(&fs);
         }
-        cut_at = 0;
-        if (!cut) continue;
-        runs++;
-        boot_until_done("resume after a cut");
-        check_named("resume after a cut", m, 4);
     }
     free(image);
     free(saved);
@@ -2645,7 +2680,6 @@ static bool gap_names(const srp_gaps_t *gaps, const char *name, uint32_t generat
     return false;
 }
 
-static void dump_write(void);
 static void organic_verify(uint32_t *lost, uint32_t *explained, uint32_t *anded)
 {
     static uint8_t buffer[8 * 1024 * 1024];
@@ -2705,16 +2739,22 @@ static void organic_verify(uint32_t *lost, uint32_t *explained, uint32_t *anded)
  * when the workload's oracle fails, for --replay=<prefix>. */
 static uint8_t *dump_flash;
 static __typeof__(nvs) dump_nvs;
+static void dump_write_to(const char *prefix);
 static void dump_before_repair(void)
 {
     if (!getenv("REPAIR_DUMP")) return;
     if (!dump_flash) dump_flash = malloc(8U * 1024 * 1024);
     memcpy(dump_flash, flash, flash_size);
     memcpy(&dump_nvs, nvs, sizeof(nvs));
+    /* REPAIR_DUMP_AT=<run>: the store before that run, whatever follows. */
+    if (getenv("REPAIR_DUMP_AT") && repair_generation() + 1 == (uint32_t)atoi(getenv("REPAIR_DUMP_AT"))) {
+        char prefix[512];
+        snprintf(prefix, sizeof(prefix), "%s-at", getenv("REPAIR_DUMP"));
+        dump_write_to(prefix);
+    }
 }
-static void dump_write(void)
+static void dump_write_to(const char *prefix)
 {
-    const char *prefix = getenv("REPAIR_DUMP");
     if (!prefix || !dump_flash) return;
     char path[512];
     snprintf(path, sizeof(path), "%s.flash", prefix);
@@ -2727,6 +2767,7 @@ static void dump_write(void)
     fclose(f);
     printf("  dumped the store before the last repair to %s.*\n", prefix);
 }
+static void dump_write(void) { dump_write_to(getenv("REPAIR_DUMP")); }
 
 /* Boots after a cut: repair (cut again sometimes) until a run finishes. */
 static void repair_until_done(uint64_t seed_value, volatile uint32_t *cuts, bool cut_inside)

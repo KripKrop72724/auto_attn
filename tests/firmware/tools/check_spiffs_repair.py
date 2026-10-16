@@ -32,6 +32,9 @@ FLAGS = ["-std=c11", "-D_POSIX_C_SOURCE=200809L", "-g", "-O1", "-fsanitize=addre
 CI_RUNS = [["--seeds=3", "--organic=0"], ["cuts", "--seeds=12", "--first-seed=3"],
            ["organic", "--organic=3", "--ticks=2500", "--first-seed=0"],
            ["organic", "--organic=3", "--ticks=2500", "--first-seed=3", "--gap=150"],
+           # Seed 832 once ended with SPIFFS_check deleting a consistent queue
+           # over a half-deleted hidden header's lookup entry (1.2 item 7).
+           ["organic", "--organic=1", "--ticks=2500", "--first-seed=821"],
            ["scenarios", "--seeds=1", "--kib=8192"]]
 
 
