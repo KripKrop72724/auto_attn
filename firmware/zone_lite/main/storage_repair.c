@@ -336,6 +336,7 @@ void storage_repair_boot(void)
     if (!s_partition) {
         s_mount_failed = true;
         s_mount_error = SPIFFS_ERR_NOT_A_FS;
+        count_records();
         return;
     }
     srr_config_t config = boot_config();
@@ -347,6 +348,8 @@ void storage_repair_boot(void)
         ESP_LOGE(TAG, "deadline timer unavailable; storage repair skipped");
         s_report.result = SRR_RESULT_NOT_RUN;
         snprintf(s_report.error_stage, sizeof(s_report.error_stage), "deadline");
+        /* Records an earlier run left still go to ADD. */
+        count_records();
         return;
     }
     s_last_yield_us = esp_timer_get_time();
