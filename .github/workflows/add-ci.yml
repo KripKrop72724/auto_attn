@@ -359,6 +359,10 @@ jobs:
           merge-multiple: true
       - name: Verify every collected test belongs to exactly one successful shard
         run: python scripts/run_ci_tests.py --verify-plans .ci --shard-count 8 --weights scripts/ci_test_durations.json
+      - name: Warn when the committed shard weights are stale
+        # Diagnostic only: it always exits 0 and runs after the coverage proof.
+        # Stale weights slow a shard down but never change which tests run.
+        run: python scripts/update_ci_test_durations.py --check scripts/ci_test_durations.json .ci/junit-*.xml
 
   frontend:
     runs-on: ubuntu-latest

@@ -184,3 +184,59 @@ def test_actual_subprocess_shards_with_committed_weights_join(tmp_path):
     (tmp_path / "weights.json").write_text(json.dumps({paths[0]: 1}))
     result = run(tmp_path, "--verify-plans", "plans", "--shard-count", "3", "--weights", "weights.json")
     assert result.returncode != 0
+
+
+UPDATER = SCRIPT.with_name("update_ci_test_durations.py")
+updater_spec = importlib.util.spec_from_file_location("ci_test_durations", UPDATER)
+updater = importlib.util.module_from_spec(updater_spec)
+updater_spec.loader.exec_module(updater)
+
+
+def junit(path, cases):
+    path.write_text("<testsuites><testsuite>" + "".join(
+        f'<testcase classname="{classname}" name="t{index}" time="{seconds}"/>'
+        for index, (classname, seconds) in enumerate(cases)) + "</testsuite></testsuites>")
+    return path
+
+
+def test_stale_weight_check_warns_without_ever_failing_or_writing(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    for file in ("tests/unit/test_a.py", "tests/unit/test_b.py", "tests/unit/test_new.py"):
+        (tmp_path / file).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / file).write_text("")
+    weights = tmp_path / "weights.json"
+    weights.write_text(json.dumps({"tests/unit/test_a.py": 100_000, "tests/unit/test_b.py": 10_000}))
+    reports = [junit(tmp_path / "junit-0.xml", [("tests.unit.test_a", 140), ("tests.unit.test_b", 30)]),
+               junit(tmp_path / "junit-1.xml", [("tests.unit.test_new.TestX", 50)])]
+    before = weights.read_text()
+    assert updater.main(["--check", str(weights), *map(str, reports)]) == 0
+    output = capsys.readouterr().out
+    # 140s against 100s is within 1.5x and 30s against 10s is within 30s: quiet.
+    assert "test_a.py" not in output and "test_b.py" not in output
+    assert "::warning title=Stale CI shard weights::tests/unit/test_new.py has no committed" in output
+    assert "junit-0.xml=170 junit-1.xml=50" in output
+    junit(reports[0], [("tests.unit.test_a", 151), ("tests.unit.test_b", 41)])
+    assert updater.main(["--check", str(weights), *map(str, reports)]) == 0
+    output = capsys.readouterr().out
+    assert "tests/unit/test_a.py took 151s against a committed weight of 100s" in output
+    assert "tests/unit/test_b.py took 41s against a committed weight of 10s" in output
+    assert weights.read_text() == before
+
+
+@pytest.mark.parametrize("report", ["<not-xml", '<testcase classname="tests.unit.gone" time="1"/>', None])
+def test_stale_weight_check_reports_unreadable_input_as_a_warning(tmp_path, monkeypatch, capsys, report):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "weights.json").write_text("{}")
+    path = tmp_path / "junit-0.xml"
+    if report is not None:
+        path.write_text(report)
+    assert updater.main(["--check", "weights.json", str(path)]) == 0
+    assert capsys.readouterr().out.startswith("::warning title=CI shard weights::Could not compare")
+
+
+def test_weight_refresh_still_refuses_an_unmappable_report(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    report = junit(tmp_path / "junit-0.xml", [("tests.unit.gone", 1)])
+    with pytest.raises(SystemExit, match="Cannot map"):
+        updater.main([str(report), "--output", str(tmp_path / "out.json")])
+    assert not (tmp_path / "out.json").exists()
