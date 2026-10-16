@@ -313,7 +313,7 @@ static const srr_ports_t ports = {
 
 static srr_config_t repair_config(void)
 {
-    srr_config_t config = {.hold_budget = 64ULL * 1024 * 1024, .image_tag = 0x2750, .allow_reformat = false};
+    srr_config_t config = {.hold_budget = 64ULL * 1024 * 1024, .image_tag = 0x2750};
     return config;
 }
 
@@ -1168,6 +1168,126 @@ static void damage_catalog(void)
     SPIFFS_unmount(&fs);
 }
 
+static model_file_t *new_model(const char *name, bool json, bool ids)
+{
+    model_file_t *m = &model[model_count++];
+    snprintf(m->name, sizeof(m->name), "%s", name);
+    m->data = malloc(1);
+    m->unreadable = calloc(1, 1);
+    m->json = json;
+    m->ids = ids;
+    return m;
+}
+
+static void model_append(model_file_t *m, const void *data, uint32_t n)
+{
+    m->data = realloc(m->data, m->size + n + 1);
+    m->unreadable = realloc(m->unreadable, m->size + n + 1);
+    memcpy(m->data + m->size, data, n);
+    memset(m->unreadable + m->size, 0, n + 1);
+    CHECK(append_bytes(m->name, data, n), "append %s %d", m->name, SPIFFS_errno(&fs));
+    m->size += n;
+}
+
+static void model_append_ids(model_file_t *m, uint32_t count)
+{
+    for (uint32_t i = 0; i < count; ++i) {
+        char id[66];
+        for (int k = 0; k < 64; ++k) id[k] = "0123456789abcdef"[rnd() % 16];
+        id[64] = '\n';
+        model_append(m, id, 65);
+    }
+}
+
+/* The lowest free page: the tail of the last block SPIFFS filled. */
+static uint32_t lowest_free_page(void)
+{
+    for (uint32_t pix = 0; pix < flash_size / PAGE; ++pix)
+        if (pix % 16 && rd16(lookup_address(pix)) == 0xFFFF && flash[pix * PAGE + 4] == 0xFF) return pix;
+    CHECK(0, "no free page");
+    return 0;
+}
+
+static void damage_torn_lookup(void)
+{
+    /* NOR left bits of a lookup entry unprogrammed: an uncommitted copy of a
+     * pending span has an entry naming no object, and live pages of another
+     * file follow it in the block. SPIFFS_check deletes such a page after an
+     * index search that overwrote the lookup page it is walking, then reads
+     * the rest of the block through another block's entries (and deletes
+     * live pages whose marking differs). The repair deletes it first. */
+    build_store(120000);
+    SPIFFS_unmount(&fs);
+    model_file_t *m = model_of("/pending.jsonl");
+    uint32_t span = 103 + rnd() % 100; /* its index page lies in an earlier block */
+    uint32_t pix = lowest_free_page();
+    copy_page(pix, rd16(entry_address(m->name, span)));
+    wr16(lookup_address(pix), (uint16_t)(object_of(m->name) | 0xFF00U));
+    mount_plain();
+    model_append_ids(model_of("/acked_uids.txt"), 60);
+    SPIFFS_unmount(&fs);
+}
+
+static void damage_full_store(void)
+{
+    /* A store that has run a while: the queues interleaved in every block,
+     * deleted pages everywhere and one free block. The pending queue's
+     * head page is flagged deleted (its moved copy survives), and every
+     * other free page holds a copy of it: one valid copy per block (an
+     * interrupted GC move leaves one) and deleted ones. No block can be
+     * compacted or quick-collected while the queue is damaged, so
+     * normalization allocates from the pages SPIFFS keeps for its GC; the
+     * check deletes the copies and compaction gives the pages back. */
+    model_reset();
+    row_seq = rnd() % 100000;
+    mount_plain();
+    model_file_t *pending = new_model("/pending.jsonl", true, false);
+    model_file_t *blocked = new_model("/blocked_identity.jsonl", true, false);
+    model_file_t *acked = new_model("/acked_uids.txt", false, true);
+    char row[600];
+    while (pending->size + blocked->size < flash_size / 2) {
+        size_t n = json_row(row, sizeof(row));
+        model_append(pending, row, (uint32_t)n);
+        n = json_row(row, sizeof(row));
+        model_append(blocked, row, (uint32_t)n);
+        if (rnd() % 4 == 0) model_append_ids(acked, 1);
+    }
+    SPIFFS_unmount(&fs);
+    uint32_t span = 10 + rnd() % 100;
+    uint32_t head = rd16(entry_address(pending->name, span));
+    uint32_t copy = free_page();
+    copy_page(copy, head);
+    flag_deleted(head);
+    uint32_t blocks = flash_size / BLOCK, keep = blocks;
+    for (uint32_t b = blocks; b-- > 0 && keep == blocks;) {
+        bool empty = true;
+        for (uint32_t e = 1; e < 16 && empty; ++e) empty = rd16(lookup_address(b * 16 + e)) == 0xFFFF;
+        if (empty) keep = b;
+    }
+    CHECK(keep < blocks, "full_store: no free block");
+    for (uint32_t pix = 0, pinned = blocks; pix < flash_size / PAGE; ++pix) {
+        if (pix % 16 == 0 || pix / 16 == keep || rd16(lookup_address(pix)) != 0xFFFF) continue;
+        copy_page(pix, copy);
+        if (pinned == pix / 16) flag_deleted(pix);
+        pinned = pix / 16;
+    }
+}
+
+static void damage_torn_probe_size(void)
+{
+    /* The first append to a new file rewrites its header in place; a reset
+     * there leaves a torn size. SPIFFS can neither truncate nor remove the
+     * file and the check keeps it, so every later create of the name fails
+     * (13FL's and P02's probe ENOENT). */
+    build_store(60000);
+    static const uint8_t probe[64] = {7};
+    write_file("/repair-probe", probe, sizeof(probe));
+    uint32_t header = header_of("/repair-probe");
+    uint32_t torn = sizeof(probe) | 0xFFFFFF00U;
+    memcpy(flash + header * PAGE + 8, &torn, 4);
+    SPIFFS_unmount(&fs);
+}
+
 static const char *const appendable[] = {"/pending.jsonl", "/blocked_identity.jsonl", "/add_pending.jsonl",
                                          "/acked_uids.txt", "/processed_commands.txt"};
 
@@ -1190,6 +1310,7 @@ static void verify_scenario(const char *name, const srr_report_t *report, bool t
         check_custody(m, base_generation, terminated);
     }
     CHECK(!exists("/persistence-probe"), "%s: probe leftover kept", name);
+    CHECK(!exists("/repair-probe") && !exists("/repair-probe-2"), "%s: repair probe left", name);
     SPIFFS_unmount(&fs);
     mount_plain();
     uint32_t evidence;
@@ -1241,6 +1362,9 @@ static const scenario_t scenarios[] = {
     {"leak_and_probe", damage_leak_and_probe, false},
     {"stale_cursors", damage_stale_cursors, false},
     {"catalog", damage_catalog, true},
+    {"torn_lookup", damage_torn_lookup, false},
+    {"full_store", damage_full_store, false},
+    {"torn_probe_size", damage_torn_probe_size, false},
 };
 
 static void run_scenario(const scenario_t *s, uint64_t seed_value, uint32_t kib)
@@ -1259,6 +1383,11 @@ static void run_scenario(const scenario_t *s, uint64_t seed_value, uint32_t kib)
     CHECK(s->expect_gaps || report.gaps == 0, "%s: %u unexpected gaps", s->name, report.gaps);
     verify_scenario(s->name, &report, !strcmp(s->name, "torn_tails"));
     if (!strcmp(s->name, "stale_cursors")) CHECK(report.cursors_reset == 3, "cursors reset %u", report.cursors_reset);
+    if (!strcmp(s->name, "torn_lookup")) CHECK(report.lookup_fixed >= 1, "torn lookup entry left");
+    if (!strcmp(s->name, "torn_probe_size")) CHECK(report.expendables_removed >= 1, "torn probe not purged");
+    if (!strcmp(s->name, "full_store"))
+        CHECK(report.reserve_pages > 0 || report.blocks_compacted > 0, "full_store: no room made (%s)",
+              srr_result_name(report.result));
     if (!strcmp(s->name, "leak_and_probe")) {
         CHECK(report.used_after < report.used_before, "leak not freed %u -> %u", report.used_before, report.used_after);
         CHECK(report.check_passes >= 1, "no check ran");
@@ -1299,6 +1428,117 @@ static void run_mirror_equivalence(const scenario_t *s, uint64_t seed_value, uin
     free(before);
     free(after_plain);
     free(nvs_before);
+}
+
+/* ---- budget, memory and the boot policy ------------------------------ */
+/* Nothing held in PSRAM (13FL's budget shortfall): normalization still makes
+ * every custody file consistent, so the check runs and loses nothing. */
+static void run_without_holds(const scenario_t *s, uint64_t seed_value, uint32_t kib)
+{
+    seed(seed_value);
+    nvs_clear();
+    format_flash(kib);
+    s->build();
+    srr_report_t report;
+    srr_config_t config = repair_config();
+    config.hold_budget = 0;
+    base_generation = 1;
+    repair_boot(&report, &config);
+    CHECK(report.files_held == 0, "%s: held %u files with no budget", s->name, report.files_held);
+    verify_scenario(s->name, &report, !strcmp(s->name, "torn_tails"));
+}
+
+/* Allocation failing at every level: the run fails or stops cleanly, and the
+ * next run (memory back) still meets every oracle. */
+static void run_with_memory_limits(const scenario_t *s, uint64_t seed_value, uint32_t kib)
+{
+    static const uint64_t limits[] = {16 * 1024, 64 * 1024, 160 * 1024, 320 * 1024};
+    for (size_t i = 0; i < sizeof(limits) / sizeof(limits[0]); ++i) {
+        seed(seed_value);
+        nvs_clear();
+        format_flash(kib);
+        s->build();
+        srr_report_t report;
+        srr_config_t config = repair_config();
+        memory_limit = limits[i];
+        repair_boot(&report, &config);
+        memory_limit = 0;
+        CHECK(report.check_deleted_live == 0, "%s with %" PRIu64 " bytes: the check deleted a live file", s->name,
+              limits[i]);
+        srp_state_t state;
+        base_generation = port_nvs_load(NULL, SRR_NVS_NAMESPACE, "state", &state, sizeof(state)) == 1 ? 1 : 1;
+        repair_boot(&report, &config);
+        verify_scenario(s->name, &report, !strcmp(s->name, "torn_tails"));
+    }
+}
+
+static void store_state(uint32_t phase, uint32_t incomplete, uint32_t failures, uint32_t flags, uint32_t tag)
+{
+    srp_state_t state;
+    memset(&state, 0, sizeof(state));
+    state.generation = 3;
+    state.phase = phase;
+    state.incomplete = incomplete;
+    state.failures = failures;
+    state.flags = flags;
+    state.image_tag = tag;
+    srp_state_seal(&state);
+    port_nvs_store(NULL, SRR_NVS_NAMESPACE, "state", &state, sizeof(state));
+}
+
+/* D1: runs ended by a crash, a watchdog or the deadline stop repairs for the
+ * image; another image tries again; an unconfirmed image after an incomplete
+ * run normalizes only. Power cuts never count. */
+static void run_policy(uint32_t kib)
+{
+    uint8_t *before = malloc(flash_size ? flash_size : kib * 1024U);
+    /* Two crashed runs, and this boot follows a third: report only. */
+    seed(4242);
+    nvs_clear();
+    format_flash(kib);
+    damage_deleted_head();
+    free(before);
+    before = malloc(flash_size);
+    memcpy(before, flash, flash_size);
+    store_state(SRP_PHASE_CHECK, 2, 2, 0, 0);
+    srr_report_t report;
+    srr_config_t config = repair_config();
+    config.previous_failed = true;
+    repair_boot(&report, &config);
+    CHECK(report.result == SRR_RESULT_REPORT_ONLY && report.mode == SRP_MODE_REPORT_ONLY, "guard: %s",
+          srr_result_name(report.result));
+    CHECK(!memcmp(before, flash, flash_size), "guard: report-only wrote to flash");
+    /* The same image stays off, whatever resets follow. */
+    config.previous_failed = false;
+    repair_boot(&report, &config);
+    CHECK(report.result == SRR_RESULT_REPORT_ONLY && !memcmp(before, flash, flash_size), "guard: same image ran");
+    /* Another image tries again. */
+    config.image_tag ^= 0xFFFF;
+    repair_boot(&report, &config);
+    CHECK(report.result == SRR_RESULT_REPAIRED && report.check_passes >= 1, "guard: new image %s",
+          srr_result_name(report.result));
+    /* Power cuts during runs never disable repairs. */
+    seed(4243);
+    nvs_clear();
+    format_flash(kib);
+    damage_deleted_head();
+    store_state(SRP_PHASE_NORMALIZE, 7, 0, 0, 0);
+    config = repair_config();
+    repair_boot(&report, &config);
+    CHECK(report.result == SRR_RESULT_REPAIRED && report.incomplete == 8 && report.failures == 0,
+          "power cuts counted: %s", srr_result_name(report.result));
+    /* An unconfirmed image after an incomplete run: normalize, no check. */
+    seed(4244);
+    nvs_clear();
+    format_flash(kib);
+    damage_erased_page();
+    store_state(SRP_PHASE_CHECK, 1, 0, 0, 0);
+    config = repair_config();
+    config.pending_verify = true;
+    repair_boot(&report, &config);
+    CHECK(report.result == SRR_RESULT_NORMALIZED && report.check_passes == 0 && report.spans_rewritten >= 1,
+          "pending verify: %s passes %u", srr_result_name(report.result), report.check_passes);
+    free(before);
 }
 
 /* ---- power cuts inside the repair ------------------------------------ */
@@ -1378,8 +1618,14 @@ static const uint8_t *find_seq(const uint8_t *row, size_t length)
 }
 
 #define ORGANIC_MAX_SEQ (1U << 18)
+/* 1: committed. 2: committed after an append failed in the same boot. A
+ * failed append (ENOSPC on a crammed store) can leave its bytes past the end
+ * of the last page and index entries past the end; SPIFFS's next append
+ * programs over them in place, so it is the AND of two rows on flash before
+ * any repair runs. Such rows are counted apart from rows a repair lost. */
 static uint8_t *committed;
 static uint32_t next_seq, organic_ticks, organic_cut_count;
+static bool append_failed_this_boot;
 
 static bool organic_append(void)
 {
@@ -1389,7 +1635,8 @@ static bool organic_append(void)
     uint32_t seq = next_seq++;
     if (seq >= ORGANIC_MAX_SEQ) return false;
     bool ok = append_bytes("/pending.jsonl", row, (uint32_t)n);
-    if (ok) committed[seq] = 1;
+    if (ok) committed[seq] = append_failed_this_boot ? 2 : 1;
+    else append_failed_this_boot = true;
     return ok;
 }
 
@@ -1478,7 +1725,7 @@ static void organic_probe_before(void)
     SPIFFS_unmount(&fs);
 }
 
-static void organic_verify(uint32_t *lost, uint32_t *explained)
+static void organic_verify(uint32_t *lost, uint32_t *explained, uint32_t *anded)
 {
     static uint8_t buffer[8 * 1024 * 1024];
     static uint8_t present[ORGANIC_MAX_SEQ];
@@ -1499,7 +1746,8 @@ static void organic_verify(uint32_t *lost, uint32_t *explained)
     for (uint32_t g = 0; g < gaps.count; ++g) any_gap |= !strcmp(gaps.gap[g].name, "/pending.jsonl");
     for (uint32_t s = 0; s < next_seq && s < ORGANIC_MAX_SEQ; ++s) {
         if (!committed[s] || present[s]) continue;
-        if (any_gap) (*explained)++;
+        if (committed[s] == 2) (*anded)++;
+        else if (any_gap) (*explained)++;
         else (*lost)++;
         if (verbose) printf("  organic: committed row %u missing after cut %u (tick %u)%s; readable before repair: %d\n", s,
                             organic_cut_count, organic_ticks, any_gap ? " (gap recorded)" : "", organic_before[s]);
@@ -1541,7 +1789,8 @@ static void run_organic(uint64_t seed_value, uint32_t kib, uint32_t ticks, uint3
     committed = calloc(ORGANIC_MAX_SEQ, 1);
     next_seq = organic_ticks = 0;
     volatile uint32_t cuts = 0, repairs = 0;
-    uint32_t lost = 0, explained = 0;
+    uint32_t lost = 0, explained = 0, anded = 0;
+    append_failed_this_boot = false;
     mount_plain();
     cut_at = flash_ops + 1 + rnd() % (2 * mean_gap);
     while (organic_ticks < ticks) {
@@ -1549,6 +1798,7 @@ static void run_organic(uint64_t seed_value, uint32_t kib, uint32_t ticks, uint3
             /* Power cut during the workload: boot, repair, carry on. */
             cuts++;
             organic_cut_count = cuts;
+            append_failed_this_boot = false;
             drop_all_memory();
             if (verbose) organic_probe_before();
             if (verbose > 1) dump_pending_index("before repair");
@@ -1556,7 +1806,7 @@ static void run_organic(uint64_t seed_value, uint32_t kib, uint32_t ticks, uint3
             if (verbose > 1) dump_pending_index("after repair");
             repairs++;
             mount_plain();
-            organic_verify(&lost, &explained);
+            organic_verify(&lost, &explained, &anded);
             cut_at = flash_ops + 1 + rnd() % (2 * mean_gap);
             continue;
         }
@@ -1590,19 +1840,20 @@ static void run_organic(uint64_t seed_value, uint32_t kib, uint32_t ticks, uint3
     SPIFFS_unmount(&fs);
     repair_until_done(seed_value, &cuts, false);
     mount_plain();
-    organic_verify(&lost, &explained);
+    organic_verify(&lost, &explained, &anded);
     u32_t total = 0, used = 0;
     SPIFFS_info(&fs, &total, &used);
     SPIFFS_unmount(&fs);
-    printf("organic seed %" PRIu64 ": %u cuts, %u repairs, %u committed rows lost, %u named by gap records, used %u%%\n",
-           seed_value, cuts, repairs, lost, explained, total ? (unsigned)(100ULL * used / total) : 0);
+    printf("organic seed %" PRIu64 ": %u cuts, %u repairs, %u committed rows lost, %u named by gap records, "
+           "%u ANDed by SPIFFS after a failed append, used %u%%\n",
+           seed_value, cuts, repairs, lost, explained, anded, total ? (unsigned)(100ULL * used / total) : 0);
     CHECK(lost == 0, "organic seed %" PRIu64 ": %u committed rows lost without a gap record", seed_value, lost);
 }
 
 int main(int argc, char **argv)
 {
     const char *only = NULL;
-    uint32_t seeds = 3, kib = 1024, organic_seeds = 4, organic_ticks_max = 1500;
+    uint32_t seeds = 3, kib = 1024, organic_seeds = 4, organic_ticks_max = 1500, mean_gap = 300, first_seed = 0;
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "-v")) verbose = 1;
         else if (!strcmp(argv[i], "-vv")) verbose = 2;
@@ -1610,6 +1861,8 @@ int main(int argc, char **argv)
         else if (!strncmp(argv[i], "--kib=", 6)) kib = (uint32_t)atoi(argv[i] + 6);
         else if (!strncmp(argv[i], "--organic=", 10)) organic_seeds = (uint32_t)atoi(argv[i] + 10);
         else if (!strncmp(argv[i], "--ticks=", 8)) organic_ticks_max = (uint32_t)atoi(argv[i] + 8);
+        else if (!strncmp(argv[i], "--gap=", 6)) mean_gap = (uint32_t)atoi(argv[i] + 6);
+        else if (!strncmp(argv[i], "--first-seed=", 13)) first_seed = (uint32_t)atoi(argv[i] + 13);
         else only = argv[i];
     }
     /* The worst case the firmware's deadline is sized for: four check passes
@@ -1627,14 +1880,21 @@ int main(int argc, char **argv)
         for (size_t i = 0; i < count; ++i) run_mirror_equivalence(&scenarios[i], 77 + i, kib);
         printf("mirror equivalence passed for %zu scenarios\n", count);
     }
+    if (!only || !strcmp(only, "budget")) {
+        for (size_t i = 0; i < count; ++i) run_without_holds(&scenarios[i], 31 + i, kib);
+        for (size_t i = 0; i < count; ++i) run_with_memory_limits(&scenarios[i], 63 + i, kib);
+        run_policy(kib);
+        printf("no holds, failing allocations and the boot policy passed\n");
+    }
     if (!only || !strcmp(only, "cuts")) {
         uint32_t runs = 0;
         for (size_t i = 0; i < count; ++i)
-            for (uint32_t s = 0; s < seeds; ++s, ++runs) run_cut_inside_repair(&scenarios[i], 5000 + s * 31 + i, kib);
+            for (uint32_t s = 0; s < seeds; ++s, ++runs)
+                run_cut_inside_repair(&scenarios[i], 5000 + (first_seed + s) * 31 + i, kib);
         printf("cuts inside the repair: %u runs passed\n", runs);
     }
     if (!only || !strcmp(only, "organic")) {
-        for (uint32_t s = 0; s < organic_seeds; ++s) run_organic(11 + s, kib, organic_ticks_max, 300);
+        for (uint32_t s = 0; s < organic_seeds; ++s) run_organic(11 + first_seed + s, kib, organic_ticks_max, mean_gap);
     }
     printf("largest repair: %" PRIu64 " HAL operations (cap %" PRIu64 ")\n", hal_max, hal_cap);
     puts("spiffs repair host tests passed");
