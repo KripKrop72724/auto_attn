@@ -14,10 +14,11 @@
 #define SI_START_DELAY_MS (60 * 1000)
 #define SI_BUDGET_US (180LL * 1000LL * 1000LL)
 /* A yield per 32 pages that read back, as in 2.7.4, where a read was a page;
- * a read is now a chunk, and only a failed chunk is read again by page. */
-#define SI_YIELD_EVERY_READS (32U / SI_CHUNK_PAGES)
+ * a read is now a chunk of data spans, and only a failed chunk is read again
+ * by span. */
+#define SI_YIELD_EVERY_READS (32U / SI_CHUNK_SPANS)
 #define SI_LOGGED_FILES 4U
-_Static_assert(SI_YIELD_EVERY_READS * SI_CHUNK_PAGES == 32U, "one yield per 32 pages read back");
+_Static_assert(SI_YIELD_EVERY_READS * SI_CHUNK_SPANS == 32U, "one yield per 32 pages read back");
 
 static si_report_t s_report;
 static bool s_ready;

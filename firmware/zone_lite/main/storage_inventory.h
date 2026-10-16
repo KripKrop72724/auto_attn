@@ -15,8 +15,12 @@
  * firmware runs it in a low-priority task a minute after boot. */
 #define SI_MAX_FILES 16U   /* reported files: unreadable ones first, then the largest */
 #define SI_MAX_NAMES 256U  /* directory entries examined */
-#define SI_PAGE_BYTES 256U /* SPIFFS page: an unreadable region is skipped to the next page */
-#define SI_CHUNK_PAGES 16U /* pages per read while a file reads back; a failed chunk is read by page */
+/* A SPIFFS data page holds 251 bytes of a file (256 less its 5-byte header),
+ * so file offset o lives in data span o / 251. Reads are aligned to spans: an
+ * unreadable region is a whole number of spans and starts on a page boundary. */
+#define SI_SPAN_BYTES 251U
+#define SI_CHUNK_SPANS 16U /* spans per read while a file reads back; a failed chunk is read by span */
+#define SI_CHUNK_BYTES (SI_CHUNK_SPANS * SI_SPAN_BYTES)
 
 typedef struct {
     char name[33];

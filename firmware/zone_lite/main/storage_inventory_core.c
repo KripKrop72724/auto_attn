@@ -2,12 +2,12 @@
 
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
-
-#define SI_CHUNK_BYTES (SI_CHUNK_PAGES * SI_PAGE_BYTES)
+#include <unistd.h>
 
 #ifdef ESP_PLATFORM
 /* newlib's off_t, and so st_size, is a 32-bit long here and 64-bit on the
@@ -47,27 +47,26 @@ static void unreadable(si_file_t *file, uint32_t offset, int error, uint32_t len
     file->unreadable_bytes += length;
 }
 
-/* Reads a file from position to its size unbuffered, a chunk at a time. A
- * chunk that fails is read again one SPIFFS page at a time, so a failed read
- * names its page. The page is counted unreadable and skipped, and the scan
- * continues: one damaged page never hides the rest of the file. With resume,
- * the read stops after the first chunk with an unreadable page and sets
- * *resume to where the rest begins. Returns false when the budget ran out. */
+/* Reads a file from position to its size with open/read/lseek, a chunk of
+ * SPIFFS data spans per read() and so about one filesystem call per 4 KiB.
+ * (newlib's stdio refills an unbuffered stream one byte per read() on the
+ * device, which 2.7.4 paid for every byte.) Every read seeks first: SPIFFS
+ * leaves the offset unchanged when a read fails. A chunk that fails is read
+ * again one span at a time, so a failed read names its exact data page. The
+ * span is counted unreadable and skipped, and the scan continues: one damaged
+ * page never hides the rest of the file. With resume, the read stops after
+ * the first chunk with an unreadable span and sets *resume to where the rest
+ * begins. Returns false when the budget ran out. */
 static bool scan_file(const char *path, uint32_t position, uint32_t size, unsigned char *chunk,
                       si_file_t *file, const si_ports_t *ports, uint32_t *resume)
 {
     errno = 0;
-    FILE *stream = fopen(path, "rb");
-    if (!stream) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) {
         unreadable(file, position, errno, size - position);
         return true;
     }
-    setvbuf(stream, NULL, _IONBF, 0);
-    if (position && fseek(stream, (long)position, SEEK_SET) != 0) {
-        unreadable(file, position, errno, size - position);
-        position = size;
-    }
-    uint32_t paged = 0; /* bytes of a failed chunk still to read one page at a time */
+    uint32_t paged = 0; /* bytes of a failed chunk still to read one span at a time */
     bool finished = true;
     while (position < size) {
         if (resume && file->first_error && !paged) {
@@ -78,42 +77,31 @@ static bool scan_file(const char *path, uint32_t position, uint32_t size, unsign
             finished = false;
             break;
         }
-        uint32_t step = paged ? SI_PAGE_BYTES : SI_CHUNK_BYTES;
-        size_t want = size - position < step ? size - position : step;
+        uint32_t step = paged ? SI_SPAN_BYTES - position % SI_SPAN_BYTES : SI_CHUNK_BYTES - position % SI_SPAN_BYTES;
+        uint32_t want = size - position < step ? size - position : step;
         errno = 0;
-        size_t got = fread(chunk, 1, want, stream);
-        if (got != want && ferror(stream) && !paged) {
-            paged = (uint32_t)want;
-            clearerr(stream);
-            if (fseek(stream, (long)position, SEEK_SET) == 0) continue;
-            unreadable(file, position, errno, size - position);
-            break;
-        }
-        uint32_t start = position;
-        position += (uint32_t)got;
-        if (got == want) {
-            if (paged) paged -= (uint32_t)got;
+        ssize_t got = lseek(fd, (off_t)position, SEEK_SET) == (off_t)position ? read(fd, chunk, want) : -1;
+        int error = errno ? errno : EIO;
+        if (got == (ssize_t)want) {
+            position += want;
+            if (paged) paged -= want;
             continue;
         }
-        /* The file ended before its reported size: what remains is missing. */
-        if (!ferror(stream)) {
-            unreadable(file, position, ENODATA, size - position);
+        if (got >= 0) {
+            /* The file ended before its reported size: what remains is missing. */
+            unreadable(file, position + (uint32_t)got, ENODATA, size - position - (uint32_t)got);
             break;
         }
-        /* Only a page read gets here: a failed chunk was read again by page. */
-        int error = errno ? errno : EIO;
-        uint32_t next = position + SI_PAGE_BYTES - position % SI_PAGE_BYTES;
-        if (next > size) next = size;
-        unreadable(file, position, error, next - position);
-        position = next;
-        paged -= position - start;
-        clearerr(stream);
-        if (position < size && fseek(stream, (long)position, SEEK_SET) != 0) {
-            unreadable(file, position, errno, size - position);
-            break;
+        if (!paged) {
+            paged = want;
+            continue;
         }
+        /* Only a span read gets here: a failed chunk is read again by span. */
+        unreadable(file, position, error, want);
+        position += want;
+        paged -= want;
     }
-    fclose(stream);
+    close(fd);
     return finished;
 }
 
