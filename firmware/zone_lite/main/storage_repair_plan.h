@@ -190,22 +190,46 @@ void srp_state_seal(srp_state_t *state);
 bool srp_state_valid(const srp_state_t *state);
 
 /* Held custody at the start of a check: enough to tell, after a reset in
- * the middle of it, which bytes a power cut may have cost. */
+ * the middle of it, which bytes a power cut may have cost. It stays in NVS
+ * (SRP_STATE_MANIFEST) until every entry is settled: found intact, put back,
+ * superseded by the file's own owner, or reported as a gap. */
 #define SRP_MANIFEST_FILES 12U
+enum {
+    SRP_MANIFEST_CURSOR = 1U << 0,   /* cursor_generation holds the file's lq checkpoint generation */
+    SRP_MANIFEST_SETTLED = 1U << 1,  /* nothing more to do for this entry */
+    SRP_MANIFEST_REPORTED = 1U << 2, /* what did not go back is already a gap record */
+};
+/* manifest flags */
+#define SRP_MANIFEST_PENDING_IMAGE 0x01U /* written by an unconfirmed image: a later boot follows a rollback */
 typedef struct {
     char name[SRP_NAME_BYTES];
-    uint8_t cls, reserved[2];
+    uint8_t cls, flags, reserved;
     uint16_t object_id;
     uint16_t reserved2;
     uint32_t size, crc;
+    uint32_t cursor_generation;
 } srp_manifest_file_t;
 typedef struct {
     uint32_t version, generation, count;
+    uint32_t image_tag, flags;
     srp_manifest_file_t file[SRP_MANIFEST_FILES];
     uint32_t crc;
 } srp_manifest_t;
 void srp_manifest_seal(srp_manifest_t *manifest);
 bool srp_manifest_valid(const srp_manifest_t *manifest);
+
+/* A held file the check removed is rebuilt under its name plus this suffix
+ * and renamed into place, so a reset during the rebuild never leaves a
+ * partial file under the real name. Such a file is expendable once no
+ * manifest names it. */
+#define SRP_RESTORE_SUFFIX ".rpr"
+
+/* Free NVS entries (32 bytes each) a run needs: room to create each journal
+ * blob that does not exist yet, room for one rewritten copy of the largest
+ * (NVS writes the new copy before it erases the old), and one page (126
+ * entries) NVS keeps for its own garbage collection. A run starts only with
+ * this much free, so it never takes the room the runtime's checkpoints need. */
+uint32_t srp_nvs_entries_needed(bool state, bool gaps, bool resets, bool manifest);
 
 uint32_t srp_crc32(uint32_t crc, const void *data, size_t length);
 

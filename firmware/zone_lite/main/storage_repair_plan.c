@@ -90,6 +90,13 @@ srp_kind_t srp_classify(const char *name)
         }
     }
     size_t length = strlen(name);
+    /* The repair's own rebuild of a held file, renamed into place when whole
+     * (the engine never removes one while a manifest names its file). */
+    size_t suffix = sizeof(SRP_RESTORE_SUFFIX) - 1U;
+    if (length > suffix + 1U && name[0] == '/' && !strcmp(name + length - suffix, SRP_RESTORE_SUFFIX)) {
+        kind.cls = SRP_CLASS_EXPENDABLE;
+        return kind;
+    }
     /* durable_queue segments: /q<lane><8 hex>.q (queue_store.c names). */
     if (length == 13 && name[0] == '/' && name[1] == 'q' && strchr("lboirhe", name[2]) && name[2] &&
         hex_run(name + 3, 8) && !strcmp(name + 11, ".q")) {
@@ -399,6 +406,22 @@ bool srp_manifest_valid(const srp_manifest_t *manifest)
     for (uint32_t i = 0; i < manifest->count; ++i)
         if (!bounded_name(manifest->file[i].name)) return false;
     return true;
+}
+
+static uint32_t blob_entries(size_t bytes)
+{
+    /* A blob index entry, a data chunk header and its 32-byte data entries. */
+    return 2U + (uint32_t)((bytes + 31U) / 32U);
+}
+
+uint32_t srp_nvs_entries_needed(bool state, bool gaps, bool resets, bool manifest)
+{
+    uint32_t needed = 126U + blob_entries(sizeof(srp_gaps_t)); /* NVS's own page; one rewrite in flight */
+    if (!state) needed += blob_entries(sizeof(srp_state_t));
+    if (!gaps) needed += blob_entries(sizeof(srp_gaps_t));
+    if (!resets) needed += blob_entries(sizeof(srp_resets_t));
+    if (!manifest) needed += blob_entries(sizeof(srp_manifest_t));
+    return needed;
 }
 
 /* ---- policy --------------------------------------------------------- */

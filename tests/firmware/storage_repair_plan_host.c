@@ -50,6 +50,13 @@ static void classes(void)
     assert(k.cls == SRP_CLASS_EVIDENCE && (k.flags & SRP_SEGMENT));
     assert(srp_classify("/zktj0123456789abcde.j").cls == SRP_CLASS_UNKNOWN);
     assert(srp_classify("/something.else").cls == SRP_CLASS_UNKNOWN && srp_classify(NULL).cls == SRP_CLASS_UNKNOWN);
+    /* The repair's own rebuild under a temporary name. */
+    assert(srp_classify("/pending.jsonl" SRP_RESTORE_SUFFIX).cls == SRP_CLASS_EXPENDABLE);
+    assert(srp_classify("/qo0000002a.q" SRP_RESTORE_SUFFIX).cls == SRP_CLASS_EXPENDABLE);
+    assert(srp_classify(SRP_RESTORE_SUFFIX).cls == SRP_CLASS_UNKNOWN);
+    /* Every custody name leaves room for the suffix in SPIFFS's 31 bytes. */
+    assert(strlen("/blocked_identity.jsonl" SRP_RESTORE_SUFFIX) < 32 &&
+           strlen("/zktj0123456789abcdef.j" SRP_RESTORE_SUFFIX) < 32);
     /* Attendance before evidence before operational before dedupe. */
     assert(srp_class_priority(SRP_CLASS_ATTENDANCE) < srp_class_priority(SRP_CLASS_EVIDENCE));
     assert(srp_class_priority(SRP_CLASS_EVIDENCE) < srp_class_priority(SRP_CLASS_OPERATIONAL));
@@ -251,6 +258,21 @@ static void journal(void)
     manifest.count = SRP_MANIFEST_FILES + 1;
     srp_manifest_seal(&manifest);
     assert(!srp_manifest_valid(&manifest));
+    /* The image and boot it belongs to, and per-file settlement, are sealed. */
+    manifest.count = 1;
+    manifest.flags = SRP_MANIFEST_PENDING_IMAGE;
+    manifest.file[0].flags = SRP_MANIFEST_CURSOR | SRP_MANIFEST_SETTLED;
+    srp_manifest_seal(&manifest);
+    assert(srp_manifest_valid(&manifest));
+    manifest.image_tag ^= 1;
+    assert(!srp_manifest_valid(&manifest));
+    /* The journal's NVS peak: the state, the manifest, the resets, the gap
+     * list twice, and a page for NVS. */
+    uint32_t first = srp_nvs_entries_needed(false, false, false, false);
+    uint32_t later = srp_nvs_entries_needed(true, true, true, true);
+    assert(first > 126U + 2U * (sizeof(srp_gaps_t) / 32U) && first < 300U);
+    assert(later > 126U + sizeof(srp_gaps_t) / 32U && later < first);
+    assert(srp_nvs_entries_needed(true, true, true, false) > later);
     assert(!strcmp(srp_phase_name(SRP_PHASE_NORMALIZE), "NORMALIZE"));
 }
 
