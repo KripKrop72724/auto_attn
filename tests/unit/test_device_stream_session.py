@@ -7,6 +7,7 @@ import threading
 from datetime import datetime, timezone
 
 import pytest
+from sqlalchemy.exc import OperationalError
 
 import zk_add.device_session as device_session
 import zk_add.web as add_web
@@ -92,6 +93,12 @@ class Backend:
         self.failures: dict[int, Exception] = {}
         self.bootstrap_gate: threading.Event | None = None
         self.bootstrap_rows: list[dict] = []
+        self.bootstrap_errors: list[Exception] = []
+        self.bootstrap_attempts = 0
+        self.connected_error: Exception | None = None
+        self.reject_error: Exception | None = None
+        self.commands_error: Exception | None = None
+        self.follow_up_for: set[int] = set()
 
     def gate(self, seq: int) -> threading.Event:
         self.gates[seq] = threading.Event()
@@ -109,10 +116,13 @@ class Backend:
         with self.lock:
             self.persisted.append(envelope_value.seq)
         return add_web.EnvelopeOutcome(
-            ack={"type": "ack", "message_id": envelope_value.message_id, "seq": envelope_value.seq}
+            ack={"type": "ack", "message_id": envelope_value.message_id, "seq": envelope_value.seq},
+            commands_for=CONNECTOR if envelope_value.seq in self.follow_up_for else None,
         )
 
     def set_connected(self, connector_pk: int, connected: bool) -> str:
+        if self.connected_error is not None:
+            raise self.connected_error
         with self.lock:
             self.connected.append((connected, list(self.persisted)))
         return "ONLINE"
@@ -120,12 +130,26 @@ class Backend:
     def bootstrap(self, connector_pk: int):
         if self.bootstrap_gate is not None:
             assert self.bootstrap_gate.wait(5), "test never released the bootstrap"
+        self.bootstrap_attempts += 1
+        if self.bootstrap_errors:
+            raise self.bootstrap_errors.pop(0)
         catalog = {"schema_version": "2", "type": "identity_catalog", "rows": self.bootstrap_rows}
         return catalog, None
 
     def reject(self, connector_pk: int, envelope_value, error: Exception) -> None:
         with self.lock:
             self.rejections.append((envelope_value.seq, type(error).__name__))
+        if self.reject_error is not None:
+            raise self.reject_error
+
+    def pending_commands(self, connector_id: str) -> list[dict]:
+        if self.commands_error is not None:
+            raise self.commands_error
+        return []
+
+
+def database_down() -> OperationalError:
+    return OperationalError("SELECT 1", {}, Exception("server closed the connection unexpectedly"))
 
 
 @pytest.fixture()
@@ -134,7 +158,8 @@ def backend(monkeypatch) -> Backend:
     monkeypatch.setattr(add_web, "authenticate_stream", lambda connector_id, token: 7)
     monkeypatch.setattr(add_web, "set_stream_connected", fake.set_connected)
     monkeypatch.setattr(add_web, "stream_bootstrap", fake.bootstrap)
-    monkeypatch.setattr(add_web, "pending_command_payloads", lambda connector_id: [])
+    monkeypatch.setattr(add_web, "pending_command_payloads", fake.pending_commands)
+    monkeypatch.setattr(add_web, "STREAM_BOOTSTRAP_RETRY_SECONDS", (0.0, 0.0))
     monkeypatch.setattr(add_web, "persist_envelope", fake.persist)
     monkeypatch.setattr(add_web, "record_envelope_rejection", fake.reject)
     monkeypatch.setattr(add_web, "connector_hub", ConnectorHub())
@@ -450,5 +475,144 @@ def test_controlled_interruption_closes_with_1013_and_stops(backend):
         assert websocket.closes == [(1013, "Controlled ADD interruption")]
         assert backend.started == [1]
         assert backend.rejections == []
+
+    asyncio.run(scenario())
+
+
+# --- ADD-side faults never drop the socket ----------------------------------
+
+
+def test_database_fault_during_authentication_refuses_cleanly_without_accepting(backend, monkeypatch, caplog):
+    def unavailable(connector_id, token):
+        raise database_down()
+
+    monkeypatch.setattr(add_web, "authenticate_stream", unavailable)
+
+    async def scenario():
+        websocket = FakeWebSocket()
+        await asyncio.wait_for(add_web.device_stream(websocket), 3)
+        assert websocket.accepted is None
+        assert websocket.closes == [(1013, None)]
+
+    asyncio.run(scenario())
+    assert "authentication unavailable error_type=OperationalError" in caplog.text
+    assert "device-token" not in caplog.text
+
+
+def test_connection_bookkeeping_faults_do_not_cost_the_session(backend, caplog):
+    backend.connected_error = database_down()
+    backend.commands_error = database_down()
+
+    async def scenario():
+        websocket = FakeWebSocket()
+        stream = asyncio.create_task(add_web.device_stream(websocket))
+        websocket.feed(1)
+        await until(lambda: acked(websocket) == [1])
+        websocket.disconnect()
+        await asyncio.wait_for(stream, 3)
+        assert websocket.closes == []
+
+    asyncio.run(scenario())
+    assert "could not record its connection" in caplog.text
+    assert "could not send pending commands" in caplog.text
+    assert "could not record its disconnection" in caplog.text
+
+
+def test_transient_bootstrap_database_fault_is_retried_within_the_session(backend):
+    backend.bootstrap_errors = [database_down(), database_down()]
+
+    async def scenario():
+        websocket = FakeWebSocket()
+        stream = asyncio.create_task(add_web.device_stream(websocket))
+        websocket.feed(1)
+        await until(lambda: acked(websocket) == [1])
+        assert backend.bootstrap_attempts == 3
+        assert websocket.sent[0]["type"] == "identity_catalog_begin"
+        websocket.disconnect()
+        await asyncio.wait_for(stream, 3)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("errors", "close"),
+    [
+        ([database_down(), database_down(), database_down()], (1013, "ADD database unavailable; retry")),
+        ([KeyError("catalog")], (1011, "ADD bootstrap failed")),
+    ],
+)
+def test_bootstrap_that_cannot_complete_closes_with_a_frame_and_processes_nothing(
+    backend, errors, close
+):
+    backend.bootstrap_errors = list(errors)
+
+    async def scenario():
+        websocket = FakeWebSocket()
+        stream = asyncio.create_task(add_web.device_stream(websocket))
+        websocket.feed(1)
+        await asyncio.wait_for(stream, 3)
+        # The session never runs without its identity catalog.
+        assert websocket.closes == [close]
+        assert websocket.sent == []
+        assert backend.started == []
+        assert backend.connected[-1] == (False, [])
+
+    asyncio.run(scenario())
+
+
+def test_rejection_bookkeeping_fault_still_answers_and_keeps_the_session(backend, caplog):
+    backend.failures[1] = database_down()
+    backend.reject_error = database_down()
+
+    async def scenario():
+        websocket = FakeWebSocket()
+        stream = asyncio.create_task(add_web.device_stream(websocket))
+        websocket.feed(1)
+        websocket.feed(2)
+        await until(lambda: acked(websocket) == [2])
+        assert [message["code"] for message in websocket.sent_of("error")] == ["MESSAGE_REJECTED"]
+        websocket.disconnect()
+        await asyncio.wait_for(stream, 3)
+        assert websocket.closes == []
+
+    asyncio.run(scenario())
+    assert "could not record a rejected envelope" in caplog.text
+    assert "message_id=message-1 error_type=OperationalError" in caplog.text
+
+
+def test_follow_up_fault_after_commit_is_not_reported_as_a_rejection(backend, caplog):
+    backend.follow_up_for = {1}
+
+    async def scenario():
+        websocket = FakeWebSocket()
+        stream = asyncio.create_task(add_web.device_stream(websocket))
+        await until(lambda: len(websocket.sent) == 2)  # bootstrap done
+        backend.commands_error = database_down()
+        websocket.feed(1)
+        websocket.feed(2)
+        await until(lambda: acked(websocket) == [1, 2])
+        websocket.disconnect()
+        await asyncio.wait_for(stream, 3)
+        assert websocket.sent_of("error") == []
+
+    asyncio.run(scenario())
+    assert backend.rejections == []
+    assert "follow-up after a committed envelope failed" in caplog.text
+
+
+def test_unexpected_session_fault_closes_with_a_frame(backend, monkeypatch):
+    async def broken(*_args):
+        raise LookupError("plumbing bug")
+
+    monkeypatch.setattr(add_web, "process_device_message", broken)
+
+    async def scenario():
+        websocket = FakeWebSocket()
+        stream = asyncio.create_task(add_web.device_stream(websocket))
+        websocket.feed(1)
+        with pytest.raises(LookupError):
+            await asyncio.wait_for(stream, 3)
+        assert websocket.closes == [(1011, "ADD internal error")]
+        assert backend.connected[-1] == (False, [])
 
     asyncio.run(scenario())
