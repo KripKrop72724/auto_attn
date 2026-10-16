@@ -13,12 +13,28 @@ static uint32_t extend(uint32_t crc, const unsigned char *data, size_t length)
     }
     return ~crc;
 }
+bool lq_checkpoint_valid(const lq_checkpoint_t *cp)
+{
+    return cp && (cp->version == 1 || cp->version == 2) && cp->generation &&
+        cp->crc == dq_crc32(cp, offsetof(lq_checkpoint_t, crc));
+}
+void lq_checkpoint_seal(lq_checkpoint_t *cp)
+{
+    if (cp) cp->crc = dq_crc32(cp, offsetof(lq_checkpoint_t, crc));
+}
+bool lq_checkpoint_cleared(const lq_checkpoint_t *previous, lq_checkpoint_t *next)
+{
+    if (!previous || !next || previous->generation == UINT32_MAX) return false;
+    *next = (lq_checkpoint_t){.version = 1, .generation = previous->generation + 1};
+    lq_checkpoint_seal(next);
+    return true;
+}
 static bool persist(legacy_queue_t *q, lq_checkpoint_t next)
 {
     if (next.generation == UINT32_MAX) return false;
     if (!next.version) next.version = 1;
     next.generation++;
-    next.crc = dq_crc32(&next, offsetof(lq_checkpoint_t, crc));
+    lq_checkpoint_seal(&next);
     errno=0;
     if (!q->port.commit(q->port.context, &next)) { q->ready=false; if(!errno)errno=EIO; return false; }
     q->checkpoint=next;
@@ -34,8 +50,7 @@ dq_result_t lq_open_step(legacy_queue_t *q, const char *path, lq_port_t port)
         int loaded=port.load(port.context,&q->checkpoint);
         lq_checkpoint_t *cp=&q->checkpoint;
         if (loaded<0) { if(!errno)errno=EIO; return DQ_IO; }
-        if (loaded && ((cp->version!=1 && cp->version!=2) || !cp->generation ||
-            cp->crc!=dq_crc32(cp,offsetof(lq_checkpoint_t,crc)))) {
+        if (loaded && !lq_checkpoint_valid(cp)) {
             q->checkpoint_corrupt=true; return DQ_CORRUPT;
         }
         q->recovering=true;

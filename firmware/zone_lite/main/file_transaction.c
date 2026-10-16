@@ -55,13 +55,30 @@ static bool save(ft_port_t port, ft_checkpoint_t *cp, uint32_t phase)
     *cp = next;
     return true;
 }
+bool ft_checkpoint_valid(const ft_checkpoint_t *cp)
+{
+    return cp && cp->version == 1 && cp->generation && cp->phase <= 2 &&
+        cp->crc == dq_crc32(cp, offsetof(ft_checkpoint_t, crc));
+}
 static bool load(ft_port_t port, ft_checkpoint_t *cp)
 {
     if (!port.load || !port.commit) return false;
     memset(cp, 0, sizeof(*cp));
     int found = port.load(port.context, cp);
-    return found == 0 || (found == 1 && cp->version == 1 && cp->generation && cp->phase <= 2 &&
-        cp->crc == dq_crc32(cp, offsetof(ft_checkpoint_t, crc)));
+    return found == 0 || (found == 1 && ft_checkpoint_valid(cp));
+}
+bool ft_checkpoint_idle(ft_port_t port)
+{
+    if (!port.load || !port.commit) return false;
+    ft_checkpoint_t cp;
+    memset(&cp, 0, sizeof(cp));
+    int found = port.load(port.context, &cp);
+    if (found < 0) return false;
+    uint32_t generation = found == 1 && ft_checkpoint_valid(&cp) ? cp.generation : 0;
+    if (generation == UINT32_MAX) return false;
+    ft_checkpoint_t next = {.version = 1, .generation = generation + 1, .phase = 0};
+    next.crc = dq_crc32(&next, offsetof(ft_checkpoint_t, crc));
+    return port.commit(port.context, &next);
 }
 bool ft_recover(const char *active, const char *stage, const char *backup, ft_port_t port)
 {

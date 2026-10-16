@@ -9,6 +9,15 @@ typedef struct {
     bool (*commit)(void *, const lq_checkpoint_t *);
     void *context;
 } lq_port_t;
+/* The NVS checkpoint format, shared with the boot storage repair: version 1
+ * (cursor on a row boundary) or 2 (inside an evidence row), a nonzero
+ * generation and dq_crc32 of the fields before crc. */
+bool lq_checkpoint_valid(const lq_checkpoint_t *checkpoint);
+void lq_checkpoint_seal(lq_checkpoint_t *checkpoint);
+/* The successor that reads every retained byte again from offset 0, as
+ * lq_reclaim commits before it removes a settled file. False only when the
+ * generation would wrap. */
+bool lq_checkpoint_cleared(const lq_checkpoint_t *previous, lq_checkpoint_t *next);
 typedef struct {
     char path[128];
     lq_checkpoint_t checkpoint;
