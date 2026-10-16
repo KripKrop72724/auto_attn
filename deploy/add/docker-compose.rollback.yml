@@ -2,7 +2,9 @@ services:
   add-api:
     # An older image cannot resolve a newer additive Alembic revision. Rollback
     # serves the retained schema without replaying or downgrading migrations.
-    command: ["uvicorn", "zk_add.web:app", "--host", "0.0.0.0", "--port", "8096", "--proxy-headers", "--workers", "1", "--timeout-keep-alive", "10"]
+    # Keep the WebSocket keepalive flags: older images' uvicorn understands them,
+    # and dropping them would silently restore the 20 s pong deadline.
+    command: ["uvicorn", "zk_add.web:app", "--host", "0.0.0.0", "--port", "8096", "--proxy-headers", "--workers", "1", "--timeout-keep-alive", "10", "--ws-ping-interval", "20", "--ws-ping-timeout", "60"]
     environment:
       # Legacy workers cannot honor a manual decision's frozen payload. Preserve
       # capture and the outbox, but disable all ADD Oracle network delivery until

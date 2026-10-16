@@ -4341,6 +4341,70 @@ def test_websocket_attendance_storage_failure_never_emits_ack(
     assert db.scalar(select(func.count()).select_from(AttendanceBatchReceipt)) == 0
 
 
+def test_device_stream_end_to_end_bootstraps_then_acks_each_message_in_order(
+    db: Session, monkeypatch: pytest.MonkeyPatch
+):
+    connector, token, _created = onboard_connector(
+        db, hardware_id=MAC, zone_id="ZONE-SLICTOWER-3FL", zone_name="ZONE-SLICTOWER-3FL",
+        device_id="1", firmware_version="2.1.0", expected_serial=SERIAL, actor="test",
+        ip_address="127.0.0.1",
+    )
+    db.commit()
+    connector_pk = connector.id
+
+    @contextmanager
+    def shared_scope():
+        try:
+            yield db
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+
+    monkeypatch.setattr(add_web, "session_scope", shared_scope)
+    import threading
+
+    disconnected = threading.Event()
+    record_connection = add_web.set_stream_connected
+
+    def recorded_connection(pk: int, connected: bool):
+        state = record_connection(pk, connected)
+        if not connected:
+            disconnected.set()
+        return state
+
+    monkeypatch.setattr(add_web, "set_stream_connected", recorded_connection)
+
+    def log_envelope(seq: int) -> str:
+        return Envelope(
+            schema_version="2", message_id=f"stream-log-{seq}", connector_id=connector.connector_id,
+            boot_id="stream-boot", seq=seq, sent_at=utc_now(), type="log",
+            payload={"level": "INFO", "subsystem": "firmware", "code": "STREAM_TEST", "message": "ok"},
+        ).model_dump_json()
+
+    headers = {"Authorization": f"Bearer {token}", "X-ADD-Connector-Id": connector.connector_id}
+    with TestClient(app).websocket_connect("/device/v2/stream", headers=headers) as stream:
+        bootstrap = [stream.receive_json(), stream.receive_json()]
+        assert [message["type"] for message in bootstrap] == [
+            "identity_catalog_begin", "identity_catalog_commit",
+        ]
+        coverage = stream.receive_json()
+        assert coverage["type"] == "source_coverage"
+        stream.send_text(log_envelope(1))
+        stream.send_text("{not an envelope")
+        stream.send_text(log_envelope(2))
+        replies = [stream.receive_json() for _ in range(3)]
+        # Leaving the block cancels the app at once; let its cleanup finish first.
+        stream.close(1000)
+        assert disconnected.wait(5), "the device session never recorded its end"
+    assert [(reply["type"], reply.get("seq", reply.get("code"))) for reply in replies] == [
+        ("ack", 1), ("error", "INVALID_ENVELOPE"), ("ack", 2),
+    ]
+    stored = db.get(Connector, connector_pk)
+    db.refresh(stored)
+    assert (stored.boot_id, stored.last_sequence, stored.connected) == ("stream-boot", 2, False)
+
+
 def test_successful_message_only_resolves_rejection_for_the_same_path(db: Session):
     connector = connector_fixture(db)
     connector.connected, connector.last_seen_at = True, utc_now()

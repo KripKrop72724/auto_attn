@@ -16,4 +16,4 @@ COPY apps/add_backend ./apps/add_backend
 USER add
 EXPOSE 8096
 
-CMD ["uvicorn", "zk_add.web:app", "--host", "0.0.0.0", "--port", "8096", "--proxy-headers"]
+CMD ["uvicorn", "zk_add.web:app", "--host", "0.0.0.0", "--port", "8096", "--proxy-headers", "--ws-ping-interval", "20", "--ws-ping-timeout", "60"]

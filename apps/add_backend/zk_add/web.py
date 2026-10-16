@@ -62,6 +62,7 @@ from zk_add.identity_conflicts import (
 )
 from zk_add.identity_catalog import identity_catalog_messages
 from zk_add.db import SessionLocal, init_db, session_scope
+from zk_add.device_session import DeviceStreamSession
 from zk_add.models import (
     AdminSession,
     AttendanceEvent,
@@ -241,6 +242,8 @@ from zk_add.source_exceptions import (
 
 
 logger = logging.getLogger(__name__)
+# A larger device frame (text length) closes the stream with 4400.
+DEVICE_MESSAGE_MAX_LENGTH = 512 * 1024
 comm_key_reveal_rate_limiter = LoginRateLimiter(
     attempts=3, window_seconds=5 * 60, lock_seconds=15 * 60
 )
@@ -4240,66 +4243,93 @@ async def device_stream(websocket: WebSocket):
         await websocket.close(code=4401)
         return
     await connector_hub.connect(connector_id, websocket)
+    # Read from the moment the socket is accepted, through the bootstrap push
+    # and every message's transaction, so pongs and uploads keep flowing.
+    session = DeviceStreamSession(websocket, connector_id)
+    session.start()
     try:
-        state = await asyncio.to_thread(set_stream_connected, connector_pk, True)
-        await browser_events.publish("device", {"connector_id": connector_id, "connected": True, "state": state})
-        catalog, coverage_payload = await asyncio.to_thread(stream_bootstrap, connector_pk)
-        if not await send_identity_catalog(connector_id, catalog):
-            await websocket.close(code=1011, reason="Identity catalog delivery failed")
-            return
-        if coverage_payload is not None:
-            if not await connector_hub.send(
-                connector_id,
-                {"type": "source_coverage", **coverage_payload},
-            ):
-                await websocket.close(code=1011, reason="Source coverage delivery failed")
-                return
-        await send_pending_commands(connector_id)
-        while True:
-            raw = await websocket.receive_text()
-            if len(raw) > 512 * 1024:
-                await websocket.close(code=4400, reason="Message too large")
-                break
-            try:
-                envelope = Envelope.model_validate_json(raw)
-            except Exception:
-                await websocket.send_json({"type": "error", "code": "INVALID_ENVELOPE"})
-                continue
-            if envelope.connector_id != connector_id:
-                await websocket.close(code=4403)
-                break
-            try:
-                await handle_envelope(connector_pk, envelope, websocket)
-            except TransportInterrupted:
-                await websocket.close(code=1013, reason="Controlled ADD interruption")
-                break
-            except WebSocketDisconnect:
-                raise
-            except Exception as exc:
-                # All device payloads can contain attendance or credential
-                # evidence. Tracebacks from validation/database drivers can
-                # include those inputs, so operational logs use metadata only.
-                logger.error(
-                    "Rejected protected source envelope connector_id=%s "
-                    "type=%s message_id=%s error_type=%s",
-                    connector_id, envelope.type, envelope.message_id,
-                    type(exc).__name__,
-                )
-                await asyncio.to_thread(record_envelope_rejection, connector_pk, envelope, exc)
-                await websocket.send_json(
-                    {
-                        "type": "error",
-                        "code": "MESSAGE_REJECTED",
-                        "message_id": envelope.message_id,
-                        "message_type": envelope.type,
-                    }
-                )
+        if await open_device_stream(session, connector_pk, connector_id):
+            while (raw := await session.next_message()) is not None:
+                if not await process_device_message(session, connector_pk, connector_id, raw):
+                    break
     except WebSocketDisconnect:
         pass
     finally:
+        await session.stop()
         await connector_hub.disconnect(connector_id, websocket)
         await asyncio.to_thread(set_stream_connected, connector_pk, False)
         await browser_events.publish("device", {"connector_id": connector_id, "connected": False})
+
+
+async def open_device_stream(session: DeviceStreamSession, connector_pk: int, connector_id: str) -> bool:
+    """Push the connect bootstrap. Messages received meanwhile wait, in order."""
+    state = await asyncio.to_thread(set_stream_connected, connector_pk, True)
+    await browser_events.publish("device", {"connector_id": connector_id, "connected": True, "state": state})
+    catalog, coverage_payload = await asyncio.to_thread(stream_bootstrap, connector_pk)
+    if not await send_identity_catalog(connector_id, catalog):
+        await session.close(1011, "Identity catalog delivery failed")
+        return False
+    if coverage_payload is not None:
+        if not await connector_hub.send(
+            connector_id,
+            {"type": "source_coverage", **coverage_payload},
+        ):
+            await session.close(1011, "Source coverage delivery failed")
+            return False
+    await send_pending_commands(connector_id)
+    return True
+
+
+async def process_device_message(
+    session: DeviceStreamSession, connector_pk: int, connector_id: str, raw: str | bytes
+) -> bool:
+    """Handle one complete device message in arrival order; False ends the session."""
+    if len(raw) > DEVICE_MESSAGE_MAX_LENGTH:
+        await session.close(4400, "Message too large")
+        return False
+    try:
+        if not isinstance(raw, str):
+            raise ValueError("Device envelopes are text frames")
+        envelope = Envelope.model_validate_json(raw)
+    except Exception:
+        await session.send_json({"type": "error", "code": "INVALID_ENVELOPE"})
+        return True
+    if envelope.connector_id != connector_id:
+        await session.close(4403)
+        return False
+    return await session.process(
+        envelope.type, handle_device_envelope(session, connector_pk, connector_id, envelope)
+    )
+
+
+async def handle_device_envelope(
+    session: DeviceStreamSession, connector_pk: int, connector_id: str, envelope: Envelope
+) -> bool:
+    try:
+        await handle_envelope(connector_pk, envelope, session)
+    except TransportInterrupted:
+        await session.close(1013, "Controlled ADD interruption")
+        return False
+    except Exception as exc:
+        # All device payloads can contain attendance or credential
+        # evidence. Tracebacks from validation/database drivers can
+        # include those inputs, so operational logs use metadata only.
+        logger.error(
+            "Rejected protected source envelope connector_id=%s "
+            "type=%s message_id=%s error_type=%s",
+            connector_id, envelope.type, envelope.message_id,
+            type(exc).__name__,
+        )
+        await asyncio.to_thread(record_envelope_rejection, connector_pk, envelope, exc)
+        await session.send_json(
+            {
+                "type": "error",
+                "code": "MESSAGE_REJECTED",
+                "message_id": envelope.message_id,
+                "message_type": envelope.type,
+            }
+        )
+    return True
 
 
 def authenticate_stream(connector_id: str, token: str) -> int:

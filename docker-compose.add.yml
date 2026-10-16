@@ -108,7 +108,10 @@ services:
       ADD_REDIS_URL: redis://redis:6379/0
       ADD_AUTO_CREATE_SCHEMA: "false"
       ADD_ADMIN_COOKIE_SECURE: ${ADD_ADMIN_COOKIE_SECURE:-true}
-    command: ["/bin/sh", "-c", "alembic -c apps/add_backend/alembic.ini upgrade head && exec uvicorn zk_add.web:app --host 0.0.0.0 --port 8096 --proxy-headers --workers 1 --timeout-keep-alive 10"]
+    # A device sending its full user snapshot cannot answer pings until the
+    # upload ends, so the pong deadline outlasts slow uploads (keep in sync with
+    # deploy/add/docker-compose.rollback.yml and apps/add_backend/Dockerfile).
+    command: ["/bin/sh", "-c", "alembic -c apps/add_backend/alembic.ini upgrade head && exec uvicorn zk_add.web:app --host 0.0.0.0 --port 8096 --proxy-headers --workers 1 --timeout-keep-alive 10 --ws-ping-interval 20 --ws-ping-timeout 60"]
     ports:
       - "0.0.0.0:8096:8096"
     depends_on:
