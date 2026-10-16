@@ -110,8 +110,10 @@ proof or have their encrypted request overwritten.
 Free container on an internal-only Docker network without published ports.
 `run_projection_checks.py` refuses an unlabelled, externally networked or unhealthy target
 and accepts no production DSN or credential. It recreates only its synthetic
-schema. CI runs this as `oracle-projection`; container smoke testing depends on
-that job. The official 23.26.3.0-lite multi-platform image is pinned by digest.
+schema. CI runs this as `oracle-projection`, in parallel with the `containers`
+smoke test. Deploy ADD still requires the whole ADD CI run, `oracle-projection`
+included, to succeed, and every exact-commit HIL gate requires it by name. The
+official 23.26.3.0-lite multi-platform image is pinned by digest.
 
 The reader compiled and passed 38 database checks on Oracle Free 26ai
 23.26.3.0.0 (ARM64). They cover every stored immutable field, daily pending/hold
