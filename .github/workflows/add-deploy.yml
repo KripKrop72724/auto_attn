@@ -17,11 +17,11 @@ on:
         default: false
         type: boolean
       runner_capacity_mode:
-        description: Inspect runner disk or clear only generated build and action staging files
+        description: Inspect runner disk or Docker, or clear generated build and signing files
         required: false
         default: none
         type: choice
-        options: [none, inspect, clean-generated]
+        options: [none, inspect, diagnose-docker, diagnose-wsl, diagnose-ords-route, clean-generated, clean-signing-scratch]
 
 permissions:
   contents: read
@@ -48,7 +48,7 @@ jobs:
           MAINTENANCE_MODE: ${{ inputs.runner_capacity_mode }}
         run: |
           $ErrorActionPreference = 'Stop'
-          if ($env:MAINTENANCE_MODE -notin @('inspect', 'clean-generated')) {
+          if ($env:MAINTENANCE_MODE -notin @('inspect', 'diagnose-docker', 'diagnose-wsl', 'diagnose-ords-route', 'clean-generated', 'clean-signing-scratch')) {
             throw 'Unsupported runner maintenance mode.'
           }
           $workRoot = [IO.Path]::GetFullPath((Split-Path -Parent $env:RUNNER_TEMP))
@@ -69,6 +69,105 @@ jobs:
             Write-Host "$label bytes=$([int64]$sum) present=true"
           }
           Show-FreeSpace 'before'
+          if ($env:MAINTENANCE_MODE -eq 'diagnose-ords-route') {
+            [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
+            foreach ($route in @(
+                @{ Name = 'public'; Host = 'eclaim2.slichealth.com' },
+                @{ Name = 'internal'; Host = 'local.slichealth.com' }
+              )) {
+              $uri = "https://$($route.Host)/ords/slic_hrm/raw_attn_capture_event/raw-captures"
+              try {
+                $response = Invoke-WebRequest -UseBasicParsing -Method Options -Uri $uri -TimeoutSec 12
+                $result = "HTTP_$($response.StatusCode)"
+              } catch {
+                $exception = $_.Exception
+                if ($exception.Response -and $exception.Response.StatusCode) {
+                  $result = "HTTP_$([int]$exception.Response.StatusCode)"
+                } elseif ($exception -is [System.Net.WebException]) {
+                  $result = "ERROR_WEB_$($exception.Status.ToString().ToUpperInvariant())"
+                } else {
+                  $result = "ERROR_$($exception.GetType().Name)"
+                }
+              }
+              Write-Host "ords_$($route.Name)_host_probe=$result"
+            }
+            exit 0
+          }
+          if ($env:MAINTENANCE_MODE -eq 'diagnose-docker') {
+            $service = Get-Service -Name 'com.docker.service' -ErrorAction SilentlyContinue
+            Write-Host "docker_service_status=$(if ($service) { $service.Status } else { 'missing' })"
+            foreach ($name in @('com.docker.backend', 'Docker Desktop')) {
+              $processes = @(Get-Process -Name $name -ErrorAction SilentlyContinue)
+              Write-Host "docker_process=$name count=$($processes.Count)"
+            }
+            $docker = Get-Command docker -ErrorAction SilentlyContinue
+            if (-not $docker) {
+              Write-Host 'docker_cli_present=false'
+              exit 0
+            }
+            $probe = New-Object System.Diagnostics.Process
+            $probe.StartInfo.FileName = $docker.Source
+            $probe.StartInfo.Arguments = 'info --format "{{.ServerVersion}}"'
+            $probe.StartInfo.UseShellExecute = $false
+            $probe.StartInfo.CreateNoWindow = $true
+            $probe.StartInfo.RedirectStandardOutput = $true
+            $probe.StartInfo.RedirectStandardError = $true
+            try {
+              [void]$probe.Start()
+              if (-not $probe.WaitForExit(15000)) {
+                $probe.Kill()
+                [void]$probe.WaitForExit(5000)
+                Write-Host 'docker_info_result=timeout'
+              } else {
+                Write-Host "docker_info_result=exit_$($probe.ExitCode)"
+              }
+            } finally {
+              $probe.Dispose()
+            }
+            exit 0
+          }
+          if ($env:MAINTENANCE_MODE -eq 'diagnose-wsl') {
+            $serverIps = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+              Where-Object { $_.IPAddress -in @('10.10.30.30', '10.10.50.3') } |
+              Select-Object -ExpandProperty IPAddress)
+            Write-Host "saved_connection_match=$(if ($serverIps.Count) { $serverIps -join ',' } else { 'neither' })"
+            foreach ($name in @('WslService', 'LxssManager', 'vmcompute')) {
+              $service = Get-Service -Name $name -ErrorAction SilentlyContinue
+              Write-Host "windows_service_$name=$(if ($service) { $service.Status } else { 'missing' })"
+            }
+            foreach ($name in @('vmmem', 'vmmemWSL')) {
+              $processes = @(Get-Process -Name $name -ErrorAction SilentlyContinue)
+              Write-Host "windows_process_$name=$($processes.Count)"
+            }
+            exit 0
+          }
+          if ($env:MAINTENANCE_MODE -eq 'clean-signing-scratch') {
+            $removed = 0
+            if (Test-Path -LiteralPath $workspace -PathType Container) {
+              foreach ($entry in @(Get-ChildItem -LiteralPath $workspace -Directory -Force |
+                  Where-Object { $_.Name -match '^zone-lite-release-sign-[0-9a-f]{32}$' })) {
+                $full = [IO.Path]::GetFullPath($entry.FullName)
+                if (-not $full.StartsWith($workspace + [IO.Path]::DirectorySeparatorChar,
+                    [StringComparison]::OrdinalIgnoreCase)) { throw 'Unsafe signing scratch path.' }
+                $key = Join-Path $full 'active-key.pem'
+                if (Test-Path -LiteralPath $key -PathType Leaf) {
+                  $length = (Get-Item -LiteralPath $key).Length
+                  if ($length -gt 1MB) { throw 'Unexpected signing scratch key size.' }
+                  if ($length -gt 0) {
+                    $random = New-Object byte[] $length
+                    $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
+                    try { $rng.GetBytes($random) } finally { $rng.Dispose() }
+                    [IO.File]::WriteAllBytes($key, $random)
+                  }
+                }
+                Remove-Item -LiteralPath $full -Recurse -Force -ErrorAction Stop
+                $removed++
+              }
+            }
+            Write-Host "removed_signing_scratch_directories=$removed"
+            Show-FreeSpace 'after'
+            exit 0
+          }
           if ($env:MAINTENANCE_MODE -eq 'inspect') {
             Show-DirectoryBytes 'actions_cache' $actionsRoot
             Show-DirectoryBytes 'runner_temp' $env:RUNNER_TEMP
