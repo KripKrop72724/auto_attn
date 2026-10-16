@@ -4,6 +4,7 @@ import argparse
 
 import uvicorn
 
+from zk_add.device_session import WS_PING_INTERVAL_SECONDS, WS_PING_TIMEOUT_SECONDS, WS_PROTOCOL
 from zk_add.settings import settings
 
 
@@ -13,7 +14,15 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=settings.port)
     parser.add_argument("--reload", action="store_true")
     args = parser.parse_args()
-    uvicorn.run("zk_add.web:app", host=args.host, port=args.port, reload=args.reload)
+    uvicorn.run(
+        "zk_add.web:app",
+        host=args.host,
+        port=args.port,
+        reload=args.reload,
+        ws=WS_PROTOCOL,
+        ws_ping_interval=WS_PING_INTERVAL_SECONDS,
+        ws_ping_timeout=WS_PING_TIMEOUT_SECONDS,
+    )
 
 
 if __name__ == "__main__":

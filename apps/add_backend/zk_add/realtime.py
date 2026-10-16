@@ -123,14 +123,29 @@ class ConnectorHub:
             if self._connections.get(connector_id) is websocket:
                 self._connections.pop(connector_id, None)
 
-    async def send(self, connector_id: str, payload: dict) -> bool:
-        return await self.send_many(connector_id, [payload])
+    def current(self, connector_id: str) -> WebSocket | None:
+        """The socket registered for a connector right now.
 
-    async def send_many(self, connector_id: str, payloads: list[dict]) -> bool:
+        Registration changes only on the event loop and never across an await,
+        so this read is consistent with connect() and disconnect().
+        """
+        return self._connections.get(connector_id)
+
+    async def send(self, connector_id: str, payload: dict, *, only_to: WebSocket | None = None) -> bool:
+        return await self.send_many(connector_id, [payload], only_to=only_to)
+
+    async def send_many(
+        self, connector_id: str, payloads: list[dict], *, only_to: WebSocket | None = None
+    ) -> bool:
+        """Send to the connector's registered socket.
+
+        With only_to, send only if that socket is still the registered one, so a
+        superseded session can never write to its successor's socket.
+        """
         async with self._lock:
             websocket = self._connections.get(connector_id)
             send_lock = self._send_locks.setdefault(connector_id, asyncio.Lock())
-        if websocket is None:
+        if websocket is None or (only_to is not None and websocket is not only_to):
             return False
         async with send_lock:
             try:

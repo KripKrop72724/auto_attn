@@ -30,7 +30,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.concurrency import run_in_threadpool
 from sqlalchemy import and_, case, func, or_, select, text
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from zk_add import APP_VERSION
@@ -62,6 +62,7 @@ from zk_add.identity_conflicts import (
 )
 from zk_add.identity_catalog import identity_catalog_messages
 from zk_add.db import SessionLocal, init_db, session_scope
+from zk_add.device_session import DeviceStreamSession
 from zk_add.models import (
     AdminSession,
     AttendanceEvent,
@@ -241,6 +242,10 @@ from zk_add.source_exceptions import (
 
 
 logger = logging.getLogger(__name__)
+# A larger device frame (text length) closes the stream with 4400.
+DEVICE_MESSAGE_MAX_LENGTH = 512 * 1024
+# Waits between connect-bootstrap attempts after a database fault.
+STREAM_BOOTSTRAP_RETRY_SECONDS = (1.0, 2.0)
 comm_key_reveal_rate_limiter = LoginRateLimiter(
     attempts=3, window_seconds=5 * 60, lock_seconds=15 * 60
 )
@@ -278,10 +283,11 @@ def identity_catalog_payload(db: Session, connector: Connector) -> dict:
     return {"schema_version": "2", "type": "identity_catalog", "rows": rows}
 
 
-async def send_identity_catalog(connector_id: str, catalog: dict) -> bool:
+async def send_identity_catalog(connector_id: str, catalog: dict, *, only_to: WebSocket | None = None) -> bool:
     return await connector_hub.send_many(
         connector_id,
         identity_catalog_messages(catalog),
+        only_to=only_to,
     )
 
 
@@ -4239,67 +4245,225 @@ async def device_stream(websocket: WebSocket):
     except ValueError:
         await websocket.close(code=4401)
         return
+    except SQLAlchemyError as exc:
+        # A database fault is not an authentication failure. Refuse the
+        # handshake without a driver traceback; the device simply retries.
+        logger.warning("ADD device stream authentication unavailable error_type=%s", type(exc).__name__)
+        await websocket.close(code=1013)
+        return
     await connector_hub.connect(connector_id, websocket)
+    # Read from the moment the socket is accepted, through the bootstrap push
+    # and every message's transaction, so pongs and uploads keep flowing.
+    session = DeviceStreamSession(
+        websocket, connector_id, slow_message_seconds=settings.slow_request_seconds,
+        is_current=lambda: connector_hub.current(connector_id) is websocket,
+    )
+    session.start()
+    try:
+        if await open_device_stream(session, connector_pk, connector_id):
+            session.startup_complete()
+            while (raw := await session.next_message()) is not None:
+                if not await process_device_message(session, connector_pk, connector_id, raw):
+                    break
+    except WebSocketDisconnect as exc:
+        session.mark_end("connection_lost", exc.code)
+    except asyncio.CancelledError:
+        session.mark_end("cancelled")
+        raise
+    except Exception as exc:
+        # Close with a frame rather than a bare TCP reset, then let uvicorn log it.
+        session.mark_end("error", 1011, type(exc).__name__)
+        await session.close(1011, "ADD internal error")
+        raise
+    finally:
+        try:
+            await session.stop()
+            await connector_hub.disconnect(connector_id, websocket)
+            try:
+                await asyncio.to_thread(set_stream_connected, connector_pk, False)
+            except Exception as exc:
+                logger.warning(
+                    "ADD device stream could not record its disconnection connector_id=%s error_type=%s",
+                    connector_id, type(exc).__name__,
+                )
+            await browser_events.publish("device", {"connector_id": connector_id, "connected": False})
+        finally:
+            # Even a cleanup cut short by cancellation reports the session.
+            session.log_end()
+
+
+async def open_device_stream(session: DeviceStreamSession, connector_pk: int, connector_id: str) -> bool:
+    """Push the connect bootstrap. Messages received meanwhile wait, in order."""
     try:
         state = await asyncio.to_thread(set_stream_connected, connector_pk, True)
-        await browser_events.publish("device", {"connector_id": connector_id, "connected": True, "state": state})
-        catalog, coverage_payload = await asyncio.to_thread(stream_bootstrap, connector_pk)
-        if not await send_identity_catalog(connector_id, catalog):
-            await websocket.close(code=1011, reason="Identity catalog delivery failed")
-            return
-        if coverage_payload is not None:
-            if not await connector_hub.send(
-                connector_id,
-                {"type": "source_coverage", **coverage_payload},
-            ):
-                await websocket.close(code=1011, reason="Source coverage delivery failed")
-                return
-        await send_pending_commands(connector_id)
-        while True:
-            raw = await websocket.receive_text()
-            if len(raw) > 512 * 1024:
-                await websocket.close(code=4400, reason="Message too large")
-                break
-            try:
-                envelope = Envelope.model_validate_json(raw)
-            except Exception:
-                await websocket.send_json({"type": "error", "code": "INVALID_ENVELOPE"})
-                continue
-            if envelope.connector_id != connector_id:
-                await websocket.close(code=4403)
-                break
-            try:
-                await handle_envelope(connector_pk, envelope, websocket)
-            except TransportInterrupted:
-                await websocket.close(code=1013, reason="Controlled ADD interruption")
-                break
-            except WebSocketDisconnect:
-                raise
-            except Exception as exc:
-                # All device payloads can contain attendance or credential
-                # evidence. Tracebacks from validation/database drivers can
-                # include those inputs, so operational logs use metadata only.
-                logger.error(
-                    "Rejected protected source envelope connector_id=%s "
-                    "type=%s message_id=%s error_type=%s",
-                    connector_id, envelope.type, envelope.message_id,
-                    type(exc).__name__,
-                )
-                await asyncio.to_thread(record_envelope_rejection, connector_pk, envelope, exc)
-                await websocket.send_json(
-                    {
-                        "type": "error",
-                        "code": "MESSAGE_REJECTED",
-                        "message_id": envelope.message_id,
-                        "message_type": envelope.type,
-                    }
-                )
-    except WebSocketDisconnect:
-        pass
-    finally:
-        await connector_hub.disconnect(connector_id, websocket)
-        await asyncio.to_thread(set_stream_connected, connector_pk, False)
-        await browser_events.publish("device", {"connector_id": connector_id, "connected": False})
+    except Exception as exc:
+        # Bookkeeping only: the first accepted message marks the connector
+        # connected again, so a database fault here must not cost the session.
+        logger.warning(
+            "ADD device stream could not record its connection connector_id=%s error_type=%s",
+            connector_id, type(exc).__name__,
+        )
+        state = None
+    await browser_events.publish("device", {"connector_id": connector_id, "connected": True, "state": state})
+    try:
+        bootstrap = await load_stream_bootstrap(session, connector_pk, connector_id)
+    except Exception as exc:
+        logger.error(
+            "ADD device stream bootstrap failed connector_id=%s error_type=%s",
+            connector_id, type(exc).__name__,
+        )
+        if not session.should_stop():
+            await session.close(1011, "ADD bootstrap failed")
+        return False
+    if session.should_stop():
+        # Superseded or closed while the bootstrap was being built: nothing of
+        # it may reach the newer session's socket through the hub.
+        return False
+    if bootstrap is None:
+        # Never run a session without its identity catalog: the device's
+        # memory-only catalog fallback relies on a re-push at reconnect.
+        await session.close(1013, "ADD database unavailable; retry")
+        return False
+    catalog, coverage_payload = bootstrap
+    # Every bootstrap send goes only to this session's own socket, never to a
+    # session that superseded it meanwhile.
+    if not await send_identity_catalog(connector_id, catalog, only_to=session.websocket):
+        if not session.should_stop():
+            await session.close(1011, "Identity catalog delivery failed")
+        return False
+    if coverage_payload is not None:
+        if not await connector_hub.send(
+            connector_id,
+            {"type": "source_coverage", **coverage_payload},
+            only_to=session.websocket,
+        ):
+            if not session.should_stop():
+                await session.close(1011, "Source coverage delivery failed")
+            return False
+    try:
+        await send_pending_commands(connector_id, only_to=session.websocket)
+    except Exception as exc:
+        # Active commands are flushed again after every accepted heartbeat.
+        logger.warning(
+            "ADD device stream could not send pending commands connector_id=%s error_type=%s",
+            connector_id, type(exc).__name__,
+        )
+    return True
+
+
+async def load_stream_bootstrap(
+    session: DeviceStreamSession, connector_pk: int, connector_id: str
+) -> tuple[dict, dict | None] | None:
+    """Build the bootstrap, retrying transient database faults within the session.
+
+    The reader keeps the socket alive meanwhile, so a short database stall no
+    longer costs the device a reconnect and another full user snapshot.
+    None means the database stayed unavailable, the device already left or a
+    newer session replaced this one.
+    """
+    for attempt, delay in enumerate((*STREAM_BOOTSTRAP_RETRY_SECONDS, None), start=1):
+        try:
+            return await asyncio.to_thread(stream_bootstrap, connector_pk)
+        except SQLAlchemyError as exc:
+            logger.warning(
+                "ADD device stream bootstrap database fault connector_id=%s attempt=%d error_type=%s",
+                connector_id, attempt, type(exc).__name__,
+            )
+            if delay is None or session.transport_closed or not session.is_current():
+                return None
+            await asyncio.sleep(delay)
+    return None
+
+
+async def process_device_message(
+    session: DeviceStreamSession, connector_pk: int, connector_id: str, raw: str | bytes
+) -> bool:
+    """Handle one complete device message in arrival order; False ends the session."""
+    if len(raw) > DEVICE_MESSAGE_MAX_LENGTH:
+        await session.close(4400, "Message too large")
+        return False
+    try:
+        if not isinstance(raw, str):
+            raise ValueError("Device envelopes are text frames")
+        envelope = Envelope.model_validate_json(raw)
+    except Exception:
+        await session.send_json({"type": "error", "code": "INVALID_ENVELOPE"})
+        return True
+    if envelope.connector_id != connector_id:
+        await session.close(4403)
+        return False
+    return await session.process(
+        envelope.type, handle_device_envelope(session, connector_pk, connector_id, envelope)
+    )
+
+
+async def handle_device_envelope(
+    session: DeviceStreamSession, connector_pk: int, connector_id: str, envelope: Envelope
+) -> bool:
+    try:
+        outcome = await accept_envelope(
+            connector_pk, envelope, session, in_thread=session.run_in_thread
+        )
+    except TransportInterrupted:
+        await session.close(1013, "Controlled ADD interruption")
+        return False
+    except Exception as exc:
+        # All device payloads can contain attendance or credential
+        # evidence. Tracebacks from validation/database drivers can
+        # include those inputs, so operational logs use metadata only.
+        logger.error(
+            "Rejected protected source envelope connector_id=%s "
+            "type=%s message_id=%s error_type=%s",
+            connector_id, envelope.type, envelope.message_id,
+            type(exc).__name__,
+        )
+        try:
+            await asyncio.to_thread(record_envelope_rejection, connector_pk, envelope, exc)
+        except Exception as record_error:
+            # Recording takes the same connector row lock that may just have
+            # timed out. The device still needs its rejection to release the
+            # message's ACK waiter, so a bookkeeping failure never ends the
+            # session.
+            logger.error(
+                "ADD could not record a rejected envelope connector_id=%s "
+                "type=%s message_id=%s error_type=%s",
+                connector_id, envelope.type, envelope.message_id,
+                type(record_error).__name__,
+            )
+        await session.send_json(
+            {
+                "type": "error",
+                "code": "MESSAGE_REJECTED",
+                "message_id": envelope.message_id,
+                "message_type": envelope.type,
+            }
+        )
+        return True
+    if outcome is None:
+        return True
+    try:
+        if session.attached:
+            await send_envelope_follow_ups(envelope, outcome, session, only_to=session.websocket)
+        else:
+            # The ACK found the socket closed or replaced. Commands sent through
+            # the hub would reach a newer session's socket ahead of its own
+            # bootstrap, which sends them itself; coverage has no socket left.
+            # The message is committed, so browsers still hear about it.
+            await publish_envelope_events(envelope, outcome)
+    except TransportInterrupted:
+        await session.close(1013, "Controlled ADD interruption")
+        return False
+    except Exception as exc:
+        # The message is committed and ACKed. Pending commands are flushed
+        # again after the next heartbeat, so this is logged, never reported
+        # to the device or to device health as a rejected message.
+        logger.error(
+            "ADD follow-up after a committed envelope failed connector_id=%s "
+            "type=%s message_id=%s error_type=%s",
+            connector_id, envelope.type, envelope.message_id,
+            type(exc).__name__,
+        )
+    return True
 
 
 def authenticate_stream(connector_id: str, token: str) -> int:
@@ -4769,17 +4933,47 @@ def persist_envelope(connector_pk: int, envelope: Envelope) -> EnvelopeOutcome |
     )
 
 
-async def handle_envelope(connector_pk: int, envelope: Envelope, websocket: WebSocket) -> None:
-    outcome = await asyncio.to_thread(persist_envelope, connector_pk, envelope)
+async def handle_envelope(
+    connector_pk: int, envelope: Envelope, websocket: WebSocket | DeviceStreamSession
+) -> None:
+    outcome = await accept_envelope(connector_pk, envelope, websocket)
+    if outcome is not None:
+        await send_envelope_follow_ups(envelope, outcome, websocket)
+
+
+async def accept_envelope(
+    connector_pk: int,
+    envelope: Envelope,
+    websocket: WebSocket | DeviceStreamSession,
+    *,
+    in_thread=asyncio.to_thread,
+) -> EnvelopeOutcome | None:
+    """Commit one device message, then ACK it; anything raised is answered as a rejection."""
+    outcome = await in_thread(persist_envelope, connector_pk, envelope)
     if outcome is None:
-        return
+        return None
     # The worker returns only after commit. No acknowledgement or browser success
     # can escape a failed transaction; reconnects replay the unacknowledged input.
     await websocket.send_json(outcome.ack)
+    return outcome
+
+
+async def send_envelope_follow_ups(
+    envelope: Envelope,
+    outcome: EnvelopeOutcome,
+    websocket: WebSocket | DeviceStreamSession,
+    *,
+    only_to: WebSocket | None = None,
+) -> None:
+    """Work after a committed message's ACK. Its failure never un-accepts the message."""
     if outcome.commands_for:
-        await send_pending_commands(outcome.commands_for)
+        await send_pending_commands(outcome.commands_for, only_to=only_to)
     if outcome.coverage is not None:
         await websocket.send_json(outcome.coverage)
+    await publish_envelope_events(envelope, outcome)
+
+
+async def publish_envelope_events(envelope: Envelope, outcome: EnvelopeOutcome) -> None:
     if outcome.provisioning is not None:
         await browser_events.publish("provisioning", outcome.provisioning)
     if outcome.event is not None:
@@ -4803,7 +4997,7 @@ def pending_command_payloads(connector_id: str) -> list[dict]:
     return payloads
 
 
-async def send_pending_commands(connector_id: str) -> None:
+async def send_pending_commands(connector_id: str, *, only_to: WebSocket | None = None) -> None:
     for payload in await asyncio.to_thread(pending_command_payloads, connector_id):
         if payload.get("command_type") == "ESP_REBOOT":
             from zk_add.hil_reboot import refresh_reboot_dispatch
@@ -4811,7 +5005,7 @@ async def send_pending_commands(connector_id: str) -> None:
             payload = await asyncio.to_thread(refresh_reboot_dispatch, payload["command_id"])
             if payload is None:
                 continue
-        await connector_hub.send(connector_id, payload)
+        await connector_hub.send(connector_id, payload, only_to=only_to)
 
 
 def mark_command_dispatched(command_id: str) -> None:
