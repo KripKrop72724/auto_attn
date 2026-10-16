@@ -467,7 +467,8 @@ NUL bytes (0x00). This is deliberate:
   cut by `lq_peek` into evidence fragments (`evidence_required`,
   legacy_queue.c:104). Each fragment is settled with
   `lq_settle_evidence`. The buffer is 1 KiB for pending in legacy mode
-  (zone_lite.c:7868-7870) and 8 KiB for blocked and the ADD outboxes.
+  (`MAX_EVENT_JSON`, zone_lite.c:7794) and 8 KiB for blocked and the ADD
+  outboxes.
 
 For segments and journal files, a NUL span fails the record CRC or the
 frame authentication. Those formats then go through their existing paths:
