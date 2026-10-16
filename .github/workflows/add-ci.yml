@@ -611,7 +611,9 @@ jobs:
         run: python3 tests/oracle/oracle_test_container.py stop --container zkt-oracle-ci
 
   containers:
-    needs: [repository-contract, windows-publication, backend, frontend, firmware, oracle-projection]
+    # Uses no artifact or result from another job, so it starts immediately.
+    # It remains one of the exact required checks, and Deploy ADD still runs
+    # only after the whole workflow, every job included, has succeeded.
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
