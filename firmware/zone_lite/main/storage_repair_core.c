@@ -68,9 +68,9 @@ typedef struct {
 
 typedef struct {
     spiffs *fs;
-    const sr_config_t *cfg;
-    const sr_ports_t *ports;
-    sr_report_t *report;
+    const srr_config_t *cfg;
+    const srr_ports_t *ports;
+    srr_report_t *report;
     uint32_t page_size, block_size, ppb, entries, blocks, total_pages, hdr_ix, ix_len;
     pg_t *pages;
     hdr_t *hdrs;
@@ -99,19 +99,19 @@ typedef struct {
 
 static run_t *s_run;
 
-const char *sr_result_name(sr_result_t result)
+const char *srr_result_name(srr_result_t result)
 {
     switch (result) {
-    case SR_RESULT_NOT_RUN: return "NOT_RUN";
-    case SR_RESULT_CLEAN: return "CLEAN";
-    case SR_RESULT_REPAIRED: return "REPAIRED";
-    case SR_RESULT_REPAIRED_WITH_GAPS: return "REPAIRED_WITH_GAPS";
-    case SR_RESULT_DEFERRED: return "DEFERRED";
-    case SR_RESULT_NORMALIZED: return "NORMALIZED";
-    case SR_RESULT_REPORT_ONLY: return "REPORT_ONLY";
-    case SR_RESULT_STOPPED: return "STOPPED";
-    case SR_RESULT_FAILED: return "FAILED";
-    case SR_RESULT_REFORMATTED: return "REFORMATTED";
+    case SRR_RESULT_NOT_RUN: return "NOT_RUN";
+    case SRR_RESULT_CLEAN: return "CLEAN";
+    case SRR_RESULT_REPAIRED: return "REPAIRED";
+    case SRR_RESULT_REPAIRED_WITH_GAPS: return "REPAIRED_WITH_GAPS";
+    case SRR_RESULT_DEFERRED: return "DEFERRED";
+    case SRR_RESULT_NORMALIZED: return "NORMALIZED";
+    case SRR_RESULT_REPORT_ONLY: return "REPORT_ONLY";
+    case SRR_RESULT_STOPPED: return "STOPPED";
+    case SRR_RESULT_FAILED: return "FAILED";
+    case SRR_RESULT_REFORMATTED: return "REFORMATTED";
     }
     return "UNKNOWN";
 }
@@ -228,12 +228,12 @@ static bool nvs_store(run_t *r, const char *ns, const char *key, const void *blo
 static bool save_state(run_t *r)
 {
     srp_state_seal(&r->state);
-    return nvs_store(r, SR_NVS_NAMESPACE, "state", &r->state, sizeof(r->state));
+    return nvs_store(r, SRR_NVS_NAMESPACE, "state", &r->state, sizeof(r->state));
 }
 static bool save_records(run_t *r)
 {
-    return nvs_store(r, SR_NVS_NAMESPACE, "gaps", r->gaps, sizeof(*r->gaps)) &&
-        nvs_store(r, SR_NVS_NAMESPACE, "resets", r->resets, sizeof(*r->resets));
+    return nvs_store(r, SRR_NVS_NAMESPACE, "gaps", r->gaps, sizeof(*r->gaps)) &&
+        nvs_store(r, SRR_NVS_NAMESPACE, "resets", r->resets, sizeof(*r->resets));
 }
 
 /* ---- survey: one pass over every block ------------------------------ */
@@ -955,12 +955,12 @@ static bool fill_gaps(run_t *r, obj_t *o)
 /* ---- gap records ---------------------------------------------------- */
 static void note_file(run_t *r, const obj_t *o)
 {
-    sr_report_t *rep = r->report;
-    sr_report_file_t *f = NULL;
+    srr_report_t *rep = r->report;
+    srr_report_file_t *f = NULL;
     for (uint32_t i = 0; i < rep->file_count && !f; ++i)
         if (!strcmp(rep->file[i].name, o->name)) f = &rep->file[i];
     if (!f) {
-        if (rep->file_count == SR_REPORT_FILES) return;
+        if (rep->file_count == SRR_REPORT_FILES) return;
         f = &rep->file[rep->file_count++];
         memcpy(f->name, o->name, sizeof(f->name));
         f->cls = (uint8_t)o->kind.cls;
@@ -992,7 +992,7 @@ static bool record_gap(run_t *r, obj_t *o, uint32_t offset, uint32_t length, int
     r->report->unreadable_bytes += length;
     o->gaps++;
     o->gap_bytes += length;
-    o->actions |= SR_FILE_GAPS;
+    o->actions |= SRR_FILE_GAPS;
     char message[160];
     snprintf(message, sizeof(message), "%s: %lu unreadable bytes at offset %lu (SPIFFS %ld, %s)", o->name,
              (unsigned long)length, (unsigned long)offset, (long)code, srp_gap_cause_name(cause));
@@ -1074,7 +1074,7 @@ static void hold_custody(run_t *r)
             r->report->files_held++;
             r->report->bytes_held += o->size;
         } else if (o->kind.cls != SRP_CLASS_DEDUPE && o->kind.cls != SRP_CLASS_UNKNOWN) {
-            o->actions |= SR_FILE_UNHELD;
+            o->actions |= SRR_FILE_UNHELD;
             r->report->files_unheld_custody++;
         }
         pace(r);
@@ -1249,12 +1249,12 @@ static bool normalize_object(run_t *r, obj_t *o)
     for (uint32_t j = 0; ok && j < o->ix_spans; ++j)
         if (o->ix_rewrite[j]) ok = rewrite_index(r, o, j, target);
     release(r, target);
-    if (ok) o->actions |= SR_FILE_NORMALIZED;
+    if (ok) o->actions |= SRR_FILE_NORMALIZED;
     return ok;
 }
 
 /* ---- the check ------------------------------------------------------ */
-void sr_check_callback(spiffs *fs, spiffs_check_type type, spiffs_check_report report, u32_t arg1, u32_t arg2)
+void srr_check_callback(spiffs *fs, spiffs_check_type type, spiffs_check_report report, u32_t arg1, u32_t arg2)
 {
     (void)fs;
     (void)type;
@@ -1342,7 +1342,7 @@ static void remove_expendables(run_t *r, bool for_room)
         if (!strstr(o->name, "probe") && !for_room) continue;
         if (remove_name(r, o->name)) {
             r->report->expendables_removed++;
-            o->actions |= SR_FILE_REMOVED;
+            o->actions |= SRR_FILE_REMOVED;
             note_file(r, o);
         }
     }
@@ -1371,7 +1371,7 @@ static bool clear_catalog(run_t *r)
         obj_t *o = find_live(r, CATALOG_FILES[i]);
         if (!o) continue;
         if (!remove_name(r, CATALOG_FILES[i])) return fail(r, "catalog_remove", SPIFFS_ERR_INTERNAL);
-        o->actions |= SR_FILE_REMOVED;
+        o->actions |= SRR_FILE_REMOVED;
         note_file(r, o);
     }
     ft_port_t port = {catalog_load, catalog_commit, r};
@@ -1429,7 +1429,7 @@ static bool reconcile_cursor(run_t *r, size_t q, bool remove_settled)
                 return fail(r, "cursor_commit", SPIFFS_ERR_INTERNAL);
             if (remove_name(r, QUEUES[q].name)) {
                 r->report->settled_removed++;
-                o->actions |= SR_FILE_REMOVED;
+                o->actions |= SRR_FILE_REMOVED;
                 note_file(r, o);
             }
         }
@@ -1449,7 +1449,7 @@ static bool reconcile_cursor(run_t *r, size_t q, bool remove_settled)
         return fail(r, "cursor_commit", SPIFFS_ERR_INTERNAL);
     r->report->cursors_reset++;
     if (o) {
-        o->actions |= SR_FILE_CURSOR_RESET;
+        o->actions |= SRR_FILE_CURSOR_RESET;
         note_file(r, o);
     }
     char message[180];
@@ -1500,7 +1500,7 @@ static bool terminate_tails(run_t *r)
         if (fd >= 0 && SPIFFS_close(r->fs, fd) < 0) ok = false;
         SPIFFS_clearerr(r->fs);
         if (!ok) return fail(r, "tail_append", SPIFFS_ERR_INTERNAL);
-        o->actions |= SR_FILE_TAIL;
+        o->actions |= SRR_FILE_TAIL;
         r->report->tails_terminated++;
         char message[120];
         snprintf(message, sizeof(message), "%s: torn row at %lu terminated", o->name, (unsigned long)o->size);
@@ -1531,7 +1531,7 @@ static bool rebuild_from_hold(run_t *r, obj_t *o)
     SPIFFS_clearerr(r->fs);
     release(r, chunk);
     if (!ok) return fail(r, "rebuild", SPIFFS_ERR_INTERNAL);
-    o->actions |= SR_FILE_REBUILT;
+    o->actions |= SRR_FILE_REBUILT;
     r->report->files_rebuilt++;
     note_file(r, o);
     return true;
@@ -1578,7 +1578,7 @@ static bool restore_held(run_t *r, bool *changed)
         *changed = true;
         o->needs_work = true;
         if (!normalize_object(r, o)) return false;
-        o->actions |= SR_FILE_RESTORED;
+        o->actions |= SRR_FILE_RESTORED;
         r->report->files_restored++;
         note_file(r, o);
     }
@@ -1602,7 +1602,7 @@ static bool write_manifest(run_t *r)
         f->crc = o->crc;
     }
     srp_manifest_seal(m);
-    if (!nvs_store(r, SR_NVS_NAMESPACE, "manifest", m, sizeof(*m))) return false;
+    if (!nvs_store(r, SRR_NVS_NAMESPACE, "manifest", m, sizeof(*m))) return false;
     r->state.flags |= SRP_STATE_MANIFEST;
     r->report->manifest_written = true;
     return save_state(r);
@@ -1756,7 +1756,7 @@ static bool normalize_all(run_t *r, bool *deferred)
 
 static void finish_report(run_t *r)
 {
-    sr_report_t *rep = r->report;
+    srr_report_t *rep = r->report;
     rep->check_fix_index = r->fix_index;
     rep->check_fix_lookup = r->fix_lookup;
     rep->check_delete_orphan_index = r->del_orphan;
@@ -1860,12 +1860,12 @@ static bool run_checks(run_t *r, bool *catalog_drop, bool *last_failed)
     return true;
 }
 
-void sr_run(spiffs *fs, const sr_config_t *config, const sr_ports_t *ports, sr_report_t *report)
+void srr_run(spiffs *fs, const srr_config_t *config, const srr_ports_t *ports, srr_report_t *report)
 {
     if (!report) return;
     memset(report, 0, sizeof(*report));
     if (!fs || !config || !ports || !ports->alloc || !ports->release) {
-        report->result = SR_RESULT_FAILED;
+        report->result = SRR_RESULT_FAILED;
         snprintf(report->error_stage, sizeof(report->error_stage), "arguments");
         return;
     }
@@ -1894,24 +1894,24 @@ void sr_run(spiffs *fs, const sr_config_t *config, const sr_ports_t *ports, sr_r
     SPIFFS_clearerr(fs);
     if (SPIFFS_OBJ_LOOKUP_PAGES(fs) != 1 || SPIFFS_DATA_PAGE_SIZE(fs) != SRP_SPAN_BYTES || r->page_size > 256 ||
         r->total_pages > 0xFFFFU) {
-        report->result = SR_RESULT_FAILED;
+        report->result = SRR_RESULT_FAILED;
         snprintf(report->error_stage, sizeof(report->error_stage), "geometry");
         return;
     }
     s_run = r;
     if (!alloc_run(r)) {
-        report->result = SR_RESULT_FAILED;
+        report->result = SRR_RESULT_FAILED;
         snprintf(report->error_stage, sizeof(report->error_stage), "memory");
         free_run(r);
         s_run = NULL;
         return;
     }
     /* The journal: where an interrupted run stopped, and the attempts guard. */
-    if (nvs_load(r, SR_NVS_NAMESPACE, "state", &r->state, sizeof(r->state)) != 1 || !srp_state_valid(&r->state))
+    if (nvs_load(r, SRR_NVS_NAMESPACE, "state", &r->state, sizeof(r->state)) != 1 || !srp_state_valid(&r->state))
         memset(&r->state, 0, sizeof(r->state));
-    if (nvs_load(r, SR_NVS_NAMESPACE, "gaps", r->gaps, sizeof(*r->gaps)) != 1 || r->gaps->count > SRP_MAX_GAPS)
+    if (nvs_load(r, SRR_NVS_NAMESPACE, "gaps", r->gaps, sizeof(*r->gaps)) != 1 || r->gaps->count > SRP_MAX_GAPS)
         memset(r->gaps, 0, sizeof(*r->gaps));
-    if (nvs_load(r, SR_NVS_NAMESPACE, "resets", r->resets, sizeof(*r->resets)) != 1 ||
+    if (nvs_load(r, SRR_NVS_NAMESPACE, "resets", r->resets, sizeof(*r->resets)) != 1 ||
         r->resets->count > SRP_MAX_RESETS)
         memset(r->resets, 0, sizeof(*r->resets));
     report->previous_phase = (srp_phase_t)r->state.phase;
@@ -1920,7 +1920,7 @@ void sr_run(spiffs *fs, const sr_config_t *config, const sr_ports_t *ports, sr_r
         if (config->previous_failed) r->state.failures++;
     }
     if (!(r->state.flags & SRP_STATE_MANIFEST) ||
-        nvs_load(r, SR_NVS_NAMESPACE, "manifest", r->previous, sizeof(*r->previous)) != 1 ||
+        nvs_load(r, SRR_NVS_NAMESPACE, "manifest", r->previous, sizeof(*r->previous)) != 1 ||
         !srp_manifest_valid(r->previous))
         memset(r->previous, 0, sizeof(*r->previous));
     if (config->damage_seen) r->state.flags |= SRP_STATE_DAMAGE_SEEN;
@@ -1949,7 +1949,7 @@ void sr_run(spiffs *fs, const sr_config_t *config, const sr_ports_t *ports, sr_r
         r->state.phase = SRP_PHASE_IDLE;
         (void)save_state(r);
         report->generation = r->state.generation;
-        report->result = SR_RESULT_REPORT_ONLY;
+        report->result = SRR_RESULT_REPORT_ONLY;
         report->check_skipped = true;
         snprintf(message, sizeof(message),
                  "storage repairs are off for this image after %lu runs ended by a crash, watchdog or deadline",
@@ -2008,13 +2008,13 @@ void sr_run(spiffs *fs, const sr_config_t *config, const sr_ports_t *ports, sr_r
     }
     finish_report(r);
     if (report->commands_damaged) r->state.flags |= SRP_STATE_COMMANDS_DAMAGED;
-    if (r->stopped) report->result = SR_RESULT_STOPPED;
-    else if (!ok || r->failed || check_failed) report->result = SR_RESULT_FAILED;
-    else if (deferred) report->result = SR_RESULT_DEFERRED;
-    else if (policy.mode == SRP_MODE_NORMALIZE_ONLY) report->result = SR_RESULT_NORMALIZED;
-    else if (report->gaps) report->result = SR_RESULT_REPAIRED_WITH_GAPS;
-    else if (r->wrote) report->result = SR_RESULT_REPAIRED;
-    else report->result = SR_RESULT_CLEAN;
+    if (r->stopped) report->result = SRR_RESULT_STOPPED;
+    else if (!ok || r->failed || check_failed) report->result = SRR_RESULT_FAILED;
+    else if (deferred) report->result = SRR_RESULT_DEFERRED;
+    else if (policy.mode == SRP_MODE_NORMALIZE_ONLY) report->result = SRR_RESULT_NORMALIZED;
+    else if (report->gaps) report->result = SRR_RESULT_REPAIRED_WITH_GAPS;
+    else if (r->wrote) report->result = SRR_RESULT_REPAIRED;
+    else report->result = SRR_RESULT_CLEAN;
     if (!r->stopped) {
         /* A finished run, even a failed one: the next boot starts afresh. */
         r->state.phase = SRP_PHASE_IDLE;
@@ -2022,7 +2022,7 @@ void sr_run(spiffs *fs, const sr_config_t *config, const sr_ports_t *ports, sr_r
         r->state.failures = 0;
         r->state.last_result = report->result;
         if (r->state.flags & SRP_STATE_MANIFEST) {
-            if (ports->nvs_erase) (void)ports->nvs_erase(ports->context, SR_NVS_NAMESPACE, "manifest");
+            if (ports->nvs_erase) (void)ports->nvs_erase(ports->context, SRR_NVS_NAMESPACE, "manifest");
             r->state.flags &= ~SRP_STATE_MANIFEST;
         }
         if (!report->check_skipped && !check_failed) r->state.flags &= ~SRP_STATE_DAMAGE_SEEN;
@@ -2032,12 +2032,12 @@ void sr_run(spiffs *fs, const sr_config_t *config, const sr_ports_t *ports, sr_r
     if (ports->now_ms) report->duration_ms = (uint32_t)(ports->now_ms(ports->context) - started);
     snprintf(message, sizeof(message),
              "run %lu %s: %lu files, %lu gaps (%lu bytes), %lu spans rewritten, %lu check passes, %lu cursors reset",
-             (unsigned long)report->generation, sr_result_name(report->result), (unsigned long)report->files,
+             (unsigned long)report->generation, srr_result_name(report->result), (unsigned long)report->files,
              (unsigned long)report->gaps, (unsigned long)report->unreadable_bytes,
              (unsigned long)report->spans_rewritten, (unsigned long)report->check_passes,
              (unsigned long)report->cursors_reset);
-    logf_line(r, report->result == SR_RESULT_FAILED ? "ERROR"
-                 : report->result == SR_RESULT_CLEAN || report->result == SR_RESULT_REPAIRED ? "INFO" : "WARN",
+    logf_line(r, report->result == SRR_RESULT_FAILED ? "ERROR"
+                 : report->result == SRR_RESULT_CLEAN || report->result == SRR_RESULT_REPAIRED ? "INFO" : "WARN",
               "STORAGE_REPAIR_DONE", message);
     set_phase(r, report->phase, 0, false);
     free_run(r);

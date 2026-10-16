@@ -2,6 +2,7 @@
 #include "cJSON.h"
 #include <assert.h>
 #include <errno.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -31,6 +32,8 @@ static QueueHandle_t s_commands = (void *)2, s_config_commands = (void *)3;
 static char s_running_command_id[80], s_queued_command_ids[16][80];
 static size_t s_queued_command_count, queue_deliveries, config_deliveries;
 static bool s_command_inbox_restored, held, queue_full;
+/* ZKT 2.7.5: storage_init has mounted /storage before the inbox is touched. */
+static atomic_bool s_storage_ready = true;
 static uint64_t now = 1, ticket;
 static zc_store_t store;
 static ft_checkpoint_t checkpoint;

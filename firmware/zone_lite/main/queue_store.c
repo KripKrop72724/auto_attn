@@ -1,6 +1,9 @@
 #include "queue_store.h"
 #include "storage_upgrade.h"
 #include "storage_budget.h"
+#if defined(ZONE_LITE_STORAGE_REPAIR) && ZONE_LITE_STORAGE_REPAIR
+#include "storage_repair.h"
+#endif
 #include <errno.h>
 #include <dirent.h>
 #include <string.h>
@@ -205,6 +208,9 @@ void qs_local_end_file(bool persisted, int captured_error, const char *file)
         health.last_operation = "local_write_commit";
         health.last_error = captured_error ? captured_error : EIO;
         name_file(health.last_file, file);
+#if defined(ZONE_LITE_STORAGE_REPAIR) && ZONE_LITE_STORAGE_REPAIR
+        storage_repair_note_damage(health.last_error);
+#endif
         restart_verification();
     }
     xSemaphoreGive(budget_lock);
@@ -219,6 +225,9 @@ void qs_local_end_legacy(lf_lane_t lane, lf_operation_t operation, dq_result_t r
     lf_record(&legacy_health, lane, operation, result, captured_error);
     health.legacy = lf_health(&legacy_health);
     if (result == DQ_IO || result == DQ_CORRUPT) {
+#if defined(ZONE_LITE_STORAGE_REPAIR) && ZONE_LITE_STORAGE_REPAIR
+        storage_repair_note_damage(result == DQ_CORRUPT ? EBADMSG : captured_error ? captured_error : EIO);
+#endif
         if (health.failures < UINT32_MAX) ++health.failures;
         uint32_t *failures = operation == LF_READ ? &health.read_failures : &health.write_failures;
         if (*failures < UINT32_MAX) ++*failures;
@@ -256,6 +265,9 @@ static void record_queue_result(dq_result_t result, const char *operation, bool 
     health.last_operation = result == DQ_FULL ? "capacity_admission" : operation;
     health.last_error = result == DQ_FULL ? ENOSPC : result == DQ_CORRUPT ? EBADMSG : (errno ? errno : EIO);
     health.last_file[0] = '\0';
+#if defined(ZONE_LITE_STORAGE_REPAIR) && ZONE_LITE_STORAGE_REPAIR
+    storage_repair_note_damage(health.last_error);
+#endif
     restart_verification();
 }
 bool qs_init(void)
@@ -428,6 +440,7 @@ bool qs_verify_persistence(void)
     unsigned char expected[32], actual[32];
     esp_fill_random(expected, sizeof(expected));
     const char *path = "/storage/persistence-probe";
+    static const char alternate[] = "/storage/persistence-probe-2";
     const char *stage = "persistence_measure";
     int nvs_error = ESP_OK;
     int file_error = 0;
@@ -453,6 +466,15 @@ bool qs_verify_persistence(void)
             (void)remove(path);
             errno = 0;
             f = fopen(path, "wb");
+            if (!f && errno == ENOENT) {
+                /* ZKT 2.7.5: a damaged probe object can refuse removal as
+                 * well; the probe proves the store, not that one name, so it
+                 * moves to a second name. The boot repair removes both. */
+                (void)remove(alternate);
+                errno = 0;
+                f = fopen(alternate, "wb");
+                if (f) path = alternate;
+            }
             if (f && health.persistence_probe_repairs < UINT32_MAX) health.persistence_probe_repairs++;
             if (!f && !errno) errno = ENOENT;
         }
@@ -552,6 +574,9 @@ bool qs_verify_persistence(void)
 #else
         if (health.persistence_probe_failures < UINT32_MAX) health.persistence_probe_failures++;
         health.persistence_probe_operation = stage;
+#if defined(ZONE_LITE_STORAGE_REPAIR) && ZONE_LITE_STORAGE_REPAIR
+        storage_repair_note_damage(nvs_error != ESP_OK ? nvs_error : file_error ? file_error : EIO);
+#endif
         health.persistence_probe_error = nvs_error != ESP_OK ? nvs_error : file_error ? file_error : EIO;
         /* Do not put a recoverable probe into last_error: that would prevent
          * both the recovery audit and this exact proof from running again.

@@ -19,6 +19,9 @@
 #include "ota_manager.h"
 #include "storage_inventory.h"
 #include "storage_recovery.h"
+#if defined(ZONE_LITE_STORAGE_REPAIR) && ZONE_LITE_STORAGE_REPAIR
+#include "storage_repair.h"
+#endif
 
 #include <ctype.h>
 #include <stdatomic.h>
@@ -214,6 +217,11 @@ static SemaphoreHandle_t s_send_lock;
 static SemaphoreHandle_t s_ack_sem;
 static SemaphoreHandle_t s_ack_wait_lock;
 static SemaphoreHandle_t s_command_lock;
+/* ZKT 2.7.5: /storage is mounted only after the boot storage repair. The
+ * supervisor starts before storage_init and restores the command inbox every
+ * second; before this is set the VFS is not there, ft_recover would see
+ * every file missing and an empty inbox would count as restored. */
+static atomic_bool s_storage_ready;
 static SemaphoreHandle_t s_catalog_lock;
 static add_zkt_telemetry_t s_zkt;
 static char s_activity[64] = "BOOTING";
@@ -2236,6 +2244,7 @@ static int command_journal_contains_locked(const char *command_id)
 #if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
     if (catalog_owner_required()) return command_owner_contains(command_id);
 #endif
+    if (!atomic_load(&s_storage_ready)) return -1;
     if (!command_journal_recover_locked()) return -1;
     FILE *file = fopen(ADD_COMMAND_INBOX_PATH, "r");
     if (!file) return errno == ENOENT ? 0 : -1;
@@ -2367,7 +2376,7 @@ static void restore_command_inbox(void)
     if (managed && !command_owner_idle()) { xSemaphoreGive(s_command_lock); return; }
     command_owner_reader_t reader = {.deadline_us = (uint64_t)esp_timer_get_time() + 30000000ULL};
 #endif
-    if (s_command_inbox_restored) { xSemaphoreGive(s_command_lock); return; }
+    if (s_command_inbox_restored || !atomic_load(&s_storage_ready)) { xSemaphoreGive(s_command_lock); return; }
     if (!command_journal_recover_locked()) {
         xSemaphoreGive(s_command_lock);
         return;
@@ -3063,6 +3072,9 @@ static void append_firmware_diagnostics(cJSON *payload, const add_zkt_telemetry_
         (local_failure.active && local_failure.last_source[0] &&
          !cJSON_AddStringToObject(storage, "local_failure_last_source", local_failure.last_source)) ||
         !storage_inventory_append(storage)) goto failed;
+#if defined(ZONE_LITE_STORAGE_REPAIR) && ZONE_LITE_STORAGE_REPAIR
+    if (!storage_repair_append(storage)) goto failed;
+#endif
     if (!append_worker_diagnostic(workers, "add_delivery", s_outbox_task_handle != NULL,
             s_outbox_tick_ms, s_outbox_buffer_ready ? s_add_worker_operation : ADD_WORKER_RESOURCE)) goto failed;
 #if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
@@ -4440,6 +4452,13 @@ static void outbox_task(void *arg)
             vTaskDelay(pdMS_TO_TICKS(1000));
             continue;
         }
+#if defined(ZONE_LITE_STORAGE_REPAIR) && ZONE_LITE_STORAGE_REPAIR
+        /* The boot storage repair's logs and evidence, a little per pass:
+         * this task already sends acknowledged queue evidence on its 8 KiB
+         * stack, so the repair needs no task of its own. */
+        storage_repair_report_step();
+        s_outbox_tick_ms = (uint32_t)monotonic_ms();
+#endif
         bool background_due = false;
         if (priority_delivery_hold_active()) {
             if (!priority_started) priority_started = now;
@@ -5601,6 +5620,97 @@ bool add_connector_boot_local_failure(void)
     if (!strcmp(led, "LOCAL_FAILURE") || !strcmp(led, "FATAL") || s_worker_start_failed) return true;
     qs_health_t storage = qs_health();
     return storage.observed && (storage.last_error || storage.persistence_probe_error);
+}
+
+void add_connector_storage_ready(void)
+{
+    atomic_store(&s_storage_ready, true);
+}
+
+/* ZKT 2.7.5: the boot storage repair filled an unreadable span of the command
+ * inbox with NUL, or found a torn last line. Either makes every later lookup
+ * "unavailable" (a line that does not decrypt) and every append fail, so the
+ * inbox is rebuilt from the complete lines that decrypt to a command, taken
+ * from the active file, its backup and its stage, each command_id once. The
+ * transaction is first set idle and the backup and stage removed, so
+ * ft_replace starts from a state ft_recover accepts; the merged lines then go
+ * to the stage and ft_replace installs them. A reset at any point leaves the
+ * repair's flag set and the merge runs again from what remains. */
+#define ADD_INBOX_ID_BYTES 96U
+bool add_connector_repair_command_inbox(void)
+{
+#if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
+    if (catalog_owner_required()) return true;
+#endif
+    if (!s_command_lock || xSemaphoreTake(s_command_lock, pdMS_TO_TICKS(5000)) != pdTRUE) return false;
+    static const char *const sources[] = {ADD_COMMAND_INBOX_PATH, ADD_COMMAND_INBOX_BACKUP_PATH,
+                                          ADD_COMMAND_INBOX_TMP_PATH};
+    const size_t capacity = ADD_COMMAND_INBOX_MAX_BYTES, max_ids = 512;
+    char *merged = heap_caps_malloc(capacity, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    char (*ids)[ADD_INBOX_ID_BYTES] = heap_caps_calloc(max_ids, ADD_INBOX_ID_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    char *line = heap_caps_malloc(ADD_COMMAND_LINE_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    size_t used = 0, count = 0;
+    unsigned kept = 0, dropped = 0;
+    bool ok = merged && ids && line;
+    for (size_t source = 0; ok && source < sizeof(sources) / sizeof(sources[0]); ++source) {
+        FILE *file = fopen(sources[source], "r");
+        if (!file) continue;
+        for (;;) {
+            /* By byte: a NUL-filled span must not hide where a line ends. */
+            size_t length = 0;
+            bool overflow = false, newline = false;
+            int ch;
+            while ((ch = fgetc(file)) != EOF) {
+                if (length + 1 < ADD_COMMAND_LINE_BYTES) line[length++] = (char)ch;
+                else overflow = true;
+                if (ch == '\n') {
+                    newline = true;
+                    break;
+                }
+            }
+            if (!length && ch == EOF) break;
+            line[length] = '\0';
+            if (overflow || !newline || memchr(line, 0, length)) {
+                dropped++;
+                continue;
+            }
+            char *plain = decrypt_storage_line(line);
+            cJSON *root = plain ? cJSON_Parse(plain) : NULL;
+            cJSON *id = root ? cJSON_GetObjectItemCaseSensitive(root, "command_id") : NULL;
+            bool valid = cJSON_IsString(id) && id->valuestring[0] && strlen(id->valuestring) < ADD_INBOX_ID_BYTES;
+            bool seen = false;
+            for (size_t i = 0; valid && i < count && !seen; ++i) seen = !strcmp(ids[i], id->valuestring);
+            if (!valid) dropped++;
+            else if (!seen && count < max_ids && used + length <= capacity) {
+                strlcpy(ids[count++], id->valuestring, ADD_INBOX_ID_BYTES);
+                memcpy(merged + used, line, length);
+                used += length;
+                kept++;
+            } else if (!seen) dropped++;
+            cJSON_Delete(root);
+            free(plain);
+        }
+        fclose(file);
+    }
+    if (ok) ok = ft_checkpoint_idle(command_transaction_port);
+    if (ok && remove(ADD_COMMAND_INBOX_TMP_PATH) != 0 && errno != ENOENT) ok = false;
+    if (ok && remove(ADD_COMMAND_INBOX_BACKUP_PATH) != 0 && errno != ENOENT) ok = false;
+    FILE *stage = ok ? fopen(ADD_COMMAND_INBOX_TMP_PATH, "w") : NULL;
+    if (ok) ok = stage && (!used || fwrite(merged, 1, used, stage) == used) && fflush(stage) == 0 &&
+        fsync(fileno(stage)) == 0;
+    if (stage && fclose(stage) != 0) ok = false;
+    if (ok) ok = ft_replace(ADD_COMMAND_INBOX_PATH, ADD_COMMAND_INBOX_TMP_PATH, ADD_COMMAND_INBOX_BACKUP_PATH,
+                            ADD_COMMAND_INBOX_MAX_BYTES, command_transaction_port);
+    if (ok) s_command_inbox_restored = false;
+    xSemaphoreGive(s_command_lock);
+    heap_caps_free(merged);
+    heap_caps_free(ids);
+    heap_caps_free(line);
+    char message[160];
+    snprintf(message, sizeof(message), "command inbox merged: %u command(s) kept, %u line(s) dropped%s", kept,
+             dropped, ok ? "" : "; merge failed");
+    ESP_LOGW(TAG, "%s", message);
+    return ok;
 }
 
 bool add_connector_log(

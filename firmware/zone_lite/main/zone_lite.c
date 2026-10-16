@@ -71,6 +71,9 @@
 #include "add_connector.h"
 #include "ota_manager.h"
 #include "storage_inventory.h"
+#if defined(ZONE_LITE_STORAGE_REPAIR) && ZONE_LITE_STORAGE_REPAIR
+#include "storage_repair.h"
+#endif
 #include "storage_recovery.h"
 #include "setup_portal.h"
 #include "zone_config.h"
@@ -3487,6 +3490,13 @@ static void seen_cache_init(void)
 
 static void storage_init(void)
 {
+#if defined(ZONE_LITE_STORAGE_REPAIR) && ZONE_LITE_STORAGE_REPAIR
+    /* ZKT 2.7.5: the custody-first repair runs on a private mount before the
+     * VFS exists, so no queue owner, cache or scan has opened a file, and
+     * before the seen cache takes 2 MiB of the PSRAM its holds need. The OTA
+     * confirmation budget starts only after storage_init returns. */
+    storage_repair_boot();
+#endif
     seen_cache_init();
     esp_vfs_spiffs_conf_t conf = {
         .base_path = STORAGE_BASE,
@@ -3504,8 +3514,13 @@ static void storage_init(void)
         ESP_LOGE(
             TAG,
             "Continuing in fail-safe online-delivery mode without erasing attendance storage");
+        add_connector_storage_ready();
         return;
     }
+#if defined(ZONE_LITE_STORAGE_REPAIR) && ZONE_LITE_STORAGE_REPAIR
+    storage_repair_after_mount();
+#endif
+    add_connector_storage_ready();
 #if defined(ZONE_LITE_FACTORY_TRIAL_IMAGE)
     if (!zf_platform_storage_check()) {
         led_status_fault(LED_STATUS_LOCAL_FAILURE);

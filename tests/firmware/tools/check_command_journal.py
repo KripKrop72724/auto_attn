@@ -19,10 +19,13 @@ program = r'''
 #include <errno.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <stdatomic.h>
 #include "cJSON.h"
 #include "file_transaction.h"
 #include "reliability.h"
 #define ZONE_LITE_HIKVISION 1 /* Preserve the legacy path; owner has separate tests. */
+/* ZKT 2.7.5: /storage is mounted (after the boot repair) before any lookup. */
+static atomic_bool s_storage_ready=true;
 #define ESP_OK 0
 #define ESP_ERR_NVS_NOT_FOUND 1
 #define NVS_READONLY 0
@@ -81,6 +84,9 @@ int main(void){
  cJSON *new_command=cJSON_Parse("{\"command_id\":\"C\"}");assert(new_command);
  assert(command_journal_append(new_command,"C"));cJSON_Delete(new_command);
  assert(command_journal_contains_locked("C")==1);
+ /* Before storage_init mounts /storage the inbox is unavailable, never empty. */
+ atomic_store(&s_storage_ready,false);assert(command_journal_contains_locked("C")==-1);
+ atomic_store(&s_storage_ready,true);
  puts("command journal allocation and persistence regressions passed");
 }
 '''

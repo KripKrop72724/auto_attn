@@ -45,18 +45,18 @@
 #include "storage_repair_plan.h"
 
 typedef enum {
-    SR_RESULT_NOT_RUN = 0,
-    SR_RESULT_CLEAN,              /* nothing needed repair */
-    SR_RESULT_REPAIRED,           /* repaired; every byte was readable */
-    SR_RESULT_REPAIRED_WITH_GAPS, /* repaired; unreadable bytes reported */
-    SR_RESULT_DEFERRED,           /* custody could not be made safe for a check this boot */
-    SR_RESULT_NORMALIZED,         /* normalize-only boot */
-    SR_RESULT_REPORT_ONLY,        /* the attempts guard stopped repairs */
-    SR_RESULT_STOPPED,            /* the deadline stopped the run */
-    SR_RESULT_FAILED,             /* the check kept failing, or a write failed */
-    SR_RESULT_REFORMATTED,
-} sr_result_t;
-const char *sr_result_name(sr_result_t result);
+    SRR_RESULT_NOT_RUN = 0,
+    SRR_RESULT_CLEAN,              /* nothing needed repair */
+    SRR_RESULT_REPAIRED,           /* repaired; every byte was readable */
+    SRR_RESULT_REPAIRED_WITH_GAPS, /* repaired; unreadable bytes reported */
+    SRR_RESULT_DEFERRED,           /* custody could not be made safe for a check this boot */
+    SRR_RESULT_NORMALIZED,         /* normalize-only boot */
+    SRR_RESULT_REPORT_ONLY,        /* the attempts guard stopped repairs */
+    SRR_RESULT_STOPPED,            /* the deadline stopped the run */
+    SRR_RESULT_FAILED,             /* the check kept failing, or a write failed */
+    SRR_RESULT_REFORMATTED,
+} srr_result_t;
+const char *srr_result_name(srr_result_t result);
 
 typedef struct {
     void *context;
@@ -74,7 +74,7 @@ typedef struct {
     bool (*nvs_erase)(void *context, const char *ns, const char *key);
     /* Breadcrumb for the RTC record, LED and deadline: called on every phase change. */
     void (*phase)(void *context, srp_phase_t phase, uint32_t pass, bool writing);
-} sr_ports_t;
+} srr_ports_t;
 
 typedef struct {
     bool pending_verify;     /* unconfirmed image */
@@ -83,28 +83,28 @@ typedef struct {
     uint32_t image_tag;      /* identifies the running image for the attempts guard */
     uint64_t hold_budget;    /* bytes the run may hold in memory */
     bool allow_reformat;     /* confirmed image and the build permits the last resort */
-} sr_config_t;
+} srr_config_t;
 
 enum {
-    SR_FILE_NORMALIZED = 1U << 0,  /* spans or index pages rewritten */
-    SR_FILE_GAPS = 1U << 1,        /* unreadable bytes reported */
-    SR_FILE_RESTORED = 1U << 2,    /* held bytes put back after the check */
-    SR_FILE_REBUILT = 1U << 3,
-    SR_FILE_TAIL = 1U << 4,        /* torn append terminated */
-    SR_FILE_CURSOR_RESET = 1U << 5,
-    SR_FILE_REMOVED = 1U << 6,     /* expendable or catalog */
-    SR_FILE_UNHELD = 1U << 7,      /* custody the budget could not hold */
+    SRR_FILE_NORMALIZED = 1U << 0,  /* spans or index pages rewritten */
+    SRR_FILE_GAPS = 1U << 1,        /* unreadable bytes reported */
+    SRR_FILE_RESTORED = 1U << 2,    /* held bytes put back after the check */
+    SRR_FILE_REBUILT = 1U << 3,
+    SRR_FILE_TAIL = 1U << 4,        /* torn append terminated */
+    SRR_FILE_CURSOR_RESET = 1U << 5,
+    SRR_FILE_REMOVED = 1U << 6,     /* expendable or catalog */
+    SRR_FILE_UNHELD = 1U << 7,      /* custody the budget could not hold */
 };
 
-#define SR_REPORT_FILES 8U
+#define SRR_REPORT_FILES 8U
 typedef struct {
     char name[SRP_NAME_BYTES];
     uint8_t cls, actions;
     uint32_t size, gaps, unreadable_bytes, spans_rewritten;
-} sr_report_file_t;
+} srr_report_file_t;
 
 typedef struct {
-    sr_result_t result;
+    srr_result_t result;
     srp_mode_t mode;
     srp_phase_t phase, previous_phase;
     uint32_t generation, incomplete, failures;
@@ -125,13 +125,13 @@ typedef struct {
     char error_stage[24];
     int32_t error_code;
     uint32_t file_count;
-    sr_report_file_t file[SR_REPORT_FILES];
-} sr_report_t;
+    srr_report_file_t file[SRR_REPORT_FILES];
+} srr_report_t;
 
 /* Runs the repair on a mounted SPIFFS with no open files. The mount must use
- * sr_check_callback as its check callback. */
-void sr_run(spiffs *fs, const sr_config_t *config, const sr_ports_t *ports, sr_report_t *report);
-void sr_check_callback(spiffs *fs, spiffs_check_type type, spiffs_check_report report, u32_t arg1, u32_t arg2);
+ * srr_check_callback as its check callback. */
+void srr_run(spiffs *fs, const srr_config_t *config, const srr_ports_t *ports, srr_report_t *report);
+void srr_check_callback(spiffs *fs, spiffs_check_type type, spiffs_check_report report, u32_t arg1, u32_t arg2);
 
 /* For the device's reporter: the NVS records awaiting ADD acknowledgement. */
-#define SR_NVS_NAMESPACE "storage_repair"
+#define SRR_NVS_NAMESPACE "storage_repair"

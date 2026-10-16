@@ -73,7 +73,9 @@ def test_rollback_image_still_finds_the_2_7_1_record() -> None:
     record keeps its layout, magic and address for an image rolled back to."""
     source = (FIRMWARE / "main/boot_report.c").read_text()
     assert source.count("RTC_NOINIT_ATTR") == 1
-    assert "typedef struct {\n    boot_rtc_t rtc;\n    boot_rtc_trace_t trace;\n} boot_retained_t;" in source
+    # 2.7.5 appends the storage repair breadcrumb after both.
+    assert ("typedef struct {\n    boot_rtc_t rtc;\n    boot_rtc_trace_t trace;\n    boot_rtc_repair_t repair;\n"
+            "} boot_retained_t;") in source
     record = source[source.index("typedef struct {\n    uint32_t magic;\n    uint32_t boot_count, panic_count"):]
     record = record[:record.index("} boot_rtc_t;")]
     # The 2.7.1 and 2.7.2 layout, field for field.

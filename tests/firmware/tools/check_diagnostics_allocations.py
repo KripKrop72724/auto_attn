@@ -87,6 +87,12 @@ static bool boot_report_append(cJSON *diagnostics){
 static bool storage_inventory_append(cJSON *storage){
  cJSON *inventory=cJSON_AddObjectToObject(storage,"inventory");
  return inventory&&cJSON_AddBoolToObject(inventory,"complete",true);}
+/* storage_repair.c (ZKT 2.7.5) has its own tests; one allocating field keeps
+ * its failure path inside this fault sweep. */
+#define ZONE_LITE_STORAGE_REPAIR 1
+static bool storage_repair_append(cJSON *storage){
+ cJSON *repair=cJSON_AddObjectToObject(storage,"repair");
+ return repair&&cJSON_AddStringToObject(repair,"result","CLEAN");}
 void led_status_local_failure_report(led_local_failure_t *report){
  memset(report,0,sizeof(*report));report->incidents=2;report->recoveries=1;}
 static bool storage_upgrade_ready(void){return true;}
@@ -163,6 +169,7 @@ int main(void){
  assert(cJSON_GetObjectItemCaseSensitive(storage,"read_failures")->valueint==3);
  assert(cJSON_GetObjectItemCaseSensitive(storage,"persistence_probe_repairs")->valueint==4);
  assert(cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(cJSON_GetObjectItemCaseSensitive(storage,"inventory"),"complete")));
+ assert(!strcmp(string(cJSON_GetObjectItemCaseSensitive(storage,"repair"),"result"),"CLEAN"));
  assert(cJSON_GetObjectItemCaseSensitive(storage,"legacy_read_faults")->valueint==1);
  assert(cJSON_GetObjectItemCaseSensitive(storage,"legacy_append_faults")->valueint==2);
  assert(cJSON_GetObjectItemCaseSensitive(storage,"legacy_retire_faults")->valueint==3);

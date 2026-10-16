@@ -176,7 +176,7 @@ static s32_t mount_with(spiffs_check_callback callback)
         CHECK(srm_init(&mirror, &raw, flash_size, BLOCK, PAGE, mirror_lookup, mirror_headers, mirror_scratch,
                        sizeof(mirror_scratch)), "mirror init");
     }
-    callback_used = callback == sr_check_callback;
+    callback_used = callback == srr_check_callback;
     return SPIFFS_mount(&fs, &cfg, work_buf, fd_buf, sizeof(fd_buf), cache_buf, sizeof(cache_buf), callback);
 }
 static void mount_plain(void) { CHECK(mount_with(plain_check_callback) == SPIFFS_OK, "mount %d", SPIFFS_errno(&fs)); }
@@ -306,25 +306,25 @@ static void port_phase(void *context, srp_phase_t phase, uint32_t pass, bool wri
     (void)context; (void)phase; (void)pass; (void)writing;
     phase_changes++;
 }
-static const sr_ports_t ports = {
+static const srr_ports_t ports = {
     .alloc = port_alloc, .release = port_release, .now_ms = port_now, .log = port_log,
     .nvs_load = port_nvs_load, .nvs_store = port_nvs_store, .nvs_erase = port_nvs_erase, .phase = port_phase,
 };
 
-static sr_config_t repair_config(void)
+static srr_config_t repair_config(void)
 {
-    sr_config_t config = {.hold_budget = 64ULL * 1024 * 1024, .image_tag = 0x2750, .allow_reformat = false};
+    srr_config_t config = {.hold_budget = 64ULL * 1024 * 1024, .image_tag = 0x2750, .allow_reformat = false};
     return config;
 }
 
 /* One boot: mount privately, repair, unmount. HAL operations are capped:
  * the firmware's deadline must never be the thing that ends a repair. */
 static uint64_t hal_cap, hal_max;
-static void repair_boot(sr_report_t *report, const sr_config_t *config)
+static void repair_boot(srr_report_t *report, const srr_config_t *config)
 {
     uint64_t start_ops = flash_ops, start_reads = flash_reads;
-    CHECK(mount_with(sr_check_callback) == SPIFFS_OK, "repair mount %d", SPIFFS_errno(&fs));
-    sr_run(&fs, config, &ports, report);
+    CHECK(mount_with(srr_check_callback) == SPIFFS_OK, "repair mount %d", SPIFFS_errno(&fs));
+    srr_run(&fs, config, &ports, report);
     SPIFFS_unmount(&fs);
     CHECK(memory_in_use == 0, "repair leaked %" PRIu64 " bytes", memory_in_use);
     uint64_t used = (flash_ops - start_ops) + (flash_reads - start_reads);
@@ -332,7 +332,7 @@ static void repair_boot(sr_report_t *report, const sr_config_t *config)
     if (hal_cap) CHECK(used <= hal_cap, "repair used %" PRIu64 " HAL operations (cap %" PRIu64 ")", used, hal_cap);
     if (verbose)
         printf("  repair %s: gaps %u spans %u checks %u hal %" PRIu64 " peak %" PRIu64 " KiB\n",
-               sr_result_name(report->result), report->gaps, report->spans_rewritten, report->check_passes, used,
+               srr_result_name(report->result), report->gaps, report->spans_rewritten, report->check_passes, used,
                memory_peak / 1024);
 }
 
@@ -777,7 +777,7 @@ static srp_gaps_t gaps_now(void)
 {
     srp_gaps_t gaps;
     memset(&gaps, 0, sizeof(gaps));
-    (void)port_nvs_load(NULL, SR_NVS_NAMESPACE, "gaps", &gaps, sizeof(gaps));
+    (void)port_nvs_load(NULL, SRR_NVS_NAMESPACE, "gaps", &gaps, sizeof(gaps));
     return gaps;
 }
 
@@ -867,10 +867,10 @@ static void check_idempotent(void)
     CHECK(SPIFFS_check(&fs) == SPIFFS_OK, "second check");
     CHECK(idempotent_fixes == 0, "second check still fixed %u things", idempotent_fixes);
     SPIFFS_unmount(&fs);
-    sr_report_t again;
-    sr_config_t config = repair_config();
+    srr_report_t again;
+    srr_config_t config = repair_config();
     repair_boot(&again, &config);
-    CHECK(again.result == SR_RESULT_CLEAN, "second repair %s (spans %u gaps %u)", sr_result_name(again.result),
+    CHECK(again.result == SRR_RESULT_CLEAN, "second repair %s (spans %u gaps %u)", srr_result_name(again.result),
           again.spans_rewritten, again.gaps);
 }
 
@@ -1171,11 +1171,11 @@ static void damage_catalog(void)
 static const char *const appendable[] = {"/pending.jsonl", "/blocked_identity.jsonl", "/add_pending.jsonl",
                                          "/acked_uids.txt", "/processed_commands.txt"};
 
-static void verify_scenario(const char *name, const sr_report_t *report, bool torn)
+static void verify_scenario(const char *name, const srr_report_t *report, bool torn)
 {
-    CHECK(report->result != SR_RESULT_FAILED && report->result != SR_RESULT_DEFERRED &&
-              report->result != SR_RESULT_STOPPED,
-          "%s: repair %s at %s (%ld)", name, sr_result_name(report->result), report->error_stage,
+    CHECK(report->result != SRR_RESULT_FAILED && report->result != SRR_RESULT_DEFERRED &&
+              report->result != SRR_RESULT_STOPPED,
+          "%s: repair %s at %s (%ld)", name, srr_result_name(report->result), report->error_stage,
           (long)report->error_code);
     CHECK(report->check_deleted_live == 0, "%s: the check deleted %u live files", name, report->check_deleted_live);
     mount_plain();
@@ -1249,12 +1249,12 @@ static void run_scenario(const scenario_t *s, uint64_t seed_value, uint32_t kib)
     nvs_clear();
     format_flash(kib);
     s->build();
-    sr_report_t report;
-    sr_config_t config = repair_config();
+    srr_report_t report;
+    srr_config_t config = repair_config();
     srp_state_t state;
-    base_generation = port_nvs_load(NULL, SR_NVS_NAMESPACE, "state", &state, sizeof(state)) == 1 ? state.generation + 1 : 1;
+    base_generation = port_nvs_load(NULL, SRR_NVS_NAMESPACE, "state", &state, sizeof(state)) == 1 ? state.generation + 1 : 1;
     repair_boot(&report, &config);
-    if (verbose) printf("%s seed %" PRIu64 ": %s\n", s->name, seed_value, sr_result_name(report.result));
+    if (verbose) printf("%s seed %" PRIu64 ": %s\n", s->name, seed_value, srr_result_name(report.result));
     CHECK(!s->expect_gaps || report.gaps > 0, "%s: no gap reported", s->name);
     CHECK(s->expect_gaps || report.gaps == 0, "%s: %u unexpected gaps", s->name, report.gaps);
     verify_scenario(s->name, &report, !strcmp(s->name, "torn_tails"));
@@ -1270,8 +1270,8 @@ static void run_scenario(const scenario_t *s, uint64_t seed_value, uint32_t kib)
 static void run_mirror_equivalence(const scenario_t *s, uint64_t seed_value, uint32_t kib)
 {
     uint8_t *before, *after_plain;
-    sr_report_t plain, mirrored;
-    sr_config_t config = repair_config();
+    srr_report_t plain, mirrored;
+    srr_config_t config = repair_config();
     seed(seed_value);
     nvs_clear();
     use_mirror = false;
@@ -1311,14 +1311,14 @@ static void run_cut_inside_repair(const scenario_t *s, uint64_t seed_value, uint
     format_flash(kib);
     s->build();
     srp_state_t state;
-    base_generation = port_nvs_load(NULL, SR_NVS_NAMESPACE, "state", &state, sizeof(state)) == 1 ? state.generation + 1 : 1;
+    base_generation = port_nvs_load(NULL, SRR_NVS_NAMESPACE, "state", &state, sizeof(state)) == 1 ? state.generation + 1 : 1;
     /* Count the repair's flash writes once, on a copy. */
     uint8_t *store = malloc(flash_size);
     memcpy(store, flash, flash_size);
     __typeof__(nvs) *nvs_before = malloc(sizeof(nvs));
     memcpy(nvs_before, nvs, sizeof(nvs));
-    sr_report_t report;
-    sr_config_t config = repair_config();
+    srr_report_t report;
+    srr_config_t config = repair_config();
     uint64_t ops_before = flash_ops;
     repair_boot(&report, &config);
     uint64_t writes = flash_ops - ops_before;
@@ -1342,12 +1342,12 @@ static void run_cut_inside_repair(const scenario_t *s, uint64_t seed_value, uint
             continue;
         }
         CHECK(++boots < 12, "%s: repair never finished after %u boots", s->name, boots);
-        sr_config_t next = repair_config();
+        srr_config_t next = repair_config();
         repair_boot(&report, &next);
-        if (report.result != SR_RESULT_STOPPED) break;
+        if (report.result != SRR_RESULT_STOPPED) break;
     }
     cut_at = 0;
-    CHECK(report.result != SR_RESULT_FAILED, "%s after cuts: %s at %s", s->name, sr_result_name(report.result),
+    CHECK(report.result != SRR_RESULT_FAILED, "%s after cuts: %s at %s", s->name, srr_result_name(report.result),
           report.error_stage);
     mount_plain();
     srp_gaps_t gaps = gaps_now();
@@ -1520,15 +1520,15 @@ static void repair_until_done(uint64_t seed_value, volatile uint32_t *cuts, bool
             continue;
         }
         CHECK(++boot < 12, "organic seed %" PRIu64 ": repair never finished", seed_value);
-        sr_report_t report;
-        sr_config_t config = repair_config();
+        srr_report_t report;
+        srr_config_t config = repair_config();
         repair_boot(&report, &config);
         cut_at = 0;
-        CHECK(report.result != SR_RESULT_FAILED, "organic seed %" PRIu64 ": repair failed at %s %ld", seed_value,
+        CHECK(report.result != SRR_RESULT_FAILED, "organic seed %" PRIu64 ": repair failed at %s %ld", seed_value,
               report.error_stage, (long)report.error_code);
         CHECK(report.check_deleted_live == 0, "organic seed %" PRIu64 ": the check deleted %u live files", seed_value,
               report.check_deleted_live);
-        if (report.result != SR_RESULT_STOPPED) return;
+        if (report.result != SRR_RESULT_STOPPED) return;
     }
 }
 
