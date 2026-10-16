@@ -177,11 +177,14 @@ jobs:
   backend-tests:
     name: backend-tests (${{ matrix.shard }})
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        shard: [0, 1]
+        # Whole files are balanced by scripts/ci_test_durations.json. The
+        # backend join pins the same count: every plan records its count and
+        # must match, so a mismatch fails closed instead of skipping tests.
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
     services:
       postgres:
         image: postgres:16-alpine
@@ -224,18 +227,25 @@ jobs:
           python scripts/generate_ci_env.py /tmp/add-ci.env --github-env "$GITHUB_ENV"
           rm -f /tmp/add-ci.env
       - name: Run isolated test shard with whole-file coverage
-        run: python scripts/run_ci_tests.py --shard-index ${{ matrix.shard }} --shard-count 2 --plan-path .ci/test-plan-${{ matrix.shard }}.json
+        run: >-
+          python scripts/run_ci_tests.py
+          --shard-index ${{ matrix.shard }} --shard-count ${{ strategy.job-total }}
+          --weights scripts/ci_test_durations.json
+          --plan-path .ci/test-plan-${{ matrix.shard }}.json
+          --junit-path .ci/junit-${{ matrix.shard }}.xml
       - name: Preserve exact collection and shard assignment
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: backend-test-plan-${{ matrix.shard }}
-          path: .ci/test-plan-${{ matrix.shard }}.json
+          path: |
+            .ci/test-plan-${{ matrix.shard }}.json
+            .ci/junit-${{ matrix.shard }}.xml
           if-no-files-found: error
           retention-days: 7
 
   backend:
-    # This exact required check cannot succeed until BOTH isolated test shards
+    # This exact required check cannot succeed until EVERY isolated test shard
     # and their complete coverage proof succeed. Signing still requires it.
     needs: [backend-tests]
     if: always()
@@ -267,7 +277,7 @@ jobs:
       ADD_REDIS_URL: redis://127.0.0.1:6379/0
       ADD_ADMIN_COOKIE_SECURE: "false"
     steps:
-      - name: Require both test shards to succeed
+      - name: Require every test shard to succeed
         env:
           SHARD_RESULT: ${{ needs.backend-tests.result }}
         run: test "$SHARD_RESULT" = success
@@ -296,7 +306,7 @@ jobs:
           path: .ci
           merge-multiple: true
       - name: Verify every collected test belongs to exactly one successful shard
-        run: python scripts/run_ci_tests.py --verify-plans .ci --shard-count 2
+        run: python scripts/run_ci_tests.py --verify-plans .ci --shard-count 8 --weights scripts/ci_test_durations.json
       - name: Validate a fresh PostgreSQL migration and schema drift
         run: |
           alembic -c apps/add_backend/alembic.ini upgrade head
