@@ -3,10 +3,13 @@
 Builds tests/firmware/spiffs_repair_host.c with ESP-IDF 5.5.3's SPIFFS sources,
 the boot repair engine and the firmware's own legacy queue, file transaction
 and append code (through a stdio shim onto the emulated flash), then runs every
-damage scenario, the metadata mirror equivalence, power cuts inside the repair
-and the power-cut simulator's workload. CI runs it in espressif/idf:v5.5.3."""
+damage scenario, the metadata mirror equivalence, resumes, restores and guards,
+power cuts inside the repair and the power-cut simulator's workload long enough
+to run the store crammed (about 70% live data, every block holding deleted
+pages). CI runs it in espressif/idf:v5.5.3; the runs go in parallel."""
 from __future__ import annotations
 
+import concurrent.futures
 import os
 import shutil
 import subprocess
@@ -22,9 +25,14 @@ SHIMMED = ["legacy_queue.c", "file_transaction.c", "reliability.c"]
 PLAIN = ["durable_queue.c", "zkt_clock.c", "storage_repair_plan.c", "storage_repair_mirror.c"]
 FLAGS = ["-std=c11", "-D_POSIX_C_SOURCE=200809L", "-g", "-O1", "-fsanitize=address,undefined",
          "-fno-omit-frame-pointer"]
-# The CI run: 1 MiB stores, every scenario with several seeds, cuts inside the
-# repair, and the simulator's workload; then the scenarios on the 8 MB store.
-CI_RUNS = [["--seeds=3", "--organic=4", "--ticks=1500"], ["scenarios", "--seeds=1", "--kib=8192"]]
+# The CI run: 1 MiB stores, every scenario with several seeds, the special
+# runs and cuts inside the repair; more cut seeds; the simulator's workload to
+# a crammed store (odd seeds also retire and recreate the queue); then the
+# scenarios on the 8 MB store.
+CI_RUNS = [["--seeds=3", "--organic=0"], ["cuts", "--seeds=12", "--first-seed=3"],
+           ["organic", "--organic=3", "--ticks=2500", "--first-seed=0"],
+           ["organic", "--organic=3", "--ticks=2500", "--first-seed=3", "--gap=150"],
+           ["scenarios", "--seeds=1", "--kib=8192"]]
 
 
 def spiffs_source_dir() -> Path | None:
@@ -81,8 +89,10 @@ def main(argv: list[str]) -> int:
         return 2
     with tempfile.TemporaryDirectory(prefix="spiffs-repair-") as temporary:
         binary = build(spiffs, Path(temporary))
-        for arguments in ([argv] if argv else CI_RUNS):
-            print(run(binary, arguments), end="")
+        runs = [argv] if argv else CI_RUNS
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(len(runs), os.cpu_count() or 1))) as pool:
+            for output in pool.map(lambda arguments: run(binary, arguments), runs):
+                print(output, end="")
     print("SPIFFS repair verified against ESP-IDF SPIFFS")
     return 0
 
