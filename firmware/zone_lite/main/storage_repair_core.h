@@ -54,7 +54,7 @@ typedef enum {
     SRR_RESULT_REPORT_ONLY,        /* the attempts guard stopped repairs */
     SRR_RESULT_STOPPED,            /* the deadline stopped the run */
     SRR_RESULT_FAILED,             /* the check kept failing, or a write failed */
-    SRR_RESULT_REFORMATTED,
+    SRR_RESULT_REFORMATTED,        /* reserved: no reformat is implemented in 2.7.5 */
 } srr_result_t;
 const char *srr_result_name(srr_result_t result);
 
@@ -82,7 +82,6 @@ typedef struct {
     bool damage_seen;        /* a runtime storage fault was recorded since the last run */
     uint32_t image_tag;      /* identifies the running image for the attempts guard */
     uint64_t hold_budget;    /* bytes the run may hold in memory */
-    bool allow_reformat;     /* confirmed image and the build permits the last resort */
 } srr_config_t;
 
 enum {
@@ -116,6 +115,7 @@ typedef struct {
     uint32_t spans_rewritten, index_rewritten, index_created, duplicates_removed, lookup_fixed;
     uint32_t tails_terminated, files_restored, files_rebuilt, cursors_reset;
     uint32_t expendables_removed, settled_removed, interrupted_losses, orphan_index_removed;
+    uint32_t blocks_compacted, reserve_pages; /* room made: blocks of deleted pages erased; GC reserve pages used */
     uint32_t check_passes, check_fix_index, check_fix_lookup, check_delete_orphan_index;
     uint32_t check_delete_page, check_delete_bad_file, check_errors;
     uint32_t check_deleted_live;   /* of the files the check deleted, ones the survey saw as live files */

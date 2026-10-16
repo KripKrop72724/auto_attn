@@ -61,6 +61,7 @@ static const srp_known_t KNOWN[] = {
     {"/persistence-probe", SRP_CLASS_EXPENDABLE, SRP_FILL_BINARY, 0, NULL, NULL},
     {"/persistence-probe-2", SRP_CLASS_EXPENDABLE, SRP_FILL_BINARY, 0, NULL, NULL},
     {"/repair-probe", SRP_CLASS_EXPENDABLE, SRP_FILL_BINARY, 0, NULL, NULL},
+    {"/repair-probe-2", SRP_CLASS_EXPENDABLE, SRP_FILL_BINARY, 0, NULL, NULL},
     {"/add_live.pos.tmp", SRP_CLASS_EXPENDABLE, SRP_FILL_BINARY, 0, NULL, NULL},
     {"/add_pending.pos.tmp", SRP_CLASS_EXPENDABLE, SRP_FILL_BINARY, 0, NULL, NULL},
 };

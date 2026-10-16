@@ -101,7 +101,7 @@ typedef enum {
     SRP_GAP_RESTORE_INTERRUPTED,
     SRP_GAP_CONTENT_UNVERIFIED,     /* same size, different bytes after an interrupted run */
     SRP_GAP_CHECK_CHANGED,          /* the check altered held bytes it could not restore */
-    SRP_GAP_REFORMAT_INTERRUPTED,
+    SRP_GAP_REFORMAT_INTERRUPTED,   /* reserved for a reformat; none in 2.7.5 */
     SRP_GAP_UNHELD_LOST,            /* not held (budget) and changed by the check */
 } srp_gap_cause_t;
 
@@ -162,7 +162,7 @@ typedef enum {
     SRP_PHASE_CHECK,        /* SPIFFS_check running on the private mount */
     SRP_PHASE_RESTORE,      /* restoring held bytes the check changed */
     SRP_PHASE_FINISH,       /* tails, cursors, catalog, probes */
-    SRP_PHASE_REFORMAT,     /* last resort: erase and rewrite */
+    SRP_PHASE_REFORMAT,     /* reserved: no reformat is implemented in 2.7.5 */
 } srp_phase_t;
 const char *srp_phase_name(srp_phase_t phase);
 

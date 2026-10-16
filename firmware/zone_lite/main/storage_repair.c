@@ -299,7 +299,6 @@ static srr_config_t boot_config(void)
     const esp_app_desc_t *app = esp_app_get_description();
     if (app) memcpy(&config.image_tag, app->app_elf_sha256, sizeof(config.image_tag));
     config.damage_seen = damage_flag_take();
-    config.allow_reformat = false;
     return config;
 }
 
@@ -599,6 +598,8 @@ bool storage_repair_append(cJSON *storage)
         cJSON_AddNumberToObject(repair, "index_rewritten", r->index_rewritten) &&
         cJSON_AddNumberToObject(repair, "duplicates_removed", r->duplicates_removed) &&
         cJSON_AddNumberToObject(repair, "orphan_index_removed", r->orphan_index_removed) &&
+        cJSON_AddNumberToObject(repair, "blocks_compacted", r->blocks_compacted) &&
+        cJSON_AddNumberToObject(repair, "reserve_pages", r->reserve_pages) &&
         cJSON_AddNumberToObject(repair, "lookup_fixed", r->lookup_fixed) &&
         cJSON_AddNumberToObject(repair, "tails_terminated", r->tails_terminated) &&
         cJSON_AddNumberToObject(repair, "files_restored", r->files_restored) &&

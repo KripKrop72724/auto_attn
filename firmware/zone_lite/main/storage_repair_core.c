@@ -88,7 +88,7 @@ typedef struct {
     srp_manifest_t *manifest, *previous;
     srp_gaps_t *gaps;
     srp_resets_t *resets;
-    bool stopped, failed, wrote, catalog_damaged;
+    bool stopped, failed, wrote, catalog_damaged, unrecordable_custody;
     uint32_t ops;
     /* check callback counters */
     uint32_t fix_index, fix_lookup, del_orphan, del_page, del_bad_file, errors;
@@ -974,6 +974,14 @@ static void note_file(run_t *r, const obj_t *o)
 
 static bool record_gap(run_t *r, obj_t *o, uint32_t offset, uint32_t length, int32_t code, srp_gap_cause_t cause)
 {
+    /* A range this run already recorded (a survey repeated after making
+     * room) is not recorded twice. */
+    for (uint32_t i = 0; i < r->gaps->count && i < SRP_MAX_GAPS; ++i) {
+        const srp_gap_t *old = &r->gaps->gap[i];
+        if (old->generation == r->state.generation && old->offset == offset && old->length == length &&
+            old->cause == (uint8_t)cause && !strcmp(old->name, o->name))
+            return true;
+    }
     srp_gap_t gap;
     memset(&gap, 0, sizeof(gap));
     memcpy(gap.name, o->name, sizeof(gap.name));
@@ -1100,17 +1108,31 @@ static bool delete_page(run_t *r, uint16_t pix)
     return spiffs_page_delete(r->fs, pix) == SPIFFS_OK;
 }
 
-static bool any_dirty_free(const run_t *r)
+/* A used page whose lookup entry still says free (the allocator can hand
+ * it out and program over it), or a lookup entry naming another object than
+ * its page does (a torn lookup write: NOR leaves some of the new bits
+ * unprogrammed). SPIFFS_check handles the second badly: for a finalized data
+ * page no index references it deletes the page after an index search that
+ * overwrote the lookup page it is walking, and reads the rest of that block
+ * through another block's lookup entries, deleting live pages. */
+static bool mislabeled(const pg_t *pg)
+{
+    if (pg->lu == SPIFFS_OBJ_ID_FREE) return !pg->erased;
+    return pg->lu != SPIFFS_OBJ_ID_DELETED && pg->lu != pg->obj;
+}
+
+static bool any_mislabeled(const run_t *r)
 {
     for (uint32_t pix = 0; pix < r->total_pages; ++pix)
-        if (pix % r->ppb && r->pages[pix].lu == SPIFFS_OBJ_ID_FREE && !r->pages[pix].erased) return true;
+        if (pix % r->ppb && mislabeled(&r->pages[pix])) return true;
     return false;
 }
 
-/* A used page whose lookup entry still says free can be handed out by the
- * allocator and programmed over. A page the survey needs (a header, an index
- * page, a reference or a byte source) gets its lookup entry; any other is
- * deleted. Runs before the first page is allocated. */
+/* A page the survey needs (a header, an index page, a reference or a byte
+ * source) whose lookup entry says free gets its lookup entry; one whose
+ * lookup entry names another object is left to normalization, which writes
+ * its bytes to a new page. Every other mislabeled page is deleted. Runs
+ * before the first page is allocated, and again after normalization. */
 static bool lookup_hygiene(run_t *r)
 {
     uint8_t *needed = zalloc(r, r->total_pages);
@@ -1130,10 +1152,16 @@ static bool lookup_hygiene(run_t *r)
     for (uint32_t pix = 0; ok && pix < r->total_pages; ++pix) {
         if (pix % r->ppb == 0) continue;
         pg_t *pg = &r->pages[pix];
-        if (pg->lu != SPIFFS_OBJ_ID_FREE || pg->erased) continue;
-        bool used = !(pg->flags & SPIFFS_PH_FLAG_USED) && pg->obj != SPIFFS_OBJ_ID_FREE &&
-            pg->obj != SPIFFS_OBJ_ID_DELETED;
-        ok = needed[pix] && used ? write_lookup(r, pix, pg->obj) : delete_page(r, (uint16_t)pix);
+        if (!mislabeled(pg)) continue;
+        if (pg->lu == SPIFFS_OBJ_ID_FREE) {
+            bool used = !(pg->flags & SPIFFS_PH_FLAG_USED) && pg->obj != SPIFFS_OBJ_ID_FREE &&
+                pg->obj != SPIFFS_OBJ_ID_DELETED;
+            ok = needed[pix] && used ? write_lookup(r, pix, pg->obj) : delete_page(r, (uint16_t)pix);
+        } else if (needed[pix]) {
+            continue;
+        } else {
+            ok = delete_page(r, (uint16_t)pix);
+        }
         if (ok) r->report->lookup_fixed++;
         pace(r);
     }
@@ -1332,12 +1360,41 @@ static bool remove_name(run_t *r, const char *name)
     return res == SPIFFS_OK;
 }
 
+/* An expendable file whose header has a torn size: the first append to a
+ * new file rewrites its header in place, and a reset there leaves a size
+ * like 0xFFFFFFFB. SPIFFS can neither truncate nor remove such a file, the
+ * check keeps it, and every later create of that name fails (13FL's and
+ * P02's probe ENOENT). Its pages go by object id. */
+static bool purge_object(run_t *r, const obj_t *o)
+{
+    for (uint32_t k = 0; k < r->obj_count; ++k)
+        if (&r->objs[k] != o && r->objs[k].obj == o->obj && !r->objs[k].hidden) return false;
+    for (uint32_t pix = 0; pix < r->total_pages; ++pix) {
+        const pg_t *pg = &r->pages[pix];
+        if (pix % r->ppb == 0 || pg->lu == SPIFFS_OBJ_ID_FREE || pg->lu == SPIFFS_OBJ_ID_DELETED ||
+            (uint16_t)(pg->lu & 0x7FFFU) != o->obj)
+            continue;
+        if (!delete_page(r, (uint16_t)pix)) return false;
+        pace(r);
+    }
+    return true;
+}
+
 /* Probe leftovers always (the runtime probe recreates its own); transient
  * cursor stages only when the store needs room. */
 static void remove_expendables(run_t *r, bool for_room)
 {
     for (uint32_t i = 0; i < r->obj_count; ++i) {
         obj_t *o = &r->objs[i];
+        if (!o->hidden && o->header != SR_NO_PAGE && !o->plausible && o->name[0] &&
+            o->kind.cls == SRP_CLASS_EXPENDABLE) {
+            if (purge_object(r, o)) {
+                r->report->expendables_removed++;
+                o->actions |= SRR_FILE_REMOVED;
+                note_file(r, o);
+            }
+            continue;
+        }
         if (!live(o) || o->kind.cls != SRP_CLASS_EXPENDABLE) continue;
         if (!strstr(o->name, "probe") && !for_room) continue;
         if (remove_name(r, o->name)) {
@@ -1346,6 +1403,12 @@ static void remove_expendables(run_t *r, bool for_room)
             note_file(r, o);
         }
     }
+}
+
+static bool remove_expendables_now(run_t *r)
+{
+    remove_expendables(r, true);
+    return true;
 }
 
 static const char *const CATALOG_FILES[] = {"/add_identities.enc", "/add_identities.tmp", "/add_identities.stage",
@@ -1367,12 +1430,23 @@ static bool clear_catalog(run_t *r)
 {
     r->state.flags |= SRP_STATE_CATALOG_CLEAR;
     if (!save_state(r)) return fail(r, "journal", SPIFFS_ERR_INTERNAL);
+    bool removed = true;
     for (size_t i = 0; i < sizeof(CATALOG_FILES) / sizeof(CATALOG_FILES[0]); ++i) {
         obj_t *o = find_live(r, CATALOG_FILES[i]);
         if (!o) continue;
-        if (!remove_name(r, CATALOG_FILES[i])) return fail(r, "catalog_remove", SPIFFS_ERR_INTERNAL);
+        if (!remove_name(r, CATALOG_FILES[i])) {
+            removed = false;
+            continue;
+        }
         o->actions |= SRR_FILE_REMOVED;
         note_file(r, o);
+    }
+    if (!removed) {
+        /* A file SPIFFS would not remove (not consistent yet): the flag
+         * stays and the next run repeats this; the transaction is not set
+         * idle while a catalog file remains. */
+        logf_line(r, "WARN", "STORAGE_REPAIR_CATALOG_DEFERRED", "a catalog file could not be removed yet");
+        return true;
     }
     ft_port_t port = {catalog_load, catalog_commit, r};
     if (!ft_checkpoint_idle(port)) return fail(r, "catalog_idle", SPIFFS_ERR_INTERNAL);
@@ -1491,6 +1565,10 @@ static bool terminate_tails(run_t *r)
         if (!object_read(r, o, o->size - 1, &last, 1) || last == '\n') continue;
         if (command) {
             r->report->commands_damaged = true;
+            if (!(r->state.flags & SRP_STATE_COMMANDS_DAMAGED)) {
+                r->state.flags |= SRP_STATE_COMMANDS_DAMAGED;
+                if (!save_state(r)) return fail(r, "journal", SPIFFS_ERR_INTERNAL);
+            }
             continue;
         }
         if (settled_offset(r, o) >= o->size) continue; /* settled: the drain retires it */
@@ -1520,17 +1598,30 @@ static bool rebuild_from_hold(run_t *r, obj_t *o)
     bool ok = fd >= 0;
     uint8_t *chunk = ok ? zalloc(r, SR_COPY_BYTES) : NULL;
     if (!chunk) ok = false;
-    for (uint32_t offset = 0; ok && offset < o->hold_size;) {
+    /* Whole data pages per write: SPIFFS writes them past its cache, so
+     * every byte before `offset` is on flash once its write returned. */
+    uint32_t offset = 0;
+    while (ok && offset < o->hold_size) {
         uint32_t n = o->hold_size - offset < SR_COPY_BYTES ? o->hold_size - offset : SR_COPY_BYTES;
         ok = held_read(o, offset, chunk, n) && SPIFFS_write(r->fs, fd, chunk, (s32_t)n) == (s32_t)n;
-        offset += n;
+        if (ok) offset += n;
         pace(r);
     }
+    s32_t error = ok ? SPIFFS_OK : SPIFFS_errno(r->fs);
     if (ok) ok = SPIFFS_fflush(r->fs, fd) >= 0;
     if (fd >= 0 && SPIFFS_close(r->fs, fd) < 0) ok = false;
     SPIFFS_clearerr(r->fs);
     release(r, chunk);
-    if (!ok) return fail(r, "rebuild", SPIFFS_ERR_INTERNAL);
+    if (!ok) {
+        /* The hold ends with this boot: what did not go back is in NVS
+         * before the run fails. */
+        int32_t code = error ? error : SPIFFS_ERR_INTERNAL;
+        if (offset < o->hold_size &&
+            record_gap(r, o, offset, o->hold_size - offset, code, SRP_GAP_CHECK_CHANGED))
+            (void)save_records(r);
+        note_file(r, o);
+        return fail(r, "rebuild", code);
+    }
     o->actions |= SRR_FILE_REBUILT;
     r->report->files_rebuilt++;
     note_file(r, o);
@@ -1668,16 +1759,26 @@ static bool resume_manifest(run_t *r)
     return !rebuilt || survey(r);
 }
 
-/* ---- persistence probe ---------------------------------------------- */
-static bool probe(run_t *r)
+static bool exists_name(run_t *r, const char *name)
 {
-    static const char name[] = "/repair-probe";
+    spiffs_stat st;
+    bool found = SPIFFS_stat(r->fs, name, &st) == SPIFFS_OK;
+    SPIFFS_clearerr(r->fs);
+    return found;
+}
+
+/* ---- persistence probe ---------------------------------------------- */
+/* Returns SPIFFS_OK, or the first SPIFFS error (SPIFFS_ERR_FULL on a store
+ * that is simply full of live data). */
+static s32_t probe(run_t *r, const char *name)
+{
     uint8_t data[64], back[64];
     for (unsigned i = 0; i < sizeof(data); ++i) data[i] = (uint8_t)(r->state.generation * 31U + i);
     r->wrote = true;
     spiffs_file fd = SPIFFS_open(r->fs, name, SPIFFS_O_CREAT | SPIFFS_O_TRUNC | SPIFFS_O_RDWR, 0);
     bool ok = fd >= 0 && SPIFFS_write(r->fs, fd, data, sizeof(data)) == (s32_t)sizeof(data) &&
         SPIFFS_fflush(r->fs, fd) >= 0;
+    s32_t error = ok ? SPIFFS_OK : SPIFFS_errno(r->fs);
     if (fd >= 0 && SPIFFS_close(r->fs, fd) < 0) ok = false;
     if (ok) {
         fd = SPIFFS_open(r->fs, name, SPIFFS_O_RDONLY, 0);
@@ -1685,9 +1786,26 @@ static bool probe(run_t *r)
             !memcmp(back, data, sizeof(data));
         if (fd >= 0 && SPIFFS_close(r->fs, fd) < 0) ok = false;
     }
-    if (SPIFFS_remove(r->fs, name) != SPIFFS_OK) ok = false;
     SPIFFS_clearerr(r->fs);
-    return ok;
+    if (SPIFFS_remove(r->fs, name) != SPIFFS_OK && exists_name(r, name)) ok = false;
+    SPIFFS_clearerr(r->fs);
+    if (ok) return SPIFFS_OK;
+    return error ? error : SPIFFS_ERR_INTERNAL;
+}
+
+/* A custody file whose header holds a torn size (1.2 item 10) is no live
+ * file to the survey: it is reported with that size and left as it is. */
+static void report_torn_headers(run_t *r)
+{
+    for (uint32_t i = 0; i < r->obj_count; ++i) {
+        obj_t *o = &r->objs[i];
+        if (o->hidden || o->header == SR_NO_PAGE || o->plausible || !o->name[0] || !custody(o)) continue;
+        char message[120];
+        snprintf(message, sizeof(message), "%s: header size %lu is torn; file left as it is", o->name,
+                 (unsigned long)o->size);
+        logf_line(r, "WARN", "STORAGE_REPAIR_SIZE_TORN", message);
+        note_file(r, o);
+    }
 }
 
 /* ---- phases --------------------------------------------------------- */
@@ -1720,9 +1838,272 @@ static bool plan_damage(run_t *r)
         if (!fill_gaps(r, o)) return fail(r, "fill_memory", SPIFFS_ERR_INTERNAL);
     }
     if (recorded && !save_records(r)) return fail(r, "journal_records", SPIFFS_ERR_INTERNAL);
+    /* What the damage obliges later steps to do is journaled before the
+     * fill hides it: a run that fails or stops after normalizing must not
+     * leave the next one unaware that the catalog is to be dropped or the
+     * command inbox merged. */
+    uint32_t flags = r->state.flags;
+    if (r->catalog_damaged) r->state.flags |= SRP_STATE_CATALOG_CLEAR;
+    if (r->report->commands_damaged) r->state.flags |= SRP_STATE_COMMANDS_DAMAGED;
+    if (flags != r->state.flags && !save_state(r)) return fail(r, "journal", SPIFFS_ERR_INTERNAL);
     return true;
 }
 
+static void clear_failure(run_t *r)
+{
+    r->failed = false;
+    r->report->error_stage[0] = '\0';
+    r->report->error_code = 0;
+}
+
+/* ---- room ----------------------------------------------------------- */
+#define SR_COMPACT_MAX_BLOCKS 48U
+
+/* Pages normalization allocates: new data pages and index page moves. */
+static uint32_t pages_for_work(const run_t *r)
+{
+    uint32_t pages = 2;
+    for (uint32_t i = 0; i < r->obj_count; ++i) {
+        const obj_t *o = &r->objs[i];
+        if (!live(o) || !o->needs_work || !o->mapped) continue;
+        for (uint32_t k = 0; k < o->patches; ++k) pages += o->patch[k].kind != PATCH_REFER;
+        for (uint32_t j = 0; j < o->ix_spans; ++j) pages += o->ix_rewrite[j] != 0;
+    }
+    return pages;
+}
+
+/* Free blocks for allocating `pages` outside a GC: SPIFFS refuses to
+ * allocate with fewer than two. */
+static uint32_t blocks_for(const run_t *r, uint32_t pages)
+{
+    return 3 + (pages + r->entries - 1) / r->entries;
+}
+
+/* Erased pages anywhere, the two blocks SPIFFS keeps for its GC included. */
+static int32_t free_pages(const run_t *r)
+{
+    return (int32_t)(r->blocks * r->entries) - (int32_t)r->fs->stats_p_allocated - (int32_t)r->fs->stats_p_deleted;
+}
+
+static bool clean_object(const obj_t *o)
+{
+    return live(o) && o->mapped && o->consistent && !o->needs_work;
+}
+
+/* A block's lookup entries in use, and its erased ones. */
+static bool block_usage(run_t *r, uint32_t b, uint32_t *used, uint32_t *erased)
+{
+    if (!hal_read(r, SPIFFS_BLOCK_TO_PADDR(r->fs, b), r->page, r->page_size)) return false;
+    *used = *erased = 0;
+    for (uint32_t e = 0; e < r->entries; ++e) {
+        uint16_t lu = le16(r->page + e * 2);
+        if (lu == SPIFFS_OBJ_ID_FREE) ++*erased;
+        else if (lu != SPIFFS_OBJ_ID_DELETED) ++*used;
+    }
+    return true;
+}
+
+/* What cleaning a block costs and gains, from the survey. SPIFFS's block
+ * cleaning moves every data page, writes the index page of each group of
+ * data pages (one object's index span) once, and moves the other index
+ * pages; then the block is erased. Erased pages consumed elsewhere: data +
+ * groups + other index pages. Net erased pages gained: deleted pages plus
+ * the group index pages the block held, less one page per group. */
+typedef struct {
+    int32_t gain;
+    uint32_t consumed, used;
+} block_cost_t;
+
+static block_cost_t block_cost(const run_t *r, uint32_t b)
+{
+    block_cost_t c = {0, 0, 0};
+    uint16_t group_obj[16], group_span[16];
+    uint32_t groups = 0, data = 0, index = 0, group_index = 0, deleted = 0;
+    for (uint32_t e = 0; e < r->entries; ++e) {
+        const pg_t *pg = &r->pages[b * r->ppb + 1 + e];
+        if (pg->lu == SPIFFS_OBJ_ID_DELETED) ++deleted;
+        if (pg->lu == SPIFFS_OBJ_ID_FREE || pg->lu == SPIFFS_OBJ_ID_DELETED || (pg->lu & SR_IX)) continue;
+        ++data;
+        uint16_t span = (uint16_t)SPIFFS_OBJ_IX_ENTRY_SPAN_IX(r->fs, pg->span);
+        bool seen = false;
+        for (uint32_t g = 0; g < groups && !seen; ++g) seen = group_obj[g] == pg->lu && group_span[g] == span;
+        if (!seen && groups < 16) {
+            group_obj[groups] = pg->lu;
+            group_span[groups++] = span;
+        }
+    }
+    for (uint32_t e = 0; e < r->entries; ++e) {
+        const pg_t *pg = &r->pages[b * r->ppb + 1 + e];
+        if (pg->lu == SPIFFS_OBJ_ID_FREE || pg->lu == SPIFFS_OBJ_ID_DELETED || !(pg->lu & SR_IX)) continue;
+        ++index;
+        for (uint32_t g = 0; g < groups; ++g)
+            if (group_obj[g] == (uint16_t)(pg->lu & ~SR_IX) && group_span[g] == pg->span) {
+                ++group_index;
+                break;
+            }
+    }
+    c.gain = (int32_t)(deleted + group_index) - (int32_t)groups;
+    c.consumed = data + groups + index - group_index;
+    c.used = data + index;
+    return c;
+}
+
+/* A deleted page that may be the bytes of a damaged file's imperfect span:
+ * the survey reads such pages (and unfinalized ones) as sources. */
+static bool byte_source(const run_t *r, const uint16_t *owner, const uint8_t *pinned, const pg_t *pg)
+{
+    if (pg->obj == SPIFFS_OBJ_ID_FREE || (pg->obj & SR_IX)) return false;
+    uint16_t id = (uint16_t)(pg->obj & 0x7FFFU);
+    if (!bit(pinned, id)) return false;
+    const obj_t *o = owner[id] ? &r->objs[owner[id] - 1] : NULL;
+    if (!o || !live(o) || !o->mapped) return true;
+    for (uint32_t i = 0; i < o->patches; ++i)
+        if (o->patch[i].span == pg->span) return true;
+    return false;
+}
+
+/* A store that has run a while keeps its deleted pages until a write needs
+ * the room. SPIFFS's own GC cannot run on a damaged store: in a block it
+ * cleans, it points an index entry at whichever page of that span it meets
+ * there (a duplicate, an uncommitted copy), deletes data pages whose index
+ * page it cannot find, and finds index pages by lookup entry, stale copies
+ * included. Its block cleaning runs here only on blocks whose every page is
+ * erased, deleted and no byte source of a damaged file, or the referenced
+ * page of a consistent file every one of whose lookup entries is a
+ * referenced page. Needs a fresh survey; returns the blocks erased. */
+static uint32_t compact(run_t *r, uint32_t target)
+{
+    spiffs *fs = r->fs;
+    if ((uint32_t)fs->free_blocks >= target) return 0;
+    uint16_t *owner = zalloc(r, 0x8000U * sizeof(uint16_t));
+    uint8_t *pinned = zalloc(r, 0x8000U / 8U);
+    uint8_t *gain = zalloc(r, r->blocks);
+    uint32_t cleaned = 0;
+    if (!owner || !pinned || !gain) goto done;
+    for (uint32_t k = 0; k < r->obj_count; ++k) {
+        const obj_t *o = &r->objs[k];
+        if (o->obj == SR_NO_PAGE) continue;
+        uint16_t id = (uint16_t)(o->obj & 0x7FFFU);
+        if (owner[id] || !clean_object(o)) set_bit(pinned, id);
+        if (!owner[id] || live(o)) owner[id] = (uint16_t)(k + 1);
+    }
+    for (uint32_t pix = 0; pix < r->total_pages; ++pix) {
+        const pg_t *pg = &r->pages[pix];
+        if (pix % r->ppb == 0 || pg->lu == SPIFFS_OBJ_ID_FREE || pg->lu == SPIFFS_OBJ_ID_DELETED) continue;
+        uint16_t id = (uint16_t)(pg->lu & 0x7FFFU);
+        if (!owner[id] || bit(pinned, id)) continue;
+        const obj_t *o = &r->objs[owner[id] - 1];
+        bool referenced = pg->obj == pg->lu &&
+            ((pg->lu & SR_IX) ? index_valid(pg->flags) && pg->span < o->ix_spans && o->ix[pg->span] == pix
+                              : data_valid(pg->flags) && pg->span < o->spans && o->ref[pg->span] == pix);
+        if (!referenced) set_bit(pinned, id);
+    }
+    for (uint32_t b = 0; b < r->blocks; ++b) {
+        bool safe = true;
+        for (uint32_t e = 0; safe && e < r->entries; ++e) {
+            const pg_t *pg = &r->pages[b * r->ppb + 1 + e];
+            if (pg->lu == SPIFFS_OBJ_ID_FREE) safe = pg->erased;
+            else if (pg->lu == SPIFFS_OBJ_ID_DELETED) safe = !byte_source(r, owner, pinned, pg);
+            else {
+                uint16_t id = (uint16_t)(pg->lu & 0x7FFFU);
+                safe = owner[id] && !bit(pinned, id);
+            }
+        }
+        block_cost_t c = block_cost(r, b);
+        gain[b] = safe && c.gain > 0 ? (uint8_t)c.gain : 0;
+    }
+    while ((uint32_t)fs->free_blocks < target && cleaned < SR_COMPACT_MAX_BLOCKS && going(r)) {
+        /* The largest net gain first, among blocks whose moves fit in the
+         * erased pages elsewhere. Pages moved into a block's erased tail by
+         * an earlier cleaning add their own moves. */
+        uint32_t best = r->blocks;
+        for (uint32_t b = 0; b < r->blocks; ++b)
+            if (gain[b] && (best == r->blocks || gain[b] > gain[best])) best = b;
+        if (best == r->blocks) break;
+        gain[best] = 0;
+        block_cost_t c = block_cost(r, best);
+        uint32_t used, erased;
+        if (!block_usage(r, best, &used, &erased)) break;
+        uint32_t consumed = c.consumed + (used > c.used ? 2 * (used - c.used) : 0);
+        if ((int32_t)(consumed + 1) > free_pages(r) - (int32_t)erased) continue;
+        r->wrote = true;
+        fs->cleaning = 1;
+        s32_t res = spiffs_gc_clean(fs, (spiffs_block_ix)best);
+        fs->cleaning = 0;
+        if (res == SPIFFS_OK) res = spiffs_gc_erase_page_stats(fs, (spiffs_block_ix)best);
+        if (res == SPIFFS_OK) res = spiffs_erase_block(fs, (spiffs_block_ix)best);
+#if SPIFFS_CACHE
+        for (uint32_t i = 0; i < r->ppb; ++i) spiffs_cache_drop_page(fs, (spiffs_page_ix)(best * r->ppb + i));
+#endif
+        /* Moves that did not finish leave what SPIFFS's own GC leaves after
+         * a reset: the next survey reads it. */
+        if (res != SPIFFS_OK) break;
+        ++cleaned;
+        pace(r);
+    }
+done:
+    release(r, owner);
+    release(r, pinned);
+    release(r, gain);
+    if (cleaned) {
+        r->report->blocks_compacted += cleaned;
+        char message[96];
+        snprintf(message, sizeof(message), "%lu blocks of deleted pages erased; %ld free blocks",
+                 (unsigned long)cleaned, (long)fs->free_blocks);
+        logf_line(r, "INFO", "STORAGE_REPAIR_COMPACTED", message);
+    }
+    return cleaned;
+}
+
+/* Erased pages to leave after normalizing into the GC reserve: what
+ * cleaning the best block (by net gain, once the damaged files are
+ * consistent) consumes, so compaction can give the reserve back. A store
+ * where no block gains keeps two. */
+static uint32_t spare_for_compaction(const run_t *r)
+{
+    int32_t best_gain = 0;
+    uint32_t spare = 2;
+    for (uint32_t b = 0; b < r->blocks; ++b) {
+        block_cost_t c = block_cost(r, b);
+        if (c.gain > best_gain) {
+            best_gain = c.gain;
+            spare = c.consumed + 2;
+        }
+    }
+    return spare;
+}
+
+/* The check and SPIFFS's own writes run SPIFFS's GC, which counts on its
+ * two free blocks: when a block it cleans needs more pages than are erased,
+ * it stops half way with data pages moved and the index on flash still
+ * naming the old ones. Compaction gives the blocks back first. */
+static bool ensure_room(run_t *r)
+{
+    if ((uint32_t)r->fs->free_blocks >= 3) return true;
+    if (!survey(r)) return false;
+    return !compact(r, 3) || survey(r);
+}
+
+/* Compacts when the work needs more free blocks than the store has; the
+ * survey and the gap plan are redone after anything moved. */
+static bool make_room(run_t *r)
+{
+    if (!compact(r, blocks_for(r, pages_for_work(r)))) return true;
+    return survey(r) && plan_damage(r);
+}
+
+static bool normalize_once(run_t *r);
+
+/* Normalization allocates pages; on a store full of live data it can run out
+ * of room before the check could free anything. Deleted pages are compacted
+ * first. When the damaged files have pages in every block (nothing can be
+ * compacted around them) and their work fits in the erased pages SPIFFS
+ * keeps for its GC, with what compaction needs to spare, normalization
+ * allocates from them as a GC does, and compaction, possible once the files
+ * are consistent, gives them back. Otherwise room is made (probe leftovers,
+ * cursor stages, the catalog, fully settled queue files), compaction tried
+ * again and normalization retried; a store still full defers the check.
+ * Nothing is lost: every step left a state the next survey understands. */
 static bool normalize_all(run_t *r, bool *deferred)
 {
     *deferred = false;
@@ -1730,6 +2111,53 @@ static bool normalize_all(run_t *r, bool *deferred)
     set_phase(r, SRP_PHASE_NORMALIZE, 0, true);
     r->state.phase = SRP_PHASE_NORMALIZE;
     if (!save_state(r)) return fail(r, "journal", SPIFFS_ERR_INTERNAL);
+    if (!make_room(r)) return false;
+    for (int attempt = 0;; ++attempt) {
+        uint32_t pages = pages_for_work(r);
+        bool reserve = (uint32_t)r->fs->free_blocks < blocks_for(r, pages) &&
+            free_pages(r) >= (int32_t)(pages + spare_for_compaction(r));
+        r->fs->cleaning = reserve ? 1 : 0;
+        bool ok = normalize_once(r);
+        r->fs->cleaning = 0;
+        if (ok) {
+            if (reserve) {
+                char message[96];
+                snprintf(message, sizeof(message), "up to %lu pages from the GC reserve", (unsigned long)pages);
+                logf_line(r, "INFO", "STORAGE_REPAIR_RESERVE", message);
+                r->report->reserve_pages += pages;
+            }
+            if ((uint32_t)r->fs->free_blocks < 3 && compact(r, 3) && !survey(r)) return false;
+            break;
+        }
+        if (r->stopped || r->report->error_code != SPIFFS_ERR_FULL) return false;
+        clear_failure(r);
+        if (attempt == 2) {
+            snprintf(r->report->error_stage, sizeof(r->report->error_stage), "full");
+            r->report->error_code = SPIFFS_ERR_FULL;
+            *deferred = true;
+            logf_line(r, "WARN", "STORAGE_REPAIR_FULL", "no room to make every file consistent; no check this boot");
+            return survey(r);
+        }
+        if (attempt == 1) {
+            if (r->report->level < 2) r->report->level = 2;
+            if (!survey(r) || !remove_expendables_now(r) || !clear_catalog(r) || !survey(r) ||
+                !reconcile_cursors(r, true))
+                return false;
+        }
+        if (!survey(r)) return false;
+        (void)compact(r, blocks_for(r, pages_for_work(r)));
+        if (!survey(r) || !plan_damage(r)) return false;
+    }
+    for (uint32_t i = 0; i < r->obj_count; ++i) {
+        obj_t *o = &r->objs[i];
+        if (live(o) && !o->consistent && custody(o)) *deferred = true;
+    }
+    if (r->unrecordable_custody) *deferred = true;
+    return true;
+}
+
+static bool normalize_once(run_t *r)
+{
     for (uint32_t i = 0; i < r->orphan_count; ++i) {
         if (!delete_page(r, r->orphans[i])) return fail(r, "orphan_index", SPIFFS_ERR_INTERNAL);
         r->report->orphan_index_removed++;
@@ -1739,19 +2167,15 @@ static bool normalize_all(run_t *r, bool *deferred)
     for (uint32_t i = 0; i < r->obj_count; ++i) {
         obj_t *o = &r->objs[i];
         if (!live(o) || !o->needs_work) continue;
-        if (o->unrecordable) {
-            *deferred |= custody(o);
-            continue;
-        }
+        if (o->unrecordable) continue;
         if (!normalize_object(r, o)) return false;
         note_file(r, o);
     }
+    for (uint32_t i = 0; i < r->obj_count; ++i)
+        if (live(&r->objs[i]) && r->objs[i].unrecordable && custody(&r->objs[i])) r->unrecordable_custody = true;
     if (!survey(r)) return false;
-    for (uint32_t i = 0; i < r->obj_count; ++i) {
-        obj_t *o = &r->objs[i];
-        if (live(o) && !o->consistent && custody(o)) *deferred = true;
-    }
-    return true;
+    /* Pages normalization moved away from a torn lookup entry. */
+    return !any_mislabeled(r) || (lookup_hygiene(r) && survey(r));
 }
 
 static void finish_report(run_t *r)
@@ -1830,7 +2254,7 @@ static bool run_checks(run_t *r, bool *catalog_drop, bool *last_failed)
             *last_failed = false;
             return true;
         }
-        if (!survey(r)) return false;
+        if (!survey(r) || !ensure_room(r)) return false;
         set_phase(r, SRP_PHASE_RESTORE, pass, true);
         r->state.phase = SRP_PHASE_RESTORE;
         if (!save_state(r)) return fail(r, "journal", SPIFFS_ERR_INTERNAL);
@@ -1848,7 +2272,7 @@ static bool run_checks(run_t *r, bool *catalog_drop, bool *last_failed)
                 r->report->level = 2;
                 if (!reconcile_cursors(r, true) || !survey(r)) return false;
             } else return true;
-            if (r->last_error == SPIFFS_ERR_FULL) (void)spiffs_gc_quick(r->fs, 0);
+            if (r->last_error == SPIFFS_ERR_FULL && !ensure_room(r)) return false;
             r->state.phase = SRP_PHASE_CHECK;
             if (!save_state(r)) return fail(r, "journal", SPIFFS_ERR_INTERNAL);
             continue;
@@ -1972,10 +2396,10 @@ void srr_run(spiffs *fs, const srr_config_t *config, const srr_ports_t *ports, s
 
     bool deferred = false, catalog_drop = false, check_failed = false;
     bool ok = survey(r);
-    if (ok && (r->state.flags & SRP_STATE_CATALOG_CLEAR)) ok = clear_catalog(r) && survey(r);
+    if (ok) report_torn_headers(r);
     if (ok && report->previous_phase >= SRP_PHASE_CHECK && report->previous_phase <= SRP_PHASE_RESTORE)
         ok = resume_manifest(r);
-    if (ok && any_dirty_free(r)) {
+    if (ok && any_mislabeled(r)) {
         /* Before the first allocation: no used page may look free. */
         set_phase(r, SRP_PHASE_NORMALIZE, 0, true);
         r->state.phase = SRP_PHASE_NORMALIZE;
@@ -1993,18 +2417,36 @@ void srr_run(spiffs *fs, const srr_config_t *config, const srr_ports_t *ports, s
     report->check_skipped = !run_check;
     if (run_check) {
         r->state.phase = SRP_PHASE_CHECK;
-        ok = write_manifest(r) || fail(r, "journal_manifest", SPIFFS_ERR_INTERNAL);
+        ok = ensure_room(r) && (write_manifest(r) || fail(r, "journal_manifest", SPIFFS_ERR_INTERNAL));
         if (ok) ok = run_checks(r, &catalog_drop, &check_failed);
     }
     if (ok && !r->stopped) {
         set_phase(r, SRP_PHASE_FINISH, 0, true);
         r->state.phase = SRP_PHASE_FINISH;
         ok = save_state(r) || fail(r, "journal", SPIFFS_ERR_INTERNAL);
+        /* Consistent or not, SPIFFS's own writes follow: room first, as
+         * far as compaction can make it safely. */
+        if (ok) ok = ensure_room(r);
         if (ok && (catalog_drop || (r->state.flags & SRP_STATE_CATALOG_CLEAR)))
             ok = clear_catalog(r) && survey(r);
         if (ok) ok = reconcile_cursors(r, false);
         if (ok) ok = terminate_tails(r);
-        if (ok && r->wrote && !check_failed && !deferred && !probe(r)) ok = fail(r, "probe", SPIFFS_ERR_INTERNAL);
+        if (ok && r->wrote && !check_failed && !deferred) {
+            s32_t probed = probe(r, "/repair-probe");
+            if (probed != SPIFFS_OK && probed != SPIFFS_ERR_FULL) {
+                /* A damaged object of that name that SPIFFS will not
+                 * recreate (the runtime probe has its alternate too). */
+                logf_line(r, "WARN", "STORAGE_REPAIR_PROBE_ALTERNATE", "/repair-probe failed; probing /repair-probe-2");
+                probed = probe(r, "/repair-probe-2");
+            }
+            if (probed == SPIFFS_ERR_FULL) {
+                /* Full of live data, not damaged: the runtime's admission
+                 * budget handles a full store. */
+                snprintf(report->error_stage, sizeof(report->error_stage), "full");
+                report->error_code = probed;
+                logf_line(r, "WARN", "STORAGE_REPAIR_FULL", "repaired, but the store has no room for a probe file");
+            } else if (probed != SPIFFS_OK) ok = fail(r, "probe", probed);
+        }
     }
     finish_report(r);
     if (report->commands_damaged) r->state.flags |= SRP_STATE_COMMANDS_DAMAGED;
