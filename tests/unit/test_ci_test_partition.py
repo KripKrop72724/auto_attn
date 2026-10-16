@@ -123,3 +123,120 @@ def test_test_execution_refuses_collection_drift_before_running_any_test(tmp_pat
     assert result.returncode != 0
     assert "collection differs" in result.stderr
     assert not (tmp_path / "executed").exists()
+
+
+def test_duration_weights_balance_whole_files_without_changing_coverage():
+    collected = items({"tests/unit/test_slow.py": 2, "tests/unit/test_a.py": 9,
+                       "tests/unit/test_b.py": 8, "tests/firmware/test_new.py": 1})
+    weights = {"tests/unit/test_slow.py": 600_000, "tests/unit/test_a.py": 4_000,
+               "tests/unit/test_b.py": 3_000, "tests/unit/test_removed.py": 9_000}
+    shards = runner.partition(collected, 2, weights)
+    # The measured slow file is isolated; unmeasured files fall back to a count estimate.
+    assert shards == [["tests/unit/test_slow.py"],
+                      ["tests/firmware/test_new.py", "tests/unit/test_a.py", "tests/unit/test_b.py"]]
+    plans = [runner.make_plan(collected, index, 2, weights) for index in (0, 1)]
+    runner.verify_plans(plans, 2, weights)
+    assert sorted(file for plan in plans for file in plan["files"]) == sorted(
+        {item["file"] for item in collected})
+
+
+@pytest.mark.parametrize("weights", [{"tests/unit/test_a.py": 0, "tests/unit/test_b.py": 0},
+                                     {"tests/unit/test_a.py": 10**9}])
+def test_zero_or_extreme_weights_never_produce_an_empty_shard(weights):
+    collected = items({"tests/unit/test_a.py": 1, "tests/unit/test_b.py": 1})
+    assert all(runner.partition(collected, 2, weights))
+
+
+@pytest.mark.parametrize("weights", [[], {"tests/unit/test_a.py": -1},
+                                     {"tests/unit/test_a.py": 1.5}, {"tests/unit/test_a.py": True}])
+def test_invalid_weights_are_rejected(weights):
+    with pytest.raises(ValueError):
+        runner.partition(items({"tests/unit/test_a.py": 1}), 1, weights)
+
+
+def test_join_rejects_plans_balanced_with_different_or_uncommitted_weights():
+    collected = items({"tests/unit/test_a.py": 2, "tests/unit/test_b.py": 1, "tests/unit/test_c.py": 1})
+    committed = {"tests/unit/test_a.py": 10, "tests/unit/test_b.py": 20}
+    other = {"tests/unit/test_a.py": 30, "tests/unit/test_b.py": 20}
+    good = [runner.make_plan(collected, index, 2, committed) for index in (0, 1)]
+    runner.verify_plans(good, 2, committed)
+    with pytest.raises(ValueError, match="committed weights"):
+        runner.verify_plans(good, 2, other)
+    mixed = [good[0], runner.make_plan(collected, 1, 2, other)]
+    with pytest.raises(ValueError):
+        runner.verify_plans(mixed, 2)
+    tampered = deepcopy(good)
+    tampered[0]["weights"] = other
+    with pytest.raises(ValueError):
+        runner.verify_plans(tampered, 2)
+
+
+def test_actual_subprocess_shards_with_committed_weights_join(tmp_path):
+    paths = synthetic_suite(tmp_path)
+    (tmp_path / "weights.json").write_text(json.dumps({paths[0]: 90_000, paths[1]: 1}))
+    for index in range(3):
+        result = run(tmp_path, "--shard-index", str(index), "--shard-count", "3",
+                     "--weights", "weights.json", "--plan-path", f"plans/test-plan-{index}.json")
+        assert result.returncode == 0, result.stdout + result.stderr
+    assert sorted((tmp_path / "executed").read_text().splitlines()) == sorted(paths)
+    result = run(tmp_path, "--verify-plans", "plans", "--shard-count", "3", "--weights", "weights.json")
+    assert result.returncode == 0, result.stdout + result.stderr
+    (tmp_path / "weights.json").write_text(json.dumps({paths[0]: 1}))
+    result = run(tmp_path, "--verify-plans", "plans", "--shard-count", "3", "--weights", "weights.json")
+    assert result.returncode != 0
+
+
+UPDATER = SCRIPT.with_name("update_ci_test_durations.py")
+updater_spec = importlib.util.spec_from_file_location("ci_test_durations", UPDATER)
+updater = importlib.util.module_from_spec(updater_spec)
+updater_spec.loader.exec_module(updater)
+
+
+def junit(path, cases):
+    path.write_text("<testsuites><testsuite>" + "".join(
+        f'<testcase classname="{classname}" name="t{index}" time="{seconds}"/>'
+        for index, (classname, seconds) in enumerate(cases)) + "</testsuite></testsuites>")
+    return path
+
+
+def test_stale_weight_check_warns_without_ever_failing_or_writing(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    for file in ("tests/unit/test_a.py", "tests/unit/test_b.py", "tests/unit/test_new.py"):
+        (tmp_path / file).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / file).write_text("")
+    weights = tmp_path / "weights.json"
+    weights.write_text(json.dumps({"tests/unit/test_a.py": 100_000, "tests/unit/test_b.py": 10_000}))
+    reports = [junit(tmp_path / "junit-0.xml", [("tests.unit.test_a", 140), ("tests.unit.test_b", 30)]),
+               junit(tmp_path / "junit-1.xml", [("tests.unit.test_new.TestX", 50)])]
+    before = weights.read_text()
+    assert updater.main(["--check", str(weights), *map(str, reports)]) == 0
+    output = capsys.readouterr().out
+    # 140s against 100s is within 1.5x and 30s against 10s is within 30s: quiet.
+    assert "test_a.py" not in output and "test_b.py" not in output
+    assert "::warning title=Stale CI shard weights::tests/unit/test_new.py has no committed" in output
+    assert "junit-0.xml=170 junit-1.xml=50" in output
+    junit(reports[0], [("tests.unit.test_a", 151), ("tests.unit.test_b", 41)])
+    assert updater.main(["--check", str(weights), *map(str, reports)]) == 0
+    output = capsys.readouterr().out
+    assert "tests/unit/test_a.py took 151s against a committed weight of 100s" in output
+    assert "tests/unit/test_b.py took 41s against a committed weight of 10s" in output
+    assert weights.read_text() == before
+
+
+@pytest.mark.parametrize("report", ["<not-xml", '<testcase classname="tests.unit.gone" time="1"/>', None])
+def test_stale_weight_check_reports_unreadable_input_as_a_warning(tmp_path, monkeypatch, capsys, report):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "weights.json").write_text("{}")
+    path = tmp_path / "junit-0.xml"
+    if report is not None:
+        path.write_text(report)
+    assert updater.main(["--check", "weights.json", str(path)]) == 0
+    assert capsys.readouterr().out.startswith("::warning title=CI shard weights::Could not compare")
+
+
+def test_weight_refresh_still_refuses_an_unmappable_report(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    report = junit(tmp_path / "junit-0.xml", [("tests.unit.gone", 1)])
+    with pytest.raises(SystemExit, match="Cannot map"):
+        updater.main([str(report), "--output", str(tmp_path / "out.json")])
+    assert not (tmp_path / "out.json").exists()

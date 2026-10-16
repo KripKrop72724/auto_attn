@@ -177,11 +177,14 @@ jobs:
   backend-tests:
     name: backend-tests (${{ matrix.shard }})
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        shard: [0, 1]
+        # Whole files are balanced by scripts/ci_test_durations.json. The
+        # backend join pins the same count: every plan records its count and
+        # must match, so a mismatch fails closed instead of skipping tests.
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
     services:
       postgres:
         image: postgres:16-alpine
@@ -224,21 +227,28 @@ jobs:
           python scripts/generate_ci_env.py /tmp/add-ci.env --github-env "$GITHUB_ENV"
           rm -f /tmp/add-ci.env
       - name: Run isolated test shard with whole-file coverage
-        run: python scripts/run_ci_tests.py --shard-index ${{ matrix.shard }} --shard-count 2 --plan-path .ci/test-plan-${{ matrix.shard }}.json
+        run: >-
+          python scripts/run_ci_tests.py
+          --shard-index ${{ matrix.shard }} --shard-count ${{ strategy.job-total }}
+          --weights scripts/ci_test_durations.json
+          --plan-path .ci/test-plan-${{ matrix.shard }}.json
+          --junit-path .ci/junit-${{ matrix.shard }}.xml
       - name: Preserve exact collection and shard assignment
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: backend-test-plan-${{ matrix.shard }}
-          path: .ci/test-plan-${{ matrix.shard }}.json
+          path: |
+            .ci/test-plan-${{ matrix.shard }}.json
+            .ci/junit-${{ matrix.shard }}.xml
           if-no-files-found: error
           retention-days: 7
 
-  backend:
-    # This exact required check cannot succeed until BOTH isolated test shards
-    # and their complete coverage proof succeed. Signing still requires it.
-    needs: [backend-tests]
-    if: always()
+  backend-static:
+    # Lint, contracts, migrations and packaging need no test results, so they
+    # start immediately and a lint failure is visible within minutes instead
+    # of after the test shards. The exact `backend` check below still cannot
+    # succeed unless this job succeeds.
     runs-on: ubuntu-latest
     timeout-minutes: 45
     services:
@@ -267,10 +277,6 @@ jobs:
       ADD_REDIS_URL: redis://127.0.0.1:6379/0
       ADD_ADMIN_COOKIE_SECURE: "false"
     steps:
-      - name: Require both test shards to succeed
-        env:
-          SHARD_RESULT: ${{ needs.backend-tests.result }}
-        run: test "$SHARD_RESULT" = success
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
@@ -290,13 +296,6 @@ jobs:
         run: python -m ruff check apps/add_backend apps/add_provisioner apps/provisioning_companion tests scripts firmware/zone_lite/tools/provision_zone_lite.py
       - name: Verify frontend OpenAPI safety contracts
         run: python scripts/check_frontend_openapi_contract.py
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: backend-test-plan-*
-          path: .ci
-          merge-multiple: true
-      - name: Verify every collected test belongs to exactly one successful shard
-        run: python scripts/run_ci_tests.py --verify-plans .ci --shard-count 2
       - name: Validate a fresh PostgreSQL migration and schema drift
         run: |
           alembic -c apps/add_backend/alembic.ini upgrade head
@@ -330,6 +329,40 @@ jobs:
           alembic -c apps/add_backend/alembic.ini check
       - name: Build Python distribution
         run: python -m build
+
+  backend:
+    # This exact required check cannot succeed until EVERY isolated test shard,
+    # their complete coverage proof, and every lint, contract, migration and
+    # packaging gate in backend-static succeed. Signing still requires it.
+    needs: [backend-tests, backend-static]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Require every test shard and every static gate to succeed
+        env:
+          SHARD_RESULT: ${{ needs.backend-tests.result }}
+          STATIC_RESULT: ${{ needs.backend-static.result }}
+        run: |
+          test "$SHARD_RESULT" = success
+          test "$STATIC_RESULT" = success
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: backend-test-plan-*
+          path: .ci
+          merge-multiple: true
+      - name: Verify every collected test belongs to exactly one successful shard
+        run: python scripts/run_ci_tests.py --verify-plans .ci --shard-count 8 --weights scripts/ci_test_durations.json
+      - name: Warn when the committed shard weights are stale
+        # Diagnostic only: it always exits 0 and runs after the coverage proof.
+        # Stale weights slow a shard down but never change which tests run.
+        run: python scripts/update_ci_test_durations.py --check scripts/ci_test_durations.json .ci/junit-*.xml
 
   frontend:
     runs-on: ubuntu-latest
@@ -365,9 +398,12 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
-  firmware:
+  firmware-production:
+    # The firmware parts run in parallel on separate runners. Each original
+    # build and its repeat stay on one runner, so every reproducibility proof
+    # still compares two independent builds of the same checkout and image.
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
         with:
@@ -423,6 +459,32 @@ jobs:
           bash -lc 'idf.py -B build-ci-hikvision -D SDKCONFIG=/tmp/zone-lite-ci-hikvision-sdkconfig -D ZONE_LITE_FAMILY=hikvision build'
       - name: Check Hikvision application family descriptor
         run: python3 scripts/check_firmware_identity.py firmware/zone_lite/build-ci-hikvision/zone_lite_hikvision.bin --family hikvision
+      - name: Record the ESP-IDF image digest this runner built with
+        run: docker image inspect espressif/idf:v5.5.3 --format '{{json .RepoDigests}}'
+      - name: Upload non-provisioned firmware build (best effort)
+        # The build above is the release gate. Artifact retention is convenient for
+        # diagnostics, but GitHub storage exhaustion must not block an unrelated ADD
+        # production deployment; signed firmware releases use the separate vault flow.
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: zone-lite-esp32s3-${{ github.sha }}
+          retention-days: 7
+          if-no-files-found: error
+          path: |
+            firmware/zone_lite/build-ci/bootloader/bootloader.bin
+            firmware/zone_lite/build-ci/partition_table/partition-table.bin
+            firmware/zone_lite/build-ci/ota_data_initial.bin
+            firmware/zone_lite/build-ci/zone_lite.bin
+            firmware/zone_lite/build-ci/flasher_args.json
+
+  firmware-journal:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: Compile gated ZKT journal writer (development only)
         run: >-
           docker run --rm
@@ -432,6 +494,28 @@ jobs:
           bash -lc 'idf.py -B build-ci-journal -D SDKCONFIG=/tmp/zone-lite-ci-journal-sdkconfig -D PROJECT_VER=2.7.0 -D ZONE_LITE_JOURNAL_WRITES=ON build'
       - name: Check candidate application identity
         run: python3 scripts/check_firmware_identity.py firmware/zone_lite/build-ci-journal/zone_lite.bin --family zkt --version 2.7.0
+      - name: Rebuild the writer at a different path and compare unsigned artifacts
+        env:
+          REPRO_VARIANT: journal
+          REPRO_VERSION: "2.7.0"
+        run: |
+          set -euo pipefail
+          docker image inspect espressif/idf:v5.5.3 --format '{{json .RepoDigests}}'
+          docker run --rm -e REPRO_VARIANT -e REPRO_VERSION \
+            -v "$GITHUB_WORKSPACE:/rebuild" -w /rebuild/firmware/zone_lite \
+            espressif/idf:v5.5.3 bash -lc \
+            'idf.py -B "build-ci-$REPRO_VARIANT-repeat" -D "SDKCONFIG=/tmp/repeat-$REPRO_VARIANT-sdkconfig" -D "PROJECT_VER=$REPRO_VERSION" -D ZONE_LITE_JOURNAL_WRITES=ON build'
+          python3 scripts/check_firmware_identity.py "firmware/zone_lite/build-ci-$REPRO_VARIANT-repeat/zone_lite.bin" --family zkt --version "$REPRO_VERSION"
+          python3 scripts/check_firmware_reproducibility.py \
+            "firmware/zone_lite/build-ci-$REPRO_VARIANT" "firmware/zone_lite/build-ci-$REPRO_VARIANT-repeat"
+
+  firmware-bridge:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: Compile capture-capable ZKT reader bridge (development only)
         run: >-
           docker run --rm
@@ -441,6 +525,35 @@ jobs:
           bash -lc 'idf.py -B build-ci-bridge -D SDKCONFIG=/tmp/zone-lite-ci-bridge-sdkconfig -D PROJECT_VER=2.6.23 -D ZONE_LITE_JOURNAL_WRITES=ON build'
       - name: Check bridge application identity
         run: python3 scripts/check_firmware_identity.py firmware/zone_lite/build-ci-bridge/zone_lite.bin --family zkt --version 2.6.23
+      - name: Check actual Xtensa startup stack budgets
+        run: >-
+          docker run --rm
+          -v "$GITHUB_WORKSPACE:/project"
+          -w /project
+          espressif/idf:v5.5.3
+          python3 scripts/check_zkt_startup_stack.py firmware/zone_lite/build-ci-bridge
+      - name: Rebuild the bridge at a different path and compare unsigned artifacts
+        env:
+          REPRO_VARIANT: bridge
+          REPRO_VERSION: "2.6.23"
+        run: |
+          set -euo pipefail
+          docker image inspect espressif/idf:v5.5.3 --format '{{json .RepoDigests}}'
+          docker run --rm -e REPRO_VARIANT -e REPRO_VERSION \
+            -v "$GITHUB_WORKSPACE:/rebuild" -w /rebuild/firmware/zone_lite \
+            espressif/idf:v5.5.3 bash -lc \
+            'idf.py -B "build-ci-$REPRO_VARIANT-repeat" -D "SDKCONFIG=/tmp/repeat-$REPRO_VARIANT-sdkconfig" -D "PROJECT_VER=$REPRO_VERSION" -D ZONE_LITE_JOURNAL_WRITES=ON build'
+          python3 scripts/check_firmware_identity.py "firmware/zone_lite/build-ci-$REPRO_VARIANT-repeat/zone_lite.bin" --family zkt --version "$REPRO_VERSION"
+          python3 scripts/check_firmware_reproducibility.py \
+            "firmware/zone_lite/build-ci-$REPRO_VARIANT" "firmware/zone_lite/build-ci-$REPRO_VARIANT-repeat"
+
+  firmware-roles:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: Compile one-shot ZKT storage recovery role
         run: >-
           docker run --rm
@@ -463,44 +576,28 @@ jobs:
         run: |
           python3 scripts/check_firmware_identity.py firmware/zone_lite/build-ci-direct/zone_lite.bin --family zkt --version 2.7.4
           python3 -c "import sys; d=open(sys.argv[1],'rb').read(); m=b'ZONE_STORAGE_CONTRACT_V2:LEGACY:READ=2:LANES=3F:BASE=2.4.12,2.5.2,2.6.6,2.6.7,2.6.8,2.6.9,2.6.10,2.6.12,2.6.13,2.6.14,2.6.15,2.7.2,2.7.3\0'; sys.exit(0 if d.count(m) == 1 and d.count(b'ZONE_STORAGE_CONTRACT_V') == 1 else 'direct contract marker is missing or ambiguous')" firmware/zone_lite/build-ci-direct/zone_lite.bin
-      - name: Check actual Xtensa startup stack budgets
-        run: >-
-          docker run --rm
-          -v "$GITHUB_WORKSPACE:/project"
-          -w /project
-          espressif/idf:v5.5.3
-          python3 scripts/check_zkt_startup_stack.py firmware/zone_lite/build-ci-bridge
-      - name: Rebuild the writer and bridge at different paths and compare unsigned artifacts
+      - name: Record the ESP-IDF image digest this runner built with
+        run: docker image inspect espressif/idf:v5.5.3 --format '{{json .RepoDigests}}'
+
+  firmware:
+    # This exact required check (HIL, signing and release gates match it by
+    # name) cannot succeed unless every firmware part above succeeded.
+    needs: [firmware-production, firmware-journal, firmware-bridge, firmware-roles]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require every firmware build, contract and reproducibility proof to succeed
+        env:
+          PRODUCTION_RESULT: ${{ needs.firmware-production.result }}
+          JOURNAL_RESULT: ${{ needs.firmware-journal.result }}
+          BRIDGE_RESULT: ${{ needs.firmware-bridge.result }}
+          ROLES_RESULT: ${{ needs.firmware-roles.result }}
         run: |
-          set -euo pipefail
-          docker image inspect espressif/idf:v5.5.3 --format '{{json .RepoDigests}}'
-          for variant in journal bridge; do
-            version=2.7.0
-            if [ "$variant" = bridge ]; then version=2.6.23; fi
-            docker run --rm -e REPRO_VARIANT="$variant" -e REPRO_VERSION="$version" \
-              -v "$GITHUB_WORKSPACE:/rebuild" -w /rebuild/firmware/zone_lite \
-              espressif/idf:v5.5.3 bash -lc \
-              'idf.py -B "build-ci-$REPRO_VARIANT-repeat" -D "SDKCONFIG=/tmp/repeat-$REPRO_VARIANT-sdkconfig" -D "PROJECT_VER=$REPRO_VERSION" -D ZONE_LITE_JOURNAL_WRITES=ON build'
-            python3 scripts/check_firmware_identity.py "firmware/zone_lite/build-ci-$variant-repeat/zone_lite.bin" --family zkt --version "$version"
-            python3 scripts/check_firmware_reproducibility.py \
-              "firmware/zone_lite/build-ci-$variant" "firmware/zone_lite/build-ci-$variant-repeat"
-          done
-      - name: Upload non-provisioned firmware build (best effort)
-        # The build above is the release gate. Artifact retention is convenient for
-        # diagnostics, but GitHub storage exhaustion must not block an unrelated ADD
-        # production deployment; signed firmware releases use the separate vault flow.
-        continue-on-error: true
-        uses: actions/upload-artifact@v4
-        with:
-          name: zone-lite-esp32s3-${{ github.sha }}
-          retention-days: 7
-          if-no-files-found: error
-          path: |
-            firmware/zone_lite/build-ci/bootloader/bootloader.bin
-            firmware/zone_lite/build-ci/partition_table/partition-table.bin
-            firmware/zone_lite/build-ci/ota_data_initial.bin
-            firmware/zone_lite/build-ci/zone_lite.bin
-            firmware/zone_lite/build-ci/flasher_args.json
+          test "$PRODUCTION_RESULT" = success
+          test "$JOURNAL_RESULT" = success
+          test "$BRIDGE_RESULT" = success
+          test "$ROLES_RESULT" = success
 
   oracle-projection:
     runs-on: ubuntu-latest
@@ -518,7 +615,9 @@ jobs:
         run: python3 tests/oracle/oracle_test_container.py stop --container zkt-oracle-ci
 
   containers:
-    needs: [repository-contract, windows-publication, backend, frontend, firmware, oracle-projection]
+    # Uses no artifact or result from another job, so it starts immediately.
+    # It remains one of the exact required checks, and Deploy ADD still runs
+    # only after the whole workflow, every job included, has succeeded.
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:

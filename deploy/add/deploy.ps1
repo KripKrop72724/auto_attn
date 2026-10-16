@@ -171,6 +171,17 @@ function Assert-DockerCapacity {
     }
 }
 
+function Write-DeployTiming {
+    param(
+        [Parameter(Mandatory = $true)][string] $Phase,
+        [Parameter(Mandatory = $true)][System.Diagnostics.Stopwatch] $Clock
+    )
+    # Phase names and durations only; never data, sizes or settings (the
+    # repository and its workflow logs are public).
+    $seconds = $Clock.Elapsed.TotalSeconds.ToString("0.0", [Globalization.CultureInfo]::InvariantCulture)
+    Write-Host "Deploy timing: phase=$Phase seconds=$seconds"
+}
+
 function Get-PostgresContainer {
     return Invoke-DockerProbe -Arguments ($compose + @("ps", "-q", "postgres"))
 }
@@ -783,14 +794,19 @@ try {
     $preRevision = Get-DatabaseRevision -DatabaseUser $dbUser -DatabaseName $dbName
     $databaseBackup = Join-Path $backupRoot "attendance-devices-$stamp.dump"
     $containerBackup = "/tmp/attendance-devices-$stamp.dump"
+    $phaseClock = [System.Diagnostics.Stopwatch]::StartNew()
     Invoke-Docker -Arguments ($compose + @(
         "exec", "-T", "postgres", "pg_dump", "-Fc", "-U", $dbUser,
         "-d", $dbName, "-f", $containerBackup
     ))
+    Write-DeployTiming -Phase "backup_pg_dump" -Clock $phaseClock
+    $phaseClock.Restart()
     Invoke-Docker -Arguments @("cp", "${postgresContainer}:$containerBackup", $databaseBackup)
     if (-not (Test-Path -LiteralPath $databaseBackup) -or (Get-Item $databaseBackup).Length -lt 100) {
         throw "The pre-deployment PostgreSQL backup is missing or invalid."
     }
+    Write-DeployTiming -Phase "backup_copy_to_host" -Clock $phaseClock
+    $phaseClock.Restart()
     $backupSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $databaseBackup).Hash
     $containerBackupHash = Invoke-Docker -Arguments @(
         "exec", $postgresContainer, "sha256sum", $containerBackup
@@ -799,17 +815,26 @@ try {
     if ($containerBackupDigest -notmatch '^[a-fA-F0-9]{64}$' -or $containerBackupDigest -ine $backupSha256) {
         throw "The saved PostgreSQL backup differs from the dump being restore-tested."
     }
+    Write-DeployTiming -Phase "backup_sha256_host_and_container" -Clock $phaseClock
+    $phaseClock.Restart()
     $backupVerifiedAt = Assert-DatabaseBackupRestorable -DatabaseUser $dbUser `
         -ContainerBackup $containerBackup -ExpectedRevision $preRevision
+    Write-DeployTiming -Phase "backup_restore_verification" -Clock $phaseClock
     Invoke-Docker -Arguments ($compose + @("exec", "-T", "postgres", "rm", "-f", $containerBackup))
 
     try {
+        $phaseClock.Restart()
         Invoke-Docker -Arguments ($compose + @("build", "--pull"))
+        Write-DeployTiming -Phase "image_build" -Clock $phaseClock
         $applicationStarted = $true
+        $phaseClock.Restart()
         Invoke-Docker -Arguments ($compose + @("up", "-d", "--remove-orphans", "--wait", "--wait-timeout", "240"))
+        Write-DeployTiming -Phase "compose_up_healthy" -Clock $phaseClock
+        $phaseClock.Restart()
         Wait-Endpoint -Uri "http://127.0.0.1:8096/health/ready"
         Wait-Endpoint -Uri "http://127.0.0.1:8095/health/ui"
         Assert-OrdsContainerAuthentication -AllowUnavailable:$allowDegradedOrds
+        Write-DeployTiming -Phase "local_endpoints_and_ords" -Clock $phaseClock
         $postRevision = Get-DatabaseRevision -DatabaseUser $dbUser -DatabaseName $dbName
         if (-not $postRevision) { throw "Alembic schema revision is unavailable after deployment." }
 

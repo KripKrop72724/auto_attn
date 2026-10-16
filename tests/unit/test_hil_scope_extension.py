@@ -4,6 +4,7 @@ from copy import deepcopy
 import importlib.util
 import json
 from pathlib import Path
+import re
 
 import pytest
 
@@ -217,3 +218,32 @@ def test_workflow_is_explicit_bounded_main_only_and_serialized_with_production()
         "-RequirePublishedHilRelease"
         in (ROOT / "deploy/add/extend-journal-hil-scope.ps1").read_text()
     )
+
+
+def test_every_exact_commit_ci_gate_requires_every_add_ci_check_by_name():
+    import yaml
+
+    # The ADD CI jobs no longer wait for one another (containers used to need
+    # all others), so a green check no longer implies any other check is green.
+    jobs = yaml.load(
+        (ROOT / ".github/workflows/add-ci.yml").read_text(), Loader=yaml.BaseLoader
+    )["jobs"]
+    assert all(check in jobs and "name" not in jobs[check] for check in helper.CHECKS)
+    gates = {
+        path.name: [line for line in path.read_text().splitlines() if "repository-contract" in line]
+        for path in sorted((ROOT / ".github/workflows").glob("*.yml"))
+        if "/check-runs" in path.read_text()
+    }
+    assert set(gates) == {
+        "factory-firmware-hil-candidate.yml",
+        "firmware-extend-2-6-0-hil.yml",
+        "firmware-hil-candidate.yml",
+    }
+    for name, lines in gates.items():
+        assert lines, name
+        for line in lines:
+            missing = [
+                check for check in helper.CHECKS
+                if not re.search(rf"(?<![\w-]){re.escape(check)}(?![\w-])", line)
+            ]
+            assert not missing, (name, missing)

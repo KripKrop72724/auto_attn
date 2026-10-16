@@ -16,11 +16,15 @@ function Assert-DatabaseBackupRestorable {
         $created = $true
         # Capture diagnostic text: pg_restore failures may include protected
         # row values. The caller receives only the failed command/exit code.
+        $restoreClock = [System.Diagnostics.Stopwatch]::StartNew()
         Invoke-Docker -Arguments ($compose + @(
             "exec", "-T", "postgres", "pg_restore", "-U", $DatabaseUser,
             "--exit-on-error", "--no-owner", "--dbname", $verificationDatabase,
             $ContainerBackup
         )) -Capture | Out-Null
+        $invariant = [Globalization.CultureInfo]::InvariantCulture
+        $restoreSeconds = $restoreClock.Elapsed.TotalSeconds.ToString("0.0", $invariant)
+        Write-Host "Deploy timing: phase=backup_pg_restore seconds=$restoreSeconds"
         $actualRevision = Get-DatabaseRevision -DatabaseUser $DatabaseUser -DatabaseName $verificationDatabase
         if ($ExpectedRevision -and $actualRevision -cne $ExpectedRevision) {
             throw "Restored backup schema revision does not match the pre-deployment revision."

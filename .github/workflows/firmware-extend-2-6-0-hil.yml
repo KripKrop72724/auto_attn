@@ -44,7 +44,7 @@ jobs:
           python3 - <<'PYCODE'
           import json
           checks = json.load(open('/tmp/hil-extension-checks.json'))['check_runs']
-          for name in ('repository-contract', 'windows-publication', 'firmware', 'backend', 'frontend', 'containers'):
+          for name in ('repository-contract', 'windows-publication', 'firmware', 'backend', 'frontend', 'oracle-projection', 'containers'):
               matching = [row for row in checks if row['name'] == name and row['app']['slug'] == 'github-actions']
               if not matching or max(matching, key=lambda row: row['id'])['conclusion'] != 'success':
                   raise SystemExit(f'Exact main commit is not green: {name}')
