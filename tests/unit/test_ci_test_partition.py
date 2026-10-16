@@ -123,3 +123,64 @@ def test_test_execution_refuses_collection_drift_before_running_any_test(tmp_pat
     assert result.returncode != 0
     assert "collection differs" in result.stderr
     assert not (tmp_path / "executed").exists()
+
+
+def test_duration_weights_balance_whole_files_without_changing_coverage():
+    collected = items({"tests/unit/test_slow.py": 2, "tests/unit/test_a.py": 9,
+                       "tests/unit/test_b.py": 8, "tests/firmware/test_new.py": 1})
+    weights = {"tests/unit/test_slow.py": 600_000, "tests/unit/test_a.py": 4_000,
+               "tests/unit/test_b.py": 3_000, "tests/unit/test_removed.py": 9_000}
+    shards = runner.partition(collected, 2, weights)
+    # The measured slow file is isolated; unmeasured files fall back to a count estimate.
+    assert shards == [["tests/unit/test_slow.py"],
+                      ["tests/firmware/test_new.py", "tests/unit/test_a.py", "tests/unit/test_b.py"]]
+    plans = [runner.make_plan(collected, index, 2, weights) for index in (0, 1)]
+    runner.verify_plans(plans, 2, weights)
+    assert sorted(file for plan in plans for file in plan["files"]) == sorted(
+        {item["file"] for item in collected})
+
+
+@pytest.mark.parametrize("weights", [{"tests/unit/test_a.py": 0, "tests/unit/test_b.py": 0},
+                                     {"tests/unit/test_a.py": 10**9}])
+def test_zero_or_extreme_weights_never_produce_an_empty_shard(weights):
+    collected = items({"tests/unit/test_a.py": 1, "tests/unit/test_b.py": 1})
+    assert all(runner.partition(collected, 2, weights))
+
+
+@pytest.mark.parametrize("weights", [[], {"tests/unit/test_a.py": -1},
+                                     {"tests/unit/test_a.py": 1.5}, {"tests/unit/test_a.py": True}])
+def test_invalid_weights_are_rejected(weights):
+    with pytest.raises(ValueError):
+        runner.partition(items({"tests/unit/test_a.py": 1}), 1, weights)
+
+
+def test_join_rejects_plans_balanced_with_different_or_uncommitted_weights():
+    collected = items({"tests/unit/test_a.py": 2, "tests/unit/test_b.py": 1, "tests/unit/test_c.py": 1})
+    committed = {"tests/unit/test_a.py": 10, "tests/unit/test_b.py": 20}
+    other = {"tests/unit/test_a.py": 30, "tests/unit/test_b.py": 20}
+    good = [runner.make_plan(collected, index, 2, committed) for index in (0, 1)]
+    runner.verify_plans(good, 2, committed)
+    with pytest.raises(ValueError, match="committed weights"):
+        runner.verify_plans(good, 2, other)
+    mixed = [good[0], runner.make_plan(collected, 1, 2, other)]
+    with pytest.raises(ValueError):
+        runner.verify_plans(mixed, 2)
+    tampered = deepcopy(good)
+    tampered[0]["weights"] = other
+    with pytest.raises(ValueError):
+        runner.verify_plans(tampered, 2)
+
+
+def test_actual_subprocess_shards_with_committed_weights_join(tmp_path):
+    paths = synthetic_suite(tmp_path)
+    (tmp_path / "weights.json").write_text(json.dumps({paths[0]: 90_000, paths[1]: 1}))
+    for index in range(3):
+        result = run(tmp_path, "--shard-index", str(index), "--shard-count", "3",
+                     "--weights", "weights.json", "--plan-path", f"plans/test-plan-{index}.json")
+        assert result.returncode == 0, result.stdout + result.stderr
+    assert sorted((tmp_path / "executed").read_text().splitlines()) == sorted(paths)
+    result = run(tmp_path, "--verify-plans", "plans", "--shard-count", "3", "--weights", "weights.json")
+    assert result.returncode == 0, result.stdout + result.stderr
+    (tmp_path / "weights.json").write_text(json.dumps({paths[0]: 1}))
+    result = run(tmp_path, "--verify-plans", "plans", "--shard-count", "3", "--weights", "weights.json")
+    assert result.returncode != 0
