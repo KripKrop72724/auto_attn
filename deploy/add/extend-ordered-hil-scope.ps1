@@ -1,6 +1,6 @@
 param(
     [Parameter(Mandatory = $true)][string]$StoreDirectory,
-    [Parameter(Mandatory = $true)][ValidateSet('2.5.4', '2.6.0', '2.6.15', '2.6.16', '2.6.17', '2.6.18', '2.6.19', '2.6.20', '2.6.21', '2.6.22', '2.6.23', '2.7.0')][string]$Version,
+    [Parameter(Mandatory = $true)][ValidateSet('2.5.4', '2.6.0', '2.6.15', '2.6.16', '2.6.17', '2.6.18', '2.6.19', '2.6.20', '2.6.21', '2.6.22', '2.6.23', '2.7.0', '2.7.4')][string]$Version,
     [Parameter(Mandatory = $true)][string]$ExpectedGitSha,
     [Parameter(Mandatory = $true)][string]$ExpectedImageSha256,
     [Parameter(Mandatory = $true)][string]$ExpectedApplicationSha256,
@@ -16,7 +16,7 @@ function Read-ExactTargets([string]$Json) {
     if (-not $Json.Trim().StartsWith('[')) { throw 'HIL targets must be a JSON array' }
     $parsed = ConvertFrom-Json -InputObject $Json
     $parsed = @($parsed)
-    $limit = if ($Version -in @('2.6.16', '2.6.17', '2.6.18', '2.6.19', '2.6.20', '2.6.21', '2.6.22', '2.6.23', '2.7.0')) { 17 } elseif ($Version -eq '2.6.15' -and $Scope2615 -eq 'Cities') { 14 } else { 8 }
+    $limit = if ($Version -eq '2.7.4') { 18 } elseif ($Version -in @('2.6.16', '2.6.17', '2.6.18', '2.6.19', '2.6.20', '2.6.21', '2.6.22', '2.6.23', '2.7.0')) { 17 } elseif ($Version -eq '2.6.15' -and $Scope2615 -eq 'Cities') { 14 } else { 8 }
     if ($parsed.Count -lt 1 -or $parsed.Count -gt $limit) { throw 'HIL target count exceeds its exact reviewed scope' }
     $targets = @()
     foreach ($row in $parsed) {
@@ -91,6 +91,13 @@ if ($Version -eq '2.6.15') {
         Assert-Zkt2615Bld5HilExtension @scopeArguments
     }
 }
+if ($Version -eq '2.7.4') {
+    # Only the reviewed ZONE-BLD9-01 K50, appended to the signed nationwide 17.
+    . (Join-Path $PSScriptRoot 'firmware-2-7-4-bld9-k50-hil-scope.ps1')
+    Assert-Zkt274Bld9K50HilExtension -ExpectedGitSha $ExpectedGitSha -ExpectedImageSha256 $ExpectedImageSha256 `
+        -ExpectedApplicationSha256 $ExpectedApplicationSha256 -ExistingTargetsJson $ExistingTargetsJson `
+        -ExtendedTargetsJson $ExtendedTargetsJson
+}
 if ($extendedTargets.Count -le $existingTargets.Count) { throw 'HIL extension must append targets' }
 for ($index = 0; $index -lt $existingTargets.Count; $index++) {
     foreach ($field in @('connector_id', 'mac', 'terminal_serial')) {
@@ -115,6 +122,14 @@ if ($Version -in @('2.6.16', '2.6.17', '2.6.18', '2.6.19', '2.6.20', '2.6.21', '
     if ($manifest.release_channel -cne 'EXPERIMENTAL_HIL_ONLY') { throw 'Journal HIL release channel changed' }
     Assert-JournalHilScope -TargetsJson (ConvertTo-Json -InputObject $manifest.hil_targets -Depth 5 -Compress) -Complete
 }
+if ($Version -eq '2.7.4') {
+    if ($manifest.release_id -cne 'zone-lite-2.7.4' -or $manifest.firmware_family -cne 'zkt') {
+        throw 'Published 2.7.4 release identity differs from the reviewed K50 extension'
+    }
+    foreach ($name in @('.revoked', '.revoked.json')) {
+        if (Test-Path -LiteralPath (Join-Path $release $name)) { throw 'Revoked release marker present' }
+    }
+}
 if ($Version -eq '2.7.0') {
     & python (Join-Path $PSScriptRoot '../../scripts/build_zkt_reader_matrix.py') --validate-manifest $manifestPath
     if ($LASTEXITCODE -ne 0) { throw 'Writer expansion requires the exact populated reader matrix' }
@@ -124,6 +139,9 @@ if ($Version -eq '2.6.22') {
     if ($LASTEXITCODE -ne 0) { throw 'Factory trial manifest or expansion is invalid' }
 }
 $marker = Get-Content -LiteralPath $markerPath -Raw | ConvertFrom-Json
+if ($Version -eq '2.7.4' -and ($marker.revoked_at -or $marker.revoked -or ($marker.state -and $marker.state -cne 'HIL_ONLY'))) {
+    throw 'Revoked or unsupported HIL marker state'
+}
 if ($manifest.version -cne $Version -or $manifest.firmware_family -eq 'hikvision' -or
     $manifest.git_sha -cne $ExpectedGitSha -or
     $manifest.image_sha256 -cne $ExpectedImageSha256 -or

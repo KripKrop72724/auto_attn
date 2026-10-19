@@ -42,6 +42,7 @@ from zk_add.storage_recovery import (
     validate_recovery_image,
 )
 from zk_add.models import Connector, DeviceTelemetry, utc_column
+from zk_add import zkt274_bld9_k50 as bld9_k50
 from zk_add.settings import settings
 from zk_add.terminal_families import require_family_match, release_family, require_production_qualification
 from zk_add.time_utils import ensure_utc, utc_now
@@ -316,6 +317,11 @@ def _parse_release_hil_targets(identity: tuple, raw: Any) -> list[HilTarget]:
         return bridge_hil_targets(raw)
     if identity[1] in RECOVERY_RELEASE_IDS and identity[0] == RECOVERY_RELEASE_IDS[identity[1]]:
         return recovery_hil_targets(raw)
+    # Only the exact signed 2.7.4 bytes may append the one reviewed K50 to the
+    # signed nationwide 17. Every other platform scope stays a strict prefix.
+    k50_targets = bld9_k50.exposure(identity, raw)
+    if k50_targets is not None:
+        return k50_targets
     if identity[1] in FLEET_PLATFORM_VERSIONS and identity[0] == f"zone-lite-{identity[1]}":
         from zk_add.zkt_bridge_contract import bridge_hil_targets
         return bridge_hil_targets(raw)
@@ -352,8 +358,8 @@ def _permitted_hil_targets(session: Session, release: FirmwareRelease) -> list[H
         validate_storage_contract(release.manifest or {}, release.version)
         if release.state != "HIL_ONLY" or release.release_id != f"zone-lite-{release.version}":
             raise ValueError("The 2.7 platform is restricted to its exact HIL-only release.")
-        from zk_add.zkt_bridge_contract import bridge_hil_targets
-        return bridge_hil_targets(raw)
+        return _parse_release_hil_targets((release.release_id, release.version, release.git_sha,
+                                           release.image_sha256, _application_sha256(release)), raw)
     bridge = release.version in {"2.6.16", "2.6.17", "2.6.18", "2.6.19", "2.6.20", "2.6.21", "2.6.22", "2.6.23", "2.7.0"}
     if not settings.firmware_hil_enabled or (not bridge and not settings.firmware_hil_targets_json):
         raise ValueError("Ordered firmware HIL quarantine is disabled.")
@@ -447,6 +453,12 @@ def _factory_3fl_bridge_target(release: FirmwareRelease, zone_id: str) -> HilTar
         if release.state != "AVAILABLE" or identity != SIGNED_BRIDGE_IDENTITIES[city_predecessor[2]]:
             raise ValueError("The city factory bridge requires the exact published signed image.")
         return CITY_TARGETS[zone_id]
+    if zone_id == bld9_k50.ZONE and release.release_id == bld9_k50.BRIDGE_IDENTITY[0]:
+        identity = (release.release_id, release.version, release.git_sha,
+                    release.image_sha256, _application_sha256(release))
+        if release.state != "AVAILABLE" or identity != bld9_k50.BRIDGE_IDENTITY:
+            raise ValueError("The ZONE-BLD9-01 factory bridge requires the exact published signed 2.4.12 image.")
+        return bld9_k50.TARGET
     if zone_id != FACTORY_3FL_BRIDGE_ZONE or release.release_id != "zone-lite-2.5.2":
         return None
     identity = (
@@ -463,7 +475,8 @@ def _factory_3fl_bridge_exclusion(connector: Connector, target: HilTarget) -> st
         return "BRIDGE_EXACT_IDENTITY_MISMATCH"
     if not connector.connected:
         return "BRIDGE_TARGET_OFFLINE"
-    predecessor = CITY_FACTORY_PREDECESSORS.get(connector.zone_id)
+    predecessor = (bld9_k50.FACTORY_PREDECESSOR if connector.zone_id == bld9_k50.ZONE
+                   else CITY_FACTORY_PREDECESSORS.get(connector.zone_id))
     version, digest = predecessor[:2] if predecessor else ("2.4.12", DIRECT_BASELINE_IMAGES["2.4.12"])
     if (not _versions_match(connector.firmware_version, version)
             or connector.ota_running_partition != "factory"
@@ -719,6 +732,9 @@ def _campaign_scope(
             reason = "FIRMWARE_FAMILY_MISMATCH"
         if permitted_targets and not any(target_matches(target, connector) for target in permitted_targets):
             reason = "HIL_EXACT_IDENTITY_MISMATCH"
+        elif permitted_targets and not any(bld9_k50.admits(target, connector) for target in permitted_targets):
+            # The reviewed ZONE-BLD9-01 K50 is a 2.7.4 target only in that zone.
+            reason = "HIL_TARGET_ZONE_MISMATCH"
         if bridge_target:
             reason = _factory_3fl_bridge_exclusion(connector, bridge_target) or reason
         if not reason:
@@ -734,7 +750,7 @@ def _campaign_scope(
             eligible = [row for row in eligible if row.hardware_id.lower() == hil_target_mac]
         else:
             eligible = [row for row in eligible if any(
-                target_matches(target, row) for target in permitted_targets
+                bld9_k50.admits(target, row) for target in permitted_targets
             )]
         if len(eligible) != 1:
             if permitted_targets is not None:
@@ -1132,7 +1148,7 @@ def assignment_for_connector(session: Session, *, connector: Connector, public_b
         except ValueError:
             return None
         if permitted_targets:
-            if not any(target_matches(target, connector) for target in permitted_targets):
+            if not any(bld9_k50.admits(target, connector) for target in permitted_targets):
                 return None
         else:
             target = str((release.manifest or {}).get("_hil_target_mac") or "").lower()
@@ -1153,7 +1169,7 @@ def assignment_for_connector(session: Session, *, connector: Connector, public_b
         except ValueError:
             return None
     if pending_offer:
-        hold = pending_offer_hold(session, connector)
+        hold = pending_offer_hold(session, connector, release)
         if hold:
             deployment.error_code = hold
             deployment.error_message = "Waiting for the nationwide ZKT upgrade slot and exact target checks."
@@ -1780,7 +1796,7 @@ def resolve_download(session: Session, token: str) -> tuple[FirmwareRelease, Pat
         connector = session.get(Connector, grant.connector_id)
         permitted_targets = _permitted_hil_targets(session, release)
         if permitted_targets:
-            if connector is None or not any(target_matches(item, connector) for item in permitted_targets):
+            if connector is None or not any(bld9_k50.admits(item, connector) for item in permitted_targets):
                 raise ValueError("HIL firmware grant exact target mismatch.")
         else:
             if not settings.firmware_hil_enabled or not target or target != configured:

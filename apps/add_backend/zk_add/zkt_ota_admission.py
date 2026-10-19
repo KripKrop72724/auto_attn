@@ -93,8 +93,9 @@ def try_assignment_lock(session, connector):
                                {"namespace": LOCK_NAMESPACE, "key": LOCK_KEY}))
 
 
-def pending_offer_hold(session, connector):
+def pending_offer_hold(session, connector, release=None):
     from zk_add.ota import FirmwareRelease
+    from zk_add.zkt274_bld9_k50 import offer_location, reserved_location
 
     if connector.firmware_family != "zkt":
         return None
@@ -103,8 +104,14 @@ def pending_offer_hold(session, connector):
     if journal_release is None:
         return None
     target = BY_ID.get(connector.connector_id)
-    if target is None or not target_matches(target.identity, connector):
-        return "NATIONWIDE_EXACT_TARGET_REQUIRED"
+    if target is not None and target_matches(target.identity, connector):
+        location = target.location
+    else:
+        # Outside the 17, only the one reviewed K50 with its exact signed 2.4.12
+        # bridge or 2.7.4 may queue for a slot, under the same limits.
+        location = offer_location(release, connector)
+        if location is None:
+            return "NATIONWIDE_EXACT_TARGET_REQUIRED"
     if not connector.connected:
         return "NATIONWIDE_TARGET_OFFLINE"
     # Paused campaigns, offline connectors and any older ZKT image still occupy
@@ -119,8 +126,9 @@ def pending_offer_hold(session, connector):
         return "NATIONWIDE_TWO_UPGRADE_RESERVATIONS"
     for connector_id in sorted(occupied):
         other = BY_ID.get(connector_id)
-        if other is None:
+        other_location = other.location if other is not None else reserved_location(connector_id)
+        if other_location is None:
             return "NATIONWIDE_ACTIVE_LOCATION_UNKNOWN"
-        if other.location == target.location:
+        if other_location == location:
             return "NATIONWIDE_LOCATION_BUSY"
     return None

@@ -185,3 +185,20 @@ def test_factory_bridge_rejects_unreviewed_release_and_target(city_session, chan
     else:
         with pytest.raises(ValueError, match="BRIDGE_EXACT_IDENTITY_MISMATCH"):
             preview_campaign_scope(session, release_public_id=bridge.release_id, zone_id=zone)
+
+
+def test_bld9_k50_bridge_stays_outside_the_city_cohort():
+    from zk_add import zkt274_bld9_k50 as bld9_k50
+    from zk_add.legacy_bld5_bridge import BRIDGE_TARGETS
+    assert bld9_k50.ZONE not in CITY_TARGETS and bld9_k50.ZONE not in CITY_FACTORY_PREDECESSORS
+    assert bld9_k50.TARGET not in HIL_2615_CITY_TARGETS and len(HIL_2615_CITY_TARGETS) == 14
+    assert bld9_k50.BRIDGE_IDENTITY == SIGNED_BRIDGE_IDENTITIES["2.4.12"]
+    assert bld9_k50.FACTORY_PREDECESSOR == (
+        "2.5.2", "c8c4356bb6a7fd4dc781e893ad5290593599b2d167be30c271bd1d5db61934f1", "2.4.12")
+    # The legacy 2.4.12 progress adapter: BLD5, both Lahore devices and the K50.
+    assert set(BRIDGE_TARGETS) == {"LF-ZONE-BLD5-01", "ZONE-LAHORE-01", "ZONE-LAHORE-02", bld9_k50.ZONE}
+    assert BRIDGE_TARGETS[bld9_k50.ZONE] == bld9_k50.TARGET
+    # The 2.6.15 city exposure cannot carry it.
+    rows = [row.model_dump() for row in (*HIL_2615_CITY_TARGETS, bld9_k50.TARGET)]
+    with pytest.raises(ValueError):
+        _parse_release_hil_targets(HIL_2615_BLD5_IDENTITY, rows)

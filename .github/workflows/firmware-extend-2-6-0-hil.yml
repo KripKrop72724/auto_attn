@@ -8,9 +8,9 @@ on:
         required: true
         default: '2.6.0'
         type: choice
-        options: ['2.6.0', '2.6.15-bld5', '2.6.15-cities']
+        options: ['2.6.0', '2.6.15-bld5', '2.6.15-cities', '2.7.4-bld9-k50-preview', '2.7.4-bld9-k50']
       confirmation:
-        description: Type EXTEND-2.6.0-HIL, EXTEND-2.6.15-BLD5-HIL, or EXTEND-2.6.15-CITIES-HIL
+        description: Type EXTEND-2.6.0-HIL, EXTEND-2.6.15-BLD5-HIL, EXTEND-2.6.15-CITIES-HIL, PREVIEW-2.7.4-BLD9-K50-HIL, or EXTEND-2.7.4-BLD9-K50-HIL
         required: true
         type: string
 
@@ -38,6 +38,8 @@ jobs:
             2.6.0) test "$CONFIRMATION" = 'EXTEND-2.6.0-HIL' ;;
             2.6.15-bld5) test "$CONFIRMATION" = 'EXTEND-2.6.15-BLD5-HIL' ;;
             2.6.15-cities) test "$CONFIRMATION" = 'EXTEND-2.6.15-CITIES-HIL' ;;
+            2.7.4-bld9-k50-preview) test "$CONFIRMATION" = 'PREVIEW-2.7.4-BLD9-K50-HIL' ;;
+            2.7.4-bld9-k50) test "$CONFIRMATION" = 'EXTEND-2.7.4-BLD9-K50-HIL' ;;
             *) exit 1 ;;
           esac
           gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/check-runs?per_page=100" > /tmp/hil-extension-checks.json
@@ -52,6 +54,11 @@ jobs:
 
   extend:
     needs: provenance
+    # The deployed-ADD checks and the marker change must observe one backend.
+    # Share the production deployment lock so a backend replacement cannot race them.
+    concurrency:
+      group: add-production
+      cancel-in-progress: false
     runs-on: [self-hosted, Windows, X64]
     environment: firmware-production
     timeout-minutes: 10
@@ -130,3 +137,13 @@ jobs:
           }
           ./deploy/add/extend-ordered-hil-scope.ps1 @arguments -PreviewOnly
           ./deploy/add/extend-ordered-hil-scope.ps1 @arguments
+      - name: Preview or extend only the ZONE-BLD9-01 K50 quarantine marker of the immutable 2.7.4 image
+        if: inputs.scope == '2.7.4-bld9-k50-preview' || inputs.scope == '2.7.4-bld9-k50'
+        env:
+          RELEASE_SCOPE: ${{ inputs.scope }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not $env:ADD_FIRMWARE_STORE_HOST_PATH) { throw 'Production firmware store is not configured' }
+          . ./deploy/add/firmware-2-7-4-bld9-k50-hil-scope.ps1
+          $mode = if ($env:RELEASE_SCOPE -ceq '2.7.4-bld9-k50') { 'apply' } else { 'preview' }
+          Invoke-Zkt274Bld9K50HilExtension -StoreDirectory $env:ADD_FIRMWARE_STORE_HOST_PATH -Mode $mode

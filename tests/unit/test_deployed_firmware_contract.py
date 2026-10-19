@@ -374,3 +374,71 @@ def test_imported_catalog_prefix_transition_is_explicit_and_never_mutated(
             session.commit()
         with pytest.raises(ValueError):
             checker.require_published_hil(manifest, signature, new_marker, 1)
+
+
+def test_deployed_check_admits_the_bld9_k50_marker_only_over_the_published_17(
+    package, published_release_database
+):
+    """The workflow's real deployed-ADD gate for the ZONE-BLD9-01 K50 2.7.4 marker."""
+    from sqlalchemy import select
+    from zk_add.zkt274_bld9_k50 import RELEASE_IDENTITY, exposed_targets
+
+    manifest, write, _ = package
+    release_id, version, git_sha, image_sha256, application_sha256 = RELEASE_IDENTITY
+    # 2.7.x manifests carry no signed hil_targets; the marker is the scope authority.
+    del manifest["hil_targets"]
+
+    def publish(value, targets):
+        paths = write(value)
+        signature = paths[1].read_text().strip()
+        maker, Release = published_release_database
+        with maker() as session:
+            session.query(Release).delete()
+            session.add(Release(
+                release_id=value["release_id"], version=value["version"], git_sha=value["git_sha"],
+                image_sha256=value["image_sha256"], image_size=1380352, signing_key_id="key",
+                partition_layout="test", storage_name="2.7.4",
+                manifest={**value, "_publication_mode": "HIL_ONLY", "_hil_target_mac": "",
+                          "_hil_targets": targets},
+                manifest_signature=signature, state="HIL_ONLY"))
+            session.commit()
+        return signature
+
+    def marker(value, targets):
+        return {"schema_version": 2, "targets": targets, **{
+            key: value[key] for key in ("version", "git_sha", "image_sha256", "application_sha256")}}
+
+    manifest.update(release_id=release_id, version=version, git_sha=git_sha, image_sha256=image_sha256,
+                    application_sha256=application_sha256, image_size=1380352, signing_key_id="key")
+    signed, extended = signed_hil_targets(), exposed_targets()
+    assert len(signed) == 17 and extended[:17] == signed and len(extended) == 18
+    signature = publish(manifest, signed)
+    # Step 1: the published 17 are current.
+    assert checker.require_published_hil(manifest, signature, marker(manifest, signed)) == "CATALOG_CURRENT"
+    # Step 3 (preview) and step 4 (after the marker is replaced): only over exactly 17.
+    candidate = marker(manifest, extended)
+    assert checker.require_published_hil(manifest, signature, candidate, 17) == "CATALOG_REFRESH_PENDING"
+    for previous in (0, 16, 18):
+        with pytest.raises(ValueError):
+            checker.require_published_hil(manifest, signature, candidate, previous)
+    # Anything but the exact 18 is refused, whatever the previous count.
+    for targets in ([*signed[:16], extended[17]], [extended[17], *signed],
+                    [*signed, {**extended[17], "terminal_serial": "OTHER"}], [*extended, signed[0]]):
+        with pytest.raises(ValueError):
+            checker.require_published_hil(manifest, signature, marker(manifest, targets), 17)
+    # After ADD's next catalog read refreshes the row, the 18 are current.
+    maker, Release = published_release_database
+    with maker() as session:
+        row = session.scalar(select(Release))
+        row.manifest = {**row.manifest, "_hil_targets": extended}
+        session.commit()
+    assert checker.require_published_hil(manifest, signature, candidate, 17) == "CATALOG_CURRENT"
+    # Another published identity keeps the strict nationwide prefix: its 17 are
+    # current, but the same 18-target marker is refused.
+    for changes in ({"git_sha": "0" * 40}, {"image_sha256": "0" * 64}, {"application_sha256": "0" * 64},
+                    {"release_id": "zone-lite-2.7.3", "version": "2.7.3"}):
+        other = {**manifest, **changes}
+        other_signature = publish(other, signed)
+        assert checker.require_published_hil(other, other_signature, marker(other, signed)) == "CATALOG_CURRENT"
+        with pytest.raises(ValueError):
+            checker.require_published_hil(other, other_signature, marker(other, extended), 17)

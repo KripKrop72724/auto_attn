@@ -6,6 +6,15 @@ exposure marker of an already published experimental `2.6.23`, `2.6.22`, or
 HIL pass. ADD retains its first-canary, qualified-reader, factory-trial,
 reservation, revocation, concurrency, and per-device health requirements.
 
+## Outside the nationwide inventory
+
+This workflow cannot add a device outside the tracked inventory. The ZONE-BLD9-01
+K50 exposure of `2.7.4` is a separate, reviewed exposure in
+`firmware-extend-2-6-0-hil.yml` (scopes `2.7.4-bld9-k50-preview` and
+`2.7.4-bld9-k50`). It appends that one device after the signed 17 for those
+exact bytes only; the nationwide denominator remains 17. See
+[zone-lite-2.7.4-hil.md](zone-lite-2.7.4-hil.md).
+
 ## Review and preview
 
 Run the workflow from current `main`, with all required CI checks successful.
