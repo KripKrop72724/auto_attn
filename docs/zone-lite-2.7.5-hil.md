@@ -71,11 +71,11 @@ Not yet measured on a device; P06 measures it first. What is known:
 
 | What | Value | Source |
 |---|---|---|
-| Clean 8 MiB store at 70% used | about 5 s of flash I/O per boot (about 39 MiB read, mostly the check), plus CPU | flash-cost model over the host harness's operation counts (third boot review) |
+| Clean 8 MiB store at 70% used | about 5 s of flash I/O per boot (about 39 MiB read), plus CPU | flash-cost model over the host harness's operation counts (third boot review) |
 | Worst damaged 8 MiB store in the harness | about 26 s of flash I/O, with worst-case 400 ms erases | same model |
 | Engine CPU, most damaged file | 422 ms per repair on the host (3.7 M steps, under sanitizers) | review run `cpu`; capped at 512 steps per page in every harness run |
 | Largest repair | 4.9 M HAL operations of a 10.4 M cap at 8 MiB | harness, fourth pass |
-| First check pass before any is measured | budgeted at 4 s per MiB with the metadata mirror (8 s without) plus 15 s: about 47 s for 8 MiB | `time_for_check`; a pass starts only if it and its restore fit before the soft deadline |
+| A check pass, as the engine budgets it | 4 s per MiB with the metadata mirror (8 s without; 32 s for 8 MiB), plus 15 s and the held bytes at 64 KiB/s for the restore after it; a later pass of the same run uses the measured one plus a quarter | `time_for_check`: a pass starts only if it and its restore fit before the soft deadline |
 
 The repair runs before Wi-Fi starts, so every boot (OTA restart, power-up or
 any other reset) is offline in ADD for `duration_ms` longer than before; the
