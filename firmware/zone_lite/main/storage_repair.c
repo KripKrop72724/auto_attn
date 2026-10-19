@@ -307,6 +307,21 @@ void storage_repair_note_damage(int error)
     nvs_close(handle);
 }
 
+/* The app a reset of the unconfirmed running image returns to. The
+ * bootloader marks the running entry ABORTED and boots the other otadata
+ * entry unless it is missing, INVALID or ABORTED
+ * (bootloader_common_ota_select_valid); then the factory app. */
+static const esp_partition_t *rollback_partition(const esp_partition_t *running)
+{
+    const esp_partition_t *other = esp_ota_get_next_update_partition(NULL);
+    esp_ota_img_states_t state;
+    if (other && running && other->address != running->address &&
+        esp_ota_get_state_partition(other, &state) == ESP_OK && state != ESP_OTA_IMG_INVALID &&
+        state != ESP_OTA_IMG_ABORTED && state != ESP_OTA_IMG_PENDING_VERIFY)
+        return other;
+    return esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_FACTORY, NULL);
+}
+
 static srr_config_t boot_config(void)
 {
     srr_config_t config = {0};
@@ -325,10 +340,13 @@ static srr_config_t boot_config(void)
     config.previous_failed = s_previous_known && (s_previous_deadline || (crash && !s_previous_returned));
     const esp_app_desc_t *app = esp_app_get_description();
     if (app) memcpy(&config.image_tag, app->app_elf_sha256, sizeof(config.image_tag));
-    /* An unconfirmed image's reset returns to the other slot's image; a
-     * manifest records it, so that image (when it runs this repair too)
-     * resumes the manifest as its own rather than as a stale one. */
-    const esp_partition_t *previous = config.pending_verify ? esp_ota_get_next_update_partition(NULL) : NULL;
+    /* An unconfirmed image's reset returns to the image the bootloader picks
+     * next: the other OTA slot when an otadata entry still selects it,
+     * otherwise the factory app (ESP-IDF 5.5.3 bootloader_utility.c; the
+     * first OTA after a factory flash has no other entry). A manifest records
+     * it, so that image (when it runs this repair too) resumes the manifest
+     * as its own rather than as a stale one. */
+    const esp_partition_t *previous = config.pending_verify ? rollback_partition(running) : NULL;
     esp_app_desc_t description;
     if (previous && running && previous->address != running->address &&
         esp_ota_get_partition_description(previous, &description) == ESP_OK)

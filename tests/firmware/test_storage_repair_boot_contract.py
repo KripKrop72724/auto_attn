@@ -103,3 +103,22 @@ def test_command_inbox_waits_for_storage_and_reports_go_through_the_outbox_task(
     # The evidence buffers live in PSRAM, not on the outbox task's stack.
     assert "char generation[80], record[120], raw[512];" not in glue.replace("    char generation[80], record[120], raw[512];\n} sr_send_t;", "")
     assert "if (!storage_repair_append(storage)) goto failed;" in connector
+
+
+def test_rollback_tag_names_the_image_the_bootloader_returns_to() -> None:
+    # A reset of an unconfirmed image boots the other otadata entry only while
+    # the bootloader still accepts it (bootloader_common_ota_select_valid:
+    # not INVALID, not ABORTED); otherwise, as on the first OTA after a
+    # factory flash (the CI flash writes the factory slot), the factory app.
+    glue = (MAIN / "storage_repair.c").read_text()
+    pick = _body(glue, "static const esp_partition_t *rollback_partition(const esp_partition_t *running)")
+    assert "esp_ota_get_state_partition(other, &state) == ESP_OK" in pick
+    for rejected in ("ESP_OTA_IMG_INVALID", "ESP_OTA_IMG_ABORTED", "ESP_OTA_IMG_PENDING_VERIFY"):
+        assert f"state != {rejected}" in pick
+    assert pick.index("return other;") < pick.index(
+        "esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_FACTORY, NULL)")
+    config = _body(glue, "static srr_config_t boot_config(void)")
+    assert "rollback_partition(running)" in config
+    assert "esp_ota_get_next_update_partition" not in config
+    partitions = (ROOT / "firmware/zone_lite/partitions.csv").read_text()
+    assert re.search(r"^factory,\s*app,\s*factory,", partitions, re.M)
