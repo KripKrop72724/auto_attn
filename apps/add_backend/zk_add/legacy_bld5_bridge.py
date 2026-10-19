@@ -119,9 +119,10 @@ def _stored_capability_evidence(
     boot. The fields belong to this boot only when every other writer is
     excluded: the offer and every download grant of a factory-gated bridge
     required the factory predecessor in them, the factory image itself staged
-    2.4.12 after the offer, every bridge event of this deployment comes from
-    this boot after that staging, and the boot before this one and every other
-    boot heard since the offer ran the predecessor version.
+    2.4.12 after the offer, this boot was first heard after that staging, every
+    bridge event of this deployment comes from this boot after that staging,
+    and the boot before this one and every other boot heard since the offer
+    ran the predecessor version.
     """
     predecessor = FACTORY_PREDECESSORS.get(connector.zone_id)
     try:
@@ -150,6 +151,13 @@ def _stored_capability_evidence(
         (event.details or {}).get("boot_id") != boot_id or event.id < staged.id for event in events
     ):
         return None
+    # The factory image reboots only after ADD has recorded its staging, so
+    # the 2.4.12 boot that staging started cannot have been heard before it.
+    first = session.scalar(select(DeviceTelemetry).where(
+        DeviceTelemetry.connector_id == connector.id, DeviceTelemetry.boot_id == boot_id,
+    ).order_by(DeviceTelemetry.created_at, DeviceTelemetry.id).limit(1))
+    if first is None or ensure_utc(first.created_at) < ensure_utc(staged.created_at):
+        return None
     other_boot = or_(DeviceTelemetry.boot_id.is_(None), DeviceTelemetry.boot_id != boot_id)
     previous = session.scalar(select(DeviceTelemetry).where(
         DeviceTelemetry.connector_id == connector.id, other_boot,
@@ -163,6 +171,7 @@ def _stored_capability_evidence(
     ):
         return None
     return {"source": "STORED_CAPABILITY", "staged_event_id": staged.id,
+            "boot_first_heard_at": ensure_utc(first.created_at).isoformat(),
             "previous_boot_id": previous.boot_id, "previous_firmware": predecessor[0],
             "previous_image_sha256": predecessor[1], "other_boot_samples_since_offer": len(since_offer)}
 

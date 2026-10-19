@@ -1,7 +1,7 @@
 import asyncio
 import json
 import os
-from datetime import timedelta
+from datetime import datetime, timedelta
 from uuid import uuid4
 
 import pytest
@@ -434,6 +434,8 @@ def stuck_incident(session, device, release, deployment, now=None):
                                        "running_version": "2.5.2", "running_partition": "factory",
                                        "image_sha256": predecessor_digest}))
     session.commit()
+    # The 2.4.12 boot is first heard after the factory image staged it and rebooted.
+    heartbeat(session, device, boot_id=X_BOOT, at=offered + timedelta(seconds=40))
     for seconds, state, error in ((49, "BOOTED_PENDING", "WAITING_FOR_RUNTIME_HEALTH"),
                                   (166, "BOOTED_PENDING", "RUNTIME_HEALTHY"), (167, "RECONCILING", None)):
         session.add(FirmwareEvent(deployment_id=deployment.id, state="LEGACY_BOOT_REPORT",
@@ -464,6 +466,9 @@ def test_stuck_incident_device_completes_on_its_next_success_retry_without_reboo
     assert proof.details["image_sha256"] == BRIDGE_IDENTITY[4]
     assert proof.details["evidence"]["source"] == "STORED_CAPABILITY"
     assert proof.details["evidence"]["previous_boot_id"] == FACTORY_BOOT
+    staged, = bridge_events(session, deployment, "READY_TO_BOOT")
+    first_heard = datetime.fromisoformat(proof.details["evidence"]["boot_first_heard_at"])
+    assert ensure_utc(staged.created_at) < first_heard < ensure_utc(staged.created_at) + timedelta(seconds=10)
     succeeded, = bridge_events(session, deployment, "SUCCEEDED")
     assert succeeded.details["image_sha256"] == BRIDGE_IDENTITY[4]
     assert succeeded.details["running_partition"] == "ota_0"
@@ -472,6 +477,7 @@ def test_stuck_incident_device_completes_on_its_next_success_retry_without_reboo
 @pytest.mark.parametrize("legacy_bridge", [bld9_k50.ZONE], indirect=True)
 @pytest.mark.parametrize("changed", [
     "rebooted", "other_boot_report", "other_boot_capability", "restaged_after_reports", "staged_from_ota", "staged_with_target_digest", "staged_by_2412",
+    "heard_before_staging",
     "not_staged", "not_offered", "staged_before_offer", "other_boot_ran_2412", "previous_boot_not_factory",
     "no_previous_boot", "digest", "partition", "secure_boot", "layout", "stale_telemetry",
 ])
@@ -497,6 +503,8 @@ def test_stored_capability_is_refused_unless_it_can_only_be_this_boot(legacy_bri
             "staged_with_target_digest": {"image_sha256": BRIDGE_IDENTITY[4]},
             "staged_by_2412": {"running_version": "2.4.12"},
         }[changed]}
+    elif changed == "heard_before_staging":
+        heartbeat(session, device, boot_id=X_BOOT, at=ensure_utc(staged.created_at) - timedelta(seconds=1))
     elif changed == "not_staged":
         session.delete(staged)
     elif changed == "not_offered":
