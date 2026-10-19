@@ -4208,7 +4208,7 @@ static void run_rebuild_salvage(uint32_t kib, uint32_t stride, uint32_t tears)
     check_hook = NULL;
     uint8_t *present = malloc(m->size + 1);
     static uint8_t buffer[8 * 1024 * 1024];
-    uint32_t runs = 0, salvaged = 0;
+    uint32_t runs = 0;
     uint64_t only_k = getenv("REVIEW_K") ? strtoull(getenv("REVIEW_K"), NULL, 10) : 0;
     for (uint64_t k = at_hook - start + 1; k <= end - start; k += stride) {
         if (only_k && k != only_k) continue;
@@ -4237,7 +4237,6 @@ static void run_rebuild_salvage(uint32_t kib, uint32_t stride, uint32_t tears)
                   "(first %u; the file reads %" PRId64 ")",
                   k, tear, lost, first, got);
             check_named("rebuild salvage", m, 1);
-            salvaged += report.sizes_recovered != 0;
         }
     }
     free(present);
