@@ -328,10 +328,12 @@ static void port_log(void *context, const char *level, const char *code, const c
     log_lines++;
     if (verbose || print_log) printf("  [%s] %s %s\n", level, code, message);
 }
+static uint32_t writing_phases; /* phases that light the repair LED */
 static void port_phase(void *context, srp_phase_t phase, uint32_t pass, bool writing)
 {
-    (void)context; (void)phase; (void)pass; (void)writing;
+    (void)context; (void)phase; (void)pass;
     phase_changes++;
+    if (writing) writing_phases++;
 }
 /* The soft deadline, in port_now units; 0: none. */
 static uint64_t deadline_at;
@@ -3294,6 +3296,45 @@ static void run_inbox_window(uint32_t kib)
     printf("command inbox: %u cuts in the merge lost no command\n", runs);
 }
 
+/* Review 3 (boot), finding 3: a never-damaged store that has run a while
+ * (deleted pages from every append's header move, two free blocks) was
+ * compacted back to three at every boot and reported REPAIRED, with a probe
+ * file written and the repair LED lit through the check. Compaction is
+ * upkeep: the result is CLEAN and no phase lights the LED. */
+static void run_healthy_compaction(uint32_t kib)
+{
+    seed(31701);
+    nvs_clear();
+    format_flash(kib);
+    model_reset();
+    row_seq = 500;
+    mount_plain();
+    model_file_t *a = new_model("/pending.jsonl", true, false), *b = new_model("/blocked_identity.jsonl", true, false);
+    char row[600];
+    u32_t total = 0, used = 0;
+    do {
+        size_t n = json_row(row, sizeof(row));
+        model_append(a, row, (uint32_t)n);
+        n = json_row(row, sizeof(row));
+        model_append(b, row, (uint32_t)n);
+        SPIFFS_info(&fs, &total, &used);
+    } while ((used < total / 100 * 70 || fs.free_blocks >= 3) && used < total / 100 * 85);
+    CHECK(fs.free_blocks < 3, "healthy store: %d free blocks", (int)fs.free_blocks);
+    SPIFFS_unmount(&fs);
+    srr_report_t report;
+    srr_config_t config = repair_config();
+    writing_phases = 0;
+    repair_boot(&report, &config);
+    CHECK(report.result == SRR_RESULT_CLEAN && report.blocks_compacted > 0 && writing_phases == 0,
+          "healthy store: %s, %u blocks compacted, %u phases lit the repair LED", srr_result_name(report.result),
+          report.blocks_compacted, writing_phases);
+    mount_plain();
+    check_custody(a, 1, false);
+    check_custody(b, 1, false);
+    SPIFFS_unmount(&fs);
+    printf("healthy store: compacted, CLEAN, no repair LED\n");
+}
+
 /* "review" runs them all; "review-<part>" one of them. */
 static void run_review_custody(uint32_t kib, const char *only)
 {
@@ -3308,6 +3349,7 @@ static void run_review_custody(uint32_t kib, const char *only)
     if (REVIEW_PART("restore")) run_crammed_restore(kib, 85, kib > 1024 ? 211 : 5);
     if (REVIEW_PART("hidden")) run_hidden_large(kib);
     if (REVIEW_PART("rebuild")) run_rebuild_cuts(kib, kib > 1024 ? 211 : 4);
+    if (REVIEW_PART("healthy")) run_healthy_compaction(kib);
     if (REVIEW_PART("inbox") || REVIEW_PART("boundary")) run_inbox_boundary(kib);
     if (REVIEW_PART("inbox") || REVIEW_PART("window")) run_inbox_window(kib);
 #undef REVIEW_PART

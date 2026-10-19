@@ -1649,7 +1649,9 @@ static bool check_pass(run_t *r, uint32_t pass, bool *fixed)
 {
     uint32_t before = r->fix_index + r->fix_lookup + r->del_orphan + r->del_page + r->del_bad_file;
     uint32_t errors = r->errors;
-    set_phase(r, SRP_PHASE_CHECK, pass, true);
+    /* The check of a consistent store writes only what it fixes (which
+     * then counts as a repair): no repair LED for it. */
+    set_phase(r, SRP_PHASE_CHECK, pass, false);
     uint64_t started = r->ports->now_ms ? r->ports->now_ms(r->ports->context) : 0;
     s32_t res = SPIFFS_check(r->fs);
     SPIFFS_clearerr(r->fs);
@@ -2937,7 +2939,9 @@ static uint32_t compact(run_t *r, uint32_t target, bool *touched)
          * deleted and erased pages alone moves nothing: it is only erased. */
         bool moves = consumed || used;
         if (moves && (int32_t)(consumed + c.groups + 2) > counted_free(r) - drift - (int32_t)erased) continue;
-        r->wrote = true;
+        /* SPIFFS's own block cleaning on a consistent store is upkeep, not a
+         * repair: it alone leaves the result CLEAN, writes no probe and lights
+         * no repair LED. */
         *touched = true;
         fs->cleaning = 1;
         s32_t res = spiffs_gc_clean(fs, (spiffs_block_ix)best);
@@ -3524,7 +3528,7 @@ void srr_run(spiffs *fs, const srr_config_t *config, const srr_ports_t *ports, s
     }
     report->check_skipped = !checked;
     if (ok && going(r)) {
-        set_phase(r, SRP_PHASE_FINISH, 0, true);
+        set_phase(r, SRP_PHASE_FINISH, 0, r->wrote);
         r->state.phase = SRP_PHASE_FINISH;
         ok = save_state(r) || fail(r, "journal", SPIFFS_ERR_INTERNAL);
         /* Consistent or not, SPIFFS's own writes follow: room first, as
