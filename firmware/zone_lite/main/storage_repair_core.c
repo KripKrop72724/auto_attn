@@ -3625,6 +3625,49 @@ static uint32_t shortage_signature(run_t *r)
     return crc ? crc : 1;
 }
 
+/* Whether level 2's removals (expendables, the catalog, fully settled
+ * queue files) could give an erased page at all: removing a file only
+ * deletes its pages, and only compaction turns deleted pages into erased
+ * ones, by erasing a block that would hold nothing else or whose remaining
+ * pages' moves fit in the erased pages elsewhere. A store crammed with
+ * damaged files in every block gains nothing from them, and the catalog
+ * would go for nothing. Needs a fresh survey. */
+static bool level2_can_free(run_t *r)
+{
+    uint8_t *gone = zalloc(r, SR_IDS / 8U);
+    if (!gone) return true;
+    for (uint32_t i = 0; i < r->obj_count; ++i) {
+        const obj_t *o = &r->objs[i];
+        if (o->hidden || o->header == SR_NO_PAGE || o->obj == SR_NO_PAGE) continue;
+        bool remove = o->kind.cls == SRP_CLASS_EXPENDABLE && !(restore_file(o->name) && manifest_active(r));
+        for (size_t c = 0; c < sizeof(CATALOG_FILES) / sizeof(CATALOG_FILES[0]) && !remove; ++c)
+            remove = live(o) && !strcmp(o->name, CATALOG_FILES[c]);
+        for (size_t q = 0; q < sizeof(QUEUES) / sizeof(QUEUES[0]) && !remove; ++q) {
+            lq_checkpoint_t cp;
+            remove = live(o) && o->size && !strcmp(o->name, QUEUES[q].name) &&
+                nvs_load(r, QUEUES[q].ns, QUEUES[q].key, &cp, sizeof(cp)) == 1 && lq_checkpoint_valid(&cp) &&
+                cp.offset == o->size;
+        }
+        if (remove) set_bit(gone, o->obj & (SR_IDS - 1));
+    }
+    int32_t erased = surveyed_free(r);
+    bool can = false;
+    for (uint32_t b = 0; b < r->blocks && !can; ++b) {
+        uint32_t remaining = 0, freed = 0, erased_here = 0;
+        for (uint32_t e = 0; e < r->entries; ++e) {
+            const pg_t *pg = &r->pages[b * r->ppb + 1 + e];
+            if (pg->lu == SPIFFS_OBJ_ID_FREE) erased_here += pg->erased;
+            else if (pg->lu == SPIFFS_OBJ_ID_DELETED || bit(gone, pg->lu & (SR_IDS - 1))) freed++;
+            else remaining++;
+        }
+        /* Moving a page costs at most itself, its group's index page and an
+         * index page of its own: three erased pages each, and two spare. */
+        can = freed && (!remaining || (int32_t)(3 * remaining + 2) <= erased - (int32_t)erased_here);
+    }
+    release(r, gone);
+    return can;
+}
+
 /* Normalization allocates pages; on a store full of live data it can run out
  * of room before the check could free anything. Deleted pages are compacted
  * first. When the damaged files have pages in every block (nothing can be
@@ -3686,14 +3729,6 @@ static bool normalize_all(run_t *r, bool *deferred)
             *deferred = true;
             r->state.flags |= SRP_STATE_FULL;
             r->state.shortage = shortage_signature(r);
-#ifdef SR_TRACE_SHORTAGE
-            {
-                char trace[140];
-                snprintf(trace, sizeof(trace), "deferred: shortage %08lx (%lu needed, %ld erased)", (unsigned long)r->state.shortage,
-                         (unsigned long)pages_for_work(r), (long)surveyed_free(r));
-                logf_line(r, "DEBUG", "STORAGE_REPAIR_SHORTAGE", trace);
-            }
-#endif
             char message[140];
             snprintf(message, sizeof(message),
                      "no room to make every file consistent (%lu pages needed, %ld erased); no check this boot",
@@ -3706,19 +3741,15 @@ static bool normalize_all(run_t *r, bool *deferred)
          * already ran, and dropping a catalog ADD has sent again buys
          * nothing. Anything else (a queue its owner settled since, files
          * that changed) gets it again. */
-        if (attempt == 1 && r->was_full && r->was_shortage == shortage_signature(r)) {
-            char message[140];
-            snprintf(message, sizeof(message), "no room-making removals: the last run deferred for this shortage (%lu pages needed, %ld erased)",
+        bool same = attempt == 1 && r->was_full && r->was_shortage == shortage_signature(r);
+        if (attempt == 1 && !same && !survey(r)) return false;
+        if (attempt == 1 && (same || !level2_can_free(r))) {
+            char message[160];
+            snprintf(message, sizeof(message), "no room-making removals: %s (%lu pages needed, %ld erased)",
+                     same ? "the last run deferred for this shortage" : "none would let a block be erased",
                      (unsigned long)pages_for_work(r), (long)surveyed_free(r));
             logf_line(r, "INFO", "STORAGE_REPAIR_LEVEL2_SKIPPED", message);
         } else if (attempt == 1) {
-#ifdef SR_TRACE_SHORTAGE
-            char trace[140];
-            snprintf(trace, sizeof(trace), "level 2: was_full %d shortage %08lx now %08lx (%lu needed, %ld erased)", r->was_full,
-                     (unsigned long)r->was_shortage, (unsigned long)shortage_signature(r), (unsigned long)pages_for_work(r),
-                     (long)surveyed_free(r));
-            logf_line(r, "DEBUG", "STORAGE_REPAIR_SHORTAGE", trace);
-#endif
             if (r->report->level < 2) r->report->level = 2;
             if (!survey(r) || !remove_expendables_now(r) || !clear_catalog(r, true) || !survey(r) ||
                 !reconcile_cursors(r, true))
@@ -4063,6 +4094,7 @@ void srr_run(spiffs *fs, const srr_config_t *config, const srr_ports_t *ports, s
     logf_line(r, "INFO", "STORAGE_REPAIR_STARTED", message);
 
     bool deferred = false, catalog_drop = false, check_failed = false, checked = false, cut_short = false;
+    bool gc_unsafe = false;
     bool ok = survey(r);
     if (ok) report_torn_headers(r);
     if (ok && any_mislabeled(r)) {
@@ -4124,14 +4156,34 @@ void srr_run(spiffs *fs, const srr_config_t *config, const srr_ports_t *ports, s
             ok = clear_catalog(r, !r->catalog_damaged) && survey(r);
         if (ok) ok = reconcile_cursors(r, false);
         if (ok) ok = terminate_tails(r);
-        if (ok && r->wrote && !check_failed && !deferred && (uint32_t)r->fs->free_blocks < 2) {
-            /* SPIFFS's GC runs inside the probe's writes; with fewer than two
-             * free blocks it can stop half way through a block (data pages
-             * moved, the index naming the originals) and damage a live file. */
-            snprintf(report->error_stage, sizeof(report->error_stage), "full");
-            report->error_code = SPIFFS_ERR_FULL;
-            logf_line(r, "WARN", "STORAGE_REPAIR_FULL",
-                      "repaired, but too few free blocks for SPIFFS's own GC; no probe file written");
+        if (ok && !check_failed && !deferred && (uint32_t)r->fs->free_blocks < 2) {
+            /* SPIFFS's GC runs inside the probe's writes and the
+             * application's; with fewer than two free blocks it cleans a
+             * block only into the erased pages there are, and stops half way
+             * (data pages moved, the index naming the originals) when the
+             * block needs more: a live file is damaged and, write after
+             * write, the store ends with no erased page (section 12). Such a
+             * store is handed over as not repaired. */
+            ok = survey(r);
+            int32_t erased = ok ? surveyed_free(r) : 0;
+            uint32_t needed = ok ? spare_for_compaction(r) : 0;
+            if (ok && erased < (int32_t)needed) {
+                gc_unsafe = true;
+                report->error_code = SPIFFS_ERR_FULL;
+                snprintf(report->error_stage, sizeof(report->error_stage), "gc_unsafe");
+                report->room_needed = needed;
+                report->room_erased = erased > 0 ? (uint32_t)erased : 0;
+                snprintf(message, sizeof(message),
+                         "%ld free blocks and %ld erased pages; SPIFFS's GC needs %lu to clean a block, so writes may "
+                         "damage files; no probe file written",
+                         (long)r->fs->free_blocks, (long)erased, (unsigned long)needed);
+                logf_line(r, "ERROR", "STORAGE_REPAIR_GC_UNSAFE", message);
+            } else if (ok && r->wrote) {
+                report->error_code = SPIFFS_ERR_FULL;
+                snprintf(report->error_stage, sizeof(report->error_stage), "full");
+                logf_line(r, "WARN", "STORAGE_REPAIR_FULL",
+                          "repaired, but too few free blocks for SPIFFS's own GC; no probe file written");
+            }
         } else if (ok && r->wrote && !check_failed && !deferred) {
             s32_t probed = probe(r, "/repair-probe");
             if (probed != SPIFFS_OK && probed != SPIFFS_ERR_FULL) {
@@ -4153,7 +4205,7 @@ void srr_run(spiffs *fs, const srr_config_t *config, const srr_ports_t *ports, s
     if (report->commands_damaged) r->state.flags |= SRP_STATE_COMMANDS_DAMAGED;
     if (r->stopped) report->result = SRR_RESULT_STOPPED;
     else if (!ok || r->failed || check_failed) report->result = SRR_RESULT_FAILED;
-    else if (deferred || cut_short) report->result = SRR_RESULT_DEFERRED;
+    else if (deferred || cut_short || gc_unsafe) report->result = SRR_RESULT_DEFERRED;
     else if (policy.mode == SRP_MODE_NORMALIZE_ONLY) report->result = SRR_RESULT_NORMALIZED;
     else if (report->gaps) report->result = SRR_RESULT_REPAIRED_WITH_GAPS;
     else if (r->wrote) report->result = SRR_RESULT_REPAIRED;

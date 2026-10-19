@@ -4246,6 +4246,88 @@ static void run_rebuild_salvage(uint32_t kib, uint32_t stride, uint32_t tears)
     printf("rebuild salvage: %u cuts inside the rebuild, every byte it had on flash kept\n", runs);
 }
 
+/* Review 4 (boot), finding 1: on a store with no erased page and the
+ * damaged queue in every block, level 2 dropped the identity catalog and
+ * still had no erased page (deleting a file erases nothing; only compaction
+ * does, and no block could be compacted). Level 2 runs only when its
+ * removals could let a block be erased. And a store handed over with fewer
+ * than two free blocks and fewer erased pages than SPIFFS's GC needs to
+ * clean a block is not REPAIRED: DEFERRED, `gc_unsafe`, with the room. */
+static void run_level2_useless(uint32_t kib)
+{
+    seed(9700);
+    nvs_clear();
+    format_flash(kib);
+    mount_plain();
+    model_reset();
+    model_file_t *catalog = make_binary_file("/add_identities.enc", 400);
+    SPIFFS_unmount(&fs);
+    full_store_with(0);
+    /* The one block of deleted pages full_store_with leaves holds a valid
+     * copy of the damaged head too: no block is free to erase. */
+    uint16_t obj = object_of("/pending.jsonl");
+    bool pinned = false;
+    for (uint32_t b = 0; b < flash_size / BLOCK && !pinned; ++b) {
+        bool all_deleted = true;
+        for (uint32_t e = 1; e < 16 && all_deleted; ++e) all_deleted = rd16(lookup_address(b * 16 + e)) == 0;
+        if (!all_deleted) continue;
+        flash[(b * 16 + 1) * PAGE + 4] |= SPIFFS_PH_FLAG_DELET;
+        wr16(lookup_address(b * 16 + 1), obj);
+        pinned = true;
+    }
+    CHECK(pinned, "level 2 useless: no block of deleted pages");
+    srr_report_t report;
+    srr_config_t config = repair_config();
+    repair_boot(&report, &config);
+    mount_plain();
+    bool kept = exists(catalog->name);
+    SPIFFS_unmount(&fs);
+    CHECK(report.result == SRR_RESULT_DEFERRED && !strcmp(report.error_stage, "full") && report.level < 2 && kept,
+          "level 2 useless: %s at %s, level %u, catalog kept %d", srr_result_name(report.result), report.error_stage,
+          report.level, kept);
+    printf("level 2 skipped where it frees nothing: DEFERRED, the catalog kept\n");
+}
+
+/* A consistent store with no free block and no erased page, live and
+ * deleted pages in every block (two queues interleaved, one removed, the
+ * free blocks' pages taken by fill files): no block's moves fit, so SPIFFS's
+ * GC would stop half way in the next writes. The repair, which has nothing
+ * to write, hands it over as DEFERRED (`gc_unsafe`, with the room it lacks),
+ * not CLEAN. */
+static void run_gc_unsafe_handover(uint32_t kib)
+{
+    seed(9710);
+    nvs_clear();
+    format_flash(kib);
+    model_reset();
+    row_seq = 700;
+    mount_plain();
+    for (uint32_t f = 0; f < sizeof(crammed_fill_names) / sizeof(crammed_fill_names[0]); ++f)
+        write_file(crammed_fill_names[f], NULL, 0);
+    model_file_t *pending = new_model("/pending.jsonl", true, false);
+    char row[600];
+    while (fs.free_blocks > 2) {
+        size_t n = json_row(row, sizeof(row));
+        model_append(pending, row, (uint32_t)n);
+        if (!append_bytes("/ballast.jsonl", row, (uint32_t)n)) break;
+    }
+    CHECK(SPIFFS_remove(&fs, "/ballast.jsonl") == SPIFFS_OK, "gc unsafe: remove ballast");
+    SPIFFS_unmount(&fs);
+    consume_erased();
+    srr_report_t report;
+    srr_config_t config = repair_config();
+    repair_boot(&report, &config);
+    CHECK(report.result == SRR_RESULT_DEFERRED && !strcmp(report.error_stage, "gc_unsafe") &&
+              report.room_needed > report.room_erased,
+          "gc unsafe: %s at %s (%u pages needed, %u erased)", srr_result_name(report.result), report.error_stage,
+          report.room_needed, report.room_erased);
+    mount_plain();
+    check_custody(pending, 1, false);
+    SPIFFS_unmount(&fs);
+    printf("a store SPIFFS's GC cannot clean: DEFERRED at gc_unsafe (%u pages needed, %u erased)\n",
+           report.room_needed, report.room_erased);
+}
+
 static void run_review_custody(uint32_t kib, const char *only)
 {
     const char *part = only && !strncmp(only, "review-", 7) ? only + 7 : NULL;
@@ -4262,6 +4344,8 @@ static void run_review_custody(uint32_t kib, const char *only)
     if (REVIEW_PART("healthy")) run_healthy_compaction(kib);
     if (REVIEW_PART("full-flag")) run_full_flag(kib);
     if (REVIEW_PART("cpu")) run_cpu_bound(kib);
+    if (REVIEW_PART("level2")) run_level2_useless(kib);
+    if (REVIEW_PART("gc-unsafe")) run_gc_unsafe_handover(kib);
     /* Review 4 (custody): the resume's merge and the repair's own copies. */
     if (REVIEW_PART("merge-dirty")) run_merge_dirty_tail(kib);
     if (REVIEW_PART("merge-crammed")) run_merge_crammed(kib);
@@ -4299,6 +4383,7 @@ static uint32_t *row_offset, *row_generation;
 static uint16_t *row_length;
 static uint32_t next_seq, organic_ticks, organic_cut_count, organic_reclaims, organic_segments, organic_gc_stops;
 static uint32_t organic_blocked; /* verifications of a queue a run without room left unreadable */
+static uint32_t organic_gc_unsafe; /* runs that handed over a store SPIFFS's GC cannot clean */
 static bool organic_blocked_now[2]; /* the last verification's */
 static srr_report_t organic_last;  /* the last finished run's report */
 static bool append_failed_this_boot;
@@ -4639,6 +4724,7 @@ static void repair_until_done(uint64_t seed_value, volatile uint32_t *cuts, bool
         CHECK(report.check_deleted_live == 0, "organic seed %" PRIu64 ": the check deleted %u live files", seed_value,
               report.check_deleted_live);
         organic_last = report;
+        if (!strcmp(report.error_stage, "gc_unsafe")) organic_gc_unsafe++;
         if (report.result != SRR_RESULT_STOPPED) return;
     }
 }
@@ -4682,6 +4768,7 @@ static void run_organic(uint64_t seed_value, uint32_t kib, uint32_t ticks, uint3
     row_generation = calloc(ORGANIC_MAX_SEQ, sizeof(uint32_t));
     row_length = calloc(ORGANIC_MAX_SEQ, sizeof(uint16_t));
     next_seq = organic_ticks = organic_reclaims = organic_segments = organic_gc_stops = organic_blocked = 0;
+    organic_gc_unsafe = 0;
     segment_size = 0;
     volatile uint32_t cuts = 0, repairs = 0;
     uint32_t lost = 0, explained = 0, anded = 0;
@@ -4787,9 +4874,9 @@ static void run_organic(uint64_t seed_value, uint32_t kib, uint32_t ticks, uint3
     SPIFFS_unmount(&fs);
     printf("organic seed %" PRIu64 ": %u cuts, %u repairs, %u committed rows lost, %u named by gap records, "
            "%u ANDed by SPIFFS after a failed append, %u files reclaimed, %u segments, %u stopped GCs, "
-           "%u checks of a queue a store with no room left unreadable, used %u%%\n",
+           "%u checks of a queue a store with no room left unreadable, %u stores handed over GC-unsafe, used %u%%\n",
            seed_value, cuts, repairs, lost, explained, anded, organic_reclaims, organic_segments, organic_gc_stops,
-           organic_blocked, total ? (unsigned)(100ULL * used / total) : 0);
+           organic_blocked, organic_gc_unsafe, total ? (unsigned)(100ULL * used / total) : 0);
     CHECK(lost == 0, "organic seed %" PRIu64 ": %u committed rows lost without a gap record", seed_value, lost);
 }
 
