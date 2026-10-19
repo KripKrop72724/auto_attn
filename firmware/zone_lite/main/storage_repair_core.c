@@ -109,7 +109,8 @@ typedef struct {
     srp_resets_t *resets;
     bool stopped, failed, wrote, catalog_damaged, unrecordable_custody;
     bool finishing;                /* the restore after a check pass: only the hard deadline ends it */
-    bool was_full;                 /* the previous run found no room (SRP_STATE_FULL) */
+    bool was_full;                 /* the previous run deferred for room (SRP_STATE_FULL) */
+    uint32_t was_shortage;         /* and what it lacked (srp_state_t.shortage) */
     bool restore_failed;
     uint32_t ops;
     uint32_t last_check_ms;
@@ -3147,6 +3148,22 @@ static bool custody_consistent(const run_t *r)
     return true;
 }
 
+/* What a run deferred for room lacked: the pages its work needs, the erased
+ * pages there are, and the files that need it (names and sizes). A later run
+ * that lacks exactly the same has nothing level 2 could change. */
+static uint32_t shortage_signature(run_t *r)
+{
+    uint32_t values[2] = {pages_for_work(r), (uint32_t)surveyed_free(r)};
+    uint32_t crc = srp_crc32(0, values, sizeof(values));
+    for (uint32_t i = 0; i < r->obj_count; ++i) {
+        const obj_t *o = &r->objs[i];
+        if (!live(o) || !o->needs_work) continue;
+        crc = srp_crc32(crc, o->name, strlen(o->name));
+        crc = srp_crc32(crc, &o->size, sizeof(o->size));
+    }
+    return crc ? crc : 1;
+}
+
 /* Normalization allocates pages; on a store full of live data it can run out
  * of room before the check could free anything. Deleted pages are compacted
  * first. When the damaged files have pages in every block (nothing can be
@@ -3184,7 +3201,6 @@ static bool normalize_all(run_t *r, bool *deferred)
         bool ok = normalize_once(r);
         r->fs->cleaning = 0;
         if (ok) {
-            r->state.flags &= ~SRP_STATE_FULL;
             if (reserve) {
                 char message[140];
                 snprintf(message, sizeof(message), "up to %lu pages from the GC reserve (%ld erased%s)",
@@ -3208,6 +3224,15 @@ static bool normalize_all(run_t *r, bool *deferred)
             r->report->room_erased = erased > 0 ? (uint32_t)erased : 0;
             *deferred = true;
             r->state.flags |= SRP_STATE_FULL;
+            r->state.shortage = shortage_signature(r);
+#ifdef SR_TRACE_SHORTAGE
+            {
+                char trace[140];
+                snprintf(trace, sizeof(trace), "deferred: shortage %08lx (%lu needed, %ld erased)", (unsigned long)r->state.shortage,
+                         (unsigned long)pages_for_work(r), (long)surveyed_free(r));
+                logf_line(r, "DEBUG", "STORAGE_REPAIR_SHORTAGE", trace);
+            }
+#endif
             char message[140];
             snprintf(message, sizeof(message),
                      "no room to make every file consistent (%lu pages needed, %ld erased); no check this boot",
@@ -3215,10 +3240,24 @@ static bool normalize_all(run_t *r, bool *deferred)
             logf_line(r, "WARN", "STORAGE_REPAIR_FULL", message);
             return survey(r);
         }
-        /* Level 2 only once: after a run that already found no room, the
-         * catalog it dropped is back from ADD and dropping it again buys
-         * nothing (the runtime retires settled queues itself). */
-        if (attempt == 1 && !r->was_full) {
+        /* Level 2 unless the last run deferred for exactly this shortage
+         * (the same work, the same erased pages, the same files): then it
+         * already ran, and dropping a catalog ADD has sent again buys
+         * nothing. Anything else (a queue its owner settled since, files
+         * that changed) gets it again. */
+        if (attempt == 1 && r->was_full && r->was_shortage == shortage_signature(r)) {
+            char message[140];
+            snprintf(message, sizeof(message), "no room-making removals: the last run deferred for this shortage (%lu pages needed, %ld erased)",
+                     (unsigned long)pages_for_work(r), (long)surveyed_free(r));
+            logf_line(r, "INFO", "STORAGE_REPAIR_LEVEL2_SKIPPED", message);
+        } else if (attempt == 1) {
+#ifdef SR_TRACE_SHORTAGE
+            char trace[140];
+            snprintf(trace, sizeof(trace), "level 2: was_full %d shortage %08lx now %08lx (%lu needed, %ld erased)", r->was_full,
+                     (unsigned long)r->was_shortage, (unsigned long)shortage_signature(r), (unsigned long)pages_for_work(r),
+                     (long)surveyed_free(r));
+            logf_line(r, "DEBUG", "STORAGE_REPAIR_SHORTAGE", trace);
+#endif
             if (r->report->level < 2) r->report->level = 2;
             if (!survey(r) || !remove_expendables_now(r) || !clear_catalog(r, true) || !survey(r) ||
                 !reconcile_cursors(r, true))
@@ -3485,7 +3524,12 @@ void srr_run(spiffs *fs, const srr_config_t *config, const srr_ports_t *ports, s
         nvs_load(r, SRR_NVS_NAMESPACE, "manifest", r->manifest, sizeof(*r->manifest)) == 1;
     if (manifest_active(r) && !have_manifest) memset(r->manifest, 0xFF, sizeof(*r->manifest));
     if (config->damage_seen) r->state.flags |= SRP_STATE_DAMAGE_SEEN;
+    /* FULL describes the last finished run only: this run sets it again
+     * when it too defers for room, and every other outcome leaves it clear. */
     r->was_full = (r->state.flags & SRP_STATE_FULL) != 0;
+    r->was_shortage = r->state.shortage;
+    r->state.flags &= ~SRP_STATE_FULL;
+    r->state.shortage = 0;
     srp_policy_input_t input = {
         .incomplete = r->state.incomplete,
         .failures = r->state.failures,

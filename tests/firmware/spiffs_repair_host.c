@@ -2526,10 +2526,119 @@ static void run_manifest_cases(uint32_t kib)
  * cleared first, as lq_reclaim does). Neither a restore in that run nor a
  * resume after a reset may bring it back, and its settled rows never replay. */
 static uint32_t erased_pages(void);
+/* stale_full: the journal says an earlier run deferred for room, for a
+ * shortage this store no longer has (review 4, boot finding 2): level 2
+ * must still run. settled: the blocked queue's cursor says it is delivered. */
+static srr_report_t retired_store(uint32_t kib, uint32_t trial, bool stale_full, bool settled,
+                                  model_file_t **pending_out, model_file_t **blocked_out);
 static void run_retired_stays_retired(uint32_t kib)
 {
     uint32_t retired = 0;
     for (uint32_t trial = 0; trial < 6; ++trial) {
+        model_file_t *pending = NULL, *blocked = NULL;
+        srr_report_t report = retired_store(kib, trial, false, true, &pending, &blocked);
+        CHECK(report.result != SRR_RESULT_FAILED, "retired: %s at %s", srr_result_name(report.result),
+              report.error_stage);
+        mount_plain();
+        check_custody(pending, 1, false);
+        bool gone = !exists(blocked->name);
+        SPIFFS_unmount(&fs);
+        lq_checkpoint_t cp;
+        CHECK(port_nvs_load(NULL, "legacy_queues", "blocked", &cp, sizeof(cp)) == 1, "blocked cursor");
+        if (report.settled_removed) {
+            retired++;
+            CHECK(gone && cp.generation == 13 && cp.offset == 0 && report.files_rebuilt == 0,
+                  "retired: blocked brought back (exists %d, cursor generation %u offset %u, rebuilt %u)", !gone,
+                  cp.generation, cp.offset, report.files_rebuilt);
+        } else {
+            CHECK(!gone && cp.generation == 12 && cp.offset == blocked->size, "kept: blocked changed");
+        }
+    }
+    CHECK(retired, "no trial needed level 2");
+    printf("retired files stay retired: %u of 6 trials retired the settled queue\n", retired);
+}
+
+static srp_state_t state_now(void)
+{
+    srp_state_t state;
+    memset(&state, 0, sizeof(state));
+    CHECK(port_nvs_load(NULL, SRR_NVS_NAMESPACE, "state", &state, sizeof(state)) == 1, "repair state");
+    return state;
+}
+
+/* Review 4 (boot), finding 2: a FULL flag a past deferral left turned level 2
+ * off for good, so a store one run with level 2 repairs deferred on every
+ * boot, and a run with no work kept the flag. The flag describes the last
+ * finished run only, and level 2 is skipped only when the shortage is the
+ * one that run already had. */
+static void run_full_flag(uint32_t kib)
+{
+    uint32_t repaired = 0;
+    for (uint32_t trial = 0; trial < 6; ++trial) {
+        model_file_t *pending = NULL, *blocked = NULL;
+        srr_report_t control = retired_store(kib, trial, false, true, &pending, &blocked);
+        srr_report_t report = retired_store(kib, trial, true, true, &pending, &blocked);
+        CHECK(report.result == control.result && report.settled_removed == control.settled_removed &&
+                  report.level == control.level,
+              "full flag, trial %u: %s (level %u, %u retired) where a fresh journal gives %s (level %u, %u retired)",
+              trial, srr_result_name(report.result), report.level, report.settled_removed,
+              srr_result_name(control.result), control.level, control.settled_removed);
+        mount_plain();
+        check_custody(pending, 1, false);
+        SPIFFS_unmount(&fs);
+        srp_state_t state = state_now();
+        CHECK(!(state.flags & SRP_STATE_FULL) || report.result == SRR_RESULT_DEFERRED,
+              "full flag, trial %u: %s left FULL set", trial, srr_result_name(report.result));
+        repaired += report.settled_removed != 0;
+    }
+    CHECK(repaired, "full flag: no trial needed level 2");
+    /* A store level 2 cannot help (its queue is not settled) defers. Later
+     * boots run level 2 again while a deferral still makes progress (the
+     * shortage changes); once one is short of exactly what the last one was,
+     * it skips level 2 and stays deferred. */
+    model_file_t *pending = NULL, *blocked = NULL;
+    srr_report_t report = retired_store(kib, 0, false, false, &pending, &blocked);
+    CHECK(report.result == SRR_RESULT_DEFERRED, "full flag: the unsettled store %s", srr_result_name(report.result));
+    srp_state_t state = state_now();
+    CHECK((state.flags & SRP_STATE_FULL) && state.shortage && report.level == 2,
+          "full flag: a deferral for room left flags %x shortage %x level %u", state.flags, state.shortage,
+          report.level);
+    uint32_t boots = 0;
+    bool skipped = false;
+    srr_config_t config = repair_config();
+    while (report.result == SRR_RESULT_DEFERRED && !skipped && boots++ < 12) {
+        repair_boot(&report, &config);
+        state = state_now();
+        skipped = report.level < 2;
+        CHECK(!skipped || (report.result == SRR_RESULT_DEFERRED && (state.flags & SRP_STATE_FULL)),
+              "full flag: level 2 skipped, then %s, flags %x", srr_result_name(report.result), state.flags);
+    }
+    CHECK(skipped || report.result != SRR_RESULT_DEFERRED, "full flag: %u boots deferred, each with level 2", boots);
+    /* A run with no work clears the flag. */
+    seed(9590);
+    nvs_clear();
+    format_flash(kib);
+    model_reset();
+    mount_plain();
+    model_file_t *queue = make_json_file("/pending.jsonl", 20000);
+    SPIFFS_unmount(&fs);
+    store_state(SRP_PHASE_IDLE, 0, 0, SRP_STATE_FULL, 0);
+    repair_boot(&report, &config);
+    state = state_now();
+    CHECK(report.result == SRR_RESULT_CLEAN && !(state.flags & SRP_STATE_FULL),
+          "full flag: a clean run left %s, flags %x", srr_result_name(report.result), state.flags);
+    mount_plain();
+    check_custody(queue, 1, false);
+    SPIFFS_unmount(&fs);
+    printf("full flag: a stale deferral does not turn level 2 off (%u of 6 retired), the same shortage skips it "
+           "(after %u boots), a clean run clears it\n",
+           repaired, boots);
+}
+
+static srr_report_t retired_store(uint32_t kib, uint32_t trial, bool stale_full, bool settled,
+                                  model_file_t **pending_out, model_file_t **blocked_out)
+{
+    {
         seed(9500 + trial);
         nvs_clear();
         format_flash(kib);
@@ -2538,7 +2647,8 @@ static void run_retired_stays_retired(uint32_t kib)
         mount_plain();
         (void)make_id_file("/acked_uids.txt", 200);
         model_file_t *blocked = make_json_file("/blocked_identity.jsonl", flash_size / 100 * 42);
-        set_cursor("legacy_queues", "blocked", blocked->size, prefix_crc(blocked, blocked->size), 12);
+        if (settled) set_cursor("legacy_queues", "blocked", blocked->size, prefix_crc(blocked, blocked->size), 12);
+        else set_cursor("legacy_queues", "blocked", 0, 0, 12);
         /* The pending queue fills the rest (any store size) until SPIFFS keeps
          * three to five free blocks, then more of its spans are damaged than
          * the erased and deleted pages could give room for: only retiring the
@@ -2559,6 +2669,15 @@ static void run_retired_stays_retired(uint32_t kib)
         CHECK(2 * damage < spans && damage < blocked->size / SPAN / 2, "retired: pending holds %u spans, %u damaged",
               spans, damage);
         for (uint32_t k = 0; k < damage; ++k) flag_deleted(rd16(entry_address(pending->name, 1 + 2 * k)));
+        if (stale_full) {
+            srp_state_t state;
+            memset(&state, 0, sizeof(state));
+            state.generation = 7;
+            state.flags = SRP_STATE_FULL;
+            state.shortage = 0x5EED;
+            srp_state_seal(&state);
+            port_nvs_store(NULL, SRR_NVS_NAMESPACE, "state", &state, sizeof(state));
+        }
         srr_report_t report;
         srr_config_t config = repair_config();
         /* The check is taken to have changed something: the restore after it
@@ -2568,25 +2687,10 @@ static void run_retired_stays_retired(uint32_t kib)
         repair_boot(&report, &config);
         hook_mode = 0;
         check_hook = NULL;
-        CHECK(report.result != SRR_RESULT_FAILED, "retired: %s at %s", srr_result_name(report.result),
-              report.error_stage);
-        mount_plain();
-        check_custody(pending, 1, false);
-        bool gone = !exists(blocked->name);
-        SPIFFS_unmount(&fs);
-        lq_checkpoint_t cp;
-        CHECK(port_nvs_load(NULL, "legacy_queues", "blocked", &cp, sizeof(cp)) == 1, "blocked cursor");
-        if (report.settled_removed) {
-            retired++;
-            CHECK(gone && cp.generation == 13 && cp.offset == 0 && report.files_rebuilt == 0,
-                  "retired: blocked brought back (exists %d, cursor generation %u offset %u, rebuilt %u)", !gone,
-                  cp.generation, cp.offset, report.files_rebuilt);
-        } else {
-            CHECK(!gone && cp.generation == 12 && cp.offset == blocked->size, "kept: blocked changed");
-        }
+        *pending_out = pending;
+        *blocked_out = blocked;
+        return report;
     }
-    CHECK(retired, "no trial needed level 2");
-    printf("retired files stay retired: %u of 6 trials retired the settled queue\n", retired);
 }
 
 /* R3: a custody file that cannot be made consistent (here: its unreadable
@@ -3464,6 +3568,7 @@ static void run_review_custody(uint32_t kib, const char *only)
     if (REVIEW_PART("hidden")) run_hidden_large(kib);
     if (REVIEW_PART("rebuild")) run_rebuild_cuts(kib, kib > 1024 ? 211 : 4);
     if (REVIEW_PART("healthy")) run_healthy_compaction(kib);
+    if (REVIEW_PART("full-flag")) run_full_flag(kib);
     if (REVIEW_PART("merged")) run_merged_from_hold(kib);
     if (REVIEW_PART("inbox") || REVIEW_PART("boundary")) run_inbox_boundary(kib);
     if (REVIEW_PART("inbox") || REVIEW_PART("window")) run_inbox_window(kib);
