@@ -173,6 +173,7 @@ enum {
     SRP_STATE_DAMAGE_SEEN = 1U << 2,    /* a runtime storage fault since the last full run */
     SRP_STATE_REPAIR_DISABLED = 1U << 3,/* the attempts guard stopped writing repairs */
     SRP_STATE_MANIFEST = 1U << 4,       /* a manifest describes the run in progress */
+    SRP_STATE_FULL = 1U << 5,           /* the last run found no room to make custody consistent */
 };
 typedef struct {
     uint32_t version;

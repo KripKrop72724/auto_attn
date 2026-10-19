@@ -15,7 +15,7 @@ REPAIR = {
     "files": 9, "files_held": 6, "bytes_held": 4612345, "files_unheld_custody": 0,
     "gaps": 1, "unreadable_bytes": 251, "records_reported": 0, "records_pending": 1, "records_dropped": 0,
     "spans_rewritten": 2, "index_rewritten": 1, "duplicates_removed": 1, "orphan_index_removed": 5,
-    "blocks_compacted": 3, "reserve_pages": 4, "sizes_recovered": 1, "strays_removed": 2, "files_superseded": 0,
+    "blocks_compacted": 3, "reserve_pages": 4, "room_needed_pages": 6, "room_erased_pages": 0, "sizes_recovered": 1, "strays_removed": 2, "files_superseded": 0,
     "lookup_fixed": 0, "tails_terminated": 1, "files_restored": 0, "files_rebuilt": 0, "cursors_reset": 1,
     "expendables_removed": 1, "settled_removed": 0, "interrupted_losses": 0,
     "used_before": 4930000, "used_after": 3540000, "total_bytes": 7700000,
@@ -27,7 +27,10 @@ REPAIR = {
     "entries": [{"name": "/blocked_identity.jsonl", "class": "attendance", "size": 3826949, "gaps": 1,
                  "unreadable_bytes": 251, "spans_rewritten": 1, "actions": ["NORMALIZED", "GAPS"]},
                 {"name": "/pending.jsonl", "class": "attendance", "size": 516, "gaps": 0,
-                 "unreadable_bytes": 0, "spans_rewritten": 0, "actions": ["NORMALIZED", "SIZE_RECOVERED"]}],
+                 "unreadable_bytes": 0, "spans_rewritten": 0, "actions": ["NORMALIZED", "SIZE_RECOVERED"]},
+                {"name": "/add_live.jsonl", "class": "attendance", "size": 90000, "gaps": 0,
+                 "unreadable_bytes": 0, "spans_rewritten": 0, "blocked_spans": 2, "blocked_offset": 50200,
+                 "actions": []}],
 }
 
 
@@ -48,12 +51,15 @@ def test_a_repair_report_is_kept_with_the_heartbeat(db):
     assert stored["result"] == "REPAIRED_WITH_GAPS" and stored["gaps"] == 1
     assert stored["check"]["delete_page"] == 5512
     assert stored["blocks_compacted"] == 3 and stored["reserve_pages"] == 4
+    assert stored["room_needed_pages"] == 6 and stored["room_erased_pages"] == 0
     assert stored["sizes_recovered"] == 1 and stored["strays_removed"] == 2 and stored["files_superseded"] == 0
     assert stored["previous_boot_returned"] is False
     assert stored["entries"][1]["actions"] == ["NORMALIZED", "SIZE_RECOVERED"]
     entry = stored["entries"][0]
     assert entry["name"] == "/blocked_identity.jsonl" and entry["actions"] == ["NORMALIZED", "GAPS"]
     assert entry.get("class", entry.get("class_")) == "attendance"
+    blocked = stored["entries"][2]
+    assert blocked["blocked_spans"] == 2 and blocked["blocked_offset"] == 50200
 
 
 def test_later_codes_are_text_and_older_firmware_sends_none():

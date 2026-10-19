@@ -26,15 +26,20 @@ PLAIN = ["durable_queue.c", "zkt_clock.c", "storage_repair_plan.c", "storage_rep
 FLAGS = ["-std=c11", "-D_POSIX_C_SOURCE=200809L", "-g", "-O1", "-fsanitize=address,undefined",
          "-fno-omit-frame-pointer"]
 # The CI run: 1 MiB stores, every scenario with several seeds, the special
-# runs and cuts inside the repair; more cut seeds; the simulator's workload to
-# a crammed store (odd seeds also retire and recreate the queue); then the
-# scenarios on the 8 MB store.
+# and review runs and cuts inside the repair; more cut seeds; the simulator's
+# workload to a crammed store (odd seeds also retire and recreate the queue),
+# on the 8 MB store too; then the scenarios on the 8 MB store.
 CI_RUNS = [["--seeds=3", "--organic=0"], ["cuts", "--seeds=12", "--first-seed=3"],
            ["organic", "--organic=3", "--ticks=2500", "--first-seed=0"],
            ["organic", "--organic=3", "--ticks=2500", "--first-seed=3", "--gap=150"],
            # Seed 832 once ended with SPIFFS_check deleting a consistent queue
            # over a half-deleted hidden header's lookup entry (1.2 item 7).
            ["organic", "--organic=1", "--ticks=2500", "--first-seed=821"],
+           # The 8 MB store crammed (77% live data, no free block, deleted
+           # pages spread thin): seed 16 left a queue unreadable and every
+           # boot deferred until the reserve rule took the erased pages the
+           # work fits in (third boot review, finding 1).
+           ["organic", "--organic=1", "--ticks=3000", "--prefill=70", "--gap=2500", "--kib=8192", "--first-seed=5"],
            ["scenarios", "--seeds=1", "--kib=8192"]]
 
 

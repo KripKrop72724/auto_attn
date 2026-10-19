@@ -182,6 +182,9 @@ class StorageRepairFile(BaseModel):
     gaps: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
     unreadable_bytes: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
     spans_rewritten: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    # After a run deferred for room: spans SPIFFS still cannot read, and the first.
+    blocked_spans: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    blocked_offset: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
     actions: list[Annotated[str, Field(pattern=UPPER_CODE)]] = Field(default_factory=list, max_length=8)
 
     model_config = ConfigDict(populate_by_name=True)
@@ -224,6 +227,9 @@ class StorageRepairDiagnostics(BaseModel):
     orphan_index_removed: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
     blocks_compacted: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
     reserve_pages: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    # A run deferred for room: pages its work needs, and the erased pages there were.
+    room_needed_pages: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    room_erased_pages: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
     sizes_recovered: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
     strays_removed: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
     files_superseded: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)

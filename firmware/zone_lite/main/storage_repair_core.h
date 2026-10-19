@@ -117,6 +117,9 @@ typedef struct {
     uint8_t cls;
     uint16_t actions;
     uint32_t size, gaps, unreadable_bytes, spans_rewritten;
+    /* After a run deferred for room: spans SPIFFS still cannot read (the
+     * repair holds their bytes, it could not rewrite them), and the first. */
+    uint32_t blocked_spans, blocked_offset;
 } srr_report_file_t;
 
 typedef struct {
@@ -133,6 +136,7 @@ typedef struct {
     uint32_t tails_terminated, files_restored, files_rebuilt, cursors_reset;
     uint32_t expendables_removed, settled_removed, interrupted_losses, orphan_index_removed;
     uint32_t blocks_compacted, reserve_pages; /* room made: blocks of deleted pages erased; GC reserve pages used */
+    uint32_t room_needed, room_erased; /* a run deferred for room: pages the work needs, erased pages there were */
     uint32_t sizes_recovered, strays_removed, files_superseded;
     uint32_t check_passes, check_fix_index, check_fix_lookup, check_delete_orphan_index;
     uint32_t check_delete_page, check_delete_bad_file, check_errors;

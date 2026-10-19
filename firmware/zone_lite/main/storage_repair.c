@@ -653,6 +653,8 @@ bool storage_repair_append(cJSON *storage)
         cJSON_AddNumberToObject(repair, "orphan_index_removed", r->orphan_index_removed) &&
         cJSON_AddNumberToObject(repair, "blocks_compacted", r->blocks_compacted) &&
         cJSON_AddNumberToObject(repair, "reserve_pages", r->reserve_pages) &&
+        (!r->room_needed || (cJSON_AddNumberToObject(repair, "room_needed_pages", r->room_needed) &&
+                             cJSON_AddNumberToObject(repair, "room_erased_pages", r->room_erased))) &&
         cJSON_AddNumberToObject(repair, "sizes_recovered", r->sizes_recovered) &&
         cJSON_AddNumberToObject(repair, "strays_removed", r->strays_removed) &&
         cJSON_AddNumberToObject(repair, "files_superseded", r->files_superseded) &&
@@ -701,7 +703,10 @@ bool storage_repair_append(cJSON *storage)
             cJSON_AddStringToObject(row, "class", srp_class_name((srp_class_t)f->cls)) &&
             cJSON_AddNumberToObject(row, "size", f->size) && cJSON_AddNumberToObject(row, "gaps", f->gaps) &&
             cJSON_AddNumberToObject(row, "unreadable_bytes", f->unreadable_bytes) &&
-            cJSON_AddNumberToObject(row, "spans_rewritten", f->spans_rewritten) && add_actions(row, f->actions);
+            cJSON_AddNumberToObject(row, "spans_rewritten", f->spans_rewritten) &&
+            (!f->blocked_spans || (cJSON_AddNumberToObject(row, "blocked_spans", f->blocked_spans) &&
+                                   cJSON_AddNumberToObject(row, "blocked_offset", f->blocked_offset))) &&
+            add_actions(row, f->actions);
         if (!row_ok || !cJSON_AddItemToArray(files, row)) {
             cJSON_Delete(row);
             return false;

@@ -72,6 +72,7 @@ typedef struct {
     uint8_t **hold;
     uint32_t hold_chunks, hold_size, crc;
     uint32_t gaps, gap_bytes, rewritten;
+    uint32_t blocked_spans, blocked_offset;
     uint16_t actions;
 } obj_t;
 
@@ -100,6 +101,7 @@ typedef struct {
     srp_resets_t *resets;
     bool stopped, failed, wrote, catalog_damaged, unrecordable_custody;
     bool finishing;                /* the restore after a check pass: only the hard deadline ends it */
+    bool was_full;                 /* the previous run found no room (SRP_STATE_FULL) */
     bool restore_failed;
     uint32_t ops;
     uint32_t last_check_ms;
@@ -1212,6 +1214,8 @@ static void note_file(run_t *r, const obj_t *o)
     f->gaps = o->gaps;
     f->unreadable_bytes = o->gap_bytes;
     f->spans_rewritten = o->rewritten;
+    f->blocked_spans = o->blocked_spans;
+    f->blocked_offset = o->blocked_offset;
 }
 
 /* A range of this file this run already recorded as unreadable. */
@@ -1792,11 +1796,16 @@ static bool catalog_commit(void *context, const ft_checkpoint_t *cp)
 /* The identity catalog is re-fetchable: ADD sends it on every connect. Its
  * files go first and then its transaction is set idle, so ft_recover finds
  * nothing to finish; a reset in between repeats both on the next boot. */
-static bool clear_catalog(run_t *r)
+static bool clear_catalog(run_t *r, bool for_room)
 {
+    bool any = false;
+    for (size_t i = 0; i < sizeof(CATALOG_FILES) / sizeof(CATALOG_FILES[0]); ++i) any |= find_live(r, CATALOG_FILES[i]) != NULL;
+    /* Making room with no catalog file: nothing to drop, nothing to write. */
+    if (for_room && !any && !(r->state.flags & SRP_STATE_CATALOG_CLEAR)) return true;
     r->state.flags |= SRP_STATE_CATALOG_CLEAR;
     if (!save_state(r)) return fail(r, "journal", SPIFFS_ERR_INTERNAL);
     bool removed = true;
+    uint32_t dropped = 0;
     for (size_t i = 0; i < sizeof(CATALOG_FILES) / sizeof(CATALOG_FILES[0]); ++i) {
         obj_t *o = find_live(r, CATALOG_FILES[i]);
         if (!o) continue;
@@ -1804,6 +1813,7 @@ static bool clear_catalog(run_t *r)
             removed = false;
             continue;
         }
+        dropped++;
         o->actions |= SRR_FILE_REMOVED;
         note_file(r, o);
     }
@@ -1817,7 +1827,8 @@ static bool clear_catalog(run_t *r)
     ft_port_t port = {catalog_load, catalog_commit, r};
     if (!ft_checkpoint_idle(port)) return fail(r, "catalog_idle", SPIFFS_ERR_INTERNAL);
     r->state.flags &= ~SRP_STATE_CATALOG_CLEAR;
-    logf_line(r, "WARN", "STORAGE_REPAIR_CATALOG_DROPPED", "identity catalog removed; ADD resends it on connect");
+    if (dropped)
+        logf_line(r, "WARN", "STORAGE_REPAIR_CATALOG_DROPPED", "identity catalog removed; ADD resends it on connect");
     return save_state(r) || fail(r, "journal", SPIFFS_ERR_INTERNAL);
 }
 
@@ -2922,8 +2933,10 @@ static uint32_t compact(run_t *r, uint32_t target, bool *touched)
         if (!block_usage(r, best, &used, &erased)) break;
         uint32_t consumed = c.consumed + (used > c.used ? 2 * (used - c.used) : 0);
         /* Room for the moves, and if a cleaning stops half way anyway, for
-         * pointing each group's index page at its moved pages. */
-        if ((int32_t)(consumed + c.groups + 2) > counted_free(r) - drift - (int32_t)erased) continue;
+         * pointing each group's index page at its moved pages. A block of
+         * deleted and erased pages alone moves nothing: it is only erased. */
+        bool moves = consumed || used;
+        if (moves && (int32_t)(consumed + c.groups + 2) > counted_free(r) - drift - (int32_t)erased) continue;
         r->wrote = true;
         *touched = true;
         fs->cleaning = 1;
@@ -3073,17 +3086,28 @@ static bool normalize_all(run_t *r, bool *deferred)
     if (!make_room(r)) return false;
     for (int attempt = 0;; ++attempt) {
         uint32_t pages = pages_for_work(r);
-        bool reserve = (uint32_t)r->fs->free_blocks < blocks_for(r, pages) &&
-            surveyed_free(r) >= (int32_t)(pages + spare_for_compaction(r));
+        /* Too few free blocks for SPIFFS's own allocation (which refuses
+         * below two, after a quick GC that may erase byte sources): the work
+         * takes the erased pages SPIFFS keeps for its GC whenever it fits in
+         * them, even when compacting the best block afterwards would need
+         * more (the store was that crammed before the repair; a custody file
+         * SPIFFS cannot read is worse). */
+        int32_t erased = surveyed_free(r);
+        uint32_t spare = spare_for_compaction(r);
+        uint32_t exact = pages - 2; /* pages_for_work's margin left out: what normalization allocates */
+        bool reserve = (uint32_t)r->fs->free_blocks < blocks_for(r, pages) && erased >= (int32_t)exact;
         r->fs->cleaning = reserve ? 1 : 0;
         bool ok = normalize_once(r);
         r->fs->cleaning = 0;
         if (ok) {
+            r->state.flags &= ~SRP_STATE_FULL;
             if (reserve) {
-                char message[96];
-                snprintf(message, sizeof(message), "up to %lu pages from the GC reserve", (unsigned long)pages);
+                char message[140];
+                snprintf(message, sizeof(message), "up to %lu pages from the GC reserve (%ld erased%s)",
+                         (unsigned long)exact, (long)erased,
+                         erased >= (int32_t)(pages + spare) ? "" : "; too few to compact the best block after");
                 logf_line(r, "INFO", "STORAGE_REPAIR_RESERVE", message);
-                r->report->reserve_pages += pages;
+                r->report->reserve_pages += exact;
             }
             if ((uint32_t)r->fs->free_blocks < 3 && !compact_to(r, 3)) return false;
             if (!any_work(r) || attempt >= 2) break;
@@ -3096,13 +3120,23 @@ static bool normalize_all(run_t *r, bool *deferred)
         if (attempt == 2) {
             snprintf(r->report->error_stage, sizeof(r->report->error_stage), "full");
             r->report->error_code = SPIFFS_ERR_FULL;
+            r->report->room_needed = exact;
+            r->report->room_erased = erased > 0 ? (uint32_t)erased : 0;
             *deferred = true;
-            logf_line(r, "WARN", "STORAGE_REPAIR_FULL", "no room to make every file consistent; no check this boot");
+            r->state.flags |= SRP_STATE_FULL;
+            char message[140];
+            snprintf(message, sizeof(message),
+                     "no room to make every file consistent (%lu pages needed, %ld erased); no check this boot",
+                     (unsigned long)exact, (long)erased);
+            logf_line(r, "WARN", "STORAGE_REPAIR_FULL", message);
             return survey(r);
         }
-        if (attempt == 1) {
+        /* Level 2 only once: after a run that already found no room, the
+         * catalog it dropped is back from ADD and dropping it again buys
+         * nothing (the runtime retires settled queues itself). */
+        if (attempt == 1 && !r->was_full) {
             if (r->report->level < 2) r->report->level = 2;
-            if (!survey(r) || !remove_expendables_now(r) || !clear_catalog(r) || !survey(r) ||
+            if (!survey(r) || !remove_expendables_now(r) || !clear_catalog(r, true) || !survey(r) ||
                 !reconcile_cursors(r, true))
                 return false;
         }
@@ -3113,6 +3147,35 @@ static bool normalize_all(run_t *r, bool *deferred)
     }
     *deferred = !custody_consistent(r);
     return true;
+}
+
+/* A run that leaves a custody file inconsistent (no room to rewrite it)
+ * reports, per file, the spans SPIFFS still cannot read: their bytes are on
+ * flash (the repair read them), but the runtime's reads stop there. */
+static void report_blocked(run_t *r)
+{
+    for (uint32_t i = 0; i < r->obj_count; ++i) {
+        obj_t *o = &r->objs[i];
+        if (!live(o) || !custody(o) || !o->mapped || (o->consistent && !o->needs_work)) continue;
+        o->blocked_spans = 0;
+        o->blocked_offset = UINT32_MAX;
+        for (uint32_t k = 0; k < o->patches; ++k) {
+            if (o->patch[k].source == SOURCE_TAIL) continue;
+            o->blocked_spans++;
+            uint32_t at = o->patch[k].span * SRP_SPAN_BYTES;
+            if (at < o->blocked_offset) o->blocked_offset = at;
+        }
+        if (!o->blocked_spans) {
+            o->blocked_offset = 0;
+            continue;
+        }
+        note_file(r, o);
+        char message[180];
+        snprintf(message, sizeof(message),
+                 "%s: %lu spans SPIFFS cannot read, the first at offset %lu; their bytes stay on flash until there is room",
+                 o->name, (unsigned long)o->blocked_spans, (unsigned long)o->blocked_offset);
+        logf_line(r, "WARN", "STORAGE_REPAIR_BLOCKED", message);
+    }
 }
 
 /* R3, just before the manifest and before every check pass: a fresh survey
@@ -3261,7 +3324,7 @@ static bool run_checks(run_t *r, bool *catalog_drop, bool *last_failed, bool *cu
                 r->report->level = 1;
                 remove_expendables(r, true);
                 *catalog_drop = true;
-                if (!clear_catalog(r) || !survey(r)) return false;
+                if (!clear_catalog(r, true) || !survey(r)) return false;
             } else if (r->report->level == 1) {
                 r->report->level = 2;
                 if (!reconcile_cursors(r, true) || !survey(r)) return false;
@@ -3338,6 +3401,7 @@ void srr_run(spiffs *fs, const srr_config_t *config, const srr_ports_t *ports, s
         nvs_load(r, SRR_NVS_NAMESPACE, "manifest", r->manifest, sizeof(*r->manifest)) == 1;
     if (manifest_active(r) && !have_manifest) memset(r->manifest, 0xFF, sizeof(*r->manifest));
     if (config->damage_seen) r->state.flags |= SRP_STATE_DAMAGE_SEEN;
+    r->was_full = (r->state.flags & SRP_STATE_FULL) != 0;
     srp_policy_input_t input = {
         .incomplete = r->state.incomplete,
         .failures = r->state.failures,
@@ -3451,9 +3515,11 @@ void srr_run(spiffs *fs, const srr_config_t *config, const srr_ports_t *ports, s
             }
         }
     }
-    if (ok && deferred)
+    if (ok && deferred) {
         logf_line(r, "WARN", "STORAGE_REPAIR_DEFERRED",
                   "a custody file could not be made consistent, or no time is left; no filesystem check this boot");
+        report_blocked(r);
+    }
     report->check_skipped = !checked;
     if (ok && going(r)) {
         set_phase(r, SRP_PHASE_FINISH, 0, true);
@@ -3463,10 +3529,18 @@ void srr_run(spiffs *fs, const srr_config_t *config, const srr_ports_t *ports, s
          * far as compaction can make it safely. */
         if (ok) ok = ensure_room(r);
         if (ok && (catalog_drop || (r->state.flags & SRP_STATE_CATALOG_CLEAR)))
-            ok = clear_catalog(r) && survey(r);
+            ok = clear_catalog(r, !r->catalog_damaged) && survey(r);
         if (ok) ok = reconcile_cursors(r, false);
         if (ok) ok = terminate_tails(r);
-        if (ok && r->wrote && !check_failed && !deferred) {
+        if (ok && r->wrote && !check_failed && !deferred && (uint32_t)r->fs->free_blocks < 2) {
+            /* SPIFFS's GC runs inside the probe's writes; with fewer than two
+             * free blocks it can stop half way through a block (data pages
+             * moved, the index naming the originals) and damage a live file. */
+            snprintf(report->error_stage, sizeof(report->error_stage), "full");
+            report->error_code = SPIFFS_ERR_FULL;
+            logf_line(r, "WARN", "STORAGE_REPAIR_FULL",
+                      "repaired, but too few free blocks for SPIFFS's own GC; no probe file written");
+        } else if (ok && r->wrote && !check_failed && !deferred) {
             s32_t probed = probe(r, "/repair-probe");
             if (probed != SPIFFS_OK && probed != SPIFFS_ERR_FULL) {
                 /* A damaged object of that name that SPIFFS will not

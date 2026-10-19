@@ -1331,7 +1331,17 @@ static void damage_torn_lookup(void)
     SPIFFS_unmount(&fs);
 }
 
-static void damage_full_store(void)
+static void full_store_with(uint32_t keep_erased);
+static void damage_full_store(void) { full_store_with(15); }
+
+/* Review 3 (boot), finding 1: the 8 MB workload's crammed stores. No free
+ * block: the one SPIFFS kept for its GC holds deleted copies too, save five
+ * erased pages; the damaged queue's work fits in them, but not with the
+ * pages compacting the best block would need on top. The repair deferred
+ * every boot, the queue unreadable from its damaged span. */
+static void damage_thin_store(void) { full_store_with(5); }
+
+static void full_store_with(uint32_t keep_erased)
 {
     /* A store that has run a while: the queues interleaved in every block,
      * deleted pages everywhere and one free block. The pending queue's
@@ -1368,8 +1378,17 @@ static void damage_full_store(void)
         if (empty) keep = b;
     }
     CHECK(keep < blocks, "full_store: no free block");
-    for (uint32_t pix = 0, pinned = blocks; pix < flash_size / PAGE; ++pix) {
-        if (pix % 16 == 0 || pix / 16 == keep || rd16(lookup_address(pix)) != 0xFFFF) continue;
+    for (uint32_t pix = 0, pinned = blocks, left = keep_erased; pix < flash_size / PAGE; ++pix) {
+        if (pix % 16 == 0 || rd16(lookup_address(pix)) != 0xFFFF) continue;
+        if (pix / 16 == keep) {
+            if (left) {
+                left--;
+                continue;
+            }
+            copy_page(pix, copy);
+            flag_deleted(pix);
+            continue;
+        }
         copy_page(pix, copy);
         if (pinned == pix / 16) flag_deleted(pix);
         pinned = pix / 16;
@@ -1809,6 +1828,7 @@ static const scenario_t scenarios[] = {
     {"torn_hidden_lookup", damage_torn_hidden_lookup, false},
     {"torn_size_inside", damage_torn_size_inside, false},
     {"segment_dirty_tail", damage_segment_dirty_tail, false},
+    {"thin_store", damage_thin_store, false},
 };
 
 static void run_scenario(const scenario_t *s, uint64_t seed_value, uint32_t kib)
@@ -1856,6 +1876,7 @@ static void run_scenario(const scenario_t *s, uint64_t seed_value, uint32_t kib)
     if (!strcmp(s->name, "strays")) CHECK(report.strays_removed >= 1, "stray page %04x left", stray_page);
     if (!strcmp(s->name, "copies_disagree")) CHECK(report.gaps == 1 && report.unreadable_bytes == 1, "disagreement");
     if (!strcmp(s->name, "scattered_bytes")) CHECK(report.gaps == 1, "scattered bytes: %u records", report.gaps);
+    if (!strcmp(s->name, "thin_store")) CHECK(report.reserve_pages > 0, "thin_store: no reserve used");
     if (!strcmp(s->name, "full_store"))
         CHECK(report.reserve_pages > 0 || report.blocks_compacted > 0, "full_store: no room made (%s)",
               srr_result_name(report.result));
@@ -2452,6 +2473,7 @@ static void run_manifest_cases(uint32_t kib)
  * room is made: level 2 retires the fully settled blocked queue (its cursor
  * cleared first, as lq_reclaim does). Neither a restore in that run nor a
  * resume after a reset may bring it back, and its settled rows never replay. */
+static uint32_t erased_pages(void);
 static void run_retired_stays_retired(uint32_t kib)
 {
     uint32_t retired = 0;
@@ -2463,12 +2485,28 @@ static void run_retired_stays_retired(uint32_t kib)
         row_seq = 1000;
         mount_plain();
         (void)make_id_file("/acked_uids.txt", 200);
-        model_file_t *blocked = make_json_file("/blocked_identity.jsonl", 440000);
+        model_file_t *blocked = make_json_file("/blocked_identity.jsonl", flash_size / 100 * 42);
         set_cursor("legacy_queues", "blocked", blocked->size, prefix_crc(blocked, blocked->size), 12);
-        uint32_t room = (uint32_t)(fs.free_blocks - 12 - 2 * trial) * 15;
-        model_file_t *pending = make_json_file("/pending.jsonl", (room - room / 120 - 6) * SPAN - 600);
+        /* The pending queue fills the rest (any store size) until SPIFFS keeps
+         * three to five free blocks, then more of its spans are damaged than
+         * the erased and deleted pages could give room for: only retiring the
+         * settled blocked queue makes it. */
+        model_file_t *pending = new_model("/pending.jsonl", true, false);
+        char chunk[4600];
+        while (fs.free_blocks > 3 + trial % 3) {
+            size_t used = 0;
+            while (used < 4000) used += json_row(chunk + used, sizeof(chunk) - used);
+            model_append(pending, chunk, (uint32_t)used);
+        }
         SPIFFS_unmount(&fs);
-        for (uint32_t span = 1; span < 160; span += 2) flag_deleted(rd16(entry_address(pending->name, span)));
+        uint32_t deleted = 0;
+        for (uint32_t pix = 0; pix < flash_size / PAGE; ++pix) deleted += pix % 16 && rd16(lookup_address(pix)) == 0;
+        /* Every other span: no block of them becomes all deleted, which
+         * SPIFFS's quick GC would erase to make room. */
+        uint32_t spans = pending->size / SPAN, damage = erased_pages() + deleted + 60;
+        CHECK(2 * damage < spans && damage < blocked->size / SPAN / 2, "retired: pending holds %u spans, %u damaged",
+              spans, damage);
+        for (uint32_t k = 0; k < damage; ++k) flag_deleted(rd16(entry_address(pending->name, 1 + 2 * k)));
         srr_report_t report;
         srr_config_t config = repair_config();
         /* The check is taken to have changed something: the restore after it
@@ -3199,11 +3237,16 @@ static void run_inbox_window(uint32_t kib)
     build_store(60000);
     char lines[8][200];
     for (unsigned i = 0; i < 8; ++i) hex_line(lines[i], 120 + i * 7);
-    char active[2000] = "", backup[2000] = "";
-    for (unsigned i = 0; i < 6; ++i) strncat(active, lines[i], 120 + i * 7);
-    for (unsigned i = 0; i < 8; ++i) strncat(backup, lines[i], 120 + i * 7);
-    write_file(INBOX, (const uint8_t *)active, (uint32_t)strlen(active));
-    write_file(INBOX_BAK, (const uint8_t *)backup, (uint32_t)strlen(backup));
+    uint8_t active[2000], backup[2000];
+    uint32_t active_size = 0, backup_size = 0;
+    for (unsigned i = 0; i < 8; ++i) {
+        if (i < 6) memcpy(active + active_size, lines[i], 120 + i * 7);
+        if (i < 6) active_size += 120 + i * 7;
+        memcpy(backup + backup_size, lines[i], 120 + i * 7);
+        backup_size += 120 + i * 7;
+    }
+    write_file(INBOX, active, active_size);
+    write_file(INBOX_BAK, backup, backup_size);
     SPIFFS_unmount(&fs);
     uint8_t *image = malloc(flash_size);
     memcpy(image, flash, flash_size);
@@ -3290,7 +3333,9 @@ static const uint8_t *find_seq(const uint8_t *row, size_t length)
 static uint8_t *committed, *row_queue;
 static uint32_t *row_offset, *row_generation;
 static uint16_t *row_length;
-static uint32_t next_seq, organic_ticks, organic_cut_count, organic_reclaims, organic_segments;
+static uint32_t next_seq, organic_ticks, organic_cut_count, organic_reclaims, organic_segments, organic_gc_stops;
+static uint32_t organic_blocked; /* verifications of a queue a run without room left unreadable */
+static srr_report_t organic_last;  /* the last finished run's report */
 static bool append_failed_this_boot;
 /* Odd seeds: pending.jsonl is retired whenever its drain catches up, and
  * the blocked queue (never retired) fills the store meanwhile. Even seeds:
@@ -3341,10 +3386,22 @@ static void organic_segment(void)
 {
     /* Uncommitted from the moment "wb" truncates it. */
     segment_size = 0;
+    int32_t free_blocks = fs.free_blocks;
     spiffs_file f = SPIFFS_open(&fs, "/qo0000002a.q", SPIFFS_O_CREAT | SPIFFS_O_TRUNC | SPIFFS_O_RDWR, 0);
     if (f < 0) {
         s32_t e = SPIFFS_errno(&fs);
         SPIFFS_clearerr(&fs);
+        /* With fewer than two free blocks SPIFFS's own GC in the truncate
+         * can run out of erased pages half way through a block (it reports
+         * NOT_FOUND): the store is full, and the next repair mends what
+         * that GC left. Any other refusal is a lane the repair left wedged. */
+        if ((e == SPIFFS_ERR_NOT_FOUND || e == SPIFFS_ERR_OUT_OF_FILE_DESCS) && free_blocks < 2) {
+            /* OUT_OF_FILE_DESCS: SPIFFS_close keeps its descriptor when its
+             * cache flush fails on such a store (the next boot frees it). */
+            organic_gc_stops++;
+            return;
+        }
+        if (e != SPIFFS_ERR_FULL) dump_write();
         CHECK(e == SPIFFS_ERR_FULL, "organic: the segment refuses \"wb\" (%d): its lane is wedged", e);
         return;
     }
@@ -3472,15 +3529,46 @@ static bool gap_names(const srp_gaps_t *gaps, const char *name, uint32_t generat
     return false;
 }
 
+/* Erased pages on flash (lookup free, page erased). */
+static uint32_t erased_pages(void)
+{
+    uint32_t n = 0;
+    for (uint32_t pix = 0; pix < flash_size / PAGE; ++pix) {
+        if (pix % 16 == 0 || rd16(lookup_address(pix)) != 0xFFFF) continue;
+        bool erased = true;
+        for (uint32_t i = 0; i < PAGE && erased; ++i) erased = flash[pix * PAGE + i] == 0xFF;
+        n += erased;
+    }
+    return n;
+}
+
 static void organic_verify(uint32_t *lost, uint32_t *explained, uint32_t *anded)
 {
     static uint8_t buffer[8 * 1024 * 1024];
     static uint8_t present[ORGANIC_MAX_SEQ];
     memset(present, 0, sizeof(present));
     int64_t got = 0;
+    bool blocked[2] = {false, false};
     for (uint32_t q = 0; q < 2; ++q) {
         got = exists(organic_queue[q]) ? read_file(organic_queue[q], buffer, sizeof(buffer)) : 0;
-        if (got < 0) dump_write();
+        if (got < 0) {
+            /* Only a store with no room for the work (SPIFFS's own GC in the
+             * workload's writes used every erased page): the run deferred,
+             * said how many pages it needed and had, the flash agrees, and
+             * the file's unreadable spans are reported. Its rows stay on
+             * flash, checked once a later run has room. */
+            const srr_report_t *l = &organic_last;
+            bool reported = false;
+            for (uint32_t i = 0; i < l->file_count; ++i)
+                reported |= !strcmp(l->file[i].name, organic_queue[q]) && l->file[i].blocked_spans > 0;
+            if (l->result == SRR_RESULT_DEFERRED && !strcmp(l->error_stage, "full") && l->room_erased < l->room_needed &&
+                erased_pages() <= l->room_erased && reported) {
+                blocked[q] = true;
+                organic_blocked++;
+                continue;
+            }
+            dump_write();
+        }
         CHECK(got >= 0, "organic: %s unreadable after repair", organic_queue[q]);
         for (int64_t start = 0, i = 0; i < got; ++i) {
             if (buffer[i] != '\n') continue;
@@ -3494,7 +3582,7 @@ static void organic_verify(uint32_t *lost, uint32_t *explained, uint32_t *anded)
     }
     srp_gaps_t gaps = gaps_now();
     for (uint32_t s = 0; s < next_seq && s < ORGANIC_MAX_SEQ; ++s) {
-        if (!committed[s] || present[s]) continue;
+        if (!committed[s] || present[s] || blocked[row_queue[s]]) continue;
         bool named = gap_names(&gaps, organic_queue[row_queue[s]], row_generation[s], row_offset[s], row_length[s]);
         if (committed[s] == 2) (*anded)++;
         else if (named) (*explained)++;
@@ -3520,7 +3608,7 @@ static void organic_verify(uint32_t *lost, uint32_t *explained, uint32_t *anded)
     }
     /* Health: the queues take appends. */
     for (uint32_t q = 0; q < 2; ++q) {
-        if (!exists(organic_queue[q])) continue;
+        if (!exists(organic_queue[q]) || blocked[q]) continue;
         void *file = (void *)rel_open_append(organic_queue[q]);
         CHECK(file != NULL, "organic: %s refuses appends after repair (errno %d)", organic_queue[q], errno);
         shim_fclose(file);
@@ -3583,10 +3671,15 @@ static void repair_until_done(uint64_t seed_value, volatile uint32_t *cuts, bool
               report.error_stage, (long)report.error_code);
         CHECK(report.check_deleted_live == 0, "organic seed %" PRIu64 ": the check deleted %u live files", seed_value,
               report.check_deleted_live);
+        organic_last = report;
         if (report.result != SRR_RESULT_STOPPED) return;
     }
 }
 
+/* --prefill=<percent>: the workload runs without cuts until the store is
+ * that full, then `ticks` more with cuts (an 8 MB store crammed in minutes
+ * rather than an hour of repairs under the sanitizers). */
+static uint32_t organic_prefill, organic_end;
 static void run_organic(uint64_t seed_value, uint32_t kib, uint32_t ticks, uint32_t mean_gap)
 {
     seed(seed_value);
@@ -3603,14 +3696,23 @@ static void run_organic(uint64_t seed_value, uint32_t kib, uint32_t ticks, uint3
     row_offset = calloc(ORGANIC_MAX_SEQ, sizeof(uint32_t));
     row_generation = calloc(ORGANIC_MAX_SEQ, sizeof(uint32_t));
     row_length = calloc(ORGANIC_MAX_SEQ, sizeof(uint16_t));
-    next_seq = organic_ticks = organic_reclaims = organic_segments = 0;
+    next_seq = organic_ticks = organic_reclaims = organic_segments = organic_gc_stops = organic_blocked = 0;
     segment_size = 0;
     volatile uint32_t cuts = 0, repairs = 0;
     uint32_t lost = 0, explained = 0, anded = 0;
     append_failed_this_boot = false;
     mount_plain();
+    organic_end = ticks;
+    if (organic_prefill) {
+        u32_t total = 0, used = 0;
+        do {
+            organic_tick();
+            SPIFFS_info(&fs, &total, &used);
+        } while ((uint64_t)used * 100 < (uint64_t)total * organic_prefill && organic_ticks < ORGANIC_MAX_SEQ / 2);
+        organic_end += organic_ticks;
+    }
     cut_at = flash_ops + 1 + rnd() % (2 * mean_gap);
-    while (organic_ticks < ticks) {
+    while (organic_ticks < organic_end) {
         if (setjmp(cut_point)) {
             /* Power cut during the workload: boot, repair, carry on. */
             cuts++;
@@ -3662,9 +3764,10 @@ static void run_organic(uint64_t seed_value, uint32_t kib, uint32_t ticks, uint3
     SPIFFS_info(&fs, &total, &used);
     SPIFFS_unmount(&fs);
     printf("organic seed %" PRIu64 ": %u cuts, %u repairs, %u committed rows lost, %u named by gap records, "
-           "%u ANDed by SPIFFS after a failed append, %u files reclaimed, %u segments, used %u%%\n",
-           seed_value, cuts, repairs, lost, explained, anded, organic_reclaims, organic_segments,
-           total ? (unsigned)(100ULL * used / total) : 0);
+           "%u ANDed by SPIFFS after a failed append, %u files reclaimed, %u segments, %u stopped GCs, "
+           "%u checks of a queue a store with no room left unreadable, used %u%%\n",
+           seed_value, cuts, repairs, lost, explained, anded, organic_reclaims, organic_segments, organic_gc_stops,
+           organic_blocked, total ? (unsigned)(100ULL * used / total) : 0);
     CHECK(lost == 0, "organic seed %" PRIu64 ": %u committed rows lost without a gap record", seed_value, lost);
 }
 
@@ -3711,6 +3814,12 @@ static void replay(const char *prefix)
         SPIFFS_close(&fs, fd);
         printf("replay: %s size %u, %u unreadable spans\n", names[i], st.size, bad);
     }
+    /* The "wb" lane's next segment, as the workload opens it. */
+    spiffs_file seg = SPIFFS_open(&fs, "/qo0000002a.q", SPIFFS_O_CREAT | SPIFFS_O_TRUNC | SPIFFS_O_RDWR, 0);
+    printf("replay: segment \"wb\" %s (%d), %d free blocks\n", seg >= 0 ? "opens" : "refused", seg >= 0 ? 0 : SPIFFS_errno(&fs),
+           (int)fs.free_blocks);
+    if (seg >= 0) SPIFFS_close(&fs, seg);
+    SPIFFS_clearerr(&fs);
     SPIFFS_unmount(&fs);
 }
 
@@ -3728,6 +3837,7 @@ int main(int argc, char **argv)
         else if (!strncmp(argv[i], "--ticks=", 8)) organic_ticks_max = (uint32_t)atoi(argv[i] + 8);
         else if (!strncmp(argv[i], "--gap=", 6)) mean_gap = (uint32_t)atoi(argv[i] + 6);
         else if (!strncmp(argv[i], "--first-seed=", 13)) first_seed = (uint32_t)atoi(argv[i] + 13);
+        else if (!strncmp(argv[i], "--prefill=", 10)) organic_prefill = (uint32_t)atoi(argv[i] + 10);
         else if (!strncmp(argv[i], "--replay=", 9)) {
             replay(argv[i] + 9);
             return 0;
