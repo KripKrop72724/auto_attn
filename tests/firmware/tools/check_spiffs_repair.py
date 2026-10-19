@@ -35,10 +35,13 @@ CI_RUNS = [["--seeds=3", "--organic=0"], ["cuts", "--seeds=12", "--first-seed=3"
            # Seed 832 once ended with SPIFFS_check deleting a consistent queue
            # over a half-deleted hidden header's lookup entry (1.2 item 7).
            ["organic", "--organic=1", "--ticks=2500", "--first-seed=821"],
-           # The 8 MB store crammed (77% live data, no free block, deleted
-           # pages spread thin): seed 16 left a queue unreadable and every
-           # boot deferred until the reserve rule took the erased pages the
-           # work fits in (third boot review, finding 1).
+           # The 8 MB store crammed (74 to 77% used, no free block, deleted
+           # pages spread thin): seeds 14 (one of the third boot review's
+           # failing seeds 11 to 15, finding 1) and 16 left a queue unreadable
+           # and every boot deferred until the reserve rule took the erased
+           # pages the work fits in. Seed 16 then ends wedged (no erased page
+           # at all; section 12 of the design): its rows are checked with room.
+           ["organic", "--organic=1", "--ticks=3000", "--prefill=70", "--gap=2500", "--kib=8192", "--first-seed=3"],
            ["organic", "--organic=1", "--ticks=3000", "--prefill=70", "--gap=2500", "--kib=8192", "--first-seed=5"],
            ["scenarios", "--seeds=1", "--kib=8192"]]
 

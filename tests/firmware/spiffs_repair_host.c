@@ -3482,6 +3482,7 @@ static uint32_t *row_offset, *row_generation;
 static uint16_t *row_length;
 static uint32_t next_seq, organic_ticks, organic_cut_count, organic_reclaims, organic_segments, organic_gc_stops;
 static uint32_t organic_blocked; /* verifications of a queue a run without room left unreadable */
+static bool organic_blocked_now[2]; /* the last verification's */
 static srr_report_t organic_last;  /* the last finished run's report */
 static bool append_failed_this_boot;
 /* Odd seeds: pending.jsonl is retired whenever its drain catches up, and
@@ -3753,6 +3754,8 @@ static void organic_verify(uint32_t *lost, uint32_t *explained, uint32_t *anded)
             break;
         }
     }
+    organic_blocked_now[0] = blocked[0];
+    organic_blocked_now[1] = blocked[1];
     /* Health: the queues take appends. */
     for (uint32_t q = 0; q < 2; ++q) {
         if (!exists(organic_queue[q]) || blocked[q]) continue;
@@ -3821,6 +3824,24 @@ static void repair_until_done(uint64_t seed_value, volatile uint32_t *cuts, bool
         organic_last = report;
         if (report.result != SRR_RESULT_STOPPED) return;
     }
+}
+
+/* Test only: the partition grows by `blocks` erased blocks, every block's
+ * magic rewritten for the new length (SPIFFS_USE_MAGIC_LENGTH), as if the
+ * store had room. */
+static void grow_flash(uint32_t blocks)
+{
+    uint32_t old = flash_size;
+    flash_size += blocks * BLOCK;
+    flash = realloc(flash, flash_size);
+    CHECK(flash, "grow flash");
+    memset(flash + old, 0xFF, flash_size - old);
+    free(mirror_lookup);
+    free(mirror_headers);
+    mirror_lookup = malloc(srm_lookup_bytes(flash_size, BLOCK, PAGE));
+    mirror_headers = malloc(srm_header_bytes(flash_size, PAGE));
+    uint32_t count = flash_size / BLOCK;
+    for (uint32_t b = 0; b < count; ++b) wr16(b * BLOCK + PAGE - 4, (uint16_t)(0x20140529U ^ PAGE ^ (count - b)));
 }
 
 /* --prefill=<percent>: the workload runs without cuts until the store is
@@ -3907,6 +3928,43 @@ static void run_organic(uint64_t seed_value, uint32_t kib, uint32_t ticks, uint3
     repair_until_done(seed_value, &cuts, false);
     mount_plain();
     organic_verify(&lost, &explained, &anded);
+    /* The workload ended on a queue a store with no room left unreadable: its
+     * rows are still unchecked. The device keeps working (SPIFFS's own GC in
+     * its writes may make room), so the workload runs on without cuts, a
+     * stretch at a time, each followed by a boot's repair. */
+    uint32_t stretches = 0;
+    while ((organic_blocked_now[0] || organic_blocked_now[1]) && stretches < 3) {
+        ++stretches;
+        for (uint32_t t = 0; t < 200; ++t) organic_tick();
+        SPIFFS_unmount(&fs);
+        repair_until_done(seed_value, &cuts, false);
+        mount_plain();
+        organic_verify(&lost, &explained, &anded);
+    }
+    bool wedged = organic_blocked_now[0] || organic_blocked_now[1];
+    if (wedged) {
+        /* Wedged: no erased page for the work and no block the repair may
+         * compact (the damaged queue has pages in every one), and SPIFFS's GC
+         * has nothing to move pages into, so no write gets room. The repair
+         * defers every boot and reports the blocked spans; its last resort (a
+         * reformat with every custody byte held) is not in 2.7.5. Its rows
+         * must still be on flash: given room (test only: the partition grows
+         * by 64 erased blocks), one repair makes the queue read, and every
+         * row it held is there or under a gap record. */
+        uint32_t erased = erased_pages();
+        SPIFFS_unmount(&fs);
+        grow_flash(64);
+        repair_until_done(seed_value, &cuts, false);
+        mount_plain();
+        organic_verify(&lost, &explained, &anded);
+        CHECK(!organic_blocked_now[0] && !organic_blocked_now[1],
+              "organic seed %" PRIu64 ": a queue still unreadable with room", seed_value);
+        printf("organic seed %" PRIu64 ": WEDGED at the end (%u erased pages; a queue unreadable for room through %u "
+               "more stretches of 200 ticks); with room it reads whole\n", seed_value, erased, stretches);
+    } else if (stretches) {
+        printf("organic seed %" PRIu64 ": ended on a queue left unreadable for room; it read whole after %u more "
+               "stretch(es) of 200 ticks\n", seed_value, stretches);
+    }
     u32_t total = 0, used = 0;
     SPIFFS_info(&fs, &total, &used);
     SPIFFS_unmount(&fs);
@@ -4009,7 +4067,7 @@ int main(int argc, char **argv)
     size_t count = sizeof(scenarios) / sizeof(scenarios[0]);
     for (size_t i = 0; i < count; ++i) {
         if (only && strcmp(only, scenarios[i].name) && strcmp(only, "scenarios")) continue;
-        for (uint32_t s = 0; s < seeds; ++s) run_scenario(&scenarios[i], 1000 + s * 7919 + i, kib);
+        for (uint32_t s = 0; s < seeds; ++s) run_scenario(&scenarios[i], 1000 + (first_seed + s) * 7919 + i, kib);
         printf("scenario %-24s %u seeds passed\n", scenarios[i].name, seeds);
     }
     if (!only || !strcmp(only, "mirror")) {
