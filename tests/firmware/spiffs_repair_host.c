@@ -2335,6 +2335,35 @@ static void run_restores(uint32_t kib)
     CHECK(gaps_now().count == recorded && port_nvs_load(NULL, SRR_NVS_NAMESPACE, "state", &state, sizeof(state)) == 1 &&
               !(state.flags & SRP_STATE_MANIFEST),
           "full restore, next boot: %u gaps (was %u)", gaps_now().count, recorded);
+    /* The held queue's restore fails for room, and the check also changed
+     * the blocked queue, which the budget could not hold: its UNHELD_LOST
+     * record must not hide the failed restore (the run fails, the manifest
+     * stays), and the next boot settles both. */
+    seed(9151);
+    nvs_clear();
+    format_flash(kib);
+    build_store(60000);
+    SPIFFS_unmount(&fs);
+    uint64_t all = 0;
+    for (uint32_t i = 0; i < model_count; ++i) all += model[i].size;
+    full_config = repair_config();
+    full_config.hold_budget = all - model_of("/blocked_identity.jsonl")->size - 1;
+    hook_mode = 1 | 2 | 8;
+    repair_boot(&full, &full_config);
+    hook_mode = 0;
+    gaps = gaps_now();
+    bool unheld = false, changed = false;
+    for (uint32_t g = 0; g < gaps.count; ++g) {
+        unheld |= gaps.gap[g].cause == SRP_GAP_UNHELD_LOST && !strcmp(gaps.gap[g].name, "/blocked_identity.jsonl");
+        changed |= gaps.gap[g].cause == SRP_GAP_CHECK_CHANGED && !strcmp(gaps.gap[g].name, "/pending.jsonl");
+    }
+    CHECK(full.result == SRR_RESULT_FAILED && unheld && changed &&
+              port_nvs_load(NULL, SRR_NVS_NAMESPACE, "state", &state, sizeof(state)) == 1 &&
+              (state.flags & SRP_STATE_MANIFEST),
+          "held and unheld restore: %s, unheld %d, changed %d", srr_result_name(full.result), unheld, changed);
+    boot_until_done("held and unheld restore, next boot");
+    CHECK(port_nvs_load(NULL, SRR_NVS_NAMESPACE, "state", &state, sizeof(state)) == 1 &&
+              !(state.flags & SRP_STATE_MANIFEST), "held and unheld restore: manifest kept");
     /* Cuts at sampled writes of the run whose check deleted and altered. */
     uint32_t runs = 0;
     for (uint32_t trial = 0; trial < 120; ++trial) {

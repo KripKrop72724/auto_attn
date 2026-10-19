@@ -2331,11 +2331,12 @@ static bool restore_held(run_t *r, bool *changed)
         placeholder.kind = srp_classify(f->name);
         placeholder.size = f->size;
         obj_t *target = now ? now : &placeholder;
+        bool failed_before = r->restore_failed;
         if (record_unrestored(r, target, f->name, 0, f->size, 0, SRP_GAP_UNHELD_LOST)) {
             /* Nothing held to put back: recorded is settled. */
             f->flags |= SRP_MANIFEST_REPORTED | SRP_MANIFEST_SETTLED;
             if (!manifest_save(r)) return fail(r, "journal_manifest", SPIFFS_ERR_INTERNAL);
-            r->restore_failed = false;
+            r->restore_failed = failed_before;
         }
     }
     if (r->restore_failed) fail(r, "restore", SPIFFS_ERR_INTERNAL);
@@ -2526,7 +2527,13 @@ static int resume_file(run_t *r, srp_manifest_file_t *f, bool stale, srp_gap_cau
         r->failed = false;
         return RESUME_BLOCKED;
     }
-    if (hidden && take_hold(r, hidden)) {
+    if (hidden && text_fill(hidden) && !take_hold(r, hidden)) {
+        /* Its rows cannot be held to go after the new file's: not settled
+         * while the original is whole on flash. */
+        snprintf(r->report->error_stage, sizeof(r->report->error_stage), "memory");
+        return RESUME_BLOCKED;
+    }
+    if (hidden) {
         /* A new file took the name meanwhile (a rolled-back image created
          * it): a text file's intact rows go after its own rows. */
         uint32_t done = 0;
@@ -2560,7 +2567,7 @@ static int resume_file(run_t *r, srp_manifest_file_t *f, bool stale, srp_gap_cau
             logf_line(r, "WARN", "STORAGE_REPAIR_MERGED", message);
             hidden->actions |= SRR_FILE_REBUILT;
             r->report->files_rebuilt++;
-        } else if (!record_unrestored(r, hidden, f->name, done, hidden->hold_size,
+        } else if (!record_unrestored(r, hidden, f->name, done, f->size,
                                       text_fill(hidden) ? SPIFFS_ERR_FULL : SPIFFS_ERR_CONFLICTING_NAME,
                                       SRP_GAP_CHECK_CHANGED)) {
             outcome = RESUME_BLOCKED;
