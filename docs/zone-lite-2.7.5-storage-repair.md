@@ -1,6 +1,7 @@
 # Zone Lite 2.7.5: custody-first SPIFFS repair
 
-Status: implemented on `release/zkt-2.7.5` (not yet versioned, not on HIL).
+Status: implemented on `release/zkt-2.7.5` and versioned 2.7.5 (HIL runbook:
+[zone-lite-2.7.5-hil.md](zone-lite-2.7.5-hil.md)); not yet on HIL.
 This document describes what was built. It replaces the first design
 (`94136b3`), which two adversarial reviews found unsafe as written, and the
 first implementation, which two more reviews found unsafe in eleven and five
@@ -870,7 +871,7 @@ Second boot review of the implementation (B1-B5):
 | B3 | The reporter read NVS every outbox pass and ignored the priority hold | Accepted: counts in RAM, the call after the hold; contract test. |
 | B4 | An unrelated crash after a stopped run counted as a repair failure | Accepted: the breadcrumb records that the repair returned. |
 | B5 | 784 B of buffers on the outbox task's stack | Accepted: one PSRAM block per send. |
-| - | Version gates (`UG_DIRECT_VERSION`, the 2.7.4 digest) and the HIL reboot window | Outside this change: they belong to tagging 2.7.5 (section 12). |
+| - | Version gates (`UG_DIRECT_VERSION`, the 2.7.4 digest) and the HIL reboot window | Done in the 2.7.5 release commit (V1 below; the reboot window in section 12). |
 
 Found by the strengthened harness while proving the fixes:
 
@@ -951,7 +952,7 @@ Third verification (V1-V6, at `77256f4`):
 
 | # | Point | Disposition |
 |---|---|---|
-| V1 | The version gate before tagging: `UG_DIRECT_VERSION` "2.7.4", the fleet's 2.7.4 digest in `ug_direct_predecessor_matches`, `project(zone_lite VERSION 2.7.4)`, the CI direct-legacy step and its marker list | Open, for the 2.7.5 release commit (as `89bb404` did for 2.7.4: also ADD's `storage_contract.py`, `deploy/add/firmware-storage-contract.ps1`, `test_hil_publication.ps1`, `test_storage_upgrade_host.py`). The full 2.7.4 application SHA-256 (`3e4bb613...`, HIL run 38529352136) is not in the repository. |
+| V1 | The version gate before tagging: `UG_DIRECT_VERSION` "2.7.4", the fleet's 2.7.4 digest in `ug_direct_predecessor_matches`, `project(zone_lite VERSION 2.7.4)`, the CI direct-legacy step and its marker list | Fixed in the 2.7.5 release commit, as `89bb404` did for 2.7.4: version 2.7.5 and `UG_DIRECT_VERSION` "2.7.5"; 2.7.4's application SHA-256 `3e4bb613ab046df5ad29e4a1ab37fd801e1778e6b0d2c41c6604fe75bbea2fac` (HIL run 38529352136) in the device guard, ADD's storage contract (`INVENTORY_*`) and the signing script; the marker ends `,2.7.2,2.7.3,2.7.4`; the CI direct-legacy step, the HIL candidate workflow, publication and signing take 2.7.5; ADD offers 2.7.5 to the HIL-only 2.7.2, 2.7.3 and 2.7.4. |
 | V2 | The retired-file special run failed in its own setup at 2 and 8 MB | Fixed (`f09b5e7`): its setup scales with the store; `special` and `review` pass at 2 and 8 MB. The fresh long run of this pass also found `torn_size_inside` stopping in its own setup for fresh seeds (no bit could tear inside the span); fixed in `cbe9e32`. |
 | V3 | New test files had no CI duration weights | Fixed (`f02d072`): the seven files without a weight have one, scaled from a local run of the eight shards; the other weights are unchanged. |
 | V4 | `test_hikvision_anchor_host.py` failed under gcc 13.3 (`-Werror=misleading-indentation` in its generated `main.c`; also on `main`, skipped by CI) | Fixed (`afa003c`): the statement is on its own line. |
@@ -1010,15 +1011,16 @@ Residual risks:
 
 - None of this has run on a device. HIL must measure duration (clean,
   cloned 13FL and P02 images), stack high-water mark, NVS free and available
-  entries and the largest internal block, all in the heartbeat. The
-  every-boot repair must fit the controlled-reboot test's recovery window
-  (`hil_reboot.py`).
-- Before tagging (section 11, V1): the direct-legacy role checks
-  `UG_DIRECT_VERSION "2.7.4"` (`upgrade_guard.h`); the fleet's 2.7.4 digest
-  must be added to `ug_direct_predecessor_matches`, ADD's storage contract
-  and the CI contract marker, `project(VERSION)` bumped and the CI
-  direct-legacy step moved to 2.7.5, or a 2.7.5 direct-legacy image fails its
-  storage upgrade check and rolls back.
+  entries and the largest internal block, all in the heartbeat (runbook:
+  `zone-lite-2.7.5-hil.md`, P06 first).
+- The controlled-reboot test's recovery window (`hil_reboot.py`: issued in
+  observation minute six, healthy by minute eight) is shorter than the
+  repair's deadline, but the two never meet: the reboot belongs to the 2.7.0
+  journal writer, which does not build the repair, and only that image is
+  reboot-capable or admitted (contract test
+  `test_controlled_reboot_window_never_meets_the_every_boot_repair`). An
+  image that runs the repair must not become reboot-capable until the window
+  covers its deadline.
 - **A wedged store (decision 1).** The harness's workload has no admission
   budget and fills until SPIFFS refuses. On such a crammed store SPIFFS's GC
   in the application's writes can stop half way again after a repair (1.2

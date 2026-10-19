@@ -122,3 +122,32 @@ def test_rollback_tag_names_the_image_the_bootloader_returns_to() -> None:
     assert "esp_ota_get_next_update_partition" not in config
     partitions = (ROOT / "firmware/zone_lite/partitions.csv").read_text()
     assert re.search(r"^factory,\s*app,\s*factory,", partitions, re.M)
+
+
+def test_controlled_reboot_window_never_meets_the_every_boot_repair() -> None:
+    # hil_reboot.py's controlled ESP reboot is issued in observation minute six
+    # and must be healthy again by minute eight (as little as two minutes),
+    # while the repair may take up to its 5 or 15 minute deadline. The two
+    # never meet: the reboot belongs to the 2.7.0 journal writer, which does
+    # not build the repair, and no image that runs the repair (2.7.5 and the
+    # other platform images) can take or be offered the reboot. Making one
+    # reboot-capable needs a recovery window that covers the repair first.
+    component = (MAIN / "CMakeLists.txt").read_text()
+    repair = component[component.index("# ZKT 2.7.5: the custody-first boot storage repair"):]
+    assert "NOT ZONE_LITE_JOURNAL_WRITES)" in repair[:repair.index("endif()")]
+    writer = component[component.index("if(ZONE_LITE_JOURNAL_WRITES)\n"):]
+    writer = writer[:writer.index("\nendif()\n")]
+    assert 'elseif(PROJECT_VER STREQUAL "2.7.0")' in writer
+    assert writer.index('elseif(PROJECT_VER STREQUAL "2.7.0")') < writer.index("ZONE_LITE_JOURNAL_WRITER_IMAGE=1")
+    assert component.count("ZONE_LITE_JOURNAL_WRITER_IMAGE=1") == 1
+    capable = _body((MAIN / "ota_manager.c").read_text(), "bool ota_manager_hil_reboot_capable(void)")
+    assert "#if defined(ZONE_LITE_JOURNAL_WRITER_IMAGE)" in capable
+    assert '!strcmp(app->version, "2.7.0")' in capable
+    reboot = (ROOT / "apps/add_backend/zk_add/hil_reboot.py").read_text()
+    scope = reboot[reboot.index("def _scope("):reboot.index("def _exclusive(")]
+    assert 'release.version != "2.7.0"' in scope and '!= "ZKT_JOURNAL_V1"' in scope
+    evidence = reboot[reboot.index("def collect_reboot_evidence("):]
+    assert 'release.version == "2.7.0"' in evidence
+    contract = (ROOT / "apps/add_backend/zk_add/storage_contract.py").read_text()
+    platform = re.search(r"^FLEET_PLATFORM_VERSIONS = \((.*)\)$", contract, re.M)
+    assert platform and '"2.7.5"' in platform.group(1) and '"2.7.0"' not in platform.group(1)

@@ -1,5 +1,13 @@
 # Zone Lite 2.7.4: ZKT platform HIL
 
+> **Superseded by [2.7.5](zone-lite-2.7.5-hil.md).** On 16 October 2026,
+> 2.7.4 confirmed on Peshawar 06 in place, and rolled back on SLICTOWER 13FL
+> and Peshawar 02 (`BOOT_HEALTH_TIMEOUT`: the persistence probe still failed
+> with ENOENT on their damaged stores). Its inventory located the damage:
+> 13FL's `blocked_identity.jsonl` is unreadable from about 50 KB, P02's
+> `pending.jsonl` at 493,968. 2.7.5 repairs the store at every boot; keep
+> 2.7.4 published while devices run it.
+
 2.7.4 is 2.7.3 plus storage diagnosis: it says which file a device's store
 cannot read back, repairs the one file the persistence probe owns, and
 accepts 2.7.3 as a rollback predecessor. Everything in the
