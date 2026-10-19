@@ -58,7 +58,8 @@ def test_a_repair_report_is_kept_with_the_heartbeat(db):
     assert stored["entries"][1]["actions"] == ["NORMALIZED", "SIZE_RECOVERED"]
     entry = stored["entries"][0]
     assert entry["name"] == "/blocked_identity.jsonl" and entry["actions"] == ["NORMALIZED", "GAPS"]
-    assert entry.get("class", entry.get("class_")) == "attendance"
+    # Stored under the key the firmware sent, not the model's field name.
+    assert entry["class"] == "attendance" and "class_" not in entry
     assert stored["nvs_available_entries_before"] == 186 and stored["nvs_available_entries_after"] == 174
     blocked = stored["entries"][2]
     assert blocked["blocked_spans"] == 2 and blocked["blocked_offset"] == 50200
