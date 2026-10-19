@@ -1964,7 +1964,11 @@ static bool reconcile_cursor(run_t *r, size_t q, bool remove_settled)
     reset.verdict = (uint8_t)verdict;
     reset.generation = r->state.generation;
     reset.previous = cp;
-    if (!srp_resets_add(r->resets, &reset)) r->report->records_dropped++;
+    /* With every reset record unacknowledged the old cursor's evidence is
+     * dropped (counted, logged), but the cursor is still cleared: a cursor
+     * lq_open_step rejects would wedge the drain, and replaying costs no row. */
+    bool kept = srp_resets_add(r->resets, &reset);
+    if (!kept) r->report->records_dropped++;
     if (!save_records(r) || !nvs_store(r, QUEUES[q].ns, QUEUES[q].key, &next, sizeof(next)))
         return fail(r, "cursor_commit", SPIFFS_ERR_INTERNAL);
     r->report->cursors_reset++;
@@ -1972,9 +1976,10 @@ static bool reconcile_cursor(run_t *r, size_t q, bool remove_settled)
         o->actions |= SRR_FILE_CURSOR_RESET;
         note_file(r, o);
     }
-    char message[180];
-    snprintf(message, sizeof(message), "%s: cursor %lu (generation %lu) cleared, %s; every retained row replays",
-             QUEUES[q].name, (unsigned long)cp.offset, (unsigned long)cp.generation, srp_cursor_verdict_name(verdict));
+    char message[200];
+    snprintf(message, sizeof(message), "%s: cursor %lu (generation %lu) cleared, %s; every retained row replays%s",
+             QUEUES[q].name, (unsigned long)cp.offset, (unsigned long)cp.generation, srp_cursor_verdict_name(verdict),
+             kept ? "" : " (its record dropped: every reset record unacknowledged)");
     logf_line(r, "WARN", "STORAGE_REPAIR_CURSOR_RESET", message);
     return true;
 }
