@@ -153,6 +153,14 @@ def test_legacy_bridge_adapter_is_limited_to_exact_release_and_zkt_target(legacy
         session, connector=device, deployment_id=deployment.deployment_id, report=report,
     ) is None
     assert deployment.status == "READY_TO_BOOT"
+    # Evidence kept while a bridge is paused is limited to the same exact target.
+    session.get(FirmwareCampaign, deployment.campaign_id).status = "PAUSED"
+    capability(session, device, release)
+    assert deployment.status == "READY_TO_BOOT"
+    assert not session.scalars(select(FirmwareEvent).where(
+        FirmwareEvent.deployment_id == deployment.id,
+        FirmwareEvent.state.in_(["LEGACY_BOOT_CAPABILITY_REPORT", "LEGACY_BOOT_CAPABILITY_VERIFIED"]),
+    )).all()
 
 
 def test_legacy_bridge_does_not_accept_partial_new_protocol_fields(legacy_bridge):
@@ -340,6 +348,65 @@ def test_wrong_or_other_boot_capability_never_completes_in_either_order(legacy_b
         send_capability()
     assert report(session, device, release, deployment, "SUCCEEDED")[0] == 409
     assert deployment.status == "READY_TO_BOOT"
+    assert not bridge_events(session, deployment, "LEGACY_BOOT_CAPABILITY_VERIFIED")
+
+
+@pytest.mark.parametrize("order", ["reports_first", "capability_first"])
+def test_capability_accepted_while_the_campaign_is_paused_completes_after_resume(legacy_bridge, order):
+    session, device, release, deployment, _sample = legacy_bridge
+    production(session)
+    campaign = session.get(FirmwareCampaign, deployment.campaign_id)
+    if order == "reports_first":
+        for state, error in (("BOOTED_PENDING", "RUNTIME_HEALTHY"), ("RECONCILING", None)):
+            assert report(session, device, release, deployment, state, error)[0] == 202
+    campaign.status = "PAUSED"
+    session.commit()
+    # ADD answers 200, so 2.4.12 never sends this report again in this boot.
+    status, body = report_capability(session, device, release)
+    assert status == 200 and body["accepted"] is True
+    assert len(bridge_events(session, deployment, "LEGACY_BOOT_CAPABILITY_REPORT")) == 1
+    assert report(session, device, release, deployment, "SUCCEEDED")[0] == 409
+    assert deployment.status == "READY_TO_BOOT"
+    assert not bridge_events(session, deployment, "LEGACY_BOOT_CAPABILITY_VERIFIED")
+    campaign.status = "ACTIVE"
+    session.commit()
+    elapse(session, device, deployment, 1800)
+    heartbeat(session, device)
+    if order == "capability_first":
+        assert report(session, device, release, deployment, "BOOTED_PENDING", "RUNTIME_HEALTHY")[0] == 202
+        assert deployment.status == "READY_TO_BOOT"
+        assert report(session, device, release, deployment, "RECONCILING")[0] == 200
+    assert report(session, device, release, deployment, "SUCCEEDED")[0] == 200
+    assert deployment.status == "SUCCEEDED"
+    proof, = bridge_events(session, deployment, "LEGACY_BOOT_CAPABILITY_VERIFIED")
+    assert proof.details["evidence"]["source"] == "CAPABILITY_REPORT"
+
+
+@pytest.mark.parametrize("inactive", ["paused", "cancelled", "release_revoked"])
+@pytest.mark.parametrize("changed", [None, "digest", "rebooted"])
+def test_capability_kept_while_the_bridge_is_inactive_never_moves_the_deployment(legacy_bridge, inactive, changed):
+    session, device, release, deployment, _sample = legacy_bridge
+    production(session)
+    for state, error in (("BOOTED_PENDING", "RUNTIME_HEALTHY"), ("RECONCILING", None)):
+        assert report(session, device, release, deployment, state, error)[0] == 202
+    campaign = session.get(FirmwareCampaign, deployment.campaign_id)
+    if inactive == "release_revoked":
+        release.state = "REVOKED"
+    else:
+        campaign.status = inactive.upper()
+    session.commit()
+    if changed == "rebooted":
+        heartbeat(session, device, boot_id="later-2412-boot")
+    assert report_capability(session, device, release, digest="0" * 64 if changed == "digest" else None)[0] == 200
+    assert len(bridge_events(session, deployment, "LEGACY_BOOT_CAPABILITY_REPORT")) == (changed != "digest")
+    assert report(session, device, release, deployment, "SUCCEEDED")[0] == 409
+    assert deployment.status == "READY_TO_BOOT"
+    if inactive == "paused" and changed is not None:
+        # Resuming never turns a wrong or other-boot report into this boot's proof.
+        campaign.status = "ACTIVE"
+        session.commit()
+        assert report(session, device, release, deployment, "SUCCEEDED")[0] == 409
+        assert deployment.status == "READY_TO_BOOT"
     assert not bridge_events(session, deployment, "LEGACY_BOOT_CAPABILITY_VERIFIED")
 
 
@@ -533,6 +600,22 @@ def test_k50_exact_device_sequence_completes_on_each_database(k50_store):
     heartbeat(session, device, boot_id=X_BOOT)
     assert run_2412_device(session, device, release, deployment)[-3:] == [
         ("SUCCEEDED", None, 409), ("CAPABILITY", None, 200), ("SUCCEEDED", None, 200)]
+    assert deployment.status == "SUCCEEDED"
+
+
+def test_k50_capability_kept_across_a_campaign_pause_on_each_database(k50_store):
+    session, device, release, deployment = k50_store
+    heartbeat(session, device, boot_id=X_BOOT)
+    for state, error in (("BOOTED_PENDING", "RUNTIME_HEALTHY"), ("RECONCILING", None)):
+        assert report(session, device, release, deployment, state, error)[0] == 202
+    campaign = session.get(FirmwareCampaign, deployment.campaign_id)
+    campaign.status = "PAUSED"
+    session.commit()
+    assert report_capability(session, device, release)[0] == 200
+    assert report(session, device, release, deployment, "SUCCEEDED")[0] == 409
+    campaign.status = "ACTIVE"
+    session.commit()
+    assert report(session, device, release, deployment, "SUCCEEDED")[0] == 200
     assert deployment.status == "SUCCEEDED"
 
 

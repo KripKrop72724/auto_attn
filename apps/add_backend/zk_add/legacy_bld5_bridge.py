@@ -43,7 +43,13 @@ EVENT_LIMIT = 200
 TELEMETRY_LIMIT = 500
 
 
-def _bridge(session: Session, connector: Connector, deployment_id: str | None = None):
+def _bridge(session: Session, connector: Connector, deployment_id: str | None = None, *, active: bool = True):
+    """Return the exact bridge deployment and its release, or None.
+
+    With active=False the campaign need not be ACTIVE nor the release
+    AVAILABLE. Such a bridge may only have evidence recorded against it; it
+    must never move the deployment.
+    """
     target = BRIDGE_TARGETS.get(connector.zone_id)
     if (connector.firmware_family != "zkt" or target is None
             or not target_matches(target, connector)):
@@ -51,16 +57,18 @@ def _bridge(session: Session, connector: Connector, deployment_id: str | None = 
     query = select(FirmwareDeployment).join(FirmwareCampaign).where(
         FirmwareDeployment.connector_id == connector.id,
         FirmwareDeployment.status.in_(["READY_TO_BOOT", "BOOTED_PENDING", "RECONCILING"]),
-        FirmwareCampaign.status == "ACTIVE", FirmwareCampaign.zone_id == connector.zone_id,
+        FirmwareCampaign.zone_id == connector.zone_id,
         FirmwareCampaign.release_id == FirmwareDeployment.release_id,
     )
+    if active:
+        query = query.where(FirmwareCampaign.status == "ACTIVE")
     if deployment_id is not None:
         query = query.where(FirmwareDeployment.deployment_id == deployment_id)
     deployment = session.scalar(query.order_by(FirmwareDeployment.id.desc()).limit(1).with_for_update())
     if deployment is None or not _versions_match(deployment.previous_version, "2.5.2"):
         return None
     release = session.get(FirmwareRelease, deployment.release_id)
-    if release is None or release.state != "AVAILABLE" or (
+    if release is None or (active and release.state != "AVAILABLE") or (
         release.release_id, release.version, release.git_sha, release.image_sha256,
         _application_sha256(release),
     ) != BRIDGE_IDENTITY or deployment.target_version != release.version or deployment.bytes_written != release.image_size:
@@ -243,7 +251,13 @@ def accept_legacy_progress(
 
 
 def verify_legacy_capability(session: Session, *, connector: Connector, capability: dict) -> None:
-    bridge = _bridge(session, connector)
+    active = _bridge(session, connector)
+    # ADD answers this report 200 whether or not the bridge is active, and
+    # 2.4.12 never repeats an accepted report in the same boot. So a matching
+    # report is kept even while the campaign is paused or the release is not
+    # AVAILABLE; only an active bridge builds the proof from it and moves the
+    # deployment, on its next report after the bridge is active again.
+    bridge = active or _bridge(session, connector, active=False)
     if bridge is None:
         return
     deployment, release = bridge
@@ -255,4 +269,5 @@ def verify_legacy_capability(session: Session, *, connector: Connector, capabili
     if not any(event.details == details for event in _of_boot(_events(session, deployment), boot_id, CAPABILITY)):
         session.add(FirmwareEvent(deployment_id=deployment.id, state=CAPABILITY, details=details))
         session.flush()  # ADD sessions do not autoflush; the proof reads this report.
-    _proof(session, connector, deployment, release, boot_id, _events(session, deployment))
+    if active is not None:
+        _proof(session, connector, deployment, release, boot_id, _events(session, deployment))
