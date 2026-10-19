@@ -92,6 +92,7 @@ typedef struct {
     bool previous_failed;    /* the previous boot ended in a crash, watchdog or the repair deadline */
     bool damage_seen;        /* a runtime storage fault was recorded since the last run */
     uint32_t image_tag;      /* identifies the running image for the attempts guard */
+    uint32_t rollback_tag;   /* unconfirmed image: the image tag of the one a reset rolls back to; 0 unknown */
     uint64_t hold_budget;    /* bytes the run may hold in memory */
     bool nvs_known;          /* nvs_available_entries was measured */
     uint32_t nvs_available_entries; /* nvs_stats_t.available_entries: NVS's own GC page left out */

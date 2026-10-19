@@ -325,6 +325,14 @@ static srr_config_t boot_config(void)
     config.previous_failed = s_previous_known && (s_previous_deadline || (crash && !s_previous_returned));
     const esp_app_desc_t *app = esp_app_get_description();
     if (app) memcpy(&config.image_tag, app->app_elf_sha256, sizeof(config.image_tag));
+    /* An unconfirmed image's reset returns to the other slot's image; a
+     * manifest records it, so that image (when it runs this repair too)
+     * resumes the manifest as its own rather than as a stale one. */
+    const esp_partition_t *previous = config.pending_verify ? esp_ota_get_next_update_partition(NULL) : NULL;
+    esp_app_desc_t description;
+    if (previous && running && previous->address != running->address &&
+        esp_ota_get_partition_description(previous, &description) == ESP_OK)
+        memcpy(&config.rollback_tag, description.app_elf_sha256, sizeof(config.rollback_tag));
     config.damage_seen = damage_flag_take();
     return config;
 }

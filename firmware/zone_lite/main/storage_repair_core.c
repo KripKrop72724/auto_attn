@@ -2419,6 +2419,7 @@ static bool write_manifest(run_t *r, bool *fits)
     m->generation = r->state.generation;
     m->image_tag = r->cfg->image_tag;
     m->flags = r->cfg->pending_verify ? SRP_MANIFEST_PENDING_IMAGE : 0;
+    m->rollback_tag = r->cfg->pending_verify ? r->cfg->rollback_tag : 0;
     uint32_t files = 0;
     for (unsigned priority = 0; priority <= 6; ++priority) {
         for (uint32_t i = 0; i < r->obj_count; ++i) {
@@ -2679,7 +2680,12 @@ static bool resume_manifest(run_t *r, bool *blocked)
     }
     /* Room first: compaction never touches a hidden original's block. */
     if (!ensure_room(r)) return false;
-    bool stale = (m->flags & SRP_MANIFEST_PENDING_IMAGE) || m->image_tag != r->cfg->image_tag;
+    /* Stale: another image may have changed the files since. An unconfirmed
+     * image's manifest is, unless this is the confirmed image a reset rolled
+     * back to: it resumes the manifest before anything else writes. */
+    bool pending = (m->flags & SRP_MANIFEST_PENDING_IMAGE) != 0;
+    bool rolled_back = pending && m->rollback_tag && !r->cfg->pending_verify && m->rollback_tag == r->cfg->image_tag;
+    bool stale = !rolled_back && (pending || m->image_tag != r->cfg->image_tag);
     srp_gap_cause_t cause = r->report->previous_phase == SRP_PHASE_RESTORE ? SRP_GAP_RESTORE_INTERRUPTED
                                                                            : SRP_GAP_CHECK_INTERRUPTED;
     for (uint32_t i = 0; i < m->count; ++i) {

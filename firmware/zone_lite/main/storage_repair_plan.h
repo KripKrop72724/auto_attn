@@ -217,6 +217,11 @@ typedef struct {
 typedef struct {
     uint32_t version, generation, count;
     uint32_t image_tag, flags;
+    /* With SRP_MANIFEST_PENDING_IMAGE: the image a reset rolls back to (the
+     * first word of its app digest; 0 when unknown). That image, running
+     * confirmed, resumes the manifest at its first boot, before anything
+     * else writes, so the manifest is current, not stale. */
+    uint32_t rollback_tag;
     srp_manifest_file_t file[SRP_MANIFEST_FILES];
     uint32_t crc;
 } srp_manifest_t;

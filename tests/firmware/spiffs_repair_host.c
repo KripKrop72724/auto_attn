@@ -2414,7 +2414,7 @@ static void run_restores(uint32_t kib)
  * took goes after the new rows. A file that only changed is unverified. */
 static void run_manifest_cases(uint32_t kib)
 {
-    for (uint32_t which = 0; which < 5; ++which) {
+    for (uint32_t which = 0; which < 7; ++which) {
         seed(9300 + which);
         nvs_clear();
         format_flash(kib);
@@ -2422,7 +2422,15 @@ static void run_manifest_cases(uint32_t kib)
         model_file_t *m = model_of(which == 4 ? "/processed_commands.txt" : "/pending.jsonl");
         set_cursor("legacy_queues", "ords_pending", 0, 0, 7);
         srp_manifest_t man;
-        manifest_begin(&man, which == 0 || which == 4 ? SRP_MANIFEST_PENDING_IMAGE : 0);
+        manifest_begin(&man, which == 0 || which >= 4 ? SRP_MANIFEST_PENDING_IMAGE : 0);
+        if (which >= 5) {
+            /* Written by a newer unconfirmed image whose check a reset cut:
+             * the bootloader rolled back to this image (5), which resumes it
+             * before anything else writes, so the manifest is current; or to
+             * another image (6), which ran meanwhile, so it is stale. */
+            man.image_tag = 0x2760;
+            man.rollback_tag = which == 5 ? repair_config().image_tag : 0x2740;
+        }
         if (which == 4) manifest_add(&man, m, SRP_CLASS_OPERATIONAL, NULL, NULL);
         else manifest_add(&man, m, SRP_CLASS_ATTENDANCE, "legacy_queues", "ords_pending");
         manifest_store(&man);
@@ -2472,7 +2480,7 @@ static void run_manifest_cases(uint32_t kib)
         config.pending_verify = which == 0 || which == 4;
         repair_boot(&report, &config);
         srp_gaps_t gaps = gaps_now();
-        if (which <= 1 || which == 4) {
+        if (which <= 1 || which == 4 || which == 6) {
             CHECK(report.files_superseded == 1 && report.gaps == 0, "manifest case %u: superseded %u gaps %u", which,
                   report.files_superseded, report.gaps);
         } else if (which == 2) {
@@ -2486,10 +2494,10 @@ static void run_manifest_cases(uint32_t kib)
             m->unreadable = calloc(m->size + 1, 1);
         } else {
             CHECK(report.gaps == 1 && gaps.count == 1 && gaps.gap[0].cause == SRP_GAP_CONTENT_UNVERIFIED &&
-                      gaps.gap[0].offset == 0 && gaps.gap[0].length == original,
-                  "manifest case 3: gaps %u", report.gaps);
+                      gaps.gap[0].offset == 0 && gaps.gap[0].length == original && !report.files_superseded,
+                  "manifest case %u: gaps %u superseded %u", which, report.gaps, report.files_superseded);
         }
-        if (which != 3) {
+        if (which != 3 && which != 5) {
             mount_plain();
             check_custody(m, 4, false);
             SPIFFS_unmount(&fs);
@@ -2500,7 +2508,7 @@ static void run_manifest_cases(uint32_t kib)
               "manifest case %u: manifest not retired", which);
         free(kept);
     }
-    printf("manifest cases: superseded, merged and unverified passed\n");
+    printf("manifest cases: superseded, merged, unverified and rolled back passed\n");
 }
 
 /* A crammed store whose damaged pending queue cannot be normalized until
