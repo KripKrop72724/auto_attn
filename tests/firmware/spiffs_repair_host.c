@@ -2051,8 +2051,8 @@ static void boot_until_done(const char *what)
 }
 
 /* A reset during the check left the held pending queue hidden (the check had
- * begun deleting it). The next boot rebuilds it from its own pages under a
- * temporary name and renames it into place. The hidden pages stay until a
+ * begun deleting it). The next boot writes a copy of its header with the
+ * flag set again (its pages are all there). The hidden pages stay until a
  * check runs, and none runs while the manifest is active, so a cut at any
  * write of that resume (each torn both ways) loses nothing at all: a later
  * boot finishes it and the file is whole, with no gap. */
@@ -2079,8 +2079,10 @@ static void run_resume_cuts(uint32_t kib)
     uint64_t before = flash_ops;
     repair_boot(&report, &config);
     uint64_t writes = flash_ops - before;
-    CHECK(report.files_rebuilt == 1 && report.gaps == 0 && report.result != SRR_RESULT_FAILED,
-          "resume: %s, rebuilt %u, gaps %u", srr_result_name(report.result), report.files_rebuilt, report.gaps);
+    CHECK(report.files_restored == 1 && report.files_rebuilt == 0 && report.gaps == 0 &&
+              report.result != SRR_RESULT_FAILED,
+          "resume: %s, restored %u, rebuilt %u, gaps %u", srr_result_name(report.result), report.files_restored,
+          report.files_rebuilt, report.gaps);
     mount_plain();
     check_custody(m, 4, false);
     CHECK(!exists("/pending.jsonl" SRP_RESTORE_SUFFIX), "resume: the rebuild was left under its temporary name");
@@ -2112,7 +2114,7 @@ static void run_resume_cuts(uint32_t kib)
     }
     free(image);
     free(saved);
-    printf("resume: rebuilt from a hidden header, %u cuts at %" PRIu64 " writes passed\n", runs, writes);
+    printf("resume: a hidden header restored, %u cuts at %" PRIu64 " writes passed\n", runs, writes);
 }
 
 /* The check deletes one held file and alters another (the hook stands in for
@@ -2476,6 +2478,503 @@ static void run_guards(uint32_t kib)
               (state.flags & SRP_STATE_MANIFEST) == 0, "time guard: manifest");
     free(before);
     printf("guards: NVS headroom, journal and check time passed\n");
+}
+
+/* ---- third review round: custody regressions --------------------------- */
+/* SPIFFS_check's DELETE_BAD_FILE is spiffs_delete_obj_lazy: it clears the
+ * header's IXDELE flag and frees nothing; its later passes (or the next
+ * check, or SPIFFS's GC) free the pages. These runs stop it right there: the
+ * hook hides a file's header after pass 1, sometimes followed by a power cut
+ * (nothing after the check's last write reaches flash). */
+static jmp_buf review_cut;
+static uint32_t review_mode;      /* 1: hide the victim; 2: then a power cut */
+static const char *review_victim = "/pending.jsonl";
+static uint64_t review_hook_ops;
+static bool review_hook(uint32_t pass)
+{
+    if (pass != 1) return false;
+    review_hook_ops = flash_ops;
+    if (!(review_mode & 1)) return false;
+    uint32_t header = header_of(review_victim);
+    flash[header * PAGE + 4] &= (uint8_t)~SPIFFS_PH_FLAG_IXDELE;
+#if SPIFFS_CACHE
+    spiffs_cache_drop_page(&fs, (spiffs_page_ix)header);
+#endif
+    if (review_mode & 2) longjmp(review_cut, 1);
+    return true;
+}
+
+/* One boot whose check hides `victim` after pass 1, then a power cut. */
+static void review_boot_cut_after_hiding(const char *victim)
+{
+    review_victim = victim;
+    review_mode = 1 | 2;
+    check_hook = review_hook;
+    srr_report_t report;
+    srr_config_t config = repair_config();
+    if (!setjmp(review_cut)) {
+        repair_boot(&report, &config);
+        CHECK(0, "the check hook never ran");
+    }
+    drop_all_memory();
+    check_hook = NULL;
+    review_mode = 0;
+}
+
+/* The file is whole at its offsets and no gap record of these runs names it. */
+static void check_whole(const char *what, const model_file_t *m, uint32_t generation_from)
+{
+    static uint8_t buffer[8 * 1024 * 1024];
+    mount_plain();
+    int64_t got = exists(m->name) ? read_file(m->name, buffer, sizeof(buffer)) : -2;
+    srp_gaps_t gaps = gaps_now();
+    SPIFFS_unmount(&fs);
+    CHECK(got == (int64_t)m->size && !memcmp(buffer, m->data, m->size), "%s: %s reads %" PRId64 " of %u bytes", what,
+          m->name, got, m->size);
+    for (uint32_t g = 0; g < gaps.count; ++g)
+        CHECK(strcmp(gaps.gap[g].name, m->name) || gaps.gap[g].generation < generation_from,
+              "%s: %s has a gap record (offset %u length %u cause %s)", what, m->name, gaps.gap[g].offset,
+              gaps.gap[g].length, srp_gap_cause_name((srp_gap_cause_t)gaps.gap[g].cause));
+}
+
+static bool manifest_kept(void)
+{
+    srp_state_t state;
+    return port_nvs_load(NULL, SRR_NVS_NAMESPACE, "state", &state, sizeof(state)) == 1 &&
+        (state.flags & SRP_STATE_MANIFEST);
+}
+
+static void fill_gap_list(uint32_t unacked)
+{
+    srp_gaps_t list;
+    memset(&list, 0, sizeof(list));
+    for (uint32_t i = 0; i < unacked && i < SRP_MAX_GAPS; ++i) {
+        srp_gap_t *g = &list.gap[list.count++];
+        snprintf(g->name, sizeof(g->name), "/old-%u", i);
+        g->cause = SRP_GAP_SALVAGE;
+        g->offset = i;
+        g->length = 1;
+        g->generation = 1;
+    }
+    port_nvs_store(NULL, SRR_NVS_NAMESPACE, "gaps", &list, sizeof(list));
+}
+
+static void ack_gap_list(void)
+{
+    srp_gaps_t list = gaps_now();
+    for (uint32_t i = 0; i < list.count; ++i) list.gap[i].flags |= SRP_RECORD_ACKED;
+    port_nvs_store(NULL, SRR_NVS_NAMESPACE, "gaps", &list, sizeof(list));
+}
+
+/* Review 3, finding 1: the manifest named the first 12 held custody files in
+ * flash order and never acked_uids.txt or a file of unknown name; a file left
+ * out had no resume, and a reset right after the check hid it lost it with no
+ * record. Every custody file is in the manifest now, in class priority; more
+ * than it holds, or than the gap list could take one record each for, and no
+ * check runs. */
+static void run_manifest_coverage(uint32_t kib)
+{
+    static const char *const names[] = {"/add_live.jsonl", "/add_pending.jsonl", "/blocked_identity.jsonl",
+                                         "/corrupt_ords.jsonl", "/add_corrupt.jsonl", "/add_corrupt.bak",
+                                         "/pending.bak", "/add_live.bak", "/add_pending.bak", "/blocked_recovery.bak",
+                                         "/add_cancelled.txt", "/processed_commands.txt", "/add_live.pos",
+                                         "/add_pending.pos", "/notes.bin"};
+    static const struct { uint32_t before; const char *victim; } cases[] = {
+        {12, "/pending.jsonl"}, {15, "/pending.jsonl"}, {2, "/acked_uids.txt"}, {6, "/notes-2.bin"}};
+    for (uint32_t c = 0; c < sizeof(cases) / sizeof(cases[0]); ++c) {
+        seed(31001 + c);
+        nvs_clear();
+        format_flash(kib);
+        model_reset();
+        row_seq = 7000;
+        mount_plain();
+        for (uint32_t i = 0; i < cases[c].before; ++i) {
+            if (strstr(names[i], ".txt")) make_id_file(names[i], 20);
+            else if (strstr(names[i], ".pos") || strstr(names[i], ".bin")) make_binary_file(names[i], 11 + 300 * (i % 2));
+            else make_json_file(names[i], 1500);
+        }
+        const char *victim = cases[c].victim;
+        model_file_t *m = strstr(victim, ".txt") ? make_id_file(victim, 400)
+                        : strstr(victim, ".bin")  ? make_binary_file(victim, 20000)
+                                                  : make_json_file(victim, 30000);
+        SPIFFS_unmount(&fs);
+        review_boot_cut_after_hiding(victim);
+        CHECK(manifest_kept(), "manifest coverage %u: no manifest after the cut", c);
+        boot_until_done("manifest coverage");
+        check_whole("manifest coverage", m, 1);
+        CHECK(!manifest_kept(), "manifest coverage %u: manifest kept", c);
+    }
+    /* More custody files than the manifest holds (files of unknown name are
+     * custody too): no check this boot, nothing written for it. */
+    seed(31010);
+    nvs_clear();
+    format_flash(kib);
+    build_store(20000);
+    for (uint32_t i = 0; i < SRP_MANIFEST_FILES; ++i) {
+        char name[32];
+        snprintf(name, sizeof(name), "/extra-%02u.bin", i);
+        uint8_t data[40];
+        memset(data, (int)i, sizeof(data));
+        write_file(name, data, sizeof(data));
+    }
+    SPIFFS_unmount(&fs);
+    srr_report_t report;
+    srr_config_t config = repair_config();
+    repair_boot(&report, &config);
+    CHECK(report.result == SRR_RESULT_DEFERRED && !strcmp(report.error_stage, "manifest") && report.check_passes == 0 &&
+              !report.manifest_written && !manifest_kept(),
+          "manifest overflow: %s at %s, %u passes", srr_result_name(report.result), report.error_stage,
+          report.check_passes);
+    /* Room in the gap list for one record per manifest entry, or no check. */
+    seed(31011);
+    nvs_clear();
+    format_flash(kib);
+    build_store(20000);
+    SPIFFS_unmount(&fs);
+    fill_gap_list(SRP_MAX_GAPS - 3);
+    store_state(SRP_PHASE_IDLE, 0, 0, 0, 0);
+    repair_boot(&report, &config);
+    CHECK(report.result == SRR_RESULT_DEFERRED && !strcmp(report.error_stage, "records") && report.check_passes == 0 &&
+              !manifest_kept(),
+          "records room: %s at %s, %u passes", srr_result_name(report.result), report.error_stage, report.check_passes);
+    ack_gap_list();
+    repair_boot(&report, &config);
+    CHECK(report.check_passes >= 1 && report.result != SRR_RESULT_DEFERRED && report.result != SRR_RESULT_FAILED,
+          "records room after acknowledgement: %s at %s", srr_result_name(report.result), report.error_stage);
+    printf("manifest coverage: every custody file named, overflow and record room passed\n");
+}
+
+/* Review 3, finding 3: with 24 unacknowledged records the restore's or the
+ * resume's record was dropped, yet the entry was marked reported or settled,
+ * and the bytes were gone with nothing naming them. Now no manifest is
+ * written (no check runs) unless the list has room for one record per entry,
+ * and an entry whose record does not fit stays in the manifest, unsettled
+ * (no check meanwhile), until it does. */
+static void run_records_full(uint32_t kib)
+{
+    /* The check would remove a held queue on a full store: with the list
+     * full, it never runs. */
+    seed(31101);
+    nvs_clear();
+    format_flash(kib);
+    build_store(60000);
+    model_file_t *m = model_of("/pending.jsonl");
+    SPIFFS_unmount(&fs);
+    fill_gap_list(SRP_MAX_GAPS);
+    store_state(SRP_PHASE_IDLE, 0, 0, 0, 0);
+    check_hook = check_alters;
+    hook_mode = 1 | 8;
+    srr_report_t report;
+    srr_config_t config = repair_config();
+    repair_boot(&report, &config);
+    hook_mode = 0;
+    check_hook = NULL;
+    CHECK(report.check_passes == 0 && report.result == SRR_RESULT_DEFERRED && !strcmp(report.error_stage, "records"),
+          "records full, restore: %s at %s, %u passes", srr_result_name(report.result), report.error_stage,
+          report.check_passes);
+    check_whole("records full, restore", m, 1);
+    /* A file changed in place after an interrupted check: its
+     * CONTENT_UNVERIFIED record does not fit. */
+    seed(31102);
+    nvs_clear();
+    format_flash(kib);
+    build_store(60000);
+    m = model_of("/pending.jsonl");
+    set_cursor("legacy_queues", "ords_pending", 0, 0, 7);
+    srp_manifest_t man;
+    manifest_begin(&man, 0);
+    manifest_add(&man, m, SRP_CLASS_ATTENDANCE, "legacy_queues", "ords_pending");
+    manifest_store(&man);
+    spiffs_file f = SPIFFS_open(&fs, m->name, SPIFFS_O_RDWR, 0);
+    CHECK(f >= 0 && SPIFFS_lseek(&fs, f, 100, SPIFFS_SEEK_SET) >= 0 && SPIFFS_write(&fs, f, (void *)"ZZZZ", 4) == 4,
+          "modify");
+    SPIFFS_close(&fs, f);
+    for (uint32_t i = 100; i < 104; ++i) m->unreadable[i] = 1;
+    SPIFFS_unmount(&fs);
+    fill_gap_list(SRP_MAX_GAPS);
+    store_state(SRP_PHASE_CHECK, 0, 0, SRP_STATE_MANIFEST, 0);
+    for (int boot = 0; boot < 2; ++boot) {
+        repair_boot(&report, &config);
+        CHECK(report.result == SRR_RESULT_DEFERRED && !strcmp(report.error_stage, "records") &&
+                  report.check_passes == 0 && manifest_kept(),
+              "records full, resume boot %d: %s at %s", boot, srr_result_name(report.result), report.error_stage);
+    }
+    ack_gap_list();
+    repair_boot(&report, &config);
+    srp_gaps_t gaps = gaps_now();
+    bool unverified = false;
+    for (uint32_t g = 0; g < gaps.count; ++g)
+        unverified |= !strcmp(gaps.gap[g].name, m->name) && gaps.gap[g].cause == SRP_GAP_CONTENT_UNVERIFIED &&
+            gaps.gap[g].offset == 0 && gaps.gap[g].length == m->size;
+    CHECK(unverified && !manifest_kept(), "records full, resume after acknowledgement: %s, recorded %d",
+          srr_result_name(report.result), unverified);
+    printf("records full: no check without room, entries wait unsettled until their record fits\n");
+}
+
+/* Review 3, finding 2: a hidden original on a crammed store. The resume
+ * rebuilt it with SPIFFS writes whose GC wiped the hidden pages, renamed a
+ * partial rebuild into place before recording its tail, and the next boot
+ * took that rebuild for the owner's new file: 52 KB lost with no record. Its
+ * header now comes back instead (one page), with a cut at sampled writes of
+ * that resume, torn both ways; the file must come back whole, no gap. */
+static void build_interleaved(uint32_t fill, model_file_t **out)
+{
+    model_reset();
+    row_seq = 100;
+    mount_plain();
+    make_id_file("/acked_uids.txt", 50);
+    model_file_t *m = new_model("/pending.jsonl", true, false);
+    char row[600];
+    static uint8_t ballast[2000];
+    memset(ballast, 0x42, sizeof(ballast));
+    while (m->size < 60000) {
+        size_t n = json_row(row, sizeof(row));
+        model_append(m, row, (uint32_t)n);
+        CHECK(append_bytes("/ballast.bin", ballast, sizeof(ballast)), "ballast");
+    }
+    u32_t total = 0, used = 0;
+    SPIFFS_info(&fs, &total, &used);
+    while (used < total / 100 * fill && append_bytes("/ballast.bin", ballast, sizeof(ballast)))
+        SPIFFS_info(&fs, &total, &used);
+    *out = m;
+}
+
+static void run_crammed_resume(uint32_t kib, uint32_t fill, uint32_t stride)
+{
+    seed(9004);
+    nvs_clear();
+    format_flash(kib);
+    model_file_t *m;
+    build_interleaved(fill, &m);
+    srp_manifest_t man;
+    manifest_begin(&man, 0);
+    manifest_add(&man, m, SRP_CLASS_ATTENDANCE, NULL, NULL);
+    manifest_store(&man);
+    store_state(SRP_PHASE_CHECK, 0, 0, SRP_STATE_MANIFEST, 0);
+    SPIFFS_unmount(&fs);
+    hide_header(m->name);
+    uint8_t *image = malloc(flash_size);
+    memcpy(image, flash, flash_size);
+    __typeof__(nvs) *saved = malloc(sizeof(nvs));
+    memcpy(saved, nvs, sizeof(nvs));
+    srr_report_t report;
+    srr_config_t config = repair_config();
+    uint64_t before = flash_ops;
+    repair_boot(&report, &config);
+    uint64_t writes = flash_ops - before;
+    CHECK(report.gaps == 0 && report.result != SRR_RESULT_FAILED, "crammed resume %u%%: %s, %u gaps", fill,
+          srr_result_name(report.result), report.gaps);
+    check_whole("crammed resume", m, 4);
+    uint32_t runs = 0;
+    for (uint64_t k = 1; k <= writes; k += stride) {
+        for (int tear = 0; tear < 2; ++tear) {
+            memcpy(flash, image, flash_size);
+            memcpy(nvs, saved, sizeof(nvs));
+            seed(9004 + k * 2 + (uint64_t)tear);
+            volatile bool cut = false;
+            cut_at = flash_ops + k;
+            if (setjmp(cut_point)) {
+                cut = true;
+                drop_all_memory();
+            } else {
+                repair_boot(&report, &config);
+            }
+            cut_at = 0;
+            if (!cut) continue;
+            runs++;
+            boot_until_done("crammed resume after a cut");
+            check_whole("crammed resume after a cut", m, 4);
+        }
+    }
+    free(image);
+    free(saved);
+    printf("crammed resume at %u%%: header restored, %u cuts at %" PRIu64 " writes passed\n", fill, runs, writes);
+}
+
+/* The same in the run: the check hides a held queue on a crammed store (85%:
+ * its rebuild could not fit), and a cut at sampled writes after the check. */
+static void run_crammed_restore(uint32_t kib, uint32_t fill, uint32_t stride)
+{
+    seed(9005);
+    nvs_clear();
+    format_flash(kib);
+    model_file_t *m;
+    build_interleaved(fill, &m);
+    SPIFFS_unmount(&fs);
+    uint8_t *image = malloc(flash_size);
+    memcpy(image, flash, flash_size);
+    __typeof__(nvs) *saved = malloc(sizeof(nvs));
+    memcpy(saved, nvs, sizeof(nvs));
+    review_victim = m->name;
+    review_mode = 1;
+    check_hook = review_hook;
+    srr_report_t report;
+    srr_config_t config = repair_config();
+    uint64_t start = flash_ops;
+    repair_boot(&report, &config);
+    uint64_t end = flash_ops, at_hook = review_hook_ops;
+    CHECK(report.result != SRR_RESULT_FAILED && report.gaps == 0, "crammed restore %u%%: %s at %s, %u gaps", fill,
+          srr_result_name(report.result), report.error_stage, report.gaps);
+    check_whole("crammed restore", m, 1);
+    uint32_t runs = 0;
+    for (uint64_t k = at_hook - start + 1; k <= end - start; k += stride) {
+        for (int tear = 0; tear < 2; ++tear) {
+            memcpy(flash, image, flash_size);
+            memcpy(nvs, saved, sizeof(nvs));
+            seed(7000 + k * 2 + (uint64_t)tear);
+            volatile bool cut = false;
+            cut_at = flash_ops + k;
+            if (setjmp(cut_point)) {
+                cut = true;
+                drop_all_memory();
+            } else {
+                repair_boot(&report, &config);
+            }
+            cut_at = 0;
+            if (!cut) continue;
+            runs++;
+            check_hook = NULL;
+            boot_until_done("crammed restore after a cut");
+            check_hook = review_hook;
+            check_whole("crammed restore after a cut", m, 1);
+        }
+    }
+    check_hook = NULL;
+    review_mode = 0;
+    free(image);
+    free(saved);
+    printf("crammed restore at %u%%: header restored, %u cuts after the check passed\n", fill, runs);
+}
+
+/* A held queue too large to rebuild beside itself (430 KB in a store 79%
+ * used): the check hides it, the run must bring it back whole. */
+static void run_hidden_large(uint32_t kib)
+{
+    seed(31201);
+    nvs_clear();
+    format_flash(kib);
+    model_reset();
+    row_seq = 3000;
+    mount_plain();
+    make_id_file("/acked_uids.txt", 100);
+    u32_t total = 0, used = 0;
+    SPIFFS_info(&fs, &total, &used);
+    model_file_t *m = make_json_file("/pending.jsonl", total * 45 / 100);
+    static uint8_t ballast[4000];
+    memset(ballast, 0x42, sizeof(ballast));
+    spiffs_file f = SPIFFS_open(&fs, "/ballast.bin", SPIFFS_O_CREAT | SPIFFS_O_TRUNC | SPIFFS_O_RDWR, 0);
+    SPIFFS_info(&fs, &total, &used);
+    while (f >= 0 && used + 8 * 4096 < total * 82 / 100 && SPIFFS_write(&fs, f, ballast, sizeof(ballast)) == 4000)
+        SPIFFS_info(&fs, &total, &used);
+    if (f >= 0) SPIFFS_close(&fs, f);
+    SPIFFS_clearerr(&fs);
+    SPIFFS_unmount(&fs);
+    review_victim = m->name;
+    review_mode = 1;
+    check_hook = review_hook;
+    srr_report_t report;
+    srr_config_t config = repair_config();
+    repair_boot(&report, &config);
+    check_hook = NULL;
+    review_mode = 0;
+    CHECK(report.result != SRR_RESULT_FAILED && report.gaps == 0, "large hidden original: %s at %s, %u gaps",
+          srr_result_name(report.result), report.error_stage, report.gaps);
+    check_whole("large hidden original", m, 1);
+    boot_until_done("large hidden original, next boot");
+    check_whole("large hidden original, next boot", m, 1);
+    printf("large hidden original: header restored, no rebuild needed\n");
+}
+
+/* The check removed a held queue outright (no hidden original) on a store
+ * too full to rebuild it whole: the rebuild's missing tail is recorded
+ * before the partial file takes the name, and a cut at any write after the
+ * check (torn both ways) never lets the next boot take the repair's own
+ * rebuild for the owner's new file. */
+/* One boot with a power cut at its k-th flash write; true when it came. */
+static bool boot_with_cut(uint64_t k)
+{
+    srr_report_t report;
+    srr_config_t config = repair_config();
+    cut_at = flash_ops + k;
+    if (setjmp(cut_point)) {
+        cut_at = 0;
+        drop_all_memory();
+        return true;
+    }
+    repair_boot(&report, &config);
+    cut_at = 0;
+    return false;
+}
+
+static bool rebuild_hook(uint32_t pass)
+{
+    bool changed = check_alters(pass);
+    if (pass == 1) review_hook_ops = flash_ops;
+    return changed;
+}
+
+static void run_rebuild_cuts(uint32_t kib, uint32_t stride)
+{
+    seed(9150);
+    nvs_clear();
+    format_flash(kib);
+    build_store(60000);
+    SPIFFS_unmount(&fs);
+    uint8_t *image = malloc(flash_size);
+    memcpy(image, flash, flash_size);
+    __typeof__(nvs) *saved = malloc(sizeof(nvs));
+    memcpy(saved, nvs, sizeof(nvs));
+    check_hook = rebuild_hook;
+    hook_mode = 1 | 8;
+    srr_report_t report;
+    srr_config_t config = repair_config();
+    uint64_t start = flash_ops;
+    repair_boot(&report, &config);
+    uint64_t end = flash_ops, at_hook = review_hook_ops;
+    uint32_t runs = 0;
+    uint64_t only_k = getenv("REVIEW_K") ? strtoull(getenv("REVIEW_K"), NULL, 10) : 0;
+    for (uint64_t k = at_hook - start + 1; k <= end - start; k += stride) {
+        for (int tear = 0; tear < 2; ++tear) {
+            if (only_k && k != only_k) continue;
+            memcpy(flash, image, flash_size);
+            memcpy(nvs, saved, sizeof(nvs));
+            seed(9150 + k * 2 + (uint64_t)tear);
+            print_log = only_k != 0;
+            check_hook = rebuild_hook;
+            hook_mode = 1 | 8;
+            bool cut = boot_with_cut(k);
+            hook_mode = 0;
+            check_hook = NULL;
+            if (!cut) continue;
+            runs++;
+            if (getenv("REVIEW_TRACE")) fprintf(stderr, "  partial rebuild: cut at write %" PRIu64 " (tear %d)\n", k, tear);
+            boot_until_done("partial rebuild after a cut");
+            for (uint32_t i = 0; i < model_count; ++i) check_named("partial rebuild after a cut", &model[i], 1);
+            CHECK(!manifest_kept(), "partial rebuild after a cut: manifest kept");
+        }
+    }
+    hook_mode = 0;
+    check_hook = NULL;
+    free(image);
+    free(saved);
+    printf("partial rebuild: %u cuts after the check passed\n", runs);
+}
+
+/* "review" runs them all; "review-<part>" one of them. */
+static void run_review_custody(uint32_t kib, const char *only)
+{
+    const char *part = only && !strncmp(only, "review-", 7) ? only + 7 : NULL;
+#define REVIEW_PART(name) (!part || !strcmp(part, name))
+    if (REVIEW_PART("coverage")) run_manifest_coverage(kib);
+    if (REVIEW_PART("records")) run_records_full(kib);
+    if (REVIEW_PART("resume")) {
+        run_crammed_resume(kib, 88, kib > 1024 ? 211 : 7);
+        run_crammed_resume(kib, 80, kib > 1024 ? 211 : 3);
+    }
+    if (REVIEW_PART("restore")) run_crammed_restore(kib, 85, kib > 1024 ? 211 : 5);
+    if (REVIEW_PART("hidden")) run_hidden_large(kib);
+    if (REVIEW_PART("rebuild")) run_rebuild_cuts(kib, kib > 1024 ? 211 : 4);
+#undef REVIEW_PART
 }
 
 /* ---- organic: the power-cut simulator's workload ----------------------- */
@@ -2973,6 +3472,7 @@ int main(int argc, char **argv)
         run_policy(kib);
         printf("no holds, failing allocations and the boot policy passed\n");
     }
+    if (!only || !strncmp(only, "review", 6)) run_review_custody(kib, only);
     if (!only || !strcmp(only, "special")) {
         run_resume_cuts(kib);
         run_restores(kib);

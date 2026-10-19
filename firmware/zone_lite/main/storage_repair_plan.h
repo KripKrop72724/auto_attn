@@ -189,15 +189,18 @@ typedef struct {
 void srp_state_seal(srp_state_t *state);
 bool srp_state_valid(const srp_state_t *state);
 
-/* Held custody at the start of a check: enough to tell, after a reset in
- * the middle of it, which bytes a power cut may have cost. It stays in NVS
- * (SRP_STATE_MANIFEST) until every entry is settled: found intact, put back,
- * superseded by the file's own owner, or reported as a gap. */
-#define SRP_MANIFEST_FILES 12U
+/* Every custody file at the start of a check, held or not: enough to tell,
+ * after a reset in the middle of it, which bytes a power cut may have cost.
+ * It stays in NVS (SRP_STATE_MANIFEST) until every entry is settled: found
+ * intact, put back, superseded by the file's own owner, or reported as a gap.
+ * No check runs when the custody files do not all fit, or when the gap list
+ * could not take one record per entry. */
+#define SRP_MANIFEST_FILES 24U
 enum {
     SRP_MANIFEST_CURSOR = 1U << 0,   /* cursor_generation holds the file's lq checkpoint generation */
     SRP_MANIFEST_SETTLED = 1U << 1,  /* nothing more to do for this entry */
     SRP_MANIFEST_REPORTED = 1U << 2, /* what did not go back is already a gap record */
+    SRP_MANIFEST_RESTORING = 1U << 3,/* the repair began putting it back: rebuild_id, restored */
 };
 /* manifest flags */
 #define SRP_MANIFEST_PENDING_IMAGE 0x01U /* written by an unconfirmed image: a later boot follows a rollback */
@@ -205,9 +208,10 @@ typedef struct {
     char name[SRP_NAME_BYTES];
     uint8_t cls, flags, reserved;
     uint16_t object_id;
-    uint16_t reserved2;
+    uint16_t rebuild_id;      /* object id of the repair's own rebuild of it; 0 when none */
     uint32_t size, crc;
     uint32_t cursor_generation;
+    uint32_t restored;        /* leading bytes of that rebuild read back as the original's */
 } srp_manifest_file_t;
 typedef struct {
     uint32_t version, generation, count;
