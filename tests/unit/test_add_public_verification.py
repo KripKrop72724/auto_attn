@@ -102,6 +102,10 @@ answer = dns["nameservers"] if server is None else dns["answers"].get(server)
 if answer is None:
     print(";; connection timed out; no servers could be reached")
     sys.exit(9)
+if server is None and isinstance(answer, list):
+    # dig 9.18 on the runner prints a retried try's error on stdout and still exits 0.
+    print(";; communications error to 1.1.1.1#53: timed out")
+    answer = [f"{names[0]}.\\t14400\\tIN\\tNS\\t{ns}" for ns in answer]
 if isinstance(answer, list):
     answer = "\\n".join(answer)
 if answer:
@@ -120,16 +124,17 @@ NO_TIMINGS = {"total": None, "dns": None, "tcp": None, "tls": None, "firstByte":
               "download": None}
 
 
-def failed(raw_output: str, source: str | None, asn: int = 150315, city: str = "Islamabad",
-           timings: dict | None = None, resolved: str | None = None) -> dict:
+def failed(raw_output: str, source: str | None, asn: int | str | None = 150315,
+           city: str = "Islamabad", timings: dict | None = None, resolved: str | None = None,
+           country: str = "PK", status_code: int | None = None) -> dict:
     """A failed result as the probe reports it; `source=None` omits failureSource."""
     result = {"status": "failed", "resolvedAddress": resolved, "headers": {},
               "rawHeaders": None, "rawBody": None, "rawOutput": raw_output,
-              "truncated": False, "statusCode": None, "statusCodeName": None,
+              "truncated": False, "statusCode": status_code, "statusCodeName": None,
               "timings": {**NO_TIMINGS, **(timings or {})}, "tls": None}
     if source is not None:
         result["failureSource"] = source
-    return {"probe": probe(asn, city), "result": result}
+    return {"probe": probe(asn, city, country), "result": result}
 
 
 def dns_timeout(asn: int = 150315, city: str = "Islamabad") -> dict:
@@ -307,6 +312,25 @@ FINAL_RESULTS = {
     "internal": failed("read ENOBUFS", "internal"),
     "dns-timeout-without-failure-source": failed(DNS_TIMEOUT, None, timings={"total": 6001}),
     "dns-timeout-blamed-on-target": failed(DNS_TIMEOUT, "target", timings={"total": 6001}),
+    # A resolver-blamed timeout that nonetheless shows contact with ADD, or comes from a
+    # probe the gate cannot attribute to a Pakistan network, is never replaced.
+    "resolver-timeout-with-address-and-timings": failed(
+        DNS_TIMEOUT, "resolver", resolved=ADD_ADDRESS,
+        timings={"total": 15000, "dns": 10, "tcp": 30, "tls": 40}),
+    "resolver-timeout-with-address": failed(DNS_TIMEOUT, "resolver", resolved=ADD_ADDRESS,
+                                            timings={"total": 6001}),
+    "resolver-timeout-with-dns-timing": failed(DNS_TIMEOUT, "resolver",
+                                               timings={"total": 6001, "dns": 10}),
+    "resolver-timeout-with-tcp-timing": failed(DNS_TIMEOUT, "resolver",
+                                               timings={"total": 6001, "tcp": 30}),
+    "resolver-timeout-with-status": failed(DNS_TIMEOUT, "resolver", timings={"total": 6001},
+                                           status_code=502),
+    "resolver-timeout-outside-pakistan": failed(DNS_TIMEOUT, "resolver", city="Delhi",
+                                                timings={"total": 6001}, country="IN"),
+    "resolver-timeout-without-asn": failed(DNS_TIMEOUT, "resolver", asn=None,
+                                           timings={"total": 6001}),
+    "resolver-timeout-with-text-asn": failed(DNS_TIMEOUT, "resolver", asn="150315",
+                                             timings={"total": 6001}),
 }
 
 

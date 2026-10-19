@@ -582,8 +582,10 @@ jobs:
             local host="$1"
             local zone="${host#*.}"
             local nameservers ns answer
-            if ! nameservers="$(dig +short +time=3 +tries=2 NS "$zone")" || \
-              [ -z "$nameservers" ]; then
+            # dig prints ";; communications error" lines on stdout when a try
+            # times out and a later one answers, so keep only NS answer records.
+            if ! nameservers="$(dig +noall +answer +time=3 +tries=2 NS "$zone" | \
+              awk '$4 == "NS" { print $5 }')" || [ -z "$nameservers" ]; then
               echo "Unable to list the nameservers of $zone from the runner." >&2
               return 1
             fi
