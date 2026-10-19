@@ -1635,6 +1635,14 @@ static void damage_torn_hidden_lookup(void)
  * header size with only low bits left set, so the size stays inside the
  * last data page. The bytes past the real end read erased; they were taken
  * for a SALVAGE gap and a junk row. The size its bytes hold is recovered. */
+/* A bit the size clears whose tear keeps the size inside its last span. */
+static bool torn_inside_possible(uint32_t size)
+{
+    for (uint32_t b = 1; b < 256; b <<= 1)
+        if ((size | b) != size && ((size | b) + SPAN - 1) / SPAN == (size + SPAN - 1) / SPAN) return true;
+    return false;
+}
+
 static void damage_torn_size_inside(void)
 {
     build_store(60000);
@@ -1644,8 +1652,10 @@ static void damage_torn_size_inside(void)
     m->size = 0;
     char row[600];
     size_t n;
+    /* A row length whose size can tear inside its last span at all (one
+     * like 0x1FB, with every low bit set, cannot). */
     do n = json_row(row, sizeof(row));
-    while ((n % SPAN) > SPAN - 40 || (n % SPAN) < 8);
+    while ((n % SPAN) > SPAN - 40 || (n % SPAN) < 8 || !torn_inside_possible((uint32_t)n));
     model_append(m, row, (uint32_t)n);
     uint32_t header = header_of(m->name), size;
     memcpy(&size, flash + header * PAGE + 8, 4);
