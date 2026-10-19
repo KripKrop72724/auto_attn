@@ -165,7 +165,10 @@ them. So:
    - Then cancel the finished bridge campaign so the zone can take the next
      one. The deployment stays `SUCCEEDED`.
 3. **Exposure** (any time after step 1). Run Actions → "Extend reviewed signed
-   ZKT HIL scope" from `main`:
+   ZKT HIL scope" from `main`. It refuses unless the main commit's
+   `repository-contract`, `windows-publication`, `firmware`, `backend`,
+   `frontend`, `oracle-projection` and `containers` checks are green, and each
+   run waits for `firmware-production` approval:
    - scope `2.7.4-bld9-k50-preview`, confirmation
      `PREVIEW-2.7.4-BLD9-K50-HIL`. It checks that the deployed ADD holds the
      published 17 as current, runs the extension preflight ("17 to 18 ordered
@@ -174,8 +177,7 @@ them. So:
    - scope `2.7.4-bld9-k50`, confirmation `EXTEND-2.7.4-BLD9-K50-HIL`. It
      repeats those checks, replaces only `.hil-only.json`, keeps the old one as
      `.hil-scope-before-*.json`, and re-checks the deployed ADD and the
-     unchanged manifest, signature and image. Approve `firmware-production`
-     when asked.
+     unchanged manifest, signature and image.
    - Both runs take the `add-production` lock that `add-deploy` uses. Run
      them when no deployment is queued: a run still waiting for the lock is
      cancelled when another run queues behind it in that group. Re-run it
