@@ -2101,6 +2101,8 @@ static bool hidden_pinned(run_t *r)
     return false;
 }
 
+static bool frozen(run_t *r, const obj_t *o);
+
 static bool terminate_tails(run_t *r)
 {
     /* A SPIFFS append with three free blocks or fewer runs SPIFFS's GC,
@@ -2109,7 +2111,9 @@ static bool terminate_tails(run_t *r)
     if ((uint32_t)r->fs->free_blocks <= 3 && hidden_pinned(r)) return true;
     for (uint32_t i = 0; i < r->obj_count; ++i) {
         obj_t *o = &r->objs[i];
-        if (!live(o) || !o->size || !o->consistent) continue;
+        /* A copy waiting under the temporary name ends where its original's
+         * bytes stop (its tail is a record already). */
+        if (!live(o) || !o->size || !o->consistent || frozen(r, o)) continue;
         bool command = (o->kind.flags & SRP_COMMAND_FAMILY) != 0;
         if (!(o->kind.flags & SRP_APPEND_TARGET) && !command) continue;
         uint8_t last;

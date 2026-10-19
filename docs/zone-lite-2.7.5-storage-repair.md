@@ -525,7 +525,9 @@ ADD has acknowledged some.
 - **Cursors** (section 7).
 - **Torn tails**: an append target whose unsettled last byte is not `\n`
   gets one `\n` (`rel_open_append` otherwise refuses every later append with
-  EBADMSG). A torn command line is left to the inbox merge. Not while a
+  EBADMSG). A torn command line is left to the inbox merge, and a copy
+  waiting under the temporary name is left as it is (its tail is a record
+  already: a `\n` there would replace the original's next byte). Not while a
   hidden original an unsettled entry waits for is on flash and three blocks
   or fewer are free (SPIFFS's GC in the append would wipe it).
 - **Catalog**: when a catalog file had a gap (or level 1 ran), all five
@@ -718,7 +720,10 @@ on its emulated SPIFFS.
   cursor moved), with a cut at every ninth write of the resume at 80% full
   (`merge-cuts`), a whole rebuild whose name a rolled-back image took
   (`rebuild-name`), an unheld file hidden on a store with no erased page
-  (`unheld-crammed`, in the run and through a resume), and a cut at every
+  (`unheld-crammed`, in the run and through a resume), a partial rebuild
+  waiting for room under its temporary name while a new file has the name
+  (`rebuild-waits`: untouched by the finish's tail termination, then merged),
+  and a cut at every
   fifth write of the repair's rebuild (`salvage`; `REVIEW_FULL=1` runs every
   write, with four tears for the rebuild). Also:
   every scenario with no holds and with allocation failing at four levels;

@@ -4328,6 +4328,84 @@ static void run_gc_unsafe_handover(uint32_t kib)
            report.room_needed, report.room_erased);
 }
 
+/* A partial rebuild left under the temporary name, its name taken by a
+ * rolled-back image's punch, on a store with no room for the merge: the
+ * copy waits, untouched (the finish's tail termination once appended a
+ * '\n' to it, replacing the original's next byte with no record), and is
+ * merged with room. */
+static void run_partial_rebuild_waits(uint32_t kib)
+{
+    seed(43100);
+    nvs_clear();
+    format_flash(kib);
+    build_store(60000);
+    SPIFFS_unmount(&fs);
+    model_file_t *m = model_of("/pending.jsonl");
+    uint8_t *image = malloc(flash_size);
+    memcpy(image, flash, flash_size);
+    __typeof__(nvs) *saved = malloc(sizeof(nvs));
+    memcpy(saved, nvs, sizeof(nvs));
+    srr_config_t config = repair_config();
+    config.pending_verify = true;
+    check_hook = rebuild_hook;
+    hook_mode = 1;
+    srr_report_t report;
+    uint64_t start = flash_ops;
+    repair_boot(&report, &config);
+    uint64_t end = flash_ops, at_hook = review_hook_ops;
+    static uint8_t buffer[8 * 1024 * 1024];
+    uint64_t chosen = 0;
+    int64_t copy = 0;
+    for (uint64_t k = at_hook - start + 40; k < end - start && !chosen; ++k) {
+        memcpy(flash, image, flash_size);
+        memcpy(nvs, saved, sizeof(nvs));
+        seed(43200 + k);
+        check_hook = rebuild_hook;
+        hook_mode = 1;
+        bool cut = boot_with_cut(k);
+        hook_mode = 0;
+        check_hook = NULL;
+        if (!cut) continue;
+        mount_plain();
+        copy = exists("/pending.jsonl.rpr") ? read_file("/pending.jsonl.rpr", buffer, sizeof(buffer)) : -1;
+        bool usable = !exists(m->name) && copy > 0 && copy < (int64_t)m->size && buffer[copy - 1] != '\n' &&
+            !memcmp(buffer, m->data, (size_t)copy);
+        if (usable) {
+            char row[600];
+            size_t n = json_row(row, sizeof(row));
+            usable = append_bytes(m->name, row, (uint32_t)n);
+            static uint8_t filler[4000];
+            memset(filler, 0x5A, sizeof(filler));
+            while (usable && append_bytes("/filler.bin", filler, sizeof(filler))) {}
+        }
+        SPIFFS_unmount(&fs);
+        if (usable) chosen = k;
+    }
+    CHECK(chosen, "partial rebuild waits: no cut left a partial rebuild ending inside a row");
+    srr_config_t again = repair_config();
+    again.pending_verify = true;
+    repair_boot(&report, &again);
+    CHECK(report.result != SRR_RESULT_FAILED && manifest_kept(), "partial rebuild waits: %s at %s, manifest kept %d",
+          srr_result_name(report.result), report.error_stage, manifest_kept());
+    int64_t after = read_named("/pending.jsonl.rpr", buffer, sizeof(buffer));
+    CHECK(after >= copy && !memcmp(buffer, m->data, (size_t)after),
+          "partial rebuild waits (cut at write %" PRIu64 "): the copy of %" PRId64 " bytes now reads %" PRId64
+          " and is no longer the original's prefix",
+          chosen, copy, after);
+    mount_plain();
+    CHECK(SPIFFS_remove(&fs, "/filler.bin") == SPIFFS_OK, "partial rebuild waits: remove filler");
+    SPIFFS_unmount(&fs);
+    boot_until_done("partial rebuild waits, with room");
+    int64_t got = read_named(m->name, buffer, sizeof(buffer));
+    CHECK(got > 0 && holds(buffer, (size_t)got, m->data, (size_t)after) && !manifest_kept(),
+          "partial rebuild waits: with room its %" PRId64 " bytes are not in %s (reads %" PRId64 ", manifest %d)", after,
+          m->name, got, manifest_kept());
+    free(image);
+    free(saved);
+    printf("partial rebuild waiting for room under its temporary name: untouched, then merged (cut at write %" PRIu64
+           ")\n", chosen);
+}
+
 static void run_review_custody(uint32_t kib, const char *only)
 {
     const char *part = only && !strncmp(only, "review-", 7) ? only + 7 : NULL;
@@ -4352,6 +4430,7 @@ static void run_review_custody(uint32_t kib, const char *only)
     if (REVIEW_PART("merge-partial")) run_merge_partial(kib);
     if (REVIEW_PART("merge-cuts")) run_merge_cuts(kib, 80, kib > 1024 ? 97 : getenv("REVIEW_FULL") ? 1 : 9);
     if (REVIEW_PART("rebuild-name")) run_rebuild_name_taken(kib);
+    if (REVIEW_PART("rebuild-waits")) run_partial_rebuild_waits(kib);
     if (REVIEW_PART("unheld-crammed")) run_unheld_crammed(kib);
     if (REVIEW_PART("salvage")) run_rebuild_salvage(kib, kib > 1024 ? 97 : getenv("REVIEW_FULL") ? 1 : 5,
                                                       getenv("REVIEW_FULL") ? 4 : 2);
