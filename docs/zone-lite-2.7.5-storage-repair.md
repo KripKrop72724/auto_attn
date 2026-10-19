@@ -772,7 +772,20 @@ on its emulated SPIFFS.
   the repair (40 fresh seeds per scenario at 1 MB, 2 at 8 MB); the special
   and review runs at 2 and 8 MB, the mirror and budget runs at 8 MB. The
   largest repair took
-  5.1 M HAL operations of the 10.4 M cap at 8 MB.
+  5.1 M HAL operations of the 10.4 M cap at 8 MB. The fourth round's pass
+  (at `4ae1e0b`): CI's configuration in `espressif/idf:v5.5.3` and again
+  natively with Apple clang 21 (identical cut and repair counts); the review
+  runs at 2 and 8 MB and the special runs at 8 MB; the merge-cut and salvage
+  runs at every write (1,362 and 1,692 runs); the third round's every-write
+  sweeps again (resume at 88%, 3,146 cuts; at 80%; restore at 85%, 394;
+  partial rebuild, 2,434; the review's store layouts for the restore order);
+  1,302 fresh cut runs inside the repair at 1 and 8 MB; every scenario with
+  10 fresh seeds, the mirror and budget runs at 8 MB; 14 fresh workload seeds
+  (12 at 1 and 2 MB with cut gaps of 150 to 900, 4 at 8 MB prefilled), and
+  the review's 8 MB seeds 11 to 15 at 20,000 ticks: 0 committed rows lost
+  everywhere; seeds 12 and 13 and two fresh prefilled 8 MB seeds (6112,
+  6121) end wedged (section 12). The largest repair took 4.9 M HAL operations
+  and 3.7 M CPU steps (557 ms of host CPU under the sanitizers) at 8 MB.
 - **Contracts** (`test_storage_repair_boot_contract.py`): boot order, CMake
   scope, no format call, the check callback, deadline before mount, no new
   task, PSRAM-only holds, the storage-ready gate, the reporter outside a
@@ -924,6 +937,14 @@ Fourth boot review (H1-H4, at `6af714a`):
 | H2 | A stale `FULL` flag turned level 2 off for good; a run with no work kept it | Fixed (`d2eab2a`): every run starts with the flag clear and sets it only when it defers for room, with a signature of the shortage; level 2 is skipped only for the same shortage (5.2). Review run `full-flag`; fails on `6af714a` (DEFERRED at level 0 where a fresh journal retires the settled queue). |
 | H3 | The engine's CPU time grew with the square of a file's damaged spans (linear patch lookups per byte): 3.9 billion steps, seconds of host CPU, minutes on the device outside every deadline check | Fixed (`8b26ad0`): patches sorted by span, binary search, scans patch by patch; the harness caps the engine's steps at 512 per page in every run. Review run `cpu` at 8 MiB: 6,073 ms per repair on `d2eab2a`, 422 ms (3.7 M steps) now. |
 | H4 | The rollback tag came from the other OTA slot even when the bootloader would return to the factory app | Fixed (`d3c4ff6`): the other slot only while an otadata entry the bootloader accepts selects it, otherwise the factory app (section 4). Contract test; fails on `6af714a`. |
+
+Found while fixing the fourth round:
+
+| Finding | Fix |
+|---|---|
+| A partial rebuild waiting under the temporary name for a merge with room (custody of the queue's kind) had a `\n` appended by the finish's tail termination; the merge took it for the original's next byte, which no record named | `1612af0`: a copy an unsettled entry names is left as it is. Review run `rebuild-waits`; fails on `a32090a`. |
+| SPIFFS's append writes a new page's header finalized before its bytes, so "finalized" does not mean "complete" for the last page an interrupted append wrote | The rebuild's salvage stops before that page (G6); the survey reads past a committed size nowhere else. |
+| A data page header torn to span 0xFFFF wrapped the 16-bit span trace to 0, so size recovery saw no page | `30fdfca`: spans past the partition are ignored. |
 
 Third verification (V1-V6, at `77256f4`):
 
