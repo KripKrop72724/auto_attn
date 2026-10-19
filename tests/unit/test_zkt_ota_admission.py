@@ -320,3 +320,150 @@ def test_real_progress_commit_settles_cancelled_attempt_and_new_attempt_reserves
             status="OFFERED", offered_at=datetime.now(timezone.utc)))
         db.commit()
         assert pending_offer_hold(db, connector(db, 11)) == "NATIONWIDE_LOCATION_BUSY"
+
+
+# ZONE-BLD9-01's K50 sits outside the 17. Only its exact signed 2.4.12 bridge
+# and 2.7.4 may queue it, at the BLD9 location, under every other limit.
+def k50_release(db, identity, state):
+    release_id, version, git_sha, image, application = identity
+    row = FirmwareRelease(release_id=release_id, version=version, git_sha=git_sha, image_sha256=image,
+        image_size=1024, signing_key_id="synthetic", partition_layout="zone-lite-ota-v1",
+        minimum_bootstrap_version="2.2.0", storage_name=f"{version}/k50.bin",
+        manifest={"application_sha256": application}, manifest_signature="synthetic", state=state)
+    db.add(row)
+    db.flush()
+    return row
+
+
+def add_device(db, target, zone, *, firmware="2.5.2", partition="factory", digest=None):
+    device = Connector(connector_id=target.connector_id, hardware_id=target.mac, zone_id=zone, zone_name=zone,
+        device_id="test", display_name=zone, firmware_family="zkt", firmware_version=firmware, connected=True,
+        active=True, is_spare=False, ota_capable=True, ota_secure_boot=True, ota_rollback_enabled=True,
+        ota_partition_layout="zone-lite-ota-v1", ota_running_partition=partition, ota_image_sha256=digest)
+    device.zkt_device = ZKTDevice(serial=target.terminal_serial, expected_serial=target.terminal_serial,
+        confirmed_serial=target.terminal_serial, terminal_binding_state="CONFIRMED")
+    db.add(device)
+    db.flush()
+    return device
+
+
+def k50_store(db):
+    from zk_add.hil_2615_cities import SIGNED_BRIDGE_IDENTITIES
+    from zk_add.zkt274_bld9_k50 import FACTORY_PREDECESSOR, RELEASE_IDENTITY, TARGET, ZONE
+    bridge = k50_release(db, SIGNED_BRIDGE_IDENTITIES["2.4.12"], "AVAILABLE")
+    release = k50_release(db, RELEASE_IDENTITY, "HIL_ONLY")
+    return add_device(db, TARGET, ZONE, digest=FACTORY_PREDECESSOR[1]), bridge, release
+
+
+def hold(db, device, release, state="DOWNLOADING"):
+    campaign = FirmwareCampaign(campaign_id="hold-" + str(device.id), release_id=release.id,
+        zone_id=device.zone_id, actor="synthetic", idempotency_key="hold-" + str(device.id),
+        reason="Synthetic occupied slot", typed_confirmation=release.version)
+    db.add(campaign)
+    db.flush()
+    db.add(FirmwareDeployment(deployment_id="hold-" + str(device.id), campaign_id=campaign.id,
+        release_id=release.id, connector_id=device.id, target_version=release.version, status=state,
+        offered_at=datetime.now(timezone.utc)))
+    db.flush()
+
+
+def test_k50_queues_only_for_its_exact_bridge_and_2_7_4(store):
+    with store() as db:
+        k50, bridge, release = k50_store(db)
+        assert pending_offer_hold(db, k50, bridge) is None
+        assert pending_offer_hold(db, k50, release) is None
+        legacy = db.scalar(select(FirmwareRelease).where(FirmwareRelease.version == "2.2.1"))
+        for other in (None, legacy):
+            assert pending_offer_hold(db, k50, other) == "NATIONWIDE_EXACT_TARGET_REQUIRED"
+        # Each release needs its exact state and signed identity.
+        for row, field, value in ((bridge, "state", "HIL_ONLY"), (release, "state", "AVAILABLE"),
+                                  (release, "git_sha", "0" * 40), (release, "image_sha256", "0" * 64),
+                                  (release, "version", "2.7.3"), (bridge, "image_sha256", "0" * 64)):
+            saved = getattr(row, field)
+            setattr(row, field, value)
+            assert pending_offer_hold(db, k50, row) == "NATIONWIDE_EXACT_TARGET_REQUIRED"
+            setattr(row, field, saved)
+        release.manifest = {"application_sha256": "0" * 64}
+        assert pending_offer_hold(db, k50, release) == "NATIONWIDE_EXACT_TARGET_REQUIRED"
+
+
+@pytest.mark.parametrize("fault", ["serial", "mac", "zone", "spare", "inactive", "connector"])
+def test_k50_exception_is_its_exact_identity_and_zone(store, fault):
+    with store() as db:
+        k50, bridge, release = k50_store(db)
+        if fault == "serial":
+            k50.zkt_device.confirmed_serial = "REPLACED"
+        elif fault == "mac":
+            k50.hardware_id = "00:11:22:33:44:55"
+        elif fault == "zone":
+            k50.zone_id = "ZONE-BLD9-02"
+        elif fault == "spare":
+            k50.is_spare = True
+        elif fault == "inactive":
+            k50.active = False
+        else:
+            k50.connector_id = "another-k50"
+        for row in (bridge, release):
+            assert pending_offer_hold(db, k50, row) == "NATIONWIDE_EXACT_TARGET_REQUIRED"
+
+
+def test_k50_shares_bld9_and_the_two_fleet_slots(store):
+    from zk_add.zkt274_bld9_k50 import TARGET
+    with store() as db:
+        k50, bridge, release = k50_store(db)
+        legacy = db.scalar(select(FirmwareRelease).where(FirmwareRelease.version == "2.2.1"))
+        bld9_01, bld9_02 = (add_device(db, TARGETS[index].identity, TARGETS[index].name, firmware="2.2.0",
+                                       partition="ota_0") for index in (15, 16))
+        k50.connected = False
+        assert pending_offer_hold(db, k50, release) == "NATIONWIDE_TARGET_OFFLINE"
+        k50.connected = True
+        # The nationwide BLD9 01 holding a slot keeps the K50 waiting, and back.
+        hold(db, bld9_01, legacy)
+        assert pending_offer_hold(db, k50, bridge) == "NATIONWIDE_LOCATION_BUSY"
+        db.scalar(select(FirmwareDeployment).where(FirmwareDeployment.connector_id == bld9_01.id)).status = "SUCCEEDED"
+        hold(db, k50, bridge)
+        assert reservation_snapshot(db)["reservations"][0]["connector_id"] == TARGET.connector_id
+        assert pending_offer_hold(db, bld9_02, legacy) == "NATIONWIDE_LOCATION_BUSY"
+        # Elsewhere a K50 slot is a known location, never LOCATION_UNKNOWN.
+        tower, swat = connector(db, 0), connector(db, 1)
+        assert pending_offer_hold(db, tower, legacy) is None
+        row = deployment(db, tower)
+        row.status, row.offered_at = "DOWNLOADING", datetime.now(timezone.utc)
+        assert pending_offer_hold(db, swat, legacy) == "NATIONWIDE_TWO_UPGRADE_RESERVATIONS"
+        # And two other slots keep the K50 waiting too.
+        db.scalar(select(FirmwareDeployment).where(FirmwareDeployment.connector_id == k50.id)).status = "SUCCEEDED"
+        row = deployment(db, swat)
+        row.status, row.offered_at = "DOWNLOADING", datetime.now(timezone.utc)
+        assert pending_offer_hold(db, k50, release) == "NATIONWIDE_TWO_UPGRADE_RESERVATIONS"
+
+
+def test_other_devices_outside_the_17_still_wait_with_the_k50_exception(store):
+    from zk_add.hil_scope import HilTarget
+    from zk_add.zkt274_bld9_k50 import ZONE
+    with store() as db:
+        _k50, bridge, release = k50_store(db)
+        stranger = add_device(db, HilTarget(connector_id="11111111-2222-3333-4444-555555555555",
+                                            mac="ac:27:6e:00:00:01", terminal_serial="ANM0000000001"), ZONE)
+        for row in (bridge, release):
+            assert pending_offer_hold(db, stranger, row) == "NATIONWIDE_EXACT_TARGET_REQUIRED"
+
+
+def test_k50_bridge_offer_through_real_assignment(store):
+    with store() as db:
+        k50, bridge, _release = k50_store(db)
+        bld9_01 = add_device(db, TARGETS[15].identity, TARGETS[15].name, firmware="2.2.0", partition="ota_0")
+        campaign = FirmwareCampaign(campaign_id="k50-bridge", release_id=bridge.id, zone_id=k50.zone_id,
+            actor="synthetic", idempotency_key="k50-bridge", reason="Synthetic K50 bridge",
+            typed_confirmation=bridge.version)
+        db.add(campaign)
+        db.flush()
+        db.add(FirmwareDeployment(deployment_id="k50-bridge", campaign_id=campaign.id, release_id=bridge.id,
+            connector_id=k50.id, previous_version=k50.firmware_version, target_version=bridge.version))
+        db.flush()
+        legacy = db.scalar(select(FirmwareRelease).where(FirmwareRelease.version == "2.2.1"))
+        hold(db, bld9_01, legacy)
+        assert offer(db, k50) is None
+        assert deployment(db, k50).error_code == "NATIONWIDE_LOCATION_BUSY"
+        db.scalar(select(FirmwareDeployment).where(FirmwareDeployment.connector_id == bld9_01.id)).status = "SUCCEEDED"
+        assert offer(db, k50)["version"] == "2.4.12"
+        assert deployment(db, k50).status == "OFFERED" and deployment(db, k50).error_code is None

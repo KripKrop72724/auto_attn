@@ -52,10 +52,10 @@ function docker {
             $arguments[6] -cnotmatch '/hil-marker.json$' -or $arguments[7] -cne '--previous-prefix-count') {
             throw 'Published checker mode or marker was not passed exactly'
         }
-        $expectedPrevious = if ($global:admissionTestScenario -eq 'published-pending') { '1' } else { '0' }
+        $expectedPrevious = if ($global:admissionTestScenario -eq 'published-pending') { '1' } elseif ($global:admissionTestScenario -eq 'published-pending-17') { '17' } else { '0' }
         if ($arguments[8] -cne $expectedPrevious) { throw 'Previous prefix permission changed' }
         if ($global:admissionTestScenario -eq 'published-reject') { $global:LASTEXITCODE = 1; return 'ADD_FIRMWARE_CONTRACT_REJECTED' }
-        $state = if ($global:admissionTestScenario -in @('published-pending', 'published-unallowed-pending')) { 'CATALOG_REFRESH_PENDING' } else { 'CATALOG_CURRENT' }
+        $state = if ($global:admissionTestScenario -in @('published-pending', 'published-pending-17', 'published-unallowed-pending')) { 'CATALOG_REFRESH_PENDING' } else { 'CATALOG_CURRENT' }
         return ('ADD_FIRMWARE_CONTRACT_ACCEPTED:' + $arguments[-1] + ':' + $state)
     }
     if ($global:admissionTestScenario -eq 'reject') { $global:LASTEXITCODE = 1; return 'ADD_FIRMWARE_CONTRACT_REJECTED' }
@@ -91,20 +91,25 @@ try {
             if ($case -eq 'pass' -and $global:admissionTestCalls.Count -lt 12) { throw 'Multi-chunk transfer was not exercised' }
         }
     }
-    foreach ($case in @('published-current', 'published-pending', 'published-unallowed-pending', 'published-reject')) {
+    # 17 is the complete signed nationwide prefix the 2.7.4 K50 extension keeps.
+    foreach ($case in @('published-current', 'published-pending', 'published-pending-17', 'published-unallowed-pending', 'published-reject')) {
         $global:admissionTestScenario = $case
         $global:admissionTestCalls.Clear()
         $global:admissionTestBytes.Clear()
         $caught = $false
         try {
-            $previousCount = if ($case -eq 'published-pending') { 1 } else { 0 }
+            $previousCount = if ($case -eq 'published-pending') { 1 } elseif ($case -eq 'published-pending-17') { 17 } else { 0 }
             $successStream = @(& $check -SourceDirectory $root -RequirePublishedHilRelease -AllowPreviousPrefixCount $previousCount)
-            $expectedState = if ($case -eq 'published-pending') { 'CATALOG_REFRESH_PENDING' } else { 'CATALOG_CURRENT' }
+            $expectedState = if ($case -in @('published-pending', 'published-pending-17')) { 'CATALOG_REFRESH_PENDING' } else { 'CATALOG_CURRENT' }
             if ($successStream.Count -ne 1 -or $successStream[0] -cne $expectedState) { throw 'Published checker success-stream state changed' }
         } catch { $caught = $true }
         if ($caught -ne ($case -in @('published-unallowed-pending', 'published-reject'))) { throw "Incorrect published admission result: $case" }
         if ($global:admissionTestCalls[-1][4] -notmatch 'rmtree') { throw 'Published check temporary-file cleanup missing' }
     }
+    $global:admissionTestCalls.Clear()
+    $rejected = $false
+    try { & $check -SourceDirectory $root -RequirePublishedHilRelease -AllowPreviousPrefixCount 18 } catch { $rejected = $true }
+    if (-not $rejected -or $global:admissionTestCalls.Count) { throw 'A previous prefix beyond the signed 17 was accepted' }
     Write-Host 'Deployed firmware admission regressions passed.'
 } finally {
     Remove-Item -LiteralPath $root -Recurse -Force

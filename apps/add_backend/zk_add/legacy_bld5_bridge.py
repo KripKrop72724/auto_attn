@@ -1,4 +1,4 @@
-"""Bridge the original 2.4.12 protocol on the exact BLD5 and Lahore ZKTs.
+"""Bridge the original 2.4.12 protocol on the exact BLD5, Lahore and BLD9 K50 ZKTs.
 
 Legacy boot reports are transport acknowledgements, not installation proof.
 The ordinary checked transitions run only after a fresh signed capability
@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 
 from zk_add.hil_scope import target_matches
 from zk_add.hil_2615_cities import CITY_FACTORY_PREDECESSORS, CITY_TARGETS, SIGNED_BRIDGE_IDENTITIES
+from zk_add import zkt274_bld9_k50 as bld9_k50
 from zk_add.models import Connector, DeviceTelemetry
 from zk_add.ota import (
     FirmwareCampaign, FirmwareDeployment, FirmwareEvent, FirmwareRelease,
@@ -22,7 +23,7 @@ BRIDGE_IDENTITY = SIGNED_BRIDGE_IDENTITIES["2.4.12"]
 BRIDGE_TARGETS = {"LF-ZONE-BLD5-01": HIL_2615_BLD5_TARGET, **{
     zone: CITY_TARGETS[zone] for zone, predecessor in CITY_FACTORY_PREDECESSORS.items()
     if predecessor[2] == "2.4.12"
-}}
+}, bld9_k50.ZONE: bld9_k50.TARGET}
 
 
 def _bridge(session: Session, connector: Connector, deployment_id: str | None = None):

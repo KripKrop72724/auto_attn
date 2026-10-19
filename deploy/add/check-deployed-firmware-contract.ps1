@@ -2,7 +2,7 @@ param(
     [Parameter(Mandatory = $true)][string]$SourceDirectory,
     [ValidatePattern('^[a-zA-Z0-9][a-zA-Z0-9_.-]+$')][string]$AddContainer = 'attendance-device-dashboard-add-api-1',
     [switch]$RequirePublishedHilRelease,
-    [ValidateRange(0,16)][int]$AllowPreviousPrefixCount = 0
+    [ValidateRange(0,17)][int]$AllowPreviousPrefixCount = 0
 )
 
 $ErrorActionPreference = 'Stop'

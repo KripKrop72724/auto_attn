@@ -718,6 +718,65 @@ foreach ($mutation in @('prefix', 'connector', 'mac', 'serial', 'order', 'missin
     try { Assert-Zkt2615CityHilExtension @changed } catch { $rejected = $true }
     if (-not $rejected) { throw "City extension accepted $mutation" }
 }
+# The ZONE-BLD9-01 K50 extension appends one reviewed device to the marker of
+# the immutable signed 2.7.4; the signed nationwide 17 stay first and complete.
+. (Join-Path $repo 'deploy/add/firmware-2-7-4-bld9-k50-hil-scope.ps1')
+$k50Json = Get-Content -LiteralPath (Join-Path $repo 'deploy/add/hil-targets-2.7.4-bld9-k50.json') -Raw
+$k50Arguments = @{
+    ExpectedGitSha = '87e14fe6e9756cd65a27e64ac1a7420fe35aa816'
+    ExpectedImageSha256 = '9a3e2226b7abff11cc264472356c186d3b9cce87a0df059aeb0a9965f1f095c5'
+    ExpectedApplicationSha256 = '3e4bb613ab046df5ad29e4a1ab37fd801e1778e6b0d2c41c6604fe75bbea2fac'
+    ExistingTargetsJson = $nationwide
+    ExtendedTargetsJson = $k50Json
+}
+Assert-Zkt274Bld9K50HilExtension @k50Arguments
+foreach ($field in @('ExpectedGitSha', 'ExpectedImageSha256', 'ExpectedApplicationSha256')) {
+    $changed = $k50Arguments.Clone()
+    $changed[$field] = '0' * $changed[$field].Length
+    $rejected = $false
+    try { Assert-Zkt274Bld9K50HilExtension @changed } catch { $rejected = $true }
+    if (-not $rejected) { throw "K50 extension accepted changed $field" }
+}
+$nationwideTargets = ConvertFrom-Json -InputObject $nationwide
+$nationwideTargets = @($nationwideTargets)
+foreach ($mutation in @('existing-prefix', 'prefix', 'connector', 'mac', 'serial', 'order', 'missing', 'extra', 'extra-key', 'k50-only')) {
+    $changed = $k50Arguments.Clone()
+    $changedTargets = ConvertFrom-Json -InputObject $changed.ExtendedTargetsJson
+    $changedTargets = @($changedTargets)
+    switch ($mutation) {
+        'existing-prefix' { $changed.ExistingTargetsJson = ConvertTo-Json -InputObject @($nationwideTargets[0..15]) -Depth 5 -Compress }
+        'prefix' { $changedTargets[16].terminal_serial = 'replacement' }
+        'connector' { $changedTargets[17].connector_id = 'replacement' }
+        'mac' { $changedTargets[17].mac = '00:11:22:33:44:55' }
+        'serial' { $changedTargets[17].terminal_serial = 'replacement' }
+        'order' { $saved = $changedTargets[16]; $changedTargets[16] = $changedTargets[17]; $changedTargets[17] = $saved }
+        'missing' { $changedTargets = @($changedTargets[0..16]) }
+        'extra' { $changedTargets = @($changedTargets) + @([pscustomobject]@{connector_id='replacement';mac='00:11:22:33:44:55';terminal_serial='replacement'}) }
+        'extra-key' { $changedTargets[17] | Add-Member -MemberType NoteProperty -Name display_name -Value 'ZONE-BLD9-01' }
+        'k50-only' { $changedTargets = @($changedTargets[17]) }
+    }
+    if ($mutation -ne 'existing-prefix') { $changed.ExtendedTargetsJson = ConvertTo-Json -InputObject $changedTargets -Depth 5 -Compress }
+    $rejected = $false
+    try { Assert-Zkt274Bld9K50HilExtension @changed } catch { $rejected = $true }
+    if (-not $rejected) { throw "K50 extension accepted $mutation" }
+}
+# The real extension refuses any other 2.7.4 bytes or platform version before
+# the published marker changes.
+$k50Marker = Join-Path $store '2.7.4/.hil-only.json'
+$k50MarkerHash = (Get-FileHash -LiteralPath $k50Marker).Hash
+$publishedK50 = Get-Content -LiteralPath (Join-Path $store '2.7.4/manifest.json') -Raw | ConvertFrom-Json
+foreach ($identity in @(
+    @{ Version = '2.7.4'; ExpectedGitSha = $publishedK50.git_sha; ExpectedImageSha256 = $publishedK50.image_sha256; ExpectedApplicationSha256 = $publishedK50.application_sha256 },
+    @{ Version = '2.7.4'; ExpectedGitSha = $k50Arguments.ExpectedGitSha; ExpectedImageSha256 = $k50Arguments.ExpectedImageSha256; ExpectedApplicationSha256 = $k50Arguments.ExpectedApplicationSha256 },
+    @{ Version = '2.7.3'; ExpectedGitSha = $k50Arguments.ExpectedGitSha; ExpectedImageSha256 = $k50Arguments.ExpectedImageSha256; ExpectedApplicationSha256 = $k50Arguments.ExpectedApplicationSha256 })) {
+    $rejected = $false
+    try {
+        & (Join-Path $repo 'deploy/add/extend-ordered-hil-scope.ps1') -StoreDirectory $store @identity `
+            -ExistingTargetsJson $nationwide -ExtendedTargetsJson $k50Json -PreviewOnly
+    } catch { $rejected = $true }
+    if (-not $rejected) { throw "K50 extension accepted $($identity.Version) $($identity.ExpectedGitSha)" }
+}
+if ((Get-FileHash -LiteralPath $k50Marker).Hash -cne $k50MarkerHash) { throw 'Refused K50 extension changed the 2.7.4 marker' }
 # Family-labelled Hikvision bytes use a separate immutable package identity.
 $hikImage = Join-Path $source 'zone-lite-hikvision-3.1.0.bin'
 [IO.File]::WriteAllText($hikImage, 'Hikvision fixture, not deployable firmware')
