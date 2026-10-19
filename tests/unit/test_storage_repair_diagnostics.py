@@ -20,6 +20,7 @@ REPAIR = {
     "expendables_removed": 1, "settled_removed": 0, "interrupted_losses": 0,
     "used_before": 4930000, "used_after": 3540000, "total_bytes": 7700000,
     "nvs_free_entries_before": 312, "nvs_free_entries_after": 300,
+    "nvs_available_entries_before": 186, "nvs_available_entries_after": 174,
     "internal_largest_before": 77824, "internal_largest_after": 77824, "stack_free_bytes": 3100,
     "log_lines_dropped": 0,
     "check": {"passes": 1, "fix_index": 0, "fix_lookup": 3, "delete_orphaned_index": 2, "delete_page": 5512,
@@ -58,6 +59,7 @@ def test_a_repair_report_is_kept_with_the_heartbeat(db):
     entry = stored["entries"][0]
     assert entry["name"] == "/blocked_identity.jsonl" and entry["actions"] == ["NORMALIZED", "GAPS"]
     assert entry.get("class", entry.get("class_")) == "attendance"
+    assert stored["nvs_available_entries_before"] == 186 and stored["nvs_available_entries_after"] == 174
     blocked = stored["entries"][2]
     assert blocked["blocked_spans"] == 2 and blocked["blocked_offset"] == 50200
 

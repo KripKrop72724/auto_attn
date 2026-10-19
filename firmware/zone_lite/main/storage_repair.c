@@ -58,7 +58,8 @@ static bool s_ran, s_mount_failed, s_mirror, s_previous_deadline, s_previous_kno
 static unsigned s_previous_phase, s_previous_pass;
 static int32_t s_mount_error;
 static uint64_t s_budget;
-static uint32_t s_nvs_free_before, s_nvs_free_after, s_internal_before, s_internal_after, s_stack_free;
+static uint32_t s_nvs_free_before, s_nvs_free_after, s_nvs_available_before, s_nvs_available_after;
+static uint32_t s_internal_before, s_internal_after, s_stack_free;
 static sr_line_t *s_lines;
 static atomic_uint s_lines_count, s_lines_sent, s_lines_dropped;
 static atomic_uint s_records_sent;
@@ -276,10 +277,14 @@ static void deadline_expired(void *argument)
     esp_restart();
 }
 
-static uint32_t nvs_free_entries(void)
+/* free_entries counts the page NVS keeps for its own GC; available_entries
+ * leaves it out (what a write can really use). */
+static void nvs_entries(uint32_t *free_entries, uint32_t *available)
 {
     nvs_stats_t stats;
-    return nvs_get_stats(NULL, &stats) == ESP_OK ? (uint32_t)stats.free_entries : 0;
+    bool known = nvs_get_stats(NULL, &stats) == ESP_OK;
+    *free_entries = known ? (uint32_t)stats.free_entries : 0;
+    *available = known ? (uint32_t)stats.available_entries : 0;
 }
 
 static bool damage_flag_take(void)
@@ -330,7 +335,7 @@ void storage_repair_boot(void)
     if (s_ran) return;
     s_ran = true;
     s_internal_before = (uint32_t)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
-    s_nvs_free_before = nvs_free_entries();
+    nvs_entries(&s_nvs_free_before, &s_nvs_available_before);
     s_lines = heap_caps_calloc(SR_LOG_LINES, sizeof(sr_line_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     s_partition = esp_partition_find_first(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_SPIFFS, NULL);
     if (!s_partition) {
@@ -398,7 +403,7 @@ void storage_repair_boot(void)
     /* The journal's NVS peak is checked before anything is written. */
     nvs_stats_t nvs_stats;
     config.nvs_known = nvs_get_stats(NULL, &nvs_stats) == ESP_OK;
-    config.nvs_free_entries = config.nvs_known ? (uint32_t)nvs_stats.free_entries : 0;
+    config.nvs_available_entries = config.nvs_known ? (uint32_t)nvs_stats.available_entries : 0;
     /* Until a pass is measured: the mirror serves the check's header reads
      * from PSRAM; without it every one is a flash read. */
     config.check_ms_per_mib = s_mirror ? SR_CHECK_MS_PER_MIB_MIRROR : SR_CHECK_MS_PER_MIB_FLASH;
@@ -441,7 +446,7 @@ void storage_repair_boot(void)
     if (efs.lock) vSemaphoreDelete(efs.lock);
     s_stack_free = (uint32_t)uxTaskGetStackHighWaterMark(NULL);
     s_internal_after = (uint32_t)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
-    s_nvs_free_after = nvs_free_entries();
+    nvs_entries(&s_nvs_free_after, &s_nvs_available_after);
     count_records();
     boot_report_repair_returned();
 }
@@ -671,6 +676,8 @@ bool storage_repair_append(cJSON *storage)
         cJSON_AddNumberToObject(repair, "total_bytes", r->total_bytes) &&
         cJSON_AddNumberToObject(repair, "nvs_free_entries_before", s_nvs_free_before) &&
         cJSON_AddNumberToObject(repair, "nvs_free_entries_after", s_nvs_free_after) &&
+        cJSON_AddNumberToObject(repair, "nvs_available_entries_before", s_nvs_available_before) &&
+        cJSON_AddNumberToObject(repair, "nvs_available_entries_after", s_nvs_available_after) &&
         cJSON_AddNumberToObject(repair, "internal_largest_before", s_internal_before) &&
         cJSON_AddNumberToObject(repair, "internal_largest_after", s_internal_after) &&
         cJSON_AddNumberToObject(repair, "stack_free_bytes", s_stack_free) &&

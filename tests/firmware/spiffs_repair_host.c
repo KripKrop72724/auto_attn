@@ -2595,7 +2595,7 @@ static void run_guards(uint32_t kib)
     srr_report_t report;
     srr_config_t config = repair_config();
     config.nvs_known = true;
-    config.nvs_free_entries = srp_nvs_entries_needed(false, false, false, false) - 1;
+    config.nvs_available_entries = srp_nvs_entries_needed(false, false, false, false) - 1;
     repair_boot(&report, &config);
     CHECK(report.result == SRR_RESULT_REPORT_ONLY && !strcmp(report.error_stage, "nvs_full") &&
               !memcmp(before, flash, flash_size),

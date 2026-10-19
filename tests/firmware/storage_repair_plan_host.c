@@ -266,12 +266,16 @@ static void journal(void)
     assert(srp_manifest_valid(&manifest));
     manifest.image_tag ^= 1;
     assert(!srp_manifest_valid(&manifest));
-    /* The journal's NVS peak: the state, the manifest, the resets, the gap
-     * list twice, and a page for NVS. */
+    /* The journal's NVS peak beside NVS's own page (available_entries leaves
+     * it out): the state, the manifest, the resets, the gap list, a rewrite
+     * of the largest of them, and the runtime's reserve. */
     uint32_t first = srp_nvs_entries_needed(false, false, false, false);
     uint32_t later = srp_nvs_entries_needed(true, true, true, true);
-    assert(first > 126U + 2U * (sizeof(srp_gaps_t) / 32U) && first < 300U);
-    assert(later > 126U + sizeof(srp_gaps_t) / 32U && later < first);
+    uint32_t largest = (uint32_t)((sizeof(srp_gaps_t) > sizeof(srp_manifest_t) ? sizeof(srp_gaps_t)
+                                                                                : sizeof(srp_manifest_t)) / 32U);
+    assert(first > SRP_NVS_RUNTIME_RESERVE + largest + (sizeof(srp_gaps_t) + sizeof(srp_manifest_t)) / 32U);
+    assert(first < 300U);
+    assert(later > SRP_NVS_RUNTIME_RESERVE + largest && later < first);
     assert(srp_nvs_entries_needed(true, true, true, false) > later);
     assert(!strcmp(srp_phase_name(SRP_PHASE_NORMALIZE), "NORMALIZE"));
 }

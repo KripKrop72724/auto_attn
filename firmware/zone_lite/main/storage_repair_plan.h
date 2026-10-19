@@ -229,11 +229,14 @@ bool srp_manifest_valid(const srp_manifest_t *manifest);
  * manifest names it. */
 #define SRP_RESTORE_SUFFIX ".rpr"
 
-/* Free NVS entries (32 bytes each) a run needs: room to create each journal
- * blob that does not exist yet, room for one rewritten copy of the largest
- * (NVS writes the new copy before it erases the old), and one page (126
- * entries) NVS keeps for its own garbage collection. A run starts only with
- * this much free, so it never takes the room the runtime's checkpoints need. */
+/* NVS entries (32 bytes each) a run needs beyond the page NVS keeps for its
+ * own garbage collection (compare with nvs_stats_t.available_entries, which
+ * already leaves that page out; free_entries counts it): room to create each
+ * journal blob that does not exist yet, room for one rewritten copy of the
+ * largest (NVS writes the new copy before it erases the old), and
+ * SRP_NVS_RUNTIME_RESERVE entries the runtime keeps for its own checkpoint
+ * commits and new keys. */
+#define SRP_NVS_RUNTIME_RESERVE 64U
 uint32_t srp_nvs_entries_needed(bool state, bool gaps, bool resets, bool manifest);
 
 uint32_t srp_crc32(uint32_t crc, const void *data, size_t length);

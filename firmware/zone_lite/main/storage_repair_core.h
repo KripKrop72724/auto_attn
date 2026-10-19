@@ -93,8 +93,8 @@ typedef struct {
     bool damage_seen;        /* a runtime storage fault was recorded since the last run */
     uint32_t image_tag;      /* identifies the running image for the attempts guard */
     uint64_t hold_budget;    /* bytes the run may hold in memory */
-    bool nvs_known;          /* nvs_free_entries was measured */
-    uint32_t nvs_free_entries;
+    bool nvs_known;          /* nvs_available_entries was measured */
+    uint32_t nvs_available_entries; /* nvs_stats_t.available_entries: NVS's own GC page left out */
     uint32_t check_ms_per_mib; /* expected SPIFFS_check duration per MiB before one has been measured */
 } srr_config_t;
 

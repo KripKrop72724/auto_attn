@@ -246,6 +246,9 @@ class StorageRepairDiagnostics(BaseModel):
     total_bytes: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
     nvs_free_entries_before: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
     nvs_free_entries_after: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    # Free entries less the page NVS keeps for its own GC (what writes can use).
+    nvs_available_entries_before: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    nvs_available_entries_after: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
     internal_largest_before: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
     internal_largest_after: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
     stack_free_bytes: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)

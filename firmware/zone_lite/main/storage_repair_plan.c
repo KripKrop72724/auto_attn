@@ -417,7 +417,8 @@ static uint32_t blob_entries(size_t bytes)
 
 uint32_t srp_nvs_entries_needed(bool state, bool gaps, bool resets, bool manifest)
 {
-    uint32_t needed = 126U + blob_entries(sizeof(srp_gaps_t)); /* NVS's own page; one rewrite in flight */
+    size_t largest = sizeof(srp_gaps_t) > sizeof(srp_manifest_t) ? sizeof(srp_gaps_t) : sizeof(srp_manifest_t);
+    uint32_t needed = SRP_NVS_RUNTIME_RESERVE + blob_entries(largest); /* one rewrite in flight */
     if (!state) needed += blob_entries(sizeof(srp_state_t));
     if (!gaps) needed += blob_entries(sizeof(srp_gaps_t));
     if (!resets) needed += blob_entries(sizeof(srp_resets_t));

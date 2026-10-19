@@ -3422,10 +3422,11 @@ void srr_run(spiffs *fs, const srr_config_t *config, const srr_ports_t *ports, s
     report->incomplete = r->state.incomplete;
     report->failures = r->state.failures;
     char message[200];
-    /* The journal's peak must fit in NVS with a page to spare: a run that
-     * fills NVS would fail the runtime's own checkpoint commits. */
+    /* The journal's peak must fit beside the page NVS keeps for itself and
+     * the runtime's own reserve: a run that fills NVS would fail the
+     * runtime's checkpoint commits. */
     uint32_t nvs_needed = srp_nvs_entries_needed(have_state, have_gaps, have_resets, have_manifest);
-    bool nvs_short = config->nvs_known && config->nvs_free_entries < nvs_needed;
+    bool nvs_short = config->nvs_known && config->nvs_available_entries < nvs_needed;
     if (policy.mode == SRP_MODE_REPORT_ONLY || nvs_short) {
         /* The guard: nothing is read file by file and nothing is written. */
         report->generation = r->state.generation;
@@ -3434,8 +3435,9 @@ void srr_run(spiffs *fs, const srr_config_t *config, const srr_ports_t *ports, s
         report->check_skipped = true;
         if (nvs_short) {
             snprintf(report->error_stage, sizeof(report->error_stage), "nvs_full");
-            snprintf(message, sizeof(message), "NVS has %lu free entries; a repair needs %lu, so this boot only reports",
-                     (unsigned long)config->nvs_free_entries, (unsigned long)nvs_needed);
+            snprintf(message, sizeof(message),
+                     "NVS has %lu available entries; a repair needs %lu, so this boot only reports",
+                     (unsigned long)config->nvs_available_entries, (unsigned long)nvs_needed);
             logf_line(r, "ERROR", "STORAGE_REPAIR_NVS_FULL", message);
         } else {
             r->state.phase = SRP_PHASE_IDLE;
