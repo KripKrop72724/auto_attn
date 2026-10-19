@@ -3594,6 +3594,658 @@ static void run_merged_from_hold(uint32_t kib)
 }
 
 /* "review" runs them all; "review-<part>" one of them. */
+/* ---- review 4 (custody): the resume's merge and copies ----------------- */
+/* Bytes of `data` at their own offsets in finalized, undeleted data pages of
+ * any object whose header (hidden or not, any size) is named `name`, marked
+ * in `present`; returns how many it marked. */
+static uint32_t bytes_on_flash_if(const uint8_t *data, uint32_t size, const char *name, uint8_t *present,
+                                  bool followed);
+static uint32_t bytes_on_flash(const uint8_t *data, uint32_t size, const char *name, uint8_t *present)
+{
+    return bytes_on_flash_if(data, size, name, present, false);
+}
+
+/* followed: only pages a finalized page of the next span follows (an
+ * append finalizes a page's header before its bytes, so the last page it
+ * wrote when a cut came may hold a torn prefix). */
+static uint32_t bytes_on_flash_if(const uint8_t *data, uint32_t size, const char *name, uint8_t *present,
+                                  bool followed)
+{
+    uint32_t pages = flash_size / PAGE, n = 0, count = 0;
+    uint16_t ids[16];
+    for (uint32_t pix = 0; pix < pages && n < 16; ++pix) {
+        uint32_t a = pix * PAGE;
+        uint16_t id = rd16(a);
+        uint8_t flags = flash[a + 4];
+        if (pix % 16 == 0 || !(id & 0x8000) || id == 0xFFFF || rd16(a + 2) != 0) continue;
+        if (flags & (SPIFFS_PH_FLAG_USED | SPIFFS_PH_FLAG_FINAL | SPIFFS_PH_FLAG_INDEX)) continue;
+        if (!(flags & SPIFFS_PH_FLAG_DELET)) continue;
+        if (strncmp((const char *)flash + a + offsetof(spiffs_page_object_ix_header, name), name, 32)) continue;
+        ids[n++] = (uint16_t)(id & 0x7FFF);
+    }
+    for (uint32_t pix = 0; pix < pages; ++pix) {
+        if (pix % 16 == 0) continue;
+        uint32_t a = pix * PAGE;
+        uint16_t obj = rd16(a), lu = rd16(lookup_address(pix));
+        uint8_t flags = flash[a + 4];
+        if ((obj & 0x8000) || lu != obj) continue;
+        if ((flags & (SPIFFS_PH_FLAG_USED | SPIFFS_PH_FLAG_FINAL)) || !(flags & SPIFFS_PH_FLAG_DELET) ||
+            !(flags & SPIFFS_PH_FLAG_INDEX))
+            continue;
+        bool mine = false;
+        for (uint32_t i = 0; i < n && !mine; ++i) mine = ids[i] == obj;
+        if (!mine) continue;
+        uint32_t span = rd16(a + 2);
+        bool next = !followed;
+        for (uint32_t q = 0; q < pages && !next; ++q) {
+            uint32_t b = q * PAGE;
+            uint8_t g = flash[b + 4];
+            next = q % 16 && rd16(b) == obj && rd16(b + 2) == span + 1 && rd16(lookup_address(q)) == obj &&
+                !(g & (SPIFFS_PH_FLAG_USED | SPIFFS_PH_FLAG_FINAL)) && (g & SPIFFS_PH_FLAG_DELET) &&
+                (g & SPIFFS_PH_FLAG_INDEX);
+        }
+        if (!next) continue;
+        for (uint32_t i = 0; i < SPAN; ++i) {
+            uint32_t off = span * SPAN + i;
+            if (off < size && flash[a + 5 + i] == data[off] && !present[off]) {
+                present[off] = 1;
+                count++;
+            }
+        }
+    }
+    return count;
+}
+
+/* The original's bytes on flash under its name or the temporary one. */
+static uint32_t original_on_flash(const uint8_t *data, uint32_t size, const char *name, uint8_t *present)
+{
+    char temp[40];
+    snprintf(temp, sizeof(temp), "%s%s", name, SRP_RESTORE_SUFFIX);
+    memset(present, 0, size + 1);
+    return bytes_on_flash(data, size, name, present) + bytes_on_flash(data, size, temp, present);
+}
+
+static int64_t read_named(const char *name, uint8_t *buffer, uint32_t capacity)
+{
+    mount_plain();
+    int64_t got = exists(name) ? read_file(name, buffer, capacity) : -2;
+    SPIFFS_unmount(&fs);
+    return got;
+}
+
+/* Rows (newline-terminated) of `data` found verbatim in `buffer`, skipping
+ * rows `skip` marks (any byte unmarked in it); *rows: the rows counted. */
+static uint32_t rows_found(const uint8_t *buffer, int64_t got, const uint8_t *data, uint32_t size,
+                           const uint8_t *whole, uint32_t *rows)
+{
+    uint32_t found = 0;
+    *rows = 0;
+    for (uint32_t start = 0; start < size;) {
+        const uint8_t *nl = memchr(data + start, '\n', size - start);
+        uint32_t end = nl ? (uint32_t)(nl - data) + 1 : size;
+        bool counted = true;
+        for (uint32_t i = start; whole && i < end && counted; ++i) counted = whole[i] != 0;
+        if (counted) {
+            (*rows)++;
+            found += got > 0 && holds(buffer, (size_t)got, data + start, end - start);
+        }
+        start = end;
+    }
+    return found;
+}
+
+/* The manifest of an interrupted unconfirmed run over /pending.jsonl, its
+ * header hidden by the check; a rolled-back image then created the name
+ * again with `new_rows` rows (written before the store filled, so the
+ * original stays intact: raw rename of another file). Returns the
+ * original's bytes (caller frees). */
+static struct {
+    char name[33];
+    uint8_t data[8192];
+    uint32_t size;
+} merge_new_file;
+static uint8_t *merge_setup(uint32_t kib, uint64_t seed_value, uint32_t new_rows, uint32_t fill, bool filler,
+                            uint32_t *size_out)
+{
+    seed(seed_value);
+    nvs_clear();
+    format_flash(kib);
+    build_store(60000);
+    model_file_t *m = model_of("/pending.jsonl");
+    set_cursor("legacy_queues", "ords_pending", 0, 0, 7);
+    srp_manifest_t man;
+    manifest_begin(&man, SRP_MANIFEST_PENDING_IMAGE);
+    manifest_add(&man, m, SRP_CLASS_ATTENDANCE, "legacy_queues", "ords_pending");
+    manifest_store(&man);
+    store_state(SRP_PHASE_CHECK, 0, 0, SRP_STATE_MANIFEST, 0);
+    uint8_t *orig = malloc(m->size);
+    memcpy(orig, m->data, m->size);
+    *size_out = m->size;
+    memset(&merge_new_file, 0, sizeof(merge_new_file));
+    snprintf(merge_new_file.name, sizeof(merge_new_file.name), "/pending.jsonl");
+    char row[600];
+    for (uint32_t i = 0; i < new_rows; ++i) {
+        size_t n = json_row(row, sizeof(row));
+        CHECK(append_bytes("/pending.new", row, (uint32_t)n), "merge setup: new rows");
+        CHECK(merge_new_file.size + n <= sizeof(merge_new_file.data), "merge setup: rows");
+        memcpy(merge_new_file.data + merge_new_file.size, row, n);
+        merge_new_file.size += (uint32_t)n;
+    }
+    static uint8_t ballast[4000];
+    memset(ballast, 0x5A, sizeof(ballast));
+    u32_t total = 0, used = 0;
+    SPIFFS_info(&fs, &total, &used);
+    if (filler)
+        while (append_bytes("/filler.bin", ballast, sizeof(ballast))) {}
+    else
+        while (used < total / 100 * fill && append_bytes("/ballast.bin", ballast, 2000)) SPIFFS_info(&fs, &total, &used);
+    SPIFFS_unmount(&fs);
+    hide_header("/pending.jsonl");
+    uint32_t header = header_of("/pending.new");
+    char name[32];
+    memset(name, 0, sizeof(name));
+    snprintf(name, sizeof(name), "/pending.jsonl");
+    memcpy(flash + header * PAGE + offsetof(spiffs_page_object_ix_header, name), name, sizeof(name));
+    return orig;
+}
+
+/* The original (`size` bytes) is whole inside the live file, or the manifest
+ * is kept with every byte of it still on flash under its name or the
+ * temporary one; the new file's rows are intact either way. */
+static void check_merged_or_kept(const char *what, const uint8_t *orig, uint32_t size)
+{
+    static uint8_t buffer[8 * 1024 * 1024];
+    int64_t got = read_named("/pending.jsonl", buffer, sizeof(buffer));
+    bool whole = got >= (int64_t)size && holds(buffer, (size_t)got, orig, size);
+    CHECK(got >= (int64_t)merge_new_file.size && !memcmp(buffer, merge_new_file.data, merge_new_file.size),
+          "%s: the new file's rows are not intact (reads %" PRId64 ")", what, got);
+    if (whole) return;
+    uint8_t *present = calloc(size + 1, 1);
+    uint32_t left = original_on_flash(orig, size, "/pending.jsonl", present);
+    free(present);
+    CHECK(manifest_kept() && left == size,
+          "%s: the original is neither whole in the live file (reads %" PRId64 ") nor kept (manifest %d, %u of %u "
+          "bytes on flash)",
+          what, got, manifest_kept(), left, size);
+}
+
+/* Custody finding 1: the merge appended into the new file before its dirty
+ * tail (an interrupted append's bytes past its end) was cleaned: the first
+ * merged row was ANDed with them, the run settled and the original went. */
+static void run_merge_dirty_tail(uint32_t kib)
+{
+    uint32_t size = 0;
+    uint8_t *orig = merge_setup(kib, 50000, 3, 0, false, &size);
+    uint32_t pix = rd16(entry_address("/pending.jsonl", (merge_new_file.size - 1) / SPAN));
+    CHECK(merge_new_file.size % SPAN && merge_new_file.size % SPAN < SPAN - 40, "merge dirty: ends at %u",
+          merge_new_file.size);
+    char row[600];
+    size_t n = json_row(row, sizeof(row));
+    for (uint32_t i = 0; i < 30 && i < n; ++i) flash[pix * PAGE + 5 + merge_new_file.size % SPAN + i] &= (uint8_t)row[i];
+    srr_report_t report;
+    srr_config_t config = repair_config();
+    repair_boot(&report, &config);
+    CHECK(report.result != SRR_RESULT_FAILED, "merge dirty: %s at %s", srr_result_name(report.result),
+          report.error_stage);
+    static uint8_t buffer[8 * 1024 * 1024];
+    int64_t got = read_named("/pending.jsonl", buffer, sizeof(buffer));
+    uint32_t rows = 0, found = rows_found(buffer, got, orig, size, NULL, &rows);
+    CHECK(found == rows && holds(buffer, (size_t)got, orig, size) && !manifest_kept(),
+          "merge dirty: %u of the original's %u rows verbatim, whole %d, manifest kept %d", found, rows,
+          got > 0 && holds(buffer, (size_t)got, orig, size), manifest_kept());
+    check_merged_or_kept("merge dirty", orig, size);
+    free(orig);
+    printf("merge after a dirty tail: the new file's tail cleaned first, %u of %u rows verbatim\n", found, rows);
+}
+
+/* Custody finding 2: a merge without room settled the entry (CHECK_CHANGED
+ * in the original's offsets) and the next check freed the intact original.
+ * Now the original waits under the temporary name (no SPIFFS GC wipes it
+ * there), the entry stays, and the merge happens on the boot with room. */
+static void run_merge_crammed(uint32_t kib)
+{
+    uint32_t size = 0;
+    uint8_t *orig = merge_setup(kib, 46000, 6, 0, true, &size);
+    uint8_t *present = calloc(size + 1, 1);
+    CHECK(original_on_flash(orig, size, "/pending.jsonl", present) == size, "merge crammed: original not intact");
+    for (int boot = 0; boot < 2; ++boot) {
+        srr_report_t report;
+        srr_config_t config = repair_config();
+        config.pending_verify = true;
+        repair_boot(&report, &config);
+        CHECK(report.result != SRR_RESULT_FAILED, "merge crammed: %s at %s", srr_result_name(report.result),
+              report.error_stage);
+        check_merged_or_kept("merge crammed", orig, size);
+    }
+    mount_plain();
+    CHECK(SPIFFS_remove(&fs, "/filler.bin") == SPIFFS_OK, "merge crammed: remove filler");
+    SPIFFS_unmount(&fs);
+    boot_until_done("merge crammed, with room");
+    static uint8_t buffer[8 * 1024 * 1024];
+    int64_t got = read_named("/pending.jsonl", buffer, sizeof(buffer));
+    CHECK(got > 0 && holds(buffer, (size_t)got, orig, size) && !manifest_kept(),
+          "merge crammed: with room the original is not whole in /pending.jsonl (reads %" PRId64 ", manifest %d)", got,
+          manifest_kept());
+    srp_gaps_t gaps = gaps_now();
+    for (uint32_t g = 0; g < gaps.count; ++g)
+        CHECK(strcmp(gaps.gap[g].name, "/pending.jsonl"), "merge crammed: a gap record (%u+%u, %s) for an intact original",
+              gaps.gap[g].offset, gaps.gap[g].length, srp_gap_cause_name((srp_gap_cause_t)gaps.gap[g].cause));
+    free(present);
+    free(orig);
+    printf("merge on a crammed store: kept until there is room, then merged whole\n");
+}
+
+/* Custody finding 3: an original SPIFFS's GC (an older image's writes) left
+ * only partly on flash was superseded with no record. Its readable rows go
+ * after the new file's, its unreadable bytes are records there; only a
+ * cursor generation that moved (the owner settled the file) supersedes it. */
+static void run_merge_partial(uint32_t kib)
+{
+    for (int moved = 0; moved < 2; ++moved) {
+        seed(45000);
+        nvs_clear();
+        format_flash(kib);
+        build_store(60000);
+        model_file_t *m = model_of("/pending.jsonl");
+        set_cursor("legacy_queues", "ords_pending", 0, 0, 7);
+        srp_manifest_t man;
+        manifest_begin(&man, SRP_MANIFEST_PENDING_IMAGE);
+        manifest_add(&man, m, SRP_CLASS_ATTENDANCE, "legacy_queues", "ords_pending");
+        manifest_store(&man);
+        store_state(SRP_PHASE_CHECK, 0, 0, SRP_STATE_MANIFEST, 0);
+        if (moved) set_cursor("legacy_queues", "ords_pending", 0, 0, 8);
+        uint32_t size = m->size;
+        uint8_t *orig = malloc(size);
+        memcpy(orig, m->data, size);
+        SPIFFS_unmount(&fs);
+        hide_header(m->name);
+        mount_plain();
+        char row[600];
+        memset(&merge_new_file, 0, sizeof(merge_new_file));
+        for (int i = 0; i < 6; ++i) {
+            size_t n = json_row(row, sizeof(row));
+            CHECK(append_bytes("/pending.jsonl", row, (uint32_t)n), "merge partial: new rows");
+            memcpy(merge_new_file.data + merge_new_file.size, row, n);
+            merge_new_file.size += (uint32_t)n;
+        }
+        static uint8_t filler[4000];
+        memset(filler, 0x5A, sizeof(filler));
+        while (append_bytes("/filler.bin", filler, sizeof(filler))) {}
+        SPIFFS_unmount(&fs);
+        uint8_t *whole = calloc(size + 1, 1);
+        uint32_t before = original_on_flash(orig, size, "/pending.jsonl", whole);
+        CHECK(before < size && before > size / 2, "merge partial: %u of %u bytes of the original on flash", before,
+              size);
+        uint32_t superseded = 0;
+        for (int boot = 0; boot < 2; ++boot) {
+            srr_report_t report;
+            srr_config_t config = repair_config();
+            config.pending_verify = true;
+            repair_boot(&report, &config);
+            CHECK(report.result != SRR_RESULT_FAILED, "merge partial: %s at %s", srr_result_name(report.result),
+                  report.error_stage);
+            superseded += report.files_superseded;
+        }
+        mount_plain();
+        (void)SPIFFS_remove(&fs, "/filler.bin");
+        SPIFFS_unmount(&fs);
+        boot_until_done("merge partial, with room");
+        static uint8_t buffer[8 * 1024 * 1024];
+        int64_t got = read_named("/pending.jsonl", buffer, sizeof(buffer));
+        CHECK(got >= (int64_t)merge_new_file.size && !memcmp(buffer, merge_new_file.data, merge_new_file.size),
+              "merge partial: the new file's rows changed");
+        srp_gaps_t gaps = gaps_now();
+        uint64_t recorded = 0;
+        for (uint32_t g = 0; g < gaps.count; ++g)
+            if (!strcmp(gaps.gap[g].name, "/pending.jsonl")) recorded += gaps.gap[g].length;
+        uint32_t rows = 0, found = rows_found(buffer, got, orig, size, whole, &rows);
+        if (moved) {
+            CHECK(superseded == 1 && !recorded, "merge partial, settled by its owner: superseded %u, %" PRIu64
+                  " bytes recorded", superseded, recorded);
+        } else {
+            CHECK(!superseded && found == rows && recorded >= size - before && !manifest_kept(),
+                  "merge partial: superseded %u, %u of %u whole rows verbatim, %" PRIu64 " bytes recorded for %u "
+                  "missing, manifest kept %d",
+                  superseded, found, rows, recorded, size - before, manifest_kept());
+        }
+        free(whole);
+        free(orig);
+    }
+    printf("merge of a partial original: its readable rows after the new file's, the rest recorded; superseded only "
+           "when its cursor moved\n");
+}
+
+/* Custody finding 2 under cuts: the merge on a store whose room comes from
+ * compaction, a cut at every `stride`th write of the resume boot, torn both
+ * ways. The original must end whole in the live file, or kept whole on
+ * flash with the manifest. */
+static void run_merge_cuts(uint32_t kib, uint32_t fill, uint32_t stride)
+{
+    uint32_t size = 0;
+    uint8_t *orig = merge_setup(kib, 48000, 6, fill, false, &size);
+    uint8_t *present = calloc(size + 1, 1);
+    CHECK(original_on_flash(orig, size, "/pending.jsonl", present) == size, "merge cuts: original not intact");
+    uint8_t *image = malloc(flash_size);
+    memcpy(image, flash, flash_size);
+    __typeof__(nvs) *saved = malloc(sizeof(nvs));
+    memcpy(saved, nvs, sizeof(nvs));
+    srr_report_t report;
+    srr_config_t config = repair_config();
+    config.pending_verify = true;
+    uint64_t start = flash_ops;
+    repair_boot(&report, &config);
+    uint64_t writes = flash_ops - start;
+    check_merged_or_kept("merge cuts, uncut", orig, size);
+    uint32_t runs = 0;
+    uint64_t only_k = getenv("REVIEW_K") ? strtoull(getenv("REVIEW_K"), NULL, 10) : 0;
+    for (uint64_t k = 1; k <= writes; k += stride) {
+        if (only_k && k != only_k) continue;
+        for (uint32_t tear = 0; tear < 2; ++tear) {
+            memcpy(flash, image, flash_size);
+            memcpy(nvs, saved, sizeof(nvs));
+            seed(49000 + k * 4 + tear);
+            print_log = only_k != 0;
+            volatile bool cut = false;
+            cut_at = flash_ops + k;
+            if (setjmp(cut_point)) {
+                cut = true;
+                drop_all_memory();
+            } else {
+                repair_boot(&report, &config);
+            }
+            cut_at = 0;
+            if (!cut) continue;
+            runs++;
+            boot_until_done("merge cuts");
+            print_log = false;
+            char what[80];
+            snprintf(what, sizeof(what), "merge cuts %u%%, cut at write %" PRIu64 " tear %u", fill, k, tear);
+            check_merged_or_kept(what, orig, size);
+        }
+    }
+    free(image);
+    free(saved);
+    free(present);
+    free(orig);
+    printf("merge under cuts (%u%% full): %u cut runs, the original merged or kept whole\n", fill, runs);
+}
+
+/* Custody finding 4: an unconfirmed boot rebuilt the queue whole under the
+ * temporary name and a cut came before the rename; the rolled-back image
+ * created the name again; the next 2.7.5 boot purged the rebuild. */
+static void run_rebuild_name_taken(uint32_t kib)
+{
+    seed(43000);
+    nvs_clear();
+    format_flash(kib);
+    build_store(60000);
+    SPIFFS_unmount(&fs);
+    model_file_t *m = model_of("/pending.jsonl");
+    uint8_t *image = malloc(flash_size);
+    memcpy(image, flash, flash_size);
+    __typeof__(nvs) *saved = malloc(sizeof(nvs));
+    memcpy(saved, nvs, sizeof(nvs));
+    srr_config_t config = repair_config();
+    config.pending_verify = true;
+    config.rollback_tag = 0x2740;
+    check_hook = rebuild_hook;
+    hook_mode = 1;
+    srr_report_t report;
+    uint64_t start = flash_ops;
+    repair_boot(&report, &config);
+    uint64_t end = flash_ops, at_hook = review_hook_ops;
+    uint8_t *present = calloc(m->size + 1, 1);
+    uint64_t chosen = 0;
+    char row[600];
+    size_t punch = 0;
+    for (uint64_t k = end - start; k > at_hook - start && !chosen; --k) {
+        memcpy(flash, image, flash_size);
+        memcpy(nvs, saved, sizeof(nvs));
+        seed(44000 + k);
+        check_hook = rebuild_hook;
+        hook_mode = 1;
+        bool cut = boot_with_cut(k);
+        hook_mode = 0;
+        check_hook = NULL;
+        if (!cut) continue;
+        memset(present, 0, m->size + 1);
+        uint32_t in_rpr = bytes_on_flash(m->data, m->size, "/pending.jsonl.rpr", present);
+        mount_plain();
+        bool named = exists(m->name), rpr = exists("/pending.jsonl.rpr");
+        bool punched = false;
+        if (in_rpr == m->size && !named && rpr) {
+            /* The rolled-back image runs: a punch creates the name. */
+            punch = json_row(row, sizeof(row));
+            punched = append_bytes(m->name, row, (uint32_t)punch);
+        }
+        SPIFFS_unmount(&fs);
+        if (punched) chosen = k;
+    }
+    hook_mode = 0;
+    check_hook = NULL;
+    CHECK(chosen, "rebuild name taken: no cut left a whole rebuild under its temporary name");
+    srr_config_t again = repair_config();
+    again.pending_verify = true;
+    repair_boot(&report, &again);
+    CHECK(report.result != SRR_RESULT_FAILED, "rebuild name taken: %s at %s", srr_result_name(report.result),
+          report.error_stage);
+    static uint8_t buffer[8 * 1024 * 1024];
+    int64_t got = read_named(m->name, buffer, sizeof(buffer));
+    CHECK(got > 0 && holds(buffer, (size_t)got, m->data, m->size) && holds(buffer, (size_t)got, (uint8_t *)row, punch),
+          "rebuild name taken (cut at write %" PRIu64 "): the rebuild's rows or the punch are not in %s (reads %" PRId64
+          ", manifest kept %d)",
+          chosen, m->name, got, manifest_kept());
+    srp_gaps_t gaps = gaps_now();
+    for (uint32_t g = 0; g < gaps.count; ++g)
+        CHECK(strcmp(gaps.gap[g].name, m->name), "rebuild name taken: a gap record (%u+%u, %s) for a whole rebuild",
+              gaps.gap[g].offset, gaps.gap[g].length, srp_gap_cause_name((srp_gap_cause_t)gaps.gap[g].cause));
+    free(present);
+    free(image);
+    free(saved);
+    printf("whole rebuild, name taken after a rollback: merged after the new file's rows (cut at write %" PRIu64 ")\n",
+           chosen);
+}
+
+/* Custody finding 5: the in-run restore of a file the budget did not hold
+ * found no page to bring its header back, recorded it as lost and settled;
+ * the next check freed every byte. It stays unsettled now, the run fails,
+ * and the next boot (here with room) brings it back whole. */
+static const char *const crammed_fill_names[] = {"/fill-a.bin", "/fill-b.bin", "/fill-c.bin"};
+static uint32_t crammed_consumed;
+
+/* Raw: every erased page becomes a full data page of an empty fill file, as
+ * SPIFFS's first append programs a header in place: a consistent store with
+ * no erased page at all. */
+static void consume_erased(void)
+{
+    uint32_t pages = flash_size / PAGE;
+    for (uint32_t b = 0; b < flash_size / BLOCK; ++b) {
+        bool any_used = false;
+        for (uint32_t e = 1; e < 16 && !any_used; ++e) {
+            uint16_t lu = rd16(lookup_address(b * 16 + e));
+            any_used = lu != 0xFFFF && lu != 0;
+        }
+        if (!any_used) {
+            uint8_t lookup[PAGE];
+            memcpy(lookup, flash + b * BLOCK, PAGE);
+            memset(flash + b * BLOCK, 0xFF, BLOCK);
+            memcpy(flash + b * BLOCK + 30, lookup + 30, PAGE - 30);
+        }
+    }
+    crammed_consumed = 0;
+    for (uint32_t f = 0; f < sizeof(crammed_fill_names) / sizeof(crammed_fill_names[0]); ++f) {
+        uint32_t header = header_of(crammed_fill_names[f]);
+        uint16_t obj = rd16(header * PAGE) & 0x7FFF;
+        uint32_t span = 0;
+        for (uint32_t pix = 0; pix < pages && span < 100; ++pix) {
+            if (pix % 16 == 0 || rd16(lookup_address(pix)) != 0xFFFF) continue;
+            bool erased = true;
+            for (uint32_t i = 0; i < PAGE && erased; ++i) erased = flash[pix * PAGE + i] == 0xFF;
+            if (!erased) continue;
+            uint8_t *p = flash + pix * PAGE;
+            p[0] = (uint8_t)obj;
+            p[1] = (uint8_t)(obj >> 8);
+            p[2] = (uint8_t)span;
+            p[3] = (uint8_t)(span >> 8);
+            p[4] = (uint8_t)(0xFF & ~(SPIFFS_PH_FLAG_USED | SPIFFS_PH_FLAG_FINAL));
+            memset(p + 5, 'F', SPAN);
+            wr16(lookup_address(pix), obj);
+            wr16(header * PAGE + sizeof(spiffs_page_object_ix_header) + span * 2, (uint16_t)pix);
+            span++;
+            crammed_consumed++;
+        }
+        uint32_t size = span * SPAN;
+        if (span) memcpy(flash + header * PAGE + offsetof(spiffs_page_object_ix_header, size), &size, 4);
+    }
+#if SPIFFS_CACHE
+    for (uint32_t pix = 0; pix < pages; ++pix) spiffs_cache_drop_page(&fs, (spiffs_page_ix)pix);
+#endif
+    uint32_t free_blocks = 0;
+    for (uint32_t b = 0; b < flash_size / BLOCK; ++b) {
+        bool empty = true;
+        for (uint32_t e = 1; e < 16 && empty; ++e) empty = rd16(lookup_address(b * 16 + e)) == 0xFFFF;
+        free_blocks += empty;
+    }
+    fs.free_blocks = free_blocks;
+    fs.stats_p_allocated += crammed_consumed;
+}
+
+static bool hide_and_cram(uint32_t pass)
+{
+    if (pass != 1) return false;
+    review_hook_ops = flash_ops;
+    uint32_t header = header_of("/pending.jsonl");
+    flash[header * PAGE + 4] &= (uint8_t)~SPIFFS_PH_FLAG_IXDELE;
+    consume_erased();
+    if (review_mode & 2) longjmp(review_cut, 1);
+    return true;
+}
+
+/* The check hides the queue and crams the store; with `cut`, a power cut
+ * right after it, and the next boot's resume. */
+static void unheld_crammed_boot(srr_report_t *report, const srr_config_t *config, bool cut)
+{
+    check_hook = hide_and_cram;
+    review_mode = cut ? 2 : 0;
+    if (cut) {
+        if (!setjmp(review_cut)) {
+            repair_boot(report, config);
+            CHECK(0, "unheld crammed: the hook never ran");
+        }
+        drop_all_memory();
+        check_hook = NULL;
+    }
+    repair_boot(report, config);
+    check_hook = NULL;
+    review_mode = 0;
+}
+
+static void run_unheld_crammed(uint32_t kib)
+{
+    for (int resume = 0; resume < 2; ++resume) {
+        seed(47000);
+        nvs_clear();
+        format_flash(kib);
+        build_store(60000);
+        for (uint32_t f = 0; f < sizeof(crammed_fill_names) / sizeof(crammed_fill_names[0]); ++f)
+            write_file(crammed_fill_names[f], NULL, 0);
+        static uint8_t filler[4000];
+        memset(filler, 0x5A, sizeof(filler));
+        while (append_bytes("/filler.bin", filler, sizeof(filler))) {}
+        SPIFFS_unmount(&fs);
+        model_file_t *m = model_of("/pending.jsonl");
+        srr_config_t config = repair_config();
+        config.hold_budget = 0; /* no holds: the manifest and R3 protect every file */
+        srr_report_t report;
+        unheld_crammed_boot(&report, &config, resume != 0);
+        uint8_t *present = calloc(m->size + 1, 1);
+        uint32_t left = original_on_flash(m->data, m->size, m->name, present);
+        CHECK(manifest_kept() && left == m->size && report.result != SRR_RESULT_CLEAN &&
+                  report.result != SRR_RESULT_REPAIRED && report.result != SRR_RESULT_REPAIRED_WITH_GAPS,
+              "unheld crammed (%s): %s at %s, manifest kept %d, %u of %u bytes on flash",
+              resume ? "resume" : "in run", srr_result_name(report.result), report.error_stage, manifest_kept(), left,
+              m->size);
+        /* Room again (the fill files go): the next boot brings it back. */
+        mount_plain();
+        for (uint32_t f = 0; f < sizeof(crammed_fill_names) / sizeof(crammed_fill_names[0]); ++f)
+            (void)SPIFFS_remove(&fs, crammed_fill_names[f]);
+        (void)SPIFFS_remove(&fs, "/filler.bin");
+        SPIFFS_unmount(&fs);
+        boot_until_done("unheld crammed, with room");
+        check_whole("unheld crammed, with room", m, 1);
+        CHECK(!manifest_kept(), "unheld crammed: manifest kept with room");
+        free(present);
+    }
+    printf("unheld file hidden on a store with no erased page: kept unsettled, back whole with room\n");
+}
+
+/* Custody finding 6: a cut inside the repair's rebuild left finalized pages
+ * past its committed size (dropped as strays), or a torn first-append size
+ * (the copy taken for an expendable and purged): up to a whole 4,016-byte
+ * write lost, recorded. Every page of the rebuild a later page follows (the
+ * last one may be torn: an append finalizes first) stays now, and every
+ * byte lost is recorded. */
+static void run_rebuild_salvage(uint32_t kib, uint32_t stride, uint32_t tears)
+{
+    seed(41000);
+    nvs_clear();
+    format_flash(kib);
+    build_store(60000);
+    SPIFFS_unmount(&fs);
+    model_file_t *m = model_of("/pending.jsonl");
+    uint8_t *image = malloc(flash_size);
+    memcpy(image, flash, flash_size);
+    __typeof__(nvs) *saved = malloc(sizeof(nvs));
+    memcpy(saved, nvs, sizeof(nvs));
+    check_hook = rebuild_hook;
+    hook_mode = 1;
+    srr_report_t report;
+    srr_config_t config = repair_config();
+    uint64_t start = flash_ops;
+    repair_boot(&report, &config);
+    uint64_t end = flash_ops, at_hook = review_hook_ops;
+    hook_mode = 0;
+    check_hook = NULL;
+    uint8_t *present = malloc(m->size + 1);
+    static uint8_t buffer[8 * 1024 * 1024];
+    uint32_t runs = 0, salvaged = 0;
+    uint64_t only_k = getenv("REVIEW_K") ? strtoull(getenv("REVIEW_K"), NULL, 10) : 0;
+    for (uint64_t k = at_hook - start + 1; k <= end - start; k += stride) {
+        if (only_k && k != only_k) continue;
+        for (uint32_t tear = 0; tear < tears; ++tear) {
+            print_log = only_k != 0;
+            memcpy(flash, image, flash_size);
+            memcpy(nvs, saved, sizeof(nvs));
+            seed(52000 + k * 16 + tear);
+            check_hook = rebuild_hook;
+            hook_mode = 1;
+            bool cut = boot_with_cut(k);
+            hook_mode = 0;
+            check_hook = NULL;
+            if (!cut) continue;
+            runs++;
+            memset(present, 0, m->size + 1);
+            (void)bytes_on_flash_if(m->data, m->size, "/pending.jsonl.rpr", present, true);
+            (void)bytes_on_flash(m->data, m->size, m->name, present);
+            boot_until_done("rebuild salvage");
+            print_log = false;
+            int64_t got = read_named(m->name, buffer, sizeof(buffer));
+            uint32_t lost = 0, first = UINT32_MAX;
+            for (uint32_t i = 0; i < m->size; ++i)
+                if (present[i] && !(got > (int64_t)i && buffer[i] == m->data[i]) && !lost++) first = i;
+            CHECK(!lost, "rebuild salvage: cut at write %" PRIu64 " tear %u: %u bytes that were on flash are gone "
+                  "(first %u; the file reads %" PRId64 ")",
+                  k, tear, lost, first, got);
+            check_named("rebuild salvage", m, 1);
+            salvaged += report.sizes_recovered != 0;
+        }
+    }
+    free(present);
+    free(image);
+    free(saved);
+    printf("rebuild salvage: %u cuts inside the rebuild, every byte it had on flash kept\n", runs);
+}
+
 static void run_review_custody(uint32_t kib, const char *only)
 {
     const char *part = only && !strncmp(only, "review-", 7) ? only + 7 : NULL;
@@ -3610,6 +4262,15 @@ static void run_review_custody(uint32_t kib, const char *only)
     if (REVIEW_PART("healthy")) run_healthy_compaction(kib);
     if (REVIEW_PART("full-flag")) run_full_flag(kib);
     if (REVIEW_PART("cpu")) run_cpu_bound(kib);
+    /* Review 4 (custody): the resume's merge and the repair's own copies. */
+    if (REVIEW_PART("merge-dirty")) run_merge_dirty_tail(kib);
+    if (REVIEW_PART("merge-crammed")) run_merge_crammed(kib);
+    if (REVIEW_PART("merge-partial")) run_merge_partial(kib);
+    if (REVIEW_PART("merge-cuts")) run_merge_cuts(kib, 80, kib > 1024 ? 97 : getenv("REVIEW_FULL") ? 1 : 9);
+    if (REVIEW_PART("rebuild-name")) run_rebuild_name_taken(kib);
+    if (REVIEW_PART("unheld-crammed")) run_unheld_crammed(kib);
+    if (REVIEW_PART("salvage")) run_rebuild_salvage(kib, kib > 1024 ? 97 : getenv("REVIEW_FULL") ? 1 : 5,
+                                                      getenv("REVIEW_FULL") ? 4 : 2);
     if (REVIEW_PART("merged")) run_merged_from_hold(kib);
     if (REVIEW_PART("inbox") || REVIEW_PART("boundary")) run_inbox_boundary(kib);
     if (REVIEW_PART("inbox") || REVIEW_PART("window")) run_inbox_window(kib);

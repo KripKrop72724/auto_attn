@@ -203,6 +203,10 @@ enum {
     SRP_MANIFEST_SETTLED = 1U << 1,  /* nothing more to do for this entry */
     SRP_MANIFEST_REPORTED = 1U << 2, /* what did not go back is already a gap record */
     SRP_MANIFEST_RESTORING = 1U << 3,/* the repair began putting it back: rebuild_id, restored */
+    SRP_MANIFEST_MERGING = 1U << 4,  /* rebuild_id's rows are being appended to the live file of
+                                      * the name (a rolled-back image created it) from `restored` */
+    SRP_MANIFEST_ADOPTED = 1U << 5,  /* rebuild_id is the original itself, its hidden header
+                                      * brought back under the temporary name */
 };
 /* manifest flags */
 #define SRP_MANIFEST_PENDING_IMAGE 0x01U /* written by an unconfirmed image: a later boot follows a rollback */
@@ -210,10 +214,12 @@ typedef struct {
     char name[SRP_NAME_BYTES];
     uint8_t cls, flags, reserved;
     uint16_t object_id;
-    uint16_t rebuild_id;      /* object id of the repair's own rebuild of it; 0 when none */
+    uint16_t rebuild_id;      /* object id of the repair's own copy of it under <name>.rpr (a
+                               * rebuild, or the original adopted there); 0 when none */
     uint32_t size, crc;
     uint32_t cursor_generation;
-    uint32_t restored;        /* leading bytes of that rebuild read back as the original's */
+    uint32_t restored;        /* leading bytes of that rebuild read back as the original's;
+                               * with MERGING, where its rows begin in the live file */
 } srp_manifest_file_t;
 typedef struct {
     uint32_t version, generation, count;

@@ -200,6 +200,13 @@ static bool fail(run_t *r, const char *stage, int32_t code)
     return false;
 }
 
+static void clear_failure(run_t *r)
+{
+    r->failed = false;
+    r->report->error_stage[0] = '\0';
+    r->report->error_code = 0;
+}
+
 static void set_phase(run_t *r, srp_phase_t phase, uint32_t pass, bool writing)
 {
     r->report->phase = phase;
@@ -320,6 +327,25 @@ static bool manifest_retire(run_t *r)
     if (!save_state(r)) return fail(r, "journal", SPIFFS_ERR_INTERNAL);
     if (r->ports->nvs_erase) (void)r->ports->nvs_erase(r->ports->context, SRR_NVS_NAMESPACE, "manifest");
     return true;
+}
+
+/* The unsettled manifest entry whose own copy under the temporary name this
+ * object is: the repair's rebuild of a held file, or the original adopted
+ * there while a new file has the name (rebuild_id names it before it is
+ * written). Such a copy is custody of its original's kind, never expendable,
+ * and nothing but the resume writes it. */
+static srp_manifest_file_t *rebuild_entry(run_t *r, const char *name, uint16_t obj)
+{
+    if (!manifest_active(r) || !restore_file(name)) return NULL;
+    for (uint32_t i = 0; i < r->manifest->count && i < SRP_MANIFEST_FILES; ++i) {
+        srp_manifest_file_t *f = &r->manifest->file[i];
+        char temp[SRP_NAME_BYTES];
+        if (!(f->flags & SRP_MANIFEST_RESTORING) || (f->flags & SRP_MANIFEST_SETTLED) || !f->rebuild_id ||
+            f->rebuild_id != obj)
+            continue;
+        if (restore_name(f->name, temp) && !strcmp(temp, name)) return f;
+    }
+    return NULL;
 }
 
 /* ---- survey: one pass over every block ------------------------------ */
@@ -561,9 +587,12 @@ static bool build_candidates(run_t *r, const obj_t *o)
 }
 
 /* A finalized data page of this object and span, flagged deleted or not.
- * An unfinalized page is never a source: its write did not finish (SPIFFS
- * finalizes a data page once its bytes are on flash), and when an index
- * names one, the page the index named was erased and its place reused. */
+ * An unfinalized page is never a source: its write did not finish (a page
+ * move or modify finalizes a data page once its bytes are on flash), and
+ * when an index names one, the page the index named was erased and its
+ * place reused. An append finalizes a new page before its bytes, but only
+ * the spans below a committed size are read here, and the size is
+ * committed after them (rebuild_salvage reads past it). */
 static bool own_data_page(const pg_t *pg, uint16_t obj, uint32_t span)
 {
     return pg->obj == obj && pg->span == span && (pg->flags & SPIFFS_PH_FLAG_INDEX) &&
@@ -922,6 +951,28 @@ static void apply_size(run_t *r, obj_t *o, const hdr_t *h)
     }
 }
 
+/* The repair's rebuild writes whole data pages (SR_COPY_BYTES is 16 of them)
+ * and SPIFFS commits the size after each write: a reset inside one leaves
+ * pages of the next spans past the committed size. SPIFFS's append writes a
+ * new data page's header finalized before its bytes (spiffs_object_append,
+ * "finalize immediately"), so the page being written when the reset came
+ * may hold a torn prefix; every earlier one was complete before the next
+ * page's lookup entry was written. Spans past the committed size count as
+ * the rebuild's while the next span has a finalized page too, up to the
+ * original's size: the last page written is left (its bytes become part of
+ * the recorded tail). */
+static uint32_t rebuild_salvage(run_t *r, const obj_t *o, const srp_manifest_file_t *f)
+{
+    uint32_t size = o->size, top = r->span_top[o->obj & (SR_IDS - 1)];
+    if ((f->flags & SRP_MANIFEST_ADOPTED) || size % SRP_SPAN_BYTES) return size;
+    for (uint32_t span = size / SRP_SPAN_BYTES; size < f->size && span + 1 < top; ++span) {
+        uint32_t want = f->size - size < SRP_SPAN_BYTES ? f->size - size : SRP_SPAN_BYTES, used = 0;
+        if (!span_end(r, o->obj, span, &used) || used < want) break;
+        size += want;
+    }
+    return size;
+}
+
 /* Builds the object list: each visible object with one chosen header (its
  * other visible headers are dropped: SPIFFS's page move or rename stopped
  * before deleting the old one), and hidden ones (a removal in progress) that
@@ -940,8 +991,11 @@ static bool build_objects(run_t *r)
     memset(r->span_top, 0, SR_IDS * sizeof(uint16_t));
     for (uint32_t pix = 0; pix < r->total_pages; ++pix) {
         const pg_t *pg = &r->pages[pix];
+        /* A span no page index of the partition can reach is a header a
+         * reset tore (its span bytes left 0xFF): it traces nothing, and
+         * 0xFFFF + 1 would wrap the 16-bit top to 0. */
         if (pix % r->ppb == 0 || (pg->obj & SR_IX) || pg->obj == SPIFFS_OBJ_ID_FREE || pg->lu != pg->obj ||
-            !data_valid(pg->flags))
+            !data_valid(pg->flags) || pg->span >= r->total_pages)
             continue;
         uint16_t *top = &r->span_top[pg->obj & (SR_IDS - 1)];
         if (pg->span + 1U > *top) *top = (uint16_t)(pg->span + 1U);
@@ -999,7 +1053,18 @@ static bool build_objects(run_t *r)
         o->header = best->pix;
         memcpy(o->name, best->name, sizeof(o->name));
         o->kind = srp_classify(o->name);
+        srp_manifest_file_t *own = rebuild_entry(r, o->name, o->obj);
+        if (own) o->kind = srp_classify(own->name);
         apply_size(r, o, best);
+        if (own && o->plausible) {
+            /* Its pages past the committed size are its bytes too: the
+             * header takes the size they end at. */
+            uint32_t salvaged = rebuild_salvage(r, o, own);
+            if (salvaged > o->size) {
+                o->size = salvaged;
+                o->size_recovered = true;
+            }
+        }
         for (uint32_t k = i; ok && k < r->hdr_count; ++k) {
             const hdr_t *c = &r->hdrs[k];
             if (c->obj == h->obj && !c->hidden && c->pix != best->pix) ok = push_drop(r, o, c->pix);
@@ -1812,22 +1877,10 @@ static bool purge_object(run_t *r, const obj_t *o)
     return true;
 }
 
-/* Every object of this name (live, hidden or torn) is gone afterwards. */
-static bool purge_name(run_t *r, const char *name)
-{
-    if (!survey(r)) return false;
-    bool any = false;
-    for (uint32_t i = 0; i < r->obj_count; ++i) {
-        obj_t *o = &r->objs[i];
-        if (o->header == SR_NO_PAGE || strcmp(o->name, name)) continue;
-        if (!purge_object(r, o)) return fail(r, "purge", SPIFFS_ERR_INTERNAL);
-        any = true;
-    }
-    return !any || survey(r);
-}
-
 static bool rename_rebuild(run_t *r, obj_t *rebuilt, const char *temp, const char *name);
 static bool ensure_room(run_t *r);
+static uint32_t compact(run_t *r, uint32_t target, bool *touched);
+static int32_t counted_free(const run_t *r);
 
 /* Probe leftovers and the repair's own leftover rebuilds (once no manifest
  * names their files) always; transient cursor stages only when the store
@@ -2038,8 +2091,22 @@ static uint32_t settled_offset(run_t *r, const obj_t *o)
  * torn append blocks every later one. One '\n' makes the fragment a complete
  * malformed row that the drain hands to ADD. A torn command line is left to
  * add_connector's merge of the command inbox. */
+static bool hidden_pinned(run_t *r)
+{
+    for (uint32_t i = 0; i < r->obj_count; ++i) {
+        const obj_t *o = &r->objs[i];
+        srp_manifest_file_t *f = o->hidden && o->header != SR_NO_PAGE ? manifest_entry(r, o->name) : NULL;
+        if (f && f->object_id == o->obj && !(f->flags & SRP_MANIFEST_SETTLED)) return true;
+    }
+    return false;
+}
+
 static bool terminate_tails(run_t *r)
 {
+    /* A SPIFFS append with three free blocks or fewer runs SPIFFS's GC,
+     * which wipes the data pages of a hidden original an unsettled manifest
+     * entry still waits for: the tails wait for a boot with room. */
+    if ((uint32_t)r->fs->free_blocks <= 3 && hidden_pinned(r)) return true;
     for (uint32_t i = 0; i < r->obj_count; ++i) {
         obj_t *o = &r->objs[i];
         if (!live(o) || !o->size || !o->consistent) continue;
@@ -2168,7 +2235,7 @@ static bool rebuild_from_hold(run_t *r, obj_t *o, const char *name, srp_manifest
         return false;
     }
     if (f) {
-        f->flags |= SRP_MANIFEST_RESTORING;
+        f->flags = (uint8_t)((f->flags | SRP_MANIFEST_RESTORING) & ~(SRP_MANIFEST_MERGING | SRP_MANIFEST_ADOPTED));
         f->rebuild_id = (uint16_t)(st.obj_id & ~SR_IX);
         f->restored = 0;
         if (!manifest_save(r)) {
@@ -2226,18 +2293,24 @@ static bool rebuild_from_hold(run_t *r, obj_t *o, const char *name, srp_manifest
 /* A file the check lazily deleted (SPIFFS_check's DELETE_BAD_FILE clears the
  * header's IXDELE flag and frees nothing itself) keeps every page until a
  * later pass, the next check or SPIFFS's GC frees them; SPIFFS's GC wipes the
- * data pages of an object whose header it cannot find, so a rebuild's own
- * writes could destroy the original. A copy of the header with the flag set
- * again (one page, SPIFFS's own page move) makes it whole. A reset in between
- * leaves the hidden header beside the live copy, which the survey drops as a
- * stray, or the hidden header alone, which the next boot unhides again. */
-static bool unhide(run_t *r, const obj_t *hidden)
+ * data pages of an object whose header it cannot find, so any SPIFFS write
+ * could destroy the original. A copy of the header with the flag set again
+ * (one page, SPIFFS's own page move) makes it a file again: under its own
+ * name, or (`name`) under the temporary one while a new file has its name.
+ * A reset in between leaves the hidden header beside the live copy, which the
+ * survey drops as a stray, or the hidden header alone, which the next boot
+ * brings back again. */
+static bool unhide_as(run_t *r, const obj_t *hidden, const char *name)
 {
     uint8_t buffer[256], expect[256];
     if (r->page_size > sizeof(buffer) || hidden->header == SR_NO_PAGE) return false;
     if (!hal_read(r, SPIFFS_PAGE_TO_PADDR(r->fs, hidden->header), expect, r->page_size))
         return fail(r, "unhide_read", SPIFFS_ERR_INTERNAL);
     expect[offsetof(spiffs_page_header, flags)] |= SPIFFS_PH_FLAG_IXDELE;
+    if (name) {
+        memset(expect + offsetof(spiffs_page_object_ix_header, name), 0, SPIFFS_OBJ_NAME_LEN);
+        memcpy(expect + offsetof(spiffs_page_object_ix_header, name), name, strlen(name));
+    }
     spiffs_page_ix pix = 0;
     s32_t res = SPIFFS_ERR_FULL;
     r->wrote = true;
@@ -2254,11 +2327,17 @@ static bool unhide(run_t *r, const obj_t *hidden)
     if (!verify_page(r, pix, expect, 0, r->page_size)) return fail(r, "unhide_verify", SPIFFS_ERR_INTERNAL);
     r->report->files_restored++;
     char message[160];
-    snprintf(message, sizeof(message), "%s: the check had begun deleting it; its intact pages are its file again",
-             hidden->name);
+    if (name)
+        snprintf(message, sizeof(message), "%s: the check had begun deleting it; its pages wait as %s", hidden->name,
+                 name);
+    else
+        snprintf(message, sizeof(message), "%s: the check had begun deleting it; its pages are its file again",
+                 hidden->name);
     logf_line(r, "WARN", "STORAGE_REPAIR_UNHIDDEN", message);
     return true;
 }
+
+static bool unhide(run_t *r, const obj_t *hidden) { return unhide_as(r, hidden, NULL); }
 
 static bool object_crc(run_t *r, obj_t *o, uint32_t length, uint32_t *crc)
 {
@@ -2280,10 +2359,13 @@ static bool matches(run_t *r, obj_t *o, const srp_manifest_file_t *f)
     return o && o->mapped && o->size >= f->size && object_crc(r, o, f->size, &crc) && crc == f->crc;
 }
 
-/* The manifest's file still whole on flash under a hidden header: the same
- * object id and name, every byte readable and matching. Mapped on demand. */
-static obj_t *intact_hidden(run_t *r, const srp_manifest_file_t *f)
+/* What is left of the manifest's file under a hidden header: the same object
+ * id and name (SPIFFS gives no other object that id while the header is on
+ * flash). *intact: every byte readable and matching. Mapped on demand. */
+static obj_t *hidden_remnant(run_t *r, const srp_manifest_file_t *f, bool *intact)
 {
+    obj_t *found = NULL;
+    *intact = false;
     for (uint32_t k = 0; k < r->obj_count; ++k) {
         obj_t *o = &r->objs[k];
         if (!o->hidden || o->header == SR_NO_PAGE || !o->plausible || o->obj != f->object_id || strcmp(o->name, f->name))
@@ -2292,9 +2374,138 @@ static obj_t *intact_hidden(run_t *r, const srp_manifest_file_t *f)
             if (r->failed) return NULL;
             continue;
         }
-        if (o->size == f->size && matches(r, o, f)) return o;
+        if (o->size == f->size && matches(r, o, f)) {
+            *intact = true;
+            return o;
+        }
+        if (!found) found = o;
     }
+    return found;
+}
+
+/* The manifest's own copy of its file under the temporary name (rebuild_id). */
+static obj_t *find_rebuild(run_t *r, const srp_manifest_file_t *f)
+{
+    char temp[SRP_NAME_BYTES];
+    if (!(f->flags & SRP_MANIFEST_RESTORING) || !f->rebuild_id || !restore_name(f->name, temp)) return NULL;
+    for (uint32_t k = 0; k < r->obj_count; ++k)
+        if (live(&r->objs[k]) && r->objs[k].obj == f->rebuild_id && !strcmp(r->objs[k].name, temp)) return &r->objs[k];
     return NULL;
+}
+
+/* Such a copy waits for the resume: no normalization writes it and no record
+ * names it (its unreadable bytes are recorded where its rows go). */
+static bool frozen(run_t *r, const obj_t *o)
+{
+    return live(o) && rebuild_entry(r, o->name, o->obj) != NULL;
+}
+
+/* Every unreadable run of o (its masked bytes) as a record of `name` at
+ * `shift` plus its offset; runs less than a page apart are one merged
+ * record, as in record_salvage_gaps. */
+static bool record_unreadable(run_t *r, obj_t *o, const char *name, uint32_t shift, uint32_t file_size,
+                              srp_gap_cause_t cause)
+{
+    obj_t target;
+    memset(&target, 0, sizeof(target));
+    snprintf(target.name, sizeof(target.name), "%s", name);
+    target.kind = srp_classify(name);
+    target.size = file_size;
+    for (uint32_t start = next_masked(o, 0); start < o->size;) {
+        uint32_t end = masked_end(o, start);
+        bool merged = false;
+        for (uint32_t next = next_masked(o, end); next < o->size && next - end < SRP_SPAN_BYTES;
+             next = next_masked(o, end)) {
+            end = masked_end(o, next);
+            merged = true;
+        }
+        patch_t *p = find_patch(o, start / SRP_SPAN_BYTES);
+        if (!record_gap_flags(r, &target, shift + start, end - start, p ? p->code : 0, cause,
+                              merged ? SRP_GAP_MERGED : 0))
+            return false;
+        r->report->interrupted_losses++;
+        start = next_masked(o, end);
+        pace(r);
+    }
+    if (target.gaps) note_file(r, &target);
+    return true;
+}
+
+/* One record of [offset, offset + length) of `name`. */
+static bool record_range(run_t *r, const char *name, uint32_t offset, uint32_t length, uint32_t file_size,
+                         srp_gap_cause_t cause)
+{
+    obj_t target;
+    memset(&target, 0, sizeof(target));
+    snprintf(target.name, sizeof(target.name), "%s", name);
+    target.kind = srp_classify(name);
+    target.size = file_size;
+    if (!length) return true;
+    if (!record_gap_flags(r, &target, offset, length, 0, cause, 0)) return false;
+    r->report->interrupted_losses++;
+    note_file(r, &target);
+    return true;
+}
+
+/* Bytes [offset, end) of src, read through the survey's map (its own pages:
+ * appending to another file moves none of them), appended to `name`. */
+static bool copy_append(run_t *r, const char *name, obj_t *src, uint32_t offset, uint32_t end)
+{
+    uint8_t *chunk = zalloc(r, SR_COPY_BYTES);
+    if (!chunk) return false;
+    r->wrote = true;
+    spiffs_file fd = SPIFFS_open(r->fs, name, SPIFFS_O_APPEND | SPIFFS_O_RDWR, 0);
+    bool ok = fd >= 0;
+    while (ok && offset < end) {
+        uint32_t n = end - offset < SR_COPY_BYTES ? end - offset : SR_COPY_BYTES;
+        ok = object_read(r, src, offset, chunk, n) && SPIFFS_write(r->fs, fd, chunk, (s32_t)n) == (s32_t)n;
+        offset += n;
+        pace(r);
+    }
+    if (ok) ok = SPIFFS_fflush(r->fs, fd) >= 0;
+    if (fd >= 0 && SPIFFS_close(r->fs, fd) < 0) ok = false;
+    SPIFFS_clearerr(r->fs);
+    release(r, chunk);
+    return ok;
+}
+
+/* 1 when a's bytes at a_offset equal b's at b_offset over length, 0 when
+ * not (or unreadable), -1 without memory. */
+static int same_bytes(run_t *r, obj_t *a, uint32_t a_offset, obj_t *b, uint32_t b_offset, uint32_t length)
+{
+    uint8_t *x = zalloc(r, SR_COPY_BYTES), *y = zalloc(r, SR_COPY_BYTES);
+    int same = x && y ? 1 : -1;
+    for (uint32_t done = 0; same == 1 && done < length;) {
+        uint32_t n = length - done < SR_COPY_BYTES ? length - done : SR_COPY_BYTES;
+        if (!object_read(r, a, a_offset + done, x, n) || !object_read(r, b, b_offset + done, y, n) || memcmp(x, y, n))
+            same = 0;
+        done += n;
+        pace(r);
+    }
+    release(r, x);
+    release(r, y);
+    return same;
+}
+
+/* Room to append `bytes` without SPIFFS's GC. spiffs_gc_check cleans a block
+ * in every write unless more than three blocks are free (and enough pages),
+ * and SPIFFS's GC before normalization, or over a hidden header, is 1.2 item
+ * 8's hazard. The free blocks must stay above three through every page the
+ * append allocates (its data pages, its index pages and a header move per
+ * write), so compaction makes them first, or nothing is written. Needs a
+ * fresh survey; surveys again after compacting. */
+static bool room_for_append(run_t *r, uint32_t bytes)
+{
+    uint32_t data = bytes / SRP_SPAN_BYTES + 2;
+    uint32_t pages = data + 2 * (data / r->ix_len + 2) + bytes / SR_COPY_BYTES + 4;
+    uint32_t target = 5 + (pages + r->entries - 1) / r->entries;
+    for (uint32_t round = 0; (uint32_t)r->fs->free_blocks < target && round < 8 && going(r); ++round) {
+        bool touched = false;
+        uint32_t cleaned = compact(r, target, &touched);
+        if (touched && !survey(r)) return false;
+        if (!cleaned) break;
+    }
+    return (uint32_t)r->fs->free_blocks >= target && counted_free(r) > (int32_t)(pages + 2 * r->entries);
 }
 
 /* In place: every span whose bytes differ from the hold gets a new page with
@@ -2349,15 +2560,59 @@ static bool restore_in_place(run_t *r, obj_t *o, bool *changed)
     return true;
 }
 
-/* Puts back what the check changed: a held file in place, or by its own
- * header when the check had only begun deleting it, or whole under a
- * temporary name when the check removed it; an unheld file only by its
- * header. What cannot go back is recorded (CHECK_CHANGED, UNHELD_LOST) and
- * its manifest entry stays (REPORTED once recorded), so the next boot tries
- * again from whatever the store still holds. */
+/* Puts back what the check changed. First every file the check had only
+ * begun deleting, held or not, by its own header (one page each, before any
+ * rebuild's SPIFFS writes could run SPIFFS's GC over a hidden header); an
+ * unheld one that is no longer whole has its unreadable bytes recorded
+ * first. Then held files: in place, or whole under a temporary name when the
+ * check removed them. What cannot go back is recorded (CHECK_CHANGED,
+ * UNHELD_LOST) and its manifest entry stays (REPORTED once recorded), so the
+ * next boot tries again from whatever the store still holds; an entry whose
+ * original is still under a hidden header is never settled, and the run
+ * fails. */
 static bool restore_held(run_t *r, bool *changed)
 {
     *changed = false;
+    bool unhidden = false;
+    for (uint32_t i = 0; manifest_active(r) && i < r->manifest->count; ++i) {
+        srp_manifest_file_t *f = &r->manifest->file[i];
+        if (f->flags & (SRP_MANIFEST_SETTLED | SRP_MANIFEST_REPORTED)) continue;
+        r->failed = false;
+        if (find_live(r, f->name)) continue;
+        bool intact = false, held = false;
+        obj_t *hidden = hidden_remnant(r, f, &intact);
+        if (r->failed) return false;
+        if (!hidden) continue;
+        for (uint32_t k = 0; k < r->obj_count && !held; ++k)
+            held = r->objs[k].hold && !strcmp(r->objs[k].name, f->name);
+        if (!intact && held) continue; /* its hold has every byte: rebuilt below */
+        *changed = true;
+        if (!intact) {
+            /* Unheld, and pages of it gone: what is left comes back, the
+             * rest is a record first. */
+            if (!record_unreadable(r, hidden, f->name, 0, f->size, SRP_GAP_UNHELD_LOST) ||
+                (hidden->size < f->size &&
+                 !record_range(r, f->name, hidden->size, f->size - hidden->size, f->size, SRP_GAP_UNHELD_LOST)) ||
+                !save_records(r)) {
+                r->restore_failed = true;
+                continue;
+            }
+            f->flags |= SRP_MANIFEST_REPORTED;
+            if (!manifest_save(r)) return fail(r, "journal_manifest", SPIFFS_ERR_INTERNAL);
+        }
+        if (unhide(r, hidden)) {
+            unhidden = true;
+            if (!intact) {
+                f->flags |= SRP_MANIFEST_SETTLED;
+                if (!manifest_save(r)) return fail(r, "journal_manifest", SPIFFS_ERR_INTERNAL);
+            }
+            continue;
+        }
+        r->failed = false;
+        /* No page for its header: a held file is rebuilt below; an unheld
+         * one stays hidden and unsettled (below). */
+    }
+    if (unhidden && !survey(r)) return false;
     for (uint32_t i = 0; i < r->obj_count; ++i) {
         obj_t *o = &r->objs[i];
         if (!o->held || !o->hold || o->retired) continue;
@@ -2365,13 +2620,6 @@ static bool restore_held(run_t *r, bool *changed)
         srp_manifest_file_t *f = manifest_entry(r, o->name);
         if (!live(o)) {
             *changed = true;
-            obj_t *hidden = f ? intact_hidden(r, f) : NULL;
-            if (hidden && unhide(r, hidden)) {
-                o->actions |= SRR_FILE_RESTORED;
-                note_file(r, o);
-                continue;
-            }
-            r->failed = false;
             if (rebuild_from_hold(r, o, o->name, f)) {
                 o->actions |= SRR_FILE_REBUILT;
                 r->report->files_rebuilt++;
@@ -2408,8 +2656,7 @@ static bool restore_held(run_t *r, bool *changed)
         }
         *changed |= one;
     }
-    /* Custody the budget could not hold: back by its header when the check
-     * had only begun deleting it; otherwise what changed is a record. */
+    /* Custody the budget could not hold. */
     for (uint32_t i = 0; manifest_active(r) && i < r->manifest->count; ++i) {
         srp_manifest_file_t *f = &r->manifest->file[i];
         if (f->flags & (SRP_MANIFEST_SETTLED | SRP_MANIFEST_REPORTED)) continue;
@@ -2421,9 +2668,19 @@ static bool restore_held(run_t *r, bool *changed)
         obj_t *now = find_live(r, f->name);
         if (matches(r, now, f)) continue;
         *changed = true;
-        obj_t *hidden = now ? NULL : intact_hidden(r, f);
-        if (hidden && unhide(r, hidden)) continue;
-        r->failed = false;
+        bool intact = false;
+        if (!now && hidden_remnant(r, f, &intact)) {
+            /* Its header could not come back (no page): it is on flash, so
+             * the entry stays unsettled and the run fails; the next boot's
+             * resume brings it back. */
+            r->restore_failed = true;
+            r->failed = false;
+            char message[160];
+            snprintf(message, sizeof(message), "%s: still under a hidden header; kept for the next boot", f->name);
+            logf_line(r, "WARN", "STORAGE_REPAIR_RESTORE_DEFERRED", message);
+            continue;
+        }
+        if (r->failed) return false;
         obj_t placeholder;
         memset(&placeholder, 0, sizeof(placeholder));
         memcpy(placeholder.name, f->name, sizeof(placeholder.name));
@@ -2432,7 +2689,8 @@ static bool restore_held(run_t *r, bool *changed)
         obj_t *target = now ? now : &placeholder;
         bool failed_before = r->restore_failed;
         if (record_unrestored(r, target, f->name, 0, f->size, 0, SRP_GAP_UNHELD_LOST)) {
-            /* Nothing held to put back: recorded is settled. */
+            /* Nothing held to put back and nothing of it on flash: recorded
+             * is settled. */
             f->flags |= SRP_MANIFEST_REPORTED | SRP_MANIFEST_SETTLED;
             if (!manifest_save(r)) return fail(r, "journal_manifest", SPIFFS_ERR_INTERNAL);
             r->restore_failed = failed_before;
@@ -2548,149 +2806,326 @@ static int resume_gap(run_t *r, srp_manifest_file_t *f, obj_t *now, uint32_t off
     return RESUME_SETTLED;
 }
 
+/* The rows of the manifest's copy under the temporary name (the repair's
+ * rebuild, or the original adopted there) go after the rows of the new file
+ * a rolled-back image created under the name:
+ *  - the new file's own damage is normalized first (its records first): an
+ *    interrupted append's bytes past its end would be ANDed into the first
+ *    merged row (1.2 item 5), an entry past its end into a page index;
+ *  - the copy's unreadable bytes, and what it lacks of the original, are
+ *    records at the places its rows take in the new file, before a byte is
+ *    written;
+ *  - room for the whole append without SPIFFS's GC, or nothing is written;
+ *  - where the rows begin is journaled (MERGING): a later boot continues a
+ *    merge whose bytes so far read back, or begins again after a file that
+ *    changed meanwhile (duplicate rows, never lost ones);
+ *  - settled only once every merged byte reads back; the copy stays until
+ *    then, and goes afterwards as an expendable.
+ * Text files only. */
+static int merge_rows(run_t *r, srp_manifest_file_t *f, srp_gap_cause_t cause)
+{
+    obj_t *now = find_live(r, f->name), *src = find_rebuild(r, f);
+    if (!now || !src) return RESUME_VERIFY;
+    /* Rounds as normalize_once's: a rewritten span's old page is a stray the
+     * next survey shows. */
+    for (uint32_t round = 0; now->needs_work && round < SR_NORMALIZE_ROUNDS; ++round) {
+        bool gap = false;
+        for (uint32_t k = 0; k < now->patches && !gap; ++k)
+            for (uint32_t b = 0; b < sizeof(now->patch[k].mask) && !gap; ++b) gap = now->patch[k].mask[b] != 0;
+        if (gap) {
+            if (!record_salvage_gaps(r, now)) {
+                snprintf(r->report->error_stage, sizeof(r->report->error_stage), "records");
+                return RESUME_BLOCKED;
+            }
+            if (!save_records(r)) return (fail(r, "journal_records", SPIFFS_ERR_INTERNAL), RESUME_FAILED);
+        }
+        if (!fill_gaps(r, now)) return (fail(r, "fill_memory", SPIFFS_ERR_INTERNAL), RESUME_FAILED);
+        bool ok = normalize_object(r, now);
+        note_file(r, now);
+        if (!ok && r->stopped) return RESUME_FAILED;
+        if (!ok) clear_failure(r);
+        if (!survey(r)) return RESUME_FAILED;
+        now = find_live(r, f->name);
+        src = find_rebuild(r, f);
+        if (!now || !src) return RESUME_VERIFY;
+        if (!ok) break;
+    }
+    if (now->needs_work) {
+        snprintf(r->report->error_stage, sizeof(r->report->error_stage), "full");
+        return RESUME_BLOCKED;
+    }
+    if (!fill_gaps(r, src)) return (fail(r, "fill_memory", SPIFFS_ERR_INTERNAL), RESUME_FAILED);
+    uint32_t length = src->size, base = 0, done = 0;
+    uint8_t last = '\n';
+    if (now->size && !object_read(r, now, now->size - 1, &last, 1)) last = '\n';
+    bool fresh = true, newline = false;
+    if ((f->flags & SRP_MANIFEST_MERGING) && f->restored <= now->size && now->size - f->restored <= length) {
+        /* A merge an earlier boot began: its bytes so far read back. */
+        int same = same_bytes(r, now, f->restored, src, 0, now->size - f->restored);
+        if (same < 0) return (fail(r, "merge_memory", SPIFFS_ERR_INTERNAL), RESUME_FAILED);
+        if (same) {
+            base = f->restored;
+            done = now->size - base;
+            fresh = false;
+        }
+    } else if ((f->flags & SRP_MANIFEST_MERGING) && f->restored == now->size + 1 && last != '\n') {
+        /* One journaled, its newline not yet written. */
+        base = f->restored;
+        newline = true;
+        fresh = false;
+    }
+    if (fresh) {
+        newline = last != '\n';
+        base = now->size + (newline ? 1U : 0U);
+        /* Records first, in the new file's offsets. What the copy lacks of
+         * the original was recorded already when the rebuild stopped
+         * (REPORTED before any merge began). */
+        bool tail = length < f->size &&
+            (!(f->flags & SRP_MANIFEST_REPORTED) || (f->flags & SRP_MANIFEST_MERGING));
+        bool recorded = false;
+        uint32_t before = r->report->gaps;
+        if (!record_unreadable(r, src, f->name, base, base + length, cause) ||
+            (tail && !record_range(r, f->name, base + length, f->size - length, base + length,
+                                   SRP_GAP_RESTORE_INTERRUPTED))) {
+            snprintf(r->report->error_stage, sizeof(r->report->error_stage), "records");
+            return RESUME_BLOCKED;
+        }
+        recorded = r->report->gaps != before;
+        if (recorded && !save_records(r)) return (fail(r, "journal_records", SPIFFS_ERR_INTERNAL), RESUME_FAILED);
+        if (recorded) f->flags |= SRP_MANIFEST_REPORTED;
+        /* Where its rows go, with the records that name those places: a
+         * boot that finds no room repeats neither. */
+        f->flags |= SRP_MANIFEST_MERGING;
+        f->restored = base;
+        if (!manifest_save(r)) return (fail(r, "journal_manifest", SPIFFS_ERR_INTERNAL), RESUME_FAILED);
+    }
+    if (!room_for_append(r, length - done + 1)) {
+        if (r->failed) return RESUME_FAILED;
+        char message[160], temp[SRP_NAME_BYTES];
+        (void)restore_name(f->name, temp);
+        snprintf(message, sizeof(message), "%s: no room to append %lu bytes without SPIFFS's GC; they wait as %s",
+                 f->name, (unsigned long)(length - done), temp);
+        logf_line(r, "WARN", "STORAGE_REPAIR_MERGE_DEFERRED", message);
+        snprintf(r->report->error_stage, sizeof(r->report->error_stage), "full");
+        return RESUME_BLOCKED;
+    }
+    /* Compaction may have surveyed again. */
+    now = find_live(r, f->name);
+    src = find_rebuild(r, f);
+    if (!now || !src) return RESUME_VERIFY;
+    if (!fill_gaps(r, src)) return (fail(r, "fill_memory", SPIFFS_ERR_INTERNAL), RESUME_FAILED);
+    bool ok = true;
+    if (newline) {
+        r->wrote = true;
+        spiffs_file fd = SPIFFS_open(r->fs, f->name, SPIFFS_O_APPEND | SPIFFS_O_RDWR, 0);
+        ok = fd >= 0 && SPIFFS_write(r->fs, fd, (void *)"\n", 1) == 1;
+        if (fd >= 0 && SPIFFS_close(r->fs, fd) < 0) ok = false;
+        SPIFFS_clearerr(r->fs);
+    }
+    if (ok) ok = copy_append(r, f->name, src, done, length);
+    /* Settled only once the merged bytes read back. */
+    if (!survey(r)) return RESUME_FAILED;
+    now = find_live(r, f->name);
+    src = find_rebuild(r, f);
+    if (now && src && now->size >= base + length && fill_gaps(r, src)) {
+        int same = same_bytes(r, now, base, src, 0, length);
+        if (same < 0) return (fail(r, "merge_memory", SPIFFS_ERR_INTERNAL), RESUME_FAILED);
+        if (same) {
+            char message[160];
+            snprintf(message, sizeof(message), "%s: %lu bytes of the interrupted run appended at %lu, after the new file's rows",
+                     f->name, (unsigned long)length, (unsigned long)base);
+            logf_line(r, "WARN", "STORAGE_REPAIR_MERGED", message);
+            now->actions |= SRR_FILE_REBUILT;
+            note_file(r, now);
+            r->report->files_rebuilt++;
+            return RESUME_SETTLED;
+        }
+    }
+    if (r->failed) return RESUME_FAILED;
+    snprintf(r->report->error_stage, sizeof(r->report->error_stage), ok ? "merge" : "full");
+    return RESUME_BLOCKED;
+}
+
+/* Objects under the temporary name other than `keep` (an earlier run's
+ * leftover, a torn copy, or a rebuild the intact original makes redundant),
+ * never the original's own object. Surveys again. */
+static bool purge_temp(run_t *r, const char *temp, uint16_t keep, uint16_t original)
+{
+    bool any = false;
+    for (uint32_t i = 0; i < r->obj_count; ++i) {
+        obj_t *o = &r->objs[i];
+        if (o->header == SR_NO_PAGE || strcmp(o->name, temp) || o->obj == keep || o->obj == original) continue;
+        if (!purge_object(r, o)) return fail(r, "purge", SPIFFS_ERR_INTERNAL);
+        any = true;
+    }
+    return !any || survey(r);
+}
+
+/* A text file's original or copy that cannot go after a new file's rows
+ * (binary): the bytes are a record, the entry settles. */
+static int conflicting_name(run_t *r, srp_manifest_file_t *f, obj_t *now)
+{
+    if (!(f->flags & SRP_MANIFEST_REPORTED)) {
+        if (!record_range(r, f->name, 0, f->size, now ? now->size : f->size, SRP_GAP_CHECK_CHANGED) ||
+            !save_records(r)) {
+            snprintf(r->report->error_stage, sizeof(r->report->error_stage), "records");
+            return RESUME_BLOCKED;
+        }
+        f->flags |= SRP_MANIFEST_REPORTED;
+    }
+    return RESUME_SETTLED;
+}
+
+/* The original under a hidden header waits under the temporary name while a
+ * new file has its name: one page, after which SPIFFS's GC moves its pages
+ * as any file's (it wipes a hidden one's). rebuild_id names it first. */
+static int adopt(run_t *r, srp_manifest_file_t *f, obj_t *hidden)
+{
+    char temp[SRP_NAME_BYTES];
+    if (!restore_name(f->name, temp)) return RESUME_BLOCKED;
+    f->flags = (uint8_t)((f->flags | SRP_MANIFEST_RESTORING | SRP_MANIFEST_ADOPTED) & ~SRP_MANIFEST_MERGING);
+    f->rebuild_id = hidden->obj;
+    f->restored = 0;
+    if (!manifest_save(r)) return (fail(r, "journal_manifest", SPIFFS_ERR_INTERNAL), RESUME_FAILED);
+    if (unhide_as(r, hidden, temp)) return RESUME_VERIFY;
+    if (r->stopped) return RESUME_FAILED;
+    r->failed = false;
+    snprintf(r->report->error_stage, sizeof(r->report->error_stage), "full");
+    return RESUME_BLOCKED;
+}
+
 /* One file of a manifest an interrupted run left, in this order:
  *  - the live file still starts with the manifest's bytes: settled;
- *  - a whole rebuild under the temporary name goes into place;
- *  - the original is still whole under a hidden header (the check had begun
- *    deleting it): its header comes back (no new file took the name), or a
- *    text file's rows go after the new file's rows; never settled while it
- *    cannot, so no check frees it meanwhile;
- *  - the repair's own restore was under way (RESTORING): what its rebuild
- *    holds goes into place and the rest is a record, before any rule that
- *    would take the rebuild for the owner's new file;
- *  - a file its owner replaced since (its queue cursor's generation moved,
- *    a new object took the name, or the manifest is a rolled-back image's)
- *    is superseded;
- *  - anything else is reported with its exact range, once.
- * RESUME_VERIFY: the caller surveys and checks the result; RESUME_BLOCKED: a
- * record could not be kept, or the original could not come back yet. */
+ *  - the original whole under a hidden header (the check had begun deleting
+ *    it): its header comes back under its name, or under the temporary
+ *    name when a new file took its name;
+ *  - the manifest's copy under the temporary name (the repair's rebuild,
+ *    its pages past the committed size included, or the adopted original):
+ *    renamed into place, its missing tail a record first; or, when a new
+ *    file has the name, its rows go after the new file's (merge_rows);
+ *  - what is left of the original under a hidden header when pages of it
+ *    are gone (SPIFFS's GC in an older image's writes): superseded only when
+ *    its owner settled the file (the queue cursor's generation moved);
+ *    otherwise its unreadable bytes are records and the rest comes back, as
+ *    above;
+ *  - nothing of it on flash: the repair's own restore was under way
+ *    (RESTORING), or its owner replaced the file (the cursor's generation
+ *    moved, a new object took the name, or the manifest is a rolled-back
+ *    image's), or anything else is reported with its exact range, once.
+ * Never settled while the original or its copy is on flash and cannot go
+ * back yet: RESUME_BLOCKED keeps the entry (and no check runs). RESUME_VERIFY:
+ * the caller surveys and checks the result. */
 static int resume_file(run_t *r, srp_manifest_file_t *f, bool stale, srp_gap_cause_t cause)
 {
     obj_t *now = find_live(r, f->name);
     if (matches(r, now, f)) return RESUME_SETTLED;
     char temp[SRP_NAME_BYTES];
     bool named = restore_name(f->name, temp);
-    obj_t *rebuilt = named ? find_live(r, temp) : NULL;
-    if (!now && rebuilt && rebuilt->size == f->size && matches(r, rebuilt, f)) {
-        if (rename_rebuild(r, rebuilt, temp, f->name)) {
-            r->report->files_rebuilt++;
-            return RESUME_VERIFY;
-        }
-        if (r->failed) return RESUME_FAILED;
-    }
-    bool ours = (f->flags & SRP_MANIFEST_RESTORING) && f->rebuild_id;
-    bool leftover = false;
-    for (uint32_t k = 0; named && k < r->obj_count; ++k)
-        leftover |= r->objs[k].header != SR_NO_PAGE && !strcmp(r->objs[k].name, temp);
-    obj_t *hidden = intact_hidden(r, f);
+    obj_t *rebuilt = find_rebuild(r, f);
+    bool intact = false;
+    obj_t *hidden = hidden_remnant(r, f, &intact);
     if (r->failed) return RESUME_FAILED;
-    if (hidden && now && now->obj == hidden->obj) hidden = NULL;
-    if (!hidden && !now && rebuilt && ours && rebuilt->obj == f->rebuild_id && rebuilt->size < f->size) {
-        /* The repair's rebuild stopped part way and the original is gone:
-         * its bytes go into place, the rest is a record first. */
-        if (!(f->flags & SRP_MANIFEST_REPORTED)) {
-            /* Up to its first unreadable byte (a torn last page). */
-            uint32_t prefix = next_masked(rebuilt, 0);
-            int outcome = resume_gap(r, f, NULL, prefix, SRP_GAP_RESTORE_INTERRUPTED);
-            if (outcome != RESUME_SETTLED) return outcome;
-            f->restored = prefix;
+    bool leftover = false;
+    for (uint32_t k = 0; named && k < r->obj_count; ++k) {
+        const obj_t *o = &r->objs[k];
+        leftover |= o->header != SR_NO_PAGE && !strcmp(o->name, temp) && o->obj != f->object_id &&
+            (o != rebuilt || intact);
+    }
+    if (leftover) {
+        if (intact && rebuilt) {
+            f->flags = (uint8_t)(f->flags & ~(SRP_MANIFEST_RESTORING | SRP_MANIFEST_MERGING | SRP_MANIFEST_ADOPTED));
+            f->rebuild_id = 0;
             if (!manifest_save(r)) return (fail(r, "journal_manifest", SPIFFS_ERR_INTERNAL), RESUME_FAILED);
         }
-        if (rename_rebuild(r, rebuilt, temp, f->name)) {
-            r->report->files_rebuilt++;
-            return RESUME_SETTLED;
+        if (!purge_temp(r, temp, intact || !rebuilt ? SR_NO_PAGE : rebuilt->obj, f->object_id)) return RESUME_FAILED;
+        now = find_live(r, f->name);
+        rebuilt = find_rebuild(r, f);
+        hidden = hidden_remnant(r, f, &intact);
+        if (r->failed) return RESUME_FAILED;
+    }
+    if (hidden && intact) {
+        if (!now) {
+            if (unhide(r, hidden)) {
+                hidden->actions |= SRR_FILE_RESTORED;
+                note_file(r, hidden);
+                return RESUME_VERIFY;
+            }
+            if (r->stopped) return RESUME_FAILED;
+            r->failed = false;
+            snprintf(r->report->error_stage, sizeof(r->report->error_stage), "full");
+            return RESUME_BLOCKED;
+        }
+        return text_fill(hidden) ? adopt(r, f, hidden) : conflicting_name(r, f, now);
+    }
+    if (rebuilt) {
+        if (now) return text_fill(rebuilt) ? merge_rows(r, f, cause) : conflicting_name(r, f, now);
+        if (rebuilt->size == f->size && matches(r, rebuilt, f)) {
+            if (rename_rebuild(r, rebuilt, temp, f->name)) {
+                r->report->files_rebuilt++;
+                return RESUME_VERIFY;
+            }
+        } else {
+            /* Stopped part way: its bytes go into place (up to its first
+             * unreadable byte), the rest is a record first. */
+            if (!(f->flags & SRP_MANIFEST_REPORTED)) {
+                uint32_t prefix = next_masked(rebuilt, 0);
+                int outcome = resume_gap(r, f, NULL, prefix, SRP_GAP_RESTORE_INTERRUPTED);
+                if (outcome != RESUME_SETTLED) return outcome;
+                f->restored = prefix;
+                if (!manifest_save(r)) return (fail(r, "journal_manifest", SPIFFS_ERR_INTERNAL), RESUME_FAILED);
+            }
+            if (rename_rebuild(r, rebuilt, temp, f->name)) {
+                r->report->files_rebuilt++;
+                return RESUME_SETTLED;
+            }
         }
         /* Kept under its temporary name for the next boot: its bytes are
          * the only copy. */
-        if (!r->report->error_stage[0]) snprintf(r->report->error_stage, sizeof(r->report->error_stage), "full");
+        if (r->stopped) return RESUME_FAILED;
         r->failed = false;
+        snprintf(r->report->error_stage, sizeof(r->report->error_stage), "full");
         return RESUME_BLOCKED;
-    }
-    if (leftover) {
-        /* An interrupted rebuild (its size may be torn); the survey after
-         * the purge moves every object, so look again. */
-        if (!purge_name(r, temp)) return RESUME_FAILED;
-        now = find_live(r, f->name);
-        hidden = intact_hidden(r, f);
-        if (r->failed) return RESUME_FAILED;
-        if (hidden && now && now->obj == hidden->obj) hidden = NULL;
-    }
-    if (hidden && !now) {
-        if (unhide(r, hidden)) {
-            hidden->actions |= SRR_FILE_RESTORED;
-            note_file(r, hidden);
-            return RESUME_VERIFY;
-        }
-        /* Not settled while the original is whole on flash: no check runs
-         * until it is back (the next boot tries again). */
-        if (!r->report->error_stage[0]) snprintf(r->report->error_stage, sizeof(r->report->error_stage), "full");
-        r->failed = false;
-        return RESUME_BLOCKED;
-    }
-    if (hidden && text_fill(hidden) && !take_hold(r, hidden)) {
-        /* Its rows cannot be held to go after the new file's: not settled
-         * while the original is whole on flash. */
-        snprintf(r->report->error_stage, sizeof(r->report->error_stage), "memory");
-        return RESUME_BLOCKED;
-    }
-    if (hidden) {
-        /* A new file took the name meanwhile (a rolled-back image created
-         * it): a text file's intact rows go after its own rows. */
-        uint32_t done = 0;
-        int outcome = RESUME_SETTLED;
-        bool merged = false;
-        if (text_fill(hidden)) {
-            f->flags |= SRP_MANIFEST_RESTORING;
-            f->rebuild_id = now->obj;
-            f->restored = 0;
-            if (!manifest_save(r)) {
-                drop_hold(r, hidden);
-                return (fail(r, "journal_manifest", SPIFFS_ERR_INTERNAL), RESUME_FAILED);
-            }
-            uint8_t last = '\n';
-            if (now->size && !object_read(r, now, now->size - 1, &last, 1)) last = '\n';
-            bool line = last == '\n';
-            if (!line) {
-                r->wrote = true;
-                spiffs_file fd = SPIFFS_open(r->fs, f->name, SPIFFS_O_APPEND | SPIFFS_O_RDWR, 0);
-                line = fd >= 0 && SPIFFS_write(r->fs, fd, (void *)"\n", 1) == 1;
-                if (fd >= 0 && SPIFFS_close(r->fs, fd) < 0) line = false;
-                SPIFFS_clearerr(r->fs);
-            }
-            merged = line && spiffs_append(r, f->name, hidden, 0, hidden->hold_size, &done);
-        }
-        if (merged) {
-            char message[160];
-            snprintf(message, sizeof(message),
-                     "%s: %lu intact bytes of the interrupted run appended after the new file's rows", f->name,
-                     (unsigned long)hidden->hold_size);
-            logf_line(r, "WARN", "STORAGE_REPAIR_MERGED", message);
-            hidden->actions |= SRR_FILE_REBUILT;
-            r->report->files_rebuilt++;
-        } else if (!record_unrestored(r, hidden, f->name, done, f->size,
-                                      text_fill(hidden) ? SPIFFS_ERR_FULL : SPIFFS_ERR_CONFLICTING_NAME,
-                                      SRP_GAP_CHECK_CHANGED)) {
-            outcome = RESUME_BLOCKED;
-            snprintf(r->report->error_stage, sizeof(r->report->error_stage), "records");
-        } else f->flags |= SRP_MANIFEST_REPORTED;
-        drop_hold(r, hidden);
-        note_file(r, hidden);
-        /* What did not go back is a gap record now: the entry settles. */
-        r->restore_failed = false;
-        r->failed = false;
-        return outcome;
-    }
-    if (r->failed) return RESUME_FAILED;
-    if (ours && !(f->flags & SRP_MANIFEST_REPORTED)) {
-        /* The repair's own restore did not finish and nothing of it can be
-         * verified: whatever now has the name, those bytes are a record. */
-        uint32_t from = now && now->obj == f->rebuild_id ? f->restored : 0;
-        return resume_gap(r, f, now, from, SRP_GAP_RESTORE_INTERRUPTED);
     }
     srp_kind_t kind = srp_classify(f->name);
     uint32_t generation = 0;
     bool cursor_moved = (f->flags & SRP_MANIFEST_CURSOR) &&
         (!cursor_generation(r, &kind, &generation) || generation != f->cursor_generation);
+    if (hidden) {
+        if (cursor_moved) {
+            supersede(r, f, now, "its queue was retired");
+            return RESUME_SETTLED;
+        }
+        if (now) return text_fill(hidden) ? adopt(r, f, hidden) : conflicting_name(r, f, now);
+        if (!(f->flags & SRP_MANIFEST_REPORTED)) {
+            if (!record_unreadable(r, hidden, f->name, 0, f->size, cause) ||
+                (hidden->size < f->size &&
+                 !record_range(r, f->name, hidden->size, f->size - hidden->size, f->size, cause))) {
+                snprintf(r->report->error_stage, sizeof(r->report->error_stage), "records");
+                return RESUME_BLOCKED;
+            }
+            if (!save_records(r)) return (fail(r, "journal_records", SPIFFS_ERR_INTERNAL), RESUME_FAILED);
+            f->flags |= SRP_MANIFEST_REPORTED;
+            if (!manifest_save(r)) return (fail(r, "journal_manifest", SPIFFS_ERR_INTERNAL), RESUME_FAILED);
+        }
+        if (unhide(r, hidden)) {
+            /* Its readable bytes are its file again; normalization fills
+             * the recorded ones. */
+            hidden->actions |= SRR_FILE_RESTORED;
+            note_file(r, hidden);
+            return RESUME_SETTLED;
+        }
+        if (r->stopped) return RESUME_FAILED;
+        r->failed = false;
+        snprintf(r->report->error_stage, sizeof(r->report->error_stage), "full");
+        return RESUME_BLOCKED;
+    }
+    bool ours = (f->flags & SRP_MANIFEST_RESTORING) && f->rebuild_id;
+    if (ours && !(f->flags & SRP_MANIFEST_REPORTED)) {
+        /* The repair's own restore did not finish and nothing of it can be
+         * verified: whatever now has the name, those bytes are a record. */
+        uint32_t from = now && now->obj == f->rebuild_id && !(f->flags & SRP_MANIFEST_MERGING) ? f->restored : 0;
+        return resume_gap(r, f, now, from, SRP_GAP_RESTORE_INTERRUPTED);
+    }
     bool replaced = now && now->obj != f->object_id && !(ours && now->obj == f->rebuild_id);
     if (stale || cursor_moved || replaced) {
         supersede(r, f, now, stale ? "another image ran" : cursor_moved ? "its queue was retired" : "a new file");
@@ -2817,7 +3252,7 @@ static bool any_work(run_t *r)
 {
     if (r->orphan_count) return true;
     for (uint32_t i = 0; i < r->obj_count; ++i)
-        if (live(&r->objs[i]) && r->objs[i].needs_work) return true;
+        if (live(&r->objs[i]) && r->objs[i].needs_work && !frozen(r, &r->objs[i])) return true;
     return false;
 }
 
@@ -2833,7 +3268,10 @@ static bool plan_damage(run_t *r)
         bool gap = false;
         for (uint32_t k = 0; k < o->patches && !gap; ++k)
             for (uint32_t b = 0; b < sizeof(o->patch[k].mask) && !gap; ++b) gap = o->patch[k].mask[b] != 0;
-        if (gap) {
+        /* A copy under the temporary name: the manifest's waits for the
+         * resume, which records its unreadable bytes where its rows go; any
+         * other is expendable. */
+        if (gap && !restore_file(o->name)) {
             uint32_t before = r->report->gaps;
             (void)record_salvage_gaps(r, o);
             if (r->report->gaps != before || o->unrecordable) recorded = true;
@@ -2855,13 +3293,6 @@ static bool plan_damage(run_t *r)
     return true;
 }
 
-static void clear_failure(run_t *r)
-{
-    r->failed = false;
-    r->report->error_stage[0] = '\0';
-    r->report->error_code = 0;
-}
-
 /* ---- room ----------------------------------------------------------- */
 #define SR_COMPACT_MAX_BLOCKS 48U
 
@@ -2871,7 +3302,7 @@ static uint32_t pages_for_work(const run_t *r)
     uint32_t pages = 2;
     for (uint32_t i = 0; i < r->obj_count; ++i) {
         const obj_t *o = &r->objs[i];
-        if (!live(o) || !o->needs_work || !o->mapped) continue;
+        if (!live(o) || !o->needs_work || !o->mapped || frozen((run_t *)r, o)) continue;
         for (uint32_t k = 0; k < o->patches; ++k) pages += o->patch[k].kind != PATCH_REFER;
         for (uint32_t j = 0; j < o->ix_spans; ++j) pages += o->ix_rewrite[j] != 0;
     }
@@ -3149,7 +3580,7 @@ static bool normalize_once(run_t *r)
         for (uint32_t i = 0; i < r->obj_count; ++i) {
             obj_t *o = &r->objs[i];
             if (!live(o) || !o->needs_work) continue;
-            if (o->unrecordable) continue;
+            if (o->unrecordable || frozen(r, o)) continue;
             if (!normalize_object(r, o)) return false;
             note_file(r, o);
         }
@@ -3160,7 +3591,8 @@ static bool normalize_once(run_t *r)
         if (any_mislabeled(r) && !(lookup_hygiene(r) && survey(r))) return false;
         bool more = false;
         for (uint32_t i = 0; i < r->obj_count; ++i)
-            if (live(&r->objs[i]) && r->objs[i].needs_work && !r->objs[i].unrecordable) more = true;
+            if (live(&r->objs[i]) && r->objs[i].needs_work && !r->objs[i].unrecordable && !frozen(r, &r->objs[i]))
+                more = true;
         if (!more && !r->orphan_count) break;
         if (!plan_damage(r)) return false;
     }
@@ -3308,7 +3740,7 @@ static void report_blocked(run_t *r)
 {
     for (uint32_t i = 0; i < r->obj_count; ++i) {
         obj_t *o = &r->objs[i];
-        if (!live(o) || !custody(o) || !o->mapped || (o->consistent && !o->needs_work)) continue;
+        if (!live(o) || !custody(o) || !o->mapped || (o->consistent && !o->needs_work) || frozen(r, o)) continue;
         o->blocked_spans = 0;
         o->blocked_offset = UINT32_MAX;
         for (uint32_t k = 0; k < o->patches; ++k) {
