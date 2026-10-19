@@ -452,16 +452,20 @@ void storage_repair_boot(void)
 void storage_repair_after_mount(void)
 {
     srp_state_t state;
-    if (port_nvs_load(NULL, SRR_NVS_NAMESPACE, "state", &state, sizeof(state)) != 1 || !srp_state_valid(&state) ||
-        !(state.flags & SRP_STATE_COMMANDS_DAMAGED))
-        return;
+    bool loaded = port_nvs_load(NULL, SRR_NVS_NAMESPACE, "state", &state, sizeof(state)) == 1 &&
+        srp_state_valid(&state);
+    bool flagged = loaded && (state.flags & SRP_STATE_COMMANDS_DAMAGED);
+    /* A merge an earlier boot left unfinished runs again even unflagged. */
+    if (!flagged && !add_connector_command_inbox_merge_pending()) return;
     if (!add_connector_repair_command_inbox()) {
         queue_line("ERROR", "STORAGE_REPAIR_COMMANDS_FAILED", "the command inbox could not be merged; it stays flagged");
         return;
     }
-    state.flags &= ~SRP_STATE_COMMANDS_DAMAGED;
-    srp_state_seal(&state);
-    (void)port_nvs_store(NULL, SRR_NVS_NAMESPACE, "state", &state, sizeof(state));
+    if (flagged) {
+        state.flags &= ~SRP_STATE_COMMANDS_DAMAGED;
+        srp_state_seal(&state);
+        (void)port_nvs_store(NULL, SRR_NVS_NAMESPACE, "state", &state, sizeof(state));
+    }
     queue_line("WARN", "STORAGE_REPAIR_COMMANDS_MERGED", "the command inbox was rebuilt from its readable lines");
 }
 

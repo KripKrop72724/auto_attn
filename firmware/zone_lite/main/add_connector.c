@@ -34,6 +34,7 @@
 #include <unistd.h>
 
 #include "cJSON.h"
+#include "command_inbox_merge.h"
 #include "esp_app_desc.h"
 #include "esp_crt_bundle.h"
 #include "esp_event.h"
@@ -132,6 +133,7 @@
 #define ADD_COMMAND_INBOX_PATH "/storage/add_commands.jsonl"
 #define ADD_COMMAND_INBOX_TMP_PATH "/storage/add_commands.tmp"
 #define ADD_COMMAND_INBOX_BACKUP_PATH "/storage/add_commands.bak"
+#define ADD_COMMAND_INBOX_MERGE_PATH "/storage/add_commands.mrg"
 #define ADD_COMMAND_INBOX_MAX_BYTES (64U * 1024U)
 #define ADD_COMMAND_LINE_BYTES 12288
 #define ADD_IDENTITY_CATALOG_PATH "/storage/add_identities.enc"
@@ -5633,86 +5635,66 @@ void add_connector_storage_ready(void)
  * inbox with NUL, or found a torn last line. Either makes every later lookup
  * "unavailable" (a line that does not decrypt) and every append fail, so the
  * inbox is rebuilt from the complete lines that decrypt to a command, taken
- * from the active file, its backup and its stage, each command_id once. The
- * transaction is first set idle and the backup and stage removed, so
- * ft_replace starts from a state ft_recover accepts; the merged lines then go
- * to the stage and ft_replace installs them. A reset at any point leaves the
- * repair's flag set and the merge runs again from what remains. */
-#define ADD_INBOX_ID_BYTES 96U
+ * from the active file, its backup, its stage and a merge file an interrupted
+ * merge left, each command_id once (command_inbox_merge.c: every line is on
+ * flash in the merge file before the backup or the stage goes). A reset at
+ * any point leaves the repair's flag set, or the merge file, and the merge
+ * runs again from what remains. */
+static bool inbox_command_id(void *context, const char *line, char *id, size_t id_bytes)
+{
+    (void)context;
+    char *plain = decrypt_storage_line(line);
+    cJSON *root = plain ? cJSON_Parse(plain) : NULL;
+    cJSON *value = root ? cJSON_GetObjectItemCaseSensitive(root, "command_id") : NULL;
+    bool valid = cJSON_IsString(value) && value->valuestring[0] && strlen(value->valuestring) + 1 < id_bytes;
+    if (valid) strlcpy(id, value->valuestring, id_bytes);
+    cJSON_Delete(root);
+    free(plain);
+    return valid;
+}
+
 bool add_connector_repair_command_inbox(void)
 {
 #if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
     if (catalog_owner_required()) return true;
 #endif
     if (!s_command_lock || xSemaphoreTake(s_command_lock, pdMS_TO_TICKS(5000)) != pdTRUE) return false;
-    static const char *const sources[] = {ADD_COMMAND_INBOX_PATH, ADD_COMMAND_INBOX_BACKUP_PATH,
-                                          ADD_COMMAND_INBOX_TMP_PATH};
-    const size_t capacity = ADD_COMMAND_INBOX_MAX_BYTES, max_ids = 512;
-    char *merged = heap_caps_malloc(capacity, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    char (*ids)[ADD_INBOX_ID_BYTES] = heap_caps_calloc(max_ids, ADD_INBOX_ID_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    char *line = heap_caps_malloc(ADD_COMMAND_LINE_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    size_t used = 0, count = 0;
-    unsigned kept = 0, dropped = 0;
-    bool ok = merged && ids && line;
-    for (size_t source = 0; ok && source < sizeof(sources) / sizeof(sources[0]); ++source) {
-        FILE *file = fopen(sources[source], "r");
-        if (!file) continue;
-        for (;;) {
-            /* By byte: a NUL-filled span must not hide where a line ends. */
-            size_t length = 0;
-            bool overflow = false, newline = false;
-            int ch;
-            while ((ch = fgetc(file)) != EOF) {
-                if (length + 1 < ADD_COMMAND_LINE_BYTES) line[length++] = (char)ch;
-                else overflow = true;
-                if (ch == '\n') {
-                    newline = true;
-                    break;
-                }
-            }
-            if (!length && ch == EOF) break;
-            line[length] = '\0';
-            if (overflow || !newline || memchr(line, 0, length)) {
-                dropped++;
-                continue;
-            }
-            char *plain = decrypt_storage_line(line);
-            cJSON *root = plain ? cJSON_Parse(plain) : NULL;
-            cJSON *id = root ? cJSON_GetObjectItemCaseSensitive(root, "command_id") : NULL;
-            bool valid = cJSON_IsString(id) && id->valuestring[0] && strlen(id->valuestring) < ADD_INBOX_ID_BYTES;
-            bool seen = false;
-            for (size_t i = 0; valid && i < count && !seen; ++i) seen = !strcmp(ids[i], id->valuestring);
-            if (!valid) dropped++;
-            else if (!seen && count < max_ids && used + length <= capacity) {
-                strlcpy(ids[count++], id->valuestring, ADD_INBOX_ID_BYTES);
-                memcpy(merged + used, line, length);
-                used += length;
-                kept++;
-            } else if (!seen) dropped++;
-            cJSON_Delete(root);
-            free(plain);
-        }
-        fclose(file);
-    }
-    if (ok) ok = ft_checkpoint_idle(command_transaction_port);
-    if (ok && remove(ADD_COMMAND_INBOX_TMP_PATH) != 0 && errno != ENOENT) ok = false;
-    if (ok && remove(ADD_COMMAND_INBOX_BACKUP_PATH) != 0 && errno != ENOENT) ok = false;
-    FILE *stage = ok ? fopen(ADD_COMMAND_INBOX_TMP_PATH, "w") : NULL;
-    if (ok) ok = stage && (!used || fwrite(merged, 1, used, stage) == used) && fflush(stage) == 0 &&
-        fsync(fileno(stage)) == 0;
-    if (stage && fclose(stage) != 0) ok = false;
-    if (ok) ok = ft_replace(ADD_COMMAND_INBOX_PATH, ADD_COMMAND_INBOX_TMP_PATH, ADD_COMMAND_INBOX_BACKUP_PATH,
-                            ADD_COMMAND_INBOX_MAX_BYTES, command_transaction_port);
+    const size_t max_ids = 512;
+    cim_config_t config = {
+        .active = ADD_COMMAND_INBOX_PATH,
+        .backup = ADD_COMMAND_INBOX_BACKUP_PATH,
+        .stage = ADD_COMMAND_INBOX_TMP_PATH,
+        .merge = ADD_COMMAND_INBOX_MERGE_PATH,
+        .merged = heap_caps_malloc(ADD_COMMAND_INBOX_MAX_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT),
+        .capacity = ADD_COMMAND_INBOX_MAX_BYTES,
+        .ids = heap_caps_calloc(max_ids, CIM_ID_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT),
+        .max_ids = max_ids,
+        .line = heap_caps_malloc(ADD_COMMAND_LINE_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT),
+        .line_bytes = ADD_COMMAND_LINE_BYTES,
+        .command_id = inbox_command_id,
+        .port = command_transaction_port,
+        .limit = ADD_COMMAND_INBOX_MAX_BYTES,
+    };
+    cim_result_t result = {0};
+    bool ok = config.merged && config.ids && config.line && cim_merge(&config, &result);
     if (ok) s_command_inbox_restored = false;
     xSemaphoreGive(s_command_lock);
-    heap_caps_free(merged);
-    heap_caps_free(ids);
-    heap_caps_free(line);
+    heap_caps_free(config.merged);
+    heap_caps_free(config.ids);
+    heap_caps_free(config.line);
     char message[160];
-    snprintf(message, sizeof(message), "command inbox merged: %u command(s) kept, %u line(s) dropped%s", kept,
-             dropped, ok ? "" : "; merge failed");
+    snprintf(message, sizeof(message), "command inbox merged: %u command(s) kept, %u line(s) dropped%s", result.kept,
+             result.dropped, ok ? "" : "; merge failed");
     ESP_LOGW(TAG, "%s", message);
     return ok;
+}
+
+/* A merge file an interrupted merge left: the merge runs again even if the
+ * repair's flag is gone. */
+bool add_connector_command_inbox_merge_pending(void)
+{
+    struct stat st;
+    return stat(ADD_COMMAND_INBOX_MERGE_PATH, &st) == 0;
 }
 
 bool add_connector_log(

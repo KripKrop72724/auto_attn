@@ -45,6 +45,7 @@
 #include "spiffs.h"
 #include "spiffs_nucleus.h"
 
+#include "command_inbox_merge.h"
 #include "file_transaction.h"
 #include "legacy_queue.h"
 #include "reliability.h"
@@ -3065,6 +3066,191 @@ static void run_rebuild_cuts(uint32_t kib, uint32_t stride)
     printf("partial rebuild: %u cuts after the check passed\n", runs);
 }
 
+/* ---- the command inbox merge (command_inbox_merge.c on the shim) ------ */
+/* A line "decrypts" here when it is all hex; its command_id is its first 16
+ * characters. */
+static bool hex_command_id(void *context, const char *line, char *id, size_t id_bytes)
+{
+    (void)context;
+    size_t length = strlen(line);
+    if (length < 17) return false;
+    for (size_t k = 0; k < length; ++k)
+        if (!strchr("0123456789abcdef", line[k])) return false;
+    snprintf(id, id_bytes, "%.16s", line);
+    return true;
+}
+static int inbox_tx_load(void *context, ft_checkpoint_t *cp)
+{
+    (void)context;
+    return port_nvs_load(NULL, "file_tx", "commands", cp, sizeof(*cp));
+}
+static bool inbox_tx_commit(void *context, const ft_checkpoint_t *cp)
+{
+    (void)context;
+    return port_nvs_store(NULL, "file_tx", "commands", cp, sizeof(*cp));
+}
+#define INBOX "/add_commands.jsonl"
+#define INBOX_BAK "/add_commands.bak"
+static bool inbox_merge(cim_result_t *result)
+{
+    static char merged[64 * 1024], ids[512][CIM_ID_BYTES], line[12288];
+    memset(ids, 0, sizeof(ids));
+    cim_config_t config = {
+        .active = INBOX, .backup = INBOX_BAK, .stage = "/add_commands.tmp", .merge = "/add_commands.mrg",
+        .merged = merged, .capacity = sizeof(merged), .ids = ids, .max_ids = 512, .line = line,
+        .line_bytes = sizeof(line), .command_id = hex_command_id,
+        .port = {inbox_tx_load, inbox_tx_commit, NULL}, .limit = sizeof(merged),
+    };
+    return cim_merge(&config, result);
+}
+static bool holds(const uint8_t *buffer, size_t size, const uint8_t *needle, size_t length)
+{
+    for (size_t i = 0; i + length <= size; ++i)
+        if (!memcmp(buffer + i, needle, length)) return true;
+    return false;
+}
+static void hex_line(char *out, uint32_t length)
+{
+    for (uint32_t k = 0; k + 1 < length; ++k) out[k] = "0123456789abcdef"[rnd() % 16];
+    out[length - 1] = '\n';
+}
+
+/* Review 3, finding 5: an unreadable span of the inbox ending exactly where a
+ * line starts is filled with NUL, newline included; the merge's splitter read
+ * the damaged line and the intact one after it as one line and dropped both.
+ * A NUL now ends a line. Every line with no unreadable byte is kept. */
+static void run_inbox_boundary(uint32_t kib)
+{
+    for (uint32_t trial = 0; trial < 4; ++trial) {
+        seed(31501 + trial);
+        nvs_clear();
+        format_flash(kib);
+        build_store(60000);
+        model_file_t *m = model_of(INBOX);
+        /* The fifth line starts where span 2 starts; span 1 is erased. */
+        static const uint32_t lengths[] = {125, 125, 125, 127, 160, 140, 150, 130};
+        uint32_t shift = trial % 2 ? 1 : 0; /* and once a byte later: the next line is cut */
+        char data[2000];
+        uint32_t size = 0, starts[8];
+        for (unsigned i = 0; i < 8; ++i) {
+            starts[i] = size;
+            uint32_t length = lengths[i] + (i == 3 ? shift : 0);
+            hex_line(data + size, length);
+            size += length;
+        }
+        free(m->data);
+        free(m->unreadable);
+        m->data = malloc(size + 1);
+        memcpy(m->data, data, size);
+        m->size = size;
+        m->unreadable = calloc(size + 1, 1);
+        write_file(m->name, m->data, m->size);
+        uint32_t span = 1 + trial / 2;
+        erase_page(rd16(entry_address(m->name, span)));
+        mark_unreadable(m, span);
+        SPIFFS_unmount(&fs);
+        srr_report_t report;
+        srr_config_t config = repair_config();
+        repair_boot(&report, &config);
+        CHECK(report.commands_damaged, "inbox boundary: the merge was not flagged");
+        mount_plain();
+        cim_result_t result;
+        CHECK(inbox_merge(&result), "inbox boundary: merge failed");
+        static uint8_t buffer[8192];
+        int64_t got = read_file(INBOX, buffer, sizeof(buffer));
+        SPIFFS_unmount(&fs);
+        for (unsigned i = 0; i < 8; ++i) {
+            uint32_t length = lengths[i] + (i == 3 ? shift : 0);
+            bool damaged = false;
+            for (uint32_t k = starts[i]; k < starts[i] + length; ++k) damaged |= m->unreadable[k] != 0;
+            if (damaged) continue;
+            CHECK(got > 0 && holds(buffer, (size_t)got, m->data + starts[i], length),
+                  "inbox boundary (trial %u): intact line %u at %u (%u bytes) dropped by the merge", trial, i,
+                  starts[i], length);
+        }
+    }
+    printf("command inbox: every intact line kept across a filled span\n");
+}
+
+/* Review 3, finding 4: the merge removed the backup and the stage before the
+ * merged lines were on flash; a cut there lost every line only the backup
+ * held. A cut at every write of the merge, torn both ways, then the next
+ * boot's repair and merge: all eight commands are in the inbox. */
+static bool inbox_merge_cut(uint64_t k)
+{
+    cut_at = flash_ops + k;
+    if (setjmp(cut_point)) {
+        /* The reset closes every file. */
+        cut_at = 0;
+        memset(shim_files, 0, sizeof(shim_files));
+        return true;
+    }
+    cim_result_t result;
+    (void)inbox_merge(&result);
+    cut_at = 0;
+    return false;
+}
+
+static void run_inbox_window(uint32_t kib)
+{
+    seed(31601);
+    nvs_clear();
+    format_flash(kib);
+    build_store(60000);
+    char lines[8][200];
+    for (unsigned i = 0; i < 8; ++i) hex_line(lines[i], 120 + i * 7);
+    char active[2000] = "", backup[2000] = "";
+    for (unsigned i = 0; i < 6; ++i) strncat(active, lines[i], 120 + i * 7);
+    for (unsigned i = 0; i < 8; ++i) strncat(backup, lines[i], 120 + i * 7);
+    write_file(INBOX, (const uint8_t *)active, (uint32_t)strlen(active));
+    write_file(INBOX_BAK, (const uint8_t *)backup, (uint32_t)strlen(backup));
+    SPIFFS_unmount(&fs);
+    uint8_t *image = malloc(flash_size);
+    memcpy(image, flash, flash_size);
+    __typeof__(nvs) *saved = malloc(sizeof(nvs));
+    memcpy(saved, nvs, sizeof(nvs));
+    mount_plain();
+    uint64_t start = flash_ops;
+    cim_result_t result;
+    CHECK(inbox_merge(&result), "inbox window: uncut merge");
+    uint64_t writes = flash_ops - start;
+    SPIFFS_unmount(&fs);
+    uint32_t runs = 0;
+    for (uint64_t k = 1; k <= writes; ++k) {
+        for (int tear = 0; tear < 2; ++tear) {
+            memcpy(flash, image, flash_size);
+            memcpy(nvs, saved, sizeof(nvs));
+            seed(31600 + k * 2 + (uint64_t)tear);
+            mount_plain();
+            bool cut = inbox_merge_cut(k);
+            if (!cut) {
+                SPIFFS_unmount(&fs);
+                continue;
+            }
+            drop_all_memory();
+            runs++;
+            /* The next boot: the repair (a torn page is its business), then
+             * the merge again (its flag or its merge file is still there). */
+            srr_report_t report;
+            srr_config_t config = repair_config();
+            repair_boot(&report, &config);
+            mount_plain();
+            CHECK(inbox_merge(&result), "inbox window: merge after a cut at write %" PRIu64 " failed", k);
+            static uint8_t buffer[65536];
+            int64_t got = read_file(INBOX, buffer, sizeof(buffer));
+            CHECK(!exists("/add_commands.mrg"), "inbox window: merge file left");
+            SPIFFS_unmount(&fs);
+            for (unsigned i = 0; i < 8; ++i)
+                CHECK(got > 0 && holds(buffer, (size_t)got, (const uint8_t *)lines[i], 120 + i * 7),
+                      "inbox window: a cut at merge write %" PRIu64 " of %" PRIu64 " (tear %d) lost command %u", k,
+                      writes, tear, i);
+        }
+    }
+    free(image);
+    free(saved);
+    printf("command inbox: %u cuts in the merge lost no command\n", runs);
+}
+
 /* "review" runs them all; "review-<part>" one of them. */
 static void run_review_custody(uint32_t kib, const char *only)
 {
@@ -3079,6 +3265,8 @@ static void run_review_custody(uint32_t kib, const char *only)
     if (REVIEW_PART("restore")) run_crammed_restore(kib, 85, kib > 1024 ? 211 : 5);
     if (REVIEW_PART("hidden")) run_hidden_large(kib);
     if (REVIEW_PART("rebuild")) run_rebuild_cuts(kib, kib > 1024 ? 211 : 4);
+    if (REVIEW_PART("inbox") || REVIEW_PART("boundary")) run_inbox_boundary(kib);
+    if (REVIEW_PART("inbox") || REVIEW_PART("window")) run_inbox_window(kib);
 #undef REVIEW_PART
 }
 

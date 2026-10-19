@@ -152,6 +152,7 @@ void add_connector_storage_ready(void);
 /* ZKT 2.7.5: rebuild the command inbox from its readable command lines after
  * the boot storage repair found a damaged or torn one. */
 bool add_connector_repair_command_inbox(void);
+bool add_connector_command_inbox_merge_pending(void);
 bool add_connector_boot_health_ready(void);
 /* Exact ZKT bridge/writer local proof; never Oracle or remote HIL acceptance. */
 bool add_connector_local_boot_health_ready(void);

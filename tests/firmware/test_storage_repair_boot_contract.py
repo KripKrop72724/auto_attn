@@ -75,9 +75,23 @@ def test_command_inbox_waits_for_storage_and_reports_go_through_the_outbox_task(
     contains = _body(connector, "static int command_journal_contains_locked(const char *command_id)")
     assert "if (!atomic_load(&s_storage_ready)) return -1;" in contains
     merge = _body(connector, "bool add_connector_repair_command_inbox(void)")
-    assert merge.index("xSemaphoreTake(s_command_lock") < merge.index("ft_checkpoint_idle(command_transaction_port)")
-    assert merge.index("ft_checkpoint_idle(") < merge.index("remove(ADD_COMMAND_INBOX_BACKUP_PATH)") \
-        < merge.index("ft_replace(")
+    assert merge.index("xSemaphoreTake(s_command_lock") < merge.index("cim_merge(&config, &result)") \
+        < merge.index("xSemaphoreGive(s_command_lock)")
+    assert ".merge = ADD_COMMAND_INBOX_MERGE_PATH," in merge
+    # Every kept line is on flash in the merge file (only ever appended to)
+    # before the backup or the stage goes; the merge file goes last.
+    module = (MAIN / "command_inbox_merge.c").read_text()
+    body = _body(module, "bool cim_merge(const cim_config_t *c, cim_result_t *result)")
+    order = ["extend_merge_file(c, used, count)", "ft_checkpoint_idle(c->port)", "remove(c->stage)",
+             "remove(c->backup)", "ft_replace(", "remove(c->merge)"]
+    positions = [body.index(marker) for marker in order]
+    assert positions == sorted(positions)
+    assert 'fopen(c->merge, "a")' in module and 'fopen(c->merge, "w")' not in module
+    # A NUL ends a line, as '\n' does.
+    assert "if (ch == '\\n' || ch == 0) {" in module
+    # A merge an earlier boot left unfinished runs again even unflagged.
+    after = _body((MAIN / "storage_repair.c").read_text(), "void storage_repair_after_mount(void)")
+    assert "add_connector_command_inbox_merge_pending()" in after
     outbox = _body(connector, "static void outbox_task(void *arg)\n{")
     assert outbox.index("if (!add_connector_is_connected()) {") < outbox.index("storage_repair_report_step();")
     # Evidence sends make direct priority senders wait: never inside a hold.
