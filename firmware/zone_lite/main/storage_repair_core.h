@@ -145,6 +145,7 @@ typedef struct {
     int32_t check_last_error;
     uint32_t total_bytes, used_before, used_after;
     uint32_t duration_ms, check_ms;
+    uint32_t cpu_steps;            /* the engine's patch lookups and mask scans (host bound; not reported) */
     char error_stage[24];
     int32_t error_code;
     uint32_t file_count;

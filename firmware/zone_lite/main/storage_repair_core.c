@@ -493,19 +493,44 @@ static bool push_drop(run_t *r, obj_t *o, uint16_t pix)
     return true;
 }
 
-static patch_t *push_patch(run_t *r, obj_t *o)
+/* Steps of the patch lookups and mask scans, for the harness's bound on the
+ * engine's CPU work (a file with thousands of damaged spans once took
+ * billions of linear-search steps). */
+static uint32_t s_cpu_steps;
+static void cpu_step(uint32_t n) { s_cpu_steps = UINT32_MAX - s_cpu_steps < n ? UINT32_MAX : s_cpu_steps + n; }
+
+/* Patches stay sorted by span, one per span: every caller adds spans in
+ * increasing order, and an out-of-order one is inserted in its place. */
+static patch_t *push_patch(run_t *r, obj_t *o, uint32_t span)
 {
     if (!grow(r, (void **)&o->patch, &o->patch_cap, o->patches, sizeof(patch_t), 4)) return NULL;
-    patch_t *p = &o->patch[o->patches++];
+    uint32_t at = o->patches;
+    while (at && o->patch[at - 1].span > span) --at;
+    if (at < o->patches) memmove(&o->patch[at + 1], &o->patch[at], (o->patches - at) * sizeof(patch_t));
+    o->patches++;
+    patch_t *p = &o->patch[at];
     memset(p, 0, sizeof(*p));
+    p->span = span;
     return p;
+}
+
+/* The first patch at or after `span` (o->patches when none). */
+static uint32_t patch_at_or_after(const obj_t *o, uint32_t span)
+{
+    uint32_t low = 0, high = o->patches;
+    while (low < high) {
+        uint32_t mid = low + (high - low) / 2;
+        cpu_step(1);
+        if (o->patch[mid].span < span) low = mid + 1;
+        else high = mid;
+    }
+    return low;
 }
 
 static patch_t *find_patch(obj_t *o, uint32_t span)
 {
-    for (uint32_t i = 0; i < o->patches; ++i)
-        if (o->patch[i].span == span) return &o->patch[i];
-    return NULL;
+    uint32_t i = patch_at_or_after(o, span);
+    return i < o->patches && o->patch[i].span == span ? &o->patch[i] : NULL;
 }
 
 static bool read_payload(run_t *r, uint16_t pix, uint8_t *out, uint32_t length)
@@ -702,7 +727,7 @@ static bool map_object(run_t *r, obj_t *o)
             if (!build_candidates(r, o)) return fail(r, "map_memory", SPIFFS_ERR_INTERNAL);
             candidates = true;
         }
-        patch_t *p = push_patch(r, o);
+        patch_t *p = push_patch(r, o, k);
         if (!p) return fail(r, "map_memory", SPIFFS_ERR_INTERNAL);
         if (!resolve_span(r, o, k, ref, code, p)) return fail(r, "map_read", SPIFFS_ERR_INTERNAL);
         o->ix_rewrite[SPIFFS_OBJ_IX_ENTRY_SPAN_IX(r->fs, k)] = 1;
@@ -725,9 +750,8 @@ static bool map_object(run_t *r, obj_t *o)
         if (!read_payload(r, o->ref[k], data, SRP_SPAN_BYTES)) return fail(r, "map_read", SPIFFS_ERR_INTERNAL);
         memset(erased, 0xFF, sizeof(erased));
         if (memcmp(data + used, erased, SRP_SPAN_BYTES - used)) {
-            patch_t *p = push_patch(r, o);
+            patch_t *p = push_patch(r, o, k);
             if (!p) return fail(r, "map_memory", SPIFFS_ERR_INTERNAL);
-            p->span = k;
             p->length = (uint16_t)used;
             p->kind = PATCH_COPY;
             p->source = SOURCE_TAIL;
@@ -1129,33 +1153,37 @@ static void held_write(obj_t *o, uint32_t offset, const uint8_t *in, uint32_t le
     }
 }
 
-static bool masked(obj_t *o, uint32_t offset)
-{
-    uint32_t span = offset / SRP_SPAN_BYTES;
-    if (span >= o->spans || o->perfect[span]) return false;
-    patch_t *p = find_patch(o, span);
-    return p && bit(p->mask, offset % SRP_SPAN_BYTES);
-}
-
-/* The next unreadable byte at or after offset, or o->size. */
+/* The next unreadable byte at or after offset, or o->size: patch by patch
+ * (only an imperfect span has one), each one's mask scanned once. */
 static uint32_t next_masked(obj_t *o, uint32_t offset)
 {
-    while (offset < o->size) {
-        uint32_t span = offset / SRP_SPAN_BYTES;
-        if (o->perfect[span]) {
-            offset = (span + 1) * SRP_SPAN_BYTES;
-            continue;
+    for (uint32_t i = patch_at_or_after(o, offset / SRP_SPAN_BYTES); i < o->patches && offset < o->size; ++i) {
+        const patch_t *p = &o->patch[i];
+        if (p->span >= o->spans) break;
+        uint32_t start = p->span * SRP_SPAN_BYTES, end = start + span_length(o, p->span);
+        if (o->perfect[p->span]) continue;
+        for (uint32_t at = offset > start ? offset : start; at < end; ++at) {
+            cpu_step(1);
+            if (bit(p->mask, at - start)) return at;
         }
-        if (masked(o, offset)) return offset;
-        ++offset;
     }
     return o->size;
 }
 
+/* The end of the unreadable run starting at start. */
 static uint32_t masked_end(obj_t *o, uint32_t start)
 {
     uint32_t end = start;
-    while (end < o->size && masked(o, end)) ++end;
+    for (uint32_t i = patch_at_or_after(o, start / SRP_SPAN_BYTES); i < o->patches && end < o->size; ++i) {
+        const patch_t *p = &o->patch[i];
+        uint32_t first = p->span * SRP_SPAN_BYTES, last = first + span_length(o, p->span);
+        if (p->span >= o->spans || first > end || o->perfect[p->span]) break;
+        while (end < last && bit(p->mask, end - first)) {
+            cpu_step(1);
+            ++end;
+        }
+        if (end < last) break;
+    }
     return end;
 }
 
@@ -1199,8 +1227,9 @@ static bool fill_gaps(run_t *r, obj_t *o)
             return false;
         }
         srp_fill(o->kind.fill, prefix_bytes, prefix, suffix_bytes, suffix, suffix_complete, fill, length);
+        patch_t *q = NULL;
         for (uint32_t at = start; at < end; ++at) {
-            patch_t *q = find_patch(o, at / SRP_SPAN_BYTES);
+            if (!q || q->span != at / SRP_SPAN_BYTES) q = find_patch(o, at / SRP_SPAN_BYTES);
             q->data[at % SRP_SPAN_BYTES] = fill[at - start];
         }
         release(r, fill);
@@ -1312,6 +1341,7 @@ static bool record_salvage_gaps(run_t *r, obj_t *o)
             return false;
         }
         start = next_masked(o, end);
+        pace(r);
     }
     return true;
 }
@@ -1339,9 +1369,11 @@ static void unmask_from_hold(obj_t *o)
     if (!o->hold || o->hold_size != o->size) return;
     for (uint32_t start = next_masked(o, 0); start < o->size;) {
         uint32_t end = masked_end(o, start);
+        patch_t *p = NULL;
         for (uint32_t at = start; at < end; ++at) {
+            cpu_step(1);
             if (held_gap(o, at)) continue;
-            patch_t *p = find_patch(o, at / SRP_SPAN_BYTES);
+            if (!p || p->span != at / SRP_SPAN_BYTES) p = find_patch(o, at / SRP_SPAN_BYTES);
             uint8_t byte;
             if (!p || !held_read(o, at, &byte, 1)) continue;
             p->data[at % SRP_SPAN_BYTES] = byte;
@@ -2284,9 +2316,8 @@ static bool restore_in_place(run_t *r, obj_t *o, bool *changed)
         bool readable = o->perfect[k] && object_read(r, o, start, now_bytes, length);
         if (readable && held_read(o, start, held_bytes, held_length) && !memcmp(now_bytes, held_bytes, held_length))
             continue;
-        patch_t *p = push_patch(r, o);
+        patch_t *p = push_patch(r, o, k);
         if (!p || !held_read(o, start, held_bytes, held_length)) return fail(r, "restore", SPIFFS_ERR_INTERNAL);
-        p->span = k;
         p->length = (uint16_t)length;
         /* The file's own bytes past the hold are unreadable: the caller
          * reports the span. */
@@ -2944,9 +2975,7 @@ static bool byte_source(const run_t *r, const uint16_t *owner, const uint8_t *pi
     if (!bit(pinned, id)) return false;
     const obj_t *o = owner[id] ? &r->objs[owner[id] - 1] : NULL;
     if (!o || !live(o) || !o->mapped) return true;
-    for (uint32_t i = 0; i < o->patches; ++i)
-        if (o->patch[i].span == pg->span) return true;
-    return false;
+    return find_patch((obj_t *)o, pg->span) != NULL;
 }
 
 /* A store that has run a while keeps its deleted pages until a write needs
@@ -3472,6 +3501,7 @@ void srr_run(spiffs *fs, const srr_config_t *config, const srr_ports_t *ports, s
     run_t run;
     memset(&run, 0, sizeof(run));
     run_t *r = &run;
+    s_cpu_steps = 0;
     r->fs = fs;
     r->cfg = config;
     r->ports = ports;
@@ -3708,6 +3738,7 @@ void srr_run(spiffs *fs, const srr_config_t *config, const srr_ports_t *ports, s
         (void)save_state(r);
     }
     report->phase = (srp_phase_t)r->state.phase;
+    report->cpu_steps = s_cpu_steps;
     if (ports->now_ms) report->duration_ms = (uint32_t)(ports->now_ms(ports->context) - started);
     snprintf(message, sizeof(message),
              "run %lu %s: %lu files, %lu gaps (%lu bytes), %lu spans rewritten, %lu check passes, %lu cursors reset",

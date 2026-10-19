@@ -34,6 +34,7 @@
 #include <errno.h>
 #include <inttypes.h>
 #include <setjmp.h>
+#include <time.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -372,11 +373,27 @@ static srr_config_t repair_config(void)
 /* One boot: mount privately, repair, unmount. HAL operations are capped:
  * the firmware's deadline must never be the thing that ends a repair. */
 static uint64_t hal_cap, hal_max;
+/* The engine's CPU work: its patch lookups and mask scans (cpu_steps), capped
+ * like the flash operations, and its CPU time (review run `cpu`). */
+static uint64_t cpu_cap, cpu_max;
+static double cpu_ms_max;
+static double cpu_ms(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &t);
+    return t.tv_sec * 1000.0 + t.tv_nsec / 1e6;
+}
 static void repair_boot(srr_report_t *report, const srr_config_t *config)
 {
     uint64_t start_ops = flash_ops, start_reads = flash_reads;
     CHECK(mount_with(srr_check_callback) == SPIFFS_OK, "repair mount %d", SPIFFS_errno(&fs));
+    double started = cpu_ms();
     srr_run(&fs, config, &ports, report);
+    double spent = cpu_ms() - started;
+    if (spent > cpu_ms_max) cpu_ms_max = spent;
+    if (report->cpu_steps > cpu_max) cpu_max = report->cpu_steps;
+    if (cpu_cap) CHECK(report->cpu_steps <= cpu_cap, "repair took %u CPU steps (cap %" PRIu64 ")", report->cpu_steps,
+                       cpu_cap);
     SPIFFS_unmount(&fs);
     CHECK(memory_in_use == 0, "repair leaked %" PRIu64 " bytes", memory_in_use);
     uint64_t used = (flash_ops - start_ops) + (flash_reads - start_reads);
@@ -2635,6 +2652,29 @@ static void run_full_flag(uint32_t kib)
            repaired, boots);
 }
 
+/* Review 4 (boot), finding 3: the retired-file store damages thousands of
+ * spans of one file (about 2,100 at 8 MiB), and the engine's patch lookups
+ * were linear, called per byte: billions of steps, seconds of host CPU (and
+ * minutes on the device, outside every pacing and deadline check). Its CPU
+ * steps are capped in every run; at 8 MiB and more (run by hand: `review-cpu
+ * --kib=8192`) its CPU time is bounded too. */
+static void run_cpu_bound(uint32_t kib)
+{
+    double before = cpu_ms_max;
+    cpu_ms_max = 0;
+    uint32_t steps = 0;
+    for (uint32_t trial = 0; trial < 2; ++trial) {
+        model_file_t *pending = NULL, *blocked = NULL;
+        srr_report_t report = retired_store(kib, trial, false, true, &pending, &blocked);
+        CHECK(report.result != SRR_RESULT_FAILED, "cpu: %s", srr_result_name(report.result));
+        if (report.cpu_steps > steps) steps = report.cpu_steps;
+    }
+    double limit = 250.0 * kib / 1024;
+    if (kib >= 4096) CHECK(cpu_ms_max < limit, "cpu: a repair took %.0f ms of CPU (limit %.0f)", cpu_ms_max, limit);
+    printf("cpu: the most damaged spans of one file: %u CPU steps, %.0f ms of CPU per repair\n", steps, cpu_ms_max);
+    if (before > cpu_ms_max) cpu_ms_max = before;
+}
+
 static srr_report_t retired_store(uint32_t kib, uint32_t trial, bool stale_full, bool settled,
                                   model_file_t **pending_out, model_file_t **blocked_out)
 {
@@ -3569,6 +3609,7 @@ static void run_review_custody(uint32_t kib, const char *only)
     if (REVIEW_PART("rebuild")) run_rebuild_cuts(kib, kib > 1024 ? 211 : 4);
     if (REVIEW_PART("healthy")) run_healthy_compaction(kib);
     if (REVIEW_PART("full-flag")) run_full_flag(kib);
+    if (REVIEW_PART("cpu")) run_cpu_bound(kib);
     if (REVIEW_PART("merged")) run_merged_from_hold(kib);
     if (REVIEW_PART("inbox") || REVIEW_PART("boundary")) run_inbox_boundary(kib);
     if (REVIEW_PART("inbox") || REVIEW_PART("window")) run_inbox_window(kib);
@@ -4179,6 +4220,10 @@ int main(int argc, char **argv)
      * (every block, then each file's index pages and text spans). */
     uint64_t pages = (uint64_t)kib * 1024U / PAGE;
     hal_cap = 4U * (pages * (pages / 512U + 1U) + 4U * pages) + 10U * (pages / 16U + 4U * pages);
+    /* Linear in the store: a few scans of every damaged span's bytes and a
+     * logarithmic lookup per span (3.7 M steps for the retired-file store's
+     * 2,100 damaged spans at 8 MiB; the linear lookups took 3.9 billion). */
+    cpu_cap = 512U * pages;
     size_t count = sizeof(scenarios) / sizeof(scenarios[0]);
     for (size_t i = 0; i < count; ++i) {
         if (only && strcmp(only, scenarios[i].name) && strcmp(only, "scenarios")) continue;
@@ -4214,7 +4259,9 @@ int main(int argc, char **argv)
     if (!only || !strcmp(only, "organic")) {
         for (uint32_t s = 0; s < organic_seeds; ++s) run_organic(11 + first_seed + s, kib, organic_ticks_max, mean_gap);
     }
-    printf("largest repair: %" PRIu64 " HAL operations (cap %" PRIu64 ")\n", hal_max, hal_cap);
+    printf("largest repair: %" PRIu64 " HAL operations (cap %" PRIu64 "), %" PRIu64 " CPU steps (cap %" PRIu64
+           "), %.0f ms of CPU\n",
+           hal_max, hal_cap, cpu_max, cpu_cap, cpu_ms_max);
     puts("spiffs repair host tests passed");
     model_reset();
     free(flash);
