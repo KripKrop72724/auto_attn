@@ -104,7 +104,10 @@ def test_direct_predecessor_hashes_and_marker_agree_across_release_gates():
         assert (f"'{version}' = '{digest}'" in signing or f"$images['{version}'] = '{digest}'" in signing)
 
 
-@pytest.mark.parametrize("marker", [LIVE_FRAME_MARKER, DELIVERY_MARKER, LOCK_MARKER])
+# The firmware reports its compiled marker in every heartbeat; ADD keeps at
+# most 160 characters, and the 2.7 markers grow by one version per release.
+@pytest.mark.parametrize("marker", [LIVE_FRAME_MARKER, DELIVERY_MARKER, LOCK_MARKER, FLEET_MARKER,
+                                    PLATFORM_MARKER, TRACE_MARKER, INVENTORY_MARKER])
 def test_signed_patch_contract_fits_runtime_heartbeat_schema(marker):
     heartbeat = HeartbeatPayload.model_validate({
         "diagnostics": {"storage": {"upgrade_contract": marker}}

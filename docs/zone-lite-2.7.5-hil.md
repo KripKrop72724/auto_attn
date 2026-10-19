@@ -63,7 +63,9 @@ The repair never restarts the ESP itself. The LED shows `STORAGE_REPAIR`
 HIL run 38529352136) as well as 2.7.2 and 2.7.3 in its rollback slot, in the
 device guard and in ADD's storage contract. The compiled marker ends
 `,2.6.15,2.7.2,2.7.3,2.7.4`: 14 qualified predecessors. Peshawar 06 moves to
-2.7.5 in place.
+2.7.5 in place. The marker, which every heartbeat reports as
+`storage.upgrade_contract`, is now 142 characters of the 160 ADD accepts:
+three more 2.7 predecessors fit before that limit has to grow (ADD first).
 
 ## Boot cost
 

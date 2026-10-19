@@ -791,7 +791,9 @@ on its emulated SPIFFS.
 - **Contracts** (`test_storage_repair_boot_contract.py`): boot order, CMake
   scope, no format call, the check callback, deadline before mount, no new
   task, PSRAM-only holds, the storage-ready gate, the reporter outside a
-  priority hold and reading no NVS with nothing pending.
+  priority hold and reading no NVS with nothing pending, the rollback tag,
+  and no image that runs the repair taking `hil_reboot.py`'s controlled
+  reboot (section 12).
 
 ## 10. Rollback
 
