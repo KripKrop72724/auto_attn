@@ -113,14 +113,48 @@ rebuilt or re-signed; only the HIL marker changes.
 - **Fleet offer guard.** Only those two exact releases may queue this device.
   It counts as location BLD9, shared with the nationwide BLD9 01 and 02, and
   the two-slot, offline and scan limits still apply. Any other device outside
-  the 17 still waits with `NATIONWIDE_EXACT_TARGET_REQUIRED`. ADD offers bytes
-  only while the device is in `ZONE-BLD9-01`.
+  the 17 still waits with `NATIONWIDE_EXACT_TARGET_REQUIRED`.
+- **Zone pin.** The device is a 2.7.4 target only while it is registered in
+  `ZONE-BLD9-01`. Elsewhere a 2.7.4 preview excludes it
+  (`HIL_TARGET_ZONE_MISMATCH`), a download grant stops working, and signed
+  request clock leniency does not apply. The 2.4.12 bridge is pinned to the
+  zone as well. The 17 still follow their connector identity.
 
 An installation here is not HIL acceptance and does not count towards the 17.
 
 ### Operator steps
 
-1. Merge, and wait for `add-deploy` to finish green.
+**Slots.** Once ADD has offered bytes for either campaign (the deployment has
+left `PENDING`), the device holds location BLD9 and one of the two fleet
+upgrade slots until its deployment reaches `SUCCEEDED`, `FAILED` or
+`ROLLED_BACK`. Cancelling the campaign does not release them:
+
+- an `OFFERED` or `DOWNLOADING` deployment becomes `CANCELLED` but stays
+  reserved, because cancellation is not evidence that the ESP stopped; only a
+  later verified installation on this device settles it, and this device
+  cannot be offered again while its own reservation holds BLD9;
+- a `VERIFYING`, `READY_TO_BOOT`, `BOOTED_PENDING` or `RECONCILING`
+  deployment is not cancelled at all and stays reserved until the device
+  reports success, failure or rollback.
+
+A stuck or cancelled attempt therefore blocks nationwide BLD9 01 and 02 and
+one fleet slot. The 17 work the same way; this device is simply not one of
+them. So:
+
+- run this test when no BLD9 01 or 02 upgrade is planned, with the K50
+  online, powered and its terminal connected;
+- do not cancel a K50 campaign after its deployment leaves `PENDING`; let it
+  reach `SUCCEEDED`, `FAILED` or `ROLLED_BACK`. An unconfirmed 2.7.4 rolls
+  back by itself within the 4-hour cap, and ADD's heartbeat check that
+  records such a return looks only at active or paused campaigns;
+- cancelling while the deployment is still `PENDING` is safe: a deployment
+  that was never offered holds no reservation.
+
+1. Merge, and wait for `add-deploy` to finish green. Then open the K50 in
+   ADD: it should be online with its terminal connected, and the only
+   warning should be the known `DEVICE_MESSAGE_REJECTED` (`EVIDENCE_INVALID`).
+   Neither the 2.4.12 bridge nor 2.7.4 admission checks device health or
+   terminal model, for this device or the 17.
 2. **Bridge.** In ADD, start a campaign for `zone-lite-2.4.12` on zone
    `ZONE-BLD9-01`. The preview must show exactly one eligible device, the K50.
    Enter a reason, type `2.4.12` and your password.
@@ -142,6 +176,10 @@ An installation here is not HIL acceptance and does not count towards the 17.
      `.hil-scope-before-*.json`, and re-checks the deployed ADD and the
      unchanged manifest, signature and image. Approve `firmware-production`
      when asked.
+   - Both runs take the `add-production` lock that `add-deploy` uses. Run
+     them when no deployment is queued: a run still waiting for the lock is
+     cancelled when another run queues behind it in that group. Re-run it
+     afterwards; a run cancelled while waiting changed nothing.
    - Open ADD's firmware page: `zone-lite-2.7.4` should list 18 allowed
      targets.
 4. **2.7.4.** Start a campaign for `zone-lite-2.7.4` on `ZONE-BLD9-01`: one
@@ -157,7 +195,8 @@ An installation here is not HIL acceptance and does not count towards the 17.
   also rolls back. A failed 2.4.12 bridge returns to factory 2.5.2.
 - **ADD.** A `FAILED` or `ROLLED_BACK` deployment pauses its campaign; cancel
   it. Do not revoke 2.7.4: other HIL devices run it.
-- **Exposure.** Cancelling the campaign is enough to stop offers. To withdraw
+- **Exposure.** Cancelling the campaign stops new offers, but it does not
+  release a reservation the device already holds (see **Slots** above). To withdraw
   the exposure as well, restore the `.hil-scope-before-*.json` backup over
   `.hil-only.json` in the store's `2.7.4` directory and open the firmware page.
   Restore it before reverting this change: an ADD without it cannot parse the
