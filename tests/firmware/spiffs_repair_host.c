@@ -1606,6 +1606,86 @@ static void damage_torn_hidden_lookup(void)
     wr16(lookup_address(header), (uint16_t)(obj & 0x7FFF));
 }
 
+/* Review 3, finding 7: a recreated pending queue's first append tore its
+ * header size with only low bits left set, so the size stays inside the
+ * last data page. The bytes past the real end read erased; they were taken
+ * for a SALVAGE gap and a junk row. The size its bytes hold is recovered. */
+static void damage_torn_size_inside(void)
+{
+    build_store(60000);
+    model_file_t *m = model_of("/pending.jsonl");
+    set_cursor("legacy_queues", "ords_pending", 0, 0, 7);
+    CHECK(SPIFFS_remove(&fs, m->name) == SPIFFS_OK, "remove");
+    m->size = 0;
+    char row[600];
+    size_t n;
+    do n = json_row(row, sizeof(row));
+    while ((n % SPAN) > SPAN - 40 || (n % SPAN) < 8);
+    model_append(m, row, (uint32_t)n);
+    uint32_t header = header_of(m->name), size;
+    memcpy(&size, flash + header * PAGE + 8, 4);
+    static const uint32_t masks[] = {0x01, 0x02, 0x10, 0x40, 0x03};
+    uint32_t torn = size | (masks[rnd() % 5] & ~size);
+    if (torn == size || (torn + SPAN - 1) / SPAN != (size + SPAN - 1) / SPAN)
+        for (uint32_t b = 1; b < 256; b <<= 1)
+            if ((size | b) != size && ((size | b) + SPAN - 1) / SPAN == (size + SPAN - 1) / SPAN) {
+                torn = size | b;
+                break;
+            }
+    CHECK(torn != size && (torn + SPAN - 1) / SPAN == (size + SPAN - 1) / SPAN, "torn size leaves the span");
+    memcpy(flash + header * PAGE + 8, &torn, 4);
+    SPIFFS_unmount(&fs);
+}
+
+/* Review 3, finding 6: a queue segment (dq_append writes its next record at
+ * its end with "r+b") whose last page holds bytes past its end that an
+ * interrupted append programmed: the repair cleaned dirty tails only for
+ * append targets, so the next record was ANDed with them on flash. */
+static void damage_segment_dirty_tail(void)
+{
+    build_store(60000);
+    model_file_t *m = model_of("/qo0000002a.q");
+    m->size = 2800;
+    write_file(m->name, m->data, m->size);
+    uint32_t spans = (m->size + SPAN - 1) / SPAN, used = m->size % SPAN;
+    uint32_t pix = rd16(entry_address(m->name, spans - 1));
+    for (uint32_t i = 0; i < 24; ++i) flash[pix * PAGE + 5 + used + i] &= (uint8_t)(0x30 + i);
+    SPIFFS_unmount(&fs);
+}
+
+/* A10 (review 3): no live file's last page holds a programmed byte past its
+ * end; SPIFFS's next append (any file: SPIFFS appends in place) would AND
+ * its bytes with it. */
+static void check_clean_tails(const char *scenario)
+{
+    uint32_t pages = flash_size / PAGE;
+    for (uint32_t pix = 0; pix < pages; ++pix) {
+        uint32_t a = pix * PAGE;
+        if (pix % 16 == 0 || !(rd16(a) & 0x8000) || rd16(a) == 0xFFFF || rd16(a + 2) != 0 ||
+            !valid_index_flags(flash[a + 4]) || !(flash[a + 4] & SPIFFS_PH_FLAG_IXDELE))
+            continue;
+        uint32_t size;
+        memcpy(&size, flash + a + 8, 4);
+        if (size == 0xFFFFFFFFU || size > flash_size || !(size % SPAN)) continue;
+        uint32_t last = (size - 1) / SPAN, ref;
+        if (last < 103) ref = rd16(a + 49 + last * 2);
+        else {
+            uint16_t obj = rd16(a) & 0x7FFF;
+            uint32_t j = 1 + (last - 103) / 124, index = 0;
+            for (uint32_t q = 0; q < pages && !index; ++q)
+                if (q % 16 && rd16(q * PAGE) == (uint16_t)(obj | 0x8000) && rd16(q * PAGE + 2) == j &&
+                    valid_index_flags(flash[q * PAGE + 4]))
+                    index = q;
+            if (!index) continue;
+            ref = rd16(index * PAGE + 8 + ((last - 103) % 124) * 2);
+        }
+        if (ref >= pages) continue;
+        for (uint32_t i = size % SPAN; i < SPAN; ++i)
+            CHECK(flash[ref * PAGE + 5 + i] == 0xFF, "%s: %.32s (size %u) has byte %02x past its end at %u", scenario,
+                  (const char *)flash + a + offsetof(spiffs_page_object_ix_header, name), size, flash[ref * PAGE + 5 + i], i - size % SPAN);
+    }
+}
+
 static const char *const appendable[] = {"/pending.jsonl", "/blocked_identity.jsonl", "/add_pending.jsonl",
                                          "/acked_uids.txt", "/processed_commands.txt"};
 
@@ -1631,6 +1711,7 @@ static void verify_scenario(const char *name, const srr_report_t *report, bool t
     CHECK(!exists("/repair-probe") && !exists("/repair-probe-2"), "%s: repair probe left", name);
     SPIFFS_unmount(&fs);
     check_no_strays(name);
+    check_clean_tails(name);
     mount_plain();
     uint32_t evidence;
     const struct { const char *name, *ns, *key; } queues[] = {
@@ -1725,6 +1806,8 @@ static const scenario_t scenarios[] = {
     {"reused_ref", damage_reused_ref, true},
     {"scattered_bytes", damage_scattered_bytes, true},
     {"torn_hidden_lookup", damage_torn_hidden_lookup, false},
+    {"torn_size_inside", damage_torn_size_inside, false},
+    {"segment_dirty_tail", damage_segment_dirty_tail, false},
 };
 
 static void run_scenario(const scenario_t *s, uint64_t seed_value, uint32_t kib)
@@ -1741,12 +1824,34 @@ static void run_scenario(const scenario_t *s, uint64_t seed_value, uint32_t kib)
     if (verbose) printf("%s seed %" PRIu64 ": %s\n", s->name, seed_value, srr_result_name(report.result));
     CHECK(!s->expect_gaps || report.gaps > 0, "%s: no gap reported", s->name);
     CHECK(s->expect_gaps || report.gaps == 0, "%s: %u unexpected gaps", s->name, report.gaps);
+    if (!strcmp(s->name, "segment_dirty_tail") && report.result != SRR_RESULT_FAILED) {
+        /* dq_append's next record: "r+b", at its end. */
+        model_file_t *m = model_of("/qo0000002a.q");
+        uint8_t record[24];
+        for (uint32_t i = 0; i < sizeof(record); ++i) record[i] = (uint8_t)(0xC5 ^ i);
+        mount_plain();
+        spiffs_file f = SPIFFS_open(&fs, m->name, SPIFFS_O_RDWR, 0);
+        CHECK(f >= 0 && SPIFFS_lseek(&fs, f, (s32_t)m->size, SPIFFS_SEEK_SET) >= 0 &&
+                  SPIFFS_write(&fs, f, record, sizeof(record)) == (s32_t)sizeof(record) && SPIFFS_close(&fs, f) >= 0,
+              "segment append");
+        static uint8_t buffer[8192];
+        int64_t got = read_file(m->name, buffer, sizeof(buffer));
+        SPIFFS_unmount(&fs);
+        CHECK(got == (int64_t)(m->size + sizeof(record)) && !memcmp(buffer + m->size, record, sizeof(record)),
+              "segment_dirty_tail: the next record was ANDed with the old bytes");
+        m->data = realloc(m->data, m->size + sizeof(record) + 1);
+        m->unreadable = realloc(m->unreadable, m->size + sizeof(record) + 1);
+        memcpy(m->data + m->size, record, sizeof(record));
+        memset(m->unreadable + m->size, 0, sizeof(record) + 1);
+        m->size += sizeof(record);
+    }
     verify_scenario(s->name, &report, !strcmp(s->name, "torn_tails"));
     if (!strcmp(s->name, "stale_cursors")) CHECK(report.cursors_reset == 3, "cursors reset %u", report.cursors_reset);
     if (!strcmp(s->name, "torn_lookup")) CHECK(report.lookup_fixed >= 1, "torn lookup entry left");
     if (!strcmp(s->name, "torn_probe_size")) CHECK(report.expendables_removed >= 1, "torn probe not purged");
-    if (!strcmp(s->name, "torn_size") || !strcmp(s->name, "torn_segment"))
+    if (!strcmp(s->name, "torn_size") || !strcmp(s->name, "torn_segment") || !strcmp(s->name, "torn_size_inside"))
         CHECK(report.sizes_recovered == 1, "%s: size not recovered", s->name);
+
     if (!strcmp(s->name, "strays")) CHECK(report.strays_removed >= 1, "stray page %04x left", stray_page);
     if (!strcmp(s->name, "copies_disagree")) CHECK(report.gaps == 1 && report.unreadable_bytes == 1, "disagreement");
     if (!strcmp(s->name, "scattered_bytes")) CHECK(report.gaps == 1, "scattered bytes: %u records", report.gaps);

@@ -567,7 +567,7 @@ static bool resolve_span(run_t *r, obj_t *o, uint32_t span, uint16_t ref, int32_
     p->source = SOURCE_FILL;
     p->from = SR_NO_PAGE;
     memset(p->data, 0xFF, sizeof(p->data));
-    bool last_of_append = (o->kind.flags & SRP_APPEND_TARGET) && span + 1 == o->spans;
+    bool last_of_append = span + 1 == o->spans; /* any file is appended in place */
     uint32_t sources = 0;
     uint16_t refer = SR_NO_PAGE;
     if (page_ok(r, ref) && own_data_page(&r->pages[ref], o->obj, span)) {
@@ -701,9 +701,11 @@ static bool map_object(run_t *r, obj_t *o)
         }
 #endif
     }
-    /* The last page of an append target must be erased past the end, or the
-     * next append is ANDed into whatever an interrupted one left there. */
-    if ((o->kind.flags & SRP_APPEND_TARGET) && o->spans && o->size % SRP_SPAN_BYTES && o->perfect[o->spans - 1]) {
+    /* The last page of a file must be erased past its end, or the next
+     * append is ANDed into whatever an interrupted one left there: queue
+     * files, and queue segments (dq_append writes at the end with "r+b"),
+     * the command inbox and every other file SPIFFS appends to in place. */
+    if (o->spans && o->size % SRP_SPAN_BYTES && o->perfect[o->spans - 1]) {
         uint32_t k = o->spans - 1, used = o->size % SRP_SPAN_BYTES;
         uint8_t erased[SRP_SPAN_BYTES];
         if (!read_payload(r, o->ref[k], data, SRP_SPAN_BYTES)) return fail(r, "map_read", SPIFFS_ERR_INTERNAL);
@@ -752,6 +754,27 @@ static bool entry_trace(run_t *r, uint16_t obj, uint16_t header, uint32_t *top, 
     return true;
 }
 
+/* Where the bytes of a data span's page end: the length before its trailing
+ * erased (0xFF) bytes, over the finalized, undeleted pages of the object and
+ * span whose lookup entry agrees (the most programmed one); 0 when there is
+ * none. A page whose lookup entry was deleted may be an earlier file's that
+ * reused the object id. */
+static bool span_end(run_t *r, uint16_t obj, uint32_t span, uint32_t *used)
+{
+    uint8_t data[SRP_SPAN_BYTES];
+    *used = 0;
+    for (uint32_t pix = 0; pix < r->total_pages; ++pix) {
+        const pg_t *pg = &r->pages[pix];
+        if (pix % r->ppb == 0 || pg->obj != obj || pg->span != span || pg->lu != obj || !data_valid(pg->flags))
+            continue;
+        if (!read_payload(r, (uint16_t)pix, data, SRP_SPAN_BYTES)) return false;
+        uint32_t n = SRP_SPAN_BYTES;
+        while (n && data[n - 1] == 0xFF) --n;
+        if (n > *used) *used = n;
+    }
+    return true;
+}
+
 /* SPIFFS programs a new or truncated file's header (size 0xFFFFFFFF) in
  * place on its first append, after the data pages. A reset there tears the
  * size: every bit the real size clears may still be set, so the header can
@@ -760,19 +783,36 @@ static bool entry_trace(run_t *r, uint16_t obj, uint16_t header, uint32_t *top, 
  * traces (no finalized data page, no index entry) and contains the bits of a
  * size inside the last traced span is such a tear; the real size is where the
  * last traced page's bytes end (a text file never holds 0xFF), or for binary
- * files the smallest such size at or after the last programmed byte. */
+ * files the smallest such size at or after the last programmed byte. A text
+ * file's torn size can also stay inside its last span (only low bits left
+ * set): its last page then ends in erased bytes the size claims, which no
+ * committed append leaves (SPIFFS commits a size only after the bytes), so
+ * the real size is again where the bytes end when the torn size contains it
+ * bitwise. A binary file's 0xFF bytes are data: inside its last span it is
+ * left as it is. */
 static bool recover_size(run_t *r, const hdr_t *h, srp_kind_t kind, uint32_t *out)
 {
     bool undefined = h->size == SPIFFS_UNDEFINED_LEN;
     *out = undefined ? 0 : h->size;
     uint64_t spans = undefined ? 0 : ((uint64_t)h->size + SRP_SPAN_BYTES - 1) / SRP_SPAN_BYTES;
+    bool text = kind.fill == SRP_FILL_JSON_ROWS || kind.fill == SRP_FILL_ID_LINES;
     /* An empty file's header holds no entries: entries with the size still
      * 0xFFFFFFFF are a first append whose header program tore before the
      * size took a bit. */
     bool impossible = undefined || h->size > r->fs->cfg.phys_size;
     uint32_t traced = r->span_top[h->obj & (SR_IDS - 1)];
-    if (!impossible && spans <= traced) return false;
-    uint32_t entries = 0, own = 0;
+    uint32_t entries = 0, own = 0, used = 0;
+    if (!impossible && spans < traced) return false;
+    if (!impossible && spans == traced) {
+        /* Inside the last span: only a text file's trailing erased bytes,
+         * and only when no index entry names a span past it. */
+        if (!text || !span_end(r, h->obj, traced - 1, &used)) return false;
+        uint32_t real = (traced - 1) * SRP_SPAN_BYTES + used;
+        if (!used || real >= h->size || (h->size & real) != real) return false;
+        if (!entry_trace(r, h->obj, h->pix, &entries, &own) || entries > traced) return false;
+        *out = real;
+        return true;
+    }
     if (!entry_trace(r, h->obj, h->pix, &entries, &own)) return false;
     if (undefined && !own) return false;
     if (entries > traced) traced = entries;
@@ -782,19 +822,10 @@ static bool recover_size(run_t *r, const hdr_t *h, srp_kind_t kind, uint32_t *ou
         *out = 0;
         return true;
     }
-    uint32_t last = traced - 1, used = 0;
-    uint8_t data[SRP_SPAN_BYTES];
-    for (uint32_t pix = 0; pix < r->total_pages; ++pix) {
-        const pg_t *pg = &r->pages[pix];
-        if (pix % r->ppb == 0 || pg->obj != h->obj || pg->span != last || !data_valid(pg->flags)) continue;
-        if (!read_payload(r, (uint16_t)pix, data, SRP_SPAN_BYTES)) return false;
-        used = SRP_SPAN_BYTES;
-        while (used && data[used - 1] == 0xFF) --used;
-        break;
-    }
+    uint32_t last = traced - 1;
+    if (!span_end(r, h->obj, last, &used)) return false;
     if (!used) used = 1;
     uint32_t low = last * SRP_SPAN_BYTES + used, high = last * SRP_SPAN_BYTES + SRP_SPAN_BYTES, chosen = 0;
-    bool text = kind.fill == SRP_FILL_JSON_ROWS || kind.fill == SRP_FILL_ID_LINES;
     for (uint32_t s = low; s <= high && !chosen; ++s) {
         if ((h->size & s) == s) chosen = s;
         if (text) break;
