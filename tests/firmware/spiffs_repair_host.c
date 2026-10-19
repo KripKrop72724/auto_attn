@@ -329,11 +329,14 @@ static void port_log(void *context, const char *level, const char *code, const c
     if (verbose || print_log) printf("  [%s] %s %s\n", level, code, message);
 }
 static uint32_t writing_phases; /* phases that light the repair LED */
+/* Stands in for something that changes the store as a phase starts. */
+static void (*phase_hook)(srp_phase_t phase, uint32_t pass);
 static void port_phase(void *context, srp_phase_t phase, uint32_t pass, bool writing)
 {
-    (void)context; (void)phase; (void)pass;
+    (void)context;
     phase_changes++;
     if (writing) writing_phases++;
+    if (phase_hook) phase_hook(phase, pass);
 }
 /* The soft deadline, in port_now units; 0: none. */
 static uint64_t deadline_at;
@@ -3364,6 +3367,70 @@ static void run_healthy_compaction(uint32_t kib)
     printf("healthy store: compacted, CLEAN, no repair LED\n");
 }
 
+/* Review 3 (custody), A10: scattered unreadable bytes less than a page apart
+ * are one merged gap record whose bounds cover the readable bytes between
+ * them. A survey later in the same run that cannot read those bytes either
+ * (the copy that held them erased: SPIFFS's GC in the run's own writes, here
+ * as normalization starts, before compaction makes room and the store is
+ * surveyed again) took the record's bounds for bytes nobody could read and
+ * filled them. They come back from the hold; only the bytes unreadable when
+ * the file was held are filled. */
+static uint32_t merged_copy_page;
+static void merged_phase_hook(srp_phase_t phase, uint32_t pass)
+{
+    if (phase != SRP_PHASE_NORMALIZE || pass != 0 || merged_copy_page == UINT32_MAX) return;
+    erase_page(merged_copy_page);
+#if SPIFFS_CACHE
+    spiffs_cache_drop_page(&fs, (spiffs_page_ix)merged_copy_page);
+#endif
+    merged_copy_page = UINT32_MAX;
+}
+
+static void run_merged_from_hold(uint32_t kib)
+{
+    seed(31801);
+    nvs_clear();
+    format_flash(kib);
+    build_store(60000);
+    model_file_t *m = model_of("/pending.jsonl");
+    /* Crammed: every append to the ballast leaves deleted pages, and fewer
+     * free blocks than the work wants, so compaction runs first. */
+    static uint8_t ballast[1000];
+    memset(ballast, 0x42, sizeof(ballast));
+    u32_t total = 0, used = 0;
+    do {
+        CHECK(append_bytes("/ballast.bin", ballast, sizeof(ballast)), "ballast");
+        SPIFFS_info(&fs, &total, &used);
+    } while ((used < total / 100 * 70 || fs.free_blocks >= 3) && used < total / 100 * 85);
+    SPIFFS_unmount(&fs);
+    /* Span 5's page lost bytes 20..123 to a torn program; a finalized copy
+     * of it holds all but 20..23 and 120..123. */
+    uint32_t span = 5, pix = rd16(entry_address(m->name, span)), copy = free_page();
+    copy_page(copy, pix);
+    memset(flash + pix * PAGE + 5 + 20, 0xFF, 104);
+    memset(flash + copy * PAGE + 5 + 20, 0xFF, 4);
+    memset(flash + copy * PAGE + 5 + 120, 0xFF, 4);
+    for (uint32_t i = 20; i < 24; ++i) m->unreadable[span * SPAN + i] = m->unreadable[span * SPAN + 100 + i] = 1;
+    merged_copy_page = copy;
+    phase_hook = merged_phase_hook;
+    srr_report_t report;
+    srr_config_t config = repair_config();
+    repair_boot(&report, &config);
+    phase_hook = NULL;
+    CHECK(merged_copy_page == UINT32_MAX, "merged record: the copy was never erased");
+    CHECK(report.result == SRR_RESULT_REPAIRED_WITH_GAPS && report.gaps == 1 && report.blocks_compacted > 0,
+          "merged record: %s at %s, %u gaps, %u blocks compacted", srr_result_name(report.result), report.error_stage,
+          report.gaps, report.blocks_compacted);
+    srp_gaps_t gaps = gaps_now();
+    CHECK(gaps.count == 1 && (gaps.gap[0].flags & SRP_GAP_MERGED) && gaps.gap[0].offset == span * SPAN + 20 &&
+              gaps.gap[0].length == 104,
+          "merged record: %u records, the first at %u length %u", gaps.count, gaps.gap[0].offset, gaps.gap[0].length);
+    mount_plain();
+    for (uint32_t i = 0; i < model_count; ++i) check_custody(&model[i], 1, false);
+    SPIFFS_unmount(&fs);
+    printf("merged record: readable bytes inside its bounds came back from the hold\n");
+}
+
 /* "review" runs them all; "review-<part>" one of them. */
 static void run_review_custody(uint32_t kib, const char *only)
 {
@@ -3379,6 +3446,7 @@ static void run_review_custody(uint32_t kib, const char *only)
     if (REVIEW_PART("hidden")) run_hidden_large(kib);
     if (REVIEW_PART("rebuild")) run_rebuild_cuts(kib, kib > 1024 ? 211 : 4);
     if (REVIEW_PART("healthy")) run_healthy_compaction(kib);
+    if (REVIEW_PART("merged")) run_merged_from_hold(kib);
     if (REVIEW_PART("inbox") || REVIEW_PART("boundary")) run_inbox_boundary(kib);
     if (REVIEW_PART("inbox") || REVIEW_PART("window")) run_inbox_window(kib);
 #undef REVIEW_PART

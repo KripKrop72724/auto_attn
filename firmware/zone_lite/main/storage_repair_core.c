@@ -54,6 +54,12 @@ typedef struct {
     uint8_t data[SRP_SPAN_BYTES];
 } patch_t;
 
+/* The bytes of one span nobody could read when its file was held. */
+typedef struct {
+    uint32_t span;
+    uint8_t mask[(SRP_SPAN_BYTES + 7) / 8];
+} held_gap_t;
+
 typedef struct {
     char name[SRP_NAME_BYTES];
     srp_kind_t kind;
@@ -71,6 +77,8 @@ typedef struct {
     uint32_t drops, drop_cap, strays;
     uint8_t **hold;
     uint32_t hold_chunks, hold_size, crc;
+    held_gap_t *held_gaps;   /* by span: what was unreadable when the hold was taken */
+    uint32_t held_gap_count;
     uint32_t gaps, gap_bytes, rewritten;
     uint32_t blocked_spans, blocked_offset;
     uint16_t actions;
@@ -331,6 +339,9 @@ static void release_maps(run_t *r, obj_t *o)
 
 static void drop_hold(run_t *r, obj_t *o)
 {
+    release(r, o->held_gaps);
+    o->held_gaps = NULL;
+    o->held_gap_count = 0;
     if (!o->hold) return;
     for (uint32_t c = 0; c < o->hold_chunks; ++c) release(r, o->hold[c]);
     release(r, o->hold);
@@ -852,6 +863,8 @@ static void move_hold(obj_t *to, obj_t *from)
     to->hold = from->hold;
     to->hold_chunks = from->hold_chunks;
     to->hold_size = from->hold_size;
+    to->held_gaps = from->held_gaps;
+    to->held_gap_count = from->held_gap_count;
     to->held = from->held;
     to->crc = from->crc;
     to->actions |= from->actions;
@@ -862,6 +875,8 @@ static void move_hold(obj_t *to, obj_t *from)
     to->retired = from->retired;
     from->hold = NULL;
     from->hold_chunks = 0;
+    from->held_gaps = NULL;
+    from->held_gap_count = 0;
     from->held = false;
 }
 
@@ -1300,27 +1315,70 @@ static bool record_salvage_gaps(run_t *r, obj_t *o)
     return true;
 }
 
+/* Unreadable when the file was held (held_gaps is sorted by span). */
+static bool held_gap(const obj_t *o, uint32_t offset)
+{
+    uint32_t span = offset / SRP_SPAN_BYTES, low = 0, high = o->held_gap_count;
+    while (low < high) {
+        uint32_t mid = low + (high - low) / 2;
+        if (o->held_gaps[mid].span < span) low = mid + 1;
+        else high = mid;
+    }
+    return low < o->held_gap_count && o->held_gaps[low].span == span &&
+        bit(o->held_gaps[low].mask, offset % SRP_SPAN_BYTES);
+}
+
 /* A file held earlier in this run whose bytes a later survey cannot read
- * (a page that was a source got erased, or moved by SPIFFS's GC): what was
- * readable when it was held comes from the hold. Ranges that were already
- * gaps then stay gaps. */
-static void unmask_from_hold(run_t *r, obj_t *o)
+ * (a page that was a source got erased, or moved by SPIFFS's GC): every byte
+ * that was readable when it was held comes from the hold, the readable bytes
+ * a merged record's bounds cover included. The bytes nobody could read then
+ * stay gaps. */
+static void unmask_from_hold(obj_t *o)
 {
     if (!o->hold || o->hold_size != o->size) return;
     for (uint32_t start = next_masked(o, 0); start < o->size;) {
         uint32_t end = masked_end(o, start);
-        if (!recorded_this_run(r, o, start, end)) {
-            for (uint32_t at = start; at < end; ++at) {
-                patch_t *p = find_patch(o, at / SRP_SPAN_BYTES);
-                uint8_t byte;
-                if (!p || !held_read(o, at, &byte, 1)) continue;
-                p->data[at % SRP_SPAN_BYTES] = byte;
-                clear_bit(p->mask, at % SRP_SPAN_BYTES);
-                if (p->source == SOURCE_FILL || p->source == SOURCE_PARTIAL) p->source = SOURCE_HELD;
-            }
+        for (uint32_t at = start; at < end; ++at) {
+            if (held_gap(o, at)) continue;
+            patch_t *p = find_patch(o, at / SRP_SPAN_BYTES);
+            uint8_t byte;
+            if (!p || !held_read(o, at, &byte, 1)) continue;
+            p->data[at % SRP_SPAN_BYTES] = byte;
+            clear_bit(p->mask, at % SRP_SPAN_BYTES);
+            if (p->source == SOURCE_FILL || p->source == SOURCE_PARTIAL) p->source = SOURCE_HELD;
         }
         start = next_masked(o, end);
     }
+}
+
+/* What a hold cannot vouch for: the spans with unreadable bytes now, sorted
+ * by span. */
+static bool note_held_gaps(run_t *r, obj_t *o)
+{
+    uint32_t count = 0;
+    for (uint32_t i = 0; i < o->patches; ++i)
+        for (uint32_t b = 0; b < sizeof(o->patch[i].mask); ++b)
+            if (o->patch[i].mask[b]) {
+                ++count;
+                break;
+            }
+    if (!count) return true;
+    o->held_gaps = zalloc(r, count * sizeof(held_gap_t));
+    if (!o->held_gaps) return false;
+    for (uint32_t i = 0; i < o->patches; ++i) {
+        const patch_t *p = &o->patch[i];
+        bool any = false;
+        for (uint32_t b = 0; b < sizeof(p->mask) && !any; ++b) any = p->mask[b] != 0;
+        if (!any) continue;
+        uint32_t at = o->held_gap_count++;
+        while (at && o->held_gaps[at - 1].span > p->span) {
+            o->held_gaps[at] = o->held_gaps[at - 1];
+            --at;
+        }
+        o->held_gaps[at].span = p->span;
+        memcpy(o->held_gaps[at].mask, p->mask, sizeof(p->mask));
+    }
+    return true;
 }
 
 /* ---- holds ---------------------------------------------------------- */
@@ -1351,6 +1409,10 @@ static bool take_hold(run_t *r, obj_t *o)
         }
         held_write(o, k * SRP_SPAN_BYTES, span, length);
         crc = srp_crc32(crc, span, length);
+    }
+    if (!note_held_gaps(r, o)) {
+        drop_hold(r, o);
+        return false;
     }
     o->crc = crc;
     o->held = true;
@@ -2724,7 +2786,7 @@ static bool plan_damage(run_t *r)
     for (uint32_t i = 0; i < r->obj_count; ++i) {
         obj_t *o = &r->objs[i];
         if (!live(o) || !o->needs_work) continue;
-        unmask_from_hold(r, o);
+        unmask_from_hold(o);
         bool gap = false;
         for (uint32_t k = 0; k < o->patches && !gap; ++k)
             for (uint32_t b = 0; b < sizeof(o->patch[k].mask) && !gap; ++b) gap = o->patch[k].mask[b] != 0;
