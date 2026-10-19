@@ -10,6 +10,8 @@ signed 17 in the HIL marker. The device runs 2.5.2 from its factory partition,
 which 2.7.4 refuses as a rollback predecessor, so it first takes the exact
 signed 2.4.12 into an OTA slot. Only those two exact releases may pass the
 fleet offer guard for this one device, and both still wait for a free slot.
+Both are pinned to ZONE-BLD9-01; elsewhere ADD neither offers nor serves them
+to this device, and 2.7.4 does not list it as a target.
 """
 from __future__ import annotations
 
@@ -53,6 +55,14 @@ def exposure(identity: tuple, raw: Any) -> list[HilTarget] | None:
     if tuple(identity) != RELEASE_IDENTITY or raw != exposed_targets():
         return None
     return [*(target.identity for target in TARGETS), TARGET]
+
+
+def admits(target: HilTarget, connector: Any) -> bool:
+    """An exact target match; this K50 is a target only while in its own zone.
+
+    The 17 follow connector identity wherever they are registered, as before.
+    """
+    return target_matches(target, connector) and (target != TARGET or connector.zone_id == ZONE)
 
 
 def offer_location(release: Any, connector: Any) -> str | None:

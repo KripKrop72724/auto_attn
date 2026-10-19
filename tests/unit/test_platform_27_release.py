@@ -423,19 +423,113 @@ def test_k50_bridge_requires_the_exact_device_factory_image_and_signed_bridge(k5
 
 
 @pytest.mark.parametrize("platform", ["2.7.4"], indirect=True)
-@pytest.mark.parametrize("bridge_done", [False, True])
-def test_k50_receives_bytes_only_in_its_own_zone(k50, bridge_done):
-    """Scope follows connector identity, as for the 17; the offer guard pins the zone."""
+def test_k50_receives_no_bridge_bytes_outside_its_own_zone(k50):
+    """An ordinary 2.4.12 campaign elsewhere may list the device; the offer guard pins the zone."""
     from zk_add.ota import FirmwareDeployment
     from sqlalchemy import select
-    session, release, bridge, device, _devices = k50
+    session, _release, bridge, device, _devices = k50
     device.zone_id = "ZONE-BLD9-02"
-    if bridge_done:
-        bridged(session, device)
-    _scope, run = start_k50(session, release if bridge_done else bridge, device.zone_id)
+    _scope, run = start_k50(session, bridge, device.zone_id)
     assert offer(session, device) is None
     deployment = session.scalar(select(FirmwareDeployment).where(FirmwareDeployment.campaign_id == run.id))
     assert deployment.status == "PENDING" and deployment.error_code == "NATIONWIDE_EXACT_TARGET_REQUIRED"
+
+
+@pytest.mark.parametrize("platform", ["2.7.4"], indirect=True)
+def test_k50_is_a_2_7_4_target_only_in_its_own_zone(k50):
+    """Campaign scope and download pin the K50's zone; the 17 still follow identity."""
+    from zk_add.ota import preview_campaign_scope, resolve_download
+    from zk_add.zkt274_bld9_k50 import ZONE
+    session, release, _bridge, device, devices = k50
+    bridged(session, device)
+    device.zone_id = "ZONE-BLD9-02"
+    session.flush()
+    with pytest.raises(ValueError, match="target exclusion: HIL_TARGET_ZONE_MISMATCH"):
+        preview_campaign_scope(session, release_public_id=release.release_id, zone_id=device.zone_id)
+    # A grant issued in ZONE-BLD9-01 does not follow the device to another zone.
+    device.zone_id = ZONE
+    session.flush()
+    _scope, run = start_k50(session, release, ZONE)
+    assignment = offer(session, device)
+    assert assignment["version"] == "2.7.4"
+    session.flush()
+    token = assignment["download_url"].rsplit("/", 1)[1]
+    device.zone_id = "ZONE-BLD9-02"
+    session.flush()
+    with pytest.raises(ValueError, match="exact target mismatch"):
+        resolve_download(session, token)
+    # Nor does a campaign row moved with it, which the scope check would no longer create.
+    run.zone_id = "ZONE-BLD9-02"
+    session.flush()
+    assert offer(session, device) is None
+    with pytest.raises(ValueError, match="exact target mismatch"):
+        resolve_download(session, token)
+    device.zone_id = run.zone_id = ZONE
+    session.flush()
+    assert resolve_download(session, token)[0] == release
+    assert offer(session, device)["version"] == "2.7.4"
+    # A nationwide target is unaffected by the K50's zone pin.
+    devices[0].zone_id = "ZONE-ELSEWHERE"
+    session.flush()
+    scope = preview_campaign_scope(session, release_public_id=release.release_id, zone_id="ZONE-ELSEWHERE")
+    assert [row["connector_id"] for row in scope["eligible"]] == [devices[0].connector_id]
+
+
+@pytest.mark.parametrize("platform", ["2.7.4"], indirect=True)
+@pytest.mark.parametrize("moved", [False, True])
+def test_k50_clock_leniency_only_in_its_own_zone(k50, moved):
+    """Signed-request clock recovery treats the K50 as a target only in ZONE-BLD9-01.
+
+    The moved case simulates a campaign row in another zone that the scope
+    check would no longer create; HMAC and nonce checks are unaffected.
+    """
+    from datetime import timedelta
+    from zk_add.hil_clock_recovery import trusted_hil_clock_matches
+    from zk_add.models import DeviceTelemetry
+    from zk_add.time_utils import utc_now
+    from zk_add.zkt274_bld9_k50 import ZONE
+    session, release, _bridge, device, _devices = k50
+    bridged(session, device)
+    device.boot_id = "boot-1"
+    _scope, run = start_k50(session, release, ZONE)
+    if moved:
+        device.zone_id = run.zone_id = "ZONE-BLD9-02"
+    now = utc_now()
+    for ago in (45, 5):
+        observed = now - timedelta(seconds=ago)
+        session.add(DeviceTelemetry(connector_id=device.id, boot_id="boot-1", created_at=observed, payload={
+            "_trusted_envelope_sent_at": (observed - timedelta(hours=2)).isoformat()}))
+    session.flush()
+    assert trusted_hil_clock_matches(session, connector=device, request_timestamp=now - timedelta(hours=2),
+                                     now=now) is (not moved)
+
+
+@pytest.mark.parametrize("platform", ["2.7.4"], indirect=True)
+def test_k50_needs_the_18_target_marker_and_restoring_the_17_withdraws_it(k50):
+    """With the published 17 (before apply, or the backup restored) ADD refuses the K50."""
+    from zk_add.ota import _permitted_hil_targets, preview_campaign_scope, resolve_download
+    from zk_add.zkt274_bld9_k50 import ZONE, exposed_targets
+    session, release, _bridge, device, _devices = k50
+    bridged(session, device)
+
+    def marker(targets):
+        release.manifest = {**release.manifest, "_hil_targets": targets}
+        session.flush()
+
+    marker(signed_hil_targets())
+    assert _permitted_hil_targets(session, release) == [row.identity for row in TARGETS]
+    # Outside the 17 the exclusion is HIL_EXACT_IDENTITY_MISMATCH, reported as no exact target in the zone.
+    with pytest.raises(ValueError, match="exact target is not active in this zone"):
+        preview_campaign_scope(session, release_public_id=release.release_id, zone_id=ZONE)
+    marker(exposed_targets())
+    start_k50(session, release, ZONE)
+    assignment = offer(session, device)
+    assert assignment["version"] == "2.7.4"
+    session.flush()
+    marker(signed_hil_targets())
+    assert offer(session, device) is None
+    with pytest.raises(ValueError, match="exact target mismatch"):
+        resolve_download(session, assignment["download_url"].rsplit("/", 1)[1])
 
 
 @pytest.mark.parametrize("platform", ["2.7.4"], indirect=True)

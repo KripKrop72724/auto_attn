@@ -732,6 +732,9 @@ def _campaign_scope(
             reason = "FIRMWARE_FAMILY_MISMATCH"
         if permitted_targets and not any(target_matches(target, connector) for target in permitted_targets):
             reason = "HIL_EXACT_IDENTITY_MISMATCH"
+        elif permitted_targets and not any(bld9_k50.admits(target, connector) for target in permitted_targets):
+            # The reviewed ZONE-BLD9-01 K50 is a 2.7.4 target only in that zone.
+            reason = "HIL_TARGET_ZONE_MISMATCH"
         if bridge_target:
             reason = _factory_3fl_bridge_exclusion(connector, bridge_target) or reason
         if not reason:
@@ -747,7 +750,7 @@ def _campaign_scope(
             eligible = [row for row in eligible if row.hardware_id.lower() == hil_target_mac]
         else:
             eligible = [row for row in eligible if any(
-                target_matches(target, row) for target in permitted_targets
+                bld9_k50.admits(target, row) for target in permitted_targets
             )]
         if len(eligible) != 1:
             if permitted_targets is not None:
@@ -1145,7 +1148,7 @@ def assignment_for_connector(session: Session, *, connector: Connector, public_b
         except ValueError:
             return None
         if permitted_targets:
-            if not any(target_matches(target, connector) for target in permitted_targets):
+            if not any(bld9_k50.admits(target, connector) for target in permitted_targets):
                 return None
         else:
             target = str((release.manifest or {}).get("_hil_target_mac") or "").lower()
@@ -1793,7 +1796,7 @@ def resolve_download(session: Session, token: str) -> tuple[FirmwareRelease, Pat
         connector = session.get(Connector, grant.connector_id)
         permitted_targets = _permitted_hil_targets(session, release)
         if permitted_targets:
-            if connector is None or not any(target_matches(item, connector) for item in permitted_targets):
+            if connector is None or not any(bld9_k50.admits(item, connector) for item in permitted_targets):
                 raise ValueError("HIL firmware grant exact target mismatch.")
         else:
             if not settings.firmware_hil_enabled or not target or target != configured:
