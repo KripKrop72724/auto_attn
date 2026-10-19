@@ -773,8 +773,9 @@ on its emulated SPIFFS.
   and review runs at 2 and 8 MB, the mirror and budget runs at 8 MB. The
   largest repair took
   5.1 M HAL operations of the 10.4 M cap at 8 MB. The fourth round's pass
-  (at `4ae1e0b`): CI's configuration in `espressif/idf:v5.5.3` and again
-  natively with Apple clang 21 (identical cut and repair counts); the review
+  (at `4ae1e0b`, natively with Apple clang 21 while Docker was down; CI's
+  configuration also in `espressif/idf:v5.5.3` at `e2c0c83`, with identical
+  cut and repair counts): CI's configuration; the review
   runs at 2 and 8 MB and the special runs at 8 MB; the merge-cut and salvage
   runs at every write (1,362 and 1,692 runs); the third round's every-write
   sweeps again (resume at 88%, 3,146 cuts; at 80%; restore at 85%, 394;
