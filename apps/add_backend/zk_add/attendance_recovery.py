@@ -170,7 +170,14 @@ def _connector_filter(statement, filters: dict[str, Any]):
     elif filters.get("provenance") == "VERIFIED":
         statement = statement.where(AttendanceEvent.device_serial.is_not(None))
     if filters.get("source_epoch") or filters.get("generation") is not None:
-        zkt = select(TerminalRecordManifest.attendance_event_id).where(TerminalRecordManifest.attendance_event_id == AttendanceEvent.id)
+        # Only the owner's own source records scope its rows. A moved
+        # terminal's later baseline links its replay to rows another
+        # connector still owns; that link must not widen this scope.
+        zkt = select(TerminalRecordManifest.attendance_event_id).where(
+            TerminalRecordManifest.attendance_event_id == AttendanceEvent.id,
+            TerminalRecordManifest.connector_id == AttendanceEvent.connector_id,
+            TerminalRecordManifest.zkt_device_id == AttendanceEvent.zkt_device_id,
+        )
         if filters.get("source_epoch"):
             zkt = zkt.join(TerminalSourceEpoch, TerminalSourceEpoch.id == TerminalRecordManifest.source_epoch_id).where(TerminalSourceEpoch.epoch_id == filters["source_epoch"])
         if filters.get("generation") is not None:

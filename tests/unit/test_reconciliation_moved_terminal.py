@@ -37,6 +37,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 
 from zk_add.attendance_identity_evidence import owner_source_manifest, source_evidence
+from zk_add.attendance_recovery import _event_statement
 from zk_add.db import Base
 from zk_add.models import (
     AttendanceEvent,
@@ -445,6 +446,12 @@ def tail_chunk(session, coverage, raws, *, start: int, end: int) -> SourceTailCh
     })
 
 
+def _scoped(session, **filters) -> set[int]:
+    """Attendance an operator's recovery filter selects."""
+    return {event.id for event, _outbox, _connector in session.execute(
+        _event_statement(session, filters)).all()}
+
+
 def _columns(row) -> dict:
     return {column.key: getattr(row, column.key) for column in AttendanceEvent.__table__.columns}
 
@@ -522,6 +529,9 @@ def test_k50_first_chunk_commits_when_its_previous_connector_owns_the_punches(db
     }]
     committed_event = _job_events(db, job, "CHUNK_COMMITTED")[-1].details
     assert committed_event["retained_elsewhere"] == 100 - PREFIX
+    # A recovery scoped to BLD9-01's source epoch does not reach 3FL's rows.
+    assert _scoped(db, connector_id=three_fl.connector_id) == set(before)
+    assert _scoped(db, source_epoch=source_epoch_uuid(db, job)) == set()
 
 
 def test_previous_owner_keeps_its_own_source_evidence(db) -> None:
@@ -534,12 +544,14 @@ def test_previous_owner_keeps_its_own_source_evidence(db) -> None:
         AttendanceEvent.event_uid == chunk.records[PREFIX].event.event_uid))
     proof = source_evidence(db, row, three_fl)
     assert proof["kind"] == "SAVED_TERMINAL_RECORD"
+    owner_epoch = source_epoch_uuid(db, _job)
+    assert row.id in _scoped(db, source_epoch=owner_epoch)
     zkt = three_fl.zkt_device
     zkt.serial = zkt.confirmed_serial = zkt.expected_serial = G3
     three_fl.connected = False
     db.flush()
     bld9 = _bld9(db)
-    _job, replay = first_chunk(db, bld9, raws)
+    job, replay = first_chunk(db, bld9, raws)
 
     _job, committed, _duplicate = apply_reconciliation_chunk(db, connector=bld9, payload=replay)
 
@@ -550,6 +562,8 @@ def test_previous_owner_keeps_its_own_source_evidence(db) -> None:
     # BLD9-01's later replay neither replaces nor revokes 3FL's own record.
     assert owner_source_manifest(db, row).connector_id == three_fl.id
     assert source_evidence(db, row, three_fl) == proof
+    assert row.id in _scoped(db, source_epoch=owner_epoch)
+    assert row.id not in _scoped(db, source_epoch=source_epoch_uuid(db, job))
 
 
 @pytest.mark.parametrize(("owner", "fact", "reason"), [
