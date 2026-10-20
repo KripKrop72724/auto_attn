@@ -9,7 +9,7 @@ import json
 import re
 from uuid import uuid4
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from zk_add.audit import append_audit
@@ -679,8 +679,12 @@ def _replay_conflict(row, incoming, *, terminal_serial: str, owned: bool) -> str
     serial, punch and user ID, never from the connector. A terminal that moved
     to another connector therefore replays rows its previous connector still
     owns. Such a row is the same punch only when every fact the UID covers
-    agrees; the owner's own rows keep their original comparison.
+    agrees, including a retained serial: ADD never recomputes the UID, so a
+    row without one proves nothing about the terminal. The owner's own rows
+    keep their original comparison, where a missing serial is legacy capture.
     """
+    if not owned and row.device_serial is None:
+        return "SOURCE_REPLAY_TERMINAL_UNPROVEN"
     if row.device_serial not in {None, terminal_serial}:
         return "SOURCE_REPLAY_TERMINAL_MISMATCH"
     if row.user_id != incoming.user_id:
@@ -692,11 +696,38 @@ def _replay_conflict(row, incoming, *, terminal_serial: str, owned: bool) -> str
     return None
 
 
-def _bound_source_attendance(session, *, connector, terminal_serial, records):
+def _owner_still_bound(session, rows, *, zkt, terminal_serial: str) -> bool:
+    """Whether a connector that owns replayed rows still claims this terminal.
+
+    Heartbeats record a terminal serial without a collision check, so two ESPs
+    can read one terminal at once. Only a terminal its previous connector no
+    longer reports, expects or has confirmed has moved.
+    """
+    connector_ids = {row.connector_id for row in rows}
+    zkt_device_ids = {row.zkt_device_id for row in rows}
+    return session.scalar(
+        select(ZKTDevice.id).where(
+            or_(ZKTDevice.connector_id.in_(connector_ids), ZKTDevice.id.in_(zkt_device_ids)),
+            ZKTDevice.id != zkt.id,
+            or_(
+                ZKTDevice.serial == terminal_serial,
+                ZKTDevice.confirmed_serial == terminal_serial,
+                ZKTDevice.expected_serial == terminal_serial,
+            ),
+        ).limit(1)
+    ) is not None
+
+
+def _bound_source_attendance(
+    session, *, connector, terminal_serial, records, link_retained_elsewhere: bool = True,
+):
     """Bind nested events to the verified source envelope, including legacy rows.
 
     Returns the events to ingest and the retained rows another connector (or
     an earlier binding of this terminal) already owns for the same punches.
+    A baseline links such rows once the terminal has provably moved here. A
+    tail passes ``link_retained_elsewhere=False``: rows owned elsewhere are
+    then returned unchecked, before anything is changed, for it to refuse.
     """
     zkt = connector.zkt_device
     if not terminal_serial or not zkt or terminal_serial != zkt.serial:
@@ -734,20 +765,35 @@ def _bound_source_attendance(session, *, connector, terminal_serial, records):
             AttendanceEvent.event_uid.in_([event.event_uid for event in events])
         )).all()
         by_uid = {event.event_uid: event for event in events}
+        owned_rows = []
         for row in existing:
-            incoming = by_uid[row.event_uid]
+            if row.connector_id == connector.id and row.zkt_device_id == zkt.id:
+                owned_rows.append(row)
+            else:
+                retained_elsewhere.append(row)
+        if retained_elsewhere and not link_retained_elsewhere:
+            return events, retained_elsewhere
+        if retained_elsewhere and _owner_still_bound(
+            session, retained_elsewhere, zkt=zkt, terminal_serial=terminal_serial,
+        ):
+            raise EvidenceRejected(
+                "SOURCE_REPLAY_OWNER_STILL_BOUND",
+                "Replayed attendance conflicts with retained source ownership.",
+            )
+        for row in existing:
             owned = row.connector_id == connector.id and row.zkt_device_id == zkt.id
-            conflict = _replay_conflict(row, incoming, terminal_serial=terminal_serial, owned=owned)
+            conflict = _replay_conflict(
+                row, by_uid[row.event_uid], terminal_serial=terminal_serial, owned=owned,
+            )
             if conflict is not None:
                 raise EvidenceRejected(
                     conflict, "Replayed attendance conflicts with retained source ownership."
                 )
-            if not owned:
-                # The same punch, captured before this terminal moved here. It
-                # stays its owner's row: linked and counted as already present,
-                # never rewritten or released through this connector's roster.
-                retained_elsewhere.append(row)
-                continue
+        # Only this connector's own rows are upgraded. A row owned elsewhere is
+        # the same punch, captured before this terminal moved here. It stays
+        # its owner's row: linked and counted as already present, never
+        # rewritten or released through this connector's roster.
+        for row in owned_rows:
             # Do not rewrite immutable facts used by an existing repair approval.
             from zk_add.models import AttendanceRepairItem
             reviewed = session.scalar(select(AttendanceRepairItem.id).where(
@@ -1723,10 +1769,18 @@ def apply_source_tail_chunk(
 
     from zk_add.service import ingest_attendance, upsert_alert
 
-    attendance, _retained_elsewhere = _bound_source_attendance(
+    attendance, retained_elsewhere = _bound_source_attendance(
         session, connector=connector, terminal_serial=coverage.terminal_serial,
-        records=payload.records,
+        records=payload.records, link_retained_elsewhere=False,
     )
+    if retained_elsewhere:
+        # Tail ordinals follow the certified cutoff, so they were read after
+        # this terminal moved here. Another connector owning one of them means
+        # a second reader, not a moved terminal.
+        return invalidate(
+            "SOURCE_TAIL_FOREIGN_OWNER",
+            "Terminal tail replayed punches another connector owns; a second reader may share this terminal.",
+        )
     if attendance:
         ingest_attendance(
             session, connector=connector, events=attendance,

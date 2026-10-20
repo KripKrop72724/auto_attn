@@ -80,7 +80,7 @@ CHUNK_PATH = {
     "reconciliation.py": {
         "apply_reconciliation_chunk", "_bound_source_attendance", "_replay_conflict",
         "_device_job", "_require_runnable", "_require_source_epoch", "_require_raw_custody",
-        "_release_source_synced_attendance", "_retained_elsewhere_details",
+        "_release_source_synced_attendance", "_retained_elsewhere_details", "_owner_still_bound",
     },
     "service.py": {"ingest_attendance"},
 }

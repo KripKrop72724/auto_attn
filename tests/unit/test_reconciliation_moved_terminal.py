@@ -11,6 +11,11 @@ conflicts with retained source ownership." for the whole chunk. The K50's
 wrong-clock prefix (zero, year-2000, all-ones and impossible dates) was never
 the cause: those records are preserved as INVALID_TIME source exceptions.
 
+A replay links such a row only while the terminal has provably moved: the
+previous connector no longer reports, expects or has confirmed its serial, and
+the row carries this terminal's serial. A certified tail never links one,
+because its ordinals were read after the move.
+
 Source rows come from a port of zone-lite ``append_terminal_source_record``
 (firmware/zone_lite/main/zone_lite.c and zkt_record.c) for every layout it
 emits: 40-byte (G3, MB40-VL, K50), 16-byte and 8-byte records.
@@ -35,14 +40,21 @@ from zk_add.attendance_identity_evidence import owner_source_manifest, source_ev
 from zk_add.db import Base
 from zk_add.models import (
     AttendanceEvent,
+    DeviceAlert,
+    ReconciliationCoverage,
     ReconciliationEvent,
+    SourceTailChunk,
     TerminalRecordManifest,
 )
 from zk_add.reconciliation import (
     apply_reconciliation_anchor,
     apply_reconciliation_chunk,
+    apply_reconciliation_manifest,
+    apply_source_tail_chunk,
     assignment_rows,
     create_reconciliation_job,
+    reconciliation_chain_digest,
+    reconciliation_chunk_digest,
     source_epoch_uuid,
 )
 from zk_add.rejection import (
@@ -55,6 +67,8 @@ from zk_add.schemas import (
     AttendanceEventIn,
     ReconciliationAnchorRequest,
     ReconciliationChunkRequest,
+    ReconciliationManifestRequest,
+    SourceTailChunkRequest,
     UserSnapshotRequest,
     UserSnapshotRow,
 )
@@ -362,10 +376,11 @@ def first_chunk(session, connector, raws, *, serial: str = K50):
     return job, ReconciliationChunkRequest.model_validate(json.loads(wire))
 
 
-def captured_copies(raws, *, sources=("LIVE", "CURRENT_RECONCILE", "DUMP_STARTUP")):
-    """The first chunk's punches as an ESP delivered them while it read this terminal."""
+def captured_copies(raws, *, sources=("LIVE", "CURRENT_RECONCILE", "DUMP_STARTUP"),
+                    start: int = 0, end: int = 100):
+    """Punches (the first chunk's by default) as an ESP delivered them while it read this terminal."""
     rows = [source_row(raw, ordinal, serial=K50, captured_at="2026-08-21T09:00:00Z")[0]
-            for ordinal, raw in enumerate(raws[:100])]
+            for ordinal, raw in enumerate(raws[start:end], start)]
     copies = []
     for index, event in enumerate(row["event"] for row in rows if "event" in row):
         copies.append(AttendanceEventIn.model_validate({
@@ -386,6 +401,48 @@ def three_fl_owned_the_terminal(session, raws):
     three_fl.connected = False
     session.flush()
     return three_fl
+
+
+def certify(session, connector, raws):
+    """Commit a one-chunk baseline over ``raws`` and seal its capture certificate."""
+    job, chunk = first_chunk(session, connector, raws)
+    job, committed, _duplicate = apply_reconciliation_chunk(session, connector=connector, payload=chunk)
+    assert committed is not None and job.committed_next_ordinal == len(raws)
+    apply_reconciliation_manifest(session, connector=connector, payload=ReconciliationManifestRequest(
+        source_epoch=chunk.source_epoch, job_id=job.job_id, generation=job.terminal_generation,
+        terminal_serial=K50, terminal_generation=job.terminal_generation, cutoff_count=len(raws),
+        latest_terminal_count=len(raws), final_chain_digest=chunk.resulting_chain_digest,
+    ))
+    coverage = session.scalar(select(ReconciliationCoverage).where(
+        ReconciliationCoverage.zkt_device_id == connector.zkt_device.id,
+        ReconciliationCoverage.active == True,  # noqa: E712
+    ))
+    assert coverage is not None and coverage.source_committed_cursor == len(raws)
+    return job, coverage
+
+
+def tail_chunk(session, coverage, raws, *, start: int, end: int) -> SourceTailChunkRequest:
+    """The source_tail_chunk Zone Lite sends for new ordinals after a certified cutoff."""
+    captured_at = utc_now().strftime("%Y-%m-%dT%H:%M:%SZ")
+    records = [source_row(raw, ordinal, serial=K50, captured_at=captured_at)[0]
+               for ordinal, raw in enumerate(raws[start:end], start)]
+    for record in records:
+        record["event"]["source"] = "CURRENT_RECONCILE"
+    draft = SourceTailChunkRequest.model_validate({
+        "source_epoch": source_epoch_uuid(session, coverage), "terminal_serial": K50,
+        "terminal_generation": coverage.terminal_generation, "record_size": len(raws[0]),
+        "start_ordinal": start, "end_ordinal": end, "latest_terminal_count": end,
+        "chunk_digest": "0" * 64, "previous_chain_digest": coverage.source_committed_chain_digest,
+        "resulting_chain_digest": "0" * 64, "records": records,
+    })
+    chunk_digest = reconciliation_chunk_digest(draft)
+    return draft.model_copy(update={
+        "chunk_digest": chunk_digest,
+        "resulting_chain_digest": reconciliation_chain_digest(
+            coverage.source_committed_chain_digest, start_ordinal=start, end_ordinal=end,
+            chunk_digest=chunk_digest,
+        ),
+    })
 
 
 def _columns(row) -> dict:
@@ -477,7 +534,8 @@ def test_previous_owner_keeps_its_own_source_evidence(db) -> None:
         AttendanceEvent.event_uid == chunk.records[PREFIX].event.event_uid))
     proof = source_evidence(db, row, three_fl)
     assert proof["kind"] == "SAVED_TERMINAL_RECORD"
-    three_fl.zkt_device.serial = three_fl.zkt_device.confirmed_serial = G3
+    zkt = three_fl.zkt_device
+    zkt.serial = zkt.confirmed_serial = zkt.expected_serial = G3
     three_fl.connected = False
     db.flush()
     bld9 = _bld9(db)
@@ -498,6 +556,7 @@ def test_previous_owner_keeps_its_own_source_evidence(db) -> None:
     ("previous", "user_id", "SOURCE_REPLAY_USER_MISMATCH"),
     ("previous", "device_event_time", "SOURCE_REPLAY_TIME_MISMATCH"),
     ("previous", "device_serial", "SOURCE_REPLAY_TERMINAL_MISMATCH"),
+    ("previous", "device_serial_missing", "SOURCE_REPLAY_TERMINAL_UNPROVEN"),
     ("previous", "punch", "SOURCE_REPLAY_PUNCH_MISMATCH"),
     ("same", "user_id", "SOURCE_REPLAY_USER_MISMATCH"),
     ("same", "device_serial", "SOURCE_REPLAY_TERMINAL_MISMATCH"),
@@ -520,6 +579,10 @@ def test_replay_contradicting_a_retained_row_still_fails_closed(db, owner, fact,
         row.device_event_time = row.device_event_time + timedelta(seconds=1)
     elif fact == "device_serial":
         row.device_serial = G3
+    elif fact == "device_serial_missing":
+        # ADD never recomputes the event UID, so a serial-less row owned
+        # elsewhere proves nothing about which terminal it came from.
+        row.device_serial = None
     else:
         row.punch = "1" if row.punch == "0" else "0"
     db.flush()
@@ -532,6 +595,83 @@ def test_replay_contradicting_a_retained_row_still_fails_closed(db, owner, fact,
     assert rejection_site(caught.value).startswith(
         "zk_add.reconciliation:_bound_source_attendance:")
     assert _manifests(db, bld9) == []
+
+
+@pytest.mark.parametrize("field", ["serial", "confirmed_serial", "expected_serial"])
+def test_replay_is_refused_while_its_owner_still_claims_the_terminal(db, field) -> None:
+    """Two ESPs reading one terminal is not a move; the old fail-closed refusal stands."""
+    raws = terminal_log()
+    three_fl = three_fl_owned_the_terminal(db, raws)
+    setattr(three_fl.zkt_device, field, K50)
+    db.flush()
+    bld9 = _bld9(db)
+    _job, chunk = first_chunk(db, bld9, raws)
+
+    with pytest.raises(EvidenceRejected, match=f"^{CONFLICT_MESSAGE[:-1]}[.]$") as caught:
+        apply_reconciliation_chunk(db, connector=bld9, payload=chunk)
+
+    assert rejection_reason(caught.value) == "SOURCE_REPLAY_OWNER_STILL_BOUND"
+    assert rejection_site(caught.value).startswith(
+        "zk_add.reconciliation:_bound_source_attendance:")
+    assert _manifests(db, bld9) == []
+
+
+@pytest.mark.parametrize("owner_moved", [False, True])
+def test_tail_replaying_punches_another_connector_owns_invalidates_coverage(db, owner_moved) -> None:
+    """A tail is read after the move, so another owner can only be a second reader."""
+    raws = terminal_log()
+    bld9 = _bld9(db)
+    job, coverage = certify(db, bld9, raws[:100])
+    three_fl = _three_fl(db)
+    accepted, _duplicates = ingest_attendance(db, connector=three_fl, events=captured_copies(
+        raws, sources=("LIVE",), start=110, end=120))
+    assert len(accepted) == 10
+    if owner_moved:
+        zkt = three_fl.zkt_device
+        zkt.serial = zkt.confirmed_serial = zkt.expected_serial = G3
+    db.flush()
+    db.expire_all()
+    owned = db.scalars(select(AttendanceEvent).where(
+        AttendanceEvent.connector_id == three_fl.id)).all()
+    before = {row.id: _columns(row) for row in owned}
+    event_count = db.scalar(select(func.count(AttendanceEvent.id)))
+    manifest_count = db.scalar(select(func.count(TerminalRecordManifest.id)))
+    tail = tail_chunk(db, coverage, raws, start=100, end=140)
+
+    held, chunk, duplicate, error_code = apply_source_tail_chunk(db, connector=bld9, payload=tail)
+
+    assert (chunk, duplicate, error_code) == (None, False, "SOURCE_TAIL_FOREIGN_OWNER")
+    assert (held.active, held.capture_state, held.invalidated_reason) == (
+        False, "SOURCE_COVERAGE_INVALIDATED", "SOURCE_TAIL_FOREIGN_OWNER")
+    assert held.source_committed_cursor == 100
+    assert (job.status, job.error_code) == ("INVALIDATED", "SOURCE_TAIL_FOREIGN_OWNER")
+    alert = db.scalar(select(DeviceAlert).where(
+        DeviceAlert.connector_id == bld9.id, DeviceAlert.code == "ADD_SOURCE_COVERAGE_INVALIDATED"))
+    assert alert.details == {"failure_category": "SOURCE_TAIL_FOREIGN_OWNER"}
+    # Nothing from the tail is linked, ingested or rewritten.
+    assert db.scalar(select(func.count(SourceTailChunk.id))) == 0
+    assert db.scalar(select(func.count(TerminalRecordManifest.id))) == manifest_count
+    assert db.scalar(select(func.count(AttendanceEvent.id))) == event_count
+    db.flush()
+    db.expire_all()
+    assert {row.id: _columns(db.get(AttendanceEvent, row.id)) for row in owned} == before
+
+
+def test_tail_of_a_moved_terminal_commits_its_own_punches(db) -> None:
+    raws = terminal_log()
+    three_fl_owned_the_terminal(db, raws)
+    bld9 = _bld9(db)
+    _job, coverage = certify(db, bld9, raws[:100])
+    tail = tail_chunk(db, coverage, raws, start=100, end=140)
+
+    coverage, chunk, duplicate, error_code = apply_source_tail_chunk(db, connector=bld9, payload=tail)
+
+    assert (error_code, duplicate, coverage.active) == (None, False, True)
+    assert coverage.source_committed_cursor == 140
+    assert (chunk.event_count, chunk.exception_count) == (40, 0)
+    tail_events = db.scalars(select(AttendanceEvent).where(AttendanceEvent.event_uid.in_(
+        [row.event.event_uid for row in tail.records]))).all()
+    assert {row.connector_id for row in tail_events} == {bld9.id}
 
 
 # --- Other record layouts: regression -------------------------------------
