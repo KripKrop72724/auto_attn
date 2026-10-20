@@ -173,6 +173,7 @@ typedef struct {
     carry_t *carry;
     src_page_t *src;
     uint32_t src_count, src_cap;
+    uint16_t *src_order;           /* src by object and span (stable): src_first */
     uint8_t *rx;                   /* 4 x 4 KiB: record, old block, target, read-back */
     bool room_retry;               /* a restore short of room waits for this run's round */
     int32_t append_error;          /* SPIFFS's error when spiffs_append stopped */
@@ -642,16 +643,32 @@ static bool read_payload(run_t *r, uint16_t pix, uint8_t *out, uint32_t length)
  * review, note 1). */
 static bool src_open(const src_page_t *s) { return s->deliverable && !s->settled && !s->reported; }
 
+/* The first position in src_order (sources by object and span, then in the
+ * order they were loaded) of this object's span: every survey asks once per
+ * span of every file, so the lookup is a binary search, not a scan of every
+ * source (round 2 review: two sources took the run past its CPU bound). */
+static uint32_t src_first(const run_t *r, uint16_t obj, uint32_t span)
+{
+    uint32_t low = 0, high = r->src_count;
+    while (low < high) {
+        uint32_t mid = low + (high - low) / 2;
+        const src_page_t *s = &r->src[r->src_order[mid]];
+        cpu_step(1);
+        if (s->obj < obj || (s->obj == obj && s->span < span)) low = mid + 1;
+        else high = mid;
+    }
+    return low;
+}
+
 /* A kept data page of a source record for this object's span: at `pix`, or
  * anywhere (any_pix). Its object must carry the name the record gave it. */
 static src_page_t *src_for(run_t *r, const obj_t *o, uint32_t span, uint16_t pix, bool any_pix)
 {
-    for (uint32_t i = 0; i < r->src_count; ++i) {
-        src_page_t *s = &r->src[i];
+    for (uint32_t k = src_first(r, o->obj, span); k < r->src_count; ++k) {
+        src_page_t *s = &r->src[r->src_order[k]];
         cpu_step(1);
-        if (!src_open(s) || s->obj != o->obj || s->span != span || (!any_pix && s->pix != pix) ||
-            strcmp(s->name, o->name))
-            continue;
+        if (s->obj != o->obj || s->span != span) break;
+        if (!src_open(s) || (!any_pix && s->pix != pix) || strcmp(s->name, o->name)) continue;
         return s;
     }
     return NULL;
@@ -663,16 +680,19 @@ static src_page_t *src_for(run_t *r, const obj_t *o, uint32_t span, uint16_t pix
  * queue's cursor, when the record was written, had not passed the span: its
  * owner cannot then have read past it, let alone retired the file and
  * created another under the same id and name. */
-static src_page_t *src_alternate(run_t *r, const obj_t *o, uint32_t span, uint16_t ref, uint32_t after)
+static src_page_t *src_alternate(run_t *r, const obj_t *o, uint32_t span, uint16_t ref, uint32_t *at)
 {
-    for (uint32_t i = after; i < r->src_count; ++i) {
-        src_page_t *s = &r->src[i];
+    for (uint32_t k = *at == UINT32_MAX ? src_first(r, o->obj, span) : *at; k < r->src_count; ++k) {
+        src_page_t *s = &r->src[r->src_order[k]];
         cpu_step(1);
-        if (!src_open(s) || s->obj != o->obj || s->span != span || s->pix == ref || strcmp(s->name, o->name) ||
-            !s->cursor_valid || s->cursor_offset >= (span + 1U) * SRP_SPAN_BYTES)
+        if (s->obj != o->obj || s->span != span) break;
+        if (!src_open(s) || s->pix == ref || strcmp(s->name, o->name) || !s->cursor_valid ||
+            s->cursor_offset >= (span + 1U) * SRP_SPAN_BYTES)
             continue;
+        *at = k + 1U;
         return s;
     }
+    *at = r->src_count;
     return NULL;
 }
 
@@ -817,8 +837,9 @@ static bool resolve_span(run_t *r, obj_t *o, uint32_t span, uint16_t ref, int32_
         sources++;
         o->actions |= SRR_FILE_REDO_SOURCE;
     }
-    for (src_page_t *alt = r->src_count ? src_alternate(r, o, span, ref, 0) : NULL; alt;
-         alt = src_alternate(r, o, span, ref, (uint32_t)(alt - r->src) + 1U)) {
+    uint32_t at = UINT32_MAX;
+    for (src_page_t *alt = r->src_count ? src_alternate(r, o, span, ref, &at) : NULL; alt;
+         alt = src_alternate(r, o, span, ref, &at)) {
         if (!src_payload(r, alt, candidate, length)) return false;
         merge_source(p, candidate, length, conflict, sources == 0);
         if (!sources) {
@@ -4209,6 +4230,7 @@ static void free_run(run_t *r)
     release(r, r->resets);
     release(r, r->span_top);
     release(r, r->src);
+    release(r, r->src_order);
     release(r, r->rx);
     release(r, r->waits);
 }
@@ -4280,6 +4302,9 @@ static bool run_checks(run_t *r, bool *catalog_drop, bool *last_failed, bool *cu
 #define SR_RECLAIM_CAP 256U
 #define SR_RECLAIM_CAP_PENDING 128U
 #define SR_RECLAIM_ROUNDS 2U
+/* Blocks a round closes after a failed verify before it stops: a worn cell
+ * is one block; a second suggests the flash, not a cell (round 2 review). */
+#define SR_RECLAIM_CLOSES 1U
 #define SR_ATTR_REFERENCED 0x01U   /* a valid index page of any object names it */
 #define SR_ATTR_INDEX 0x02U        /* its own header says header or index page, not deleted */
 
@@ -4439,6 +4464,23 @@ static SR_NOINLINE bool load_sources(run_t *r)
                 memcpy(sp->name, rec.object[k].name, sizeof(sp->name));
             }
         }
+    }
+    /* By object and span, stable (equal keys keep the load order: slot,
+     * then entry), for src_first. */
+    if (!r->src_count) return true;
+    r->src_order = zalloc(r, r->src_count * sizeof(uint16_t));
+    if (!r->src_order) return fail(r, "sources_memory", SPIFFS_ERR_INTERNAL);
+    for (uint32_t i = 0; i < r->src_count; ++i) {
+        uint32_t at = i;
+        const src_page_t *s = &r->src[i];
+        while (at) {
+            const src_page_t *t = &r->src[r->src_order[at - 1]];
+            cpu_step(1);
+            if (t->obj < s->obj || (t->obj == s->obj && t->span <= s->span)) break;
+            r->src_order[at] = r->src_order[at - 1];
+            --at;
+        }
+        r->src_order[at] = (uint16_t)i;
     }
     return true;
 }
@@ -4746,9 +4788,10 @@ static SR_NOINLINE bool encode_record(run_t *r, const cand_t *b, uint32_t reclai
  * it leaves an open record that recovery decides from the block); if it
  * will not take, the attempts word is used up (recovery then makes the
  * record a source, never redoes it) and the journal gets SOURCES (R2-4).
- * True when the round may go on. */
+ * Only SR_RECLAIM_CLOSES blocks a round: the next failed block, closed or
+ * not, stops it. True when the round may go on. */
 static SR_NOINLINE bool failed_block(run_t *r, const srx_io_t *io, const cand_t *b, uint32_t slot,
-                                     srx_write_t written, const uint8_t *target, uint8_t *back)
+                                     srx_write_t written, const uint8_t *target, uint8_t *back, bool may_go_on)
 {
     carry_t *c = r->carry;
     srr_reclaim_report_t *rep = &c->reclaim;
@@ -4767,7 +4810,7 @@ static SR_NOINLINE bool failed_block(run_t *r, const srx_io_t *io, const cand_t 
     c->area.slot[slot] = SRX_SLOT_SOURCE;
     rep->failed++;
     rep->sources++;
-    bool go_on = closed && marked;
+    bool go_on = closed && marked && may_go_on;
     snprintf(message, sizeof(message), "block %u %s; %s%s", (unsigned)b->block,
              written == SRX_WRITE_VERIFY ? "would not verify"
              : written == SRX_WRITE_IO   ? "could not be written"
@@ -4820,7 +4863,7 @@ static SR_NOINLINE void reclaim_round(run_t *r, const char *trigger)
     uint16_t *ref_owner = zalloc(r, r->total_pages * sizeof(uint16_t)), *owner_index = zalloc(r, SR_IDS * sizeof(uint16_t));
     uint8_t *magic_ok = zalloc(r, r->blocks);
     cand_t *cand = zalloc(r, r->blocks * sizeof(cand_t));
-    uint32_t count = 0, bad_magic = 0, taken = 0, freed = 0, kept_pages = 0;
+    uint32_t count = 0, bad_magic = 0, taken = 0, freed = 0, kept_pages = 0, closes = 0;
     bool stop = false;
     char *mismatched = NULL;
     uint32_t mismatches = 0;
@@ -4988,7 +5031,8 @@ static SR_NOINLINE void reclaim_round(run_t *r, const char *trigger)
             continue;
         }
         /* Not done: its record serves the next run as a byte source. */
-        if (failed_block(r, &io, b, slot, written, target, back)) {
+        if (failed_block(r, &io, b, slot, written, target, back, closes < SR_RECLAIM_CLOSES)) {
+            closes++;
             gained += b->gain;
         } else {
             c->halt = true;

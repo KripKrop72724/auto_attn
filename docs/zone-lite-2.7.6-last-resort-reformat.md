@@ -343,8 +343,12 @@ mirror follows; every read-back raw):
    byte source, and the round goes on with the next candidate (round 2
    review, R2-1): the store again has a valid magic on every block, so the
    next window is the only one without. The record's pages serve the next
-   run (section 10.3). A block that does not read back closed gets its magic
-   cleared again and the round stops: the remount erases it, as before.
+   run (section 10.3). One block per round (`SR_RECLAIM_CLOSES`): a second
+   block that will not verify is closed too and stops the round, since two
+   suggest the flash rather than a worn cell, and each closed block leaves
+   its bytes in the redo area alone until the next run puts them back. A
+   block that does not read back closed gets its magic cleared again and the
+   round stops: the remount erases it, as before.
    If the source bit will not take (an area write error), the record's four
    attempt bits are cleared instead (recovery then makes it a source, never
    redoes it), the journal keeps `ACTIVE` and gets `SOURCES`, and the round
@@ -678,6 +682,13 @@ another generation, and the entry's bytes would replace that generation's
 (a reported entry over a later generation's span that a SALVAGE fill left
 NUL put the old generation's rows there). A reported entry settles only if
 its bytes turn up where the index names them, and never counts as waiting.
+
+Every survey asks for a source once per span of every file, so a run sorts
+the sources it loaded by object and span (stably: equal keys keep the slot
+and entry order) and looks them up by binary search. The linear scan this
+replaced cost a span times every source per survey: two closed blocks' 28
+pages took the 1 MiB T5 store's next run to 2.3 million steps (the harness
+bounds a run at 512 per page: 2.1 million); now 0.37 million.
 
 ### 10.4 Settlement (at the end of every run)
 

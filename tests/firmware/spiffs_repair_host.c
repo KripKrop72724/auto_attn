@@ -112,7 +112,17 @@ static bool round_active;          /* a reformat round is under way */
 static uint64_t first_window_ops;  /* flash_ops when its first window opened */
 static bool worn_next_page;
 static bool worn_magic_next; /* round 2 review: the first window's magic becomes the worn cell (the block will not close) */
-static uint32_t worn_address = UINT32_MAX;
+static bool worn_second_window; /* round 2 review: and the first page of the next window's block, a second worn cell */
+static uint32_t worn_address = UINT32_MAX, worn_address2 = UINT32_MAX;
+/* A program over a worn cell reports success; one bit stays set. */
+static bool wear(uint8_t *mem, uint32_t address, const uint8_t *src, uint32_t length, uint32_t worn)
+{
+    if (worn < address || worn - address >= length) return false;
+    for (uint32_t i = 0; i < length; ++i) mem[address + i] &= src[i];
+    uint8_t want = (uint8_t)~src[worn - address];
+    mem[worn] |= (uint8_t)(want & (uint8_t)(0U - want));
+    return true;
+}
 static bool nor_write(uint8_t *mem, uint32_t size, uint32_t address, const void *buffer, uint32_t length)
 {
     if ((uint64_t)address + length > size) return false;
@@ -147,12 +157,14 @@ static bool nor_write(uint8_t *mem, uint32_t size, uint32_t address, const void 
             if (src[i] != 0xFF) worn_address = address + i;
         worn_next_page = false;
     }
-    if (mem == flash && worn_address >= address && worn_address - address < length) {
-        for (uint32_t i = 0; i < length; ++i) mem[address + i] &= src[i];
-        uint8_t want = (uint8_t)~src[worn_address - address];
-        mem[worn_address] |= (uint8_t)(want & (uint8_t)(0U - want));
-        return true;
+    if (mem == flash && worn_second_window && worn_address != UINT32_MAX && round_active && length == PAGE &&
+        address / BLOCK != worn_address / BLOCK) {
+        for (uint32_t i = 0; i < length && worn_address2 == UINT32_MAX; ++i)
+            if (src[i] != 0xFF) worn_address2 = address + i;
+        worn_second_window = false;
     }
+    if (mem == flash && (wear(mem, address, src, length, worn_address) || wear(mem, address, src, length, worn_address2)))
+        return true;
     /* A worn cell: the program reports success, one bit stays set. */
     if (fail_program_at && flash_ops == fail_program_at) {
         bool kept = false;
@@ -5075,7 +5087,7 @@ static void check_round(const uint8_t *before, const uint8_t *after)
 
 static void round_ended(void)
 {
-    worn_address = UINT32_MAX;
+    worn_address = worn_address2 = UINT32_MAX;
     if (!round_active) return;
     round_active = false;
     round_end_ops = flash_ops;
@@ -6184,28 +6196,33 @@ static void t5_store(uint32_t kib, uint64_t seed_value)
  * CHECK_CHANGED, with 17 candidates left). When the block will not close
  * either (a worn cell in its magic) the round stops and the remount erases
  * it; the restore still runs again, room being decided from the erased
- * pages after the remount and not from the blocks reformatted. */
+ * pages after the remount and not from the blocks reformatted. A second
+ * worn window in the same round is closed too and stops the round (one
+ * close per round: SR_RECLAIM_CLOSES). */
 static void run_worn_round(uint32_t kib)
 {
     srr_config_t config = config_2760(false);
     srr_report_t report;
-    for (int closes = 1; closes >= 0; --closes) {
-        const char *how = closes ? "a worn cell in the first window, closed" : "a worn magic, the block not closed";
+    for (int closes = 2; closes >= 0; --closes) {
+        const char *how = closes == 2 ? "two worn windows, both closed, the round stopped at the second"
+                        : closes ? "a worn cell in the first window, closed" : "a worn magic, the block not closed";
         t5_store(kib, 47000);
         t5_victim = "/processed_commands.txt";
         t5_alter = false;
         check_hook = t5_remove_and_cram;
         logged_count = 0;
         worn_next_page = closes != 0;
+        worn_second_window = closes == 2;
         worn_magic_next = closes == 0;
         uint32_t closed_before = round_closed_blocks, failed_before = round_failed_blocks;
         repair_boot(&report, &config);
-        worn_next_page = worn_magic_next = false;
-        worn_address = UINT32_MAX;
+        worn_next_page = worn_magic_next = worn_second_window = false;
+        worn_address = worn_address2 = UINT32_MAX;
         check_hook = NULL;
         uint32_t closed = round_closed_blocks - closed_before, failed = round_failed_blocks - failed_before;
-        CHECK(report.reclaim.failed == 1 && failed == 1 && closed == (closes ? 1U : 0U) &&
-                  (closes ? report.reclaim.blocks > 0 : report.reclaim.blocks == 0) &&
+        uint32_t want_failed = closes == 2 ? 2U : 1U, want_closed = (uint32_t)closes;
+        CHECK(report.reclaim.failed == want_failed && failed == want_failed && closed == want_closed &&
+                  (closes == 1 ? report.reclaim.blocks > 0 : report.reclaim.blocks == 0) &&
                   code_logged("STORAGE_REPAIR_RESTORE_WAITING") && code_logged("STORAGE_REPAIR_RESTORE_RETRIED") &&
                   !gaps_naming(t5_victim) && report.result != SRR_RESULT_FAILED,
               "t5, %s: %s at %s, %u blocks, %u failed (%u closed), %u gap records naming %s", how,
