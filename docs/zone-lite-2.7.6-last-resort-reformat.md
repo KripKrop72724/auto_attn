@@ -4,8 +4,11 @@ Status: implemented and verified on the host (section 17), not yet on a
 device; the version is not bumped yet. This is the second design round,
 after two reviews of the first (commit 7556422): a custody review (C1 to C6,
 H1 to H4, M1, M2) and a device review (D1 to D10). Section 16 says what
-became of every point. Branch `release/zkt-2.7.6` from `origin/main` 5de7724
-(2.7.5 released, #398 and #400 merged).
+became of every point. The implementation (eaf7ec3) then had its own first
+review round, a custody review (D1 to D3 and a low finding) and a device and
+build review (six low findings); section 18 says what became of each.
+Branch `release/zkt-2.7.6` from `origin/main` 5de7724 (2.7.5 released, #398
+and #400 merged).
 
 Owner decision, 16 October 2026, reconfirmed 20 October ("yes start 2.7.6"):
 a last-resort reformat is approved when the store cannot otherwise be made
@@ -52,7 +55,25 @@ What changed from the first round:
   gap with the record kept for good (C4, C5).
 - **The keep set** comes from flash structure alone (H1), and blocks whose
   magic has two set bits or fewer are never chosen (D2: block 983's magic is
-  0x0000).
+  0x0000), nor blocks whose magic has every byte 0x00 or 0xFF (round 1 review
+  of the implementation, D3: block 810's is 0x00FF).
+
+What the implementation's round 1 review changed (section 18):
+
+- **Cursor offsets.** A record keeps a queue's cursor offset only when it
+  is verified against the file when the record is written, and no offset
+  settles a page while the file can still get its bytes back (10.4).
+- **An area that cannot be read** while it may hold queue bytes leaves the
+  queues' unreadable spans for a boot that can (10.1); nothing is filled or
+  recorded as lost.
+- **A restore short of room** (T5) waits for the round and runs again with
+  its hold alive; only what still cannot go back is recorded, once (7.5).
+- **A torn erase** that reads a valid magic is redone on the same image
+  (10.1); weak magics include byte-wise ones (6.1).
+- **The report** ADD gets covers every run of the boot (11); a run that
+  cannot load its byte sources fails before writing; a boot without its
+  deadline writes nothing; the geometry is pinned; the stack is measured
+  again (12).
 
 ## 1. Evidence
 
@@ -109,8 +130,10 @@ writes anything (the exposure histogram, section 11).
    mount; two fail it with `SPIFFS_ERR_NOT_A_FS`. Any mount by any image
    therefore erases a block a reset left without magic.
 3. **Low magics.** At 8 MiB block 983's magic is 0x0000, 11 blocks have one
-   set bit and 55 have two (D2). Clearing such a magic changes little or
-   nothing, and a torn erase can make it read valid again.
+   set bit and 55 have two (D2), and block 810's is 0x00FF (round 1 review,
+   D3). Clearing such a magic changes little or nothing, and a torn erase can
+   make it read valid again: the window clears it to 0x0000, and an erase cut
+   short leaves each byte erased or not (0x00FF, 0xFF00).
 4. **Free blocks are counted by entry 0.** The mount counts a block as free
    when its entry 0 is free; the allocator decrements `free_blocks` when it
    takes an entry 0.
@@ -180,7 +203,7 @@ when that run is about to hand the store over without room:
 | T2 | fewer than two free blocks and fewer erased pages than SPIFFS's GC needs (`gc_unsafe`) | `DEFERRED`, `gc_unsafe` |
 | T3 | a resume entry blocked for room (`error_stage` `full`) | `RESTORE_DEFERRED` / `MERGE_DEFERRED` |
 | T4 | a failed check pass with `SPIFFS_ERR_FULL` | `FAILED` |
-| T5 | the restore after a check could not bring a file back (no page for its header) | `FAILED`, `restore`, the manifest kept |
+| T5 | a restore after a check had no page (a rebuild's header, the rest of a partial rebuild, a changed span's new page): it waits for the round (7.5) | `FAILED`, `restore`, the held bytes recorded and lost |
 
 and all of these hold:
 
@@ -198,7 +221,8 @@ and all of these hold:
 Then the next run starts from scratch (generation + 1): survey,
 normalization, the hold, the check, the restore, compaction, the finish and
 the probe, with room. Holds die with the run that took them; the first run
-compares them after the round (section 7.4).
+compares them after the round (section 7.4), and a restore that waited for
+the round's room runs again before they die (section 7.5).
 
 **Why not "deferred for the same shortage on consecutive boots".** Not
 needed: the reclaim deletes nothing anything reads (R9) and every kept byte
@@ -264,7 +288,7 @@ candidate, nor is one where nothing would be dropped.
 | 22 | `u16 block`, `u16 kept_mask`, `u16 drop_mask` |
 | 28 | `u16 erase_count`, `u16 block_count` |
 | 32 | `u32 old_crc`, `u32 new_crc` (CRC-32 of the block before, and of the target) |
-| 40 | 5 x 40 bytes: per object owning a kept data page, `u16 obj`, `u8 class`, `u8 flags` (bit 0: cursor valid), `u32 cursor_offset` (its queue checkpoint's offset when the record was written), `char name[32]` |
+| 40 | 5 x 40 bytes: per object owning a kept data page, `u16 obj`, `u8 class`, `u8 flags` (bit 0: cursor verified), `u32 cursor_offset` (its queue checkpoint's offset when the record was written, kept only when `srp_cursor_verdict` found it valid for the file then: round 1 review, D1), `char name[32]` |
 | 240 | `u32 header_crc` (bytes 0 to 239) |
 | 244 | `u32 done` (`0xFFFFFFFF` open; any bit cleared: done) |
 | 248 | `u32 settle`: bit e cleared, entry e settled; bit 16+e cleared, entry e reported to ADD; bit 31 cleared, the record is a byte source |
@@ -285,8 +309,9 @@ mirror follows; every read-back raw):
    erased only if it does not already read all `0xFF` (D6), programmed and
    read back raw. A slot that does not verify is skipped; a second failure
    ends the round (`RECLAIM_FAILED`).
-2. **Window open.** Clear B's magic (program `0x0000`; B's magic has three or
-   more set bits, so this always invalidates it).
+2. **Window open.** Clear B's magic (program `0x0000`; B's magic is strong,
+   6.1, so this always invalidates it, and an erase cut short cannot make it
+   read valid again byte by byte).
 3. Erase B.
 4. Program the kept pages, the lookup bytes, then the erase count.
 5. Program the magic. **Window closed.**
@@ -311,7 +336,9 @@ itself once by 2 s (H2, D7). Nothing else writes the store during a round.
 A block is a candidate only when all of these hold:
 
 - something is dropped (R9) and no entry is mislabeled (5.1);
-- its magic is valid and has at least three set bits (D2);
+- its magic is valid and strong: at least three set bits (D2) and not every
+  byte 0x00 or 0xFF (round 1 review, D3; 68 blocks of 2,048 are weak, 983
+  and 810 among them);
 - it is not the block of any record that is not retired (G5);
 - no kept page is a header or index page, judged by the page's own header
   (object id with the index flag, deleted flag clear), not by its lookup
@@ -381,10 +408,37 @@ reclaim leaves inside blocks (1.3 item 5).
 ### 7.4 The held-CRC oracle
 
 After the round the store is surveyed again and every held file is compared
-with its hold, span by span (bytes that were unreadable when held excepted).
-A difference stops reclaiming for this boot, logs
+with its hold, span by span (bytes that were unreadable when held excepted;
+a file whose restore waits for the round, 7.5, reads what the check left
+and is not compared). A difference stops reclaiming for this boot, logs
 `STORAGE_REPAIR_RECLAIM_MISMATCH`, remounts and puts the held bytes back in
 place (2.7.5's `restore_in_place`). The harness proves it never fires.
+
+### 7.5 A restore short of room (T5; round 1 review, D2)
+
+A held file whose restore after a check pass finds no page (SPIFFS_ERR_FULL,
+or SPIFFS_ERR_NOT_FOUND from its allocator when its counters still show free
+blocks) while a round may follow in the same run waits: nothing is recorded
+yet, `STORAGE_REPAIR_RESTORE_WAITING` says so, and the round's target counts
+the pages the waiting bytes need. It may be the rebuild's header (the check
+freed the file), the rest of a partial rebuild (the partial file takes the
+name as before), or a changed span's new page.
+
+After the round's remount, when the erased pages cover every waiting byte,
+the restore runs again (compaction first, as after a check pass) while the
+holds are still in memory, and whatever still cannot go back is recorded
+then (`STORAGE_REPAIR_RESTORE_RETRIED`). Otherwise (the round could not make
+that room, did not run, or could not remount) the waiting bytes are recorded
+as they stood: a restore that would stop part way would only take the
+round's room from SPIFFS's own writes. Either way before the holds die with
+the run. A recorded rebuild's manifest entry is marked reported, so the
+resume never records the same bytes a second time (2.7.5 recorded the rebuild
+twice: CHECK_CHANGED, then RESTORE_INTERRUPTED).
+
+A reset before the retry leaves the entry unreported, and the next boot's
+resume records it, as for any reset during a restore. The round still never
+comes between a check pass and its restore (H4): it follows the restore, and
+only the retry of a restore that waited for its room comes after it.
 
 ## 8. Confirmed or unconfirmed
 
@@ -442,6 +496,11 @@ Valid records are read in every state where the area can be read (M1).
 `FOREIGN` blocks new records only; programming the progress words of our own
 records is allowed. A foreign tail is never claimed without the owner (D8).
 
+The redo records hold Zone Lite's SPIFFS geometry (256-byte pages, 4 KiB
+blocks, the length magic): pinned at build time (`_Static_assert`s in the
+glue and the engine) and checked again before a round, recovery and loading
+sources (round 1 review, low 5).
+
 ### 9.2 The ring and wear
 
 A new record takes the free slot after the newest sequence. Done and retired
@@ -454,7 +513,9 @@ in done slots until reuse, with the same exposure as the plaintext store.
 
 `srp_reclaim_t`: `version`, `flags` (`CLAIMED`: this device has written the
 area, never cleared; `ACTIVE`: a round may have open records; `SOURCES`:
-records found open must become byte sources), `reclaim_id`, `rounds`,
+records found open must become byte sources; `HELD`: the area holds byte
+sources not yet retired, set by recovery from what it inspected and by a
+round whose record became a source, round 1 review), `reclaim_id`, `rounds`,
 `blocks`, `pages_freed`, `crc`. About 32 bytes, 4 NVS entries. Written once
 before a round's first record, once after it, and by recovery (section 10).
 Older images ignore the key; the 2.7.5 layouts (`srp_state_t`,
@@ -473,18 +534,39 @@ For each valid record that is neither done nor a source, in sequence order:
 | four attempts already used (D5) | mark it a source |
 | B raw equals the target (`new_crc`) | program the erase count and magic again with the same values (D4), verify raw, program `done` |
 | B raw has no valid magic, or equals the old image (`old_crc`) | one more attempt bit; then 5.3 steps 2 to 7 from the record |
+| B has a valid magic and reads as the window's erase cut short: every byte the record holds (kept pages, their lookup entries, erased entries, the lookup page's other bytes) is there with bits only set, and some kept byte is not erased (round 1 review, D3) | redo, as above |
 | anything else (B has a magic and other content: something mounted and wrote it) | mark it a source (C2) |
 
 B without a valid magic proves no mount happened since the reset (any mount
 erases it), so redoing it overwrites only the round's own interrupted
-writes. A source is never redone again (its bit 31 is cleared before
-anything else happens to it).
+writes. A torn erase that reads a valid magic again (a bit-level tear; a
+strong magic cannot byte by byte) is redone on the same image too: a mount's
+erase leaves no kept byte, and a page programmed since into a kept or erased
+entry clears bits the record has set. Before this rule such a block was
+taken for another writer's and stayed mounted half erased. A source is never
+redone again (its bit 31 is cleared before anything else happens to it).
 
 If the area cannot be inspected this boot (not registered, unreadable, no
 memory) while the journal says `ACTIVE`, recovery writes `SOURCES` to the
 journal before returning; if that write fails, the VFS does not mount the
 store this boot (`storage_repair_storage_allowed()` false; LOCAL_FAILURE,
 as for a failed mount) (C2). The private repair mount is skipped too.
+
+Such a boot cannot read the records' bytes either. When the journal says
+they may hold queue bytes (`ACTIVE`, `SOURCES` or `HELD`) the run is told
+(`srr_config_t.sources_unread`, `STORAGE_REPAIR_RECLAIM_SOURCES`): a reclaim
+queue's unreadable spans wait, neither filled nor recorded, and the file
+stays blocked as on a store without room, until a boot that reads the area
+puts the bytes back (round 1 review, low: such a boot used to fill them and
+tell ADD they were lost). A run that can read the area but cannot allocate
+the buffer for its byte sources, or read one, fails before it writes
+anything (`sources_memory`, `sources_read`; low 6).
+
+Without the deadline timer (it could not be created) recovery writes
+nothing: open records go to the journal as sources, as for an area that
+cannot be read, and the boot's breadcrumb is marked returned. The `REFORMAT`
+breadcrumb is set only while recovery acts on an open record, so a crash
+later in the boot is not taken for the repair's (low 2).
 
 | Cut at | Next boot, same confirmed image | After a rollback |
 |---|---|---|
@@ -516,9 +598,9 @@ A kept page that is deleted but named by the file's index (13FL's head) is a
 source the same way. A kept *copy* of span k at another page (an interrupted
 GC or page move left it, and another image's SPIFFS GC may have deleted it
 since) is a source as 2.7.5 trusts such a copy on flash, but only when the
-record's cursor offset for X had not passed the span: X's owner cannot then
-have read past it, let alone retired X and created another file under the
-same id and name.
+record's verified cursor offset for X had not passed the span: X's owner
+cannot then have read past it, let alone retired X and created another file
+under the same id and name.
 Where a span reads, instead, as exactly the fill a SALVAGE gap left (a boot
 that could not read the area filled it), the record's bytes put it back in
 place; the cursor reconciliation then replays from a changed prefix
@@ -531,13 +613,17 @@ Each kept entry ends in exactly one terminal way (C5):
 | Entry | Settled when |
 |---|---|
 | deleted, leaked, catalog or probe page | at once: nothing to deliver |
-| a queue file's data page | **back on flash**: every byte P programmed is present at the page X's index names for span k (more bytes are allowed: an append in place); or **settled by offset**: the record's cursor offset is past the span's end |
+| a queue file's data page | **back on flash**: every byte P programmed is present at the page X's index names for span k (more bytes are allowed: an append in place); or, once X is gone or holds other bytes there under its id and name, **settled by offset**: the record's cursor offset, verified when it was written, is past the span's end |
 | a queue file's page whose file is gone or changed and that the offset does not cover | **reported**: a `REFORMAT_INTERRUPTED` gap of exactly its range; the record is kept for good |
 
-A span still unreadable for room waits for a later run. When every entry is
-settled the record is retired (bit 31 stays, `settle` says retired); a
-record with a reported entry is never reused (its bytes stay in the area).
-Rows can be delivered twice; none is lost.
+While X (the same id and name) still holds the span unreadable, or filled
+where the record's bytes belong, the entry waits: the next run with room
+puts the bytes back. No offset settles it then (round 1 review, D1: a stale
+cursor that was never verified once settled 3,514 readable bytes, the record
+retired, and the next run filled the span). When every entry is settled the
+record is retired (bit 31 stays, `settle` says retired); a record with a
+reported entry is never reused (its bytes stay in the area). Rows can be
+delivered twice; none is lost.
 
 ## 11. Reporting to ADD
 
@@ -547,15 +633,25 @@ Rows can be delivered twice; none is lost.
 |---|---|---|
 | `STORAGE_REPAIR_RECLAIM` | WARN | n blocks reformatted in place for the trigger: m deleted pages erased, k kept; e erased pages now |
 | `STORAGE_REPAIR_RECLAIM_REDONE` | WARN | block b completed from the redo area after a reset (or re-asserted) |
-| `STORAGE_REPAIR_RECLAIM_SOURCES` | ERROR | records that became byte sources, and why |
+| `STORAGE_REPAIR_RECLAIM_SOURCES` | ERROR | records that became byte sources, and why; byte sources a run could not load (it fails before writing); WARN: the area cannot be read and may hold queue bytes, which wait |
 | `STORAGE_REPAIR_RECLAIM_SETTLED` | WARN | source pages settled, reported or still waiting |
 | `STORAGE_REPAIR_RECLAIM_SHORT` | WARN | stopped before the target (no candidate, time, cap, slots), with the histogram |
 | `STORAGE_REPAIR_RECLAIM_UNAVAILABLE` | ERROR | the redo area is not `READY`; the store stays as 2.7.5 leaves it |
 | `STORAGE_REPAIR_RECLAIM_FAILED` | ERROR | a slot or block that would not verify |
 | `STORAGE_REPAIR_RECLAIM_MISMATCH` | ERROR | the held-CRC oracle fired |
+| `STORAGE_REPAIR_RESTORE_WAITING` | WARN | a held file's restore had no page and waits for the round (7.5) |
+| `STORAGE_REPAIR_RESTORE_RETRIED` | WARN/ERROR | restores that waited: how many went back after the round, or why they were recorded as they stood |
 
-**Heartbeat.** `diagnostics.storage.repair` gains `level: 3` when a round
-ran, `runs`, and a `reclaim` object sent every boot: `area` (the state),
+**Heartbeat.** `diagnostics.storage.repair` is the boot's report over every
+run (round 1 review, low 1): the last run's outcome (result, mode, phase,
+stage, holds, the store it leaves), the first run's starting point
+(`used_before`, the previous phase, the attempts guard), the work of every
+run added up (spans rewritten, strays, cursors reset, gaps, check passes,
+...), the room figures of the last run that lacked room, and each file's
+actions and counts merged (its blocked spans the last run's). Before, it was
+the last run's alone: P02's first 2.7.6 run (153 spans, 1 page needed, 0
+erased) would have reached ADD as 51 spans with no room figures. It gains
+`level: 3` when a round ran, `runs`, and a `reclaim` object sent every boot: `area` (the state),
 `area_foreign_sectors`, `area_first_foreign`, `area_foreign_crc` (when
 foreign), `trigger`, `rounds`, `blocks`, `pages_freed`, `pages_kept`,
 `erased_after`, `redone`, `sources`, `settled`, `reported`, `records_open`,
@@ -594,10 +690,29 @@ soft deadline of an unconfirmed image. The 900 s confirmation budget starts
 after `storage_init`. HIL measures `reclaim.ms` and `duration_ms`.
 
 PSRAM: four 4 KiB buffers for the round, three for recovery. Internal: the
-external partition's list item (about 100 bytes, freed on return). Stack
-(`-fstack-usage`, ESP-IDF 5.5.3): `run_once` 1,552 B (2.7.5's `srr_run` was
-1,168 B: the round is inlined), `srx_recover` 608 B from
-`storage_repair_boot` (432 B); P02 reported 4,112 B free of 8 KiB.
+external partition's list item (about 100 bytes, freed on return).
+
+Stack (round 1 review, low 3; the figures this section gave before were
+wrong). Measured with ESP-IDF 5.5.3's GCC on the production build, every
+repair and SPIFFS source compiled again with `-fcallgraph-info=su`; the
+deepest static chain from `storage_repair_boot`, indirect calls aside:
+
+| | 2.7.5 (5de7724) | eaf7ec3 | now |
+|---|---|---|---|
+| deepest chain | 3,232 B | 4,016 B | 3,584 B |
+| through | `srr_run`, `restore_held`, `unhide_as` | `run_once`, `run_checks`, `restore_held`, `restore_in_place`, `rewrite_index` | `run_once`, `settle_waits`, `restore_held`, `restore_in_place`, `rewrite_index` |
+| `srr_run` | 928 B | 48 B | 48 B |
+| `run_once` | (in `srr_run`) | 1,552 B | 944 B |
+| `reclaim_round` | | (in `run_once`) | 528 B |
+| `storage_repair_boot` | 432 B | 432 B | 448 B |
+
+The round's candidate plan, record encoder, held comparison and settlement
+are kept out of `run_once`'s frame (`SR_NOINLINE`); each chain ends in
+SPIFFS's own `spiffs_page_move` and cache frames. The review measured 3,104 B
+and 3,888 B leaving SPIFFS's leaf frames out: the same 128 B less. P02's
+4,112 B free of 8 KiB came from a run that skipped the check, so it is not
+2.7.5's worst case: HIL must read `stack_free_bytes` on P02's first 2.7.6
+boot and require at least 2,048 B.
 
 ## 13. Harness
 
@@ -659,7 +774,23 @@ one of them, `REVIEW_FULL=1` cuts at every write instead of sampling.
   filled spans put back the next boot), and a refused journal (the store not
   mounted that boot).
 - **`reclaim-mirror`**: the same flash, redo area and report with and
-  without the metadata mirror.
+  without the metadata mirror; the remount keeps the mirror as the device's
+  does (one mirror per boot) and checks it against one read fresh from flash
+  at every remount; P02's round cut through the mirror (round 1 review, low
+  4).
+- **Round 1 review of the implementation** (section 18): `reclaim-stale`
+  (a cut in a window over 14 pages of the queue, block 133, then a boot that
+  cannot read the area, then boots that can, with a stale cursor, a cursor
+  before the damage, a verified cursor past the window, and on the gc-unsafe
+  store: every readable byte back, gap records only for unreadable bytes,
+  records keep only verified cursors), `reclaim-restore` (T5: a held file
+  freed or changed by the check on a store without room, with and without a
+  redo area, and one the round cannot make room for), `reclaim-torn` (six
+  torn erases that read a valid magic, redone), `reclaim-sources` (byte
+  sources without memory), `reclaim-p02` (the boot's report over its runs,
+  also with 2.7.6 straight on P02's store). The host-only `prefer` port
+  lets a test put a round's first window over a block it names (any eligible
+  block is the engine's free choice); the device leaves it NULL.
 - **Organic:** a store that ends wedged is now a failure (the partition is
   no longer grown to read it); CI's prefilled 8 MiB seeds and the long seeds
   must end healthy.
@@ -719,10 +850,17 @@ for 2.7.5.
 - A redo given up after four attempts (supply that cannot sustain an erase)
   turns into sources; the spans stay unreadable to the application until a
   run has room for them.
-- As in 2.7.5, held bytes the restore cannot put back for room (a check
-  that unexpectedly removed a held file on a full store) are reported, not
-  kept: the round (T5) then gives the store room in the same boot, but the
-  hold has died with the run that took it.
+- Held bytes a restore cannot put back even after the round (the round could
+  not make room for all of them, as on a store crammed with files never put
+  in a window) are recorded once, before the hold dies (7.5); a reset before
+  the retry costs the held bytes, recorded by the next boot's resume, as for
+  any reset during a restore.
+- A device whose redo area cannot be read while it holds byte sources keeps
+  the affected queues blocked (their unreadable spans wait) until a boot
+  reads the area.
+- A record written while a queue's cursor could not be verified (an
+  unreadable span before it) never settles by offset: an entry whose file is
+  then gone is reported, its record kept for good.
 - A round leaves a run's work for the next run of the same boot, so a boot
   may run the repair three times (two rounds); the deadlines bound it.
 - None of this has run on a device.
@@ -768,9 +906,13 @@ for 2.7.5.
 | 3c546a6 | ADD: `StorageRepairReclaim`, `runs` |
 | 31b8897 | GCC format-truncation fix, the namespace host's stub |
 | 29e094b | P02 builder exact to the field report; recorded copies as sources |
+| eaf7ec3 | this section, the first time |
+| a400229 | the round 1 review of the implementation: every finding (section 18), with its regression tests |
+| 38b52ec | the log line for a queue that waits for an area that cannot be read |
 
-**Results** (host, ESP-IDF 5.5.3 SPIFFS, ASan and UBSan; Apple clang natively
-and GCC in `espressif/idf:v5.5.3`):
+**Results at eaf7ec3** (host, ESP-IDF 5.5.3 SPIFFS, ASan and UBSan; Apple
+clang natively and GCC in `espressif/idf:v5.5.3`; the results after the
+round 1 review follow these):
 
 - The CI harness configuration (`check_spiffs_repair.py`, every entry,
   including the new 8 MiB reclaim entries): passes natively and in the IDF
@@ -804,3 +946,34 @@ and GCC in `espressif/idf:v5.5.3`):
 Not run here: a device (HIL), the 8 backend shards with Postgres (no model
 or migration changed), and the release step (version, upgrade guard
 digests, signing).
+
+## 18. Round 1 review of the implementation (eaf7ec3) and what became of it
+
+Two reviews of eaf7ec3: a custody review (refuted it: three defects losing
+readable bytes, D1 to D3, and a low finding) and a device and build review
+(no blocking defect, six low findings). Every finding is accepted and fixed
+in a400229 and 38b52ec. Each fix has a host test that fails with that fix
+taken out of the final code and passes with it (the second column of the
+proof); where the reviewer left a reproduction (`rv276-repro.patch`: modes
+`rvH1`, `rvT5`, `rv810`) it was run on eaf7ec3 and on the fixed code (the
+first column).
+
+| Finding | What changed | Proof: the reviewer's reproduction, eaf7ec3 then fixed; the regression test without the fix |
+|---|---|---|
+| **D1** (high) a record settles on a queue cursor that was never verified, and its bytes are then lost | A record keeps a queue's cursor offset only when `verified_cursor` finds it valid for the file when the record is written (present, its CRC good, `srp_cursor_verdict` KEEP: prefix readable, prefix CRC matching), once per queue per round. `settle_sources` never settles by offset while the file (its id and name) holds the span unreadable, or filled where the record's bytes belong: the entry waits and the next run with room puts the bytes back. Offset settlement only once the file is gone or holds other bytes there (10.4) | `RV_STALE=1 rvH1 --kib=1024`: 3,514 readable bytes lost (offset 110,189, spans 439 to 452); fixed: 0 lost. `reclaim-stale` with the record-time check taken out: "record 4 keeps the queue's cursor offset although it could not be verified"; with the settlement rule taken out: "/pending.jsonl byte 110189 changed 6e -> 00" (a verified cursor past the window) |
+| **D2** (medium) T5 makes room, but the held bytes have already been dropped | A restore after a check that finds no page waits for the round (7.5): nothing recorded, the round's target counts the waiting pages, and the restore runs again after the round while the holds live, when the erased pages cover it; only what still cannot go back is recorded, once. A recorded rebuild's manifest entry is marked reported, so the resume adds no second record. SPIFFS_ERR_NOT_FOUND from the allocator counts as no room. The held-CRC oracle skips a file whose restore waits | `RV_VICTIM=/processed_commands.txt rvT5 --kib=1024`: the command dedupe file missing after 17 blocks reformatted, two records for the same range (CHECK_CHANGED, RESTORE_INTERRUPTED); fixed: byte-exact, no record. `reclaim-restore` without the deferral: "freed with a redo area: ... 1 gap records"; without the reported mark: "the resume recorded the same bytes again (2 records)" |
+| **D3** (medium) the weak-magic rule misses block 810 (0x00FF) at 8 MiB | A magic with every byte 0x00 or 0xFF is weak (68 of 2,048 blocks, 983 and 810 among them). On the same image a block with a valid magic that reads as the window's erase cut short (every byte the record holds there with bits only set, a kept byte not yet erased) is redone, not taken for another writer's. The cut sweeps cannot reach block 810 any more (it is never eligible); the exhaustive tear check over every block of 64- to 4,096-block stores and the round oracle (every reformatted block strong) cover it instead | `RV_UNCONF=1 RV_P02_LEAK=35 RV_PREFER=810 RV_N=4 rv810 --kib=8192`: 4 of 4 tears that left the magic valid lost or changed `/processed_commands.txt` for the old image; fixed: block 810 is never taken ("block 810 not taken first"). The exhaustive tear check on eaf7ec3's `srx_magic_strong`: blocks 810 of 2,048 and 2,858 of 4,096 strong yet tear-valid; fixed: none. `reclaim-torn` without the torn-erase rule: "0 redone, 1 sources"; with it 6 of 6 redone |
+| **Low** a boot that cannot read the area records SALVAGE gaps for bytes the next boot restores | The journal's new `HELD` flag (byte sources not yet retired) with `ACTIVE` and `SOURCES` tells a boot that cannot read the area that records may hold queue bytes (`srr_config_t.sources_unread`): a reclaim queue's unreadable spans wait, neither filled nor recorded, and `STORAGE_REPAIR_RECLAIM_SOURCES` says why (10.1) | `RV_STALE=0 rvH1`: a SALVAGE record of 3,514 bytes the next boot restored; `RV_H1_GCU=1`: 1,255 bytes; fixed: only span 2's bytes, which nobody could read. `reclaim-stale` with the hold-back taken out: "3514 readable bytes reported unreadable" |
+| **Low 1** the heartbeat reports only a boot's last run | `merge_report`: the boot's report over every run (11) | `reclaim-p02` without the merge: "2 runs, 12 spans rewritten (12 damaged), 0 pages needed, 0 erased" (the last run's); with it 48 spans (3 x 12 in the first run, 12 in the second) and 1 page needed, 0 erased; at 8 MiB 204 spans (153 + 51) |
+| **Low 2** a leftover REFORMAT breadcrumb, and recovery running without a deadline | Without the deadline timer recovery writes nothing (open records go to the journal as sources) and the breadcrumb is marked returned; the REFORMAT breadcrumb is set only while recovery acts on an open record (10.1) | Device glue, not reachable by the host harness: `test_a_boot_without_its_deadline_writes_nothing_and_returns_its_breadcrumb` fails on eaf7ec3, passes |
+| **Low 3** the stack figures in the doc are wrong | Corrected and measured again (12); the round's plan, record encoder, held comparison and settlement are kept out of `run_once`'s frame: the deepest chain is 3,584 B (eaf7ec3 4,016 B, 2.7.5 3,232 B, all with SPIFFS's leaf frames). HIL must see `stack_free_bytes` of at least 2,048 B on P02's first 2.7.6 boot | `-fcallgraph-info=su` on the production build, section 12 |
+| **Low 4** the harness does not remount the way the device does | The harness's remount keeps the mirror and checks it against one read fresh from flash at every remount; P02's round is also cut through the mirror | `reclaim-mirror` with the old remount: "2 mirror inits, 0 kept-mirror checks for 1 rounds" |
+| **Low 5** nothing checks the page and block geometry | `_Static_assert`s on the page size, block size and length magic in the glue and the engine; the round, recovery's registration and loading sources check the mounted geometry (9.1) | `test_the_redo_geometry_is_pinned_at_build_time_and_checked_before_any_round` fails on eaf7ec3, passes |
+| **Low 6** a failed buffer allocation drops the redo sources silently | A run whose area holds a source record fails before writing when it cannot allocate the buffer (`sources_memory`) or read a record (`sources_read`) | `reclaim-sources` without the fix: "REPAIRED_WITH_GAPS ... 1 gap records" (the span filled and recorded as lost); with it FAILED before writing, and the next boot puts the bytes back |
+| Note: 864 B more static internal RAM (`s_area`) | Not a defect; left as it is (the boot's area table, used during `storage_repair_boot`) | |
+
+Still open, as the device review listed them (release blockers, not
+defects): the version bump, the ADD storage contract versions and the
+direct-legacy BASE marker including 2.7.5 (so devices on 2.7.5 can take
+2.7.6), the upgrade-guard digests, signing, and a hardware-in-loop run,
+with the stack and the time on P02.
