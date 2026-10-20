@@ -4439,13 +4439,17 @@ static void reclaim_round(run_t *r, const char *trigger)
         cand[at] = next;
         cpu_step(at < 64 ? at : 64);
     }
-    snprintf(message, sizeof(message),
-             "%s: %ld pages short; blocks: %lu candidates (%lu holding nothing any image reads, %lu custody), %lu "
-             "with an index page, %lu excluded, %lu with a weak magic%s",
-             trigger, (long)want, (unsigned long)rep->candidates, (unsigned long)rep->unconfirmed_blocks,
-             (unsigned long)rep->custody_blocks, (unsigned long)rep->index_blocks, (unsigned long)rep->excluded_blocks,
-             (unsigned long)rep->low_magic_blocks, unconfirmed ? "; unconfirmed image" : "");
-    logf_line(r, "INFO", "STORAGE_REPAIR_RECLAIM_EXPOSURE", message);
+    {
+        char line[256];
+        snprintf(line, sizeof(line),
+                 "%s: %ld pages short; blocks: %lu candidates (%lu holding nothing any image reads, %lu custody), "
+                 "%lu with an index page, %lu excluded, %lu with a weak magic%s",
+                 trigger, (long)want, (unsigned long)rep->candidates, (unsigned long)rep->unconfirmed_blocks,
+                 (unsigned long)rep->custody_blocks, (unsigned long)rep->index_blocks,
+                 (unsigned long)rep->excluded_blocks, (unsigned long)rep->low_magic_blocks,
+                 unconfirmed ? "; unconfirmed image" : "");
+        logf_line(r, "INFO", "STORAGE_REPAIR_RECLAIM_EXPOSURE", line);
+    }
     if (!writable) {
         snprintf(message, sizeof(message), "the redo area is %s; no reformat, the store stays as it is",
                  srx_area_name(c->have_area ? c->area.state : SRX_AREA_ABSENT));

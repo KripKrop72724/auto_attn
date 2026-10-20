@@ -505,7 +505,7 @@ static srr_config_t repair_config(void)
 
 /* One boot: mount privately, repair, unmount. HAL operations are capped:
  * the firmware's deadline must never be the thing that ends a repair. */
-static uint64_t hal_cap, hal_max;
+static uint64_t hal_cap, hal_max, hal_max_cap;
 /* The engine's CPU work: its patch lookups and mask scans (cpu_steps), capped
  * like the flash operations, and its CPU time (review run `cpu`). */
 static uint64_t cpu_cap, cpu_max;
@@ -578,13 +578,16 @@ static void repair_boot(srr_report_t *report, const srr_config_t *base)
     SPIFFS_unmount(&fs);
     CHECK(memory_in_use == 0, "repair leaked %" PRIu64 " bytes", memory_in_use);
     uint64_t used = (flash_ops - start_ops) + (flash_reads - start_reads);
-    if (used > hal_max) hal_max = used;
     /* 2.7.6: a round is followed by another run of the repair; and a check
      * pass that deletes thousands of leaked pages (P02's half-removed file,
      * once a round gave the store room) reads every page header up to eight
      * times more per 512-page range. */
     uint64_t pages = flash_size / PAGE;
     uint64_t cap = hal_cap * (report->runs ? report->runs : 1) + 8U * pages * (pages / 512U + 1U);
+    if (used > hal_max) {
+        hal_max = used;
+        hal_max_cap = cap;
+    }
     if (hal_cap && used > cap) dump_write();
     if (hal_cap) CHECK(used <= cap, "repair used %" PRIu64 " HAL operations (cap %" PRIu64 ")", used, cap);
     if (verbose)
@@ -6237,7 +6240,7 @@ int main(int argc, char **argv)
     }
     printf("largest repair: %" PRIu64 " HAL operations (cap %" PRIu64 "), %" PRIu64 " CPU steps (cap %" PRIu64
            "), %.0f ms of CPU; %u blocks reformatted in place, each checked page by page\n",
-           hal_max, hal_cap, cpu_max, cpu_cap, cpu_ms_max, round_checks_total);
+           hal_max, hal_max_cap, cpu_max, cpu_cap, cpu_ms_max, round_checks_total);
     puts("spiffs repair host tests passed");
     model_reset();
     free(flash);
