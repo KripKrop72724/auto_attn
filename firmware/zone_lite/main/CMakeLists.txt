@@ -30,8 +30,8 @@ target_sources(${COMPONENT_LIB} PRIVATE "zkt_record.c" "zkt_socket_io.c" "add_so
 # for esp_spiffs_t, spiffs_nucleus.h); no ESP-IDF source is copied. Not in the
 # Hikvision family, the one-shot recovery role or the journal roles.
 if(NOT ZONE_LITE_FAMILY STREQUAL "hikvision" AND NOT ZONE_LITE_STORAGE_RECOVERY AND NOT ZONE_LITE_JOURNAL_WRITES)
-    target_sources(${COMPONENT_LIB} PRIVATE "storage_repair_plan.c" "storage_repair_mirror.c" "storage_repair_core.c"
-        "storage_repair.c")
+    target_sources(${COMPONENT_LIB} PRIVATE "storage_repair_plan.c" "storage_repair_mirror.c" "storage_repair_redo.c"
+        "storage_repair_core.c" "storage_repair.c")
     idf_component_get_property(zone_lite_spiffs_dir spiffs COMPONENT_DIR)
     target_include_directories(${COMPONENT_LIB} PRIVATE "${zone_lite_spiffs_dir}" "${zone_lite_spiffs_dir}/spiffs/src")
     target_compile_definitions(${COMPONENT_LIB} PRIVATE ZONE_LITE_STORAGE_REPAIR=1)

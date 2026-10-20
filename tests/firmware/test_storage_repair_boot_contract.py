@@ -1,4 +1,5 @@
-"""ZKT 2.7.5: where the boot storage repair runs and what it may touch."""
+"""ZKT 2.7.5: where the boot storage repair runs and what it may touch; 2.7.6:
+its last-resort in-place reformat and the redo area past the partition table."""
 from pathlib import Path
 import re
 
@@ -14,7 +15,7 @@ def _body(source: str, signature: str) -> str:
 def test_repair_runs_first_in_storage_init_and_before_the_vfs() -> None:
     app = (MAIN / "zone_lite.c").read_text()
     init = _body(app, "static void storage_init(void)")
-    order = ["storage_repair_boot();", "seen_cache_init();", "esp_vfs_spiffs_register(&conf);",
+    order = ["storage_repair_boot();", "seen_cache_init();", "if (storage_mount_allowed()) spiffs_ret = esp_vfs_spiffs_register(&conf);",
              "storage_repair_after_mount();", "storage_upgrade_init()", "g_queue_store_ready = qs_init();"]
     positions = [init.index(marker) for marker in order]
     assert positions == sorted(positions)
@@ -34,7 +35,8 @@ def test_repair_is_built_only_into_zkt_production_roles() -> None:
     block = block[:block.index("endif()")]
     assert ('if(NOT ZONE_LITE_FAMILY STREQUAL "hikvision" AND NOT ZONE_LITE_STORAGE_RECOVERY AND '
             "NOT ZONE_LITE_JOURNAL_WRITES)") in block
-    for source in ("storage_repair_plan.c", "storage_repair_mirror.c", "storage_repair_core.c", "storage_repair.c"):
+    for source in ("storage_repair_plan.c", "storage_repair_mirror.c", "storage_repair_redo.c", "storage_repair_core.c",
+                   "storage_repair.c"):
         assert f'"{source}"' in block
     assert "ZONE_LITE_STORAGE_REPAIR=1" in block
     assert 'idf_component_get_property(zone_lite_spiffs_dir spiffs COMPONENT_DIR)' in block
@@ -45,8 +47,12 @@ def test_repair_is_built_only_into_zkt_production_roles() -> None:
 
 
 def test_no_reformat_and_the_check_callback_never_calls_spiffs() -> None:
-    for name in ("storage_repair_core.c", "storage_repair.c", "storage_repair_plan.c", "storage_repair_mirror.c"):
-        assert "SPIFFS_format" not in (MAIN / name).read_text()
+    # 2.7.6 reformats in place, block by block, never the whole partition.
+    for name in ("storage_repair_core.c", "storage_repair.c", "storage_repair_plan.c", "storage_repair_mirror.c",
+                 "storage_repair_redo.c"):
+        text = (MAIN / name).read_text()
+        assert "SPIFFS_format" not in text and "esp_spiffs_format" not in text
+        assert "format_if_mount_failed = true" not in text
     core = (MAIN / "storage_repair_core.c").read_text()
     callback = _body(core, "void srr_check_callback(")
     assert "SPIFFS_" not in callback.replace("SPIFFS_CHECK_", "")
@@ -151,3 +157,98 @@ def test_controlled_reboot_window_never_meets_the_every_boot_repair() -> None:
     contract = (ROOT / "apps/add_backend/zk_add/storage_contract.py").read_text()
     platform = re.search(r"^FLEET_PLATFORM_VERSIONS = \((.*)\)$", contract, re.M)
     assert platform and '"2.7.5"' in platform.group(1) and '"2.7.0"' not in platform.group(1)
+
+
+def test_the_redo_area_is_reached_only_through_its_own_registered_handle() -> None:
+    glue = (MAIN / "storage_repair.c").read_text()
+    # Exactly the 384 KiB past the last partition of the 16 MiB chip.
+    assert "#define SR_REDO_OFFSET 0xFA0000U" in glue and "#define SR_REDO_BYTES 0x60000U" in glue
+    register = _body(glue, "static srx_area_state_t redo_register(void)")
+    assert "esp_flash_get_physical_size(esp_flash_default_chip, &physical)" in register
+    assert "partition->address + partition->size > SR_REDO_OFFSET" in register
+    assert ("esp_partition_register_external(NULL, SR_REDO_OFFSET, SR_REDO_BYTES, \"srp_redo\", "
+            "ESP_PARTITION_TYPE_DATA,") in register
+    # Every write and erase of the area goes through that handle; no raw
+    # esp_flash call anywhere in the repair.
+    for name in ("storage_repair.c", "storage_repair_core.c", "storage_repair_redo.c"):
+        text = (MAIN / name).read_text()
+        assert "esp_flash_write" not in text and "esp_flash_erase" not in text and "spi_flash_write" not in text
+    assert "esp_partition_write(s_redo, address, s_bounce, n)" in _body(glue, "static bool area_write(")
+    assert "esp_partition_erase_range(s_redo, address, length)" in _body(glue, "static bool area_erase(")
+    # Discovery reads every sector before anything is written to the area,
+    # and an area that is not READY (foreign, absent, overlapping) is never
+    # written: the engine checks the state before a round.
+    recover = _body(glue, "static void redo_recover(srr_config_t *config)")
+    assert recover.index("redo_register()") < recover.index("srx_discover(") < recover.index("srx_recover(")
+    core = (MAIN / "storage_repair_core.c").read_text()
+    assert "c->area.state == SRX_AREA_READY" in _body(core, "static void reclaim_round(run_t *r, const char *trigger)")
+    # Deregistered on every way out of the boot.
+    boot = _body(glue, "void storage_repair_boot(void)")
+    assert boot.count("esp_partition_deregister_external(s_redo)") == 2
+
+
+def test_the_redo_runs_on_raw_flash_before_any_mount_in_every_mode() -> None:
+    glue = (MAIN / "storage_repair.c").read_text()
+    boot = _body(glue, "void storage_repair_boot(void)")
+    # Before the mirror and before the private mount, and before the run can
+    # decide REPORT_ONLY; the hard deadline already armed.
+    assert boot.index("esp_timer_start_once(s_deadline_timer") < boot.index("redo_recover(&config);")
+    assert boot.index("redo_recover(&config);") < boot.index("srm_init(") < boot.index("SPIFFS_mount(")
+    assert boot.index("redo_recover(&config);") < boot.index("if (!timed) {")
+    # A block that may be open and cannot be journaled keeps the store
+    # unmounted: no private mount, and storage_init does not mount it.
+    assert "&& !s_mount_blocked;" in boot
+    assert "bool storage_repair_storage_allowed(void) { return !s_mount_blocked; }" in glue
+    app = (MAIN / "zone_lite.c").read_text()
+    allowed = _body(app, "static bool storage_mount_allowed(void)")
+    assert "return storage_repair_storage_allowed();" in allowed
+    init = _body(app, "static void storage_init(void)")
+    assert "if (storage_mount_allowed()) spiffs_ret = esp_vfs_spiffs_register(&conf);" in init
+    # The redo decision table: a record is replayed only over a block with no
+    # magic, the old image or the target, never for another image or an
+    # unconfirmed one, and a source never again.
+    redo = (MAIN / "storage_repair_redo.c").read_text()
+    decide = _body(redo, "srx_action_t srx_decide(")
+    assert "(r->flags & SRX_FLAG_UNCONFIRMED) || r->image_tag != running_tag || force_sources" in decide
+    assert "srx_attempts_used(r->attempts) >= SRX_ATTEMPTS" in decide
+    assert "!srx_has_magic(raw_block, block_count, r->block) || crc == r->old_crc" in decide
+    assert "if (r->done != 0xFFFFFFFFU || srx_is_source(r)) return SRX_ACT_NONE;" in decide
+    # The magic is cleared first and programmed last.
+    writer = _body(redo, "srx_write_t srx_write_block(")
+    assert writer.index("base + SRX_MAGIC_OFFSET, cleared, 2") < writer.index("io->store_erase(") \
+        < writer.index("base + SRX_ERASE_COUNT_OFFSET") < writer.index("base + SRX_MAGIC_OFFSET, target + SRX_MAGIC_OFFSET")
+
+
+def test_a_round_never_comes_between_a_check_pass_and_its_restore() -> None:
+    core = (MAIN / "storage_repair_core.c").read_text()
+    assert "reclaim_round(" not in _body(core, "static bool run_checks(")
+    run = _body(core, "static void run_once(")
+    # At the end of a run: after its finish, its result and its journal.
+    assert run.index("finish_report(r);") < run.index("const char *trigger = reclaim_trigger(r, check_failed);") \
+        < run.index("if (trigger) reclaim_round(r, trigger);")
+    assert core.count("reclaim_round(r, trigger)") == 1
+    # The store is remounted after a round, never patched.
+    assert "r->ports->remount(r->ports->context)" in _body(core, "static void reclaim_round(run_t *r, const char *trigger)")
+    assert "free_blocks++" not in core and "stats_p_deleted -=" not in core
+
+
+def test_the_deadline_waits_for_an_open_window_and_brownouts_count() -> None:
+    glue = (MAIN / "storage_repair.c").read_text()
+    expired = _body(glue, "static void deadline_expired(void *argument)")
+    assert "atomic_load(&s_window_open) && !atomic_exchange(&s_deadline_deferred, true)" in expired
+    assert "esp_timer_start_once(s_deadline_timer, SR_WINDOW_GRACE_US)" in expired
+    assert expired.index("SR_WINDOW_GRACE_US") < expired.index("esp_restart();")
+    assert "#define SR_WINDOW_GRACE_US 2000000LL" in glue
+    assert "reason == ESP_RST_BROWNOUT" in _body(glue, "static srr_config_t boot_config(void)")
+
+
+def test_the_heartbeat_reclaim_fields_are_the_ones_add_accepts() -> None:
+    glue = (MAIN / "storage_repair.c").read_text()
+    append = _body(glue, "bool storage_repair_append(cJSON *storage)")
+    sent = set(re.findall(r'cJSON_Add\w+ToObject\(reclaim, "([a-z_]+)"', append))
+    schemas = (ROOT / "apps/add_backend/zk_add/schemas.py").read_text()
+    model = schemas[schemas.index("class StorageRepairReclaim(BaseModel):"):schemas.index("class StorageRepairDiagnostics(")]
+    accepted = set(re.findall(r"^    ([a-z_]+): ", model, re.M))
+    assert sent and sent <= accepted, sent - accepted
+    assert 'cJSON_AddNumberToObject(repair, "runs", r->runs)' in append
+    assert '{SRR_FILE_REDO_SOURCE, "REDO_SOURCE"}' in glue
