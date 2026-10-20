@@ -237,3 +237,13 @@ srx_action_t srx_decide(const srx_record_t *record, const uint8_t *raw_block, ui
  * SOURCES flag before anything mounts the store, or keeps it unmounted. */
 uint32_t srx_recover(const srx_io_t *io, uint32_t block_count, uint32_t running_tag, bool force_sources,
                      uint8_t *work, srx_area_t *area);
+
+/* The reclaim journal after the boot recovery (review C2). `inspected`: the
+ * area was read and recovery ran; `open_left`: what srx_recover returned.
+ * An active round whose records could not be inspected, or that recovery
+ * left open, sets SOURCES: the store may be mounted (and written) before a
+ * later boot reads those records, so none may then be redone. An inspected
+ * area with nothing left open clears ACTIVE and SOURCES. True when the
+ * journal changed: the caller saves it before anything mounts the store,
+ * and keeps the store unmounted when saving a new SOURCES flag fails. */
+bool srx_journal_after_recovery(srp_reclaim_t *journal, bool inspected, uint32_t open_left);

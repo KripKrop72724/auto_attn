@@ -39,6 +39,14 @@
  *     a damaged identity catalog is dropped for ADD to resend, and leftover
  *     probe files are removed.
  *
+ * 2.7.6, the last resort (storage_repair_redo.h): a run about to hand over
+ * a store with no room (normalization still SPIFFS_ERR_FULL, GC-unsafe, a
+ * resume blocked for room, a check pass that ran out of room) reformats
+ * blocks in place, each one's kept pages first in a verified redo record
+ * outside the partition, then remounts the store and runs again. Records the
+ * boot recovery could not complete are byte sources for the survey, settled
+ * at the end of every run.
+ *
  * The engine has no ESP-IDF dependency: the host harness runs it against
  * ESP-IDF 5.5.3's own SPIFFS on an emulated NOR flash with power cuts. */
 #include <stdbool.h>
@@ -47,6 +55,7 @@
 
 #include "spiffs.h"
 #include "storage_repair_plan.h"
+#include "storage_repair_redo.h"
 
 typedef enum {
     SRR_RESULT_NOT_RUN = 0,
@@ -58,7 +67,7 @@ typedef enum {
     SRR_RESULT_REPORT_ONLY,        /* the attempts guard stopped repairs */
     SRR_RESULT_STOPPED,            /* the deadline stopped the run */
     SRR_RESULT_FAILED,             /* the check kept failing, or a write failed */
-    SRR_RESULT_REFORMATTED,        /* reserved: no reformat is implemented in 2.7.5 */
+    SRR_RESULT_REFORMATTED,        /* reserved: never sent (a run reports the store it leaves) */
 } srr_result_t;
 const char *srr_result_name(srr_result_t result);
 
@@ -85,6 +94,24 @@ typedef struct {
      * the repair's mount; true when it changed the store, standing in for a
      * check that altered a held file. */
     bool (*after_check)(void *context, uint32_t pass);
+    /* 2.7.6, the last resort; without `redo` and `remount` a store with no
+     * room is left as 2.7.5 leaves it. `redo`'s area_* reach the redo area;
+     * its store_* are not used (the engine writes the store through the
+     * mount's HAL and reads it back through raw_read). */
+    const srx_io_t *redo;
+    /* Flash, never the metadata mirror; NULL: the mount's HAL reads flash. */
+    bool (*raw_read)(void *context, uint32_t address, void *buffer, uint32_t length);
+    /* The metadata mirror read again from flash over a verified block. */
+    void (*refresh)(void *context, uint32_t address, uint32_t length);
+    /* Unmount and mount the private store again: SPIFFS's counters from a
+     * fresh scan after a round. False: the store is not mounted. */
+    bool (*remount)(void *context);
+    /* A block's window (magic cleared, not yet programmed) opens or closes:
+     * the hard deadline defers itself while one is open. */
+    void (*window)(void *context, bool open);
+    /* NVS available entries now (measured before every run); negative when
+     * unknown. */
+    int32_t (*nvs_available)(void *context);
 } srr_ports_t;
 
 typedef struct {
@@ -97,6 +124,9 @@ typedef struct {
     bool nvs_known;          /* nvs_available_entries was measured */
     uint32_t nvs_available_entries; /* nvs_stats_t.available_entries: NVS's own GC page left out */
     uint32_t check_ms_per_mib; /* expected SPIFFS_check duration per MiB before one has been measured */
+    /* 2.7.6: the redo area as discovery and the boot recovery left it (NULL:
+     * none). The engine writes new records only when its state is READY. */
+    const srx_area_t *area;
 } srr_config_t;
 
 enum {
@@ -110,6 +140,7 @@ enum {
     SRR_FILE_UNHELD = 1U << 7,      /* custody the budget could not hold */
     SRR_FILE_SIZE_RECOVERED = 1U << 8, /* a torn header size replaced by the size its pages hold */
     SRR_FILE_SUPERSEDED = 1U << 9,  /* after an interrupted run, its owner had replaced it */
+    SRR_FILE_REDO_SOURCE = 1U << 10, /* 2.7.6: bytes taken from a redo record */
 };
 
 #define SRR_REPORT_FILES 8U
@@ -123,12 +154,27 @@ typedef struct {
     uint32_t blocked_spans, blocked_offset;
 } srr_report_file_t;
 
+/* 2.7.6: the last resort, over every run of the boot and the boot recovery. */
+typedef struct {
+    uint8_t area;                  /* srx_area_state_t */
+    bool wanted;                   /* a run ended without room */
+    char trigger[12];              /* full, gc_unsafe, check_full */
+    uint32_t area_foreign, area_first_foreign, area_foreign_crc;
+    uint32_t rounds, blocks, pages_freed, pages_kept, erased_after, ms;
+    uint32_t redone, sources, settled, reported, records_open, failed, held_mismatch;
+    /* The exposure histogram of the last round considered: blocks a round
+     * may take now, on an unconfirmed image, only on a confirmed one, and
+     * the blocks kept out by an index page, an excluded file or the magic. */
+    uint32_t candidates, unconfirmed_blocks, custody_blocks, index_blocks, excluded_blocks, low_magic_blocks;
+    char short_reason[12];         /* why a round stopped before its target */
+} srr_reclaim_report_t;
+
 typedef struct {
     srr_result_t result;
     srp_mode_t mode;
     srp_phase_t phase, previous_phase;
     uint32_t generation, incomplete, failures;
-    uint8_t level;                 /* escalation level reached: 0 plain, 1 expendables, 2 settled files */
+    uint8_t level;                 /* escalation level reached: 0 plain, 1 expendables, 2 settled files, 3 reformat */
     bool reformatted, check_skipped, manifest_written, commands_damaged;
     uint32_t files, files_held, files_unheld_custody;
     uint64_t bytes_held;
@@ -150,6 +196,8 @@ typedef struct {
     int32_t error_code;
     uint32_t file_count;
     srr_report_file_t file[SRR_REPORT_FILES];
+    uint32_t runs;                 /* 2.7.6: runs this boot (a round is followed by another run) */
+    srr_reclaim_report_t reclaim;
 } srr_report_t;
 
 /* Runs the repair on a mounted SPIFFS with no open files. The mount must use

@@ -179,6 +179,7 @@ when that run is about to hand the store over without room:
 | T2 | fewer than two free blocks and fewer erased pages than SPIFFS's GC needs (`gc_unsafe`) | `DEFERRED`, `gc_unsafe` |
 | T3 | a resume entry blocked for room (`error_stage` `full`) | `RESTORE_DEFERRED` / `MERGE_DEFERRED` |
 | T4 | a failed check pass with `SPIFFS_ERR_FULL` | `FAILED` |
+| T5 | the restore after a check could not bring a file back (no page for its header) | `FAILED`, `restore`, the manifest kept |
 
 and all of these hold:
 

@@ -505,3 +505,18 @@ uint32_t srx_recover(const srx_io_t *io, uint32_t block_count, uint32_t running_
     for (uint32_t s = 0; s < area->slots; ++s) open += area->slot[s] == SRX_SLOT_OPEN;
     return open;
 }
+
+bool srx_journal_after_recovery(srp_reclaim_t *journal, bool inspected, uint32_t open_left)
+{
+    uint32_t flags = journal->flags;
+    if (!inspected) {
+        if (flags & SRP_RECLAIM_ACTIVE) journal->flags |= SRP_RECLAIM_SOURCES;
+    } else if (open_left) {
+        journal->flags |= SRP_RECLAIM_SOURCES | SRP_RECLAIM_ACTIVE;
+    } else {
+        journal->flags &= ~(uint32_t)(SRP_RECLAIM_ACTIVE | SRP_RECLAIM_SOURCES);
+    }
+    if (journal->flags == flags) return false;
+    srp_reclaim_seal(journal);
+    return true;
+}

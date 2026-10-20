@@ -744,6 +744,14 @@ static void redo_records(void)
     assert(!srp_reclaim_valid(&j));
     assert(sizeof(srp_reclaim_t) == 28 && srp_reclaim_entries_needed(false) == 4U * 3U && srp_reclaim_entries_needed(true) == 3U * 3U);
     assert(!strcmp(srx_area_name(SRX_AREA_FOREIGN), "FOREIGN"));
+    /* The journal after recovery (C2). */
+    srp_reclaim_t k = {.flags = SRP_RECLAIM_CLAIMED | SRP_RECLAIM_ACTIVE};
+    assert(srx_journal_after_recovery(&k, false, 0) && (k.flags & SRP_RECLAIM_SOURCES) && srp_reclaim_valid(&k));
+    assert(!srx_journal_after_recovery(&k, false, 0));
+    assert(srx_journal_after_recovery(&k, true, 0) && k.flags == SRP_RECLAIM_CLAIMED);
+    assert(srx_journal_after_recovery(&k, true, 2) && (k.flags & SRP_RECLAIM_SOURCES) && (k.flags & SRP_RECLAIM_ACTIVE));
+    srp_reclaim_t idle = {.flags = SRP_RECLAIM_CLAIMED};
+    assert(!srx_journal_after_recovery(&idle, false, 0) && !srx_journal_after_recovery(&idle, true, 0));
 }
 
 int main(void)

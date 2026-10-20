@@ -15,6 +15,7 @@
 #define SR_ERR_ERASED_CONTENT (-10200)   /* a text page holds erased (0xFF) bytes */
 #define SR_ERR_LOOKUP_MISMATCH (-10201)  /* the page is right but its lookup entry is not */
 #define SR_ERR_SOURCES_DISAGREE (-10202) /* the pages that hold this span disagree on a byte */
+#define SR_ERR_REDO_FILL (-10203)        /* 2.7.6: a span filled earlier whose bytes a redo record holds */
 #define SR_ROW_WINDOW 8192U              /* longest row a drain reads (DQ_MAX_RECORD_BYTES) */
 #define SR_HOLD_CHUNK (64U * 1024U)
 #define SR_MAX_OBJECTS 320U
@@ -29,7 +30,8 @@
 #define SR_RESTORE_BYTES_PER_MS 64U
 
 enum { PATCH_COPY = 1, PATCH_REFER };
-enum { SOURCE_FILL = 0, SOURCE_RELOCATE, SOURCE_ALTERNATE, SOURCE_DELETED, SOURCE_PARTIAL, SOURCE_TAIL, SOURCE_HELD };
+enum { SOURCE_FILL = 0, SOURCE_RELOCATE, SOURCE_ALTERNATE, SOURCE_DELETED, SOURCE_PARTIAL, SOURCE_TAIL, SOURCE_HELD,
+       SOURCE_REDO };
 
 typedef struct {
     uint16_t lu, obj, span;
@@ -84,6 +86,28 @@ typedef struct {
     uint16_t actions;
 } obj_t;
 
+/* 2.7.6: a kept page of a redo record that became a byte source. */
+typedef struct {
+    uint8_t slot, entry;
+    bool deliverable;              /* a data page of an object its record names */
+    bool settled, reported;        /* its record's settle bits */
+    uint16_t obj, span, pix;
+    uint32_t offset;               /* of the page within the redo area */
+    uint32_t cursor_offset;
+    bool cursor_valid;
+    char name[SRP_NAME_BYTES];
+} src_page_t;
+
+/* What one run leaves the next one of the same boot. */
+typedef struct {
+    srx_area_t area;
+    bool have_area;
+    uint32_t rounds, blocks;
+    bool reclaimed;                /* the run ended with a round: run again */
+    bool halt;                     /* no more rounds this boot */
+    srr_reclaim_report_t reclaim;
+} carry_t;
+
 typedef struct {
     spiffs *fs;
     const srr_config_t *cfg;
@@ -119,6 +143,11 @@ typedef struct {
     int32_t last_error;
     uint16_t deleted_ids[16];
     uint32_t deleted_count;
+    /* 2.7.6 */
+    carry_t *carry;
+    src_page_t *src;
+    uint32_t src_count, src_cap;
+    uint8_t *rx;                   /* 4 x 4 KiB: record, old block, target, read-back */
 } run_t;
 
 static run_t *s_run;
@@ -566,6 +595,45 @@ static bool read_payload(run_t *r, uint16_t pix, uint8_t *out, uint32_t length)
     return hal_read(r, SPIFFS_PAGE_TO_PADDR(r->fs, pix) + sizeof(spiffs_page_header), out, length);
 }
 
+/* ---- redo records as byte sources (2.7.6) -------------------------------- */
+/* A kept data page of a source record for this object's span: at `pix`, or
+ * anywhere (any_pix). Its object must carry the name the record gave it. */
+static src_page_t *src_for(run_t *r, const obj_t *o, uint32_t span, uint16_t pix, bool any_pix)
+{
+    for (uint32_t i = 0; i < r->src_count; ++i) {
+        src_page_t *s = &r->src[i];
+        cpu_step(1);
+        if (!s->deliverable || s->obj != o->obj || s->span != span || (!any_pix && s->pix != pix) ||
+            strcmp(s->name, o->name))
+            continue;
+        return s;
+    }
+    return NULL;
+}
+
+static bool src_payload(run_t *r, const src_page_t *s, uint8_t *out, uint32_t length)
+{
+    const srx_io_t *io = r->ports->redo;
+    return io && io->area_read(io->context, s->offset + sizeof(spiffs_page_header), out, length);
+}
+
+/* A span that reads, instead of a source record's bytes, the fill a SALVAGE
+ * gap left (a boot that could not read the redo area filled it): every byte
+ * that differs reads as a fill byte. The span of an append-only file never
+ * changes once full, so nothing else can differ. */
+static bool fill_restorable(run_t *r, const src_page_t *s, uint16_t ref, uint32_t length)
+{
+    uint8_t now[SRP_SPAN_BYTES], held[SRP_SPAN_BYTES];
+    if (!read_payload(r, ref, now, length) || !src_payload(r, s, held, length)) return false;
+    bool differs = false;
+    for (uint32_t i = 0; i < length; ++i) {
+        if (now[i] == held[i]) continue;
+        if ((now[i] != 0 && now[i] != '\n' && now[i] != '0') || held[i] == 0xFF) return false;
+        differs = true;
+    }
+    return differs;
+}
+
 /* Finalized data pages of this object by span, in page order. Built once per
  * object that has an imperfect span. */
 static bool build_candidates(run_t *r, const obj_t *o)
@@ -658,6 +726,19 @@ static bool resolve_span(run_t *r, obj_t *o, uint32_t span, uint16_t ref, int32_
         if (refer == SR_NO_PAGE && perfect_data(r, o->obj, span, pix)) refer = pix;
         sources++;
     }
+    /* 2.7.6: the page the index names, as a source record holds it, when
+     * that page is not this file's any more (a mount erased its block). */
+    src_page_t *src = r->src_count ? src_for(r, o, span, ref, false) : NULL;
+    if (src && !(page_ok(r, ref) && own_data_page(&r->pages[ref], o->obj, span))) {
+        if (!src_payload(r, src, candidate, length)) return false;
+        merge_source(p, candidate, length, conflict, sources == 0);
+        if (!sources) {
+            p->from = SR_NO_PAGE;
+            p->source = SOURCE_REDO;
+        }
+        sources++;
+        o->actions |= SRR_FILE_REDO_SOURCE;
+    }
     uint32_t unreadable = 0;
     bool disagree = false;
     for (uint32_t i = 0; i < length; ++i) {
@@ -749,6 +830,22 @@ static bool map_object(run_t *r, obj_t *o)
         else if (text_fill(o)) {
             if (!read_payload(r, ref, data, length)) return fail(r, "map_read", SPIFFS_ERR_INTERNAL);
             if (memchr(data, 0xFF, length)) code = SR_ERR_ERASED_CONTENT;
+        }
+        src_page_t *redo = !code && r->src_count ? src_for(r, o, k, 0, true) : NULL;
+        if (redo && fill_restorable(r, redo, ref, length)) {
+            /* Back in place from the record; the cursor's reconciliation
+             * then replays from the changed prefix (duplicates, no loss). */
+            patch_t *p = push_patch(r, o, k);
+            if (!p) return fail(r, "map_memory", SPIFFS_ERR_INTERNAL);
+            p->length = (uint16_t)length;
+            p->kind = PATCH_COPY;
+            p->source = SOURCE_REDO;
+            p->from = SR_NO_PAGE;
+            p->code = SR_ERR_REDO_FILL;
+            if (!src_payload(r, redo, p->data, length)) return fail(r, "map_read", SPIFFS_ERR_INTERNAL);
+            o->ix_rewrite[SPIFFS_OBJ_IX_ENTRY_SPAN_IX(r->fs, k)] = 1;
+            o->actions |= SRR_FILE_REDO_SOURCE;
+            continue;
         }
         if (!code) {
             o->perfect[k] = 1;
@@ -3818,18 +3915,24 @@ static bool custody_ready(run_t *r, bool *ready)
 /* Time for one more check pass and the restore after it before the soft
  * deadline: a pass cut by the hard deadline is a reset inside SPIFFS_check
  * (on an unconfirmed image, a rollback). */
-static bool time_for_check(run_t *r)
+/* A check pass and the restore after it: measured, or estimated per MiB. */
+static uint64_t check_estimate_ms(const run_t *r)
 {
-    if (!r->ports->remaining_ms) return true;
     uint64_t mib = ((uint64_t)r->blocks * r->block_size + (1U << 20) - 1) >> 20;
     uint32_t per_mib = r->cfg->check_ms_per_mib ? r->cfg->check_ms_per_mib : SR_CHECK_MS_PER_MIB_DEFAULT;
     uint64_t check = r->last_check_ms ? (uint64_t)r->last_check_ms * 5 / 4 : mib * per_mib;
-    uint64_t restore = SR_RESTORE_BASE_MS + r->report->bytes_held / SR_RESTORE_BYTES_PER_MS;
+    return check + SR_RESTORE_BASE_MS + r->report->bytes_held / SR_RESTORE_BYTES_PER_MS;
+}
+
+static bool time_for_check(run_t *r)
+{
+    if (!r->ports->remaining_ms) return true;
+    uint64_t need = check_estimate_ms(r);
     uint64_t left = r->ports->remaining_ms(r->ports->context);
-    if (left >= check + restore) return true;
+    if (left >= need) return true;
     char message[140];
     snprintf(message, sizeof(message), "%lu s left; a check pass and its restore need about %lu s",
-             (unsigned long)(left / 1000), (unsigned long)((check + restore) / 1000));
+             (unsigned long)(left / 1000), (unsigned long)(need / 1000));
     logf_line(r, "WARN", "STORAGE_REPAIR_NO_TIME", message);
     return false;
 }
@@ -3890,6 +3993,8 @@ static void free_run(run_t *r)
     release(r, r->gaps);
     release(r, r->resets);
     release(r, r->span_top);
+    release(r, r->src);
+    release(r, r->rx);
 }
 
 /* The checks, with room made between failed passes: probe leftovers, cursor
@@ -3953,7 +4058,660 @@ static bool run_checks(run_t *r, bool *catalog_drop, bool *last_failed, bool *cu
     return manifest_retire(r);
 }
 
-void srr_run(spiffs *fs, const srr_config_t *config, const srr_ports_t *ports, srr_report_t *report)
+/* ---- the last resort: blocks reformatted in place (2.7.6) ---------------- */
+#define SR_RECLAIM_BLOCK_MS 2000U  /* a block's worst case: two erases, about 20 programs, two retries */
+#define SR_RECLAIM_MARGIN 30U      /* erased pages for SPIFFS's own writes in the check and the finish */
+#define SR_RECLAIM_CAP 256U
+#define SR_RECLAIM_CAP_PENDING 128U
+#define SR_RECLAIM_ROUNDS 2U
+#define SR_ATTR_REFERENCED 0x01U   /* a valid index page of any object names it */
+#define SR_ATTR_INDEX 0x02U        /* its own header says header or index page, not deleted */
+
+/* Append-only queues drained by cursor: a page of one settles by its bytes
+ * or by the cursor offset its record keeps. */
+static const char *const RECLAIM_QUEUES[] = {"/pending.jsonl", "/blocked_identity.jsonl", "/corrupt_ords.jsonl",
+                                             "/add_corrupt.jsonl", "/add_corrupt.bak"};
+
+static bool reclaim_queue(const char *name)
+{
+    for (size_t i = 0; i < sizeof(RECLAIM_QUEUES) / sizeof(RECLAIM_QUEUES[0]); ++i)
+        if (!strcmp(name, RECLAIM_QUEUES[i])) return true;
+    return false;
+}
+
+/* Files whose data pages may be in a window on a confirmed image: those
+ * queues, the re-fetchable identity catalog and probe files. Never the ADD
+ * outboxes or their .pos, the command inbox, the processed, cancelled and
+ * acked ID files, segments, copies, the repair's own .rpr files or a file of
+ * unknown name. */
+static bool reclaimable_file(const obj_t *o)
+{
+    if (restore_file(o->name)) return false;
+    if (o->kind.cls == SRP_CLASS_CATALOG) return true;
+    if (o->kind.cls == SRP_CLASS_EXPENDABLE) return strstr(o->name, "probe") != NULL;
+    return reclaim_queue(o->name);
+}
+
+/* The engine's flash for srx_*: the store through the mount's HAL (so the
+ * mirror follows), read back raw; the redo area through its port. */
+static bool rx_store_read(void *context, uint32_t offset, void *buffer, uint32_t length)
+{
+    run_t *r = context;
+    uint32_t address = r->fs->cfg.phys_addr + offset;
+    if (r->ports->raw_read) return r->ports->raw_read(r->ports->context, address, buffer, length);
+    return r->fs->cfg.hal_read_f(r->fs, address, length, buffer) == SPIFFS_OK;
+}
+static bool rx_store_write(void *context, uint32_t offset, const void *buffer, uint32_t length)
+{
+    run_t *r = context;
+    r->wrote = true;
+    return r->fs->cfg.hal_write_f(r->fs, r->fs->cfg.phys_addr + offset, length, (u8_t *)buffer) == SPIFFS_OK;
+}
+static bool rx_store_erase(void *context, uint32_t offset, uint32_t length)
+{
+    run_t *r = context;
+    r->wrote = true;
+    return r->fs->cfg.hal_erase_f(r->fs, r->fs->cfg.phys_addr + offset, length) == SPIFFS_OK;
+}
+static bool rx_area_read(void *context, uint32_t offset, void *buffer, uint32_t length)
+{
+    const srx_io_t *a = ((run_t *)context)->ports->redo;
+    return a->area_read(a->context, offset, buffer, length);
+}
+static bool rx_area_write(void *context, uint32_t offset, const void *buffer, uint32_t length)
+{
+    const srx_io_t *a = ((run_t *)context)->ports->redo;
+    return a->area_write(a->context, offset, buffer, length);
+}
+static bool rx_area_erase(void *context, uint32_t offset, uint32_t length)
+{
+    const srx_io_t *a = ((run_t *)context)->ports->redo;
+    return a->area_erase(a->context, offset, length);
+}
+static void rx_window(void *context, bool open)
+{
+    run_t *r = context;
+    if (r->ports->window) r->ports->window(r->ports->context, open);
+}
+/* Time for one more block and the next run's check and restore. */
+static bool rx_may_retry(void *context)
+{
+    run_t *r = context;
+    return !r->ports->remaining_ms ||
+        r->ports->remaining_ms(r->ports->context) >= SR_RECLAIM_BLOCK_MS + check_estimate_ms(r);
+}
+static void rx_log(void *context, const char *level, const char *code, const char *message)
+{
+    logf_line(context, level, code, message);
+}
+static srx_io_t engine_io(run_t *r)
+{
+    srx_io_t io = {
+        .context = r, .area_size = r->ports->redo ? r->ports->redo->area_size : 0, .area_read = rx_area_read,
+        .area_write = rx_area_write, .area_erase = rx_area_erase, .store_read = rx_store_read,
+        .store_write = rx_store_write, .store_erase = rx_store_erase, .window = rx_window,
+        .may_retry = rx_may_retry, .log = rx_log,
+    };
+    return io;
+}
+
+/* The kept pages of every record the boot recovery made a byte source. */
+static bool load_sources(run_t *r)
+{
+    carry_t *c = r->carry;
+    if (!c || !c->have_area || !r->ports->redo || !r->rx) return true;
+    const srx_io_t *a = r->ports->redo;
+    for (uint32_t slot = 0; slot < c->area.slots; ++slot) {
+        if (c->area.slot[slot] != SRX_SLOT_SOURCE) continue;
+        srx_record_t rec;
+        if (!a->area_read(a->context, slot * SRX_BLOCK, r->rx, SRX_BLOCK) || !srx_decode(r->rx, &rec, NULL) ||
+            rec.block_count != r->blocks)
+            continue;
+        for (uint32_t e = 0; e < SRX_ENTRIES; ++e) {
+            const uint8_t *page = srx_kept_page(r->rx, &rec, e);
+            if (!page) continue;
+            if (!grow(r, (void **)&r->src, &r->src_cap, r->src_count, sizeof(src_page_t), 32))
+                return fail(r, "sources_memory", SPIFFS_ERR_INTERNAL);
+            src_page_t *sp = &r->src[r->src_count++];
+            memset(sp, 0, sizeof(*sp));
+            sp->slot = (uint8_t)slot;
+            sp->entry = (uint8_t)e;
+            sp->obj = srx_get16(page);
+            sp->span = srx_get16(page + 2);
+            sp->pix = (uint16_t)(rec.block * r->ppb + 1 + e);
+            sp->offset = slot * SRX_BLOCK + (uint32_t)(page - r->rx);
+            sp->settled = !(rec.settle & (1U << e));
+            sp->reported = !(rec.settle & (1U << (16 + e)));
+            /* A finalized data page of an object its record names: in use, or
+             * deleted but named by that object's index (13FL's head). */
+            uint16_t lu = srx_get16(r->rx + SRX_OFF_LOOKUP + e * 2);
+            bool data = !(sp->obj & SR_IX) && (page[4] & SPIFFS_PH_FLAG_INDEX) &&
+                !(page[4] & (SPIFFS_PH_FLAG_USED | SPIFFS_PH_FLAG_FINAL));
+            for (uint32_t k = 0; k < rec.objects; ++k) {
+                if (rec.object[k].obj != sp->obj) continue;
+                sp->deliverable = data && (lu == sp->obj || lu == SPIFFS_OBJ_ID_DELETED);
+                sp->cursor_valid = (rec.object[k].flags & SRX_OBJECT_CURSOR) != 0;
+                sp->cursor_offset = rec.object[k].cursor_offset;
+                memcpy(sp->name, rec.object[k].name, sizeof(sp->name));
+            }
+        }
+    }
+    return true;
+}
+
+/* Each kept entry of a source record ends one way: nothing to deliver;
+ * back on flash (every byte it holds is at the page the file's index names
+ * for its span); settled by the cursor offset its record kept; waiting for
+ * room (its span still unreadable); or reported to ADD as a gap, its record
+ * then kept for good. A record whose every entry settled is retired. */
+static void settle_sources(run_t *r)
+{
+    carry_t *c = r->carry;
+    if (!c || !r->src_count || r->failed || !survey(r)) return;
+    srx_io_t io = engine_io(r);
+    uint32_t settled = 0, reported = 0, waiting = 0;
+    uint8_t now[SRP_SPAN_BYTES], held[SRP_SPAN_BYTES];
+    for (uint32_t i = 0; i < r->src_count; ++i) {
+        src_page_t *sp = &r->src[i];
+        if (sp->settled) continue;
+        bool done = !sp->deliverable, report = false;
+        obj_t *x = NULL;
+        for (uint32_t k = 0; !done && k < r->obj_count && !x; ++k)
+            if (live(&r->objs[k]) && r->objs[k].mapped && r->objs[k].obj == sp->obj &&
+                !strcmp(r->objs[k].name, sp->name))
+                x = &r->objs[k];
+        if (!done && x && sp->span < x->spans && x->perfect[sp->span]) {
+            uint32_t length = span_length(x, sp->span);
+            done = read_payload(r, x->ref[sp->span], now, length) && src_payload(r, sp, held, length);
+            for (uint32_t b = 0; done && b < length; ++b) done = held[b] == 0xFF || now[b] == held[b];
+        }
+        if (!done && sp->cursor_valid && sp->cursor_offset >= (sp->span + 1U) * SRP_SPAN_BYTES) done = true;
+        if (!done) {
+            if (x && sp->span < x->spans && !x->perfect[sp->span]) waiting++;
+            else report = true;
+        }
+        if (done) {
+            if (srx_clear_bits(&io, sp->slot, SRX_OFF_SETTLE, 1U << sp->entry)) {
+                sp->settled = true;
+                settled++;
+            }
+            continue;
+        }
+        if (!report || sp->reported) continue;
+        uint32_t size = x ? x->size : (sp->span + 1U) * SRP_SPAN_BYTES;
+        if (record_range(r, sp->name, sp->span * SRP_SPAN_BYTES, SRP_SPAN_BYTES, size, SRP_GAP_REFORMAT_INTERRUPTED) &&
+            save_records(r) && srx_clear_bits(&io, sp->slot, SRX_OFF_SETTLE, 1U << (16 + sp->entry))) {
+            sp->reported = true;
+            reported++;
+        }
+    }
+    uint32_t retired = 0;
+    for (uint32_t slot = 0; slot < c->area.slots; ++slot) {
+        if (c->area.slot[slot] != SRX_SLOT_SOURCE) continue;
+        bool all = true, mine = false;
+        for (uint32_t i = 0; i < r->src_count; ++i)
+            if (r->src[i].slot == slot) {
+                mine = true;
+                all &= r->src[i].settled;
+            }
+        if (mine && all) {
+            c->area.slot[slot] = SRX_SLOT_RETIRED;
+            retired++;
+        }
+    }
+    c->reclaim.settled += settled;
+    c->reclaim.reported += reported;
+    if (!settled && !reported && !waiting) return;
+    char message[160];
+    snprintf(message, sizeof(message),
+             "redo sources: %lu pages settled, %lu reported as gaps, %lu waiting for room; %lu records retired",
+             (unsigned long)settled, (unsigned long)reported, (unsigned long)waiting, (unsigned long)retired);
+    logf_line(r, reported ? "ERROR" : "WARN", "STORAGE_REPAIR_RECLAIM_SETTLED", message);
+}
+
+typedef struct {
+    uint16_t block, kept, dropped;
+    uint8_t gain, tail;
+} cand_t;
+
+static bool cand_before(const cand_t *a, const cand_t *b)
+{
+    if (a->tail != b->tail) return a->tail > b->tail;
+    if (a->gain != b->gain) return a->gain > b->gain;
+    return a->block < b->block;
+}
+
+/* Whether a held file still reads what was held (bytes that were
+ * unreadable when it was held, and bytes unreadable now, aside). */
+static bool held_differs(run_t *r, obj_t *o)
+{
+    uint8_t now[SRP_SPAN_BYTES], held[SRP_SPAN_BYTES];
+    if (!o->hold || !o->mapped || o->size < o->hold_size) return o->hold != NULL;
+    for (uint32_t k = 0; k * SRP_SPAN_BYTES < o->hold_size; ++k) {
+        uint32_t start = k * SRP_SPAN_BYTES;
+        uint32_t length = o->hold_size - start < SRP_SPAN_BYTES ? o->hold_size - start : SRP_SPAN_BYTES;
+        const patch_t *p = o->perfect[k] ? NULL : find_patch(o, k);
+        if (o->perfect[k]) {
+            if (!read_payload(r, o->ref[k], now, length)) return true;
+        } else if (p) {
+            memcpy(now, p->data, length);
+        } else {
+            continue;
+        }
+        if (!held_read(o, start, held, length)) return true;
+        for (uint32_t b = 0; b < length; ++b) {
+            if (now[b] == held[b] || held_gap(o, start + b) || (p && !p->filled && bit(p->mask, b))) continue;
+            return true;
+        }
+        pace(r);
+    }
+    return false;
+}
+
+/* What makes a page kept out of every window, or custody a confirmed image
+ * may expose (SRX_KEEP_*); only asked of pages a block keeps. */
+static uint8_t keep_class(run_t *r, uint32_t pix, const uint8_t *attr, const uint16_t *ref_owner,
+                          const uint8_t *has_header, const uint16_t *owner_index)
+{
+    const pg_t *pg = &r->pages[pix];
+    bool referenced = attr[pix] & SR_ATTR_REFERENCED;
+    uint32_t id;
+    if (pg->lu != SPIFFS_OBJ_ID_FREE && pg->lu != SPIFFS_OBJ_ID_DELETED) id = pg->lu & (SR_IDS - 1);
+    else if (referenced) id = (uint32_t)(ref_owner[pix] - 1U);
+    else return SRX_KEEP_NONE; /* deleted, named by no index: read by nothing */
+    bool headered = bit(has_header, id) || (referenced && bit(has_header, (uint32_t)(ref_owner[pix] - 1U)));
+    if (!headered) return SRX_KEEP_NONE; /* leaked: no header, no index of a file names it */
+    const obj_t *o = owner_index[id] ? &r->objs[owner_index[id] - 1] : NULL;
+    if (!o || !live(o) || !o->mapped || !reclaimable_file(o) || (pg->obj & SR_IX)) return SRX_KEEP_EXCLUDED;
+    /* The last data page: an append would fail on it after a mount erased
+     * its block, or program into another file's page reused there. */
+    if (!o->spans || pg->span + 1U >= o->spans || o->ref[o->spans - 1] == pix) return SRX_KEEP_EXCLUDED;
+    return SRX_KEEP_CUSTODY;
+}
+
+/* One round at the end of a run that would hand over a store without room:
+ * blocks reformatted in place, then the store remounted; the caller runs the
+ * repair again. A store without a usable redo area is only measured. */
+static void reclaim_round(run_t *r, const char *trigger)
+{
+    carry_t *c = r->carry;
+    srr_reclaim_report_t *rep = &c->reclaim;
+    uint64_t started = r->ports->now_ms ? r->ports->now_ms(r->ports->context) : 0;
+    char message[200];
+    snprintf(rep->trigger, sizeof(rep->trigger), "%s", trigger);
+    rep->wanted = true;
+    bool unconfirmed = r->cfg->pending_verify;
+    bool writable = c->have_area && c->area.state == SRX_AREA_READY && r->ports->redo && r->ports->remount && r->rx;
+    /* The run's own outcome stays in its report whatever the round does. */
+    char stage[sizeof(r->report->error_stage)];
+    memcpy(stage, r->report->error_stage, sizeof(stage));
+    int32_t code = r->report->error_code;
+    bool phased = false, remounted = true, sources = false;
+    r->failed = false;
+    uint32_t phase_before = r->state.phase;
+    if (!survey(r)) {
+        r->failed = false;
+        memcpy(r->report->error_stage, stage, sizeof(stage));
+        r->report->error_code = code;
+        return;
+    }
+    int32_t erased = surveyed_free(r);
+    uint32_t work = pages_for_work(r) - 2U;
+    if (r->report->room_needed > work) work = r->report->room_needed;
+    int32_t want = (int32_t)(work + spare_for_compaction(r) + SR_RECLAIM_MARGIN) - erased;
+    uint8_t *attr = zalloc(r, r->total_pages), *has_header = zalloc(r, SR_IDS / 8U);
+    uint16_t *ref_owner = zalloc(r, r->total_pages * sizeof(uint16_t)), *owner_index = zalloc(r, SR_IDS * sizeof(uint16_t));
+    uint8_t *magic_ok = zalloc(r, r->blocks);
+    cand_t *cand = zalloc(r, r->blocks * sizeof(cand_t));
+    uint32_t count = 0, bad_magic = 0, taken = 0, freed = 0, kept_pages = 0;
+    bool stop = false;
+    char *mismatched = NULL;
+    uint32_t mismatches = 0;
+    if (!attr || !has_header || !ref_owner || !owner_index || !magic_ok || !cand) {
+        snprintf(rep->short_reason, sizeof(rep->short_reason), "memory");
+        goto done;
+    }
+    /* Every page a valid index page of any object names (visible, hidden,
+     * orphaned, implausible: written and not deleted), and every object
+     * with a header anywhere. */
+    for (uint32_t pix = 0; pix < r->total_pages; ++pix) {
+        const pg_t *pg = &r->pages[pix];
+        if (pix % r->ppb == 0 || pg->obj == SPIFFS_OBJ_ID_FREE || !(pg->obj & SR_IX) || !(pg->flags & SPIFFS_PH_FLAG_DELET))
+            continue;
+        attr[pix] |= SR_ATTR_INDEX;
+        uint16_t id = (uint16_t)(pg->obj & (SR_IDS - 1));
+        if (pg->span == 0) set_bit(has_header, id);
+        if (!hal_read(r, SPIFFS_PAGE_TO_PADDR(r->fs, pix), r->page, r->page_size)) {
+            snprintf(rep->short_reason, sizeof(rep->short_reason), "read");
+            goto done;
+        }
+        uint32_t span = pg->span ? 1U : 0U;
+        const uint8_t *table = r->page + table_offset(span);
+        for (uint32_t i = 0; i < entries_of(r, span); ++i) {
+            uint16_t ref = le16(table + i * 2);
+            if (ref >= r->total_pages || ref % r->ppb == 0) continue;
+            attr[ref] |= SR_ATTR_REFERENCED;
+            if (!ref_owner[ref]) ref_owner[ref] = (uint16_t)(id + 1U);
+        }
+    }
+    for (uint32_t k = 0; k < r->obj_count; ++k)
+        if (live(&r->objs[k]) && r->objs[k].mapped) owner_index[r->objs[k].obj & (SR_IDS - 1)] = (uint16_t)(k + 1);
+    /* Every block's magic, read raw: the store must never have two blocks
+     * without one (no image could mount it). */
+    for (uint32_t b = 0; b < r->blocks; ++b) {
+        uint8_t raw[2];
+        if (!rx_store_read(r, b * r->block_size + SRX_MAGIC_OFFSET, raw, 2)) {
+            snprintf(rep->short_reason, sizeof(rep->short_reason), "read");
+            goto done;
+        }
+        bool valid = srx_get16(raw) == srx_spiffs_magic(r->blocks, b);
+        bad_magic += !valid;
+        magic_ok[b] = valid && srx_magic_strong(r->blocks, b);
+    }
+    rep->candidates = rep->unconfirmed_blocks = rep->custody_blocks = 0;
+    rep->index_blocks = rep->excluded_blocks = rep->low_magic_blocks = 0;
+    for (uint32_t b = 0; b < r->blocks; ++b) {
+        srx_entry_t e[SRX_ENTRIES];
+        for (uint32_t i = 0; i < SRX_ENTRIES; ++i) {
+            uint32_t pix = b * r->ppb + 1 + i;
+            const pg_t *pg = &r->pages[pix];
+            e[i] = (srx_entry_t){.lu = pg->lu, .obj = pg->obj, .flags = pg->flags, .erased = pg->erased != 0,
+                                 .referenced = (attr[pix] & SR_ATTR_REFERENCED) != 0,
+                                 .index = (attr[pix] & SR_ATTR_INDEX) != 0};
+            e[i].keep = keep_class(r, pix, attr, ref_owner, has_header, owner_index);
+        }
+        srx_plan_t plan = srx_plan_block(e, magic_ok[b] != 0, false);
+        bool busy = c->have_area && srx_block_busy(&c->area, b);
+        if (plan.reason == SRX_PLAN_INDEX) rep->index_blocks++;
+        else if (plan.reason == SRX_PLAN_EXCLUDED || (busy && plan.reason == SRX_PLAN_OK)) rep->excluded_blocks++;
+        else if (plan.reason == SRX_PLAN_MAGIC) rep->low_magic_blocks++;
+        if (plan.reason != SRX_PLAN_OK || busy) continue;
+        if (plan.custody) rep->custody_blocks++;
+        else rep->unconfirmed_blocks++;
+        if (unconfirmed && plan.custody) continue;
+        rep->candidates++;
+        cand_t next = {(uint16_t)b, plan.kept, plan.dropped, plan.gain, plan.tail};
+        uint32_t at = count++;
+        while (at && cand_before(&next, &cand[at - 1])) {
+            cand[at] = cand[at - 1];
+            --at;
+        }
+        cand[at] = next;
+        cpu_step(at < 64 ? at : 64);
+    }
+    snprintf(message, sizeof(message),
+             "%s: %ld pages short; blocks: %lu candidates (%lu holding nothing any image reads, %lu custody), %lu "
+             "with an index page, %lu excluded, %lu with a weak magic%s",
+             trigger, (long)want, (unsigned long)rep->candidates, (unsigned long)rep->unconfirmed_blocks,
+             (unsigned long)rep->custody_blocks, (unsigned long)rep->index_blocks, (unsigned long)rep->excluded_blocks,
+             (unsigned long)rep->low_magic_blocks, unconfirmed ? "; unconfirmed image" : "");
+    logf_line(r, "INFO", "STORAGE_REPAIR_RECLAIM_EXPOSURE", message);
+    if (!writable) {
+        snprintf(message, sizeof(message), "the redo area is %s; no reformat, the store stays as it is",
+                 srx_area_name(c->have_area ? c->area.state : SRX_AREA_ABSENT));
+        logf_line(r, "ERROR", "STORAGE_REPAIR_RECLAIM_UNAVAILABLE", message);
+        snprintf(rep->short_reason, sizeof(rep->short_reason), "area");
+        goto done;
+    }
+    if (bad_magic || want <= 0 || !count) {
+        snprintf(rep->short_reason, sizeof(rep->short_reason), bad_magic ? "magic" : want <= 0 ? "room" : "candidate");
+        snprintf(message, sizeof(message), "no round: %s",
+                 bad_magic ? "a block without a valid magic" : want <= 0 ? "erased pages enough" : "no candidate block");
+        logf_line(r, "WARN", "STORAGE_REPAIR_RECLAIM_SHORT", message);
+        goto done;
+    }
+    /* NVS for the journal's writes, measured now. */
+    srp_reclaim_t journal;
+    int loaded = nvs_load(r, SRR_NVS_NAMESPACE, "reclaim", &journal, sizeof(journal));
+    bool have_journal = loaded == 1 && srp_reclaim_valid(&journal);
+    if (!have_journal) memset(&journal, 0, sizeof(journal));
+    if (r->ports->nvs_available) {
+        int32_t available = r->ports->nvs_available(r->ports->context);
+        uint32_t needed = srp_nvs_entries_needed(true, true, true, manifest_active(r)) +
+            srp_reclaim_entries_needed(have_journal);
+        if (available >= 0 && (uint32_t)available < needed) {
+            snprintf(rep->short_reason, sizeof(rep->short_reason), "nvs");
+            logf_line(r, "WARN", "STORAGE_REPAIR_RECLAIM_SHORT", "no round: NVS has too few entries for its journal");
+            goto done;
+        }
+    }
+    journal.flags |= SRP_RECLAIM_CLAIMED | SRP_RECLAIM_ACTIVE;
+    journal.reclaim_id = (journal.reclaim_id > c->area.newest_reclaim ? journal.reclaim_id : c->area.newest_reclaim) + 1U;
+    journal.rounds++;
+    srp_reclaim_seal(&journal);
+    r->state.phase = SRP_PHASE_REFORMAT;
+    phased = true;
+    set_phase(r, SRP_PHASE_REFORMAT, c->rounds + 1U, true);
+    if (!save_state(r) || !nvs_store(r, SRR_NVS_NAMESPACE, "reclaim", &journal, sizeof(journal))) {
+        snprintf(rep->short_reason, sizeof(rep->short_reason), "journal");
+        logf_line(r, "ERROR", "STORAGE_REPAIR_RECLAIM_FAILED", "the reclaim journal could not be saved; no round");
+        goto done;
+    }
+    c->rounds++;
+    srx_io_t io = engine_io(r);
+    uint8_t *sector = r->rx, *old = r->rx + SRX_BLOCK, *target = r->rx + 2 * SRX_BLOCK, *back = r->rx + 3 * SRX_BLOCK;
+    uint32_t cap = unconfirmed ? SR_RECLAIM_CAP_PENDING : SR_RECLAIM_CAP;
+    uint32_t next_slot = 0;
+    for (uint32_t s = 0; s < c->area.slots; ++s)
+        if (c->area.sequence[s] == c->area.newest_sequence && c->area.slot[s] != SRX_SLOT_ERASED &&
+            c->area.slot[s] != SRX_SLOT_TORN && c->area.slot[s] != SRX_SLOT_FOREIGN)
+            next_slot = s + 1;
+    int32_t gained = 0;
+    for (uint32_t i = 0; i < count && gained < want && !stop; ++i) {
+        const cand_t *b = &cand[i];
+        if (c->blocks >= cap) {
+            snprintf(rep->short_reason, sizeof(rep->short_reason), "cap");
+            break;
+        }
+        if (!rx_may_retry(r)) {
+            snprintf(rep->short_reason, sizeof(rep->short_reason), "time");
+            break;
+        }
+        uint32_t base = b->block * r->block_size;
+        if (!rx_store_read(r, base, old, SRX_BLOCK)) {
+            snprintf(rep->short_reason, sizeof(rep->short_reason), "read");
+            break;
+        }
+        /* What the plan drops must still read deleted, raw. */
+        bool same = srx_has_magic(old, r->blocks, b->block);
+        for (uint32_t e = 0; same && e < SRX_ENTRIES; ++e)
+            if (b->dropped & (1U << e))
+                same = srx_get16(old + e * 2) == SPIFFS_OBJ_ID_DELETED && !(old[(1 + e) * SRX_PAGE + 4] & SPIFFS_PH_FLAG_DELET);
+        if (!same) continue;
+        srx_record_t h;
+        memset(&h, 0, sizeof(h));
+        h.reclaim_id = journal.reclaim_id;
+        h.sequence = ++c->area.newest_sequence;
+        h.image_tag = r->cfg->image_tag;
+        h.flags = unconfirmed ? SRX_FLAG_UNCONFIRMED : 0;
+        h.block = b->block;
+        h.kept_mask = b->kept;
+        h.drop_mask = b->dropped;
+        h.erase_count = (uint16_t)r->fs->max_erase_count;
+        h.block_count = (uint16_t)r->blocks;
+        h.old_crc = srp_crc32(0, old, SRX_BLOCK);
+        h.new_crc = srx_target(old, b->dropped, h.erase_count, r->blocks, b->block, target);
+        bool fits = true;
+        for (uint32_t e = 0; e < SRX_ENTRIES && fits; ++e) {
+            uint32_t pix = b->block * r->ppb + 1 + e;
+            const pg_t *pg = &r->pages[pix];
+            if (!(b->kept & (1U << e)) || pg->lu == SPIFFS_OBJ_ID_FREE) continue;
+            /* The queue whose data page this is: by its lookup entry, or for
+             * a deleted page by the index that names it. */
+            uint32_t id = pg->lu != SPIFFS_OBJ_ID_DELETED ? (uint32_t)(pg->lu & (SR_IDS - 1))
+                        : ref_owner[pix] ? (uint32_t)(ref_owner[pix] - 1U) : SR_IDS;
+            if (id == SR_IDS) continue;
+            uint16_t index = owner_index[id];
+            const obj_t *o = index ? &r->objs[index - 1] : NULL;
+            if (!o || !reclaim_queue(o->name)) continue;
+            bool listed = false;
+            for (uint32_t k = 0; k < h.objects && !listed; ++k) listed = h.object[k].obj == o->obj;
+            if (listed) continue;
+            if (h.objects == SRX_OBJECTS) {
+                fits = false;
+                break;
+            }
+            srx_object_t *entry = &h.object[h.objects++];
+            entry->obj = o->obj;
+            entry->cls = (uint8_t)o->kind.cls;
+            snprintf(entry->name, sizeof(entry->name), "%s", o->name);
+            lq_checkpoint_t cp;
+            if (o->kind.lq_namespace && nvs_load(r, o->kind.lq_namespace, o->kind.lq_key, &cp, sizeof(cp)) == 1 &&
+                lq_checkpoint_valid(&cp)) {
+                entry->flags |= SRX_OBJECT_CURSOR;
+                entry->cursor_offset = cp.offset;
+            }
+        }
+        if (!fits) continue;
+        srx_encode(&h, target, sector);
+        /* A free slot, the one after the newest record first. */
+        uint32_t slot = c->area.slots;
+        for (uint32_t tried = 0; tried < 2 && slot == c->area.slots; ++tried) {
+            for (uint32_t k = 0; k < c->area.slots; ++k) {
+                uint32_t s = (next_slot + k) % c->area.slots;
+                if (srx_slot_free(&c->area, s)) {
+                    slot = s;
+                    break;
+                }
+            }
+            if (slot == c->area.slots) break;
+            if (!srx_write_record(&io, slot, sector, back)) {
+                c->area.slot[slot] = SRX_SLOT_FOREIGN; /* not again this boot */
+                rep->failed++;
+                slot = c->area.slots;
+                if (tried) stop = true;
+            }
+        }
+        if (slot == c->area.slots) {
+            snprintf(rep->short_reason, sizeof(rep->short_reason), stop ? "slot" : "slots");
+            if (stop) logf_line(r, "ERROR", "STORAGE_REPAIR_RECLAIM_FAILED", "two redo slots would not verify; round stopped");
+            break;
+        }
+        next_slot = slot + 1;
+        c->area.slot[slot] = SRX_SLOT_OPEN;
+        c->area.block[slot] = b->block;
+        c->area.sequence[slot] = h.sequence;
+        srx_write_t written = srx_write_block(&io, b->block, target, back, 2);
+        if (r->ports->refresh) r->ports->refresh(r->ports->context, r->fs->cfg.phys_addr + base, SRX_BLOCK);
+        if (written == SRX_WRITE_OK && srx_clear_bits(&io, slot, SRX_OFF_DONE, 0xFFFFFFFFU)) {
+            c->area.slot[slot] = SRX_SLOT_DONE;
+            taken++;
+            c->blocks++;
+            freed += b->gain;
+            gained += b->gain;
+            for (uint32_t e = 0; e < SRX_ENTRIES; ++e) kept_pages += (b->kept >> e) & 1U;
+            continue;
+        }
+        /* It would not verify (or a write failed): left without magic, the
+         * remount erases it and its record serves the next run as a source. */
+        (void)srx_clear_bits(&io, slot, SRX_OFF_SETTLE, SRX_SETTLE_SOURCE);
+        c->area.slot[slot] = SRX_SLOT_SOURCE;
+        sources = true;
+        rep->failed++;
+        rep->sources++;
+        snprintf(message, sizeof(message), "block %u %s; its record is a byte source and the round stops",
+                 (unsigned)b->block, written == SRX_WRITE_VERIFY ? "would not verify" : "could not be written");
+        logf_line(r, "ERROR", "STORAGE_REPAIR_RECLAIM_FAILED", message);
+        c->halt = true;
+        stop = true;
+    }
+    if (gained < want && !rep->short_reason[0]) snprintf(rep->short_reason, sizeof(rep->short_reason), "candidate");
+    /* Every record of the round done or a source: the journal is idle. */
+    bool open = false;
+    for (uint32_t s = 0; s < c->area.slots; ++s) open |= c->area.slot[s] == SRX_SLOT_OPEN;
+    if (!open) journal.flags &= ~SRP_RECLAIM_ACTIVE;
+    journal.blocks += taken;
+    journal.pages_freed += freed;
+    srp_reclaim_seal(&journal);
+    (void)nvs_store(r, SRR_NVS_NAMESPACE, "reclaim", &journal, sizeof(journal));
+    rep->rounds++;
+    rep->blocks += taken;
+    rep->pages_freed += freed;
+    rep->pages_kept += kept_pages;
+    /* The held-CRC oracle: every held file reads what was held. */
+    if (taken && survey(r)) {
+        for (uint32_t k = 0; k < r->obj_count; ++k) {
+            obj_t *o = &r->objs[k];
+            if (!o->hold || o->retired || !live(o) || !held_differs(r, o)) continue;
+            if (!mismatched) mismatched = zalloc(r, SRR_REPORT_FILES * SRP_NAME_BYTES);
+            if (mismatched && mismatches < SRR_REPORT_FILES)
+                memcpy(mismatched + mismatches++ * SRP_NAME_BYTES, o->name, SRP_NAME_BYTES);
+        }
+    }
+    r->failed = false;
+    if (!r->ports->remount(r->ports->context)) {
+        remounted = false;
+        c->halt = true;
+        logf_line(r, "ERROR", "STORAGE_REPAIR_RECLAIM_FAILED", "the store did not mount again after the round");
+        goto done;
+    }
+    if (mismatches) {
+        rep->held_mismatch += mismatches;
+        c->halt = true;
+        snprintf(message, sizeof(message), "%lu held files read differently after the round (the first %s); put back",
+                 (unsigned long)mismatches, mismatched);
+        logf_line(r, "ERROR", "STORAGE_REPAIR_RECLAIM_MISMATCH", message);
+        for (uint32_t m = 0; m < mismatches && survey(r); ++m) {
+            obj_t *o = find_live(r, mismatched + m * SRP_NAME_BYTES);
+            bool changed = false;
+            if (o && o->hold) (void)restore_in_place(r, o, &changed);
+            r->failed = false;
+        }
+    }
+    c->reclaimed = taken > 0 || sources;
+    if (survey(r)) rep->erased_after = (uint32_t)surveyed_free(r);
+    snprintf(message, sizeof(message),
+             "%lu blocks reformatted in place for %s: %lu deleted pages erased, %lu pages kept; %lu erased pages now",
+             (unsigned long)taken, trigger, (unsigned long)freed, (unsigned long)kept_pages,
+             (unsigned long)rep->erased_after);
+    logf_line(r, "WARN", "STORAGE_REPAIR_RECLAIM", message);
+    if (gained < want) {
+        snprintf(message, sizeof(message), "stopped %ld pages short of the target (%s)", (long)(want - gained),
+                 rep->short_reason);
+        logf_line(r, "WARN", "STORAGE_REPAIR_RECLAIM_SHORT", message);
+    }
+    if (taken) r->report->level = 3;
+done:
+    if (phased) {
+        r->state.phase = phase_before;
+        (void)save_state(r);
+    }
+    r->failed = !remounted;
+    memcpy(r->report->error_stage, stage, sizeof(stage));
+    r->report->error_code = code;
+    if (!remounted) {
+        snprintf(r->report->error_stage, sizeof(r->report->error_stage), "remount");
+        r->report->error_code = SPIFFS_ERR_INTERNAL;
+        r->report->result = SRR_RESULT_FAILED;
+    }
+    release(r, attr);
+    release(r, has_header);
+    release(r, ref_owner);
+    release(r, owner_index);
+    release(r, magic_ok);
+    release(r, cand);
+    release(r, mismatched);
+    if (r->ports->now_ms) rep->ms += (uint32_t)(r->ports->now_ms(r->ports->context) - started);
+}
+
+/* The run ends without room where 2.7.5 would hand the store over so: the
+ * trigger, or NULL. */
+static const char *reclaim_trigger(run_t *r, bool check_failed)
+{
+    const srr_report_t *rep = r->report;
+    if (!r->carry || r->stopped || r->carry->halt || r->carry->rounds >= SR_RECLAIM_ROUNDS) return NULL;
+    if (rep->result != SRR_RESULT_DEFERRED && rep->result != SRR_RESULT_FAILED) return NULL;
+    if (!strcmp(rep->error_stage, "gc_unsafe")) return "gc_unsafe";
+    if (!strcmp(rep->error_stage, "full")) return "full";
+    if (check_failed && r->last_error == SPIFFS_ERR_FULL) return "check_full";
+    /* The restore after a check could not bring a file back (no page for
+     * its header): the round goes ahead only if the store is short of room. */
+    if (r->restore_failed) return "restore";
+    return NULL;
+}
+
+static void run_once(spiffs *fs, const srr_config_t *config, const srr_ports_t *ports, srr_report_t *report,
+                     carry_t *carry)
 {
     if (!report) return;
     memset(report, 0, sizeof(*report));
@@ -3993,9 +4751,19 @@ void srr_run(spiffs *fs, const srr_config_t *config, const srr_ports_t *ports, s
         return;
     }
     s_run = r;
+    r->carry = carry;
     if (!alloc_run(r)) {
         report->result = SRR_RESULT_FAILED;
         snprintf(report->error_stage, sizeof(report->error_stage), "memory");
+        free_run(r);
+        s_run = NULL;
+        return;
+    }
+    /* 2.7.6: the round's buffers, and the records the boot recovery made
+     * byte sources (without them a span they hold would be filled). */
+    if (carry && carry->have_area && ports->redo) r->rx = zalloc(r, 4U * SRX_BLOCK);
+    if (!load_sources(r)) {
+        report->result = SRR_RESULT_FAILED;
         free_run(r);
         s_run = NULL;
         return;
@@ -4048,7 +4816,17 @@ void srr_run(spiffs *fs, const srr_config_t *config, const srr_ports_t *ports, s
      * the runtime's own reserve: a run that fills NVS would fail the
      * runtime's checkpoint commits. */
     uint32_t nvs_needed = srp_nvs_entries_needed(have_state, have_gaps, have_resets, have_manifest);
-    bool nvs_short = config->nvs_known && config->nvs_available_entries < nvs_needed;
+    bool nvs_known = config->nvs_known;
+    uint32_t nvs_available = config->nvs_available_entries;
+    if (ports->nvs_available) {
+        /* Measured again: an earlier run of this boot wrote the journal. */
+        int32_t now = ports->nvs_available(ports->context);
+        if (now >= 0) {
+            nvs_known = true;
+            nvs_available = (uint32_t)now;
+        }
+    }
+    bool nvs_short = nvs_known && nvs_available < nvs_needed;
     if (policy.mode == SRP_MODE_REPORT_ONLY || nvs_short) {
         /* The guard: nothing is read file by file and nothing is written. */
         report->generation = r->state.generation;
@@ -4059,7 +4837,7 @@ void srr_run(spiffs *fs, const srr_config_t *config, const srr_ports_t *ports, s
             snprintf(report->error_stage, sizeof(report->error_stage), "nvs_full");
             snprintf(message, sizeof(message),
                      "NVS has %lu available entries; a repair needs %lu, so this boot only reports",
-                     (unsigned long)config->nvs_available_entries, (unsigned long)nvs_needed);
+                     (unsigned long)nvs_available, (unsigned long)nvs_needed);
             logf_line(r, "ERROR", "STORAGE_REPAIR_NVS_FULL", message);
         } else {
             r->state.phase = SRP_PHASE_IDLE;
@@ -4202,6 +4980,8 @@ void srr_run(spiffs *fs, const srr_config_t *config, const srr_ports_t *ports, s
             } else if (probed != SPIFFS_OK) ok = fail(r, "probe", probed);
         }
     }
+    /* 2.7.6: pages of source records that went back, or settle otherwise. */
+    if (ok && !r->stopped) settle_sources(r);
     finish_report(r);
     if (report->commands_damaged) r->state.flags |= SRP_STATE_COMMANDS_DAMAGED;
     if (r->stopped) report->result = SRR_RESULT_STOPPED;
@@ -4222,6 +5002,10 @@ void srr_run(spiffs *fs, const srr_config_t *config, const srr_ports_t *ports, s
         if (checked && !check_failed && !cut_short) r->state.flags &= ~SRP_STATE_DAMAGE_SEEN;
         (void)save_state(r);
     }
+    /* 2.7.6: a run about to hand over a store without room reformats blocks
+     * in place, and the caller runs the repair again. */
+    const char *trigger = reclaim_trigger(r, check_failed);
+    if (trigger) reclaim_round(r, trigger);
     report->phase = (srp_phase_t)r->state.phase;
     report->cpu_steps = s_cpu_steps;
     if (ports->now_ms) report->duration_ms = (uint32_t)(ports->now_ms(ports->context) - started);
@@ -4237,4 +5021,48 @@ void srr_run(spiffs *fs, const srr_config_t *config, const srr_ports_t *ports, s
     set_phase(r, report->phase, 0, false);
     free_run(r);
     s_run = NULL;
+}
+
+void srr_run(spiffs *fs, const srr_config_t *config, const srr_ports_t *ports, srr_report_t *report)
+{
+    if (!report) return;
+    carry_t *carry = config && ports && ports->alloc && ports->release ? ports->alloc(ports->context, sizeof(carry_t)) : NULL;
+    if (carry) {
+        memset(carry, 0, sizeof(*carry));
+        if (config->area) {
+            carry->area = *config->area;
+            carry->have_area = true;
+        }
+    }
+    uint64_t started = ports && ports->now_ms ? ports->now_ms(ports->context) : 0;
+    uint32_t runs = 0;
+    for (;;) {
+        if (carry) carry->reclaimed = false;
+        run_once(fs, config, ports, report, carry);
+        runs++;
+        if (!carry || !carry->reclaimed || runs > SR_RECLAIM_ROUNDS) break;
+    }
+    report->runs = runs;
+    if (ports && ports->now_ms) report->duration_ms = (uint32_t)(ports->now_ms(ports->context) - started);
+    if (!carry) return;
+    srr_reclaim_report_t *rep = &report->reclaim;
+    *rep = carry->reclaim;
+    const srx_area_t *area = &carry->area;
+    rep->area = (uint8_t)(carry->have_area ? area->state : SRX_AREA_ABSENT);
+    if (carry->have_area) {
+        rep->area_foreign = area->foreign;
+        rep->area_first_foreign = area->first_foreign;
+        rep->area_foreign_crc = area->foreign_crc;
+        rep->redone += area->redone + area->reasserted;
+        rep->sources += area->to_sources;
+        rep->failed += area->failed;
+        for (uint32_t s = 0; s < area->slots; ++s)
+            rep->records_open += area->slot[s] == SRX_SLOT_OPEN || area->slot[s] == SRX_SLOT_SOURCE;
+    }
+    if (rep->blocks) {
+        report->level = 3;
+        /* The run after a round found nothing more to do: the boot did. */
+        if (report->result == SRR_RESULT_CLEAN) report->result = SRR_RESULT_REPAIRED;
+    }
+    ports->release(ports->context, carry);
 }

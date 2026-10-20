@@ -51,6 +51,10 @@ def test_repair_against_esp_idf_spiffs_with_power_cuts(tmp_path: Path) -> None:
     output = tool.run(binary, ["--seeds=2", "--organic=2", "--ticks=1200"])
     assert "cuts inside the repair" in output and "mirror equivalence passed" in output
     assert "0 committed rows lost" in output
+    # 2.7.6: P02's store reformatted in place, confirmed and unconfirmed,
+    # with cuts in the round and through the old image.
+    assert "p02 1024 KiB unconfirmed: 2.7.5 DEFERRED" in output and "through the old image" in output
+    assert "reclaim mirror equivalence passed" in output
 
 
 def test_ci_runs_the_repair_harness_in_the_esp_idf_image() -> None:
