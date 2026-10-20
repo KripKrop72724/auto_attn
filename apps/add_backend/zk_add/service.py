@@ -686,7 +686,8 @@ def apply_firmware_diagnostics(session: Session, connector: Connector, payload: 
 
     now = utc_now()
     diagnostics = payload.diagnostics
-    evidence = diagnostics.model_dump(mode="json") if diagnostics else None
+    # By alias: a repair entry's "class" is stored as the firmware sent it.
+    evidence = diagnostics.model_dump(mode="json", by_alias=True) if diagnostics else None
     recovery_role = storage_recovery_role(session, connector, payload)
     if evidence is not None:
         # Bind runtime image/boot evidence to this authenticated sample. The

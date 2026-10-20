@@ -53,6 +53,11 @@ static atomic_bool s_hil_reboot_reserved;
 #define OTA_RESUME_CHECKPOINT_BYTES (64 * 1024)
 #define OTA_HTTP_RESPONSE_BYTES 8192
 #define OTA_HTTP_TRANSPORT_BUFFER_BYTES 4096
+/* The request line and headers of a signed ADD request (bearer token, five
+ * X-ADD headers, 64-hex signature) exceed esp_http_client's default 512-byte
+ * transmit buffer, which logged "HTTP_HEADER: Buffer length is small to fit
+ * all the headers" on every 60 s poll. */
+#define OTA_HTTP_REQUEST_HEADER_BYTES 1024
 #define OTA_TASK_PRIORITY 5
 
 typedef struct {
@@ -249,6 +254,7 @@ static bool signed_request(
         .crt_bundle_attach = esp_crt_bundle_attach,
         .timeout_ms = 15000,
         .buffer_size = OTA_HTTP_TRANSPORT_BUFFER_BYTES,
+        .buffer_size_tx = OTA_HTTP_REQUEST_HEADER_BYTES,
     };
     esp_http_client_handle_t client = esp_http_client_init(&http);
     if (!client) return false;

@@ -32,6 +32,9 @@ bool ug_direct_predecessor_matches(const char *version, const uint8_t digest[32]
     /* 2.7.3: the panic-trace HIL image, so its devices upgrade in place. */
     static const char platform_273[] =
         "98855248bb4325103b5253ab4b15f4e939adf3ace89c208d463b09ec9ca21a6a";
+    /* 2.7.4: the storage-inventory HIL image, so its devices upgrade in place. */
+    static const char platform_274[] =
+        "3e4bb613ab046df5ad29e4a1ab37fd801e1778e6b0d2c41c6604fe75bbea2fac";
     const char *expected = !strcmp(version, "2.4.12") ? baseline_2412 :
         !strcmp(version, "2.5.2") ? baseline_252 :
         !strcmp(version, "2.6.6") ? hil_266 :
@@ -44,7 +47,8 @@ bool ug_direct_predecessor_matches(const char *version, const uint8_t digest[32]
         !strcmp(version, "2.6.14") ? hil_2614 :
         !strcmp(version, "2.6.15") ? fleet_2615 :
         !strcmp(version, "2.7.2") ? platform_272 :
-        !strcmp(version, "2.7.3") ? platform_273 : NULL;
+        !strcmp(version, "2.7.3") ? platform_273 :
+        !strcmp(version, "2.7.4") ? platform_274 : NULL;
     if (!expected) return false;
     static const char hex[] = "0123456789abcdef";
     for (unsigned i = 0; i < 32; ++i) {

@@ -10,6 +10,12 @@ typedef struct {
     bool (*commit)(void *, const ft_checkpoint_t *);
     void *context;
 } ft_port_t;
+bool ft_checkpoint_valid(const ft_checkpoint_t *checkpoint);
+/* Commits phase 0 with the next generation, for an owner that has removed
+ * every file of the transaction: ft_recover then expects no committed
+ * generation. A checkpoint that fails its CRC restarts at generation 1; one
+ * NVS cannot read is never overwritten. */
+bool ft_checkpoint_idle(ft_port_t port);
 bool ft_recover(const char *active, const char *stage, const char *backup, ft_port_t port);
 bool ft_replace(const char *active, const char *stage, const char *backup, size_t limit, ft_port_t port);
 

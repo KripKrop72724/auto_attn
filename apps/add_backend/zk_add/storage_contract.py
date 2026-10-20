@@ -7,8 +7,8 @@ DIRECT_VERSION = "2.6.1"
 # The 2.7 platform images in the legacy authority of the 2.6.15 fleet. 2.7.2
 # replaces 2.7.1, whose terminal framing failed on the 3FL G3; 2.7.3 records
 # the panic trace 3FL's 2.7.2 cache error lacked; 2.7.4 reports the storage
-# damage that kept 2.7.3 from confirming on 13FL.
-FLEET_PLATFORM_VERSIONS = ("2.7.1", "2.7.2", "2.7.3", "2.7.4")
+# damage that kept 2.7.3 from confirming on 13FL; 2.7.5 repairs it at boot.
+FLEET_PLATFORM_VERSIONS = ("2.7.1", "2.7.2", "2.7.3", "2.7.4", "2.7.5")
 FLEET_PLATFORM_VERSION = FLEET_PLATFORM_VERSIONS[-1]
 DIRECT_VERSIONS = (DIRECT_VERSION, "2.6.2", "2.6.3", "2.6.4", "2.6.5", "2.6.6", "2.6.7", "2.6.8", "2.6.9", "2.6.10", "2.6.11", "2.6.12", "2.6.13", "2.6.14", "2.6.15", *FLEET_PLATFORM_VERSIONS)
 DIRECT_BASELINES = ("2.4.12", "2.5.2")
@@ -91,10 +91,19 @@ TRACE_BASELINE_IMAGES = {
     "2.7.3": "98855248bb4325103b5253ab4b15f4e939adf3ace89c208d463b09ec9ca21a6a",
 }
 TRACE_MARKER = PLATFORM_MARKER + ",2.7.3"
+# 2.7.5 also accepts 2.7.4, so every 2.7.4 HIL device upgrades in place.
+INVENTORY_BASELINES = (*TRACE_BASELINES, "2.7.4")
+INVENTORY_BASELINE_IMAGES = {
+    **TRACE_BASELINE_IMAGES,
+    "2.7.4": "3e4bb613ab046df5ad29e4a1ab37fd801e1778e6b0d2c41c6604fe75bbea2fac",
+}
+INVENTORY_MARKER = TRACE_MARKER + ",2.7.4"
 
 
 def platform_baselines(version: str) -> tuple[tuple[str, ...], dict[str, str]]:
     """The rollback predecessors a 2.7 platform image accepts."""
+    if version == "2.7.5":
+        return INVENTORY_BASELINES, INVENTORY_BASELINE_IMAGES
     if version == "2.7.4":
         return TRACE_BASELINES, TRACE_BASELINE_IMAGES
     if version == "2.7.3":

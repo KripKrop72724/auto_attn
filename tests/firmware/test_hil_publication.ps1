@@ -186,6 +186,30 @@ foreach ($platformVersion in @('2.7.1', '2.7.2', '2.7.3')) {
 $rejected = $false
 try { Get-FirmwareStorageContract -ImagePath $contractImage -Version '2.7.4' | Out-Null } catch { $rejected = $true }
 if (-not $rejected) { throw '2.7.4 accepted the 2.7.3 storage contract' }
+# 2.7.5 also rolls back to 2.7.4, the storage-inventory HIL image.
+$inventoryMarker = $traceMarker + ',2.7.4'
+[IO.File]::WriteAllText($contractImage, $inventoryMarker + [char]0)
+$inventoryContract = Get-FirmwareStorageContract -ImagePath $contractImage -Version '2.7.5'
+if ($inventoryContract.allowed_bootstrap_versions.Count -ne 14 -or $inventoryContract.allowed_bootstrap_versions[10] -ne '2.6.15' -or
+    $inventoryContract.allowed_bootstrap_versions[11] -ne '2.7.2' -or $inventoryContract.allowed_bootstrap_versions[12] -ne '2.7.3' -or
+    $inventoryContract.allowed_bootstrap_versions[13] -ne '2.7.4' -or
+    $inventoryContract.allowed_bootstrap_images['2.7.4'] -ne '3e4bb613ab046df5ad29e4a1ab37fd801e1778e6b0d2c41c6604fe75bbea2fac' -or
+    $inventoryContract.allowed_bootstrap_images['2.7.3'] -ne '98855248bb4325103b5253ab4b15f4e939adf3ace89c208d463b09ec9ca21a6a' -or
+    $inventoryContract.allowed_bootstrap_images['2.7.2'] -ne 'e908496e0695d8c29e96a6f2db3840060eeab526c4012e29a3deef826f7c8eea' -or
+    $inventoryContract.allowed_bootstrap_images['2.6.15'] -ne '832c0c3d8dac6e41d7cd0a9d4fbe4508e4f66982fa5ddeceaca4dc5adcbd80d6') {
+    throw '2.7.5 rollback targets changed'
+}
+foreach ($platformVersion in @('2.7.1', '2.7.2', '2.7.3', '2.7.4')) {
+    $rejected = $false
+    try { Get-FirmwareStorageContract -ImagePath $contractImage -Version $platformVersion | Out-Null } catch { $rejected = $true }
+    if (-not $rejected) { throw "$platformVersion accepted the 2.7.5 storage contract" }
+}
+foreach ($earlierMarker in @($traceMarker, $platformMarker, $fleetMarker)) {
+    [IO.File]::WriteAllText($contractImage, $earlierMarker + [char]0)
+    $rejected = $false
+    try { Get-FirmwareStorageContract -ImagePath $contractImage -Version '2.7.5' | Out-Null } catch { $rejected = $true }
+    if (-not $rejected) { throw '2.7.5 accepted an earlier platform storage contract' }
+}
 [IO.File]::WriteAllText($contractImage, $fleetMarker + [char]0)
 $rejected = $false
 try { Get-FirmwareStorageContract -ImagePath $contractImage -Version '2.7.3' | Out-Null } catch { $rejected = $true }
@@ -637,7 +661,7 @@ if ($zkt2615Marker.targets.Count -ne 5 -or $zkt2615Marker.application_sha256 -cn
 # The 2.7 platform publishes only HIL_ONLY, to an exact prefix of the signed
 # nationwide scope. 2.7.1 is published last, as before this loop existed.
 $nationwide = Get-Content -LiteralPath (Join-Path $repo 'deploy/add/hil-targets-zkt-270.json') -Raw
-foreach ($platformVersion in @('2.7.4', '2.7.3', '2.7.2', '2.7.1')) {
+foreach ($platformVersion in @('2.7.5', '2.7.4', '2.7.3', '2.7.2', '2.7.1')) {
     $platformImage = Join-Path $source "zone-lite-$platformVersion.bin"
     [IO.File]::WriteAllText($platformImage, "ZKT $platformVersion fixture, not deployable firmware")
     $manifest.version=$platformVersion

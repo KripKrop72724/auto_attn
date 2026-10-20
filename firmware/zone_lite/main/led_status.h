@@ -20,6 +20,8 @@ typedef enum {
     LED_STATUS_LOCAL_FAILURE,
     LED_STATUS_FATAL,
     LED_STATUS_BLOCKED_IDENTITY,
+    /* ZKT 2.7.5: the boot storage repair is writing; do not power the unit off. */
+    LED_STATUS_STORAGE_REPAIR,
 } led_status_t;
 
 typedef enum {

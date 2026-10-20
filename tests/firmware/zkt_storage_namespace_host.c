@@ -39,6 +39,9 @@ static esp_err_t esp_vfs_spiffs_register(const esp_vfs_spiffs_conf_t *config)
 static bool in_mount(const char *path)
 { return mounted[0] && !strncmp(path, mounted, strlen(mounted)) && path[strlen(mounted)] == '/'; }
 static bool storage_upgrade_init(void) { return true; }
+/* ZKT 2.7.5: the command inbox waits for this; every path out of the mount sets it. */
+static bool storage_ready;
+static void add_connector_storage_ready(void) { storage_ready = true; }
 bool qs_init(void) { return true; }
 static bool restore_pending_backup_if_needed(void) { assert(mounted[0]); return pending_restored; }
 static bool restore_blocked_backup_if_needed(void) { assert(mounted[0]); return blocked_restored; }
@@ -56,6 +59,7 @@ int main(void)
 {
     storage_init(); /* Actual boot function records the actual VFS mount. */
     assert(g_queue_store_ready && g_seen_lock && legacy_reads == 3 && !backlog && !storage_faults);
+    assert(storage_ready);
     assert(start_owner(NULL, "SYNTHETIC-TERMINAL")); /* Actual runtime adapter. */
     assert(!strcmp(mounted, ZJ_DEVICE_DIRECTORY)); /* OTA evidence directory. */
     assert(!strcmp(journal_prefix, ZJ_DEVICE_PREFIX));

@@ -3,6 +3,7 @@
 #include <stdbool.h>
 
 #include "cJSON.h"
+#include "esp_system.h"
 
 /* How far the previous boot got before it ended. Stages only advance. */
 typedef enum {
@@ -28,5 +29,12 @@ typedef enum {
  * error and fault address, and each core's task, PC and backtrace. */
 void boot_report_init(void);
 void boot_report_stage(boot_stage_t stage);
+/* ZKT 2.7.5 boot storage repair: its phase and check pass, whether its
+ * deadline is restarting the ESP, and whether it returned, kept for the next
+ * boot (RTC memory survives every reset except a power cut). */
+void boot_report_repair(unsigned phase, unsigned pass, bool deadline);
+void boot_report_repair_returned(void);
+bool boot_report_previous_repair(unsigned *phase, unsigned *pass, bool *deadline, bool *returned);
+esp_reset_reason_t boot_report_reset_reason(void);
 /* Add diagnostics.boot_report to a heartbeat. */
 bool boot_report_append(cJSON *diagnostics);

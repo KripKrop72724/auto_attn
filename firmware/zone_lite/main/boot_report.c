@@ -84,12 +84,27 @@ typedef struct {
 
 #define BOOT_TRACE_MAGIC (UINT32_C(0x5A4C4254) ^ (uint32_t)sizeof(boot_rtc_trace_t))
 
+/* ZKT 2.7.5: where the boot storage repair was, so the next boot can say a
+ * run was cut short and whether its deadline did it. After the trace, so the
+ * 2.7.1 and 2.7.3 layouts an older image reads are unchanged. */
+typedef struct {
+    uint32_t magic;
+    uint32_t boot_count; /* the boot this describes */
+    uint32_t phase, pass, deadline;
+    uint32_t returned;   /* storage_repair_boot returned: a later crash is not the repair's */
+    uint32_t checksum;
+} boot_rtc_repair_t;
+
+#define BOOT_REPAIR_MAGIC (UINT32_C(0x5A4C5252) ^ (uint32_t)sizeof(boot_rtc_repair_t))
+
 typedef struct {
     esp_reset_reason_t reason;
     bool rtc_valid; /* the previous boot's record survived */
     bool trace_valid; /* and so did its panic trace */
+    bool repair_valid; /* and its repair breadcrumb */
     boot_rtc_t previous;
     boot_rtc_trace_t trace;
+    boot_rtc_repair_t repair;
     char last_invalid_partition[17];
 } boot_report_t;
 
@@ -99,11 +114,13 @@ typedef struct {
 typedef struct {
     boot_rtc_t rtc;
     boot_rtc_trace_t trace;
+    boot_rtc_repair_t repair;
 } boot_retained_t;
 
 static RTC_NOINIT_ATTR boot_retained_t s_retained;
 #define s_rtc (s_retained.rtc)
 #define s_trace (s_retained.trace)
+#define s_repair (s_retained.repair)
 static boot_report_t s_report;
 /* Zeroed at every boot: whether this boot has started its part of s_rtc. */
 static bool s_started;
@@ -129,6 +146,11 @@ static uint32_t PANIC_ATTR checksum(const boot_rtc_t *rtc)
 static uint32_t PANIC_ATTR trace_checksum(const boot_rtc_trace_t *trace)
 {
     return fnv1a(trace, offsetof(boot_rtc_trace_t, checksum));
+}
+
+static uint32_t repair_checksum(const boot_rtc_repair_t *repair)
+{
+    return fnv1a(repair, offsetof(boot_rtc_repair_t, checksum));
 }
 
 static void PANIC_ATTR seal(void)
@@ -407,10 +429,14 @@ void boot_report_init(void)
         s_report.previous = s_rtc;
         s_report.trace_valid = trace_describes(&s_rtc);
         if (s_report.trace_valid) s_report.trace = s_trace;
+        s_report.repair_valid = s_repair.magic == BOOT_REPAIR_MAGIC &&
+            s_repair.checksum == repair_checksum(&s_repair) && s_repair.boot_count == s_rtc.boot_count;
+        if (s_report.repair_valid) s_report.repair = s_repair;
     } else {
         reset_record();
     }
     s_trace.magic = 0;
+    s_repair.magic = 0;
     ++s_rtc.boot_count;
     count_reset(s_report.reason);
     clear_boot_fields();
@@ -439,6 +465,44 @@ void boot_report_init(void)
     }
     /* Exact uptime for orderly restarts, OTA and rollback included. */
     (void)esp_register_shutdown_handler(on_restart);
+}
+
+void boot_report_repair(unsigned phase, unsigned pass, bool deadline)
+{
+    portENTER_CRITICAL_SAFE(&s_lock);
+    s_repair.magic = BOOT_REPAIR_MAGIC;
+    s_repair.boot_count = s_rtc.boot_count;
+    s_repair.phase = phase;
+    s_repair.pass = pass;
+    s_repair.deadline = deadline ? 1U : 0U;
+    s_repair.returned = 0;
+    s_repair.checksum = repair_checksum(&s_repair);
+    portEXIT_CRITICAL_SAFE(&s_lock);
+}
+
+void boot_report_repair_returned(void)
+{
+    portENTER_CRITICAL_SAFE(&s_lock);
+    if (s_repair.magic == BOOT_REPAIR_MAGIC && s_repair.boot_count == s_rtc.boot_count) {
+        s_repair.returned = 1;
+        s_repair.checksum = repair_checksum(&s_repair);
+    }
+    portEXIT_CRITICAL_SAFE(&s_lock);
+}
+
+bool boot_report_previous_repair(unsigned *phase, unsigned *pass, bool *deadline, bool *returned)
+{
+    if (!s_report.repair_valid) return false;
+    if (phase) *phase = s_report.repair.phase;
+    if (pass) *pass = s_report.repair.pass;
+    if (deadline) *deadline = s_report.repair.deadline != 0;
+    if (returned) *returned = s_report.repair.returned != 0;
+    return true;
+}
+
+esp_reset_reason_t boot_report_reset_reason(void)
+{
+    return s_report.reason;
 }
 
 void boot_report_stage(boot_stage_t stage)

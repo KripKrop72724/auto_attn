@@ -110,6 +110,8 @@ static int priority_for_status(led_status_t status)
         return 40;
     case LED_STATUS_WIFI_CONNECTING:
         return 30;
+    case LED_STATUS_STORAGE_REPAIR:
+        return 25;
     case LED_STATUS_BOOTING:
         return 20;
     case LED_STATUS_HEALTHY:
@@ -226,6 +228,10 @@ static void render_status(led_status_t status, bool live_flash, int64_t tick_ms)
         break;
     case LED_STATUS_BLOCKED_IDENTITY:
         set_rgb(slow_on ? 255 : 0, 0, slow_on ? 255 : 0);
+        break;
+    case LED_STATUS_STORAGE_REPAIR:
+        /* Fast white and blue: unlike any other state, and not a fault. */
+        set_rgb(fast_on ? 255 : 0, fast_on ? 255 : 0, 255);
         break;
     default:
         set_rgb(0, 0, 0);
@@ -452,6 +458,7 @@ const char *led_status_current_name(void)
     case LED_STATUS_LOCAL_FAILURE: return "LOCAL_FAILURE";
     case LED_STATUS_FATAL: return "FATAL";
     case LED_STATUS_BLOCKED_IDENTITY: return "BLOCKED_IDENTITY";
+    case LED_STATUS_STORAGE_REPAIR: return "STORAGE_REPAIR";
     default: return "UNKNOWN";
     }
 }

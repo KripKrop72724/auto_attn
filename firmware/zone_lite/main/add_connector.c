@@ -19,6 +19,9 @@
 #include "ota_manager.h"
 #include "storage_inventory.h"
 #include "storage_recovery.h"
+#if defined(ZONE_LITE_STORAGE_REPAIR) && ZONE_LITE_STORAGE_REPAIR
+#include "storage_repair.h"
+#endif
 
 #include <ctype.h>
 #include <stdatomic.h>
@@ -31,6 +34,7 @@
 #include <unistd.h>
 
 #include "cJSON.h"
+#include "command_inbox_merge.h"
 #include "esp_app_desc.h"
 #include "esp_crt_bundle.h"
 #include "esp_event.h"
@@ -129,6 +133,7 @@
 #define ADD_COMMAND_INBOX_PATH "/storage/add_commands.jsonl"
 #define ADD_COMMAND_INBOX_TMP_PATH "/storage/add_commands.tmp"
 #define ADD_COMMAND_INBOX_BACKUP_PATH "/storage/add_commands.bak"
+#define ADD_COMMAND_INBOX_MERGE_PATH "/storage/add_commands.mrg"
 #define ADD_COMMAND_INBOX_MAX_BYTES (64U * 1024U)
 #define ADD_COMMAND_LINE_BYTES 12288
 #define ADD_IDENTITY_CATALOG_PATH "/storage/add_identities.enc"
@@ -214,6 +219,11 @@ static SemaphoreHandle_t s_send_lock;
 static SemaphoreHandle_t s_ack_sem;
 static SemaphoreHandle_t s_ack_wait_lock;
 static SemaphoreHandle_t s_command_lock;
+/* ZKT 2.7.5: /storage is mounted only after the boot storage repair. The
+ * supervisor starts before storage_init and restores the command inbox every
+ * second; before this is set the VFS is not there, ft_recover would see
+ * every file missing and an empty inbox would count as restored. */
+static atomic_bool s_storage_ready;
 static SemaphoreHandle_t s_catalog_lock;
 static add_zkt_telemetry_t s_zkt;
 static char s_activity[64] = "BOOTING";
@@ -288,7 +298,9 @@ static add_outbox_t s_live_outbox = {
 };
 static int64_t s_disconnected_since_ms;
 static int64_t s_last_transport_restart_ms;
-static volatile uint32_t s_priority_delivery_until_ms;
+/* Milliseconds of uptime, 64-bit: in 32 bits the unset deadline read as a hold
+ * from 24.9 to 49.7 days of uptime, and a past one again 24.9 days after it. */
+static atomic_int_least64_t s_priority_delivery_until_ms;
 
 static TaskHandle_t s_outbox_task_handle;
 static atomic_bool s_background_ack_waiting;
@@ -318,8 +330,7 @@ static int64_t monotonic_ms(void)
 
 static bool priority_delivery_hold_active(void)
 {
-    uint32_t now = (uint32_t)monotonic_ms();
-    return (int32_t)(s_priority_delivery_until_ms - now) > 0;
+    return monotonic_ms() < atomic_load(&s_priority_delivery_until_ms);
 }
 
 static const char *firmware_version(void)
@@ -2235,6 +2246,7 @@ static int command_journal_contains_locked(const char *command_id)
 #if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
     if (catalog_owner_required()) return command_owner_contains(command_id);
 #endif
+    if (!atomic_load(&s_storage_ready)) return -1;
     if (!command_journal_recover_locked()) return -1;
     FILE *file = fopen(ADD_COMMAND_INBOX_PATH, "r");
     if (!file) return errno == ENOENT ? 0 : -1;
@@ -2366,7 +2378,7 @@ static void restore_command_inbox(void)
     if (managed && !command_owner_idle()) { xSemaphoreGive(s_command_lock); return; }
     command_owner_reader_t reader = {.deadline_us = (uint64_t)esp_timer_get_time() + 30000000ULL};
 #endif
-    if (s_command_inbox_restored) { xSemaphoreGive(s_command_lock); return; }
+    if (s_command_inbox_restored || !atomic_load(&s_storage_ready)) { xSemaphoreGive(s_command_lock); return; }
     if (!command_journal_recover_locked()) {
         xSemaphoreGive(s_command_lock);
         return;
@@ -3062,6 +3074,9 @@ static void append_firmware_diagnostics(cJSON *payload, const add_zkt_telemetry_
         (local_failure.active && local_failure.last_source[0] &&
          !cJSON_AddStringToObject(storage, "local_failure_last_source", local_failure.last_source)) ||
         !storage_inventory_append(storage)) goto failed;
+#if defined(ZONE_LITE_STORAGE_REPAIR) && ZONE_LITE_STORAGE_REPAIR
+    if (!storage_repair_append(storage)) goto failed;
+#endif
     if (!append_worker_diagnostic(workers, "add_delivery", s_outbox_task_handle != NULL,
             s_outbox_tick_ms, s_outbox_buffer_ready ? s_add_worker_operation : ADD_WORKER_RESOURCE)) goto failed;
 #if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
@@ -3898,8 +3913,8 @@ static bool deliver_attendance_payloads_acknowledged(
     // cannot accept more bytes, and every batch is acknowledged by ADD before
     // success.  Event UIDs make a later terminal retry or old-outbox drain
     // idempotent.
-    s_priority_delivery_until_ms = (uint32_t)monotonic_ms() +
-        ADD_PRIORITY_ACK_LOCK_TIMEOUT_MS + ADD_PRIORITY_ACK_TIMEOUT_MS;
+    atomic_store(&s_priority_delivery_until_ms, monotonic_ms() +
+        ADD_PRIORITY_ACK_LOCK_TIMEOUT_MS + ADD_PRIORITY_ACK_TIMEOUT_MS);
     bool ok = true;
     for (size_t i = 0; i < count; i++) {
         bool inferred_live = false;
@@ -3922,11 +3937,10 @@ static bool deliver_attendance_payloads_acknowledged(
             ok = false;
             break;
         }
-        s_priority_delivery_until_ms = (uint32_t)monotonic_ms() +
-            ADD_PRIORITY_ACK_LOCK_TIMEOUT_MS + ADD_PRIORITY_ACK_TIMEOUT_MS;
+        atomic_store(&s_priority_delivery_until_ms, monotonic_ms() +
+            ADD_PRIORITY_ACK_LOCK_TIMEOUT_MS + ADD_PRIORITY_ACK_TIMEOUT_MS);
     }
-    s_priority_delivery_until_ms =
-        (uint32_t)monotonic_ms() + ADD_PRIORITY_HOLD_MS;
+    atomic_store(&s_priority_delivery_until_ms, monotonic_ms() + ADD_PRIORITY_HOLD_MS);
     ESP_LOGW(
         TAG,
         "ADD reconcile outbox unavailable; acknowledged direct delivery %s batches=%lu",
@@ -4450,6 +4464,15 @@ static void outbox_task(void *arg)
             background_due = true;
         }
         priority_started = 0;
+#if defined(ZONE_LITE_STORAGE_REPAIR) && ZONE_LITE_STORAGE_REPAIR
+        /* The boot storage repair's logs and evidence, a little per pass
+         * and only outside a priority hold (an evidence send makes direct
+         * priority senders wait): this task already sends acknowledged queue
+         * evidence on its 8 KiB stack, so the repair needs no task of its
+         * own. With nothing pending it reads no NVS. */
+        storage_repair_report_step();
+        s_outbox_tick_ms = (uint32_t)monotonic_ms();
+#endif
         unsigned ready = 0;
         for (unsigned i = 0; i < 6; i++) {
             uint32_t depth = 0;
@@ -5601,6 +5624,77 @@ bool add_connector_boot_local_failure(void)
     if (!strcmp(led, "LOCAL_FAILURE") || !strcmp(led, "FATAL") || s_worker_start_failed) return true;
     qs_health_t storage = qs_health();
     return storage.observed && (storage.last_error || storage.persistence_probe_error);
+}
+
+void add_connector_storage_ready(void)
+{
+    atomic_store(&s_storage_ready, true);
+}
+
+/* ZKT 2.7.5: the boot storage repair filled an unreadable span of the command
+ * inbox with NUL, or found a torn last line. Either makes every later lookup
+ * "unavailable" (a line that does not decrypt) and every append fail, so the
+ * inbox is rebuilt from the complete lines that decrypt to a command, taken
+ * from the active file, its backup, its stage and a merge file an interrupted
+ * merge left, each command_id once (command_inbox_merge.c: every line is on
+ * flash in the merge file before the backup or the stage goes). A reset at
+ * any point leaves the repair's flag set, or the merge file, and the merge
+ * runs again from what remains. */
+static bool inbox_command_id(void *context, const char *line, char *id, size_t id_bytes)
+{
+    (void)context;
+    char *plain = decrypt_storage_line(line);
+    cJSON *root = plain ? cJSON_Parse(plain) : NULL;
+    cJSON *value = root ? cJSON_GetObjectItemCaseSensitive(root, "command_id") : NULL;
+    bool valid = cJSON_IsString(value) && value->valuestring[0] && strlen(value->valuestring) + 1 < id_bytes;
+    if (valid) strlcpy(id, value->valuestring, id_bytes);
+    cJSON_Delete(root);
+    free(plain);
+    return valid;
+}
+
+bool add_connector_repair_command_inbox(void)
+{
+#if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
+    if (catalog_owner_required()) return true;
+#endif
+    if (!s_command_lock || xSemaphoreTake(s_command_lock, pdMS_TO_TICKS(5000)) != pdTRUE) return false;
+    const size_t max_ids = 512;
+    cim_config_t config = {
+        .active = ADD_COMMAND_INBOX_PATH,
+        .backup = ADD_COMMAND_INBOX_BACKUP_PATH,
+        .stage = ADD_COMMAND_INBOX_TMP_PATH,
+        .merge = ADD_COMMAND_INBOX_MERGE_PATH,
+        .merged = heap_caps_malloc(ADD_COMMAND_INBOX_MAX_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT),
+        .capacity = ADD_COMMAND_INBOX_MAX_BYTES,
+        .ids = heap_caps_calloc(max_ids, CIM_ID_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT),
+        .max_ids = max_ids,
+        .line = heap_caps_malloc(ADD_COMMAND_LINE_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT),
+        .line_bytes = ADD_COMMAND_LINE_BYTES,
+        .command_id = inbox_command_id,
+        .port = command_transaction_port,
+        .limit = ADD_COMMAND_INBOX_MAX_BYTES,
+    };
+    cim_result_t result = {0};
+    bool ok = config.merged && config.ids && config.line && cim_merge(&config, &result);
+    if (ok) s_command_inbox_restored = false;
+    xSemaphoreGive(s_command_lock);
+    heap_caps_free(config.merged);
+    heap_caps_free(config.ids);
+    heap_caps_free(config.line);
+    char message[160];
+    snprintf(message, sizeof(message), "command inbox merged: %u command(s) kept, %u line(s) dropped%s", result.kept,
+             result.dropped, ok ? "" : "; merge failed");
+    ESP_LOGW(TAG, "%s", message);
+    return ok;
+}
+
+/* A merge file an interrupted merge left: the merge runs again even if the
+ * repair's flag is gone. */
+bool add_connector_command_inbox_merge_pending(void)
+{
+    struct stat st;
+    return stat(ADD_COMMAND_INBOX_MERGE_PATH, &st) == 0;
 }
 
 bool add_connector_log(

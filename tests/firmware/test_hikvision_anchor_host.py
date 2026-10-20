@@ -25,7 +25,8 @@ int main(int argc,char **argv){
     for(int a=1;a<argc;a++){
         unsigned char digest[32];
         if(!hik_anchor_digest(argv[a],strlen(argv[a]),digest)){puts("INVALID");continue;}
-        for(unsigned i=0;i<32;i++)printf("%02x",digest[i]);puts("");
+        for(unsigned i=0;i<32;i++)printf("%02x",digest[i]);
+        puts("");
     }
     return 0;
 }
