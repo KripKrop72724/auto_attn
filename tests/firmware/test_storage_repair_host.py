@@ -1,7 +1,9 @@
-"""ZKT 2.7.5: the custody-first boot storage repair.
+"""ZKT 2.7.5: the custody-first boot storage repair; 2.7.6: its last-resort
+in-place reformat.
 
-The decisions that need no filesystem and the metadata mirror run with plain
-cc in every test shard. The engine runs against ESP-IDF 5.5.3's own SPIFFS with
+The decisions that need no filesystem, the metadata mirror and the redo
+records (codec, block plan, writer, boot recovery) run with plain cc in every
+test shard. The engine runs against ESP-IDF 5.5.3's own SPIFFS with
 power cuts (tools/check_spiffs_repair.py); CI's firmware-production job runs it
 in espressif/idf:v5.5.3, and here it runs wherever the ESP-IDF sources are."""
 from pathlib import Path
@@ -32,7 +34,7 @@ def test_plan_and_mirror(tmp_path: Path) -> None:
     executable = tmp_path / "storage-repair-plan"
     subprocess.run([compiler, *FLAGS, "-I", str(MAIN), str(ROOT / "tests/firmware/storage_repair_plan_host.c"),
                     *(str(MAIN / name) for name in ("storage_repair_plan.c", "storage_repair_mirror.c",
-                                                     "legacy_queue.c", "durable_queue.c", "reliability.c",
+                                                     "storage_repair_redo.c", "legacy_queue.c", "durable_queue.c", "reliability.c",
                                                      "zkt_clock.c")),
                     "-o", str(executable)], check=True)
     result = subprocess.run([str(executable)], capture_output=True, text=True)

@@ -426,6 +426,24 @@ uint32_t srp_nvs_entries_needed(bool state, bool gaps, bool resets, bool manifes
     return needed;
 }
 
+void srp_reclaim_seal(srp_reclaim_t *journal)
+{
+    if (!journal) return;
+    journal->version = SRP_RECLAIM_VERSION;
+    journal->crc = srp_crc32(0, journal, offsetof(srp_reclaim_t, crc));
+}
+
+bool srp_reclaim_valid(const srp_reclaim_t *journal)
+{
+    return journal && journal->version == SRP_RECLAIM_VERSION &&
+        journal->crc == srp_crc32(0, journal, offsetof(srp_reclaim_t, crc));
+}
+
+uint32_t srp_reclaim_entries_needed(bool journal)
+{
+    return (journal ? 0U : blob_entries(sizeof(srp_reclaim_t))) + 3U * blob_entries(sizeof(srp_reclaim_t));
+}
+
 /* ---- policy --------------------------------------------------------- */
 const char *srp_mode_name(srp_mode_t mode)
 {

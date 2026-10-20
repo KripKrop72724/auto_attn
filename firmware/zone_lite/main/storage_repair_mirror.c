@@ -116,3 +116,11 @@ bool srm_erase(srm_mirror_t *m, uint32_t address, uint32_t length)
     }
     return ok;
 }
+
+bool srm_refresh(srm_mirror_t *m, uint32_t address, uint32_t length)
+{
+    if (!m->valid || !length || (uint64_t)address + length > m->size) return m->valid || !length;
+    for (uint32_t page = address / m->page_size; page <= (address + length - 1) / m->page_size; ++page)
+        if (!refresh_page(m, page)) return false;
+    return true;
+}
