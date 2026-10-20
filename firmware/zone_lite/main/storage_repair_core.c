@@ -282,8 +282,10 @@ static bool save_records(run_t *r)
         nvs_store(r, SRR_NVS_NAMESPACE, "resets", r->resets, sizeof(*r->resets));
 }
 
-/* The generation of a legacy queue file's checkpoint: it changes whenever
- * its owner retires the file (lq_reclaim) or a cursor is cleared. */
+/* The generation of a legacy queue file's checkpoint. It moves on every
+ * settled row as well as when its owner retires the file, so it proves
+ * nothing about retirement (2.7.6, review C3): the manifest records it for
+ * the report only. */
 static bool cursor_generation(run_t *r, const srp_kind_t *kind, uint32_t *generation)
 {
     lq_checkpoint_t cp;
@@ -3008,14 +3010,13 @@ static int adopt(run_t *r, srp_manifest_file_t *f, obj_t *hidden)
  *    renamed into place, its missing tail a record first; or, when a new
  *    file has the name, its rows go after the new file's (merge_rows);
  *  - what is left of the original under a hidden header when pages of it
- *    are gone (SPIFFS's GC in an older image's writes): superseded only when
- *    its owner settled the file (the queue cursor's generation moved);
- *    otherwise its unreadable bytes are records and the rest comes back, as
- *    above;
+ *    are gone (SPIFFS's GC in an older image's writes): its unreadable bytes
+ *    are records and the rest comes back, as above (2.7.6: never superseded
+ *    by a moved cursor generation, which every settled row moves);
  *  - nothing of it on flash: the repair's own restore was under way
- *    (RESTORING), or its owner replaced the file (the cursor's generation
- *    moved, a new object took the name, or the manifest is a rolled-back
- *    image's), or anything else is reported with its exact range, once.
+ *    (RESTORING), or its owner replaced the file (a new object took the
+ *    name, or the manifest is a rolled-back image's), or anything else is
+ *    reported with its exact range, once.
  * Never settled while the original or its copy is on flash and cannot go
  * back yet: RESUME_BLOCKED keeps the entry (and no check runs). RESUME_VERIFY:
  * the caller surveys and checks the result. */
@@ -3090,15 +3091,11 @@ static int resume_file(run_t *r, srp_manifest_file_t *f, bool stale, srp_gap_cau
         snprintf(r->report->error_stage, sizeof(r->report->error_stage), "full");
         return RESUME_BLOCKED;
     }
-    srp_kind_t kind = srp_classify(f->name);
-    uint32_t generation = 0;
-    bool cursor_moved = (f->flags & SRP_MANIFEST_CURSOR) &&
-        (!cursor_generation(r, &kind, &generation) || generation != f->cursor_generation);
+    /* 2.7.6 (review C3): a queue cursor's generation moves on every settled
+     * row (legacy_queue.c persist), not only when its owner retires the
+     * file, so it never makes readable bytes superseded: what is left of the
+     * original comes back (its rows may then be delivered twice). */
     if (hidden) {
-        if (cursor_moved) {
-            supersede(r, f, now, "its queue was retired");
-            return RESUME_SETTLED;
-        }
         if (now) return text_fill(hidden) ? adopt(r, f, hidden) : conflicting_name(r, f, now);
         if (!(f->flags & SRP_MANIFEST_REPORTED)) {
             if (!record_unreadable(r, hidden, f->name, 0, f->size, cause) ||
@@ -3131,8 +3128,8 @@ static int resume_file(run_t *r, srp_manifest_file_t *f, bool stale, srp_gap_cau
         return resume_gap(r, f, now, from, SRP_GAP_RESTORE_INTERRUPTED);
     }
     bool replaced = now && now->obj != f->object_id && !(ours && now->obj == f->rebuild_id);
-    if (stale || cursor_moved || replaced) {
-        supersede(r, f, now, stale ? "another image ran" : cursor_moved ? "its queue was retired" : "a new file");
+    if (stale || replaced) {
+        supersede(r, f, now, stale ? "another image ran" : "a new file");
         return RESUME_SETTLED;
     }
     if (f->flags & SRP_MANIFEST_REPORTED) return RESUME_SETTLED;

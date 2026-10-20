@@ -2507,7 +2507,18 @@ static void run_manifest_cases(uint32_t kib)
         config.pending_verify = which == 0 || which == 4;
         repair_boot(&report, &config);
         srp_gaps_t gaps = gaps_now();
-        if (which <= 1 || which == 4 || which == 6) {
+        bool unverified = false;
+        if (which == 1) {
+            /* 2.7.6 (review C3): the cursor's generation moved, which every
+             * settled row does; that is no proof the queue was retired. The
+             * new file reused the original's object id, so nothing says it
+             * was replaced either: the original's range is reported. (A
+             * level 2 retirement marks its entry settled first.) */
+            unverified = report.gaps == 1 && gaps.count == 1 && gaps.gap[0].cause == SRP_GAP_CONTENT_UNVERIFIED &&
+                gaps.gap[0].offset == 0 && gaps.gap[0].length == original;
+            CHECK((report.files_superseded == 1 && report.gaps == 0) || (unverified && !report.files_superseded),
+                  "manifest case 1: superseded %u gaps %u", report.files_superseded, report.gaps);
+        } else if (which == 0 || which == 4 || which == 6) {
             CHECK(report.files_superseded == 1 && report.gaps == 0, "manifest case %u: superseded %u gaps %u", which,
                   report.files_superseded, report.gaps);
         } else if (which == 2) {
@@ -2524,7 +2535,7 @@ static void run_manifest_cases(uint32_t kib)
                       gaps.gap[0].offset == 0 && gaps.gap[0].length == original && !report.files_superseded,
                   "manifest case %u: gaps %u superseded %u", which, report.gaps, report.files_superseded);
         }
-        if (which != 3 && which != 5) {
+        if (which != 3 && which != 5 && !unverified) {
             mount_plain();
             check_custody(m, 4, false);
             SPIFFS_unmount(&fs);
@@ -3837,8 +3848,9 @@ static void run_merge_crammed(uint32_t kib)
 
 /* Custody finding 3: an original SPIFFS's GC (an older image's writes) left
  * only partly on flash was superseded with no record. Its readable rows go
- * after the new file's, its unreadable bytes are records there; only a
- * cursor generation that moved (the owner settled the file) supersedes it. */
+ * after the new file's, its unreadable bytes are records there. 2.7.5 still
+ * superseded it when its queue cursor's generation moved; that moves on
+ * every settled row, so 2.7.6 brings it back then too. */
 static void run_merge_partial(uint32_t kib)
 {
     for (int moved = 0; moved < 2; ++moved) {
@@ -3899,20 +3911,18 @@ static void run_merge_partial(uint32_t kib)
         for (uint32_t g = 0; g < gaps.count; ++g)
             if (!strcmp(gaps.gap[g].name, "/pending.jsonl")) recorded += gaps.gap[g].length;
         uint32_t rows = 0, found = rows_found(buffer, got, orig, size, whole, &rows);
-        if (moved) {
-            CHECK(superseded == 1 && !recorded, "merge partial, settled by its owner: superseded %u, %" PRIu64
-                  " bytes recorded", superseded, recorded);
-        } else {
-            CHECK(!superseded && found == rows && recorded >= size - before && !manifest_kept(),
-                  "merge partial: superseded %u, %u of %u whole rows verbatim, %" PRIu64 " bytes recorded for %u "
-                  "missing, manifest kept %d",
-                  superseded, found, rows, recorded, size - before, manifest_kept());
-        }
+        /* 2.7.6 (review C3): a moved cursor generation (moved) no longer
+         * supersedes the remnant: every settled row moves it, so it proves no
+         * retirement. Both ways its readable rows come back. */
+        CHECK(!superseded && found == rows && recorded >= size - before && !manifest_kept(),
+              "merge partial%s: superseded %u, %u of %u whole rows verbatim, %" PRIu64 " bytes recorded for %u "
+              "missing, manifest kept %d",
+              moved ? " (cursor moved)" : "", superseded, found, rows, recorded, size - before, manifest_kept());
         free(whole);
         free(orig);
     }
-    printf("merge of a partial original: its readable rows after the new file's, the rest recorded; superseded only "
-           "when its cursor moved\n");
+    printf("merge of a partial original: its readable rows after the new file's, the rest recorded, whether or not "
+           "its cursor moved\n");
 }
 
 /* Custody finding 2 under cuts: the merge on a store whose room comes from
