@@ -909,6 +909,9 @@ for 2.7.5.
 | eaf7ec3 | this section, the first time |
 | a400229 | the round 1 review of the implementation: every finding (section 18), with its regression tests |
 | 38b52ec | the log line for a queue that waits for an area that cannot be read |
+| 2d26d08 | section 18 and the sections the fixes changed |
+| f3988b8 | `reclaim-stale`'s cursor before the damage kept before it at 8 MiB (a test error, not the engine's) |
+| this commit | the verification after the round 1 review, below |
 
 **Results at eaf7ec3** (host, ESP-IDF 5.5.3 SPIFFS, ASan and UBSan; Apple
 clang natively and GCC in `espressif/idf:v5.5.3`; the results after the
@@ -943,8 +946,59 @@ round 1 review follow these):
 - `idf.py build`: production, Hikvision, and the direct legacy role (2.7.5
   version, as CI builds it) all build; `-fstack-usage` as in section 12.
 
-Not run here: a device (HIL), the 8 backend shards with Postgres (no model
-or migration changed), and the release step (version, upgrade guard
+**Results after the round 1 review** (f3988b8; the same host setup):
+
+- Each finding's proof (section 18): the reviewer's reproductions on
+  eaf7ec3 and on the fixed code; each regression test fails with its fix
+  taken out of the final code (the record-time cursor check and the
+  settlement rule of D1 one at a time, the low finding's hold-back, D2's
+  deferral and its reported mark, D3's torn-erase redo, low 1, low 4, low 6)
+  and passes with it; the exhaustive tear check fails on eaf7ec3's weak-magic
+  rule; the two glue contract tests (low 2, low 5) fail on eaf7ec3's
+  sources.
+- The CI harness configuration (`check_spiffs_repair.py`, all 12 entries,
+  the 1 MiB entry now running the round 1 parts too): passes natively (6
+  minutes on 8 cores) and in `espressif/idf:v5.5.3` with GCC (22 minutes,
+  the host loaded).
+- Cut at every write and erase of the round (`REVIEW_FULL=1`): at 1 MiB, P02
+  48 and gc-unsafe 92 cuts confirmed, 188 through the old image and 188
+  through the released 2.7.5 unconfirmed; at 8 MiB, 48 and 96 confirmed, 150
+  and 150 through the old images. Every one: custody byte-exact, no gap
+  record. 48 cuts inside a boot's redo at 8 MiB; the area cases at 1 and 8
+  MiB; mirror equivalence, the kept mirror checked at every remount and
+  P02's round cut through it at 1 and 8 MiB; the round 1 parts at 8 MiB too
+  (the stale-cursor cases over block 1,067 and, on the gc-unsafe store,
+  block 1,600; T5; torn magics; sources without memory).
+- P02 at 8 MiB: the released 2.7.5 reproduces the field report; 2.7.6
+  reformats 3 blocks (confirmed) or 5 (unconfirmed), keeps 68 weak magics out
+  (block 810 among them), and ends `REPAIRED` with no gap; the boot's report
+  carries 204 spans rewritten (153 + 51) and the first run's room figures.
+- Organic workload (20,000 ticks at 8 MiB, the seed printed is the
+  harness's): seeds 23, 24, 27, 622, 623 and 723 end healthy with 0
+  committed rows lost and no gap record (1 to 27 rounds, 7 to 189 blocks);
+  prefilled 8 MiB seeds 122 to 125 (3,000 ticks) and 1 MiB seeds 322 to 329
+  and 822 to 823: 0 lost, none handed over GC-unsafe.
+- `tests/firmware` in the IDF image: 377 passed; `test_hikvision_api_host`
+  ran past its 60 s limit with the host loaded and passes alone (43 s); this
+  branch does not touch the Hikvision code.
+- ADD: the 8 backend shards (`scripts/run_ci_tests.py` against Postgres 16
+  and Redis 7, as `backend-tests` runs them): 4,736 passed, 669 skipped, and
+  `--verify-plans` confirms complete, disjoint coverage. 41 of the skips run
+  in CI but not here (39 need `jq` for the deploy step, 2 a git checkout);
+  the rest are skipped in CI too (583 want
+  `ADD_SAFE_REPAIR_TEST_DATABASE_URL`, the others other qualification
+  databases or ESP-IDF sources). Ruff with CI's paths, the frontend OpenAPI
+  contract and the repository contract pass. ADD's code is unchanged since
+  3c546a6: the merged report has the same fields.
+- `idf.py build` in `espressif/idf:v5.5.3`: production, the 2.7.5 direct
+  legacy role (its identity and exact rollback contract marker), Hikvision
+  (its family descriptor; 3 warnings, in files this branch does not touch),
+  recovery 2.6.27 (identity, contract marker), the 2.7.0 journal writer and
+  the 2.6.23 bridge (identities, startup stack budgets): all build, the
+  repair's roles with 0 warnings; the production image is 1,441,792 bytes
+  (45% of its 2.5 MiB slot free). Stack: section 12.
+
+Not run here: a device (HIL), and the release step (version, upgrade guard
 digests, signing).
 
 ## 18. Round 1 review of the implementation (eaf7ec3) and what became of it
