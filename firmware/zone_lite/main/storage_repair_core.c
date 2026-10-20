@@ -611,6 +611,25 @@ static src_page_t *src_for(run_t *r, const obj_t *o, uint32_t span, uint16_t pix
     return NULL;
 }
 
+/* A recorded copy of the span at another page (an interrupted GC or page
+ * move left it; SPIFFS's GC in another image's writes may have deleted it
+ * since). Trusted as 2.7.5 trusts such a copy on flash, and only while the
+ * queue's cursor, when the record was written, had not passed the span: its
+ * owner cannot then have read past it, let alone retired the file and
+ * created another under the same id and name. */
+static src_page_t *src_alternate(run_t *r, const obj_t *o, uint32_t span, uint16_t ref, uint32_t after)
+{
+    for (uint32_t i = after; i < r->src_count; ++i) {
+        src_page_t *s = &r->src[i];
+        cpu_step(1);
+        if (!s->deliverable || s->obj != o->obj || s->span != span || s->pix == ref || strcmp(s->name, o->name) ||
+            !s->cursor_valid || s->cursor_offset >= (span + 1U) * SRP_SPAN_BYTES)
+            continue;
+        return s;
+    }
+    return NULL;
+}
+
 static bool src_payload(run_t *r, const src_page_t *s, uint8_t *out, uint32_t length)
 {
     const srx_io_t *io = r->ports->redo;
@@ -731,6 +750,17 @@ static bool resolve_span(run_t *r, obj_t *o, uint32_t span, uint16_t ref, int32_
     src_page_t *src = r->src_count ? src_for(r, o, span, ref, false) : NULL;
     if (src && !(page_ok(r, ref) && own_data_page(&r->pages[ref], o->obj, span))) {
         if (!src_payload(r, src, candidate, length)) return false;
+        merge_source(p, candidate, length, conflict, sources == 0);
+        if (!sources) {
+            p->from = SR_NO_PAGE;
+            p->source = SOURCE_REDO;
+        }
+        sources++;
+        o->actions |= SRR_FILE_REDO_SOURCE;
+    }
+    for (src_page_t *alt = r->src_count ? src_alternate(r, o, span, ref, 0) : NULL; alt;
+         alt = src_alternate(r, o, span, ref, (uint32_t)(alt - r->src) + 1U)) {
+        if (!src_payload(r, alt, candidate, length)) return false;
         merge_source(p, candidate, length, conflict, sources == 0);
         if (!sources) {
             p->from = SR_NO_PAGE;

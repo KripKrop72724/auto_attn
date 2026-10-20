@@ -5004,7 +5004,7 @@ static void check_models_exact(const char *what)
 }
 
 /* ---- builders ------------------------------------------------------------ */
-static uint32_t p02_span;
+static uint32_t p02_span, p02_spans;
 
 /* Peshawar-02 as 2.7.5 left it (20 October 2026): no erased page, every
  * block holding a page of the damaged pending queue or of a file whose
@@ -5044,28 +5044,106 @@ static void build_p02(void)
         if (rnd() % 9 == 0) model_append(outbox, row, (uint32_t)json_row(row, sizeof(row)));
         if (rnd() % 13 == 0) model_append_ids(commands, 1);
     }
-    uint32_t cursor = row_boundary_after(pending, pending->size / 3);
-    set_cursor("legacy_queues", "ords_pending", cursor, prefix_crc(pending, cursor), 5);
-    SPIFFS_unmount(&fs);
-    /* The damaged span: its referenced page deleted, a valid copy in a free
-     * page of every block that has one, every other free page a deleted
-     * copy: no erased page anywhere, and no block 2.7.5 may compact. */
+    /* P02's cursor reset: one past its file. */
+    set_cursor("add_legacy", "live", live->size + 500, 0, 3);
     uint32_t spans = pending->size / SPAN;
-    p02_span = 10 + rnd() % (spans / 2);
-    uint32_t head = rd16(entry_address(pending->name, p02_span));
     uint16_t obj = object_of(pending->name);
-    for (uint32_t b = 0; b < flash_size / BLOCK; ++b) {
-        bool pinned = false;
-        for (uint32_t e = 1; e < 16; ++e) {
-            uint32_t pix = b * 16 + e;
-            if (rd16(lookup_address(pix)) != 0xFFFF) continue;
-            memcpy(flash + pix * PAGE, flash + head * PAGE, PAGE);
-            wr16(lookup_address(pix), obj);
-            if (pinned) flag_deleted(pix);
-            pinned = true;
+    uint32_t header = header_of(pending->name);
+    SPIFFS_unmount(&fs);
+    /* The free pages, block by block. */
+    uint32_t pages = flash_size / PAGE, free_count = 0;
+    uint32_t *free_pages = calloc(pages, sizeof(uint32_t));
+    for (uint32_t pix = 0; pix < pages; ++pix)
+        if (pix % 16 && rd16(lookup_address(pix)) == 0xFFFF) free_pages[free_count++] = pix;
+    /* Damaged spans in one index page, each with its referenced page deleted
+     * and a valid copy elsewhere (an interrupted GC move): 2.7.5 refers each
+     * to its copy (P02's 153 rewritten spans are 51 such, counted in each of
+     * three attempts) and then needs one page, the index page's rewrite. */
+    p02_spans = flash_size >= 8U * 1024 * 1024 ? 51 : 12;
+    if (p02_spans + 6 > free_count) p02_spans = free_count > 6 ? free_count - 6 : 1;
+    uint32_t first = 103 + 124 * (1 + rnd() % ((spans - 103) / 124 - 1)) + 2;
+    if (first + p02_spans > 103 + 124 * ((first - 103) / 124 + 1)) p02_spans = 103 + 124 * ((first - 103) / 124 + 1) - first;
+    p02_span = first;
+    /* The queue's drain has settled rows before the damage, not past it. */
+    uint32_t cursor = row_boundary_after(pending, first * SPAN / 2);
+    set_cursor("legacy_queues", "ords_pending", cursor, prefix_crc(pending, cursor), 5);
+    /* Live pages, one first in every block that has a free page (no block
+     * left all deleted, which 2.7.5 could erase, even once the strays go):
+     * the copies (and, past them, more copies of the first damaged span),
+     * then four strays past the end (an append that never committed) and a
+     * stale header copy with an older size (a page move that stopped). */
+    uint8_t pin[PAGE];
+    memcpy(pin, flash + rd16(entry_address(pending->name, first)) * PAGE, PAGE);
+    uint8_t *taken = calloc(pages, 1);
+    uint32_t copies = 0, extras = 0;
+    for (int pass = 0; pass < 2; ++pass)
+        for (uint32_t i = 0; i < free_count; ++i) {
+            uint32_t pix = free_pages[i];
+            bool first_in_block = i == 0 || free_pages[i - 1] / 16 != pix / 16;
+            if (taken[pix] || (pass == 0) != first_in_block) continue;
+            uint8_t *page = flash + pix * PAGE;
+            if (copies < p02_spans) {
+                uint32_t head = rd16(entry_address(pending->name, first + copies++));
+                memcpy(page, flash + head * PAGE, PAGE);
+                wr16(lookup_address(pix), obj);
+            } else if (pass == 0) {
+                memcpy(page, pin, PAGE);
+                wr16(lookup_address(pix), obj);
+            } else if (extras < 4) {
+                memset(page, 0xFF, PAGE);
+                wr16(pix * PAGE, obj);
+                wr16(pix * PAGE + 2, (uint16_t)(spans + 2 + extras));
+                page[4] = 0xFC;
+                memset(page + 5, 'x', 100);
+                wr16(lookup_address(pix), obj);
+                extras++;
+                taken[pix] = 2;
+            } else if (extras == 4) {
+                memcpy(page, flash + header * PAGE, PAGE);
+                uint32_t older = pending->size - 50;
+                memcpy(page + 8, &older, 4);
+                wr16(lookup_address(pix), (uint16_t)(obj | 0x8000));
+                extras++;
+                taken[pix] = 2;
+            } else {
+                continue;
+            }
+            if (!taken[pix]) taken[pix] = 1;
         }
+    CHECK(copies == p02_spans && extras == 5, "p02: %u copies, %u strays placed", copies, extras);
+    for (uint32_t k = 0; k < p02_spans; ++k) {
+        uint32_t head = rd16(entry_address(pending->name, first + k));
+        flag_deleted(head);
+        taken[head] = 3; /* the damage itself: never a pin's place below */
     }
-    flag_deleted(head);
+    /* Every other free page a deleted copy: no erased page anywhere. */
+    for (uint32_t i = 0; i < free_count; ++i) {
+        uint32_t pix = free_pages[i];
+        if (taken[pix]) continue;
+        memcpy(flash + pix * PAGE, pin, PAGE);
+        wr16(lookup_address(pix), obj);
+        flag_deleted(pix);
+    }
+    /* No block may end all deleted once 2.7.5 drops the orphan index pages,
+     * the strays and the duplicate: P02 logged LEVEL2_SKIPPED, no removal
+     * there let a block be erased. A block that would is pinned by one more
+     * copy over a deleted page. */
+    uint16_t old_obj = (uint16_t)(rd16(header_of("/blocked_identity.jsonl") * PAGE) & 0x7FFF);
+    for (uint32_t b = 0; b < pages / 16; ++b) {
+        bool live = false;
+        uint32_t spare = 0;
+        for (uint32_t e = 1; e < 16 && !live; ++e) {
+            uint32_t pix = b * 16 + e;
+            uint16_t lu = rd16(lookup_address(pix));
+            if (lu == 0 && !spare && taken[pix] != 3) spare = pix;
+            live = lu != 0 && lu != 0xFFFF && lu != (uint16_t)(old_obj | 0x8000) && taken[pix] != 2;
+        }
+        if (live || !spare) continue;
+        memcpy(flash + spare * PAGE, pin, PAGE);
+        wr16(lookup_address(spare), obj);
+    }
+    free(taken);
+    free(free_pages);
     /* The old file's removal stopped after its header. */
     flag_deleted(header_of("/blocked_identity.jsonl"));
 }
@@ -5081,10 +5159,13 @@ static void p02_as_275(void)
     CHECK(old.result == SRR_RESULT_DEFERRED && !strcmp(old.error_stage, "full") && old.error_code == SPIFFS_ERR_FULL &&
               old.room_needed == 1 && old.room_erased == 0 && old.orphan_index_removed > 0 && old.check_skipped &&
               old.blocks_compacted == 0 && old.reserve_pages == 0 && code_logged("STORAGE_REPAIR_LEVEL2_SKIPPED") &&
-              code_logged("STORAGE_REPAIR_FULL"),
-          "p02: 2.7.5 %s at %s (%ld), %u pages needed, %u erased, %u orphans, check skipped %d, level 2 skipped %d",
+              code_logged("STORAGE_REPAIR_FULL") && old.spans_rewritten == 3 * p02_spans && old.strays_removed == 4 &&
+              old.duplicates_removed == 1 && old.cursors_reset == 1 && old.gaps == 0,
+          "p02: 2.7.5 %s at %s (%ld), %u pages needed, %u erased, %u orphans, %u spans rewritten (%u damaged), %u "
+          "strays, %u duplicates, %u cursors reset, %u gaps, check skipped %d, level 2 skipped %d",
           srr_result_name(old.result), old.error_stage, (long)old.error_code, old.room_needed, old.room_erased,
-          old.orphan_index_removed, old.check_skipped, code_logged("STORAGE_REPAIR_LEVEL2_SKIPPED"));
+          old.orphan_index_removed, old.spans_rewritten, p02_spans, old.strays_removed, old.duplicates_removed,
+          old.cursors_reset, old.gaps, old.check_skipped, code_logged("STORAGE_REPAIR_LEVEL2_SKIPPED"));
 }
 
 /* Every record in the redo area. */
@@ -5133,10 +5214,11 @@ static void run_reclaim_p02(uint32_t kib, bool unconfirmed, bool unheld)
     if (unconfirmed) CHECK(rc->unconfirmed_blocks > 0, "p02 unconfirmed: no block holding nothing any image reads");
     if (kib >= 8192) CHECK(rc->low_magic_blocks > 0, "p02 8 MiB: no weak-magic block kept out");
     verify_reclaimed("p02");
-    printf("p02 %u KiB%s%s: 2.7.5 DEFERRED (full, 1 page needed, 0 erased); 2.7.6 reformatted %u blocks (%u deleted "
+    printf("p02 %u KiB%s%s: 2.7.5 DEFERRED (full, 1 page needed, 0 erased, %u spans rewritten, 4 strays, 1 "
+           "duplicate, 1 cursor reset); 2.7.6 reformatted %u blocks (%u deleted "
            "pages erased, %u kept; %u candidates, %u holding nothing any image reads, %u custody, %u index, %u "
            "excluded, %u weak magic) in %u ms, then REPAIRED with no gap\n",
-           kib, unconfirmed ? " unconfirmed" : " confirmed", unheld ? " with no holds" : "", rc->blocks,
+           kib, unconfirmed ? " unconfirmed" : " confirmed", unheld ? " with no holds" : "", 3 * p02_spans, rc->blocks,
            rc->pages_freed, rc->pages_kept, rc->candidates, rc->unconfirmed_blocks, rc->custody_blocks,
            rc->index_blocks, rc->excluded_blocks, rc->low_magic_blocks, rc->ms);
 }
@@ -5423,7 +5505,10 @@ static void run_reclaim_area(uint32_t kib)
               (journal_flags() & (SRP_RECLAIM_ACTIVE | SRP_RECLAIM_SOURCES)) == 0,
           "another writer: %u sources, %u gap records, journal %x", report.reclaim.sources, model_gaps(), journal_flags());
     records = area_records(&pending, &sources, &open);
-    CHECK(!open, "another writer: %u open records", open);
+    bool from_record = false;
+    for (uint32_t i = 0; i < report.file_count; ++i) from_record |= (report.file[i].actions & SRR_FILE_REDO_SOURCE) != 0;
+    CHECK(!open && (from_record || report.reclaim.settled), "another writer: %u open records, bytes from the record %d, "
+          "%u settled", open, from_record, report.reclaim.settled);
     mount_plain();
     for (uint32_t i = 0; i < model_count; ++i) check_custody(&model[i], 1, false);
     SPIFFS_unmount(&fs);
