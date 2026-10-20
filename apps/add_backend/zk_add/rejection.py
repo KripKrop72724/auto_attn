@@ -25,6 +25,12 @@ class EvidenceRejected(ValueError):
         super().__init__(message or reason_code)
         self.reason_code = reason_code
 
+    def __reduce__(self):
+        # ``args`` holds only the message, so the default reduction would
+        # rebuild without a reason. Copies and pickles keep both.
+        state = {key: value for key, value in self.__dict__.items() if key != "reason_code"}
+        return type(self), (self.reason_code, *self.args[:1]), state or None
+
 
 def rejection_category(error: Exception) -> str:
     if isinstance(error, ValidationError):

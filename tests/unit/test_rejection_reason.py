@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import ast
+import copy
 from pathlib import Path
+import pickle
 
 import pytest
 from pydantic import ValidationError
@@ -36,6 +38,21 @@ def test_coded_rejection_keeps_its_message_and_reports_only_its_code() -> None:
     assert str(error) == "Chunk digest does not match its canonical source records."
     assert (rejection_category(error), rejection_reason(error)) == ("EVIDENCE_INVALID", "CHUNK_DIGEST_MISMATCH")
     assert str(EvidenceRejected("SOURCE_NOT_ANCHORED")) == "SOURCE_NOT_ANCHORED"
+
+
+@pytest.mark.parametrize("clone", [
+    copy.copy, copy.deepcopy, lambda error: pickle.loads(pickle.dumps(error)),
+])
+def test_coded_rejection_survives_copy_and_pickle(clone) -> None:
+    error = EvidenceRejected("SOURCE_REPLAY_OWNER_STILL_BOUND", "Replayed attendance conflicts.")
+    error.add_note("kept")
+    cloned = clone(error)
+    assert type(cloned) is EvidenceRejected
+    assert (cloned.reason_code, str(cloned), cloned.args) == (
+        "SOURCE_REPLAY_OWNER_STILL_BOUND", "Replayed attendance conflicts.", ("Replayed attendance conflicts.",))
+    assert cloned.__notes__ == ["kept"]
+    bare = clone(EvidenceRejected("SOURCE_NOT_ANCHORED"))
+    assert (bare.reason_code, str(bare)) == ("SOURCE_NOT_ANCHORED", "SOURCE_NOT_ANCHORED")
 
 
 @pytest.mark.parametrize("code", ["lowercase_code", "NOUNDERSCORE", "_LEADING", "TRAILING_", "A_" + "B" * 80, CNIC])
