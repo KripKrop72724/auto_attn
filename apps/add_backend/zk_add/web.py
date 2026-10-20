@@ -3189,7 +3189,11 @@ def attendance_identity_evidence_report(
     auth: tuple[Session, AdminContext] = Depends(require_admin),
 ):
     """Show an administrator why a held punch can or cannot be auto released."""
-    from zk_add.attendance_identity_evidence import identity_evidence, source_evidence
+    from zk_add.attendance_identity_evidence import (
+        identity_evidence,
+        owner_source_manifest,
+        source_evidence,
+    )
     from zk_add.models import AttendanceIdentityHistory, TerminalRecordManifest, TerminalSourceEpoch
     from zk_add.service import synced_cnic_identity_proven
 
@@ -3208,13 +3212,9 @@ def attendance_identity_evidence_report(
         if zkt else []
     )
     user = users[0] if len(users) == 1 else None
-    manifest = db.scalar(
-        select(TerminalRecordManifest).where(
-            TerminalRecordManifest.attendance_event_id == event.id
-        ).order_by(
-            TerminalRecordManifest.canonical_source.desc(), TerminalRecordManifest.id.desc()
-        ).limit(1)
-    )
+    # The owner's own record, as source_evidence reads it. manifest_rows below
+    # still lists a later baseline's replay retained under another connector.
+    manifest = owner_source_manifest(db, event)
     epoch = (
         db.get(TerminalSourceEpoch, manifest.source_epoch_id)
         if manifest and manifest.source_epoch_id else None
@@ -4411,11 +4411,13 @@ async def handle_device_envelope(
         # All device payloads can contain attendance or credential
         # evidence. Tracebacks from validation/database drivers can
         # include those inputs, so operational logs use metadata only.
+        from zk_add.rejection import rejection_reason
+
         logger.error(
             "Rejected protected source envelope connector_id=%s "
-            "type=%s message_id=%s error_type=%s",
+            "type=%s message_id=%s error_type=%s error_reason=%s",
             connector_id, envelope.type, envelope.message_id,
-            type(exc).__name__,
+            type(exc).__name__, rejection_reason(exc),
         )
         try:
             await asyncio.to_thread(record_envelope_rejection, connector_pk, envelope, exc)
@@ -4522,20 +4524,24 @@ def record_envelope_rejection(connector_pk: int, envelope: Envelope, error: Exce
     error_type = type(error).__name__[:80]
     from pydantic import ValidationError
 
-    from zk_add.rejection import rejection_category
+    from zk_add.rejection import rejection_category, rejection_reason, rejection_site
 
     category = rejection_category(error)
     # Field locations only: rejected values can carry attendance or credentials.
     error_paths = [".".join(str(part) for part in row.get("loc", ()))[:120]
                    for row in error.errors(include_input=False, include_url=False)[:5]
                    ] if isinstance(error, ValidationError) else []
+    # A bounded code and the ADD code location, never the message or payload.
+    error_reason = rejection_reason(error)
+    error_site = rejection_site(error) if error_reason is not None else None
     with session_scope() as db:
         connector = db.scalar(select(Connector).where(Connector.id == connector_pk).with_for_update())
         if connector is None:
             return
         alert = record_message_rejection(
             db, connector, message_type=envelope.type, category=category, error_type=error_type,
-            error_paths=error_paths, request_id=envelope.message_id, boot_id=envelope.boot_id)
+            error_paths=error_paths, request_id=envelope.message_id, boot_id=envelope.boot_id,
+            error_reason=error_reason, error_site=error_site)
         if settings.device_health_derived_enabled:
             apply_device_health(db, connector, source="REJECTION")
         else:
@@ -4555,7 +4561,9 @@ def record_envelope_rejection(connector_pk: int, envelope: Envelope, error: Exce
                     message=alert.message,
                     context={"message_type": envelope.type, "error_type": error_type,
                              "request_id": envelope.message_id, "error_category": category,
-                             "error_paths": error_paths},
+                             "error_paths": error_paths,
+                             **({"error_reason": error_reason, "error_site": error_site}
+                                if error_reason is not None else {})},
                     device_time=envelope.sent_at,
                 )
             ],

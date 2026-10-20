@@ -37,6 +37,7 @@ from zk_add.ords_states import (
     classify_ords_assurance_status,
     normalize_ords_status,
 )
+from zk_add.rejection import EvidenceRejected
 from zk_add.schemas import (
     ReconciliationAssignmentReleaseRequest,
     ReconciliationAnchorRequest,
@@ -126,7 +127,9 @@ def _require_source_epoch(
     if supplied is None or expected is None or not hmac.compare_digest(supplied, expected):
         # Reject stale transport before either duplicate ACK or safety-hold
         # mutation: an old epoch must not invalidate valid replacement coverage.
-        raise ValueError("Source epoch is missing, stale, or belongs to another terminal.")
+        raise EvidenceRejected(
+            "SOURCE_EPOCH_MISMATCH", "Source epoch is missing, stale, or belongs to another terminal."
+        )
 
 
 def _request_digest(*, connector: Connector, reason: str, confirmation: str, scope: str = "ALL_RECORDS") -> str:
@@ -669,20 +672,52 @@ def _source_claim_evidence(source, *, identity_missing: bool) -> dict:
     }
 
 
+def _replay_conflict(row, incoming, *, terminal_serial: str, owned: bool) -> str | None:
+    """The first retained fact a verified source replay contradicts, as a code.
+
+    Zone Lite derives a punch's event UID only from its device time, terminal
+    serial, punch and user ID, never from the connector. A terminal that moved
+    to another connector therefore replays rows its previous connector still
+    owns. Such a row is the same punch only when every fact the UID covers
+    agrees; the owner's own rows keep their original comparison.
+    """
+    if row.device_serial not in {None, terminal_serial}:
+        return "SOURCE_REPLAY_TERMINAL_MISMATCH"
+    if row.user_id != incoming.user_id:
+        return "SOURCE_REPLAY_USER_MISMATCH"
+    if ensure_utc(row.device_event_time) != ensure_utc(incoming.device_event_time):
+        return "SOURCE_REPLAY_TIME_MISMATCH"
+    if not owned and row.punch != (None if incoming.punch is None else str(incoming.punch)):
+        return "SOURCE_REPLAY_PUNCH_MISMATCH"
+    return None
+
+
 def _bound_source_attendance(session, *, connector, terminal_serial, records):
-    """Bind nested events to the verified source envelope, including legacy rows."""
+    """Bind nested events to the verified source envelope, including legacy rows.
+
+    Returns the events to ingest and the retained rows another connector (or
+    an earlier binding of this terminal) already owns for the same punches.
+    """
     zkt = connector.zkt_device
     if not terminal_serial or not zkt or terminal_serial != zkt.serial:
-        raise ValueError("Source terminal no longer matches the connector binding.")
+        raise EvidenceRejected(
+            "SOURCE_TERMINAL_BINDING_MISMATCH",
+            "Source terminal no longer matches the connector binding.",
+        )
     events = []
+    retained_elsewhere = []
     for source in records:
         incoming = source.event
         if incoming is None:
             continue
         if incoming.terminal_serial not in {None, terminal_serial}:
-            raise ValueError("Attendance terminal differs from its source envelope.")
+            raise EvidenceRejected(
+                "SOURCE_EVENT_TERMINAL_MISMATCH", "Attendance terminal differs from its source envelope."
+            )
         if incoming.source not in {"FULL_HISTORY", "CURRENT_RECONCILE"}:
-            raise ValueError("Source history must use a historical capture type.")
+            raise EvidenceRejected(
+                "SOURCE_EVENT_CAPTURE_TYPE_INVALID", "Source history must use a historical capture type."
+            )
         if _source_identity_missing(source):
             continue
         events.append(incoming.model_copy(update={
@@ -701,11 +736,18 @@ def _bound_source_attendance(session, *, connector, terminal_serial, records):
         by_uid = {event.event_uid: event for event in events}
         for row in existing:
             incoming = by_uid[row.event_uid]
-            if (row.connector_id != connector.id or row.zkt_device_id != zkt.id
-                    or row.device_serial not in {None, terminal_serial}
-                    or row.user_id != incoming.user_id
-                    or ensure_utc(row.device_event_time) != ensure_utc(incoming.device_event_time)):
-                raise ValueError("Replayed attendance conflicts with retained source ownership.")
+            owned = row.connector_id == connector.id and row.zkt_device_id == zkt.id
+            conflict = _replay_conflict(row, incoming, terminal_serial=terminal_serial, owned=owned)
+            if conflict is not None:
+                raise EvidenceRejected(
+                    conflict, "Replayed attendance conflicts with retained source ownership."
+                )
+            if not owned:
+                # The same punch, captured before this terminal moved here. It
+                # stays its owner's row: linked and counted as already present,
+                # never rewritten or released through this connector's roster.
+                retained_elsewhere.append(row)
+                continue
             # Do not rewrite immutable facts used by an existing repair approval.
             from zk_add.models import AttendanceRepairItem
             reviewed = session.scalar(select(AttendanceRepairItem.id).where(
@@ -717,15 +759,33 @@ def _bound_source_attendance(session, *, connector, terminal_serial, records):
                                  "terminal_provenance": "VERIFIED_SOURCE_REPLAY"}
             if reviewed is None:
                 recover_verified_source_identity(session, connector=connector, row=row)
-    return events
+    return events, retained_elsewhere
+
+
+def _retained_elsewhere_details(session, rows, *, start_ordinal: int, end_ordinal: int) -> dict:
+    """Bounded, non-secret evidence of replayed rows another connector owns."""
+    owner_ids = sorted({row.connector_id for row in rows})
+    owners = session.scalars(
+        select(Connector.connector_id).where(Connector.id.in_(owner_ids[:8]))
+    ).all()
+    return {
+        "start_ordinal": start_ordinal,
+        "end_ordinal": end_ordinal,
+        "retained_elsewhere": len({row.id for row in rows}),
+        "owner_count": len(owner_ids),
+        "owner_connector_ids": sorted(owners),
+    }
 
 
 def _release_source_synced_attendance(session, *, connector, events) -> set[int]:
     """Resolve this source batch only after its canonical manifests are durable."""
+    zkt = connector.zkt_device
     candidates = [
         row for row in events
         if row.source == "CURRENT_RECONCILE"
         and row.ords_status in {"BLOCKED_IDENTITY", "WAITING_FOR_SNAPSHOT"}
+        # A row retained by another connector is released only by its owner.
+        and row.connector_id == connector.id and row.zkt_device_id == zkt.id
     ]
     if not candidates:
         return set()
@@ -733,7 +793,6 @@ def _release_source_synced_attendance(session, *, connector, events) -> set[int]
     from zk_add.models import DeviceUser
     from zk_add.service import release_synced_cnic_attendance_event
 
-    zkt = connector.zkt_device
     users = {
         user.user_id: user
         for user in session.scalars(select(DeviceUser).where(
@@ -757,10 +816,14 @@ def apply_reconciliation_chunk(
 ) -> tuple[ReconciliationJob, ReconciliationChunk | None, bool]:
     job = _device_job(session, connector, payload.job_id)
     if payload.generation != job.terminal_generation:
-        raise ValueError("Reconciliation generation does not match the assignment.")
+        raise EvidenceRejected(
+            "SOURCE_GENERATION_MISMATCH", "Reconciliation generation does not match the assignment."
+        )
     _require_source_epoch(session, connector, job, payload.source_epoch)
     if job.cutoff_count is None or job.record_size is None:
-        raise ValueError("Reconciliation must be anchored before accepting chunks.")
+        raise EvidenceRejected(
+            "SOURCE_NOT_ANCHORED", "Reconciliation must be anchored before accepting chunks."
+        )
     existing = session.scalar(
         select(ReconciliationChunk).where(
             ReconciliationChunk.job_id == job.id,
@@ -791,40 +854,60 @@ def apply_reconciliation_chunk(
     _require_raw_custody(connector, payload.records)
     if payload.assignment_id is not None:
         if job.active_assignment_id != payload.assignment_id:
-            raise ValueError("Reconciliation assignment lease is no longer active.")
+            raise EvidenceRejected(
+                "ASSIGNMENT_LEASE_INACTIVE", "Reconciliation assignment lease is no longer active."
+            )
         if (
             job.credit_start_ordinal is None
             or job.credit_end_ordinal is None
             or payload.start_ordinal < job.credit_start_ordinal
             or payload.end_ordinal > job.credit_end_ordinal
         ):
-            raise ValueError("Chunk is outside its durable reconciliation credit.")
+            raise EvidenceRejected(
+                "CHUNK_OUTSIDE_CREDIT", "Chunk is outside its durable reconciliation credit."
+            )
     if payload.start_ordinal != job.committed_next_ordinal:
-        raise ValueError(
-            f"Expected source ordinal {job.committed_next_ordinal}, got {payload.start_ordinal}."
+        raise EvidenceRejected(
+            "CHUNK_ORDINAL_UNEXPECTED",
+            f"Expected source ordinal {job.committed_next_ordinal}, got {payload.start_ordinal}.",
         )
     if payload.end_ordinal > job.cutoff_count:
-        raise ValueError("Chunk exceeds the anchored source cutoff.")
+        raise EvidenceRejected("CHUNK_EXCEEDS_CUTOFF", "Chunk exceeds the anchored source cutoff.")
     for source in payload.records:
         try:
             raw_record = base64.b64decode(source.raw_record_b64, validate=True)
         except (binascii.Error, ValueError) as exc:
-            raise ValueError("Source record contains invalid base64 evidence.") from exc
+            raise EvidenceRejected(
+                "SOURCE_RECORD_BASE64_INVALID", "Source record contains invalid base64 evidence."
+            ) from exc
         if len(raw_record) != job.record_size:
-            raise ValueError("Source record evidence does not match the anchored record size.")
+            raise EvidenceRejected(
+                "SOURCE_RECORD_SIZE_MISMATCH",
+                "Source record evidence does not match the anchored record size.",
+            )
         if hashlib.sha256(raw_record).hexdigest() != source.raw_record_digest:
-            raise ValueError("Source record digest does not match its protected raw evidence.")
+            raise EvidenceRejected(
+                "SOURCE_RECORD_DIGEST_MISMATCH",
+                "Source record digest does not match its protected raw evidence.",
+            )
     if (
         payload.start_ordinal == 0
         and payload.records[0].raw_record_digest != job.first_anchor_digest
     ):
-        raise ValueError("The first committed source row does not match the immutable anchor.")
+        raise EvidenceRejected(
+            "SOURCE_FIRST_ANCHOR_MISMATCH",
+            "The first committed source row does not match the immutable anchor.",
+        )
     canonical_digest = reconciliation_chunk_digest(payload)
     if canonical_digest != payload.chunk_digest:
-        raise ValueError("Chunk digest does not match its canonical source records.")
+        raise EvidenceRejected(
+            "CHUNK_DIGEST_MISMATCH", "Chunk digest does not match its canonical source records."
+        )
     expected_previous = job.last_chain_digest
     if payload.previous_chain_digest != expected_previous:
-        raise ValueError("Chunk chain does not continue from the committed checkpoint.")
+        raise EvidenceRejected(
+            "CHUNK_CHAIN_DISCONTINUOUS", "Chunk chain does not continue from the committed checkpoint."
+        )
     expected_result = reconciliation_chain_digest(
         expected_previous,
         start_ordinal=payload.start_ordinal,
@@ -832,7 +915,7 @@ def apply_reconciliation_chunk(
         chunk_digest=payload.chunk_digest,
     )
     if payload.resulting_chain_digest != expected_result:
-        raise ValueError("Resulting chunk chain digest is invalid.")
+        raise EvidenceRejected("CHUNK_CHAIN_RESULT_INVALID", "Resulting chunk chain digest is invalid.")
 
     existing_source_rows = {
         row.ordinal: row
@@ -890,7 +973,7 @@ def apply_reconciliation_chunk(
 
     from zk_add.service import ingest_attendance
 
-    attendance = _bound_source_attendance(
+    attendance, retained_elsewhere = _bound_source_attendance(
         session, connector=connector, terminal_serial=job.terminal_serial,
         records=[row for row in payload.records
                  if row.ordinal not in interpretation_drift_ordinals],
@@ -1029,6 +1112,16 @@ def apply_reconciliation_chunk(
             _release_assignment(job)
     job.status = "RUNNING"
     job.phase = "SCANNING_TERMINAL"
+    if retained_elsewhere:
+        _event(
+            session,
+            job,
+            "SOURCE_REPLAY_RETAINED_ELSEWHERE",
+            _retained_elsewhere_details(
+                session, retained_elsewhere,
+                start_ordinal=payload.start_ordinal, end_ordinal=payload.end_ordinal,
+            ),
+        )
     _event(
         session,
         job,
@@ -1038,6 +1131,7 @@ def apply_reconciliation_chunk(
             "end_ordinal": payload.end_ordinal,
             "accepted": chunk.accepted_count,
             "already_present": chunk.already_present_count,
+            "retained_elsewhere": len({row.id for row in retained_elsewhere}),
             "blocked_identity": blocked,
             "quarantined": quarantined,
             "raw_preserved": len(raw_manifests),
@@ -1629,7 +1723,7 @@ def apply_source_tail_chunk(
 
     from zk_add.service import ingest_attendance, upsert_alert
 
-    attendance = _bound_source_attendance(
+    attendance, _retained_elsewhere = _bound_source_attendance(
         session, connector=connector, terminal_serial=coverage.terminal_serial,
         records=payload.records,
     )
@@ -3066,7 +3160,10 @@ def _sealed_evidence(evidence: dict) -> dict:
 
 def _device_job(session: Session, connector: Connector, job_id: str) -> ReconciliationJob:
     if connector.firmware_family == "hikvision":
-        raise ValueError("Hikvision reconciliation requires serial-source page evidence.")
+        raise EvidenceRejected(
+            "HIKVISION_SERIAL_SOURCE_REQUIRED",
+            "Hikvision reconciliation requires serial-source page evidence.",
+        )
     job = session.scalar(
         select(ReconciliationJob)
         .where(
@@ -3076,15 +3173,20 @@ def _device_job(session: Session, connector: Connector, job_id: str) -> Reconcil
         .with_for_update()
     )
     if job is None:
-        raise ValueError("Unknown reconciliation assignment.")
+        raise EvidenceRejected("RECONCILIATION_JOB_UNKNOWN", "Unknown reconciliation assignment.")
     return job
 
 
 def _require_runnable(job: ReconciliationJob, generation: int) -> None:
     if job.status in TERMINAL_JOB_STATES | PAUSED_JOB_STATES:
-        raise ValueError(f"Reconciliation is not accepting source data while {job.status}.")
+        raise EvidenceRejected(
+            "RECONCILIATION_NOT_RUNNABLE",
+            f"Reconciliation is not accepting source data while {job.status}.",
+        )
     if generation != job.terminal_generation:
-        raise ValueError("Reconciliation generation does not match the assignment.")
+        raise EvidenceRejected(
+            "SOURCE_GENERATION_MISMATCH", "Reconciliation generation does not match the assignment."
+        )
 
 
 def _begin_source_divergence(

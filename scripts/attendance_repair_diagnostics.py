@@ -122,10 +122,14 @@ def normal_source_ownership_proven(session, event, connector):
     from zk_add.models import TerminalRecordManifest, TerminalSourceEpoch
     from zk_add.time_utils import ensure_utc
 
+    # Only the owner's records prove its row. A moved terminal's later baseline
+    # under another connector links its replay to this row without owning it.
     rows = session.execute(select(TerminalRecordManifest, TerminalSourceEpoch).join(
         TerminalSourceEpoch, TerminalSourceEpoch.id == TerminalRecordManifest.source_epoch_id,
     ).where(
         TerminalRecordManifest.attendance_event_id == event.id,
+        TerminalRecordManifest.connector_id == event.connector_id,
+        TerminalRecordManifest.zkt_device_id == event.zkt_device_id,
         TerminalRecordManifest.canonical_source.is_(True),
         TerminalSourceEpoch.state == "ACTIVE",
     ).order_by(TerminalRecordManifest.id.desc()).limit(31)).all()

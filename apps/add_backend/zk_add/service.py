@@ -3927,11 +3927,16 @@ def ingest_attendance(
     session: Session, *, connector: Connector, events: list[AttendanceEventIn],
     defer_synced_identity_release: bool = False,
 ) -> tuple[list[str], list[str]]:
+    from zk_add.rejection import EvidenceRejected
+
     if connector.firmware_family == "hikvision":
-        raise ValueError("Hikvision attendance requires source-evidence ingestion.")
+        raise EvidenceRejected(
+            "HIKVISION_SOURCE_EVIDENCE_REQUIRED",
+            "Hikvision attendance requires source-evidence ingestion.",
+        )
     zkt = connector.zkt_device
     if zkt is None:
-        raise ValueError("Connector has no assigned ZKT device.")
+        raise EvidenceRejected("ZKT_DEVICE_UNASSIGNED", "Connector has no assigned ZKT device.")
     accepted: list[str] = []
     duplicates: list[str] = []
     event_uids = [incoming.event_uid for incoming in events]
@@ -5876,8 +5881,10 @@ def record_message_rejection(
     request_id: str,
     boot_id: str | None,
     now: datetime | None = None,
+    error_reason: str | None = None,
+    error_site: str | None = None,
 ) -> DeviceAlert:
-    """Track a rejected message per type; field paths only, never values.
+    """Track a rejected message per type; field paths and codes only, never values.
 
     A device-side rejection (the message itself is invalid) is
     DEVICE_MESSAGE_REJECTED. A failure inside ADD is
@@ -5886,8 +5893,9 @@ def record_message_rejection(
     now = now or utc_now()
     device_side = category in DEVICE_REJECTION_CATEGORIES
     code = "DEVICE_MESSAGE_REJECTED" if device_side else "ADD_MESSAGE_PROCESSING_FAILED"
-    message = (f"{message_type} message was rejected ({category})." if device_side
-               else f"ADD could not process a {message_type} message ({category}).")
+    label = f"{category}: {error_reason}" if error_reason else category
+    message = (f"{message_type} message was rejected ({label})." if device_side
+               else f"ADD could not process a {message_type} message ({label}).")
     existing = open_alert_row(session, connector, code)
     previous = (existing.details or {}) if existing is not None else {}
     types = {name: dict(entry) for name, entry in (previous.get("types") or {}).items() if isinstance(entry, dict)}
@@ -5903,13 +5911,15 @@ def record_message_rejection(
         **entry, "category": category, "error_type": error_type, "error_paths": error_paths[:5],
         "count": int(entry.get("count") or 0) + 1, "last_at": now.isoformat(), "boot_id": boot_id,
         "firmware_version": connector.firmware_version, "request_id": request_id,
+        # Why the latest one was refused, so an unknown rejection is diagnosable.
+        "error_reason": error_reason, "error_site": error_site,
     }
     while len(types) > MAX_REJECTION_TYPES:
         types.pop(min(types, key=lambda name: str(types[name].get("last_at") or "")))
     return upsert_alert(
         session, connector, code=code, severity="HIGH" if device_side else "WARNING", message=message,
         details={"message_type": message_type, "error_type": error_type, "request_id": request_id,
-                 "error_category": category, "types": types},
+                 "error_category": category, "error_reason": error_reason, "types": types},
     )
 
 
