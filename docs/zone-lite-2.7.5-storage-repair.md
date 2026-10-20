@@ -991,6 +991,10 @@ Decisions for the owner:
    - **A reformat** with every custody byte held (or every queue file
      settled or empty with a verified cursor): confirmed image only,
      operational and dedupe files held, `.pos` written as 0.
+
+   The owner approved a last-resort reformat (16 and 20 October 2026). 2.7.6
+   does it in place, one block at a time, with each block's kept pages in a
+   redo record past the partition table: `zone-lite-2.7.6-last-resort-reformat.md`.
 2. **`CONFIG_SPIFFS_USE_MTIME=n`.** Not changed. Every writable open
    rewrites the header to update the time (another page move per append, 1.2
    item 1); turning it off removes that window and changes no format.

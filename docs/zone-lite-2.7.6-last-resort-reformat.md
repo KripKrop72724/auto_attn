@@ -1,10 +1,11 @@
 # Zone Lite 2.7.6: last-resort reformat for wedged stores
 
-Status: second design round, after two reviews of the first (commit
-7556422): a custody review (C1 to C6, H1 to H4, M1, M2) and a device review
-(D1 to D10). Section 16 says what became of every point. Branch
-`release/zkt-2.7.6` from `origin/main` 5de7724 (2.7.5 released, #398 and #400
-merged). The version is not bumped yet.
+Status: implemented and verified on the host (section 17), not yet on a
+device; the version is not bumped yet. This is the second design round,
+after two reviews of the first (commit 7556422): a custody review (C1 to C6,
+H1 to H4, M1, M2) and a device review (D1 to D10). Section 16 says what
+became of every point. Branch `release/zkt-2.7.6` from `origin/main` 5de7724
+(2.7.5 released, #398 and #400 merged).
 
 Owner decision, 16 October 2026, reconfirmed 20 October ("yes start 2.7.6"):
 a last-resort reformat is approved when the store cannot otherwise be made
@@ -511,6 +512,13 @@ index p is a source for span k of the live object X when:
 
 It merges by the 2.7.5 rules (more programmed wins; a disagreement is a gap)
 as the page the index names, and normalization gives the span a new page.
+A kept page that is deleted but named by the file's index (13FL's head) is a
+source the same way. A kept *copy* of span k at another page (an interrupted
+GC or page move left it, and another image's SPIFFS GC may have deleted it
+since) is a source as 2.7.5 trusts such a copy on flash, but only when the
+record's cursor offset for X had not passed the span: X's owner cannot then
+have read past it, let alone retired X and created another file under the
+same id and name.
 Where a span reads, instead, as exactly the fill a SALVAGE gap left (a boot
 that could not read the area filled it), the record's bytes put it back in
 place; the cursor reconciliation then replays from a changed prefix
@@ -574,49 +582,87 @@ fields on `StorageRepairDiagnostics`.
 | **block** | **~115 ms** | **~0.9 s; 1.8 s with two retries** |
 
 Discovery about 50 ms every boot; the raw magic check about 40 ms per round.
+Measured on the host (section 17): the check pass after a round on the
+8 MiB P02 store deletes about 6,700 leaked pages and reads every page header
+about seven times per 512-page range (15.7 million HAL reads, against 2.1
+million for a pass with nothing to delete); on the device those reads are
+mirror hits, but HIL must measure the pass.
 P02 (unconfirmed): 2.7.5's 21 s run, the round, then a second run with the
 check over 8 MB, deleting the leaked pages, the restore comparison of 3.58 MB
 held, compaction and the probe: **about 60 to 90 s** (D9), inside the 255 s
 soft deadline of an unconfirmed image. The 900 s confirmation budget starts
 after `storage_init`. HIL measures `reclaim.ms` and `duration_ms`.
 
-PSRAM: three 4 KiB buffers for the round and recovery. Internal: the
-external partition's list item (about 100 bytes, freed on return).
+PSRAM: four 4 KiB buffers for the round, three for recovery. Internal: the
+external partition's list item (about 100 bytes, freed on return). Stack
+(`-fstack-usage`, ESP-IDF 5.5.3): `run_once` 1,552 B (2.7.5's `srr_run` was
+1,168 B: the round is inlined), `srx_recover` 608 B from
+`storage_repair_boot` (432 B); P02 reported 4,112 B free of 8 KiB.
 
 ## 13. Harness
 
-Everything runs in `spiffs_repair_host.c` against ESP-IDF 5.5.3's SPIFFS:
+Everything runs in `spiffs_repair_host.c` against ESP-IDF 5.5.3's SPIFFS
+(`check_spiffs_repair.py`); `reclaim` runs every part below, `reclaim-<part>`
+one of them, `REVIEW_FULL=1` cuts at every write instead of sampling.
 
 - **The redo area:** a second emulated NOR region of 96 sectors under the
-  same power-cut model (every write and erase counted, both tear modes).
-- **Builders** at 1 and 8 MiB:
-  - `p02`: no erased page, every block holding a page of the damaged pending
-    queue or of a leaked file, orphan index pages over about a fifth of the
-    store, deleted header copies everywhere, a REFER-only damaged span.
-    The released 2.7.5 engine (`tests/firmware/fixtures/storage_repair_2_7_5`,
-    byte-identical to 0954fd3) must reproduce P02's report on it (`DEFERRED`,
-    `full`, 1 page needed, 0 erased, `LEVEL2_SKIPPED`); then 2.7.6, both
-    unconfirmed and confirmed, must end healthy;
-  - `deep`, `gc-unsafe`, `unheld-crammed`, `head-deleted`, `over-budget`,
-    `low-magic` (block 983 at 8 MiB: never chosen).
-- **Oracles** on every reclaim, on top of 2.7.5's: kept pages byte-identical
-  at their indices; dropped pages were unread and are now erased under free
-  entries; entry 0; magic and erase count in every block; SPIFFS's counters
-  after the remount equal a fresh mount's; no `DEFERRED` for room; at least
-  three free blocks at the end; journal not active; held CRCs unchanged;
-  SPIFFS's GC on reclaimed stores moves nothing a live file reads.
-- **Cut sweeps:** a cut at every write and erase of the round and of the
-  recovery, both tears, at 1 and 8 MiB. Confirmed: custody byte-exact, zero
-  gaps. Unconfirmed: the rollback interleave (a plain mount, every file read
-  byte for byte against the store before the round, a stretch of the
-  firmware's own legacy queue workload, then 2.7.6 again), and the same with
-  the released 2.7.5 engine as the old image.
-- **Area and records:** foreign, a torn first record, a ring wrap, records
-  turned sources by another writer, by a failed verify and by the attempts
-  tally, `REPORT_ONLY` completing a redo, the area unreadable with an active
-  journal.
-- **Organic:** CI's prefilled 8 MiB runs must end not wedged; the 2.7.5 wedge
-  allowance (growing the partition) is gone.
+  same power-cut model (every write and erase counted, both tear modes),
+  kept beside the NVS model so every snapshot takes it too.
+- **`reclaim-p02`**, at 1 and 8 MiB: a store built like P02 after 2.7.5 (no
+  erased page; every block holding a page of the damaged pending queue or of
+  a file whose removal stopped after its header, a fifth of the store; its
+  orphan index pages; deleted header and index copies everywhere; 51 spans
+  of one index page (12 at 1 MiB) whose referenced pages are deleted while
+  valid copies remain, so 2.7.5 refers each to its copy and then needs
+  exactly one page, the index rewrite; four strays past the end; a stale
+  header copy; a cursor past its file). The released 2.7.5 engine
+  (`tests/firmware/fixtures/storage_repair_2_7_5`, byte-identical to 0954fd3)
+  must first reproduce P02's report on it: at 8 MiB exactly the field's
+  (`DEFERRED`, `full`, -10001, 1 page needed, 0 erased, 153 spans
+  rewritten, 4 strays, 1 duplicate, 1 cursor reset, orphans removed,
+  `LEVEL2_SKIPPED`, check skipped).
+  2.7.6 must then end `REPAIRED` with no gap, confirmed, unconfirmed, and
+  with no holds at all (13FL's case).
+- **Gc-unsafe and full stores** (`review-gc-unsafe`, `review-level2`,
+  `review-unheld-crammed`): each runs twice, without a redo area (2.7.5's
+  outcome kept: `DEFERRED`) and with one (reformatted, healthy, the hidden
+  file back whole in the same boot).
+- **Oracles** on every reformatted block, page by page, when the round
+  remounts: every kept entry byte-identical with its lookup entry at its
+  index; every dropped one was a deleted page no valid index page named and
+  is now erased under a free entry; entry 0 kept while a later entry is; the
+  magic valid (or, for a block that would not verify, absent with a source
+  record); no weak-magic block touched; on an unconfirmed image no page of
+  any file kept. After the boot (`verify_reclaimed`): every block's magic
+  and erase count, SPIFFS's own free-block count equal to the flash's, no
+  written page under a free lookup entry, no open record, the journal idle,
+  every model file byte-exact, three free blocks or more, no stray page,
+  clean tails, appends and a probe file, SPIFFS's GC on every third block
+  moving nothing a live file reads, and a clean next repair.
+- **`reclaim-cuts`**: a cut at every write and erase of the round (P02 and
+  the gc-unsafe store, confirmed), both tears; the next boots must leave
+  custody byte-exact with no gap record at all.
+- **`reclaim-rollback`**: the same on an unconfirmed image, where each cut
+  returns to the old image: a plain mount (SPIFFS's remedy), every file
+  listed and read byte for byte against the store as the round began, the
+  old image's punches, an outbox row and a probe file; then 2.7.6 again.
+  Once more with the released 2.7.5 repair running as the old image: it must
+  report no gap on any file.
+- **`reclaim-redo`**: a cut at each of the first 24 writes of a boot's redo,
+  both tears.
+- **`reclaim-area`**: a foreign area (never written, the store left as 2.7.5
+  leaves it), a torn first record in a claimed area with a full ring of done
+  records, another image writing the block after a cut (sources, back in
+  place, retired), a worn cell that never verifies (a source, back from it
+  the next run), four browned-out redos (the tally), report-only completing a
+  redo, the area unreadable with an active journal (sources journaled, the
+  filled spans put back the next boot), and a refused journal (the store not
+  mounted that boot).
+- **`reclaim-mirror`**: the same flash, redo area and report with and
+  without the metadata mirror.
+- **Organic:** a store that ends wedged is now a failure (the partition is
+  no longer grown to read it); CI's prefilled 8 MiB seeds and the long seeds
+  must end healthy.
 
 ## 14. Files
 
@@ -664,10 +710,21 @@ for 2.7.5.
 - Out of reach: a store full of live custody; an unmountable store.
 - A worn sector that will not verify becomes a source and later writes to it
   can still fail (SPIFFS has no bad-block handling).
-- A reported entry keeps its record (and slot) for good.
+- A reported entry keeps its record (and slot) for good, and nothing yet
+  delivers or releases it (C4). Once all 96 slots hold retained or open
+  records, rounds stop with `short` `slots` and the device behaves as 2.7.5.
+- The `CLAIMED` flag lives in NVS: a device whose NVS is erased sees its own
+  torn slots as foreign, and its area stays `FOREIGN` (never written again)
+  until the owner decides; its valid records are still read and honoured.
 - A redo given up after four attempts (supply that cannot sustain an erase)
   turns into sources; the spans stay unreadable to the application until a
   run has room for them.
+- As in 2.7.5, held bytes the restore cannot put back for room (a check
+  that unexpectedly removed a held file on a full store) are reported, not
+  kept: the round (T5) then gives the store room in the same boot, but the
+  hold has died with the run that took it.
+- A round leaves a run's work for the next run of the same boot, so a boot
+  may run the repair three times (two rounds); the deadlines bound it.
 - None of this has run on a device.
 
 ## 16. Review points and what became of them
@@ -677,8 +734,8 @@ for 2.7.5.
 | C1 unconfirmed window | Accepted, option (b) | Section 8. Option (a) is listed for the owner. A per-block exposure histogram goes to ADD before anything is written. The rollback harness checks every file byte for byte through plain SPIFFS after the remedy (any reader of any image) and runs the firmware's legacy queue workload; running 2.5.2's and 2.4.12's `zone_lite.c` themselves is not done: they need FreeRTOS, ESP-IDF and HTTP, and with no page of any file in a window their reads are identical by construction, which is what the oracle checks |
 | C2 redo without proof | Accepted | 10.1: raw condition; sources are sticky; journal `SOURCES` or no mount |
 | C3 generation is not retirement | Accepted | 10.3 and 10.4 use offsets only; 2.7.5's `resume_file` no longer supersedes a hidden remnant, or a vanished file, on a moved generation (its tests now expect the remnant back, or a record) |
-| C4 readable bytes reduced to offsets | Accepted | 10.3, 10.4: delivery in place, settlement by offset, otherwise a record with the bytes kept for good; the SALVAGE-fill restore |
-| C5 deadlock, not total | Accepted | G5 allows other blocks; 10.4 is total; "back on flash" is a subset test |
+| C4 readable bytes reduced to offsets | Accepted in part | 10.3, 10.4: delivery in place (the record's page is a source for the span the index names, also a recorded copy while the cursor had not passed it), settlement by offset, the SALVAGE-fill restore in place, and otherwise a record whose bytes are kept for good (never retired or erased). Not built: rebuilding rows from a record span plus the current neighbouring bytes and appending them through `merge_rows`. That case is a file that is gone or changed under the record; its neighbours then belong to another file or generation, so the rebuilt rows would be a guess spliced into the ORDS stream, and a misframed row is worse than a reported gap whose bytes stay on the device. ADD gets the gap and the record id; delivering a retained record (or acknowledging it) is a later, owner-driven step |
+| C5 deadlock, not total | Accepted, delivery as a reported outcome | G5 allows other blocks with the open record's pages kept; "back on flash" is a subset test (an append in place settles); a re-created name with a reused object id fails the record's name or cursor test and is reported; 10.4 is total with "reported" (record kept) as the terminal case in place of "deliver" (see C4) |
 | C6 mirror reads | Accepted | R12, 5.3 steps 6 and 8, the raw magic check |
 | H1 keep set | Accepted, except one clause | R9 and 6.1 from flash structure; the index-flag test reads the page header. Not taken: "it is not a header or index page" for pages whose own deleted flag is set and whose lookup entry is `0x0000`: no SPIFFS path and no 2.7.x rule reads such a page (1.3 item 6), and keeping them would keep most of the gain (every append's header move leaves one). Index and header pages that are not deleted keep their block out entirely |
 | H2 any reset, flicker | Accepted in part | Deadline gate and deferral (5.3, 10.1). Not taken: a 60 s uptime delay for unconfirmed windows, since with C1 (b) such a window exposes nothing readable |
@@ -687,7 +744,7 @@ for 2.7.5.
 | M1 recovery and NVS | Accepted | 9.1: records read in every readable state |
 | M2 the 2.7.5 stand-in | Accepted | The released engine, vendored byte-identical, runs as the old image |
 | D1 redo after the mount | Accepted | 10.1 before any mount |
-| D2 low magics | Accepted | 6.1, and the `low-magic` harness case |
+| D2 low magics | Accepted | 6.1; the round oracle fails any reformatted block with two set magic bits or fewer, and the 8 MiB P02 run must keep such blocks out (67 at 8 MiB) |
 | D3 wrong bytes, appends | Accepted | Section 8 corrected; last data pages never in a window |
 | D4 torn magic or done | Accepted | 10.1 re-asserts both |
 | D5 brownouts | Accepted | The attempts tally; BROWNOUT counted |
@@ -696,3 +753,54 @@ for 2.7.5.
 | D8 P06 cannot vouch for P02's tail | Accepted | 9.1 reports foreign detail; decision 2; P02's first boot may be discovery |
 | D9 estimates | Accepted | Section 12 |
 | D10 NVS writes | Accepted | G4 |
+
+## 17. Implementation and verification (20 October 2026)
+
+**Commits** on `release/zkt-2.7.6` (each pushed):
+
+| Commit | What |
+|---|---|
+| fc39f2e | this design, second round |
+| dd402a2 | `storage_repair_redo.c`: record, plan, writer, recovery; the reclaim journal; `srm_refresh`; plain cc tests |
+| 4c6eddc | C3: no supersession by a moved cursor generation (2.7.5's resume) |
+| ae4037b | the round in the engine, sources and settlement; the harness's redo area, P02 builder, oracles, cuts, rollbacks; the vendored released 2.7.5 engine |
+| 51dfbdc | the device glue: discovery, recovery before any mount, ports, deadline deferral, mount gate, heartbeat |
+| 3c546a6 | ADD: `StorageRepairReclaim`, `runs` |
+| 31b8897 | GCC format-truncation fix, the namespace host's stub |
+| 29e094b | P02 builder exact to the field report; recorded copies as sources |
+
+**Results** (host, ESP-IDF 5.5.3 SPIFFS, ASan and UBSan; Apple clang natively
+and GCC in `espressif/idf:v5.5.3`):
+
+- The CI harness configuration (`check_spiffs_repair.py`, every entry,
+  including the new 8 MiB reclaim entries): passes natively and in the IDF
+  image (about 4 minutes on 8 cores).
+- P02 at 8 MiB: the released 2.7.5 reproduces the field report exactly;
+  2.7.6 then reformats 3 blocks (confirmed) or 5 blocks holding nothing any
+  image reads (unconfirmed: 731 such candidates of 2,048), and ends
+  `REPAIRED` with no gap, also with no holds at all.
+- Cut at every write and erase of the round (`REVIEW_FULL=1`): at 1 MiB, P02
+  48 and gc-unsafe 92 cuts confirmed, 188 through the old image and 188
+  through the released 2.7.5 unconfirmed; at 8 MiB, P02 48 and gc-unsafe 96
+  confirmed, 150 and 150 through the old images. Every one: custody
+  byte-exact, no gap record, every file read identical by plain SPIFFS after
+  an unconfirmed cut.
+- 48 cuts inside a boot's redo; the area cases (foreign, torn record and
+  full ring, another writer, worn cell, four browned-out redos, report-only
+  redo, unreadable area, refused journal) at 1 and 8 MiB; mirror
+  equivalence.
+- Organic workload, fresh and long seeds: 8 MiB seeds 12, 13 and 16 at
+  20,000 ticks (wedged on 2.7.5) end healthy with 0 committed rows lost
+  (9 to 10 rounds, 66 to 95 blocks each); 8 MiB prefilled fresh seeds 111 to
+  119 and 211 to 214: 0 rows lost, none wedged, none handed over GC-unsafe;
+  1 MiB fresh seeds 311 to 318: 0 lost (no round needed); 620 fresh cut
+  runs of the scenarios.
+- `tests/firmware` in the IDF image: 376 passed. ADD: the diagnostics,
+  heartbeat, storage contract and recovery tests (479 passed), ruff, the
+  OpenAPI and repository contracts.
+- `idf.py build`: production, Hikvision, and the direct legacy role (2.7.5
+  version, as CI builds it) all build; `-fstack-usage` as in section 12.
+
+Not run here: a device (HIL), the 8 backend shards with Postgres (no model
+or migration changed), and the release step (version, upgrade guard
+digests, signing).
