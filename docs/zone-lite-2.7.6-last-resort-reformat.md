@@ -50,9 +50,10 @@ What changed from the first round:
   reads raw flash and refreshes the metadata mirror (C6).
 - **Supersession** never follows a cursor generation, which moves on every
   settled row (C3); that 2.7.5 rule is fixed too. A record's pages settle
-  only when their bytes read back where the file's index points, or by the
-  cursor offset taken when the record was written, or they go to ADD as a
-  gap with the record kept for good (C4, C5).
+  only when their bytes read back where the file's index points, or (once
+  the file is gone or changed) by the cursor offset taken, and verified,
+  when the record was written, or they go to ADD as a gap with the record
+  kept for good (C4, C5; round 1 review, D1).
 - **The keep set** comes from flash structure alone (H1), and blocks whose
   magic has two set bits or fewer are never chosen (D2: block 983's magic is
   0x0000), nor blocks whose magic has every byte 0x00 or 0xFF (round 1 review
@@ -400,7 +401,7 @@ reclaim leaves inside blocks (1.3 item 5).
 | Sketch (2.7.5 section 12) | Here |
 |---|---|
 | Confirmed image only | Unconfirmed boots touch only blocks holding no page of any file (section 8) |
-| Queues settled or empty with a verified cursor | Not needed: no queue byte moves; a record keeps each queue's cursor offset for settlement |
+| Queues settled or empty with a verified cursor | Not needed: no queue byte moves; a record keeps each queue's cursor offset, verified against the file when it is written, for settlement |
 | Operational and dedupe files held | Not needed by the round (nothing is rewritten from RAM); they never enter a window. The hold still guards the check |
 | `.pos` written as 0 | Not needed: offsets do not change |
 | Its own power-cut harness coverage | Section 13 |
@@ -911,7 +912,7 @@ for 2.7.5.
 | 38b52ec | the log line for a queue that waits for an area that cannot be read |
 | 2d26d08 | section 18 and the sections the fixes changed |
 | f3988b8 | `reclaim-stale`'s cursor before the damage kept before it at 8 MiB (a test error, not the engine's) |
-| this commit | the verification after the round 1 review, below |
+| 98c7953 | the verification after the round 1 review, below (the wedged seeds added next) |
 
 **Results at eaf7ec3** (host, ESP-IDF 5.5.3 SPIFFS, ASan and UBSan; Apple
 clang natively and GCC in `espressif/idf:v5.5.3`; the results after the
@@ -973,11 +974,13 @@ round 1 review follow these):
   reformats 3 blocks (confirmed) or 5 (unconfirmed), keeps 68 weak magics out
   (block 810 among them), and ends `REPAIRED` with no gap; the boot's report
   carries 204 spans rewritten (153 + 51) and the first run's room figures.
-- Organic workload (20,000 ticks at 8 MiB, the seed printed is the
-  harness's): seeds 23, 24, 27, 622, 623 and 723 end healthy with 0
-  committed rows lost and no gap record (1 to 27 rounds, 7 to 189 blocks);
-  prefilled 8 MiB seeds 122 to 125 (3,000 ticks) and 1 MiB seeds 322 to 329
-  and 822 to 823: 0 lost, none handed over GC-unsafe.
+- Organic workload (20,000 ticks at 8 MiB; the seed is the one the harness
+  prints, `--first-seed` plus 11): seeds 12, 13 and 16 (wedged on 2.7.5) end
+  healthy with 0 committed rows lost and no gap record (9 to 10 rounds, 66 to
+  95 blocks each, as at eaf7ec3); fresh seeds 23, 24, 27, 622, 623 and 723
+  the same (1 to 27 rounds, 7 to 189 blocks); prefilled 8 MiB seeds 122 to
+  125 (3,000 ticks) and 1 MiB seeds 322 to 329 and 822 to 823: 0 lost, none
+  handed over GC-unsafe.
 - `tests/firmware` in the IDF image: 377 passed; `test_hikvision_api_host`
   ran past its 60 s limit with the host loaded and passes alone (43 s); this
   branch does not touch the Hikvision code.
