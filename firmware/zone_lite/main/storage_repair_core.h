@@ -112,6 +112,10 @@ typedef struct {
     /* NVS available entries now (measured before every run); negative when
      * unknown. */
     int32_t (*nvs_available)(void *context);
+    /* Host tests only (NULL on the device): a candidate block a round takes
+     * first. Which eligible block goes first is the engine's free choice; a
+     * test uses it to put a window over pages it names. */
+    bool (*prefer)(void *context, uint32_t block);
 } srr_ports_t;
 
 typedef struct {
@@ -127,6 +131,11 @@ typedef struct {
     /* 2.7.6: the redo area as discovery and the boot recovery left it (NULL:
      * none). The engine writes new records only when its state is READY. */
     const srx_area_t *area;
+    /* 2.7.6 (round 1 review, low): the area could not be read this boot while
+     * the reclaim journal says records may hold queue bytes (ACTIVE, SOURCES
+     * or HELD): a queue's unreadable bytes wait for a boot that reads them,
+     * never filled or recorded as lost. */
+    bool sources_unread;
 } srr_config_t;
 
 enum {

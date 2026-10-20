@@ -55,6 +55,19 @@ def test_repair_against_esp_idf_spiffs_with_power_cuts(tmp_path: Path) -> None:
     # with cuts in the round and through the old image.
     assert "p02 1024 KiB unconfirmed: 2.7.5 DEFERRED (full, 1 page needed, 0 erased" in output and "through the old image" in output
     assert "reclaim mirror equivalence passed" in output
+    # The round 1 review of the implementation: records keep only verified
+    # cursors and an offset never settles bytes the file can get back (D1);
+    # a boot without the area leaves them alone (low); a restore short of
+    # room waits for the round (D2); a torn erase reading a valid magic is
+    # redone (D3); sources without memory fail the run (low 6); the boot's
+    # report covers every run (low 1); the remount keeps the mirror (low 4).
+    assert "p02, a stale cursor: a cut in block 133's window (14 pages the queue's index names)" in output
+    assert "t5 /processed_commands.txt freed by the check on a store without room: the round made room" in output
+    assert "t5 /processed_commands.txt changed by the check on a store without room: the round made room" in output
+    assert "torn magic: 6 erases cut short with the magic reading valid" in output
+    assert "byte sources without memory for them: the run failed before writing" in output
+    assert "2.7.6 first: the boot's report keeps the first run's strays, duplicate, cursor reset" in output
+    assert "p02 confirmed, mirrored:" in output
 
 
 def test_ci_runs_the_repair_harness_in_the_esp_idf_image() -> None:

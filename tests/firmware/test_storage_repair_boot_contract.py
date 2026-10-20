@@ -178,10 +178,10 @@ def test_the_redo_area_is_reached_only_through_its_own_registered_handle() -> No
     # Discovery reads every sector before anything is written to the area,
     # and an area that is not READY (foreign, absent, overlapping) is never
     # written: the engine checks the state before a round.
-    recover = _body(glue, "static void redo_recover(srr_config_t *config)")
+    recover = _body(glue, "static void redo_recover(srr_config_t *config, bool timed)")
     assert recover.index("redo_register()") < recover.index("srx_discover(") < recover.index("srx_recover(")
     core = (MAIN / "storage_repair_core.c").read_text()
-    assert "c->area.state == SRX_AREA_READY" in _body(core, "static void reclaim_round(run_t *r, const char *trigger)")
+    assert "c->area.state == SRX_AREA_READY" in _body(core, "static SR_NOINLINE void reclaim_round(run_t *r, const char *trigger)")
     # Deregistered on every way out of the boot.
     boot = _body(glue, "void storage_repair_boot(void)")
     assert boot.count("esp_partition_deregister_external(s_redo)") == 2
@@ -192,9 +192,9 @@ def test_the_redo_runs_on_raw_flash_before_any_mount_in_every_mode() -> None:
     boot = _body(glue, "void storage_repair_boot(void)")
     # Before the mirror and before the private mount, and before the run can
     # decide REPORT_ONLY; the hard deadline already armed.
-    assert boot.index("esp_timer_start_once(s_deadline_timer") < boot.index("redo_recover(&config);")
-    assert boot.index("redo_recover(&config);") < boot.index("srm_init(") < boot.index("SPIFFS_mount(")
-    assert boot.index("redo_recover(&config);") < boot.index("if (!timed) {")
+    assert boot.index("esp_timer_start_once(s_deadline_timer") < boot.index("redo_recover(&config, timed);")
+    assert boot.index("redo_recover(&config, timed);") < boot.index("srm_init(") < boot.index("SPIFFS_mount(")
+    assert boot.index("redo_recover(&config, timed);") < boot.index("if (!timed) {")
     # A block that may be open and cannot be journaled keeps the store
     # unmounted: no private mount, and storage_init does not mount it.
     assert "&& !s_mount_blocked;" in boot
@@ -228,7 +228,7 @@ def test_a_round_never_comes_between_a_check_pass_and_its_restore() -> None:
         < run.index("if (trigger) reclaim_round(r, trigger);")
     assert core.count("reclaim_round(r, trigger)") == 1
     # The store is remounted after a round, never patched.
-    assert "r->ports->remount(r->ports->context)" in _body(core, "static void reclaim_round(run_t *r, const char *trigger)")
+    assert "r->ports->remount(r->ports->context)" in _body(core, "static SR_NOINLINE void reclaim_round(run_t *r, const char *trigger)")
     assert "free_blocks++" not in core and "stats_p_deleted -=" not in core
 
 
@@ -252,3 +252,46 @@ def test_the_heartbeat_reclaim_fields_are_the_ones_add_accepts() -> None:
     assert sent and sent <= accepted, sent - accepted
     assert 'cJSON_AddNumberToObject(repair, "runs", r->runs)' in append
     assert '{SRR_FILE_REDO_SOURCE, "REDO_SOURCE"}' in glue
+
+
+def test_a_boot_without_its_deadline_writes_nothing_and_returns_its_breadcrumb() -> None:
+    # Round 1 review, low 2: without the deadline timer no flash is written
+    # (open records go to the journal as sources, as for an area that cannot
+    # be read), the boot's repair breadcrumb says it returned, and the
+    # REFORMAT breadcrumb is set only while recovery acts on an open record.
+    glue = (MAIN / "storage_repair.c").read_text()
+    boot = _body(glue, "void storage_repair_boot(void)")
+    no_timer = boot[boot.index("if (!timed) {"):]
+    no_timer = no_timer[:no_timer.index("return;")]
+    assert "boot_report_repair_returned();" in no_timer
+    assert "srx_recover(" not in no_timer and "SPIFFS_mount(" not in no_timer
+    recover = _body(glue, "static void redo_recover(srr_config_t *config, bool timed)")
+    assert "inspected = timed && (s_area.state == SRX_AREA_READY || s_area.state == SRX_AREA_FOREIGN);" in recover
+    assert recover.count("boot_report_repair(") == 1 and recover.count("srx_recover(") == 1
+    acts = recover[recover.index("if (inspected && records_open) {"):]
+    assert acts.index("boot_report_repair(SRP_PHASE_REFORMAT, 0, false);") < acts.index("srx_recover(") < acts.index("}")
+    assert recover.index("srx_discover(") < recover.index("if (inspected && records_open) {")
+    # A boot that cannot read records that may hold bytes tells the engine.
+    assert "config->sources_unread = have && srx_sources_unread(&journal, inspected);" in recover
+    assert "srx_journal_after_recovery(&journal, inspected, open, srx_sources_left(&s_area))" in recover
+
+
+def test_the_redo_geometry_is_pinned_at_build_time_and_checked_before_any_round() -> None:
+    # Round 1 review, low 5: the records and the round hold 256-byte pages in
+    # 4 KiB blocks with SPIFFS's length magic.
+    glue = (MAIN / "storage_repair.c").read_text()
+    assert '_Static_assert(CONFIG_SPIFFS_PAGE_SIZE == SRX_PAGE, ' in glue
+    assert '_Static_assert(SRX_BLOCK == 4096U && SRX_ENTRIES + 1U == SRX_BLOCK / SRX_PAGE, ' in glue
+    assert "#if !defined(CONFIG_SPIFFS_USE_MAGIC) || !defined(CONFIG_SPIFFS_USE_MAGIC_LENGTH)" in glue
+    register = _body(glue, "static srx_area_state_t redo_register(void)")
+    assert "s_partition->erase_size != SRX_BLOCK || s_partition->size % SRX_BLOCK" in register
+    assert "uint32_t page = CONFIG_SPIFFS_PAGE_SIZE, block = SRX_BLOCK;" in _body(glue, "void storage_repair_boot(void)")
+    core = (MAIN / "storage_repair_core.c").read_text()
+    assert "_Static_assert(SPIFFS_USE_MAGIC && SPIFFS_USE_MAGIC_LENGTH, " in core
+    geometry = _body(core, "static bool redo_geometry(const run_t *r)")
+    assert "r->page_size == SRX_PAGE && r->block_size == SRX_BLOCK && r->ppb == SRX_ENTRIES + 1U" in geometry
+    round_ = _body(core, "static SR_NOINLINE void reclaim_round(run_t *r, const char *trigger)")
+    assert "bool geometry = redo_geometry(r);" in round_
+    assert "r->ports->remount && r->rx &&\n        geometry;" in round_
+    assert "!redo_geometry(r)) return true;" in _body(core, "static SR_NOINLINE bool load_sources(run_t *r)")
+    assert "redo_geometry(r)" in _body(core, "static bool round_possible(const run_t *r)")

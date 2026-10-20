@@ -259,12 +259,15 @@ uint32_t srp_crc32(uint32_t crc, const void *data, size_t length);
  * foreign); never cleared. ACTIVE: a round may have records not yet done.
  * SOURCES: records found open must become byte sources, never be redone (a
  * boot could not inspect the area while a round was active, so the store
- * may have been mounted since). */
+ * may have been mounted since). HELD: the area holds byte sources not yet
+ * retired (round 1 review, low): a boot that cannot read it leaves the
+ * queues' unreadable bytes for one that can. */
 #define SRP_RECLAIM_VERSION 1U
 enum {
     SRP_RECLAIM_CLAIMED = 1U << 0,
     SRP_RECLAIM_ACTIVE = 1U << 1,
     SRP_RECLAIM_SOURCES = 1U << 2,
+    SRP_RECLAIM_HELD = 1U << 3,
 };
 typedef struct {
     uint32_t version, flags, reclaim_id, rounds, blocks, pages_freed;

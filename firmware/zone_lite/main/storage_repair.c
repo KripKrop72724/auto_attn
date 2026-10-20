@@ -60,6 +60,14 @@ static const char *TAG = "storage_repair";
 /* While a block's window is open (its magic cleared, not yet programmed
  * back) the hard deadline waits once, this long, before it restarts. */
 #define SR_WINDOW_GRACE_US 2000000LL
+/* The redo records and the round hold Zone Lite's SPIFFS geometry: 256-byte
+ * pages in 4 KiB blocks, with SPIFFS's length magic (round 1 review, low 5;
+ * the engine checks the mounted geometry again before any round). */
+_Static_assert(CONFIG_SPIFFS_PAGE_SIZE == SRX_PAGE, "the redo records hold 256-byte SPIFFS pages");
+_Static_assert(SRX_BLOCK == 4096U && SRX_ENTRIES + 1U == SRX_BLOCK / SRX_PAGE, "the redo records hold 4 KiB blocks");
+#if !defined(CONFIG_SPIFFS_USE_MAGIC) || !defined(CONFIG_SPIFFS_USE_MAGIC_LENGTH)
+#error "the redo records assume SPIFFS's length magic"
+#endif
 
 typedef struct {
     char level[6], code[40], message[200];
@@ -496,6 +504,8 @@ static srx_area_state_t redo_register(void)
     }
     esp_partition_iterator_release(it);
     if (!clear) return SRX_AREA_ABSENT;
+    /* The store's blocks are the records' (low 5). */
+    if (!s_partition || s_partition->erase_size != SRX_BLOCK || s_partition->size % SRX_BLOCK) return SRX_AREA_ABSENT;
     if (esp_partition_register_external(NULL, SR_REDO_OFFSET, SR_REDO_BYTES, "srp_redo", ESP_PARTITION_TYPE_DATA,
                                         (esp_partition_subtype_t)SR_REDO_SUBTYPE, &s_redo) != ESP_OK) {
         s_redo = NULL;
@@ -508,8 +518,12 @@ static srx_area_state_t redo_register(void)
  * C2, M1): the area read, every record a reset left open completed on raw
  * flash (or made a byte source), the reclaim journal updated. A round that
  * may have open records nobody could inspect makes them sources for later
- * boots; when even that cannot be journaled the store stays unmounted. */
-static void redo_recover(srr_config_t *config)
+ * boots; when even that cannot be journaled the store stays unmounted.
+ * Without the deadline (`timed` false) nothing is written to the store or
+ * the area: open records go to the journal as sources, as for an area that
+ * cannot be read (round 1 review, low 2). The breadcrumb names the reformat
+ * only while recovery acts on an open record. */
+static void redo_recover(srr_config_t *config, bool timed)
 {
     memset(&s_area, 0, sizeof(s_area));
     srp_reclaim_t journal;
@@ -526,21 +540,27 @@ static void redo_recover(srr_config_t *config)
     } else if (!work || !s_bounce) {
         s_area.state = SRX_AREA_NO_MEMORY;
     } else {
-        boot_report_repair(SRP_PHASE_REFORMAT, 0, false);
         srx_discover(&REDO_IO, have && (journal.flags & SRP_RECLAIM_CLAIMED), work, &s_area);
-        inspected = s_area.state == SRX_AREA_READY || s_area.state == SRX_AREA_FOREIGN;
-        if (inspected)
+        inspected = timed && (s_area.state == SRX_AREA_READY || s_area.state == SRX_AREA_FOREIGN);
+        uint32_t records_open = 0;
+        for (uint32_t s = 0; s < s_area.slots; ++s) records_open += s_area.slot[s] == SRX_SLOT_OPEN;
+        if (inspected && records_open) {
+            boot_report_repair(SRP_PHASE_REFORMAT, 0, false);
             open = srx_recover(&REDO_IO, s_partition->size / SRX_BLOCK, config->image_tag,
                                have && (journal.flags & SRP_RECLAIM_SOURCES), work, &s_area);
+        }
     }
     heap_caps_free(work);
-    if (have && srx_journal_after_recovery(&journal, inspected, open) &&
+    if (have && srx_journal_after_recovery(&journal, inspected, open, srx_sources_left(&s_area)) &&
         !port_nvs_store(NULL, SRR_NVS_NAMESPACE, "reclaim", &journal, sizeof(journal)) &&
         (journal.flags & SRP_RECLAIM_SOURCES)) {
         s_mount_blocked = true;
         queue_line("ERROR", "STORAGE_REPAIR_RECLAIM_SOURCES",
                    "an interrupted reformat could not be journaled; the store stays unmounted this boot");
     }
+    /* Byte sources this boot cannot read: the queues' unreadable bytes wait
+     * for a boot that can (round 1 review, low). */
+    config->sources_unread = have && srx_sources_unread(&journal, inspected);
     config->area = &s_area;
 }
 
@@ -585,10 +605,11 @@ void storage_repair_boot(void)
     s_last_yield_us = esp_timer_get_time();
     s_soft_deadline_us = s_last_yield_us + limit - SR_SOFT_MARGIN_US;
     /* 2.7.6: a block a reset left half reformatted is completed first, on raw
-     * flash, whatever else this boot can or cannot do. */
-    redo_recover(&config);
+     * flash, whatever else this boot can or cannot do (with the deadline). */
+    redo_recover(&config, timed);
     if (!timed) {
-        /* No deadline, no run: a hang here could never roll back. */
+        /* No deadline, no run: a hang here could never roll back. Nothing was
+         * written to the store or the area. */
         ESP_LOGE(TAG, "deadline timer unavailable; storage repair skipped");
         s_report.result = SRR_RESULT_NOT_RUN;
         snprintf(s_report.error_stage, sizeof(s_report.error_stage), "deadline");
@@ -601,13 +622,16 @@ void storage_repair_boot(void)
         note_area();
         /* Records an earlier run left still go to ADD. */
         count_records();
+        /* This boot's repair is over: a crash later in it is not the
+         * repair's (round 1 review, low 2). */
+        boot_report_repair_returned();
         return;
     }
     boot_report_repair(SRP_PHASE_SURVEY, 0, false);
 
     /* Internal: SPIFFS's own buffers and the lock (flash operations cannot
      * run from PSRAM stacks or need internal buffers). */
-    uint32_t page = CONFIG_SPIFFS_PAGE_SIZE, block = 4096U;
+    uint32_t page = CONFIG_SPIFFS_PAGE_SIZE, block = SRX_BLOCK;
     memset(&s_efs, 0, sizeof(s_efs));
     memset(&s_fs, 0, sizeof(s_fs));
     s_fds_bytes = SR_FD_COUNT * sizeof(spiffs_fd);

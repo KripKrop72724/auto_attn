@@ -522,9 +522,23 @@ static void redo_plan(void)
 {
     /* The low magics D2 found: block 983 of 2,048 is 0x0000. */
     assert(srx_spiffs_magic(2048, 983) == 0 && !srx_magic_strong(2048, 983));
+    /* Round 1 review, D3: block 810's magic is 0x00FF. The window clears it
+     * to 0x0000 and an erase cut short leaves each byte erased or not (the
+     * harness's NOR model), so it can read valid over a half-erased block. */
+    assert(srx_spiffs_magic(2048, 810) == 0x00FF && !srx_magic_strong(2048, 810));
     unsigned weak = 0;
     for (uint32_t b = 0; b < 2048; ++b) weak += !srx_magic_strong(2048, b);
-    assert(weak == 67);
+    assert(weak == 68);
+    /* Every store size the firmware or the harness uses: no strong magic can
+     * read valid after a byte-wise torn erase of its cleared value. */
+    for (uint32_t blocks = 64; blocks <= 4096; blocks *= 2)
+        for (uint32_t b = 0; b < blocks; ++b) {
+            uint16_t magic = srx_spiffs_magic(blocks, b);
+            for (unsigned tear = 0; tear < 4; ++tear) {
+                uint16_t reads = (uint16_t)(((tear & 1U) ? 0x00FFU : 0U) | ((tear & 2U) ? 0xFF00U : 0U));
+                assert(reads != magic || !srx_magic_strong(blocks, b));
+            }
+        }
     srx_entry_t e[15];
     /* Interior and tail drops; the referenced deleted page stays. */
     rx_block(3, "uudurddfffffff" "f");
@@ -637,25 +651,63 @@ static void redo_records(void)
     memcpy(sector, rx_area, 4096);
     assert(srx_decode(sector, &r, NULL));
     memcpy(raw, rx_store + 10 * 4096, 4096);
-    assert(srx_decide(&r, raw, RX_BLOCKS, 0x2760, false) == SRX_ACT_REDO);          /* the old image */
-    assert(srx_decide(&r, raw, RX_BLOCKS, 0x2750, false) == SRX_ACT_SOURCE);        /* another image */
-    assert(srx_decide(&r, raw, RX_BLOCKS, 0x2760, true) == SRX_ACT_SOURCE);         /* the journal */
+    assert(srx_decide(&r, raw, target, RX_BLOCKS, 0x2760, false) == SRX_ACT_REDO);          /* the old image */
+    assert(srx_decide(&r, raw, target, RX_BLOCKS, 0x2750, false) == SRX_ACT_SOURCE);        /* another image */
+    assert(srx_decide(&r, raw, target, RX_BLOCKS, 0x2760, true) == SRX_ACT_SOURCE);         /* the journal */
     memcpy(raw, target, 4096);
-    assert(srx_decide(&r, raw, RX_BLOCKS, 0x2760, false) == SRX_ACT_REASSERT);      /* complete */
+    assert(srx_decide(&r, raw, target, RX_BLOCKS, 0x2760, false) == SRX_ACT_REASSERT);      /* complete */
     memset(raw, 0xFF, 4096);
-    assert(srx_decide(&r, raw, RX_BLOCKS, 0x2760, false) == SRX_ACT_REDO);          /* no magic */
+    assert(srx_decide(&r, raw, target, RX_BLOCKS, 0x2760, false) == SRX_ACT_REDO);          /* no magic */
     put16_at(raw + 252, srx_spiffs_magic(RX_BLOCKS, 10));
-    assert(srx_decide(&r, raw, RX_BLOCKS, 0x2760, false) == SRX_ACT_CHANGED);       /* mounted since */
+    assert(srx_decide(&r, raw, target, RX_BLOCKS, 0x2760, false) == SRX_ACT_CHANGED);       /* mounted since */
+    assert(srx_decide(&r, raw, NULL, RX_BLOCKS, 0x2760, false) == SRX_ACT_CHANGED);
+    /* Round 1 review, D3: the window's erase cut short with the magic
+     * reading valid (each byte of the block with its magic cleared erased or
+     * kept, bits only set): redone. The same with a page programmed since in
+     * an erased entry, or a kept byte cleared, or no kept byte left (a
+     * mount's erase): changed. */
+    for (unsigned trial = 0; trial < 64; ++trial) {
+        memcpy(raw, rx_store + 10 * 4096, 4096);
+        put16_at(raw + 252, 0);
+        uint32_t state = 0x9E3779B9U * (trial + 1);
+        for (uint32_t i = 0; i < 4096; ++i) {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            if (trial % 2 ? state & 1U : (state & 7U) == 0) raw[i] = 0xFF;
+            else if (trial % 4 == 3) raw[i] |= (uint8_t)state;    /* partly erased bits */
+        }
+        put16_at(raw + 252, srx_spiffs_magic(RX_BLOCKS, 10));
+        assert(srx_torn_erase(&r, raw, target) && srx_decide(&r, raw, target, RX_BLOCKS, 0x2760, false) == SRX_ACT_REDO);
+        assert(srx_decide(&r, raw, target, RX_BLOCKS, 0x2750, false) == SRX_ACT_SOURCE);
+        assert(srx_decide(&r, raw, target, RX_BLOCKS, 0x2760, true) == SRX_ACT_SOURCE);
+    }
+    memcpy(raw, rx_store + 10 * 4096, 4096);
+    memset(raw + 2048, 0xFF, 2048);
+    put16_at(raw + 252, srx_spiffs_magic(RX_BLOCKS, 10));
+    assert(srx_decide(&r, raw, target, RX_BLOCKS, 0x2760, false) == SRX_ACT_REDO);
+    raw[(1 + 9) * 256 + 7] = 0x12;                                                      /* an erased entry written */
+    assert(!srx_torn_erase(&r, raw, target) && srx_decide(&r, raw, target, RX_BLOCKS, 0x2760, false) == SRX_ACT_CHANGED);
+    memcpy(raw, rx_store + 10 * 4096, 4096);
+    put16_at(raw + 252, srx_spiffs_magic(RX_BLOCKS, 10));
+    raw[(1 + 0) * 256 + 40] &= 0x0F;                                                     /* a kept byte cleared */
+    assert(srx_decide(&r, raw, target, RX_BLOCKS, 0x2760, false) == SRX_ACT_CHANGED);
+    memset(raw, 0xFF, 4096);
+    put16_at(raw + 254, 13);
+    put16_at(raw + 252, srx_spiffs_magic(RX_BLOCKS, 10));
+    memset(raw + (1 + 2) * 256, 0x33, 256);                                             /* a dropped entry written */
+    put16_at(raw + 2 * 2, 9);
+    assert(!srx_torn_erase(&r, raw, target) && srx_decide(&r, raw, target, RX_BLOCKS, 0x2760, false) == SRX_ACT_CHANGED);
     srx_record_t unconfirmed = r;
     unconfirmed.flags |= SRX_FLAG_UNCONFIRMED;
-    assert(srx_decide(&unconfirmed, target, RX_BLOCKS, 0x2760, false) == SRX_ACT_SOURCE);
+    assert(srx_decide(&unconfirmed, target, target, RX_BLOCKS, 0x2760, false) == SRX_ACT_SOURCE);
     srx_record_t tired = r;
     tired.attempts = 0xFFFFFFF0U;
     memset(raw, 0xFF, 4096);
-    assert(srx_decide(&tired, raw, RX_BLOCKS, 0x2760, false) == SRX_ACT_EXHAUSTED);
+    assert(srx_decide(&tired, raw, target, RX_BLOCKS, 0x2760, false) == SRX_ACT_EXHAUSTED);
     srx_record_t done = r;
     done.done = 0;
-    assert(srx_decide(&done, raw, RX_BLOCKS, 0x2760, false) == SRX_ACT_NONE);
+    assert(srx_decide(&done, raw, target, RX_BLOCKS, 0x2760, false) == SRX_ACT_NONE);
 
     /* Recovery: a cut left the block without magic, half erased. */
     memset(rx_store + 10 * 4096, 0xFF, 2048);
@@ -746,12 +798,26 @@ static void redo_records(void)
     assert(!strcmp(srx_area_name(SRX_AREA_FOREIGN), "FOREIGN"));
     /* The journal after recovery (C2). */
     srp_reclaim_t k = {.flags = SRP_RECLAIM_CLAIMED | SRP_RECLAIM_ACTIVE};
-    assert(srx_journal_after_recovery(&k, false, 0) && (k.flags & SRP_RECLAIM_SOURCES) && srp_reclaim_valid(&k));
-    assert(!srx_journal_after_recovery(&k, false, 0));
-    assert(srx_journal_after_recovery(&k, true, 0) && k.flags == SRP_RECLAIM_CLAIMED);
-    assert(srx_journal_after_recovery(&k, true, 2) && (k.flags & SRP_RECLAIM_SOURCES) && (k.flags & SRP_RECLAIM_ACTIVE));
+    assert(srx_journal_after_recovery(&k, false, 0, 0) && (k.flags & SRP_RECLAIM_SOURCES) && srp_reclaim_valid(&k));
+    assert(!srx_journal_after_recovery(&k, false, 0, 0) && srx_sources_unread(&k, false) && !srx_sources_unread(&k, true));
+    assert(srx_journal_after_recovery(&k, true, 0, 0) && k.flags == SRP_RECLAIM_CLAIMED);
+    assert(srx_journal_after_recovery(&k, true, 2, 0) && (k.flags & SRP_RECLAIM_SOURCES) && (k.flags & SRP_RECLAIM_ACTIVE));
     srp_reclaim_t idle = {.flags = SRP_RECLAIM_CLAIMED};
-    assert(!srx_journal_after_recovery(&idle, false, 0) && !srx_journal_after_recovery(&idle, true, 0));
+    assert(!srx_journal_after_recovery(&idle, false, 0, 0) && !srx_journal_after_recovery(&idle, true, 0, 0));
+    assert(!srx_sources_unread(&idle, false));
+    /* Round 1 review, low: HELD follows the inspected area's source records,
+     * so a later boot that cannot read the area knows bytes may be there. */
+    assert(srx_journal_after_recovery(&idle, true, 0, 3) && idle.flags == (SRP_RECLAIM_CLAIMED | SRP_RECLAIM_HELD));
+    assert(!srx_journal_after_recovery(&idle, false, 0, 0) && idle.flags == (SRP_RECLAIM_CLAIMED | SRP_RECLAIM_HELD));
+    assert(srx_sources_unread(&idle, false) && !srx_sources_unread(&idle, true));
+    assert(srx_journal_after_recovery(&idle, true, 0, 0) && idle.flags == SRP_RECLAIM_CLAIMED && srp_reclaim_valid(&idle));
+    srx_area_t held_area;
+    memset(&held_area, 0, sizeof(held_area));
+    held_area.slots = 4;
+    held_area.slot[1] = SRX_SLOT_SOURCE;
+    held_area.slot[2] = SRX_SLOT_RETIRED;
+    held_area.slot[3] = SRX_SLOT_SOURCE;
+    assert(srx_sources_left(&held_area) == 2);
 }
 
 int main(void)

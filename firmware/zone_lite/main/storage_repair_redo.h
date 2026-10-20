@@ -79,8 +79,10 @@ typedef struct {
 } srx_record_t;
 
 uint16_t srx_spiffs_magic(uint32_t block_count, uint32_t block);
-/* At least three set bits: clearing it always invalidates it, and a torn
- * erase cannot plausibly make it read valid (block 983 of 2,048 has 0x0000). */
+/* At least three set bits and not every byte 0x00 or 0xFF: clearing it
+ * always invalidates it, and an erase cut short (each byte erased or not)
+ * cannot make it read valid again (block 983 of 2,048 has 0x0000, block 810
+ * 0x00FF). */
 bool srx_magic_strong(uint32_t block_count, uint32_t block);
 /* The block's lookup page (at least 256 bytes) carries its valid magic. */
 bool srx_has_magic(const uint8_t *lookup, uint32_t block_count, uint32_t block);
@@ -225,11 +227,18 @@ typedef enum {
     SRX_ACT_SOURCE,       /* another image's, or an unconfirmed image's, or the journal says so */
     SRX_ACT_EXHAUSTED,    /* its attempts used */
     SRX_ACT_REASSERT,     /* the block is the target: magic and erase count again, then done */
-    SRX_ACT_REDO,         /* no magic, or the old image: the window again from the record */
+    SRX_ACT_REDO,         /* no magic, the old image, or its erase torn: the window again from the record */
     SRX_ACT_CHANGED,      /* something mounted and wrote the block: a source */
 } srx_action_t;
-srx_action_t srx_decide(const srx_record_t *record, const uint8_t *raw_block, uint32_t block_count,
-                        uint32_t running_tag, bool force_sources);
+/* `target`: the record's expanded target (NULL: a block with a valid magic
+ * that is neither the old image nor the target is CHANGED). With it, such a
+ * block that reads as the window's own erase cut short (srx_torn_erase) is
+ * redone. */
+srx_action_t srx_decide(const srx_record_t *record, const uint8_t *raw_block, const uint8_t *target,
+                        uint32_t block_count, uint32_t running_tag, bool force_sources);
+/* The block reads as an erase of its window cut short: every byte the record
+ * holds is there with bits only set, and some kept byte is not erased. */
+bool srx_torn_erase(const srx_record_t *record, const uint8_t *raw_block, const uint8_t *target);
 
 /* Boot recovery on raw flash, before any mount, in every mode: every open
  * record in sequence order, per srx_decide. `work`: 3 x 4096 bytes. Returns
@@ -243,7 +252,15 @@ uint32_t srx_recover(const srx_io_t *io, uint32_t block_count, uint32_t running_
  * An active round whose records could not be inspected, or that recovery
  * left open, sets SOURCES: the store may be mounted (and written) before a
  * later boot reads those records, so none may then be redone. An inspected
- * area with nothing left open clears ACTIVE and SOURCES. True when the
- * journal changed: the caller saves it before anything mounts the store,
- * and keeps the store unmounted when saving a new SOURCES flag fails. */
-bool srx_journal_after_recovery(srp_reclaim_t *journal, bool inspected, uint32_t open_left);
+ * area with nothing left open clears ACTIVE and SOURCES. HELD follows the
+ * inspected area: set while it holds a source record (srx_sources_left), so
+ * a boot that cannot read it knows the queues' unreadable bytes may be
+ * there. True when the journal changed: the caller saves it before anything
+ * mounts the store, and keeps the store unmounted when saving a new SOURCES
+ * flag fails. */
+bool srx_journal_after_recovery(srp_reclaim_t *journal, bool inspected, uint32_t open_left, uint32_t sources_left);
+/* Records of the area that are byte sources not yet retired. */
+uint32_t srx_sources_left(const srx_area_t *area);
+/* The engine's srr_config_t.sources_unread: the journal says records may hold
+ * bytes (ACTIVE, SOURCES or HELD) and the area was not inspected. */
+bool srx_sources_unread(const srp_reclaim_t *journal, bool inspected);

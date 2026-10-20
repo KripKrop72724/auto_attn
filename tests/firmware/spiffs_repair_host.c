@@ -191,6 +191,12 @@ static bool raw_erase(void *context, uint32_t address, uint32_t length)
 static srm_mirror_t mirror;
 static bool use_mirror;
 static uint8_t *mirror_lookup, *mirror_headers, mirror_scratch[BLOCK];
+/* 2.7.6 (round 1 review, low 4): the device's remount after a round keeps
+ * its mirror (SPIFFS reads it through the HAL; writes, erases and refreshes
+ * kept it current), so the harness's does too, and checks it against one
+ * read fresh from flash. */
+static bool keep_mirror;
+static uint32_t mirror_inits, mirror_compares;
 
 static s32_t hal_read(struct spiffs_t *fs, u32_t addr, u32_t size, u8_t *dst)
 {
@@ -239,11 +245,13 @@ static s32_t mount_with(spiffs_check_callback callback)
     cfg.phys_erase_block = BLOCK;
     cfg.log_block_size = BLOCK;
     cfg.log_page_size = PAGE;
-    if (use_mirror) {
+    if (use_mirror && !keep_mirror) {
         static const srm_flash_t raw = {NULL, raw_read, raw_write, raw_erase};
         CHECK(srm_init(&mirror, &raw, flash_size, BLOCK, PAGE, mirror_lookup, mirror_headers, mirror_scratch,
                        sizeof(mirror_scratch)), "mirror init");
+        mirror_inits++;
     }
+    keep_mirror = false;
     callback_used = callback == srr_check_callback;
     return SPIFFS_mount(&fs, &cfg, work_buf, fd_buf, sizeof(fd_buf), cache_buf, sizeof(cache_buf), callback);
 }
@@ -332,6 +340,8 @@ static void nvs_clear(void)
 static bool redo_enabled = true; /* false: no redo area, the store is left as 2.7.5 leaves it */
 static bool redo_unreadable;     /* this boot cannot read the area */
 static uint32_t redo_windows;    /* windows opened (magic cleared) */
+static uint64_t window_ops[512]; /* flash_ops as each window of this boot's rounds opened */
+static uint32_t window_count;
 static bool redo_read(void *context, uint32_t address, void *buffer, uint32_t length)
 {
     (void)context;
@@ -356,6 +366,7 @@ static void redo_window(void *context, bool open)
     if (!open) return;
     redo_windows++;
     if (round_active && !first_window_ops) first_window_ops = flash_ops;
+    if (round_active && window_count < sizeof(window_ops) / sizeof(window_ops[0])) window_ops[window_count++] = flash_ops;
 }
 static void port_log(void *context, const char *level, const char *code, const char *message);
 static const srx_io_t redo_io = {
@@ -376,10 +387,12 @@ typedef struct allocation {
 } allocation_t;
 static allocation_t allocations = {&allocations, &allocations, 0, 0};
 
+static size_t fail_alloc_bytes; /* an allocation of exactly this size fails (2.7.6: the round's 16 KiB) */
 static void *port_alloc(void *context, size_t bytes)
 {
     (void)context;
     if (memory_limit && memory_in_use + bytes > memory_limit) return NULL;
+    if (fail_alloc_bytes && bytes == fail_alloc_bytes) return NULL;
     allocation_t *a = malloc(sizeof(allocation_t) + bytes);
     if (!a) return NULL;
     a->bytes = bytes;
@@ -468,11 +481,43 @@ static bool port_after_check(void *context, uint32_t pass)
 }
 static s32_t mount_with(spiffs_check_callback callback);
 static void round_ended(void);
+/* The kept mirror equals one read fresh from flash (a lookup page's own
+ * header slot aside: the mirror serves that page from its lookup copy). */
+static void check_kept_mirror(void)
+{
+    static uint8_t *lookup, *headers;
+    static size_t lookup_size, header_size;
+    size_t need_lookup = srm_lookup_bytes(flash_size, BLOCK, PAGE), need_headers = srm_header_bytes(flash_size, PAGE);
+    if (lookup_size < need_lookup) {
+        free(lookup);
+        lookup = malloc(lookup_size = need_lookup);
+    }
+    if (header_size < need_headers) {
+        free(headers);
+        headers = malloc(header_size = need_headers);
+    }
+    static const srm_flash_t raw = {NULL, raw_read, raw_write, raw_erase};
+    srm_mirror_t fresh;
+    uint64_t reads = flash_reads;
+    CHECK(srm_init(&fresh, &raw, flash_size, BLOCK, PAGE, lookup, headers, mirror_scratch, sizeof(mirror_scratch)),
+          "fresh mirror");
+    flash_reads = reads;
+    CHECK(mirror.valid && !memcmp(mirror.lookup, lookup, need_lookup), "the kept mirror's lookup pages differ from flash");
+    for (uint32_t page = 0; page < flash_size / PAGE; ++page)
+        CHECK(page % (BLOCK / PAGE) == 0 || !memcmp(mirror.headers + page * 5, headers + page * 5, 5),
+              "the kept mirror's header of page %u differs from flash", page);
+    mirror_compares++;
+}
+
 static bool port_remount(void *context)
 {
     (void)context;
     round_ended();
     SPIFFS_unmount(&fs);
+    if (use_mirror) {
+        check_kept_mirror();
+        keep_mirror = true;
+    }
     return mount_with(srr_check_callback) == SPIFFS_OK;
 }
 static bool port_raw_read(void *context, uint32_t address, void *buffer, uint32_t length)
@@ -490,11 +535,18 @@ static int32_t port_nvs_available(void *context)
     (void)context;
     return nvs_available_now;
 }
+static uint32_t prefer_block = UINT32_MAX; /* a round takes this candidate first */
+static bool port_prefer(void *context, uint32_t block)
+{
+    (void)context;
+    return block == prefer_block;
+}
 static srr_ports_t ports = {
     .alloc = port_alloc, .release = port_release, .keep_going = port_keep_going, .remaining_ms = port_remaining,
     .now_ms = port_now, .log = port_log, .nvs_load = port_nvs_load, .nvs_store = port_nvs_store,
     .nvs_erase = port_nvs_erase, .phase = port_phase, .after_check = port_after_check,
     .raw_read = port_raw_read, .refresh = port_refresh, .window = redo_window, .nvs_available = port_nvs_available,
+    .prefer = port_prefer,
 };
 
 static srr_config_t repair_config(void)
@@ -545,10 +597,11 @@ static void premount(srr_config_t *config)
     boot_open_left = inspected ? srx_recover(&redo_io, flash_size / BLOCK, config->image_tag,
                                              have && (journal.flags & SRP_RECLAIM_SOURCES), work, &boot_area)
                                : 0;
-    if (have && srx_journal_after_recovery(&journal, inspected, boot_open_left)) {
+    if (have && srx_journal_after_recovery(&journal, inspected, boot_open_left, srx_sources_left(&boot_area))) {
         bool saved = !journal_refused && port_nvs_store(NULL, SRR_NVS_NAMESPACE, "reclaim", &journal, sizeof(journal));
         mount_blocked = !saved && (journal.flags & SRP_RECLAIM_SOURCES);
     }
+    config->sources_unread = have && srx_sources_unread(&journal, inspected);
     ports.redo = &redo_io;
     ports.remount = port_remount;
     config->area = &boot_area;
@@ -559,6 +612,7 @@ static void repair_boot(srr_report_t *report, const srr_config_t *base)
     uint64_t start_ops = flash_ops, start_reads = flash_reads;
     srr_config_t copy = *base, *config = &copy;
     boot_runs = 0;
+    window_count = 0;
     premount(config);
     if (mount_blocked) {
         memset(report, 0, sizeof(*report));
@@ -5211,6 +5265,13 @@ static void run_reclaim_p02(uint32_t kib, bool unconfirmed, bool unheld)
     uint32_t pending = 0, sources = 0, open = 0, records = area_records(&pending, &sources, &open);
     CHECK(records >= rc->blocks && !open && !sources && (!unconfirmed || pending == records),
           "p02: %u records, %u unconfirmed, %u sources, %u open", records, pending, sources, open);
+    /* Round 1 review, low 1: ADD gets the boot's report over every run: the
+     * first run's 2.7.5 work and room figures (P02's field report: 3 x 51
+     * spans, 1 page needed, 0 erased) and the second run's spans too. */
+    CHECK(report.runs == 2 && report.spans_rewritten >= 4 * p02_spans && report.room_needed == 1 &&
+              report.room_erased == 0 && report.check_skipped == false,
+          "p02: the boot's report: %u runs, %u spans rewritten (%u damaged), %u pages needed, %u erased", report.runs,
+          report.spans_rewritten, p02_spans, report.room_needed, report.room_erased);
     if (unconfirmed) CHECK(rc->unconfirmed_blocks > 0, "p02 unconfirmed: no block holding nothing any image reads");
     if (kib >= 8192) CHECK(rc->low_magic_blocks > 0, "p02 8 MiB: no weak-magic block kept out");
     verify_reclaimed("p02");
@@ -5221,6 +5282,33 @@ static void run_reclaim_p02(uint32_t kib, bool unconfirmed, bool unheld)
            kib, unconfirmed ? " unconfirmed" : " confirmed", unheld ? " with no holds" : "", 3 * p02_spans, rc->blocks,
            rc->pages_freed, rc->pages_kept, rc->candidates, rc->unconfirmed_blocks, rc->custody_blocks,
            rc->index_blocks, rc->excluded_blocks, rc->low_magic_blocks, rc->ms);
+}
+
+/* Round 1 review, low 1: 2.7.6 straight on P02's store (2.7.5 never ran):
+ * the boot's report keeps the first run's strays, duplicate and cursor
+ * reset, and the file entry of the queue whose cursor it reset. */
+static void run_reclaim_p02_direct(uint32_t kib)
+{
+    seed(61050 + kib);
+    nvs_clear();
+    format_flash(kib);
+    build_p02();
+    srr_config_t config = config_2760(false);
+    srr_report_t report;
+    repair_boot(&report, &config);
+    bool reset_noted = false;
+    for (uint32_t i = 0; i < report.file_count; ++i)
+        reset_noted |= !strcmp(report.file[i].name, "/add_live.jsonl") &&
+            (report.file[i].actions & SRR_FILE_CURSOR_RESET);
+    CHECK(report.result == SRR_RESULT_REPAIRED && report.runs == 2 && report.strays_removed >= 4 &&
+              report.duplicates_removed >= 1 && report.cursors_reset >= 1 && report.orphan_index_removed > 0 &&
+              report.room_needed == 1 && reset_noted && report.reclaim.blocks > 0,
+          "p02 direct: %s, %u runs, %u strays, %u duplicates, %u cursors reset (noted %d), %u orphans, %u pages needed",
+          srr_result_name(report.result), report.runs, report.strays_removed, report.duplicates_removed,
+          report.cursors_reset, reset_noted, report.orphan_index_removed, report.room_needed);
+    printf("p02 %u KiB, 2.7.6 first: the boot's report keeps the first run's strays, duplicate, cursor reset and "
+           "room figures over its %u runs (%u strays, %u spans rewritten in all)\n", kib, report.runs,
+           report.strays_removed, report.spans_rewritten);
 }
 
 /* ---- cuts at every write of the round ------------------------------------ */
@@ -5602,8 +5690,14 @@ static void run_reclaim_mirror(uint32_t kib)
     snapshot_t after = snapshot_take();
     snapshot_put(&image);
     use_mirror = true;
+    mirror_inits = mirror_compares = 0;
     repair_boot(&mirrored, &config);
     use_mirror = false;
+    /* The device's remount: one mirror for the boot, kept across the round's
+     * remount and equal to flash there. */
+    CHECK(mirror_inits == 1 && mirror_compares == mirrored.reclaim.rounds && mirror_compares >= 1,
+          "reclaim: %u mirror inits, %u kept-mirror checks for %u rounds", mirror_inits, mirror_compares,
+          mirrored.reclaim.rounds);
     CHECK(!memcmp(flash, after.flash, flash_size) && !memcmp(nvs.redo, after.nvs->redo, REDO_BYTES),
           "reclaim: the mirror changed the store or the redo area");
     CHECK(plain.result == mirrored.result && plain.reclaim.blocks == mirrored.reclaim.blocks &&
@@ -5640,6 +5734,350 @@ static void run_redo_cuts(uint32_t kib)
     printf("redo: %u cuts inside the boot recovery's redo, custody byte-exact, no gap\n", runs);
 }
 
+/* ---- round 1 review of the implementation ---------------------------------- */
+/* The records in the redo area, oldest first: the i-th opened the round's
+ * i-th window (no retries in these stores). */
+static uint32_t records_by_sequence(srx_record_t *out, uint32_t *slots, uint32_t capacity)
+{
+    static uint8_t sector[4096];
+    uint32_t n = 0;
+    for (uint32_t slot = 0; slot < REDO_BYTES / 4096; ++slot) {
+        srx_record_t r;
+        memcpy(sector, nvs.redo + slot * 4096, 4096);
+        if (!srx_decode(sector, &r, NULL) || n == capacity) continue;
+        uint32_t at = n++;
+        while (at && out[at - 1].sequence > r.sequence) {
+            out[at] = out[at - 1];
+            slots[at] = slots[at - 1];
+            --at;
+        }
+        out[at] = r;
+        slots[at] = slot;
+    }
+    return n;
+}
+
+/* Data pages of the file a record keeps that its index names now (the
+ * store as the round began). */
+static uint32_t kept_pages_of(const uint8_t *sector, const srx_record_t *r, const char *name)
+{
+    uint16_t obj = object_of(name);
+    uint32_t n = 0;
+    for (uint32_t e = 0; e < SRX_ENTRIES; ++e) {
+        const uint8_t *page = srx_kept_page(sector, r, e);
+        if (!page || srx_get16(page) != obj) continue;
+        n += rd16(entry_address(name, srx_get16(page + 2))) == r->block * 16U + 1U + e;
+    }
+    return n;
+}
+
+/* A block of P02's queue holding at least six pages its index names, the
+ * rest deleted pages: a round given it first puts a window over the queue's
+ * own bytes (the round's ranking takes blocks of deleted pages first). */
+static uint32_t p02_queue_block(void)
+{
+    model_file_t *pending = model_of("/pending.jsonl");
+    uint16_t obj = object_of(pending->name);
+    uint32_t spans = pending->size / SPAN;
+    for (uint32_t sp = spans / 3; sp + 30 < spans; ++sp) {
+        uint32_t b = rd16(entry_address(pending->name, sp)) / 16, kept = 0, dropped = 0;
+        bool ok = true;
+        for (uint32_t e = 1; e < 16 && ok; ++e) {
+            uint32_t q = b * 16 + e;
+            uint16_t lu = rd16(lookup_address(q));
+            if (lu == 0) {
+                dropped += !(flash[q * PAGE + 4] & SPIFFS_PH_FLAG_DELET);
+                continue;
+            }
+            if (lu == 0xFFFF) continue;
+            ok = lu == obj && rd16(q * PAGE) == obj && rd16(entry_address(pending->name, rd16(q * PAGE + 2))) == q;
+            kept++;
+        }
+        if (ok && dropped && kept >= 6) return b;
+    }
+    return UINT32_MAX;
+}
+
+/* Round 1 review, D1 and the low finding: a cut in the window of a block
+ * holding the queue's referenced pages, then a boot that cannot read the
+ * redo area (SOURCES journaled, the mount erases the block), then boots that
+ * can. CURSOR_STALE: an early span nothing can read and a cursor past it
+ * whose prefix CRC is another file's (the reviewer's scenario: block 133 of
+ * the 1 MiB store, seed 64007); it cannot be verified (PREFIX_GAP, left as
+ * it is). CURSOR_BEFORE: the same damage, a valid cursor before it.
+ * CURSOR_PAST: no damage, a valid cursor past the window's spans (its rows
+ * delivered). Records keep only a verified cursor offset, and no offset
+ * settles bytes the file can still get back (D1): every readable byte comes
+ * back. Gap records name only the bytes nobody could read (low: the boot
+ * without the area leaves the queue's unreadable bytes alone instead of
+ * filling them). */
+enum { CURSOR_STALE, CURSOR_BEFORE, CURSOR_PAST };
+static void run_unread_area(uint32_t kib, void (*build)(void), const char *what, int mode)
+{
+    bool stale = mode == CURSOR_STALE;
+    srr_config_t config = config_2760(false);
+    bool p02 = build == build_p02;
+    uint64_t seed_value = p02 ? 64007 : 64510 + kib;
+    seed(seed_value);
+    nvs_clear();
+    format_flash(kib);
+    build();
+    model_file_t *pending = model_of("/pending.jsonl");
+    uint16_t obj = object_of(pending->name);
+    if (mode != CURSOR_PAST) {
+        uint32_t pix = rd16(entry_address(pending->name, 2));
+        wr16(pix * PAGE, 0x0155);
+        wr16(lookup_address(pix), 0x0155);
+        mark_unreadable(pending, 2);
+    }
+    uint32_t spans = pending->size / SPAN;
+    uint32_t cursor = row_boundary_after(pending, mode == CURSOR_BEFORE ? SPAN : (spans - 8) * SPAN);
+    set_cursor("legacy_queues", "ords_pending", cursor, prefix_crc(pending, cursor) ^ (stale ? 0x5A5A5A5AU : 0U), 9);
+    /* On P02 a block of the queue's own pages goes first. */
+    prefer_block = p02 ? p02_queue_block() : UINT32_MAX;
+    CHECK(!p02 || prefer_block != UINT32_MAX, "%s: no block of the queue's referenced pages", what);
+    snapshot_t image = snapshot_take();
+    srr_report_t report;
+    uint64_t start = flash_ops;
+    repair_boot(&report, &config);
+    srx_record_t records[64];
+    uint32_t slots[64], count = records_by_sequence(records, slots, 64), chosen = UINT32_MAX, kept = 0;
+    CHECK(count == window_count && count, "%s: %u records, %u windows", what, count, window_count);
+    /* D1: a record keeps the queue's cursor offset only when it was verified
+     * (a cursor past an unreadable span never is); checked once the boots
+     * below showed what an unverified one costs. */
+    uint32_t wrong_cursor = UINT32_MAX;
+    for (uint32_t i = 0; i < count; ++i)
+        for (uint32_t k = 0; k < records[i].objects; ++k) {
+            const srx_object_t *entry = &records[i].object[k];
+            bool kept_offset = (entry->flags & SRX_OBJECT_CURSOR) != 0;
+            if (entry->obj == obj && (stale ? kept_offset : !kept_offset || entry->cursor_offset != cursor))
+                wrong_cursor = records[i].sequence;
+        }
+    uint8_t *sectors = malloc((size_t)count * 4096);
+    for (uint32_t i = 0; i < count; ++i) memcpy(sectors + (size_t)i * 4096, nvs.redo + slots[i] * 4096, 4096);
+    snapshot_put(&image);
+    snapshot_free(&image);
+    /* The first window over pages the queue's index names. */
+    for (uint32_t i = 0; i < count && chosen == UINT32_MAX; ++i) {
+        kept = kept_pages_of(sectors + (size_t)i * 4096, &records[i], pending->name);
+        if (kept) chosen = i;
+    }
+    free(sectors);
+    CHECK(chosen != UINT32_MAX, "%s: no window over pages the queue's index names (%u records)", what, count);
+    uint64_t k = window_ops[chosen] - start + 2; /* the window's erase */
+    seed(seed_value);
+    CHECK(boot_with_cut_with(k, &config), "%s: the cut never came", what);
+    round_active = false;
+    redo_unreadable = true;
+    logged_count = 0;
+    repair_boot(&report, &config);
+    redo_unreadable = false;
+    CHECK(journal_flags() & SRP_RECLAIM_SOURCES, "%s: the unreadable area left the journal %x", what, journal_flags());
+    srr_report_t after;
+    boot_until_done_with(what, &config, &after);
+    prefer_block = UINT32_MAX;
+    mount_plain();
+    for (uint32_t i = 0; i < model_count; ++i) check_custody(&model[i], 1, false);
+    SPIFFS_unmount(&fs);
+    check_reclaimed_structure(what);
+    CHECK(wrong_cursor == UINT32_MAX, "%s: record %u keeps the queue's cursor offset %s", what, wrong_cursor,
+          stale ? "although it could not be verified" : "wrong or not at all although it was verified");
+    printf("%s: a cut in block %u's window (%u pages the queue's index names), then a boot without the redo area "
+           "(%s), then %s: every readable byte back, gap records only for the bytes nobody could read\n",
+           what, records[chosen].block, kept, srr_result_name(report.result), srr_result_name(after.result));
+}
+
+/* Round 1 review, D2 (T5): the check frees a held file, or changes one, and
+ * leaves no erased page, so its restore has no page (for the rebuild's
+ * header, or the changed span's new page). With a redo area the round makes
+ * room while the hold still lives and the file goes back byte for byte, with
+ * no gap record (the command dedupe file, removed or changed). When even the
+ * round cannot make room for all of it (the 30 KB queue on a store crammed
+ * with files never put in a window), what still cannot go back is recorded
+ * once, after the round. Without a redo area (2.7.5's outcome) its bytes are
+ * recorded once: the manifest entry is marked reported, so the resume adds
+ * no second record for the same range. */
+static const char *t5_victim;
+static bool t5_alter;
+static bool t5_remove_and_cram(uint32_t pass)
+{
+    if (pass != 1) return false;
+    if (t5_alter) {
+        spiffs_file f = SPIFFS_open(&fs, t5_victim, SPIFFS_O_RDWR, 0);
+        static const uint8_t junk[16] = "XXXXXXXXXXXXXXX";
+        CHECK(f >= 0 && SPIFFS_lseek(&fs, f, 300, SPIFFS_SEEK_SET) == 300 &&
+                  SPIFFS_write(&fs, f, (void *)junk, sizeof(junk)) == (s32_t)sizeof(junk),
+              "t5: change %s", t5_victim);
+        SPIFFS_close(&fs, f);
+    } else {
+        CHECK(SPIFFS_remove(&fs, t5_victim) == SPIFFS_OK, "t5: remove %s", t5_victim);
+    }
+    SPIFFS_clearerr(&fs);
+    consume_erased();
+    return true;
+}
+
+static uint32_t gaps_naming(const char *name)
+{
+    srp_gaps_t gaps = gaps_now();
+    uint32_t n = 0;
+    for (uint32_t g = 0; g < gaps.count; ++g) n += !strcmp(gaps.gap[g].name, name);
+    return n;
+}
+
+static void run_restore_room(uint32_t kib)
+{
+    static const struct {
+        const char *victim;
+        bool alter, room;
+    } cases[] = {{"/processed_commands.txt", false, true}, {"/pending.jsonl", false, false},
+                 {"/processed_commands.txt", true, true}};
+    for (uint32_t v = 0; v < sizeof(cases) / sizeof(cases[0]); ++v) {
+        for (int redo = 0; redo < 2; ++redo) {
+            redo_enabled = redo != 0;
+            seed(47000 + v);
+            nvs_clear();
+            format_flash(kib);
+            build_store(60000);
+            for (uint32_t f = 0; f < sizeof(crammed_fill_names) / sizeof(crammed_fill_names[0]); ++f)
+                write_file(crammed_fill_names[f], NULL, 0);
+            static uint8_t filler[4000];
+            memset(filler, 0x5A, sizeof(filler));
+            while (append_bytes("/filler.bin", filler, sizeof(filler))) {}
+            SPIFFS_unmount(&fs);
+            t5_victim = cases[v].victim;
+            t5_alter = cases[v].alter;
+            const char *how = t5_alter ? "changed" : "freed";
+            srr_config_t config = config_2760(false);
+            srr_report_t report;
+            check_hook = t5_remove_and_cram;
+            logged_count = 0;
+            repair_boot(&report, &config);
+            check_hook = NULL;
+            uint32_t blocks = report.reclaim.blocks;
+            if (redo && !cases[v].room) {
+                /* The round cannot make room for 30 KB here: recorded once. */
+                CHECK(!strcmp(report.reclaim.trigger, "restore") && report.reclaim.blocks > 0 &&
+                          code_logged("STORAGE_REPAIR_RESTORE_WAITING") && code_logged("STORAGE_REPAIR_RESTORE_RETRIED") &&
+                          gaps_naming(t5_victim) == 1,
+                      "t5 %s, room short after the round: %s, %u blocks, %u gap records", t5_victim,
+                      srr_result_name(report.result), report.reclaim.blocks, gaps_naming(t5_victim));
+                repair_boot(&report, &config);
+                CHECK(gaps_naming(t5_victim) == 1, "t5 %s: the same bytes recorded again (%u records)", t5_victim,
+                      gaps_naming(t5_victim));
+                printf("t5 %s %s: the round could not make room for all of it (%u blocks); recorded once after the "
+                       "round, never twice\n", t5_victim, how, blocks);
+            } else if (redo) {
+                CHECK(!strcmp(report.reclaim.trigger, "restore") && report.reclaim.blocks > 0 &&
+                          code_logged("STORAGE_REPAIR_RESTORE_WAITING") && code_logged("STORAGE_REPAIR_RESTORE_RETRIED") &&
+                          !gaps_naming(t5_victim) && report.result != SRR_RESULT_FAILED,
+                      "t5 %s %s with a redo area: %s at %s, trigger '%s', %u blocks, %u gap records", t5_victim, how,
+                      srr_result_name(report.result), report.error_stage, report.reclaim.trigger,
+                      report.reclaim.blocks, gaps_naming(t5_victim));
+                boot_until_done_with("t5, next boot", &config, NULL);
+                CHECK(!gaps_naming(t5_victim), "t5 %s: %u gap records", t5_victim, gaps_naming(t5_victim));
+                mount_plain();
+                for (uint32_t i = 0; i < model_count; ++i) check_custody(&model[i], 1, false);
+                SPIFFS_unmount(&fs);
+                printf("t5 %s %s by the check on a store without room: the round made room (%u blocks) while its "
+                       "hold lived; back byte for byte, no gap record\n", t5_victim, how, blocks);
+            } else {
+                CHECK(report.result == SRR_RESULT_FAILED && gaps_naming(t5_victim) == 1,
+                      "t5 %s %s without a redo area: %s, %u gap records", t5_victim, how,
+                      srr_result_name(report.result), gaps_naming(t5_victim));
+                repair_boot(&report, &config);
+                CHECK(gaps_naming(t5_victim) == 1, "t5 %s: the resume recorded the same bytes again (%u records)",
+                      t5_victim, gaps_naming(t5_victim));
+                printf("t5 %s %s without a redo area: recorded once (2.7.5's outcome, no second record)\n", t5_victim,
+                       how);
+            }
+        }
+    }
+    redo_enabled = true;
+    t5_alter = false;
+}
+
+/* Round 1 review, D3: an erase of a window cut short whose magic reads valid
+ * again. A strong magic cannot in the byte model (the exhaustive test in
+ * storage_repair_plan_host.c); a bit-level tear can. On the same image the
+ * block is completed from its record (it is a torn erase, not a block
+ * another image wrote), so no half-erased block mounts. */
+static void run_torn_magic(uint32_t kib)
+{
+    srr_config_t config = config_2760(false);
+    uint32_t redone = 0;
+    for (uint32_t trial = 0; trial < 6; ++trial) {
+        p02_cut_in_window(kib, 64600 + trial, &config);
+        srx_record_t records[64];
+        uint32_t slots[64], count = records_by_sequence(records, slots, 64), open = UINT32_MAX;
+        for (uint32_t i = 0; i < count && open == UINT32_MAX; ++i)
+            if (records[i].done == 0xFFFFFFFFU && !srx_is_source(&records[i])) open = i;
+        CHECK(open != UINT32_MAX, "torn magic: no open record");
+        uint32_t block = records[open].block, blocks = flash_size / BLOCK;
+        CHECK(srx_magic_strong(blocks, block), "torn magic: block %u has a weak magic", block);
+        wr16(block * BLOCK + 252, srx_spiffs_magic(blocks, block));
+        srr_report_t report;
+        logged_count = 0;
+        repair_boot(&report, &config);
+        CHECK(boot_area.redone == 1 && !boot_area.to_sources,
+              "torn magic, trial %u: block %u with a valid magic after a torn erase: %u redone, %u sources", trial, block,
+              boot_area.redone, boot_area.to_sources);
+        boot_until_done_with("torn magic", &config, &report);
+        check_models_exact("torn magic");
+        CHECK(!model_gaps(), "torn magic: %u gap records", model_gaps());
+        check_reclaimed_structure("torn magic");
+        redone++;
+    }
+    printf("torn magic: %u erases cut short with the magic reading valid, each block completed from its record\n",
+           redone);
+}
+
+/* Round 1 review, low 6: a boot whose record became a byte source cannot
+ * allocate the round's 16 KiB buffer. Without it the run would fill the
+ * spans the record holds and record them as lost: it fails before writing
+ * anything, and the next boot puts the bytes back. */
+static void run_sources_memory(uint32_t kib)
+{
+    srr_config_t config = config_2760(false);
+    seed(64007);
+    nvs_clear();
+    format_flash(kib);
+    build_p02();
+    p02_as_275();
+    prefer_block = p02_queue_block();
+    CHECK(prefer_block != UINT32_MAX, "sources without memory: no block of the queue's pages");
+    snapshot_t image = snapshot_take();
+    srr_report_t report;
+    uint64_t start = flash_ops;
+    repair_boot(&report, &config);
+    CHECK(first_window_ops > start, "sources without memory: no window opened");
+    uint64_t k = first_window_ops - start + 2; /* the window's erase, over the queue's pages */
+    snapshot_put(&image);
+    snapshot_free(&image);
+    seed(64007);
+    CHECK(boot_with_cut_with(k, &config), "sources without memory: the cut never came");
+    round_active = false;
+    prefer_block = UINT32_MAX;
+    mount_plain();
+    char row[600];
+    model_file_t *queue = model_of("/pending.jsonl");
+    for (int i = 0; i < 4; ++i) CHECK(model_try_append(queue, row, (uint32_t)json_row(row, sizeof(row))), "other writer");
+    SPIFFS_unmount(&fs);
+    fail_alloc_bytes = 4U * SRX_BLOCK;
+    logged_count = 0;
+    repair_boot(&report, &config);
+    fail_alloc_bytes = 0;
+    CHECK(report.result == SRR_RESULT_FAILED && !strcmp(report.error_stage, "sources_memory") &&
+              boot_area.to_sources == 1 && !model_gaps(),
+          "sources without memory: %s at %s, %u sources, %u gap records", srr_result_name(report.result),
+          report.error_stage, boot_area.to_sources, model_gaps());
+    boot_until_done_with("sources without memory, next boot", &config, &report);
+    check_models_exact("sources without memory");
+    CHECK(!model_gaps(), "sources without memory: %u gap records", model_gaps());
+    printf("byte sources without memory for them: the run failed before writing; the next boot put them back\n");
+}
+
 static void run_reclaim(uint32_t kib, const char *only)
 {
     const char *part = only && !strncmp(only, "reclaim-", 8) ? only + 8 : NULL;
@@ -5650,10 +6088,27 @@ static void run_reclaim(uint32_t kib, const char *only)
         run_reclaim_p02(kib, false, false);
         run_reclaim_p02(kib, true, false);
         run_reclaim_p02(kib, false, true);
+        run_reclaim_p02_direct(kib);
     }
     if (RECLAIM_PART("area")) run_reclaim_area(kib);
-    if (RECLAIM_PART("mirror")) run_reclaim_mirror(kib);
+    if (RECLAIM_PART("mirror")) {
+        run_reclaim_mirror(kib);
+        /* The device's mirror through cuts in the round (low 4). */
+        use_mirror = true;
+        run_reclaim_cuts("p02 confirmed, mirrored", build_p02, kib, false, AFTER_SAME, full ? 1 : kib > 1024 ? 83 : 5);
+        use_mirror = false;
+    }
     if (RECLAIM_PART("redo")) run_redo_cuts(kib);
+    /* Round 1 review of the implementation. */
+    if (RECLAIM_PART("stale")) {
+        run_unread_area(kib, build_p02, "p02, a stale cursor", CURSOR_STALE);
+        run_unread_area(kib, build_p02, "p02, a cursor before the damage", CURSOR_BEFORE);
+        run_unread_area(kib, build_p02, "p02, a verified cursor past the window", CURSOR_PAST);
+        run_unread_area(kib, build_gc_unsafe, "gc-unsafe, a cursor before the damage", CURSOR_BEFORE);
+    }
+    if (RECLAIM_PART("restore")) run_restore_room(kib);
+    if (RECLAIM_PART("torn")) run_torn_magic(kib);
+    if (RECLAIM_PART("sources")) run_sources_memory(kib);
     if (RECLAIM_PART("cuts")) {
         run_reclaim_cuts("p02 confirmed", build_p02, kib, false, AFTER_SAME, stride);
         run_reclaim_cuts("gc-unsafe confirmed", build_gc_unsafe, kib, false, AFTER_SAME, stride);

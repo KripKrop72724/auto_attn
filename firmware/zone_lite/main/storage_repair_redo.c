@@ -30,9 +30,16 @@ static unsigned popcount16(uint16_t v)
     return n;
 }
 
+/* Weak: two set bits or fewer, or every byte 0x00 or 0xFF (round 1 review,
+ * D3). The window clears the magic to 0x0000 before the erase; an erase cut
+ * short leaves each byte erased or not, so 0x00FF (block 810 of 2,048) or
+ * 0xFF00 can read valid again over a half-erased block. */
 bool srx_magic_strong(uint32_t block_count, uint32_t block)
 {
-    return popcount16(srx_spiffs_magic(block_count, block)) >= 3;
+    uint16_t magic = srx_spiffs_magic(block_count, block);
+    uint8_t low = (uint8_t)magic, high = (uint8_t)(magic >> 8);
+    bool bytewise = (low == 0x00 || low == 0xFF) && (high == 0x00 || high == 0xFF);
+    return popcount16(magic) >= 3 && !bytewise;
 }
 
 bool srx_has_magic(const uint8_t *lookup, uint32_t block_count, uint32_t block)
@@ -392,8 +399,35 @@ bool srx_block_busy(const srx_area_t *area, uint32_t block)
     return false;
 }
 
-srx_action_t srx_decide(const srx_record_t *r, const uint8_t *raw_block, uint32_t block_count, uint32_t running_tag,
-                        bool force_sources)
+/* An erase of the window cut short, whose magic happens to read valid (round
+ * 1 review, D3): every byte the record knows (kept pages and their lookup
+ * entries, erased entries, the lookup page's other bytes) is its byte with
+ * bits only set, as an erase sets them, and some kept byte is not erased yet.
+ * A mount's erase leaves no kept byte, and a page programmed since into a
+ * kept or erased entry clears bits the record has set. Bytes the record does
+ * not hold (dropped pages and their lookup entries, the old erase count, the
+ * cleared magic) may read anything. */
+bool srx_torn_erase(const srx_record_t *r, const uint8_t *raw_block, const uint8_t *target)
+{
+    bool remnant = false;
+    for (uint32_t e = 0; e < SRX_ENTRIES; ++e) {
+        if (r->drop_mask & (1U << e)) continue;
+        for (uint32_t i = e * 2; i < e * 2 + 2; ++i)
+            if ((raw_block[i] & target[i]) != target[i]) return false;
+        const uint8_t *now = raw_block + (1 + e) * SRX_PAGE, *want = target + (1 + e) * SRX_PAGE;
+        bool kept = (r->kept_mask & (1U << e)) != 0;
+        for (uint32_t i = 0; i < SRX_PAGE; ++i) {
+            if ((now[i] & want[i]) != want[i]) return false;
+            remnant |= kept && now[i] != 0xFF;
+        }
+    }
+    for (uint32_t i = SRX_ENTRIES * 2; i < SRX_LOOKUP_BYTES; ++i)
+        if ((raw_block[i] & target[i]) != target[i]) return false;
+    return remnant;
+}
+
+srx_action_t srx_decide(const srx_record_t *r, const uint8_t *raw_block, const uint8_t *target, uint32_t block_count,
+                        uint32_t running_tag, bool force_sources)
 {
     if (r->done != 0xFFFFFFFFU || srx_is_source(r)) return SRX_ACT_NONE;
     if ((r->flags & SRX_FLAG_UNCONFIRMED) || r->image_tag != running_tag || force_sources ||
@@ -405,6 +439,8 @@ srx_action_t srx_decide(const srx_record_t *r, const uint8_t *raw_block, uint32_
     /* No magic: no mount has happened since (any mount erases such a block),
      * so the only writes since the record are the round's own. */
     if (!srx_has_magic(raw_block, block_count, r->block) || crc == r->old_crc) return SRX_ACT_REDO;
+    /* The same image, no journal sources: only the round's own erase, torn. */
+    if (target && srx_torn_erase(r, raw_block, target)) return SRX_ACT_REDO;
     return SRX_ACT_CHANGED;
 }
 
@@ -420,7 +456,7 @@ static void recover_one(const srx_io_t *io, uint32_t slot, uint32_t block_count,
         area->failed++;
         return; /* the next boot tries again; nothing was written */
     }
-    srx_action_t action = srx_decide(&r, raw, block_count, running_tag, force_sources);
+    srx_action_t action = srx_decide(&r, raw, target, block_count, running_tag, force_sources);
     switch (action) {
     case SRX_ACT_NONE: return;
     case SRX_ACT_REASSERT: {
@@ -506,17 +542,30 @@ uint32_t srx_recover(const srx_io_t *io, uint32_t block_count, uint32_t running_
     return open;
 }
 
-bool srx_journal_after_recovery(srp_reclaim_t *journal, bool inspected, uint32_t open_left)
+bool srx_journal_after_recovery(srp_reclaim_t *journal, bool inspected, uint32_t open_left, uint32_t sources_left)
 {
     uint32_t flags = journal->flags;
     if (!inspected) {
         if (flags & SRP_RECLAIM_ACTIVE) journal->flags |= SRP_RECLAIM_SOURCES;
-    } else if (open_left) {
-        journal->flags |= SRP_RECLAIM_SOURCES | SRP_RECLAIM_ACTIVE;
     } else {
-        journal->flags &= ~(uint32_t)(SRP_RECLAIM_ACTIVE | SRP_RECLAIM_SOURCES);
+        if (open_left) journal->flags |= SRP_RECLAIM_SOURCES | SRP_RECLAIM_ACTIVE;
+        else journal->flags &= ~(uint32_t)(SRP_RECLAIM_ACTIVE | SRP_RECLAIM_SOURCES);
+        if (sources_left) journal->flags |= SRP_RECLAIM_HELD;
+        else journal->flags &= ~(uint32_t)SRP_RECLAIM_HELD;
     }
     if (journal->flags == flags) return false;
     srp_reclaim_seal(journal);
     return true;
+}
+
+uint32_t srx_sources_left(const srx_area_t *area)
+{
+    uint32_t n = 0;
+    for (uint32_t s = 0; s < area->slots; ++s) n += area->slot[s] == SRX_SLOT_SOURCE;
+    return n;
+}
+
+bool srx_sources_unread(const srp_reclaim_t *journal, bool inspected)
+{
+    return !inspected && (journal->flags & (SRP_RECLAIM_ACTIVE | SRP_RECLAIM_SOURCES | SRP_RECLAIM_HELD));
 }
