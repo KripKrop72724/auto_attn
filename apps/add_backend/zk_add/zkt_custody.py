@@ -273,6 +273,10 @@ def source_occurrence_delivery_hold(session: Session, connector: Connector, iden
     if event_id is None:
         return None  # Preserved exceptions have no attendance delivery claim.
     event = session.get(AttendanceEvent, event_id)
+    # A moved terminal's baseline links its replay to the punch the previous
+    # connector still owns (SOURCE_REPLAY_RETAINED_ELSEWHERE). This connector
+    # never delivers that row, so its occurrence stays held here; delivery
+    # remains with the owner.
     if (event is None or event.connector_id != connector.id or event.zkt_device_id != zkt.id
             or event.device_serial != manifest.terminal_serial):
         return "SOURCE_ATTENDANCE_BINDING_UNVERIFIED"

@@ -193,8 +193,30 @@ def manifest_identity_matches_event(manifest, event: AttendanceEvent) -> bool:
     )
 
 
+def owner_source_manifest(session: Session, event: AttendanceEvent):
+    """The newest source record the event's own connector and terminal binding linked.
+
+    A terminal that moved to another connector replays punches its previous
+    connector still owns. That later baseline links its own manifest to the
+    retained row only after the user, time, serial and punch all matched, so
+    it neither adds to nor revokes the owner's source evidence.
+    """
+    from zk_add.models import TerminalRecordManifest
+
+    return session.scalar(
+        select(TerminalRecordManifest)
+        .where(
+            TerminalRecordManifest.attendance_event_id == event.id,
+            TerminalRecordManifest.connector_id == event.connector_id,
+            TerminalRecordManifest.zkt_device_id == event.zkt_device_id,
+        )
+        .order_by(TerminalRecordManifest.canonical_source.desc(), TerminalRecordManifest.id.desc())
+        .limit(1)
+    )
+
+
 def source_evidence(session: Session, event: AttendanceEvent, connector: Connector) -> dict | None:
-    from zk_add.models import TerminalRecordManifest, TerminalSourceEpoch
+    from zk_add.models import TerminalSourceEpoch
 
     if event.source in {"LIVE", "LIVE_POLL"}:
         return {"kind": "CAPTURE_BINDING", "serial": event.device_serial}
@@ -210,14 +232,7 @@ def source_evidence(session: Session, event: AttendanceEvent, connector: Connect
             and event.device_serial == zkt.confirmed_serial == zkt.serial
         ):
             near_live = {"kind": "NEAR_LIVE_RECONCILE", "serial": event.device_serial}
-    manifest = session.scalar(
-        select(TerminalRecordManifest)
-        .where(
-            TerminalRecordManifest.attendance_event_id == event.id,
-        )
-        .order_by(TerminalRecordManifest.canonical_source.desc(), TerminalRecordManifest.id.desc())
-        .limit(1)
-    )
+    manifest = owner_source_manifest(session, event)
     if manifest:
         if not (
             manifest.connector_id == connector.id

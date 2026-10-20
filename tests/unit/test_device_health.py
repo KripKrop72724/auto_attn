@@ -1095,6 +1095,34 @@ def test_device_rejection_tracks_types_and_field_paths_without_values(db, envelo
     assert (reason.code, reason.tier, reason.currency) == ("DEVICE_MESSAGE_REJECTED", "DEGRADED", "CURRENT")
 
 
+def test_evidence_rejection_records_its_reason_code_and_site_never_its_message(db, envelopes):
+    from zk_add.reconciliation import _device_job
+
+    connector = live(db, connector_fixture(db))
+    secret = "35202-1234567-1"
+    try:
+        _device_job(db, connector, "job-that-does-not-exist")
+    except ValueError as exc:
+        coded = exc
+    reject(connector, envelopes(connector, "reconcile_chunk", {"records": [secret]}), coded)
+    reject(connector, envelopes(connector, "log", {}), ValueError(f"user {secret} conflicts"))
+    row = alert_row(db, connector, "DEVICE_MESSAGE_REJECTED")
+    chunk = row.details["types"]["reconcile_chunk"]
+    assert (chunk["category"], chunk["error_reason"]) == ("EVIDENCE_INVALID", "RECONCILIATION_JOB_UNKNOWN")
+    assert chunk["error_site"].startswith("zk_add.reconciliation:_device_job:")
+    assert row.details["types"]["log"]["error_reason"] == "UNCLASSIFIED_VALUE_ERROR"
+    assert row.message == "log message was rejected (EVIDENCE_INVALID: UNCLASSIFIED_VALUE_ERROR)."
+    logs = db.scalars(select(DeviceLog).where(DeviceLog.connector_id == connector.id).order_by(DeviceLog.id)).all()
+    assert logs[0].message == "reconcile_chunk message was rejected (EVIDENCE_INVALID: RECONCILIATION_JOB_UNKNOWN)."
+    assert (logs[0].context["error_reason"], logs[0].context["error_site"]) == (
+        "RECONCILIATION_JOB_UNKNOWN", chunk["error_site"])
+    stored = str(row.details) + str([log.context for log in logs]) + str([log.message for log in logs])
+    assert secret not in stored and "does-not-exist" not in stored
+    assert evaluate_health(db, connector).reasons[0].evidence_summary == (
+        "log x1 (EVIDENCE_INVALID: UNCLASSIFIED_VALUE_ERROR); "
+        "reconcile_chunk x1 (EVIDENCE_INVALID: RECONCILIATION_JOB_UNKNOWN)")
+
+
 def test_rejection_types_are_bounded(db, envelopes):
     connector = live(db, connector_fixture(db))
     for index in range(18):

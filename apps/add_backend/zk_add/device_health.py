@@ -627,7 +627,8 @@ def _evidence_summary(row: DeviceAlert) -> str | None:
                    f"{latch.get('firmware_version') or 'unknown'}.")
     if not summary and row.code in {"DEVICE_MESSAGE_REJECTED", "ADD_MESSAGE_PROCESSING_FAILED"}:
         summary = "; ".join(
-            f"{name} x{int(entry.get('count') or 1)} ({entry.get('category') or 'UNKNOWN'})"
+            f"{name} x{int(entry.get('count') or 1)} ({entry.get('category') or 'UNKNOWN'}"
+            f"{': ' + str(entry['error_reason']) if entry.get('error_reason') else ''})"
             for name, entry in sorted(_rejection_entries(row).items()))
     if not summary and row.code == "HIK_CAPTURE_UNHEALTHY" and details.get("reason"):
         summary = f"{details['reason']} (poll error {details.get('poll_error')})."
