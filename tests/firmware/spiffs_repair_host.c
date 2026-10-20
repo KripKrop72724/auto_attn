@@ -5831,7 +5831,10 @@ static void run_unread_area(uint32_t kib, void (*build)(void), const char *what,
         mark_unreadable(pending, 2);
     }
     uint32_t spans = pending->size / SPAN;
-    uint32_t cursor = row_boundary_after(pending, mode == CURSOR_BEFORE ? SPAN : (spans - 8) * SPAN);
+    /* Before the damage: the last row boundary at or before span 2. */
+    uint32_t cursor = 2 * SPAN;
+    while (mode == CURSOR_BEFORE && cursor > 0 && pending->data[cursor - 1] != '\n') --cursor;
+    if (mode != CURSOR_BEFORE) cursor = row_boundary_after(pending, (spans - 8) * SPAN);
     set_cursor("legacy_queues", "ords_pending", cursor, prefix_crc(pending, cursor) ^ (stale ? 0x5A5A5A5AU : 0U), 9);
     /* On P02 a block of the queue's own pages goes first. */
     prefer_block = p02 ? p02_queue_block() : UINT32_MAX;
