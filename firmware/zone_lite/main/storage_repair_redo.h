@@ -172,6 +172,13 @@ typedef enum { SRX_WRITE_OK = 0, SRX_WRITE_IO, SRX_WRITE_VERIFY } srx_write_t;
  * verifies is left without magic. `readback`: 4096 bytes of scratch. */
 srx_write_t srx_write_block(const srx_io_t *io, uint32_t block, const uint8_t *target, uint8_t *readback,
                             unsigned retries);
+/* A block srx_write_block left without its target (it would not verify, or
+ * a write failed), closed as SPIFFS's own erase leaves a block: erased, the
+ * target's erase count, then its magic, read back raw (round 2 review,
+ * R2-1). Its kept pages are in its record, which the caller makes a byte
+ * source. True when the block reads exactly so; otherwise its magic is
+ * cleared again, so that any mount erases it. `readback`: 4096 bytes. */
+bool srx_close_block(const srx_io_t *io, uint32_t block, const uint8_t *target, uint8_t *readback);
 /* Programs a record into a slot (erased first unless it reads all 0xFF) and
  * reads it back. `scratch`: 4096 bytes. */
 bool srx_write_record(const srx_io_t *io, uint32_t slot, const uint8_t *sector, uint8_t *scratch);

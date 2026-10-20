@@ -295,3 +295,22 @@ def test_the_redo_geometry_is_pinned_at_build_time_and_checked_before_any_round(
     assert "r->ports->remount && r->rx &&\n        geometry;" in round_
     assert "!redo_geometry(r)) return true;" in _body(core, "static SR_NOINLINE bool load_sources(run_t *r)")
     assert "redo_geometry(r)" in _body(core, "static bool round_possible(const run_t *r)")
+
+
+def test_a_record_nothing_marks_a_source_keeps_the_store_unmounted() -> None:
+    # Round 2 review, R2-4: a round whose failed block's record could be made
+    # neither a source nor journaled as one stops writing the store, and the
+    # VFS does not mount it that boot. R2-2: records recovery leaves open are
+    # journaled as sources even when NVS had no reclaim journal.
+    glue = (MAIN / "storage_repair.c").read_text()
+    boot = _body(glue, "void storage_repair_boot(void)")
+    run = boot[boot.index("srr_run(&s_fs, &config, &PORTS, &s_report);"):]
+    assert run.index("SPIFFS_unmount(&s_fs);") < run.index("if (s_report.reclaim.store_blocked) s_mount_blocked = true;")
+    recover = _body(glue, "static void redo_recover(srr_config_t *config, bool timed)")
+    assert "if (srx_journal_after_recovery(&journal, inspected, open, srx_sources_left(&s_area)) &&" in recover
+    assert "have && srx_journal_after_recovery" not in recover
+    core = (MAIN / "storage_repair_core.c").read_text()
+    round_ = _body(core, "static SR_NOINLINE void reclaim_round(run_t *r, const char *trigger)")
+    assert round_.index("if (r->unguarded && !journaled) {") < round_.index("r->ports->remount(r->ports->context)")
+    failed = _body(core, "static SR_NOINLINE bool failed_block(")
+    assert failed.index("srx_close_block(") < failed.index("SRX_OFF_SETTLE, SRX_SETTLE_SOURCE")

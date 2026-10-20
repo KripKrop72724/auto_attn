@@ -68,6 +68,19 @@ def test_repair_against_esp_idf_spiffs_with_power_cuts(tmp_path: Path) -> None:
     assert "byte sources without memory for them: the run failed before writing" in output
     assert "2.7.6 first: the boot's report keeps the first run's strays, duplicate, cursor reset" in output
     assert "p02 confirmed, mirrored:" in output
+    # The round 2 review: a block that will not verify is closed and the
+    # round goes on (R2-1); a record recovery left open is that boot's source
+    # (R2-2); a range is recorded once per boot (R2-3); a source bit that will
+    # not take is journaled, never redone (R2-4); an ended entry is no source
+    # for a later generation (note 1).
+    assert "t5 /processed_commands.txt freed by the check, a worn cell in the first window, closed:" in output
+    assert "t5 /processed_commands.txt freed by the check, a worn magic, the block not closed:" in output
+    assert "open record, its settle word stuck: a cut in block 133's window" in output
+    assert "open record, the journal lost: a cut in block 133's window" in output
+    assert "one unreadable span over 2 runs of a boot: one gap record, 251 bytes in the boot's report" in output
+    assert "source bit, attempts and journal refused: block 135 closed, the record never redone" in output
+    assert "source generations, a reported entry over a filled span: the live bytes kept" in output
+    assert "p02 confirmed, a worn first window:" in output and "a worn first window, old image:" in output
 
 
 def test_ci_runs_the_repair_harness_in_the_esp_idf_image() -> None:

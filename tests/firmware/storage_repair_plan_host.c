@@ -788,6 +788,28 @@ static void redo_records(void)
     assert(srx_clear_bits(&RX_IO, 0, SRX_OFF_SETTLE, SRX_SETTLE_SOURCE | (1U << 0) | (1U << 1) | (1U << 20)));
     memcpy(sector, rx_area, 4096);
     assert(srx_decode(sector, &r, NULL) && !srx_retired(&r) && srx_retained(&r));
+    /* Round 2 review, R2-1: a block that would not verify is closed as
+     * SPIFFS's own erase leaves one (erased, the target's erase count, its
+     * magic last); recovery takes a closed block for another writer's (no
+     * kept byte left), never for a torn erase to redo. */
+    memset(rx_area, 0xFF, sizeof(rx_area));
+    rx_block(16, "uuddufffffffff" "f");
+    rx_record(0, 16, (1U << 2) | (1U << 3), 10, 0, 0x2760, target);
+    assert(srx_close_block(&RX_IO, 16, target, raw));
+    const uint8_t *closed = rx_store + 16 * 4096;
+    assert(srx_has_magic(closed, RX_BLOCKS, 16) && srx_get16(closed + 254) == srx_get16(target + 254) &&
+           srx_erased(closed, 252) && srx_erased(closed + 256, 4096 - 256));
+    memcpy(sector, rx_area, 4096);
+    assert(srx_decode(sector, &r, expanded) && !srx_torn_erase(&r, closed, expanded) &&
+           srx_decide(&r, closed, expanded, RX_BLOCKS, 0x2760, false) == SRX_ACT_CHANGED);
+    /* A close whose magic will not program: false, and the magic cleared
+     * again so that any mount erases the block. */
+    rx_block(17, "uuddufffffffff" "f");
+    rx_record(1, 17, (1U << 2) | (1U << 3), 11, 0, 0x2760, target);
+    rx_fail_store_write = 2; /* the erase count, then the magic */
+    rx_store_writes = 0;
+    assert(!srx_close_block(&RX_IO, 17, target, raw) && !srx_has_magic(rx_store + 17 * 4096, RX_BLOCKS, 17));
+    rx_fail_store_write = 0;
     /* The reclaim journal and its NVS entries. */
     srp_reclaim_t j = {.flags = SRP_RECLAIM_CLAIMED | SRP_RECLAIM_ACTIVE, .reclaim_id = 3};
     srp_reclaim_seal(&j);

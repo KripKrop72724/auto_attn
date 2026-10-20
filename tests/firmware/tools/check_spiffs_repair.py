@@ -55,7 +55,14 @@ CI_RUNS = [["--seeds=3", "--organic=0"], ["cuts", "--seeds=12", "--first-seed=3"
            ["reclaim-p02", "--kib=8192"],
            ["reclaim-cuts", "--kib=8192"],
            ["reclaim-rollback", "--kib=8192"],
-           ["reclaim-area", "--kib=8192"]]
+           ["reclaim-area", "--kib=8192"],
+           # The round 2 review of the implementation: a block that will not
+           # verify is closed and the round goes on, a record recovery left
+           # open is a source that boot, one gap record per range a boot
+           # finds, a source bit that will not take, sources across file
+           # generations (the cuts and rollback entries add a worn first
+           # window).
+           ["reclaim-round2", "--kib=8192"]]
 
 
 def spiffs_source_dir() -> Path | None:

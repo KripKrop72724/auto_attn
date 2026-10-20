@@ -551,7 +551,10 @@ static void redo_recover(srr_config_t *config, bool timed)
         }
     }
     heap_caps_free(work);
-    if (have && srx_journal_after_recovery(&journal, inspected, open, srx_sources_left(&s_area)) &&
+    /* Also without a journal (NVS lost it): records left open, or sources,
+     * get one, so no later boot redoes an open record after this boot's
+     * mount (round 2 review, R2-2). */
+    if (srx_journal_after_recovery(&journal, inspected, open, srx_sources_left(&s_area)) &&
         !port_nvs_store(NULL, SRR_NVS_NAMESPACE, "reclaim", &journal, sizeof(journal)) &&
         (journal.flags & SRP_RECLAIM_SOURCES)) {
         s_mount_blocked = true;
@@ -687,6 +690,9 @@ void storage_repair_boot(void)
         if (mounted == SPIFFS_OK) {
             srr_run(&s_fs, &config, &PORTS, &s_report);
             SPIFFS_unmount(&s_fs);
+            /* A failed block's record nothing durable marks a source (round 2
+             * review, R2-4): the store is not written this boot. */
+            if (s_report.reclaim.store_blocked) s_mount_blocked = true;
         } else {
             s_mount_failed = true;
             s_mount_error = SPIFFS_errno(&s_fs);

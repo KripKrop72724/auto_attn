@@ -129,6 +129,9 @@ typedef struct {
     /* Round 1 review, low 1: the boot's report over every run. */
     srr_report_t total;
     uint32_t merged;
+    /* Round 2 review, R2-3: the first run's generation: gap records of this
+     * boot's runs are not made twice. */
+    uint32_t first_generation;
 } carry_t;
 
 typedef struct {
@@ -176,6 +179,14 @@ typedef struct {
     restore_wait_t *waits;
     uint32_t wait_count, wait_pages;
     bool unmounted;                /* the round's remount failed: no SPIFFS call any more */
+    bool round_remounted;          /* this run's round remounted the store */
+    bool retrying;                 /* the restore after the round: only the files that waited */
+    /* Round 2 review, R2-4: a failed block's record would not take its source
+     * bit (unmarked), nor its used-up attempts (unguarded). */
+    bool unmarked, unguarded;
+    /* Round 2 review, R2-3: a gap an earlier run of this boot recorded was
+     * found again (not recorded twice; the run still ends WITH_GAPS). */
+    bool gaps_seen;
 } run_t;
 
 static run_t *s_run;
@@ -624,6 +635,13 @@ static bool read_payload(run_t *r, uint16_t pix, uint8_t *out, uint32_t length)
 }
 
 /* ---- redo records as byte sources (2.7.6) -------------------------------- */
+/* An entry that still has bytes to deliver. One that ended (settled: back
+ * on flash, or delivered by offset; reported: its file gone or holding
+ * other bytes there) is never a source again: a later file under the same
+ * id and name is another generation, whose bytes it would replace (round 2
+ * review, note 1). */
+static bool src_open(const src_page_t *s) { return s->deliverable && !s->settled && !s->reported; }
+
 /* A kept data page of a source record for this object's span: at `pix`, or
  * anywhere (any_pix). Its object must carry the name the record gave it. */
 static src_page_t *src_for(run_t *r, const obj_t *o, uint32_t span, uint16_t pix, bool any_pix)
@@ -631,7 +649,7 @@ static src_page_t *src_for(run_t *r, const obj_t *o, uint32_t span, uint16_t pix
     for (uint32_t i = 0; i < r->src_count; ++i) {
         src_page_t *s = &r->src[i];
         cpu_step(1);
-        if (!s->deliverable || s->obj != o->obj || s->span != span || (!any_pix && s->pix != pix) ||
+        if (!src_open(s) || s->obj != o->obj || s->span != span || (!any_pix && s->pix != pix) ||
             strcmp(s->name, o->name))
             continue;
         return s;
@@ -650,7 +668,7 @@ static src_page_t *src_alternate(run_t *r, const obj_t *o, uint32_t span, uint16
     for (uint32_t i = after; i < r->src_count; ++i) {
         src_page_t *s = &r->src[i];
         cpu_step(1);
-        if (!s->deliverable || s->obj != o->obj || s->span != span || s->pix == ref || strcmp(s->name, o->name) ||
+        if (!src_open(s) || s->obj != o->obj || s->span != span || s->pix == ref || strcmp(s->name, o->name) ||
             !s->cursor_valid || s->cursor_offset >= (span + 1U) * SRP_SPAN_BYTES)
             continue;
         return s;
@@ -664,18 +682,31 @@ static bool src_payload(run_t *r, const src_page_t *s, uint8_t *out, uint32_t le
     return io && io->area_read(io->context, s->offset + sizeof(spiffs_page_header), out, length);
 }
 
+/* A byte srp_fill writes for this file's fill (round 2 review, note 1:
+ * the queues are JSON rows, filled with NUL and newlines, never '0'). */
+static bool fill_byte(const obj_t *o, uint8_t b)
+{
+    switch (o->kind.fill) {
+    case SRP_FILL_JSON_ROWS: return b == 0 || b == '\n';
+    case SRP_FILL_ID_LINES: return b == '\n';
+    case SRP_FILL_CURSOR: return b == '0' || b == '\n';
+    case SRP_FILL_BINARY: break;
+    }
+    return b == 0;
+}
+
 /* A span that reads, instead of a source record's bytes, the fill a SALVAGE
  * gap left (a boot that could not read the redo area filled it): every byte
- * that differs reads as a fill byte. The span of an append-only file never
- * changes once full, so nothing else can differ. */
-static bool fill_restorable(run_t *r, const src_page_t *s, uint16_t ref, uint32_t length)
+ * that differs reads as one of the file's fill bytes. The span of an
+ * append-only file never changes once full, so nothing else can differ. */
+static bool fill_restorable(run_t *r, const obj_t *o, const src_page_t *s, uint16_t ref, uint32_t length)
 {
     uint8_t now[SRP_SPAN_BYTES], held[SRP_SPAN_BYTES];
     if (!read_payload(r, ref, now, length) || !src_payload(r, s, held, length)) return false;
     bool differs = false;
     for (uint32_t i = 0; i < length; ++i) {
         if (now[i] == held[i]) continue;
-        if ((now[i] != 0 && now[i] != '\n' && now[i] != '0') || held[i] == 0xFF) return false;
+        if (!fill_byte(o, now[i]) || held[i] == 0xFF) return false;
         differs = true;
     }
     return differs;
@@ -909,7 +940,7 @@ static bool map_object(run_t *r, obj_t *o)
             if (memchr(data, 0xFF, length)) code = SR_ERR_ERASED_CONTENT;
         }
         src_page_t *redo = !code && r->src_count ? src_for(r, o, k, 0, true) : NULL;
-        if (redo && fill_restorable(r, redo, ref, length)) {
+        if (redo && fill_restorable(r, o, redo, ref, length)) {
             /* Back in place from the record; the cursor's reconciliation
              * then replays from the changed prefix (duplicates, no loss). */
             patch_t *p = push_patch(r, o, k);
@@ -1505,14 +1536,36 @@ static void note_file(run_t *r, const obj_t *o)
     f->blocked_offset = o->blocked_offset;
 }
 
-/* A range of this file this run already recorded as unreadable. */
-static bool recorded_this_run(const run_t *r, const obj_t *o, uint32_t start, uint32_t end)
+/* A record of a run of this boot: this run's, or (2.7.6, round 2 review,
+ * R2-3) an earlier run's before a round. Every run is a new generation, and
+ * nothing acknowledges a record before the boot's report is sent. */
+static bool this_boot(const run_t *r, uint32_t generation)
+{
+    uint32_t first = r->carry && r->carry->first_generation ? r->carry->first_generation : r->state.generation;
+    return generation >= first && generation <= r->state.generation;
+}
+
+/* A range found again that an earlier run of this boot recorded: not a second
+ * record (ADD would count the loss twice, and the 24-record list would fill
+ * twice as fast and then widen records over readable bytes), but the file and
+ * the run still say they have gaps. */
+static void gap_seen(run_t *r, obj_t *o, uint32_t generation)
+{
+    if (generation == r->state.generation) return;
+    r->gaps_seen = true;
+    o->actions |= SRR_FILE_GAPS;
+}
+
+/* A range of this file a run of this boot already recorded as unreadable. */
+static bool recorded_this_boot(run_t *r, obj_t *o, uint32_t start, uint32_t end)
 {
     for (uint32_t i = 0; i < r->gaps->count && i < SRP_MAX_GAPS; ++i) {
         const srp_gap_t *g = &r->gaps->gap[i];
-        if (g->generation == r->state.generation && !strcmp(g->name, o->name) && g->offset <= start &&
-            (uint64_t)g->offset + g->length >= end)
+        if (this_boot(r, g->generation) && !strcmp(g->name, o->name) && g->offset <= start &&
+            (uint64_t)g->offset + g->length >= end) {
+            gap_seen(r, o, g->generation);
             return true;
+        }
     }
     return false;
 }
@@ -1520,13 +1573,15 @@ static bool recorded_this_run(const run_t *r, const obj_t *o, uint32_t start, ui
 static bool record_gap_flags(run_t *r, obj_t *o, uint32_t offset, uint32_t length, int32_t code,
                              srp_gap_cause_t cause, uint8_t flags)
 {
-    /* A range this run already recorded (a survey repeated after making
-     * room) is not recorded twice. */
+    /* A range a run of this boot already recorded (a survey repeated after
+     * making room, or the run after a round) is not recorded twice. */
     for (uint32_t i = 0; i < r->gaps->count && i < SRP_MAX_GAPS; ++i) {
         const srp_gap_t *old = &r->gaps->gap[i];
-        if (old->generation == r->state.generation && old->offset == offset && old->length == length &&
-            old->cause == (uint8_t)cause && !strcmp(old->name, o->name))
+        if (this_boot(r, old->generation) && old->offset == offset && old->length == length &&
+            old->cause == (uint8_t)cause && !strcmp(old->name, o->name)) {
+            gap_seen(r, o, old->generation);
             return true;
+        }
     }
     srp_gap_t gap;
     memset(&gap, 0, sizeof(gap));
@@ -1576,7 +1631,7 @@ static bool record_salvage_gaps(run_t *r, obj_t *o)
             merged = true;
         }
         patch_t *p = find_patch(o, start / SRP_SPAN_BYTES);
-        if (!recorded_this_run(r, o, start, end) &&
+        if (!recorded_this_boot(r, o, start, end) &&
             !record_gap_flags(r, o, start, end - start, p ? p->code : 0, SRP_GAP_SALVAGE,
                               merged ? SRP_GAP_MERGED : 0)) {
             o->unrecordable = true;
@@ -2809,6 +2864,20 @@ static bool restore_in_place(run_t *r, obj_t *o, bool *changed)
  * next boot tries again from whatever the store still holds; an entry whose
  * original is still under a hidden header is never settled, and the run
  * fails. */
+/* 2.7.6 (round 2 review, R2-1): in the restore after a round only the files
+ * that waited for its room. Every other held or unheld file was put back
+ * (or recorded) before the round, and differs now only where a block of
+ * the round would not verify: those bytes are in that block's record, a
+ * byte source for the next run (put back from a hold here, they took the
+ * room the waiting file needed; recorded here, they were reported lost). */
+static bool skip_restore(const run_t *r, const char *name)
+{
+    if (!r->retrying) return false;
+    for (uint32_t i = 0; i < r->wait_count; ++i)
+        if (!strcmp(r->waits[i].name, name)) return false;
+    return true;
+}
+
 static bool restore_held(run_t *r, bool *changed)
 {
     *changed = false;
@@ -2816,6 +2885,7 @@ static bool restore_held(run_t *r, bool *changed)
     for (uint32_t i = 0; manifest_active(r) && i < r->manifest->count; ++i) {
         srp_manifest_file_t *f = &r->manifest->file[i];
         if (f->flags & (SRP_MANIFEST_SETTLED | SRP_MANIFEST_REPORTED)) continue;
+        if (skip_restore(r, f->name)) continue;
         r->failed = false;
         if (find_live(r, f->name)) continue;
         bool intact = false, held = false;
@@ -2854,7 +2924,7 @@ static bool restore_held(run_t *r, bool *changed)
     if (unhidden && !survey(r)) return false;
     for (uint32_t i = 0; i < r->obj_count; ++i) {
         obj_t *o = &r->objs[i];
-        if (!o->held || !o->hold || o->retired) continue;
+        if (!o->held || !o->hold || o->retired || skip_restore(r, o->name)) continue;
         r->failed = false;
         srp_manifest_file_t *f = manifest_entry(r, o->name);
         if (!live(o)) {
@@ -2903,7 +2973,7 @@ static bool restore_held(run_t *r, bool *changed)
     /* Custody the budget could not hold. */
     for (uint32_t i = 0; manifest_active(r) && i < r->manifest->count; ++i) {
         srp_manifest_file_t *f = &r->manifest->file[i];
-        if (f->flags & (SRP_MANIFEST_SETTLED | SRP_MANIFEST_REPORTED)) continue;
+        if (f->flags & (SRP_MANIFEST_SETTLED | SRP_MANIFEST_REPORTED) || skip_restore(r, f->name)) continue;
         bool held = false;
         for (uint32_t k = 0; k < r->obj_count && !held; ++k)
             held = r->objs[k].hold && !strcmp(r->objs[k].name, f->name);
@@ -4205,7 +4275,7 @@ static bool run_checks(run_t *r, bool *catalog_drop, bool *last_failed, bool *cu
 }
 
 /* ---- the last resort: blocks reformatted in place (2.7.6) ---------------- */
-#define SR_RECLAIM_BLOCK_MS 2000U  /* a block's worst case: two erases, about 20 programs, two retries */
+#define SR_RECLAIM_BLOCK_MS 2500U  /* a block's worst case: two retries and the close of one that will not verify */
 #define SR_RECLAIM_MARGIN 30U      /* erased pages for SPIFFS's own writes in the check and the finish */
 #define SR_RECLAIM_CAP 256U
 #define SR_RECLAIM_CAP_PENDING 128U
@@ -4310,18 +4380,33 @@ static bool redo_geometry(const run_t *r)
         r->entries == SRX_ENTRIES;
 }
 
-/* The kept pages of every record the boot recovery made a byte source.
- * Without them a span they hold would be filled and recorded as lost: a
- * run that cannot load them (no memory for the buffer, a read error) fails
- * before it writes anything (round 1 review, low 6). */
+/* A record whose kept pages are byte sources this run: one the boot
+ * recovery (or a round) made a source, and one recovery had to leave open
+ * (it could not write the area: round 2 review, R2-2). An open record is
+ * never redone after this boot's mount (the journal says SOURCES, or the
+ * store stays unmounted), and its block, erased by the mount or not, is
+ * read by the same rules as a source's (10.3): without it the run filled
+ * the spans it holds and recorded them as lost. */
+static bool source_slot(const carry_t *c, uint32_t slot)
+{
+    return c->area.slot[slot] == SRX_SLOT_SOURCE || c->area.slot[slot] == SRX_SLOT_OPEN;
+}
+
+/* The kept pages of every record that is a byte source this run. Without
+ * them a span they hold would be filled and recorded as lost: a run that
+ * cannot load them (no memory for the buffer, a read error) fails before
+ * it writes anything (round 1 review, low 6). */
 static SR_NOINLINE bool load_sources(run_t *r)
 {
     carry_t *c = r->carry;
-    if (!c || !c->have_area || !r->ports->redo || !srx_sources_left(&c->area) || !redo_geometry(r)) return true;
+    if (!c || !c->have_area || !r->ports->redo || !redo_geometry(r)) return true;
+    bool any = false;
+    for (uint32_t slot = 0; slot < c->area.slots && !any; ++slot) any = source_slot(c, slot);
+    if (!any) return true;
     if (!r->rx) return fail(r, "sources_memory", SPIFFS_ERR_INTERNAL);
     const srx_io_t *a = r->ports->redo;
     for (uint32_t slot = 0; slot < c->area.slots; ++slot) {
-        if (c->area.slot[slot] != SRX_SLOT_SOURCE) continue;
+        if (!source_slot(c, slot)) continue;
         srx_record_t rec;
         if (!a->area_read(a->context, slot * SRX_BLOCK, r->rx, SRX_BLOCK) || !srx_decode(r->rx, &rec, NULL))
             return fail(r, "sources_read", SPIFFS_ERR_INTERNAL);
@@ -4394,7 +4479,7 @@ static SR_NOINLINE void settle_sources(run_t *r)
                 for (uint32_t b = 0; done && b < length; ++b) done = held[b] == 0xFF || now[b] == held[b];
                 /* A span a boot without the area filled: back from the record
                  * in the next run. */
-                if (!done) wait = !read || fill_restorable(r, sp, ref, length);
+                if (!done) wait = !read || fill_restorable(r, x, sp, ref, length);
             } else {
                 wait = true;
             }
@@ -4402,7 +4487,9 @@ static SR_NOINLINE void settle_sources(run_t *r)
         /* The file gone, or other bytes under its id and name: the verified
          * cursor offset settles what its owner had delivered. */
         if (!done && !wait && sp->cursor_valid && sp->cursor_offset >= (sp->span + 1U) * SRP_SPAN_BYTES) done = true;
-        if (!done) {
+        /* A reported entry is no source any more (src_open): it settles only
+         * if its bytes turn up where the index names them, and never waits. */
+        if (!done && !sp->reported) {
             if (wait) waiting++;
             else report = true;
         }
@@ -4646,6 +4733,53 @@ static SR_NOINLINE bool encode_record(run_t *r, const cand_t *b, uint32_t reclai
     return true;
 }
 
+/* A block of the round that is not done: it would not verify (a worn
+ * cell), a write failed, or its record's `done` would not take. Its record
+ * becomes a byte source for the next run. A block that does not hold its
+ * target is closed as SPIFFS's own erase leaves a block (erased, its erase
+ * count and magic), so the store again has every magic but the next
+ * window's and the round goes on (round 2 review, R2-1: stopping here left
+ * a restore that waited for this round short of room, and its held bytes
+ * were recorded as lost while 17 candidates were left). A block that will
+ * not close keeps no magic for the remount to erase, and the round stops.
+ * The source bit is cleared only once the block is closed (a reset before
+ * it leaves an open record that recovery decides from the block); if it
+ * will not take, the attempts word is used up (recovery then makes the
+ * record a source, never redoes it) and the journal gets SOURCES (R2-4).
+ * True when the round may go on. */
+static SR_NOINLINE bool failed_block(run_t *r, const srx_io_t *io, const cand_t *b, uint32_t slot,
+                                     srx_write_t written, const uint8_t *target, uint8_t *back)
+{
+    carry_t *c = r->carry;
+    srr_reclaim_report_t *rep = &c->reclaim;
+    char message[200];
+    bool closed = false;
+    if (written != SRX_WRITE_OK) {
+        closed = srx_close_block(io, b->block, target, back);
+        if (r->ports->refresh)
+            r->ports->refresh(r->ports->context, r->fs->cfg.phys_addr + b->block * r->block_size, SRX_BLOCK);
+    }
+    bool marked = srx_clear_bits(io, slot, SRX_OFF_SETTLE, SRX_SETTLE_SOURCE);
+    if (!marked) {
+        r->unmarked = true;
+        if (!srx_clear_bits(io, slot, SRX_OFF_ATTEMPTS, (1U << SRX_ATTEMPTS) - 1U)) r->unguarded = true;
+    }
+    c->area.slot[slot] = SRX_SLOT_SOURCE;
+    rep->failed++;
+    rep->sources++;
+    bool go_on = closed && marked;
+    snprintf(message, sizeof(message), "block %u %s; %s%s", (unsigned)b->block,
+             written == SRX_WRITE_VERIFY ? "would not verify"
+             : written == SRX_WRITE_IO   ? "could not be written"
+                                         : "was written but its record would not take done",
+             !marked ? "its record would not take the source bit (journaled as a source)"
+             : closed ? "erased and closed, its record a byte source"
+                      : "its record is a byte source",
+             go_on ? "; the round goes on" : "; the round stops");
+    logf_line(r, "ERROR", "STORAGE_REPAIR_RECLAIM_FAILED", message);
+    return go_on;
+}
+
 /* One round at the end of a run that would hand over a store without room:
  * blocks reformatted in place, then the store remounted; the caller runs the
  * repair again. A store without a usable redo area is only measured. */
@@ -4853,31 +4987,31 @@ static SR_NOINLINE void reclaim_round(run_t *r, const char *trigger)
             for (uint32_t e = 0; e < SRX_ENTRIES; ++e) kept_pages += (b->kept >> e) & 1U;
             continue;
         }
-        /* It would not verify (or a write failed): left without magic, the
-         * remount erases it and its record serves the next run as a source. */
-        (void)srx_clear_bits(&io, slot, SRX_OFF_SETTLE, SRX_SETTLE_SOURCE);
-        c->area.slot[slot] = SRX_SLOT_SOURCE;
+        /* Not done: its record serves the next run as a byte source. */
+        if (failed_block(r, &io, b, slot, written, target, back)) {
+            gained += b->gain;
+        } else {
+            c->halt = true;
+            stop = true;
+        }
         sources = true;
-        rep->failed++;
-        rep->sources++;
-        snprintf(message, sizeof(message), "block %u %s; its record is a byte source and the round stops",
-                 (unsigned)b->block, written == SRX_WRITE_VERIFY ? "would not verify" : "could not be written");
-        logf_line(r, "ERROR", "STORAGE_REPAIR_RECLAIM_FAILED", message);
-        c->halt = true;
-        stop = true;
     }
     if (gained < want && !rep->short_reason[0]) snprintf(rep->short_reason, sizeof(rep->short_reason), "candidate");
-    /* Every record of the round done or a source: the journal is idle. */
-    bool open = false;
+    /* Every record of the round done or a source: the journal is idle. A
+     * failed block's record whose source bit would not take keeps the round
+     * active and the journal says SOURCES (round 2 review, R2-4): no later
+     * boot redoes it after the store was written. */
+    bool open = r->unmarked;
     for (uint32_t s = 0; s < c->area.slots; ++s) open |= c->area.slot[s] == SRX_SLOT_OPEN;
     if (!open) journal.flags &= ~SRP_RECLAIM_ACTIVE;
+    if (r->unmarked) journal.flags |= SRP_RECLAIM_SOURCES;
     /* A record that became a source: a boot that cannot read the area must
      * not fill what it holds (round 1 review, low). */
     if (sources) journal.flags |= SRP_RECLAIM_HELD;
     journal.blocks += taken;
     journal.pages_freed += freed;
     srp_reclaim_seal(&journal);
-    (void)nvs_store(r, SRR_NVS_NAMESPACE, "reclaim", &journal, sizeof(journal));
+    bool journaled = nvs_store(r, SRR_NVS_NAMESPACE, "reclaim", &journal, sizeof(journal));
     rep->rounds++;
     rep->blocks += taken;
     rep->pages_freed += freed;
@@ -4895,6 +5029,20 @@ static SR_NOINLINE void reclaim_round(run_t *r, const char *trigger)
                 memcpy(mismatched + mismatches++ * SRP_NAME_BYTES, o->name, SRP_NAME_BYTES);
         }
     }
+    if (r->unguarded && !journaled) {
+        /* Nothing durable says that record is never to be redone: nothing
+         * writes the store again this boot, and the VFS does not mount it
+         * (as when recovery cannot journal SOURCES, 10.1). The next boot
+         * decides the record from the block as this round left it. */
+        rep->store_blocked = true;
+        remounted = false;
+        r->unmounted = true;
+        c->halt = true;
+        logf_line(r, "ERROR", "STORAGE_REPAIR_RECLAIM_FAILED",
+                  "a failed block's record could not be made a source or journaled; the store stays unmounted this "
+                  "boot");
+        goto done;
+    }
     r->failed = false;
     if (!r->ports->remount(r->ports->context)) {
         remounted = false;
@@ -4903,6 +5051,7 @@ static SR_NOINLINE void reclaim_round(run_t *r, const char *trigger)
         logf_line(r, "ERROR", "STORAGE_REPAIR_RECLAIM_FAILED", "the store did not mount again after the round");
         goto done;
     }
+    r->round_remounted = true;
     if (mismatches) {
         rep->held_mismatch += mismatches;
         c->halt = true;
@@ -4938,7 +5087,7 @@ done:
     memcpy(r->report->error_stage, stage, sizeof(stage));
     r->report->error_code = code;
     if (!remounted) {
-        snprintf(r->report->error_stage, sizeof(r->report->error_stage), "remount");
+        snprintf(r->report->error_stage, sizeof(r->report->error_stage), rep->store_blocked ? "reclaim_journal" : "remount");
         r->report->error_code = SPIFFS_ERR_INTERNAL;
         r->report->result = SRR_RESULT_FAILED;
     }
@@ -5010,9 +5159,12 @@ static SR_NOINLINE void settle_waits(run_t *r, bool room)
         set_phase(r, SRP_PHASE_RESTORE, 0, true);
         bool changed = false;
         /* As after a check pass: SPIFFS's free blocks first (the round's
-         * erased pages are holes compaction turns into them). */
+         * erased pages are holes compaction turns into them). Only the files
+         * that waited (skip_restore). */
+        r->retrying = true;
         retried = survey(r) && ensure_room(r) && (!any_mislabeled(r) || (lookup_hygiene(r) && survey(r))) &&
             restore_held(r, &changed);
+        r->retrying = false;
         r->finishing = false;
         uint32_t back = 0;
         for (uint32_t i = 0; retried && i < r->wait_count; ++i) {
@@ -5190,6 +5342,7 @@ static void run_once(spiffs *fs, const srr_config_t *config, const srr_ports_t *
         return;
     }
     r->state.generation++;
+    if (carry && !carry->first_generation) carry->first_generation = r->state.generation;
     /* A manifest to settle keeps the phase at RESTORE until it is retired. */
     r->state.phase = manifest_active(r) ? SRP_PHASE_RESTORE : SRP_PHASE_SURVEY;
     report->generation = r->state.generation;
@@ -5332,7 +5485,7 @@ static void run_once(spiffs *fs, const srr_config_t *config, const srr_ports_t *
     else if (!ok || r->failed || check_failed) report->result = SRR_RESULT_FAILED;
     else if (deferred || cut_short || gc_unsafe) report->result = SRR_RESULT_DEFERRED;
     else if (policy.mode == SRP_MODE_NORMALIZE_ONLY) report->result = SRR_RESULT_NORMALIZED;
-    else if (report->gaps) report->result = SRR_RESULT_REPAIRED_WITH_GAPS;
+    else if (report->gaps || r->gaps_seen) report->result = SRR_RESULT_REPAIRED_WITH_GAPS;
     else if (r->wrote) report->result = SRR_RESULT_REPAIRED;
     else report->result = SRR_RESULT_CLEAN;
     if (!r->stopped) {
@@ -5349,9 +5502,10 @@ static void run_once(spiffs *fs, const srr_config_t *config, const srr_ports_t *
     /* 2.7.6: a run about to hand over a store without room reformats blocks
      * in place, and the caller runs the repair again. */
     const char *trigger = reclaim_trigger(r, check_failed);
-    uint32_t blocks_before = carry ? carry->blocks : 0;
     if (trigger) reclaim_round(r, trigger);
-    settle_waits(r, carry && carry->blocks > blocks_before);
+    /* Room is decided from the erased pages once the round remounted the
+     * store, whatever it did (round 2 review, R2-1). */
+    settle_waits(r, r->round_remounted);
     report->phase = (srp_phase_t)r->state.phase;
     report->cpu_steps = s_cpu_steps;
     if (ports->now_ms) report->duration_ms = (uint32_t)(ports->now_ms(ports->context) - started);

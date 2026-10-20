@@ -176,6 +176,10 @@ typedef struct {
      * the blocks kept out by an index page, an excluded file or the magic. */
     uint32_t candidates, unconfirmed_blocks, custody_blocks, index_blocks, excluded_blocks, low_magic_blocks;
     char short_reason[12];         /* why a round stopped before its target */
+    /* Round 2 review, R2-4: a failed block's record could be made neither a
+     * source nor journaled as one; the store was not written again and the
+     * VFS must not mount it this boot. */
+    bool store_blocked;
 } srr_reclaim_report_t;
 
 typedef struct {

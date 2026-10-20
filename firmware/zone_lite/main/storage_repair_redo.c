@@ -308,6 +308,25 @@ srx_write_t srx_write_block(const srx_io_t *io, uint32_t block, const uint8_t *t
     return result;
 }
 
+/* A reset at any of these writes leaves the record open (its source bit is
+ * cleared only after this returns) and the block either without a magic (a
+ * mount erases it; the same image's recovery redoes it) or closed: valid,
+ * every entry erased. Recovery takes a closed block for another writer's
+ * (no kept byte left) and makes the record a source. */
+bool srx_close_block(const srx_io_t *io, uint32_t block, const uint8_t *target, uint8_t *readback)
+{
+    uint32_t base = block * SRX_BLOCK;
+    static const uint8_t cleared[2] = {0, 0};
+    bool ok = io->store_erase(io->context, base, SRX_BLOCK) &&
+        io->store_write(io->context, base + SRX_ERASE_COUNT_OFFSET, target + SRX_ERASE_COUNT_OFFSET, 2) &&
+        io->store_write(io->context, base + SRX_MAGIC_OFFSET, target + SRX_MAGIC_OFFSET, 2) &&
+        io->store_read(io->context, base, readback, SRX_BLOCK);
+    for (uint32_t i = 0; ok && i < SRX_BLOCK; ++i)
+        ok = readback[i] == (i >= SRX_MAGIC_OFFSET && i < SRX_MAGIC_OFFSET + 4U ? target[i] : 0xFFU);
+    if (!ok) (void)io->store_write(io->context, base + SRX_MAGIC_OFFSET, cleared, 2);
+    return ok;
+}
+
 bool srx_write_record(const srx_io_t *io, uint32_t slot, const uint8_t *sector, uint8_t *scratch)
 {
     uint32_t base = slot * SRX_BLOCK;
