@@ -5028,27 +5028,37 @@ static void check_round(const uint8_t *before, const uint8_t *after)
         bool magic = srx_get16(is + 252) == srx_spiffs_magic(blocks, b);
         bool closed = magic && srx_erased(is, 252);
         for (uint32_t i = 256; closed && i < BLOCK; i += PAGE) closed = srx_erased(is + i, PAGE);
-        if (!magic || closed) {
+        /* The block's newest record says what the round did with it. */
+        static uint8_t sector[4096];
+        srx_record_t rec, newest;
+        bool found = false;
+        for (uint32_t slot = 0; slot < REDO_BYTES / 4096; ++slot) {
+            memcpy(sector, nvs.redo + slot * 4096, 4096);
+            if (srx_decode(sector, &rec, NULL) && rec.block == b && (!found || rec.sequence > newest.sequence)) {
+                newest = rec;
+                found = true;
+            }
+        }
+        if (!magic || (closed && found && newest.done == 0xFFFFFFFFU)) {
             /* Only a block that would not verify: closed as SPIFFS's own
              * erase leaves a block, or (when it would not close) without its
              * magic; its record a source, or (round 2 review, R2-4: the
              * source bit would not take) open with its attempts used up or
-             * the journal saying SOURCES. */
-            bool source = false;
-            static uint8_t sector[4096];
-            for (uint32_t slot = 0; slot < REDO_BYTES / 4096 && !source; ++slot) {
-                srx_record_t r;
-                memcpy(sector, nvs.redo + slot * 4096, 4096);
-                source = srx_decode(sector, &r, NULL) && r.block == b &&
-                    (srx_is_source(&r) || srx_attempts_used(r.attempts) >= SRX_ATTEMPTS ||
-                     (r.done == 0xFFFFFFFFU && (journal_flags() & SRP_RECLAIM_SOURCES)));
-            }
+             * the journal saying SOURCES. (A done block whose every entry
+             * was dropped reads closed too: it is checked below.) */
+            bool source = found && newest.done == 0xFFFFFFFFU &&
+                (srx_is_source(&newest) || srx_attempts_used(newest.attempts) >= SRX_ATTEMPTS ||
+                 (journal_flags() & SRP_RECLAIM_SOURCES));
             CHECK(source, "round: block %u ends %s and no source record", b, magic ? "closed" : "without its magic");
             CHECK(!magic || srx_get16(is + 254) != 0xFFFF, "round: block %u closed without an erase count", b);
             round_failed_blocks++;
             round_closed_blocks += magic;
             continue;
         }
+        /* Reformatted: its record done (or a source whose `done` would not
+         * take, the block holding its target). */
+        CHECK(found && (newest.done != 0xFFFFFFFFU || srx_is_source(&newest)),
+              "round: block %u changed and its record is neither done nor a source", b);
         CHECK(srx_get16(is + 252) == srx_spiffs_magic(blocks, b), "round: block %u ends without its magic", b);
         CHECK(!memcmp(was + 30, is + 30, 252 - 30), "round: block %u's other lookup bytes changed", b);
         bool later_kept = false;
