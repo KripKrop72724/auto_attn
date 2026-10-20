@@ -5209,6 +5209,10 @@ static void run_once(spiffs *fs, const srr_config_t *config, const srr_ports_t *
              srp_phase_name((srp_phase_t)report->previous_phase), (unsigned long)report->used_before,
              (unsigned long)report->total_bytes);
     logf_line(r, "INFO", "STORAGE_REPAIR_STARTED", message);
+    if (config->sources_unread)
+        logf_line(r, "WARN", "STORAGE_REPAIR_RECLAIM_SOURCES",
+                  "the redo area cannot be read and may hold queue bytes: their unreadable spans wait for a boot that "
+                  "reads it (nothing filled or recorded as lost)");
 
     bool deferred = false, catalog_drop = false, check_failed = false, checked = false, cut_short = false;
     bool gc_unsafe = false;

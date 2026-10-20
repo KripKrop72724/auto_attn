@@ -5873,7 +5873,8 @@ static void run_unread_area(uint32_t kib, void (*build)(void), const char *what,
     logged_count = 0;
     repair_boot(&report, &config);
     redo_unreadable = false;
-    CHECK(journal_flags() & SRP_RECLAIM_SOURCES, "%s: the unreadable area left the journal %x", what, journal_flags());
+    CHECK((journal_flags() & SRP_RECLAIM_SOURCES) && code_logged("STORAGE_REPAIR_RECLAIM_SOURCES"),
+          "%s: the unreadable area left the journal %x", what, journal_flags());
     srr_report_t after;
     boot_until_done_with(what, &config, &after);
     prefer_block = UINT32_MAX;
