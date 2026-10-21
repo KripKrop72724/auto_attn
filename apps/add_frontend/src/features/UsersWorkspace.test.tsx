@@ -154,6 +154,32 @@ describe('Selected-terminal users workspace', () => {
     expect((screen.getByLabelText(/Terminal role/) as HTMLSelectElement).disabled).toBe(true)
   })
 
+  it('keeps a suspect CNIC suffix out of the name when an administrator sets the CNIC', async () => {
+    const saleem = user({
+      user_id: '04048', uid: '55', display_name: 'A.Saleem-A4230111028815', cnic_masked: null,
+      cnic_available: false, identity_complete: false, machine_name_preview: 'A.Saleem-A4230111028815',
+      cnic_format_suspect: true, cnic_format_suspect_reason: 'LETTER_BEFORE_DIGITS',
+      suggested_display_name: 'A.Saleem',
+    })
+    const fetchMock = vi.fn(async () => response({ command }))
+    vi.stubGlobal('fetch', fetchMock)
+    function DialogHarness() {
+      const toast = useToast()
+      return <UserOperationDialog state={{ mode: 'edit', user: saleem }} device={device} onClose={() => {}} onCommand={() => {}} toast={toast} />
+    }
+    render(<DialogHarness />)
+    expect(screen.getByRole('note').textContent).toMatch(/ADD never uses those digits/)
+    expect((screen.getByLabelText('Full canonical name') as HTMLInputElement).value).toBe('A.Saleem')
+    fireEvent.change(screen.getByLabelText('Replacement CNIC (required for missing CNIC)'), { target: { value: '4230111028815' } })
+    expect(screen.getByText('A.Saleem-4230111028815')).toBeTruthy()
+    fireEvent.change(screen.getByLabelText('Confirm administrator password'), { target: { value: 'test-password' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm operation' }))
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled())
+    const body = JSON.parse(String((fetchMock.mock.calls[0] as unknown as [string, RequestInit])[1].body))
+    expect(body.display_name).toBe('A.Saleem')
+    expect(body.cnic).toBe('4230111028815')
+  })
+
   it('opens the exact missing-CNIC employee from an attendance review deep link', async () => {
     const missingCnic = user({
       id: 10,

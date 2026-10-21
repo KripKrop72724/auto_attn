@@ -37,6 +37,7 @@ def queued_direct_approval(store):
         direct.create(db, actor="test", request=DirectOrdsStartRequest(
             event_ids=[event_id], reason="Test saved approval", password="test-password",
             idempotency_key="diagnostic-approval",
+            cnic_choices=[{"event_id": event_id, "choice": "CURRENT"}],
         ))
         db.commit()
     with sessions() as db:

@@ -942,7 +942,14 @@ def claim_ords_batch(limit: int) -> list[tuple[int, dict, int, bool]]:
             if decision and decision.proof.get("policy") == "manual-direct-ords-v1":
                 connector = session.get(Connector, event.connector_id)
                 from zk_add.attendance_force_release import delivery_payload
+                from zk_add.attendance_release_safety import time_refusal
 
+                if time_refusal(event):
+                    # An administrator approval never makes an impossible time true.
+                    row.status = event.ords_status = "QUARANTINED_INVALID_DEVICE_TIME"
+                    row.last_error = "The punch time is invalid; it is never sent to Oracle."
+                    row.next_attempt_at = None
+                    continue
                 candidate_payload = delivery_payload(session, event, connector)
                 if candidate_payload is None:
                     row.status = event.ords_status = "BLOCKED_IDENTITY"

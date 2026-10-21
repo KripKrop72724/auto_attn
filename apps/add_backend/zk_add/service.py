@@ -40,7 +40,7 @@ from zk_add.crypto import (
     normalize_cnic,
 )
 from zk_add.attendance_identity_evidence import TERMINAL_RECONCILE_SOURCES
-from zk_add.identity import build_machine_name, parse_machine_name
+from zk_add.identity import build_machine_name, clean_display_name, parse_machine_name
 from zk_add.identity_conflicts import (
     valid_identity_resolutions,
     valid_resolution_for_user,
@@ -1706,6 +1706,9 @@ def _replace_user_snapshot(
     resolved_conflicts = reconcile_device_user_identity_conflicts(
         session, connector=connector, zkt=zkt
     )
+    from zk_add.attendance_release_safety import refresh_cnic_format_alert
+
+    refresh_cnic_format_alert(session, connector, zkt)
     affected = {
         row.id: row
         for row in [*identity_changed, *resolved_conflicts]
@@ -4988,6 +4991,9 @@ def create_device_user_command(
         session, zkt=zkt, user_id_override=user_id_override
     )
     name_limit = int(zkt.capability_profile.get("name_bytes", 24))
+    # The CNIC is stored once, as the name suffix; a CNIC-like suffix typed
+    # into the name would otherwise be cut into the 24-byte terminal name.
+    display_name = clean_display_name(display_name) or display_name
     machine_name = build_machine_name(
         display_name=display_name,
         cnic=normalized_cnic,
@@ -5127,6 +5133,11 @@ def update_device_user_command(
     if claims and not claims_are_approved_aliases:
         raise ValueError(duplicate_cnic_message(claims))
     next_display = " ".join((display_name or user.display_name).strip().split())
+    if cnic is not None:
+        # Setting a verified CNIC (e.g. for "A.Saleem-A4230111028815") must not
+        # keep the unparsed CNIC text in the name: the 24-byte terminal name
+        # would become "A.Saleem-A-<CNIC>".
+        next_display = clean_display_name(next_display) or next_display
     next_shift = user.shift_worker if shift_worker is None else shift_worker
     next_privilege = user.privilege if privilege is None else privilege
     if (connector.firmware_family == "hikvision" and next_privilege != user.privilege

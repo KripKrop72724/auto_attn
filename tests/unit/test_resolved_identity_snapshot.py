@@ -84,6 +84,9 @@ def saved_direct_approval(db, connector):
         request=DirectOrdsStartRequest(
             event_ids=[row.id], reason="Reviewed current employee for this exact saved punch.",
             password="test-password", idempotency_key=str(uuid4()),
+            # Duplicate-CNIC users have no retained interval: the administrator
+            # explicitly chose today's CNIC for the verified same employee.
+            cnic_choices=[{"event_id": row.id, "choice": "CURRENT"}],
         ),
     )
     direct.advance_once(db)

@@ -39,6 +39,11 @@ def main() -> None:
     assert {"expected_code", "reason", "password", "idempotency_key"}.issubset(
         request_properties(spec, "/api/v1/devices/{connector_id}/clear-error", "post")
     )
+    # The send dialog's explicit CNIC choices and "send now" confirmations.
+    assert {"event_ids", "reason", "password", "idempotency_key", "cnic_choices", "send_now_event_ids"}.issubset(
+        request_properties(spec, "/api/v2/attendance-direct-ords", "post")
+    )
+    assert {"event_ids"}.issubset(request_properties(spec, "/api/v2/attendance-direct-ords/preview", "post"))
     assert "get" in paths["/api/v1/device-health/shadow"]
     assert {"connector_ids"}.issubset(request_properties(spec, "/api/v1/device-health/cleanup/preview", "post"))
     assert {"connector_ids", "digest", "expires_at", "signature", "alert_ids", "error_fix_connector_ids", "reason",

@@ -25,7 +25,11 @@ export function UserOperationDialog({
   toast: ReturnType<typeof useToast>
 }) {
   const user = state.mode === 'create' ? null : state.user
-  const [displayName, setDisplayName] = useState(user?.display_name || '')
+  // A suspect CNIC suffix stays out of the name: the CNIC is appended once, within 24 bytes.
+  const suspectName = Boolean(state.mode === 'edit' && user?.cnic_format_suspect && !user.cnic_available)
+  const [displayName, setDisplayName] = useState(
+    (suspectName && user?.suggested_display_name) || user?.display_name || '',
+  )
   const [cnic, setCnic] = useState('')
   const [shiftWorker, setShiftWorker] = useState(user?.shift_worker || false)
   const [privilege, setPrivilege] = useState<0 | 14>(user?.privilege || 0)
@@ -180,6 +184,7 @@ export function UserOperationDialog({
           : 'This connector has older firmware that restricts deletion of enrolled fingerprints or cards. Update the Hikvision connector firmware to delete the entire profile and its credentials.'}</p>}
         {(state.mode === 'create' || state.mode === 'edit') && (
           <>
+            {suspectName && user && <div className="message pattern-waiting" role="note"><Icon name="alert" /><span>The terminal name “{user.display_name}” contains a CNIC in a format ADD cannot use, so this employee's punches are held. ADD never uses those digits. Confirm the CNIC with HR and enter it below; the name is kept as “{user.suggested_display_name || user.display_name}” so the terminal's {nameByteLimit}-byte name holds the full CNIC.</span></div>}
             <div className="form-grid">
               <label>Full canonical name<input value={displayName} onChange={(event) => setDisplayName(event.target.value)} maxLength={255} aria-invalid={Boolean(fieldErrors.display_name)} />{fieldErrors.display_name?.[0] && <small className="field-error">{fieldErrors.display_name[0]}</small>}</label>
               <label>{state.mode === 'edit' ? conflictRequiresCnic ? 'Replacement CNIC (required to resolve conflict)' : missingCnicRequiresCnic ? 'Replacement CNIC (required for missing CNIC)' : 'Replacement CNIC (leave blank to preserve)' : 'CNIC'}<input inputMode="numeric" autoComplete="off" value={cnic} onChange={(event) => setCnic(event.target.value.replace(/\D/g, '').slice(0, 13))} placeholder="13 digits" required={editRequiresCnic} aria-invalid={Boolean(fieldErrors.cnic)} />{fieldErrors.cnic?.[0] && <small className="field-error">{fieldErrors.cnic[0]}</small>}</label>

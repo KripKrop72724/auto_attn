@@ -1206,6 +1206,10 @@ export interface DeviceUser {
   machine_name_preview: string | null
   current_command_state: string | null
   read_only: boolean
+  /** The terminal name holds a CNIC ADD cannot parse (e.g. a letter before the digits). Never used. */
+  cnic_format_suspect?: boolean
+  cnic_format_suspect_reason?: 'LETTER_BEFORE_DIGITS' | 'SEPARATED_DIGITS' | 'UNSUPPORTED_SEPARATOR' | null
+  suggested_display_name?: string | null
 }
 
 export interface AttendanceRepairCohortCandidate {
@@ -1565,6 +1569,7 @@ export interface IdentityIntegrity {
   total_users: number
   with_cnic: number
   missing_cnic: number
+  cnic_format_suspect_users?: number
   duplicate_groups: number
   duplicate_users: number
   resolved_duplicate_groups: number
@@ -1663,10 +1668,49 @@ export interface HistoricalIdentityReport {
   unassigned_groups?: HistoricalIdentityCandidate[]
 }
 
+export type PunchTimeCnicState = 'MATCHES_CURRENT' | 'DIFFERS' | 'AMBIGUOUS' | 'NONE'
+export type DirectOrdsCnicChoice = 'PUNCH_TIME' | 'CURRENT'
+
+/** Read-only checks shown before an administrator approves a direct Oracle send. */
+export interface DirectOrdsPreviewRow {
+  event_id: number
+  user_id: string
+  display_name: string | null
+  device_event_time: string
+  exclusion: string | null
+  exclusion_reason: string | null
+  cnic_source: 'SAVED_PUNCH' | 'SYNCED_USER' | 'PUNCH_TIME_HISTORY' | null
+  punch_time_cnic: PunchTimeCnicState | null
+  punch_time_cnic_masked: string | null
+  punch_time_display_name: string | null
+  current_cnic_masked: string | null
+  uid_matches_current: boolean
+  cnic_choice_required: boolean
+  cnic_choices: DirectOrdsCnicChoice[]
+  default_cnic_choice: DirectOrdsCnicChoice | null
+  auto_release_at_next_snapshot: boolean
+  awaiting_next_snapshot: boolean
+  database_guard: string
+}
+
+export interface DirectOrdsPreview {
+  rows: DirectOrdsPreviewRow[]
+  missing_event_ids: number[]
+  counts: { selected: number; refused: number; cnic_choice_required: number; auto_release_soon: number }
+}
+
 export interface AttendanceEvent {
   cnic_not_linked?: boolean
   force_release?: { run_id: string; policy?: string | null; administrator: string; approved_at: string; reason: string; audit_id: number | null; snapshot_id: number | null; sync_command_id: number | null; needs_attention?: boolean; approved_identity?: { display_name: string | null; cnic_masked: string | null } | null } | null
-  direct_ords_identity?: { eligible: boolean; cnic_source: 'SAVED_PUNCH' | 'SYNCED_USER' | null; exclusion: 'UNKNOWN_USER' | 'CNIC_MISSING' | 'INVALID_EVENT_UID' | null } | null
+  direct_ords_identity?: {
+    eligible: boolean
+    cnic_source: 'SAVED_PUNCH' | 'SYNCED_USER' | null
+    exclusion: 'UNKNOWN_USER' | 'CNIC_MISSING' | 'INVALID_EVENT_UID' | 'CLOCK_INVALID' | 'TIME_IMPOSSIBLE' | null
+    /** Which CNIC the terminal held for this user ID at the punch time. */
+    punch_time_cnic?: PunchTimeCnicState | null
+    /** The send dialog must ask which CNIC to use; ADD never picks today's by user ID alone. */
+    cnic_choice_required?: boolean
+  } | null
   id: number
   event_uid: string
   device_serial: string | null

@@ -39,7 +39,11 @@ from zk_add import attendance_force_release as force_release
 from zk_add import attendance_direct_ords as direct_ords
 from zk_add.attendance_cnic_link import cnic_not_linked_expression
 from zk_add.attendance_force_schemas import ForceCheckRequest, ForceStartRequest, ForceControlRequest, UserRefreshRequest
-from zk_add.attendance_direct_ords_schemas import DirectOrdsRecheckRequest, DirectOrdsStartRequest
+from zk_add.attendance_direct_ords_schemas import (
+    DirectOrdsPreviewRequest,
+    DirectOrdsRecheckRequest,
+    DirectOrdsStartRequest,
+)
 from zk_add.audit import append_audit
 from zk_add.hikvision_evidence import ObservationIn, preserve_observation
 from zk_add.schemas import HikvisionPolicyRequest, HikvisionWriteExceptionRequest
@@ -612,6 +616,16 @@ def list_direct_ords_runs(
         .order_by(AttendanceRecoveryJob.id.desc()).limit(limit)
     ).all()
     return {"rows": [direct_ords.serialize(db, row) for row in rows]}
+
+
+@app.post("/api/v2/attendance-direct-ords/preview")
+def preview_direct_ords_run(
+    body: DirectOrdsPreviewRequest,
+    auth: tuple[Session, AdminContext] = Depends(require_admin),
+):
+    """Read-only: refused punch times, CNIC choices and imminent automatic releases."""
+    db, _context = auth
+    return direct_ords.preview(db, body.event_ids)
 
 
 @app.post("/api/v2/attendance-direct-ords", status_code=202)
@@ -3265,6 +3279,14 @@ def attendance_identity_evidence_report(
 
     source = source_evidence(db, event, connector) if connector else None
     evidence = identity_evidence(db, event, connector) if connector else None
+    auto_release_eligible = bool(
+        connector and zkt and user
+        and synced_cnic_identity_proven(db, connector, zkt, user, event)
+    )
+    safety = _identity_release_safety(
+        db, event, connector=connector, zkt=zkt, user=user, manifest=manifest,
+        source=source, auto_release_eligible=auto_release_eligible,
+    )
     return {
         "event_id": event.id,
         "ords_status": event.ords_status,
@@ -3353,10 +3375,108 @@ def attendance_identity_evidence_report(
         "active_user_cnic_matches_history": bool(
             user and evidence and user.cnic_lookup_hash == evidence.cnic_hash
         ),
-        "auto_release_eligible": bool(
-            connector and zkt and user
-            and synced_cnic_identity_proven(db, connector, zkt, user, event)
-        ),
+        "auto_release_eligible": auto_release_eligible,
+        **safety,
+    }
+
+
+IDENTITY_RELEASE_HINTS = {
+    "CLOCK_INVALID": "The terminal clock was invalid for this punch. It can never be sent to Oracle.",
+    "TIME_IMPOSSIBLE": "The punch time is impossible. It can never be sent to Oracle.",
+    "AUTO_RELEASE_AT_NEXT_SNAPSHOT": (
+        "ADD's own proof and the database guard pass: the next user snapshot "
+        "(normally within 15 minutes) releases this punch. Do not send it by hand."
+    ),
+    "AWAITING_NEXT_SNAPSHOT": (
+        "This punch arrived after the latest user snapshot. ADD checks it again at the next "
+        "snapshot (normally within 15 minutes) and may release it automatically."
+    ),
+    "DATABASE_GUARD_REJECTS": (
+        "ADD's proof passes but the installed database guard would keep this punch held."
+    ),
+    "NO_SAVED_TERMINAL_RECORD": (
+        "No saved terminal record yet: a full-history or tail read must link this punch "
+        "to the terminal's own attendance log before ADD can prove its source."
+    ),
+    "PUNCH_TIME_CNIC_DIFFERS": (
+        "The terminal held a different CNIC for this user ID at punch time. A manual send "
+        "must choose which CNIC to use; the punch-time CNIC is the default."
+    ),
+    "PUNCH_TIME_CNIC_AMBIGUOUS": (
+        "Several or revoked identity records cover the punch time. ADD cannot name one CNIC."
+    ),
+    "NO_PUNCH_TIME_IDENTITY": (
+        "ADD has no identity record for this user ID at punch time. Today's CNIC may only be "
+        "used after HR confirms the user ID belonged to the same employee then."
+    ),
+}
+
+
+def _identity_release_safety(
+    db, event, *, connector, zkt, user, manifest, source, auto_release_eligible,
+) -> dict:
+    """Read-only facts an administrator needs before overriding a hold by hand."""
+    from zk_add.attendance_identity_evidence import TERMINAL_RECONCILE_SOURCES
+    from zk_add.attendance_release_safety import (
+        AMBIGUOUS,
+        DIFFERS,
+        NONE,
+        auto_release_preview,
+        database_guard_state,
+        punch_time_identity,
+        time_refusal,
+    )
+
+    try:
+        current_cnic = normalize_cnic(decrypt_cnic(user.cnic_encrypted)) if user else None
+    except Exception:
+        current_cnic = None
+    punch = punch_time_identity(
+        db, event, cnic_lookup(current_cnic) if current_cnic else None,
+    )
+    guard = (
+        database_guard_state(db, event=event, zkt=zkt, user=user)
+        if connector and zkt and user else "NOT_CHECKED"
+    )
+    release = auto_release_preview(db, event, include_guard=False)
+    at_next_snapshot = bool(
+        release["held"] and auto_release_eligible and guard in {"ACCEPTED", "NOT_APPLICABLE"}
+    )
+    saved_record = manifest is not None
+    codes = []
+    refusal = time_refusal(event)
+    if refusal:
+        codes.append(refusal)
+    if at_next_snapshot:
+        codes.append("AUTO_RELEASE_AT_NEXT_SNAPSHOT")
+    elif release["awaiting_snapshot"]:
+        codes.append("AWAITING_NEXT_SNAPSHOT")
+    if auto_release_eligible and guard == "REJECTED":
+        codes.append("DATABASE_GUARD_REJECTS")
+    if not saved_record and source is None and event.source in TERMINAL_RECONCILE_SOURCES:
+        codes.append("NO_SAVED_TERMINAL_RECORD")
+    punch_code = {
+        DIFFERS: "PUNCH_TIME_CNIC_DIFFERS",
+        AMBIGUOUS: "PUNCH_TIME_CNIC_AMBIGUOUS",
+        NONE: "NO_PUNCH_TIME_IDENTITY",
+    }.get(punch.state)
+    if punch_code:
+        codes.append(punch_code)
+    return {
+        "time_refusal": refusal,
+        "database_guard": guard,
+        "auto_release_at_next_snapshot": at_next_snapshot,
+        "awaiting_next_snapshot": release["awaiting_snapshot"],
+        "saved_terminal_record": saved_record,
+        "punch_time_cnic": {
+            "state": punch.state,
+            "cnic_masked": mask_cnic(punch.cnic) if punch.cnic else None,
+            "display_name": punch.display_name,
+            "history_ids": list(punch.history_ids),
+        },
+        "current_cnic_masked": mask_cnic(current_cnic),
+        "punch_time_cnic_matches_current": punch.state == "MATCHES_CURRENT",
+        "hints": [{"code": code, "message": IDENTITY_RELEASE_HINTS[code]} for code in codes],
     }
 
 
@@ -5105,6 +5225,9 @@ def device_user_identity_integrity(
                 if member.id != user.id
             ]
     with_cnic = sum(bool(user.cnic_lookup_hash) for user in active)
+    from zk_add.attendance_release_safety import suspect_user_count
+
+    cnic_format_suspect = suspect_user_count(active)
     unresolved_groups = [
         group
         for group in duplicate_groups
@@ -5120,6 +5243,7 @@ def device_user_identity_integrity(
             "total_users": len(active),
             "with_cnic": with_cnic,
             "missing_cnic": len(active) - with_cnic,
+            "cnic_format_suspect_users": cnic_format_suspect,
             "duplicate_groups": len(duplicate_groups),
             "duplicate_users": sum(len(group) for group in duplicate_groups),
             "resolved_duplicate_groups": len(duplicate_groups) - len(unresolved_groups),
@@ -5140,8 +5264,12 @@ def serialize_user(
 ) -> dict:
     from zk_add.service import user_profile_is_writable
 
+    from zk_add.identity import suspect_cnic_name
+
     cnic = decrypt_cnic(row.cnic_encrypted)
     machine_name = decrypt_text(row.machine_name_encrypted) or ""
+    # Never parsed or used: an operator confirms the CNIC with HR first.
+    suspect = None if cnic else suspect_cnic_name(machine_name)
     if cnic and machine_name:
         machine_name = machine_name.replace(cnic, mask_cnic(cnic) or "[CNIC]")
     return {
@@ -5172,6 +5300,9 @@ def serialize_user(
         "machine_name_preview": machine_name or None,
         "current_command_state": "PENDING" if row.current_command_id else None,
         "read_only": bool(zkt and not user_profile_is_writable(zkt.connector, zkt)),
+        "cnic_format_suspect": suspect is not None,
+        "cnic_format_suspect_reason": suspect.reason if suspect else None,
+        "suggested_display_name": suspect.display_name if suspect and suspect.display_name else None,
     }
 
 

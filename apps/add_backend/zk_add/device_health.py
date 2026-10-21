@@ -42,7 +42,7 @@ STARTUP_PHASES = frozenset(HIL_STARTUP_PHASES - {"READY"}) | {"BRIDGE_VALIDATION
 WORKFLOW_OWNED_CODES = frozenset({
     "ADMIN_REVOKE_OVERDUE", "ATTENDANCE_EVENT_QUARANTINED", "ATTENDANCE_REPAIR_NEEDS_ATTENTION",
     "ATTENDANCE_REPAIR_STALLED", "ORDS_DELIVERY_FAILED", "DUPLICATE_USER_CNIC",
-    "ORACLE_RECEIPT_CONNECTOR_MISMATCH", "HISTORY_BACKFILL_BLOCKED",
+    "ORACLE_RECEIPT_CONNECTOR_MISMATCH", "HISTORY_BACKFILL_BLOCKED", "USER_CNIC_FORMAT_SUSPECT",
 })
 DIAGNOSTICS_CODES = ("ESP_DURABILITY_FAULT", "ESP_DELIVERY_WORKER_FAULT")
 
@@ -128,6 +128,9 @@ POLICY = {
     "USER_DELETION_JOB_INCOMPLETE": Policy(
         109, False, "LATCHED", "Clears when the user deletion job completes."),
     "DUPLICATE_USER_CNIC": Policy(109, False, "LATCHED", "Clears when the duplicate CNIC is resolved."),
+    "USER_CNIC_FORMAT_SUSPECT": Policy(
+        109, False, "LATCHED",
+        "Clears at the next user snapshot once no active user's name hides a CNIC typo."),
     "ORACLE_RECEIPT_CONNECTOR_MISMATCH": Policy(
         109, False, "LATCHED", "Clears when Oracle receipts match this connector."),
     "ADMIN_REVOKE_OVERDUE": Policy(109, False, "LATCHED", "Clears when the temporary admin is revoked."),
