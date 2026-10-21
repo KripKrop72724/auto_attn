@@ -125,6 +125,10 @@ POLICY = {
     "ADD_SOURCE_COVERAGE_INVALIDATED": Policy(
         108, False, "LATCHED", "Clears through a source coverage review."),
     "TERMINAL_SOURCE_EXCEPTION": Policy(108, False, "LATCHED", "Clears through a source exception review."),
+    "TERMINAL_NEWEST_RECORD_CORRECTED": Policy(
+        108, False, "LATCHED",
+        "Clears when an operator resolves it after HR verifies the punch corrected from an unwritten "
+        "newest terminal record."),
     "USER_DELETION_JOB_INCOMPLETE": Policy(
         109, False, "LATCHED", "Clears when the user deletion job completes."),
     "DUPLICATE_USER_CNIC": Policy(109, False, "LATCHED", "Clears when the duplicate CNIC is resolved."),

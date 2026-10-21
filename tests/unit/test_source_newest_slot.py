@@ -1,4 +1,4 @@
-"""A terminal's newest attendance slot is settled from a later read, never trusted.
+"""A terminal's newest attendance slot is settled from a later reconcile, never trusted.
 
 The record shapes are the 40-byte uFace800 rows ADD received from MULTAN-01
 and KARACHI-01 on 21 October 2026: the newest slot of every tail read was zero
@@ -9,10 +9,12 @@ the next punch.
 from __future__ import annotations
 
 import base64
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import os
+import time
 from uuid import uuid4
 
 import pytest
@@ -26,12 +28,17 @@ from zk_add import source_newest_slot as newest_slot
 from zk_add.db import Base
 from zk_add.models import (
     AttendanceEvent,
+    AttendanceSourceCorrection,
     AuditEvent,
+    Connector,
+    DeviceAlert,
+    ReconciliationChunk,
     ReconciliationCoverage,
     ReconciliationDivergence,
     ReconciliationEvent,
     ReconciliationJob,
     TerminalRecordManifest,
+    TerminalRecordReview,
     TerminalSourceEpoch,
 )
 from zk_add.schemas import (
@@ -47,7 +54,7 @@ from zk_add.schemas import (
 )
 from zk_add.service import ingest_attendance, onboard_connector, replace_user_snapshot
 from zk_add.settings import settings
-from zk_add.source_exceptions import list_source_exceptions, source_exception_detail
+from zk_add.source_exceptions import list_source_exceptions, review_source_exception, source_exception_detail
 from zk_add.time_utils import utc_now
 from zk_add.zkt_decode import PAKISTAN_TIME, encode_time
 
@@ -338,106 +345,217 @@ def test_genuine_bad_clock_and_capped_range_rows_are_not_newest_slot(source_db):
     assert all(row["source_condition"] is None and row["operator_reason"] is None for row in listed)
 
 
-@pytest.mark.parametrize("live_captured", [True, False])
-def test_rewound_tail_replay_settles_newest_slot_without_invalidating_coverage(source_db, live_captured):
+ZERO_DIGEST = hashlib.sha256(ZERO).hexdigest()
+
+
+def history(*rows):
+    """Reconcile rows for ordinals 0.., given as punches or ready source rows."""
+    return [row.row(index, source="FULL_HISTORY") if isinstance(row, Punch) else row
+            for index, row in enumerate(rows)]
+
+
+def anchor_job(session, connector, *, cutoff, padding=0, key=None):
+    """A complete reconcile in the active epoch, anchored the way every firmware anchors it."""
+    connector.zkt_device.attendance_count = cutoff
+    job = service.create_reconciliation_job(
+        session, connector=connector, actor="operator", reason="Re-read terminal source after deployment.",
+        confirmation="RECONCILE 1 FROM START", idempotency_key=key or f"newest-slot-{uuid4().hex}",
+    )
+    service.apply_reconciliation_anchor(session, connector=connector, payload=ReconciliationAnchorRequest(
+        job_id=job.job_id, source_epoch=service.source_epoch_uuid(session, job),
+        generation=job.terminal_generation, terminal_serial=SERIAL,
+        terminal_generation=job.terminal_generation, cutoff_count=cutoff, latest_terminal_count=cutoff,
+        record_size=40, source_total_bytes=4 + cutoff * 40 + padding,
+        first_anchor_digest=P0.row(0).raw_record_digest,
+    ))
+    session.commit()
+    return job
+
+
+def seal(session, connector, job, chain):
+    service.apply_reconciliation_manifest(session, connector=connector, payload=ReconciliationManifestRequest(
+        job_id=job.job_id, source_epoch=service.source_epoch_uuid(session, job),
+        generation=job.terminal_generation, terminal_serial=SERIAL,
+        terminal_generation=job.terminal_generation, cutoff_count=job.cutoff_count,
+        latest_terminal_count=job.cutoff_count, final_chain_digest=chain,
+    ))
+    session.commit()
+
+
+def rows_at(session, ordinal):
+    return session.scalars(select(TerminalRecordManifest).where(
+        TerminalRecordManifest.ordinal == ordinal).order_by(TerminalRecordManifest.id)).all()
+
+
+def job_states(session, job):
+    return session.scalars(select(ReconciliationEvent.state).where(ReconciliationEvent.job_id == job.id)).all()
+
+
+def replay(session, connector, coverage, before, records, *, latest):
+    request = tail_request(session, coverage, records, latest=latest, previous=before)
+    result = service.apply_source_tail_chunk(session, connector=connector, payload=request)
+    session.commit()
+    return result
+
+
+def correct(session, connector, row, *, key="pre-deploy-correction"):
+    """A correction made before ADD refused them on newest-slot rows: user 44's bytes, a new time."""
+    derived = Punch(uid=17, user_id="44", local=at(12))
+    ingest_attendance(session, connector=connector, events=[derived.event("CURRENT_RECONCILE")])
+    session.flush()
+    event = session.scalar(select(AttendanceEvent).where(AttendanceEvent.event_uid == derived.event_uid))
+    correction = AttendanceSourceCorrection(
+        source_kind="ZKT_MANIFEST", source_ref=f"ZKT_MANIFEST:{row.id}", connector_id=connector.id,
+        manifest_id=row.id, original_digest=row.raw_record_digest, correction_version=1,
+        corrected_device_time=derived.local, status="CREATED", derived_event_uid=derived.event_uid,
+        derived_attendance_event_id=event.id, actor="operator", reason="Pre-deploy correction",
+        idempotency_key=key,
+    )
+    session.add(correction)
+    session.commit()
+    return correction, event
+
+
+def test_rewound_tail_replay_is_superseded_without_changing_any_row(source_db):
     session, connector, _ = source_db
     coverage, before, _ = first_tail(session, connector, junk(3, "zero"))
     cursor, chain = coverage.source_committed_cursor, coverage.source_committed_chain_digest
-    if live_captured:
-        ingest_attendance(session, connector=connector, events=[P3.event("LIVE")])
-        session.commit()
     events_before = session.scalar(select(func.count(AttendanceEvent.id)))
+    rows_before = session.scalar(select(func.count(TerminalRecordManifest.id)))
     # A stale coverage push rewound the reader to ordinal 1. Two more punches
     # arrived, so slot 3 now holds P3 and slot 5 is the new unwritten slot.
-    replay = tail_request(session, coverage, [P1.row(1), P2.row(2), P3.row(3), P4.row(4),
-                                              junk(5, "bare_timestamp")], latest=6, previous=before)
-    result, chunk, duplicate, error = service.apply_source_tail_chunk(
-        session, connector=connector, payload=replay)
-    session.commit()
+    records = [P1.row(1), P2.row(2), P3.row(3), P4.row(4), junk(5, "bare_timestamp")]
+    result, chunk, duplicate, error = replay(session, connector, coverage, before, records, latest=6)
     assert error == newest_slot.REPLAY_SUPERSEDED_CODE and chunk is None and not duplicate
     assert result.active and result.capture_state != "SOURCE_COVERAGE_INVALIDATED"
     assert (result.source_committed_cursor, result.source_committed_chain_digest) == (cursor, chain)
-    settled = canonical(session, 3)
-    assert settled.source_kind == "TAIL" and settled.disposition in {"EVENT", "BLOCKED_IDENTITY"}
-    assert settled.raw_record_digest == P3.row(3).raw_record_digest
-    superseded = session.scalars(select(TerminalRecordManifest).where(
-        TerminalRecordManifest.ordinal == 3,
-        TerminalRecordManifest.canonical_source == False,  # noqa: E712
-    )).all()
-    assert [row.raw_record_digest for row in superseded] == [hashlib.sha256(ZERO).hexdigest()]
-    event = session.get(AttendanceEvent, settled.attendance_event_id)
-    assert event.event_uid == P3.event_uid and event.user_id == "50"
-    assert session.scalar(select(func.count(AttendanceEvent.id))) == events_before + (0 if live_captured else 1)
-    assert session.scalar(select(func.count(AttendanceEvent.id)).where(
-        AttendanceEvent.event_uid == P3.event_uid)) == 1
-    # Ordinals beyond ADD's cursor are not committed by a replay.
-    assert canonical(session, 4) is None and canonical(session, 5) is None
-    assert 3 not in {row["ordinal"] for row in list_source_exceptions(session)["rows"]}
-    audit = session.scalar(select(AuditEvent).where(AuditEvent.action == newest_slot.SETTLED_STATE))
-    assert audit is not None and audit.target_id == str(superseded[0].id)
-    # The reader adopts ADD's cursor and continues; its newest slot is new junk.
+    # The replay has no receipt, so it changes nothing ADD stores.
+    assert canonical(session, 3).raw_record_digest == ZERO_DIGEST
+    assert canonical(session, 3).source_kind == "TAIL"
+    assert session.scalar(select(func.count(TerminalRecordManifest.id))) == rows_before
+    assert session.scalar(select(func.count(AttendanceEvent.id))) == events_before
+    assert newest_slot.is_unsettled_newest(session, canonical(session, 3))
+    # One durable record per distinct replay, however often it is resent.
+    replay(session, connector, coverage, before, records, latest=6)
+    job = session.get(ReconciliationJob, coverage.job_id)
+    events = session.scalars(select(ReconciliationEvent).where(
+        ReconciliationEvent.job_id == job.id,
+        ReconciliationEvent.state == newest_slot.REPLAY_SUPERSEDED_CODE)).all()
+    assert len(events) == 1
+    details = events[0].details
+    assert (details["start_ordinal"], details["end_ordinal"], details["latest_terminal_count"]) == (1, 6, 6)
+    assert details["source_committed_cursor"] == cursor
+    assert [(row["ordinal"], row["committed_raw_record_digest"], row["replay_read_newest"])
+            for row in details["unsettled_rows"]] == [(3, ZERO_DIGEST, False)]
+    assert session.scalar(select(func.count(AuditEvent.id)).where(
+        AuditEvent.action == newest_slot.REPLAY_SUPERSEDED_CODE)) == 1
+    # The reader adopts ADD's cursor and continues with an ordinary tail.
     next_tail = tail_request(session, result, [P4.row(4), junk(5, "bare_timestamp")], latest=6)
     assert service.apply_source_tail_chunk(session, connector=connector, payload=next_tail)[3] is None
     session.commit()
     assert result.source_committed_cursor == 6
 
 
-def test_replay_that_changes_a_settled_row_still_invalidates(source_db):
+def test_replay_that_changes_a_committed_row_still_invalidates(source_db):
     session, connector, _ = source_db
     coverage, before, _ = first_tail(session, connector, junk(3, "zero"))
     changed = Punch(uid=17, user_id="44", local=at(3))
-    replay = tail_request(session, coverage, [P1.row(1), changed.row(2), P3.row(3), P4.row(4)],
-                          latest=5, previous=before)
-    result, chunk, _, error = service.apply_source_tail_chunk(session, connector=connector, payload=replay)
+    result, chunk, _, error = replay(session, connector, coverage, before,
+                                     [P1.row(1), changed.row(2), P3.row(3), P4.row(4)], latest=5)
     assert error == "SOURCE_TAIL_REPLAY_DIVERGED" and chunk is None
     assert result.active is False and result.capture_state == "SOURCE_COVERAGE_INVALIDATED"
-    assert canonical(session, 3).raw_record_digest == hashlib.sha256(ZERO).hexdigest()
+    assert canonical(session, 3).raw_record_digest == ZERO_DIGEST
 
 
-def test_replay_that_still_reads_the_newest_slot_settles_nothing(source_db):
+def test_replay_that_still_reads_the_newest_slot_is_superseded(source_db):
     session, connector, _ = source_db
     coverage, before, _ = first_tail(session, connector, junk(3, "zero"))
     cursor = coverage.source_committed_cursor
     # No punch since: the replay ends at the same unwritten slot, with other bytes.
-    replay = tail_request(session, coverage, [P1.row(1), P2.row(2), junk(3, "bare_timestamp")],
-                          latest=4, previous=before)
-    result, _, _, error = service.apply_source_tail_chunk(session, connector=connector, payload=replay)
-    session.commit()
+    result, _, _, error = replay(session, connector, coverage, before,
+                                 [P1.row(1), P2.row(2), junk(3, "bare_timestamp")], latest=4)
     assert error == newest_slot.REPLAY_SUPERSEDED_CODE and result.active
     assert result.source_committed_cursor == cursor
-    assert canonical(session, 3).raw_record_digest == hashlib.sha256(ZERO).hexdigest()
-    assert session.scalar(select(func.count(TerminalRecordManifest.id)).where(
-        TerminalRecordManifest.ordinal == 3)) == 1
+    assert [row.raw_record_digest for row in rows_at(session, 3)] == [ZERO_DIGEST]
 
 
-def test_superseded_replay_answers_with_current_coverage_over_the_device_stream(source_db, monkeypatch):
+@pytest.mark.parametrize("owner", ["foreign", "conflicting"])
+def test_superseded_replay_keeps_the_ordinary_tail_conflict_signals(source_db, owner):
+    session, connector, _ = source_db
+    coverage, before, _ = first_tail(session, connector, junk(3, "zero"))
+    if owner == "foreign":
+        # Another connector owns P3's event UID: a second reader on this terminal.
+        other, _token, _created = onboard_connector(
+            session, hardware_id="e0:72:a1:d6:f3:42", zone_id="ZONE-MULTAN-01",
+            zone_name="ZONE-MULTAN-01", device_id="2", firmware_version="zone-lite-2.7.5",
+            expected_serial="OTHER-TERMINAL", actor="test", ip_address="127.0.0.1",
+        )
+        session.flush()
+        ingest_attendance(session, connector=other, events=[P3.event("LIVE").model_copy(
+            update={"terminal_serial": None})])
+        expected = "SOURCE_TAIL_FOREIGN_OWNER"
+    else:
+        # This connector holds the same event UID for a different person.
+        ingest_attendance(session, connector=connector, events=[P3.event("LIVE").model_copy(
+            update={"user_id": "44"})])
+        expected = "SOURCE_REPLAY_USER_MISMATCH"
+    session.commit()
+    result, _, _, error = replay(session, connector, coverage, before,
+                                 [P1.row(1), P2.row(2), P3.row(3), junk(4, "zero")], latest=5)
+    assert error == expected
+    assert result.active is False and result.invalidated_reason == expected
+    assert canonical(session, 3).raw_record_digest == ZERO_DIGEST
+
+
+def test_superseded_coverage_push_is_applied_by_every_firmware_generation(source_db, monkeypatch):
     from zk_add import web
     session, connector, factory = source_db
     coverage, before, _ = first_tail(session, connector, junk(3, "uid_without_user"))
     connector.boot_id, connector.last_sequence = "newest-slot-boot", 10
     session.commit()
     monkeypatch.setattr("zk_add.db.SessionLocal", factory)
-    replay = tail_request(session, coverage, [P1.row(1), P2.row(2), P3.row(3), junk(4, "zero")],
-                          latest=5, previous=before)
+    request = tail_request(session, coverage, [P1.row(1), P2.row(2), P3.row(3), junk(4, "zero")],
+                           latest=5, previous=before)
     envelope = Envelope(connector_id=connector.connector_id, message_id=str(uuid4()),
                         boot_id=connector.boot_id, seq=11, sent_at=utc_now(), type="source_tail_chunk",
-                        payload=replay.model_dump(mode="json"))
+                        payload=request.model_dump(mode="json"))
     outcome = web.persist_envelope(connector.id, envelope)
     assert outcome.ack["type"] == "error"
     assert outcome.ack["code"] == newest_slot.REPLAY_SUPERSEDED_CODE
     assert outcome.ack["committed_next_ordinal"] == 4
-    assert outcome.coverage["type"] == "source_coverage" and outcome.coverage["active"] is True
-    assert outcome.coverage["source_committed_cursor"] == 4
-    assert outcome.coverage["source_committed_chain_digest"] == coverage.source_committed_chain_digest
-    assert outcome.coverage["terminal_serial"] == SERIAL
-    json.dumps(outcome.coverage)
+    push = json.loads(json.dumps(outcome.coverage))
+    assert push["source_committed_cursor"] == 4
+    assert push["source_committed_chain_digest"] == coverage.source_committed_chain_digest
+
+    def number(value, minimum=0):
+        return type(value) in {int, float} and minimum <= value <= 2**32 - 1 and value == int(value)
+
+    # 2.4.12 (45690c4), 2.5.2 (c8c5a0e) and 2.6.15 (3d62ecf): the
+    # "source_coverage" handler in add_connector.c.
+    assert (push["type"] == "source_coverage" and isinstance(push["terminal_serial"], str)
+            and push["terminal_serial"] and type(push["terminal_generation"]) in {int, float}
+            and type(push["source_committed_cursor"]) in {int, float}
+            and isinstance(push["source_committed_chain_digest"], str)
+            and len(push["source_committed_chain_digest"]) == 64 and isinstance(push["active"], bool))
+    # 2.6.16 and later: add_source_parse_coverage in add_source_wire.c, with
+    # the epoch required for an active push.
+    epoch = push["source_epoch"]
+    assert push["active"] is True and isinstance(epoch, str) and len(epoch) == 36
+    assert all(char == "-" if index in {8, 13, 18, 23} else char in "0123456789abcdef"
+               for index, char in enumerate(epoch))
+    assert 0 < len(push["terminal_serial"]) < 80
+    assert number(push["terminal_generation"], 1) and number(push["source_committed_cursor"])
+    assert all(char in "0123456789abcdef" for char in push["source_committed_chain_digest"])
+    # The same push a manifest handoff already sends to every generation.
     with factory() as db:
+        assert push == json.loads(json.dumps(service.source_coverage_payload(
+            db, db.get(ReconciliationCoverage, coverage.id))))
         connector_row = db.get(type(connector), connector.id)
         assert connector_row.lifecycle_state != "DEGRADED"
         assert db.scalar(select(TerminalRecordManifest.disposition).where(
             TerminalRecordManifest.ordinal == 3,
             TerminalRecordManifest.canonical_source == True,  # noqa: E712
-        )) in {"EVENT", "BLOCKED_IDENTITY"}
+        )) == "IDENTITY_UNRESOLVED"
 
 
 @pytest.mark.parametrize("live_captured", [True, False])
@@ -449,91 +567,275 @@ def test_same_epoch_reconcile_settles_newest_slot_instead_of_diverging(source_db
         session.commit()
     events_before = session.scalar(select(func.count(AttendanceEvent.id)))
     epoch = session.scalar(select(TerminalSourceEpoch))
-    connector.zkt_device.attendance_count = 5
-    job = service.create_reconciliation_job(
-        session, connector=connector, actor="operator", reason="Re-read terminal source after deployment.",
-        confirmation="RECONCILE 1 FROM START", idempotency_key="newest-slot-reread",
-    )
+    job = anchor_job(session, connector, cutoff=5)
     assert job.source_epoch_id == epoch.id
-    service.apply_reconciliation_anchor(session, connector=connector, payload=ReconciliationAnchorRequest(
-        job_id=job.job_id, source_epoch=service.source_epoch_uuid(session, job),
-        generation=job.terminal_generation, terminal_serial=SERIAL,
-        terminal_generation=job.terminal_generation, cutoff_count=5, latest_terminal_count=5,
-        record_size=40, source_total_bytes=4 + 5 * 40, first_anchor_digest=P0.row(0).raw_record_digest,
-    ))
-    session.commit()
-    history = [P0.row(0, source="FULL_HISTORY"), P1.row(1, source="FULL_HISTORY"),
-               P2.row(2, source="FULL_HISTORY"), P3.row(3, source="FULL_HISTORY"), junk(4, "zero")]
-    commit_chunk(session, connector, job, history)
-    session.commit()
+    commit_chunk(session, connector, job, history(P0, P1, P2, P3, junk(4, "zero")))
     assert job.phase != "VERIFYING_SOURCE_CHANGE" and job.committed_next_ordinal == 5
     assert session.scalar(select(func.count(ReconciliationDivergence.id))) == 0
     settled = canonical(session, 3)
-    assert settled.source_kind == "BASELINE" and settled.job_id == job.id
+    assert settled.source_kind == "BASELINE" and settled.job_id == job.id and settled.chunk_id is not None
     assert settled.raw_record_digest == P3.row(3).raw_record_digest
     assert session.get(AttendanceEvent, settled.attendance_event_id).event_uid == P3.event_uid
     assert session.scalar(select(func.count(AttendanceEvent.id))) == events_before + (0 if live_captured else 1)
-    states = session.scalars(select(ReconciliationEvent.state).where(ReconciliationEvent.job_id == job.id)).all()
-    assert newest_slot.SETTLED_STATE in states
-    # This job's own final ordinal was the newest slot when anchored.
+    retired = [row for row in rows_at(session, 3) if not row.canonical_source]
+    assert [(row.source_kind, row.raw_record_digest) for row in retired] == [("TAIL", ZERO_DIGEST)]
+    event = session.scalar(select(ReconciliationEvent).where(
+        ReconciliationEvent.job_id == job.id, ReconciliationEvent.state == newest_slot.SETTLED_STATE))
+    [entry] = event.details["rows"]
+    # The audit names the stored disposition and both rows.
+    assert (entry["settled_disposition"], entry["settled_manifest_id"]) == (settled.disposition, settled.id)
+    assert (entry["superseded_manifest_id"], entry["superseded_raw_record_digest"]) == (retired[0].id, ZERO_DIGEST)
+    audit = session.scalar(select(AuditEvent).where(AuditEvent.action == newest_slot.SETTLED_STATE))
+    assert audit.target_id == str(retired[0].id)
+    # This job's own final ordinal may have been the newest slot when read.
     assert newest_slot.is_unsettled_newest(session, canonical(session, 4))
     assert not newest_slot.is_unsettled_newest(session, settled)
 
 
-def test_same_epoch_reconcile_that_reads_the_slot_as_newest_again_keeps_it(source_db):
+@pytest.mark.parametrize("padding", [0, 8])
+def test_reread_at_the_jobs_own_final_ordinal_is_kept_only_as_a_receipt(source_db, padding):
+    """The final ordinal may still be the newest slot, whatever the prepared buffer's size."""
     session, connector, _ = source_db
     first_tail(session, connector, junk(3, "zero"))
-    job = service.create_reconciliation_job(
-        session, connector=connector, actor="operator", reason="Re-read terminal source after deployment.",
-        confirmation="RECONCILE 1 FROM START", idempotency_key="newest-slot-reread-same",
-    )
-    service.apply_reconciliation_anchor(session, connector=connector, payload=ReconciliationAnchorRequest(
-        job_id=job.job_id, source_epoch=service.source_epoch_uuid(session, job),
-        generation=job.terminal_generation, terminal_serial=SERIAL,
-        terminal_generation=job.terminal_generation, cutoff_count=4, latest_terminal_count=4,
-        record_size=40, source_total_bytes=4 + 4 * 40, first_anchor_digest=P0.row(0).raw_record_digest,
-    ))
-    session.commit()
-    commit_chunk(session, connector, job, [P0.row(0, source="FULL_HISTORY"), P1.row(1, source="FULL_HISTORY"),
-                                           P2.row(2, source="FULL_HISTORY"), junk(3, "bare_timestamp")])
-    session.commit()
+    events_before = session.scalar(select(func.count(AttendanceEvent.id)))
+    job = anchor_job(session, connector, cutoff=4, padding=padding)
+    assert newest_slot.baseline_newest_ordinal(job) == 3
+    # No punch since: slot 3 is still unwritten and returns stale bytes that
+    # decode as a valid punch for user 44.
+    stale = Punch(uid=17, user_id="44", local=at(7))
+    chain = commit_chunk(session, connector, job, history(P0, P1, P2, stale.row(3, source="FULL_HISTORY")))
     assert job.phase != "VERIFYING_SOURCE_CHANGE" and job.committed_next_ordinal == 4
     assert session.scalar(select(func.count(ReconciliationDivergence.id))) == 0
-    assert canonical(session, 3).raw_record_digest == hashlib.sha256(ZERO).hexdigest()
-    assert session.scalar(select(func.count(TerminalRecordManifest.id)).where(
-        TerminalRecordManifest.ordinal == 3)) == 1
+    assert session.scalar(select(func.count(AttendanceEvent.id))) == events_before
+    assert canonical(session, 3).raw_record_digest == ZERO_DIGEST
+    receipt = next(row for row in rows_at(session, 3) if not row.canonical_source)
+    assert (receipt.source_kind, receipt.job_id) == (newest_slot.REREAD_SOURCE_KIND, job.id)
+    assert receipt.chunk_id is not None and receipt.attendance_event_id is None
+    assert receipt.raw_record_digest == stale.row(3).raw_record_digest
+    assert newest_slot.REREAD_STATE in job_states(session, job)
+    # A re-read of the unwritten slot does not confirm or settle it.
+    assert newest_slot.is_unsettled_newest(session, canonical(session, 3))
+    # Every committed byte is accounted for when the job certifies.
+    seal(session, connector, job, chain)
+    assert job.capture_certified_at is not None
+    assert job.quarantined_count == 1
 
 
-def test_same_epoch_reconcile_still_diverges_on_a_changed_settled_row(source_db):
+def test_raw_custody_reread_of_an_unsettled_row_stays_a_source_change(source_db):
+    """A 2.7.6 raw-custody re-read is never settled, dropped or certified over."""
     session, connector, _ = source_db
     first_tail(session, connector, junk(3, "zero"))
-    job = service.create_reconciliation_job(
-        session, connector=connector, actor="operator", reason="Re-read terminal source after deployment.",
-        confirmation="RECONCILE 1 FROM START", idempotency_key="newest-slot-reread-changed",
-    )
-    service.apply_reconciliation_anchor(session, connector=connector, payload=ReconciliationAnchorRequest(
-        job_id=job.job_id, source_epoch=service.source_epoch_uuid(session, job),
-        generation=job.terminal_generation, terminal_serial=SERIAL,
-        terminal_generation=job.terminal_generation, cutoff_count=5, latest_terminal_count=5,
-        record_size=40, source_total_bytes=4 + 5 * 40, first_anchor_digest=P0.row(0).raw_record_digest,
-    ))
+    connector.zkt_custody_enabled = True
     session.commit()
-    changed = Punch(uid=17, user_id="44", local=at(3))
-    commit_chunk(session, connector, job, [P0.row(0, source="FULL_HISTORY"), P1.row(1, source="FULL_HISTORY"),
-                                           changed.row(2, source="FULL_HISTORY"),
-                                           P3.row(3, source="FULL_HISTORY"), junk(4, "zero")])
-    assert job.phase == "VERIFYING_SOURCE_CHANGE"
-    assert session.scalar(select(ReconciliationDivergence.ordinal)) == 2
+
+    def raw(ordinal, value):
+        digest = hashlib.sha256(value).hexdigest()
+        return ReconciliationSourceRecord(
+            ordinal=ordinal, raw_record_digest=digest,
+            terminal_record_key=hashlib.sha256(f"{SERIAL}:{digest}".encode()).hexdigest(),
+            occurrence_index=ordinal + 1, disposition="RAW_PRESERVED", event=None,
+            raw_record_b64=base64.b64encode(value).decode())
+
+    job = anchor_job(session, connector, cutoff=5)
+    commit_chunk(session, connector, job, history(P0, P1, P2, raw(3, P3.raw), raw(4, ZERO)))
+    assert job.phase == "VERIFYING_SOURCE_CHANGE" and job.committed_next_ordinal == 0
+    divergence = session.scalar(select(ReconciliationDivergence))
+    assert (divergence.ordinal, divergence.new_raw_digest) == (3, hashlib.sha256(P3.raw).hexdigest())
+    assert canonical(session, 3).raw_record_digest == ZERO_DIGEST
+    assert job.capture_certified_at is None
 
 
-@pytest.mark.parametrize("latest, newest", [(2, True), (3, False)])
-def test_baseline_final_ordinal_is_newest_only_when_the_anchor_ended_there(source_db, latest, newest):
+@pytest.mark.parametrize("shape", ["copied_identity_bad_time", "uid_without_user"])
+def test_settled_row_is_not_newest_and_a_later_change_is_a_source_change(source_db, shape):
+    session, connector, _ = source_db
+    first_tail(session, connector, junk(3, "zero"))
+    # Slot 3 now holds a genuine bad-clock punch or a deleted user's punch.
+    genuine = junk(3, shape)
+    first = anchor_job(session, connector, cutoff=5)
+    commit_chunk(session, connector, first, history(P0, P1, P2, genuine, junk(4, "zero")))
+    settled = canonical(session, 3)
+    assert settled.raw_record_digest == genuine.raw_record_digest and settled.job_id == first.id
+    assert not newest_slot.is_unsettled_newest(session, settled)
+    listed = {row["ordinal"]: row for row in list_source_exceptions(session)["rows"]}
+    assert listed[3]["source_condition"] is None
+    assert listed[4]["source_condition"] == newest_slot.UNSETTLED_CONDITION
+    if shape == "copied_identity_bad_time":
+        from zk_add.attendance_recovery import RecoveryError, _correction_candidate
+        # A genuine clock fault is correctable under the ordinary rules again.
+        try:
+            _correction_candidate(session, "ZKT_MANIFEST", f"ZKT_MANIFEST:{settled.id}",
+                                  datetime(2026, 10, 21, 12, 0, tzinfo=timezone.utc))
+        except RecoveryError as other:
+            assert other.code != newest_slot.UNSETTLED_CONDITION
+    service.control_reconciliation_job(session, job=first, action="cancel", actor="operator",
+                                       reason="Superseded by a later re-read.", idempotency_key="cancel-first")
+    session.commit()
+    # A later read of the now-written slot with other bytes is a real source change.
+    second = anchor_job(session, connector, cutoff=6)
+    commit_chunk(session, connector, second, history(P0, P1, P2, P3, P4, junk(5, "zero")))
+    assert second.phase == "VERIFYING_SOURCE_CHANGE"
+    assert session.scalar(select(ReconciliationDivergence.ordinal)) == 3
+    assert canonical(session, 3).id == settled.id
+
+
+def test_identical_reread_confirms_a_genuine_newest_record(source_db):
+    session, connector, _ = source_db
+    # A genuine bad-clock punch happened to be the tail's newest slot.
+    genuine = junk(3, "copied_identity_bad_time")
+    first_tail(session, connector, genuine)
+    row = canonical(session, 3)
+    assert newest_slot.is_unsettled_newest(session, row)
+    job = anchor_job(session, connector, cutoff=5)
+    commit_chunk(session, connector, job, history(P0, P1, P2, genuine, junk(4, "zero")))
+    assert canonical(session, 3).id == row.id  # the original read keeps the slot
+    receipt = next(item for item in rows_at(session, 3) if not item.canonical_source)
+    assert (receipt.source_kind, receipt.job_id, receipt.raw_record_digest) == (
+        newest_slot.REREAD_SOURCE_KIND, job.id, row.raw_record_digest)
+    assert newest_slot.CONFIRMED_STATE in job_states(session, job)
+    assert not newest_slot.is_unsettled_newest(session, row)
+    assert {item["ordinal"]: item for item in list_source_exceptions(session)["rows"]}[3][
+        "source_condition"] is None
+    service.control_reconciliation_job(session, job=job, action="cancel", actor="operator",
+                                       reason="Confirmed.", idempotency_key="cancel-confirm")
+    session.commit()
+    # Once confirmed, a different later read is a source change, not a settlement.
+    later = anchor_job(session, connector, cutoff=6)
+    commit_chunk(session, connector, later, history(P0, P1, P2, P3, P4, junk(5, "zero")))
+    assert later.phase == "VERIFYING_SOURCE_CHANGE"
+
+
+def test_corrected_newest_row_is_never_settled_and_raises_an_alert(source_db):
+    session, connector, _ = source_db
+    coverage, before, _ = first_tail(session, connector, junk(3, "copied_identity_bad_time"))
+    prior = canonical(session, 3)
+    correction, derived = correct(session, connector, prior)
+    listed = list_source_exceptions(session, corrected=True)["rows"]
+    assert [(row["ordinal"], row["source_condition"], row["source_correction_ids"]) for row in listed] == [
+        (3, newest_slot.CORRECTED_CONDITION, [correction.correction_id])]
+    assert "HR must verify" in listed[0]["operator_reason"]
+    assert 3 not in {row["ordinal"] for row in list_source_exceptions(session, corrected=False)["rows"]}
+    # A rewound replay shows the slot now holds P3: rows stay, HR is alerted.
+    _, _, _, error = replay(session, connector, coverage, before,
+                            [P1.row(1), P2.row(2), P3.row(3), P4.row(4), junk(5, "zero")], latest=6)
+    assert error == newest_slot.REPLAY_SUPERSEDED_CODE
+    alert = session.scalar(select(DeviceAlert).where(DeviceAlert.code == newest_slot.CORRECTED_ALERT))
+    assert alert is not None and alert.severity == "CRITICAL"
+    assert alert.details["correction_ids"] == [correction.correction_id]
+    session.delete(alert)
+    session.commit()
+    events_before = session.scalar(select(func.count(AttendanceEvent.id)))
+    # A reconcile that reads P3 there stops instead of hiding the corrected punch.
+    job = anchor_job(session, connector, cutoff=6)
+    commit_chunk(session, connector, job, history(P0, P1, P2, P3, P4, junk(5, "zero")))
+    assert (job.status, job.error_code) == ("NEEDS_ATTENTION", newest_slot.CORRECTED_HOLD)
+    assert job.committed_next_ordinal == 0
+    assert session.scalar(select(func.count(ReconciliationChunk.id)).where(ReconciliationChunk.job_id == job.id)) == 0
+    assert canonical(session, 3).id == prior.id
+    assert session.scalar(select(func.count(AttendanceEvent.id))) == events_before
+    assert session.get(AttendanceSourceCorrection, correction.id).status == "CREATED"
+    hold = session.scalar(select(ReconciliationEvent).where(
+        ReconciliationEvent.job_id == job.id, ReconciliationEvent.state == newest_slot.CORRECTED_HOLD))
+    assert hold.details["correction_ids"] == [correction.correction_id]
+    alert = session.scalar(select(DeviceAlert).where(DeviceAlert.code == newest_slot.CORRECTED_ALERT))
+    assert alert is not None and alert.details["job_id"] == job.job_id
+
+
+def test_reviewed_newest_row_settles_and_its_review_stays_with_the_excluded_bytes(source_db):
+    session, connector, _ = source_db
+    first_tail(session, connector, junk(3, "zero"))
+    prior = canonical(session, 3)
+    review = review_source_exception(session, row=prior, actor="operator",
+                                     reason="Unwritten newest record", idempotency_key="review-3")
+    session.commit()
+    assert list_source_exceptions(session)["totals"]["reviewed"] == 1
+    job = anchor_job(session, connector, cutoff=5)
+    commit_chunk(session, connector, job, history(P0, P1, P2, P3, junk(4, "zero")))
+    assert canonical(session, 3).raw_record_digest == P3.row(3).raw_record_digest
+    assert session.get(TerminalRecordReview, review.id).manifest_id == prior.id
+    assert not session.get(TerminalRecordManifest, prior.id).canonical_source
+    event = session.scalar(select(ReconciliationEvent).where(
+        ReconciliationEvent.job_id == job.id, ReconciliationEvent.state == newest_slot.SETTLED_STATE))
+    assert event.details["rows"][0]["superseded_review_ids"] == [review.review_id]
+    totals = list_source_exceptions(session)["totals"]
+    # Only ordinal 4, this job's own unreviewed final ordinal, is still an exception.
+    assert (totals["all"], totals["reviewed"], totals["open"]) == (1, 0, 1)
+
+
+def test_tail_replay_cannot_break_an_open_jobs_sealed_cohort(source_db):
+    session, connector, _ = source_db
+    coverage, before, _ = first_tail(session, connector, junk(3, "zero"))
+    # The runbook's quiet-window reconcile: no punch since the last tail.
+    job = anchor_job(session, connector, cutoff=4)
+    chain = commit_chunk(session, connector, job, history(P0, P1, P2, junk(3, "bare_timestamp")))
+    seal(session, connector, job, chain)
+    assert "retained_coverage" in job.capture_certificate
+    assert service.source_exception_assurance(session, job)["state"] == "REVIEW_REQUIRED"
+    _, _, _, error = replay(session, connector, coverage, before,
+                            [P1.row(1), P2.row(2), P3.row(3), P4.row(4), junk(5, "zero")], latest=6)
+    assert error == newest_slot.REPLAY_SUPERSEDED_CODE
+    service.refresh_reconciliation_assurance(session, job)
+    session.commit()
+    assurance = service.source_exception_assurance(session, job)
+    assert assurance["state"] == "REVIEW_REQUIRED" and assurance["mismatch_reasons"] == []
+    assert job.wait_reason == service.SOURCE_EXCEPTION_REVIEW_HOLD
+
+
+def test_reconcile_never_settles_rows_another_open_job_sealed(source_db):
+    session, connector, _ = source_db
+    first_tail(session, connector, junk(3, "zero"))
+    sealed = anchor_job(session, connector, cutoff=4)
+    seal(session, connector, sealed, commit_chunk(
+        session, connector, sealed, history(P0, P1, P2, junk(3, "bare_timestamp"))))
+    assert sealed.capture_certified_at is not None and sealed.status == "NEEDS_ATTENTION"
+    # A connector runs one job at a time, so two open jobs on one terminal
+    # need a job left open under an earlier connector binding.
+    other, _token, _created = onboard_connector(
+        session, hardware_id="e0:72:a1:d6:f3:43", zone_id="ZONE-MULTAN-01", zone_name="ZONE-MULTAN-01",
+        device_id="3", firmware_version="zone-lite-2.7.5", expected_serial="EARLIER-BINDING",
+        actor="test", ip_address="127.0.0.1",
+    )
+    session.flush()
+    sealed.connector_id = other.id
+    session.commit()
+    job = anchor_job(session, connector, cutoff=6)
+    commit_chunk(session, connector, job, history(P0, P1, P2, P3, P4, junk(5, "zero")))
+    assert (job.status, job.error_code) == ("NEEDS_ATTENTION", newest_slot.OPEN_JOB_HOLD)
+    assert job.committed_next_ordinal == 0 and canonical(session, 3).raw_record_digest == ZERO_DIGEST
+    assert service.source_exception_assurance(session, sealed)["mismatch_reasons"] == []
+
+
+def test_job_held_by_its_own_final_identity_row_is_not_promised_a_reread_exit(source_db):
+    """Owner decision pending: an unwritten final ordinal with an unresolved identity holds the job."""
+    session, connector, _ = source_db
+    job = certify_baseline(session, connector, [P0.row(0, source="FULL_HISTORY"), junk(1, "uid_without_user")])
+    row = canonical(session, 1)
+    assert newest_slot.is_unsettled_newest(session, row)
+    review_source_exception(session, row=row, actor="operator", reason="Unwritten newest record",
+                            idempotency_key="review-own-final")
+    session.commit()
+    service.refresh_reconciliation_assurance(session, job)
+    session.commit()
+    assert job.wait_reason == service.SOURCE_IDENTITY_HOLD
+    reason = source_exception_detail(session, row)["operator_reason"]
+    assert "stays held until the owner decides" in reason
+    # A re-read cannot run while the job is open; cancelling it is the exit.
+    with pytest.raises(ValueError):
+        anchor_job(session, connector, cutoff=2)
+
+
+@pytest.mark.parametrize("latest, padding", [(2, 0), (2, 8), (3, 0)])
+def test_baseline_final_ordinal_is_always_possibly_newest(source_db, latest, padding):
     session, connector, _ = source_db
     job = certify_baseline(session, connector, [P0.row(0, source="FULL_HISTORY"), junk(1, "zero")],
                            latest=latest)
+    if padding:
+        job.source_total_bytes += padding
     row = canonical(session, 1)
     assert row.job_id == job.id
-    assert newest_slot.is_unsettled_newest(session, row) is newest
+    assert newest_slot.baseline_newest_ordinal(job) == 1
+    assert newest_slot.is_unsettled_newest(session, row)
+    job.source_total_bytes = None
+    assert newest_slot.is_unsettled_newest(session, row)
 
 
 def test_recovery_epoch_copy_is_judged_by_the_read_it_copies(source_db):
@@ -559,7 +861,7 @@ def test_recovery_epoch_copy_is_judged_by_the_read_it_copies(source_db):
     assert newest_slot.unsettled_newest_ids(session, [copy, canonical(session, 2)]) == {copy.id}
 
 
-def test_source_time_correction_refuses_newest_slot_bytes(source_db, monkeypatch):
+def test_source_time_correction_refuses_newest_slot_bytes(source_db):
     from zk_add.attendance_recovery import RecoveryError, _correction_candidate
     session, connector, _ = source_db
     certify_baseline(session, connector, [P0.row(0, source="FULL_HISTORY")])
@@ -580,16 +882,38 @@ def test_source_time_correction_refuses_newest_slot_bytes(source_db, monkeypatch
         assert other.code != newest_slot.UNSETTLED_CONDITION
 
 
-def test_job_scoped_exception_listing_and_assurance_drop_a_settled_row(source_db):
-    session, connector, _ = source_db
-    coverage, before, _ = first_tail(session, connector, junk(3, "zero"))
-    assert list_source_exceptions(session)["totals"]["invalid_time"] == 1
-    replay = tail_request(session, coverage, [P1.row(1), P2.row(2), P3.row(3), junk(4, "zero")],
-                          latest=5, previous=before)
-    assert service.apply_source_tail_chunk(session, connector=connector, payload=replay)[3] == \
-        newest_slot.REPLAY_SUPERSEDED_CODE
-    session.commit()
-    totals = list_source_exceptions(session)["totals"]
-    assert totals["invalid_time"] == 0 and totals["all"] == 0
-    job = session.scalar(select(ReconciliationJob))
-    assert service.source_exception_assurance(session, job)["open"] == 0
+def test_concurrent_delivery_of_a_settling_chunk_settles_once(source_db):
+    session, connector, factory = source_db
+    if session.get_bind().dialect.name != "postgresql":
+        pytest.skip("Row locks between concurrent transactions need PostgreSQL")
+    first_tail(session, connector, junk(3, "zero"))
+    job = anchor_job(session, connector, cutoff=5)
+    records = history(P0, P1, P2, P3, junk(4, "zero"))
+    draft = ReconciliationChunkRequest(
+        job_id=job.job_id, source_epoch=service.source_epoch_uuid(session, job),
+        generation=job.terminal_generation, sequence=0, start_ordinal=0, end_ordinal=5,
+        chunk_digest="0" * 64, previous_chain_digest=None, resulting_chain_digest="0" * 64, records=records,
+    )
+    digest = service.reconciliation_chunk_digest(draft)
+    payload = draft.model_copy(update={"chunk_digest": digest, "resulting_chain_digest": (
+        service.reconciliation_chain_digest(None, start_ordinal=0, end_ordinal=5, chunk_digest=digest))})
+
+    def deliver(db):
+        return service.apply_reconciliation_chunk(db, connector=db.get(Connector, connector.id), payload=payload)
+
+    with factory() as first, factory() as second, ThreadPoolExecutor(max_workers=1) as pool:
+        _, chunk, duplicate = deliver(first)
+        assert chunk is not None and not duplicate
+        # The same chunk, redelivered over another stream before the first commits.
+        pending = pool.submit(lambda: (deliver(second), second.commit()))
+        time.sleep(1)
+        assert not pending.done()
+        first.commit()
+        (_, replayed, duplicate), _ = pending.result(timeout=30)
+        assert duplicate and replayed.id == chunk.id
+    session.expire_all()
+    assert [row.raw_record_digest for row in rows_at(session, 3) if row.canonical_source] == [
+        P3.row(3).raw_record_digest]
+    assert [row.raw_record_digest for row in rows_at(session, 3) if not row.canonical_source] == [ZERO_DIGEST]
+    assert session.scalar(select(func.count(AuditEvent.id)).where(
+        AuditEvent.action == newest_slot.SETTLED_STATE)) == 1

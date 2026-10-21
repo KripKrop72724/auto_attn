@@ -109,11 +109,17 @@ def test_production_sized_old_checkpoint_retains_longer_chain_and_exact_lost_ack
     data = scenario(reconciliation_db, baseline=3086, checkpoint=3000, cutoff=3172, current=4512)
     session, connector, job, coverage, payload = data
     before = snapshot(coverage)
-    original_count = session.scalar(select(func.count(TerminalRecordManifest.id)))
+    canonical_rows = select(func.count(TerminalRecordManifest.id)).where(
+        TerminalRecordManifest.canonical_source == True)  # noqa: E712
+    original_count = session.scalar(canonical_rows)
     finish(data)
     assert job.capture_certified_at and job.status == "COMPLETED"
     assert snapshot(coverage) == before
-    assert session.scalar(select(func.count(TerminalRecordManifest.id))) == original_count == 4512
+    assert session.scalar(canonical_rows) == original_count == 4512
+    # The retained baseline's final ordinal may have been its newest slot; the
+    # identical re-read is kept as the receipt that confirms it.
+    assert session.scalars(select(TerminalRecordManifest.ordinal).where(
+        TerminalRecordManifest.canonical_source == False)).all() == [3085]  # noqa: E712
     own = session.scalar(select(ReconciliationCoverage).where(ReconciliationCoverage.job_id == job.id))
     assert own.active is False and own.source_committed_cursor == 3172
     assert own.capture_evidence["retained_coverage"]["coverage_id"] == coverage.coverage_id

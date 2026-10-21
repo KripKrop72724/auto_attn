@@ -9,6 +9,7 @@ from zk_add import source_newest_slot as newest_slot
 from zk_add.audit import append_audit
 from zk_add.crypto import decrypt_text
 from zk_add.models import (
+    AttendanceSourceCorrection,
     AuditEvent,
     Connector,
     ReconciliationCoverage,
@@ -63,8 +64,12 @@ def _serialize(
     coverage: ReconciliationCoverage | None,
     *,
     newest_unsettled: bool = False,
+    correction_ids: list[str] | None = None,
 ) -> dict:
     committed_cursor = coverage.source_committed_cursor if coverage else 0
+    condition = None
+    if newest_unsettled:
+        condition = newest_slot.CORRECTED_CONDITION if correction_ids else newest_slot.UNSETTLED_CONDITION
     return {
         "id": row.id,
         "connector_id": connector.connector_id if connector else None,
@@ -98,8 +103,12 @@ def _serialize(
         ),
         # Derived from the receipt that read the row; the stored codes above
         # stay exactly as the reader sent them.
-        "source_condition": newest_slot.UNSETTLED_CONDITION if newest_unsettled else None,
-        "operator_reason": newest_slot.OPERATOR_REASON if newest_unsettled else None,
+        "source_condition": condition,
+        "operator_reason": (
+            newest_slot.CORRECTED_REASON if condition == newest_slot.CORRECTED_CONDITION
+            else newest_slot.OPERATOR_REASON if condition else None
+        ),
+        "source_correction_ids": list(correction_ids or []),
     }
 
 
@@ -112,6 +121,7 @@ def list_source_exceptions(
     error_code: str | None = None,
     review_state: str | None = None,
     ordinal: int | None = None,
+    corrected: bool | None = None,
     cursor: int | None = None,
     limit: int = 100,
 ) -> dict:
@@ -142,6 +152,15 @@ def list_source_exceptions(
         statement = statement.where(
             TerminalRecordManifest.id.in_(select(TerminalRecordReview.manifest_id))
         )
+    if corrected is not None:
+        live_corrections = select(AttendanceSourceCorrection.manifest_id).where(
+            AttendanceSourceCorrection.manifest_id.is_not(None),
+            AttendanceSourceCorrection.status == "CREATED",
+        )
+        statement = statement.where(
+            TerminalRecordManifest.id.in_(live_corrections) if corrected
+            else ~TerminalRecordManifest.id.in_(live_corrections)
+        )
     filtered_total = session.scalar(
         select(func.count()).select_from(statement.order_by(None).subquery())
     ) or 0
@@ -162,6 +181,7 @@ def list_source_exceptions(
     } if page else {}
     coverage = _coverage_by_terminal(session, list({row.zkt_device_id for row in page}))
     unsettled = newest_slot.unsettled_newest_ids(session, page) if page else set()
+    corrections = newest_slot.created_corrections(session, [row.id for row in page])
 
     totals_statement = select(
         func.count(TerminalRecordManifest.id),
@@ -174,8 +194,15 @@ def list_source_exceptions(
         TerminalRecordManifest.disposition.in_(EXCEPTION_DISPOSITIONS),
     )
     total, invalid_time, malformed, identity_unresolved, affected_terminals = session.execute(totals_statement).one()
+    # Reviews stay with the bytes they reviewed; a settled row's review is
+    # no longer an open or reviewed exception.
     reviewed = session.scalar(
         select(func.count(func.distinct(TerminalRecordReview.manifest_id)))
+        .join(TerminalRecordManifest, TerminalRecordManifest.id == TerminalRecordReview.manifest_id)
+        .where(
+            TerminalRecordManifest.canonical_source == True,  # noqa: E712
+            TerminalRecordManifest.disposition.in_(EXCEPTION_DISPOSITIONS),
+        )
     ) or 0
     return {
         "totals": {
@@ -194,6 +221,7 @@ def list_source_exceptions(
                 reviews.get(row.id),
                 coverage.get((row.zkt_device_id, row.generation)),
                 newest_unsettled=row.id in unsettled,
+                correction_ids=corrections.get(row.id),
             )
             for row in page
         ],
@@ -213,7 +241,8 @@ def source_exception_detail(session: Session, row: TerminalRecordManifest) -> di
         (row.zkt_device_id, row.generation)
     )
     result = _serialize(row, connector, reviews[-1] if reviews else None, coverage,
-                        newest_unsettled=newest_slot.is_unsettled_newest(session, row))
+                        newest_unsettled=newest_slot.is_unsettled_newest(session, row),
+                        correction_ids=newest_slot.created_corrections(session, [row.id]).get(row.id))
     result["reviews"] = [
         {
             "review_id": review.review_id,

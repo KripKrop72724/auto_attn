@@ -1011,8 +1011,10 @@ def _correction_candidate(session: Session, source_kind: str, source_ref: str, c
             # These bytes were read before the terminal wrote the slot. The
             # punch that fills it belongs to whoever punched next, so any
             # identity in them would attribute that punch to the wrong person.
+            # A later complete reconcile settles the slot, or confirms these
+            # bytes as a genuine record, which makes it correctable again.
             raise RecoveryError(
-                "This row is the terminal's unwritten newest record, not a punch; re-read the slot instead.",
+                "This row is the terminal's unwritten newest record, not a punch, and cannot be corrected.",
                 UNSETTLED_CONDITION,
             )
         user = _exact_device_user(session, manifest)

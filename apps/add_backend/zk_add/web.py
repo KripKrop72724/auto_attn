@@ -231,6 +231,7 @@ from zk_add.reconciliation import (
     refresh_reconciliations_for_source_exception,
     serialize_job,
     serialize_coverage,
+    source_coverage_payload,
     source_exception_assurance,
 )
 from zk_add.source_exceptions import (
@@ -1827,6 +1828,7 @@ def source_exceptions(
     error_code: str | None = None,
     review_state: str | None = None,
     ordinal: int | None = Query(default=None, ge=0),
+    corrected: bool | None = None,
     cursor: int | None = Query(default=None, ge=1),
     limit: int = Query(default=100, ge=1, le=500),
     auth: tuple[Session, AdminContext] = Depends(require_admin),
@@ -1853,6 +1855,7 @@ def source_exceptions(
         error_code=error_code,
         review_state=review_state,
         ordinal=ordinal,
+        corrected=corrected,
         cursor=cursor,
         limit=limit,
     )
@@ -4929,8 +4932,9 @@ def persist_envelope(connector_pk: int, envelope: Envelope) -> EnvelopeOutcome |
                 "raw_preserved_count": chunk.raw_preserved_count if chunk is not None else 0,
             }
             if error_code == newest_slot.REPLAY_SUPERSEDED_CODE:
-                # A rewound reader resumes from ADD's unchanged committed cursor.
-                authoritative_coverage_payload = newest_slot.coverage_authority(db, coverage)
+                # A rewound reader resumes from ADD's unchanged committed cursor,
+                # in the same push a manifest handoff already sends every generation.
+                authoritative_coverage_payload = source_coverage_payload(db, coverage)
         else:
             event_payload = {"connector_id": connector.connector_id, "type": envelope.type}
         # The same transaction that accepted the message clears its type's

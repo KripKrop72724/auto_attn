@@ -978,27 +978,34 @@ def apply_reconciliation_chunk(
         ).all()
     }
     interpretation_drift_ordinals: set[int] = set()
+    # Earlier reads of the terminal's newest slot (see source_newest_slot).
     unsettled_priors = (
         newest_slot.unsettled_newest_ids(session, existing_source_rows.values())
         if existing_source_rows else set()
     )
     newest_ordinal = newest_slot.baseline_newest_ordinal(job)
     settled_priors: dict[int, TerminalRecordManifest] = {}
-    still_unsettled_ordinals: set[int] = set()
+    reread_states: dict[int, str] = {}
     for source in payload.records:
         prior = existing_source_rows.get(source.ordinal)
         if prior is None:
             continue
-        if prior.id in unsettled_priors and not newest_slot.same_source_read(prior, source):
+        if prior.id in unsettled_priors and source.disposition != "RAW_PRESERVED":
             # An earlier read of the terminal's newest slot is not evidence of
-            # the punch it later holds. A read made while a later record
-            # existed settles it; another newest-slot read leaves it as it is.
-            # Neither is a source mutation.
-            if source.ordinal != newest_ordinal and source.disposition != "RAW_PRESERVED":
-                settled_priors[source.ordinal] = prior
-            else:
-                still_unsettled_ordinals.add(source.ordinal)
-            continue
+            # the punch it later holds. This job's own final ordinal may be the
+            # newest slot again, so a different read there is kept only as a
+            # receipt. Anywhere else this job read the slot while later records
+            # existed: different bytes settle it, identical bytes confirm it.
+            # None of these is a source mutation. Raw custody keeps the
+            # ordinary comparison below.
+            if not newest_slot.same_source_read(prior, source):
+                if source.ordinal == newest_ordinal:
+                    reread_states[source.ordinal] = newest_slot.REREAD_STATE
+                else:
+                    settled_priors[source.ordinal] = prior
+                continue
+            if source.ordinal != newest_ordinal:
+                reread_states[source.ordinal] = newest_slot.CONFIRMED_STATE
         prior_parsed = prior.disposition in {
             "EVENT",
             "BLOCKED_IDENTITY",
@@ -1034,14 +1041,35 @@ def apply_reconciliation_chunk(
                     "raw_record_digest": source.raw_record_digest,
                 },
             )
+    if settled_priors:
+        block = newest_slot.settlement_block(session, job=job, priors=list(settled_priors.values()))
+        if block is not None:
+            code, message, details = block
+            _safety_hold(session, job, code, message)
+            _event(session, job, code, details)
+            if code == newest_slot.CORRECTED_HOLD:
+                from zk_add.service import upsert_alert
+
+                upsert_alert(
+                    session,
+                    connector,
+                    code="TERMINAL_NEWEST_RECORD_CORRECTED",
+                    severity="CRITICAL",
+                    message=message,
+                    details={"failure_category": code, "job_id": job.job_id, **details},
+                )
+            return job, None, False
 
     from zk_add.service import ingest_attendance
 
+    newest_rereads = {
+        ordinal for ordinal, state in reread_states.items() if state == newest_slot.REREAD_STATE
+    }
     attendance, retained_elsewhere = _bound_source_attendance(
         session, connector=connector, terminal_serial=job.terminal_serial,
         records=[row for row in payload.records
                  if row.ordinal not in interpretation_drift_ordinals
-                 and row.ordinal not in still_unsettled_ordinals],
+                 and row.ordinal not in newest_rereads],
     )
     accepted_uids: set[str] = set()
     duplicate_uids: set[str] = set()
@@ -1090,14 +1118,12 @@ def apply_reconciliation_chunk(
             )
         ).all()
     )
-    sources_by_ordinal = {row.ordinal: row for row in payload.records}
     for ordinal, prior in settled_priors.items():
         # The settled read becomes this ordinal's canonical row below.
-        _event(session, job, newest_slot.SETTLED_STATE, newest_slot.retire_unsettled_row(
-            session, prior=prior, source=sources_by_ordinal[ordinal],
-            origin="RECONCILIATION_CHUNK", job_id=job.job_id,
-        ))
+        newest_slot.retire(session, prior)
         existing_source_rows.pop(ordinal)
+    settled_manifests: dict[int, TerminalRecordManifest] = {}
+    reread_receipts: dict[int, TerminalRecordManifest] = {}
     raw_manifests = []
     for source in payload.records:
         identity_missing = _source_identity_missing(source)
@@ -1148,8 +1174,33 @@ def apply_reconciliation_chunk(
                 **_source_claim_evidence(source, identity_missing=identity_missing),
             )
             session.add(manifest)
+            if source.ordinal in settled_priors:
+                settled_manifests[source.ordinal] = manifest
+        elif source.ordinal in reread_states:
+            reread_receipts[source.ordinal] = newest_slot.reread_receipt(
+                job=job, chunk_id=chunk.id, connector=connector, source=source,
+            )
+            session.add(reread_receipts[source.ordinal])
         if disposition == "RAW_PRESERVED":
             raw_manifests.append(prior if prior is not None else manifest)
+    if settled_manifests or reread_receipts:
+        session.flush()
+    if settled_manifests:
+        _event(session, job, newest_slot.SETTLED_STATE, {"chunk_id": chunk.id, "rows": [
+            newest_slot.record_settlement(
+                session, job=job, chunk_id=chunk.id, prior=settled_priors[ordinal], settled=manifest,
+            )
+            for ordinal, manifest in sorted(settled_manifests.items())
+        ]})
+    for state in (newest_slot.CONFIRMED_STATE, newest_slot.REREAD_STATE):
+        rows = [
+            {"ordinal": ordinal, "manifest_id": existing_source_rows[ordinal].id,
+             "receipt_manifest_id": receipt.id, "raw_record_digest": receipt.raw_record_digest,
+             "committed_raw_record_digest": existing_source_rows[ordinal].raw_record_digest}
+            for ordinal, receipt in sorted(reread_receipts.items()) if reread_states[ordinal] == state
+        ]
+        if rows:
+            _event(session, job, state, {"chunk_id": chunk.id, "rows": rows})
     from zk_add.zkt_custody_work import attach_source_work
     attach_source_work(session, connector, raw_manifests)
     released = _release_source_synced_attendance(
@@ -1481,6 +1532,11 @@ def reconciliation_manifest_authority(session, connector, job):
         return None
     if coverage.source_committed_cursor < job.cutoff_count:
         raise ValueError("Committed source authority regressed below the manifest cutoff.")
+    return source_coverage_payload(session, coverage)
+
+
+def source_coverage_payload(session, coverage):
+    """The active coverage push every Zone Lite generation applies as its tail cursor."""
     return {"type": "source_coverage", "coverage_id": coverage.coverage_id,
         "source_epoch_id": coverage.source_epoch_id, "source_epoch": source_epoch_uuid(session, coverage),
         "terminal_serial": coverage.terminal_serial, "terminal_generation": coverage.terminal_generation,
@@ -1740,8 +1796,9 @@ def apply_source_tail_chunk(
             or (existing.raw_preserved_count and reconciliation_chunk_digest(payload) != payload.chunk_digest)
         ):
             # A rewound reader re-reads committed ordinals. Only a change
-            # outside unsettled newest-slot reads is a source divergence.
-            code = newest_slot.answer_tail_replay(
+            # outside unsettled newest-slot reads is a source divergence; the
+            # replay itself never changes a committed row.
+            code = newest_slot.judge_tail_replay(
                 session, connector=connector, coverage=coverage, existing=existing, payload=payload,
             )
             if code is None:
