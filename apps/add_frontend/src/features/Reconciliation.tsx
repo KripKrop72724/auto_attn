@@ -788,12 +788,16 @@ function SourceExceptionDrawer({
             <article className="info-copy pattern-blocked">
               <Icon name="shield" />
               <div>
-                <h3>{row.disposition === 'IDENTITY_UNRESOLVED'
+                <h3>{row.source_condition === 'TERMINAL_NEWEST_RECORD_UNSETTLED'
+                  ? 'Terminal newest record not yet written'
+                  : row.disposition === 'IDENTITY_UNRESOLVED'
                   ? 'Held for verified historical identity'
                   : 'Excluded from attendance and Oracle'}</h3>
                 <p>
                   ADD preserved this terminal ordinal as immutable evidence.
-                  {row.disposition === 'IDENTITY_UNRESOLVED'
+                  {row.source_condition === 'TERMINAL_NEWEST_RECORD_UNSETTLED'
+                    ? ` ${row.operator_reason || 'These bytes were read before the terminal wrote this slot. They are not a punch.'}`
+                    : row.disposition === 'IDENTITY_UNRESOLVED'
                     ? ' Identity operations must establish an independently supported user reference. A historical attendance UID cannot identify the current enrollment owner. A review note does not resolve this hold or certify Oracle delivery.'
                     : ' Review never creates, edits, or deletes attendance. Completing every review in a certified job automatically resumes assurance for its valid records.'}
                 </p>
@@ -2656,6 +2660,9 @@ export function ReconciliationView({
                   <div data-label="Exception">
                     <StatusBadge state={row.disposition} />
                     <small>{row.error_code || 'No error code'}</small>
+                    {row.source_condition === 'TERMINAL_NEWEST_RECORD_UNSETTLED' && (
+                      <small>Newest record read before the terminal wrote it; not a punch</small>
+                    )}
                   </div>
                   <div data-label="Observed identity">
                     <strong>Attendance UID {row.observed_uid || '—'}</strong>

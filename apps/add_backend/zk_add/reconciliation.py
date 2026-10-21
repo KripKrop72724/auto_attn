@@ -12,6 +12,7 @@ from uuid import uuid4
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
+from zk_add import source_newest_slot as newest_slot
 from zk_add.audit import append_audit
 from zk_add.crypto import encrypt_text
 from zk_add.models import (
@@ -977,9 +978,26 @@ def apply_reconciliation_chunk(
         ).all()
     }
     interpretation_drift_ordinals: set[int] = set()
+    unsettled_priors = (
+        newest_slot.unsettled_newest_ids(session, existing_source_rows.values())
+        if existing_source_rows else set()
+    )
+    newest_ordinal = newest_slot.baseline_newest_ordinal(job)
+    settled_priors: dict[int, TerminalRecordManifest] = {}
+    still_unsettled_ordinals: set[int] = set()
     for source in payload.records:
         prior = existing_source_rows.get(source.ordinal)
         if prior is None:
+            continue
+        if prior.id in unsettled_priors and not newest_slot.same_source_read(prior, source):
+            # An earlier read of the terminal's newest slot is not evidence of
+            # the punch it later holds. A read made while a later record
+            # existed settles it; another newest-slot read leaves it as it is.
+            # Neither is a source mutation.
+            if source.ordinal != newest_ordinal and source.disposition != "RAW_PRESERVED":
+                settled_priors[source.ordinal] = prior
+            else:
+                still_unsettled_ordinals.add(source.ordinal)
             continue
         prior_parsed = prior.disposition in {
             "EVENT",
@@ -1022,7 +1040,8 @@ def apply_reconciliation_chunk(
     attendance, retained_elsewhere = _bound_source_attendance(
         session, connector=connector, terminal_serial=job.terminal_serial,
         records=[row for row in payload.records
-                 if row.ordinal not in interpretation_drift_ordinals],
+                 if row.ordinal not in interpretation_drift_ordinals
+                 and row.ordinal not in still_unsettled_ordinals],
     )
     accepted_uids: set[str] = set()
     duplicate_uids: set[str] = set()
@@ -1071,6 +1090,14 @@ def apply_reconciliation_chunk(
             )
         ).all()
     )
+    sources_by_ordinal = {row.ordinal: row for row in payload.records}
+    for ordinal, prior in settled_priors.items():
+        # The settled read becomes this ordinal's canonical row below.
+        _event(session, job, newest_slot.SETTLED_STATE, newest_slot.retire_unsettled_row(
+            session, prior=prior, source=sources_by_ordinal[ordinal],
+            origin="RECONCILIATION_CHUNK", job_id=job.job_id,
+        ))
+        existing_source_rows.pop(ordinal)
     raw_manifests = []
     for source in payload.records:
         identity_missing = _source_identity_missing(source)
@@ -1712,8 +1739,15 @@ def apply_source_tail_chunk(
             or existing.resulting_chain_digest != payload.resulting_chain_digest
             or (existing.raw_preserved_count and reconciliation_chunk_digest(payload) != payload.chunk_digest)
         ):
+            # A rewound reader re-reads committed ordinals. Only a change
+            # outside unsettled newest-slot reads is a source divergence.
+            code = newest_slot.answer_tail_replay(
+                session, connector=connector, coverage=coverage, existing=existing, payload=payload,
+            )
+            if code is None:
+                return coverage, None, False, newest_slot.REPLAY_SUPERSEDED_CODE
             return invalidate(
-                "SOURCE_TAIL_REPLAY_DIVERGED",
+                code,
                 "A replayed terminal tail range no longer matched its committed evidence.",
             )
         return coverage, existing, True, None

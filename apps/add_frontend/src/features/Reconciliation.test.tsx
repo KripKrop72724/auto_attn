@@ -496,6 +496,41 @@ describe('Reviewed source-exception continuation', () => {
     expect(screen.queryByText(/assurance resumes automatically from its existing checkpoint/i)).toBeNull()
   })
 
+  it('explains an unwritten newest terminal record instead of a clock fault', async () => {
+    const unsettled: SourceException = {
+      ...sourceException,
+      source_kind: 'TAIL',
+      ordinal: 15379,
+      source_condition: 'TERMINAL_NEWEST_RECORD_UNSETTLED',
+      operator_reason:
+        'The terminal reported this ordinal as its newest record before it had written the record.',
+    }
+    const base = reconciliationFetch()
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = new URL(String(input), 'https://add.test').pathname
+      if (path === `/api/v1/source-exceptions/${sourceException.id}`) return json(unsettled)
+      const response = await base(input, init)
+      const body = await response.json()
+      if (path === '/api/v1/source-exceptions') body.rows = [unsettled]
+      return json(body)
+    }))
+    window.history.replaceState(
+      null,
+      '',
+      `/reconciliation?tab=source-exceptions&job_id=${job().job_id}&device_id=${device.connector_id}`,
+    )
+    render(<Harness />)
+
+    const row = await screen.findByRole('listitem')
+    expect(within(row).getByText(/Newest record read before the terminal wrote it/)).toBeTruthy()
+    fireEvent.click(within(row).getByRole('button', { name: 'Inspect' }))
+    expect(
+      await screen.findByRole('heading', { name: 'Terminal newest record not yet written' }),
+    ).toBeTruthy()
+    expect(screen.getByText(/reported this ordinal as its newest record/)).toBeTruthy()
+    expect(screen.queryByText('Excluded from attendance and Oracle')).toBeNull()
+  })
+
   it('redirects the retired employee-repair deep link to Attendance review', async () => {
     window.history.replaceState(
       null,

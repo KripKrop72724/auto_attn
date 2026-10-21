@@ -37,6 +37,7 @@ from zk_add import APP_VERSION
 from zk_add.hil_transport import TransportInterrupted, enforce_transport
 from zk_add import attendance_force_release as force_release
 from zk_add import attendance_direct_ords as direct_ords
+from zk_add import source_newest_slot as newest_slot
 from zk_add.attendance_cnic_link import cnic_not_linked_expression
 from zk_add.attendance_force_schemas import ForceCheckRequest, ForceStartRequest, ForceControlRequest, UserRefreshRequest
 from zk_add.attendance_direct_ords_schemas import DirectOrdsRecheckRequest, DirectOrdsStartRequest
@@ -4927,6 +4928,9 @@ def persist_envelope(connector_pk: int, envelope: Envelope) -> EnvelopeOutcome |
                 "exception_count": chunk.exception_count if chunk is not None else 0,
                 "raw_preserved_count": chunk.raw_preserved_count if chunk is not None else 0,
             }
+            if error_code == newest_slot.REPLAY_SUPERSEDED_CODE:
+                # A rewound reader resumes from ADD's unchanged committed cursor.
+                authoritative_coverage_payload = newest_slot.coverage_authority(db, coverage)
         else:
             event_payload = {"connector_id": connector.connector_id, "type": envelope.type}
         # The same transaction that accepted the message clears its type's

@@ -5,6 +5,7 @@ import base64
 from sqlalchemy import case, func, select
 from sqlalchemy.orm import Session
 
+from zk_add import source_newest_slot as newest_slot
 from zk_add.audit import append_audit
 from zk_add.crypto import decrypt_text
 from zk_add.models import (
@@ -60,6 +61,8 @@ def _serialize(
     connector: Connector | None,
     review: TerminalRecordReview | None,
     coverage: ReconciliationCoverage | None,
+    *,
+    newest_unsettled: bool = False,
 ) -> dict:
     committed_cursor = coverage.source_committed_cursor if coverage else 0
     return {
@@ -93,6 +96,10 @@ def _serialize(
             "HELD_IDENTITY_EVIDENCE_REQUIRED"
             if row.disposition == "IDENTITY_UNRESOLVED" else "EXCLUDED_FAIL_CLOSED"
         ),
+        # Derived from the receipt that read the row; the stored codes above
+        # stay exactly as the reader sent them.
+        "source_condition": newest_slot.UNSETTLED_CONDITION if newest_unsettled else None,
+        "operator_reason": newest_slot.OPERATOR_REASON if newest_unsettled else None,
     }
 
 
@@ -154,6 +161,7 @@ def list_source_exceptions(
         ).all()
     } if page else {}
     coverage = _coverage_by_terminal(session, list({row.zkt_device_id for row in page}))
+    unsettled = newest_slot.unsettled_newest_ids(session, page) if page else set()
 
     totals_statement = select(
         func.count(TerminalRecordManifest.id),
@@ -185,6 +193,7 @@ def list_source_exceptions(
                 connectors.get(row.connector_id),
                 reviews.get(row.id),
                 coverage.get((row.zkt_device_id, row.generation)),
+                newest_unsettled=row.id in unsettled,
             )
             for row in page
         ],
@@ -203,7 +212,8 @@ def source_exception_detail(session: Session, row: TerminalRecordManifest) -> di
     coverage = _coverage_by_terminal(session, [row.zkt_device_id]).get(
         (row.zkt_device_id, row.generation)
     )
-    result = _serialize(row, connector, reviews[-1] if reviews else None, coverage)
+    result = _serialize(row, connector, reviews[-1] if reviews else None, coverage,
+                        newest_unsettled=newest_slot.is_unsettled_newest(session, row))
     result["reviews"] = [
         {
             "review_id": review.review_id,
