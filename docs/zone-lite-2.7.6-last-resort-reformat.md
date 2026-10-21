@@ -1,7 +1,8 @@
 # Zone Lite 2.7.6: last-resort reformat for wedged stores
 
-Status: implemented and verified on the host (section 17), not yet on a
-device; the version is not bumped yet. This is the second design round,
+Status: implemented and verified on the host (section 17) and versioned
+2.7.6 (HIL runbook: [zone-lite-2.7.6-hil.md](zone-lite-2.7.6-hil.md)); not
+yet on a device. This is the second design round,
 after two reviews of the first (commit 7556422): a custody review (C1 to C6,
 H1 to H4, M1, M2) and a device review (D1 to D10). Section 16 says what
 became of every point. The implementation (eaf7ec3) then had its own first
@@ -957,9 +958,16 @@ one of them, `REVIEW_FULL=1` cuts at every write instead of sampling.
 | ADD | `schemas.py`, `tests/unit/test_storage_repair_diagnostics.py` |
 | Tests | `spiffs_repair_host.c`, `check_spiffs_repair.py`, `storage_repair_plan_host.c`, `test_storage_repair_host.py`, `test_storage_repair_boot_contract.py`, the 2.7.5 fixture |
 
-The release commit (version, 2.7.5's digest in the upgrade guard, storage
-contract and signing scripts, HIL runbook) is a later step, as `0954fd3` did
-for 2.7.5.
+The release commit `ab079f1` versions it, as `0954fd3` did for 2.7.5:
+version 2.7.6 and `UG_DIRECT_VERSION` "2.7.6"; 2.7.5's application SHA-256
+`430e2daf29dd99ff006a476ff584e4201493d661cee67e4b4f9ba15545b17a40` (HIL run
+39371984527; ADD's published record, and the image Peshawar 06 reports) in
+the device guard, ADD's storage contract (`REPAIR_*`,
+`platform_baselines("2.7.6")`) and the signing script; the marker ends
+`,2.7.2,2.7.3,2.7.4,2.7.5` (148 of the 160 characters ADD keeps); the CI
+direct-legacy step, the HIL candidate workflow, publication and signing take
+2.7.6; ADD offers 2.7.6 to the HIL-only 2.7.2 to 2.7.5. The HIL runbook is
+[zone-lite-2.7.6-hil.md](zone-lite-2.7.6-hil.md).
 
 ## 15. Open decisions and residual risks
 
@@ -1301,7 +1309,9 @@ changes after ce52dba matter only under the verification knob
   contract pass.
 
 Not run here: a device (HIL), and the release step (version, upgrade guard
-digests, signing).
+digests, signing). The release commit `ab079f1` has since done the version,
+the guard digest, the storage contract and the signing script's lists
+(section 14); signing happens when HIL publishes the candidate.
 
 ## 18. Round 1 review of the implementation (eaf7ec3) and what became of it
 
@@ -1332,7 +1342,9 @@ Still open, as the device review listed them (release blockers, not
 defects): the version bump, the ADD storage contract versions and the
 direct-legacy BASE marker including 2.7.5 (so devices on 2.7.5 can take
 2.7.6), the upgrade-guard digests, signing, and a hardware-in-loop run,
-with the stack and the time on P02.
+with the stack and the time on P02. All but signing (at HIL publication) and
+the hardware run are done in the release commit `ab079f1` (section 14); the
+runbook says what HIL must read on P02.
 
 ## 19. Round 2 review of the implementation (6e6a982) and what became of it
 
