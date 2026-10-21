@@ -144,8 +144,10 @@ def preview_page(
         select(AttendanceEvent)
         .where(*_held_dump_rows(list(by_id)), AttendanceEvent.id > after_id)
         .order_by(AttendanceEvent.id)
-        .limit(bounded)
+        .limit(bounded + 1)
     ).all()
+    more = len(rows) > bounded
+    rows = rows[:bounded]
     groups = _empty_groups()
     users: dict = {}
     for row in rows:
@@ -162,7 +164,7 @@ def preview_page(
         "zone_id": zone_id,
         "after_id": after_id,
         "scanned": len(rows),
-        "next_after_id": rows[-1].id if len(rows) == bounded else None,
+        "next_after_id": rows[-1].id if more else None,
         "groups": _group_rows(groups),
         "window_hours": settings.attendance_dump_identity_auto_release_hours,
         "devices": [
