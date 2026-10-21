@@ -298,17 +298,34 @@ def advance_once(session: Session, *, limit: int | None = None) -> int:
     connector_ids = list(job.scope["connector_ids"])
     batch = max(1, min(limit or settings.attendance_identity_backlog_batch_size, 1000))
     now = utc_now()
-    rows = session.scalars(
-        select(AttendanceEvent)
-        .where(
-            *_held_dump_rows(connector_ids),
-            AttendanceEvent.id > job.cursor,
-            AttendanceEvent.id <= job.scope["max_event_id"],
-        )
-        .order_by(AttendanceEvent.id)
-        .limit(batch)
-        .with_for_update(skip_locked=True)
+    pending = (
+        *_held_dump_rows(connector_ids),
+        AttendanceEvent.id > job.cursor,
+        AttendanceEvent.id <= job.scope["max_event_id"],
+    )
+    candidates = session.scalars(
+        select(AttendanceEvent.id).where(*pending).order_by(AttendanceEvent.id).limit(batch)
     ).all()
+    # A snapshot or delivery transaction may hold some of these rows. Skip
+    # locks to avoid deadlocks, but stop before the first unavailable row so
+    # the cursor never passes a held punch it did not evaluate.
+    locked = {
+        row.id: row
+        for row in session.scalars(
+            select(AttendanceEvent)
+            .where(*pending, AttendanceEvent.id.in_(candidates))
+            .order_by(AttendanceEvent.id)
+            .with_for_update(skip_locked=True)
+        ).all()
+    } if candidates else {}
+    rows = []
+    for event_id in candidates:
+        if event_id not in locked:
+            break
+        rows.append(locked[event_id])
+    if candidates and not rows:
+        job.updated_at = now
+        return 0
     if not rows:
         job.status = "COMPLETED"
         job.completed_at = job.updated_at = now

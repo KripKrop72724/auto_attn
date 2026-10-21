@@ -19,6 +19,7 @@ from zk_add import attendance_identity_backlog as backlog
 from zk_add.models import (
     AttendanceEvent,
     AttendanceIdentityHistory,
+    AttendanceRecoveryJob,
     Connector,
     DeviceUser,
     OrdsOutbox,
@@ -306,8 +307,28 @@ def test_snapshot_and_owner_backlog_release_pass_the_installed_guard(force_pg):
             typed_confirmation=f"RELEASE {zone}", idempotency_key="pg-backlog-0001",
         )
         db.commit()
+    # A snapshot transaction holding the row: the batch waits, never skips it.
+    with sessions() as holder:
+        holder.scalar(
+            select(AttendanceEvent).where(AttendanceEvent.event_uid == old.event_uid)
+            .with_for_update()
+        )
+        with sessions() as db:
+            assert backlog.advance_once(db) == 0
+            db.commit()
+        holder.rollback()
+    with sessions() as db:
+        job = db.scalar(select(AttendanceRecoveryJob).where(
+            AttendanceRecoveryJob.action == backlog.ACTION
+        ))
+        assert job.status == "RELEASING" and job.cursor == 0
     for _ in range(3):
         with sessions() as db:
             backlog.advance_once(db)
             db.commit()
     assert status(old.event_uid) == ("PENDING", False)
+    with sessions() as db:
+        job = db.scalar(select(AttendanceRecoveryJob).where(
+            AttendanceRecoveryJob.action == backlog.ACTION
+        ))
+        assert job.status == "COMPLETED" and job.succeeded_count == 1
