@@ -359,6 +359,22 @@ def test_e57a3a37_shaped_hold_certifies_on_one_retry_without_rescan(reconciliati
     assert service.preflight_reconciliation(session, connector)["generation"]["state"] == "MATCHED"
 
 
+def test_preflight_blocks_a_second_job_while_the_scheduler_keeps_running_its_own(reconciliation_db):  # noqa: F811
+    session, connector = reconciliation_db
+    connector.zkt_device.attendance_count = 9
+    job = create(session, connector, 9, "running-job")
+    scan(session, connector, job, 4)
+    session.commit()
+    preflight = service.preflight_reconciliation(session, connector)
+    assert [(row["code"], row["job_id"]) for row in preflight["hard_blockers"]] == [("RECONCILIATION_ACTIVE", job.job_id)]
+    assert preflight["generation"]["state"] == "NO_ACTIVE_COVERAGE"
+    with pytest.raises(ValueError, match=f"already has active reconciliation {job.job_id}"):
+        service.create_reconciliation_job(session, connector=connector, actor="test", reason="A second scan.",
+            confirmation="RECONCILE 1 FROM START", idempotency_key="second-job")
+    offer = dict(service.assignment_rows(session))[connector.connector_id]
+    assert offer["committed_next_ordinal"] == 4 and job.status == "RUNNING" and job.error_code is None
+
+
 @pytest.mark.parametrize("with_epoch", [True, False])
 def test_late_old_generation_tail_gets_structured_error_and_current_coverage(reconciliation_db, monkeypatch, with_epoch):  # noqa: F811
     from zk_add import web

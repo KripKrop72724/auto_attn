@@ -231,7 +231,8 @@ def _generation_preflight(connector: Connector, coverage: ReconciliationCoverage
 def preflight_reconciliation(
     session: Session, connector: Connector, *, include_active_job: bool = True,
 ) -> dict:
-    """Readiness for a new job; the scheduler excludes the job it is running."""
+    """Readiness for a new job. The scheduler passes include_active_job=False
+    for the job it is running, which must not block itself."""
     if connector.firmware_family == "hikvision":
         from zk_add.hikvision_reconciliation import preflight
         return preflight(session, connector)
@@ -363,7 +364,9 @@ def preflight_reconciliation(
             }
         )
     generation = _generation_preflight(connector, coverage)
-    if generation["state"] == "NEWER_THAN_CONNECTOR":
+    # Both blockers below concern a new job; the scheduler's running job keeps
+    # its own generation and is judged when it seals.
+    if include_active_job and generation["state"] == "NEWER_THAN_CONNECTOR":
         hard.append({"code": SOURCE_GENERATION_STALE, "message": generation["message"]})
     if include_active_job:
         active_job = session.scalar(
