@@ -989,6 +989,19 @@ for 2.7.5.
    keep the VFS off the store while any queue span waits on sources. (b) is a
    design change for its own review round; (c) stops the device's attendance
    while the area cannot be read.
+6. Torn SPIFFS erases before an image without a repair (found by the
+   verification after the round 2 fixes; residual risk below). Options: (a)
+   accept it for 2.7.6: it is SPIFFS's own exposure at every GC erase, the
+   released 2.7.5's probe and compaction included, and an image that repairs
+   first (2.7.5, 2.7.6) is not exposed to it; (b) in the repair's boot,
+   clear a block's magic before every erase SPIFFS issues through the
+   repair's HAL, as the round's own erases do, so that a torn erase reads as
+   an aborted one and the mount erases it (left: the 68 weak-magic blocks of
+   an 8 MiB store and bit-level tears, note 3); (c) the same in the runtime
+   HAL for every application GC erase. (b) and (c) change the HAL under
+   SPIFFS and need their own review and power-cut harness coverage; (c) is a
+   fleet-wide change for its own release. The recommendation is (a) for
+   2.7.6, with (c) considered on its own.
 
 **Residual risks:**
 
@@ -1046,6 +1059,24 @@ for 2.7.5.
   a record that became a source or used up its attempts, mount it half
   erased, as SPIFFS's own torn GC erases have always left blocks. The
   harness tears byte by byte only.
+- Torn SPIFFS erases before an image without a repair (owner decision 6;
+  reproduced, not a defect of the round): SPIFFS erases a block (its GC, as
+  inside the probe's or the application's writes, or 2.7.5's compaction
+  through `spiffs_erase_block`) without clearing its magic first, so a cut
+  can leave the magic valid while lookup entries read free above written
+  pages. 2.7.5 and 2.7.6 clean such pages before anything writes; an image
+  that writes through plain SPIFFS first programs over them, and the AND of
+  two pages can rename a queue's header: the whole queue is lost and no gap
+  record names it. The sweep to the end of the boot (verification only,
+  salt 31) found it on P02 at 1 MiB: the probe's GC erase of block 0 torn
+  after the round of an unconfirmed boot, then the old image's appends:
+  `/pending.jsonl` (335,939 bytes) read -1, its header renamed
+  `/pdndind.jsenl`. On the device this needs a rollback to an image older
+  than 2.7.5 (a direct upgrade to 2.7.6 from one); a device whose old image
+  is 2.7.5 repairs first. The same exposure exists at every GC erase of such
+  an image in normal operation, and on 2.7.5's own unconfirmed boot (its
+  probe is byte-identical); 2.7.6 adds the erases of the run after a round,
+  on stores 2.7.5 left wedged and never wrote.
 - None of this has run on a device.
 
 ## 16. Review points and what became of them
@@ -1226,11 +1257,16 @@ Every defect is accepted and fixed in 037bfe2; each fix has a host test that
 fails with that fix taken out of the final code (the third column). The
 reviewer's reproductions (`rv276-r2-repro.patch`: `rvE1`, `rvE2`, `rvE3`,
 `rvE5`) reproduce every defect on 6e6a982 and pass on 037bfe2 at 1 and
-8 MiB, with the reviewer's own checks (second column).
+8 MiB, with the reviewer's own checks (second column). That patch lived in
+the session's scratch directory, which the host's power loss of 21 October
+took; it is not in the repository. At the final code the in-tree tests
+that model each reproduction (third column; `reclaim-round2`) pass at 1 and
+8 MiB in CI's configuration, and each fix was taken out again, one at a
+time, against them (section 17).
 
 | Finding | What changed | The reviewer's reproduction, 6e6a982 then fixed | The regression test without the fix |
 |---|---|---|---|
-| **R2-1** (medium) a block that will not verify ends the round, and a held file waiting for it is recorded as lost | 5.3 step 6: the block is closed as SPIFFS's own erase leaves a block (erased, the target's erase count, its magic last, read back raw), then its record is marked a source, and the round goes on; a block that will not close keeps no magic and the round stops. 7.5: room for the waiting restore is decided from the erased pages after the round's remount (not from the blocks reformatted), and that retry puts back only the files that waited | `rvE2`: "0 blocks reformatted … 15 erased pages now", `/processed_commands.txt` recorded CHECK_CHANGED and gone; fixed: block 15 closed, 16 blocks reformatted, "1 of 1 held files … put back", byte-exact, no gap record | `reclaim-worn` without the close: "a worn cell in the first window, closed: REPAIRED at full, 0 blocks, 1 failed (0 closed)"; without the erased-page rule, and without the retry's restriction to the waiting files: "a worn magic, the block not closed: … 1 gap records naming /processed_commands.txt" (the restriction: the queue whose pages were in the failed block took the room) |
+| **R2-1** (medium) a block that will not verify ends the round, and a held file waiting for it is recorded as lost | 5.3 step 6: the block is closed as SPIFFS's own erase leaves a block (erased, the target's erase count, its magic last, read back raw), then its record is marked a source, and the round goes on; a block that will not close keeps no magic and the round stops. 7.5: room for the waiting restore is decided from the erased pages after the round's remount (not from the blocks reformatted), and that retry puts back only the files that waited | `rvE2`: "0 blocks reformatted … 15 erased pages now", `/processed_commands.txt` recorded CHECK_CHANGED and gone; fixed: block 15 closed, 16 blocks reformatted, "1 of 1 held files … put back", byte-exact, no gap record | `reclaim-worn` without the close: "two worn windows, both closed, the round stopped at the second: REPAIRED at full, 0 blocks, 1 failed (0 closed)" (at 037bfe2, before the two-window case: "a worn cell in the first window, closed: … 0 blocks, 1 failed (0 closed)"); without the erased-page rule, and without the retry's restriction to the waiting files: "two worn windows, …: 0 blocks, 2 failed (2 closed), 1 gap records naming /processed_commands.txt" (at 037bfe2 the same for "a worn magic, the block not closed"; the restriction: the queue whose pages were in the failed block took the room) |
 | **R2-2** (low to medium) a recovery that cannot write leaves a record open, and the same boot records its bytes as lost | 10.1: a record recovery leaves open is a byte source for that boot's runs (`load_sources` takes open records too), by 10.3's rules; recovery journals SOURCES for it even when NVS had no reclaim journal (else a later boot could redo it after this boot's mount) | `rvE1` at 1 and 8 MiB (blocks 133 and 1,067): `REPAIRED_WITH_GAPS`, 2 SALVAGE records, 7,028 unreadable bytes; fixed: `REPAIRED`, no gap record, the queue byte-exact | `reclaim-open` without open records as sources: "REPAIRED_WITH_GAPS with 1 gap records, 3514 unreadable bytes"; without the journal for a device whose journal was lost: "recovery left 1 open (journal 3)" (no SOURCES) |
 | **R2-3** (low) one unreadable range gets a gap record per run, and the heartbeat adds them up | 11: a range a run of the boot already recorded (same file, cause, bounds; or covered, for SALVAGE) is not recorded again by a later run of the boot; the run still ends `REPAIRED_WITH_GAPS` and the file keeps its `GAPS` action, so the boot's report counts it once | `rvE3` at 1 and 8 MiB: 2 records (generations 2 and 3), gaps 2, 502 bytes; fixed: 1 record, gaps 1, 251 bytes, the file entry 251 | `reclaim-gaps` without the boot-wide dedupe: "2 records (502 bytes); the report says 2 gaps, 502 bytes (the file 2, 502)" |
 | **R2-4** (low) the round ignores a failed SOURCE-bit write and still clears ACTIVE | 5.3 step 6: if the source bit will not take, the record's four attempt bits are cleared (recovery then makes it a source, never redoes it), the journal keeps `ACTIVE` and gets `SOURCES`, and the round stops; if neither takes either, the store is not written again that boot (no remount, no further run; the glue keeps the VFS off it: `reclaim.store_blocked`, `error_stage` `reclaim_journal`) | `RV_E5=1 rvE5`: the round's own check failed ("block 135 ends without its magic and no source record on flash"), the journal 9 with the record open; fixed (without `RV_E5`): the journal `CLAIMED, ACTIVE, SOURCES, HELD`, the next boot makes the record a source, 0 redone, every file exact (1 and 8 MiB; at 8 MiB the run after the round put the queue's pages back into the closed block 1,069 itself, the layout the reviewer feared) | `reclaim-unmarked` without the attempts and journal: the round oracle "block 135 ends closed and no source record"; without the store kept unmounted: the same, for the variant with the journal refused too |
@@ -1255,3 +1291,25 @@ The device and build review found no defect. Its two observations:
   per MiB (32 s at 8 MiB); P02's real pass projects to about 29 to 31 s. The
   45 s between the soft and hard deadlines covers an overrun; HIL records
   `check_ms` on P02.
+
+What the verification after the fixes changed or found:
+
+- **One close per round** (279e4ac): a second block that will not verify is
+  closed too and stops the round (two suggest the flash, not a cell). The
+  sources a run loads are sorted by object and span and looked up by binary
+  search: with two closed blocks' 28 pages the linear lookup took the 1 MiB
+  T5 store's next run past the harness's CPU bound (2.3 million steps
+  against 2.1 million); now 0.37 million (10.3).
+- **The round oracle reads each changed block's own record** (3d2b145): a
+  done block whose every entry was dropped reads exactly as a closed one.
+- **Cuts after the round** (ce52dba, then da1544c), verification only
+  (`REVIEW_TO_END`): through the old image they are judged by custody or
+  evidence (13). One kind is sorted out and counted instead: a cut that
+  tears an erase SPIFFS issues (its GC inside the probe's `SPIFFS_open`, or
+  2.7.5's compaction) leaving the magic valid over free lookup entries
+  above written pages, followed by the old image's plain SPIFFS. Salt 31
+  found it: the queue's header renamed and the queue lost. It is SPIFFS's
+  own exposure (the probe is byte-identical to the released 2.7.5's; the
+  application's GC erases the same way); the same image after it, which
+  cleans such pages first (2.7.5's lookup hygiene), keeps every oracle.
+  Residual risk and owner decision 6 (section 15).
