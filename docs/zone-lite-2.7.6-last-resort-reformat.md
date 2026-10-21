@@ -1140,7 +1140,7 @@ for 2.7.5.
 | da1544c | `REVIEW_TO_END`: a torn SPIFFS erase before the old image sorted out and counted |
 | a162b59 | owner decision 6 and its residual risk; section 19's notes on the verification |
 | 8c31951 | what such a torn erase cost, measured |
-| (next) | the verification after the round 2 review, below |
+| d534fd4 | the verification after the round 2 review, below |
 
 **Results at eaf7ec3** (host, ESP-IDF 5.5.3 SPIFFS, ASan and UBSan; Apple
 clang natively and GCC in `espressif/idf:v5.5.3`; the results after the
@@ -1231,8 +1231,8 @@ round 1 review follow these):
 
 **Results after the round 2 review** (21 October, after the host's power
 loss; the engine and glue as at ce52dba, the harness as at 8c31951, whose
-changes after ce52dba touch only the verification knob `REVIEW_TO_END`;
-the same host setup):
+changes after ce52dba matter only under the verification knob
+`REVIEW_TO_END`; the same host setup):
 
 - Each fix taken out of the final code, one at a time, against its test at
   1 MiB (section 19, third column): the close of a failed block
