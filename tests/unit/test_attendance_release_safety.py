@@ -14,7 +14,6 @@ from test_add_backend import (
     connector_fixture,
     db as db,
     make_writable,
-    snapshot_user,
 )
 from test_attendance_force_release import store as store
 from test_attendance_repair import CORRECT_CNIC, WRONG_CNIC, repair_store as repair_store

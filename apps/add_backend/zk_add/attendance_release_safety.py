@@ -134,26 +134,44 @@ def _interval_query(keys):
     )
 
 
+def _overlapping(query, earliest, latest):
+    """Only intervals that can cover a punch between ``earliest`` and ``latest``."""
+    tolerance = timedelta(seconds=settings.identity_snapshot_capture_tolerance_seconds)
+    return query.where(
+        AttendanceIdentityHistory.observed_from <= latest,
+        AttendanceIdentityHistory.observed_until >= earliest - tolerance,
+    )
+
+
 def punch_time_identity(session: Session, event, current_cnic_hash: str | None) -> PunchTimeIdentity:
-    if not (event.zkt_device_id and event.device_serial and event.user_id):
+    if not (
+        event.zkt_device_id and event.device_serial and event.user_id
+        and event.device_event_time is not None
+    ):
         return PunchTimeIdentity(NONE)
+    when = ensure_utc(event.device_event_time)
     intervals = session.scalars(
-        _interval_query([(event.zkt_device_id, event.device_serial, event.user_id)])
-        .order_by(AttendanceIdentityHistory.id).limit(5 * MAX_INTERVALS)
+        _overlapping(
+            _interval_query([(event.zkt_device_id, event.device_serial, event.user_id)]), when, when,
+        ).order_by(AttendanceIdentityHistory.id).limit(MAX_INTERVALS + 1)
     ).all()
     return classify_punch_time(event, intervals, current_cnic_hash)
 
 
 def intervals_for_page(session: Session, events) -> dict[tuple, list[AttendanceIdentityHistory]]:
     """Retained intervals for a ledger page in bounded, chunked queries."""
-    keys = sorted({
-        (row.zkt_device_id, row.device_serial, row.user_id)
-        for row in events
-        if row.zkt_device_id and row.device_serial and row.user_id
-    })
+    rows = [
+        row for row in events
+        if row.zkt_device_id and row.device_serial and row.user_id and row.device_event_time
+    ]
     found: dict[tuple, list[AttendanceIdentityHistory]] = {}
+    if not rows:
+        return found
+    keys = sorted({(row.zkt_device_id, row.device_serial, row.user_id) for row in rows})
+    times = [ensure_utc(row.device_event_time) for row in rows]
     for start in range(0, len(keys), 200):
-        for row in session.scalars(_interval_query(keys[start:start + 200])).all():
+        query = _overlapping(_interval_query(keys[start:start + 200]), min(times), max(times))
+        for row in session.scalars(query.limit(20 * MAX_INTERVALS)).all():
             found.setdefault((row.zkt_device_id, row.terminal_serial, row.user_id), []).append(row)
     return found
 
