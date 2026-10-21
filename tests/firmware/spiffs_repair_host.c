@@ -5493,6 +5493,29 @@ static uint32_t custody_or_evidence(const model_file_t *m, const char *what)
     return lost;
 }
 
+/* The same, measured without failing: bytes of the file lost, and how many
+ * of them no gap record covers (all of them for a file that does not read). */
+static void custody_measured(const model_file_t *m, uint32_t *lost, uint32_t *uncovered)
+{
+    static uint8_t buffer[8 * 1024 * 1024];
+    int64_t got = read_file(m->name, buffer, sizeof(buffer));
+    if (got < (int64_t)m->size) {
+        *lost += m->size;
+        *uncovered += m->size;
+        return;
+    }
+    srp_gaps_t gaps = gaps_now();
+    for (uint32_t i = 0; i < m->size; ++i) {
+        if (buffer[i] == m->data[i] && !m->unreadable[i]) continue;
+        bool covered = false;
+        for (uint32_t g = 0; g < gaps.count && !covered; ++g)
+            covered = !strcmp(gaps.gap[g].name, m->name) && i >= gaps.gap[g].offset &&
+                i < gaps.gap[g].offset + gaps.gap[g].length;
+        *lost += buffer[i] != m->data[i];
+        *uncovered += !covered;
+    }
+}
+
 static uint32_t p02_queue_block(void);
 static uint64_t env_u64(const char *name) { return getenv(name) ? strtoull(getenv(name), NULL, 10) : 0; }
 static void run_reclaim_cuts(const char *what, void (*build)(void), uint32_t kib, bool unconfirmed, after_cut_t after,
@@ -5533,7 +5556,7 @@ static void run_reclaim_cuts(const char *what, void (*build)(void), uint32_t kib
           "%s: %u failed blocks, %u closed", what, report.reclaim.failed, round_closed_blocks - closed_before);
     uint64_t first = round_start_ops - start + 1, last = round_end_ops - start, round_last = last;
     if (getenv("REVIEW_TO_END")) last = flash_ops - start;
-    uint32_t evidenced = 0, spiffs_torn = 0;
+    uint32_t evidenced = 0, spiffs_torn = 0, spiffs_torn_lost = 0;
     uint32_t runs = 0, rollbacks = 0;
     uint64_t only_k = getenv("REVIEW_K") ? strtoull(getenv("REVIEW_K"), NULL, 10) : 0;
     for (uint64_t k = first; k <= last; k += stride) {
@@ -5596,8 +5619,13 @@ static void run_reclaim_cuts(const char *what, void (*build)(void), uint32_t kib
                  * on its own unconfirmed boot: counted and printed, not
                  * judged here (design section 15). */
                 spiffs_torn++;
+                uint32_t lost = 0, uncovered = 0;
+                mount_plain();
+                for (uint32_t i = 0; i < model_count; ++i) custody_measured(&model[i], &lost, &uncovered);
+                SPIFFS_unmount(&fs);
+                spiffs_torn_lost += lost != 0;
                 printf("%s: after the round, SPIFFS's own erase torn with its magic valid, then the old image: "
-                       "not judged\n", label);
+                       "%u bytes lost, %u of them with no gap record (not judged)\n", label, lost, uncovered);
                 check_reclaimed_structure(label);
                 continue;
             }
@@ -5635,8 +5663,8 @@ static void run_reclaim_cuts(const char *what, void (*build)(void), uint32_t kib
         printf("%s: %u cuts after the round (through the old image) lost bytes, every one covered by a gap record\n",
                what, evidenced);
     if (spiffs_torn)
-        printf("%s: %u cuts after the round tore SPIFFS's own erase with the magic valid, then the old image: not "
-               "judged\n", what, spiffs_torn);
+        printf("%s: %u cuts after the round tore SPIFFS's own erase with the magic valid, then the old image (%u of "
+               "them lost bytes): not judged\n", what, spiffs_torn, spiffs_torn_lost);
     printf("%s: %u cuts in the round%s (writes %" PRIu64 "..%" PRIu64 ", every %u), %u through the old image; "
            "custody byte-exact, no gap%s\n", what, runs, getenv("REVIEW_TO_END") ? " and to the end of the boot" : "",
            first, last, stride, rollbacks, evidenced || spiffs_torn ? " but for those" : "");
