@@ -1071,9 +1071,13 @@ for 2.7.5.
   salt 31) found it on P02 at 1 MiB: the probe's GC erase of block 0 torn
   after the round of an unconfirmed boot, then the old image's appends:
   `/pending.jsonl` (335,939 bytes) read -1, its header renamed
-  `/pdndind.jsenl`. On the device this needs a rollback to an image older
-  than 2.7.5 (a direct upgrade to 2.7.6 from one); a device whose old image
-  is 2.7.5 repairs first. The same exposure exists at every GC erase of such
+  `/pdndind.jsenl`; 341,740 bytes in all and no gap record. Of the 8 such
+  cuts in that sweep, 4 lost nothing and 2 lost 502 bytes, each covered by a
+  gap record. On the device this needs a rollback to an image older than
+  2.7.5 (a direct upgrade to 2.7.6 from one); a device whose old image is
+  2.7.5 runs its repair, lookup hygiene included, before the VFS mounts.
+  (The harness's "released 2.7.5" sweep runs the old image's plain writes
+  before 2.7.5's repair, so it shows the same loss.) The same exposure exists at every GC erase of such
   an image in normal operation, and on 2.7.5's own unconfirmed boot (its
   probe is byte-identical); 2.7.6 adds the erases of the run after a round,
   on stores 2.7.5 left wedged and never wrote.
@@ -1126,6 +1130,17 @@ for 2.7.5.
 | 2d26d08 | section 18 and the sections the fixes changed |
 | f3988b8 | `reclaim-stale`'s cursor before the damage kept before it at 8 MiB (a test error, not the engine's) |
 | 98c7953 | the verification after the round 1 review, below (the wedged seeds added next) |
+| 6e6a982 | the wedged organic seeds in the round 1 verification |
+| 037bfe2 | the round 2 review of the implementation: every defect (section 19), with its regression tests |
+| 0ce260e | section 19 and the sections the fixes changed |
+| 279e4ac | one close per round; sources sorted and looked up by object and span |
+| 3d2b145 | the round oracle decides a changed block by its own record |
+| ce52dba | `REVIEW_TO_END`: cuts after the round through the old image judged by custody or evidence |
+| 80bc660 | section 12's resolved stack chain, section 13's oracle for cuts after the round |
+| da1544c | `REVIEW_TO_END`: a torn SPIFFS erase before the old image sorted out and counted |
+| a162b59 | owner decision 6 and its residual risk; section 19's notes on the verification |
+| 8c31951 | what such a torn erase cost, measured |
+| (next) | the verification after the round 2 review, below |
 
 **Results at eaf7ec3** (host, ESP-IDF 5.5.3 SPIFFS, ASan and UBSan; Apple
 clang natively and GCC in `espressif/idf:v5.5.3`; the results after the
@@ -1213,6 +1228,77 @@ round 1 review follow these):
   the 2.6.23 bridge (identities, startup stack budgets): all build, the
   repair's roles with 0 warnings; the production image is 1,441,792 bytes
   (45% of its 2.5 MiB slot free). Stack: section 12.
+
+**Results after the round 2 review** (21 October, after the host's power
+loss; the engine and glue as at ce52dba, the harness as at 8c31951, whose
+changes after ce52dba touch only the verification knob `REVIEW_TO_END`;
+the same host setup):
+
+- Each fix taken out of the final code, one at a time, against its test at
+  1 MiB (section 19, third column): the close of a failed block
+  (`reclaim-worn`: "two worn windows … 1 failed (0 closed)"); room from the
+  erased pages after the remount, and the retry only for the files that
+  waited ("… 2 failed (2 closed), 1 gap records naming
+  /processed_commands.txt"); open records as sources (`reclaim-open`:
+  `REPAIRED_WITH_GAPS`, 3,514 unreadable bytes); one record per range per
+  boot (`reclaim-gaps`: 2 records, 502 bytes); a source bit that will not
+  take (`reclaim-unmarked`: "block 135 ends closed and no source record"),
+  and the store kept unmounted (the same, for the variant with the journal
+  refused); ended entries as sources (`reclaim-generations`: 251 bytes
+  differ) and `'0'` as JSON fill (5 differ). Each fails without its fix and
+  passes with it. The glue's journal without NVS (R2-2) is pinned by
+  `test_a_record_nothing_marks_a_source_keeps_the_store_unmounted`.
+- The CI harness configuration (`check_spiffs_repair.py`, 13 entries,
+  `reclaim-round2` at 8 MiB among them): passes natively at ce52dba
+  (6 minutes) and at 8c31951 (10 minutes, the host loaded), and with GCC in
+  `espressif/idf:v5.5.3` at 80bc660 (12.5 minutes) and at 8c31951
+  (9 minutes). `test_storage_repair_host.py`, the boot contract and the
+  diagnostics tests in `add-test-env:local` with ESP-IDF's SPIFFS sources
+  mounted: 23 passed, none skipped.
+- Cut at every write and erase of the round (`REVIEW_FULL=1`): at 1 MiB,
+  P02 48, gc-unsafe 92 and the worn first window 80 confirmed; 188, 188 and
+  248 through the old images; with fresh salts 33 to 36, 192, 458 and 320
+  confirmed, 702, 702 and 942 through the old images. At 8 MiB, 48, 96 and
+  80 confirmed; 150, 150 and 210 through the old images. Every one: custody
+  byte-exact, no gap record.
+- Cut at every write to the end of the boot (`REVIEW_TO_END`,
+  `REVIEW_PREFER_QUEUE`, `REVIEW_FULL`), 1 MiB, salts 31 and 32: confirmed,
+  P02 3,620 and 3,626, gc-unsafe 258 and 264, the worn first window 3,812
+  and 3,860 cuts: every one byte-exact with no gap record. Through the old
+  images, 3,720, 3,720 and 3,764 cuts (salt 31) and 3,686, 3,686 and 3,734
+  (salt 32): custody byte-exact with no gap but for 16 cuts at the first
+  writes after the round (a SPIFFS page move torn before its lookup entry,
+  then the old image's plain writes: 251 bytes lost each time, covered by a
+  gap record) and, at salt 31, 8 cuts that tore SPIFFS's own erase with
+  its magic valid (section 15, owner decision 6: 2 of them lost 341,740
+  bytes with no gap record). At 8 MiB (salt 41; about 14,000 writes from
+  the round to the probe), cuts at 19 positions of the sweeps' every-41st
+  grid (8 of the every-83rd grid for the sweeps sampled so), the last in the
+  probe, both tears: P02 38, gc-unsafe 4 and the worn first window 38
+  confirmed; 38, 16 and 16 through the old images: every one byte-exact
+  with no gap record.
+- Organic workload: 8 MiB at 20,000 ticks, seeds 12, 13 and 16 (wedged on
+  2.7.5): healthy, 0 committed rows lost, no gap record (10, 9 and 10
+  rounds; 95, 66 and 91 blocks); prefilled fresh 8 MiB seeds 911 to 914
+  (3,000 ticks): 0 lost, none handed over GC-unsafe (1 to 5 rounds, 7 to 47
+  blocks); fresh 1 MiB seeds 1,111 to 1,114: 0 lost.
+- `idf.py build` in `espressif/idf:v5.5.3`: production (0 warnings,
+  1,441,792 bytes, 45% free), the 2.7.5 direct legacy role (0 warnings, its
+  identity and exact contract marker), Hikvision (family descriptor; the 3
+  warnings already on main), recovery 2.6.27 (identity, marker), the 2.7.0
+  journal writer and the 2.6.23 bridge (identities, startup stack budgets,
+  and each rebuilt at another path byte-identical, as CI's reproducibility
+  steps do). Stack: section 12 (unchanged frames).
+- ADD (unchanged since 3c546a6): the 8 backend shards against Postgres 16
+  and Redis 7: 4,737 passed, 669 skipped (one more than after round 1: the
+  round 2 boot contract test), and `--verify-plans` confirms complete,
+  disjoint coverage. Shard 0's first run, with the host fully loaded, failed
+  one WebSocket session test
+  (`test_session_end_classifies_how_the_socket_closed[1005-True-keepalive_timeout]`:
+  the session ended with a heartbeat still in flight); it passed on the
+  rerun, and ADD's code is unchanged.
+  Ruff with CI's paths, the frontend OpenAPI contract and the repository
+  contract pass.
 
 Not run here: a device (HIL), and the release step (version, upgrade guard
 digests, signing).
