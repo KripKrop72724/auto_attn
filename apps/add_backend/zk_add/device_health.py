@@ -124,6 +124,8 @@ POLICY = {
         107, False, "LATCHED", "Clears when the attendance repair completes."),
     "ADD_SOURCE_COVERAGE_INVALIDATED": Policy(
         108, False, "LATCHED", "Clears through a source coverage review."),
+    "ADD_SOURCE_GENERATION_LINEAGE_DIVERGED": Policy(
+        108, False, "LATCHED", "Clears through a source coverage review."),
     "TERMINAL_SOURCE_EXCEPTION": Policy(108, False, "LATCHED", "Clears through a source exception review."),
     "USER_DELETION_JOB_INCOMPLETE": Policy(
         109, False, "LATCHED", "Clears when the user deletion job completes."),

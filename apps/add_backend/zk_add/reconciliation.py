@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+from dataclasses import dataclass
 from datetime import timedelta
 import hashlib
 import hmac
@@ -9,8 +10,8 @@ import json
 import re
 from uuid import uuid4
 
-from sqlalchemy import func, or_, select
-from sqlalchemy.orm import Session
+from sqlalchemy import and_, func, or_, select
+from sqlalchemy.orm import Session, aliased
 
 from zk_add.audit import append_audit
 from zk_add.crypto import encrypt_text
@@ -76,6 +77,26 @@ SOURCE_INTERPRETATION_HOLD = "SOURCE_INTERPRETATION_REQUIRED"
 SOURCE_EXCEPTION_SCOPE_MISMATCH = "SOURCE_EXCEPTION_SCOPE_MISMATCH"
 SOURCE_IDENTITY_GUARD_VERSION = "zkt-source-identity-guard-1"
 SOURCE_MISSING_REFERENCE = "HISTORICAL_IDENTITY_EVIDENCE_REQUIRED"
+SOURCE_GENERATION_LINEAGE_DIVERGED = "SOURCE_GENERATION_LINEAGE_DIVERGED"
+SOURCE_GENERATION_STALE = "SOURCE_GENERATION_STALE"
+SOURCE_TAIL_STALE_GENERATION = "SOURCE_TAIL_STALE_GENERATION"
+GENERATION_SUPERSEDED_REASON = "SUPERSEDED_BY_NEW_GENERATION_CERTIFICATE"
+# Sealing derives these holds from committed evidence alone. The device sends
+# the same manifest again on a plain retry, so the same evidence gives the
+# same hold; a retry helps only after that evidence changed.
+COVERAGE_FINALISATION_HOLDS = frozenset({
+    "SOURCE_COVERAGE_RETENTION_BINDING_MISMATCH",
+    "SOURCE_COVERAGE_RETENTION_COUNT_REGRESSION",
+    "SOURCE_COVERAGE_RETAINED_CERTIFICATE_INVALID",
+    "SOURCE_COVERAGE_PROOF_LIMIT",
+    "SOURCE_COVERAGE_CHAIN_GAP",
+    "SOURCE_COVERAGE_CHAIN_DIVERGED",
+    "SOURCE_COVERAGE_CHAIN_ENDPOINT_DIVERGED",
+    "SOURCE_COVERAGE_CANONICAL_GAP",
+    "SOURCE_COVERAGE_CANONICAL_EVIDENCE_MISSING",
+    SOURCE_GENERATION_LINEAGE_DIVERGED,
+    SOURCE_GENERATION_STALE,
+})
 
 
 def _release_assignment(job: ReconciliationJob) -> None:
@@ -181,7 +202,36 @@ def _active_or_new_source_epoch(
     return epoch
 
 
-def preflight_reconciliation(session: Session, connector: Connector) -> dict:
+def _generation_preflight(connector: Connector, coverage: ReconciliationCoverage | None) -> dict:
+    """How a new job's generation relates to the certified coverage it would meet."""
+    connector_generation = max(1, connector.onboarding_generation or 0)
+    coverage_generation = coverage.terminal_generation if coverage is not None else None
+    if coverage_generation is None:
+        state, message = "NO_ACTIVE_COVERAGE", "No certified source coverage exists; a new job certifies its own."
+    elif coverage_generation == connector_generation:
+        state, message = "MATCHED", "The certified coverage belongs to the connector's current generation."
+    elif coverage_generation < connector_generation:
+        state = "PREVIOUS_GENERATION"
+        message = (
+            f"The certified coverage is generation {coverage_generation}; this connector re-onboarded as "
+            f"generation {connector_generation}. A new job replaces that coverage only after ADD proves its "
+            "scan holds the same raw terminal history (ordinal, raw digest and record size). Otherwise it "
+            "holds for review and the existing coverage, tail and evidence stay unchanged."
+        )
+    else:
+        state = "NEWER_THAN_CONNECTOR"
+        message = (
+            f"The certified coverage is generation {coverage_generation}, newer than the connector's "
+            f"generation {connector_generation}. ADD never replaces newer coverage with an older generation."
+        )
+    return {"connector_generation": connector_generation, "coverage_generation": coverage_generation,
+            "next_job_generation": connector_generation, "state": state, "message": message}
+
+
+def preflight_reconciliation(
+    session: Session, connector: Connector, *, include_active_job: bool = True,
+) -> dict:
+    """Readiness for a new job; the scheduler excludes the job it is running."""
     if connector.firmware_family == "hikvision":
         from zk_add.hikvision_reconciliation import preflight
         return preflight(session, connector)
@@ -312,6 +362,25 @@ def preflight_reconciliation(session: Session, connector: Connector) -> dict:
                 ),
             }
         )
+    generation = _generation_preflight(connector, coverage)
+    if generation["state"] == "NEWER_THAN_CONNECTOR":
+        hard.append({"code": SOURCE_GENERATION_STALE, "message": generation["message"]})
+    if include_active_job:
+        active_job = session.scalar(
+            select(ReconciliationJob).where(
+                ReconciliationJob.connector_id == connector.id,
+                ReconciliationJob.status.not_in(TERMINAL_JOB_STATES),
+            ).order_by(ReconciliationJob.id.desc()).limit(1)
+        )
+        if active_job is not None:
+            held = active_job.status == "NEEDS_ATTENTION"
+            hard.append({
+                "code": "RECONCILIATION_HELD" if held else "RECONCILIATION_ACTIVE",
+                "message": f"Device already has active reconciliation {active_job.job_id}."
+                + (f" It is held for review ({active_job.error_code or active_job.wait_reason});"
+                   " retry or cancel it before starting another." if held else ""),
+                "job_id": active_job.job_id,
+            })
     return {
         "eligible": not hard,
         "ready_now": not hard and not waitable,
@@ -324,7 +393,9 @@ def preflight_reconciliation(session: Session, connector: Connector) -> dict:
             "zone_id": connector.zone_id,
             "connected": connector.connected,
             "firmware_version": connector.firmware_version,
+            "onboarding_generation": connector.onboarding_generation,
         },
+        "generation": generation,
         "terminal": None
         if zkt is None
         else {
@@ -445,6 +516,10 @@ def control_reconciliation_job(
 ) -> ReconciliationJob:
     if expected_state is not None and action != "retry":
         raise ValueError("Expected state is supported only for a guarded retry.")
+    # A request without the newer connector-generation field keeps its
+    # original digest, so its lost-response replay still matches.
+    digest_exclude = {"connector_generation"} if (
+        expected_state is not None and expected_state.connector_generation is None) else set()
     connector = session.scalar(select(Connector).where(Connector.id == job.connector_id)
         .with_for_update().execution_options(populate_existing=True))
     locked = session.scalar(
@@ -457,7 +532,7 @@ def control_reconciliation_job(
     job = locked
     if action not in {"pause", "resume", "cancel", "retry"}:
         raise ValueError("Unknown reconciliation control action.")
-    expected_digest = hashlib.sha256(json.dumps(expected_state.model_dump(mode="json"),
+    expected_digest = hashlib.sha256(json.dumps(expected_state.model_dump(mode="json", exclude=digest_exclude),
         sort_keys=True, separators=(",", ":")).encode()).hexdigest() if expected_state is not None else None
     replay = session.scalar(
         select(ReconciliationEvent).where(
@@ -483,14 +558,27 @@ def control_reconciliation_job(
             "application_sha256": connector.ota_image_sha256 if connector else None,
             "diagnostics_sample_sequence": (connector.firmware_diagnostics or {}).get("sample_sequence") if connector else None,
             "diagnostics_at": ensure_utc(connector.firmware_diagnostics_at) if connector and connector.firmware_diagnostics_at else None}
-        if (actual != expected_state.model_dump() or connector is None
+        # The job keeps the generation it was created in; a connector that
+        # re-onboarded since is a separate, optionally pinned, fact.
+        if (actual != expected_state.model_dump(exclude={"connector_generation"}) or connector is None
                 or binding_serial != expected_state.terminal_serial
-                or connector.onboarding_generation != expected_state.terminal_generation):
+                or job.terminal_generation != expected_state.terminal_generation
+                or (expected_state.connector_generation is not None
+                    and connector.onboarding_generation != expected_state.connector_generation)):
             raise ValueError("Reconciliation retry evidence changed; refresh and review before retrying.")
     if job.status in TERMINAL_JOB_STATES:
         if action == "retry" and job.status == "FAILED":
             raise ValueError("Failed jobs retain evidence; create a new audited job instead.")
         raise ValueError(f"Reconciliation is already {job.status.lower()}.")
+    if (action == "retry" and job.status == "NEEDS_ATTENTION"
+            and job.error_code in COVERAGE_FINALISATION_HOLDS
+            and predicted_finalisation_hold(session, job) == job.error_code):
+        raise ValueError(
+            f"Retry would hold again with {job.error_code}: ADD re-checked the sealed checkpoint "
+            "against the current source coverage and the same evidence gives the same answer. The live "
+            "tail, the current coverage and all committed evidence are unchanged. Cancelling is safe and "
+            "keeps them; retry once the source evidence changes."
+        )
     if action == "retry" and (job.quarantined_count or job.raw_preserved_count):
         source_assurance = source_exception_assurance(session, job)
         if source_assurance["raw_interpretation_open"]:
@@ -1388,6 +1476,192 @@ def _retained_coverage_proof(session, job, coverage):
         "retained_tail_chain": tail_chain, "canonical_inventory": inventory}
 
 
+GENERATION_SUPERSEDE_POLICY = "SUPERSEDE_PREVIOUS_GENERATION_RAW_LINEAGE_V1"
+LINEAGE_DRIFT_SAMPLE = 20
+_DIGEST = re.compile(r"[0-9a-f]{64}")
+
+
+class _LineageDiverged(ValueError):
+    def __init__(self, details: dict):
+        super().__init__(SOURCE_GENERATION_LINEAGE_DIVERGED)
+        self.details = details
+
+
+def _generation_lineage_proof(session, job, coverage, *, cutoff):
+    """Prove, read-only, that an older generation's ledger is this job's terminal history.
+
+    A connector re-onboards (a new generation) while its terminal keeps the
+    same history. Raw bytes are that history; record keys and occurrence
+    indexes are firmware interpretation, so a difference there with identical
+    bytes is recorded drift, never divergence. Every canonical source kind is
+    compared, including a recovery epoch's RECOVERY_PREFIX rows. The proof
+    covers the ordinals both ledgers hold and is bounded like the other
+    receipt proofs.
+    """
+    epoch = session.get(TerminalSourceEpoch, job.source_epoch_id) if job.source_epoch_id else None
+    previous = session.get(TerminalSourceEpoch, coverage.source_epoch_id) if coverage.source_epoch_id else None
+    if (epoch is None or epoch.state != "ACTIVE" or epoch.zkt_device_id != job.zkt_device_id
+            or epoch.terminal_generation != job.terminal_generation
+            or previous is None or previous.id == epoch.id or previous.state != "ACTIVE"
+            or previous.zkt_device_id != job.zkt_device_id
+            or previous.terminal_generation != coverage.terminal_generation
+            or not coverage.active or coverage.zkt_device_id != job.zkt_device_id
+            or not job.terminal_serial or coverage.terminal_serial != job.terminal_serial
+            or not 1 <= coverage.terminal_generation < job.terminal_generation
+            or job.record_size not in {8, 16, 40}):
+        raise ValueError("SOURCE_COVERAGE_RETENTION_BINDING_MISMATCH")
+    span = min(cutoff, coverage.source_committed_cursor)
+    if not 0 <= span <= COVERAGE_PROOF_MAX_RECORDS:
+        raise ValueError("SOURCE_COVERAGE_PROOF_LIMIT")
+    old, new = aliased(TerminalRecordManifest), aliased(TerminalRecordManifest)
+
+    def scope(row, generation, epoch_id):
+        return (row.zkt_device_id == job.zkt_device_id, row.generation == generation,
+                row.source_epoch_id == epoch_id, row.canonical_source == True,  # noqa: E712
+                row.ordinal < span)
+
+    old_scope = scope(old, coverage.terminal_generation, coverage.source_epoch_id)
+    new_scope = scope(new, job.terminal_generation, job.source_epoch_id)
+    for side, side_scope in ((old, old_scope), (new, new_scope)):
+        # The unique canonical-ordinal index plus these bounds proves both
+        # ledgers are contiguous from zero; a negative ordinal fails here.
+        count, first, last = session.execute(select(func.count(side.id), func.min(side.ordinal),
+            func.max(side.ordinal)).where(*side_scope)).one()
+        if count != span or (span and (first != 0 or last != span - 1)):
+            raise ValueError("SOURCE_COVERAGE_CANONICAL_GAP")
+    lineage, drift = hashlib.sha256(), hashlib.sha256()
+    drift_count, drift_sample, after = 0, [], -1
+    while after + 1 < span:
+        rows = session.execute(select(
+            new.ordinal.label("ordinal"), new.raw_record_digest.label("raw"),
+            new.record_size.label("size"), new.terminal_record_key.label("key"),
+            new.occurrence_index.label("occurrence"), old.ordinal.label("old_ordinal"),
+            old.raw_record_digest.label("old_raw"), old.record_size.label("old_size"),
+            old.terminal_record_key.label("old_key"), old.occurrence_index.label("old_occurrence"),
+        ).select_from(new).outerjoin(old, and_(*old_scope, old.ordinal == new.ordinal))
+            .where(*new_scope, new.ordinal > after)
+            .order_by(new.ordinal).limit(COVERAGE_PROOF_PAGE)).all()
+        if not rows:
+            raise ValueError("SOURCE_COVERAGE_CANONICAL_GAP")
+        for row in rows:
+            if row.ordinal != after + 1 or row.old_ordinal != row.ordinal:
+                raise ValueError("SOURCE_COVERAGE_CANONICAL_GAP")
+            if (not _DIGEST.fullmatch(row.raw or "") or not _DIGEST.fullmatch(row.old_raw or "")
+                    or row.size not in {8, 16, 40} or row.old_size is None):
+                raise ValueError("SOURCE_COVERAGE_CANONICAL_EVIDENCE_MISSING")
+            if row.raw != row.old_raw or row.size != row.old_size:
+                raise _LineageDiverged({
+                    "ordinal": row.ordinal,
+                    "previous_generation": coverage.terminal_generation,
+                    "generation": job.terminal_generation,
+                    "previous_raw_record_digest": row.old_raw, "raw_record_digest": row.raw,
+                    "previous_record_size": row.old_size, "record_size": row.size,
+                    "coverage_id": coverage.coverage_id, "job_id": job.job_id,
+                })
+            if (row.key, row.occurrence) != (row.old_key, row.old_occurrence):
+                drift_count += 1
+                if len(drift_sample) < LINEAGE_DRIFT_SAMPLE:
+                    drift_sample.append(row.ordinal)
+                drift.update(json.dumps([row.ordinal, row.old_key, row.old_occurrence, row.key, row.occurrence],
+                    separators=(",", ":")).encode() + b"\n")
+            lineage.update(json.dumps([row.ordinal, row.raw, row.size], separators=(",", ":")).encode() + b"\n")
+            after = row.ordinal
+    prior_job = session.get(ReconciliationJob, coverage.job_id)
+    return {
+        "policy": GENERATION_SUPERSEDE_POLICY,
+        "coverage_id": coverage.coverage_id,
+        "job_id": prior_job.job_id if prior_job is not None else None,
+        "terminal_serial": coverage.terminal_serial,
+        "terminal_generation": coverage.terminal_generation,
+        "source_epoch": previous.epoch_id,
+        "source_epoch_sequence": previous.sequence,
+        "certified_source_cursor": coverage.certified_source_cursor,
+        "source_chain_digest": coverage.source_chain_digest,
+        "source_committed_cursor": coverage.source_committed_cursor,
+        "source_committed_chain_digest": coverage.source_committed_chain_digest,
+        "capture_state": coverage.capture_state,
+        "oracle_state": coverage.oracle_state,
+        "capture_evidence_signature": (coverage.capture_evidence or {}).get("evidence_signature"),
+        # Ordinals the old coverage committed past this cutoff. The terminal
+        # re-reads them as this generation's tail; ADD keeps both copies.
+        "replayed_after_cutoff": max(0, coverage.source_committed_cursor - cutoff),
+        "lineage": {"compared_records": span, "bound_fields": ["ordinal", "raw_record_digest", "record_size"],
+                    "lineage_sha256": lineage.hexdigest()},
+        "interpretation_drift": {"count": drift_count, "first_ordinals": drift_sample,
+                                 "drift_sha256": drift.hexdigest() if drift_count else None},
+    }
+
+
+@dataclass
+class _FinalisationPlan:
+    hold: str | None = None
+    message: str | None = None
+    details: dict | None = None
+    retained: ReconciliationCoverage | None = None
+    retention: dict | None = None
+    predecessor: ReconciliationCoverage | None = None
+    superseded: dict | None = None
+
+
+def _finalisation_plan(session, job, prior_coverages, *, cutoff) -> _FinalisationPlan:
+    """Decide, read-only, how a sealed cutoff relates to the terminal's active coverage.
+
+    Same generation keeps the longer-coverage retention proof unchanged. An
+    older generation is replaced only with a raw lineage proof. Newer coverage
+    is never replaced by an older generation's job.
+    """
+    newer = [row for row in prior_coverages if row.terminal_generation > job.terminal_generation]
+    if newer:
+        return _FinalisationPlan(hold=SOURCE_GENERATION_STALE, message=(
+            f"The active source coverage is generation {newer[0].terminal_generation}, newer than this "
+            f"job's generation {job.terminal_generation}. ADD never replaces newer coverage with an older "
+            "generation; that coverage, its tail and all evidence are unchanged. Cancel this job."))
+    older = [row for row in prior_coverages if row.terminal_generation < job.terminal_generation]
+    if older:
+        if len(prior_coverages) != 1:
+            return _FinalisationPlan(hold="SOURCE_COVERAGE_RETENTION_BINDING_MISMATCH", message=(
+                "More than one active source coverage exists; nothing was replaced."))
+        predecessor = older[0]
+        try:
+            superseded = _generation_lineage_proof(session, job, predecessor, cutoff=cutoff)
+        except _LineageDiverged as exc:
+            return _FinalisationPlan(hold=SOURCE_GENERATION_LINEAGE_DIVERGED, details=exc.details, message=(
+                f"The generation {job.terminal_generation} scan read different raw terminal history at "
+                f"ordinal {exc.details['ordinal']} than the certified generation "
+                f"{predecessor.terminal_generation} ledger. ADD replaced nothing: the existing coverage, its "
+                "live tail and all evidence are unchanged. Cancelling is safe and keeps them; the divergence "
+                "needs source review."))
+        except ValueError as exc:
+            return _FinalisationPlan(hold=str(exc), message=(
+                f"The generation {predecessor.terminal_generation} source coverage could not be proven to hold "
+                "this terminal's history; its cursor, tail and evidence remain unchanged."))
+        return _FinalisationPlan(predecessor=predecessor, superseded=superseded)
+    retained = next((row for row in prior_coverages if row.source_committed_cursor >= cutoff), None)
+    if retained is None:
+        return _FinalisationPlan()
+    try:
+        retention = _retained_coverage_proof(session, job, retained)
+    except ValueError as exc:
+        return _FinalisationPlan(hold=str(exc), message=(
+            "The longer committed source coverage could not be safely retained; its cursor and evidence remain unchanged."))
+    return _FinalisationPlan(retained=retained, retention=retention)
+
+
+def predicted_finalisation_hold(session, job) -> str | None:
+    """The hold a manifest at this job's sealed checkpoint would now produce, read-only.
+
+    None means sealing would certify (or the job is not at its cutoff, where a
+    prediction says nothing). Nothing is locked or changed.
+    """
+    if (job.capture_certified_at is not None or job.cutoff_count is None
+            or job.committed_next_ordinal != job.cutoff_count):
+        return None
+    prior = session.scalars(select(ReconciliationCoverage).where(
+        ReconciliationCoverage.zkt_device_id == job.zkt_device_id,
+        ReconciliationCoverage.active == True)).all()  # noqa: E712
+    return _finalisation_plan(session, job, prior, cutoff=job.cutoff_count).hold
+
+
 def _assurance_coverage(session, job):
     """Resolve a job's own certificate without lending it another job's tail."""
     certificate = job.capture_certificate or {}
@@ -1454,6 +1728,11 @@ def reconciliation_manifest_authority(session, connector, job):
         return None
     if coverage.source_committed_cursor < job.cutoff_count:
         raise ValueError("Committed source authority regressed below the manifest cutoff.")
+    return coverage_authority_payload(session, coverage)
+
+
+def coverage_authority_payload(session, coverage: ReconciliationCoverage) -> dict:
+    """The JSON-native source_coverage push every Zone Lite generation parses."""
     return {"type": "source_coverage", "coverage_id": coverage.coverage_id,
         "source_epoch_id": coverage.source_epoch_id, "source_epoch": source_epoch_uuid(session, coverage),
         "terminal_serial": coverage.terminal_serial, "terminal_generation": coverage.terminal_generation,
@@ -1531,15 +1810,16 @@ def apply_reconciliation_manifest(
         ReconciliationCoverage.zkt_device_id == job.zkt_device_id,
         ReconciliationCoverage.active == True).with_for_update()  # noqa: E712
         .execution_options(populate_existing=True)).all()
-    retained = next((row for row in prior_coverages
-                     if row.source_committed_cursor >= payload.cutoff_count), None)
-    retention = None
-    if retained is not None:
-        try:
-            retention = _retained_coverage_proof(session, job, retained)
-        except ValueError as exc:
-            return _safety_hold(session, job, str(exc),
-                "The longer committed source coverage could not be safely retained; its cursor and evidence remain unchanged.")
+    plan = _finalisation_plan(session, job, prior_coverages, cutoff=payload.cutoff_count)
+    if plan.hold is not None:
+        if plan.hold == SOURCE_GENERATION_LINEAGE_DIVERGED:
+            _event(session, job, SOURCE_GENERATION_LINEAGE_DIVERGED, plan.details or {})
+            from zk_add.service import upsert_alert
+            upsert_alert(session, connector, code="ADD_SOURCE_GENERATION_LINEAGE_DIVERGED",
+                severity="CRITICAL", message=plan.message,
+                details={"failure_category": SOURCE_GENERATION_LINEAGE_DIVERGED, **(plan.details or {})})
+        return _safety_hold(session, job, plan.hold, plan.message)
+    retained, retention, superseded = plan.retained, plan.retention, plan.superseded
     now = utc_now()
     evidence = _sealed_evidence({
         "job_id": job.job_id,
@@ -1554,6 +1834,7 @@ def apply_reconciliation_manifest(
         "firmware_version": job.firmware_version,
         "certified_at": now.isoformat(),
         **({"retained_coverage": retention} if retention is not None else {}),
+        **({"superseded_generation": superseded} if superseded is not None else {}),
     })
     capture_state = (
         "SOURCE_CAPTURE_CERTIFIED_RAW_PENDING"
@@ -1565,9 +1846,37 @@ def apply_reconciliation_manifest(
     if retained is None:
         for prior in prior_coverages:
             prior.active = False
-            prior.invalidated_reason = "SUPERSEDED_BY_NEW_SOURCE_CERTIFICATE"
+            prior.invalidated_reason = (
+                GENERATION_SUPERSEDED_REASON
+                if plan.predecessor is not None and prior.id == plan.predecessor.id
+                else "SUPERSEDED_BY_NEW_SOURCE_CERTIFICATE"
+            )
             prior.invalidated_at = now
             prior.updated_at = now
+    if plan.predecessor is not None:
+        # The proven older generation retires with its coverage, in this same
+        # transaction. Its rows stay as immutable evidence; only new tails
+        # are refused, and the device is answered with the current coverage.
+        previous_epoch = session.get(TerminalSourceEpoch, plan.predecessor.source_epoch_id)
+        previous_epoch.state = "SUPERSEDED"
+        previous_epoch.superseded_at = now
+        previous_epoch.updated_at = now
+        _event(session, job, "SOURCE_GENERATION_SUPERSEDED", superseded)
+        append_audit(
+            session,
+            actor="system:source-generation",
+            action="SOURCE_COVERAGE_GENERATION_SUPERSEDED",
+            target_type="reconciliation_coverage",
+            target_id=plan.predecessor.coverage_id,
+            outcome=GENERATION_SUPERSEDED_REASON,
+            before={"active": True, "terminal_generation": plan.predecessor.terminal_generation,
+                    "source_epoch": superseded["source_epoch"],
+                    "source_committed_cursor": plan.predecessor.source_committed_cursor},
+            after={"job_id": job.job_id, "terminal_generation": job.terminal_generation,
+                   "certified_source_cursor": payload.cutoff_count,
+                   "lineage_sha256": superseded["lineage"]["lineage_sha256"],
+                   "interpretation_drift": superseded["interpretation_drift"]["count"]},
+        )
     coverage = ReconciliationCoverage(
         zkt_device_id=job.zkt_device_id,
         job_id=job.id,
@@ -1649,6 +1958,26 @@ def _invalidate_tail_coverage(
     )
 
 
+def _stale_generation_tail(session, zkt, coverage, payload) -> bool:
+    """A tail from this terminal in an older generation than ADD's active coverage.
+
+    The device has not applied ADD's newer certificate yet (a tail already in
+    flight, or a lost manifest ACK). A supplied epoch must be one of this
+    terminal's epochs in that older generation; anything else keeps the
+    ordinary epoch rejection.
+    """
+    if (payload.terminal_serial != coverage.terminal_serial
+            or not 1 <= payload.terminal_generation < coverage.terminal_generation):
+        return False
+    if payload.source_epoch is None:
+        return True
+    return session.scalar(select(TerminalSourceEpoch.id).where(
+        TerminalSourceEpoch.epoch_id == payload.source_epoch,
+        TerminalSourceEpoch.zkt_device_id == zkt.id,
+        TerminalSourceEpoch.terminal_generation == payload.terminal_generation,
+    ).limit(1)) is not None
+
+
 def apply_source_tail_chunk(
     session: Session,
     *,
@@ -1676,6 +2005,12 @@ def apply_source_tail_chunk(
     )
     if coverage is None:
         raise ValueError("Terminal has no active certified source coverage.")
+    if _stale_generation_tail(session, zkt, coverage, payload):
+        # Checked before the epoch: a late tail carries its retired epoch. It
+        # is not a terminal change and not a rejected message: nothing is
+        # committed, the newer coverage stays, and the transport answers with
+        # a structured error plus that coverage for the device to adopt.
+        return coverage, None, False, SOURCE_TAIL_STALE_GENERATION
     _require_source_epoch(session, connector, coverage, payload.source_epoch)
 
     def invalidate(code: str, message: str):
@@ -2583,7 +2918,8 @@ def assignment_rows(session: Session) -> list[tuple[str, dict]]:
             job.phase = "WAITING_FOR_SAFE_WINDOW"
             job.wait_reason = "HISTORY_BACKLOG_BACKPRESSURE"
             continue
-        preflight = preflight_reconciliation(session, connector)
+        # This job is the device's active job: it must not block itself.
+        preflight = preflight_reconciliation(session, connector, include_active_job=False)
         if preflight["hard_blockers"]:
             _safety_hold(
                 session,
@@ -2902,6 +3238,7 @@ def serialize_job(session: Session, job: ReconciliationJob, *, include_events: b
             "display_name": connector.display_name,
             "zone_id": connector.zone_id,
             "connected": connector.connected,
+            "onboarding_generation": connector.onboarding_generation,
         },
         "terminal": {
             "serial": job.terminal_serial,
@@ -3677,6 +4014,14 @@ def _operator_status(job: ReconciliationJob, *, connected: bool) -> tuple[str, s
         return (
             "WAITING_FOR_ORACLE_CAPACITY",
             "Terminal capture is temporarily paused while previously committed Oracle work drains.",
+        )
+    if job.status == "NEEDS_ATTENTION" and job.error_code in COVERAGE_FINALISATION_HOLDS:
+        return (
+            "REVIEW_REQUIRED",
+            f"{job.error_message or 'Sealing this source checkpoint was held fail-closed.'} "
+            "The live tail and the current source coverage keep custody, and every committed record is kept. "
+            "Cancelling is safe. Retry is accepted only when ADD's re-check of this checkpoint no longer "
+            "predicts the same hold.",
         )
     if job.status == "NEEDS_ATTENTION":
         return (
