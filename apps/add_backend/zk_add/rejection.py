@@ -51,8 +51,17 @@ def rejection_reason(error: Exception) -> str | None:
 
     A plain ValueError whose whole message is already a code keeps it. Any
     other message may quote device values, so it is reported only as
-    UNCLASSIFIED_VALUE_ERROR together with ``rejection_site``.
+    UNCLASSIFIED_VALUE_ERROR together with ``rejection_site``. A schema error
+    has a reason only when a validator raised a PydanticCustomError whose
+    type is a code (queue_evidence.verify_bytes); ordinary field errors keep
+    their field paths instead.
     """
+    if isinstance(error, ValidationError):
+        for row in error.errors(include_input=False, include_url=False):
+            kind = row.get("type")
+            if isinstance(kind, str) and len(kind) <= REASON_CODE_MAX_LENGTH and REASON_CODE.fullmatch(kind):
+                return kind
+        return None
     if rejection_category(error) != "EVIDENCE_INVALID":
         return None
     if isinstance(error, EvidenceRejected):

@@ -84,7 +84,8 @@ POLICY = {
         55, True, "POSITIVE", "Clears when the Hikvision terminal is online and its last check succeeded.",
         RULE),
     "DEVICE_MESSAGE_REJECTED": Policy(
-        60, True, "REJECTION", "Clears when ADD accepts the next message of each rejected type.", RULE),
+        60, True, "REJECTION", "Clears when ADD accepts the next message of each rejected type; a refused "
+        "queue_evidence clears only once ADD holds every record it refused.", RULE),
     "ADD_MESSAGE_PROCESSING_FAILED": Policy(
         65, False, "REJECTION", "Clears when ADD processes the next message of each failed type.", RULE),
     "HIK_LIGHT_RECONCILE_BLOCKED": Policy(
@@ -518,6 +519,22 @@ def _rejection_entries(row: DeviceAlert) -> dict[str, dict]:
         "first_at": row.first_seen_at, "last_at": row.last_seen_at}}
 
 
+def unheld_evidence(entry: object) -> tuple[int, int]:
+    """(refused records ADD does not hold yet, refusals it cannot match)."""
+    if not isinstance(entry, dict):
+        return 0, 0
+    pending = entry.get("pending")
+    return (len([item for item in pending if isinstance(item, dict)]) if isinstance(pending, list) else 0,
+            int(entry.get("untracked_refusals") or 0))
+
+
+def _unheld_summary(entry: dict) -> str:
+    pending, untracked = unheld_evidence(entry)
+    parts = ([f"{pending} refused record{'s' if pending != 1 else ''} not yet held"] if pending else []) + (
+        [f"{untracked} unmatched refusal{'s' if untracked != 1 else ''}"] if untracked else [])
+    return "; " + ", ".join(parts) if parts else ""
+
+
 def _entry_current(entry: dict, now: datetime) -> bool:
     age = _age(now, _when(entry.get("last_at")))
     return age is not None and age <= settings.message_rejection_current_seconds
@@ -628,7 +645,7 @@ def _evidence_summary(row: DeviceAlert) -> str | None:
     if not summary and row.code in {"DEVICE_MESSAGE_REJECTED", "ADD_MESSAGE_PROCESSING_FAILED"}:
         summary = "; ".join(
             f"{name} x{int(entry.get('count') or 1)} ({entry.get('category') or 'UNKNOWN'}"
-            f"{': ' + str(entry['error_reason']) if entry.get('error_reason') else ''})"
+            f"{': ' + str(entry['error_reason']) if entry.get('error_reason') else ''}{_unheld_summary(entry)})"
             for name, entry in sorted(_rejection_entries(row).items()))
     if not summary and row.code == "HIK_CAPTURE_UNHEALTHY" and details.get("reason"):
         summary = f"{details['reason']} (poll error {details.get('poll_error')})."

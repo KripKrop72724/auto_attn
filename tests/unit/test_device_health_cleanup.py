@@ -254,6 +254,21 @@ def test_health_switches_are_deployable_repository_variables():
     assert '$environment["ADD_DEVICE_HEALTH_${healthFlag}_ENABLED"] = $deployValue' in deploy
 
 
+def test_unheld_queue_evidence_refusal_needs_review_however_old(db, fleet):
+    row = fleet["rejection"]
+    old = (utc_now() - timedelta(days=3)).isoformat()
+    row.details = {"message_type": "queue_evidence", "types": {"queue_evidence": {
+        "category": "SCHEMA_INVALID", "error_reason": "QUEUE_EVIDENCE_DIGEST_MISMATCH", "count": 1,
+        "first_at": old, "last_at": old, "boot_id": "earlier-boot", "untracked_refusals": 0,
+        "pending": [{"queue": "blocked_legacy", "queue_generation": "0123456789abcdef0123456789abcdef-legacy-218",
+                     "record_id": "0:0:2915066926", "claimed_digest": "a" * 64, "received_digest": "b" * 64}]}}}
+    db.commit()
+    client, _headers = admin_client(db)
+    rows = {item["alert_id"]: item for item in preview(client)["rows"]}
+    assert (rows[row.id]["class"], rows[row.id]["default_selected"]) == ("REVIEW", False)
+    assert "not yet held by ADD" in rows[row.id]["rationale"]
+
+
 def test_current_rejection_is_never_a_cleanup_candidate(db, fleet):
     current = open_alert(db, fleet["p06"], "DEVICE_MESSAGE_REJECTED",
                          details={"message_type": "attendance_batch", "error_category": "SCHEMA_INVALID"})

@@ -77,6 +77,7 @@ from zk_add.schemas import (
     OracleReceiptBatchRequest,
     UserSnapshotRequest,
 )
+from zk_add.queue_evidence import evidence_identity
 from zk_add.security import connector_token_hash
 from zk_add.settings import settings
 from zk_add.identity_states import (
@@ -5868,6 +5869,82 @@ def close_alert_row(row: DeviceAlert, *, resolution: dict | None = None, touch_l
 
 REJECTION_CODES = ("DEVICE_MESSAGE_REJECTED", "ADD_MESSAGE_PROCESSING_FAILED")
 MAX_REJECTION_TYPES = 16
+# Refused queue_evidence records ADD does not hold yet, per rejection entry.
+MAX_PENDING_EVIDENCE = 16
+MAX_EVIDENCE_RESOLUTIONS = 16
+
+
+def _track_refused_evidence(entry: dict, evidence: dict | None, *, reason: str, request_id: str,
+                            now: datetime) -> dict:
+    """Add one refused queue_evidence copy to the records ADD must still hold.
+
+    A record is pending until ADD holds it (resolve_message_rejection). A
+    refusal whose identity ADD could not read, or one beyond the bound, is
+    counted in untracked_refusals: nothing can show it was held later, so
+    only an operator who verified the device can resolve it.
+    """
+    if "pending" in entry:
+        pending = [dict(item) for item in entry.get("pending") or [] if isinstance(item, dict)]
+        untracked = int(entry.get("untracked_refusals") or 0)
+    else:
+        # Refusals recorded before identities were tracked have none to match.
+        pending, untracked = [], int(entry.get("count") or 0)
+    identity = evidence_identity(evidence)
+    previous = next((item for item in pending if evidence_identity(item) == identity), None) if identity else None
+    if identity is None or (previous is None and len(pending) >= MAX_PENDING_EVIDENCE):
+        return {"pending": pending, "untracked_refusals": untracked + 1}
+    if previous is not None:
+        pending.remove(previous)
+    pending.append({
+        "queue": identity[0], "queue_generation": identity[1], "record_id": identity[2],
+        "claimed_digest": evidence.get("claimed_digest"), "received_digest": evidence.get("received_digest"),
+        "received_bytes": evidence.get("received_bytes"), "reason": reason, "request_id": request_id,
+        "count": int((previous or {}).get("count") or 0) + 1,
+        "first_at": (previous or {}).get("first_at") or now.isoformat(), "last_at": now.isoformat(),
+    })
+    return {"pending": pending, "untracked_refusals": untracked}
+
+
+def _settle_refused_evidence(entry: object, accepted: dict | None, now: datetime) -> tuple[dict | None, list[dict]]:
+    """Which pending refusals an accepted queue_evidence holds.
+
+    Returns the entry still outstanding (None once nothing is) and what was
+    held. A refused record is held when ADD accepts the same identity, or
+    the same verified bytes in the same queue under a later identity (a
+    re-blocked row gets a new generation). Entries written before identities
+    were tracked keep the old rule: any accepted queue_evidence clears them.
+    """
+    if not isinstance(entry, dict) or "pending" not in entry:
+        return None, []
+    pending = [item for item in entry.get("pending") or [] if isinstance(item, dict)]
+    identity = evidence_identity(accepted)
+    digest = (accepted or {}).get("payload_digest")
+    held, kept = [], []
+    for item in pending:
+        same_identity = identity is not None and evidence_identity(item) == identity
+        same_bytes = (identity is not None and item.get("queue") == identity[0] and isinstance(digest, str)
+                      and digest in {item.get("claimed_digest"), item.get("received_digest")})
+        if not (same_identity or same_bytes):
+            kept.append(item)
+            continue
+        claimed, received = item.get("claimed_digest"), item.get("received_digest")
+        if digest == claimed and digest != received:
+            finding = "SENT_BYTES_CHANGED"  # the ESP hashed the bytes ADD now holds; others arrived
+        elif digest == received and digest != claimed:
+            finding = "DIGEST_CHANGED"  # the bytes arrived intact; the digest beside them did not
+        else:
+            finding = "BOTH_DIFFER"
+        held.append({
+            "queue": item.get("queue"), "queue_generation": item.get("queue_generation"),
+            "record_id": item.get("record_id"), "reason": item.get("reason"),
+            "refused_request_id": item.get("request_id"), "refused_count": item.get("count"),
+            "held_as": {"queue": identity[0], "queue_generation": identity[1], "record_id": identity[2]},
+            "match": "SAME_IDENTITY" if same_identity else "SAME_BYTES", "finding": finding,
+            "at": now.isoformat(),
+        })
+    if not kept and not int(entry.get("untracked_refusals") or 0):
+        return None, held
+    return {**entry, "pending": kept}, held
 
 
 def record_message_rejection(
@@ -5883,12 +5960,16 @@ def record_message_rejection(
     now: datetime | None = None,
     error_reason: str | None = None,
     error_site: str | None = None,
+    error_types: list[str] | None = None,
+    evidence: dict | None = None,
 ) -> DeviceAlert:
     """Track a rejected message per type; field paths and codes only, never values.
 
     A device-side rejection (the message itself is invalid) is
     DEVICE_MESSAGE_REJECTED. A failure inside ADD is
     ADD_MESSAGE_PROCESSING_FAILED, so the device is not blamed for it.
+    A refused queue_evidence also records the record ADD must still hold
+    (queue_evidence.refused_copy), never its bytes.
     """
     now = now or utc_now()
     device_side = category in DEVICE_REJECTION_CATEGORIES
@@ -5907,13 +5988,17 @@ def record_message_rejection(
             "last_at": ensure_utc(existing.last_seen_at).isoformat() if existing.last_seen_at else now.isoformat(),
             "request_id": previous.get("request_id")}
     entry = types.pop(message_type, None) or {"count": 0, "first_at": now.isoformat()}
-    types[message_type] = {
+    refreshed = {
         **entry, "category": category, "error_type": error_type, "error_paths": error_paths[:5],
         "count": int(entry.get("count") or 0) + 1, "last_at": now.isoformat(), "boot_id": boot_id,
         "firmware_version": connector.firmware_version, "request_id": request_id,
         # Why the latest one was refused, so an unknown rejection is diagnosable.
-        "error_reason": error_reason, "error_site": error_site,
+        "error_reason": error_reason, "error_site": error_site, "error_types": (error_types or [])[:5],
     }
+    if message_type == "queue_evidence":
+        refreshed.update(_track_refused_evidence(
+            entry, evidence, reason=error_reason or category, request_id=request_id, now=now))
+    types[message_type] = refreshed
     while len(types) > MAX_REJECTION_TYPES:
         types.pop(min(types, key=lambda name: str(types[name].get("last_at") or "")))
     return upsert_alert(
@@ -5929,8 +6014,13 @@ def resolve_message_rejection(
     *,
     message_type: str,
     rederive: bool = True,
+    evidence: dict | None = None,
 ) -> bool:
-    """An accepted message clears only the rejection entry for its own type."""
+    """An accepted message clears only the rejection entry for its own type.
+
+    A queue_evidence entry clears only once ADD holds every record it
+    refused: ``evidence`` is the identity and digest just accepted.
+    """
     now = utc_now()
     changed = False
     resolved_codes = set()
@@ -5943,15 +6033,26 @@ def resolve_message_rejection(
     ).all():
         details = row.details or {}
         types = details.get("types") if isinstance(details.get("types"), dict) else {}
+        held = []
         if types:
             if message_type not in types:
                 continue
             remaining = {name: entry for name, entry in types.items() if name != message_type}
+            if message_type == "queue_evidence":
+                outstanding, held = _settle_refused_evidence(types[message_type], evidence, now)
+                if outstanding is not None:
+                    if not held:
+                        continue  # this acceptance holds none of the refused records
+                    remaining[message_type] = outstanding
         elif details.get("message_type") == message_type:
             remaining = {}
         else:
             continue
         changed = True
+        if held:
+            details = {**details, "evidence_resolutions": (
+                [item for item in details.get("evidence_resolutions") or [] if isinstance(item, dict)]
+                + held)[-MAX_EVIDENCE_RESOLUTIONS:]}
         if remaining:
             row.details = {**details, "types": remaining}
         else:

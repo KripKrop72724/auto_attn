@@ -38,6 +38,7 @@ from zk_add.device_health import (
     duplicate_serial_claimed,
     gate_effect,
     plain_version,
+    unheld_evidence,
 )
 from zk_add.device_health_actions import HealthActionError, _rederive
 from zk_add.models import AuditEvent, Connector, DeviceAlert, DeviceTelemetry
@@ -180,6 +181,11 @@ def _cleared(session: Session, connector: Connector, row: DeviceAlert, open_code
     if code in {"DEVICE_MESSAGE_REJECTED", "ADD_MESSAGE_PROCESSING_FAILED"}:
         if alert_currency(row, connector, now=now) == CURRENT:
             return None
+        if any(unheld_evidence(entry) != (0, 0) for entry in _rejection_entries(row).values()):
+            # Time passing proves nothing about custody: someone must check the
+            # device still holds each refused record, then resolve it with a reason.
+            return REVIEW, False, ("Refused queue_evidence records are not yet held by ADD; verify them on "
+                                   "the device before resolving.")
         entries = _rejection_entries(row).values()
         old = all(not _entry_current(entry, now) and (
             (entry.get("boot_id") and entry.get("boot_id") != connector.boot_id)
