@@ -182,6 +182,12 @@ static bool nor_write(uint8_t *mem, uint32_t size, uint32_t address, const void 
     return true;
 }
 
+/* The last cut tore a store block's erase through SPIFFS's own erase (its GC,
+ * or 2.7.5's compaction; the round's own erases clear the magic first) and
+ * left the block's magic valid over lookup entries that read free above
+ * written pages: plain SPIFFS then programs over those pages. REVIEW_TO_END
+ * sorts such cuts out when the old image runs next. */
+static bool cut_tore_spiffs_erase;
 static bool nor_erase(uint8_t *mem, uint32_t size, uint32_t address, uint32_t length)
 {
     if ((uint64_t)address + length > size) return false;
@@ -189,6 +195,16 @@ static bool nor_erase(uint8_t *mem, uint32_t size, uint32_t address, uint32_t le
     if (cut_at && flash_ops == cut_at) {
         for (uint32_t i = 0; i < length; ++i)
             if (rnd() & 1) mem[address + i] = 0xFF;
+        if (mem == flash && length == BLOCK && address % BLOCK == 0 && !round_active) {
+            uint32_t free_over_data = 0;
+            for (uint32_t e = 0; e + 1 < BLOCK / PAGE; ++e) {
+                bool erased = true;
+                for (uint32_t i = 0; i < PAGE && erased; ++i) erased = mem[address + (e + 1) * PAGE + i] == 0xFF;
+                free_over_data += mem[address + 2 * e] == 0xFF && mem[address + 2 * e + 1] == 0xFF && !erased;
+            }
+            uint16_t magic = (uint16_t)(mem[address + 252] | mem[address + 253] << 8);
+            cut_tore_spiffs_erase = free_over_data && magic == srx_spiffs_magic(flash_size / BLOCK, address / BLOCK);
+        }
         longjmp(cut_point, 1);
     }
     memset(mem + address, 0xFF, length);
@@ -5517,7 +5533,7 @@ static void run_reclaim_cuts(const char *what, void (*build)(void), uint32_t kib
           "%s: %u failed blocks, %u closed", what, report.reclaim.failed, round_closed_blocks - closed_before);
     uint64_t first = round_start_ops - start + 1, last = round_end_ops - start, round_last = last;
     if (getenv("REVIEW_TO_END")) last = flash_ops - start;
-    uint32_t evidenced = 0;
+    uint32_t evidenced = 0, spiffs_torn = 0;
     uint32_t runs = 0, rollbacks = 0;
     uint64_t only_k = getenv("REVIEW_K") ? strtoull(getenv("REVIEW_K"), NULL, 10) : 0;
     for (uint64_t k = first; k <= last; k += stride) {
@@ -5539,6 +5555,7 @@ static void run_reclaim_cuts(const char *what, void (*build)(void), uint32_t kib
             round_files_wanted = unconfirmed;
             print_log = only_k != 0;
             worn_next_page = sweep_worn;
+            cut_tore_spiffs_erase = false;
             bool cut = boot_with_cut_with(k, &config);
             worn_next_page = false;
             worn_address = UINT32_MAX;
@@ -5568,6 +5585,22 @@ static void run_reclaim_cuts(const char *what, void (*build)(void), uint32_t kib
             srr_report_t done;
             boot_until_done_with(label, &config, &done);
             print_log = false;
+            if (after_round && unconfirmed && after != AFTER_SAME && cut_tore_spiffs_erase) {
+                /* REVIEW_TO_END: the cut tore an erase through SPIFFS's own
+                 * erase (its GC in the probe's writes, or 2.7.5's compaction)
+                 * and the block kept a valid magic over lookup entries
+                 * reading free above written pages; the old image's plain
+                 * SPIFFS programs over them (the AND of two pages: a queue's
+                 * header renamed, the queue gone). SPIFFS's own exposure at
+                 * every GC erase, the application's included, and 2.7.5's
+                 * on its own unconfirmed boot: counted and printed, not
+                 * judged here (design section 15). */
+                spiffs_torn++;
+                printf("%s: after the round, SPIFFS's own erase torn with its magic valid, then the old image: "
+                       "not judged\n", label);
+                check_reclaimed_structure(label);
+                continue;
+            }
             if (after_round && unconfirmed && after != AFTER_SAME) {
                 /* REVIEW_TO_END: a cut in the run after the round (2.7.5's own
                  * writes, SPIFFS page moves among them), then the old image's
@@ -5601,9 +5634,12 @@ static void run_reclaim_cuts(const char *what, void (*build)(void), uint32_t kib
     if (evidenced)
         printf("%s: %u cuts after the round (through the old image) lost bytes, every one covered by a gap record\n",
                what, evidenced);
+    if (spiffs_torn)
+        printf("%s: %u cuts after the round tore SPIFFS's own erase with the magic valid, then the old image: not "
+               "judged\n", what, spiffs_torn);
     printf("%s: %u cuts in the round%s (writes %" PRIu64 "..%" PRIu64 ", every %u), %u through the old image; "
            "custody byte-exact, no gap%s\n", what, runs, getenv("REVIEW_TO_END") ? " and to the end of the boot" : "",
-           first, last, stride, rollbacks, evidenced ? " but for those" : "");
+           first, last, stride, rollbacks, evidenced || spiffs_torn ? " but for those" : "");
 }
 
 /* The gc-unsafe store of run_gc_unsafe_handover (T2). */
