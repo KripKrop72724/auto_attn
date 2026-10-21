@@ -19,16 +19,17 @@ from zk_add.storage_contract import (COMPAT_MARKER, DIRECT_BASELINES, DIRECT_MAR
                                      DELIVERY_BASELINES, DELIVERY_BASELINE_IMAGES, DELIVERY_MARKER,
                                      LOCK_BASELINES, LOCK_BASELINE_IMAGES, LOCK_MARKER,
                                      FLEET_MARKER,
-                                     PLATFORM_MARKER, TRACE_MARKER, INVENTORY_BASELINE_IMAGES, INVENTORY_MARKER,
+                                     PLATFORM_MARKER, TRACE_MARKER, INVENTORY_MARKER,
+                                     REPAIR_BASELINE_IMAGES, REPAIR_MARKER,
                                      platform_baselines, validate_storage_contract)
 from zk_add.time_utils import utc_now
 from zk_add.schemas import HeartbeatPayload
 
 
 def manifest(version):
-    if version in ("2.6.1", "2.6.2", "2.6.3", "2.6.4", "2.6.5", "2.6.6", "2.6.7", "2.6.8", "2.6.9", "2.6.10", "2.6.11", "2.6.12", "2.6.13", "2.6.14", "2.6.15", "2.7.1", "2.7.2", "2.7.3", "2.7.4", "2.7.5"):
-        baselines = platform_baselines(version)[0] if version in ("2.7.1", "2.7.2", "2.7.3", "2.7.4", "2.7.5") else LOCK_BASELINES if version == "2.6.15" else DELIVERY_BASELINES if version == "2.6.14" else LIVE_FRAME_BASELINES if version == "2.6.13" else PROBE_BASELINES if version in {"2.6.11", "2.6.12"} else PRESSURE_BASELINES if version == "2.6.10" else CONTENTION_BASELINES if version == "2.6.9" else DIAGNOSTIC_BASELINES if version == "2.6.8" else RETRY_BASELINES if version == "2.6.7" else DIRECT_BASELINES
-        images = platform_baselines(version)[1] if version in ("2.7.1", "2.7.2", "2.7.3", "2.7.4", "2.7.5") else LOCK_BASELINE_IMAGES if version == "2.6.15" else DELIVERY_BASELINE_IMAGES if version == "2.6.14" else LIVE_FRAME_BASELINE_IMAGES if version == "2.6.13" else PROBE_BASELINE_IMAGES if version in {"2.6.11", "2.6.12"} else PRESSURE_BASELINE_IMAGES if version == "2.6.10" else CONTENTION_BASELINE_IMAGES if version == "2.6.9" else DIAGNOSTIC_BASELINE_IMAGES if version == "2.6.8" else RETRY_BASELINE_IMAGES if version == "2.6.7" else DIRECT_BASELINE_IMAGES
+    if version in ("2.6.1", "2.6.2", "2.6.3", "2.6.4", "2.6.5", "2.6.6", "2.6.7", "2.6.8", "2.6.9", "2.6.10", "2.6.11", "2.6.12", "2.6.13", "2.6.14", "2.6.15", "2.7.1", "2.7.2", "2.7.3", "2.7.4", "2.7.5", "2.7.6"):
+        baselines = platform_baselines(version)[0] if version in ("2.7.1", "2.7.2", "2.7.3", "2.7.4", "2.7.5", "2.7.6") else LOCK_BASELINES if version == "2.6.15" else DELIVERY_BASELINES if version == "2.6.14" else LIVE_FRAME_BASELINES if version == "2.6.13" else PROBE_BASELINES if version in {"2.6.11", "2.6.12"} else PRESSURE_BASELINES if version == "2.6.10" else CONTENTION_BASELINES if version == "2.6.9" else DIAGNOSTIC_BASELINES if version == "2.6.8" else RETRY_BASELINES if version == "2.6.7" else DIRECT_BASELINES
+        images = platform_baselines(version)[1] if version in ("2.7.1", "2.7.2", "2.7.3", "2.7.4", "2.7.5", "2.7.6") else LOCK_BASELINE_IMAGES if version == "2.6.15" else DELIVERY_BASELINE_IMAGES if version == "2.6.14" else LIVE_FRAME_BASELINE_IMAGES if version == "2.6.13" else PROBE_BASELINE_IMAGES if version in {"2.6.11", "2.6.12"} else PRESSURE_BASELINE_IMAGES if version == "2.6.10" else CONTENTION_BASELINE_IMAGES if version == "2.6.9" else DIAGNOSTIC_BASELINE_IMAGES if version == "2.6.8" else RETRY_BASELINE_IMAGES if version == "2.6.7" else DIRECT_BASELINE_IMAGES
         return {"application_sha256": "c" * 64, "minimum_bootstrap_version": "2.4.12",
                 "queue_storage": {"schema_version": 2, "read_format": 2, "reader_mask": 63,
                                   "write_format": 1, "allowed_bootstrap_versions": list(baselines),
@@ -48,7 +49,7 @@ def test_signed_contract_rejects_unqualified_capabilities(field, value):
 
 
 def test_signed_contract_required_for_both_storage_releases():
-    for version in ("2.5.4", "2.6.0", "2.6.1", "2.6.2", "2.6.3", "2.6.4", "2.6.5", "2.6.6", "2.6.7", "2.6.8", "2.6.9", "2.6.10", "2.6.11", "2.6.12", "2.6.13", "2.6.14", "2.6.15", "2.7.1", "2.7.2", "2.7.3", "2.7.4", "2.7.5"):
+    for version in ("2.5.4", "2.6.0", "2.6.1", "2.6.2", "2.6.3", "2.6.4", "2.6.5", "2.6.6", "2.6.7", "2.6.8", "2.6.9", "2.6.10", "2.6.11", "2.6.12", "2.6.13", "2.6.14", "2.6.15", "2.7.1", "2.7.2", "2.7.3", "2.7.4", "2.7.5", "2.7.6"):
         assert validate_storage_contract(manifest(version), version)
         with pytest.raises(ValueError):
             validate_storage_contract({}, version)
@@ -94,12 +95,16 @@ def test_direct_predecessor_hashes_and_marker_agree_across_release_gates():
     assert LOCK_MARKER in firmware
     assert LOCK_MARKER in signing
     # The 2.7 platform may roll back to any qualified predecessor, the fleet's
-    # 2.6.15 included; 2.7.3 also to 2.7.2, 2.7.4 to 2.7.2 and 2.7.3, and
-    # 2.7.5 to 2.7.2, 2.7.3 and 2.7.4.
+    # 2.6.15 included; 2.7.3 also to 2.7.2, 2.7.4 to 2.7.2 and 2.7.3, 2.7.5
+    # to 2.7.2, 2.7.3 and 2.7.4, and 2.7.6 to 2.7.2, 2.7.3, 2.7.4 and 2.7.5.
     assert FLEET_MARKER in signing and PLATFORM_MARKER in signing and TRACE_MARKER in signing
-    assert INVENTORY_MARKER in firmware and INVENTORY_MARKER in signing
-    assert INVENTORY_MARKER.endswith(",2.6.15,2.7.2,2.7.3,2.7.4")
-    for version, digest in INVENTORY_BASELINE_IMAGES.items():
+    assert INVENTORY_MARKER in signing
+    assert REPAIR_MARKER in firmware and REPAIR_MARKER in signing
+    assert REPAIR_MARKER.endswith(",2.6.15,2.7.2,2.7.3,2.7.4,2.7.5")
+    # The exact signed 2.7.5 that HIL run 39371984527 published (ADD's
+    # zone-lite-2.7.5 manifest; Peshawar 06 reports the same running image).
+    assert REPAIR_BASELINE_IMAGES["2.7.5"] == "430e2daf29dd99ff006a476ff584e4201493d661cee67e4b4f9ba15545b17a40"
+    for version, digest in REPAIR_BASELINE_IMAGES.items():
         assert f'!strcmp(version, "{version}")' in guard and f'"{digest}"' in guard
         assert (f"'{version}' = '{digest}'" in signing or f"$images['{version}'] = '{digest}'" in signing)
 
@@ -107,7 +112,7 @@ def test_direct_predecessor_hashes_and_marker_agree_across_release_gates():
 # The firmware reports its compiled marker in every heartbeat; ADD keeps at
 # most 160 characters, and the 2.7 markers grow by one version per release.
 @pytest.mark.parametrize("marker", [LIVE_FRAME_MARKER, DELIVERY_MARKER, LOCK_MARKER, FLEET_MARKER,
-                                    PLATFORM_MARKER, TRACE_MARKER, INVENTORY_MARKER])
+                                    PLATFORM_MARKER, TRACE_MARKER, INVENTORY_MARKER, REPAIR_MARKER])
 def test_signed_patch_contract_fits_runtime_heartbeat_schema(marker):
     heartbeat = HeartbeatPayload.model_validate({
         "diagnostics": {"storage": {"upgrade_contract": marker}}
@@ -273,19 +278,21 @@ def test_269_accepts_only_signed_hil_predecessors(predecessor_version):
     ("2.7.4", "2.4.12"), ("2.7.4", "2.5.2"), ("2.7.4", "2.6.15"), ("2.7.4", "2.7.2"), ("2.7.4", "2.7.3"),
     ("2.7.5", "2.4.12"), ("2.7.5", "2.5.2"), ("2.7.5", "2.6.15"), ("2.7.5", "2.7.2"), ("2.7.5", "2.7.3"),
     ("2.7.5", "2.7.4"),
+    ("2.7.6", "2.4.12"), ("2.7.6", "2.5.2"), ("2.7.6", "2.6.15"), ("2.7.6", "2.7.2"), ("2.7.6", "2.7.3"),
+    ("2.7.6", "2.7.4"), ("2.7.6", "2.7.5"),
 ])
 def test_latest_patch_accepts_only_exact_signed_predecessor(version, predecessor_version):
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
     with Session(engine) as session:
-        digest = (platform_baselines(version)[1] if version in ("2.7.1", "2.7.2", "2.7.3", "2.7.4", "2.7.5") else LOCK_BASELINE_IMAGES if version == "2.6.15" else DELIVERY_BASELINE_IMAGES if version == "2.6.14" else LIVE_FRAME_BASELINE_IMAGES if version == "2.6.13" else PROBE_BASELINE_IMAGES if version in {"2.6.11", "2.6.12"} else PRESSURE_BASELINE_IMAGES)[predecessor_version]
+        digest = (platform_baselines(version)[1] if version in ("2.7.1", "2.7.2", "2.7.3", "2.7.4", "2.7.5", "2.7.6") else LOCK_BASELINE_IMAGES if version == "2.6.15" else DELIVERY_BASELINE_IMAGES if version == "2.6.14" else LIVE_FRAME_BASELINE_IMAGES if version == "2.6.13" else PROBE_BASELINE_IMAGES if version in {"2.6.11", "2.6.12"} else PRESSURE_BASELINE_IMAGES)[predecessor_version]
         predecessor = FirmwareRelease(
             release_id=f"zone-lite-{predecessor_version}", version=predecessor_version,
             git_sha="a" * 40, image_sha256="b" * 64, image_size=1024,
             signing_key_id="key", partition_layout="zone-lite-ota-v1",
             minimum_bootstrap_version="2.2.0", storage_name="predecessor.bin",
             manifest={"application_sha256": digest}, manifest_signature="fixture",
-            state="HIL_ONLY" if predecessor_version in {"2.6.9", "2.6.10", "2.6.12", "2.6.13", "2.6.14", "2.6.15", "2.7.2", "2.7.3", "2.7.4"} else "AVAILABLE",
+            state="HIL_ONLY" if predecessor_version in {"2.6.9", "2.6.10", "2.6.12", "2.6.13", "2.6.14", "2.6.15", "2.7.2", "2.7.3", "2.7.4", "2.7.5"} else "AVAILABLE",
         )
         release = FirmwareRelease(
             release_id=f"zone-lite-{version}", version=version, git_sha="c" * 40,

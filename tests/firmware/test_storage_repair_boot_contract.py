@@ -135,9 +135,10 @@ def test_controlled_reboot_window_never_meets_the_every_boot_repair() -> None:
     # and must be healthy again by minute eight (as little as two minutes),
     # while the repair may take up to its 5 or 15 minute deadline. The two
     # never meet: the reboot belongs to the 2.7.0 journal writer, which does
-    # not build the repair, and no image that runs the repair (2.7.5 and the
-    # other platform images) can take or be offered the reboot. Making one
-    # reboot-capable needs a recovery window that covers the repair first.
+    # not build the repair, and no image that runs the repair (2.7.5, 2.7.6
+    # and the other platform images) can take or be offered the reboot. Making
+    # one reboot-capable needs a recovery window that covers the repair first;
+    # 2.7.6's rounds and redo recovery run inside the same deadlines.
     component = (MAIN / "CMakeLists.txt").read_text()
     repair = component[component.index("# ZKT 2.7.5: the custody-first boot storage repair"):]
     assert "NOT ZONE_LITE_JOURNAL_WRITES)" in repair[:repair.index("endif()")]
@@ -156,7 +157,8 @@ def test_controlled_reboot_window_never_meets_the_every_boot_repair() -> None:
     assert 'release.version == "2.7.0"' in evidence
     contract = (ROOT / "apps/add_backend/zk_add/storage_contract.py").read_text()
     platform = re.search(r"^FLEET_PLATFORM_VERSIONS = \((.*)\)$", contract, re.M)
-    assert platform and '"2.7.5"' in platform.group(1) and '"2.7.0"' not in platform.group(1)
+    assert platform and '"2.7.5"' in platform.group(1) and '"2.7.6"' in platform.group(1)
+    assert '"2.7.0"' not in platform.group(1)
 
 
 def test_the_redo_area_is_reached_only_through_its_own_registered_handle() -> None:
