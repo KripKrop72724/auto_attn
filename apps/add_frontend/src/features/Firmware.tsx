@@ -491,9 +491,11 @@ function CampaignDetailDrawer({
                       {deployment.error_code && (
                         <div className="wide">
                           <dt>
-                            {activeDeploymentStates.includes(deployment.status)
-                              ? 'Last interruption'
-                              : 'Failure'}
+                            {deployment.status === 'PENDING'
+                              ? 'Hold'
+                              : activeDeploymentStates.includes(deployment.status)
+                                ? 'Last interruption'
+                                : 'Failure'}
                           </dt>
                           <dd>
                             {deployment.error_code} ·{' '}
