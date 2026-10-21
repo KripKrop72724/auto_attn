@@ -4,6 +4,7 @@ import hashlib
 import json
 import re
 import secrets
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
@@ -39,7 +40,10 @@ from zk_add.crypto import (
     mask_cnic,
     normalize_cnic,
 )
-from zk_add.attendance_identity_evidence import TERMINAL_RECONCILE_SOURCES
+from zk_add.attendance_identity_evidence import (
+    DUMP_RECONCILE_SOURCES,
+    TERMINAL_RECONCILE_SOURCES,
+)
 from zk_add.identity import build_machine_name, parse_machine_name
 from zk_add.identity_conflicts import (
     valid_identity_resolutions,
@@ -66,7 +70,6 @@ from zk_add.models import (
     OrdsOutbox,
     Site,
     TemporaryAdminLease,
-    TerminalRecordManifest,
     UserDeletionItem,
     UserDeletionJob,
     ZKTDevice,
@@ -1754,12 +1757,35 @@ def _replace_user_snapshot(
             AttendanceEvent.ords_status.in_(("BLOCKED_IDENTITY", "WAITING_FOR_SNAPSHOT")),
         ).distinct()).all()
         if held_user_ids:
+            # Legacy dump rows held since the rollout window opened can use
+            # their authenticated batch proof, capped per snapshot. Older
+            # holds need the owner's audited backlog release.
+            dump_release = dump_identity_auto_release()
             for row in session.scalars(select(DeviceUser).where(
                 DeviceUser.zkt_device_id == zkt.id,
                 DeviceUser.user_id.in_(held_user_ids),
                 DeviceUser.lifecycle_state == "ACTIVE",
             )).all():
-                release_synced_cnic_attendance(session, zkt=zkt, user=row)
+                release_synced_cnic_attendance(
+                    session, zkt=zkt, user=row, dump_release=dump_release
+                )
+            if dump_release is not None and dump_release.released_ids:
+                append_audit(
+                    session,
+                    actor=DUMP_AUTO_RELEASE_ACTOR,
+                    action="ATTENDANCE_DUMP_IDENTITY_AUTO_RELEASED",
+                    target_type="connector",
+                    target_id=connector.connector_id,
+                    outcome="RELEASED",
+                    after={
+                        "snapshot_id": snapshot_record.snapshot_id,
+                        "proof": "AUTHENTICATED_RECONCILE_BATCH",
+                        "released": len(dump_release.released_ids),
+                        "event_ids": dump_release.released_ids,
+                        "window_hours": settings.attendance_dump_identity_auto_release_hours,
+                        "batch_cap": settings.attendance_dump_identity_auto_release_batch,
+                    },
+                )
     zkt.updated_at = utc_now()
     return len(snapshot.users)
 
@@ -3217,9 +3243,14 @@ def enrich_undelivered_attendance(
 
 def synced_cnic_identity_proven(
     session: Session, connector: Connector, zkt: ZKTDevice,
-    user: DeviceUser, row: AttendanceEvent,
+    user: DeviceUser, row: AttendanceEvent, *, allow_reconcile_batch: bool = False,
 ) -> bool:
-    """Check the roster and capture proof used by both repair and delivery."""
+    """Check the roster and capture proof used by both repair and delivery.
+
+    allow_reconcile_batch also accepts a legacy dump row without a saved
+    terminal record (AUTHENTICATED_RECONCILE_BATCH). That proof always needs a
+    retained, fingerprint-bound interval whose CNIC is the user's current one.
+    """
     if not (
         zkt.snapshot_complete and zkt.identity_snapshot_stable
         and zkt.identity_snapshot_observed_at and zkt.confirmed_serial == zkt.serial
@@ -3268,7 +3299,15 @@ def synced_cnic_identity_proven(
     from zk_add.attendance_identity_evidence import identity_evidence
     from zk_add.models import AttendanceIdentityHistory
 
-    evidence = identity_evidence(session, row, connector)
+    evidence = identity_evidence(
+        session, row, connector, allow_reconcile_batch=allow_reconcile_batch
+    )
+    if (
+        evidence
+        and evidence.proof["source"]["kind"] == "AUTHENTICATED_RECONCILE_BATCH"
+        and evidence.proof["kind"] not in {"RETAINED_INTERVAL", "RETAINED_EQUIVALENT_INTERVALS"}
+    ):
+        return False
     if evidence and evidence.proof["kind"] == "LEGACY_CONTINUITY":
         # A revoked or conflicting interval cannot be bypassed by the older
         # aggregate roster proof. Use that fallback only when no per-user
@@ -3292,9 +3331,77 @@ def synced_cnic_identity_proven(
     )
 
 
+DUMP_AUTO_RELEASE_ACTOR = "system:identity-dump-auto-release"
+
+
+@dataclass
+class DumpIdentityRelease:
+    """Permission to release legacy dump rows on AUTHENTICATED_RECONCILE_BATCH.
+
+    held_since: rows ADD received earlier stay held (None: no age limit, used
+    only by the owner's audited backlog release). A row this proof released
+    before and delivery re-held is not new backlog. remaining caps releases.
+    """
+
+    held_since: datetime | None
+    remaining: int
+    released_ids: list[int] = field(default_factory=list)
+
+    def admits(self, row: AttendanceEvent) -> bool:
+        if self.remaining <= 0 or row.source not in DUMP_RECONCILE_SOURCES:
+            return False
+        if self.held_since is None or row.identity_resolution_status == "RESOLVED_SYNCED_CNIC":
+            return True
+        return bool(row.received_at and ensure_utc(row.received_at) >= self.held_since)
+
+
+def dump_identity_auto_release(now: datetime | None = None) -> DumpIdentityRelease | None:
+    """The automatic rollout policy for one connector snapshot, or None when off."""
+    hours = settings.attendance_dump_identity_auto_release_hours
+    cap = settings.attendance_dump_identity_auto_release_batch
+    if hours <= 0 or cap <= 0:
+        return None
+    return DumpIdentityRelease(
+        held_since=ensure_utc(now or utc_now()) - timedelta(hours=hours), remaining=cap
+    )
+
+
+def synced_cnic_release_proof(
+    session: Session, *, zkt: ZKTDevice, user: DeviceUser, row: AttendanceEvent,
+    dump_release: DumpIdentityRelease | None = None,
+) -> str | None:
+    """Read-only: the proof an automatic release would use now, or None.
+
+    Returns "SYNCED_CNIC" for the established proofs, or
+    "AUTHENTICATED_RECONCILE_BATCH" when only the dump-row proof applies and
+    dump_release admits the row. Both must also pass the installed database
+    guard, so a preview counts exactly what a release would change.
+    """
+    if row.ords_status not in {"BLOCKED_IDENTITY", "WAITING_FOR_SNAPSHOT"}:
+        return None
+    proof = None
+    if synced_cnic_identity_proven(session, zkt.connector, zkt, user, row):
+        proof = "SYNCED_CNIC"
+    elif (
+        dump_release is not None and dump_release.admits(row)
+        and synced_cnic_identity_proven(
+            session, zkt.connector, zkt, user, row, allow_reconcile_batch=True
+        )
+    ):
+        proof = "AUTHENTICATED_RECONCILE_BATCH"
+    if proof is None:
+        return None
+    from zk_add.attendance_auto_release_guard import database_synced_cnic_release_proven
+
+    if not database_synced_cnic_release_proven(session, row=row, zkt=zkt, user=user):
+        return None
+    return proof
+
+
 def release_synced_cnic_attendance(
     session: Session, *, zkt: ZKTDevice, user: DeviceUser,
     limit: int | None = None, after_id: int = 0,
+    dump_release: DumpIdentityRelease | None = None,
 ) -> int:
     """Release held ZKT punches when the device roster proves their CNIC.
 
@@ -3313,23 +3420,26 @@ def release_synced_cnic_attendance(
         ).order_by(AttendanceEvent.id).limit(limit).with_for_update(skip_locked=True)
     ).all()
     return sum(
-        release_synced_cnic_attendance_event(session, zkt=zkt, user=user, row=row)
+        release_synced_cnic_attendance_event(
+            session, zkt=zkt, user=user, row=row, dump_release=dump_release
+        )
         for row in rows
     )
 
 
 def release_synced_cnic_attendance_event(
     session: Session, *, zkt: ZKTDevice, user: DeviceUser, row: AttendanceEvent,
+    dump_release: DumpIdentityRelease | None = None,
 ) -> bool:
     """Use the same retained proof for newly ingested punches and backlog repair."""
-    if row.ords_status not in {"BLOCKED_IDENTITY", "WAITING_FOR_SNAPSHOT"}:
+    proof = synced_cnic_release_proof(
+        session, zkt=zkt, user=user, row=row, dump_release=dump_release
+    )
+    if proof is None:
         return False
-    if not synced_cnic_identity_proven(session, zkt.connector, zkt, user, row):
-        return False
-    from zk_add.attendance_auto_release_guard import database_synced_cnic_release_proven
-
-    if not database_synced_cnic_release_proven(session, row=row, zkt=zkt, user=user):
-        return False
+    if proof == "AUTHENTICATED_RECONCILE_BATCH":
+        dump_release.remaining -= 1
+        dump_release.released_ids.append(row.id)
     row.device_user_id = user.id
     row.identity_snapshot_id = zkt.identity_snapshot_id
     row.identity_resolution_status = "RESOLVED_SYNCED_CNIC"
@@ -3511,27 +3621,23 @@ def repair_attendance_delivery_backlog(
         # evidence proves continuity.  This is also the HIK/ZKT boundary that
         # prevents a current user ID from silently claiming reused history.
         if row.identity_resolution_status == "BLOCKED_PROVENANCE":
+            # A held row was offered to the synced-CNIC release above. Past the
+            # approval check, the recovery contract accepts a current, exact
+            # UID/user match when the durable event itself carries a verified
+            # serial and the identity snapshot proves continuity. Keep this
+            # inside the row lock; ambiguous or stale history remains
+            # fail-closed.
             connector = session.get(Connector, row.connector_id)
-            if connector is not None and recover_verified_source_identity(
-                session, connector=connector, row=row
+            from zk_add.attendance_recovery import _apply_verified_identity
+            outbox = session.scalar(
+                select(OrdsOutbox).where(OrdsOutbox.attendance_event_id == row.id)
+            )
+            if connector is None or not _apply_verified_identity(
+                session, row, outbox, connector
             ):
-                repaired += 1
-            else:
-                # The recovery contract also accepts a current, exact UID/user
-                # match when the durable event itself carries a verified serial
-                # and the identity snapshot proves continuity.  Keep this
-                # fallback inside the row lock; ambiguous or stale history
-                # remains fail-closed.
-                from zk_add.attendance_recovery import _apply_verified_identity
-                outbox = session.scalar(
-                    select(OrdsOutbox).where(OrdsOutbox.attendance_event_id == row.id)
-                )
-                if connector is None or not _apply_verified_identity(
-                    session, row, outbox, connector
-                ):
-                    unresolved += 1
-                    continue
-                repaired += 1
+                unresolved += 1
+                continue
+            repaired += 1
 
         if row.cnic_lookup_hash and row.identity_resolution_status in VERIFIED_IDENTITY_RESOLUTION_STATUSES:
             row.ords_status = "PENDING"
@@ -3771,88 +3877,6 @@ def block_undelivered_attendance(
             outbox.next_attempt_at = None
         changed += 1
     return changed
-
-
-def recover_verified_source_identity(session: Session, *, connector: Connector, row: AttendanceEvent) -> bool:
-    """Recover a provenance hold only when retained identity proves continuity."""
-    from zk_add.attendance_manual_guard import requires_approval
-    if requires_approval(row):
-        return False
-    zkt = connector.zkt_device
-    source_manifest = None
-    if zkt is not None:
-        source_manifest = session.scalar(select(TerminalRecordManifest.id).where(
-            TerminalRecordManifest.attendance_event_id == row.id,
-            TerminalRecordManifest.connector_id == connector.id,
-            TerminalRecordManifest.zkt_device_id == zkt.id,
-            TerminalRecordManifest.canonical_source.is_(True),
-        ).limit(1))
-    source_attested = bool(
-        source_manifest is not None
-        or (row.raw_event or {}).get("reconciliation_source") == "VERIFIED_TERMINAL_SOURCE"
-    )
-    if (zkt is None or not source_attested or row.ords_status != "BLOCKED_IDENTITY"
-            or row.identity_resolution_status != "BLOCKED_PROVENANCE"
-            or row.cnic_lookup_hash or row.identity_content_status == "VERIFIED"
-            or row.clock_quality != "OK"):
-        return False
-    user = session.scalar(select(DeviceUser).where(
-        DeviceUser.zkt_device_id == zkt.id,
-        DeviceUser.user_id == row.user_id,
-        DeviceUser.uid == row.uid,
-        DeviceUser.lifecycle_state == "ACTIVE",
-        DeviceUser.present.is_(True),
-        DeviceUser.identity_conflict_code.is_(None),
-    ))
-    if not user or not user.cnic_lookup_hash:
-        return False
-    if (
-        user.snapshot_revision is None
-        or zkt.identity_snapshot_revision is None
-        or user.snapshot_revision != zkt.identity_snapshot_revision
-    ):
-        return False
-    try:
-        cnic = decrypt_cnic(user.cnic_encrypted)
-        if not cnic or cnic_lookup(cnic) != user.cnic_lookup_hash:
-            return False
-    except Exception:
-        return False
-    if not historical_identity_is_supported(
-        serial=row.device_serial, bound_serial=zkt.serial,
-        confirmed_serial=zkt.confirmed_serial,
-        uid=row.uid, expected_uid=user.uid,
-        fingerprint=row.identity_terminal_fingerprint,
-        expected_fingerprint=user.terminal_identity_fingerprint,
-        event_time=row.device_event_time, continuity_started=zkt.last_identity_change_at,
-        snapshot_observed=zkt.identity_snapshot_observed_at,
-        snapshot_stable=bool(zkt.snapshot_complete and zkt.identity_snapshot_stable
-                             and zkt.identity_snapshot_id),
-        tolerance_seconds=settings.identity_snapshot_capture_tolerance_seconds,
-        allow_user_id_only=not row.uid and not row.identity_terminal_fingerprint,
-        expected_user_id=user.user_id,
-    ):
-        return False
-    row.device_user_id = user.id
-    row.identity_snapshot_id = zkt.identity_snapshot_id
-    row.identity_resolution_status = "RESOLVED_CURRENT_SNAPSHOT"
-    row.identity_resolved_at = row.identity_repaired_at = utc_now()
-    row.identity_repair_reason = "VERIFIED_SOURCE_REPLAY_CONTINUITY"
-    row.display_name = user.display_name
-    row.cnic_encrypted = user.cnic_encrypted
-    row.cnic_lookup_hash = user.cnic_lookup_hash
-    row.cnic_last4 = user.cnic_last4
-    row.ords_status = "PENDING"
-    outbox = session.scalar(select(OrdsOutbox).where(
-        OrdsOutbox.attendance_event_id == row.id
-    ))
-    if outbox is None:
-        session.add(OrdsOutbox(attendance_event_id=row.id, status="PENDING",
-                               delivery_type="FULL_HISTORY"))
-    elif outbox.status == "BLOCKED_IDENTITY":
-        outbox.status = "PENDING"
-        outbox.next_attempt_at = None
-    return True
 
 
 def repair_missing_terminal_provenance(

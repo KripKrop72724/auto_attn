@@ -363,12 +363,14 @@ async def _safe_attendance_repair_loop(stop: asyncio.Event) -> None:
     from zk_add.attendance_safe_repair import tick
     from zk_add.attendance_force_release import tick as force_tick
     from zk_add.attendance_direct_ords import tick as direct_tick
+    from zk_add.attendance_identity_backlog import tick as backlog_tick
 
     while not stop.is_set():
         for work, code in (
             (tick, "SAFE_ATTENDANCE_REPAIR_WORKER_ERROR"),
             (force_tick, "MANUAL_FORCE_RELEASE_WORKER_ERROR"),
             (direct_tick, "DIRECT_ORDS_WORKER_ERROR"),
+            (backlog_tick, "IDENTITY_BACKLOG_RELEASE_WORKER_ERROR"),
         ):
             try:
                 await asyncio.to_thread(work)

@@ -583,6 +583,10 @@ from zk_add import attendance_safe_repair as safe_repair  # noqa: E402
 from zk_add.attendance_safe_repair_schemas import (  # noqa: E402
     SafeRepairCheckRequest, SafeRepairStartRequest, SafeRepairControlRequest,
 )
+from zk_add import attendance_identity_backlog as identity_backlog  # noqa: E402
+from zk_add.attendance_identity_backlog_schemas import (  # noqa: E402
+    IdentityBacklogReleaseRequest, IdentityBacklogStopRequest,
+)
 
 
 @app.get("/api/v2/attendance-force-releases")
@@ -669,6 +673,95 @@ def recheck_direct_ords_legacy(
         return direct_ords.serialize(db, job)
     except RecoveryError as exc:
         raise HTTPException(status_code=409, detail={"code": exc.code, "message": str(exc)}) from exc
+
+
+@app.get("/api/v2/attendance-identity-backlog/preview")
+def preview_identity_backlog(
+    zone_id: str = Query(min_length=1, max_length=100),
+    after_id: int = Query(default=0, ge=0),
+    limit: int = Query(default=500, ge=1, le=identity_backlog.PREVIEW_PAGE_MAX),
+    auth: tuple[Session, AdminContext] = Depends(require_admin),
+):
+    """Read-only count of a zone's held dump punches the release proof would accept."""
+    db, _context = auth
+    try:
+        return identity_backlog.preview_page(db, zone_id=zone_id, after_id=after_id, limit=limit)
+    except RecoveryError as exc:
+        raise HTTPException(status_code=409, detail={"code": exc.code, "message": str(exc)}) from exc
+
+
+@app.get("/api/v2/attendance-identity-backlog/releases")
+def list_identity_backlog_releases(
+    zone_id: str | None = Query(default=None, max_length=100),
+    limit: int = Query(default=10, ge=1, le=30),
+    auth: tuple[Session, AdminContext] = Depends(require_admin),
+):
+    db, _context = auth
+    rows = db.scalars(
+        select(AttendanceRecoveryJob)
+        .where(AttendanceRecoveryJob.action == identity_backlog.ACTION)
+        .order_by(AttendanceRecoveryJob.id.desc())
+        .limit(200 if zone_id else limit)
+    ).all()
+    if zone_id:
+        rows = [row for row in rows if row.scope["request"]["zone_id"] == zone_id][:limit]
+    return {
+        "rows": [identity_backlog.serialize(row) for row in rows],
+        "confirmation": identity_backlog.confirmation_phrase(zone_id) if zone_id else None,
+    }
+
+
+@app.post("/api/v2/attendance-identity-backlog/releases", status_code=202)
+def start_identity_backlog_release(
+    body: IdentityBacklogReleaseRequest,
+    request: Request,
+    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+):
+    """Owner step-up: release a zone's held dump punches that pass the same proof."""
+    db, context = auth
+    require_step_up(body.password.get_secret_value(), db, context)
+    try:
+        job = identity_backlog.create_release(
+            db, actor=context.username, zone_id=body.zone_id, reason=body.reason,
+            typed_confirmation=body.typed_confirmation, idempotency_key=body.idempotency_key,
+            ip_address=client_ip(request),
+        )
+        db.flush()
+        return identity_backlog.serialize(job)
+    except RecoveryError as exc:
+        raise HTTPException(status_code=409, detail={"code": exc.code, "message": str(exc)}) from exc
+
+
+def _identity_backlog_job(db, job_id):
+    row = _recovery_job_or_404(db, job_id)
+    if row.action != identity_backlog.ACTION:
+        raise HTTPException(status_code=404, detail="Zone release not found.")
+    return row
+
+
+@app.get("/api/v2/attendance-identity-backlog/releases/{job_id}")
+def get_identity_backlog_release(
+    job_id: str, auth: tuple[Session, AdminContext] = Depends(require_admin),
+):
+    db, _context = auth
+    return identity_backlog.serialize(_identity_backlog_job(db, job_id))
+
+
+@app.post("/api/v2/attendance-identity-backlog/releases/{job_id}/stop")
+def stop_identity_backlog_release(
+    job_id: str,
+    body: IdentityBacklogStopRequest,
+    request: Request,
+    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+):
+    db, context = auth
+    require_step_up(body.password.get_secret_value(), db, context)
+    job = identity_backlog.stop(
+        db, _identity_backlog_job(db, job_id), actor=context.username,
+        ip_address=client_ip(request),
+    )
+    db.flush()
+    return identity_backlog.serialize(job)
 
 
 @app.post("/api/v2/attendance-force-releases", status_code=202)

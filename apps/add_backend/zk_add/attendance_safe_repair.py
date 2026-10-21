@@ -544,10 +544,14 @@ def delivery_proof_valid(session: Session, event: AttendanceEvent, connector: Co
 
         zkt = connector.zkt_device
         user = session.get(DeviceUser, event.device_user_id) if event.device_user_id else None
+        # Recheck whichever proof released it, including a legacy dump row's
+        # authenticated batch. The rollout window limits releases, not proof.
         return bool(
             zkt and user and event.identity_snapshot_id == zkt.identity_snapshot_id
             and event.cnic_lookup_hash == user.cnic_lookup_hash
-            and synced_cnic_identity_proven(session, connector, zkt, user, event)
+            and synced_cnic_identity_proven(
+                session, connector, zkt, user, event, allow_reconcile_batch=True
+            )
         )
     if event.identity_resolution_status != "RESOLVED_RETAINED_IDENTITY":
         return True
