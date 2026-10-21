@@ -531,6 +531,43 @@ describe('Reviewed source-exception continuation', () => {
     expect(screen.queryByText('Excluded from attendance and Oracle')).toBeNull()
   })
 
+  it('flags a source correction made from an unwritten newest record for HR', async () => {
+    const corrected: SourceException = {
+      ...sourceException,
+      source_kind: 'TAIL',
+      ordinal: 14360,
+      source_condition: 'TERMINAL_NEWEST_RECORD_CORRECTED',
+      operator_reason:
+        'A source time correction was created from this row before ADD recognised it as the terminal\'s unwritten newest record. HR must verify that punch.',
+      source_correction_ids: ['b9c8e8a0-6f4f-4a56-9a53-6a0c9f3d2e11'],
+    }
+    const base = reconciliationFetch()
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = new URL(String(input), 'https://add.test').pathname
+      if (path === `/api/v1/source-exceptions/${sourceException.id}`) return json(corrected)
+      const response = await base(input, init)
+      const body = await response.json()
+      if (path === '/api/v1/source-exceptions') body.rows = [corrected]
+      return json(body)
+    }))
+    window.history.replaceState(
+      null,
+      '',
+      `/reconciliation?tab=source-exceptions&job_id=${job().job_id}&device_id=${device.connector_id}`,
+    )
+    render(<Harness />)
+
+    const row = await screen.findByRole('listitem')
+    expect(within(row).getByText(/Corrected from an unwritten newest record; HR must verify/)).toBeTruthy()
+    expect(within(row).queryByText(/Newest record read before the terminal wrote it/)).toBeNull()
+    fireEvent.click(within(row).getByRole('button', { name: 'Inspect' }))
+    expect(
+      await screen.findByRole('heading', { name: 'Corrected from an unwritten newest record' }),
+    ).toBeTruthy()
+    expect(screen.getByText(/HR must verify that punch/)).toBeTruthy()
+    expect(screen.queryByText('Terminal newest record not yet written')).toBeNull()
+  })
+
   it('redirects the retired employee-repair deep link to Attendance review', async () => {
     window.history.replaceState(
       null,

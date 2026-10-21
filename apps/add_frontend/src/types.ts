@@ -678,8 +678,9 @@ export interface SourceException {
   cursor_advanced: boolean
   oracle_action: 'EXCLUDED_FAIL_CLOSED' | 'HELD_IDENTITY_EVIDENCE_REQUIRED'
   // Derived from the receipt that read the row; older backends omit it.
-  source_condition?: 'TERMINAL_NEWEST_RECORD_UNSETTLED' | null
+  source_condition?: 'TERMINAL_NEWEST_RECORD_UNSETTLED' | 'TERMINAL_NEWEST_RECORD_CORRECTED' | null
   operator_reason?: string | null
+  source_correction_ids?: string[]
   reviews?: SourceExceptionReview[]
 }
 

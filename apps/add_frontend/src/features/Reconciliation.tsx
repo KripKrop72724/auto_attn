@@ -788,14 +788,18 @@ function SourceExceptionDrawer({
             <article className="info-copy pattern-blocked">
               <Icon name="shield" />
               <div>
-                <h3>{row.source_condition === 'TERMINAL_NEWEST_RECORD_UNSETTLED'
+                <h3>{row.source_condition === 'TERMINAL_NEWEST_RECORD_CORRECTED'
+                  ? 'Corrected from an unwritten newest record'
+                  : row.source_condition === 'TERMINAL_NEWEST_RECORD_UNSETTLED'
                   ? 'Terminal newest record not yet written'
                   : row.disposition === 'IDENTITY_UNRESOLVED'
                   ? 'Held for verified historical identity'
                   : 'Excluded from attendance and Oracle'}</h3>
                 <p>
                   ADD preserved this terminal ordinal as immutable evidence.
-                  {row.source_condition === 'TERMINAL_NEWEST_RECORD_UNSETTLED'
+                  {row.source_condition === 'TERMINAL_NEWEST_RECORD_CORRECTED'
+                    ? ` ${row.operator_reason || 'A source time correction was made from bytes that were not the punch in this slot. HR must verify the corrected punch.'}`
+                    : row.source_condition === 'TERMINAL_NEWEST_RECORD_UNSETTLED'
                     ? ` ${row.operator_reason || 'These bytes were read before the terminal wrote this slot. They are not a punch.'}`
                     : row.disposition === 'IDENTITY_UNRESOLVED'
                     ? ' Identity operations must establish an independently supported user reference. A historical attendance UID cannot identify the current enrollment owner. A review note does not resolve this hold or certify Oracle delivery.'
@@ -2662,6 +2666,9 @@ export function ReconciliationView({
                     <small>{row.error_code || 'No error code'}</small>
                     {row.source_condition === 'TERMINAL_NEWEST_RECORD_UNSETTLED' && (
                       <small>Newest record read before the terminal wrote it; not a punch</small>
+                    )}
+                    {row.source_condition === 'TERMINAL_NEWEST_RECORD_CORRECTED' && (
+                      <small>Corrected from an unwritten newest record; HR must verify the punch</small>
                     )}
                   </div>
                   <div data-label="Observed identity">
