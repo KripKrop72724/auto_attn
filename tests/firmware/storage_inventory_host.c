@@ -11,6 +11,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "span_digest.h"
 #include "storage_inventory.h"
 
 #define CHUNK_BYTES SI_CHUNK_BYTES
@@ -197,11 +198,18 @@ int main(int argc, char **argv)
     assert(blocked && blocked->bytes == 4000 && blocked->first_error == EIO);
     /* Bytes 1000-1299 lie in data spans 3-5: a page's exact boundary. */
     assert(blocked->first_error_offset == 3 * SI_SPAN_BYTES && blocked->unreadable_bytes == 3 * SI_SPAN_BYTES);
+    /* 2.7.7: the spans themselves, as the confirm-first exception compares
+     * them with the spans the boot repair holds: 3, 4 and 5, all EIO. */
+    assert(blocked->unreadable_spans == 3 && blocked->last_error_offset == 5 * SI_SPAN_BYTES);
+    assert(blocked->span_digest == span_digest_add(span_digest_add(span_digest_add(0, 5), 3), 4));
+    assert(!blocked->span_errors_other && !blocked->other_unreadable);
     const si_file_t *probe = find(&report, "persistence-probe");
     assert(probe && probe->first_error == ENOENT && probe->first_error_offset == 0 && probe->unreadable_bytes == 32);
+    assert(probe->other_unreadable && !probe->unreadable_spans && !probe->span_digest);
     const si_file_t *pending = find(&report, "pending_events.jsonl");
     assert(pending && pending->first_error == ENODATA && pending->first_error_offset == 512);
     assert(pending->unreadable_bytes == 2000 - 512);
+    assert(pending->other_unreadable && !pending->unreadable_spans);
     assert(report.unreadable_bytes == 3 * SI_SPAN_BYTES + 32 + 1488);
     /* Unreadable files first, then the largest. */
     assert(!strcmp(report.file[0].name, "blocked_identity.jsonl") && !strcmp(report.file[1].name, "pending_events.jsonl"));
@@ -243,6 +251,14 @@ int main(int argc, char **argv)
     assert(journal && journal->bytes == 6 * CHUNK_BYTES && journal->first_error == EIO);
     assert(journal->first_error_offset == CHUNK_BYTES - SI_SPAN_BYTES);
     assert(journal->unreadable_bytes == 3 * SI_SPAN_BYTES);
+    /* The spans across the chunk boundary (first pass) and the later one
+     * (the rest, mapped in the second pass) are one set. */
+    uint32_t later = (4 * CHUNK_BYTES + 300) / SI_SPAN_BYTES;
+    assert(journal->unreadable_spans == 3 && journal->last_error_offset == later * SI_SPAN_BYTES);
+    assert(journal->span_digest == span_digest_add(span_digest_add(span_digest_add(0, later),
+                                                                   CHUNK_BYTES / SI_SPAN_BYTES),
+                                                   CHUNK_BYTES / SI_SPAN_BYTES - 1));
+    assert(!journal->other_unreadable && !journal->span_errors_other);
     assert(reads < 6 * SI_CHUNK_SPANS);
     assert_all_closed();
 

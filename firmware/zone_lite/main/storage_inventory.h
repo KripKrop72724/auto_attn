@@ -28,6 +28,14 @@ typedef struct {
     uint32_t unreadable_bytes;
     uint32_t first_error_offset;
     int first_error; /* errno of the first failed open or read; 0 when fully readable */
+    /* ZKT 2.7.7: the data spans that would not read back one at a time (each
+     * a failed span read, errno in span_errors_other when not EIO): how many,
+     * the last one's offset and an order-free digest of their indices
+     * (span_digest.h), so the confirm-first exception can compare them with
+     * the spans the boot repair holds on flash. other_unreadable: bytes lost
+     * any other way (an open or stat failure, a file ending before its size). */
+    uint32_t unreadable_spans, last_error_offset, span_digest, span_errors_other;
+    bool other_unreadable;
 } si_file_t;
 
 typedef struct {
@@ -53,3 +61,5 @@ void si_scan(const char *directory, const si_ports_t *ports, si_report_t *report
  * heartbeat once it has finished, and each unreadable file is logged once. */
 void storage_inventory_start(void);
 bool storage_inventory_append(cJSON *storage);
+/* ZKT 2.7.7: a copy of the finished scan; false while it has not finished. */
+bool storage_inventory_snapshot(si_report_t *out);

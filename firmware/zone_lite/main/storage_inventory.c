@@ -89,10 +89,22 @@ static bool append_file(cJSON *rows, const si_file_t *source)
               (!file.first_error ||
                (cJSON_AddNumberToObject(row, "unreadable_bytes", file.unreadable_bytes) &&
                 cJSON_AddNumberToObject(row, "first_error", file.first_error) &&
-                cJSON_AddNumberToObject(row, "first_error_offset", file.first_error_offset)));
+                cJSON_AddNumberToObject(row, "first_error_offset", file.first_error_offset) &&
+                /* 2.7.7: the unreadable spans, as the exception compares them. */
+                cJSON_AddNumberToObject(row, "unreadable_spans", file.unreadable_spans) &&
+                cJSON_AddNumberToObject(row, "last_error_offset", file.last_error_offset) &&
+                cJSON_AddNumberToObject(row, "span_digest", file.span_digest) &&
+                cJSON_AddBoolToObject(row, "other_unreadable", file.other_unreadable)));
     if (ok && cJSON_AddItemToArray(rows, row)) return true;
     cJSON_Delete(row);
     return false;
+}
+
+bool storage_inventory_snapshot(si_report_t *out)
+{
+    if (!out || !__atomic_load_n(&s_ready, __ATOMIC_ACQUIRE)) return false;
+    *out = s_report; /* written once, before s_ready */
+    return true;
 }
 
 bool storage_inventory_append(cJSON *storage)

@@ -4,6 +4,7 @@
 #include <string.h>
 
 #include "file_transaction.h"
+#include "span_digest.h"
 #include "spiffs_nucleus.h"
 
 /* ESP-IDF's SPIFFS layout with 16-bit ids and one lookup page per block, as
@@ -88,7 +89,7 @@ typedef struct {
     held_gap_t *held_gaps;   /* by span: what was unreadable when the hold was taken */
     uint32_t held_gap_count;
     uint32_t gaps, gap_bytes, rewritten;
-    uint32_t blocked_spans, blocked_offset;
+    uint32_t blocked_spans, blocked_offset, blocked_last, blocked_digest;
     uint16_t actions;
     /* 2.7.6 (round 1 review, low): a queue with unreadable bytes while the
      * boot could not read redo records that may hold them: nothing fills or
@@ -188,6 +189,10 @@ typedef struct {
     /* Round 2 review, R2-3: a gap an earlier run of this boot recorded was
      * found again (not recorded twice; the run still ends WITH_GAPS). */
     bool gaps_seen;
+    /* 2.7.7: source pages the run's settlement left waiting for room; a
+     * survey of this run completed. */
+    uint32_t src_waiting;
+    bool surveyed;
 } run_t;
 
 static run_t *s_run;
@@ -1382,7 +1387,9 @@ static bool build_objects(run_t *r)
 
 static bool survey(run_t *r)
 {
-    return !r->failed && scan(r) && build_objects(r);
+    bool ok = !r->failed && scan(r) && build_objects(r);
+    r->surveyed |= ok;
+    return ok;
 }
 
 static obj_t *find_live(run_t *r, const char *name)
@@ -1555,6 +1562,8 @@ static void note_file(run_t *r, const obj_t *o)
     f->spans_rewritten = o->rewritten;
     f->blocked_spans = o->blocked_spans;
     f->blocked_offset = o->blocked_offset;
+    rep->blocked_last[f - rep->file] = o->blocked_last;
+    rep->blocked_digest[f - rep->file] = o->blocked_digest;
 }
 
 /* A record of a run of this boot: this run's, or (2.7.6, round 2 review,
@@ -4108,11 +4117,14 @@ static void report_blocked(run_t *r)
         if (!live(o) || !custody(o) || !o->mapped || (o->consistent && !o->needs_work) || frozen(r, o)) continue;
         o->blocked_spans = 0;
         o->blocked_offset = UINT32_MAX;
+        o->blocked_last = o->blocked_digest = 0;
         for (uint32_t k = 0; k < o->patches; ++k) {
             if (o->patch[k].source == SOURCE_TAIL) continue;
             o->blocked_spans++;
             uint32_t at = o->patch[k].span * SRP_SPAN_BYTES;
             if (at < o->blocked_offset) o->blocked_offset = at;
+            if (at > o->blocked_last) o->blocked_last = at;
+            o->blocked_digest = span_digest_add(o->blocked_digest, o->patch[k].span);
         }
         if (!o->blocked_spans) {
             o->blocked_offset = 0;
@@ -4196,6 +4208,15 @@ static void finish_report(run_t *r)
         rep->files++;
         if (o->actions) note_file(r, o);
     }
+    /* 2.7.7: every object header the survey read, hidden ones too: whether
+     * one names a journal file (the OTA guard's evidence when the VFS is not
+     * mounted this boot). */
+    rep->names_surveyed = r->surveyed;
+    rep->journal_names = false;
+    static const char journal[] = "/zktj";
+    /* A header whose name cannot be read might be one: fail closed. */
+    for (uint32_t i = 0; i < r->hdr_count && !rep->journal_names; ++i)
+        rep->journal_names = !r->hdrs[i].named || !strncmp(r->hdrs[i].name, journal, sizeof(journal) - 1);
 }
 
 static bool alloc_run(run_t *r)
@@ -4566,6 +4587,7 @@ static SR_NOINLINE void settle_sources(run_t *r)
     }
     c->reclaim.settled += settled;
     c->reclaim.reported += reported;
+    r->src_waiting = waiting;
     if (!settled && !reported && !waiting) return;
     char message[160];
     snprintf(message, sizeof(message),
@@ -4633,10 +4655,27 @@ static SR_NOINLINE bool held_differs(run_t *r, obj_t *o)
     return false;
 }
 
+/* 2.7.7: why a kept page is SRX_KEEP_EXCLUDED (the report's breakdown). */
+enum { SR_EXCL_NONE = 0, SR_EXCL_HIDDEN, SR_EXCL_UNWINDOWED, SR_EXCL_LAST_PAGE, SR_EXCL_INDEX_FLAG };
+
 /* Out of reclaim_round's frame (low 3): the round's own frame is on the
  * deepest path of the boot's stack (its put-back restores a held file). */
 static uint8_t keep_class(run_t *r, uint32_t pix, const uint8_t *attr, const uint16_t *ref_owner,
-                          const uint8_t *has_header, const uint16_t *owner_index);
+                          const uint8_t *has_header, const uint16_t *owner_index, uint8_t *why, uint16_t *who);
+
+/* 2.7.7: the name of the object with id `id` by its header (hidden ones too):
+ * the excluded breakdown's most excluding object. */
+static void header_name(const run_t *r, uint16_t id, char *out)
+{
+    snprintf(out, SRP_NAME_BYTES, "?");
+    for (uint32_t i = 0; i < r->hdr_count; ++i) {
+        const hdr_t *h = &r->hdrs[i];
+        if ((h->obj & (SR_IDS - 1)) != id || !h->named) continue;
+        memcpy(out, h->name, SRP_NAME_BYTES);
+        out[SRP_NAME_BYTES - 1] = '\0';
+        if (!h->hidden) return;
+    }
+}
 
 /* Every block's plan (srx_plan_block over its entries as the survey and the
  * index references see them), the exposure histogram, and the candidates in
@@ -4648,28 +4687,76 @@ static SR_NOINLINE uint32_t plan_candidates(run_t *r, const uint8_t *attr, const
     carry_t *c = r->carry;
     srr_reclaim_report_t *rep = &c->reclaim;
     bool unconfirmed = r->cfg->pending_verify;
+    /* 2.7.7: a round boot of the confirm-first exception takes custody
+     * blocks only when this run held every custody file. */
+    bool hold_missing = r->cfg->custody_needs_hold && r->report->files_unheld_custody;
     uint32_t count = 0;
     rep->candidates = rep->unconfirmed_blocks = rep->custody_blocks = 0;
     rep->index_blocks = rep->excluded_blocks = rep->low_magic_blocks = 0;
+    rep->custody_gain = rep->unconfirmed_gain = rep->held_out = 0;
+    rep->excluded_hidden = rep->excluded_unwindowed = rep->excluded_last_page = rep->excluded_index_flag = 0;
+    rep->excluded_busy = rep->excluded_mixed = rep->excluded_file_blocks = 0;
+    rep->excluded_file[0] = '\0';
+    /* Blocks each object excludes, in the run's arena (SR_IDS entries are
+     * too many for the boot's stack); none: the breakdown's object is left out. */
+    uint16_t *excluding = zalloc(r, SR_IDS * sizeof(uint16_t));
     for (uint32_t b = 0; b < r->blocks; ++b) {
         srx_entry_t e[SRX_ENTRIES];
+        uint8_t why[SRX_ENTRIES];
+        uint16_t who[SRX_ENTRIES];
         for (uint32_t i = 0; i < SRX_ENTRIES; ++i) {
             uint32_t pix = b * r->ppb + 1 + i;
             const pg_t *pg = &r->pages[pix];
             e[i] = (srx_entry_t){.lu = pg->lu, .obj = pg->obj, .flags = pg->flags, .erased = pg->erased != 0,
                                  .referenced = (attr[pix] & SR_ATTR_REFERENCED) != 0,
                                  .index = (attr[pix] & SR_ATTR_INDEX) != 0};
-            e[i].keep = keep_class(r, pix, attr, ref_owner, has_header, owner_index);
+            why[i] = SR_EXCL_NONE;
+            who[i] = 0;
+            e[i].keep = keep_class(r, pix, attr, ref_owner, has_header, owner_index, &why[i], &who[i]);
         }
         srx_plan_t plan = srx_plan_block(e, magic_ok[b] != 0, false);
         bool busy = c->have_area && srx_block_busy(&c->area, b);
         if (plan.reason == SRX_PLAN_INDEX) rep->index_blocks++;
         else if (plan.reason == SRX_PLAN_EXCLUDED || (busy && plan.reason == SRX_PLAN_OK)) rep->excluded_blocks++;
         else if (plan.reason == SRX_PLAN_MAGIC) rep->low_magic_blocks++;
+        if (plan.reason == SRX_PLAN_OK && busy) rep->excluded_busy++;
+        if (plan.reason == SRX_PLAN_EXCLUDED) {
+            /* The reasons of the block's kept excluding pages: one, or mixed;
+             * each excluding object counted once for the block. */
+            uint8_t reason = SR_EXCL_NONE;
+            bool mixed = false;
+            uint16_t seen[SRX_ENTRIES];
+            uint32_t seen_count = 0;
+            for (uint32_t i = 0; i < SRX_ENTRIES; ++i) {
+                if (!(plan.kept & (1U << i)) || e[i].index || e[i].keep != SRX_KEEP_EXCLUDED) continue;
+                if (reason == SR_EXCL_NONE) reason = why[i];
+                else if (reason != why[i]) mixed = true;
+                bool counted = false;
+                for (uint32_t k = 0; k < seen_count && !counted; ++k) counted = seen[k] == who[i];
+                if (counted || !who[i]) continue;
+                seen[seen_count++] = who[i];
+                uint16_t id = (uint16_t)(who[i] - 1U);
+                if (excluding && excluding[id] < UINT16_MAX) excluding[id]++;
+            }
+            if (mixed) rep->excluded_mixed++;
+            else if (reason == SR_EXCL_HIDDEN) rep->excluded_hidden++;
+            else if (reason == SR_EXCL_UNWINDOWED) rep->excluded_unwindowed++;
+            else if (reason == SR_EXCL_LAST_PAGE) rep->excluded_last_page++;
+            else if (reason == SR_EXCL_INDEX_FLAG) rep->excluded_index_flag++;
+        }
         if (plan.reason != SRX_PLAN_OK || busy) continue;
-        if (plan.custody) rep->custody_blocks++;
-        else rep->unconfirmed_blocks++;
+        if (plan.custody) {
+            rep->custody_blocks++;
+            rep->custody_gain += plan.gain;
+        } else {
+            rep->unconfirmed_blocks++;
+            rep->unconfirmed_gain += plan.gain;
+        }
         if (unconfirmed && plan.custody) continue;
+        if (hold_missing && plan.custody) {
+            rep->held_out++;
+            continue;
+        }
         rep->candidates++;
         cand_t next = {(uint16_t)b, plan.kept, plan.dropped, plan.gain, plan.tail,
                        r->ports->prefer && r->ports->prefer(r->ports->context, b)};
@@ -4680,6 +4767,20 @@ static SR_NOINLINE uint32_t plan_candidates(run_t *r, const uint8_t *attr, const
         }
         cand[at] = next;
         cpu_step(at < 64 ? at : 64);
+    }
+    if (excluding) {
+        uint32_t most = 0;
+        uint16_t most_id = 0;
+        for (uint32_t id = 0; id < SR_IDS; ++id)
+            if (excluding[id] > most) {
+                most = excluding[id];
+                most_id = (uint16_t)id;
+            }
+        if (most) {
+            rep->excluded_file_blocks = most;
+            header_name(r, most_id, rep->excluded_file);
+        }
+        release(r, excluding);
     }
     return count;
 }
@@ -4700,7 +4801,7 @@ static SR_NOINLINE void log_exposure(run_t *r, const char *trigger, int32_t want
 /* What makes a page kept out of every window, or custody a confirmed image
  * may expose (SRX_KEEP_*); only asked of pages a block keeps. */
 static uint8_t keep_class(run_t *r, uint32_t pix, const uint8_t *attr, const uint16_t *ref_owner,
-                          const uint8_t *has_header, const uint16_t *owner_index)
+                          const uint8_t *has_header, const uint16_t *owner_index, uint8_t *why, uint16_t *who)
 {
     const pg_t *pg = &r->pages[pix];
     bool referenced = attr[pix] & SR_ATTR_REFERENCED;
@@ -4711,10 +4812,27 @@ static uint8_t keep_class(run_t *r, uint32_t pix, const uint8_t *attr, const uin
     bool headered = bit(has_header, id) || (referenced && bit(has_header, (uint32_t)(ref_owner[pix] - 1U)));
     if (!headered) return SRX_KEEP_NONE; /* leaked: no header, no index of a file names it */
     const obj_t *o = owner_index[id] ? &r->objs[owner_index[id] - 1] : NULL;
-    if (!o || !live(o) || !o->mapped || !reclaimable_file(o) || (pg->obj & SR_IX)) return SRX_KEEP_EXCLUDED;
+    /* 2.7.7, the report's breakdown only: which reason and which object. */
+    *who = (uint16_t)(id + 1U);
+    if (!o || !live(o) || !o->mapped) {
+        *why = SR_EXCL_HIDDEN;
+        return SRX_KEEP_EXCLUDED;
+    }
+    if (!reclaimable_file(o)) {
+        *why = SR_EXCL_UNWINDOWED;
+        return SRX_KEEP_EXCLUDED;
+    }
+    if (pg->obj & SR_IX) {
+        *why = SR_EXCL_INDEX_FLAG;
+        return SRX_KEEP_EXCLUDED;
+    }
     /* The last data page: an append would fail on it after a mount erased
      * its block, or program into another file's page reused there. */
-    if (!o->spans || pg->span + 1U >= o->spans || o->ref[o->spans - 1] == pix) return SRX_KEEP_EXCLUDED;
+    if (!o->spans || pg->span + 1U >= o->spans || o->ref[o->spans - 1] == pix) {
+        *why = SR_EXCL_LAST_PAGE;
+        return SRX_KEEP_EXCLUDED;
+    }
+    *who = 0;
     return SRX_KEEP_CUSTODY;
 }
 
@@ -4859,6 +4977,9 @@ static SR_NOINLINE void reclaim_round(run_t *r, const char *trigger)
     /* Held files whose restore waits for this round's room (D2). */
     work += r->wait_pages;
     int32_t want = (int32_t)(work + spare_for_compaction(r) + SR_RECLAIM_MARGIN) - erased;
+    /* 2.7.7: what this round considered, for the report. */
+    rep->target = work + spare_for_compaction(r) + SR_RECLAIM_MARGIN;
+    rep->want = want > 0 ? (uint32_t)want : 0;
     uint8_t *attr = zalloc(r, r->total_pages), *has_header = zalloc(r, SR_IDS / 8U);
     uint16_t *ref_owner = zalloc(r, r->total_pages * sizeof(uint16_t)), *owner_index = zalloc(r, SR_IDS * sizeof(uint16_t));
     uint8_t *magic_ok = zalloc(r, r->blocks);
@@ -4923,9 +5044,14 @@ static SR_NOINLINE void reclaim_round(run_t *r, const char *trigger)
         goto done;
     }
     if (bad_magic || want <= 0 || !count) {
-        snprintf(rep->short_reason, sizeof(rep->short_reason), bad_magic ? "magic" : want <= 0 ? "room" : "candidate");
+        /* 2.7.7: custody blocks a round boot would take but for an unheld
+         * custody file say so (retryable), rather than "candidate". */
+        bool hold = !count && rep->held_out;
+        snprintf(rep->short_reason, sizeof(rep->short_reason),
+                 bad_magic ? "magic" : want <= 0 ? "room" : hold ? "hold" : "candidate");
         snprintf(message, sizeof(message), "no round: %s",
-                 bad_magic ? "a block without a valid magic" : want <= 0 ? "erased pages enough" : "no candidate block");
+                 bad_magic ? "a block without a valid magic" : want <= 0 ? "erased pages enough"
+                 : hold ? "custody blocks wait for every custody file to be held" : "no candidate block");
         logf_line(r, "WARN", "STORAGE_REPAIR_RECLAIM_SHORT", message);
         goto done;
     }
@@ -5040,7 +5166,8 @@ static SR_NOINLINE void reclaim_round(run_t *r, const char *trigger)
         }
         sources = true;
     }
-    if (gained < want && !rep->short_reason[0]) snprintf(rep->short_reason, sizeof(rep->short_reason), "candidate");
+    if (gained < want && !rep->short_reason[0])
+        snprintf(rep->short_reason, sizeof(rep->short_reason), rep->held_out ? "hold" : "candidate");
     /* Every record of the round done or a source: the journal is idle. A
      * failed block's record whose source bit would not take keeps the round
      * active and the journal says SOURCES (round 2 review, R2-4): no later
@@ -5414,6 +5541,14 @@ static void run_once(spiffs *fs, const srr_config_t *config, const srr_ports_t *
     bool deferred = false, catalog_drop = false, check_failed = false, checked = false, cut_short = false;
     bool gc_unsafe = false;
     bool ok = survey(r);
+    /* 2.7.7: the store as it arrived, before this boot wrote anything (the
+     * boot recovery writes raw only blocks a reset left in a window). */
+    if (ok && carry && !carry->reclaim.mount_measured) {
+        int32_t arrived = surveyed_free(r);
+        carry->reclaim.erased_at_mount = arrived > 0 ? (uint32_t)arrived : 0;
+        carry->reclaim.free_blocks_at_mount = fs->free_blocks > 0 ? (uint32_t)fs->free_blocks : 0;
+        carry->reclaim.mount_measured = true;
+    }
     if (ok) report_torn_headers(r);
     if (ok && any_mislabeled(r)) {
         /* Before the first allocation (the resume's rebuilds included): no
@@ -5552,6 +5687,13 @@ static void run_once(spiffs *fs, const srr_config_t *config, const srr_ports_t *
     settle_waits(r, r->round_remounted);
     report->phase = (srp_phase_t)r->state.phase;
     report->cpu_steps = s_cpu_steps;
+    /* 2.7.7: what the next boots and the confirm-first gate read. */
+    report->manifest_active = manifest_active(r);
+    if (carry) {
+        uint32_t awaiting = 0;
+        for (uint32_t i = 0; i < r->obj_count; ++i) awaiting += live(&r->objs[i]) && r->objs[i].awaiting;
+        carry->reclaim.waiting = r->src_waiting + awaiting;
+    }
     if (ports->now_ms) report->duration_ms = (uint32_t)(ports->now_ms(ports->context) - started);
     snprintf(message, sizeof(message),
              "run %lu %s: %lu files, %lu gaps (%lu bytes), %lu spans rewritten, %lu check passes, %lu cursors reset",
@@ -5634,7 +5776,10 @@ static SR_NOINLINE void merge_report(srr_report_t *t, const srr_report_t *n)
 #undef SR_SUM
     /* A file the last run did not note was not blocked in it: a deferred run
      * notes every file it leaves blocked. */
-    for (uint32_t i = 0; i < t->file_count; ++i) t->file[i].blocked_spans = t->file[i].blocked_offset = 0;
+    for (uint32_t i = 0; i < t->file_count; ++i) {
+        t->file[i].blocked_spans = t->file[i].blocked_offset = 0;
+        t->blocked_last[i] = t->blocked_digest[i] = 0;
+    }
     for (uint32_t k = 0; k < n->file_count; ++k) {
         const srr_report_file_t *from = &n->file[k];
         srr_report_file_t *to = NULL;
@@ -5644,6 +5789,8 @@ static SR_NOINLINE void merge_report(srr_report_t *t, const srr_report_t *n)
             if (t->file_count == SRR_REPORT_FILES) continue;
             to = &t->file[t->file_count++];
             *to = *from;
+            t->blocked_last[to - t->file] = n->blocked_last[k];
+            t->blocked_digest[to - t->file] = n->blocked_digest[k];
             continue;
         }
         to->actions |= from->actions;
@@ -5653,7 +5800,13 @@ static SR_NOINLINE void merge_report(srr_report_t *t, const srr_report_t *n)
         to->spans_rewritten += from->spans_rewritten;
         to->blocked_spans = from->blocked_spans;
         to->blocked_offset = from->blocked_offset;
+        t->blocked_last[to - t->file] = n->blocked_last[k];
+        t->blocked_digest[to - t->file] = n->blocked_digest[k];
     }
+    /* 2.7.7: the last run's. */
+    t->manifest_active = n->manifest_active;
+    t->names_surveyed = n->names_surveyed;
+    t->journal_names = n->journal_names;
 }
 
 void srr_run(spiffs *fs, const srr_config_t *config, const srr_ports_t *ports, srr_report_t *report)
