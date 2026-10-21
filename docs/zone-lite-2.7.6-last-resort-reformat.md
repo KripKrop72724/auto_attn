@@ -815,6 +815,20 @@ and 3,888 B leaving SPIFFS's leaf frames out: the same 128 B less. P02's
 2.7.5's worst case: HIL must read `stack_free_bytes` on P02's first 2.7.6
 boot and require at least 2,048 B.
 
+With indirect calls resolved (round 2 device review: SPIFFS's HAL, the
+mirror, `esp_flash`, the ports, NVS, and newlib's `vprintf` under `ESP_LOG`
+at 1,264 B read from the ELF), the deepest realistic chain is **4,544 B**:
+the static chain above as far as `rewrite_index`, then `logf_line` (32 B),
+the glue's `port_log` (48 B), `esp_log` (96 B) and `vprintf`. That is the
+T5 retry's path (`settle_waits`); P02's first boot has no T5 retry, so its
+`stack_free_bytes` will not cover it (about 208 B short). With `app_main`
+(720 B), `main_task` (48 B) and an interrupt frame, the worst case is about
+5.6 KB of the 8 KiB task: about 2.5 KB free, 0.5 KB above the HIL floor.
+After the round 2 fixes (ce52dba) every frame on both chains is unchanged
+(the static chain 3,584 B, the chain to `logf_line` 3,136 B); the new
+`failed_block` (288 B) under `reclaim_round` (528 B) and `load_sources`
+(336 B) lie on shallower chains.
+
 ## 13. Harness
 
 Everything runs in `spiffs_repair_host.c` against ESP-IDF 5.5.3's SPIFFS
@@ -915,7 +929,16 @@ one of them, `REVIEW_FULL=1` cuts at every write instead of sampling.
   source bit and the windows after it). Verification knobs (not CI):
   `REVIEW_TO_END` (cut to the end of the boot), `REVIEW_PREFER_QUEUE` (P02's
   first window over the queue's pages), `REVIEW_SALT` and
-  `REVIEW_BUILD_SALT` (fresh seeds).
+  `REVIEW_BUILD_SALT` (fresh seeds). Under `REVIEW_TO_END` a cut after the
+  round's remount on an unconfirmed image, followed by the old image, is
+  judged by custody or evidence (every byte its own or covered by a gap
+  record; such cuts are counted and printed), not by Review C1 and "no gap":
+  the run after the round changes files on purpose (2.7.5's own repair), and
+  a cut in its SPIFFS page moves followed by the old image's plain SPIFFS is
+  SPIFFS's own power-cut exposure, the same as a cut in 2.7.5's own run on
+  its unconfirmed boot before a rollback (and the same on 6e6a982). The
+  free-block count oracle is relaxed there too (note 4). Cuts in the round's
+  own windows keep the strict oracles.
 - **Organic:** a store that ends wedged is now a failure (the partition is
   no longer grown to read it); CI's prefilled 8 MiB seeds and the long seeds
   must end healthy.
