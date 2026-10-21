@@ -1,0 +1,313 @@
+"""PostgreSQL: the 0054 hold guard admits a dump row only with its retained interval."""
+
+import hashlib
+from datetime import timedelta
+from importlib.util import module_from_spec, spec_from_file_location
+from pathlib import Path
+
+import pytest
+from alembic.migration import MigrationContext
+from alembic.operations import Operations
+from sqlalchemy import func, select, text
+from sqlalchemy.exc import DBAPIError
+
+from test_attendance_force_postgres import force_pg as force_pg
+from test_attendance_repair import repair_store as repair_store
+from test_safe_attendance_repair import store as store
+from test_safe_attendance_repair_postgres import postgres_store as postgres_store
+from zk_add import attendance_identity_backlog as backlog
+from zk_add.models import (
+    AttendanceEvent,
+    AttendanceIdentityHistory,
+    Connector,
+    DeviceUser,
+    OrdsOutbox,
+)
+from zk_add.schemas import AttendanceEventIn, UserSnapshotRequest, UserSnapshotRow
+from zk_add.service import (
+    DumpIdentityRelease,
+    ingest_attendance,
+    release_synced_cnic_attendance,
+    replace_user_snapshot,
+    synced_cnic_identity_proven,
+)
+from zk_add.time_utils import utc_now
+
+VERSIONS = Path(__file__).parents[2] / "apps/add_backend/migrations/versions"
+EARLIER_GUARDS = (
+    "20260925_0036_auto_synced_cnic.py",
+    "20260929_0037_reconciled_cnic_guard.py",
+    "20260929_0038_saved_reconcile_cnic_guard.py",
+    "20260929_0039_delayed_record_uid_guard.py",
+    "20260929_0040_manual_hold_event_diagnostic.py",
+    "20260929_0041_legacy_reconcile_cnic_guard.py",
+    "20261012_0053_reconciled_record_uid_sources.py",
+)
+DUMP_GUARD = "20261021_0054_identity_dump_auto_release.py"
+FP = "a" * 64
+
+
+def _apply(engine, filename):
+    spec = spec_from_file_location(filename.removesuffix(".py"), VERSIONS / filename)
+    migration = module_from_spec(spec)
+    spec.loader.exec_module(migration)
+    with engine.begin() as conn:
+        with Operations.context(MigrationContext.configure(conn)):
+            migration.upgrade()
+
+
+def _proposed(conn_or_db, event_id, user_id):
+    """The guard's verdict on the release the application would write."""
+    return conn_or_db.execute(text("""
+        SELECT add_auto_reconciled_cnic_verified(jsonb_populate_record(
+          NULL::add_attendance_events,
+          to_jsonb(e) || jsonb_build_object(
+            'device_user_id', u.id,
+            'identity_snapshot_id', z.identity_snapshot_id,
+            'identity_resolution_status', 'RESOLVED_SYNCED_CNIC',
+            'identity_repair_reason', 'VERIFIED_SYNCED_CNIC',
+            'cnic_lookup_hash', u.cnic_lookup_hash,
+            'cnic_encrypted', u.cnic_encrypted)))
+        FROM add_attendance_events e
+        JOIN add_device_users u ON u.id = :user_id
+        JOIN add_zkt_devices z ON z.id = e.zkt_device_id
+        WHERE e.id = :event_id
+    """), {"event_id": event_id, "user_id": user_id}).scalar()
+
+
+def _held_dump(sessions):
+    with sessions() as db:
+        event = db.scalar(select(AttendanceEvent))
+        connector = db.get(Connector, event.connector_id)
+        zkt = connector.zkt_device
+        user = db.get(DeviceUser, event.device_user_id)
+        when = utc_now() - timedelta(minutes=30)
+        event.source = "DUMP_RECONNECT"
+        event.device_event_time = when
+        # Read from the terminal long after the punch: only the batch and the
+        # retained interval can prove who punched.
+        event.captured_at = when + timedelta(minutes=25)
+        event.received_at = event.captured_at + timedelta(seconds=2)
+        event.identity_terminal_fingerprint = FP
+        event.device_user_id = None
+        event.identity_snapshot_id = None
+        event.identity_resolution_status = "BLOCKED_PROVENANCE"
+        event.ords_status = "BLOCKED_IDENTITY"
+        event.manual_release_required = True
+        event.cnic_encrypted = event.cnic_lookup_hash = event.cnic_last4 = None
+        event.captured_cnic_lookup_hash = None
+        event.raw_event = {"attendance_record_uid": "28943"}
+        user.terminal_identity_fingerprint = FP
+        db.add(AttendanceIdentityHistory(
+            zkt_device_id=zkt.id, device_user_id=user.id,
+            terminal_serial=zkt.serial, user_id=user.user_id, uid=user.uid,
+            fingerprint=FP, cnic_encrypted=user.cnic_encrypted,
+            cnic_lookup_hash=user.cnic_lookup_hash,
+            first_snapshot_id=zkt.identity_snapshot_id,
+            last_snapshot_id=zkt.identity_snapshot_id,
+            last_revision=zkt.identity_snapshot_revision,
+            observed_from=when - timedelta(minutes=10),
+            observed_until=when + timedelta(minutes=10),
+        ))
+        # Whole-roster continuity also spans the punch; it must not matter.
+        zkt.last_identity_change_at = when - timedelta(hours=1)
+        db.commit()
+        return event.id, user.id
+
+
+BREAKERS = {
+    "revoked": "UPDATE add_attendance_identity_history SET revoked = true",
+    "interval_gap": "UPDATE add_attendance_identity_history "
+                    "SET observed_until = observed_from + INTERVAL '1 minute'",
+    "fingerprint": f"UPDATE add_attendance_identity_history SET fingerprint = '{'b' * 64}'",
+    "uid": "UPDATE add_attendance_identity_history SET uid = '99'",
+    "cnic_changed": f"UPDATE add_attendance_identity_history SET cnic_lookup_hash = '{'0' * 64}'",
+    # The interval covering the punch belongs to an earlier device user record.
+    "recreated_user": """
+        WITH former AS (
+          INSERT INTO add_device_users (
+            user_key, zkt_device_id, uid, user_id, display_name,
+            terminal_identity_fingerprint, cnic_encrypted, cnic_lookup_hash, cnic_last4,
+            shift_worker, privilege, present, lifecycle_state, source, row_version,
+            observed_at, created_at, updated_at)
+          SELECT 'former', zkt_device_id, uid, user_id, 'Former',
+            terminal_identity_fingerprint, cnic_encrypted, cnic_lookup_hash, cnic_last4,
+            shift_worker, privilege, false, 'DELETED', source, 1,
+            observed_at, created_at, updated_at
+          FROM add_device_users LIMIT 1
+          RETURNING id)
+        UPDATE add_attendance_identity_history SET device_user_id = (SELECT id FROM former)
+    """,
+    # Whole-roster continuity alone never admits a dump row.
+    "legacy_continuity_only": "DELETE FROM add_attendance_identity_history",
+    # Captured within ten minutes of the punch, with only whole-roster continuity.
+    "near_capture_legacy_only": """
+        UPDATE add_attendance_events
+          SET captured_at = device_event_time + INTERVAL '5 minutes',
+              received_at = device_event_time + INTERVAL '5 minutes 2 seconds';
+        DELETE FROM add_attendance_identity_history;
+    """,
+    "receipt_lag": "UPDATE add_attendance_events "
+                   "SET received_at = captured_at + INTERVAL '11 minutes'",
+    "event_uid": "UPDATE add_attendance_events SET event_uid = upper(event_uid)",
+    # Any saved record decides; this one is not canonical, so it proves nothing.
+    "non_canonical_saved_record": """
+        INSERT INTO add_terminal_record_manifest (
+          connector_id, zkt_device_id, terminal_serial, generation, ordinal, source_kind,
+          canonical_source, record_size, raw_record_digest, terminal_record_key,
+          occurrence_index, attendance_event_id, disposition, observed_uid, observed_user_id,
+          created_at)
+        SELECT e.connector_id, e.zkt_device_id, e.device_serial, 1, 0, 'BASELINE', false, 40,
+          repeat('b', 64), repeat('c', 64), 1, e.id, 'EVENT', '28943', e.user_id, now()
+        FROM add_attendance_events e
+    """,
+}
+
+
+def test_dump_guard_admits_only_a_retained_interval_release(force_pg):
+    sessions, _, _ = force_pg
+    engine = sessions.kw["bind"]
+    event_id, user_id = _held_dump(sessions)
+    for filename in EARLIER_GUARDS:
+        _apply(engine, filename)
+    with engine.connect() as conn:
+        assert _proposed(conn, event_id, user_id) is False
+
+    with sessions() as db:
+        event = db.get(AttendanceEvent, event_id)
+        connector = db.get(Connector, event.connector_id)
+        zkt, user = connector.zkt_device, db.get(DeviceUser, user_id)
+        assert not synced_cnic_identity_proven(db, connector, zkt, user, event)
+        assert synced_cnic_identity_proven(
+            db, connector, zkt, user, event, allow_reconcile_batch=True
+        )
+        # The older guard refuses: the row stays held without a rollback.
+        assert release_synced_cnic_attendance(
+            db, zkt=zkt, user=user,
+            dump_release=DumpIdentityRelease(held_since=None, remaining=10),
+        ) == 0
+        db.commit()
+        assert db.get(AttendanceEvent, event_id).ords_status == "BLOCKED_IDENTITY"
+
+    _apply(engine, DUMP_GUARD)
+    with engine.connect() as conn:
+        assert _proposed(conn, event_id, user_id) is True
+    for name, statement in BREAKERS.items():
+        with engine.connect() as conn:
+            conn.execute(text(statement))
+            assert _proposed(conn, event_id, user_id) is False, name
+            conn.rollback()
+
+    with sessions() as db:
+        zkt = db.get(Connector, db.get(AttendanceEvent, event_id).connector_id).zkt_device
+        assert release_synced_cnic_attendance(
+            db, zkt=zkt, user=db.get(DeviceUser, user_id),
+            dump_release=DumpIdentityRelease(held_since=None, remaining=10),
+        ) == 1
+        db.commit()
+    with sessions() as db:
+        event = db.get(AttendanceEvent, event_id)
+        assert event.ords_status == "PENDING" and not event.manual_release_required
+        assert event.identity_resolution_status == "RESOLVED_SYNCED_CNIC"
+        assert db.scalar(select(func.count(OrdsOutbox.id)).where(
+            OrdsOutbox.attendance_event_id == event_id
+        )) == 1
+
+    # The trigger itself: an unproven raw release cannot reach delivery.
+    with engine.begin() as conn:
+        conn.execute(text("""
+            UPDATE add_attendance_events SET ords_status = 'BLOCKED_IDENTITY',
+              manual_release_required = true WHERE id = :id
+        """), {"id": event_id})
+        conn.execute(text("UPDATE add_attendance_identity_history SET revoked = true"))
+    with pytest.raises(DBAPIError, match="explicit administrator approval"):
+        with engine.begin() as conn:
+            conn.execute(text("""
+                UPDATE add_attendance_events SET ords_status = 'PENDING',
+                  manual_release_required = false WHERE id = :id
+            """), {"id": event_id})
+    with engine.begin() as conn:
+        conn.execute(text("UPDATE add_attendance_identity_history SET revoked = false"))
+        conn.execute(text("""
+            UPDATE add_attendance_events SET ords_status = 'PENDING',
+              manual_release_required = false WHERE id = :id
+        """), {"id": event_id})
+    with sessions() as db:
+        event = db.get(AttendanceEvent, event_id)
+        assert event.ords_status == "PENDING" and not event.manual_release_required
+
+
+def test_snapshot_and_owner_backlog_release_pass_the_installed_guard(force_pg):
+    sessions, _, _ = force_pg
+    engine = sessions.kw["bind"]
+    for filename in (*EARLIER_GUARDS, DUMP_GUARD):
+        _apply(engine, filename)
+    now = utc_now()
+
+    def snapshot(db, connector, key, observed_at):
+        replace_user_snapshot(
+            db, connector=connector,
+            snapshot=UserSnapshotRequest(
+                snapshot_id=key, complete=True, stable=True, observed_at=observed_at,
+                users=[UserSnapshotRow(
+                    uid="7", user_id="1007", name="Test Person-3520212345671",
+                    terminal_identity_fingerprint=FP,
+                )],
+            ),
+        )
+
+    def dump(seed, when, captured):
+        return AttendanceEventIn(
+            event_uid=hashlib.sha256(seed.encode()).hexdigest(), uid="7", user_id="1007",
+            terminal_serial="TEST-REPAIR-SERIAL", terminal_identity_fingerprint=FP,
+            device_event_time=when, captured_at=captured, source="DUMP_RECONNECT",
+            clock_quality="OK", punch=0, raw_event={"attendance_record_uid": "28943"},
+        )
+
+    recent = dump("pg-recent", now - timedelta(minutes=20), now - timedelta(minutes=1))
+    old = dump("pg-old", now - timedelta(days=4), now - timedelta(days=4) + timedelta(minutes=3))
+    with sessions() as db:
+        connector = db.scalar(select(Connector))
+        snapshot(db, connector, "pg-s0", now - timedelta(days=5))
+        ingest_attendance(db, connector=connector, events=[old])
+        db.flush()
+        old_row = db.scalar(select(AttendanceEvent).where(AttendanceEvent.event_uid == old.event_uid))
+        # ADD held it four days ago, before the rollout window.
+        old_row.received_at = old.captured_at + timedelta(seconds=20)
+        db.commit()
+    with sessions() as db:
+        connector = db.scalar(select(Connector))
+        snapshot(db, connector, "pg-s1", now - timedelta(minutes=25))
+        ingest_attendance(db, connector=connector, events=[recent])
+        db.commit()
+    with sessions() as db:
+        rows = db.scalars(select(AttendanceEvent).where(
+            AttendanceEvent.event_uid.in_([recent.event_uid, old.event_uid])
+        )).all()
+        assert [row.ords_status for row in rows] == ["BLOCKED_IDENTITY"] * 2
+        connector = db.scalar(select(Connector))
+        snapshot(db, connector, "pg-s2", utc_now())
+        db.commit()
+
+    def status(event_uid):
+        with sessions() as db:
+            row = db.scalar(select(AttendanceEvent).where(AttendanceEvent.event_uid == event_uid))
+            return row.ords_status, row.manual_release_required
+
+    assert status(recent.event_uid) == ("PENDING", False)
+    assert status(old.event_uid) == ("BLOCKED_IDENTITY", True)
+
+    with sessions() as db:
+        zone = db.scalar(select(Connector)).zone_id
+        preview = backlog.preview_page(db, zone_id=zone)
+        assert sum(g["provable"] for g in preview["groups"]) == 1
+        backlog.create_release(
+            db, actor="StateHealthAdmin", zone_id=zone, reason="Owner backlog release",
+            typed_confirmation=f"RELEASE {zone}", idempotency_key="pg-backlog-0001",
+        )
+        db.commit()
+    for _ in range(3):
+        with sessions() as db:
+            backlog.advance_once(db)
+            db.commit()
+    assert status(old.event_uid) == ("PENDING", False)
