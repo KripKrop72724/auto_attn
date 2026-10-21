@@ -228,6 +228,45 @@ def test_explicit_current_choice_sends_todays_cnic(store):
         assert decision.proof["cnic_choice"] == "CURRENT"
 
 
+def test_a_changed_cnic_choice_cannot_reuse_the_same_request_key(store):
+    from zk_add.attendance_recovery import RecoveryError
+
+    sessions, _connector_id, _uid = store
+    event_id = held_event(sessions)
+    with sessions() as db:
+        add_punch_time_interval(db, db.get(AttendanceEvent, event_id))
+        job = direct.create(db, actor="operator", request=start(event_id, key="same-key", choice="PUNCH_TIME"))
+        assert direct.create(
+            db, actor="operator", request=start(event_id, key="same-key", choice="PUNCH_TIME"),
+        ).id == job.id
+        with pytest.raises(RecoveryError, match="request key"):
+            direct.create(db, actor="operator", request=start(event_id, key="same-key", choice="CURRENT"))
+        assert job.scope["cnic_choices"] == {str(event_id): "PUNCH_TIME"}
+
+
+def test_choices_and_send_now_must_name_selected_punches():
+    with pytest.raises(ValueError, match="one CNIC per selected punch"):
+        DirectOrdsStartRequest(
+            event_ids=[1], reason="Reviewed", password="x", idempotency_key="release-safety-validate",
+            cnic_choices=[{"event_id": 2, "choice": "CURRENT"}],
+        )
+    with pytest.raises(ValueError, match="one CNIC per selected punch"):
+        DirectOrdsStartRequest(
+            event_ids=[1], reason="Reviewed", password="x", idempotency_key="release-safety-validate",
+            cnic_choices=[{"event_id": 1, "choice": "CURRENT"}, {"event_id": 1, "choice": "PUNCH_TIME"}],
+        )
+    with pytest.raises(ValueError, match="sending now only for selected"):
+        DirectOrdsStartRequest(
+            event_ids=[1], reason="Reviewed", password="x", idempotency_key="release-safety-validate",
+            send_now_event_ids=[3],
+        )
+    with pytest.raises(ValueError):
+        DirectOrdsStartRequest(
+            event_ids=[1], reason="Reviewed", password="x", idempotency_key="release-safety-validate",
+            cnic_choices=[{"event_id": 1, "choice": "WHOEVER_HOLDS_THE_ID"}],
+        )
+
+
 @pytest.mark.parametrize("interval", ["revoked", "other_uid", "two_cnics"])
 def test_ambiguous_punch_time_identity_offers_only_explicit_current(store, interval):
     sessions, _connector_id, _uid = store
