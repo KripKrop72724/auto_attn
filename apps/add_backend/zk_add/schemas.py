@@ -190,6 +190,43 @@ class StorageRepairFile(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
 
+class StorageRepairReclaim(BaseModel):
+    # ZKT 2.7.6 and later: the repair's last resort for a store with no room,
+    # blocks reformatted in place with their kept pages in a redo area past
+    # the last partition, sent every boot. `area` is that area's state;
+    # `trigger` and the block counts describe a run that ended without room
+    # (the exposure histogram: blocks a round may take now, on an unconfirmed
+    # image, only on a confirmed one, and the ones kept out). Every field is
+    # optional and codes are text, so a later firmware never fails validation.
+    area: str | None = Field(default=None, pattern=UPPER_CODE)
+    trigger: str | None = Field(default=None, max_length=24, pattern=r"^[a-z_]{1,24}$")
+    short: str | None = Field(default=None, max_length=24, pattern=r"^[a-z_]{1,24}$")
+    rounds: int | None = Field(default=None, ge=0, le=64)
+    blocks: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    pages_freed: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    pages_kept: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    erased_after: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    redone: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    sources: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    settled: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    reported: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    records_open: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    failed: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    held_mismatch: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    ms: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    candidates: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    unconfirmed_blocks: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    custody_blocks: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    index_blocks: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    excluded_blocks: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    low_magic_blocks: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    # A foreign area (written by something else; never claimed): how many of
+    # its 96 sectors, the first one, and the CRC-32 of that sector.
+    area_foreign_sectors: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    area_first_foreign: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    area_foreign_crc: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+
+
 class StorageRepairDiagnostics(BaseModel):
     # ZKT 2.7.5 and later: the custody-first SPIFFS repair that runs at every
     # boot before the store is mounted. Codes are text, not literals, so a
@@ -257,6 +294,19 @@ class StorageRepairDiagnostics(BaseModel):
     error_code: int | None = Field(default=None, ge=-(2**31), le=2**31 - 1)
     check: StorageRepairCheck | None = None
     entries: list[StorageRepairFile] = Field(default_factory=list, max_length=8)
+    # ZKT 2.7.6 and later: runs of the repair this boot (a round of the last
+    # resort is followed by another), and the last resort itself; an
+    # unreadable reclaim object is dropped rather than the whole report.
+    runs: int | None = Field(default=None, ge=0, le=64)
+    reclaim: StorageRepairReclaim | None = None
+
+    @field_validator("reclaim", mode="before")
+    @classmethod
+    def readable_reclaim(cls, value: Any) -> StorageRepairReclaim | None:
+        try:
+            return StorageRepairReclaim.model_validate(value) if value is not None else None
+        except ValidationError:
+            return None
 
 
 class StorageDiagnostics(BaseModel):

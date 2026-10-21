@@ -574,17 +574,17 @@ jobs:
         run: |
           python3 scripts/check_firmware_identity.py firmware/zone_lite/build-ci-recovery/zone_lite.bin --family zkt --version 2.6.27
           python3 -c "import sys; d=open(sys.argv[1],'rb').read(); m=b'ZONE_STORAGE_CONTRACT_V2:RECOVERY:READ=2:LANES=3F:BASE=2.5.2\0'; sys.exit(0 if d.count(m) == 1 and d.count(b'ZONE_STORAGE_CONTRACT_V') == 1 else 'recovery contract marker is missing or ambiguous')" firmware/zone_lite/build-ci-recovery/zone_lite.bin
-      - name: Compile the ZKT 2.7.5 direct legacy role exactly as HIL signs it
+      - name: Compile the ZKT 2.7.6 direct legacy role exactly as HIL signs it
         run: >-
           docker run --rm
           -v "$GITHUB_WORKSPACE:/project"
           -w /project/firmware/zone_lite
           espressif/idf:v5.5.3
-          bash -lc 'idf.py -B build-ci-direct -D SDKCONFIG=/tmp/zone-lite-ci-direct-sdkconfig -D PROJECT_VER=2.7.5 -D ZONE_LITE_DIRECT_LEGACY_UPGRADE=ON build'
-      - name: Check 2.7.5 identity and its exact compiled rollback contract
+          bash -lc 'idf.py -B build-ci-direct -D SDKCONFIG=/tmp/zone-lite-ci-direct-sdkconfig -D PROJECT_VER=2.7.6 -D ZONE_LITE_DIRECT_LEGACY_UPGRADE=ON build'
+      - name: Check 2.7.6 identity and its exact compiled rollback contract
         run: |
-          python3 scripts/check_firmware_identity.py firmware/zone_lite/build-ci-direct/zone_lite.bin --family zkt --version 2.7.5
-          python3 -c "import sys; d=open(sys.argv[1],'rb').read(); m=b'ZONE_STORAGE_CONTRACT_V2:LEGACY:READ=2:LANES=3F:BASE=2.4.12,2.5.2,2.6.6,2.6.7,2.6.8,2.6.9,2.6.10,2.6.12,2.6.13,2.6.14,2.6.15,2.7.2,2.7.3,2.7.4\0'; sys.exit(0 if d.count(m) == 1 and d.count(b'ZONE_STORAGE_CONTRACT_V') == 1 else 'direct contract marker is missing or ambiguous')" firmware/zone_lite/build-ci-direct/zone_lite.bin
+          python3 scripts/check_firmware_identity.py firmware/zone_lite/build-ci-direct/zone_lite.bin --family zkt --version 2.7.6
+          python3 -c "import sys; d=open(sys.argv[1],'rb').read(); m=b'ZONE_STORAGE_CONTRACT_V2:LEGACY:READ=2:LANES=3F:BASE=2.4.12,2.5.2,2.6.6,2.6.7,2.6.8,2.6.9,2.6.10,2.6.12,2.6.13,2.6.14,2.6.15,2.7.2,2.7.3,2.7.4,2.7.5\0'; sys.exit(0 if d.count(m) == 1 and d.count(b'ZONE_STORAGE_CONTRACT_V') == 1 else 'direct contract marker is missing or ambiguous')" firmware/zone_lite/build-ci-direct/zone_lite.bin
       - name: Record the ESP-IDF image digest this runner built with
         run: docker image inspect espressif/idf:v5.5.3 --format '{{json .RepoDigests}}'
 

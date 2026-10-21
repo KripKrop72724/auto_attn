@@ -1,6 +1,8 @@
 /* ZKT 2.7.5 storage repair: the decisions that need no filesystem, and the
- * metadata mirror, with plain cc. The SPIFFS engine itself runs in
- * spiffs_repair_host.c against ESP-IDF's own SPIFFS. */
+ * metadata mirror, with plain cc; 2.7.6: the redo records, the block plan,
+ * the per-block writer and the boot recovery of the last-resort reformat.
+ * The SPIFFS engine itself runs in spiffs_repair_host.c against ESP-IDF's
+ * own SPIFFS. */
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -11,6 +13,7 @@
 #include "reliability.h"
 #include "storage_repair_mirror.h"
 #include "storage_repair_plan.h"
+#include "storage_repair_redo.h"
 
 static void classes(void)
 {
@@ -398,6 +401,445 @@ static void mirror(void)
     assert(srm_read(&m, 20480, got, 256) && !memcmp(got, flash + 20480, 256));
     assert(srm_read(&m, 20480 + 256 * 10, got, 5) && !memcmp(got, flash + 20480 + 2560, 5));
     assert(m.refreshes > 0);
+    /* 2.7.6: a program that reported success but did not stick is read again
+     * from flash once the caller verified the block on raw flash. */
+    assert(srm_write(&m, 24576 + 252, &zero, 1));
+    flash[24576 + 252] = 0x5A;
+    assert(srm_read(&m, 24576 + 252, got, 1) && got[0] == 0);
+    assert(srm_refresh(&m, 24576, 4096));
+    assert(srm_read(&m, 24576 + 252, got, 1) && got[0] == 0x5A);
+}
+
+
+/* ---- 2.7.6: the last-resort reformat ----------------------------------- */
+#define RX_BLOCKS 64U
+static uint8_t rx_store[RX_BLOCKS * 4096], rx_area[8 * 4096];
+static int rx_fail_store_write, rx_corrupt_after; /* fail the n-th store write; corrupt a byte n writes on */
+static unsigned rx_store_writes, rx_windows_open;
+static bool rx_read(void *c, uint32_t o, void *b, uint32_t n, uint8_t *mem, size_t size)
+{
+    (void)c;
+    if ((uint64_t)o + n > size) return false;
+    memcpy(b, mem + o, n);
+    return true;
+}
+static bool rx_area_read(void *c, uint32_t o, void *b, uint32_t n) { return rx_read(c, o, b, n, rx_area, sizeof(rx_area)); }
+static bool rx_store_read(void *c, uint32_t o, void *b, uint32_t n) { return rx_read(c, o, b, n, rx_store, sizeof(rx_store)); }
+static bool rx_program(uint8_t *mem, size_t size, uint32_t o, const void *b, uint32_t n)
+{
+    if ((uint64_t)o + n > size) return false;
+    const uint8_t *src = b;
+    for (uint32_t i = 0; i < n; ++i) mem[o + i] &= src[i];
+    return true;
+}
+static bool rx_area_write(void *c, uint32_t o, const void *b, uint32_t n)
+{
+    (void)c;
+    return rx_program(rx_area, sizeof(rx_area), o, b, n);
+}
+static bool rx_store_write(void *c, uint32_t o, const void *b, uint32_t n)
+{
+    (void)c;
+    if (rx_fail_store_write && ++rx_store_writes == (unsigned)rx_fail_store_write) return false;
+    bool ok = rx_program(rx_store, sizeof(rx_store), o, b, n);
+    /* A sector that does not hold what it is programmed with. */
+    if (ok && rx_corrupt_after && n == 256) rx_store[o + 17] &= 0x0F;
+    return ok;
+}
+static bool rx_erase(uint8_t *mem, size_t size, uint32_t o, uint32_t n)
+{
+    if ((uint64_t)o + n > size) return false;
+    memset(mem + o, 0xFF, n);
+    return true;
+}
+static bool rx_area_erase(void *c, uint32_t o, uint32_t n)
+{
+    (void)c;
+    return rx_erase(rx_area, sizeof(rx_area), o, n);
+}
+static bool rx_store_erase(void *c, uint32_t o, uint32_t n)
+{
+    (void)c;
+    return rx_erase(rx_store, sizeof(rx_store), o, n);
+}
+static void rx_window(void *c, bool open)
+{
+    (void)c;
+    if (open) rx_windows_open++;
+}
+static const srx_io_t RX_IO = {
+    .area_size = sizeof(rx_area), .area_read = rx_area_read, .area_write = rx_area_write, .area_erase = rx_area_erase,
+    .store_read = rx_store_read, .store_write = rx_store_write, .store_erase = rx_store_erase, .window = rx_window,
+};
+
+static void put16_at(uint8_t *p, uint16_t v)
+{
+    p[0] = (uint8_t)v;
+    p[1] = (uint8_t)(v >> 8);
+}
+
+/* A block of the test store: entries per `kinds` ('d' deleted unread, 'u'
+ * used by object 5, 'f' erased, 'r' deleted but referenced), magic valid. */
+static void rx_block(uint32_t block, const char *kinds)
+{
+    uint8_t *b = rx_store + block * 4096;
+    memset(b, 0xFF, 4096);
+    for (uint32_t e = 0; e < 15; ++e) {
+        uint8_t *page = b + (1 + e) * 256;
+        switch (kinds[e]) {
+        case 'u':
+            put16_at(b + e * 2, 5);
+            put16_at(page, 5);
+            put16_at(page + 2, (uint16_t)e);
+            page[4] = 0xFC; /* finalized data page */
+            memset(page + 5, 'a' + (int)e, 251);
+            break;
+        case 'd': case 'r':
+            put16_at(b + e * 2, 0);
+            put16_at(page, 5);
+            put16_at(page + 2, (uint16_t)(100 + e));
+            page[4] = 0x7C; /* deleted */
+            memset(page + 5, 'z', 251);
+            break;
+        default: break;
+        }
+    }
+    put16_at(b + 254, 7);
+    put16_at(b + 252, srx_spiffs_magic(RX_BLOCKS, block));
+}
+
+static void rx_entries(uint32_t block, const char *kinds, srx_entry_t *entry)
+{
+    const uint8_t *b = rx_store + block * 4096;
+    for (uint32_t e = 0; e < 15; ++e) {
+        const uint8_t *page = b + (1 + e) * 256;
+        entry[e] = (srx_entry_t){.lu = srx_get16(b + e * 2), .obj = srx_get16(page), .flags = page[4],
+                                 .erased = srx_erased(page, 256), .referenced = kinds[e] == 'r'};
+    }
+}
+
+static void redo_plan(void)
+{
+    /* The low magics D2 found: block 983 of 2,048 is 0x0000. */
+    assert(srx_spiffs_magic(2048, 983) == 0 && !srx_magic_strong(2048, 983));
+    /* Round 1 review, D3: block 810's magic is 0x00FF. The window clears it
+     * to 0x0000 and an erase cut short leaves each byte erased or not (the
+     * harness's NOR model), so it can read valid over a half-erased block. */
+    assert(srx_spiffs_magic(2048, 810) == 0x00FF && !srx_magic_strong(2048, 810));
+    unsigned weak = 0;
+    for (uint32_t b = 0; b < 2048; ++b) weak += !srx_magic_strong(2048, b);
+    assert(weak == 68);
+    /* Every store size the firmware or the harness uses: no strong magic can
+     * read valid after a byte-wise torn erase of its cleared value. */
+    for (uint32_t blocks = 64; blocks <= 4096; blocks *= 2)
+        for (uint32_t b = 0; b < blocks; ++b) {
+            uint16_t magic = srx_spiffs_magic(blocks, b);
+            for (unsigned tear = 0; tear < 4; ++tear) {
+                uint16_t reads = (uint16_t)(((tear & 1U) ? 0x00FFU : 0U) | ((tear & 2U) ? 0xFF00U : 0U));
+                assert(reads != magic || !srx_magic_strong(blocks, b));
+            }
+        }
+    srx_entry_t e[15];
+    /* Interior and tail drops; the referenced deleted page stays. */
+    rx_block(3, "uudurddfffffff" "f");
+    rx_entries(3, "uudurddfffffff" "f", e);
+    srx_plan_t p = srx_plan_block(e, true, false);
+    assert(p.reason == SRX_PLAN_OK && p.dropped == ((1U << 2) | (1U << 5) | (1U << 6)) && p.gain == 3 && p.tail == 2);
+    assert(p.kept == ((1U << 0) | (1U << 1) | (1U << 3) | (1U << 4)));
+    /* Entry 0 stays while a later entry stays (SPIFFS counts free blocks by it). */
+    rx_block(4, "dduddfffffffff" "f");
+    rx_entries(4, "dduddfffffffff" "f", e);
+    p = srx_plan_block(e, true, false);
+    assert(p.reason == SRX_PLAN_OK && (p.kept & 1U) && !(p.dropped & 1U) && p.dropped == ((1U << 1) | (1U << 3) | (1U << 4)));
+    /* All deleted: the whole block. */
+    rx_block(5, "ddddddddddddddd");
+    rx_entries(5, "ddddddddddddddd", e);
+    p = srx_plan_block(e, true, true);
+    assert(p.reason == SRX_PLAN_OK && p.dropped == 0x7FFF && !p.kept && p.tail == 15);
+    /* Nothing to drop, a weak magic, an index page, custody on an unconfirmed image. */
+    rx_block(6, "uuuufffffffffff");
+    rx_entries(6, "uuuufffffffffff", e);
+    assert(srx_plan_block(e, true, false).reason == SRX_PLAN_NO_GAIN);
+    rx_entries(3, "uudurddfffffff" "f", e);
+    assert(srx_plan_block(e, false, false).reason == SRX_PLAN_MAGIC);
+    e[1].index = true;
+    assert(srx_plan_block(e, true, false).reason == SRX_PLAN_INDEX);
+    e[1].index = false;
+    e[0].keep = SRX_KEEP_EXCLUDED;
+    assert(srx_plan_block(e, true, false).reason == SRX_PLAN_EXCLUDED);
+    e[0].keep = SRX_KEEP_CUSTODY;
+    p = srx_plan_block(e, true, false);
+    assert(p.reason == SRX_PLAN_OK && p.custody);
+    assert(srx_plan_block(e, true, true).reason == SRX_PLAN_CUSTODY);
+    /* A free lookup entry over a page that is not erased, or one naming
+     * another object: never a candidate. */
+    rx_entries(3, "uudurddfffffff" "f", e);
+    e[9].erased = false;
+    assert(srx_plan_block(e, true, false).reason == SRX_PLAN_MISLABELED);
+    rx_entries(3, "uudurddfffffff" "f", e);
+    e[0].lu = 6;
+    assert(srx_plan_block(e, true, false).reason == SRX_PLAN_MISLABELED);
+}
+
+static void rx_record(uint32_t slot, uint32_t block, uint16_t drop, uint32_t sequence, uint8_t flags, uint32_t tag,
+                      uint8_t *target)
+{
+    static uint8_t sector[4096];
+    srx_record_t h;
+    memset(&h, 0, sizeof(h));
+    h.reclaim_id = 9;
+    h.sequence = sequence;
+    h.image_tag = tag;
+    h.flags = flags;
+    h.block = (uint16_t)block;
+    h.drop_mask = drop;
+    h.block_count = RX_BLOCKS;
+    h.erase_count = 12;
+    for (uint32_t e = 0; e < 15; ++e) {
+        uint16_t lu = srx_get16(rx_store + block * 4096 + e * 2);
+        if (!(drop & (1U << e)) && !(lu == 0xFFFF && srx_erased(rx_store + block * 4096 + (1 + e) * 256, 256)))
+            h.kept_mask |= (uint16_t)(1U << e);
+    }
+    h.old_crc = srp_crc32(0, rx_store + block * 4096, 4096);
+    h.new_crc = srx_target(rx_store + block * 4096, drop, 12, RX_BLOCKS, block, target);
+    h.objects = 1;
+    h.object[0] = (srx_object_t){.obj = 5, .cls = SRP_CLASS_ATTENDANCE, .flags = SRX_OBJECT_CURSOR, .cursor_offset = 777};
+    snprintf(h.object[0].name, sizeof(h.object[0].name), "/pending.jsonl");
+    srx_encode(&h, target, sector);
+    static uint8_t scratch[4096];
+    assert(srx_write_record(&RX_IO, slot, sector, scratch));
+}
+
+static void redo_records(void)
+{
+    static uint8_t target[4096], expanded[4096], sector[4096], work[3 * 4096];
+    memset(rx_area, 0xFF, sizeof(rx_area));
+    rx_block(10, "uudurddfffffff" "f");
+    uint16_t drop = (1U << 2) | (1U << 5) | (1U << 6);
+    rx_record(0, 10, drop, 1, 0, 0x2760, target);
+    srx_record_t r;
+    memcpy(sector, rx_area, 4096);
+    assert(srx_decode(sector, &r, expanded) && !memcmp(expanded, target, 4096));
+    assert(r.block == 10 && r.kept_mask == ((1U << 0) | (1U << 1) | (1U << 3) | (1U << 4)) && r.objects == 1);
+    assert(!strcmp(r.object[0].name, "/pending.jsonl") && r.object[0].cursor_offset == 777);
+    assert(srx_kept_page(sector, &r, 3) == sector + 512 + 2 * 256 && !srx_kept_page(sector, &r, 2));
+    assert(srx_get16(target + 252) == srx_spiffs_magic(RX_BLOCKS, 10) && srx_get16(target + 254) == 12);
+    assert(srx_get16(target + 2 * 2) == 0xFFFF && srx_erased(target + 3 * 256, 256));
+    /* Torn header, torn page: invalid. */
+    sector[9] ^= 1;
+    assert(!srx_decode(sector, &r, NULL));
+    sector[9] ^= 1;
+    sector[600] ^= 1;
+    assert(!srx_decode(sector, &r, NULL));
+    /* Progress words. */
+    assert(srx_attempts_used(0xFFFFFFFFU) == 0 && srx_attempts_used(0xFFFFFFF8U) == 3);
+    assert(srx_clear_bits(&RX_IO, 0, SRX_OFF_ATTEMPTS, 1U));
+    memcpy(sector, rx_area, 4096);
+    assert(srx_decode(sector, &r, NULL) && srx_attempts_used(r.attempts) == 1 && !srx_is_source(&r));
+    /* Discovery: claimed or not. */
+    memset(rx_area + 3 * 4096, 0, 100);   /* a torn write in slot 3 */
+    srx_area_t area;
+    srx_discover(&RX_IO, true, sector, &area);
+    assert(area.state == SRX_AREA_READY && area.slots == 8 && area.slot[0] == SRX_SLOT_OPEN && area.slot[3] == SRX_SLOT_TORN);
+    assert(srx_slot_free(&area, 3) && !srx_slot_free(&area, 0) && srx_block_busy(&area, 10) && !srx_block_busy(&area, 11));
+    srx_discover(&RX_IO, false, sector, &area);
+    assert(area.state == SRX_AREA_FOREIGN && area.foreign == 1 && area.first_foreign == 3 && area.slot[0] == SRX_SLOT_OPEN);
+    memset(rx_area + 3 * 4096, 0xFF, 4096);
+
+    /* The decision table (C2, D4, D5). */
+    static uint8_t raw[4096];
+    memcpy(sector, rx_area, 4096);
+    assert(srx_decode(sector, &r, NULL));
+    memcpy(raw, rx_store + 10 * 4096, 4096);
+    assert(srx_decide(&r, raw, target, RX_BLOCKS, 0x2760, false) == SRX_ACT_REDO);          /* the old image */
+    assert(srx_decide(&r, raw, target, RX_BLOCKS, 0x2750, false) == SRX_ACT_SOURCE);        /* another image */
+    assert(srx_decide(&r, raw, target, RX_BLOCKS, 0x2760, true) == SRX_ACT_SOURCE);         /* the journal */
+    memcpy(raw, target, 4096);
+    assert(srx_decide(&r, raw, target, RX_BLOCKS, 0x2760, false) == SRX_ACT_REASSERT);      /* complete */
+    memset(raw, 0xFF, 4096);
+    assert(srx_decide(&r, raw, target, RX_BLOCKS, 0x2760, false) == SRX_ACT_REDO);          /* no magic */
+    put16_at(raw + 252, srx_spiffs_magic(RX_BLOCKS, 10));
+    assert(srx_decide(&r, raw, target, RX_BLOCKS, 0x2760, false) == SRX_ACT_CHANGED);       /* mounted since */
+    assert(srx_decide(&r, raw, NULL, RX_BLOCKS, 0x2760, false) == SRX_ACT_CHANGED);
+    /* Round 1 review, D3: the window's erase cut short with the magic
+     * reading valid (each byte of the block with its magic cleared erased or
+     * kept, bits only set): redone. The same with a page programmed since in
+     * an erased entry, or a kept byte cleared, or no kept byte left (a
+     * mount's erase): changed. */
+    for (unsigned trial = 0; trial < 64; ++trial) {
+        memcpy(raw, rx_store + 10 * 4096, 4096);
+        put16_at(raw + 252, 0);
+        uint32_t state = 0x9E3779B9U * (trial + 1);
+        for (uint32_t i = 0; i < 4096; ++i) {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            if (trial % 2 ? state & 1U : (state & 7U) == 0) raw[i] = 0xFF;
+            else if (trial % 4 == 3) raw[i] |= (uint8_t)state;    /* partly erased bits */
+        }
+        put16_at(raw + 252, srx_spiffs_magic(RX_BLOCKS, 10));
+        assert(srx_torn_erase(&r, raw, target) && srx_decide(&r, raw, target, RX_BLOCKS, 0x2760, false) == SRX_ACT_REDO);
+        assert(srx_decide(&r, raw, target, RX_BLOCKS, 0x2750, false) == SRX_ACT_SOURCE);
+        assert(srx_decide(&r, raw, target, RX_BLOCKS, 0x2760, true) == SRX_ACT_SOURCE);
+    }
+    memcpy(raw, rx_store + 10 * 4096, 4096);
+    memset(raw + 2048, 0xFF, 2048);
+    put16_at(raw + 252, srx_spiffs_magic(RX_BLOCKS, 10));
+    assert(srx_decide(&r, raw, target, RX_BLOCKS, 0x2760, false) == SRX_ACT_REDO);
+    raw[(1 + 9) * 256 + 7] = 0x12;                                                      /* an erased entry written */
+    assert(!srx_torn_erase(&r, raw, target) && srx_decide(&r, raw, target, RX_BLOCKS, 0x2760, false) == SRX_ACT_CHANGED);
+    memcpy(raw, rx_store + 10 * 4096, 4096);
+    put16_at(raw + 252, srx_spiffs_magic(RX_BLOCKS, 10));
+    raw[(1 + 0) * 256 + 40] &= 0x0F;                                                     /* a kept byte cleared */
+    assert(srx_decide(&r, raw, target, RX_BLOCKS, 0x2760, false) == SRX_ACT_CHANGED);
+    memset(raw, 0xFF, 4096);
+    put16_at(raw + 254, 13);
+    put16_at(raw + 252, srx_spiffs_magic(RX_BLOCKS, 10));
+    memset(raw + (1 + 2) * 256, 0x33, 256);                                             /* a dropped entry written */
+    put16_at(raw + 2 * 2, 9);
+    assert(!srx_torn_erase(&r, raw, target) && srx_decide(&r, raw, target, RX_BLOCKS, 0x2760, false) == SRX_ACT_CHANGED);
+    srx_record_t unconfirmed = r;
+    unconfirmed.flags |= SRX_FLAG_UNCONFIRMED;
+    assert(srx_decide(&unconfirmed, target, target, RX_BLOCKS, 0x2760, false) == SRX_ACT_SOURCE);
+    srx_record_t tired = r;
+    tired.attempts = 0xFFFFFFF0U;
+    memset(raw, 0xFF, 4096);
+    assert(srx_decide(&tired, raw, target, RX_BLOCKS, 0x2760, false) == SRX_ACT_EXHAUSTED);
+    srx_record_t done = r;
+    done.done = 0;
+    assert(srx_decide(&done, raw, target, RX_BLOCKS, 0x2760, false) == SRX_ACT_NONE);
+
+    /* Recovery: a cut left the block without magic, half erased. */
+    memset(rx_store + 10 * 4096, 0xFF, 2048);
+    srx_discover(&RX_IO, true, sector, &area);
+    assert(srx_recover(&RX_IO, RX_BLOCKS, 0x2760, false, work, &area) == 0);
+    assert(area.redone == 1 && area.slot[0] == SRX_SLOT_DONE && !memcmp(rx_store + 10 * 4096, target, 4096));
+    memcpy(sector, rx_area, 4096);
+    assert(srx_decode(sector, &r, NULL) && r.done != 0xFFFFFFFFU && srx_attempts_used(r.attempts) == 2);
+    /* Re-assert: the block is the target, done not yet programmed. */
+    memset(rx_area, 0xFF, sizeof(rx_area));
+    rx_block(11, "duddddudffffff" "f");
+    rx_record(1, 11, (1U << 2) | (1U << 3) | (1U << 4) | (1U << 5), 4, 0, 0x2760, target);
+    memcpy(rx_store + 11 * 4096, target, 4096);
+    srx_discover(&RX_IO, true, sector, &area);
+    assert(srx_recover(&RX_IO, RX_BLOCKS, 0x2760, false, work, &area) == 0 && area.reasserted == 1 &&
+           area.slot[1] == SRX_SLOT_DONE);
+    /* Another writer: a source, never redone, and sticky. */
+    memset(rx_area, 0xFF, sizeof(rx_area));
+    rx_block(12, "uuddufffffffff" "f");
+    rx_record(2, 12, (1U << 2) | (1U << 3), 5, 0, 0x2760, target);
+    rx_block(12, "uuuuuuufffffff" "f");                    /* mounted (erased) and written since */
+    static uint8_t now[4096];
+    memcpy(now, rx_store + 12 * 4096, 4096);
+    srx_discover(&RX_IO, true, sector, &area);
+    assert(srx_recover(&RX_IO, RX_BLOCKS, 0x2760, false, work, &area) == 0 && area.to_sources == 1 &&
+           area.slot[2] == SRX_SLOT_SOURCE && !memcmp(now, rx_store + 12 * 4096, 4096));
+    memset(rx_store + 12 * 4096 + 252, 0, 2);                /* a later GC erase torn: no magic now */
+    memcpy(now, rx_store + 12 * 4096, 4096);
+    srx_discover(&RX_IO, true, sector, &area);
+    assert(srx_recover(&RX_IO, RX_BLOCKS, 0x2760, false, work, &area) == 0 && area.redone == 0 &&
+           !memcmp(now, rx_store + 12 * 4096, 4096));
+    /* An unconfirmed image's record: a source whatever the block says. */
+    memset(rx_area, 0xFF, sizeof(rx_area));
+    rx_block(13, "ddudddffffffff" "f");
+    rx_record(0, 13, (1U << 0) | (1U << 1) | (1U << 3) | (1U << 4) | (1U << 5), 6, SRX_FLAG_UNCONFIRMED, 0x2760,
+              target);
+    memset(rx_store + 13 * 4096 + 252, 0, 2);
+    srx_discover(&RX_IO, true, sector, &area);
+    assert(srx_recover(&RX_IO, RX_BLOCKS, 0x2760, false, work, &area) == 0 && area.slot[0] == SRX_SLOT_SOURCE &&
+           area.redone == 0);
+    /* The attempts tally: four, then a source. */
+    memset(rx_area, 0xFF, sizeof(rx_area));
+    rx_block(14, "uuddufffffffff" "f");
+    rx_record(0, 14, (1U << 2) | (1U << 3), 7, 0, 0x2760, target);
+    assert(srx_clear_bits(&RX_IO, 0, SRX_OFF_ATTEMPTS, 0xFU));
+    memset(rx_store + 14 * 4096, 0xFF, 4096);
+    srx_discover(&RX_IO, true, sector, &area);
+    assert(srx_recover(&RX_IO, RX_BLOCKS, 0x2760, false, work, &area) == 0 && area.exhausted == 1 &&
+           area.slot[0] == SRX_SLOT_SOURCE);
+    /* A store write error leaves the record open for the caller. */
+    memset(rx_area, 0xFF, sizeof(rx_area));
+    rx_block(15, "uuddufffffffff" "f");
+    rx_record(0, 15, (1U << 2) | (1U << 3), 8, 0, 0x2760, target);
+    memset(rx_store + 15 * 4096 + 252, 0, 2);
+    rx_fail_store_write = 3;
+    rx_store_writes = 0;
+    srx_discover(&RX_IO, true, sector, &area);
+    assert(srx_recover(&RX_IO, RX_BLOCKS, 0x2760, false, work, &area) == 1 && area.slot[0] == SRX_SLOT_OPEN);
+    rx_fail_store_write = 0;
+    /* A block that never verifies: retried twice, left without magic, a source. */
+    rx_corrupt_after = 1;
+    rx_windows_open = 0;
+    srx_discover(&RX_IO, true, sector, &area);
+    assert(srx_recover(&RX_IO, RX_BLOCKS, 0x2760, false, work, &area) == 0 && area.slot[0] == SRX_SLOT_SOURCE &&
+           area.exhausted == 1 && rx_windows_open == 3);
+    assert(!srx_has_magic(rx_store + 15 * 4096, RX_BLOCKS, 15));
+    rx_corrupt_after = 0;
+    /* Settling: every kept entry settled retires it; a reported one keeps it. */
+    memcpy(sector, rx_area, 4096);
+    assert(srx_decode(sector, &r, NULL) && srx_is_source(&r) && !srx_retired(&r) && !srx_retained(&r));
+    assert(srx_clear_bits(&RX_IO, 0, SRX_OFF_SETTLE, (1U << 0) | (1U << 1) | (1U << 4)));
+    memcpy(sector, rx_area, 4096);
+    assert(srx_decode(sector, &r, NULL) && srx_retired(&r));
+    srx_discover(&RX_IO, true, sector, &area);
+    assert(area.slot[0] == SRX_SLOT_RETIRED && srx_slot_free(&area, 0));
+    memset(rx_area, 0xFF, sizeof(rx_area));
+    rx_record(0, 15, (1U << 2) | (1U << 3), 9, 0, 0x2760, target);
+    assert(srx_clear_bits(&RX_IO, 0, SRX_OFF_SETTLE, SRX_SETTLE_SOURCE | (1U << 0) | (1U << 1) | (1U << 20)));
+    memcpy(sector, rx_area, 4096);
+    assert(srx_decode(sector, &r, NULL) && !srx_retired(&r) && srx_retained(&r));
+    /* Round 2 review, R2-1: a block that would not verify is closed as
+     * SPIFFS's own erase leaves one (erased, the target's erase count, its
+     * magic last); recovery takes a closed block for another writer's (no
+     * kept byte left), never for a torn erase to redo. */
+    memset(rx_area, 0xFF, sizeof(rx_area));
+    rx_block(16, "uuddufffffffff" "f");
+    rx_record(0, 16, (1U << 2) | (1U << 3), 10, 0, 0x2760, target);
+    assert(srx_close_block(&RX_IO, 16, target, raw));
+    const uint8_t *closed = rx_store + 16 * 4096;
+    assert(srx_has_magic(closed, RX_BLOCKS, 16) && srx_get16(closed + 254) == srx_get16(target + 254) &&
+           srx_erased(closed, 252) && srx_erased(closed + 256, 4096 - 256));
+    memcpy(sector, rx_area, 4096);
+    assert(srx_decode(sector, &r, expanded) && !srx_torn_erase(&r, closed, expanded) &&
+           srx_decide(&r, closed, expanded, RX_BLOCKS, 0x2760, false) == SRX_ACT_CHANGED);
+    /* A close whose magic will not program: false, and the magic cleared
+     * again so that any mount erases the block. */
+    rx_block(17, "uuddufffffffff" "f");
+    rx_record(1, 17, (1U << 2) | (1U << 3), 11, 0, 0x2760, target);
+    rx_fail_store_write = 2; /* the erase count, then the magic */
+    rx_store_writes = 0;
+    assert(!srx_close_block(&RX_IO, 17, target, raw) && !srx_has_magic(rx_store + 17 * 4096, RX_BLOCKS, 17));
+    rx_fail_store_write = 0;
+    /* The reclaim journal and its NVS entries. */
+    srp_reclaim_t j = {.flags = SRP_RECLAIM_CLAIMED | SRP_RECLAIM_ACTIVE, .reclaim_id = 3};
+    srp_reclaim_seal(&j);
+    assert(srp_reclaim_valid(&j));
+    j.reclaim_id++;
+    assert(!srp_reclaim_valid(&j));
+    assert(sizeof(srp_reclaim_t) == 28 && srp_reclaim_entries_needed(false) == 4U * 3U && srp_reclaim_entries_needed(true) == 3U * 3U);
+    assert(!strcmp(srx_area_name(SRX_AREA_FOREIGN), "FOREIGN"));
+    /* The journal after recovery (C2). */
+    srp_reclaim_t k = {.flags = SRP_RECLAIM_CLAIMED | SRP_RECLAIM_ACTIVE};
+    assert(srx_journal_after_recovery(&k, false, 0, 0) && (k.flags & SRP_RECLAIM_SOURCES) && srp_reclaim_valid(&k));
+    assert(!srx_journal_after_recovery(&k, false, 0, 0) && srx_sources_unread(&k, false) && !srx_sources_unread(&k, true));
+    assert(srx_journal_after_recovery(&k, true, 0, 0) && k.flags == SRP_RECLAIM_CLAIMED);
+    assert(srx_journal_after_recovery(&k, true, 2, 0) && (k.flags & SRP_RECLAIM_SOURCES) && (k.flags & SRP_RECLAIM_ACTIVE));
+    srp_reclaim_t idle = {.flags = SRP_RECLAIM_CLAIMED};
+    assert(!srx_journal_after_recovery(&idle, false, 0, 0) && !srx_journal_after_recovery(&idle, true, 0, 0));
+    assert(!srx_sources_unread(&idle, false));
+    /* Round 1 review, low: HELD follows the inspected area's source records,
+     * so a later boot that cannot read the area knows bytes may be there. */
+    assert(srx_journal_after_recovery(&idle, true, 0, 3) && idle.flags == (SRP_RECLAIM_CLAIMED | SRP_RECLAIM_HELD));
+    assert(!srx_journal_after_recovery(&idle, false, 0, 0) && idle.flags == (SRP_RECLAIM_CLAIMED | SRP_RECLAIM_HELD));
+    assert(srx_sources_unread(&idle, false) && !srx_sources_unread(&idle, true));
+    assert(srx_journal_after_recovery(&idle, true, 0, 0) && idle.flags == SRP_RECLAIM_CLAIMED && srp_reclaim_valid(&idle));
+    srx_area_t held_area;
+    memset(&held_area, 0, sizeof(held_area));
+    held_area.slots = 4;
+    held_area.slot[1] = SRX_SLOT_SOURCE;
+    held_area.slot[2] = SRX_SLOT_RETIRED;
+    held_area.slot[3] = SRX_SLOT_SOURCE;
+    assert(srx_sources_left(&held_area) == 2);
 }
 
 int main(void)
@@ -410,6 +852,8 @@ int main(void)
     policy();
     budget();
     mirror();
+    redo_plan();
+    redo_records();
     puts("storage repair plan host tests passed");
     return 0;
 }

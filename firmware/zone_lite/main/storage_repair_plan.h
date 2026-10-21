@@ -101,7 +101,7 @@ typedef enum {
     SRP_GAP_RESTORE_INTERRUPTED,
     SRP_GAP_CONTENT_UNVERIFIED,     /* same size, different bytes after an interrupted run */
     SRP_GAP_CHECK_CHANGED,          /* the check altered held bytes it could not restore */
-    SRP_GAP_REFORMAT_INTERRUPTED,   /* reserved for a reformat; none in 2.7.5 */
+    SRP_GAP_REFORMAT_INTERRUPTED,   /* 2.7.6: a reformatted block's page whose file changed before it went back */
     SRP_GAP_UNHELD_LOST,            /* not held (budget) and changed by the check */
 } srp_gap_cause_t;
 
@@ -162,7 +162,7 @@ typedef enum {
     SRP_PHASE_CHECK,        /* SPIFFS_check running on the private mount */
     SRP_PHASE_RESTORE,      /* restoring held bytes the check changed */
     SRP_PHASE_FINISH,       /* tails, cursors, catalog, probes */
-    SRP_PHASE_REFORMAT,     /* reserved: no reformat is implemented in 2.7.5 */
+    SRP_PHASE_REFORMAT,     /* 2.7.6: a block reformatted in place (storage_repair_redo.h) */
 } srp_phase_t;
 const char *srp_phase_name(srp_phase_t phase);
 
@@ -252,6 +252,33 @@ bool srp_manifest_valid(const srp_manifest_t *manifest);
 uint32_t srp_nvs_entries_needed(bool state, bool gaps, bool resets, bool manifest);
 
 uint32_t srp_crc32(uint32_t crc, const void *data, size_t length);
+
+/* ZKT 2.7.6: the reclaim journal (NVS storage_repair/reclaim), a key older
+ * images ignore. CLAIMED: this device has written the redo area (a sector
+ * that is neither erased nor a valid record is then its own torn write, not
+ * foreign); never cleared. ACTIVE: a round may have records not yet done.
+ * SOURCES: records found open must become byte sources, never be redone (a
+ * boot could not inspect the area while a round was active, so the store
+ * may have been mounted since). HELD: the area holds byte sources not yet
+ * retired (round 1 review, low): a boot that cannot read it leaves the
+ * queues' unreadable bytes for one that can. */
+#define SRP_RECLAIM_VERSION 1U
+enum {
+    SRP_RECLAIM_CLAIMED = 1U << 0,
+    SRP_RECLAIM_ACTIVE = 1U << 1,
+    SRP_RECLAIM_SOURCES = 1U << 2,
+    SRP_RECLAIM_HELD = 1U << 3,
+};
+typedef struct {
+    uint32_t version, flags, reclaim_id, rounds, blocks, pages_freed;
+    uint32_t crc;
+} srp_reclaim_t;
+void srp_reclaim_seal(srp_reclaim_t *journal);
+bool srp_reclaim_valid(const srp_reclaim_t *journal);
+/* NVS entries a boot's reclaim journal writes need beyond
+ * srp_nvs_entries_needed: its creation when absent and three rewrites (active,
+ * idle, sources). */
+uint32_t srp_reclaim_entries_needed(bool journal);
 
 /* ---- policy -------------------------------------------------------- */
 typedef enum {

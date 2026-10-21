@@ -3488,6 +3488,18 @@ static void seen_cache_init(void)
     }
 }
 
+/* ZKT 2.7.6: the boot repair may forbid the mount this boot (a block its
+ * last-resort reformat left open that it could neither complete nor
+ * journal as a byte source: any mount would erase it). */
+static bool storage_mount_allowed(void)
+{
+#if defined(ZONE_LITE_STORAGE_REPAIR) && ZONE_LITE_STORAGE_REPAIR
+    return storage_repair_storage_allowed();
+#else
+    return true;
+#endif
+}
+
 static void storage_init(void)
 {
 #if defined(ZONE_LITE_STORAGE_REPAIR) && ZONE_LITE_STORAGE_REPAIR
@@ -3507,7 +3519,8 @@ static void storage_init(void)
         // erasing it would destroy the only offline copy of unsent punches.
         .format_if_mount_failed = false,
     };
-    esp_err_t spiffs_ret = esp_vfs_spiffs_register(&conf);
+    esp_err_t spiffs_ret = ESP_ERR_INVALID_STATE;
+    if (storage_mount_allowed()) spiffs_ret = esp_vfs_spiffs_register(&conf);
     if (spiffs_ret != ESP_OK) {
         ESP_LOGE(TAG, "Could not mount SPIFFS storage: %s", esp_err_to_name(spiffs_ret));
         led_status_fault(LED_STATUS_LOCAL_FAILURE);

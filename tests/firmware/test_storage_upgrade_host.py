@@ -81,6 +81,8 @@ int esp_partition_get_sha256(const esp_partition_t *p,uint8_t *out){
         "98855248bb4325103b5253ab4b15f4e939adf3ace89c208d463b09ec9ca21a6a":
         !strcmp(previous_app.version,"2.7.4")?
         "3e4bb613ab046df5ad29e4a1ab37fd801e1778e6b0d2c41c6604fe75bbea2fac":
+        !strcmp(previous_app.version,"2.7.5")?
+        "430e2daf29dd99ff006a476ff584e4201493d661cee67e4b4f9ba15545b17a40":
         "4b4aa0697551f527b48b58e95229cd21e362f6ba25398a2d46263bdbf289146b";
     for(unsigned i=0;i<32;++i){unsigned value=0;assert(sscanf(hex+2*i,"%2x",&value)==1);out[i]=(uint8_t)value;}
     if(failure==7)out[0]^=1;
@@ -134,16 +136,19 @@ int main(void)
     strcpy(previous_app.version,"2.6.14");assert(storage_upgrade_init());
     /* The 2.7 platform rolls back to the fleet's exact signed 2.6.15. */
     strcpy(previous_app.version,"2.6.15");assert(storage_upgrade_init());
-    assert(!strcmp(UG_DIRECT_VERSION,"2.7.5"));
-    assert(!strcmp(strstr(storage_upgrade_contract(),",2.6.15,"),",2.6.15,2.7.2,2.7.3,2.7.4"));
-    /* 2.7.5 also rolls back to 2.7.2 (3FL), 2.7.3 and 2.7.4 (their HIL
+    assert(!strcmp(UG_DIRECT_VERSION,"2.7.6"));
+    assert(!strcmp(strstr(storage_upgrade_contract(),",2.6.15,"),",2.6.15,2.7.2,2.7.3,2.7.4,2.7.5"));
+    /* 2.7.6 also rolls back to 2.7.2 (3FL), 2.7.3, 2.7.4 and 2.7.5 (their HIL
      * devices), and to no other 2.7 image: 2.7.1 with 2.7.2's digest is still
-     * refused, and so is a 2.7.5 in the other slot. */
+     * refused, so is 2.7.5 on other bytes, and so is a 2.7.6 in the other
+     * slot. */
     strcpy(previous_app.version,"2.7.2");assert(storage_upgrade_init());
     strcpy(previous_app.version,"2.7.3");assert(storage_upgrade_init());
     strcpy(previous_app.version,"2.7.4");assert(storage_upgrade_init());
+    strcpy(previous_app.version,"2.7.5");assert(storage_upgrade_init());
+    failure=7;assert(!storage_upgrade_init());failure=0;
     strcpy(previous_app.version,"2.7.1");assert(!storage_upgrade_init());
-    strcpy(previous_app.version,"2.7.5");assert(!storage_upgrade_init());
+    strcpy(previous_app.version,"2.7.6");assert(!storage_upgrade_init());
     strcpy(previous_app.version,"2.6.15");
     failure=7;assert(!storage_upgrade_init());failure=0;
     failure=6;assert(!storage_upgrade_init());failure=7;assert(!storage_upgrade_init());failure=0;

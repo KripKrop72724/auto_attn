@@ -1,4 +1,5 @@
-"""Repair power-cut damage against ESP-IDF's own SPIFFS on the host (ZKT 2.7.5).
+"""Repair power-cut damage against ESP-IDF's own SPIFFS on the host (ZKT 2.7.5,
+and 2.7.6's last-resort reformat).
 
 Builds tests/firmware/spiffs_repair_host.c with ESP-IDF 5.5.3's SPIFFS sources,
 the boot repair engine and the firmware's own legacy queue, file transaction
@@ -22,13 +23,14 @@ MAIN = ROOT / "firmware/zone_lite/main"
 HOST = ROOT / "tests/firmware"
 SPIFFS_SOURCES = ["spiffs_nucleus.c", "spiffs_gc.c", "spiffs_hydrogen.c", "spiffs_cache.c", "spiffs_check.c"]
 SHIMMED = ["legacy_queue.c", "file_transaction.c", "reliability.c", "command_inbox_merge.c"]
-PLAIN = ["durable_queue.c", "zkt_clock.c", "storage_repair_plan.c", "storage_repair_mirror.c"]
+PLAIN = ["durable_queue.c", "zkt_clock.c", "storage_repair_plan.c", "storage_repair_mirror.c", "storage_repair_redo.c"]
 FLAGS = ["-std=c11", "-D_POSIX_C_SOURCE=200809L", "-g", "-O1", "-fsanitize=address,undefined",
          "-fno-omit-frame-pointer"]
-# The CI run: 1 MiB stores, every scenario with several seeds, the special
-# and review runs and cuts inside the repair; more cut seeds; the simulator's
-# workload to a crammed store (odd seeds also retire and recreate the queue),
-# on the 8 MB store too; then the scenarios on the 8 MB store.
+# The CI run: 1 MiB stores, every scenario with several seeds, the special,
+# review and reclaim runs and cuts inside the repair; more cut seeds; the
+# simulator's workload to a crammed store (odd seeds also retire and recreate
+# the queue), on the 8 MB store too; then the scenarios and the reclaim runs
+# on the 8 MB store.
 CI_RUNS = [["--seeds=3", "--organic=0"], ["cuts", "--seeds=12", "--first-seed=3"],
            ["organic", "--organic=3", "--ticks=2500", "--first-seed=0"],
            ["organic", "--organic=3", "--ticks=2500", "--first-seed=3", "--gap=150"],
@@ -43,7 +45,24 @@ CI_RUNS = [["--seeds=3", "--organic=0"], ["cuts", "--seeds=12", "--first-seed=3"
            # at all; section 12 of the design): its rows are checked with room.
            ["organic", "--organic=1", "--ticks=3000", "--prefill=70", "--gap=2500", "--kib=8192", "--first-seed=3"],
            ["organic", "--organic=1", "--ticks=3000", "--prefill=70", "--gap=2500", "--kib=8192", "--first-seed=5"],
-           ["scenarios", "--seeds=1", "--kib=8192"]]
+           ["scenarios", "--seeds=1", "--kib=8192"],
+           # 2.7.6, the last resort (the first run takes it at 1 MiB): P02's
+           # store as 2.7.5 left it (2.7.5, released, must reproduce its
+           # report first), confirmed and unconfirmed; the redo area's states
+           # and records; a cut at every third write of the round (every one
+           # with REVIEW_FULL=1), through the old image and the released 2.7.5
+           # too; at 8 MiB sampled. A wedged organic store is now a failure.
+           ["reclaim-p02", "--kib=8192"],
+           ["reclaim-cuts", "--kib=8192"],
+           ["reclaim-rollback", "--kib=8192"],
+           ["reclaim-area", "--kib=8192"],
+           # The round 2 review of the implementation: a block that will not
+           # verify is closed and the round goes on, a record recovery left
+           # open is a source that boot, one gap record per range a boot
+           # finds, a source bit that will not take, sources across file
+           # generations (the cuts and rollback entries add a worn first
+           # window).
+           ["reclaim-round2", "--kib=8192"]]
 
 
 def spiffs_source_dir() -> Path | None:
@@ -74,6 +93,17 @@ def build(spiffs: Path, output: Path) -> Path:
         compile_one(MAIN / source, *strict)
     spiffs_includes = ["-fno-sanitize=alignment", "-I", str(config), "-I", str(spiffs)]
     compile_one(MAIN / "storage_repair_core.c", *strict, *spiffs_includes)
+    # The released 2.7.5 engine (byte-identical to 0954fd3), the old image of
+    # the 2.7.6 rollback runs: its own header first, its three public names
+    # renamed. Its structs are a prefix of 2.7.6's.
+    released = HOST / "fixtures/storage_repair_2_7_5"
+    renamed = ["-Dsrr_run=srr275_run", "-Dsrr_check_callback=srr275_check_callback",
+               "-Dsrr_result_name=srr275_result_name"]
+    target = output / "storage_repair_core_2_7_5.o"
+    subprocess.run([compiler, *FLAGS, "-Wall", "-Wextra", "-Werror", "-I", str(released), "-I", str(MAIN),
+                    *spiffs_includes, *renamed, "-c", str(released / "storage_repair_core.c"), "-o", str(target)],
+                   check=True)
+    objects.append(str(target))
     compile_one(HOST / "spiffs_repair_host.c", *strict, *spiffs_includes)
     binary = output / "spiffs-repair"
     subprocess.run([compiler, "-fsanitize=address,undefined", *objects, "-o", str(binary)], check=True)

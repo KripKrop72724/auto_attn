@@ -42,3 +42,7 @@ bool srm_init(srm_mirror_t *mirror, const srm_flash_t *flash, uint32_t size, uin
 bool srm_read(srm_mirror_t *mirror, uint32_t address, void *buffer, uint32_t length);
 bool srm_write(srm_mirror_t *mirror, uint32_t address, const void *buffer, uint32_t length);
 bool srm_erase(srm_mirror_t *mirror, uint32_t address, uint32_t length);
+/* ZKT 2.7.6: the mirrored bytes of [address, address + length) read again
+ * from flash (after writes whose result the caller verified on raw flash:
+ * a program that reported success may not have stuck). */
+bool srm_refresh(srm_mirror_t *mirror, uint32_t address, uint32_t length);

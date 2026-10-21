@@ -8,6 +8,7 @@
 #include "add_connector.h"
 #include "boot_report.h"
 #include "esp_app_desc.h"
+#include "esp_flash.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_memory_utils.h"
@@ -25,6 +26,7 @@
 #include "spiffs_nucleus.h"
 #include "storage_repair_core.h"
 #include "storage_repair_mirror.h"
+#include "storage_repair_redo.h"
 
 static const char *TAG = "storage_repair";
 
@@ -48,6 +50,24 @@ static const char *TAG = "storage_repair";
  * soft deadline): with the metadata mirror, and reading flash. */
 #define SR_CHECK_MS_PER_MIB_MIRROR 4000U
 #define SR_CHECK_MS_PER_MIB_FLASH 8000U
+/* 2.7.6: the redo area, the 384 KiB past the last partition of the 16 MiB
+ * chip (storage ends at 0xFA0000); reached only through a partition handle
+ * registered for exactly that range. */
+#define SR_REDO_OFFSET 0xFA0000U
+#define SR_REDO_BYTES 0x60000U
+#define SR_CHIP_BYTES 0x1000000U
+#define SR_REDO_SUBTYPE 0x99
+/* While a block's window is open (its magic cleared, not yet programmed
+ * back) the hard deadline waits once, this long, before it restarts. */
+#define SR_WINDOW_GRACE_US 2000000LL
+/* The redo records and the round hold Zone Lite's SPIFFS geometry: 256-byte
+ * pages in 4 KiB blocks, with SPIFFS's length magic (round 1 review, low 5;
+ * the engine checks the mounted geometry again before any round). */
+_Static_assert(CONFIG_SPIFFS_PAGE_SIZE == SRX_PAGE, "the redo records hold 256-byte SPIFFS pages");
+_Static_assert(SRX_BLOCK == 4096U && SRX_ENTRIES + 1U == SRX_BLOCK / SRX_PAGE, "the redo records hold 4 KiB blocks");
+#if !defined(CONFIG_SPIFFS_USE_MAGIC) || !defined(CONFIG_SPIFFS_USE_MAGIC_LENGTH)
+#error "the redo records assume SPIFFS's length magic"
+#endif
 
 typedef struct {
     char level[6], code[40], message[200];
@@ -70,6 +90,10 @@ static atomic_uint s_records_pending, s_records_acked;
 static atomic_bool s_damage_noted;
 
 static const esp_partition_t *s_partition;
+static const esp_partition_t *s_redo;
+static srx_area_t s_area;
+static bool s_mount_blocked;
+static atomic_bool s_window_open, s_deadline_deferred;
 static uint8_t *s_bounce;
 static srm_mirror_t s_mirror_state;
 static int64_t s_last_yield_us, s_soft_deadline_us;
@@ -131,6 +155,60 @@ static bool raw_erase(void *context, uint32_t address, uint32_t length)
     maybe_yield();
     return esp_partition_erase_range(s_partition, address, length) == ESP_OK;
 }
+
+/* The redo area through the same bounce buffer; nothing when it is not
+ * registered. */
+static bool area_read(void *context, uint32_t address, void *buffer, uint32_t length)
+{
+    (void)context;
+    if (!s_redo || !s_bounce) return false;
+    maybe_yield();
+    uint8_t *out = buffer;
+    while (length) {
+        uint32_t n = length < SR_BOUNCE_BYTES ? length : SR_BOUNCE_BYTES;
+        if (esp_partition_read(s_redo, address, s_bounce, n) != ESP_OK) return false;
+        memcpy(out, s_bounce, n);
+        out += n;
+        address += n;
+        length -= n;
+    }
+    return true;
+}
+
+static bool area_write(void *context, uint32_t address, const void *buffer, uint32_t length)
+{
+    (void)context;
+    if (!s_redo || !s_bounce) return false;
+    maybe_yield();
+    const uint8_t *in = buffer;
+    while (length) {
+        uint32_t n = length < SR_BOUNCE_BYTES ? length : SR_BOUNCE_BYTES;
+        memcpy(s_bounce, in, n);
+        if (esp_partition_write(s_redo, address, s_bounce, n) != ESP_OK) return false;
+        in += n;
+        address += n;
+        length -= n;
+    }
+    return true;
+}
+
+static bool area_erase(void *context, uint32_t address, uint32_t length)
+{
+    (void)context;
+    if (!s_redo) return false;
+    maybe_yield();
+    return esp_partition_erase_range(s_redo, address, length) == ESP_OK;
+}
+
+static void port_window(void *context, bool open);
+static void port_log(void *context, const char *level, const char *code, const char *message);
+
+/* The redo area for the engine and the boot recovery; the store raw. */
+static const srx_io_t REDO_IO = {
+    .area_size = SR_REDO_BYTES, .area_read = area_read, .area_write = area_write, .area_erase = area_erase,
+    .store_read = raw_read, .store_write = raw_write, .store_erase = raw_erase, .window = port_window,
+    .log = port_log,
+};
 
 static s32_t hal_read(spiffs *fs, u32_t addr, u32_t size, u8_t *dst)
 {
@@ -251,6 +329,45 @@ static void port_phase(void *context, srp_phase_t phase, uint32_t pass, bool wri
     led_status_set(writing ? LED_STATUS_STORAGE_REPAIR : LED_STATUS_BOOTING);
 }
 
+/* ---- 2.7.6: the last resort's ports -------------------------------------- */
+/* The private mount, at file scope: the engine remounts it after a round. */
+static esp_spiffs_t s_efs;
+static spiffs s_fs;
+static uint8_t *s_work, *s_fds, *s_cache;
+static size_t s_fds_bytes, s_cache_bytes;
+
+static bool port_raw_read(void *context, uint32_t address, void *buffer, uint32_t length)
+{
+    return raw_read(context, address, buffer, length);
+}
+
+static void port_refresh(void *context, uint32_t address, uint32_t length)
+{
+    (void)context;
+    if (s_mirror) (void)srm_refresh(&s_mirror_state, address, length);
+}
+
+static bool port_remount(void *context)
+{
+    (void)context;
+    SPIFFS_unmount(&s_fs);
+    return SPIFFS_mount(&s_fs, &s_efs.cfg, s_work, s_fds, s_fds_bytes, s_cache, s_cache_bytes, srr_check_callback) ==
+        SPIFFS_OK;
+}
+
+static void port_window(void *context, bool open)
+{
+    (void)context;
+    atomic_store(&s_window_open, open);
+}
+
+static int32_t port_nvs_available(void *context)
+{
+    (void)context;
+    nvs_stats_t stats;
+    return nvs_get_stats(NULL, &stats) == ESP_OK ? (int32_t)stats.available_entries : -1;
+}
+
 static const srr_ports_t PORTS = {
     .alloc = port_alloc,
     .release = port_release,
@@ -263,6 +380,12 @@ static const srr_ports_t PORTS = {
     .nvs_store = port_nvs_store,
     .nvs_erase = port_nvs_erase,
     .phase = port_phase,
+    .redo = &REDO_IO,
+    .raw_read = port_raw_read,
+    .refresh = port_refresh,
+    .remount = port_remount,
+    .window = port_window,
+    .nvs_available = port_nvs_available,
 };
 
 /* ---- the deadline ---------------------------------------------------- */
@@ -273,6 +396,12 @@ static const srr_ports_t PORTS = {
 static void deadline_expired(void *argument)
 {
     (void)argument;
+    /* 2.7.6: inside a block's window (its magic cleared, not yet programmed
+     * back) the restart waits once, at most 2 s: on the same image the next
+     * boot would redo the block, but a window is never cut on purpose. */
+    if (atomic_load(&s_window_open) && !atomic_exchange(&s_deadline_deferred, true) &&
+        esp_timer_start_once(s_deadline_timer, SR_WINDOW_GRACE_US) == ESP_OK)
+        return;
     boot_report_repair(s_phase, s_pass, true);
     esp_restart();
 }
@@ -335,8 +464,10 @@ static srr_config_t boot_config(void)
     /* A failure is the repair's only when the previous boot's breadcrumb
      * shows it had not returned when the crash or watchdog came, or that its
      * deadline fired: an unrelated crash after a stopped run is not. */
+    /* 2.7.6 (review D5): a brownout that ends a repair counts too: an erase
+     * that pulls the supply down every boot must not loop forever. */
     bool crash = reason == ESP_RST_PANIC || reason == ESP_RST_INT_WDT || reason == ESP_RST_TASK_WDT ||
-        reason == ESP_RST_WDT || reason == ESP_RST_CPU_LOCKUP;
+        reason == ESP_RST_WDT || reason == ESP_RST_CPU_LOCKUP || reason == ESP_RST_BROWNOUT;
     config.previous_failed = s_previous_known && (s_previous_deadline || (crash && !s_previous_returned));
     const esp_app_desc_t *app = esp_app_get_description();
     if (app) memcpy(&config.image_tag, app->app_elf_sha256, sizeof(config.image_tag));
@@ -355,6 +486,102 @@ static srr_config_t boot_config(void)
     return config;
 }
 
+/* ---- 2.7.6: the redo area ------------------------------------------------ */
+/* Proven unused (the chip is 16 MiB, no partition of the table reaches past
+ * 0xFA0000), then registered for exactly that range, which also proves no
+ * overlap. Deregistered before storage_repair_boot returns. */
+static srx_area_state_t redo_register(void)
+{
+    uint32_t physical = 0;
+    if (!esp_flash_default_chip || esp_flash_get_physical_size(esp_flash_default_chip, &physical) != ESP_OK ||
+        physical < SR_CHIP_BYTES || esp_flash_default_chip->size < SR_CHIP_BYTES)
+        return SRX_AREA_ABSENT;
+    bool clear = true;
+    esp_partition_iterator_t it = esp_partition_find(ESP_PARTITION_TYPE_ANY, ESP_PARTITION_SUBTYPE_ANY, NULL);
+    for (; it; it = esp_partition_next(it)) {
+        const esp_partition_t *partition = esp_partition_get(it);
+        if (partition->address + partition->size > SR_REDO_OFFSET) clear = false;
+    }
+    esp_partition_iterator_release(it);
+    if (!clear) return SRX_AREA_ABSENT;
+    /* The store's blocks are the records' (low 5). */
+    if (!s_partition || s_partition->erase_size != SRX_BLOCK || s_partition->size % SRX_BLOCK) return SRX_AREA_ABSENT;
+    if (esp_partition_register_external(NULL, SR_REDO_OFFSET, SR_REDO_BYTES, "srp_redo", ESP_PARTITION_TYPE_DATA,
+                                        (esp_partition_subtype_t)SR_REDO_SUBTYPE, &s_redo) != ESP_OK) {
+        s_redo = NULL;
+        return SRX_AREA_OVERLAP;
+    }
+    return SRX_AREA_READY;
+}
+
+/* Every boot, in every mode, before anything mounts the store (reviews D1,
+ * C2, M1): the area read, every record a reset left open completed on raw
+ * flash (or made a byte source), the reclaim journal updated. A round that
+ * may have open records nobody could inspect makes them sources for later
+ * boots; when even that cannot be journaled the store stays unmounted.
+ * Without the deadline (`timed` false) nothing is written to the store or
+ * the area: open records go to the journal as sources, as for an area that
+ * cannot be read (round 1 review, low 2). The breadcrumb names the reformat
+ * only while recovery acts on an open record. */
+static void redo_recover(srr_config_t *config, bool timed)
+{
+    memset(&s_area, 0, sizeof(s_area));
+    srp_reclaim_t journal;
+    bool have = port_nvs_load(NULL, SRR_NVS_NAMESPACE, "reclaim", &journal, sizeof(journal)) == 1 &&
+        srp_reclaim_valid(&journal);
+    if (!have) memset(&journal, 0, sizeof(journal));
+    srx_area_state_t state = redo_register();
+    uint8_t *work = state == SRX_AREA_READY ? heap_caps_malloc(3U * SRX_BLOCK, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
+                                            : NULL;
+    bool inspected = false;
+    uint32_t open = 0;
+    if (state != SRX_AREA_READY) {
+        s_area.state = state;
+    } else if (!work || !s_bounce) {
+        s_area.state = SRX_AREA_NO_MEMORY;
+    } else {
+        srx_discover(&REDO_IO, have && (journal.flags & SRP_RECLAIM_CLAIMED), work, &s_area);
+        inspected = timed && (s_area.state == SRX_AREA_READY || s_area.state == SRX_AREA_FOREIGN);
+        uint32_t records_open = 0;
+        for (uint32_t s = 0; s < s_area.slots; ++s) records_open += s_area.slot[s] == SRX_SLOT_OPEN;
+        if (inspected && records_open) {
+            boot_report_repair(SRP_PHASE_REFORMAT, 0, false);
+            open = srx_recover(&REDO_IO, s_partition->size / SRX_BLOCK, config->image_tag,
+                               have && (journal.flags & SRP_RECLAIM_SOURCES), work, &s_area);
+        }
+    }
+    heap_caps_free(work);
+    /* Also without a journal (NVS lost it): records left open, or sources,
+     * get one, so no later boot redoes an open record after this boot's
+     * mount (round 2 review, R2-2). */
+    if (srx_journal_after_recovery(&journal, inspected, open, srx_sources_left(&s_area)) &&
+        !port_nvs_store(NULL, SRR_NVS_NAMESPACE, "reclaim", &journal, sizeof(journal)) &&
+        (journal.flags & SRP_RECLAIM_SOURCES)) {
+        s_mount_blocked = true;
+        queue_line("ERROR", "STORAGE_REPAIR_RECLAIM_SOURCES",
+                   "an interrupted reformat could not be journaled; the store stays unmounted this boot");
+    }
+    /* Byte sources this boot cannot read: the queues' unreadable bytes wait
+     * for a boot that can (round 1 review, low). */
+    config->sources_unread = have && srx_sources_unread(&journal, inspected);
+    config->area = &s_area;
+}
+
+bool storage_repair_storage_allowed(void) { return !s_mount_blocked; }
+
+/* The area as discovery and recovery left it, for a boot no run reported. */
+static void note_area(void)
+{
+    if (s_report.runs) return;
+    s_report.reclaim.area = (uint8_t)s_area.state;
+    s_report.reclaim.area_foreign = s_area.foreign;
+    s_report.reclaim.area_first_foreign = s_area.first_foreign;
+    s_report.reclaim.area_foreign_crc = s_area.foreign_crc;
+    s_report.reclaim.redone = s_area.redone + s_area.reasserted;
+    s_report.reclaim.sources = s_area.to_sources;
+    s_report.reclaim.failed = s_area.failed;
+}
+
 /* ---- the run --------------------------------------------------------- */
 void storage_repair_boot(void)
 {
@@ -371,45 +598,60 @@ void storage_repair_boot(void)
         return;
     }
     srr_config_t config = boot_config();
+    /* Internal: the bounce buffer every transfer of the store and of the redo
+     * area goes through. */
+    s_bounce = heap_caps_malloc(SR_BOUNCE_BYTES, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     int64_t limit = config.pending_verify ? SR_DEADLINE_PENDING_US : SR_DEADLINE_CONFIRMED_US;
     const esp_timer_create_args_t timer = {.callback = deadline_expired, .name = "repair_deadline"};
-    if (esp_timer_create(&timer, &s_deadline_timer) != ESP_OK ||
-        esp_timer_start_once(s_deadline_timer, (uint64_t)limit) != ESP_OK) {
-        /* No deadline, no run: a hang here could never roll back. */
+    bool timed = esp_timer_create(&timer, &s_deadline_timer) == ESP_OK &&
+        esp_timer_start_once(s_deadline_timer, (uint64_t)limit) == ESP_OK;
+    s_last_yield_us = esp_timer_get_time();
+    s_soft_deadline_us = s_last_yield_us + limit - SR_SOFT_MARGIN_US;
+    /* 2.7.6: a block a reset left half reformatted is completed first, on raw
+     * flash, whatever else this boot can or cannot do (with the deadline). */
+    redo_recover(&config, timed);
+    if (!timed) {
+        /* No deadline, no run: a hang here could never roll back. Nothing was
+         * written to the store or the area. */
         ESP_LOGE(TAG, "deadline timer unavailable; storage repair skipped");
         s_report.result = SRR_RESULT_NOT_RUN;
         snprintf(s_report.error_stage, sizeof(s_report.error_stage), "deadline");
+        if (s_deadline_timer) (void)esp_timer_delete(s_deadline_timer);
+        s_deadline_timer = NULL;
+        heap_caps_free(s_bounce);
+        s_bounce = NULL;
+        if (s_redo) (void)esp_partition_deregister_external(s_redo);
+        s_redo = NULL;
+        note_area();
         /* Records an earlier run left still go to ADD. */
         count_records();
+        /* This boot's repair is over: a crash later in it is not the
+         * repair's (round 1 review, low 2). */
+        boot_report_repair_returned();
         return;
     }
-    s_last_yield_us = esp_timer_get_time();
-    s_soft_deadline_us = s_last_yield_us + limit - SR_SOFT_MARGIN_US;
     boot_report_repair(SRP_PHASE_SURVEY, 0, false);
 
-    /* Internal: the bounce buffer, SPIFFS's own buffers and the lock (flash
-     * operations cannot run from PSRAM stacks or need internal buffers). */
-    uint32_t page = CONFIG_SPIFFS_PAGE_SIZE, block = 4096U;
-    static esp_spiffs_t efs;
-    static spiffs fs;
-    memset(&efs, 0, sizeof(efs));
-    memset(&fs, 0, sizeof(fs));
-    size_t fds_bytes = SR_FD_COUNT * sizeof(spiffs_fd);
-    size_t cache_bytes = sizeof(spiffs_cache) + SR_FD_COUNT * (sizeof(spiffs_cache_page) + page);
-    s_bounce = heap_caps_malloc(SR_BOUNCE_BYTES, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    uint8_t *work = heap_caps_calloc(1, page * 2, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    uint8_t *fds = heap_caps_calloc(1, fds_bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    uint8_t *cache = heap_caps_calloc(1, cache_bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    efs.lock = xSemaphoreCreateMutex();
-    efs.partition = s_partition;
-    efs.fs = &fs;
+    /* Internal: SPIFFS's own buffers and the lock (flash operations cannot
+     * run from PSRAM stacks or need internal buffers). */
+    uint32_t page = CONFIG_SPIFFS_PAGE_SIZE, block = SRX_BLOCK;
+    memset(&s_efs, 0, sizeof(s_efs));
+    memset(&s_fs, 0, sizeof(s_fs));
+    s_fds_bytes = SR_FD_COUNT * sizeof(spiffs_fd);
+    s_cache_bytes = sizeof(spiffs_cache) + SR_FD_COUNT * (sizeof(spiffs_cache_page) + page);
+    s_work = heap_caps_calloc(1, page * 2, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    s_fds = heap_caps_calloc(1, s_fds_bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    s_cache = heap_caps_calloc(1, s_cache_bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    s_efs.lock = xSemaphoreCreateMutex();
+    s_efs.partition = s_partition;
+    s_efs.fs = &s_fs;
     /* The metadata mirror first: it turns the check's 2.1 M header reads
      * into PSRAM copies, and is counted against the budget before holds. */
     size_t lookup_bytes = srm_lookup_bytes(s_partition->size, block, page);
     size_t header_bytes = srm_header_bytes(s_partition->size, page);
     uint8_t *lookup = heap_caps_malloc(lookup_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     uint8_t *headers = heap_caps_malloc(header_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    bool ready = s_bounce && work && fds && cache && efs.lock;
+    bool ready = s_bounce && s_work && s_fds && s_cache && s_efs.lock && !s_mount_blocked;
     if (ready && lookup && headers) {
         const srm_flash_t raw = {NULL, raw_read, raw_write, raw_erase};
         uint8_t *scratch = heap_caps_malloc(block, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
@@ -434,29 +676,37 @@ void storage_repair_boot(void)
      * from PSRAM; without it every one is a flash read. */
     config.check_ms_per_mib = s_mirror ? SR_CHECK_MS_PER_MIB_MIRROR : SR_CHECK_MS_PER_MIB_FLASH;
     if (ready) {
-        efs.cfg.hal_read_f = hal_read;
-        efs.cfg.hal_write_f = hal_write;
-        efs.cfg.hal_erase_f = hal_erase;
-        efs.cfg.log_block_size = block;
-        efs.cfg.log_page_size = page;
-        efs.cfg.phys_addr = 0;
-        efs.cfg.phys_erase_block = block;
-        efs.cfg.phys_size = s_partition->size;
-        fs.user_data = &efs;
-        s32_t mounted = SPIFFS_mount(&fs, &efs.cfg, work, fds, fds_bytes, cache, cache_bytes, srr_check_callback);
+        s_efs.cfg.hal_read_f = hal_read;
+        s_efs.cfg.hal_write_f = hal_write;
+        s_efs.cfg.hal_erase_f = hal_erase;
+        s_efs.cfg.log_block_size = block;
+        s_efs.cfg.log_page_size = page;
+        s_efs.cfg.phys_addr = 0;
+        s_efs.cfg.phys_erase_block = block;
+        s_efs.cfg.phys_size = s_partition->size;
+        s_fs.user_data = &s_efs;
+        s32_t mounted = SPIFFS_mount(&s_fs, &s_efs.cfg, s_work, s_fds, s_fds_bytes, s_cache, s_cache_bytes,
+                                     srr_check_callback);
         if (mounted == SPIFFS_OK) {
-            srr_run(&fs, &config, &PORTS, &s_report);
-            SPIFFS_unmount(&fs);
+            srr_run(&s_fs, &config, &PORTS, &s_report);
+            SPIFFS_unmount(&s_fs);
+            /* A failed block's record nothing durable marks a source (round 2
+             * review, R2-4): the store is not written this boot. */
+            if (s_report.reclaim.store_blocked) s_mount_blocked = true;
         } else {
             s_mount_failed = true;
-            s_mount_error = SPIFFS_errno(&fs);
+            s_mount_error = SPIFFS_errno(&s_fs);
             ESP_LOGE(TAG, "private mount failed %" PRId32 "; nothing repaired", s_mount_error);
             queue_line("ERROR", "STORAGE_REPAIR_MOUNT_FAILED", "the storage partition would not mount; nothing repaired");
         }
+    } else if (s_mount_blocked) {
+        snprintf(s_report.error_stage, sizeof(s_report.error_stage), "unmounted");
+        s_report.result = SRR_RESULT_NOT_RUN;
     } else {
         snprintf(s_report.error_stage, sizeof(s_report.error_stage), "internal_memory");
         s_report.result = SRR_RESULT_FAILED;
     }
+    note_area();
     (void)esp_timer_stop(s_deadline_timer);
     (void)esp_timer_delete(s_deadline_timer);
     s_deadline_timer = NULL;
@@ -464,12 +714,15 @@ void storage_repair_boot(void)
     heap_caps_free(lookup);
     heap_caps_free(headers);
     s_mirror_state.lookup = s_mirror_state.headers = NULL;
-    heap_caps_free(cache);
-    heap_caps_free(fds);
-    heap_caps_free(work);
+    heap_caps_free(s_cache);
+    heap_caps_free(s_fds);
+    heap_caps_free(s_work);
+    s_cache = s_fds = s_work = NULL;
     heap_caps_free(s_bounce);
     s_bounce = NULL;
-    if (efs.lock) vSemaphoreDelete(efs.lock);
+    if (s_efs.lock) vSemaphoreDelete(s_efs.lock);
+    if (s_redo) (void)esp_partition_deregister_external(s_redo);
+    s_redo = NULL;
     s_stack_free = (uint32_t)uxTaskGetStackHighWaterMark(NULL);
     s_internal_after = (uint32_t)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
     nvs_entries(&s_nvs_free_after, &s_nvs_available_after);
@@ -625,7 +878,8 @@ static bool add_actions(cJSON *row, uint16_t actions)
     } names[] = {{SRR_FILE_NORMALIZED, "NORMALIZED"}, {SRR_FILE_GAPS, "GAPS"}, {SRR_FILE_RESTORED, "RESTORED"},
                  {SRR_FILE_REBUILT, "REBUILT"}, {SRR_FILE_TAIL, "TAIL_TERMINATED"},
                  {SRR_FILE_CURSOR_RESET, "CURSOR_RESET"}, {SRR_FILE_REMOVED, "REMOVED"}, {SRR_FILE_UNHELD, "UNHELD"},
-                 {SRR_FILE_SIZE_RECOVERED, "SIZE_RECOVERED"}, {SRR_FILE_SUPERSEDED, "SUPERSEDED"}};
+                 {SRR_FILE_SIZE_RECOVERED, "SIZE_RECOVERED"}, {SRR_FILE_SUPERSEDED, "SUPERSEDED"},
+                 {SRR_FILE_REDO_SOURCE, "REDO_SOURCE"}};
     cJSON *list = cJSON_AddArrayToObject(row, "actions");
     if (!list) return false;
     unsigned listed = 0;
@@ -726,6 +980,35 @@ bool storage_repair_append(cJSON *storage)
         cJSON_AddNumberToObject(check, "deleted_live_files", r->check_deleted_live) &&
         cJSON_AddNumberToObject(check, "errors", r->check_errors) &&
         cJSON_AddNumberToObject(check, "last_error", r->check_last_error);
+    /* 2.7.6: the last resort, every boot (the area's state at least). */
+    const srr_reclaim_report_t *x = &r->reclaim;
+    cJSON *reclaim = ok ? cJSON_AddObjectToObject(repair, "reclaim") : NULL;
+    ok = reclaim && cJSON_AddNumberToObject(repair, "runs", r->runs) &&
+        cJSON_AddStringToObject(reclaim, "area", srx_area_name((srx_area_state_t)x->area)) &&
+        cJSON_AddNumberToObject(reclaim, "rounds", x->rounds) && cJSON_AddNumberToObject(reclaim, "blocks", x->blocks) &&
+        cJSON_AddNumberToObject(reclaim, "pages_freed", x->pages_freed) &&
+        cJSON_AddNumberToObject(reclaim, "pages_kept", x->pages_kept) &&
+        cJSON_AddNumberToObject(reclaim, "erased_after", x->erased_after) &&
+        cJSON_AddNumberToObject(reclaim, "redone", x->redone) && cJSON_AddNumberToObject(reclaim, "sources", x->sources) &&
+        cJSON_AddNumberToObject(reclaim, "settled", x->settled) &&
+        cJSON_AddNumberToObject(reclaim, "reported", x->reported) &&
+        cJSON_AddNumberToObject(reclaim, "records_open", x->records_open) &&
+        cJSON_AddNumberToObject(reclaim, "failed", x->failed) &&
+        cJSON_AddNumberToObject(reclaim, "held_mismatch", x->held_mismatch) &&
+        cJSON_AddNumberToObject(reclaim, "ms", x->ms);
+    if (ok && x->wanted)
+        ok = cJSON_AddStringToObject(reclaim, "trigger", x->trigger) &&
+            (!x->short_reason[0] || cJSON_AddStringToObject(reclaim, "short", x->short_reason)) &&
+            cJSON_AddNumberToObject(reclaim, "candidates", x->candidates) &&
+            cJSON_AddNumberToObject(reclaim, "unconfirmed_blocks", x->unconfirmed_blocks) &&
+            cJSON_AddNumberToObject(reclaim, "custody_blocks", x->custody_blocks) &&
+            cJSON_AddNumberToObject(reclaim, "index_blocks", x->index_blocks) &&
+            cJSON_AddNumberToObject(reclaim, "excluded_blocks", x->excluded_blocks) &&
+            cJSON_AddNumberToObject(reclaim, "low_magic_blocks", x->low_magic_blocks);
+    if (ok && x->area == SRX_AREA_FOREIGN)
+        ok = cJSON_AddNumberToObject(reclaim, "area_foreign_sectors", x->area_foreign) &&
+            cJSON_AddNumberToObject(reclaim, "area_first_foreign", x->area_first_foreign) &&
+            cJSON_AddNumberToObject(reclaim, "area_foreign_crc", x->area_foreign_crc);
     cJSON *files = ok ? cJSON_AddArrayToObject(repair, "entries") : NULL;
     if (!files) return false;
     for (uint32_t i = 0; i < r->file_count && i < SRR_REPORT_FILES; ++i) {

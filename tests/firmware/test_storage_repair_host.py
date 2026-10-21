@@ -1,7 +1,9 @@
-"""ZKT 2.7.5: the custody-first boot storage repair.
+"""ZKT 2.7.5: the custody-first boot storage repair; 2.7.6: its last-resort
+in-place reformat.
 
-The decisions that need no filesystem and the metadata mirror run with plain
-cc in every test shard. The engine runs against ESP-IDF 5.5.3's own SPIFFS with
+The decisions that need no filesystem, the metadata mirror and the redo
+records (codec, block plan, writer, boot recovery) run with plain cc in every
+test shard. The engine runs against ESP-IDF 5.5.3's own SPIFFS with
 power cuts (tools/check_spiffs_repair.py); CI's firmware-production job runs it
 in espressif/idf:v5.5.3, and here it runs wherever the ESP-IDF sources are."""
 from pathlib import Path
@@ -32,7 +34,7 @@ def test_plan_and_mirror(tmp_path: Path) -> None:
     executable = tmp_path / "storage-repair-plan"
     subprocess.run([compiler, *FLAGS, "-I", str(MAIN), str(ROOT / "tests/firmware/storage_repair_plan_host.c"),
                     *(str(MAIN / name) for name in ("storage_repair_plan.c", "storage_repair_mirror.c",
-                                                     "legacy_queue.c", "durable_queue.c", "reliability.c",
+                                                     "storage_repair_redo.c", "legacy_queue.c", "durable_queue.c", "reliability.c",
                                                      "zkt_clock.c")),
                     "-o", str(executable)], check=True)
     result = subprocess.run([str(executable)], capture_output=True, text=True)
@@ -49,6 +51,36 @@ def test_repair_against_esp_idf_spiffs_with_power_cuts(tmp_path: Path) -> None:
     output = tool.run(binary, ["--seeds=2", "--organic=2", "--ticks=1200"])
     assert "cuts inside the repair" in output and "mirror equivalence passed" in output
     assert "0 committed rows lost" in output
+    # 2.7.6: P02's store reformatted in place, confirmed and unconfirmed,
+    # with cuts in the round and through the old image.
+    assert "p02 1024 KiB unconfirmed: 2.7.5 DEFERRED (full, 1 page needed, 0 erased" in output and "through the old image" in output
+    assert "reclaim mirror equivalence passed" in output
+    # The round 1 review of the implementation: records keep only verified
+    # cursors and an offset never settles bytes the file can get back (D1);
+    # a boot without the area leaves them alone (low); a restore short of
+    # room waits for the round (D2); a torn erase reading a valid magic is
+    # redone (D3); sources without memory fail the run (low 6); the boot's
+    # report covers every run (low 1); the remount keeps the mirror (low 4).
+    assert "p02, a stale cursor: a cut in block 133's window (14 pages the queue's index names)" in output
+    assert "t5 /processed_commands.txt freed by the check on a store without room: the round made room" in output
+    assert "t5 /processed_commands.txt changed by the check on a store without room: the round made room" in output
+    assert "torn magic: 6 erases cut short with the magic reading valid" in output
+    assert "byte sources without memory for them: the run failed before writing" in output
+    assert "2.7.6 first: the boot's report keeps the first run's strays, duplicate, cursor reset" in output
+    assert "p02 confirmed, mirrored:" in output
+    # The round 2 review: a block that will not verify is closed and the
+    # round goes on (R2-1); a record recovery left open is that boot's source
+    # (R2-2); a range is recorded once per boot (R2-3); a source bit that will
+    # not take is journaled, never redone (R2-4); an ended entry is no source
+    # for a later generation (note 1).
+    assert "t5 /processed_commands.txt freed by the check, a worn cell in the first window, closed:" in output
+    assert "t5 /processed_commands.txt freed by the check, a worn magic, the block not closed:" in output
+    assert "open record, its settle word stuck: a cut in block 133's window" in output
+    assert "open record, the journal lost: a cut in block 133's window" in output
+    assert "one unreadable span over 2 runs of a boot: one gap record, 251 bytes in the boot's report" in output
+    assert "source bit, attempts and journal refused: block 135 closed, the record never redone" in output
+    assert "source generations, a reported entry over a filled span: the live bytes kept" in output
+    assert "p02 confirmed, a worn first window:" in output and "a worn first window, old image:" in output
 
 
 def test_ci_runs_the_repair_harness_in_the_esp_idf_image() -> None:

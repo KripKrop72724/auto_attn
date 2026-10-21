@@ -1,5 +1,14 @@
 # Zone Lite 2.7.5: ZKT platform HIL
 
+> **Superseded by [2.7.6](zone-lite-2.7.6-hil.md).** On 20 October 2026,
+> 2.7.5 confirmed on Peshawar 06 in place (`CLEAN` in 8.0 s, check 3.9 s).
+> On Peshawar 02 (from 2.5.2) the repair made `pending.jsonl` fully readable
+> (153 spans rewritten, 0 gaps) but ended `DEFERRED` (`full`: 1 page needed,
+> 0 erased), the probe still failed with ENOENT and the image rolled back to
+> 2.5.2 (`BOOT_HEALTH_TIMEOUT`): the wedged store of the design's decision 1.
+> 2.7.6 adds the last-resort reformat in place; keep 2.7.5 published while
+> devices run it.
+
 2.7.5 is 2.7.4 plus the custody-first SPIFFS repair: at every boot, before the
 store is mounted, it makes every custody file readable again without losing a
 readable unsettled row, runs SPIFFS's own check only on a consistent store,

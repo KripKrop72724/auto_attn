@@ -10,6 +10,7 @@
 #define MALLOC_CAP_8BIT 2U
 #define LED_STATUS_LOCAL_FAILURE 1
 #define ESP_OK 0
+#define ESP_ERR_INVALID_STATE 0x103
 #define ESP_LOGW(...) ((void)0)
 #define ESP_LOGE(...) ((void)0)
 #define ESP_LOGI(...) ((void)0)
