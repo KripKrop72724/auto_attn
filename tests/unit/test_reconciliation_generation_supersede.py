@@ -142,7 +142,7 @@ def generation_scenario(db, *, baseline=5, current=11, cutoff=7, old=source, new
     return session, connector, prior, coverage, job
 
 
-def test_previous_generation_coverage_is_superseded_with_sealed_lineage_and_positive_ack(reconciliation_db, monkeypatch):
+def test_previous_generation_coverage_is_superseded_with_sealed_lineage_and_positive_ack(reconciliation_db, monkeypatch):  # noqa: F811
     from zk_add import web
     session, connector, prior, old, job = generation_scenario(reconciliation_db)
     old_epoch = session.get(TerminalSourceEpoch, old.source_epoch_id)
@@ -184,7 +184,7 @@ def test_previous_generation_coverage_is_superseded_with_sealed_lineage_and_posi
     assert new.source_committed_cursor == 11 and old.source_committed_cursor == 11
 
 
-def test_generation_two_tail_replays_old_tail_without_duplicate_attendance_or_outbox(reconciliation_db):
+def test_generation_two_tail_replays_old_tail_without_duplicate_attendance_or_outbox(reconciliation_db):  # noqa: F811
     session, connector, prior, old, job = generation_scenario(
         reconciliation_db, old=lambda i: punch(i, "CURRENT_RECONCILE" if i >= 5 else "FULL_HISTORY"),
         new=punch, old_complete=True)
@@ -204,7 +204,20 @@ def test_generation_two_tail_replays_old_tail_without_duplicate_attendance_or_ou
     assert linked == 11
 
 
-def test_recovery_epoch_with_recovery_prefix_and_record_key_drift_still_proves_lineage(reconciliation_db):
+def test_production_sized_previous_generation_is_proven_across_pages(reconciliation_db):  # noqa: F811
+    session, connector, prior, old, job = generation_scenario(reconciliation_db, baseline=3086, current=4512, cutoff=3172)
+    seal(session, connector, job)
+    sealed = job.capture_certificate["superseded_generation"]
+    assert job.status == "COMPLETED" and active(session).job_id == job.id
+    assert sealed["lineage"]["compared_records"] == 3172 and sealed["replayed_after_cutoff"] == 1340
+    expected = hashlib.sha256()
+    for ordinal in range(3172):
+        expected.update(json.dumps([ordinal, source(ordinal).raw_record_digest, 40], separators=(",", ":")).encode() + b"\n")
+    assert sealed["lineage"]["lineage_sha256"] == expected.hexdigest()
+
+
+def test_recovery_epoch_with_recovery_prefix_and_record_key_drift_still_proves_lineage(reconciliation_db, monkeypatch):  # noqa: F811
+    monkeypatch.setattr(service, "LINEAGE_PROOF_PAGE", 2)  # several pages across all three source kinds
     session, connector, prior, old, job = generation_scenario(reconciliation_db, recovery_at=3, new=drifted)
     old_epoch = session.get(TerminalSourceEpoch, old.source_epoch_id)
     assert old_epoch.sequence == 2 and old_epoch.parent_epoch_id is not None
@@ -218,7 +231,7 @@ def test_recovery_epoch_with_recovery_prefix_and_record_key_drift_still_proves_l
     assert old_epoch.state == "SUPERSEDED" and old.invalidated_reason == service.GENERATION_SUPERSEDED_REASON
 
 
-def test_shorter_previous_generation_coverage_also_requires_and_records_lineage(reconciliation_db):
+def test_shorter_previous_generation_coverage_also_requires_and_records_lineage(reconciliation_db):  # noqa: F811
     session, connector, prior, old, job = generation_scenario(reconciliation_db, baseline=5, current=5, cutoff=7)
     seal(session, connector, job)
     sealed = job.capture_certificate["superseded_generation"]
@@ -226,7 +239,7 @@ def test_shorter_previous_generation_coverage_also_requires_and_records_lineage(
     assert old.invalidated_reason == service.GENERATION_SUPERSEDED_REASON
 
 
-def test_real_lineage_divergence_holds_alerts_refuses_retry_and_cancel_keeps_custody(reconciliation_db):
+def test_real_lineage_divergence_holds_alerts_refuses_retry_and_cancel_keeps_custody(reconciliation_db):  # noqa: F811
     def changed(ordinal):
         if ordinal != 3:
             return source(ordinal)
@@ -249,9 +262,10 @@ def test_real_lineage_divergence_holds_alerts_refuses_retry_and_cancel_keeps_cus
     assert service.predicted_finalisation_hold(session, job) == service.SOURCE_GENERATION_LINEAGE_DIVERGED
     state, message = service._operator_status(job, connected=True)
     assert state == "REVIEW_REQUIRED" and "Cancelling is safe" in message
-    with pytest.raises(ValueError, match="Retry would hold again"):
-        service.control_reconciliation_job(session, job=job, action="retry", actor="test",
-            reason="Retry the held generation seal.", idempotency_key="lineage-retry")
+    for action in ("retry", "resume"):
+        with pytest.raises(ValueError, match="Retry would hold again"):
+            service.control_reconciliation_job(session, job=job, action=action, actor="test",
+                reason="Retry the held generation seal.", idempotency_key=f"lineage-{action}")
     assert job.status == "NEEDS_ATTENTION" and job.retry_count == 0
     service.control_reconciliation_job(session, job=job, action="cancel", actor="test",
         reason="Documented exit: keep the existing coverage.", idempotency_key="lineage-cancel")
@@ -264,7 +278,7 @@ def test_real_lineage_divergence_holds_alerts_refuses_retry_and_cancel_keeps_cus
 
 @pytest.mark.parametrize("fault", ["missing_epoch", "superseded_epoch", "wrong_generation_epoch", "serial",
                                    "old_gap", "limit"])
-def test_unprovable_previous_generation_binding_holds_without_replacing_it(reconciliation_db, monkeypatch, fault):
+def test_unprovable_previous_generation_binding_holds_without_replacing_it(reconciliation_db, monkeypatch, fault):  # noqa: F811
     session, connector, prior, old, job = generation_scenario(reconciliation_db)
     old_epoch = session.get(TerminalSourceEpoch, old.source_epoch_id)
     expected = BINDING
@@ -295,7 +309,7 @@ def test_unprovable_previous_generation_binding_holds_without_replacing_it(recon
             reason="Retry the held generation seal.", idempotency_key="binding-retry")
 
 
-def test_newer_coverage_generation_holds_the_older_job_as_stale(reconciliation_db):
+def test_newer_coverage_generation_holds_the_older_job_as_stale(reconciliation_db):  # noqa: F811
     session, connector, prior, old, job = generation_scenario(reconciliation_db)
     old.terminal_generation = 3
     session.get(TerminalSourceEpoch, old.source_epoch_id).terminal_generation = 3
@@ -311,7 +325,7 @@ def test_newer_coverage_generation_holds_the_older_job_as_stale(reconciliation_d
     assert [row["code"] for row in preflight["hard_blockers"]] == [service.SOURCE_GENERATION_STALE]
 
 
-def test_e57a3a37_shaped_hold_certifies_on_one_retry_without_rescan(reconciliation_db):
+def test_e57a3a37_shaped_hold_certifies_on_one_retry_without_rescan(reconciliation_db):  # noqa: F811
     session, connector, prior, old, job = generation_scenario(reconciliation_db, baseline=5, current=12, cutoff=9)
     # Before this fix sealing held here; production retried once and held again.
     service._safety_hold(session, job, BINDING, "The longer committed source coverage could not be safely retained.")
@@ -346,7 +360,7 @@ def test_e57a3a37_shaped_hold_certifies_on_one_retry_without_rescan(reconciliati
 
 
 @pytest.mark.parametrize("with_epoch", [True, False])
-def test_late_old_generation_tail_gets_structured_error_and_current_coverage(reconciliation_db, monkeypatch, with_epoch):
+def test_late_old_generation_tail_gets_structured_error_and_current_coverage(reconciliation_db, monkeypatch, with_epoch):  # noqa: F811
     from zk_add import web
     session, connector, prior, old, job = generation_scenario(reconciliation_db)
     old_epoch_id = session.get(TerminalSourceEpoch, old.source_epoch_id).epoch_id
@@ -373,7 +387,7 @@ def test_late_old_generation_tail_gets_structured_error_and_current_coverage(rec
         ["DEVICE_MESSAGE_REJECTED", "ADD_SOURCE_COVERAGE_INVALIDATED"]))) == 0
 
 
-def test_old_generation_tail_with_a_foreign_epoch_keeps_the_ordinary_rejection(reconciliation_db):
+def test_old_generation_tail_with_a_foreign_epoch_keeps_the_ordinary_rejection(reconciliation_db):  # noqa: F811
     from zk_add.rejection import EvidenceRejected
     session, connector, prior, old, job = generation_scenario(reconciliation_db)
     seal(session, connector, job)
@@ -385,7 +399,7 @@ def test_old_generation_tail_with_a_foreign_epoch_keeps_the_ordinary_rejection(r
     assert snapshot(new) == before and new.active
 
 
-def test_guarded_retry_compares_the_jobs_generation_not_the_connectors(reconciliation_db):
+def test_guarded_retry_compares_the_jobs_generation_not_the_connectors(reconciliation_db):  # noqa: F811
     # SLICTOWER-3FL: its held job is generation 5 while the connector re-onboarded to 6.
     from test_reconciliation_monotonic_coverage import scenario
     session, connector, job, coverage, _ = scenario(reconciliation_db)
@@ -403,7 +417,7 @@ def test_guarded_retry_compares_the_jobs_generation_not_the_connectors(reconcili
     assert job.status == "QUEUED" and job.terminal_generation == connector.onboarding_generation - 1
 
 
-def test_guarded_retry_without_connector_generation_keeps_its_original_digest(reconciliation_db):
+def test_guarded_retry_without_connector_generation_keeps_its_original_digest(reconciliation_db):  # noqa: F811
     from test_reconciliation_monotonic_coverage import scenario
     session, connector, job, coverage, _ = scenario(reconciliation_db)
     expected = retry_expectation(session, connector, job)
@@ -416,7 +430,7 @@ def test_guarded_retry_without_connector_generation_keeps_its_original_digest(re
         json.dumps(legacy, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
-def test_attendance_repair_does_not_attach_to_a_deterministically_held_job(reconciliation_db):
+def test_attendance_repair_does_not_attach_to_a_deterministically_held_job(reconciliation_db):  # noqa: F811
     from zk_add.attendance_repair import RepairError, _attach_source_dependency
     session, connector, prior, old, job = generation_scenario(reconciliation_db)
     service._safety_hold(session, job, BINDING, "held")
@@ -425,7 +439,7 @@ def test_attendance_repair_does_not_attach_to_a_deterministically_held_job(recon
     assert raised.value.code == "SOURCE_DEPENDENCY_UNAVAILABLE" and job.job_id in str(raised.value)
 
 
-def test_source_load_baseline_binds_after_the_generation_supersede(reconciliation_db):
+def test_source_load_baseline_binds_after_the_generation_supersede(reconciliation_db):  # noqa: F811
     from zk_add.zkt_source_load import source_load_baseline
     session, connector, prior, old, job = generation_scenario(reconciliation_db)
     before = source_load_baseline(session, connector)
@@ -437,7 +451,7 @@ def test_source_load_baseline_binds_after_the_generation_supersede(reconciliatio
     assert after["source_snapshot"]["generation"] == 2 and after["source_inventory_complete"]
 
 
-def test_same_generation_retention_is_unchanged(reconciliation_db):
+def test_same_generation_retention_is_unchanged(reconciliation_db):  # noqa: F811
     from test_reconciliation_monotonic_coverage import finish, scenario
     data = scenario(reconciliation_db)
     session, connector, job, coverage, _ = data

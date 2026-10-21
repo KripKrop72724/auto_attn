@@ -570,7 +570,8 @@ def control_reconciliation_job(
         if action == "retry" and job.status == "FAILED":
             raise ValueError("Failed jobs retain evidence; create a new audited job instead.")
         raise ValueError(f"Reconciliation is already {job.status.lower()}.")
-    if (action == "retry" and job.status == "NEEDS_ATTENTION"
+    # Resume re-queues a held job too, so it cannot bypass this check.
+    if (action in {"retry", "resume"} and job.status == "NEEDS_ATTENTION"
             and job.error_code in COVERAGE_FINALISATION_HOLDS
             and predicted_finalisation_hold(session, job) == job.error_code):
         raise ValueError(
@@ -1478,6 +1479,9 @@ def _retained_coverage_proof(session, job, coverage):
 
 GENERATION_SUPERSEDE_POLICY = "SUPERSEDE_PREVIOUS_GENERATION_RAW_LINEAGE_V1"
 LINEAGE_DRIFT_SAMPLE = 20
+# Each page is one indexed join of two small rows per ordinal: 95k ordinals
+# (the largest fleet terminal) take under a hundred round trips.
+LINEAGE_PROOF_PAGE = 1000
 _DIGEST = re.compile(r"[0-9a-f]{64}")
 
 
@@ -1540,7 +1544,7 @@ def _generation_lineage_proof(session, job, coverage, *, cutoff):
             old.terminal_record_key.label("old_key"), old.occurrence_index.label("old_occurrence"),
         ).select_from(new).outerjoin(old, and_(*old_scope, old.ordinal == new.ordinal))
             .where(*new_scope, new.ordinal > after)
-            .order_by(new.ordinal).limit(COVERAGE_PROOF_PAGE)).all()
+            .order_by(new.ordinal).limit(LINEAGE_PROOF_PAGE)).all()
         if not rows:
             raise ValueError("SOURCE_COVERAGE_CANONICAL_GAP")
         for row in rows:
