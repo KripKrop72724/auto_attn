@@ -23,7 +23,8 @@ MAIN = ROOT / "firmware/zone_lite/main"
 HOST = ROOT / "tests/firmware"
 SPIFFS_SOURCES = ["spiffs_nucleus.c", "spiffs_gc.c", "spiffs_hydrogen.c", "spiffs_cache.c", "spiffs_check.c"]
 SHIMMED = ["legacy_queue.c", "file_transaction.c", "reliability.c", "command_inbox_merge.c"]
-PLAIN = ["durable_queue.c", "zkt_clock.c", "storage_repair_plan.c", "storage_repair_mirror.c", "storage_repair_redo.c"]
+PLAIN = ["durable_queue.c", "zkt_clock.c", "storage_repair_plan.c", "storage_repair_mirror.c", "storage_repair_redo.c",
+         "storage_exception.c"]
 FLAGS = ["-std=c11", "-D_POSIX_C_SOURCE=200809L", "-g", "-O1", "-fsanitize=address,undefined",
          "-fno-omit-frame-pointer"]
 # The CI run: 1 MiB stores, every scenario with several seeds, the special,

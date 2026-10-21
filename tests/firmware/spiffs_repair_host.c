@@ -50,6 +50,9 @@
 #include "file_transaction.h"
 #include "legacy_queue.h"
 #include "reliability.h"
+#include "span_digest.h"
+#include "storage_exception.h"
+#include "storage_exception_srr.h"
 #include "storage_repair_core.h"
 #include "storage_repair_mirror.h"
 #include "storage_repair_plan.h"
@@ -5152,44 +5155,11 @@ static void check_models_exact(const char *what)
 /* ---- builders ------------------------------------------------------------ */
 static uint32_t p02_span, p02_spans;
 
-/* Peshawar-02 as 2.7.5 left it (20 October 2026): no erased page, every
- * block holding a page of the damaged pending queue or of a file whose
- * removal stopped after its header (its orphan index pages over a fifth of
- * the store), deleted header and index copies everywhere, and a damaged span
- * whose referenced page is deleted while valid copies of it remain, so
- * normalization needs exactly one page (the index rewrite). */
-static void build_p02(void)
+/* P02's damage on a built store (the pending queue and the outbox whose
+ * cursor 2.7.5 reset), with no erased page left; `old_name` is the file whose
+ * removal stopped. */
+static void p02_damage(model_file_t *pending, model_file_t *live, const char *old_name)
 {
-    model_reset();
-    row_seq = 4000;
-    mount_plain();
-    char row[600], chunk[4600];
-    /* The file that will be half removed, written alone in small appends
-     * (each moves its header and index page): its blocks hold its data pages
-     * and those deleted copies only. */
-    uint32_t written = 0;
-    while (written < flash_size / 5) {
-        size_t n = json_row(row, sizeof(row));
-        CHECK(append_bytes("/blocked_identity.jsonl", row, (uint32_t)n), "p02: the old file");
-        written += (uint32_t)n;
-    }
-    model_file_t *pending = new_model("/pending.jsonl", true, false);
-    model_file_t *acked = new_model("/acked_uids.txt", false, true);
-    model_file_t *live = new_model("/add_live.jsonl", true, false);
-    model_file_t *outbox = new_model("/add_pending.jsonl", true, false);
-    model_file_t *commands = new_model("/processed_commands.txt", false, true);
-    u32_t total = 0, used = 0;
-    for (;;) {
-        SPIFFS_info(&fs, &total, &used);
-        if (used >= total / 100 * 60) break;
-        size_t at = 0;
-        while (at < 1800) at += json_row(chunk + at, sizeof(chunk) - at);
-        model_append(pending, chunk, (uint32_t)at);
-        if (rnd() % 3 == 0) model_append_ids(acked, 2);
-        if (rnd() % 7 == 0) model_append(live, row, (uint32_t)json_row(row, sizeof(row)));
-        if (rnd() % 9 == 0) model_append(outbox, row, (uint32_t)json_row(row, sizeof(row)));
-        if (rnd() % 13 == 0) model_append_ids(commands, 1);
-    }
     /* P02's cursor reset: one past its file. */
     set_cursor("add_legacy", "live", live->size + 500, 0, 3);
     uint32_t spans = pending->size / SPAN;
@@ -5274,7 +5244,7 @@ static void build_p02(void)
      * the strays and the duplicate: P02 logged LEVEL2_SKIPPED, no removal
      * there let a block be erased. A block that would is pinned by one more
      * copy over a deleted page. */
-    uint16_t old_obj = (uint16_t)(rd16(header_of("/blocked_identity.jsonl") * PAGE) & 0x7FFF);
+    uint16_t old_obj = (uint16_t)(rd16(header_of(old_name) * PAGE) & 0x7FFF);
     for (uint32_t b = 0; b < pages / 16; ++b) {
         bool live = false;
         uint32_t spare = 0;
@@ -5290,6 +5260,47 @@ static void build_p02(void)
     }
     free(taken);
     free(free_pages);
+}
+
+/* Peshawar-02 as 2.7.5 left it (20 October 2026): no erased page, every
+ * block holding a page of the damaged pending queue or of a file whose
+ * removal stopped after its header (its orphan index pages over a fifth of
+ * the store), deleted header and index copies everywhere, and a damaged span
+ * whose referenced page is deleted while valid copies of it remain, so
+ * normalization needs exactly one page (the index rewrite). */
+static void build_p02(void)
+{
+    model_reset();
+    row_seq = 4000;
+    mount_plain();
+    char row[600], chunk[4600];
+    /* The file that will be half removed, written alone in small appends
+     * (each moves its header and index page): its blocks hold its data pages
+     * and those deleted copies only. */
+    uint32_t written = 0;
+    while (written < flash_size / 5) {
+        size_t n = json_row(row, sizeof(row));
+        CHECK(append_bytes("/blocked_identity.jsonl", row, (uint32_t)n), "p02: the old file");
+        written += (uint32_t)n;
+    }
+    model_file_t *pending = new_model("/pending.jsonl", true, false);
+    model_file_t *acked = new_model("/acked_uids.txt", false, true);
+    model_file_t *live = new_model("/add_live.jsonl", true, false);
+    model_file_t *outbox = new_model("/add_pending.jsonl", true, false);
+    model_file_t *commands = new_model("/processed_commands.txt", false, true);
+    u32_t total = 0, used = 0;
+    for (;;) {
+        SPIFFS_info(&fs, &total, &used);
+        if (used >= total / 100 * 60) break;
+        size_t at = 0;
+        while (at < 1800) at += json_row(chunk + at, sizeof(chunk) - at);
+        model_append(pending, chunk, (uint32_t)at);
+        if (rnd() % 3 == 0) model_append_ids(acked, 2);
+        if (rnd() % 7 == 0) model_append(live, row, (uint32_t)json_row(row, sizeof(row)));
+        if (rnd() % 9 == 0) model_append(outbox, row, (uint32_t)json_row(row, sizeof(row)));
+        if (rnd() % 13 == 0) model_append_ids(commands, 1);
+    }
+    p02_damage(pending, live, "/blocked_identity.jsonl");
     /* The old file's removal stopped after its header. */
     flag_deleted(header_of("/blocked_identity.jsonl"));
 }
@@ -5401,6 +5412,307 @@ static void run_reclaim_p02_direct(uint32_t kib)
     printf("p02 %u KiB, 2.7.6 first: the boot's report keeps the first run's strays, duplicate, cursor reset and "
            "room figures over its %u runs (%u strays, %u spans rewritten in all)\n", kib, report.runs,
            report.strays_removed, report.spans_rewritten);
+}
+
+/* ---- 2.7.7: Peshawar-02 as its first 2.7.6 boot found it ------------------ */
+/* P02's first 2.7.6 boot (21 October 2026, unconfirmed, from 2.5.2) found no
+ * block an unconfirmed image may take and 67 a confirmed one may: 1,817
+ * blocks excluded, 88 with an index page, 68 with a weak magic, 34 pages
+ * short. The 2.7.6 model above wrote the half-removed file alone and then
+ * deleted its header, so its pages were leaked (read by nothing) and
+ * clustered: 731 usable blocks. On the device nearly every block holds a page
+ * the planner calls EXCLUDED. This builder writes P02's history interleaved,
+ * as 2.5.2 appended for months: each step a pending chunk, acked IDs and rows
+ * of the ORDS rewrite stage that was later removed, with quiet stretches of
+ * pending alone; then 2.7.6's P02 damage; then the removal stopped after
+ * flagging the stage's header (E2: a hidden header, its pages EXCLUDED). The
+ * variants: E1 alone (the header deleted, the never-windowed file denser),
+ * every custody block dropping exactly one page (the analytic worst case),
+ * and too few custody pages for the shortfall. */
+enum { P02F_HIDDEN = 0, P02F_UNWINDOWED, P02F_MIN_GAIN, P02F_SHORT };
+static uint32_t p02field_variant;
+#define P02F_REMOVED "/pending.tmp"
+#define P02F_TAG 0x2770U
+#define P02F_SHORT_BLOCKS 20U
+
+static void p02field_rows(const char *name, uint32_t bytes)
+{
+    char row[600];
+    for (uint32_t done = 0; done < bytes;) {
+        size_t n = json_row(row, sizeof(row));
+        CHECK(append_bytes(name, row, (uint32_t)n), "p02field: %s %d", name, SPIFFS_errno(&fs));
+        done += (uint32_t)n;
+    }
+}
+
+static void build_p02field(void)
+{
+    model_reset();
+    row_seq = 9000;
+    mount_plain();
+    model_file_t *pending = new_model("/pending.jsonl", true, false);
+    model_file_t *acked = new_model("/acked_uids.txt", false, true);
+    model_file_t *live = new_model("/add_live.jsonl", true, false);
+    model_file_t *outbox = new_model("/add_pending.jsonl", true, false);
+    model_file_t *commands = new_model("/processed_commands.txt", false, true);
+    bool e1 = p02field_variant == P02F_UNWINDOWED;
+    char row[600], chunk[1600];
+    uint32_t step = 0, quiet = 0, next_quiet = 25 + rnd() % 4;
+    u32_t total = 0, used = 0;
+    for (;;) {
+        SPIFFS_info(&fs, &total, &used);
+        if (used >= total / 100 * 62) break;
+        size_t at = 0;
+        while (at < 1000) at += json_row(chunk + at, sizeof(chunk) - at);
+        model_append(pending, chunk, (uint32_t)at);
+        ++step;
+        if (quiet) {
+            --quiet;
+            continue;
+        }
+        if (step >= next_quiet) {
+            /* A quiet stretch: pending alone for four steps. */
+            quiet = 3;
+            next_quiet = step + 4 + 25 + rnd() % 4;
+            continue;
+        }
+        model_append_ids(acked, e1 ? 9 : 6);
+        p02field_rows(P02F_REMOVED, e1 ? 400 : 550);
+        if (rnd() % 7 == 0) model_append(live, row, (uint32_t)json_row(row, sizeof(row)));
+        if (rnd() % 9 == 0) model_append(outbox, row, (uint32_t)json_row(row, sizeof(row)));
+        if (rnd() % 13 == 0) model_append_ids(commands, 1);
+    }
+    p02_damage(pending, live, P02F_REMOVED);
+    /* The stage's removal stopped after flagging its header (E2): hidden,
+     * its pages still on flash. E1: the header deleted, its pages leaked. */
+    if (e1) flag_deleted(header_of(P02F_REMOVED));
+    else hide_header(P02F_REMOVED);
+}
+
+/* The blocks a confirmed round may take, as the planner sees them on this
+ * model (the harness's own reading of section 6.1): a valid strong magic, a
+ * droppable page past the entry-0 rule, no header or index page, and every
+ * kept page either a non-last data page of /pending.jsonl (custody) or
+ * leaked (no header anywhere). `blocks` gets 1 per such block. */
+static uint32_t p02field_custody_blocks(uint8_t *blocks, uint16_t *gain)
+{
+    uint32_t pages = flash_size / PAGE, count = 0;
+    uint8_t *referenced = calloc(pages, 1), *headered = calloc(0x8000, 1);
+    for (uint32_t pix = 0; pix < pages; ++pix) {
+        const uint8_t *page = flash + pix * PAGE;
+        uint16_t obj = (uint16_t)(page[0] | (page[1] << 8)), span = (uint16_t)(page[2] | (page[3] << 8));
+        if (pix % 16 == 0 || obj == 0xFFFF || !(obj & 0x8000) || !(page[4] & SPIFFS_PH_FLAG_DELET)) continue;
+        if (span == 0) headered[obj & 0x7FFF] = 1;
+        uint32_t table = span == 0 ? 49 : 8, entries = span == 0 ? 103 : 124;
+        for (uint32_t i = 0; i < entries; ++i) {
+            uint16_t ref = (uint16_t)(page[table + i * 2] | (page[table + i * 2 + 1] << 8));
+            if (ref < pages && ref % 16) referenced[ref] = 1;
+        }
+    }
+    mount_plain();
+    uint16_t pending = object_of("/pending.jsonl");
+    spiffs_stat st;
+    CHECK(SPIFFS_stat(&fs, "/pending.jsonl", &st) == SPIFFS_OK, "p02field: stat pending");
+    SPIFFS_unmount(&fs);
+    uint32_t last_span = (st.size + SPAN - 1) / SPAN - 1;
+    for (uint32_t b = 0; b < flash_size / BLOCK; ++b) {
+        blocks[b] = 0;
+        if (gain) gain[b] = 0;
+        if (srx_get16(flash + b * BLOCK + 252) != srx_spiffs_magic(flash_size / BLOCK, b) ||
+            !srx_magic_strong(flash_size / BLOCK, b))
+            continue;
+        bool usable = true, custody = false;
+        uint32_t dropped = 0;
+        bool later_kept = false, drop0 = false;
+        for (uint32_t e = SRX_ENTRIES; e-- > 0 && usable;) {
+            uint32_t pix = b * 16 + 1 + e;
+            const uint8_t *page = flash + pix * PAGE;
+            uint16_t lu = rd16(lookup_address(pix)), obj = (uint16_t)(page[0] | (page[1] << 8));
+            uint16_t span = (uint16_t)(page[2] | (page[3] << 8));
+            if (lu == 0xFFFF && srx_erased(page, PAGE)) continue;
+            if (lu == 0 && !(page[4] & SPIFFS_PH_FLAG_DELET) && !referenced[pix]) {
+                if (e == 0) drop0 = true;
+                else dropped++;
+                continue;
+            }
+            later_kept = true;
+            if (lu == 0 || lu == 0xFFFF || (obj & 0x8000) || lu != obj) usable = false;
+            else if (!headered[lu & 0x7FFF]) continue; /* leaked */
+            else if (lu == pending && span < last_span) custody = true;
+            else usable = false;
+        }
+        if (drop0 && !later_kept) dropped++;
+        if (!usable || !custody || !dropped) continue;
+        blocks[b] = 1;
+        if (gain) gain[b] = (uint16_t)dropped;
+        count++;
+    }
+    free(referenced);
+    free(headered);
+    return count;
+}
+
+/* Every droppable page of a custody block but `keep` becomes a leaked page
+ * (an object with no header anywhere): kept, read by nothing. */
+static void p02field_leak_drops(uint32_t b, uint32_t keep)
+{
+    uint8_t *referenced = NULL;
+    (void)referenced;
+    uint32_t kept = 0;
+    for (uint32_t e = SRX_ENTRIES; e-- > 0;) {
+        uint32_t pix = b * 16 + 1 + e;
+        uint8_t *page = flash + pix * PAGE;
+        if (rd16(lookup_address(pix)) != 0 || (page[4] & SPIFFS_PH_FLAG_DELET)) continue;
+        if (e > 0 && kept < keep) {
+            ++kept;
+            continue;
+        }
+        /* A finalized data page of object 0x7EEE, never headered. NOR: the
+         * page is rewritten from erased in the model's flash directly. */
+        memset(page, 0xFF, PAGE);
+        wr16(pix * PAGE, 0x7EEE);
+        wr16(pix * PAGE + 2, (uint16_t)(e + 1));
+        page[4] = 0xFC;
+        memset(page + 5, 'l', 64);
+        wr16(lookup_address(pix), 0x7EEE);
+    }
+}
+
+static srr_config_t config_2770(bool unconfirmed)
+{
+    srr_config_t config = repair_config();
+    config.image_tag = P02F_TAG; /* confirmation keeps the image's tag (critique 4) */
+    config.pending_verify = unconfirmed;
+    config.rollback_tag = unconfirmed ? 0x2520 : 0;
+    /* The exception's round boot takes custody blocks only with every custody
+     * file held (critique 11). */
+    config.custody_needs_hold = !unconfirmed;
+    return config;
+}
+
+/* The glue's redo-area test on the unconfirmed boot (critique 3): CLAIMED in
+ * the journal first, then one slot programmed and erased. */
+static srx_test_t p02field_area_test(void)
+{
+    static uint8_t scratch[4096];
+    srp_reclaim_t journal;
+    if (port_nvs_load(NULL, SRR_NVS_NAMESPACE, "reclaim", &journal, sizeof(journal)) != 1 ||
+        !srp_reclaim_valid(&journal))
+        memset(&journal, 0, sizeof(journal));
+    if (!(journal.flags & SRP_RECLAIM_CLAIMED)) {
+        journal.flags |= SRP_RECLAIM_CLAIMED;
+        srp_reclaim_seal(&journal);
+        if (!port_nvs_store(NULL, SRR_NVS_NAMESPACE, "reclaim", &journal, sizeof(journal))) return SRX_TEST_NOT_RUN;
+    }
+    return srx_area_test(&redo_io, &boot_area, scratch, NULL);
+}
+
+/* 2.7.4's inventory as the VFS would read the store: every file span by span
+ * (sx_inventory_t, as storage_repair.c hands it to the gate). */
+static void p02field_inventory(sx_inventory_t *v)
+{
+    static uint8_t buffer[SPAN];
+    memset(v, 0, sizeof(*v));
+    mount_plain();
+    spiffs_DIR dir;
+    struct spiffs_dirent entry;
+    CHECK(SPIFFS_opendir(&fs, "/", &dir), "p02field: opendir");
+    v->done = v->complete = true;
+    while (SPIFFS_readdir(&dir, &entry)) {
+        v->files++;
+        CHECK(v->count < SX_INVENTORY_FILES, "p02field: more than %u files", SX_INVENTORY_FILES);
+        sx_inventory_file_t *f = &v->file[v->count++];
+        snprintf(f->name, sizeof(f->name), "%.32s", (const char *)entry.name + 1);
+        f->bytes = entry.size;
+        spiffs_file fd = SPIFFS_open(&fs, (const char *)entry.name, SPIFFS_O_RDONLY, 0);
+        if (fd < 0) {
+            f->first_error = ENOENT;
+            f->unreadable_bytes = entry.size;
+            f->other_unreadable = true;
+            SPIFFS_clearerr(&fs);
+            continue;
+        }
+        for (uint32_t at = 0; at < entry.size; at += SPAN) {
+            uint32_t want = entry.size - at < SPAN ? entry.size - at : SPAN;
+            SPIFFS_lseek(&fs, fd, (s32_t)at, SPIFFS_SEEK_SET);
+            if (SPIFFS_read(&fs, fd, buffer, (s32_t)want) == (s32_t)want) continue;
+            SPIFFS_clearerr(&fs);
+            if (!f->first_error) {
+                f->first_error = EIO;
+                f->first_error_offset = at;
+            }
+            f->unreadable_bytes += want;
+            f->unreadable_spans++;
+            f->last_error_offset = at;
+            f->span_digest = span_digest_add(f->span_digest, at / SPAN);
+        }
+        SPIFFS_close(&fs, fd);
+        v->unreadable_files += f->first_error != 0;
+    }
+    SPIFFS_closedir(&dir);
+    SPIFFS_clearerr(&fs);
+    SPIFFS_unmount(&fs);
+}
+
+/* The gate's storage terms on the unconfirmed boot's own report, with ADD,
+ * the OTA path and the runtime as P02's 2.7.6 boot had them. */
+static sx_reason_t p02field_gate(const srr_report_t *report, srx_test_t test)
+{
+    static sx_repair_t repair;
+    static sx_inventory_t inventory;
+    static sx_runtime_t runtime;
+    sx_from_srr(report, &repair);
+    repair.storage_allowed = !mount_blocked;
+    repair.pending_verify = true;
+    snprintf(repair.area_test, sizeof(repair.area_test), "%s", srx_test_name(test));
+    p02field_inventory(&inventory);
+    memset(&runtime, 0, sizeof(runtime));
+    runtime.qs_known = runtime.qs_observed = runtime.qs_available = runtime.led_known = true;
+    runtime.probe_error = ENOENT;
+    runtime.probe_operation = "persistence_open_write";
+    runtime.spiffs_mounted = runtime.health_known = runtime.add_connected = true;
+    runtime.capability_accepted = runtime.ota_precheck_ok = runtime.passive_slot_ok = true;
+    runtime.health_blockers = SX_H_QS_RECOVERY | SX_H_QS_PERSISTENCE | SX_H_QS_PROBE_ERROR;
+    runtime.internal_largest = 63488;
+    sx_input_t input = {.production_role = true, .running_pending = true, .ota_deployment = true,
+                        .repair = &repair, .inventory = &inventory, .runtime = &runtime};
+    return sx_evaluate(&input);
+}
+
+/* The store as P02's 2.7.6 boot left it, for the confirmed boot: built, the
+ * released 2.7.5 run on it (P02's 20 October report), the variant's
+ * conversion, the unconfirmed 2.7.7 boot (deferred, nothing taken) and the
+ * glue's area test. Returns that boot's report. */
+static uint8_t *p02field_custody; /* the custody blocks before the confirmed boot */
+static srr_report_t p02field_unconfirmed;
+static void p02field_prepare(void)
+{
+    build_p02field();
+    p02_as_275();
+    uint32_t blocks = flash_size / BLOCK;
+    if (!p02field_custody) p02field_custody = malloc(8U * 1024U * 1024U / BLOCK);
+    uint16_t *gain = calloc(blocks, sizeof(uint16_t));
+    p02field_custody_blocks(p02field_custody, gain);
+    if (p02field_variant == P02F_MIN_GAIN || p02field_variant == P02F_SHORT) {
+        uint32_t kept = 0;
+        for (uint32_t b = 0; b < blocks; ++b) {
+            if (!p02field_custody[b]) continue;
+            bool keep = p02field_variant == P02F_MIN_GAIN || kept < P02F_SHORT_BLOCKS;
+            p02field_leak_drops(b, keep ? 1 : 0);
+            kept += keep;
+        }
+        p02field_custody_blocks(p02field_custody, gain);
+    }
+    free(gain);
+    srr_config_t config = config_2770(true);
+    uint32_t checked = round_checks;
+    logged_count = 0;
+    repair_boot(&p02field_unconfirmed, &config);
+    /* An unconfirmed boot takes no custody block (2.7.6 section 8). */
+    CHECK(round_checks == checked && !p02field_unconfirmed.reclaim.blocks,
+          "p02field: the unconfirmed boot reformatted %u blocks", p02field_unconfirmed.reclaim.blocks);
+    uint32_t pending_records = 0, sources = 0, open = 0;
+    CHECK(!area_records(&pending_records, &sources, &open), "p02field: the unconfirmed boot wrote a record");
 }
 
 /* ---- cuts at every write of the round ------------------------------------ */
@@ -5529,8 +5841,15 @@ static void run_reclaim_cuts(const char *what, void (*build)(void), uint32_t kib
     seed(62000 + kib + env_u64("REVIEW_BUILD_SALT") * 7919U);
     nvs_clear();
     format_flash(kib);
-    build();
-    if (build == build_p02) p02_as_275();
+    /* 2.7.7: P02's field store as its unconfirmed boot left it; the round is
+     * the confirmed boot's (the same image tag). */
+    if (build == build_p02field) {
+        p02field_prepare();
+        CHECK(p02field_area_test() == SRX_TEST_PASSED, "%s: the area test", what);
+    } else {
+        build();
+        if (build == build_p02) p02_as_275();
+    }
     snapshot_t image = snapshot_take();
     model_file_t *saved = calloc(MAX_MODEL, sizeof(model_file_t));
     uint32_t saved_count = model_count;
@@ -5541,7 +5860,7 @@ static void run_reclaim_cuts(const char *what, void (*build)(void), uint32_t kib
         memcpy(saved[i].data, model[i].data, model[i].size + 1);
         memcpy(saved[i].unreadable, model[i].unreadable, model[i].size + 1);
     }
-    srr_config_t config = config_2760(unconfirmed);
+    srr_config_t config = build == build_p02field ? config_2770(false) : config_2760(unconfirmed);
     srr_report_t report;
     uint64_t start = flash_ops;
     round_start_ops = round_end_ops = 0;
@@ -6657,6 +6976,190 @@ static void run_source_generations(uint32_t kib)
     }
 }
 
+/* ---- 2.7.7: the confirm-first exception on P02's field store ---------------- */
+static bool within(uint32_t got, uint32_t want, uint32_t percent)
+{
+    uint32_t slack = (want * percent + 99U) / 100U;
+    return got + slack >= want && got <= want + slack;
+}
+
+/* A cut at every write of the area test: the next discovery reads the area
+ * READY (the slot this device's own torn write, a free one), never FOREIGN;
+ * and without CLAIMED first it would read FOREIGN (why the glue saves it). */
+static void p02field_area_test_cuts(void)
+{
+    static uint8_t work[4096];
+    snapshot_t image = snapshot_take();
+    uint32_t cuts = 0, foreign_unclaimed = 0;
+    for (uint64_t k = 1;; ++k) {
+        snapshot_put(&image);
+        seed(65000 + k);
+        cut_at = flash_ops + k;
+        bool cut = false;
+        if (setjmp(cut_point)) cut = true;
+        else (void)p02field_area_test();
+        cut_at = 0;
+        if (!cut) break;
+        cuts++;
+        srx_area_t area;
+        srx_discover(&redo_io, true, work, &area);
+        CHECK(area.state == SRX_AREA_READY, "area test cut %" PRIu64 ": the area reads %s", k, srx_area_name(area.state));
+        srx_discover(&redo_io, false, work, &area);
+        foreign_unclaimed += area.state == SRX_AREA_FOREIGN;
+    }
+    snapshot_put(&image);
+    snapshot_free(&image);
+    CHECK(cuts >= 2 && foreign_unclaimed, "area test: %u cuts, %u foreign without CLAIMED", cuts, foreign_unclaimed);
+    printf("p02field: the redo area test cut at each of its %u writes: the area stays READY (CLAIMED first; %u of "
+           "those would read FOREIGN without it)\n", cuts, foreign_unclaimed);
+}
+
+static void run_reclaim_p02field(uint32_t kib, uint32_t variant)
+{
+    static const char *const names[] = {"hidden header", "unwindowed files", "minimum gain", "custody short"};
+    p02field_variant = variant;
+    seed(64000 + kib + variant * 17 + env_u64("REVIEW_BUILD_SALT") * 7919U);
+    nvs_clear();
+    format_flash(kib);
+    p02field_prepare();
+    const srr_report_t *u = &p02field_unconfirmed;
+    const srr_reclaim_report_t *x = &u->reclaim;
+    uint32_t mine = 0;
+    for (uint32_t b = 0; b < flash_size / BLOCK; ++b) mine += p02field_custody[b];
+    printf("p02field %u KiB %s: unconfirmed 2.7.7 %s at %s (%ld), short %s, %u rounds, %u candidates (%u holding "
+           "nothing any image reads, %u custody, %u gain), %u index, %u excluded (%u hidden, %u unwindowed, %u last "
+           "page, %u index flag, %u busy, %u mixed; most %s, %u blocks), %u weak magic; %u pages short of %u, %u "
+           "erased at mount; the harness counts %u custody blocks\n",
+           kib, names[variant], srr_result_name(u->result), u->error_stage, (long)u->error_code, x->short_reason,
+           x->rounds, x->candidates, x->unconfirmed_blocks, x->custody_blocks, x->custody_gain, x->index_blocks,
+           x->excluded_blocks, x->excluded_hidden, x->excluded_unwindowed, x->excluded_last_page,
+           x->excluded_index_flag, x->excluded_busy, x->excluded_mixed, x->excluded_file, x->excluded_file_blocks,
+           x->low_magic_blocks, x->want, x->target, x->erased_at_mount, mine);
+    CHECK(u->result == SRR_RESULT_DEFERRED && !strcmp(u->error_stage, "full") && u->error_code == SPIFFS_ERR_FULL &&
+              !strcmp(x->trigger, "full") && !strcmp(x->short_reason, "candidate") && !x->rounds && !x->candidates &&
+              !x->unconfirmed_blocks && !u->gaps && !u->files_unheld_custody && !u->manifest_active &&
+              x->mount_measured && !x->erased_at_mount && x->want > 0 && x->target > x->want - 1,
+          "p02field %s: the unconfirmed boot is not P02's 21 October report", names[variant]);
+    /* The harness's own reading of the confirmed rules agrees with the planner. */
+    CHECK(mine == x->custody_blocks, "p02field %s: the harness counts %u custody blocks, the planner %u", names[variant],
+          mine, x->custody_blocks);
+    CHECK(x->excluded_hidden + x->excluded_unwindowed + x->excluded_last_page + x->excluded_index_flag +
+                  x->excluded_mixed + x->excluded_busy == x->excluded_blocks,
+          "p02field: the excluded breakdown adds up to %u of %u", x->excluded_hidden + x->excluded_unwindowed +
+          x->excluded_last_page + x->excluded_index_flag + x->excluded_mixed + x->excluded_busy, x->excluded_blocks);
+    if (kib >= 8192 && variant == P02F_HIDDEN) {
+        /* The fit to the field: custody and index within 10%, excluded within
+         * 2%, the weak magics, the shortfall within 4 pages. */
+        CHECK(within(x->custody_blocks, 67, 10) && within(x->index_blocks, 88, 10) &&
+                  within(x->excluded_blocks, 1817, 2) && x->low_magic_blocks == 68 && x->want + 4 >= 34 &&
+                  x->want <= 38,
+              "p02field: %u custody, %u index, %u excluded, %u weak, %u short: not P02's histogram", x->custody_blocks,
+              x->index_blocks, x->excluded_blocks, x->low_magic_blocks, x->want);
+        /* E2 is what excludes the blocks, and the hidden stage is the object. */
+        CHECK(!strcmp(x->excluded_file, P02F_REMOVED) && x->excluded_hidden + x->excluded_mixed > x->excluded_unwindowed,
+              "p02field: the breakdown names %s", x->excluded_file);
+    }
+    if (variant == P02F_UNWINDOWED)
+        CHECK(!x->excluded_hidden && strcmp(x->excluded_file, P02F_REMOVED),
+              "p02field E1: %u blocks excluded by a hidden header (%s)", x->excluded_hidden, x->excluded_file);
+    if (variant == P02F_MIN_GAIN) CHECK(x->custody_gain == x->custody_blocks, "p02field: minimum gain %u of %u blocks",
+                                        x->custody_gain, x->custody_blocks);
+    /* The glue's area test, then the gate on this boot's own report. */
+    srx_test_t test = p02field_area_test();
+    CHECK(test == SRX_TEST_PASSED, "p02field: the area test %s", srx_test_name(test));
+    if (variant == P02F_HIDDEN) p02field_area_test_cuts();
+    sx_reason_t gate = p02field_gate(u, test);
+    /* The worst case at 1 MiB has fewer custody blocks than pages short:
+     * every one drops a page, and that is still too few. */
+    bool short_of_room = variant == P02F_SHORT || (variant == P02F_MIN_GAIN && kib < 8192);
+    sx_reason_t expected = short_of_room ? SX_CUSTODY_SHORT : SX_OK;
+    CHECK(gate == expected, "p02field %s: the gate says %s, expected %s", names[variant], sx_reason_name(gate),
+          sx_reason_name(expected));
+    CHECK(short_of_room == (x->custody_gain < x->want), "p02field %s: %u custody pages for %u short", names[variant],
+          x->custody_gain, x->want);
+    if (short_of_room) {
+        printf("p02field %u KiB %s: %u custody pages for %u short: the gate refuses %s, the image rolls back as 2.7.6\n",
+               kib, names[variant], x->custody_gain, x->want, sx_reason_name(gate));
+        return;
+    }
+    /* The confirmed boot: the same image, pending_verify now false. */
+    srr_config_t config = config_2770(false);
+    srr_report_t report;
+    uint32_t checked = round_checks;
+    logged_count = 0;
+    repair_boot(&report, &config);
+    const srr_reclaim_report_t *c = &report.reclaim;
+    static sx_repair_t after;
+    sx_from_srr(&report, &after);
+    after.storage_allowed = !mount_blocked;
+    CHECK(report.result == SRR_RESULT_REPAIRED && !report.gaps && c->blocks > 0 && round_checks - checked == c->blocks &&
+              c->erased_after >= x->want && !c->failed && !c->held_mismatch && !c->waiting &&
+              sx_round_outcome(&after) == SX_ROUND_OK,
+          "p02field %s confirmed: %s at %s, %u gaps, %u blocks, %u erased after (%u short), %u failed, outcome %s",
+          names[variant], srr_result_name(report.result), report.error_stage, report.gaps, c->blocks, c->erased_after,
+          x->want, c->failed, sx_outcome_name(sx_round_outcome(&after)));
+    /* Every block the round reformatted was a custody block: no excluded,
+     * index or weak-magic block touched. */
+    static uint8_t sector[4096];
+    uint32_t records = 0;
+    for (uint32_t slot = 0; slot < REDO_BYTES / 4096; ++slot) {
+        srx_record_t r;
+        memcpy(sector, nvs.redo + slot * 4096, 4096);
+        if (!srx_decode(sector, &r, NULL)) continue;
+        records++;
+        CHECK(r.block < flash_size / BLOCK && p02field_custody[r.block] && !(r.flags & SRX_FLAG_UNCONFIRMED),
+              "p02field: block %u reformatted, not a custody block", r.block);
+    }
+    CHECK(records == c->blocks, "p02field: %u records for %u blocks", records, c->blocks);
+    check_models_exact("p02field confirmed");
+    verify_reclaimed("p02field confirmed");
+    printf("p02field %u KiB %s: the gate ELIGIBLE; the confirmed boot reformatted %u custody blocks (%u deleted "
+           "pages erased, %u kept, %u erased after), then REPAIRED with no gap, every file byte-exact\n",
+           kib, names[variant], c->blocks, c->pages_freed, c->pages_kept, c->erased_after);
+}
+
+/* Critique 4: confirmation keeps the image's tag, so the attempts guard's
+ * state carries over to the round boot. Two runs of this image already ended
+ * by the deadline (the third ends the guard), or the guard already stopped
+ * repairs for it: the round boot only reports, and the outcome is no retry. */
+static void run_p02field_guard(uint32_t kib)
+{
+    p02field_variant = P02F_HIDDEN;
+    for (int mode = 0; mode < 2; ++mode) {
+        seed(64500 + kib + (uint64_t)mode);
+        nvs_clear();
+        format_flash(kib);
+        p02field_prepare();
+        if (mode == 0) store_state(SRP_PHASE_SURVEY, 2, 2, 0, P02F_TAG);
+        else store_state(SRP_PHASE_IDLE, 0, 0, SRP_STATE_REPAIR_DISABLED, P02F_TAG);
+        srr_config_t config = config_2770(false);
+        config.previous_failed = mode == 0;
+        srr_report_t report;
+        repair_boot(&report, &config);
+        static sx_repair_t after;
+        sx_from_srr(&report, &after);
+        after.storage_allowed = true;
+        CHECK(report.result == SRR_RESULT_REPORT_ONLY && !report.reclaim.blocks &&
+                  sx_round_outcome(&after) == SX_ROUND_GUARD && !sx_outcome_retryable(sx_round_outcome(&after)),
+              "p02field guard %d: %s, %u blocks", mode, srr_result_name(report.result), report.reclaim.blocks);
+        /* With another image's tag (the design's first proof) the guard
+         * would have let the round run: the stop is per image (counted
+         * failures stop every image). */
+        if (mode == 0) continue;
+        nvs_clear();
+        format_flash(kib);
+        seed(64500 + kib + (uint64_t)mode);
+        p02field_prepare();
+        if (mode == 0) store_state(SRP_PHASE_SURVEY, 2, 2, 0, P02F_TAG);
+        else store_state(SRP_PHASE_IDLE, 0, 0, SRP_STATE_REPAIR_DISABLED, P02F_TAG);
+        config.image_tag = P02F_TAG + 1;
+        repair_boot(&report, &config);
+        CHECK(report.result != SRR_RESULT_REPORT_ONLY, "p02field guard %d: another tag still only reports", mode);
+    }
+    printf("p02field %u KiB: the attempts guard's state carries over to the round boot (same image tag): REPORT_ONLY, "
+           "no round, no retry; with repairs stopped for the image, another image's tag would have run it\n", kib);
+}
+
 static void run_reclaim(uint32_t kib, const char *only)
 {
     const char *part = only && !strncmp(only, "reclaim-", 8) ? only + 8 : NULL;
@@ -6670,6 +7173,24 @@ static void run_reclaim(uint32_t kib, const char *only)
         run_reclaim_p02_direct(kib);
     }
     if (RECLAIM_PART("area")) run_reclaim_area(kib);
+    /* 2.7.7: the confirm-first exception on P02's field store (CI at 8 MiB):
+     * the fit, the gate, the confirmed round, the worst case, too few custody
+     * pages, the guard carried over, and cuts in the confirmed round. */
+    if (RECLAIM_PART("p02field")) {
+        run_reclaim_p02field(kib, P02F_HIDDEN);
+        run_reclaim_p02field(kib, P02F_UNWINDOWED);
+        run_reclaim_p02field(kib, P02F_MIN_GAIN);
+        run_reclaim_p02field(kib, P02F_SHORT);
+        run_p02field_guard(kib);
+        p02field_variant = P02F_HIDDEN;
+        run_reclaim_cuts("p02field confirmed", build_p02field, kib, false, AFTER_SAME, stride);
+        if (kib >= 8192) {
+            p02field_variant = P02F_MIN_GAIN;
+            run_reclaim_cuts("p02field confirmed, minimum gain", build_p02field, kib, false, AFTER_SAME,
+                             full ? 1 : stride * 3);
+        }
+        p02field_variant = P02F_HIDDEN;
+    }
     if (RECLAIM_PART("mirror")) {
         run_reclaim_mirror(kib);
         /* The device's mirror through cuts in the round (low 4). */
