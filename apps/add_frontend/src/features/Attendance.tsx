@@ -20,6 +20,7 @@ import type { RealtimeState } from '../realtime'
 import type { AttendanceEvent, Device } from '../types'
 import { AttendanceReleaseHistory } from './AttendanceRelease'
 import { DirectOrdsSend } from './DirectOrdsSend'
+import { IdentityBacklogRelease } from './IdentityBacklogRelease'
 
 type AttendanceRange = 'latest' | 'today' | 'last24' | 'custom'
 type AttendanceViewMode = 'all-events' | 'needs-review' | 'release-history'
@@ -613,6 +614,7 @@ export function AttendanceView({
       >
         {mode === 'all-events' && <AllAttendanceEvents devices={devices} revision={revision} realtimeState={realtimeState} realtimeLastSyncAt={realtimeLastSyncAt} onReviewEmployee={reviewEmployee} />}
         {mode === 'needs-review' && <ManualForceRelease devices={devices} toast={safeToast} initialConnectorId={reviewConnectorId} />}
+        {mode === 'needs-review' && <IdentityBacklogRelease devices={devices} toast={safeToast} />}
         {mode === 'release-history' && <AttendanceReleaseHistory devices={devices} revision={revision} toast={safeToast} initialJobId={releaseJobId} />}
         {mode === 'release-history' && <SafeAttendanceRepair devices={devices} toast={safeToast} />}
       </div>
