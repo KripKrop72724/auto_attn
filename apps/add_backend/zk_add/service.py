@@ -15,7 +15,10 @@ from zk_add.audit import append_audit
 from zk_add.device_health import (
     Health,
     bind_unbound_row,
+    ROLLBACK_SLOT_RESIDUE,
     classify_led_latch,
+    rollback_slot_residue_candidate,
+    rollback_slot_residue_latch,
     diagnostics_evidence,
     diagnostics_reporting,
     DEVICE_REJECTION_CATEGORIES,
@@ -301,8 +304,19 @@ def apply_ota_heartbeat_diagnostics(
         session, connector=connector, deployment=deployment, payload=payload,
     )
     if evidence is not None:
-        rollback_code = "PREVIOUS_FIRMWARE_OBSERVED"
-        rollback_message = (
+        from zk_add.ota_interruption import TARGET_BOOT_INTERRUPTED, diagnose_return, interrupted_message
+
+        # Evidence and classification read the deployment before it leaves
+        # BOOTED_PENDING; neither can start another attempt.
+        try:
+            diagnosis = diagnose_return(session, connector=connector, deployment=deployment,
+                                        return_evidence=evidence)
+        except (ArithmeticError, KeyError, TypeError, ValueError):
+            # Missing evidence never blocks the existing fail-closed return.
+            diagnosis = {"classification": "UNCLASSIFIED", "unclassified_reasons": ["EVIDENCE_UNAVAILABLE"]}
+        interrupted = diagnosis["classification"] == TARGET_BOOT_INTERRUPTED
+        rollback_code = TARGET_BOOT_INTERRUPTED if interrupted else "PREVIOUS_FIRMWARE_OBSERVED"
+        rollback_message = interrupted_message(diagnosis) if interrupted else (
             "The ESP has returned to its previous firmware after a verified "
             "target boot. Two fresh heartbeats confirm the return; the reset "
             "cause was not reported. The campaign remains paused for review."
@@ -315,12 +329,15 @@ def apply_ota_heartbeat_diagnostics(
             running_partition=ota.running_partition,
             image_sha256=ota.image_sha256,
             error_code=rollback_code, error_message=rollback_message,
+            event_details={"return_evidence": evidence, "diagnosis": diagnosis},
         )
         connector.last_error_code = f"OTA_{rollback_code}"
         connector.last_error_message = rollback_message
         upsert_alert(
             session, connector, code="OTA_DEVICE_ROLLED_BACK", severity="HIGH",
-            message=rollback_message, details=evidence,
+            message=rollback_message, details={
+                **evidence, "classification": diagnosis["classification"], "diagnosis": diagnosis,
+            },
         )
         return
 
@@ -364,6 +381,18 @@ def apply_ota_heartbeat_diagnostics(
             and _local_boot_is_waiting(payload, release)):
         connector.ota_state = "UPDATING"
         return
+    from zk_add.ota_interruption import DOWNLOAD_RETRIES_EXHAUSTED, download_interruption
+
+    interruption = download_interruption(
+        session, connector=connector, deployment=deployment, release=release,
+        payload=payload, error_code=error_code, runtime_state=runtime_state,
+    )
+    if interruption is not None and interruption["decision"] != "EXHAUSTED":
+        # 2.6.0-2.6.15 resume this deployment from their durable journal when
+        # it is offered again; the end-to-end signature and digest checks
+        # still gate boot selection.
+        connector.ota_state = "UPDATING"
+        return
     bounded_bytes = min(
         release.image_size,
         max(deployment.bytes_written, ota.bytes_written),
@@ -372,6 +401,8 @@ def apply_ota_heartbeat_diagnostics(
         error_code,
         "The ESP reported a fail-closed OTA error.",
     )
+    if interruption is not None:
+        error_code, error_message = DOWNLOAD_RETRIES_EXHAUSTED, interruption["message"]
     record_progress(
         session,
         connector=connector,
@@ -758,6 +789,12 @@ def apply_firmware_diagnostics(session: Session, connector: Connector, payload: 
                       resolution={"kind": "CONDITION_CLEARED"}, touch_last_seen=False)
     latch = classify_led_latch(payload.led_state, evidence, storage_verified=storage_verified,
                                workers_verified=workers_verified, firmware_version=connector.firmware_version)
+    if latch is None and rollback_slot_residue_candidate(evidence, connector.firmware_version):
+        from zk_add.ota_interruption import rollback_slot_residue_record
+
+        # Every device gate held; the latch also needs ADD's own record that a
+        # 2.7.x download wrote the other slot after the last 2.6.15 install.
+        latch = rollback_slot_residue_latch(rollback_slot_residue_record(session, connector))
     for code, failed, verified, message in (
         ("ESP_DURABILITY_FAULT", storage_failed, storage_verified,
          "Attendance preservation needs recovery; connectivity alone does not confirm durable storage."),
@@ -770,6 +807,8 @@ def apply_firmware_diagnostics(session: Session, connector: Connector, payload: 
             message = (f"Attendance preservation needs recovery: {record['summary']}."
                        if code == "ESP_DURABILITY_FAULT" else
                        f"Attendance delivery worker fault: {record['summary']}.")[:1000]
+            if code == "ESP_DURABILITY_FAULT" and (latch or {}).get("kind") == ROLLBACK_SLOT_RESIDUE:
+                message = f"Persistence unverified - OTA rollback slot residue: {record['summary']}."[:1000]
             previous = (existing.details or {}) if existing is not None else {}
             same_boot = previous.get("boot_id") == connector.boot_id and previous.get("boot_first_seen_at")
             upsert_alert(session, connector, code=code, severity="HIGH", message=message, details={

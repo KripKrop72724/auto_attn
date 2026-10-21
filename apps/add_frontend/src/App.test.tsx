@@ -980,6 +980,57 @@ describe('State Life ADD interface', () => {
     expect(document.body.textContent).not.toContain('local-step-up-value')
   })
 
+  it('requires the owner override before starting a campaign with ESP stability warnings', async () => {
+    await import('./features/Firmware')
+    const base = fetchStub()
+    const warning = {
+      code: 'ESP_RESET_RATE_HIGH',
+      connector_id: device.connector_id,
+      display_name: device.display_name,
+      message: `${device.display_name}: 46 ESP resets in 30 online hours on 2.6.15 over 7 days (1.53/h; the warning threshold is 0.5/h).`,
+    }
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).endsWith('/api/v1/firmware/campaigns/preflight')) {
+        return response({
+          scope_token: 'signed-test-scope-token-with-sufficient-length',
+          expires_at: '2099-07-27T12:05:00Z',
+          release: { release_id: 'release-2-2-4', version: '2.2.4', state: 'HIL_ONLY' },
+          zone_id: device.zone_id,
+          counts: { candidates: 1, eligible: 1, excluded: 0, offline: 0 },
+          eligible: [device],
+          excluded: [],
+          stability_warnings: [warning],
+        })
+      }
+      return base(input, init)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    render(<App />)
+    await screen.findByRole('heading', { name: 'Fleet', level: 1 })
+    fireEvent.click(screen.getByRole('button', { name: 'Firmware' }))
+    expect(await screen.findByRole('heading', { name: 'Firmware', level: 1 })).toBeTruthy()
+    const newCampaign = screen.getByRole('button', { name: 'New campaign' }) as HTMLButtonElement
+    await waitFor(() => expect(newCampaign.disabled).toBe(false))
+    fireEvent.click(newCampaign)
+    fireEvent.change(screen.getByLabelText('Release channel'), { target: { value: 'release-2-2-4' } })
+    expect(await screen.findByText(/Exact-device HIL quarantine/)).toBeTruthy()
+    fireEvent.change(screen.getByLabelText('Audited reason'), { target: { value: 'Retry after the power fix' } })
+    fireEvent.change(screen.getByLabelText(/Type exact version/), { target: { value: '2.2.4' } })
+    fireEvent.change(screen.getByLabelText('Administrator password'), { target: { value: 'local-step-up-value' } })
+    fireEvent.click(screen.getByRole('button', { name: /preview eligible and excluded devices/i }))
+    expect(await screen.findByText(/46 ESP resets in 30 online hours/)).toBeTruthy()
+    const start = screen.getByRole('button', { name: /start sequential rollout/i }) as HTMLButtonElement
+    expect(start.disabled).toBe(true)
+    fireEvent.click(screen.getByLabelText(/Override the stability warnings/))
+    await waitFor(() => expect(start.disabled).toBe(false))
+    fireEvent.click(start)
+    expect(await screen.findByText(/campaign created for 1 eligible device/i)).toBeTruthy()
+    const campaignCall = fetchMock.mock.calls.find(
+      ([input, init]) => String(input).endsWith('/api/v1/firmware/campaigns') && init?.method === 'POST',
+    )
+    expect(JSON.parse(String(campaignCall?.[1]?.body))).toMatchObject({ override_stability_warnings: true })
+  })
+
   it('returns to the login screen when any request reports an expired session', async () => {
     render(<App />)
     await screen.findByRole('heading', { name: 'Fleet', level: 1 })

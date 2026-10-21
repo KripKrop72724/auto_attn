@@ -23,6 +23,10 @@ def main() -> None:
     assert {"release_id", "zone_id", "reason", "typed_confirmation", "password", "scope_token", "idempotency_key"}.issubset(
         request_properties(spec, "/api/v1/firmware/campaigns", "post")
     )
+    assert "override_stability_warnings" in request_properties(spec, "/api/v1/firmware/campaigns", "post")
+    assert {"deployment_id", "reason", "typed_confirmation", "password", "override_stability_warnings"}.issubset(
+        request_properties(spec, "/api/v1/firmware/campaigns/{campaign_id}/retry-target", "post")
+    )
     assert {"reason", "typed_confirmation"}.issubset(
         request_properties(spec, "/api/v2/devices/{connector_id}/users/{user_key}", "patch")
     )

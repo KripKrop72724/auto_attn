@@ -5553,11 +5553,22 @@ class _FirmwareCampaignIn(_BaseModel):
     password: str = _Field(min_length=1, max_length=512)
     scope_token: str = _Field(min_length=32, max_length=4096)
     idempotency_key: str = _Field(min_length=8, max_length=120)
+    # Required when the preflight reports ESP stability warnings (A3).
+    override_stability_warnings: bool = False
 
 
 class _FirmwarePreflightIn(_BaseModel):
     release_id: str = _Field(min_length=1, max_length=100)
     zone_id: str = _Field(min_length=1, max_length=100)
+
+
+class _FirmwareRetryTargetIn(_BaseModel):
+    model_config = _ConfigDict(extra="forbid")
+    deployment_id: str = _Field(min_length=1, max_length=100)
+    reason: str = _Field(min_length=10, max_length=200)
+    typed_confirmation: str = _Field(min_length=1, max_length=80)
+    password: str = _Field(min_length=1, max_length=512)
+    override_stability_warnings: bool = False
 
 
 class _FirmwareControlIn(_BaseModel):
@@ -5847,13 +5858,15 @@ async def start_firmware_campaign(
             db, release_public_id=body.release_id, zone_id=body.zone_id, reason=body.reason,
             typed_confirmation=body.typed_confirmation, actor=context.username,
             scope_token=body.scope_token, idempotency_key=body.idempotency_key,
+            override_stability_warnings=body.override_stability_warnings,
         )
     except (ValueError, RuntimeError) as error:
         raise HTTPException(status_code=409, detail=str(error)) from error
     from zk_add.zkt_hil_schedule import campaign_audit_scope
     _append_audit(db, actor=context.username, action="FIRMWARE_CAMPAIGN_CREATED", target_type="zone",
                   target_id=body.zone_id, outcome="ACTIVE", after={"campaign_id": campaign.campaign_id,
-                      "release_id": body.release_id, **campaign_audit_scope(db, campaign)})
+                      "release_id": body.release_id, **campaign_audit_scope(db, campaign),
+                      **({"override_stability_warnings": True} if body.override_stability_warnings else {})})
     db.commit()
     await browser_events.publish(
         "firmware",
@@ -5861,6 +5874,40 @@ async def start_firmware_campaign(
     )
     return {"campaign_id": campaign.campaign_id, "status": campaign.status,
             "eligible": campaign.eligible_count, "legacy_skipped": campaign.legacy_skipped_count}
+
+
+# Registered before the generic {action} route, which would otherwise match.
+@app.post("/api/v1/firmware/campaigns/{campaign_id}/retry-target")
+async def retry_firmware_campaign_target(
+    campaign_id: str,
+    body: _FirmwareRetryTargetIn,
+    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+):
+    """Owner-only: one new attempt for a target boot ADD classified as interrupted."""
+    from zk_add.ota_interruption import retry_interrupted_target
+
+    db, context = auth
+    if not (settings.firmware_ota_enabled or settings.firmware_hil_enabled):
+        raise HTTPException(status_code=409, detail="Firmware OTA remains disabled until pilot acceptance.")
+    require_step_up(body.password, db, context)
+    try:
+        result = retry_interrupted_target(
+            db, campaign_public_id=campaign_id, deployment_public_id=body.deployment_id,
+            actor=context.username, reason=body.reason, typed_confirmation=body.typed_confirmation,
+            override_stability_warnings=body.override_stability_warnings,
+        )
+    except LookupError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    _append_audit(db, actor=context.username, action="FIRMWARE_CAMPAIGN_RETRY_TARGET",
+                  target_type="firmware_campaign", target_id=campaign_id, outcome=result["status"],
+                  after={"reason": body.reason, "deployment_id": result["deployment_id"],
+                         "retry_of": result["retry_of"], "connector_id": result["connector_id"],
+                         "stability_warnings_overridden": result["stability_warnings_overridden"]})
+    db.commit()
+    await browser_events.publish("firmware", {"campaign_id": campaign_id, "status": result["status"]})
+    return result
 
 
 @app.post("/api/v1/firmware/campaigns/{campaign_id}/{action}")

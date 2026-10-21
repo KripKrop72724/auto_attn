@@ -824,9 +824,13 @@ def preview_campaign_scope(
             "ota_state": row.ota_state,
         }
 
+    from zk_add.esp_stability import stability_warnings
+    warnings = [warning for row in eligible for warning in stability_warnings(session, row)]
     return {
         "scope_token": token,
         "expires_at": expires_at,
+        # Owner-overridable; never part of the signed scope digest.
+        "stability_warnings": warnings,
         "release": {
             "release_id": release.release_id,
             "version": release.version,
@@ -1025,6 +1029,7 @@ def create_campaign(
     actor: str,
     scope_token: str,
     idempotency_key: str,
+    override_stability_warnings: bool = False,
 ) -> FirmwareCampaign:
     replay = session.scalar(
         select(FirmwareCampaign).where(
@@ -1057,6 +1062,12 @@ def create_campaign(
     if session.scalar(select(FirmwareCampaign).where(
         FirmwareCampaign.zone_id == zone_id, FirmwareCampaign.status.in_(["ACTIVE", "PAUSED"]))):
         raise ValueError("This zone already has an active or paused firmware campaign.")
+    from zk_add.esp_stability import stability_warnings
+    warnings = {row.id: stability_warnings(session, row) for row in eligible}
+    flagged = [warning for rows in warnings.values() for warning in rows]
+    if flagged and not override_stability_warnings:
+        raise ValueError("ESP stability warnings need the owner's override: "
+                         + " ".join(warning["message"] for warning in flagged))
     campaign = FirmwareCampaign(campaign_id=secrets.token_hex(16), release_id=release.id, zone_id=zone_id,
         actor=actor, idempotency_key=idempotency_key, reason=reason,
         typed_confirmation=typed_confirmation, eligible_count=len(eligible),
@@ -1069,6 +1080,10 @@ def create_campaign(
             target_version=release.version)
         session.add(deployment)
         session.flush()
+        if warnings.get(connector.id):
+            session.add(FirmwareEvent(deployment_id=deployment.id, state="STABILITY_WARNINGS_OVERRIDDEN",
+                details={"actor": actor, "warnings": [
+                    {"code": warning["code"], "message": warning["message"]} for warning in warnings[connector.id]]}))
         reserve(session, release, campaign, deployment, nationwide)
         if release.version == "2.6.22":
             from zk_add.zkt_factory_trial import reserve_trial
@@ -1195,6 +1210,12 @@ def assignment_for_connector(session: Session, *, connector: Connector, public_b
                 return None
         except ValueError:
             return None
+    if not pending_offer:
+        # Only a deployment with a recorded 2.6.x download interruption is
+        # ever withheld here, and only for its bounded backoff.
+        from zk_add.ota_interruption import download_retry_hold
+        if download_retry_hold(session, deployment):
+            return None
     token = secrets.token_urlsafe(32)
     session.add(FirmwareDownloadGrant(token_hash=hashlib.sha256(token.encode()).hexdigest(),
         deployment_id=deployment.id, connector_id=connector.id,
@@ -1219,7 +1240,9 @@ def record_progress(
     image_sha256: str | None = None,
     error_code: str | None = None,
     error_message: str | None = None,
+    event_details: dict[str, Any] | None = None,
 ) -> FirmwareDeployment:
+    """Apply one checked transition; event_details (server-side evidence only) joins its event."""
     if state not in ACTIVE_DEPLOYMENT_STATES | TERMINAL_DEPLOYMENT_STATES:
         raise ValueError("Unknown firmware deployment state.")
     deployment = session.scalar(select(FirmwareDeployment).where(
@@ -1275,6 +1298,7 @@ def record_progress(
                                   "running_partition": running_partition,
                                   "image_sha256": image_sha256,
                                   **({"recovery": recovery} if recovery else {}),
+                                  **(event_details or {}),
                               }))
     if state in TERMINAL_DEPLOYMENT_STATES:
         deployment.completed_at = utc_now()
@@ -1574,6 +1598,7 @@ def _deployment_rows(
     campaign: FirmwareCampaign,
     *,
     include_events: bool,
+    include_diagnosis: bool = False,
 ) -> tuple[dict[str, int], list[dict[str, Any]]]:
     deployments = list(
         session.scalars(
@@ -1619,6 +1644,7 @@ def _deployment_rows(
                     if include_events and deployment.offered_at is not None
                     else None
                 ),
+                **(_rollback_rows(session, campaign, deployment) if include_diagnosis else {}),
                 "events": [
                     {
                         "state": event.state,
@@ -1632,15 +1658,26 @@ def _deployment_rows(
     return counts, rows
 
 
+def _rollback_rows(session: Session, campaign: FirmwareCampaign,
+                   deployment: FirmwareDeployment) -> dict[str, Any]:
+    """Re-read rollback evidence and the owner's retry hint for one detail view."""
+    if deployment.status != "ROLLED_BACK":
+        return {"rollback_diagnosis": None, "retry": None}
+    from zk_add.ota_interruption import refreshed_diagnosis, retry_view
+    return {"rollback_diagnosis": refreshed_diagnosis(session, deployment),
+            "retry": retry_view(session, campaign, deployment)}
+
+
 def _serialize_campaign(
     session: Session,
     campaign: FirmwareCampaign,
     *,
     include_deployments: bool,
     include_events: bool,
+    include_diagnosis: bool = False,
 ) -> dict[str, Any]:
     counts, deployments = _deployment_rows(
-        session, campaign, include_events=include_events
+        session, campaign, include_events=include_events, include_diagnosis=include_diagnosis
     )
     release = session.get(FirmwareRelease, campaign.release_id)
     zone_name = session.scalar(
@@ -1767,7 +1804,7 @@ def campaign_detail(session: Session, campaign_id: str) -> dict[str, Any] | None
     if campaign is None:
         return None
     return _serialize_campaign(
-        session, campaign, include_deployments=True, include_events=True
+        session, campaign, include_deployments=True, include_events=True, include_diagnosis=True
     )
 
 

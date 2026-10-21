@@ -462,6 +462,57 @@ def classify_led_latch(led_state: str | None, evidence: dict | None, *, storage_
     return None
 
 
+# Signed 2.6.15 checks at boot (zone_lite.c:3196) that the other OTA slot
+# holds a qualified predecessor (2.4.12 to 2.6.14). Any 2.7.x download writes
+# that slot, so every later 2.6.15 boot latches LOCAL_FAILURE, never verifies
+# persistence and reports durability DEGRADED until a 2.7.x install succeeds,
+# with no storage I/O fault behind it.
+ROLLBACK_SLOT_RESIDUE = "OTA_ROLLBACK_SLOT_RESIDUE"
+RESIDUE_FIRMWARE_VERSION = "2.6.15"
+RESIDUE_APPLICATION_SHA256 = "832c0c3d8dac6e41d7cd0a9d4fbe4508e4f66982fa5ddeceaca4dc5adcbd80d6"
+RESIDUE_LED_SOURCE = "zone_lite.c:3196"
+RESIDUE_UPGRADE_ERROR = "STORAGE_DIRECT_ROLLBACK_IMAGE_UNQUALIFIED"
+RESIDUE_ERROR_FIELDS = ("error_code", "error_operation", "persistence_probe_error", "persistence_probe_operation",
+                        "legacy_error_code", "legacy_error_operation", "legacy_error_queue")
+
+
+def rollback_slot_residue_candidate(evidence: dict | None, firmware_version: str | None) -> bool:
+    """Every device-side gate of the rollback-slot residue latch; any I/O fault fails it."""
+    if not isinstance(evidence, dict) or not isinstance(evidence.get("storage"), dict):
+        return False
+    storage = evidence["storage"]
+    runtime = evidence.get("ota_runtime") if isinstance(evidence.get("ota_runtime"), dict) else {}
+    return (
+        plain_version(firmware_version) == RESIDUE_FIRMWARE_VERSION
+        and runtime.get("image_sha256") == RESIDUE_APPLICATION_SHA256
+        and evidence.get("journal_storage") is None
+        and storage.get("local_failure_source") == RESIDUE_LED_SOURCE
+        and storage.get("local_failure_last_source") in (None, RESIDUE_LED_SOURCE)
+        and storage.get("upgrade_error") == RESIDUE_UPGRADE_ERROR
+        and storage.get("upgrade_ready") is not True
+        and storage.get("durability") == "DEGRADED"
+        and storage.get("recovery_complete") is True
+        and type(storage.get("write_failures")) is int and storage["write_failures"] == 0
+        and type(storage.get("read_failures")) is int and storage["read_failures"] == 0
+        and all(storage.get(name) in (None, 0) for name in STORAGE_COUNTERS)
+        and not any(_reported(storage.get(name)) for name in RESIDUE_ERROR_FIELDS)
+        and storage.get("fault_class") in (None, "NONE")
+    )
+
+
+def rollback_slot_residue_latch(record: dict | None) -> dict | None:
+    """The latch, only with ADD's own record of the 2.7.x download that wrote the slot."""
+    if not record:
+        return None
+    return {"kind": ROLLBACK_SLOT_RESIDUE, "source": RESIDUE_LED_SOURCE,
+            "firmware_version": RESIDUE_FIRMWARE_VERSION, "upgrade_error": RESIDUE_UPGRADE_ERROR,
+            "residue": record}
+
+
+def _residue(details: dict) -> bool:
+    return (details.get("latch") or {}).get("kind") == ROLLBACK_SLOT_RESIDUE
+
+
 def _refreshing_heartbeat(session: Session, row: DeviceAlert) -> DeviceTelemetry | None:
     """The heartbeat that last refreshed a diagnostics alert; it records the boot."""
     seen = ensure_utc(row.last_seen_at)
@@ -572,11 +623,13 @@ def _rule_tier(row: DeviceAlert, connector: Connector, currency: str, *, now: da
             # fault stays a gating warning; capable firmware keeps it DEGRADED
             # until one of its boots verifies or fails storage.
             return WARNING if diagnostics_reporting(connector) == "NOT_REPORTED_BY_FIRMWARE" else DEGRADED
+        if _residue(details):
+            return WARNING  # persistence unverified - OTA rollback slot residue
         return _latched_led_tier(details) or DEGRADED
     if row.code == "ESP_DELIVERY_WORKER_FAULT":
         return WARNING if currency == PREVIOUS_BOOT else DEGRADED
     if row.code == "ESP_LOCAL_FAILURE":
-        if (details.get("latch") or {}).get("kind") == "LED_LATCH_STORAGE_VERIFIED":
+        if (details.get("latch") or {}).get("kind") in {"LED_LATCH_STORAGE_VERIFIED", ROLLBACK_SLOT_RESIDUE}:
             return WARNING
         return _latched_led_tier(details) or (WARNING if currency == HELD else DEGRADED)
     if row.code == "HIK_CAPTURE_UNHEALTHY":
@@ -611,7 +664,11 @@ def _error_code(row: DeviceAlert) -> str:
     if row.code == "HIK_CAPTURE_UNHEALTHY":
         return str(details.get("reason") or row.code)[:120]
     if row.code == "OTA_DEVICE_ROLLED_BACK":
+        if details.get("classification") == "TARGET_BOOT_INTERRUPTED":
+            return "OTA_TARGET_BOOT_INTERRUPTED"
         return "OTA_PREVIOUS_FIRMWARE_OBSERVED"
+    if row.code in {"ESP_DURABILITY_FAULT", "ESP_LOCAL_FAILURE"} and _residue(details):
+        return ROLLBACK_SLOT_RESIDUE
     if row.code == "OTA_DEVICE_REPORTED_FAILURE" and details.get("error_code"):
         return f"OTA_{details['error_code']}"[:120]
     return row.code
@@ -622,6 +679,15 @@ def _evidence_summary(row: DeviceAlert) -> str | None:
     evidence = details.get("evidence")
     summary = evidence.get("summary") if isinstance(evidence, dict) else None
     latch = details.get("latch")
+    if _residue(details):
+        residue = latch.get("residue") or {}
+        return (f"Persistence unverified - OTA rollback slot residue: {latch.get('source')} on "
+                f"{latch.get('firmware_version')} after {residue.get('target_version') or '2.7.x'} wrote "
+                f"{residue.get('bytes_written') or 'some'} bytes to the other slot; no storage I/O errors"
+                + (f" ({summary})" if summary else "") + ".")[:300]
+    diagnosis = details.get("diagnosis")
+    if row.code == "OTA_DEVICE_ROLLED_BACK" and isinstance(diagnosis, dict) and diagnosis.get("summary"):
+        return str(diagnosis["summary"])[:300]
     if not summary and isinstance(latch, dict) and latch.get("kind"):
         summary = (f"{latch['kind']}: latched by {latch.get('source') or 'an unreported source'} on firmware "
                    f"{latch.get('firmware_version') or 'unknown'}.")

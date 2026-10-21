@@ -94,6 +94,33 @@ minutes earlier.
   (`WARNING`) and `ADD_DEVICE_HEALTH_LATCHED_LED_SOURCES`.
 - The derived model is enforced on deploy. There was no shadow-only period.
 
+### Interrupted OTA attempts (21 October 2026, MULTAN-02)
+
+- **Rollback-slot residue.** Signed 2.6.15 checks at boot (`zone_lite.c:3196`)
+  that the other OTA slot holds a qualified predecessor. Any 2.7.x download
+  writes that slot, so every later 2.6.15 boot reports
+  `STORAGE_DIRECT_ROLLBACK_IMAGE_UNQUALIFIED`, never verifies persistence and
+  reports DEGRADED until a 2.7.x install succeeds. `ESP_DURABILITY_FAULT` and
+  `ESP_LOCAL_FAILURE` become a gating WARNING with error code
+  `OTA_ROLLBACK_SLOT_RESIDUE` ("persistence unverified - OTA rollback slot
+  residue") only when all of these hold: firmware 2.6.15 with application
+  digest `832c0c3d...`, LED source exactly `zone_lite.c:3196` (and no later
+  source), that upgrade error, `recovery_complete` true, every write, read,
+  probe and legacy counter 0, no error code or operation, no fault class, and
+  ADD's own record that a 2.7.x deployment wrote bytes after the ESP's last
+  successful 2.6.15 install. Any I/O failure removes the latch and keeps
+  DEGRADED. Holds are unchanged.
+- **Interrupted target boot.** A heartbeat-observed return to the previous
+  firmware is labelled `TARGET_BOOT_INTERRUPTED` (error code
+  `OTA_TARGET_BOOT_INTERRUPTED`) when the new image never reported
+  confirmation, `RUNTIME_HEALTHY` or a failure, and ran at most 5 minutes.
+  Otherwise it stays `PREVIOUS_FIRMWARE_OBSERVED`. Both record the rollback
+  evidence: the target's estimated lifetime and last progress report, any
+  target-boot logs and heartbeats, the ESP's resets per online hour on the old
+  firmware over 7 days, the terminal's first time sync after the new boot, other
+  ESP resets at the same location within ±120 s and whether a reconcile was
+  running. The evidence never names a cause.
+
 ## Evidence ADD records
 
 - Diagnostics alerts record `boot_id`, `firmware_version`, `binding`

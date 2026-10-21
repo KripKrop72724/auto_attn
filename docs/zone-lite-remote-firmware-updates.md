@@ -135,6 +135,10 @@ Campaigns are always per-zone. Creation requires a recent password step-up, CSRF
 5. Pause immediately on any failure, rollback, unexpected identity state, or attendance regression.
 6. Update only devices that attest `OTA_READY`; legacy devices remain
    operational and are reported separately.
+7. The preflight warns when an eligible ESP resets more than 0.5 times per
+   online hour on its current firmware over 7 days, or has been up less than
+   30 minutes. Starting the campaign then needs the owner's explicit override,
+   which is recorded on each affected deployment and in the audit log.
 
 Do not convert a legacy device into an OTA campaign participant by editing the database. Eligibility must come from device capability attestation.
 
@@ -143,9 +147,11 @@ Do not convert a legacy device into an OTA campaign participant by editing the d
 | Failure | Expected result |
 | --- | --- |
 | Power loss before or during download | Current application keeps booting; download resumes from its checkpoint |
+| 2.6.0-2.6.15 download stops (`DOWNLOAD_INCOMPLETE`, `DOWNLOAD_BEGIN_FAILED`) | The deployment stays active; ADD withholds the assignment for 2 min, then 10 min, and the ESP resumes from its journal; the third stop fails it with `DOWNLOAD_RETRIES_EXHAUSTED` and pauses the campaign. Every other version and error still fails and pauses at once |
 | Corrupt or truncated image | SHA-256 or image validation fails; current slot remains active; campaign pauses |
 | Power loss after setting the boot partition | Bootloader starts the candidate; missing confirmation causes rollback |
 | Candidate crashes on first boot | Bootloader rolls back; ADD records `ROLLED_BACK`; campaign pauses |
+| Candidate reset within 5 min with no failure report | `ROLLED_BACK` `TARGET_BOOT_INTERRUPTED` with rollback evidence; campaign pauses; only the owner's step-up "Retry same target" adds one new attempt (refused after two interrupted boots of one release on one ESP) |
 | ADD unavailable | Attendance capture and local queue continue; OTA waits |
 | ESP offline | Deployment remains pending indefinitely |
 | Legacy ESP polls old endpoints only | Existing behavior is unchanged |
