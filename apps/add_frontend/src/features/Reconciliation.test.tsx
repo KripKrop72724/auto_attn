@@ -552,4 +552,47 @@ describe('Hikvision reconciliation scope', () => {
       expect(JSON.parse(String(call?.[1]?.body))).toMatchObject({ scope, confirmation })
     })
   })
+
+  it.each([true, false])('offers recent-tail recovery only when ADD holds a resume point (%s)', async (eligible) => {
+    window.history.replaceState(null, '', '/reconciliation')
+    const hik = { ...device, firmware_family: 'hikvision' as const }
+    const fallback = reconciliationFetch()
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = new URL(String(input), 'https://add.test').pathname
+      if (path === `/api/v1/devices/${device.connector_id}`) return json(hik)
+      if (path.endsWith('/reconciliations/preflight')) return json({
+        eligible: true, ready_now: true, hard_blockers: [], waitable_blockers: [],
+        terminal: null, coverage: null, source_protocol: 'hikvision-isapi-v1',
+        recent_tail: eligible
+          ? { eligible: true, anchor_serial: 597801, begin_serial: 597782, reason: null }
+          : { eligible: false, anchor_serial: null, begin_serial: null,
+              reason: 'ADD holds no checkpointed live-poll record for this terminal; use a full terminal audit instead.' },
+      })
+      if (path.endsWith('/reconciliations/full-history')) return json(job())
+      return fallback(input, init)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    render(<Harness terminal={hik} />)
+    fireEvent.click(screen.getByRole('button', { name: 'Select terminal' }))
+    fireEvent.click(within(screen.getByRole('listbox')).getByRole('option'))
+    const start = await screen.findByRole('button', { name: 'Reconcile attendance' })
+    await waitFor(() => expect((start as HTMLButtonElement).disabled).toBe(false))
+    fireEvent.click(start)
+    fireEvent.change(screen.getByLabelText(/History scope/), { target: { value: 'RECENT_TAIL' } })
+    expect(await screen.findByText(eligible
+      ? /Resumes at terminal serial 597782/
+      : /holds no checkpointed live-poll record/)).toBeTruthy()
+    const confirmation = `RECONCILE ${device.device_id} RECENT TAIL`
+    fireEvent.change(screen.getByLabelText('Audited reason'), { target: { value: 'Recover punches while the poll anchor is blocked' } })
+    fireEvent.change(screen.getByLabelText(new RegExp(`Type ${confirmation}`)), { target: { value: confirmation } })
+    fireEvent.change(screen.getByLabelText('Administrator password'), { target: { value: 'test-only-password' } })
+    const submit = screen.getByRole('button', { name: 'Start durable reconcile' }) as HTMLButtonElement
+    expect(submit.disabled).toBe(!eligible)
+    if (!eligible) return
+    fireEvent.click(submit)
+    await waitFor(() => {
+      const call = fetchMock.mock.calls.find(([input]) => String(input).endsWith('/reconciliations/full-history'))
+      expect(JSON.parse(String(call?.[1]?.body))).toMatchObject({ scope: 'RECENT_TAIL', confirmation })
+    })
+  })
 })

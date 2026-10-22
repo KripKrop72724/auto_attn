@@ -604,6 +604,12 @@ export interface Overview {
 
 export interface ReconciliationPreflight {
   active_user_history?: { eligible: boolean; user_count: number | null; reason: string | null }
+  recent_tail?: {
+    eligible: boolean
+    anchor_serial: number | null
+    begin_serial: number | null
+    reason: string | null
+  }
   source_protocol?: string
   eligible: boolean
   ready_now: boolean
@@ -903,8 +909,23 @@ export interface ReconciliationDivergenceReveal {
   new_raw_digest: string
 }
 
+export type HikvisionHistoryScope = 'ACTIVE_USERS' | 'ALL_RECORDS' | 'RECENT_TAIL'
+
 export interface ReconciliationJob {
-  scope?: 'ACTIVE_USERS' | 'ALL_RECORDS'
+  scope?: HikvisionHistoryScope
+  recent_tail?: {
+    anchor_serial: number
+    begin_serial: number
+    last_serial: number | null
+    anchor_returned: boolean | null
+    pages: number
+    records: number
+    fact_conflicts: number
+    continuity_conflicts: number
+    caught_up: boolean
+    caught_up_at: string | null
+    coverage_certified: false
+  }
   active_user_scope?: {
     user_count: number
     completed_users: number
