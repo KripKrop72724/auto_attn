@@ -4,7 +4,8 @@ param(
     [Parameter(Mandatory = $true)][string]$OutputDirectory,
     [Parameter(Mandatory = $true)][ValidatePattern('^[0-9a-fA-F]{2}(:[0-9a-fA-F]{2}){5}$')][string]$DeviceMac,
     [Parameter(Mandatory = $true)][ValidatePattern('^[0-9a-fA-F]{40}$')][string]$GitSha,
-    [ValidateSet('zkt', 'hikvision')][string]$FirmwareFamily = 'zkt'
+    [ValidateSet('zkt', 'hikvision')][string]$FirmwareFamily = 'zkt',
+    [ValidateSet('factory', 'usb-wifi-rescue', 'usb-wifi-rescue-seed')][string]$ImageRole = 'factory'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -54,8 +55,40 @@ function Clear-PlaintextFile {
 }
 
 $unsigned = (Resolve-Path $UnsignedDirectory).Path
-& python scripts/check_firmware_identity.py (Join-Path $unsigned 'zone_lite.bin') --family $FirmwareFamily
-if ($LASTEXITCODE -ne 0) { throw 'Factory application identity does not match firmware family' }
+if ($ImageRole -eq 'factory') {
+    & python scripts/check_firmware_identity.py (Join-Path $unsigned 'zone_lite.bin') --family $FirmwareFamily
+    if ($LASTEXITCODE -ne 0) { throw 'Factory application identity does not match firmware family' }
+} else {
+    if ($FirmwareFamily -ne 'zkt' -or $DeviceMac.ToLowerInvariant() -ne '14:c1:9f:46:ae:1c' -or $env:ADD_FACTORY_VERSION) {
+        throw 'USB rescue signing is HIL-only for the exact spare and cannot publish a factory bundle'
+    }
+    $existingVault = Join-Path $VaultDirectory 'vault-manifest.json'
+    if (-not (Test-Path -LiteralPath $existingVault -PathType Leaf)) { throw 'USB rescue cannot create or replace signing keys' }
+    $existingManifest = Get-Content -LiteralPath $existingVault -Raw | ConvertFrom-Json
+    if (@($existingManifest.keys).Count -ne 3 -or
+        @($existingManifest.keys | Where-Object { $_.number -eq 1 -and $_.state -eq 'ACTIVE' }).Count -ne 1) {
+        throw 'Expected existing active bootstrap signer is unavailable'
+    }
+    foreach ($number in 1..3) {
+        foreach ($name in @("key-$number.dpapi", "key-$number.entropy", "key-$number-public.pem")) {
+            if (-not (Test-Path -LiteralPath (Join-Path $VaultDirectory $name) -PathType Leaf)) {
+                throw 'Existing USB rescue signing vault is incomplete'
+            }
+        }
+    }
+    $validatorPython = (Get-Command python -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
+    $validationPreference = $ErrorActionPreference
+    $validationExit = -1
+    try {
+        # Windows PowerShell 5.1 turns native stderr into ErrorRecords. An
+        # invalid artifact is an expected refusal, not an incidental traceback
+        # that should skip the explicit before-key-access failure below.
+        $ErrorActionPreference = 'Continue'
+        & $validatorPython scripts/usb_wifi_rescue_artifacts.py $unsigned --role $ImageRole 2>&1 | Out-Null
+        $validationExit = $LASTEXITCODE
+    } finally { $ErrorActionPreference = $validationPreference }
+    if ($validationExit -ne 0) { throw 'USB rescue artifact validation failed before key access' }
+}
 foreach ($required in @('bootloader.bin', 'zone_lite.bin', 'partition-table.bin', 'ota_data_initial.bin', 'flasher_args.json')) {
     if (-not (Test-Path -LiteralPath (Join-Path $unsigned $required) -PathType Leaf)) {
         throw "Unsigned firmware package is missing $required"
@@ -72,6 +105,7 @@ if ($LASTEXITCODE -ne 0) { throw 'Could not restrict firmware-vault ACLs' }
 
 $vaultManifest = Join-Path $VaultDirectory 'vault-manifest.json'
 if (-not (Test-Path -LiteralPath $vaultManifest -PathType Leaf)) {
+    if ($ImageRole -ne 'factory') { throw 'USB rescue must never generate a replacement vault' }
     $staging = Join-Path $env:TEMP ('zone-lite-vault-staging-' + [guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path $staging | Out-Null
     $container = 'zone-lite-keygen-' + [guid]::NewGuid().ToString('N')
@@ -218,7 +252,7 @@ try {
         Copy-Item -LiteralPath (Join-Path $VaultDirectory "key-$number-public.pem") -Destination (Join-Path $output "key-$number-public.pem")
     }
     Copy-Item -LiteralPath $vaultManifest -Destination (Join-Path $output 'vault-manifest.json')
-    $package = @{
+    $packageFields = @{
         schema_version = 1
         firmware_family = $FirmwareFamily
         target_mac = $DeviceMac.ToLowerInvariant()
@@ -226,7 +260,14 @@ try {
         created_at = [DateTime]::UtcNow.ToString('o')
         bootloader_sha256 = (Get-FileHash (Join-Path $output 'bootloader-signed.bin') -Algorithm SHA256).Hash.ToLowerInvariant()
         application_sha256 = (Get-FileHash (Join-Path $output 'zone-lite-signed.bin') -Algorithm SHA256).Hash.ToLowerInvariant()
-    } | ConvertTo-Json
+    }
+    if ($ImageRole -ne 'factory') {
+        $packageFields.image_role = $ImageRole
+        $packageFields.hil_only = $true
+        $packageFields.factory_release_eligible = $false
+        [IO.File]::WriteAllText((Join-Path $output '.hil-only.json'), '{"state":"HIL_ONLY","purpose":"USB_WIFI_RESCUE"}', (New-Object Text.UTF8Encoding($false)))
+    }
+    $package = $packageFields | ConvertTo-Json
     [IO.File]::WriteAllText((Join-Path $output 'bootstrap-manifest.json'), $package, (New-Object Text.UTF8Encoding($false)))
     if ($env:ADD_FACTORY_VERSION) {
         & python scripts/build_factory_manifest.py `

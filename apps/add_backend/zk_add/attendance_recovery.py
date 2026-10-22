@@ -36,6 +36,10 @@ from zk_add.models import (
     AuditEvent,
 )
 from zk_add.hikvision_evidence import HikvisionEvidence
+from zk_add.ords_outbox_coverage import (
+    IDENTITY_HELD_WITHOUT_OUTBOX_STATUSES,
+    ords_outbox_coverage,
+)
 from zk_add.ords_states import (
     ORDS_ACKNOWLEDGED_STATUSES,
     ORDS_ACTIVE_STATUSES,
@@ -583,23 +587,13 @@ def build_recovery_preview(session: Session, *, action: str, filters: Any) -> di
     }
 
 
-def recovery_summary(session: Session) -> dict:
+def recovery_summary(session: Session, *, outbox_coverage: dict | None = None) -> dict:
     now = utc_now()
     status_rows = session.execute(
         select(AttendanceEvent.ords_status, func.count(AttendanceEvent.id)).group_by(AttendanceEvent.ords_status)
     ).all()
     status_counts = {normalize_ords_status(status): int(count) for status, count in status_rows}
-    missing_outbox = int(
-        session.scalar(
-            select(func.count(AttendanceEvent.id))
-            .outerjoin(OrdsOutbox, OrdsOutbox.attendance_event_id == AttendanceEvent.id)
-            .where(
-                OrdsOutbox.id.is_(None),
-                ~AttendanceEvent.ords_status.in_(tuple(ORDS_ACKNOWLEDGED_STATUSES)),
-            )
-        )
-        or 0
-    )
+    coverage = outbox_coverage if outbox_coverage is not None else ords_outbox_coverage(session)
     stale_in_flight = int(
         session.scalar(
             select(func.count(OrdsOutbox.id)).where(
@@ -615,14 +609,19 @@ def recovery_summary(session: Session) -> dict:
     safe_statuses = {"PENDING", "FAILED_RETRYABLE", "RETRYING"}
     safe = sum(status_counts.get(status, 0) for status in safe_statuses)
     active_in_flight = status_counts.get("IN_FLIGHT", 0)
-    identity = sum(status_counts.get(status, 0) for status in ORDS_IDENTITY_HELD_STATUSES)
+    # The same identity-hold set as the outbox coverage split, so a
+    # WAITING_FOR_SNAPSHOT event is "held" on both tiles. Source review counts
+    # every other state, including firmware-receipt and membership checks that
+    # are still being verified; an outbox-less one of those is also counted as
+    # Missing outbox, because the worker verifies only through an outbox row.
+    identity = sum(status_counts.get(status, 0) for status in IDENTITY_HELD_WITHOUT_OUTBOX_STATUSES)
     review = sum(
         count
         for status, count in status_counts.items()
         if status not in (
             safe_statuses
             | {"IN_FLIGHT"}
-            | ORDS_IDENTITY_HELD_STATUSES
+            | IDENTITY_HELD_WITHOUT_OUTBOX_STATUSES
             | ORDS_ACKNOWLEDGED_STATUSES
         )
     )
@@ -652,7 +651,11 @@ def recovery_summary(session: Session) -> dict:
         "allowed_zones": [z.strip() for z in settings.attendance_recovery_allowed_zones.split(",") if z.strip()],
         "delivery": {
             "safe_retryable": safe,
-            "missing_outbox": missing_outbox,
+            # Deliverable rows (and decided holds) without an outbox; identity
+            # holds and review quarantines are counted apart.
+            "missing_outbox": coverage["missing_outbox"],
+            "held_without_outbox": coverage["held_without_outbox"],
+            "review_without_outbox": coverage["review_without_outbox"],
             "stale_in_flight": stale_in_flight,
             "active_in_flight": active_in_flight,
             "identity_held": identity,
@@ -1465,6 +1468,20 @@ def _create_timestamp_correction(session: Session, job: AttendanceRecoveryJob, i
         existing_correction = session.scalar(select(AttendanceSourceCorrection).join(HikvisionEvidence,
             HikvisionEvidence.id == AttendanceSourceCorrection.hikvision_evidence_id).where(
             HikvisionEvidence.event_uid == evidence.event_uid, AttendanceSourceCorrection.status == "CREATED"))
+    if item.source_kind == "ZKT_MANIFEST" and not existing_correction:
+        # A recovery epoch or a new connector generation holds the same terminal
+        # record again under a new manifest row. The record is its terminal,
+        # serial, ordinal and raw bytes: one correction for it is enough, and a
+        # second would deliver a second derived punch.
+        manifest = session.get(TerminalRecordManifest, item.manifest_id)
+        existing_correction = session.scalar(select(AttendanceSourceCorrection).join(TerminalRecordManifest,
+            TerminalRecordManifest.id == AttendanceSourceCorrection.manifest_id).where(
+            TerminalRecordManifest.zkt_device_id == manifest.zkt_device_id,
+            TerminalRecordManifest.terminal_serial == manifest.terminal_serial,
+            TerminalRecordManifest.ordinal == manifest.ordinal,
+            TerminalRecordManifest.raw_record_digest == manifest.raw_record_digest,
+            AttendanceSourceCorrection.status == "CREATED",
+        ).order_by(AttendanceSourceCorrection.id.asc()).limit(1))
     if existing_correction:
         item.attempt_count += 1
         _mark_item(item, status="SKIPPED", outcome="ALREADY_CORRECTED", result={"correction_id": existing_correction.correction_id})

@@ -598,6 +598,12 @@ export interface Overview {
     membership_reverify: number
     oldest_backlog_at: string | null
     last_attempt_at: string | null
+    missing_outbox?: number
+    held_without_outbox?: number
+    review_without_outbox?: number
+    decided_held_without_outbox?: number
+    without_outbox_total?: number
+    without_outbox_by_status?: Record<string, number>
   }
   attendance_recovery?: AttendanceRecoverySummary
 }
@@ -742,6 +748,8 @@ export interface AttendanceRecoverySummary {
   delivery: {
     safe_retryable: number
     missing_outbox: number
+    held_without_outbox?: number
+    review_without_outbox?: number
     stale_in_flight: number
     active_in_flight?: number
     identity_held: number
@@ -1691,7 +1699,70 @@ export interface HistoricalIdentityReport {
   unassigned_groups?: HistoricalIdentityCandidate[]
 }
 
+export type CheckinNotificationStatus = 'NOTIFIED' | 'PENDING' | 'RETRYING' | 'FAILED' | 'NOT_SENT'
+
+// The employee "attendance punched" phone notification for one punch. Punches
+// from before the feature have no stored row and arrive as NOT_SENT.
+export interface CheckinNotification {
+  status: CheckinNotificationStatus
+  reason: string | null
+  detail: string | null
+  sent_at: string | null
+  attempts: number
+  next_attempt_at: string | null
+  last_http_status: number | null
+  host: 'PRIMARY' | 'FALLBACK' | null
+  updated_at: string | null
+  can_retry: boolean
+  manual_retry: boolean
+}
+
+export interface CheckinNotificationOverview {
+  state: 'OK' | 'DEGRADED' | 'PAUSED' | 'OFF' | 'NOT_CONFIGURED'
+  configured: boolean
+  mode: 'OFF' | 'PILOT' | 'ALL'
+  punch_policy: 'ALL_PUNCHES' | 'FIRST_PER_DAY'
+  pilot_zone_count: number
+  pilot_cnic_count: number
+  last_success_at: string | null
+  last_failure_at: string | null
+  last_failure_category: string | null
+  consecutive_failures: number
+  preferred_host: 'PRIMARY' | 'FALLBACK'
+  primary_reprobe_at: string | null
+  paused_until: string | null
+  oldest_pending_at: string | null
+  oldest_pending_age_seconds: number
+  started_at: string | null
+  last_24h: {
+    notified: number
+    pending: number
+    retrying: number
+    failed: number
+    not_sent: number
+    not_sent_reasons: Record<string, number>
+    window_hours: number
+  }
+}
+
+export interface CheckinNotificationSettings extends CheckinNotificationOverview {
+  revision: number
+  pilot_zone_ids: string[]
+  pilot_cnics: Array<{ id: string; masked: string | null }>
+  updated_by: string | null
+  updated_at: string | null
+  endpoint_host: string | null
+  fallback_host: string | null
+  cnic_json_type: 'number' | 'string'
+  stale_window_hours: number
+  coalesce_seconds: number
+  retry_window_hours: number
+  modes: Array<'OFF' | 'PILOT' | 'ALL'>
+  punch_policies: Array<'ALL_PUNCHES' | 'FIRST_PER_DAY'>
+}
+
 export interface AttendanceEvent {
+  checkin_notification?: CheckinNotification | null
   cnic_not_linked?: boolean
   force_release?: { run_id: string; policy?: string | null; administrator: string; approved_at: string; reason: string; audit_id: number | null; snapshot_id: number | null; sync_command_id: number | null; needs_attention?: boolean; approved_identity?: { display_name: string | null; cnic_masked: string | null } | null } | null
   direct_ords_identity?: { eligible: boolean; cnic_source: 'SAVED_PUNCH' | 'SYNCED_USER' | null; exclusion: 'UNKNOWN_USER' | 'CNIC_MISSING' | 'INVALID_EVENT_UID' | null } | null

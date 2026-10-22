@@ -1,0 +1,3 @@
+# Unsigned spare tests are not production recovery qualification.
+CONFIG_NVS_ENCRYPTION=n
+CONFIG_SECURE_BOOT=n
