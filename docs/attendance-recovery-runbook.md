@@ -31,11 +31,20 @@ preview mode.
 ## Operator lanes
 
 - **Safe delivery** contains missing outbox rows, pending events, retryable
-  transport failures, and expired in-flight leases. The **Missing outbox**
-  count includes only deliverable events; identity-held and quarantined events
-  have no delivery row by design and are named beside it, not inside it. Preview and approve a
+  transport failures, and expired in-flight leases. Preview and approve a
   frozen batch; the worker queues each event through the existing one-row
   outbox contract.
+- **Missing outbox** counts only deliverable events without a delivery row.
+  The historical sweep rebuilds `PENDING`, `FAILED_RETRYABLE` and `RETRYING`
+  rows within one pass. An `IN_FLIGHT`, firmware-receipt or membership-check
+  event without a row stays missing until **Rebuild missing outbox** is
+  previewed and approved (it needs the preview and execution gates above), or
+  its loss is investigated. Identity holds
+  (`BLOCKED_IDENTITY`, `QUARANTINED_IDENTITY_REUSE`, `WAITING_FOR_SNAPSHOT`)
+  and review quarantines have no delivery row by design. The tile names them
+  as "held" and "for review" beside the count, not inside it, and turns amber
+  when any review row exists. A held count is ADD's queue, not Oracle: a
+  legacy terminal may already have posted the punch itself.
 - **Identity held** is read-only. Exact terminal serial, UID, user ID,
   snapshot revision, active state, and authoritative CNIC evidence must agree
   before a held event can be reclassified into the safe lane. Name similarity

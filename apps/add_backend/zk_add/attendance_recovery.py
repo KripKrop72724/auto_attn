@@ -643,7 +643,8 @@ def recovery_summary(session: Session, *, outbox_coverage: dict | None = None) -
         "allowed_zones": [z.strip() for z in settings.attendance_recovery_allowed_zones.split(",") if z.strip()],
         "delivery": {
             "safe_retryable": safe,
-            # Deliverable rows to rebuild; held rows have no outbox by design.
+            # Deliverable rows to rebuild; identity holds and review
+            # quarantines have no outbox by design and are counted apart.
             "missing_outbox": coverage["missing_outbox"],
             "held_without_outbox": coverage["held_without_outbox"],
             "review_without_outbox": coverage["review_without_outbox"],

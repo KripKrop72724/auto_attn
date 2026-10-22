@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { AttendanceRecoverySummary } from '../types'
-import { withoutOutboxDetail } from './AttendanceRecovery'
+import { withoutOutboxDetail, withoutOutboxTone } from './AttendanceRecovery'
 
 const delivery = (overrides: Partial<AttendanceRecoverySummary['delivery']>): AttendanceRecoverySummary['delivery'] => ({
   safe_retryable: 0,
@@ -13,13 +13,34 @@ const delivery = (overrides: Partial<AttendanceRecoverySummary['delivery']>): At
 })
 
 describe('missing outbox detail', () => {
-  it('keeps held rows out of the missing count and names them separately', () => {
-    expect(withoutOutboxDetail(delivery({ held_without_outbox: 75002, review_without_outbox: 143 })))
-      .toBe(`Deliverable rows to rebuild · ${(75145).toLocaleString()} held rows have none by design`)
+  it('names held and review rows apart and keeps both out of the missing count', () => {
+    expect(withoutOutboxDetail(delivery({ held_without_outbox: 74838, review_without_outbox: 307 })))
+      .toBe(`Deliverable rows to rebuild · ${(74838).toLocaleString()} held · ${(307).toLocaleString()} for review`)
   })
 
-  it('stays the plain rebuild label for an older backend or no held rows', () => {
-    expect(withoutOutboxDetail(delivery({}))).toBe('Deliverable rows to rebuild')
-    expect(withoutOutboxDetail(undefined)).toBe('Deliverable rows to rebuild')
+  it('never calls review rows held', () => {
+    expect(withoutOutboxDetail(delivery({ held_without_outbox: 0, review_without_outbox: 3 })))
+      .toBe('Deliverable rows to rebuild · 3 for review')
+    expect(withoutOutboxDetail(delivery({ held_without_outbox: 5, review_without_outbox: 0 })))
+      .toBe('Deliverable rows to rebuild · 5 held')
+    expect(withoutOutboxDetail(delivery({ held_without_outbox: 0, review_without_outbox: 0 })))
+      .toBe('Deliverable rows to rebuild')
+  })
+
+  it('keeps the original label when an older backend still counts held rows as missing', () => {
+    expect(withoutOutboxDetail(delivery({ missing_outbox: 75145 }))).toBe('Durable rows to rebuild')
+    expect(withoutOutboxDetail(undefined)).toBe('Durable rows to rebuild')
+  })
+})
+
+describe('missing outbox tone', () => {
+  it('stays positive when only identity-held rows lack an outbox', () => {
+    expect(withoutOutboxTone(delivery({ held_without_outbox: 74838, review_without_outbox: 0 }))).toBe('positive')
+    expect(withoutOutboxTone(undefined)).toBe('positive')
+  })
+
+  it('turns amber for a real gap or any review row', () => {
+    expect(withoutOutboxTone(delivery({ missing_outbox: 1 }))).toBe('warning')
+    expect(withoutOutboxTone(delivery({ held_without_outbox: 74838, review_without_outbox: 307 }))).toBe('warning')
   })
 })

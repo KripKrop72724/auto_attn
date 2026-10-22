@@ -242,8 +242,8 @@ def ords_delivery_metrics(session: Session, *, outbox_coverage: dict | None = No
         "membership_reverify": membership_reverify,
         "oldest_backlog_at": oldest_backlog_at,
         "last_attempt_at": last_attempt_at,
-        # Only deliverable punches without an outbox row are missing; held and
-        # quarantined punches get no Oracle work item by design.
+        # Only deliverable punches without an outbox row are missing; identity
+        # holds and review quarantines get no Oracle work item by design.
         "missing_outbox": coverage["missing_outbox"],
         "held_without_outbox": coverage["held_without_outbox"],
         "review_without_outbox": coverage["review_without_outbox"],
@@ -251,10 +251,13 @@ def ords_delivery_metrics(session: Session, *, outbox_coverage: dict | None = No
         "without_outbox_by_status": coverage["without_outbox_by_status"],
         "historical_sweep": {
             "state": sweep.state if sweep else "NOT_STARTED",
-            # The sweep re-checks held rows for as long as they are held and
-            # queues one only after verified release proof. Its counters add
-            # up every row visit since started_at, not distinct punches.
-            "counter_scope": "CUMULATIVE_ROW_VISITS",
+            # Every counter is a running total since started_at, never a count
+            # of distinct punches. scanned and unresolved add each row visit,
+            # and a held row is revisited for as long as it is held. repaired
+            # adds repair steps (one synced-CNIC release adds two), and
+            # outbox_created leaves out the outbox such a release creates.
+            # docs/attendance-delivery-sweep.md defines each counter.
+            "counter_scope": "CUMULATIVE_SINCE_STARTED_AT",
             "last_event_id": sweep.last_event_id if sweep else None,
             "pages": sweep.pages if sweep else 0,
             "scanned": sweep.scanned_count if sweep else 0,

@@ -25,12 +25,25 @@ function formatDate(value: string | null) {
   return new Date(value).toLocaleString()
 }
 
-// Held and quarantined punches get no Oracle work item until they are
-// released, so they are shown beside the missing count, never inside it.
-export function withoutOutboxDetail(delivery?: AttendanceRecoverySummary['delivery']) {
-  const byDesign = (delivery?.held_without_outbox ?? 0) + (delivery?.review_without_outbox ?? 0)
-  if (!byDesign) return 'Deliverable rows to rebuild'
-  return `Deliverable rows to rebuild · ${byDesign.toLocaleString()} held rows have none by design`
+// Identity-held and review-quarantined punches get no Oracle work item until
+// they are released, so they are named beside the missing count, never inside
+// it. Review rows (non-identity quarantines and unknown states) are never
+// called held, and they keep the tile amber so an unknown state is not hidden.
+type RecoveryDelivery = AttendanceRecoverySummary['delivery']
+
+export function withoutOutboxDetail(delivery?: RecoveryDelivery) {
+  if (!delivery || (delivery.held_without_outbox === undefined && delivery.review_without_outbox === undefined)) {
+    // An older backend counted held rows inside missing_outbox.
+    return 'Durable rows to rebuild'
+  }
+  const parts = ['Deliverable rows to rebuild']
+  if (delivery.held_without_outbox) parts.push(`${delivery.held_without_outbox.toLocaleString()} held`)
+  if (delivery.review_without_outbox) parts.push(`${delivery.review_without_outbox.toLocaleString()} for review`)
+  return parts.join(' · ')
+}
+
+export function withoutOutboxTone(delivery?: RecoveryDelivery): 'positive' | 'warning' {
+  return delivery?.missing_outbox || delivery?.review_without_outbox ? 'warning' : 'positive'
 }
 
 export function AttendanceRecovery({ revision, toast }: { revision: number; toast: Toast }) {
@@ -242,7 +255,7 @@ export function AttendanceRecovery({ revision, toast }: { revision: number; toas
     <div className="reconciliation-recovery">
       <section className="metric-grid reconciliation-metrics" aria-label="Recovery health">
         <Metric label="Safe delivery" value={(delivery?.safe_retryable ?? 0).toLocaleString()} detail="Eligible for preview and bulk retry" icon="refresh" tone={delivery?.safe_retryable ? 'warning' : 'positive'} />
-        <Metric label="Missing outbox" value={(delivery?.missing_outbox ?? 0).toLocaleString()} detail={withoutOutboxDetail(delivery)} icon="server" tone={delivery?.missing_outbox ? 'warning' : 'positive'} />
+        <Metric label="Missing outbox" value={(delivery?.missing_outbox ?? 0).toLocaleString()} detail={withoutOutboxDetail(delivery)} icon="server" tone={withoutOutboxTone(delivery)} />
         <Metric label="Active in-flight" value={(delivery?.active_in_flight ?? 0).toLocaleString()} detail="Owned by a live worker lease" icon="pulse" tone="neutral" />
         <Metric label="Identity held" value={(delivery?.identity_held ?? 0).toLocaleString()} detail="Read-only evidence lane" icon="shield" tone={delivery?.identity_held ? 'warning' : 'positive'} />
         <Metric label="Source review" value={(delivery?.permanent_review ?? 0).toLocaleString()} detail={`${summary?.source.zkt_invalid_time ?? 0} invalid ZKT timestamps`} icon="alert" tone={delivery?.permanent_review ? 'critical' : 'positive'} />
