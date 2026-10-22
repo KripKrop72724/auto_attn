@@ -199,6 +199,7 @@ from zk_add.comm_keys import (
     serialize_operation as serialize_comm_key_operation,
 )
 from zk_add.worker import maintenance_loop, ords_delivery_metrics
+from zk_add.ords_outbox_coverage import ords_outbox_coverage
 from zk_add.attendance_repair import attendance_release_states, repair_worker_metrics
 from zk_add.attendance_recovery import (
     RecoveryError,
@@ -575,9 +576,11 @@ def session_info(auth: tuple[Session, AdminContext] = Depends(require_admin)):
 def overview(auth: tuple[Session, AdminContext] = Depends(require_admin)):
     db, _context = auth
     result = fleet_counts(db)
-    result["ords_delivery"] = ords_delivery_metrics(db)
+    # Both summaries report the same anti-join; run it once per request.
+    coverage = ords_outbox_coverage(db)
+    result["ords_delivery"] = ords_delivery_metrics(db, outbox_coverage=coverage)
     result["attendance_repair"] = repair_worker_metrics(db)
-    result["attendance_recovery"] = recovery_summary(db)
+    result["attendance_recovery"] = recovery_summary(db, outbox_coverage=coverage)
     result["checkin_notifications"] = checkin_notify.overview(db)
     return result
 

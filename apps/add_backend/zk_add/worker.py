@@ -37,6 +37,7 @@ from zk_add.ords_states import (
     ORDS_MEMBERSHIP_REVERIFY_STATUSES,
 )
 from zk_add.identity_states import VERIFIED_IDENTITY_RESOLUTION_STATUSES
+from zk_add.ords_outbox_coverage import ords_outbox_coverage
 from zk_add.realtime import browser_events, connector_hub
 from zk_add.provisioning import (
     TERMINAL_STATES as PROVISIONING_TERMINAL_STATES,
@@ -176,7 +177,7 @@ def ords_failure_category(
     return f"HTTP_{status}"
 
 
-def ords_delivery_metrics(session: Session) -> dict:
+def ords_delivery_metrics(session: Session, *, outbox_coverage: dict | None = None) -> dict:
     rows = session.execute(
         select(OrdsOutbox.status, func.count(OrdsOutbox.id)).group_by(OrdsOutbox.status)
     ).all()
@@ -226,19 +227,7 @@ def ords_delivery_metrics(session: Session) -> dict:
         if status.upper() in ORDS_ACKNOWLEDGED_STATUSES
     )
     sweep = session.get(AttendanceDeliverySweep, 1)
-    missing_outbox = int(
-        session.scalar(
-            select(func.count(AttendanceEvent.id))
-            .outerjoin(OrdsOutbox, OrdsOutbox.attendance_event_id == AttendanceEvent.id)
-            .where(
-                OrdsOutbox.id.is_(None),
-                ~AttendanceEvent.ords_status.in_(
-                    tuple(ORDS_ACKNOWLEDGED_STATUSES)
-                ),
-            )
-        )
-        or 0
-    )
+    coverage = outbox_coverage if outbox_coverage is not None else ords_outbox_coverage(session)
     return {
         "backlog": active_outbox + blocked_identity,
         "pending": counts.get("pending", 0),
@@ -254,9 +243,24 @@ def ords_delivery_metrics(session: Session) -> dict:
         "membership_reverify": membership_reverify,
         "oldest_backlog_at": oldest_backlog_at,
         "last_attempt_at": last_attempt_at,
-        "missing_outbox": missing_outbox,
+        # Only deliverable punches, and held punches that already have a
+        # release decision, are missing an outbox row; other identity holds
+        # and review quarantines get no Oracle work item by design.
+        "missing_outbox": coverage["missing_outbox"],
+        "held_without_outbox": coverage["held_without_outbox"],
+        "review_without_outbox": coverage["review_without_outbox"],
+        "decided_held_without_outbox": coverage["decided_held_without_outbox"],
+        "without_outbox_total": coverage["without_outbox_total"],
+        "without_outbox_by_status": coverage["without_outbox_by_status"],
         "historical_sweep": {
             "state": sweep.state if sweep else "NOT_STARTED",
+            # Every counter is a running total since started_at, never a count
+            # of distinct punches. scanned and unresolved add each row visit,
+            # and a held row is revisited for as long as it is held. repaired
+            # adds repair steps (one synced-CNIC release adds two), and
+            # outbox_created leaves out the outbox such a release creates.
+            # docs/attendance-delivery-sweep.md defines each counter.
+            "counter_scope": "CUMULATIVE_SINCE_STARTED_AT",
             "last_event_id": sweep.last_event_id if sweep else None,
             "pages": sweep.pages if sweep else 0,
             "scanned": sweep.scanned_count if sweep else 0,
@@ -264,6 +268,7 @@ def ords_delivery_metrics(session: Session) -> dict:
             "outbox_created": sweep.outbox_created_count if sweep else 0,
             "unresolved": sweep.unresolved_count if sweep else 0,
             "quarantined": sweep.quarantined_count if sweep else 0,
+            "started_at": sweep.started_at if sweep else None,
             "updated_at": sweep.updated_at if sweep else None,
         },
     }
