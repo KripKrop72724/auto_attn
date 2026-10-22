@@ -16,7 +16,7 @@ concurrency:
 jobs:
   windows-publication:
     runs-on: windows-2022
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
         with:
@@ -43,6 +43,56 @@ jobs:
         run: |
           python -c "import hashlib,pathlib; from scripts.invoke_factory_audit import AUDITOR_SHA256; digest=hashlib.sha256(pathlib.Path('scripts/audit_factory_bundle.py').read_bytes()).hexdigest(); raise SystemExit(0 if digest == AUDITOR_SHA256 else 'AUDITOR_CHECKOUT_HASH_MISMATCH')"
           if ($LASTEXITCODE -ne 0) { throw 'Pinned factory auditor checkout did not verify.' }
+
+      - name: Get digest-pinned Zig compiler
+        shell: powershell
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+          $archive = Join-Path $env:RUNNER_TEMP 'zig.zip'
+          Invoke-WebRequest -Uri 'https://ziglang.org/download/0.14.1/zig-x86_64-windows-0.14.1.zip' -OutFile $archive
+          if ((Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant() -ne '554f5378228923ffd558eac35e21af020c73789d87afeabf4bfd16f2e6feed2c') { throw 'Zig digest mismatch' }
+          Expand-Archive -LiteralPath $archive -DestinationPath $env:RUNNER_TEMP
+      - name: Verify tools and build offline executable
+        shell: powershell
+        run: |
+          $tools = Join-Path $env:RUNNER_TEMP 'security-tools.zip'
+          python tools/usb-security-check/prepare_tools.py $tools
+          if ($LASTEXITCODE -ne 0) { throw 'Tool verification failed' }
+          $zig = Join-Path $env:RUNNER_TEMP 'zig-x86_64-windows-0.14.1/zig.exe'
+          python tools/usb-security-check/build.py $zig $tools
+          if ($LASTEXITCODE -ne 0) { throw 'Windows build failed' }
+      - name: Verify serial logging with absent, busy and streaming USB devices
+        shell: powershell
+        run: ./tools/usb-security-check/test-collector.ps1
+      - name: Verify serial logging in PowerShell Core
+        shell: pwsh
+        run: ./tools/usb-security-check/test-collector.ps1
+      - name: Exercise native GUI, PowerShell GUI and bundled offline esptool
+        shell: powershell
+        run: |
+          $exe = Join-Path $PWD 'dist/SLIC-USB-Security-Check-v1.3.exe'
+          $process = Start-Process -FilePath $exe -ArgumentList '--ui-smoke-test' -PassThru
+          if (-not $process.WaitForExit(60000)) { $process.Kill(); throw 'GUI smoke test timed out' }
+          $process.Refresh()
+          if ($process.ExitCode -ne 0) { throw "GUI smoke test failed: $($process.ExitCode)" }
+          New-Item -ItemType Directory smoke-logs -Force | Out-Null
+          $desktop = [Environment]::GetFolderPath('Desktop')
+          foreach ($folder in @($desktop, $env:TEMP)) {
+            if ($folder -and (Test-Path $folder)) {
+              Get-ChildItem -LiteralPath $folder -Filter 'SLIC-Startup-*.txt' | Copy-Item -Destination smoke-logs
+            }
+          }
+          $content = (Get-ChildItem smoke-logs -File | Get-Content) -join "`n"
+          if ($content -notmatch 'Confirmed: diagnostic GUI reported its Shown event' -or $content -notmatch '5\.1\.0') { throw 'GUI/offline tool evidence missing' }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: SLIC-USB-Security-Check-v1.3-windows
+          retention-days: 7
+          path: |
+            dist/SLIC-USB-Security-Check-v1.3.exe
+            smoke-logs/
+            tools/usb-security-check/tool-metadata.json
 
   repository-contract:
     runs-on: ubuntu-latest
