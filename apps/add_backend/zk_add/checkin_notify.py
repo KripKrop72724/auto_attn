@@ -15,7 +15,8 @@ Design (see docs/checkin-notifications.md for the operator view):
   confirmation path might have missed (recent punches only).
 * The CNIC stored on the row is the one Oracle received for that punch: the
   delivery paths pass it explicitly (``note_delivered_cnic``); otherwise the
-  punch's own saved CNIC is used.
+  punch's own saved CNIC is used, unless the terminal captured a different
+  CNIC (then the row is "not sent: CNIC uncertain").
 * A worker claims due rows with a lease (``FOR UPDATE SKIP LOCKED`` on
   PostgreSQL), applies the anti-spam policy (age window, invalid clock,
   OFF / PILOT / ALL, coalescing, first punch per day), sends with a bounded
@@ -155,6 +156,16 @@ def _row_values(event: AttendanceEvent, delivered_cnic: str | None, now: datetim
             # Keep the punch's own protected CNIC; never block the confirmation.
             cnic_encrypted, lookup, last4 = event.cnic_encrypted, event.cnic_lookup_hash, event.cnic_last4
     skip = _initial_skip_reason(event, punch, confirmed, bool(cnic_encrypted and lookup))
+    if (
+        skip is None
+        and not delivered_cnic
+        and event.captured_cnic_lookup_hash
+        and event.captured_cnic_lookup_hash != lookup
+    ):
+        # No delivery path told us the CNIC Oracle received (for example the
+        # terminal delivered it itself), and the terminal's own CNIC differs
+        # from the saved one: never notify a possibly different employee.
+        skip = "CNIC_UNCERTAIN"
     return {
         "attendance_event_id": event.id,
         "connector_id": event.connector_id,

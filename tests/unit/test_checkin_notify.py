@@ -287,6 +287,23 @@ def test_membership_and_firmware_receipt_confirmations_record_rows(store):
     }
 
 
+def test_a_terminal_delivered_punch_with_a_different_captured_cnic_is_not_notified(store):
+    sessions, connector_id = store
+    same = punch(sessions, status="FIRMWARE_RECEIPT_VERIFYING")
+    changed = punch(sessions, status="FIRMWARE_RECEIPT_VERIFYING", cnic=OTHER_CNIC)
+    with sessions() as db:
+        db.get(AttendanceEvent, same).captured_cnic_lookup_hash = cnic_lookup(CNIC)
+        # The terminal sent CNIC to Oracle; ADD's saved identity says OTHER_CNIC.
+        db.get(AttendanceEvent, changed).captured_cnic_lookup_hash = cnic_lookup(CNIC)
+        db.commit()
+    outboxes = [(outbox_id(sessions, event_id), "f" * 64, connector_id) for event_id in (same, changed)]
+    worker.apply_firmware_receipt_audit_results(
+        outboxes, set(), status=200, transport_error=None, response_parsed=True,
+    )
+    states = {row.attendance_event_id: (row.status, row.reason) for row in rows(sessions)}
+    assert states == {same: ("PENDING", None), changed: ("SKIPPED", "CNIC_UNCERTAIN")}
+
+
 def test_a_rolled_back_confirmation_leaves_no_row(store):
     sessions, _ = store
     event_id = punch(sessions)

@@ -85,7 +85,7 @@ Punch policy: **Every punch** (default) or **First punch of the day** (PKT).
 | Pending | Queued; sends within seconds. |
 | Retrying | A network error, timeout, HTTP 429 or 5xx; retried with backoff for up to 6 hours. |
 | Failed | The HRM service refused it (another HTTP 4xx or `success: false`), or 6 hours of retries ran out. Click it for the reason; an administrator can **Retry notification**. |
-| Not sent · reason | Deliberately not sent: before feature, old punch, invalid time, no CNIC, grouped, not first of day, outside pilot, disabled, not configured, or awaiting Oracle. |
+| Not sent · reason | Deliberately not sent: before feature, old punch, invalid time, no CNIC, CNIC uncertain (the terminal delivered the punch itself with a CNIC that differs from ADD's saved one), grouped, not first of day, outside pilot, disabled, not configured, or awaiting Oracle. |
 
 Filter by these states with **Filters → Phone notification**. The strip above
 the list shows the mode, health and the last 24 hours' counts.
