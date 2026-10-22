@@ -15,6 +15,12 @@ ZONE-SLICTOWER-3FL (zone-lite-2.7.2) on 22 Oct, device logs (UTC):
   coverage as SOURCE_TAIL_REPLAY_DIVERGED; from 13:22:15 / 07:36:39 every tail
   was rejected until the socket reconnected.
 
+ZONE-LAHORE-01 (zone-lite-2.6.15) on 12 Oct fits the same race with a longer
+bootstrap: 12:06:54 reconnect, 12:07:57 CURRENT_TAIL_CHECKPOINT_RETRY while the
+catalog was still streaming (applied 12:08:06), then a replay divergence at
+12:23:02. A tail held behind the bootstrap past the reader's 30 s ACK wait is
+committed by ADD while the reader keeps C.
+
 Every Zone Lite generation (2.4.12 through 2.7.6) keeps source_coverage pushes
 in a queue of one (xQueueOverwrite) and applies the queued push only between
 loop steps, after the tail step returns. ADD now follows the ACK of a tail
@@ -176,6 +182,14 @@ def test_p06_bootstrap_push_queued_during_a_tail_no_longer_rewinds_the_reader(wi
         late.receive(resync)
         late.loop_step()
         assert late.cursor == start + 3 and late.chain == ack["resulting_chain_digest"]
+        # ZONE-LAHORE-01 (2.6.15, 12 Oct): the tail waited behind the bootstrap
+        # longer than the reader's 30 s ACK wait, so the ACK found no waiter and
+        # the reader kept C. The coverage that follows the ACK still moves it.
+        timed_out = _reader_at(start, bootstrap)
+        for frame in frames:
+            timed_out.receive(frame)
+        timed_out.loop_step()
+        assert timed_out.cursor == start + 3 and timed_out.rewinds == []
 
         # The next tail extends from the ACKed cursor and commits. No push is
         # owed any more, so its ACK is not followed by another one.
