@@ -133,6 +133,10 @@ POLICY = {
     "ORACLE_RECEIPT_CONNECTOR_MISMATCH": Policy(
         109, False, "LATCHED", "Clears when Oracle receipts match this connector."),
     "ADMIN_REVOKE_OVERDUE": Policy(109, False, "LATCHED", "Clears when the temporary admin is revoked."),
+    # A staged HIL plan stopped on this device (hil_plans). Never a hold: the
+    # plan has already stopped, and the device's own alerts carry its faults.
+    "FIRMWARE_HIL_PLAN_HALTED": Policy(
+        109, False, "LATCHED", "Resolved by an operator after reviewing the halted staged HIL plan."),
 }
 UNKNOWN_POLICY = Policy(110, False, "LATCHED", "No automatic clear condition is known for this code.")
 ZKT_LINK = {

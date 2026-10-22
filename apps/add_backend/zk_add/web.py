@@ -6010,6 +6010,15 @@ class _HilPlanPreviewIn(_BaseModel):
     stage_timeout_minutes: int = _Field(default=_hil_plans.DEFAULT_STAGE_TIMEOUT_MINUTES,
                                         ge=_hil_plans.MIN_STAGE_TIMEOUT_MINUTES,
                                         le=_hil_plans.MAX_STAGE_TIMEOUT_MINUTES)
+    soak_minutes: int = _Field(default=_hil_plans.DEFAULT_SOAK_MINUTES, ge=_hil_plans.MIN_SOAK_MINUTES,
+                               le=_hil_plans.MAX_SOAK_MINUTES)
+    window_start_hour: int = _Field(default=_hil_plans.DEFAULT_WINDOW_START_HOUR, ge=0, le=23)
+    window_end_hour: int = _Field(default=_hil_plans.DEFAULT_WINDOW_END_HOUR, ge=1, le=24)
+
+    def options(self) -> dict:
+        return {"expires_in_hours": self.expires_in_hours, "stage_timeout_minutes": self.stage_timeout_minutes,
+                "soak_minutes": self.soak_minutes, "window_start_hour": self.window_start_hour,
+                "window_end_hour": self.window_end_hour}
 
 
 class _HilPlanApproveIn(_HilPlanPreviewIn):
@@ -6037,8 +6046,7 @@ def preview_firmware_hil_plan(
     db, _ = auth
     try:
         return _hil_plans.resolve_plan(db, release_public_id=body.release_id, stages=body.stages,
-                                       expires_in_hours=body.expires_in_hours,
-                                       stage_timeout_minutes=body.stage_timeout_minutes)
+                                       **body.options())
     except (ValueError, RuntimeError) as error:
         raise HTTPException(status_code=409, detail=str(error)) from error
     finally:
@@ -6046,20 +6054,17 @@ def preview_firmware_hil_plan(
         db.rollback()
 
 
-@app.post("/api/v1/firmware/hil-plans", status_code=201)
-async def approve_firmware_hil_plan(
-    body: _HilPlanApproveIn,
-    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
-):
+def _approve_hil_plan(body: _HilPlanApproveIn, auth: tuple[Session, AdminContext]) -> dict:
+    """Step-up, the per-device preflights and the commit: slow, blocking work for the threadpool."""
     db, context = auth
     require_step_up(body.password, db, context)
     try:
         plan, created = _hil_plans.create_plan(
             db, release_public_id=body.release_id, stages=body.stages, reason=body.reason,
             typed_confirmation=body.typed_confirmation, plan_digest=body.plan_digest,
-            actor=context.username, idempotency_key=body.idempotency_key,
-            expires_in_hours=body.expires_in_hours, stage_timeout_minutes=body.stage_timeout_minutes)
+            actor=context.username, idempotency_key=body.idempotency_key, **body.options())
     except (ValueError, RuntimeError) as error:
+        db.rollback()
         raise HTTPException(status_code=409, detail=str(error)) from error
     except IntegrityError as error:
         db.rollback()
@@ -6070,11 +6075,20 @@ async def approve_firmware_hil_plan(
                       after={"plan_id": plan.plan_id, "release_id": plan.release_public_id,
                              "image_sha256": plan.image_sha256, "application_sha256": plan.application_sha256,
                              "plan_digest": plan.plan_digest, "stages": plan.stages, "reason": body.reason,
-                             "expires_at": plan.expires_at.isoformat(),
-                             "stage_timeout_minutes": body.stage_timeout_minutes})
+                             "expires_at": plan.expires_at.isoformat(), **body.options()})
     db.commit()
-    await browser_events.publish("firmware", {"hil_plan": {"plan_id": plan.plan_id, "status": plan.status}})
     return {**_hil_plans.serialize_plan(db, plan), "created": created}
+
+
+@app.post("/api/v1/firmware/hil-plans", status_code=201)
+async def approve_firmware_hil_plan(
+    body: _HilPlanApproveIn,
+    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+):
+    # Never on the event loop: it also carries every device WebSocket.
+    result = await run_in_threadpool(_approve_hil_plan, body, auth)
+    await browser_events.publish("firmware", {"hil_plan": {"plan_id": result["plan_id"], "status": result["status"]}})
+    return result
 
 
 @app.get("/api/v1/firmware/hil-plans/{plan_id}")
@@ -6086,6 +6100,24 @@ def get_firmware_hil_plan(plan_id: str, auth: tuple[Session, AdminContext] = Dep
     return row
 
 
+def _control_hil_plan(plan_id: str, action: str, body: _FirmwareControlIn,
+                      auth: tuple[Session, AdminContext]) -> dict:
+    """Step-up, row and advisory locks and the commit: blocking work for the threadpool."""
+    db, context = auth
+    require_step_up(body.password, db, context)
+    try:
+        result = _hil_plans.control_plan(db, plan_id=plan_id, action=action, actor=context.username,
+                                         reason=body.reason)
+    except LookupError as error:
+        db.rollback()
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except ValueError as error:
+        db.rollback()
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    db.commit()
+    return result
+
+
 @app.post("/api/v1/firmware/hil-plans/{plan_id}/{action}")
 async def control_firmware_hil_plan(
     plan_id: str,
@@ -6093,16 +6125,8 @@ async def control_firmware_hil_plan(
     body: _FirmwareControlIn,
     auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
 ):
-    db, context = auth
-    require_step_up(body.password, db, context)
-    try:
-        result = _hil_plans.control_plan(db, plan_id=plan_id, action=action, actor=context.username,
-                                         reason=body.reason)
-    except LookupError as error:
-        raise HTTPException(status_code=404, detail=str(error)) from error
-    except ValueError as error:
-        raise HTTPException(status_code=409, detail=str(error)) from error
-    db.commit()
+    # Waits for the plan row a stage start may hold; never on the event loop.
+    result = await run_in_threadpool(_control_hil_plan, plan_id, action, body, auth)
     await browser_events.publish("firmware", {"hil_plan": result})
     return result
 

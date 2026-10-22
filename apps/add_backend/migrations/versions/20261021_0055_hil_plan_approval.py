@@ -8,8 +8,9 @@ idempotency key.
 from alembic import op
 import sqlalchemy as sa
 
-revision = "20261021_0054_hil_plan"
-down_revision = "20261012_0053"
+revision = "20261021_0055_hil_plan"
+# Follows the check-in notifications migration (#402), the head on main.
+down_revision = "20261022_0054"
 branch_labels = None
 depends_on = None
 
@@ -43,6 +44,9 @@ def upgrade() -> None:
         sa.Column("approved_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("expires_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("stage_timeout_seconds", sa.Integer(), nullable=False),
+        sa.Column("soak_seconds", sa.Integer(), nullable=False),
+        sa.Column("window_start_hour", sa.Integer(), nullable=False),
+        sa.Column("window_end_hour", sa.Integer(), nullable=False),
         sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("completed_at", sa.DateTime(timezone=True), nullable=True),
         sa.UniqueConstraint("approved_by", "idempotency_key", name="uq_add_hil_plan_actor_key"),

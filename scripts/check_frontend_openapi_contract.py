@@ -49,11 +49,13 @@ def main() -> None:
     # require the password step-up and an audited reason.
     assert "get" in paths["/api/v1/firmware/hil-plans"]
     assert "get" in paths["/api/v1/firmware/hil-plans/{plan_id}"]
-    assert {"release_id", "stages", "expires_in_hours", "stage_timeout_minutes"}.issubset(
+    hil_plan_options = {"expires_in_hours", "stage_timeout_minutes", "soak_minutes", "window_start_hour",
+                        "window_end_hour"}
+    assert {"release_id", "stages", *hil_plan_options}.issubset(
         request_properties(spec, "/api/v1/firmware/hil-plans/preview", "post")
     )
     assert {"release_id", "stages", "reason", "typed_confirmation", "password", "plan_digest",
-            "idempotency_key", "expires_in_hours", "stage_timeout_minutes"}.issubset(
+            "idempotency_key", *hil_plan_options}.issubset(
         request_properties(spec, "/api/v1/firmware/hil-plans", "post")
     )
     assert {"reason", "password"}.issubset(

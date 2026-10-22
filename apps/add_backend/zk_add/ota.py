@@ -690,8 +690,10 @@ def _campaign_scope(
     *,
     release_public_id: str,
     zone_id: str,
+    sync_store: bool = True,
 ) -> tuple[FirmwareRelease, list[Connector], list[Connector], list[tuple[Connector, str]]]:
-    sync_release_store(session)
+    if sync_store:
+        sync_release_store(session)
     release = session.scalar(
         select(FirmwareRelease).where(
             FirmwareRelease.release_id == release_public_id,
@@ -793,11 +795,14 @@ def preview_campaign_scope(
     release_public_id: str,
     zone_id: str,
     ttl_seconds: int = 5 * 60,
+    sync_store: bool = True,
 ) -> dict[str, Any]:
+    """sync_store=False only when the caller verified the release store in this transaction."""
     release, connectors, eligible, excluded = _campaign_scope(
         session,
         release_public_id=release_public_id,
         zone_id=zone_id,
+        sync_store=sync_store,
     )
     expires_at = utc_now() + timedelta(seconds=ttl_seconds)
     from zk_add.zkt_hil_schedule import schedule
