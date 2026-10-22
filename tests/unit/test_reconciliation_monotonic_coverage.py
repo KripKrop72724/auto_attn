@@ -1,4 +1,5 @@
 """An older baseline can finish without replacing a longer live source chain."""
+from contextlib import contextmanager
 from copy import deepcopy
 import base64
 import hashlib
@@ -316,17 +317,29 @@ def test_failed_database_commit_cannot_return_a_manifest_receipt(reconciliation_
     assert session.scalar(select(func.count(ReconciliationCoverage.id))) == 1
 
 
+def postgres_url():
+    import os
+    url = os.environ.get("ADD_SAFE_REPAIR_TEST_DATABASE_URL") or (os.environ.get("ADD_DATABASE_URL") if os.environ.get("CI") else None)
+    if not url or not url.startswith("postgresql"):
+        pytest.skip("Set ADD_SAFE_REPAIR_TEST_DATABASE_URL for PostgreSQL qualification")
+    return url
+
+
 @pytest.fixture
 def pg_scenario(reconciliation_db):  # noqa: F811
-    import os
+    url = postgres_url()
+    data = scenario(reconciliation_db)
+    with postgres_copy(data[0], url) as factory:
+        yield factory, tuple(row.id for row in data[1:4]), data[4]
+
+
+@contextmanager
+def postgres_copy(sqlite_session, url):
+    """Copy a committed SQLite scenario into a disposable PostgreSQL schema."""
     from uuid import uuid4
     from sqlalchemy import create_engine, text
     from sqlalchemy.orm import sessionmaker
     from zk_add.models import Base
-    url = os.environ.get("ADD_SAFE_REPAIR_TEST_DATABASE_URL") or (os.environ.get("ADD_DATABASE_URL") if os.environ.get("CI") else None)
-    if not url or not url.startswith("postgresql"):
-        pytest.skip("Set ADD_SAFE_REPAIR_TEST_DATABASE_URL for PostgreSQL qualification")
-    data = scenario(reconciliation_db)
     schema = "reconciliation_monotonic_" + uuid4().hex
     admin = create_engine(url)
     with admin.begin() as db:
@@ -337,7 +350,7 @@ def pg_scenario(reconciliation_db):  # noqa: F811
         with engine.begin() as db:
             deferred_snapshots = []
             for table in Base.metadata.sorted_tables:
-                rows = [dict(row) for row in data[0].execute(select(table)).mappings()]
+                rows = [dict(row) for row in sqlite_session.execute(select(table)).mappings()]
                 if rows:
                     if table.name == "add_zkt_devices":
                         for row in rows:
@@ -350,7 +363,7 @@ def pg_scenario(reconciliation_db):  # noqa: F811
             table = Base.metadata.tables["add_zkt_devices"]
             for device_id, snapshot_id in deferred_snapshots:
                 db.execute(table.update().where(table.c.id == device_id).values(identity_snapshot_id=snapshot_id))
-        yield sessionmaker(engine, autoflush=False, expire_on_commit=False), tuple(row.id for row in data[1:4]), data[4]
+        yield sessionmaker(engine, autoflush=False, expire_on_commit=False)
     finally:
         engine.dispose()
         with admin.begin() as db:

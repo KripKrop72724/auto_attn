@@ -54,6 +54,7 @@ from zk_add.models import (
 )
 from zk_add.ords_states import ORDS_ACTIVE_STATUSES, ORDS_TERMINAL_REVIEW_STATUSES
 from zk_add.reconciliation import (
+    COVERAGE_FINALISATION_HOLDS,
     TERMINAL_JOB_STATES as RECONCILIATION_TERMINAL_STATES,
     active_coverage,
     create_reconciliation_job,
@@ -2093,6 +2094,15 @@ def _attach_source_dependency(
             ReconciliationJob.status.not_in(RECONCILIATION_TERMINAL_STATES),
         )
     )
+    if active is not None and active.error_code in COVERAGE_FINALISATION_HOLDS:
+        # Sealing this job is held on committed source evidence (a paused job
+        # keeps that code); waiting on it cannot certify the repair's source.
+        # An operator retries or cancels it.
+        raise RepairError(
+            f"The device's source reconciliation {active.job_id} is held ({active.error_code}); "
+            "retry or cancel it before preparing a repair.",
+            code="SOURCE_DEPENDENCY_UNAVAILABLE",
+        )
     if active is None:
         try:
             active = create_reconciliation_job(
