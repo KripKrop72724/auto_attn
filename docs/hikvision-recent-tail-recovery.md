@@ -88,10 +88,21 @@ G04600476.
   not transient. The stream is replaying late-September history again. On each
   reconnect, about every 40 seconds, the connector reads connected for about
   0.5 seconds and then disconnected, which is the race fixed here.
+- **22 Oct, 19:27 PKT:** unchanged. The poll still fails at cursor 597801 with
+  HTTP 200 at the events stage. The stream has delivered 716
+  replayed and zero current records since the reboot. On this boot the ESP has
+  already logged `durable_storage_failed` again (17:30 and 17:32 PKT, three
+  failures), and its source queue reached 2,486 records. Storage still reports
+  `HEALTHY` with 0.77 of 7.7 MB used. The replay, not the punches, is what fills
+  the queue.
 
 Recovery: run **Recent tail** once. It resumes at serial 597782. If the terminal
 reused serials 597794 to 597801 after the power loss, those serials are held for
-review, and every later punch is ingested.
+review, and every later punch is ingested. Check that the job reports new
+records from 19 Oct onwards. A tail that catches up with no new records while
+the site was punching can mean the terminal numbered its new events below the
+resume point. Do not treat that as "nothing missing": escalate it for a full
+terminal audit.
 
 ## Firmware follow-up (targeted USB build, not yet built)
 
