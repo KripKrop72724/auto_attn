@@ -1759,7 +1759,10 @@ def apply_ords_delivery_result(
         row.next_attempt_at = None
         row.last_error = None
         if event:
-            note_delivered_cnic(session, event.id, delivered_cnic)
+            # Only Oracle's acceptance of THIS request proves it stored this
+            # CNIC; 409 "already exists" may hold an earlier copy's CNIC.
+            if status in {200, 201}:
+                note_delivered_cnic(session, event.id, delivered_cnic)
             event.ords_status = "ACKED"
             event.oracle_confirmed_at = confirmed_at
             event.oracle_confirmation_path = "ADD_DELIVERY"
@@ -1831,7 +1834,9 @@ def apply_ords_batch_results(
     membership_failure: tuple[int | None, str | None, bool] | None,
     results: list[tuple[int, int, int | None, object, str | None, bool]],
 ) -> None:
-    # The exact CNIC each claim sent (or would have sent) to Oracle.
+    # The CNIC each claim sent (or would have sent) to Oracle. A membership
+    # confirmation only proves the punch ID exists, so there it is evidence
+    # for "CNIC uncertain", never a different CNIC to notify.
     delivered = {
         claim[0]: claim[1].get("cnic") if isinstance(claim[1], dict) else None for claim in claims
     }

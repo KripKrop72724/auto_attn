@@ -28,6 +28,7 @@ button.notify-pill:focus-visible { outline: 2px solid var(--accent); outline-off
 .notify-facts dt { color: var(--text-tertiary); font-size: 13px; }
 .notify-facts dd { min-width: 0; margin: 0; color: var(--text); font-size: 13px; overflow-wrap: anywhere; }
 .notify-copy { margin: 0 0 12px; color: var(--text-secondary); font-size: 13px; line-height: 1.5; }
+.notify-copy.notify-warning { padding: 8px 10px; border: 1px solid var(--warning-border); border-radius: var(--radius-md); background: var(--warning-subtle); color: var(--text); }
 
 .notify-mode { display: grid; gap: 6px; margin: 0 0 12px; padding: 10px 12px 12px; border: 1px solid var(--border); border-radius: var(--radius-md); }
 .notify-mode legend { padding: 0 4px; color: var(--text); font-size: 13px; font-weight: 500; }

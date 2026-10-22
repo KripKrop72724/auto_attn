@@ -304,6 +304,84 @@ def test_a_terminal_delivered_punch_with_a_different_captured_cnic_is_not_notifi
     assert states == {same: ("PENDING", None), changed: ("SKIPPED", "CNIC_UNCERTAIN")}
 
 
+def _in_flight(sessions, event_id: int, *, captured: str | None = None) -> int:
+    claim_id = outbox_id(sessions, event_id)
+    with sessions() as db:
+        db.get(OrdsOutbox, claim_id).status = "IN_FLIGHT"
+        if captured:
+            db.get(AttendanceEvent, event_id).captured_cnic_lookup_hash = cnic_lookup(captured)
+        db.commit()
+    return claim_id
+
+
+def test_oracle_already_has_it_never_names_a_cnic_oracle_may_not_hold(store):
+    # The terminal delivered the punch with CNIC itself; ADD's saved CNIC is
+    # OTHER_CNIC. A 409 or a membership check only proves the punch ID exists.
+    sessions, connector_id = store
+    conflict = punch(sessions, cnic=OTHER_CNIC)
+    member = punch(sessions, cnic=OTHER_CNIC)
+    conflict_claim = _in_flight(sessions, conflict, captured=CNIC)
+    member_claim = _in_flight(sessions, member, captured=CNIC)
+    claims = [
+        (conflict_claim, {"cnic": OTHER_CNIC}, connector_id, False),
+        (member_claim, {"cnic": OTHER_CNIC}, connector_id, False),
+    ]
+    worker.apply_ords_batch_results(
+        claims, [member_claim], None, [(conflict_claim, connector_id, 409, None, None, True)]
+    )
+    for event_id, path in ((conflict, "ADD_DELIVERY"), (member, "ORDS_MEMBERSHIP_CHECK")):
+        row = row_for(sessions, event_id)
+        assert (row.status, row.reason, row.confirmation_path) == ("SKIPPED", "CNIC_UNCERTAIN", path)
+
+
+def test_a_membership_check_notifies_the_saved_cnic_only_when_nothing_disagrees(store):
+    sessions, connector_id = store
+    agreeing = punch(sessions, cnic=CNIC)
+    stale_payload = punch(sessions, cnic=CNIC)
+    claims = [
+        (_in_flight(sessions, agreeing), {"cnic": CNIC}, connector_id, False),
+        # The CNIC ADD would have sent differs from the saved one.
+        (_in_flight(sessions, stale_payload), {"cnic": OTHER_CNIC}, connector_id, False),
+    ]
+    worker.apply_ords_batch_results(claims, [claim[0] for claim in claims], None, [])
+    row = row_for(sessions, agreeing)
+    assert row.status == "PENDING" and decrypt_cnic(row.cnic_encrypted) == CNIC
+    row = row_for(sessions, stale_payload)
+    assert (row.status, row.reason) == ("SKIPPED", "CNIC_UNCERTAIN")
+    assert row.cnic_lookup_hash == cnic_lookup(CNIC)  # Never the unproven CNIC.
+
+
+def test_an_accepted_add_delivery_names_the_cnic_it_sent(store):
+    # Oracle stored ADD's own POST, so its CNIC wins over a stale capture.
+    sessions, connector_id = store
+    event_id = punch(sessions, cnic=OTHER_CNIC)
+    claim_id = _in_flight(sessions, event_id, captured=CNIC)
+    worker.apply_ords_batch_results(
+        [(claim_id, {"cnic": OTHER_CNIC}, connector_id, False)], [], None,
+        [(claim_id, connector_id, 201, {"success": True}, None, True)],
+    )
+    row = row_for(sessions, event_id)
+    assert row.status == "PENDING" and decrypt_cnic(row.cnic_encrypted) == OTHER_CNIC
+
+
+def test_the_sweep_never_guesses_the_cnic_of_an_approved_release(store):
+    sessions, _ = store
+    forced = punch(sessions, status="ACKED_CHECK")
+    ordinary = punch(sessions, status="ACKED", cnic=OTHER_CNIC)
+    with sessions() as db:
+        db.execute(text("DELETE FROM add_attendance_checkin_notifications"))
+        db.get(AttendanceEvent, forced).oracle_confirmation_path = "ADD_FORCE_CONTENT_CHECK"
+        db.get(AttendanceEvent, ordinary).oracle_confirmation_path = "ADD_DELIVERY"
+        for event_id in (forced, ordinary):
+            db.get(AttendanceEvent, event_id).oracle_confirmed_at = utc_now()
+        db.commit()
+    assert notify.sweep_missing_rows() == 2
+    assert (row_for(sessions, forced).status, row_for(sessions, forced).reason) == (
+        "SKIPPED", "CNIC_UNCERTAIN"
+    )
+    assert row_for(sessions, ordinary).status == "PENDING"
+
+
 def test_a_rolled_back_confirmation_leaves_no_row(store):
     sessions, _ = store
     event_id = punch(sessions)
@@ -488,13 +566,55 @@ def test_backoff_is_exponential_bounded_and_jittered(monkeypatch):
     assert max(delays) <= settings.checkin_notify_backoff_max_seconds
 
 
-def test_timeouts_are_retried(store):
+UNCERTAIN = {
+    "read_timeout": (httpx.ReadTimeout("no response in time"), "TRANSPORT_TIMEOUT"),
+    "write_timeout": (httpx.WriteTimeout("request body stalled"), "TRANSPORT_TIMEOUT"),
+    "reset_after_send": (httpx.ReadError("[Errno 104] Connection reset by peer"), "TRANSPORT_READERROR"),
+    "disconnect_without_response": (
+        httpx.RemoteProtocolError("Server disconnected without sending a response."),
+        "TRANSPORT_REMOTEPROTOCOLERROR",
+    ),
+    "http_500": (httpx.Response(500), "HTTP_500"),
+    "http_502": (httpx.Response(502), "HTTP_502"),
+    "http_504": (httpx.Response(504), "HTTP_504"),
+}
+
+
+@pytest.mark.parametrize("outcome,category", UNCERTAIN.values(), ids=UNCERTAIN.keys())
+def test_a_possibly_delivered_request_is_never_repeated(store, monkeypatch, outcome, category):
+    # For example the HRM service pushes the message, then answers too slowly
+    # or fails afterwards: repeating it would reach the same phone again.
     sessions, _ = store
+    monkeypatch.setattr(settings, "checkin_notify_circuit_failure_threshold", 10)
     event_id = punch(sessions)
     confirm(sessions, event_id)
-    deliver(Recorder(httpx.ReadTimeout("slow")))
+    recorder = Recorder(outcome)
+    deliver(recorder)
     row = row_for(sessions, event_id)
-    assert (row.status, row.reason) == ("RETRYING", "TRANSPORT_TIMEOUT")
+    assert (row.status, row.reason, row.detail) == ("FAILED", "DELIVERY_UNCERTAIN", category)
+    assert row.next_attempt_at is None and row.host_used == "PRIMARY"
+    with sessions() as db:
+        control = db.get(CheckinNotifyControl, 1)
+        # Still counted, so a service that keeps failing pauses sending.
+        assert control.consecutive_failures == 1 and control.last_failure_category == category
+    move_back(sessions, event_id, next_attempt_at=utc_now() - timedelta(seconds=1))
+    deliver(recorder)
+    assert len(recorder.requests) == 1
+
+
+DECLINED = {status: httpx.Response(status) for status in (401, 403, 408, 425, 429, 503)}
+
+
+@pytest.mark.parametrize("response", DECLINED.values(), ids=[f"http_{s}" for s in DECLINED])
+def test_a_request_the_service_declined_without_processing_is_retried(store, monkeypatch, response):
+    sessions, _ = store
+    monkeypatch.setattr(settings, "checkin_notify_circuit_failure_threshold", 10)
+    event_id = punch(sessions)
+    confirm(sessions, event_id)
+    deliver(Recorder(response))
+    row = row_for(sessions, event_id)
+    assert (row.status, row.reason) == ("RETRYING", f"HTTP_{response.status_code}")
+    assert row.next_attempt_at is not None
 
 
 # --------------------------------------------------------------------------
@@ -596,7 +716,9 @@ def test_an_overall_attempt_timeout_never_falls_back(store, monkeypatch):
     asyncio.run(notify.deliver_once(transport=httpx.MockTransport(handler)))
     assert seen == ["ords.example.invalid"]
     row = row_for(sessions, event_id)
-    assert (row.status, row.reason, row.host_used) == ("RETRYING", "TRANSPORT_TIMEOUT", "PRIMARY")
+    assert (row.status, row.reason, row.detail, row.host_used) == (
+        "FAILED", "DELIVERY_UNCERTAIN", "TRANSPORT_TIMEOUT", "PRIMARY"
+    )
 
 
 def test_both_hosts_unreachable_is_retried_later(store):
@@ -718,9 +840,9 @@ def test_real_reset_after_send_and_read_timeout_are_classified_as_maybe_delivere
                 )
 
     closed = asyncio.run(run("close"))
-    assert not closed.not_sent and closed.outcome == "RETRY"
+    assert not closed.not_sent and closed.uncertain and closed.outcome == "FAILED"
     slow = asyncio.run(run("sleep"))
-    assert not slow.not_sent and slow.category == "TRANSPORT_TIMEOUT"
+    assert not slow.not_sent and slow.uncertain and slow.category == "TRANSPORT_TIMEOUT"
 
 
 def test_other_client_errors_fail_without_retry_or_pausing(store):
@@ -757,12 +879,12 @@ def test_circuit_breaker_pauses_then_one_probe_resumes(store, monkeypatch):
     for event_id in (first, second, third):
         confirm(sessions, event_id)
     monkeypatch.setattr(settings, "checkin_notify_batch_size", 2)
-    failing = Recorder(httpx.Response(502))
+    failing = Recorder(httpx.Response(503))
     deliver(failing)
     with sessions() as db:
         control = db.get(CheckinNotifyControl, 1)
         assert control.consecutive_failures == 2 and control.paused_until is not None
-        assert control.last_failure_category == "HTTP_502"
+        assert control.last_failure_category == "HTTP_503"
     claim = deliver(failing)
     assert claim.paused and len(failing.requests) == 2
     with sessions() as db:
@@ -776,6 +898,95 @@ def test_circuit_breaker_pauses_then_one_probe_resumes(store, monkeypatch):
         control = db.get(CheckinNotifyControl, 1)
         assert control.consecutive_failures == 0 and control.paused_until is None
         assert control.last_success_at is not None
+
+
+def _pause_seconds(sessions) -> float:
+    with sessions() as db:
+        control = db.get(CheckinNotifyControl, 1)
+        return (notify.ensure_utc(control.paused_until) - utc_now()).total_seconds()
+
+
+def test_a_burst_of_failures_starts_with_the_shortest_pause_then_doubles(store, monkeypatch):
+    # A short outage during the morning rush fails a whole batch at once.
+    sessions, _ = store
+    monkeypatch.setattr(settings, "checkin_notify_fallback_url", None)
+    for index in range(12):
+        confirm(sessions, punch(sessions, cnic=f"35202{index:08d}"))
+    deliver(Recorder(httpx.ConnectError("down")))
+    with sessions() as db:
+        assert db.get(CheckinNotifyControl, 1).consecutive_failures == 5
+    assert 50 <= _pause_seconds(sessions) <= 61  # 60 s, not the 15 min cap.
+    with sessions() as db:
+        db.get(CheckinNotifyControl, 1).paused_until = utc_now() - timedelta(seconds=1)
+        for row in db.scalars(select(Notification)).all():
+            row.next_attempt_at = utc_now() - timedelta(seconds=1)
+        db.commit()
+    probe = Recorder(httpx.ConnectError("still down"))
+    claim = deliver(probe)
+    assert len(claim.jobs) == 1 and len(probe.requests) == 1
+    assert 110 <= _pause_seconds(sessions) <= 121  # A failed probe doubles it.
+
+
+def test_each_result_is_saved_as_soon_as_its_request_finishes(store, monkeypatch):
+    sessions, _ = store
+    first, second = punch(sessions, cnic=CNIC), punch(sessions, cnic=OTHER_CNIC)
+    confirm(sessions, first)
+    confirm(sessions, second)
+    saved: list[list[int]] = []
+    real_apply = notify.apply_results
+
+    def recording_apply(results, **kwargs):
+        real_apply(results, **kwargs)
+        saved.append([job.row_id for job, _result in results])
+
+    monkeypatch.setattr(notify, "apply_results", recording_apply)
+    seen_while_second_in_flight: list[list[list[int]]] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if json.loads(request.content)["cnic"] == int(OTHER_CNIC):
+            for _ in range(200):
+                if saved:
+                    break
+                await asyncio.sleep(0.01)
+            seen_while_second_in_flight.append(list(saved))
+        return httpx.Response(200, json={"success": True})
+
+    asyncio.run(notify.deliver_once(transport=httpx.MockTransport(handler)))
+    first_row = row_for(sessions, first)
+    # The first punch's result was committed while the second was still in flight.
+    assert seen_while_second_in_flight == [[[first_row.id]]]
+    assert len(saved) == 2
+    assert {row_for(sessions, first).status, row_for(sessions, second).status} == {"SENT"}
+
+
+def test_switching_off_stops_a_batch_that_is_already_being_sent(store, monkeypatch):
+    sessions, _ = store
+    monkeypatch.setattr(settings, "checkin_notify_concurrency", 1)
+    monkeypatch.setattr(notify, "SETTINGS_WATCH_SECONDS", 0.0)
+    events = [punch(sessions, cnic=c) for c in (CNIC, OTHER_CNIC, "3520211111111")]
+    for event_id in events:
+        confirm(sessions, event_id)
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if len(requests) == 1:  # An administrator switches to OFF meanwhile.
+            with sessions() as db:
+                control = db.get(CheckinNotifyControl, 1)
+                control.mode, control.revision = "OFF", control.revision + 1
+                db.commit()
+        return httpx.Response(200, json={"success": True})
+
+    claim = asyncio.run(notify.deliver_once(transport=httpx.MockTransport(handler)))
+    assert len(claim.jobs) == 3 and len(requests) == 1
+    assert [row_for(sessions, e).status for e in events] == ["SENT", "PENDING", "PENDING"]
+    later = Recorder()
+    deliver(later)
+    assert later.requests == []
+    assert [(row_for(sessions, e).status, row_for(sessions, e).reason) for e in events[1:]] == [
+        ("SKIPPED", "DISABLED"), ("SKIPPED", "DISABLED")
+    ]
+    assert row_for(sessions, events[1]).attempt_count == 0
 
 
 def test_authentication_failure_pauses_without_failing_the_punch(store, monkeypatch):
@@ -1086,14 +1297,41 @@ def test_admin_can_retry_only_a_failed_notification(store, admin):
     assert retried.status_code == 200, retried.text
     assert retried.json()["checkin_notification"]["status"] == "PENDING"
     assert client.post(path, json=body, headers=headers).status_code == 409
-    # An administrator retry is allowed after the automatic age window.
-    move_back(sessions, event_id, punch_time=utc_now() - timedelta(hours=20))
     recorder = Recorder()
     deliver(recorder)
     assert len(recorder.requests) == 1 and row_for(sessions, event_id).status == "SENT"
     with sessions() as db:
         audit = db.scalar(select(AuditEvent).where(AuditEvent.action == "CHECKIN_NOTIFY_RETRY"))
         assert audit.target_id == str(event_id)
+
+
+def test_an_administrator_retry_never_notifies_outside_the_age_window(store, admin):
+    sessions, _ = store
+    client, headers = admin
+    old, ageing = punch(sessions, cnic=CNIC), punch(sessions, cnic=OTHER_CNIC)
+    for event_id in (old, ageing):
+        confirm(sessions, event_id)
+    deliver(Recorder(httpx.Response(400)))
+    body = {"reason": "HRM fixed the employee record", "password": "correct-password"}
+    # A failure from days ago offers no retry and the API refuses one.
+    move_back(sessions, old, punch_time=utc_now() - timedelta(days=3))
+    with sessions() as db:
+        event = db.get(AttendanceEvent, old)
+        assert notify.pill(event, row_for(sessions, old), None)["can_retry"] is False
+    refused = client.post(f"/api/v1/attendance/{old}/checkin-notification/retry", json=body,
+                          headers=headers)
+    assert refused.status_code == 409 and "older than 12 hours" in refused.text
+    assert row_for(sessions, old).status == "FAILED"
+    # A retry queued in time that ages past the window before sending is skipped.
+    queued = client.post(f"/api/v1/attendance/{ageing}/checkin-notification/retry", json=body,
+                         headers=headers)
+    assert queued.status_code == 200, queued.text
+    move_back(sessions, ageing, punch_time=utc_now() - timedelta(hours=20))
+    recorder = Recorder()
+    deliver(recorder)
+    assert recorder.requests == []
+    row = row_for(sessions, ageing)
+    assert (row.status, row.reason) == ("SKIPPED", "OLD_PUNCH")
     missing = client.post("/api/v1/attendance/999999/checkin-notification/retry", json=body,
                           headers=headers)
     assert missing.status_code == 404

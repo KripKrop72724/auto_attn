@@ -55,6 +55,7 @@ const reasonLabels: Record<string, string> = {
   EVENT_MISSING: 'The punch is no longer available',
   NOT_RECORDED: 'No notification was recorded for this punch',
   RETRY_WINDOW_EXHAUSTED: 'Gave up after retrying for the whole retry period',
+  DELIVERY_UNCERTAIN: 'The HRM service gave no clear answer, so the employee may already have the message; it is not repeated automatically',
   API_REPORTED_FAILURE: 'The HRM service reported that it could not send it',
   TRANSPORT_ALL_HOSTS_UNREACHABLE: 'Neither notification host could be reached',
   TRANSPORT_TIMEOUT: 'The HRM service did not answer in time',
@@ -198,6 +199,9 @@ function CheckinNotifyDetails({
           {facts.map(([label, text]) => <div key={label}><dt>{label}</dt><dd>{text}</dd></div>)}
         </dl>
         <p className="notify-copy">ADD asks the HRM service to send the employee an “attendance punched” message only after Oracle confirms the punch. Punch delivery to Oracle is never affected by this notification.</p>
+        {value.can_retry && value.reason === 'DELIVERY_UNCERTAIN' && (
+          <p className="notify-copy notify-warning" role="note">The employee may already have received this message. Retrying can send it a second time.</p>
+        )}
         {value.can_retry && (
           <>
             <label>Audited reason<textarea value={reason} maxLength={300} placeholder="At least 10 characters" onChange={(event) => setReason(event.target.value)} /></label>

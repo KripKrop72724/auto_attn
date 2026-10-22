@@ -7,11 +7,16 @@ punched" message to the employee's phone:
 POST <host>/ords/slic_hrm/ESS_APIS/attendance_checkin_notify
 X-Api-Key: <secret ADD_CHECKIN_NOTIFY_API_KEY>
 Content-Type: application/json
-{"cnic": 6110113371079}
+{"cnic": <13-digit CNIC as a JSON number>}
 ```
 
-The CNIC is the exact CNIC ADD delivered to Oracle for that punch, sent as a
-JSON number (`ADD_CHECKIN_NOTIFY_CNIC_JSON_TYPE=string` sends it as a string).
+The CNIC is the exact CNIC Oracle holds for that punch, sent as a JSON number
+(`ADD_CHECKIN_NOTIFY_CNIC_JSON_TYPE=string` sends it as a string). It is taken
+from a confirmation that proves what Oracle stored (ADD's own accepted POST, or
+a content check). When Oracle only confirmed that the punch ID exists
+(membership checks, "already exists", the terminal's own delivery) ADD uses its
+saved CNIC, and sends nothing ("Not sent · CNIC uncertain") if the terminal's
+captured CNIC or the CNIC ADD would have sent differs from it.
 Notifications never delay or change Oracle delivery: a failed notification
 leaves the punch and its Oracle status untouched.
 
@@ -83,9 +88,9 @@ Punch policy: **Every punch** (default) or **First punch of the day** (PKT).
 |------|---------|
 | Notified hh:mm | The HRM service accepted the request at that time (PKT). |
 | Pending | Queued; sends within seconds. |
-| Retrying | A network error, timeout, HTTP 429 or 5xx; retried with backoff for up to 6 hours. |
-| Failed | The HRM service refused it (another HTTP 4xx or `success: false`), or 6 hours of retries ran out. Click it for the reason; an administrator can **Retry notification**. |
-| Not sent · reason | Deliberately not sent: before feature, old punch, invalid time, no CNIC, CNIC uncertain (the terminal delivered the punch itself with a CNIC that differs from ADD's saved one), grouped, not first of day, outside pilot, disabled, not configured, or awaiting Oracle. |
+| Retrying | The request never reached the HRM service (DNS, connection, TLS) or the service declined it without processing (HTTP 401, 403, 408, 425, 429, 503); retried with backoff for up to 6 hours. |
+| Failed | The HRM service refused it (another HTTP 4xx or `success: false`), 6 hours of retries ran out, or **the outcome is unknown** (a timeout, a reset after sending, or another 5xx): the employee may already have the message, so ADD never repeats it automatically. Click it for the reason; within 12 hours of the punch an administrator can **Retry notification** (the dialog warns that an unknown outcome may send it twice). |
+| Not sent · reason | Deliberately not sent: before feature, old punch, invalid time, no CNIC, CNIC uncertain (Oracle may hold a different CNIC than ADD's saved one), grouped, not first of day, outside pilot, disabled, not configured, or awaiting Oracle. |
 
 Filter by these states with **Filters → Phone notification**. The strip above
 the list shows the mode, health and the last 24 hours' counts.
@@ -95,7 +100,8 @@ the list shows the mode, health and the last 24 hours' counts.
 * **Not configured**: the secret is missing from `add-production`; add it and
   redeploy.
 * **Paused after failures**: 5 consecutive network/5xx/401/403 failures pause
-  sending (60 s, doubling to 15 min). One probe resumes it. HTTP 401/403 means
+  sending for 60 s; each failed probe doubles the pause, up to 15 min. One
+  successful probe resumes it. HTTP 401/403 means
   the key is wrong or revoked: ask HRM, update the secret, redeploy. Waiting
   notifications resume automatically; nothing is lost while paused.
 * **Using public fallback host** in the strip: ADD cannot reach
@@ -112,9 +118,11 @@ the list shows the mode, health and the last 24 hours' counts.
 Each punch gets at most one notification row, written in the same database
 transaction that records Oracle's confirmation, so a confirmation can never be
 missed or doubled. The worker leases rows (`FOR UPDATE SKIP LOCKED`), bounds
-every request to 10 s, caps concurrency and rate, and survives restarts and
-multiple processes. Delivery is at least once: if ADD stops after the HRM
-service received a request but before ADD recorded the answer, or a request
-times out after the service received it, that punch is sent again on retry.
-This rare window is the only way an employee can receive a duplicate message.
+every request to 10 s, caps concurrency and rate, saves each answer as soon as
+it arrives, and survives restarts and multiple processes. A request whose
+outcome is unknown is never repeated automatically. The only way an employee
+can receive a duplicate message is ADD stopping while a request is in flight
+(sent, answer not yet saved): that one punch is sent again after its lease
+expires. Switching to **Off** also stops a batch already being sent: requests
+not yet started are put back and then recorded as "Not sent · disabled".
 Logs never contain the key or a full CNIC (only `*****-****123-4`).

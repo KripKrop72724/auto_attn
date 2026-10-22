@@ -143,6 +143,18 @@ describe('Phone notification pills on the Attendance page', () => {
     expect(JSON.parse(String(call[1]?.body))).toEqual({ reason: 'HRM fixed the employee record', password: 'secret-password' })
   }, 20000)
 
+  it('warns that a retry after an unclear answer can send the message twice', async () => {
+    const uncertain = event(7, 'Gul Nawaz', pill({ status: 'FAILED', reason: 'DELIVERY_UNCERTAIN', detail: 'TRANSPORT_TIMEOUT', attempts: 1, host: 'PRIMARY', can_retry: true }))
+    vi.stubGlobal('fetch', vi.fn(async () => response({ rows: [...rows, uncertain], next_cursor: null, checkin_notifications: summary })))
+    render(<AttendanceView {...props} />)
+    const row = await screen.findByRole('article', { name: /Gul Nawaz/ }, wait)
+    fireEvent.click(within(row).getByRole('button', { name: /Phone notification: Failed/ }))
+    const dialog = await screen.findByRole('dialog', { name: 'Phone notification' }, wait)
+    expect(dialog.textContent).toContain('may already have the message; it is not repeated automatically')
+    expect(within(dialog).getByRole('note').textContent).toContain('Retrying can send it a second time')
+    expect(within(dialog).getByRole('button', { name: /Retry notification/ })).toBeTruthy()
+  }, 20000)
+
   it('offers no retry for a notification that was not sent', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => response({ rows, next_cursor: null, checkin_notifications: summary })))
     render(<AttendanceView {...props} />)

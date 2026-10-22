@@ -13,27 +13,37 @@ Design (see docs/checkin-notifications.md for the operator view):
   Periodic re-verification of an already confirmed punch is not a new
   confirmation and never creates a row. A slow sweep re-creates any row a
   confirmation path might have missed (recent punches only).
-* The CNIC stored on the row is the one Oracle received for that punch: the
-  delivery paths pass it explicitly (``note_delivered_cnic``); otherwise the
-  punch's own saved CNIC is used, unless the terminal captured a different
-  CNIC (then the row is "not sent: CNIC uncertain").
+* The CNIC stored on the row is the one Oracle received for that punch. Only
+  confirmations that prove what Oracle stored (ADD's own accepted POST and
+  the content checks, ``CONTENT_VERIFIED_PATHS``) may pass a different CNIC
+  (``note_delivered_cnic``). Every other confirmation only proves the punch
+  ID exists, so the punch's saved CNIC is used, and the row is "not sent:
+  CNIC uncertain" when the terminal captured a different CNIC or the CNIC the
+  path would have sent differs from the saved one.
 * A worker claims due rows with a lease (``FOR UPDATE SKIP LOCKED`` on
   PostgreSQL), applies the anti-spam policy (age window, invalid clock,
-  OFF / PILOT / ALL, coalescing, first punch per day), sends with a bounded
-  timeout, concurrency and request rate, retries network failures, timeouts,
-  429 and 5xx with exponential backoff and jitter for a bounded period, and
-  records a terminal FAILED for other client errors. A persisted circuit
-  breaker pauses all sending after consecutive failures.
+  OFF / PILOT / ALL, coalescing, first punch per day), and sends with a
+  bounded timeout, concurrency and request rate. It retries with exponential
+  backoff and jitter, for a bounded period, ONLY when the request provably
+  never reached the service (DNS, connect, TLS) or the service declined it
+  without processing (401, 403, 408, 425, 429, 503). A read or write timeout,
+  a reset after sending, or another 5xx may mean the phone already got the
+  message, so the row fails as DELIVERY_UNCERTAIN and is never repeated
+  automatically; other client errors fail too. A persisted circuit breaker
+  pauses all sending after consecutive failures (60 s, doubling per failed
+  probe up to the maximum). Each result is saved as soon as its request
+  finishes, and a settings change stops the rest of a claimed batch.
 * Two hosts: the internal ORDS host (primary) and the public host (fallback).
   An attempt moves to the other host ONLY when it provably never reached a
   server (DNS failure, connection refused, connect timeout, TLS handshake
   failure). A read timeout, a reset after sending or any HTTP response is
   final for that attempt, so a fallback can never duplicate a notification.
   The host that last delivered is remembered; the primary is re-probed.
-* Delivery is at-least-once: if the process dies after the HTTP request was
-  sent but before the result commits, the lease expires and the punch is sent
-  again. Every attempt is hard-bounded, and a job starts only while its whole
-  budget fits inside its lease, so a live worker never overlaps a reclaim.
+* The one remaining duplicate window: if the process dies while a request
+  is in flight (after it was sent, before its result commits), the lease
+  expires and the punch is sent again. Every attempt is hard-bounded, and a
+  job starts only while its whole budget fits inside its lease, so a live
+  worker never overlaps a reclaim.
 * Old punches are never backfilled: no row means "not sent".
 
 The API key and full CNICs are never logged or stored in plain text.
@@ -97,6 +107,15 @@ PILL_FILTERS = ("NOTIFIED", "PENDING", "RETRYING", "FAILED", "NOT_SENT")
 # Pakistan Standard Time has no daylight saving; a fixed offset needs no tzdata.
 PKT = timezone(timedelta(hours=5))
 ALERT_CODE = "CHECKIN_NOTIFY_DEGRADED"
+# Confirmations that prove which CNIC Oracle stored for the punch: ADD's own
+# POST that Oracle accepted (200/201) and the content checks against Oracle's
+# stored record. Only these may name a CNIC that differs from the saved one.
+CONTENT_VERIFIED_PATHS = frozenset(
+    {"ADD_DELIVERY", "ADD_ZKT_PROJECTION_V2", "ADD_FORCE_CONTENT_CHECK"}
+)
+# HTTP answers that mean the service declined the request without processing
+# it, so nothing reached the employee and a retry cannot duplicate a message.
+DECLINED_STATUSES = frozenset({401, 403, 408, 425, 429, 503})
 _HINT_KEY = "checkin_notify_delivered_cnic"
 _DIGITS = re.compile(r"\d{5,}")
 _SAFE_CATEGORY = re.compile(r"[^A-Z0-9_]")
@@ -143,29 +162,43 @@ def _initial_skip_reason(
     return None
 
 
-def _row_values(event: AttendanceEvent, delivered_cnic: str | None, now: datetime) -> dict:
+def _lookup_or_none(cnic: str) -> str | None:
+    try:
+        return cnic_lookup(cnic)
+    except Exception:
+        return None
+
+
+def _row_values(
+    event: AttendanceEvent, delivered_cnic: str | None, now: datetime, *, swept: bool = False
+) -> dict:
     punch = ensure_utc(event.device_event_time)
     confirmed = ensure_utc(event.oracle_confirmed_at) if event.oracle_confirmed_at else now
     cnic_encrypted, lookup, last4 = event.cnic_encrypted, event.cnic_lookup_hash, event.cnic_last4
-    if delivered_cnic:
+    path = event.oracle_confirmation_path or ""
+    trusted = bool(delivered_cnic) and path in CONTENT_VERIFIED_PATHS
+    if trusted:
         try:
             cnic_encrypted = encrypt_cnic(delivered_cnic)
             lookup = cnic_lookup(delivered_cnic)
             last4 = delivered_cnic[-4:]
         except Exception:
             # Keep the punch's own protected CNIC; never block the confirmation.
+            trusted = False
             cnic_encrypted, lookup, last4 = event.cnic_encrypted, event.cnic_lookup_hash, event.cnic_last4
     skip = _initial_skip_reason(event, punch, confirmed, bool(cnic_encrypted and lookup))
-    if (
-        skip is None
-        and not delivered_cnic
-        and event.captured_cnic_lookup_hash
-        and event.captured_cnic_lookup_hash != lookup
-    ):
-        # No delivery path told us the CNIC Oracle received (for example the
-        # terminal delivered it itself), and the terminal's own CNIC differs
-        # from the saved one: never notify a possibly different employee.
-        skip = "CNIC_UNCERTAIN"
+    if skip is None and not trusted:
+        # Nothing proves which CNIC Oracle stored: this confirmation only shows
+        # the punch ID exists (membership checks, Oracle's "already exists",
+        # the terminal's own delivery). Notify the saved CNIC only when no
+        # evidence points at a different one.
+        if (
+            (event.captured_cnic_lookup_hash and event.captured_cnic_lookup_hash != lookup)
+            or (delivered_cnic and _lookup_or_none(delivered_cnic) != lookup)
+            # The safety-net sweep cannot know the CNIC of an approved release.
+            or (swept and path.startswith("ADD_FORCE"))
+        ):
+            skip = "CNIC_UNCERTAIN"
     return {
         "attendance_event_id": event.id,
         "connector_id": event.connector_id,
@@ -354,6 +387,10 @@ class SendResult:
     # True only when the request provably never reached a server: DNS
     # failure, connection refused, connect timeout or TLS handshake failure.
     not_sent: bool = False
+    # True when the employee may already have received the message (a timeout
+    # or reset after sending, or a 5xx other than 503): never repeated
+    # automatically, recorded as FAILED / DELIVERY_UNCERTAIN.
+    uncertain: bool = False
 
 
 @dataclass
@@ -417,12 +454,12 @@ def _evaluate(
         return Decision("SKIP", "DISABLED")
     if not row.cnic_encrypted or not row.cnic_lookup_hash:
         return Decision("SKIP", "NO_CNIC")
-    if not row.manual_retry:
-        tolerance = timedelta(seconds=settings.checkin_notify_future_tolerance_seconds)
-        if event.clock_quality == "INVALID" or punch > now + tolerance:
-            return Decision("SKIP", "INVALID_CLOCK")
-        if now - punch > _window():
-            return Decision("SKIP", "OLD_PUNCH")
+    # These apply to administrator retries too: never notify outside the window.
+    tolerance = timedelta(seconds=settings.checkin_notify_future_tolerance_seconds)
+    if event.clock_quality == "INVALID" or punch > now + tolerance:
+        return Decision("SKIP", "INVALID_CLOCK")
+    if now - punch > _window():
+        return Decision("SKIP", "OLD_PUNCH")
     if row.retry_deadline_at and now > ensure_utc(row.retry_deadline_at):
         # Also covers rows that waited out a long pause without an attempt:
         # a message hours after the punch is noise, not a confirmation.
@@ -454,6 +491,7 @@ class Claim:
     paused: bool = False
     processed: int = 0
     route: tuple[str, ...] = ()
+    revision: int | None = None
 
 
 def _host_budget_seconds() -> float:
@@ -538,7 +576,7 @@ def claim_batch(limit: int | None = None, *, now: datetime | None = None) -> Cla
                 jobs.append(SendJob(row.id, row.attempt_count, cnic, masked_last4(row.cnic_last4)))
             # Later rows of this batch must see this decision when coalescing.
             session.flush()
-        return Claim(jobs, processed=len(rows), route=route)
+        return Claim(jobs, processed=len(rows), route=route, revision=control.revision)
 
 
 def _safe_detail(value: object) -> str | None:
@@ -586,11 +624,16 @@ async def post_notification(
             "RETRY", f"TRANSPORT_{name}", circuit_failure=True, host=host, not_sent=True
         )
     except (httpx.TimeoutException, asyncio.TimeoutError):
-        # A read or write timeout may follow a delivered request.
-        return SendResult("RETRY", "TRANSPORT_TIMEOUT", circuit_failure=True, host=host)
+        # A read or write timeout may follow a delivered request: the phone may
+        # already have the message, so it is never repeated automatically.
+        return SendResult(
+            "FAILED", "TRANSPORT_TIMEOUT", circuit_failure=True, host=host, uncertain=True
+        )
     except httpx.HTTPError as exc:
         name = _SAFE_CATEGORY.sub("_", type(exc).__name__.upper())[:40]
-        return SendResult("RETRY", f"TRANSPORT_{name}", circuit_failure=True, host=host)
+        return SendResult(
+            "FAILED", f"TRANSPORT_{name}", circuit_failure=True, host=host, uncertain=True
+        )
     status = response.status_code
     body: object = None
     try:
@@ -607,15 +650,18 @@ async def post_notification(
         ):
             return SendResult("FAILED", "API_REPORTED_FAILURE", status, detail=message, host=host)
         return SendResult("SENT", f"HTTP_{status}", status, host=host)
-    if status in {401, 403}:
-        # A key or permission problem affects every punch: pause, keep the rows.
-        return SendResult(
-            "RETRY", f"HTTP_{status}", status, circuit_failure=True, detail=message, host=host
-        )
-    if status in {408, 425, 429} or status >= 500:
+    if status in DECLINED_STATUSES:
+        # Declined without processing (401/403 is a key or permission problem
+        # that affects every punch): pause, keep the rows, retry later.
         return SendResult(
             "RETRY", f"HTTP_{status}", status, circuit_failure=True,
             retry_after=_retry_after(response), detail=message, host=host,
+        )
+    if status >= 500:
+        # The service may have pushed the message before failing.
+        return SendResult(
+            "FAILED", f"HTTP_{status}", status, circuit_failure=True,
+            detail=message, host=host, uncertain=True,
         )
     return SendResult("FAILED", f"HTTP_{status}", status, detail=message, host=host)
 
@@ -677,6 +723,10 @@ def apply_results(results: list[tuple[SendJob, SendResult]], *, now: datetime | 
     with session_scope() as session:
         now = now or utc_now()
         control = ensure_control(session, lock=True)
+        failures_before = control.consecutive_failures
+        # While a pause is running, failures of requests already in flight do
+        # not escalate it; only a failed half-open probe doubles the pause.
+        already_paused = bool(control.paused_until and ensure_utc(control.paused_until) > now)
         for job, result in results:
             row = session.scalar(
                 select(Notification).where(Notification.id == job.row_id).with_for_update()
@@ -712,6 +762,15 @@ def apply_results(results: list[tuple[SendJob, SendResult]], *, now: datetime | 
                     "Check-in notification attempt failed row=%s cnic=%s category=%s",
                     row.id, job.masked, result.category,
                 )
+            elif result.uncertain:
+                # The employee may already have the message: never repeat it
+                # automatically (an administrator can, with an audit entry).
+                row.status, row.reason, row.next_attempt_at = "FAILED", "DELIVERY_UNCERTAIN", None
+                row.detail = _join(result.category, result.detail) if result.detail else result.category
+                logger.warning(
+                    "Check-in notification outcome unknown, not repeated row=%s cnic=%s category=%s",
+                    row.id, job.masked, result.category,
+                )
             else:
                 row.status, row.reason, row.next_attempt_at = "FAILED", result.category, None
                 logger.warning(
@@ -733,13 +792,20 @@ def apply_results(results: list[tuple[SendJob, SendResult]], *, now: datetime | 
                 elif result.host == PRIMARY:
                     control.preferred_host, control.primary_reprobe_at = PRIMARY, None
             elif result.circuit_failure:
-                control.consecutive_failures += 1
+                if not already_paused:
+                    control.consecutive_failures += 1
                 control.last_failure_at = now
                 control.last_failure_category = result.category[:60]
         threshold = settings.checkin_notify_circuit_failure_threshold
-        if control.consecutive_failures >= threshold and any(
-            result.circuit_failure for _job, result in results
+        if (
+            not already_paused
+            and control.consecutive_failures >= threshold
+            and any(result.circuit_failure for _job, result in results)
         ):
+            if failures_before < threshold:
+                # A first trip always starts with the shortest pause, however
+                # many requests of one batch failed together.
+                control.consecutive_failures = threshold
             exponent = min(control.consecutive_failures - threshold, 12)
             pause = min(
                 settings.checkin_notify_circuit_max_pause_seconds,
@@ -768,11 +834,40 @@ class _RateLimiter:
             self._next = max(now, self._next) + self.interval
 
 
+def _control_revision() -> int | None:
+    with session_scope() as session:
+        return session.scalar(
+            select(CheckinNotifyControl.revision).where(CheckinNotifyControl.id == 1)
+        )
+
+
+SETTINGS_WATCH_SECONDS = 1.0
+
+
+class _SettingsWatch:
+    """Notices an administrator settings change (for example OFF) mid-batch."""
+
+    def __init__(self, revision: int | None, lock: asyncio.Lock) -> None:
+        self.revision = revision
+        self.current = revision
+        self.checked = time.monotonic()
+        self._lock = lock  # Shared with result saving: one database user at a time.
+
+    async def changed(self) -> bool:
+        async with self._lock:
+            if time.monotonic() - self.checked >= SETTINGS_WATCH_SECONDS:
+                self.current = await asyncio.to_thread(_control_revision)
+                self.checked = time.monotonic()
+            return self.current != self.revision
+
+
 async def deliver_once(*, transport: httpx.AsyncBaseTransport | None = None) -> Claim:
     claim = await asyncio.to_thread(claim_batch)
     if not claim.jobs:
         return claim
     claimed_at = time.monotonic()
+    persist_lock = asyncio.Lock()
+    watch = _SettingsWatch(claim.revision, persist_lock)
     start_deadline = _start_deadline_seconds()
     router = Router(claim.route or tuple(host_urls()))
     limiter = _RateLimiter(settings.checkin_notify_rate_per_second)
@@ -786,19 +881,34 @@ async def deliver_once(*, transport: httpx.AsyncBaseTransport | None = None) -> 
         timeout=timeout, transport=transport, follow_redirects=False
     ) as client:
 
-        async def one(job: SendJob) -> tuple[SendJob, SendResult]:
+        async def attempt(job: SendJob) -> SendResult:
             async with semaphore:
                 await limiter.wait()
                 if time.monotonic() - claimed_at > start_deadline:
-                    return job, SendResult("RELEASED", "LEASE_BUDGET")
+                    return SendResult("RELEASED", "LEASE_BUDGET")
+                if await watch.changed():
+                    # Re-decided under the new settings (OFF skips it).
+                    return SendResult("RELEASED", "SETTINGS_CHANGED")
                 try:
-                    return job, await send_with_fallback(client, job, router)
+                    return await send_with_fallback(client, job, router)
                 except Exception as exc:  # Never lose the lease bookkeeping.
                     name = _SAFE_CATEGORY.sub("_", type(exc).__name__.upper())[:40]
-                    return job, SendResult("RETRY", f"CLIENT_{name}", circuit_failure=True)
+                    return SendResult(
+                        "FAILED", f"CLIENT_{name}", circuit_failure=True, uncertain=True
+                    )
 
-        results = await asyncio.gather(*(one(job) for job in claim.jobs))
-    await asyncio.to_thread(apply_results, list(results))
+        async def one(job: SendJob) -> None:
+            result = await attempt(job)
+            # Save each result as soon as it is known, so a restart mid-batch
+            # never re-sends a request that already finished.
+            async with persist_lock:
+                await asyncio.to_thread(apply_results, [(job, result)])
+
+        # Let every job finish (and save) before the client closes.
+        outcomes = await asyncio.gather(*(one(job) for job in claim.jobs), return_exceptions=True)
+    for outcome in outcomes:
+        if isinstance(outcome, BaseException):
+            raise outcome
     return claim
 
 
@@ -827,7 +937,7 @@ def sweep_missing_rows(*, limit: int = 200, now: datetime | None = None) -> int:
             .order_by(AttendanceEvent.id)
             .limit(limit)
         ).all()
-        _insert_rows(session, [_row_values(event, None, now) for event in events])
+        _insert_rows(session, [_row_values(event, None, now, swept=True) for event in events])
         return len(events)
 
 
@@ -938,6 +1048,11 @@ def feature_started_at(session: Session) -> datetime | None:
     return ensure_utc(value) if value else None
 
 
+def _within_window(punch_time: datetime | None) -> bool:
+    """A notification is only ever sent inside the age window, even by hand."""
+    return punch_time is not None and utc_now() - ensure_utc(punch_time) <= _window()
+
+
 def pill(event: AttendanceEvent, row: Notification | None, started_at: datetime | None) -> dict:
     if row is None:
         if event.ords_status not in STILL_CONFIRMED_STATUSES:
@@ -964,7 +1079,7 @@ def pill(event: AttendanceEvent, row: Notification | None, started_at: datetime 
         "last_http_status": row.last_http_status,
         "host": row.host_used,
         "updated_at": row.updated_at,
-        "can_retry": row.status == "FAILED",
+        "can_retry": row.status == "FAILED" and _within_window(row.punch_time),
         "manual_retry": bool(row.manual_retry),
     }
 
@@ -1200,6 +1315,11 @@ def retry_notification(
         raise CheckinNotifyError(404, "This punch has no check-in notification to retry.")
     if row.status != "FAILED":
         raise CheckinNotifyError(409, "Only a failed check-in notification can be retried.")
+    if not _within_window(row.punch_time):
+        hours = f"{settings.checkin_notify_stale_window_hours:g}"
+        raise CheckinNotifyError(
+            409, f"This punch is older than {hours} hours, so it can no longer be notified."
+        )
     now = utc_now()
     before = {"status": row.status, "reason": row.reason, "attempts": row.attempt_count}
     row.status = "PENDING"
