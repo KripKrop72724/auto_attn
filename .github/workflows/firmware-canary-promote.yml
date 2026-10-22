@@ -153,7 +153,9 @@ jobs:
               $campaign.status -ne 'CANCELLED' -or
               [int]$campaign.eligible -ne 1 -or
               [int]$campaign.legacy_skipped -ne 0 -or
-              [int]$campaign.counts.SUCCEEDED -ne 1
+              [int]$campaign.counts.SUCCEEDED -ne 1 -or
+              [int]$campaign.counts.ROLLED_BACK -ne 0 -or
+              [int]$campaign.counts.FAILED -ne 0
             ) {
               throw 'Exact closed production-canary campaign did not contain one successful deployment.'
             }

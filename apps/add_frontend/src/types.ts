@@ -255,6 +255,18 @@ export interface FirmwareScopePreview {
   counts: { candidates: number; eligible: number; excluded: number; offline: number }
   eligible: Array<Pick<Device, 'connector_id' | 'display_name' | 'zone_id' | 'hardware_id' | 'connected' | 'firmware_version' | 'ota_state'>>
   excluded: Array<Pick<Device, 'connector_id' | 'display_name' | 'zone_id' | 'hardware_id' | 'connected' | 'firmware_version' | 'ota_state'> & { reason: string }>
+  // Owner-overridable ESP reset-rate and uptime warnings; never part of the signed scope.
+  stability_warnings?: FirmwareStabilityWarning[]
+  // An override must name this digest, so it covers exactly the warnings shown.
+  stability_warnings_digest?: string
+}
+
+export interface FirmwareStabilityWarning {
+  code: 'ESP_RESET_RATE_HIGH' | 'ESP_UPTIME_SHORT' | 'TARGET_BOOT_INTERRUPTED_REPEATEDLY' | string
+  connector_id: string
+  display_name?: string | null
+  message: string
+  [key: string]: unknown
 }
 
 export interface AlertQueueResponse {
@@ -1203,6 +1215,79 @@ export interface FirmwareTransportDiagnostics {
   }
 }
 
+export interface FirmwareRollbackDiagnosis {
+  classification: 'TARGET_BOOT_INTERRUPTED' | 'UNCLASSIFIED' | string | null
+  unclassified_reasons?: string[]
+  summary?: string
+  target_version?: string
+  previous_version?: string
+  classified_at?: string | null
+  target_boot?: {
+    estimated_lifetime_seconds: { min: number | null; max: number | null }
+    last_progress_at: string | null
+    last_progress_state: string | null
+    last_progress_code: string | null
+    progress_reports: number
+    failure_reports: Array<{ state: string; error_code: string | null; at: string | null }>
+    logs_received: number
+    telemetry_received: number
+  }
+  previous_firmware_resets?: {
+    resets: number
+    boot_ids: number
+    online_hours: number
+    reset_rate_per_online_hour: number
+    days: number
+  }
+  // ADD's receipt of the terminal's time sync: an upper bound on when it answered.
+  terminal?: {
+    time_sync_after_new_boot_seconds: number | null
+    answered_within_30_seconds: boolean | null
+    bound?: 'upper' | null
+    source?: 'received_at' | 'inconsistent' | null
+  }
+  location_resets?: {
+    location: string | null
+    peers_checked: number
+    window_seconds: number
+    complete: boolean
+    resets: Array<{ connector_id: string; display_name: string; offset_seconds: number }>
+  }
+  reconcile_at_reset?: { running: boolean | null; last_target_activity: string | null }
+}
+
+// Campaign detail's hint only; the owner's dialog reads FirmwareRetryPreflight.
+export interface FirmwareRetryView {
+  available: boolean
+  refusal: string | null
+  interrupted_boots: number
+  limit: number
+  // Other PENDING deployments that resuming the campaign also offers.
+  pending_deployments?: number
+}
+
+// The ESP's current storage and queue state, shown with the retry.
+export interface FirmwareRetryEspState {
+  connected: boolean
+  firmware_version: string | null
+  boot_id: string | null
+  storage_reported: boolean
+  storage_durability: string | null
+  storage_io_faults: Record<string, unknown> | null
+  diagnostics_at: string | null
+  outbox_depth: number | null
+  last_heartbeat_at: string | null
+}
+
+export interface FirmwareRetryPreflight extends FirmwareRetryView {
+  campaign_id: string
+  deployment_id: string
+  target_version: string
+  stability_warnings: FirmwareStabilityWarning[]
+  stability_warnings_digest: string
+  esp_state: FirmwareRetryEspState | null
+}
+
 export interface FirmwareDeployment {
   deployment_id: string
   connector_id: string | null
@@ -1220,6 +1305,9 @@ export interface FirmwareDeployment {
   completed_at: string | null
   updated_at: string
   transport_diagnostics: FirmwareTransportDiagnostics | null
+  // Campaign detail only: re-read rollback evidence and the owner's retry hint.
+  rollback_diagnosis?: FirmwareRollbackDiagnosis | null
+  retry?: FirmwareRetryView | null
   events: FirmwareDeploymentEvent[]
 }
 

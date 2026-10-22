@@ -94,6 +94,51 @@ minutes earlier.
   (`WARNING`) and `ADD_DEVICE_HEALTH_LATCHED_LED_SOURCES`.
 - The derived model is enforced on deploy. There was no shadow-only period.
 
+### Interrupted OTA attempts (21 October 2026, MULTAN-02)
+
+- **Rollback-slot residue.** Signed 2.6.15 checks at boot (`zone_lite.c:3196`)
+  that the other OTA slot holds a qualified predecessor. Any 2.7.x download
+  writes that slot, so every later 2.6.15 boot reports
+  `STORAGE_DIRECT_ROLLBACK_IMAGE_UNQUALIFIED`, never runs its persistence
+  probe and reports DEGRADED until a 2.7.x install succeeds. ADD names that
+  cause but keeps the tier DEGRADED: zero I/O counters on such a boot are not
+  a passed probe, 2.6.15 reports only the first latch's source (a later
+  `LOCAL_FAILURE` on the same boot is invisible), and its legacy-queue reads
+  and writes can fail without touching the counters. `ESP_DURABILITY_FAULT`
+  and `ESP_LOCAL_FAILURE` get error code `OTA_ROLLBACK_SLOT_RESIDUE`
+  ("persistence unverified - OTA rollback slot residue ... the persistence
+  probe did not run") only when all of these hold: firmware 2.6.15 with
+  application digest `832c0c3d...`, LED source exactly `zone_lite.c:3196`
+  (and no later source reported), that upgrade error, `recovery_complete`
+  true, every write, read, probe and legacy counter 0, no error code or
+  operation and no fault class on this boot; no storage I/O fault in the
+  last reported counters of any earlier boot in the last 14 days; and ADD's
+  own record that a 2.7.x deployment wrote bytes after this ESP's last
+  successful 2.6.15 install (a connector row is one ESP: a replacement is a
+  new connector). Any I/O failure removes the label. The latched-LED policy
+  (`ADD_DEVICE_HEALTH_LATCHED_LED_SOURCES`) does not apply to it, tiers and
+  holds are unchanged, and the alert stays open and gating. An ESP with an
+  I/O fault on an earlier boot in the window (MULTAN-02 had EIO write
+  failures on 15 October) shows the generic durability fault until that boot
+  is 14 days old.
+- **Interrupted target boot.** For a 2.6.0-2.6.15 ESP, a return to the
+  previous firmware is labelled `TARGET_BOOT_INTERRUPTED` (error code
+  `OTA_TARGET_BOOT_INTERRUPTED`) when the new image never reported
+  confirmation, `RUNTIME_HEALTHY` or a failure, and ran less than 5 minutes.
+  ADD reads the same evidence whether it saw the return in two heartbeats or
+  the ESP reported `ROLLED_BACK BOOTLOADER_ROLLBACK` first (that report waits,
+  with a 409 the ESP repeats every 60 s, up to 10 minutes for the return
+  boot's first heartbeat). Otherwise the return stays
+  `PREVIOUS_FIRMWARE_OBSERVED` (heartbeats) or `BOOTLOADER_ROLLBACK` (the
+  ESP's report). Returns to 2.4.12, 2.5.2, 2.6.16+ or 2.7.x, and targets with
+  their own return evidence (journal bridges, 2.7.0, recovery images, 2.7.6)
+  are never classified. The evidence records the target's estimated lifetime
+  and last progress report, any target-boot logs and heartbeats, the ESP's
+  resets per online hour on the old firmware over 7 days (restarts ADD caused
+  excluded), when ADD received the terminal's first time sync after the new
+  boot (an upper bound), other ESP resets at the same location within ±120 s
+  and whether a reconcile was running. The evidence never names a cause.
+
 ## Evidence ADD records
 
 - Diagnostics alerts record `boot_id`, `firmware_version`, `binding`
