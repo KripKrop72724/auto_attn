@@ -397,7 +397,15 @@ def preflight(session, connector):
         }
     except ValueError as exc:
         active_scope = {"eligible": False, "user_count": None, "reason": str(exc)}
+    # The scheduler re-runs this preflight every cycle for the device's active
+    # job; only a device without one can start a tail, so skip the evidence scan.
+    active_job = session.scalar(select(ReconciliationJob.id).where(
+        ReconciliationJob.connector_id == connector.id,
+        ReconciliationJob.status.not_in(["COMPLETED", "CANCELLED", "FAILED", "INVALIDATED"]),
+    ).limit(1))
     try:
+        if active_job is not None:
+            raise ValueError("Finish or cancel this device's active reconciliation first.")
         tail = recent_tail_scope(session, connector)
         tail_scope = {"eligible": not hard, "anchor_serial": tail["anchor_serial"],
                       "begin_serial": tail["begin_serial"], "reason": None}

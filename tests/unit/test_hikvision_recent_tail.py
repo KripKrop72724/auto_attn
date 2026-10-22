@@ -332,6 +332,15 @@ def test_preflight_treats_an_anchor_mismatch_terminal_as_answering(db, monkeypat
         "poll_error": 6, "poll_stage": "events", "poll_http_status": 200}}
     terminal.last_seen_at = utc_now() - timedelta(seconds=settings.offline_after_seconds + 5)
     assert not terminal_answering(terminal)
+    # While a job runs (the scheduler re-checks it every cycle) no evidence scan
+    # is needed: another job cannot start anyway.
+    session.add(ReconciliationJob(connector_id=connector.id, zkt_device_id=terminal.id, actor="t", reason="t",
+                                  idempotency_key="running", request_digest="d" * 64,
+                                  terminal_serial="terminal", mode=MODE, status="RUNNING"))
+    session.flush()
+    assert preflight(session, connector)["recent_tail"] == {
+        "eligible": False, "anchor_serial": None, "begin_serial": None,
+        "reason": "Finish or cancel this device's active reconciliation first."}
 
 
 def test_create_and_serialize_recent_tail_job(db, monkeypatch):
