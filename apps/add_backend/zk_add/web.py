@@ -37,6 +37,7 @@ from zk_add import APP_VERSION
 from zk_add.hil_transport import TransportInterrupted, enforce_transport
 from zk_add import attendance_force_release as force_release
 from zk_add import attendance_direct_ords as direct_ords
+from zk_add import checkin_notify
 from zk_add.attendance_cnic_link import cnic_not_linked_expression
 from zk_add.attendance_force_schemas import ForceCheckRequest, ForceStartRequest, ForceControlRequest, UserRefreshRequest
 from zk_add.attendance_direct_ords_schemas import DirectOrdsRecheckRequest, DirectOrdsStartRequest
@@ -65,6 +66,7 @@ from zk_add.db import SessionLocal, init_db, session_scope
 from zk_add.device_session import DeviceStreamSession
 from zk_add.models import (
     AdminSession,
+    AttendanceCheckinNotification,
     AttendanceEvent,
     AttendanceRecoveryJob,
     Connector,
@@ -576,6 +578,7 @@ def overview(auth: tuple[Session, AdminContext] = Depends(require_admin)):
     result["ords_delivery"] = ords_delivery_metrics(db)
     result["attendance_repair"] = repair_worker_metrics(db)
     result["attendance_recovery"] = recovery_summary(db)
+    result["checkin_notifications"] = checkin_notify.overview(db)
     return result
 
 
@@ -3403,6 +3406,7 @@ def attendance(
     clock_quality: str | None = None,
     forced: bool = False,
     ords_status: list[str] = Query(default=[]),
+    notify_status: list[str] = Query(default=[]),
     cnic_present: bool | None = None,
     from_time: str | None = None,
     to_time: str | None = None,
@@ -3453,6 +3457,13 @@ def attendance(
                 AttendanceEvent.cnic_encrypted == "",
             )
         )
+    if notify_status:
+        if not set(notify_status) <= set(checkin_notify.PILL_FILTERS):
+            raise HTTPException(status_code=422, detail="Select valid phone notification statuses.")
+        statement = statement.outerjoin(
+            AttendanceCheckinNotification,
+            AttendanceCheckinNotification.attendance_event_id == AttendanceEvent.id,
+        ).where(checkin_notify.filter_condition(sorted(set(notify_status))))
     if ords_status:
         stored_statuses = set(ords_status) - {"CNIC_NOT_LINKED"}
         selected_states = [AttendanceEvent.ords_status.in_(stored_statuses)]
@@ -3484,6 +3495,7 @@ def attendance(
     release_states = attendance_release_states(db, page_rows)
     force_metadata = force_release.metadata_for_page(db, page_rows)
     direct_ords_identity = direct_ords.identity_hints_for_page(db, page_rows)
+    notifications = checkin_notify.pills_for_page(db, page_rows)
     return {
         "rows": [
             {
@@ -3495,14 +3507,64 @@ def attendance(
                 "force_release": force_metadata.get(row.id),
                 "direct_ords_identity": direct_ords_identity.get(row.id),
                 "cnic_not_linked": bool(results[index][1]),
+                "checkin_notification": notifications.get(row.id),
             }
             for index, row in enumerate(page_rows)
         ],
         "next_cursor": next_cursor,
+        # A compact summary for the first page; older pages do not repeat it.
+        "checkin_notifications": None if cursor else checkin_notify.overview(db),
         "status_options": db.scalars(
             select(AttendanceEvent.ords_status).distinct().order_by(AttendanceEvent.ords_status).limit(100)
         ).all() + ["CNIC_NOT_LINKED"],
     }
+
+
+@app.get("/api/v1/checkin-notifications")
+def checkin_notification_settings(auth: tuple[Session, AdminContext] = Depends(require_admin)):
+    """Mode, pilot allowlist, health and 24-hour counts of check-in notifications."""
+    db, _context = auth
+    return checkin_notify.describe_control(db)
+
+
+@app.put("/api/v1/checkin-notifications/settings")
+def update_checkin_notification_settings(
+    request: Request,
+    body: checkin_notify.CheckinNotifySettingsRequest,
+    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+):
+    """Switch OFF / PILOT / ALL at runtime; password step-up and audited."""
+    db, context = auth
+    require_step_up(body.password.get_secret_value(), db, context)
+    try:
+        result = checkin_notify.update_control(
+            db, body, actor=context.username, ip_address=client_ip(request)
+        )
+    except checkin_notify.CheckinNotifyError as error:
+        raise HTTPException(status_code=error.status, detail=error.detail) from error
+    db.commit()
+    return result
+
+
+@app.post("/api/v1/attendance/{event_id}/checkin-notification/retry")
+def retry_checkin_notification(
+    request: Request,
+    event_id: int,
+    body: checkin_notify.CheckinNotifyRetryRequest,
+    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+):
+    """Queue one failed notification again; password step-up and audited."""
+    db, context = auth
+    require_step_up(body.password.get_secret_value(), db, context)
+    try:
+        result = checkin_notify.retry_notification(
+            db, event_id=event_id, actor=context.username, reason=body.reason,
+            ip_address=client_ip(request),
+        )
+    except checkin_notify.CheckinNotifyError as error:
+        raise HTTPException(status_code=error.status, detail=error.detail) from error
+    db.commit()
+    return {"checkin_notification": result}
 
 
 @app.get("/api/v1/devices/{connector_id}/logs")
