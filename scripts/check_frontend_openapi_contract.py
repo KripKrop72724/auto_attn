@@ -49,6 +49,15 @@ def main() -> None:
     assert {"expected_code", "reason", "password", "idempotency_key"}.issubset(
         request_properties(spec, "/api/v1/devices/{connector_id}/clear-error", "post")
     )
+    assert {"zone_id", "reason", "typed_confirmation", "password", "idempotency_key"}.issubset(
+        request_properties(spec, "/api/v2/attendance-identity-backlog/releases", "post")
+    )
+    assert {"password"}.issubset(
+        request_properties(
+            spec, "/api/v2/attendance-identity-backlog/releases/{job_id}/stop", "post"
+        )
+    )
+    assert "get" in paths["/api/v2/attendance-identity-backlog/preview"]
     # The send dialog's explicit CNIC choices and "send now" confirmations.
     assert {"event_ids", "reason", "password", "idempotency_key", "cnic_choices", "send_now_event_ids"}.issubset(
         request_properties(spec, "/api/v2/attendance-direct-ords", "post")

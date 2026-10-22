@@ -1273,7 +1273,7 @@ def test_events_only_read_from_a_newest_slot_are_never_released(source_db, monke
     item = session.scalar(select(AttendanceRecoveryItem).where(AttendanceRecoveryItem.job_id == job.id))
     assert (item.status, item.error_code) == ("SKIPPED", newest_slot.UNCONFIRMED_CONDITION)
     session.rollback()
-    monkeypatch.setattr("zk_add.service.synced_cnic_identity_proven", lambda *args: True)
+    monkeypatch.setattr("zk_add.service.synced_cnic_proof_kind", lambda *args, **kwargs: "LIVE_ROSTER")
     monkeypatch.setattr("zk_add.attendance_auto_release_guard.database_synced_cnic_release_proven",
                         lambda *args, **kwargs: True)
     user = session.scalar(select(DeviceUser).where(DeviceUser.user_id == "44"))
@@ -1609,7 +1609,7 @@ def test_automatic_release_alerts_when_it_holds_back_a_newest_slot_punch(source_
     session.commit()
     first_tail(session, connector, held.row(3))
     event = session.get(AttendanceEvent, event_id(session, held))
-    monkeypatch.setattr("zk_add.service.synced_cnic_identity_proven", lambda *args: True)
+    monkeypatch.setattr("zk_add.service.synced_cnic_proof_kind", lambda *args, **kwargs: "LIVE_ROSTER")
     monkeypatch.setattr("zk_add.attendance_auto_release_guard.database_synced_cnic_release_proven",
                         lambda *args, **kwargs: True)
     user = session.scalar(select(DeviceUser).where(DeviceUser.user_id == "44"))

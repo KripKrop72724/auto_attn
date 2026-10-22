@@ -1173,6 +1173,14 @@ def test_identity_evidence_reports_guard_cnics_record_and_auto_release(store):
         event.captured_cnic_lookup_hash = db.scalar(select(DeviceUser)).cnic_lookup_hash
         db.flush()
         report = attendance_identity_evidence_report(event_id, auth=(db, None))
+        # The capture names today's CNIC but the retained punch-time record names
+        # another: conflicting evidence stays held for review (#416).
+        assert report["auto_release_eligible"] is False
+        assert report["auto_release_at_next_snapshot"] is False
+        # Once that record is revoked, the terminal's own capture proves the CNIC.
+        punch_time_record(db).revoked = True
+        db.flush()
+        report = attendance_identity_evidence_report(event_id, auth=(db, None))
         assert report["auto_release_eligible"] is True
         assert report["auto_release_at_next_snapshot"] is True
         assert "AUTO_RELEASE_AT_NEXT_SNAPSHOT" in [hint["code"] for hint in report["hints"]]
@@ -1669,10 +1677,16 @@ def test_automatic_release_takes_over_a_posted_approval_only_with_the_same_cnic(
     with sessions() as db:
         event = db.get(AttendanceEvent, event_id)
         assert event.ords_status == "BLOCKED_IDENTITY"
-        # The terminal's own capture proves today's CNIC: ADD's release sends it.
+        # The terminal's own capture proves today's CNIC: ADD's release sends it
+        # once the conflicting punch-time record is revoked (conflicting
+        # evidence alone stays held, #416).
         event.captured_cnic_lookup_hash = cnic_lookup(CORRECT_CNIC)
         zkt = db.get(Connector, event.connector_id).zkt_device
-        assert release_synced_cnic_attendance_event(db, zkt=zkt, user=db.scalar(select(DeviceUser)), row=event)
+        user = db.scalar(select(DeviceUser))
+        assert not release_synced_cnic_attendance_event(db, zkt=zkt, user=user, row=event)
+        punch_time_record(db).revoked = True
+        db.flush()
+        assert release_synced_cnic_attendance_event(db, zkt=zkt, user=user, row=event)
         db.commit()
     with sessions() as db:
         event = db.get(AttendanceEvent, event_id)

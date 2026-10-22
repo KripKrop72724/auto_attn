@@ -893,8 +893,6 @@ def _bound_source_attendance(
             },
         }))
     if events:
-        from zk_add.service import recover_verified_source_identity
-
         existing = session.scalars(select(AttendanceEvent).where(
             AttendanceEvent.event_uid.in_([event.event_uid for event in events])
         )).all()
@@ -926,7 +924,9 @@ def _bound_source_attendance(
         # Only this connector's own rows are upgraded. A row owned elsewhere is
         # the same punch, captured before this terminal moved here. It stays
         # its owner's row: linked and counted as already present, never
-        # rewritten or released through this connector's roster.
+        # rewritten or released through this connector's roster. A held owned
+        # row is released after its saved record is linked, by
+        # _release_source_synced_attendance.
         for row in owned_rows:
             # Do not rewrite immutable facts used by an existing repair approval.
             from zk_add.models import AttendanceRepairItem
@@ -937,8 +937,6 @@ def _bound_source_attendance(
                 row.device_serial = terminal_serial
                 row.raw_event = {**(row.raw_event or {}),
                                  "terminal_provenance": "VERIFIED_SOURCE_REPLAY"}
-            if reviewed is None:
-                recover_verified_source_identity(session, connector=connector, row=row)
     return events, retained_elsewhere
 
 
@@ -958,18 +956,49 @@ def _retained_elsewhere_details(session, rows, *, start_ordinal: int, end_ordina
 
 
 def _release_source_synced_attendance(session, *, connector, events) -> set[int]:
-    """Resolve this source batch only after its canonical manifests are durable."""
+    """Resolve this source batch only after its canonical manifests are durable.
+
+    Every punch read back from the terminal's log qualifies, including a held
+    row this chunk found already present (a legacy dump or an earlier read)
+    and linked to its saved record. The proof is the one the next roster
+    snapshot would apply; it only runs sooner. The device waits for this
+    chunk's acknowledgement, so rows other than current-reconcile ones are
+    capped per chunk; the next roster snapshot releases the rest.
+    """
+    from zk_add.attendance_identity_evidence import TERMINAL_RECONCILE_SOURCES
+
     zkt = connector.zkt_device
-    candidates = [
+    held = [
         row for row in events
-        if row.source == "CURRENT_RECONCILE"
+        if row.source in TERMINAL_RECONCILE_SOURCES
         and row.ords_status in {"BLOCKED_IDENTITY", "WAITING_FOR_SNAPSHOT"}
         # A row retained by another connector is released only by its owner.
         and row.connector_id == connector.id and row.zkt_device_id == zkt.id
     ]
-    if not candidates:
+    if not held:
         return set()
     session.flush()
+    held.sort(key=lambda row: row.id)
+    candidates = [row for row in held if row.source == "CURRENT_RECONCILE"] + [
+        row for row in held if row.source != "CURRENT_RECONCILE"
+    ][:settings.attendance_chunk_history_release_limit]
+    if not candidates:
+        return set()
+    # A roster snapshot or the owner's backlog release may have released one
+    # of these rows since this chunk loaded it. Lock and re-read them; a row
+    # another transaction holds is left to it (it is not released twice).
+    candidates = [
+        row for row in session.scalars(
+            select(AttendanceEvent)
+            .where(AttendanceEvent.id.in_([row.id for row in candidates]))
+            .order_by(AttendanceEvent.id)
+            .with_for_update(skip_locked=True)
+            .execution_options(populate_existing=True)
+        ).all()
+        if row.ords_status in {"BLOCKED_IDENTITY", "WAITING_FOR_SNAPSHOT"}
+    ]
+    if not candidates:
+        return set()
     from zk_add.models import DeviceUser
     from zk_add.service import release_synced_cnic_attendance_event
 
