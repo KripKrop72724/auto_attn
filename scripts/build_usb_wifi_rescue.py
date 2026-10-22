@@ -4,12 +4,30 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 
 from usb_wifi_rescue_artifacts import application_digest, validate_package
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+@contextmanager
+def owned_build_directory():
+    with tempfile.TemporaryDirectory(prefix='add-usb-rescue-build-') as temporary:
+        scratch = Path(temporary)
+        try:
+            yield scratch
+        finally:
+            if sys.platform.startswith('linux'):
+                # The IDF image builds as root. Restore ownership before the
+                # non-root Linux runner deletes generated headers and objects.
+                # Do not follow build symlinks outside this private scratch tree.
+                subprocess.run(['docker', 'run', '--rm', '-v', f'{scratch}:/scratch',
+                                '--entrypoint', '/bin/chown', 'espressif/idf:v5.5.3',
+                                '-hR', f'{os.getuid()}:{os.getgid()}', '/scratch'], check=True)
 
 
 def main():
@@ -23,8 +41,7 @@ def main():
     if not 8 <= len(password.encode()) <= 63 or not password.isascii() or not password.isprintable():
         raise ValueError('An explicit printable ASCII recovery password is required')
     output.mkdir(parents=True)
-    with tempfile.TemporaryDirectory(prefix='add-usb-rescue-build-') as temporary:
-        scratch = Path(temporary)
+    with owned_build_directory() as scratch:
 
         def build(project, name, options, env):
             command = ['docker', 'run', '--rm', '-e', 'SLIC_RESCUE_WIFI_PASSWORD',
@@ -36,9 +53,11 @@ def main():
             print('Building quarantined role:', name, flush=True)
             proc = subprocess.run(command, check=False, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
             # Never export the configured password through compiler diagnostics.
-            log = proc.stdout.decode(errors='replace').replace(password, '[REDACTED]')
+            escaped = password.replace('\\', '\\\\').replace('"', '\\"')
+            log = proc.stdout.decode(errors='replace').replace(escaped, '[REDACTED]').replace(password, '[REDACTED]')
             (output / f'{name}-build.log').write_text(log)
             if proc.returncode:
+                print(log[-12000:], flush=True)
                 raise RuntimeError(f'{name} build failed; redacted diagnostics retained')
 
         env = os.environ.copy()
@@ -61,7 +80,7 @@ def main():
                 shutil.copy2(source / src, dest / target)
             reports[name] = validate_package(dest, role)
         (output / 'build-report.json').write_text(json.dumps(reports, indent=2) + '\n')
-        print('Quarantined roles built; no signing, flash writes or eFuse burns performed.')
+    print('Quarantined roles built; temporary files removed; no signing, flash writes or eFuse burns performed.')
 
 
 if __name__ == '__main__':
