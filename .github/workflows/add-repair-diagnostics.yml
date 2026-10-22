@@ -3,6 +3,11 @@ name: ADD read-only repair diagnostics
 on:
   workflow_dispatch:
     inputs:
+      provisioning_inspect:
+        description: Inspect protected provisioning configuration and public package metadata only
+        required: false
+        default: false
+        type: boolean
       direct_run_id:
         description: 'Optional saved direct Oracle send run ID for bounded error-code diagnostics'
         required: false
@@ -29,8 +34,20 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  provisioning-inspect:
+    if: inputs.provisioning_inspect == true
+    runs-on: [self-hosted, Windows, X64]
+    environment: add-production
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Inspect protected provisioning readiness without exposing credentials
+        shell: powershell
+        run: ./deploy/add/inspect-provisioning.ps1
   inspect:
-    if: github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/main' && inputs.provisioning_inspect != true
     runs-on: [self-hosted, Windows, X64]
     environment: add-production
     timeout-minutes: 5
