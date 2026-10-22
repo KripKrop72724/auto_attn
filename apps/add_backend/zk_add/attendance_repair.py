@@ -2094,6 +2094,17 @@ def _attach_source_dependency(
             ReconciliationJob.status.not_in(RECONCILIATION_TERMINAL_STATES),
         )
     )
+    from zk_add import source_newest_slot as newest_slot
+
+    if active is not None and active.error_code in {newest_slot.PUNCH_PENDING_HOLD, newest_slot.OPEN_JOB_HOLD}:
+        # The job waits for a terminal newest-record punch ADD has not received
+        # (or for another job): it cannot certify the repair's source until an
+        # operator cancels it and reconciles again.
+        raise RepairError(
+            f"The device's source reconciliation {active.job_id} is held ({active.error_code}); "
+            "cancel it and run another complete source reconcile before preparing a repair.",
+            code="SOURCE_DEPENDENCY_UNAVAILABLE",
+        )
     if active is not None and active.error_code in COVERAGE_FINALISATION_HOLDS:
         # Sealing this job is held on committed source evidence (a paused job
         # keeps that code); waiting on it cannot certify the repair's source.

@@ -141,6 +141,21 @@ POLICY = {
     "ADD_SOURCE_TAIL_STALE_GENERATION": Policy(
         108, False, "POSITIVE", "Clears when ADD commits a tail in the current coverage generation."),
     "TERMINAL_SOURCE_EXCEPTION": Policy(108, False, "LATCHED", "Clears through a source exception review."),
+    "TERMINAL_NEWEST_RECORD_CORRECTED": Policy(
+        108, False, "LATCHED",
+        "Clears when an operator resolves it after HR verifies the punch corrected from an unwritten "
+        "newest terminal record."),
+    "TERMINAL_NEWEST_RECORD_CHANGED": Policy(
+        108, False, "LATCHED",
+        "Clears when an operator resolves it after HR verifies the punch ADD took from an unwritten "
+        "newest terminal record."),
+    "TERMINAL_NEWEST_RECORD_PUNCH_UNRECEIVED": Policy(
+        108, False, "LATCHED",
+        "Clears by itself once ADD accounts for every listed slot: a complete source reconcile reads it "
+        "while later records exist, or LIVE capture delivers its punch."),
+    "TERMINAL_NEWEST_RECORD_RELEASE_HELD": Policy(
+        108, False, "LATCHED",
+        "Clears by itself once every listed punch is released or confirmed by a complete source reconcile."),
     "USER_DELETION_JOB_INCOMPLETE": Policy(
         109, False, "LATCHED", "Clears when the user deletion job completes."),
     "DUPLICATE_USER_CNIC": Policy(109, False, "LATCHED", "Clears when the duplicate CNIC is resolved."),

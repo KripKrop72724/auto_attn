@@ -38,6 +38,7 @@ from zk_add.hil_transport import TransportInterrupted, enforce_transport
 from zk_add import attendance_force_release as force_release
 from zk_add import attendance_direct_ords as direct_ords
 from zk_add import checkin_notify
+from zk_add import source_newest_slot as newest_slot
 from zk_add.attendance_cnic_link import cnic_not_linked_expression
 from zk_add.attendance_force_schemas import ForceCheckRequest, ForceStartRequest, ForceControlRequest, UserRefreshRequest
 from zk_add.attendance_direct_ords_schemas import DirectOrdsRecheckRequest, DirectOrdsStartRequest
@@ -1841,6 +1842,7 @@ def source_exceptions(
     error_code: str | None = None,
     review_state: str | None = None,
     ordinal: int | None = Query(default=None, ge=0),
+    corrected: bool | None = None,
     cursor: int | None = Query(default=None, ge=1),
     limit: int = Query(default=100, ge=1, le=500),
     auth: tuple[Session, AdminContext] = Depends(require_admin),
@@ -1867,6 +1869,7 @@ def source_exceptions(
         error_code=error_code,
         review_state=review_state,
         ordinal=ordinal,
+        corrected=corrected,
         cursor=cursor,
         limit=limit,
     )
@@ -1890,6 +1893,8 @@ def source_exceptions(
                     "state",
                     "cohort_digest",
                     "correction_ids",
+                    "newest_held",
+                    "newest_punch_unreceived",
                 )
             },
         }
@@ -2091,6 +2096,7 @@ def zkt_source_evidence_list(
     before: int | None = Query(default=None, ge=1),
     limit: int = Query(default=20, ge=1, le=50),
     disposition: str | None = Query(default=None, max_length=50),
+    newest: bool = False,
     auth: tuple[Session, AdminContext] = Depends(require_admin),
 ):
     from zk_add.zkt_source_evidence import list_evidence
@@ -2099,7 +2105,8 @@ def zkt_source_evidence_list(
     try:
         response.headers["Cache-Control"] = "no-store, max-age=0"
         response.headers["Pragma"] = "no-cache"
-        return list_evidence(db, connector, before=before, limit=limit, disposition=disposition)
+        return list_evidence(db, connector, before=before, limit=limit, disposition=disposition,
+                             newest=newest)
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
@@ -4133,13 +4140,17 @@ def persist_device_reconciliation_chunk(
             "phase": job.phase,
             "committed_next_ordinal": job.committed_next_ordinal,
         }))
+    # A safety hold or a source-change probe commits no chunk; answer with
+    # the submitted chunk's identity, as the device stream does.
     response = {
-        "ok": job.status != "NEEDS_ATTENTION",
+        "ok": chunk is not None and job.status != "NEEDS_ATTENTION",
         "job_id": job.job_id,
-        "generation": chunk.generation,
-        "sequence": chunk.sequence,
+        "generation": chunk.generation if chunk is not None else body.generation,
+        "sequence": chunk.sequence if chunk is not None else body.sequence,
         "committed_next_ordinal": job.committed_next_ordinal,
-        "resulting_chain_digest": chunk.resulting_chain_digest,
+        "resulting_chain_digest": (
+            chunk.resulting_chain_digest if chunk is not None else body.resulting_chain_digest
+        ),
         "duplicate": duplicate,
     }
 
@@ -5105,6 +5116,14 @@ def persist_envelope(connector_pk: int, envelope: Envelope) -> EnvelopeOutcome |
                 # rejection (no DEGRADED, no last_error_code): it needs ADD's
                 # current coverage, exactly like the manifest authority path.
                 authoritative_coverage_payload = coverage_authority_payload(db, coverage)
+                stale_generation_tail = True
+            elif error_code == newest_slot.REPLAY_SUPERSEDED_CODE:
+                # A rewound reader replayed committed ordinals and differed only
+                # in newest-slot reads. Like a refused stale epoch, it resumes
+                # from ADD's unchanged committed cursor: the push goes before
+                # the error ACK so the reader applies it before its next tail.
+                # Its replay committed no tail evidence, so it clears nothing.
+                coverage_before_ack_payload = active_coverage_push(db, coverage)
                 stale_generation_tail = True
         else:
             event_payload = {"connector_id": connector.connector_id, "type": envelope.type}

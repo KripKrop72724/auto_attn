@@ -109,9 +109,11 @@ def scanned_before_chunk_lineage():
 
 def tail_payload(session, coverage, start, stop, record=source, **update):
     epoch = session.get(TerminalSourceEpoch, coverage.source_epoch_id)
+    # The terminal already holds a later record, so the tail's last read is
+    # not its unwritten newest slot (see test_source_newest_slot).
     draft = SourceTailChunkRequest(source_epoch=epoch.epoch_id, terminal_serial=SERIAL,
         terminal_generation=coverage.terminal_generation, record_size=40, start_ordinal=start, end_ordinal=stop,
-        latest_terminal_count=stop, previous_chain_digest=coverage.source_committed_chain_digest,
+        latest_terminal_count=stop + 1, previous_chain_digest=coverage.source_committed_chain_digest,
         chunk_digest="0" * 64, resulting_chain_digest="0" * 64, records=[record(i) for i in range(start, stop)])
     digest = service.reconciliation_chunk_digest(draft)
     chain = service.reconciliation_chain_digest(coverage.source_committed_chain_digest,

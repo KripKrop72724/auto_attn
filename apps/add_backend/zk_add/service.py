@@ -3357,6 +3357,14 @@ def release_synced_cnic_attendance_event(
         return False
     if not synced_cnic_identity_proven(session, zkt.connector, zkt, user, row):
         return False
+    from zk_add.source_newest_slot import alert_release_held, newest_only_event_ids
+
+    if newest_only_event_ids(session, [row]):
+        # Read only from the terminal's unwritten newest slot: its identity
+        # bytes may belong to someone else until a later read confirms them.
+        if zkt.connector is not None:
+            alert_release_held(session, zkt.connector, row)
+        return False
     from zk_add.attendance_auto_release_guard import database_synced_cnic_release_proven
 
     if not database_synced_cnic_release_proven(session, row=row, zkt=zkt, user=user):

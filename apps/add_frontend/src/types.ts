@@ -691,7 +691,29 @@ export interface SourceException {
   source_committed_cursor: number
   cursor_advanced: boolean
   oracle_action: 'EXCLUDED_FAIL_CLOSED' | 'HELD_IDENTITY_EVIDENCE_REQUIRED'
+  // Derived from the receipt that read the row; older backends omit it.
+  source_condition?:
+    | 'TERMINAL_NEWEST_RECORD_UNSETTLED'
+    | 'TERMINAL_NEWEST_RECORD_UNCONFIRMED'
+    | 'TERMINAL_NEWEST_RECORD_CORRECTED'
+    | 'TERMINAL_NEWEST_RECORD_OUT_OF_ORDER'
+    | null
+  operator_reason?: string | null
+  source_correction_ids?: string[]
+  // Detail only: later reads of this slot kept as receipts.
+  slot_receipts?: SourceSlotReceipt[]
   reviews?: SourceExceptionReview[]
+}
+
+export interface SourceSlotReceipt {
+  manifest_id: number
+  source_kind: string
+  job_id: string | null
+  raw_record_digest: string
+  disposition: string
+  decodes_as_punch: boolean
+  punch_received: boolean | null
+  observed_at: string
 }
 
 export interface SourceExceptionTotals {
@@ -729,7 +751,10 @@ export interface SourceExceptionAssurance {
   identity_unresolved_open?: number
   raw_preserved?: number
   raw_interpretation_open?: number
-  state: 'NONE' | 'REVIEW_REQUIRED' | 'IDENTITY_EVIDENCE_REQUIRED' | 'INTERPRETATION_REQUIRED' | 'REVIEWED_EXCLUSIONS' | 'CORRECTED_DERIVED_EVENTS' | 'SCOPE_MISMATCH'
+  newest_held?: number
+  newest_punch_unreceived?: number
+  state: 'NONE' | 'REVIEW_REQUIRED' | 'IDENTITY_EVIDENCE_REQUIRED' | 'INTERPRETATION_REQUIRED' | 'NEWEST_PUNCH_UNRECEIVED' | 'REVIEWED_EXCLUSIONS' | 'CORRECTED_DERIVED_EVENTS' | 'SCOPE_MISMATCH'
+
   cohort_digest: string | null
   correction_ids?: string[]
 }
