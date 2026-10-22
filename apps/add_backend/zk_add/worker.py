@@ -1832,7 +1832,9 @@ def apply_ords_batch_results(
     results: list[tuple[int, int, int | None, object, str | None, bool]],
 ) -> None:
     # The exact CNIC each claim sent (or would have sent) to Oracle.
-    delivered = {claim[0]: claim[1].get("cnic") for claim in claims}
+    delivered = {
+        claim[0]: claim[1].get("cnic") if isinstance(claim[1], dict) else None for claim in claims
+    }
     with session_scope() as session:
         for claimed_id in confirmed_claim_ids:
             apply_ords_confirmation(
