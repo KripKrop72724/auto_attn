@@ -3308,7 +3308,7 @@ def attendance_identity_evidence_report(
         source_evidence,
     )
     from zk_add.models import AttendanceIdentityHistory, TerminalRecordManifest, TerminalSourceEpoch
-    from zk_add.service import dump_release_outlook, synced_cnic_identity_proven
+    from zk_add.service import synced_cnic_identity_proven
 
     db, _context = auth
     event = db.get(AttendanceEvent, event_id)
@@ -3384,9 +3384,6 @@ def attendance_identity_evidence_report(
         "clock_quality": event.clock_quality,
         "source": event.source,
         "source_proof": source["kind"] if source else None,
-        # A legacy dump row only the authenticated batch proof can release:
-        # whether a later snapshot or only the owner's zone release will.
-        "dump_release": dump_release_outlook(db, event),
         "manifest_disposition": manifest.disposition if manifest else None,
         "manifest_canonical_source": manifest.canonical_source if manifest else None,
         "manifest_owner_matches": bool(

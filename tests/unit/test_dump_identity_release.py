@@ -12,7 +12,8 @@ from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
 
 import pytest
-from sqlalchemy import func, select
+from sqlalchemy import event as sa_event
+from sqlalchemy import func, select, update
 
 from test_add_backend import (
     CNIC,
@@ -41,6 +42,7 @@ from zk_add.models import (
     DeviceUser,
     OrdsOutbox,
     TerminalRecordManifest,
+    ZKTDevice,
 )
 from zk_add.reconciliation import (
     apply_reconciliation_anchor,
@@ -232,10 +234,12 @@ def test_held_dump_row_is_released_by_the_next_snapshot(db, auto_zone, punch, so
     row = _ingest_held(
         db, connector, _dump("kh-1", when, now - timedelta(minutes=1), source=source)
     )
-    # Ingest never uses the batch proof; the evidence says what will release it.
-    assert dump_release_outlook(db, row)["release_path"] == (
-        None if punch == "after_last_snapshot" else "AUTOMATIC_SNAPSHOT_RELEASE"
-    )
+    # Ingest never uses the batch proof; the outlook says what will release it.
+    # A punch after the last snapshot waits for the next one to cover it.
+    outlook = dump_release_outlook(db, row)
+    assert outlook["release_path"] == "AUTOMATIC_SNAPSHOT_RELEASE"
+    assert outlook["proof_passes"] is (punch == "between_snapshots")
+    assert outlook["awaiting_next_snapshot"] is (punch == "after_last_snapshot")
 
     _snapshot(db, connector, "s2", utc_now())
 
@@ -885,7 +889,7 @@ def test_backlog_release_api_requires_owner_step_up_and_the_signed_check(db):
     [group] = preview["groups"]
     assert group == {
         "connector_id": connector.connector_id, "source": "DUMP_RECONNECT",
-        "age": "UP_TO_7_DAYS", "held": 1, "provable": 1,
+        "age": "UP_TO_7_DAYS", "held": 1, "provable": 1, "next_snapshot": 0,
     }
     page = client.get(f"{root}/preview", params={
         "zone_id": zone, "after_id": 0, "as_of": preview["as_of"],
@@ -957,22 +961,23 @@ def test_backlog_release_api_requires_owner_step_up_and_the_signed_check(db):
     assert (run["released"], run["waiting_oracle"], run["delivered"]) == (1, 1, 0)
 
 
-def test_identity_evidence_shows_how_a_dump_hold_can_be_released(db, monkeypatch):
+def test_identity_evidence_report_is_left_to_the_release_safety_branch(db, monkeypatch):
+    """The endpoint is unchanged here; dump_release_outlook is the helper for it."""
     connector = _connector(db)
     _snapshot(db, connector, "s0", utc_now() - timedelta(days=5))
     row = _old_hold(db, connector, "evidence")
     _snapshot(db, connector, "s1", utc_now())
     client, _headers = _admin_client(db)
-    url = f"/api/v2/attendance/{row.id}/identity-evidence"
-    report = client.get(url).json()
-    assert report["auto_release_eligible"] is False
-    assert report["dump_release"]["proof_passes"] is True
-    assert report["dump_release"]["release_path"] == "OWNER_BACKLOG_RELEASE"
+    report = client.get(f"/api/v2/attendance/{row.id}/identity-evidence").json()
+    assert report["auto_release_eligible"] is False and "dump_release" not in report
+    outlook = dump_release_outlook(db, row)
+    assert outlook["proof_passes"] is True
+    assert outlook["release_path"] == "OWNER_BACKLOG_RELEASE"
+    # Even with every zone and a week-long window, ADD saw no roster between
+    # five days ago and now: only the owner can release this punch.
     monkeypatch.setattr(settings, "attendance_dump_identity_auto_release_zones", "*")
     monkeypatch.setattr(settings, "attendance_dump_identity_auto_release_hours", 7 * 24)
-    assert client.get(url).json()["dump_release"]["release_path"] == (
-        "AUTOMATIC_SNAPSHOT_RELEASE"
-    )
+    assert dump_release_outlook(db, row)["release_path"] == "OWNER_BACKLOG_RELEASE"
 
 
 def _chunk_record(ordinal, event, *, observed_uid="7"):
@@ -1024,11 +1029,15 @@ def _apply_baseline(db, connector, records):
     return chunk
 
 
-def test_baseline_chunk_releases_covered_history_and_held_dump_rows(reconciliation_db, monkeypatch):
+@pytest.mark.parametrize("history_limit", [25, 1])
+def test_baseline_chunk_releases_covered_history_and_held_dump_rows(
+    reconciliation_db, monkeypatch, history_limit,
+):
     db, connector = reconciliation_db
     db.autoflush = False
     # Only the saved-record proof may act at chunk time.
     monkeypatch.setattr(settings, "attendance_dump_identity_auto_release_hours", 0)
+    monkeypatch.setattr(settings, "attendance_chunk_history_release_limit", history_limit)
     start = utc_now() - timedelta(minutes=5)
     for index in range(2):
         replace_user_snapshot(
@@ -1074,6 +1083,26 @@ def test_baseline_chunk_releases_covered_history_and_held_dump_rows(reconciliati
         for row in db.scalars(select(AttendanceEvent)).all()
     }
     released_history = rows[history.event_uid]
+    if history_limit == 1:
+        # The device waits for the chunk's acknowledgement, so the chunk
+        # releases only the first held row; the next snapshot does the rest.
+        assert held_dump.ords_status == "PENDING"
+        assert released_history.ords_status == "BLOCKED_IDENTITY"
+        assert chunk.blocked_identity_count == 2
+        replace_user_snapshot(
+            db, connector=connector,
+            snapshot=UserSnapshotRequest(
+                snapshot_id="chunk-2", complete=True, stable=True,
+                observed_at=start + timedelta(minutes=2),
+                users=[UserSnapshotRow(
+                    uid="7", user_id="1007", name=f"Ayesha-{CNIC}",
+                    terminal_identity_fingerprint=FP,
+                )],
+            ),
+        )
+        db.flush()
+    else:
+        assert chunk.blocked_identity_count == 1
     assert released_history.source == "FULL_HISTORY"
     assert released_history.ords_status == "PENDING"
     assert released_history.identity_resolution_status == "RESOLVED_SYNCED_CNIC"
@@ -1082,7 +1111,6 @@ def test_baseline_chunk_releases_covered_history_and_held_dump_rows(reconciliati
     assert decrypt_cnic(held_dump.cnic_encrypted) == CNIC
     still_held = rows[uncovered.event_uid]
     assert still_held.ords_status == "BLOCKED_IDENTITY" and still_held.cnic_lookup_hash is None
-    assert chunk.blocked_identity_count == 1
     assert chunk.already_present_count == 1
 
 
@@ -1159,3 +1187,283 @@ def test_tail_chunk_releases_a_held_dump_row_it_links(reconciliation_db):
     assert decrypt_cnic(held_dump.cnic_encrypted) == CNIC
     # The saved-record proof keeps its usual lane; only the batch proof moves.
     assert _outbox(db, held_dump).delivery_type == "CURRENT_RECONCILE"
+
+
+@pytest.mark.parametrize("case", ["outage", "old_punch"])
+def test_a_dump_of_outage_or_old_punches_waits_for_the_owner(db, auto_zone, case):
+    """A new hold is not a new punch: an ESP back from an outage uploads old ones."""
+    connector = _connector(db)
+    now = utc_now()
+    if case == "outage":
+        # The last roster ADD saw before the ESP went down, 50 hours ago. The
+        # identity interval still continues across the outage.
+        when = now - timedelta(hours=49)
+        _snapshot(db, connector, "s0", now - timedelta(hours=50))
+    else:
+        # Rosters closely around a punch older than the 72-hour window.
+        when = now - timedelta(days=4)
+        _snapshot(db, connector, "s0", when - timedelta(minutes=5))
+        _snapshot(db, connector, "s0b", when + timedelta(minutes=5))
+    # The startup dump reaches ADD now: the hold itself is brand new.
+    row = _ingest_held(db, connector, _dump(
+        f"late-{case}", when, now - timedelta(minutes=1), source="DUMP_STARTUP",
+    ))
+    _snapshot(db, connector, "s1", utc_now())
+
+    assert row.ords_status == "BLOCKED_IDENTITY" and row.cnic_lookup_hash is None
+    assert not _audits(db, "ATTENDANCE_DUMP_IDENTITY_AUTO_RELEASED")
+    outlook = dump_release_outlook(db, row)
+    assert outlook["proof_passes"] and outlook["release_path"] == "OWNER_BACKLOG_RELEASE"
+    # The proof itself passes, so the owner can release it after checking.
+    first, totals = check = _check(db, connector.zone_id)
+    assert totals == {
+        (connector.connector_id, "DUMP_STARTUP", "AUTOMATIC_WINDOW"): {"held": 1, "provable": 1}
+    }
+    _approve(db, connector.zone_id, key=f"late-{case}", check=check)
+    assert backlog.advance_once(db) == 1
+    assert row.ords_status == "PENDING"
+
+
+def test_auto_release_is_capped_per_connector_hour_across_reconnects(
+    db, auto_zone, monkeypatch,
+):
+    monkeypatch.setattr(settings, "attendance_dump_identity_auto_release_hourly_cap", 2)
+    connector = _connector(db)
+    now = utc_now()
+    _snapshot(db, connector, "s0", now - timedelta(minutes=40))
+    _snapshot(db, connector, "s1", now - timedelta(minutes=25))
+    rows = [
+        _ingest_held(db, connector, _dump(
+            f"hour-{index}", now - timedelta(minutes=20 - index), now - timedelta(minutes=1)
+        ))
+        for index in range(3)
+    ]
+    # A reconnect storm: 2.6.x sends a roster snapshot on every reconnect.
+    for index in range(3):
+        _snapshot(db, connector, f"storm-{index}", utc_now())
+    assert [row.ords_status for row in rows] == ["PENDING", "PENDING", "BLOCKED_IDENTITY"]
+    [audit] = _audits(db, "ATTENDANCE_DUMP_IDENTITY_AUTO_RELEASED")
+    assert (audit.after["released"], audit.after["hourly_cap"]) == (2, 2)
+    assert audit.after["max_snapshot_gap_minutes"] == 60
+    # An hour later the connector's budget is available again.
+    audit.created_at = ensure_utc(audit.created_at) - timedelta(minutes=61)
+    db.flush()
+    _snapshot(db, connector, "later", utc_now())
+    assert rows[2].ords_status == "PENDING"
+
+
+def test_owner_release_takes_only_punches_held_and_never_released_at_the_check(
+    db, monkeypatch,
+):
+    """A punch on its way to Oracle at the check is not taken in if delivery re-holds it."""
+    connector = _connector(db)
+    _snapshot(db, connector, "s0", utc_now() - timedelta(days=5))
+    earlier, checked = (_old_hold(db, connector, seed) for seed in ("earlier", "checked"))
+    _snapshot(db, connector, "s1", utc_now())
+    user = db.scalar(select(DeviceUser).where(DeviceUser.user_id == "11"))
+    # Released before the check (for example when the zone was enabled).
+    assert release_synced_cnic_attendance_event(
+        db, zkt=connector.zkt_device, user=user, row=earlier,
+        dump_release=DumpIdentityRelease(held_since=None, remaining=1, rereleases_remaining=1),
+    )
+    db.flush()
+    first, totals = check = _check(db, connector.zone_id)
+    assert first["held_total"] == 1 and first["reheld_outside_check"] == 0
+    # A newer snapshot reaches ADD before Oracle; delivery holds it again.
+    _snapshot(db, connector, "s2", utc_now())
+    assert _deliver(db, monkeypatch) == []
+    assert earlier.ords_status == "BLOCKED_IDENTITY"
+    job = _approve(db, connector.zone_id, key="frozen-1", check=check)
+    assert job.scope["held_at_approval"] == 1
+    while backlog.advance_once(db):
+        pass
+    assert checked.ords_status == "PENDING"
+    assert earlier.ords_status == "BLOCKED_IDENTITY"  # not this run's punch
+    assert _run(db, job)["released"] == 1
+    assert [audit.after["event_ids"] for audit in _audits(
+        db, "ATTENDANCE_IDENTITY_BACKLOG_RELEASE_BATCH"
+    )] == [[checked.id]]
+    again, _totals = _check(db, connector.zone_id)
+    assert again["held_total"] == 0 and again["reheld_outside_check"] == 1
+
+
+def test_owner_release_uses_only_the_dump_proof(db):
+    """A punch another proof releases is left to the roster snapshot that applies it."""
+    connector = _connector(db)
+    zkt = connector.zkt_device
+    _snapshot(db, connector, "s0", utc_now() - timedelta(days=5))
+    saved, dump_only = (_old_hold(db, connector, seed) for seed in ("saved", "dump-only"))
+    _snapshot(db, connector, "s1", utc_now())
+    # A later terminal read linked the terminal's own saved record.
+    db.add(TerminalRecordManifest(
+        connector_id=connector.id, zkt_device_id=zkt.id, terminal_serial=SERIAL,
+        generation=1, ordinal=0, canonical_source=True, record_size=40,
+        raw_record_digest="b" * 64, terminal_record_key="c" * 64,
+        attendance_event_id=saved.id, disposition="EVENT",
+        observed_uid="69", observed_user_id="11",
+    ))
+    db.flush()
+    assert saved.ords_status == "BLOCKED_IDENTITY"
+    first = backlog.preview_page(db, zone_id=connector.zone_id, actor=ADMIN)
+    assert first["groups"] == [{
+        "connector_id": connector.connector_id, "source": "DUMP_RECONNECT",
+        "age": "UP_TO_7_DAYS", "held": 2, "provable": 1, "next_snapshot": 1,
+    }]
+    job = _approve(db, connector.zone_id, key="dump-only-1", approved=1, held=2)
+    while backlog.advance_once(db):
+        pass
+    assert dump_only.ords_status == "PENDING"
+    assert saved.ords_status == "BLOCKED_IDENTITY"
+    run = _run(db, job)
+    assert (run["released"], run["kept_held"], run["left_to_snapshot"]) == (1, 0, 1)
+    batches = [audit.after for audit in _audits(db, "ATTENDANCE_IDENTITY_BACKLOG_RELEASE_BATCH")]
+    assert [batch["left_to_snapshot_event_ids"] for batch in batches] == [[saved.id], []]
+    assert [batch["event_ids"] for batch in batches] == [[], [dump_only.id]]
+    assert {batch["proof"] for batch in batches} == {"AUTHENTICATED_RECONCILE_BATCH"}
+    # The next roster snapshot releases it on its saved record, as before.
+    _snapshot(db, connector, "s2", utc_now())
+    assert saved.ords_status == "PENDING"
+    assert saved.identity_resolution_status == "RESOLVED_SYNCED_CNIC"
+    # The saved-record proof keeps its usual lane.
+    assert _outbox(db, saved).delivery_type == "CURRENT_RECONCILE"
+
+
+def test_a_partial_roster_pauses_the_owner_release_instead_of_passing_punches(db):
+    connector = _connector(db)
+    _snapshot(db, connector, "s0", utc_now() - timedelta(days=5))
+    rows = [_old_hold(db, connector, f"partial-{index}") for index in range(3)]
+    _snapshot(db, connector, "s1", utc_now())
+    job = _approve(db, connector.zone_id, key="partial-1")
+    assert job.requested_count == 3
+    # The terminal sends one partial roster (common on 2.6.x) during the run.
+    replace_user_snapshot(db, connector=connector, snapshot=UserSnapshotRequest(
+        snapshot_id="partial", complete=False, stable=True, observed_at=utc_now(), users=[],
+    ))
+    db.flush()
+    assert not connector.zkt_device.snapshot_complete
+    assert backlog.advance_once(db) == 0
+    assert job.status == "RELEASING" and job.cursor == 0
+    assert _run(db, job)["waiting_reason"] == "WAITING_FOR_COMPLETE_ROSTER"
+    assert [row.ords_status for row in rows] == ["BLOCKED_IDENTITY"] * 3
+    _snapshot(db, connector, "s2", utc_now())
+    while backlog.advance_once(db):
+        pass
+    assert [row.ords_status for row in rows] == ["PENDING"] * 3
+    run = _run(db, job)
+    assert (run["released"], run["kept_held"], run["waiting_reason"]) == (3, 0, None)
+
+
+def test_a_roster_replaced_while_a_punch_is_checked_is_checked_again(db, monkeypatch):
+    connector = _connector(db)
+    _snapshot(db, connector, "s0", utc_now() - timedelta(days=5))
+    row = _old_hold(db, connector, "raced")
+    _snapshot(db, connector, "s1", utc_now())
+    job = _approve(db, connector.zone_id, key="raced-1")
+    real_release = backlog.release_synced_cnic_attendance_event
+    calls = []
+
+    def stale_release(session, **arguments):
+        # Another transaction commits the routine snapshot mid-check, so the
+        # installed guard refuses the release against the newer roster.
+        calls.append(arguments["row"].id)
+        return False if len(calls) == 1 else real_release(session, **arguments)
+
+    monkeypatch.setattr(backlog, "release_synced_cnic_attendance_event", stale_release)
+    monkeypatch.setattr(backlog, "_roster_changed", lambda session, zkt: True)
+    assert backlog.advance_once(db) == 0
+    assert job.cursor == 0 and row.ords_status == "BLOCKED_IDENTITY"
+    run = _run(db, job)
+    assert run["kept_held"] == 0 and run["waiting_reason"] == "WAITING_FOR_ROSTER_UPDATE"
+    assert backlog.advance_once(db) == 1
+    assert row.ords_status == "PENDING" and _run(db, job)["kept_held"] == 0
+    assert calls == [row.id, row.id]
+
+
+def test_roster_changed_reads_the_terminal_past_the_session(db):
+    connector = _connector(db)
+    _snapshot(db, connector, "s0", utc_now())
+    zkt = connector.zkt_device
+    assert not backlog._roster_changed(db, zkt)
+    # What a snapshot committed by another transaction looks like here.
+    db.execute(
+        update(ZKTDevice).where(ZKTDevice.id == zkt.id)
+        .values(identity_snapshot_revision=zkt.identity_snapshot_revision + 1)
+        .execution_options(synchronize_session=False)
+    )
+    assert backlog._roster_changed(db, zkt)
+
+
+def test_stop_releases_nothing_more_but_follows_released_punches_to_oracle(db, monkeypatch):
+    connector = _connector(db)
+    _snapshot(db, connector, "s0", utc_now() - timedelta(days=5))
+    released, waiting = (_old_hold(db, connector, f"stop-{index}") for index in range(2))
+    _snapshot(db, connector, "s1", utc_now())
+    job = _approve(db, connector.zone_id, key="stop-follow")
+    assert backlog.advance_once(db, limit=1) == 1
+    assert released.ords_status == "PENDING" and waiting.ords_status == "BLOCKED_IDENTITY"
+    backlog.stop(db, job, actor=ADMIN)
+    assert job.status == "STOPPED_FOLLOWING" and job.completed_at is None
+    [stopped] = _audits(db, "ATTENDANCE_IDENTITY_BACKLOG_RELEASE_STOPPED")
+    assert stopped.after["still_following"] == 1
+
+    # A newer snapshot reaches ADD before Oracle; delivery holds it again.
+    _snapshot(db, connector, "s2", utc_now())
+    assert _deliver(db, monkeypatch) == []
+    assert released.ords_status == "BLOCKED_IDENTITY"
+    _snapshot(db, connector, "s3", utc_now())
+    assert backlog.advance_once(db) == 0  # nothing new is checked
+    assert released.ords_status == "PENDING"  # but the released punch is followed
+    assert waiting.ords_status == "BLOCKED_IDENTITY"
+    with pytest.raises(backlog.RecoveryError) as running:
+        _approve(db, connector.zone_id, key="stop-follow-2")
+    assert running.value.code == "RELEASE_ALREADY_RUNNING"
+
+    [_claim] = _deliver(db, monkeypatch)
+    _acknowledge(db, released)
+    backlog.advance_once(db)
+    assert job.status == "STOPPED" and job.completed_at is not None
+    run = _run(db, job)
+    assert (run["released"], run["delivered"], run["waiting_oracle"]) == (1, 1, 0)
+    [completed] = _audits(db, "ATTENDANCE_IDENTITY_BACKLOG_RELEASE_COMPLETED")
+    assert completed.after["stopped"] is True and completed.outcome == "STOPPED"
+    assert waiting.ords_status == "BLOCKED_IDENTITY"
+
+
+def test_a_punch_after_the_last_snapshot_shows_it_awaits_the_next_one(db, monkeypatch):
+    connector = _connector(db)
+    now = utc_now()
+    _snapshot(db, connector, "s0", now - timedelta(minutes=40))
+    _snapshot(db, connector, "s1", now - timedelta(minutes=25))
+    row = _ingest_held(
+        db, connector, _dump("newest", now - timedelta(minutes=20), now - timedelta(minutes=1))
+    )
+    outlook = dump_release_outlook(db, row)
+    assert outlook["proof"] == "AUTHENTICATED_RECONCILE_BATCH"
+    assert outlook["awaiting_next_snapshot"] and not outlook["proof_passes"]
+    assert outlook["release_path"] == "OWNER_BACKLOG_RELEASE"  # zone not enabled
+    monkeypatch.setattr(settings, "attendance_dump_identity_auto_release_zones", "*")
+    assert dump_release_outlook(db, row)["release_path"] == "AUTOMATIC_SNAPSHOT_RELEASE"
+    # A changed fingerprint never shows a path.
+    row.identity_terminal_fingerprint = "b" * 64
+    db.flush()
+    assert dump_release_outlook(db, row)["release_path"] is None
+
+
+def test_a_snapshot_reads_no_outbox_for_held_punches_it_cannot_release(db):
+    connector = _connector(db)
+    _snapshot(db, connector, "s0", utc_now() - timedelta(days=5))
+    for index in range(20):
+        _old_hold(db, connector, f"cost-{index}")
+    statements = []
+
+    def count(conn, cursor, statement, parameters, context, executemany):
+        statements.append(statement)
+
+    engine = db.get_bind()
+    sa_event.listen(engine, "before_cursor_execute", count)
+    try:
+        _snapshot(db, connector, "s1", utc_now())
+    finally:
+        sa_event.remove(engine, "before_cursor_execute", count)
+    assert statements
+    assert not [statement for statement in statements if "FROM add_ords_outbox" in statement]

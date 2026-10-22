@@ -827,21 +827,29 @@ def _release_source_synced_attendance(session, *, connector, events) -> set[int]
     Every punch read back from the terminal's log qualifies, including a held
     row this chunk found already present (a legacy dump or an earlier read)
     and linked to its saved record. The proof is the one the next roster
-    snapshot would apply; it only runs sooner.
+    snapshot would apply; it only runs sooner. The device waits for this
+    chunk's acknowledgement, so rows other than current-reconcile ones are
+    capped per chunk; the next roster snapshot releases the rest.
     """
     from zk_add.attendance_identity_evidence import TERMINAL_RECONCILE_SOURCES
 
     zkt = connector.zkt_device
-    candidates = [
+    held = [
         row for row in events
         if row.source in TERMINAL_RECONCILE_SOURCES
         and row.ords_status in {"BLOCKED_IDENTITY", "WAITING_FOR_SNAPSHOT"}
         # A row retained by another connector is released only by its owner.
         and row.connector_id == connector.id and row.zkt_device_id == zkt.id
     ]
-    if not candidates:
+    if not held:
         return set()
     session.flush()
+    held.sort(key=lambda row: row.id)
+    candidates = [row for row in held if row.source == "CURRENT_RECONCILE"] + [
+        row for row in held if row.source != "CURRENT_RECONCILE"
+    ][:settings.attendance_chunk_history_release_limit]
+    if not candidates:
+        return set()
     # A roster snapshot or the owner's backlog release may have released one
     # of these rows since this chunk loaded it. Lock and re-read them; a row
     # another transaction holds is left to it (it is not released twice).

@@ -84,23 +84,36 @@ class AddSettings(BaseSettings):
     identity_snapshot_capture_tolerance_seconds: int = 5
     # A legacy reconnect/startup dump row without a saved terminal record can
     # be released on its authenticated batch and retained CNIC interval
-    # (AUTHENTICATED_RECONCILE_BATCH). false withdraws that proof everywhere:
-    # no automatic or owner release, and the pre-send check holds rows it
-    # released that Oracle has not yet acknowledged.
+    # (AUTHENTICATED_RECONCILE_BATCH). This is the kill switch: false
+    # withdraws that proof everywhere. No automatic release, running owner
+    # releases pause, no new one can be approved, and the pre-send check
+    # holds rows it released that Oracle has not yet acknowledged.
     attendance_dump_identity_release_enabled: bool = True
     # Automatic release at a later roster snapshot runs only for these zone
-    # IDs (comma-separated; "*" for every zone; empty: none, the default),
-    # only for rows ADD held within the window (0 hours: off), and at most
-    # the batch cap per connector per snapshot. Older holds need the owner's
-    # audited backlog release, which uses the same proof.
+    # IDs (comma-separated; "*" for every zone; empty: none, the default).
+    # It admits a punch only when both the punch and ADD's hold of it are
+    # within the window (0 hours: off) and ADD's complete roster snapshots
+    # just before and after the punch are at most the gap apart. At most the
+    # batch cap per connector per snapshot, and the hourly cap per connector
+    # in any hour. Everything else needs the owner's audited backlog
+    # release, which uses the same proof.
     attendance_dump_identity_auto_release_zones: str = ""
     attendance_dump_identity_auto_release_hours: int = Field(default=72, ge=0, le=14 * 24)
     attendance_dump_identity_auto_release_batch: int = Field(default=100, ge=0, le=500)
+    attendance_dump_identity_auto_release_hourly_cap: int = Field(default=200, ge=0, le=5000)
+    attendance_dump_identity_auto_release_max_snapshot_gap_minutes: int = Field(
+        default=60, ge=1, le=24 * 60
+    )
     # The owner's backlog release locks and checks this many rows per worker
     # transaction, and queues no more while this many of its released rows
     # still wait for Oracle.
     attendance_identity_backlog_batch_size: int = Field(default=25, ge=1, le=200)
     attendance_identity_backlog_in_flight_limit: int = Field(default=100, ge=1, le=1000)
+    # Held full-history, dump and 15-minute reconcile rows a source chunk
+    # links to their saved record are released in the chunk's transaction,
+    # at most this many per chunk (0: none); the next roster snapshot
+    # releases the rest. Current-reconcile rows are always released there.
+    attendance_chunk_history_release_limit: int = Field(default=25, ge=0, le=100)
     identity_repair_sla_seconds: int = 60
     reconciliation_enabled: bool = False
     reconciliation_self_healing_enabled: bool = False
