@@ -511,6 +511,12 @@ def control_reconciliation_job(
                 "The source-exception cohort does not match its capture certificate; "
                 "generic retry cannot override this safety hold."
             )
+        if source_assurance["state"] == newest_slot.PUNCH_PENDING_STATE:
+            raise ValueError(
+                "A terminal newest-record slot in this job's range holds a punch ADD has not "
+                "received; a generic retry cannot read it. Cancel this job and run another "
+                "complete source reconcile after the next punch."
+            )
     before = job.status
     _release_assignment(job)
     if action == "pause":
@@ -979,32 +985,49 @@ def apply_reconciliation_chunk(
     }
     interpretation_drift_ordinals: set[int] = set()
     # Earlier reads of the terminal's newest slot (see source_newest_slot).
-    unsettled_priors = (
-        newest_slot.unsettled_newest_ids(session, existing_source_rows.values())
+    newest_priors = (
+        newest_slot.newest_read_ids(session, [
+            row for row in existing_source_rows.values() if row.disposition != "RAW_PRESERVED"])
         if existing_source_rows else set()
     )
+    unsettled_priors = {
+        row.id for row in existing_source_rows.values()
+        if row.id in newest_priors and row.disposition in newest_slot.SETTLEABLE_DISPOSITIONS
+    }
     newest_ordinal = newest_slot.baseline_newest_ordinal(job)
     settled_priors: dict[int, TerminalRecordManifest] = {}
+    changed_priors: list[tuple[TerminalRecordManifest, object]] = []
     reread_states: dict[int, str] = {}
     for source in payload.records:
         prior = existing_source_rows.get(source.ordinal)
         if prior is None:
             continue
-        if prior.id in unsettled_priors and source.disposition != "RAW_PRESERVED":
+        if prior.id in newest_priors and source.disposition != "RAW_PRESERVED":
             # An earlier read of the terminal's newest slot is not evidence of
             # the punch it later holds. This job's own final ordinal may be the
             # newest slot again, so a different read there is kept only as a
             # receipt. Anywhere else this job read the slot while later records
-            # existed: different bytes settle it, identical bytes confirm it.
-            # None of these is a source mutation. Raw custody keeps the
-            # ordinary comparison below.
-            if not newest_slot.same_source_read(prior, source):
-                if source.ordinal == newest_ordinal:
+            # existed: different bytes settle it and identical bytes confirm it
+            # (a held punch is then settled, so it is ingested). A read that
+            # delivered a punch is settled only when this job read its bytes
+            # at an earlier ordinal, proving it a byte copy; otherwise the job
+            # stops for review. None of these is a source mutation. Raw custody
+            # keeps the ordinary comparison below.
+            same = newest_slot.same_source_read(prior, source)
+            if source.ordinal == newest_ordinal:
+                if not same:
                     reread_states[source.ordinal] = newest_slot.REREAD_STATE
-                else:
+                    continue
+            elif not same or newest_slot.is_held(prior):
+                if prior.id in unsettled_priors or newest_slot.copy_proven(
+                    session, job=job, prior=prior, records=payload.records,
+                    start_ordinal=payload.start_ordinal,
+                ):
                     settled_priors[source.ordinal] = prior
+                else:
+                    changed_priors.append((prior, source))
                 continue
-            if source.ordinal != newest_ordinal:
+            else:
                 reread_states[source.ordinal] = newest_slot.CONFIRMED_STATE
         prior_parsed = prior.disposition in {
             "EVENT",
@@ -1041,6 +1064,21 @@ def apply_reconciliation_chunk(
                     "raw_record_digest": source.raw_record_digest,
                 },
             )
+    if changed_priors:
+        from zk_add.service import upsert_alert
+
+        code, message, details = newest_slot.changed_block(changed_priors)
+        _safety_hold(session, job, code, message)
+        _event(session, job, code, details)
+        upsert_alert(
+            session,
+            connector,
+            code="TERMINAL_NEWEST_RECORD_CHANGED",
+            severity="CRITICAL",
+            message=message,
+            details={"failure_category": code, "job_id": job.job_id, **details},
+        )
+        return job, None, False
     if settled_priors:
         block = newest_slot.settlement_block(session, job=job, priors=list(settled_priors.values()))
         if block is not None:
@@ -1192,15 +1230,29 @@ def apply_reconciliation_chunk(
             )
             for ordinal, manifest in sorted(settled_manifests.items())
         ]})
+    # A re-read of this job's own final ordinal that decodes as a punch ADD
+    # has not received is evidence of a missed punch, not of an exclusion.
+    unreceived = set(newest_slot.unreceived_ordinals(session, connector=connector, records=[
+        source for source in payload.records if reread_states.get(source.ordinal) == newest_slot.REREAD_STATE
+    ])) if newest_rereads else set()
     for state in (newest_slot.CONFIRMED_STATE, newest_slot.REREAD_STATE):
         rows = [
             {"ordinal": ordinal, "manifest_id": existing_source_rows[ordinal].id,
              "receipt_manifest_id": receipt.id, "raw_record_digest": receipt.raw_record_digest,
-             "committed_raw_record_digest": existing_source_rows[ordinal].raw_record_digest}
+             "committed_raw_record_digest": existing_source_rows[ordinal].raw_record_digest,
+             **({"punch_unreceived": ordinal in unreceived} if state == newest_slot.REREAD_STATE else {})}
             for ordinal, receipt in sorted(reread_receipts.items()) if reread_states[ordinal] == state
         ]
         if rows:
             _event(session, job, state, {"chunk_id": chunk.id, "rows": rows})
+    if unreceived:
+        newest_slot.alert_unreceived(
+            session, connector, cause=newest_slot.REREAD_SOURCE_KIND, ordinals=sorted(unreceived),
+            details={
+                "job_id": job.job_id,
+                "receipt_manifest_ids": [reread_receipts[ordinal].id for ordinal in sorted(unreceived)],
+            },
+        )
     from zk_add.zkt_custody_work import attach_source_work
     attach_source_work(session, connector, raw_manifests)
     released = _release_source_synced_attendance(
@@ -1624,6 +1676,9 @@ def apply_reconciliation_manifest(
             return _safety_hold(session, job, str(exc),
                 "The longer committed source coverage could not be safely retained; its cursor and evidence remain unchanged.")
     now = utc_now()
+    # The final ordinal may have been read as the terminal's unwritten newest
+    # slot. The certificate names it: no read of its eventual punch backs it.
+    unconfirmed_newest = newest_slot.unconfirmed_newest_ordinals(session, job)
     evidence = _sealed_evidence({
         "job_id": job.job_id,
         "terminal_serial": job.terminal_serial,
@@ -1637,6 +1692,7 @@ def apply_reconciliation_manifest(
         "firmware_version": job.firmware_version,
         "certified_at": now.isoformat(),
         **({"retained_coverage": retention} if retention is not None else {}),
+        **({"unconfirmed_newest_ordinals": unconfirmed_newest} if unconfirmed_newest else {}),
     })
     capture_state = (
         "SOURCE_CAPTURE_CERTIFIED_RAW_PENDING"
@@ -1860,6 +1916,11 @@ def apply_source_tail_chunk(
 
     from zk_add.service import ingest_attendance, upsert_alert
 
+    # The read of the terminal's newest slot may precede the terminal writing
+    # it: a punch there that no capture has delivered is held, not ingested.
+    held_uids = newest_slot.held_newest_uids(
+        session, records=payload.records, newest_ordinal=payload.latest_terminal_count - 1,
+    )
     attendance, retained_elsewhere = _bound_source_attendance(
         session, connector=connector, terminal_serial=coverage.terminal_serial,
         records=payload.records, link_retained_elsewhere=False,
@@ -1872,6 +1933,8 @@ def apply_source_tail_chunk(
             "SOURCE_TAIL_FOREIGN_OWNER",
             "Terminal tail replayed punches another connector owns; a second reader may share this terminal.",
         )
+    if held_uids:
+        attendance = [row for row in attendance if row.event_uid not in set(held_uids.values())]
     if attendance:
         ingest_attendance(
             session, connector=connector, events=attendance,
@@ -1922,10 +1985,13 @@ def apply_source_tail_chunk(
         ).all()
     )
     raw_manifests = []
+    held_manifests = []
     for source in payload.records:
         identity_missing = _source_identity_missing(source)
-        event = events_by_uid.get(source.event.event_uid) if source.event and not identity_missing else None
-        disposition = "IDENTITY_UNRESOLVED" if identity_missing else source.disposition
+        held = source.ordinal in held_uids
+        event = (events_by_uid.get(source.event.event_uid)
+                 if source.event and not identity_missing and not held else None)
+        disposition = "IDENTITY_UNRESOLVED" if identity_missing or held else source.disposition
         if event is not None:
             event_count += 1
             if source.terminal_record_key in seen_terminal_keys:
@@ -1958,15 +2024,19 @@ def apply_source_tail_chunk(
                 attendance_event_id=event.id if event else None,
                 disposition=disposition,
                 protected_raw_record=encrypt_text(source.raw_record_b64),
-                error_code=SOURCE_MISSING_REFERENCE if identity_missing else source.error_code,
+                error_code=(SOURCE_MISSING_REFERENCE if identity_missing
+                            else newest_slot.HELD_CODE if held else source.error_code),
                 raw_timestamp=source.raw_timestamp,
                 observed_uid=source.observed_uid,
                 observed_user_id=None if identity_missing else source.observed_user_id,
-                **_source_claim_evidence(source, identity_missing=identity_missing),
+                **(newest_slot.claim_evidence(source, reason=newest_slot.HELD_CODE) if held
+                   else _source_claim_evidence(source, identity_missing=identity_missing)),
         )
         session.add(manifest)
         if disposition == "RAW_PRESERVED":
             raw_manifests.append(manifest)
+        if held:
+            held_manifests.append(manifest)
     from zk_add.zkt_custody_work import attach_source_work
     attach_source_work(session, connector, raw_manifests)
     released = _release_source_synced_attendance(
@@ -1988,6 +2058,13 @@ def apply_source_tail_chunk(
         coverage.capture_state = "SOURCE_CAPTURE_CERTIFIED_RAW_PENDING"
         coverage.oracle_state = "ORACLE_SOURCE_INTERPRETATION_PENDING"
         coverage.oracle_certified_at = None
+    if held_manifests:
+        session.flush()
+        newest_slot.alert_unreceived(
+            session, connector, cause="TAIL", ordinals=[row.ordinal for row in held_manifests],
+            details={"coverage_id": coverage.coverage_id,
+                     "held_manifest_ids": [row.id for row in held_manifests]},
+        )
     if exceptions:
         coverage.capture_state = "SOURCE_CAPTURE_CERTIFIED_WITH_EXCEPTIONS"
         upsert_alert(
@@ -2033,6 +2110,9 @@ def source_exception_assurance(
         "review_evidence_digest": None,
         "review_ids": [],
         "correction_ids": [],
+        "newest_held": 0,
+        "newest_punch_unreceived": 0,
+        "newest_received_event_ids": [],
     }
     if not (job.quarantined_count or job.raw_preserved_count):
         if (job.capture_certified_at is not None
@@ -2055,6 +2135,11 @@ def source_exception_assurance(
         )
         .order_by(TerminalRecordManifest.ordinal.asc(), TerminalRecordManifest.id.asc())
     ).all()
+    # A later job may settle this job's final ordinal; the sealed cohort keeps
+    # the row this job certified and reviewed.
+    manifests = newest_slot.sealed_cohort(
+        session, job, manifests, dispositions=SOURCE_EXCEPTION_DISPOSITIONS | {"RAW_PRESERVED"},
+    )
     manifest_ids = [row.id for row in manifests]
     earliest_reviews: dict[int, TerminalRecordReview] = {}
     if manifest_ids:
@@ -2070,9 +2155,13 @@ def source_exception_assurance(
 
     invalid_time = sum(row.disposition == "INVALID_TIME" for row in manifests)
     malformed = sum(row.disposition == "MALFORMED" for row in manifests)
+    # Held newest-slot punches resolve only when an independent capture holds
+    # the same punch; slots with evidence of a punch ADD has not received
+    # cannot be excluded by a review or a correction.
+    held_ids, pending_ids, newest_events = newest_slot.cohort_newest_evidence(session, job, manifests)
     identity_manifest_ids = {
         row.id for row in manifests if row.disposition == "IDENTITY_UNRESOLVED"
-    }
+    } - held_ids
     raw_manifest_ids = {row.id for row in manifests if row.disposition == "RAW_PRESERVED"}
     reviewed = len(earliest_reviews)
     corrections = session.scalars(
@@ -2093,8 +2182,9 @@ def source_exception_assurance(
     # exclusion or prove its employee. Only derived correction evidence may
     # supply an event, whose identity and Oracle result are checked separately.
     resolved_manifest_ids = (
-        set(earliest_reviews) - identity_manifest_ids - raw_manifest_ids
-    ) | corrected_manifest_ids
+        (set(earliest_reviews) - identity_manifest_ids - raw_manifest_ids - held_ids)
+        | corrected_manifest_ids | held_ids
+    ) - pending_ids
     identity_open = len(identity_manifest_ids - corrected_manifest_ids)
     cohort_material = {
         "job_id": job.job_id,
@@ -2132,6 +2222,13 @@ def source_exception_assurance(
             for row in corrections
         ],
     }
+    if held_ids or pending_ids or newest_events:
+        # Only cohorts with newest-slot punch evidence carry this, so every
+        # earlier sealed review gate keeps its evidence digest.
+        review_material["newest_slot"] = {
+            "held": sorted(held_ids), "pending": sorted(pending_ids),
+            "received_event_ids": sorted(newest_events),
+        }
     review_evidence_digest = hashlib.sha256(
         json.dumps(review_material, separators=(",", ":"), sort_keys=True).encode()
     ).hexdigest()
@@ -2146,8 +2243,12 @@ def source_exception_assurance(
         "identity_unresolved_open": identity_open,
         "raw_preserved": len(raw_manifest_ids),
         "raw_interpretation_open": len(raw_manifest_ids),
+        "newest_held": len(held_ids),
+        "newest_punch_unreceived": len(pending_ids),
+        "newest_received_event_ids": sorted(newest_events),
         "state": "INTERPRETATION_REQUIRED" if raw_manifest_ids else
-                 "IDENTITY_EVIDENCE_REQUIRED" if identity_open else "REVIEW_REQUIRED",
+                 "IDENTITY_EVIDENCE_REQUIRED" if identity_open else
+                 newest_slot.PUNCH_PENDING_STATE if pending_ids else "REVIEW_REQUIRED",
         "cohort_digest": cohort_digest,
         "review_evidence_digest": review_evidence_digest,
         "review_ids": [
@@ -2312,7 +2413,18 @@ def refresh_reconciliation_assurance(
         )
         .distinct()
     )
-    event_ids = manifest_events.union(corrected_events).subquery()
+    # Do not materialize a growing exception cohort on every unfinished scan.
+    # Sealed review evidence is checked after capture; the ongoing identity
+    # count is a scoped aggregate while capture is still incomplete.
+    source_assurance = source_exception_assurance(session, job) if job.capture_certified_at else None
+    # An independent capture of a punch a newest-slot read held or re-read
+    # belongs to this job's Oracle membership.
+    newest_events = (source_assurance or {}).get("newest_received_event_ids") or []
+    event_ids = (
+        manifest_events.union(corrected_events, select(AttendanceEvent.id).where(
+            AttendanceEvent.id.in_(newest_events)))
+        if newest_events else manifest_events.union(corrected_events)
+    ).subquery()
     status_rows = session.execute(
         select(AttendanceEvent.ords_status, func.count(AttendanceEvent.id))
         .where(AttendanceEvent.id.in_(select(event_ids.c.attendance_event_id)))
@@ -2332,10 +2444,6 @@ def refresh_reconciliation_assurance(
         outcome_counts[classify_ords_assurance_status(status)] += count
     target = sum(status_counts.values())
     confirmed = outcome_counts["CONFIRMED"]
-    # Do not materialize a growing exception cohort on every unfinished scan.
-    # Sealed review evidence is checked after capture; the ongoing identity
-    # count is a scoped aggregate while capture is still incomplete.
-    source_assurance = source_exception_assurance(session, job) if job.capture_certified_at else None
     if source_assurance is None:
         corrected_identity = (
             select(AttendanceSourceCorrection.id)
@@ -2396,9 +2504,13 @@ def refresh_reconciliation_assurance(
     managed_oracle_hold = (
         job.error_code == "ORACLE_TERMINAL_OUTCOME_REQUIRES_REVIEW"
     )
+    source_holds = {
+        SOURCE_EXCEPTION_REVIEW_HOLD, SOURCE_EXCEPTION_SCOPE_MISMATCH, SOURCE_IDENTITY_HOLD,
+        SOURCE_INTERPRETATION_HOLD, newest_slot.PUNCH_PENDING_HOLD,
+    }
     managed_source_hold = (
-        job.wait_reason in {SOURCE_EXCEPTION_REVIEW_HOLD, SOURCE_EXCEPTION_SCOPE_MISMATCH, SOURCE_IDENTITY_HOLD, SOURCE_INTERPRETATION_HOLD}
-        or job.error_code in {SOURCE_EXCEPTION_REVIEW_HOLD, SOURCE_EXCEPTION_SCOPE_MISMATCH, SOURCE_IDENTITY_HOLD, SOURCE_INTERPRETATION_HOLD}
+        job.wait_reason in source_holds
+        or job.error_code in source_holds
         or (
             (job.quarantined_count > 0 or job.raw_preserved_count > 0)
             and job.error_code is None
@@ -2447,6 +2559,19 @@ def refresh_reconciliation_assurance(
         )
         if coverage is not None:
             coverage.oracle_state = "ORACLE_IDENTITY_EVIDENCE_REQUIRED"
+    elif source_assurance["state"] == newest_slot.PUNCH_PENDING_STATE:
+        job.phase = "FINAL_ASSURANCE"
+        job.status = "NEEDS_ATTENTION"
+        job.wait_reason = job.error_code = newest_slot.PUNCH_PENDING_HOLD
+        job.error_message = (
+            f"{source_assurance['newest_punch_unreceived']:,} terminal newest-record slot(s) in this "
+            "job's range hold a punch ADD has not received. A review cannot exclude them. Assurance "
+            "resumes automatically if LIVE capture delivers the same punch; otherwise cancel this "
+            "job and, after the next punch on the terminal, run another complete source reconcile, "
+            "which reads the slot while a later record exists."
+        )
+        if coverage is not None:
+            coverage.oracle_state = "ORACLE_MEMBERSHIP_PENDING"
     elif source_assurance["state"] == "REVIEW_REQUIRED":
         job.phase = "FINAL_ASSURANCE"
         job.status = "NEEDS_ATTENTION"
@@ -2535,6 +2660,9 @@ def refresh_reconciliation_assurance(
                 "certified_at": now.isoformat(),
                 "policy": "APPEND_ONLY_MEMBERSHIP",
             }
+            unconfirmed_newest = (job.capture_certificate or {}).get("unconfirmed_newest_ordinals")
+            if unconfirmed_newest:
+                evidence_body["unconfirmed_newest_ordinals"] = unconfirmed_newest
             if gate_evidence is not None:
                 evidence_body["reviewed_source_exceptions"] = {
                     "count": source_assurance["total"],
@@ -2983,6 +3111,8 @@ def serialize_job(session: Session, job: ReconciliationJob, *, include_events: b
             "identity_unresolved_open": exception_assurance["identity_unresolved_open"],
             "raw_preserved": exception_assurance["raw_preserved"],
             "raw_interpretation_open": exception_assurance["raw_interpretation_open"],
+            "newest_held": exception_assurance.get("newest_held", 0),
+            "newest_punch_unreceived": exception_assurance.get("newest_punch_unreceived", 0),
             "state": exception_assurance["state"],
             "cohort_digest": exception_assurance.get("cohort_digest"),
             "correction_ids": exception_assurance.get("correction_ids", []),
@@ -3474,6 +3604,23 @@ def apply_source_probe_result(
     divergence.observations = observations
     divergence.protected_new_raw_record = encrypt_text(payload.record.raw_record_b64)
     divergence.updated_at = now
+    if _newest_slot_divergence(session, job=job, divergence=divergence, probed=payload.record):
+        # Opened before ADD recognised the terminal's newest slot. The chunk
+        # is read again from the checkpoint, where a newest-slot row is
+        # settled, re-read or held for review instead of recovered as a
+        # source change.
+        divergence.state = newest_slot.PROBE_SUPERSEDED_STATE
+        divergence.resolved_at = now
+        divergence.next_probe_at = None
+        job.status = "QUEUED"
+        job.phase = "RECOVERING_AFTER_INTERRUPTION"
+        job.wait_reason = None
+        job.next_retry_at = now
+        job.auto_retry_count += 1
+        _event(session, job, newest_slot.PROBE_REQUEUED_STATE,
+               {"divergence_id": divergence.divergence_id, "ordinal": divergence.ordinal})
+        job.updated_at = now
+        return job
     recent_probe_digests = [
         item.get("raw_record_digest")
         for item in observations
@@ -3554,6 +3701,23 @@ def apply_source_probe_result(
             job.next_retry_at = divergence.next_probe_at
     job.updated_at = now
     return job
+
+
+def _newest_slot_divergence(session, *, job, divergence, probed) -> bool:
+    """Whether a divergence only compares against a read of the terminal's newest slot."""
+    if "RAW_PRESERVED" in {divergence.new_disposition, probed.disposition}:
+        return False
+    prior = session.scalar(select(TerminalRecordManifest).where(
+        TerminalRecordManifest.zkt_device_id == job.zkt_device_id,
+        TerminalRecordManifest.generation == job.terminal_generation,
+        TerminalRecordManifest.source_epoch_id == divergence.source_epoch_id,
+        TerminalRecordManifest.canonical_source == True,  # noqa: E712
+        TerminalRecordManifest.ordinal == divergence.ordinal,
+        TerminalRecordManifest.raw_record_digest == divergence.old_raw_digest,
+    ))
+    return (prior is not None and prior.disposition != "RAW_PRESERVED"
+            and divergence.source_epoch_id == job.source_epoch_id
+            and prior.id in newest_slot.newest_read_ids(session, [prior]))
 
 
 def _activate_recovery_epoch(

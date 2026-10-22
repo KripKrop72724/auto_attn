@@ -8,6 +8,7 @@ from uuid import uuid4
 
 from sqlalchemy import func, select, tuple_
 
+from zk_add import source_newest_slot as newest_slot
 from zk_add.attendance_force_release import _lock_scheduler
 from zk_add.attendance_legacy_uid import potentially_recoverable
 from zk_add.attendance_manual_guard import decision_for
@@ -166,7 +167,10 @@ def create(session, *, actor: str, request):
             error = "INVALID_EVENT_UID"
         elif not connector or not terminal:
             error = "SOURCE_MISSING"
-        elif not error:
+        elif not error and newest_slot.newest_only_event_ids(session, [event]):
+            # Bytes read from an unwritten newest slot may carry another person's identity.
+            error = newest_slot.UNCONFIRMED_CONDITION
+        if not error:
             accepted += 1
         payload = (
             _payload(connector, terminal, event, user, cnic, source)
@@ -254,6 +258,8 @@ def _queue(session, job, item):
         return  # Let the earlier claim settle; the next short tick will recheck.
     else:
         user, cnic, source, current_cnic, code = _known_user_and_cnic(session, event)
+        if not code and newest_slot.newest_only_event_ids(session, [event]):
+            code = newest_slot.UNCONFIRMED_CONDITION
     if code:
         item.status, item.error_code, item.completed_at = "SKIPPED", code, utc_now()
         item.result = {"reason": code.replace("_", " ").title()}

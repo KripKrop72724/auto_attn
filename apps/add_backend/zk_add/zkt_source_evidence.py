@@ -9,12 +9,20 @@ import base64
 import hashlib
 import json
 
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select
 
 from zk_add.time_utils import ensure_utc
 from zk_add.audit import append_audit
 from zk_add.crypto import decrypt_text
-from zk_add.models import AttendanceEvent, AuditEvent, TerminalRecordManifest, TerminalSourceEpoch
+from zk_add.models import (
+    AttendanceEvent,
+    AuditEvent,
+    ReconciliationCoverage,
+    ReconciliationJob,
+    SourceTailChunk,
+    TerminalRecordManifest,
+    TerminalSourceEpoch,
+)
 
 
 def _scope(connector):
@@ -24,15 +32,52 @@ def _scope(connector):
             TerminalRecordManifest.zkt_device_id == connector.zkt_device.id)
 
 
-def list_evidence(session, connector, *, before=None, limit=20, disposition=None):
+def _newest_candidates():
+    """Canonical rows read as a tail's newest slot or as a baseline's final ordinal."""
+    manifest = TerminalRecordManifest
+    tail_newest = select(SourceTailChunk.id).join(
+        ReconciliationCoverage, ReconciliationCoverage.id == SourceTailChunk.coverage_id,
+    ).where(
+        SourceTailChunk.zkt_device_id == manifest.zkt_device_id,
+        SourceTailChunk.generation == manifest.generation,
+        SourceTailChunk.end_ordinal == manifest.ordinal + 1,
+        SourceTailChunk.latest_terminal_count == SourceTailChunk.end_ordinal,
+        or_(ReconciliationCoverage.source_epoch_id == manifest.source_epoch_id,
+            and_(ReconciliationCoverage.source_epoch_id.is_(None), manifest.source_epoch_id.is_(None))),
+    ).exists()
+    baseline_final = select(ReconciliationJob.id).where(
+        ReconciliationJob.id == manifest.job_id,
+        ReconciliationJob.cutoff_count == manifest.ordinal + 1,
+    ).exists()
+    return and_(
+        manifest.canonical_source == True,  # noqa: E712
+        manifest.disposition != "RAW_PRESERVED",
+        or_(and_(manifest.source_kind == "TAIL", tail_newest),
+            and_(manifest.source_kind == "BASELINE", baseline_final)),
+    )
+
+
+def list_evidence(session, connector, *, before=None, limit=20, disposition=None, newest=False):
+    """List retained rows; ``newest`` keeps rows read as the terminal's newest slot.
+
+    That read-only pre-check shows, before a reconcile, which newest-slot rows
+    delivered or held a punch (see ``source_newest_slot``).
+    """
+    from zk_add import source_newest_slot as newest_slot
+
     maximum = max(1, min(limit, 50))
     query = select(TerminalRecordManifest).where(*_scope(connector))
     if before is not None:
         query = query.where(TerminalRecordManifest.id < before)
     if disposition is not None:
         query = query.where(TerminalRecordManifest.disposition == disposition)
+    if newest:
+        query = query.where(_newest_candidates())
     rows = session.scalars(query.order_by(TerminalRecordManifest.id.desc()).limit(maximum + 1)).all()
     page = rows[:maximum]
+    candidates = [row for row in page if row.disposition != "RAW_PRESERVED"]
+    assumed = newest_slot.newest_read_ids(session, candidates) if candidates else set()
+    observed = newest_slot.newest_read_ids(session, candidates, observed_only=True) if candidates else set()
     return {"connector_id": connector.connector_id,
         "current_model": connector.zkt_device.model, "model_at_capture": "NOT_RECORDED",
         "qualification": "NOT_ASSERTED",
@@ -44,6 +89,9 @@ def list_evidence(session, connector, *, before=None, limit=20, disposition=None
             "interpretation_version": row.interpretation_version,
             "source_claim_available": bool(row.protected_source_claim),
             "error_code": row.error_code, "evidence_available": bool(row.protected_raw_record),
+            # Unconfirmed reads of the terminal's newest slot: observed by a
+            # tail's own count, or assumed at a baseline's final ordinal.
+            "newest_read": row.id in assumed, "newest_read_observed": row.id in observed,
             "created_at": ensure_utc(row.created_at)} for row in page],
         "next_cursor": page[-1].id if len(rows) > maximum and page else None}
 

@@ -129,6 +129,14 @@ POLICY = {
         108, False, "LATCHED",
         "Clears when an operator resolves it after HR verifies the punch corrected from an unwritten "
         "newest terminal record."),
+    "TERMINAL_NEWEST_RECORD_CHANGED": Policy(
+        108, False, "LATCHED",
+        "Clears when an operator resolves it after HR verifies the punch ADD took from an unwritten "
+        "newest terminal record."),
+    "TERMINAL_NEWEST_RECORD_PUNCH_UNRECEIVED": Policy(
+        108, False, "LATCHED",
+        "Clears when an operator resolves it after a complete source reconcile reads the slot or LIVE "
+        "capture delivers the punch."),
     "USER_DELETION_JOB_INCOMPLETE": Policy(
         109, False, "LATCHED", "Clears when the user deletion job completes."),
     "DUPLICATE_USER_CNIC": Policy(109, False, "LATCHED", "Clears when the duplicate CNIC is resolved."),

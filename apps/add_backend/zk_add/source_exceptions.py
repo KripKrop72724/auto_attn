@@ -69,7 +69,11 @@ def _serialize(
     committed_cursor = coverage.source_committed_cursor if coverage else 0
     condition = None
     if newest_unsettled:
-        condition = newest_slot.CORRECTED_CONDITION if correction_ids else newest_slot.UNSETTLED_CONDITION
+        condition = (
+            newest_slot.CORRECTED_CONDITION if correction_ids
+            else newest_slot.UNCONFIRMED_CONDITION if newest_slot.is_held(row)
+            else newest_slot.UNSETTLED_CONDITION
+        )
     return {
         "id": row.id,
         "connector_id": connector.connector_id if connector else None,
@@ -104,10 +108,11 @@ def _serialize(
         # Derived from the receipt that read the row; the stored codes above
         # stay exactly as the reader sent them.
         "source_condition": condition,
-        "operator_reason": (
-            newest_slot.CORRECTED_REASON if condition == newest_slot.CORRECTED_CONDITION
-            else newest_slot.OPERATOR_REASON if condition else None
-        ),
+        "operator_reason": {
+            newest_slot.CORRECTED_CONDITION: newest_slot.CORRECTED_REASON,
+            newest_slot.UNCONFIRMED_CONDITION: newest_slot.UNCONFIRMED_REASON,
+            newest_slot.UNSETTLED_CONDITION: newest_slot.OPERATOR_REASON,
+        }.get(condition),
         "source_correction_ids": list(correction_ids or []),
     }
 
@@ -181,7 +186,7 @@ def list_source_exceptions(
     } if page else {}
     coverage = _coverage_by_terminal(session, list({row.zkt_device_id for row in page}))
     unsettled = newest_slot.unsettled_newest_ids(session, page) if page else set()
-    corrections = newest_slot.created_corrections(session, [row.id for row in page])
+    corrections = newest_slot.corrections_by_row(session, page)
 
     totals_statement = select(
         func.count(TerminalRecordManifest.id),
@@ -242,7 +247,10 @@ def source_exception_detail(session: Session, row: TerminalRecordManifest) -> di
     )
     result = _serialize(row, connector, reviews[-1] if reviews else None, coverage,
                         newest_unsettled=newest_slot.is_unsettled_newest(session, row),
-                        correction_ids=newest_slot.created_corrections(session, [row.id]).get(row.id))
+                        correction_ids=newest_slot.corrections_by_row(session, [row]).get(row.id))
+    # Later reads of this slot, kept as receipts, and whether ADD holds the
+    # punch each decodes to.
+    result["slot_receipts"] = newest_slot.slot_receipts(session, row)
     result["reviews"] = [
         {
             "review_id": review.review_id,

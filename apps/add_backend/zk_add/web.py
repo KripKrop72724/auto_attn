@@ -1879,6 +1879,8 @@ def source_exceptions(
                     "state",
                     "cohort_digest",
                     "correction_ids",
+                    "newest_held",
+                    "newest_punch_unreceived",
                 )
             },
         }
@@ -2047,6 +2049,7 @@ def zkt_source_evidence_list(
     before: int | None = Query(default=None, ge=1),
     limit: int = Query(default=20, ge=1, le=50),
     disposition: str | None = Query(default=None, max_length=50),
+    newest: bool = False,
     auth: tuple[Session, AdminContext] = Depends(require_admin),
 ):
     from zk_add.zkt_source_evidence import list_evidence
@@ -2055,7 +2058,8 @@ def zkt_source_evidence_list(
     try:
         response.headers["Cache-Control"] = "no-store, max-age=0"
         response.headers["Pragma"] = "no-cache"
-        return list_evidence(db, connector, before=before, limit=limit, disposition=disposition)
+        return list_evidence(db, connector, before=before, limit=limit, disposition=disposition,
+                             newest=newest)
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
@@ -4028,13 +4032,17 @@ def persist_device_reconciliation_chunk(
             "phase": job.phase,
             "committed_next_ordinal": job.committed_next_ordinal,
         }))
+    # A safety hold or a source-change probe commits no chunk; answer with
+    # the submitted chunk's identity, as the device stream does.
     response = {
-        "ok": job.status != "NEEDS_ATTENTION",
+        "ok": chunk is not None and job.status != "NEEDS_ATTENTION",
         "job_id": job.job_id,
-        "generation": chunk.generation,
-        "sequence": chunk.sequence,
+        "generation": chunk.generation if chunk is not None else body.generation,
+        "sequence": chunk.sequence if chunk is not None else body.sequence,
         "committed_next_ordinal": job.committed_next_ordinal,
-        "resulting_chain_digest": chunk.resulting_chain_digest,
+        "resulting_chain_digest": (
+            chunk.resulting_chain_digest if chunk is not None else body.resulting_chain_digest
+        ),
         "duplicate": duplicate,
     }
 
