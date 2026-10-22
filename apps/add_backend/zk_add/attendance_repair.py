@@ -2120,6 +2120,16 @@ def _attach_source_dependency(
                 "The required full-device source reconciliation could not be queued.",
                 code="SOURCE_DEPENDENCY_UNAVAILABLE",
             ) from exc
+    from zk_add.reconciliation import hikvision_tail_job
+
+    if hikvision_tail_job(session, active):
+        # A recent tail never certifies source coverage, so waiting on it
+        # would wait forever; it is also the terminal's only capture path.
+        raise RepairError(
+            f"Recent-tail recovery {active.job_id} is following this terminal and never certifies "
+            "source coverage; prepare the repair after it ends.",
+            code="SOURCE_DEPENDENCY_UNAVAILABLE",
+        )
     job.source_reconciliation_job_id = active.id
     job.status = "PREPARING_SOURCE"
     job.phase = "WAITING_SOURCE_RECONCILIATION"
