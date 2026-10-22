@@ -52,6 +52,25 @@ class Envelope(BaseModel):
     payload: dict[str, Any] = Field(default_factory=dict)
 
 
+UPPER_CODE = r"^[A-Z_]{1,40}$"
+
+
+class OtaStorageException(BaseModel):
+    # ZKT 2.7.7 and later: the confirm-first storage exception (owner decision
+    # D3 (a), 21 October 2026). On an unconfirmed boot: the gate's state
+    # (EVALUATING, REFUSED, ELIGIBLE, CONFIRMING), its reason and for how long;
+    # once confirmed that way: the record's state (CONFIRMED, ROUND_DONE,
+    # ROUND_SHORT with the round's outcome, UNREPAIRED, UNHEALTHY, ABANDONED)
+    # and its bounded restarts. Every field is optional and codes are text, so
+    # a later firmware never fails validation.
+    state: str | None = Field(default=None, pattern=UPPER_CODE)
+    reason: str | None = Field(default=None, pattern=UPPER_CODE)
+    since_seconds: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    restarts: int | None = Field(default=None, ge=0, le=255)
+    round_boots: int | None = Field(default=None, ge=0, le=255)
+    crashes: int | None = Field(default=None, ge=0, le=255)
+
+
 class OtaHeartbeatPayload(BaseModel):
     """Bounded OTA runtime evidence emitted by Zone Lite heartbeats."""
 
@@ -78,6 +97,32 @@ class OtaHeartbeatPayload(BaseModel):
     boot_confirm_active_seconds: int | None = Field(default=None, ge=0, le=2**32 - 1)
     boot_confirm_paused_seconds: int | None = Field(default=None, ge=0, le=2**32 - 1)
     boot_confirm_elapsed_seconds: int | None = Field(default=None, ge=0, le=2**32 - 1)
+    # ZKT 2.7.7 and later: the confirm-first storage exception, how the
+    # running image was confirmed, and the boot-health terms that fail while
+    # it is unconfirmed. Unreadable values are dropped, never the heartbeat.
+    storage_exception: OtaStorageException | None = None
+    confirm_reason: str | None = Field(default=None, pattern=UPPER_CODE)
+    boot_health_blockers: list[Annotated[str, Field(pattern=UPPER_CODE)]] = Field(default_factory=list, max_length=32)
+
+    @field_validator("storage_exception", mode="before")
+    @classmethod
+    def readable_storage_exception(cls, value: Any) -> OtaStorageException | None:
+        try:
+            return OtaStorageException.model_validate(value) if value is not None else None
+        except ValidationError:
+            return None
+
+    @field_validator("confirm_reason", mode="before")
+    @classmethod
+    def readable_confirm_reason(cls, value: Any) -> str | None:
+        return value if isinstance(value, str) and re.fullmatch(UPPER_CODE, value) else None
+
+    @field_validator("boot_health_blockers", mode="before")
+    @classmethod
+    def readable_blockers(cls, value: Any) -> list[str]:
+        if not isinstance(value, list):
+            return []
+        return [item for item in value if isinstance(item, str) and re.fullmatch(UPPER_CODE, item)][:32]
 
 
 class QueueDiagnostics(BaseModel):
@@ -144,6 +189,13 @@ class StorageInventoryFile(BaseModel):
     unreadable_bytes: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
     first_error: int | None = None
     first_error_offset: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    # ZKT 2.7.7 and later: the spans that would not read back one at a time,
+    # the last one's offset, an order-free digest of their indices (compared
+    # with the spans the boot repair holds), and bytes lost any other way.
+    unreadable_spans: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    last_error_offset: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    span_digest: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    other_unreadable: bool | None = None
 
 
 class StorageInventory(BaseModel):
@@ -157,9 +209,6 @@ class StorageInventory(BaseModel):
     unreadable_bytes: int = Field(ge=0)
     error: int | None = None
     entries: list[StorageInventoryFile] = Field(default_factory=list, max_length=16)
-
-
-UPPER_CODE = r"^[A-Z_]{1,40}$"
 
 
 class StorageRepairCheck(BaseModel):
@@ -185,6 +234,9 @@ class StorageRepairFile(BaseModel):
     # After a run deferred for room: spans SPIFFS still cannot read, and the first.
     blocked_spans: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
     blocked_offset: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    # ZKT 2.7.7 and later: the last blocked span and an order-free digest of them.
+    blocked_last: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    blocked_digest: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
     actions: list[Annotated[str, Field(pattern=UPPER_CODE)]] = Field(default_factory=list, max_length=8)
 
     model_config = ConfigDict(populate_by_name=True)
@@ -225,6 +277,36 @@ class StorageRepairReclaim(BaseModel):
     area_foreign_sectors: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
     area_first_foreign: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
     area_foreign_crc: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    # ZKT 2.7.7 and later (diagnostics): the pages the round considered short
+    # and its target; the pages the confirmed rules would drop from the
+    # custody blocks and from the blocks any image may take; custody blocks
+    # left out for an unheld custody file; the excluded blocks by the one
+    # reason their excluding pages share (or mixed) and the object excluding
+    # the most; the store as the first survey found it; queue spans waiting
+    # for byte sources; the redo area's program/erase test; the OTA floor.
+    want: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    target: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    custody_gain: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    unconfirmed_gain: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    held_out: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    excluded_hidden: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    excluded_unwindowed: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    excluded_last_page: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    excluded_index_flag: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    excluded_busy: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    excluded_mixed: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    excluded_file: str | None = Field(default=None, max_length=32, pattern=PRINTABLE_TEXT)
+    excluded_file_blocks: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    erased_at_mount: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    free_blocks_at_mount: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    waiting: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    area_test: str | None = Field(default=None, pattern=UPPER_CODE)
+    ota_floor: bool | None = None
+
+    @field_validator("excluded_file", mode="before")
+    @classmethod
+    def readable_excluded_file(cls, value: Any) -> str | None:
+        return value if isinstance(value, str) and len(value) <= 32 and re.fullmatch(PRINTABLE_TEXT, value) else None
 
 
 class StorageRepairDiagnostics(BaseModel):
@@ -299,6 +381,10 @@ class StorageRepairDiagnostics(BaseModel):
     # unreadable reclaim object is dropped rather than the whole report.
     runs: int | None = Field(default=None, ge=0, le=64)
     reclaim: StorageRepairReclaim | None = None
+    # ZKT 2.7.7 and later: a manifest still active when the boot's last run
+    # ended; whether the survey saw a journal file's header.
+    manifest_active: bool | None = None
+    journal_names: bool | None = None
 
     @field_validator("reclaim", mode="before")
     @classmethod

@@ -199,6 +199,8 @@ OTA_FAILURE_MESSAGES = {
     "DOWNLOAD_OR_SIGNATURE_FAILED": "The ESP could not complete and authenticate the OTA download.",
     "PARTITION_HASH_FAILED": "The ESP could not read back the written OTA partition digest.",
     "IMAGE_HASH_MISMATCH": "The written OTA partition digest does not match the signed release.",
+    # ZKT 2.7.7: the device's OTA floor refused an image that cannot read its redo area.
+    "STORAGE_REDO_FLOOR": "The ESP keeps custody in its storage redo area; only 2.7.6 or later may be installed.",
 }
 LOCAL_BOOT_WAIT_REASONS = frozenset({
     "BOOT_LOCAL_STORAGE_UPGRADE", "BOOT_LOCAL_JOURNAL_RECOVERY",

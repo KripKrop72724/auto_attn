@@ -128,6 +128,13 @@ DEPLOYMENT_TRANSITIONS = {
     "RECONCILING": {"RECONCILING", "SUCCEEDED", "FAILED", "ROLLED_BACK", "RELEASE_REVOKED"},
 }
 SEMVER_PATTERN = re.compile(r"^(?:zone-lite-)?(\d+)\.(\d+)\.(\d+)$")
+# ZKT 2.7.7: the confirm-first storage exception's progress code, and the
+# first image that reads 2.7.6's redo area (the OTA floor of critique 1).
+STORAGE_EXCEPTION_CODE = "STORAGE_REPAIR_EXCEPTION"
+REDO_AWARE_VERSION = (2, 7, 6)
+STORAGE_EXCEPTION_CONFIRMED_STATES = {
+    "CONFIRMING", "CONFIRMED", "ROUND_DONE", "ROUND_SHORT", "UNREPAIRED", "UNHEALTHY",
+}
 
 
 class FirmwareRelease(Base):
@@ -597,12 +604,35 @@ def _decode_scope_token(token: str) -> dict[str, Any]:
     return payload
 
 
+def _redo_floor_exclusion(release: FirmwareRelease, connector: Connector) -> str | None:
+    """ZKT 2.7.7, critique 1: once a device's redo area holds anything (or it
+    confirmed under the storage exception), an image that cannot read that
+    area would mount the store and erase custody kept in a record. The device
+    refuses such a target itself; ADD does not offer it."""
+    version = semantic_version(release.version)
+    if connector.firmware_family != "zkt" or version is None or version >= REDO_AWARE_VERSION:
+        return None
+    evidence = connector.firmware_diagnostics if isinstance(connector.firmware_diagnostics, dict) else {}
+    storage = evidence.get("storage") if isinstance(evidence.get("storage"), dict) else {}
+    repair = storage.get("repair") if isinstance(storage.get("repair"), dict) else {}
+    reclaim = repair.get("reclaim") if isinstance(repair.get("reclaim"), dict) else {}
+    runtime = evidence.get("ota_runtime") if isinstance(evidence.get("ota_runtime"), dict) else {}
+    exception = runtime.get("storage_exception") if isinstance(runtime.get("storage_exception"), dict) else {}
+    if (reclaim.get("ota_floor") is True or runtime.get("confirm_reason") == STORAGE_EXCEPTION_CODE
+            or exception.get("state") in STORAGE_EXCEPTION_CONFIRMED_STATES):
+        return "STORAGE_REDO_FLOOR"
+    return None
+
+
 def _storage_predecessor_exclusion(session: Session, release: FirmwareRelease, connector: Connector,
                                    *, deployment_id: int | None = None) -> str | None:
     try:
         contract = validate_storage_contract(release.manifest or {}, release.version)
     except ValueError:
         return "STORAGE_CONTRACT_INVALID"
+    floor = _redo_floor_exclusion(release, connector)
+    if floor:
+        return floor
     if release.version == "2.6.22":
         from zk_add.zkt_factory_trial import admission_hold
         return admission_hold(session, release, connector, own_deployment_id=deployment_id)
@@ -1275,6 +1305,9 @@ def record_progress(
                                   "running_partition": running_partition,
                                   "image_sha256": image_sha256,
                                   **({"recovery": recovery} if recovery else {}),
+                                  # ZKT 2.7.7: the evidence a report names
+                                  # survives the next transition (critique 12).
+                                  **({"error_message": error_message[:500]} if error_message else {}),
                               }))
     if state in TERMINAL_DEPLOYMENT_STATES:
         deployment.completed_at = utc_now()
@@ -1306,7 +1339,17 @@ def progress_receipt(session: Session, deployment: FirmwareDeployment, *, reques
         "target_version": deployment.target_version,
         "application_sha256": _application_sha256(release),
         "confirm": requested_state == "BOOTED_PENDING" and deployment.status == "BOOTED_PENDING",
+        # ZKT 2.7.7: the device checks the code it reported was the one stored.
+        "error_code": deployment.error_code,
     }
+    if requested_state == "BOOTED_PENDING" and deployment.error_code == STORAGE_EXCEPTION_CODE:
+        # ZKT 2.7.7 (H3): ADD's veto over the confirm-first storage exception.
+        # The image may mark itself valid only while its release is offered
+        # and its campaign active; pausing the campaign withholds it.
+        campaign = session.get(FirmwareCampaign, deployment.campaign_id)
+        receipt["storage_exception_allowed"] = bool(
+            receipt["confirm"] and release.state in {"AVAILABLE", "HIL_ONLY"}
+            and campaign is not None and campaign.status == "ACTIVE")
     if deployment.status == "ROLLED_BACK" and deployment.target_version == "2.7.0":
         event = session.scalar(select(FirmwareEvent).where(
             FirmwareEvent.deployment_id == deployment.id, FirmwareEvent.state == "ROLLED_BACK")
