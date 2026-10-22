@@ -137,7 +137,7 @@ def _request_digest(*, connector: Connector, reason: str, confirmation: str, sco
         {
             "connector_id": connector.connector_id,
             "confirmation": confirmation,
-            "mode": "ACTIVE_USERS" if scope == "ACTIVE_USERS" else "FULL_HISTORY_BASELINE",
+            "mode": scope if scope in {"ACTIVE_USERS", "RECENT_TAIL"} else "FULL_HISTORY_BASELINE",
             "reason": reason.strip(),
         },
         separators=(",", ":"),
@@ -352,8 +352,9 @@ def create_reconciliation_job(
     idempotency_key: str,
     scope: str = "ALL_RECORDS",
 ) -> ReconciliationJob:
-    if scope not in {"ALL_RECORDS", "ACTIVE_USERS"} or (scope == "ACTIVE_USERS" and connector.firmware_family != "hikvision"):
-        raise ValueError("Active-user history is supported only for qualified Hikvision terminals.")
+    if scope not in {"ALL_RECORDS", "ACTIVE_USERS", "RECENT_TAIL"} or (
+            scope != "ALL_RECORDS" and connector.firmware_family != "hikvision"):
+        raise ValueError("Active-user history and recent-tail recovery are supported only for Hikvision terminals.")
     locked_connector = session.scalar(
         select(Connector).where(Connector.id == connector.id).with_for_update()
     )
@@ -373,7 +374,8 @@ def create_reconciliation_job(
         if existing.request_digest != digest:
             raise ValueError("That idempotency key was used for a different request.")
         return existing
-    expected = f"RECONCILE {connector.device_id} " + ("ACTIVE USERS" if scope == "ACTIVE_USERS" else "FROM START")
+    expected = f"RECONCILE {connector.device_id} " + {
+        "ACTIVE_USERS": "ACTIVE USERS", "RECENT_TAIL": "RECENT TAIL"}.get(scope, "FROM START")
     if confirmation != expected:
         raise ValueError(f"Type {expected} exactly to confirm this operation.")
     preflight = preflight_reconciliation(session, connector)
@@ -2530,6 +2532,15 @@ def refresh_all_reconciliation_assurance(session: Session) -> list[dict]:
     return updates
 
 
+def _hikvision_tail_job(session: Session, job: ReconciliationJob) -> bool:
+    if job.mode != "HIKVISION_SERIAL_HISTORY":
+        return False
+    from zk_add.hikvision_reconciliation import TAIL_SCOPE, HikvisionReconciliationState
+
+    state = session.get(HikvisionReconciliationState, job.id)
+    return bool(state and (state.data or {}).get("scope") == TAIL_SCOPE)
+
+
 def assignment_rows(session: Session) -> list[tuple[str, dict]]:
     if not settings.reconciliation_enabled:
         return []
@@ -2579,7 +2590,9 @@ def assignment_rows(session: Session) -> list[tuple[str, dict]]:
             if job.wait_reason == "HISTORY_BACKLOG_BACKPRESSURE"
             else settings.reconciliation_history_backlog_pause
         )
-        if history_backlog >= backlog_limit:
+        # A recent-tail job is a device's only capture path while its own poll
+        # is blocked; at one 20-record page per cycle it cannot flood ORDS.
+        if history_backlog >= backlog_limit and not _hikvision_tail_job(session, job):
             job.phase = "WAITING_FOR_SAFE_WINDOW"
             job.wait_reason = "HISTORY_BACKLOG_BACKPRESSURE"
             continue
@@ -2972,6 +2985,14 @@ def serialize_job(session: Session, job: ReconciliationJob, *, include_events: b
         source = hik_state.data if hik_state else {}
         checkpoint = source.get("checkpoint", {})
         result["scope"] = source.get("scope", "ALL_RECORDS")
+        if result["scope"] == "RECENT_TAIL":
+            from zk_add.hikvision_reconciliation import tail_operator_status, tail_summary
+            result["recent_tail"] = tail_summary(source)
+            result["progress"]["remaining"] = None
+            checkpoint = {"last_serial": source.get("last_serial")}
+            status = tail_operator_status(job, source)
+            if status:
+                result["operator_state"], result["operator_message"] = status
         if result["scope"] == "ACTIVE_USERS":
             result["active_user_scope"] = {
                 "user_count": len(source["employee_numbers"]),

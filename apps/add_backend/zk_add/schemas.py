@@ -859,7 +859,7 @@ class AttendanceBatchRequest(BaseModel):
 
 
 class ReconciliationCreateRequest(BaseModel):
-    scope: Literal["ALL_RECORDS", "ACTIVE_USERS"] = "ALL_RECORDS"
+    scope: Literal["ALL_RECORDS", "ACTIVE_USERS", "RECENT_TAIL"] = "ALL_RECORDS"
     reason: str = Field(min_length=10, max_length=500)
     confirmation: str = Field(min_length=10, max_length=180)
     password: str = Field(min_length=1, max_length=512)
