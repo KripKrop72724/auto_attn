@@ -86,7 +86,10 @@ def saved_direct_approval(db, connector):
             password="test-password", idempotency_key=str(uuid4()),
             # Duplicate-CNIC users have no retained interval: the administrator
             # explicitly chose today's CNIC for the verified same employee.
-            cnic_choices=[{"event_id": row.id, "choice": "CURRENT"}],
+            cnic_choices=[{
+                "event_id": row.id, "choice": "CURRENT",
+                "evidence_digest": direct.preview(db, [row.id])["rows"][0]["evidence_digest"],
+            }],
         ),
     )
     direct.advance_once(db)

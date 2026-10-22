@@ -32,11 +32,13 @@ from zk_add.settings import settings
 from zk_add.time_utils import utc_now
 
 
-def request(event_id, *, key="direct-approval-one", choice=None, send_now=False):
+def request(event_id, *, key="direct-approval-one", choice=None, send_now=False, db=None):
+    """A send request; a CNIC choice echoes the evidence digest the preview shows."""
+    digest = direct.preview(db, [event_id])["rows"][0]["evidence_digest"] if choice else None
     return DirectOrdsStartRequest(
         event_ids=[event_id], reason="Administrator reviewed saved punch",
         password="test-admin-password", idempotency_key=key,
-        cnic_choices=[{"event_id": event_id, "choice": choice}] if choice else [],
+        cnic_choices=[{"event_id": event_id, "choice": choice, "evidence_digest": digest}] if choice else [],
         send_now_event_ids=[event_id] if send_now else [],
     )
 
@@ -228,7 +230,7 @@ def test_held_punch_without_saved_cnic_uses_synced_user_and_keeps_source_unchang
             "eligible": True, "cnic_source": "SYNCED_USER", "exclusion": None,
             "punch_time_cnic": "NONE", "cnic_choice_required": True,
         }
-        direct.create(db, actor="operator", request=request(event_id, choice="CURRENT"))
+        direct.create(db, actor="operator", request=request(event_id, choice="CURRENT", db=db))
         db.commit()
         item = db.scalar(select(Item))
         assert item.status == "READY"
@@ -267,7 +269,7 @@ def test_approved_direct_missing_serial_checks_frozen_unknown_namespace(
         event = db.scalar(select(AttendanceEvent))
         event.device_serial = missing_serial
         event_id = event.id
-        direct.create(db, actor="operator", request=request(event_id, choice="CURRENT"))
+        direct.create(db, actor="operator", request=request(event_id, choice="CURRENT", db=db))
         db.commit()
     with sessions() as db:
         direct.advance_once(db)
@@ -347,7 +349,7 @@ def test_real_serial_added_after_missing_serial_approval_still_blocks_dispatch(s
         event = db.scalar(select(AttendanceEvent))
         event.device_serial = None
         event_id = event.id
-        direct.create(db, actor="operator", request=request(event_id, choice="CURRENT"))
+        direct.create(db, actor="operator", request=request(event_id, choice="CURRENT", db=db))
         db.commit()
     with sessions() as db:
         direct.advance_once(db)
@@ -371,7 +373,7 @@ def test_synced_cnic_change_after_approval_stops_dispatch(store):
         event_id = event.id
         db.commit()
     with sessions() as db:
-        direct.create(db, actor="operator", request=request(event_id, choice="CURRENT"))
+        direct.create(db, actor="operator", request=request(event_id, choice="CURRENT", db=db))
         db.commit()
     with sessions() as db:
         db.scalar(select(DeviceUser)).cnic_encrypted = encrypt_cnic(WRONG_CNIC)
@@ -392,7 +394,7 @@ def test_synced_cnic_change_after_queue_blocks_approved_payload(store):
         event_id = event.id
         db.commit()
     with sessions() as db:
-        direct.create(db, actor="operator", request=request(event_id, choice="CURRENT"))
+        direct.create(db, actor="operator", request=request(event_id, choice="CURRENT", db=db))
         db.commit()
     with sessions() as db:
         direct.advance_once(db)

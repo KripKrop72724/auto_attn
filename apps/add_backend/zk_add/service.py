@@ -40,7 +40,12 @@ from zk_add.crypto import (
     normalize_cnic,
 )
 from zk_add.attendance_identity_evidence import TERMINAL_RECONCILE_SOURCES
-from zk_add.identity import build_machine_name, clean_display_name, parse_machine_name
+from zk_add.identity import (
+    build_machine_name,
+    clean_display_name,
+    parse_machine_name,
+    suspect_cnic_name,
+)
 from zk_add.identity_conflicts import (
     valid_identity_resolutions,
     valid_resolution_for_user,
@@ -5010,6 +5015,9 @@ def create_device_user_command(
     name_limit = int(zkt.capability_profile.get("name_bytes", 24))
     # The CNIC is stored once, as the name suffix; a CNIC-like suffix typed
     # into the name would otherwise be cut into the 24-byte terminal name.
+    # A "-S" shift-worker marker inside that suffix is kept as the flag.
+    suspect = suspect_cnic_name(display_name)
+    shift_worker = bool(shift_worker or (suspect and suspect.shift_worker))
     display_name = clean_display_name(display_name) or display_name
     machine_name = build_machine_name(
         display_name=display_name,
@@ -5150,12 +5158,18 @@ def update_device_user_command(
     if claims and not claims_are_approved_aliases:
         raise ValueError(duplicate_cnic_message(claims))
     next_display = " ".join((display_name or user.display_name).strip().split())
+    next_shift = user.shift_worker if shift_worker is None else shift_worker
     if cnic is not None:
         # Setting a verified CNIC (e.g. for "A.Saleem-A4230111028815") must not
         # keep the unparsed CNIC text in the name: the 24-byte terminal name
-        # would become "A.Saleem-A-<CNIC>".
+        # would become "A.Saleem-A-<CNIC>". The unparsed name never set the
+        # shift-worker flag, so a "-S" marker in it is kept as the flag rather
+        # than silently dropped with the suffix.
+        suspect = suspect_cnic_name(next_display) or (
+            None if user.cnic_lookup_hash else suspect_cnic_name(decrypt_text(user.machine_name_encrypted))
+        )
         next_display = clean_display_name(next_display) or next_display
-    next_shift = user.shift_worker if shift_worker is None else shift_worker
+        next_shift = bool(next_shift or (suspect and suspect.shift_worker))
     next_privilege = user.privilege if privilege is None else privilege
     if (connector.firmware_family == "hikvision" and next_privilege != user.privilege
             and not zkt.capability_profile.get("user_role_write")):

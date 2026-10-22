@@ -8,9 +8,14 @@ reads what ADD retained about who held the terminal user ID at the punch time
 send, one other CNIC asks the administrator which to use, and today's CNIC is
 used without asking only when the punch-time records show nothing else.
 Punches ADD's own proof is about to release need an explicit "send now" too.
+
+Every CNIC choice echoes the digest of the evidence the administrator saw in
+the read-only preview; a choice made against evidence that has since changed
+is skipped, never applied to the new evidence. Sending a punch-time CNIC that
+another active terminal user holds today needs its own explicit confirmation.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from uuid import uuid4
 
 from sqlalchemy import func, select, tuple_
@@ -26,12 +31,13 @@ from zk_add.attendance_release_safety import (
     DIFFERS,
     IDENTITY_CONFLICT_UNRESOLVED,
     MATCHES_CURRENT,
+    NAME_DIFFERS,
     NONE,
     PUNCH_TIME_CNIC_HELD_BY_OTHER,
     PunchTimeIdentity,
+    approval_tokens,
     auto_release_preview,
     classify,
-    contradiction_tokens,
     load_punch_evidence,
     other_cnics_masked,
     punch_cnics_held_elsewhere,
@@ -109,6 +115,18 @@ REASONS = {
         "ADD's own identity proof released this punch after the approval stopped; "
         "Oracle confirmed it through normal delivery."
     ),
+    "CNIC_CHOICE_STALE": (
+        "ADD's records for this punch changed after the checks were loaded. "
+        "Reload the checks and choose again. No Oracle send was made."
+    ),
+    "PUNCH_TIME_CNIC_HELD_BY_OTHER": (
+        "Another active terminal user has the punch-time CNIC today. Confirm that "
+        "explicitly, after HR confirms who punched, to send it."
+    ),
+    "PREVIOUS_POST_UNCERTAIN": (
+        "An earlier approval for this punch may already have reached Oracle with another "
+        "identity. It cannot be replaced by hand; review the Oracle record first."
+    ),
 }
 
 
@@ -125,6 +143,7 @@ class Resolution:
     choice: str | None = None
     choices: tuple[str, ...] = ()
     interval: AttendanceIdentityHistory | None = None  # names the punch-time CNIC
+    held_elsewhere: bool = False  # another active terminal user holds the punch-time CNIC today
 
 
 def _source_digest(event: AttendanceEvent, connector: Connector) -> str:
@@ -156,7 +175,15 @@ def choices_for(punch: PunchTimeIdentity) -> tuple[str, ...]:
     if punch.state == DIFFERS:
         # Today's CNIC only for the same terminal user record whose CNIC was edited.
         return (PUNCH_TIME, CURRENT) if punch.continuity else (PUNCH_TIME,)
-    if punch.state in {CHANGED_NEAR_PUNCH, AMBIGUOUS, NONE}:
+    if punch.state == CHANGED_NEAR_PUNCH:
+        # The nearest record's CNIC when that record is usable; today's CNIC
+        # only when the record on the other side of the punch holds it.
+        return tuple(
+            option for option, allowed in (
+                (PUNCH_TIME, punch.interval is not None), (CURRENT, punch.current_nearby),
+            ) if allowed
+        )
+    if punch.state in {AMBIGUOUS, NONE}:
         return (CURRENT,)
     return ()
 
@@ -282,12 +309,15 @@ def _revalidate(session, event, saved: dict, users=None) -> Resolution:
     if saved_cnic:
         return Resolution(user, saved_cnic, "SAVED_PUNCH", current_cnic)
     punch = single_event_identity(session, event, user, current_hash)
+    held = False
     if source == PUNCH_TIME_SOURCE:
         sent_hash = saved.get("sent_cnic_hash") or saved.get("punch_time_cnic_hash")
         interval = _punch_time_interval(punch, sent_hash)
         if interval is None:
             return Resolution(user, None, None, current_cnic, "PUNCH_TIME_CNIC_DIFFERS", punch_time=punch)
+        held = bool(punch_cnics_held_elsewhere(session, [(sent_hash, user.id)]))
         resolution = _punch_time_resolution(user, current_cnic, punch, interval, choice=PUNCH_TIME)
+        resolution = replace(resolution, held_elsewhere=held)
     else:
         sent_hash = current_hash
         resolution = Resolution(
@@ -295,7 +325,7 @@ def _revalidate(session, event, saved: dict, users=None) -> Resolution:
             punch_time=punch, choice=saved.get("cnic_choice"),
         )
     accepted = frozenset(saved.get("evidence_tokens") or ()) if "cnic_choice" in saved else frozenset()
-    if not contradiction_tokens(punch, sent_hash) <= accepted:
+    if not approval_tokens(punch, sent_hash, held_by_other=held) <= accepted:
         return Resolution(user, None, None, current_cnic, "PUNCH_TIME_CNIC_DIFFERS", punch_time=punch)
     return resolution
 
@@ -373,7 +403,10 @@ def _identity_proof(resolution: Resolution, *, legacy: bool = False) -> dict:
         "punch_time_cnic_hash": sent_hash if resolution.source == PUNCH_TIME_SOURCE else None,
         "sent_cnic_hash": sent_hash,
         # Evidence the administrator saw and accepted; anything new stops it.
-        "evidence_tokens": sorted(contradiction_tokens(punch, sent_hash)) if punch else [],
+        "evidence_tokens": sorted(approval_tokens(
+            punch, sent_hash,
+            held_by_other=resolution.held_elsewhere and resolution.source == PUNCH_TIME_SOURCE,
+        )) if punch else [],
     }
 
 
@@ -398,6 +431,20 @@ def _same_identity(saved: dict, resolution: Resolution) -> bool:
     return saved.get("current_cnic_hash") == cnic_lookup(resolution.current_cnic)
 
 
+def _released_automatically_after(event, decision) -> bool:
+    """ADD's own identity proof released this punch after the direct approval was saved."""
+    from zk_add.attendance_manual_guard import requires_approval
+
+    return not (
+        decision is None
+        or decision.proof.get("policy") != POLICY
+        or decision.created_at is None
+        or event.identity_resolved_at is None
+        or requires_approval(event)
+        or ensure_utc(event.identity_resolved_at) <= ensure_utc(decision.created_at)
+    )
+
+
 def superseded_by_automatic_release(session, event, decision) -> bool:
     """ADD's own proof released this punch after a stopped direct approval.
 
@@ -407,29 +454,68 @@ def superseded_by_automatic_release(session, event, decision) -> bool:
     it again. The automatic path is unchanged; this only stops a stale manual
     approval from overriding it.
     """
-    from zk_add.attendance_manual_guard import requires_approval
-
-    if (
-        decision is None
-        or decision.proof.get("policy") != POLICY
-        or decision.created_at is None
-        or event.identity_resolved_at is None
-        or requires_approval(event)
-        or ensure_utc(event.identity_resolved_at) <= ensure_utc(decision.created_at)
-    ):
+    if not _released_automatically_after(event, decision):
         return False
     return approved_payload(session, event, session.get(Connector, event.connector_id), decision) is None
 
 
-def _replaceable(session, event, decision, outbox, connector) -> bool:
-    """A saved direct approval that can no longer deliver may be replaced."""
-    return bool(
+def _post_attempted(session, decision) -> bool:
+    """Whether a direct approval may already have POSTed to Oracle.
+
+    Send intent is saved before every direct POST (``reserve_direct_post``),
+    so a zero count proves no POST under this approval. A missing item is
+    treated as attempted.
+    """
+    item = session.get(Item, decision.item_id) if decision.item_id else None
+    return item is None or bool((item.result or {}).get("direct_post_attempts"))
+
+
+def _replacement_block(session, event, decision, outbox, connector) -> str | None:
+    """Why a saved direct approval may not be replaced; None when it may.
+
+    Only an approval that can no longer deliver, that ADD's own release has
+    not taken over, and that never POSTed to Oracle may be replaced: a POST
+    may have stored the earlier identity in Oracle, and a replacement's first
+    content check would otherwise POST a different identity for the same
+    event UID.
+    """
+    if not (
         decision.proof.get("policy") == POLICY
         and event.ords_status in REPLACEABLE_STATUSES
         and not (outbox and outbox.status == "IN_FLIGHT")
         and event.oracle_confirmed_at is None
         and connector is not None
+        and not _released_automatically_after(event, decision)
         and approved_payload(session, event, connector, decision) is None
+    ):
+        return "ALREADY_DELIVERING"
+    if _post_attempted(session, decision):
+        return "PREVIOUS_POST_UNCERTAIN"
+    return None
+
+
+def evidence_digest(event, resolution: Resolution, held_elsewhere: bool) -> str | None:
+    """The punch-time evidence the administrator saw; a CNIC choice is bound to it.
+
+    An opaque SHA-256 over keyed CNIC lookup hashes and record ids: it reveals
+    no CNIC, and any new record, signal or holder changes it.
+    """
+    punch, user = resolution.punch_time, resolution.user
+    if punch is None or user is None:
+        return None
+    return _digest([
+        "punch-time-evidence-v1", event.id, user.user_key, cnic_lookup(resolution.current_cnic),
+        punch.state, sorted(punch.signals), sorted(value for value in punch.evidence_hashes if value),
+        punch.unknown_holder, punch.cnic_hash, punch.interval.id if punch.interval is not None else None,
+        punch.basis, punch.position, list(choices_for(punch)), bool(held_elsewhere),
+    ])
+
+
+def _auto_release_key(event, digest):
+    """What the cached automatic-release answer for a punch depended on."""
+    return (
+        event.ords_status, bool(event.manual_release_required), event.captured_cnic_lookup_hash,
+        event.identity_resolved_at.isoformat() if event.identity_resolved_at else None, digest,
     )
 
 
@@ -442,15 +528,37 @@ class Assessment:
     error: str | None
     auto_release: dict
     replaces_decision: bool = False
+    held_elsewhere: bool = False
+    evidence_digest: str | None = None
 
 
-def assess_many(session, events, *, choices=None, send_now=frozenset(), include_guard=True) -> list[Assessment]:
-    """Everything a direct approval checks for each punch, without writing."""
+def assess_many(
+    session, events, *, choices=None, send_now=frozenset(), include_guard=True,
+    evidence_digests=None, held_confirmed=frozenset(), auto_release_cache=None,
+) -> list[Assessment]:
+    """Everything a direct approval checks for each punch, without writing.
+
+    ``evidence_digests`` (approval only) binds each CNIC choice to the
+    evidence the administrator saw. ``auto_release_cache`` reuses automatic
+    release answers computed before the scheduler lock for punches whose
+    state and evidence did not change since.
+    """
     from zk_add.worker import event_uid_is_valid
 
     choices = choices or {}
+    auto_release_cache = auto_release_cache or {}
     users_by_event = _users_by_event(session, events)
     finders = _identity_finders(session, events, users_by_event)
+    resolutions = {
+        event.id: _resolve(event, users_by_event[event.id], finders[event.id], choice=choices.get(event.id))
+        for event in events
+    }
+    held = punch_cnics_held_elsewhere(session, [
+        (resolution.punch_time.cnic_hash, resolution.user.id)
+        for resolution in resolutions.values()
+        if resolution.punch_time is not None and resolution.user is not None
+        and resolution.punch_time.cnic_hash and PUNCH_TIME in choices_for(resolution.punch_time)
+    ])
     ids = [event.id for event in events]
     decisions: dict = {}
     outboxes: dict = {}
@@ -468,34 +576,57 @@ def assess_many(session, events, *, choices=None, send_now=frozenset(), include_
     for event in events:
         connector = session.get(Connector, event.connector_id)
         terminal = session.get(ZKTDevice, event.zkt_device_id)
-        resolution = _resolve(event, users_by_event[event.id], finders[event.id], choice=choices.get(event.id))
+        resolution = resolutions[event.id]
+        held_elsewhere = bool(
+            resolution.punch_time is not None and resolution.user is not None
+            and (resolution.punch_time.cnic_hash, resolution.user.id) in held
+        )
+        resolution = replace(resolution, held_elsewhere=held_elsewhere)
+        digest = evidence_digest(event, resolution, held_elsewhere)
         outbox, decision = outboxes.get(event.id), decisions.get(event.id)
-        replaces = False
+        block = _replacement_block(session, event, decision, outbox, connector) if decision is not None else None
+        replaces = decision is not None and block is None
         auto_release = {"at_next_snapshot": False, "awaiting_snapshot": False, "database_guard": "NOT_CHECKED"}
         if event.ords_status in ORDS_ACKNOWLEDGED_STATUSES and event.oracle_confirmed_at:
             error = "ALREADY_CONFIRMED"
         elif outbox and outbox.status == "IN_FLIGHT":
             error = "ALREADY_DELIVERING"
-        elif decision is not None and not (replaces := _replaceable(session, event, decision, outbox, connector)):
-            error = "ALREADY_DELIVERING"
+        elif block:
+            error = block
         elif not (event_uid_is_valid(event.event_uid) or potentially_recoverable(event.event_uid)):
             error = "INVALID_EVENT_UID"
         elif not connector or not terminal:
             error = "SOURCE_MISSING"
         else:
-            error = time_refusal(event) or resolution.error
+            stale = bool(
+                evidence_digests is not None and event.id in choices
+                and evidence_digests.get(event.id) != digest
+            )
+            error = time_refusal(event) or ("CNIC_CHOICE_STALE" if stale else None) or resolution.error
+        if (
+            error is None and resolution.source == PUNCH_TIME_SOURCE and held_elsewhere
+            and event.id not in held_confirmed
+        ):
+            error = PUNCH_TIME_CNIC_HELD_BY_OTHER
         if error is None and resolution.source == PUNCH_TIME_SOURCE and not _employee_name(event, resolution):
             error = "PUNCH_TIME_NAME_MISSING"
         if error is None or error == "CNIC_CHOICE_REQUIRED":
-            auto_release = auto_release_preview(
-                session, event, user=resolution.user, identity=resolution.punch_time,
-                include_guard=include_guard,
-            )
+            key = _auto_release_key(event, digest)
+            cached = auto_release_cache.get(event.id)
+            if cached is not None and cached[0] == key:
+                auto_release = cached[1]
+            else:
+                auto_release = auto_release_preview(
+                    session, event, user=resolution.user, identity=resolution.punch_time,
+                    include_guard=include_guard,
+                )
             if error is None and event.id not in send_now and (
                 auto_release["at_next_snapshot"] or auto_release["awaiting_snapshot"]
             ):
                 error = "AUTO_RELEASE_PENDING"
-        checks.append(Assessment(event, connector, terminal, resolution, error, auto_release, replaces))
+        checks.append(Assessment(
+            event, connector, terminal, resolution, error, auto_release, replaces, held_elsewhere, digest,
+        ))
     return checks
 
 
@@ -514,18 +645,37 @@ def _reason(error: str | None) -> str:
     return error.replace("_", " ").title() if error else "Approved; waiting to prepare delivery."
 
 
-def _decision(row, punch, resolution, held_elsewhere: bool) -> tuple[str | None, str | None]:
-    """How the dialog asks for this punch: one choice per group of identical evidence."""
+def _group_key(kind: str, row: dict, *facts) -> str:
+    """An opaque group id: punches share it only when their evidence is identical."""
+    return f"{kind}|" + _digest([
+        kind, row["zkt_device_id"], row["device_serial"], row["user_id"], *facts,
+    ])[:24]
+
+
+def _decision(row, punch, held_elsewhere: bool) -> tuple[str | None, str | None]:
+    """How the dialog asks for this punch: one choice per group of identical evidence.
+
+    Groups never span terminals, serials or user IDs. Punches whose records
+    disagree near the punch time, or whose saved name is not today's user's,
+    are decided one at a time.
+    """
     if row["exclusion"] is not None or not row["cnic_choice_required"]:
         return None, None
-    terminal = row["zkt_device_id"]
+    per_row = f"row|{row['event_id']}"
+    choices = row["cnic_choices"]
+    signals = sorted(punch.signals)
     if punch.state == DIFFERS:
-        return "CHOOSE_CNIC", f"choose|{terminal}|{row['user_id']}|{(punch.cnic_hash or '')[:16]}|{int(held_elsewhere)}"
-    if punch.state == NONE:
-        # No record at all: one confirmation per terminal user ID.
-        return "CONFIRM_TODAY", f"today|{terminal}|{row['user_id']}"
-    # Records near or at the punch time disagree: confirm each punch on its own.
-    return "CONFIRM_TODAY", f"row|{row['event_id']}"
+        return "CHOOSE_CNIC", _group_key(
+            "choose", row, punch.cnic_hash, punch.basis, choices, signals, held_elsewhere,
+        )
+    if punch.state == CHANGED_NEAR_PUNCH:
+        return ("CHOOSE_CNIC" if PUNCH_TIME in choices else "CONFIRM_TODAY"), per_row
+    if punch.state == NONE and NAME_DIFFERS not in punch.signals:
+        # No record at the punch time: one confirmation per terminal user ID,
+        # serial and position in ADD's history (before its first record, in a
+        # break, after its last record, or no record at all).
+        return "CONFIRM_TODAY", _group_key("today", row, punch.position, signals)
+    return "CONFIRM_TODAY", per_row
 
 
 def preview(session, event_ids) -> dict:
@@ -536,24 +686,17 @@ def preview(session, event_ids) -> dict:
     ).all()
     found = {row.id for row in rows}
     checks = assess_many(session, rows)
-    held = punch_cnics_held_elsewhere(session, [
-        (check.resolution.punch_time.cnic_hash, check.resolution.user.id)
-        for check in checks
-        if check.resolution.punch_time is not None and check.resolution.punch_time.state == DIFFERS
-    ])
     result = []
     for check in checks:
         event = check.event
         resolution, punch = check.resolution, check.resolution.punch_time
         user = resolution.user
         current_hash = cnic_lookup(resolution.current_cnic)
-        held_elsewhere = bool(
-            punch is not None and punch.state == DIFFERS and user is not None
-            and (punch.cnic_hash, user.id) in held
-        )
+        held_elsewhere = check.held_elsewhere
         signals = sorted((punch.signals if punch else set()) | (
             {PUNCH_TIME_CNIC_HELD_BY_OTHER} if held_elsewhere else set()
         ))
+        other_cnic = bool(punch is not None and punch.cnic_hash and punch.interval is not None)
         hidden = {None, "CNIC_CHOICE_REQUIRED", "AUTO_RELEASE_PENDING"}
         row = {
             "event_id": event.id,
@@ -566,8 +709,14 @@ def preview(session, event_ids) -> dict:
             "exclusion_reason": None if check.error in hidden else _reason(check.error),
             "cnic_source": resolution.source,
             "punch_time_cnic": punch.state if punch else None,
-            "punch_time_cnic_masked": mask_cnic(punch.cnic) if punch and punch.state == DIFFERS else None,
-            "punch_time_display_name": punch.display_name if punch and punch.state == DIFFERS else None,
+            "punch_time_cnic_masked": mask_cnic(punch.cnic) if other_cnic else None,
+            "punch_time_display_name": punch.display_name if other_cnic else None,
+            # COVERING_RECORD, BRIDGED_GAP (a break between two identical
+            # records) or NEAREST_RECORD (no record covers the punch).
+            "punch_time_cnic_basis": punch.basis if other_cnic else None,
+            "record_position": punch.position if punch else None,
+            "first_observed_at": punch.first_observed_at if punch else None,
+            "punch_display_name": event.display_name if punch and NAME_DIFFERS in punch.signals else None,
             "other_cnics_masked": other_cnics_masked(punch, current_hash) if punch else [],
             "evidence_signals": signals,
             "current_cnic_masked": mask_cnic(resolution.current_cnic),
@@ -583,8 +732,11 @@ def preview(session, event_ids) -> dict:
             "cnic_choice_required": check.error == "CNIC_CHOICE_REQUIRED",
             "cnic_choices": list(resolution.choices),
             "default_cnic_choice": (
-                PUNCH_TIME if PUNCH_TIME in resolution.choices and not held_elsewhere else None
+                PUNCH_TIME if punch is not None and punch.state == DIFFERS
+                and PUNCH_TIME in resolution.choices and not held_elsewhere else None
             ),
+            # Echoed with a CNIC choice; ADD skips the choice if the evidence changed.
+            "evidence_digest": check.evidence_digest,
             "auto_release_at_next_snapshot": check.auto_release["at_next_snapshot"],
             "awaiting_next_snapshot": check.auto_release["awaiting_snapshot"],
             "database_guard": check.auto_release["database_guard"],
@@ -592,7 +744,7 @@ def preview(session, event_ids) -> dict:
                 "ALREADY_CONFIRMED", "ALREADY_DELIVERING",
             },
         }
-        row["decision_kind"], row["decision_group"] = _decision(row, punch, resolution, held_elsewhere)
+        row["decision_kind"], row["decision_group"] = _decision(row, punch, held_elsewhere)
         result.append(row)
     return {
         "rows": result,
@@ -609,35 +761,84 @@ def preview(session, event_ids) -> dict:
     }
 
 
-def _request_decisions(request) -> tuple[dict[int, str], set[int]]:
-    choices = {row.event_id: row.choice for row in getattr(request, "cnic_choices", None) or []}
-    send_now = set(getattr(request, "send_now_event_ids", None) or [])
-    return choices, send_now
+@dataclass(frozen=True)
+class RequestDecisions:
+    choices: dict
+    send_now: frozenset
+    evidence_digests: dict
+    held_confirmed: frozenset
+
+
+def _request_decisions(request) -> RequestDecisions:
+    rows = getattr(request, "cnic_choices", None) or []
+    return RequestDecisions(
+        choices={row.event_id: row.choice for row in rows},
+        send_now=frozenset(getattr(request, "send_now_event_ids", None) or []),
+        evidence_digests={row.event_id: row.evidence_digest for row in rows},
+        held_confirmed=frozenset(row.event_id for row in rows if row.held_by_other_confirmed),
+    )
+
+
+def _existing_run(session, *, actor: str, request, request_digest: str):
+    previous = session.scalar(select(Job).where(Job.idempotency_key == request.idempotency_key))
+    if previous and (
+        previous.action != ACTION or previous.actor != actor or previous.candidate_digest != request_digest
+    ):
+        raise RecoveryError("This request key belongs to another selection.", "IDEMPOTENCY_CONFLICT")
+    return previous
 
 
 def create(session, *, actor: str, request):
-    _lock_scheduler(session)
     event_ids = sorted(request.event_ids)
-    choices, send_now = _request_decisions(request)
+    decided = _request_decisions(request)
+    choices, send_now = decided.choices, decided.send_now
     request_digest = _digest(
         [ACTION, actor, event_ids, request.reason.strip()]
         # Approvals saved before per-punch decisions keep their digest.
-        + ([sorted(choices.items()), sorted(send_now)] if choices or send_now else [])
+        + ([
+            sorted(
+                [event_id, choice, decided.evidence_digests.get(event_id), event_id in decided.held_confirmed]
+                for event_id, choice in choices.items()
+            ),
+            sorted(send_now),
+        ] if choices or send_now else [])
     )
-    previous = session.scalar(select(Job).where(Job.idempotency_key == request.idempotency_key))
+    previous = _existing_run(session, actor=actor, request=request, request_digest=request_digest)
     if previous:
-        if previous.action != ACTION or previous.actor != actor or previous.candidate_digest != request_digest:
-            raise RecoveryError("This request key belongs to another selection.", "IDEMPOTENCY_CONFLICT")
+        return previous
+    decisions = dict(
+        choices=choices, send_now=send_now, evidence_digests=decided.evidence_digests,
+        held_confirmed=decided.held_confirmed,
+    )
+    # ADD's automatic proof and its database guard are the slow part of the
+    # checks (one proof per punch). Run them before taking the scheduler lock
+    # and the row locks, so a snapshot release never waits on them; under the
+    # locks every identity, time, choice and delivery check runs again, and
+    # an automatic-release answer is reused only for a punch whose state and
+    # evidence are unchanged. Every check reads before the run is added, so
+    # the read-only database guard probe never flushes a half-built approval.
+    unlocked = session.scalars(
+        select(AttendanceEvent).where(AttendanceEvent.id.in_(event_ids)).order_by(AttendanceEvent.id)
+    ).all()
+    if len(unlocked) != len(event_ids):
+        raise RecoveryError("One of the selected punches is no longer saved.", "SOURCE_MISSING")
+    early = {
+        check.event.id: (_auto_release_key(check.event, check.evidence_digest), check.auto_release)
+        for check in assess_many(session, unlocked, **decisions)
+        if check.error is None or check.error in {"CNIC_CHOICE_REQUIRED", "AUTO_RELEASE_PENDING"}
+    }
+    _lock_scheduler(session)
+    previous = _existing_run(session, actor=actor, request=request, request_digest=request_digest)
+    if previous:
         return previous
     rows = session.scalars(
         select(AttendanceEvent).where(AttendanceEvent.id.in_(event_ids))
         .order_by(AttendanceEvent.id).with_for_update()
+        .execution_options(populate_existing=True)
     ).all()
     if len(rows) != len(event_ids):
         raise RecoveryError("One of the selected punches is no longer saved.", "SOURCE_MISSING")
-    # Every check reads before the run is added, so the read-only database
-    # guard probe never flushes a half-built approval.
-    checks = assess_many(session, rows, choices=choices, send_now=send_now)
+    checks = assess_many(session, rows, auto_release_cache=early, **decisions)
     now = utc_now()
     job = Job(
         action=ACTION, status="RUNNING", actor=actor,
@@ -648,6 +849,10 @@ def create(session, *, actor: str, request):
             "selected_event_ids": event_ids,
             "approval": {"at": now.isoformat(), "reason_encrypted": encrypt_text(request.reason.strip())},
             "cnic_choices": {str(key): value for key, value in sorted(choices.items())},
+            "cnic_choice_evidence": {
+                str(key): value for key, value in sorted(decided.evidence_digests.items())
+            },
+            "held_by_other_confirmed_event_ids": sorted(decided.held_confirmed),
             "send_now_event_ids": sorted(send_now),
         },
         candidate_digest=request_digest,
@@ -709,6 +914,7 @@ def create(session, *, actor: str, request):
                 for choice in sorted(set(choices.values()))
             },
             "send_now": len(send_now),
+            "held_by_other_confirmed": len(decided.held_confirmed),
             "replaces_stopped_approvals": replaced,
         },
     )
@@ -762,8 +968,8 @@ def _queue(session, job, item):
         code = "SOURCE_CHANGED"
     elif event.ords_status in ORDS_ACKNOWLEDGED_STATUSES and event.oracle_confirmed_at:
         code = "ALREADY_CONFIRMED"
-    elif previous is not None and not _replaceable(session, event, previous, outbox, connector):
-        code = "ALREADY_DELIVERING"
+    elif previous is not None and (block := _replacement_block(session, event, previous, outbox, connector)):
+        code = block
     elif outbox and outbox.status == "IN_FLIGHT":
         return  # Let the earlier claim settle; the next short tick will recheck.
     else:
@@ -840,8 +1046,13 @@ def _observe(session, job):
             item.status, item.error_code, item.completed_at = "NEEDS_REVIEW", "SOURCE_MISSING", utc_now()
         elif decision is not None and decision.item_id != item.id:
             # A later explicit approval replaced this stopped one; it owns delivery.
+            # Replacement is refused after any POST, so nothing of this one is in
+            # Oracle; a recorded POST would still be shown for review.
             item.status, item.error_code, item.completed_at = "SKIPPED", "SUPERSEDED", utc_now()
-            item.result = {**item.result, "reason": REASONS["SUPERSEDED"], "needs_attention": False}
+            item.result = {
+                **item.result, "reason": REASONS["SUPERSEDED"],
+                "needs_attention": bool(item.result.get("direct_post_attempts")),
+            }
         elif event.ords_status in ORDS_ACKNOWLEDGED_STATUSES and event.oracle_confirmed_at:
             if decision and item.result.get("oracle_verified_payload_digest") == decision.payload_digest:
                 item.status, item.completed_at = "CONFIRMED", utc_now()

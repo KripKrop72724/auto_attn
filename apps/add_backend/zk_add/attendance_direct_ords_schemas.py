@@ -11,6 +11,11 @@ class DirectOrdsCnicChoice(BaseModel):
     model_config = ConfigDict(extra="forbid")
     event_id: int = Field(ge=1)
     choice: Literal["PUNCH_TIME", "CURRENT"]
+    # The preview's evidence_digest for this punch. A choice made against
+    # evidence that changed before approval is skipped, never re-applied.
+    evidence_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    # Required to send a punch-time CNIC another active terminal user holds today.
+    held_by_other_confirmed: bool = False
 
 
 class DirectOrdsStartRequest(BaseModel):

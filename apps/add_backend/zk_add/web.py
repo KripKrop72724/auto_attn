@@ -3412,7 +3412,21 @@ IDENTITY_RELEASE_HINTS = {
     ),
     "PUNCH_TIME_CNIC_CHANGED_NEARBY": (
         "No record covers the punch time, and the nearest record before or after it holds "
-        "another CNIC. Today's CNIC may only be sent after HR confirms who held the user ID."
+        "another CNIC. A manual send asks for this punch on its own: the nearest record's "
+        "CNIC, or today's CNIC only when the record on the other side holds it. Choose only "
+        "after HR confirms who held the user ID."
+    ),
+    "PUNCH_TIME_CNIC_BRIDGED_GAP": (
+        "No record covers the punch time, but the records just before and after it are the "
+        "same terminal user with the same other CNIC. A manual send treats that CNIC as the "
+        "punch-time CNIC."
+    ),
+    "PUNCH_BEFORE_FIRST_OBSERVATION": (
+        "The punch is older than ADD's first record of this terminal user ID (see "
+        "first_observed_at). A user ID reused before then cannot be detected; confirm with HR."
+    ),
+    "NAME_DIFFERS": (
+        "The name saved with the punch is not today's user's name. Confirm with HR who punched."
     ),
     "PUNCH_TIME_CNIC_AMBIGUOUS": (
         "The records at punch time are revoked, belong to another terminal UID, or the user "
@@ -3435,7 +3449,10 @@ def _identity_release_safety(
         CHANGED_NEAR_PUNCH,
         CONFLICT,
         DIFFERS,
+        GAP_BRIDGED_SAME_CNIC,
+        NAME_DIFFERS,
         NONE,
+        PUNCH_BEFORE_FIRST_OBSERVATION,
         auto_release_preview,
         database_guard_state,
         other_cnics_masked,
@@ -3480,6 +3497,14 @@ def _identity_release_safety(
     }.get(punch.state)
     if punch_code:
         codes.append(punch_code)
+    for signal, code in (
+        (GAP_BRIDGED_SAME_CNIC, "PUNCH_TIME_CNIC_BRIDGED_GAP"),
+        (PUNCH_BEFORE_FIRST_OBSERVATION, "PUNCH_BEFORE_FIRST_OBSERVATION"),
+        (NAME_DIFFERS, "NAME_DIFFERS"),
+    ):
+        if signal in punch.signals:
+            codes.append(code)
+    other_cnic = bool(punch.cnic_hash and punch.interval is not None)
     return {
         "time_refusal": refusal,
         "database_guard": guard,
@@ -3488,8 +3513,13 @@ def _identity_release_safety(
         "saved_terminal_record": saved_record,
         "punch_time_cnic": {
             "state": punch.state,
-            "cnic_masked": mask_cnic(punch.cnic) if punch.state == DIFFERS and punch.cnic else None,
-            "display_name": punch.display_name if punch.state == DIFFERS else None,
+            # The single other CNIC at or near the punch (DIFFERS, or the
+            # nearest record for CHANGED_NEAR_PUNCH), masked.
+            "cnic_masked": mask_cnic(punch.cnic) if other_cnic and punch.cnic else None,
+            "display_name": punch.display_name if other_cnic else None,
+            "basis": punch.basis if other_cnic else None,
+            "record_position": punch.position,
+            "first_observed_at": punch.first_observed_at,
             "history_ids": list(punch.history_ids),
             "other_cnics_masked": other_cnics_masked(punch, current_hash),
             "evidence_signals": sorted(punch.signals),
@@ -5324,6 +5354,8 @@ def serialize_user(
         "cnic_format_suspect": suspect is not None,
         "cnic_format_suspect_reason": suspect.reason if suspect else None,
         "suggested_display_name": suspect.display_name if suspect and suspect.display_name else None,
+        # The unparsed name's "-S" marker; the edit dialog keeps it as the flag.
+        "suggested_shift_worker": bool(suspect and suspect.shift_worker),
     }
 
 

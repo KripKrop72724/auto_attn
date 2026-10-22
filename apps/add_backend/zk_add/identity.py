@@ -42,6 +42,7 @@ class SuspectCnicName:
 
     display_name: str
     reason: str  # LETTER_BEFORE_DIGITS, SEPARATED_DIGITS or UNSUPPORTED_SEPARATOR
+    shift_worker: bool = False  # the name carried the "-S" shift-worker marker
 
 
 def suspect_cnic_name(value: str | None) -> SuspectCnicName | None:
@@ -65,6 +66,7 @@ def suspect_cnic_name(value: str | None) -> SuspectCnicName | None:
     return SuspectCnicName(
         display_name=" ".join(match.group("display").strip(" -_.").split()),
         reason=reason,
+        shift_worker=bool(match.group("shift")),
     )
 
 
