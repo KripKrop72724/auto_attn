@@ -2230,4 +2230,85 @@ class AttendanceForceReleaseControl(Base):
     created_at: Mapped[datetime] = utc_column()
 
 
+
+class AttendanceCheckinNotification(Base):
+    """Durable phone-notification outbox: at most one row per attendance punch.
+
+    The row is written in the same transaction that records Oracle's
+    confirmation of the punch (see zk_add.checkin_notify). Absence of a row for
+    an older punch means "not sent" (the punch predates this feature); old
+    attendance rows are never backfilled. There are deliberately no foreign
+    keys: creating one would lock the large attendance table during the live
+    migration, and attendance rows are an append-only ledger.
+    """
+
+    __tablename__ = "add_attendance_checkin_notifications"
+    __table_args__ = (
+        UniqueConstraint("attendance_event_id", name="uq_add_checkin_notify_event"),
+        Index("ix_add_checkin_notify_due", "status", "next_attempt_at"),
+        Index("ix_add_checkin_notify_cnic_time", "cnic_lookup_hash", "punch_time"),
+        Index("ix_add_checkin_notify_connector", "connector_id", "status"),
+        Index("ix_add_checkin_notify_created", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    attendance_event_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    connector_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    punch_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    confirmed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    confirmation_path: Mapped[str | None] = mapped_column(String(40))
+    # The CNIC Oracle received for this punch, protected like every saved CNIC.
+    cnic_encrypted: Mapped[str | None] = mapped_column(Text)
+    cnic_lookup_hash: Mapped[str | None] = mapped_column(String(64))
+    cnic_last4: Mapped[str | None] = mapped_column(String(4))
+    # PENDING, SENDING (leased), RETRYING, SENT, FAILED or SKIPPED.
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="PENDING")
+    reason: Mapped[str | None] = mapped_column(String(60))
+    detail: Mapped[str | None] = mapped_column(String(200))
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    attempt_base: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_http_status: Mapped[int | None] = mapped_column(Integer)
+    # PRIMARY or FALLBACK: the host that answered (or was last tried).
+    host_used: Mapped[str | None] = mapped_column(String(20))
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    grouped_into_id: Mapped[int | None] = mapped_column(Integer)
+    manual_retry: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
+    retry_deadline_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = utc_column()
+    updated_at: Mapped[datetime] = utc_column()
+
+
+class CheckinNotifyControl(Base):
+    """Singleton runtime switch and shared circuit state for check-in notifications."""
+
+    __tablename__ = "add_checkin_notify_control"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    mode: Mapped[str] = mapped_column(String(10), nullable=False)
+    punch_policy: Mapped[str] = mapped_column(String(20), nullable=False)
+    pilot_zone_ids: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    # [{"hash": keyed CNIC lookup hash, "masked": "*****-****123-4"}]
+    pilot_cnics: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    updated_by: Mapped[str | None] = mapped_column(String(120))
+    update_reason: Mapped[str | None] = mapped_column(String(300))
+    consecutive_failures: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    paused_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_success_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_failure_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_failure_category: Mapped[str | None] = mapped_column(String(60))
+    # Sticky host: the one that last answered; the primary is re-probed.
+    preferred_host: Mapped[str] = mapped_column(String(20), nullable=False, default="PRIMARY")
+    primary_reprobe_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # The first time this feature ran: punches before it were never notified.
+    created_at: Mapped[datetime] = utc_column()
+    updated_at: Mapped[datetime] = utc_column()
+
+
 from zk_add import attendance_manual_guard as _attendance_manual_guard  # noqa: E402,F401
+from zk_add import checkin_notify as _checkin_notify  # noqa: E402,F401

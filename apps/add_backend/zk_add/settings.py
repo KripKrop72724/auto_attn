@@ -2,9 +2,15 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Literal
+from urllib.parse import urlsplit
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+CHECKIN_NOTIFY_PATH = "/ords/slic_hrm/ESS_APIS/attendance_checkin_notify"
+# Public ORDS host, reachable from outside the organisation network.
+CHECKIN_NOTIFY_FALLBACK_URL = "https://eclaim2.slichealth.com" + CHECKIN_NOTIFY_PATH
 
 
 class AddSettings(BaseSettings):
@@ -136,6 +142,41 @@ class AddSettings(BaseSettings):
     ords_firmware_audit_batch_size: int = 500
     ords_membership_reverify_seconds: int = 24 * 60 * 60
 
+    # Employee "attendance punched" phone notification (HRM ORDS service),
+    # sent only after Oracle confirms the punch. Nothing is sent without the
+    # API key (NOT_CONFIGURED). The live mode (OFF / PILOT / ALL), punch policy
+    # and pilot allowlist are stored in the database and changed by an
+    # administrator at runtime; the defaults below seed that row once. The
+    # owner's rollout is ALL zones at once, so ALL is the default.
+    # The URL defaults to the host of ADD_ORDS_BASE_URL (the internal ORDS
+    # host) plus CHECKIN_NOTIFY_PATH. The fallback (public) host is used only
+    # when an attempt on the other host provably never reached a server.
+    # See docs/checkin-notifications.md.
+    checkin_notify_url: str | None = None
+    checkin_notify_fallback_url: str | None = CHECKIN_NOTIFY_FALLBACK_URL
+    checkin_notify_api_key: str | None = None
+    checkin_notify_cnic_json_type: Literal["number", "string"] = "number"
+    checkin_notify_default_mode: Literal["OFF", "PILOT", "ALL"] = "ALL"
+    checkin_notify_default_punch_policy: Literal["ALL_PUNCHES", "FIRST_PER_DAY"] = "ALL_PUNCHES"
+    checkin_notify_default_pilot_zone_ids: str = ""
+    checkin_notify_timeout_seconds: float = Field(default=10.0, ge=1.0, le=60.0)
+    checkin_notify_connect_timeout_seconds: float = Field(default=5.0, ge=0.5, le=30.0)
+    checkin_notify_primary_reprobe_seconds: int = Field(default=600, ge=30, le=24 * 60 * 60)
+    checkin_notify_stale_window_hours: float = Field(default=12.0, ge=0.25, le=72.0)
+    checkin_notify_future_tolerance_seconds: int = Field(default=300, ge=0, le=3600)
+    checkin_notify_coalesce_seconds: int = Field(default=120, ge=0, le=3600)
+    checkin_notify_retry_window_hours: float = Field(default=6.0, ge=0.05, le=48.0)
+    checkin_notify_backoff_initial_seconds: int = Field(default=15, ge=1, le=600)
+    checkin_notify_backoff_max_seconds: int = Field(default=1800, ge=5, le=6 * 60 * 60)
+    checkin_notify_batch_size: int = Field(default=25, ge=1, le=200)
+    checkin_notify_concurrency: int = Field(default=4, ge=1, le=16)
+    checkin_notify_rate_per_second: float = Field(default=5.0, ge=0.1, le=50.0)
+    checkin_notify_circuit_failure_threshold: int = Field(default=5, ge=1, le=100)
+    checkin_notify_circuit_pause_seconds: int = Field(default=60, ge=1, le=60 * 60)
+    checkin_notify_circuit_max_pause_seconds: int = Field(default=900, ge=1, le=6 * 60 * 60)
+    checkin_notify_backlog_alert_seconds: int = Field(default=600, ge=60, le=24 * 60 * 60)
+    checkin_notify_failure_alert_count: int = Field(default=3, ge=1, le=1000)
+
     user_command_retry_seconds: int = 30 * 60
     command_redispatch_seconds: int = 20
     firmware_ota_enabled: bool = False
@@ -171,6 +212,26 @@ class AddSettings(BaseSettings):
     provisioning_factory_store_path: str = "/factory-firmware"
     provisioning_public_ws_url: str = "wss://autoattn.slichealth.com/companion/v1/stream"
     provisioning_hardware_profile: str = "esp32s3-16mb-zone-lite-v1"
+
+    @property
+    def resolved_checkin_notify_url(self) -> str | None:
+        """Explicit URL, else the ORDS host (scheme and authority only) + path."""
+        explicit = (self.checkin_notify_url or "").strip()
+        if explicit:
+            return explicit
+        parts = urlsplit((self.ords_base_url or "").strip())
+        if parts.scheme not in {"http", "https"} or not parts.netloc:
+            return None
+        return f"{parts.scheme}://{parts.netloc}{CHECKIN_NOTIFY_PATH}"
+
+    @property
+    def resolved_checkin_notify_fallback_url(self) -> str | None:
+        """The fallback URL, or None when unset, invalid or the same as the primary."""
+        value = (self.checkin_notify_fallback_url or "").strip()
+        parts = urlsplit(value)
+        if parts.scheme not in {"http", "https"} or not parts.netloc:
+            return None
+        return None if value == self.resolved_checkin_notify_url else value
 
     @property
     def sqlite_path(self) -> Path:
