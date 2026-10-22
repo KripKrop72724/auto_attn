@@ -239,6 +239,7 @@ from zk_add.source_exceptions import (
     review_source_exception,
     source_exception_detail,
 )
+from zk_add.source_tail_authority import inactive_coverage_push, refuse_tail_without_authority
 
 
 logger = logging.getLogger(__name__)
@@ -4890,6 +4891,15 @@ def persist_envelope(connector_pk: int, envelope: Envelope) -> EnvelopeOutcome |
                     "source_committed_chain_digest": "0" * 64,
                     "active": False,
                 }
+        elif envelope.type == "source_tail_chunk" and (
+            tail_refusal := refuse_tail_without_authority(db, connector=connector, envelope=envelope)
+        ) is not None:
+            # The ESP is extending a certificate ADD no longer holds, or holds
+            # under another epoch. A plain rejection would leave its state
+            # unchanged and it would resend the same range every interval.
+            ack_payload = tail_refusal.ack
+            event_payload = tail_refusal.event
+            authoritative_coverage_payload = tail_refusal.coverage
         elif envelope.type == "source_tail_chunk":
             tail = SourceTailChunkRequest.model_validate(envelope.payload)
             coverage, chunk, duplicate, error_code = apply_source_tail_chunk(
@@ -4897,6 +4907,12 @@ def persist_envelope(connector_pk: int, envelope: Envelope) -> EnvelopeOutcome |
                 connector=connector,
                 payload=tail,
             )
+            if error_code and not coverage.active:
+                # This tail just invalidated the certificate it extended. The
+                # ESP drops its certificate only on a coverage push.
+                authoritative_coverage_payload = inactive_coverage_push(
+                    connector, terminal_serial=tail.terminal_serial
+                )
             event_payload = {
                 "connector_id": connector.connector_id,
                 "coverage_id": coverage.coverage_id,
