@@ -31,7 +31,9 @@ preview mode.
 ## Operator lanes
 
 - **Safe delivery** contains missing outbox rows, pending events, retryable
-  transport failures, and expired in-flight leases. Preview and approve a
+  transport failures, and expired in-flight leases. The **Missing outbox**
+  count includes only deliverable events; identity-held and quarantined events
+  have no delivery row by design and are named beside it, not inside it. Preview and approve a
   frozen batch; the worker queues each event through the existing one-row
   outbox contract.
 - **Identity held** is read-only. Exact terminal serial, UID, user ID,

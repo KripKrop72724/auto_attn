@@ -36,6 +36,7 @@ from zk_add.models import (
     AuditEvent,
 )
 from zk_add.hikvision_evidence import HikvisionEvidence
+from zk_add.ords_outbox_coverage import ords_outbox_coverage
 from zk_add.ords_states import (
     ORDS_ACKNOWLEDGED_STATUSES,
     ORDS_ACTIVE_STATUSES,
@@ -583,23 +584,13 @@ def build_recovery_preview(session: Session, *, action: str, filters: Any) -> di
     }
 
 
-def recovery_summary(session: Session) -> dict:
+def recovery_summary(session: Session, *, outbox_coverage: dict | None = None) -> dict:
     now = utc_now()
     status_rows = session.execute(
         select(AttendanceEvent.ords_status, func.count(AttendanceEvent.id)).group_by(AttendanceEvent.ords_status)
     ).all()
     status_counts = {normalize_ords_status(status): int(count) for status, count in status_rows}
-    missing_outbox = int(
-        session.scalar(
-            select(func.count(AttendanceEvent.id))
-            .outerjoin(OrdsOutbox, OrdsOutbox.attendance_event_id == AttendanceEvent.id)
-            .where(
-                OrdsOutbox.id.is_(None),
-                ~AttendanceEvent.ords_status.in_(tuple(ORDS_ACKNOWLEDGED_STATUSES)),
-            )
-        )
-        or 0
-    )
+    coverage = outbox_coverage if outbox_coverage is not None else ords_outbox_coverage(session)
     stale_in_flight = int(
         session.scalar(
             select(func.count(OrdsOutbox.id)).where(
@@ -652,7 +643,10 @@ def recovery_summary(session: Session) -> dict:
         "allowed_zones": [z.strip() for z in settings.attendance_recovery_allowed_zones.split(",") if z.strip()],
         "delivery": {
             "safe_retryable": safe,
-            "missing_outbox": missing_outbox,
+            # Deliverable rows to rebuild; held rows have no outbox by design.
+            "missing_outbox": coverage["missing_outbox"],
+            "held_without_outbox": coverage["held_without_outbox"],
+            "review_without_outbox": coverage["review_without_outbox"],
             "stale_in_flight": stale_in_flight,
             "active_in_flight": active_in_flight,
             "identity_held": identity,

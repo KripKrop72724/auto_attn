@@ -598,6 +598,11 @@ export interface Overview {
     membership_reverify: number
     oldest_backlog_at: string | null
     last_attempt_at: string | null
+    missing_outbox?: number
+    held_without_outbox?: number
+    review_without_outbox?: number
+    without_outbox_total?: number
+    without_outbox_by_status?: Record<string, number>
   }
   attendance_recovery?: AttendanceRecoverySummary
 }
@@ -734,6 +739,8 @@ export interface AttendanceRecoverySummary {
   delivery: {
     safe_retryable: number
     missing_outbox: number
+    held_without_outbox?: number
+    review_without_outbox?: number
     stale_in_flight: number
     active_in_flight?: number
     identity_held: number
