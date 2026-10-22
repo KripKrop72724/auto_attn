@@ -606,8 +606,10 @@ export interface ReconciliationPreflight {
   active_user_history?: { eligible: boolean; user_count: number | null; reason: string | null }
   recent_tail?: {
     eligible: boolean
+    ready_now?: boolean
     anchor_serial: number | null
     begin_serial: number | null
+    earlier_breaks?: number[]
     reason: string | null
   }
   source_protocol?: string
@@ -916,14 +918,19 @@ export interface ReconciliationJob {
   recent_tail?: {
     anchor_serial: number
     begin_serial: number
+    boundary_serial: number | null
+    earlier_breaks: number[]
     last_serial: number | null
     anchor_returned: boolean | null
     pages: number
     records: number
+    overlap_records: number
     fact_conflicts: number
+    confirmed_conflicts: number
     continuity_conflicts: number
     caught_up: boolean
     caught_up_at: string | null
+    last_page_at: string | null
     coverage_certified: false
   }
   active_user_scope?: {
@@ -944,7 +951,7 @@ export interface ReconciliationJob {
   operator_state?: string
   operator_message?: string
   completion_outcome?: string | null
-  assurance_outcome?: 'ALL_CONFIRMED' | 'COMPLETED_WITH_IDENTITY_HOLDS' | 'COMPLETED_WITH_CORRECTIONS' | 'COMPLETED_WITH_REVIEW' | 'REVIEW_REQUIRED' | null
+  assurance_outcome?: 'ALL_CONFIRMED' | 'COMPLETED_WITH_IDENTITY_HOLDS' | 'COMPLETED_WITH_CORRECTIONS' | 'COMPLETED_WITH_REVIEW' | 'REVIEW_REQUIRED' | 'NOT_CERTIFIED' | null
   review_required?: boolean
   source_exception_assurance: SourceExceptionAssurance
   connector: null | {

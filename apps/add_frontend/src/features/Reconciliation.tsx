@@ -2074,7 +2074,7 @@ export function ReconciliationView({
                         {job.mode === 'HIKVISION_SERIAL_HISTORY' && <p>{job.scope === 'ACTIVE_USERS'
                           ? `Active-user history · ${job.active_user_scope?.completed_users ?? 0}/${job.active_user_scope?.user_count ?? 0} users verified · excludes former users`
                           : job.scope === 'RECENT_TAIL'
-                            ? `Recent tail · from serial ${job.recent_tail?.begin_serial ?? '?'} · last ${job.recent_tail?.last_serial ?? 'pending'} · ${job.recent_tail?.records ?? 0} new records${job.recent_tail?.fact_conflicts ? ` · ${job.recent_tail.fact_conflicts} changed serials held for review` : ''} · no coverage certificate`
+                            ? `Recent tail · from serial ${job.recent_tail?.begin_serial ?? '?'} · last ${job.recent_tail?.last_serial ?? 'pending'} · ${job.recent_tail?.records ?? 0} new records after serial ${job.recent_tail?.anchor_serial ?? '?'} · ${job.recent_tail?.overlap_records ?? 0} held records re-read${job.recent_tail?.fact_conflicts ? ` · ${job.recent_tail.fact_conflicts} changed serials held for review` : ''} · no coverage certificate`
                             : 'Full terminal audit · all records'}</p>}
                         <small>
                           {job.terminal.serial || 'serial pending'} · requested{' '}
@@ -2790,7 +2790,7 @@ export function ReconciliationView({
                   <option value="RECENT_TAIL">Recent tail — resume after the last held punch and keep following</option>
                 </select>
                 {recentTail && preflight?.recent_tail && <p>{preflight.recent_tail.eligible
-                  ? `Resumes at terminal serial ${preflight.recent_tail.begin_serial} (re-reads up to serial ${preflight.recent_tail.anchor_serial}, the last punch ADD holds from the ESP poll).`
+                  ? `Resumes at terminal serial ${preflight.recent_tail.begin_serial} (re-reads up to serial ${preflight.recent_tail.anchor_serial}, the resume point: the last serial before the newest break in ADD's ESP-poll records). It steps back further if those records changed.${preflight.recent_tail.earlier_breaks?.length ? ` ADD's poll records also break after serial${preflight.recent_tail.earlier_breaks.length === 1 ? '' : 's'} ${preflight.recent_tail.earlier_breaks.join(', ')}; only a full terminal audit covers those.` : ''}${preflight.recent_tail.ready_now === false ? ' Waiting for the terminal and ESP.' : ''}`
                   : preflight.recent_tail.reason}</p>}
                 {activeUsersOnly && preflight?.active_user_history && <p>{preflight.active_user_history.eligible
                   ? `${preflight.active_user_history.user_count} active users in the verified snapshot.`
@@ -2798,7 +2798,7 @@ export function ReconciliationView({
                 <small>{activeUsersOnly
                   ? 'Freezes the current complete user snapshot. Searches only those employees’ retained history; former users are excluded. Refresh terminal users first if the snapshot is older than 15 minutes. No records are deleted.'
                   : recentTail
-                    ? 'For a terminal whose own poll is blocked: reads every record after the last punch ADD holds, then checks for new punches every 15 seconds until cancelled or the ESP poll recovers. Re-read records that changed are held for review. It never certifies coverage.'
+                    ? 'For a terminal whose own poll is blocked: reads every record after the resume point, then checks for new punches every 15 seconds until cancelled or the ESP poll is proven to work again. Re-read records that changed are held for review. It never certifies coverage, and while it runs no other reconciliation can start on this device.'
                     : 'Scans all retained terminal records, including former users and non-attendance events.'}</small>
               </label>
             )}
