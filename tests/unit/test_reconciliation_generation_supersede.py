@@ -479,21 +479,32 @@ def test_previous_coverage_failing_on_its_own_evidence_is_invalidated_and_the_jo
 
 
 @pytest.mark.parametrize("terminal_lost_records", [True, False])
-def test_manifest_count_below_the_previous_cursor_is_sealed_and_checked_by_the_first_tail(
+def test_manifest_count_below_the_previous_cursor_invalidates_it_and_every_tail_rechecks(
         reconciliation_db, terminal_lost_records):  # noqa: F811
     session, connector, prior, old, job = generation_scenario(
         reconciliation_db, old=lambda i: punch(i, "CURRENT_RECONCILE" if i >= 5 else "FULL_HISTORY"), new=punch,
         old_complete=True)
-    # The manifest reports 8 although generation 1 committed 11: either the
-    # terminal lost ordinals 8..10, or the manifest waited out its ACK and
-    # arrived after a later tail. Sealing cannot tell; the next tail can.
+    old_epoch = session.get(TerminalSourceEpoch, old.source_epoch_id)
+    # The manifest reports 8 although generation 1 committed 11: the terminal
+    # no longer holds ordinals that coverage certified (or, rarely, a replayed
+    # manifest carries an older count). It is never marked superseded by proof.
     connector.zkt_device.attendance_count = 8
     seal(session, connector, job)
     session.commit()
     sealed = job.capture_certificate["superseded_generation"]
-    assert (sealed["outcome"], sealed["latest_terminal_count"]) == (service.GENERATION_SUPERSEDED, 8)
-    assert sealed["terminal_count_below_previous_cursor"] is True and sealed["replay"]["through"] == 11
+    assert (sealed["outcome"], sealed["failure"], sealed["latest_terminal_count"]) == (
+        service.GENERATION_PREVIOUS_INVALIDATED, "TERMINAL_ATTENDANCE_COUNT_REGRESSED", 8)
+    assert sealed["terminal_count_below_previous_cursor"] is True and sealed["lineage"]["compared_records"] == 7
+    assert sealed["replay"] == {"source_epoch": old_epoch.epoch_id, "through": 11, "previous_row_required": True}
+    assert (old.active, old.invalidated_reason, old.capture_state) == (
+        False, "TERMINAL_ATTENDANCE_COUNT_REGRESSED", "SOURCE_COVERAGE_INVALIDATED")
+    assert prior.status == "INVALIDATED" and old_epoch.state == "ACTIVE"
+    invalidated = alert(session, "ADD_SOURCE_COVERAGE_INVALIDATED")
+    assert invalidated.severity == "CRITICAL" and "reported 8 attendance records" in invalidated.message
+    assert invalidated.details["failure_category"] == "TERMINAL_ATTENDANCE_COUNT_REGRESSED"
+    # The job certifies only the seven records it proved.
     new = active(session)
+    assert (new.job_id, new.source_committed_cursor) == (job.id, 7) and job.capture_certified_at is not None
     events = session.scalar(select(func.count(AttendanceEvent.id)))
     if terminal_lost_records:
         # Its first tail carries a fresh count of 9: ordinals 9 and 10 are gone,
@@ -506,10 +517,68 @@ def test_manifest_count_below_the_previous_cursor_is_sealed_and_checked_by_the_f
         assert alert(session, "ADD_SOURCE_COVERAGE_INVALIDATED").severity == "CRITICAL"
         assert session.scalar(select(func.count(AttendanceEvent.id))) == events
     else:
+        # A stale manifest count costs a latched alert for review, never custody.
         tail(session, connector, new, 11, lambda i: punch(i, "CURRENT_RECONCILE"))
         session.commit()
         assert new.active and new.source_committed_cursor == 11
         assert session.scalar(select(func.count(AttendanceEvent.id))) == events
+        assert alert(session, "ADD_SOURCE_COVERAGE_INVALIDATED") is not None
+
+
+def test_shorter_previous_generation_coverage_with_a_ledger_gap_is_retired_not_a_dead_end(reconciliation_db):  # noqa: F811
+    # The old coverage committed 5 and the job proved 7: a gap in the old
+    # ledger says nothing against the job's own complete ledger.
+    session, connector, prior, old, job = generation_scenario(reconciliation_db, baseline=5, current=5, cutoff=7)
+    session.delete(session.scalar(select(TerminalRecordManifest).where(
+        TerminalRecordManifest.source_epoch_id == old.source_epoch_id, TerminalRecordManifest.ordinal == 2)))
+    session.commit()
+    assert service.predicted_finalisation_hold(session, job) is None
+    seal(session, connector, job)
+    session.commit()
+    sealed = job.capture_certificate["superseded_generation"]
+    assert (sealed["outcome"], sealed["failure"]) == (service.GENERATION_PREVIOUS_INVALIDATED,
+                                                      "PREVIOUS_LEDGER_INCOMPLETE")
+    assert sealed["previous_ledger"]["first_unproven_ordinals"] == [2] and sealed["replayed_after_cutoff"] == 0
+    assert job.capture_certified_at is not None and active(session).job_id == job.id
+    assert (old.active, old.invalidated_reason) == (False, "PREVIOUS_LEDGER_INCOMPLETE")
+    assert alert(session, "ADD_SOURCE_COVERAGE_INVALIDATED").severity == "CRITICAL"
+
+
+def test_the_replay_window_binds_every_later_job_and_coverage_in_the_new_epoch(reconciliation_db):  # noqa: F811
+    session, connector, prior, old, job = generation_scenario(reconciliation_db)
+    seal(session, connector, job)
+    replacing = active(session)
+    session.commit()
+    assert job.status == "COMPLETED"
+    # Before the terminal re-reads 7..10, a second generation-2 full reconcile
+    # in the same epoch certifies 9 and replaces the coverage that sealed the
+    # window; its own certificate names no older generation.
+    second = create(session, connector, 9, "second-generation-two")
+    assert second.source_epoch_id == job.source_epoch_id
+    scan(session, connector, second, 9, width=97)
+    seal(session, connector, second)
+    session.commit()
+    current = active(session)
+    assert current.job_id == second.id and "superseded_generation" not in second.capture_certificate
+    assert (replacing.active, replacing.invalidated_reason) == (False, "SUPERSEDED_BY_NEW_SOURCE_CERTIFICATE")
+    manifests = session.scalar(select(func.count(TerminalRecordManifest.id)))
+    # Ordinal 10 was committed by generation 1; the terminal now returns other bytes there.
+    _, chunk, _, error = service.apply_source_tail_chunk(session, connector=connector,
+        payload=tail_payload(session, current, 9, 11, changed_at(10), latest_terminal_count=11))
+    session.commit()
+    assert (chunk, error) == (None, service.SOURCE_TAIL_LINEAGE_DIVERGED)
+    assert (current.active, current.source_committed_cursor) == (False, 9)
+    assert session.scalar(select(func.count(TerminalRecordManifest.id))) == manifests
+    assert "ordinal 10" in alert(session, "ADD_SOURCE_COVERAGE_INVALIDATED").message
+    # A full reconcile in that epoch still compares 9..10 with the replaced ledger.
+    rescan = create(session, connector, 11, "rescan-after-window-divergence", changed_at(10))
+    assert rescan.source_epoch_id == job.source_epoch_id
+    _, chunk, _ = service.apply_reconciliation_chunk(session, connector=connector,
+        payload=chunk_payload(session, rescan, 0, 11, changed_at(10)))
+    assert chunk is None and rescan.phase == "VERIFYING_SOURCE_CHANGE"
+    divergence = session.scalar(select(ReconciliationDivergence).where(ReconciliationDivergence.job_id == rescan.id))
+    assert (divergence.ordinal, divergence.old_raw_digest) == (10, source(10).raw_record_digest)
+    assert session.scalar(select(func.count(TerminalRecordManifest.id))) == manifests
 
 
 @pytest.mark.parametrize("fault,expected", [
@@ -834,12 +903,17 @@ def pg_generation(reconciliation_db):  # noqa: F811
         yield factory, (connector.id, job.id, old.id), payload, old_epoch
 
 
-@pytest.mark.parametrize("first_action", ["manifest", "tail"])
-def test_postgres_old_tail_and_new_generation_manifest_commit_in_either_order(pg_generation, first_action):
+@pytest.mark.parametrize("first_action,manifest_count", [("manifest", 12), ("tail", 12), ("tail", 11)])
+def test_postgres_old_tail_and_new_generation_manifest_commit_in_either_order(
+        pg_generation, first_action, manifest_count):
     from concurrent.futures import ThreadPoolExecutor
     from threading import Event
     import time
     factory, (connector_id, job_id, old_id), payload, old_epoch = pg_generation
+    # The firmware reads the count just before sending, so a manifest racing
+    # the tail to 12 normally reports 12. A manifest built before that tail
+    # but committed after it reports 11 (the rare stale case).
+    payload = payload.model_copy(update={"latest_terminal_count": manifest_count})
     waiting, results = Event(), {}
 
     def act(db, action):
@@ -871,13 +945,23 @@ def test_postgres_old_tail_and_new_generation_manifest_commit_in_either_order(pg
         new = active(db)
         assert job.capture_certified_at and job.status == "COMPLETED"
         assert (new.job_id, new.terminal_generation, new.source_committed_cursor) == (job_id, 2, 7)
-        assert not old.active and old.invalidated_reason == service.GENERATION_SUPERSEDED_REASON
+        sealed = job.capture_certificate["superseded_generation"]
         if first_action == "tail":
             assert results["tail"] is None and old.source_committed_cursor == 12
-            assert job.capture_certificate["superseded_generation"]["source_committed_cursor"] == 12
+            assert sealed["source_committed_cursor"] == sealed["replay"]["through"] == 12
         else:
             assert results["tail"] == service.SOURCE_TAIL_STALE_GENERATION and old.source_committed_cursor == 11
-        assert db.get(TerminalSourceEpoch, old.source_epoch_id).state == "SUPERSEDED"
+        assert not old.active
+        if manifest_count < old.source_committed_cursor:
+            # Never marked superseded by proof; the cost is a latched alert for
+            # review, while the job certifies exactly what it proved.
+            assert (sealed["outcome"], old.invalidated_reason) == (
+                service.GENERATION_PREVIOUS_INVALIDATED, "TERMINAL_ATTENDANCE_COUNT_REGRESSED")
+            assert alert(db, "ADD_SOURCE_COVERAGE_INVALIDATED").severity == "CRITICAL"
+        else:
+            assert (sealed["outcome"], old.invalidated_reason) == (
+                service.GENERATION_SUPERSEDED, service.GENERATION_SUPERSEDED_REASON)
+            assert db.get(TerminalSourceEpoch, old.source_epoch_id).state == "SUPERSEDED"
         saved = deepcopy(job.capture_certificate)
         service.apply_reconciliation_manifest(db, connector=db.get(Connector, connector_id), payload=payload)
         db.commit()

@@ -1583,10 +1583,10 @@ def _generation_lineage_proof(session, job, coverage, *, cutoff, latest_count):
     is SUPERSEDED when the older ledger holds every ordinal its coverage
     committed and agrees wherever both hold, or PREVIOUS_COVERAGE_INVALIDATED
     when that coverage fails on its own evidence (no binding to this terminal's
-    ledger, or missing or malformed rows). A terminal count below its committed
-    cursor is checked by the replacing coverage's tails. `replay` names the
-    older ledger the new generation's tail must still match, and reach, when
-    it re-reads the ordinals after the cutoff.
+    ledger, missing or malformed rows, or a manifest terminal count below its
+    committed cursor). `replay` names the older ledger every later read in
+    this job's epoch must still match, and every tail must reach, when the
+    terminal re-reads the ordinals after the cutoff.
     """
     epoch = session.get(TerminalSourceEpoch, job.source_epoch_id) if job.source_epoch_id else None
     if (epoch is None or epoch.state != "ACTIVE" or epoch.zkt_device_id != job.zkt_device_id
@@ -1712,19 +1712,29 @@ def _generation_lineage_proof(session, job, coverage, *, cutoff, latest_count):
         # re-reads them as this generation's tail and each must match.
         "replayed_after_cutoff": max(0, old_cursor - cutoff),
     }
-    # A manifest count below the old cursor is sealed, not trusted either way:
-    # a manifest that waited out its ACK can arrive after a later tail. Every
-    # tail of the new coverage carries a fresh count and must reach `through`,
-    # so a terminal that really lost those ordinals fails closed on its first
-    # tail, before anything from them is ingested.
-    sealed["terminal_count_below_previous_cursor"] = latest_count is not None and latest_count < old_cursor
+    # The firmware reads the terminal count just before it sends the manifest.
+    # A count below the old committed cursor says the terminal no longer holds
+    # ordinals the old coverage certified, so that coverage is never marked as
+    # superseded by proof: it is invalidated with a latched CRITICAL alert.
+    # The job still certifies only the ledger it proved, and every tail of the
+    # new coverage carries a fresh count that must reach `through`, so a
+    # terminal that really lost those ordinals fails closed on its first tail
+    # before anything from it is ingested. (A manifest replayed after a later
+    # tail can carry an older count; the cost is a spurious alert, never
+    # custody.)
+    count_regressed = latest_count is not None and latest_count < old_cursor
+    sealed["terminal_count_below_previous_cursor"] = count_regressed
+    replay = {"source_epoch": previous.epoch_id, "through": old_cursor,
+              "previous_row_required": not (unproven or replay_unproven)}
     if unproven or replay_unproven:
         return {**block, **sealed, "outcome": GENERATION_PREVIOUS_INVALIDATED, "failure": "PREVIOUS_LEDGER_INCOMPLETE",
                 "previous_ledger": {"unproven_below_cutoff": len(unproven), "first_unproven_ordinals":
                                     unproven[:LINEAGE_SAMPLE], "unproven_after_cutoff": replay_unproven},
-                "replay": {"source_epoch": previous.epoch_id, "through": old_cursor, "previous_row_required": False}}
-    return {**block, **sealed, "outcome": GENERATION_SUPERSEDED,
-            "replay": {"source_epoch": previous.epoch_id, "through": old_cursor, "previous_row_required": True}}
+                "replay": replay}
+    if count_regressed:
+        return {**block, **sealed, "outcome": GENERATION_PREVIOUS_INVALIDATED,
+                "failure": "TERMINAL_ATTENDANCE_COUNT_REGRESSED", "replay": replay}
+    return {**block, **sealed, "outcome": GENERATION_SUPERSEDED, "replay": replay}
 
 
 @dataclass
@@ -1830,15 +1840,22 @@ def finalisation_hold_guidance(code: str | None) -> str:
             "this job does not resolve it.")
 
 
+def _replay_window(block) -> dict | None:
+    replay = block.get("replay") if isinstance(block, dict) else None
+    return replay if isinstance(replay, dict) and type(replay.get("through")) is int else None
+
+
 def _lineage_predecessor(session, *, zkt_device_id: int, generation: int, serial: str | None,
                          source_epoch_id: int | None, coverage: ReconciliationCoverage | None = None):
     """The older-generation ledger a read in `generation` must still match, or None.
 
     An older generation's coverage that is still active has not been replaced
     yet. After a lineage supersede, the replacing coverage's certificate names
-    the replaced ledger and the ordinals the terminal re-reads from it; that
-    stays binding on this epoch even if the replacing coverage was later
-    invalidated, until a confirmed source change moves the job to a new epoch.
+    the replaced ledger and the ordinals the terminal re-reads from it. That
+    window belongs to the epoch, not to one coverage: every later job and
+    coverage in it stays bound, even after the replacing coverage was itself
+    replaced or invalidated, until a confirmed source change moves the
+    terminal to a new epoch.
     Returns (epoch row id, ledger generation, through ordinal, row required).
     """
     if coverage is None:
@@ -1849,14 +1866,23 @@ def _lineage_predecessor(session, *, zkt_device_id: int, generation: int, serial
                  and row.terminal_serial == serial and row.source_epoch_id is not None]
         if older:
             return older[0].source_epoch_id, older[0].terminal_generation, older[0].source_committed_cursor, False
-        coverage = session.scalar(select(ReconciliationCoverage).where(
-            ReconciliationCoverage.zkt_device_id == zkt_device_id,
-            ReconciliationCoverage.terminal_generation == generation,
-            ReconciliationCoverage.source_epoch_id == source_epoch_id,
-        ).order_by(ReconciliationCoverage.id.desc()).limit(1))
-    block = ((coverage.capture_evidence or {}).get("superseded_generation") if coverage is not None else None)
-    replay = block.get("replay") if isinstance(block, dict) else None
-    if not isinstance(replay, dict) or type(replay.get("through")) is not int:
+    block = (coverage.capture_evidence or {}).get("superseded_generation") if coverage is not None else None
+    if _replay_window(block) is None:
+        block = None
+        # Generation 1 never replaced an older generation; skip the lookup on
+        # the fleet's common path.
+        if generation > 1 and source_epoch_id is not None:
+            for evidence in session.scalars(select(ReconciliationCoverage.capture_evidence).where(
+                    ReconciliationCoverage.zkt_device_id == zkt_device_id,
+                    ReconciliationCoverage.terminal_generation == generation,
+                    ReconciliationCoverage.source_epoch_id == source_epoch_id,
+            ).order_by(ReconciliationCoverage.id)):
+                candidate = (evidence or {}).get("superseded_generation")
+                if _replay_window(candidate) is not None:
+                    block = candidate
+                    break
+    replay = _replay_window(block)
+    if replay is None:
         return None
     epoch = session.scalar(select(TerminalSourceEpoch).where(
         TerminalSourceEpoch.epoch_id == replay.get("source_epoch"),
@@ -2132,11 +2158,18 @@ def _retire_previous_generation(session, *, connector, job, coverage, sealed, cu
         # That coverage failed on its own evidence. Retire it the way a tail
         # divergence does: latched CRITICAL alert, its job INVALIDATED. This
         # job's coverage stands on its own complete ledger.
-        _invalidate_tail_coverage(
-            session, connector=connector, coverage=coverage, code=sealed["failure"],
-            message=(f"Generation {coverage.terminal_generation} source coverage {coverage.coverage_id} could not "
-                     f"be proven against this terminal's ledger ({sealed['failure']}) and was invalidated while "
-                     f"generation {job.terminal_generation} job {job.job_id} certified its own complete ledger."))
+        if sealed["failure"] == "TERMINAL_ATTENDANCE_COUNT_REGRESSED":
+            message = (f"The terminal reported {sealed['latest_terminal_count']} attendance records, fewer than the "
+                       f"{coverage.source_committed_cursor} its generation {coverage.terminal_generation} source "
+                       f"coverage {coverage.coverage_id} committed. That coverage was invalidated while generation "
+                       f"{job.terminal_generation} job {job.job_id} certified the {cutoff} records it proved; "
+                       "tails must still match the older ledger and reach its committed cursor.")
+        else:
+            message = (f"Generation {coverage.terminal_generation} source coverage {coverage.coverage_id} could not "
+                       f"be proven against this terminal's ledger ({sealed['failure']}) and was invalidated while "
+                       f"generation {job.terminal_generation} job {job.job_id} certified its own complete ledger.")
+        _invalidate_tail_coverage(session, connector=connector, coverage=coverage, code=sealed["failure"],
+                                  message=message)
     _event(session, job, "SOURCE_GENERATION_SUPERSEDED" if proven else "SOURCE_GENERATION_PREVIOUS_INVALIDATED",
            sealed)
     append_audit(
