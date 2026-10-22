@@ -117,12 +117,14 @@ minutes earlier.
 - A refused `queue_evidence` records why (`QUEUE_EVIDENCE_DIGEST_MISMATCH`,
   `_BASE64_INVALID`, `_LENGTH_INVALID`, `_IDENTITY_REUSED`,
   `_CONNECTOR_MISMATCH`, or the ADD-side category) and the copy's queue,
-  generation, record id, claimed digest and received digest. Never its bytes
-  or provenance. The device still gets the same `MESSAGE_REJECTED`.
+  generation, record id, claimed digest, and the received digest, size and
+  CRC-32. Never its bytes or provenance. The device still gets the same `MESSAGE_REJECTED`.
 - That entry stays open until ADD holds each refused copy:
   - the same identity with the claimed digest or the received digest; or
   - under another generation of the same queue (a re-blocked row), the
-    claimed digest, or the received digest with the same record id.
+    claimed digest, or the received digest with the same legacy record id
+    when that id ends with the CRC-32 of the bytes that arrived. Segmented
+    ids carry no CRC, so they never match this way.
   An acceptance from another lane, the same identity with other bytes, or
   another record whose bytes match what arrived does not hold it. Each hold
   is kept in `evidence_resolutions` with a finding (`COPY_INTACT`,

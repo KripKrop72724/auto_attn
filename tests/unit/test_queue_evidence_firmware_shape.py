@@ -777,29 +777,52 @@ def test_overlap_refusal_while_another_type_is_rejected_leaves_only_that_type(de
     assert hold(sessions, connector_pk)["last_error_code"] == "DEVICE_MESSAGE_REJECTED"
 
 
-def test_a_damaged_digest_is_held_by_the_reblocked_row_under_the_same_record_id(device_stream):
+@pytest.mark.parametrize("record_id", [
+    legacy_record_id(0, MALFORMED_ROW),  # outbox and ORDS legacy lanes: offset:crc
+    f"0:0:{zlib.crc32(MALFORMED_ROW)}",  # the blocked legacy lane, as MULTAN-02's 0:0:2915066926
+])
+def test_a_damaged_digest_is_held_by_the_reblocked_row_under_the_same_record_id(device_stream, record_id):
     """The digest, not the bytes, was damaged; the row is re-blocked under a new generation.
 
     The received digest names the record only with its record id, which for a
-    legacy lane carries the row's CRC-32.
+    legacy lane ends with the CRC-32 of the row (lq_peek) and so of what arrived.
     """
     sessions, connector_pk, connector_id = device_stream
-    first = legacy_payload(connector_id, MALFORMED_ROW, queue="blocked_legacy", generation=218, offset=0)
+    generation = f"{INSTANCE}-legacy-218"
+    first = firmware_payload(connector_id, "blocked_legacy", generation, record_id, MALFORMED_ROW, "LEGACY_RECOVERY")
     flipped = ("0" if first["payload_digest"][0] != "0" else "1") + first["payload_digest"][1:]
     refused(connector_pk, connector_id, {**first, "payload_digest": flipped}, 8)
+    _alert, entry = rejection_entry(sessions, connector_pk)
+    assert entry["pending"][0]["received_crc32"] == zlib.crc32(MALFORMED_ROW)
     # The same bytes at another record id of another generation are another record.
     held(connector_pk, connector_id, legacy_payload(
         connector_id, MALFORMED_ROW, queue="blocked_legacy", generation=300, offset=7), 9)
     alert, entry = rejection_entry(sessions, connector_pk)
     assert alert.state == "OPEN" and pending_identities(entry) == [identity(first)]
-    reblocked = legacy_payload(connector_id, MALFORMED_ROW, queue="blocked_legacy", generation=416, offset=0)
-    assert reblocked["record_id"] == first["record_id"]
+    reblocked = {**first, "queue_generation": f"{INSTANCE}-legacy-416"}
     held(connector_pk, connector_id, reblocked, 10)
     alert, entry = rejection_entry(sessions, connector_pk)
     assert entry is None and alert.state == "RESOLVED"
     [resolution] = alert.details["evidence_resolutions"]
     assert (resolution["held_as"]["queue_generation"], resolution["match"], resolution["finding"]) == (
         reblocked["queue_generation"], "SAME_BYTES", "DIGEST_CHANGED")
+
+
+def test_a_record_id_without_the_rows_crc_never_names_the_bytes_that_arrived(device_stream):
+    """Segmented ids (segment:offset:sequence) repeat across storage instances: no CRC, no hold."""
+    sessions, connector_pk, connector_id = device_stream
+    queue, generation, record_id, reason, serial = FIRMWARE_SHAPES["blocked_segmented"]
+    first = firmware_payload(connector_id, queue, generation, record_id, MALFORMED_ROW, reason, serial)
+    flipped = ("0" if first["payload_digest"][0] != "0" else "1") + first["payload_digest"][1:]
+    refused(connector_pk, connector_id, {**first, "payload_digest": flipped}, 8)
+    other_instance = generation.replace(INSTANCE, "f" * 32)
+    held(connector_pk, connector_id, {**first, "queue_generation": other_instance}, 9)
+    alert, entry = rejection_entry(sessions, connector_pk)
+    assert alert.state == "OPEN" and pending_identities(entry) == [identity(first)] and resolutions(alert) == []
+    # The device's own retry under the refused identity still holds it.
+    held(connector_pk, connector_id, first, 10)
+    alert, entry = rejection_entry(sessions, connector_pk)
+    assert entry is None and resolutions(alert) == [(record_id, "SAME_IDENTITY", "DIGEST_CHANGED")]
 
 
 def test_a_damaged_digest_overlapping_its_reblocked_row_is_resolved_at_once(device_stream):

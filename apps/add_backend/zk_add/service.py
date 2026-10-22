@@ -5919,7 +5919,8 @@ def _track_refused_evidence(session: Session, connector: Connector, entry: dict,
         return {**tracked, "untracked_refusals": untracked + 1}, None
     copy = {"queue": identity[0], "queue_generation": identity[1], "record_id": identity[2],
             "claimed_digest": evidence.get("claimed_digest"), "received_digest": evidence.get("received_digest"),
-            "received_bytes": evidence.get("received_bytes"), "reason": reason, "request_id": request_id}
+            "received_bytes": evidence.get("received_bytes"), "received_crc32": evidence.get("received_crc32"),
+            "reason": reason, "request_id": request_id}
     previous = next((item for item in pending
                      if all(item.get(name) == copy[name] for name in _COPY_KEY)), None)
     copy.update({"count": int((previous or {}).get("count") or 0) + 1,

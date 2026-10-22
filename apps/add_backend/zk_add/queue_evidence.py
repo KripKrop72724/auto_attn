@@ -7,6 +7,7 @@ import hmac
 import json
 import re
 import uuid
+import zlib
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -96,6 +97,8 @@ def refused_copy(payload: object) -> dict:
     digest (what arrived) show, once the honest copy is held, whether the
     bytes or the digest changed. Both are SHA-256 values of the kind ADD
     already lists for every held record (GET /devices/{id}/queue-evidence).
+    The CRC-32 of what arrived is checked against a legacy record id, which
+    ends with the CRC-32 of its row (lq_peek), to show those bytes are that row.
     """
     payload = payload if isinstance(payload, dict) else {}
     facts: dict = {}
@@ -105,7 +108,7 @@ def refused_copy(payload: object) -> dict:
                                 and re.fullmatch(pattern, value)) else None
     claimed = payload.get("payload_digest")
     facts["claimed_digest"] = claimed if isinstance(claimed, str) and re.fullmatch(DIGEST_PATTERN, claimed) else None
-    facts["received_digest"] = facts["received_bytes"] = None
+    facts["received_digest"] = facts["received_bytes"] = facts["received_crc32"] = None
     encoded = payload.get("raw_b64")
     if isinstance(encoded, str) and 4 <= len(encoded) <= MAX_RAW_B64:
         try:
@@ -115,6 +118,7 @@ def refused_copy(payload: object) -> dict:
         if raw is not None:
             facts["received_digest"] = hashlib.sha256(raw).hexdigest()
             facts["received_bytes"] = len(raw)
+            facts["received_crc32"] = zlib.crc32(raw)
     return facts
 
 
@@ -130,6 +134,19 @@ def _digest(value: object) -> str | None:
     return value if isinstance(value, str) and re.fullmatch(DIGEST_PATTERN, value) else None
 
 
+def _names_received_bytes(refused: dict) -> bool:
+    """Whether the refused copy's record id ends with the CRC-32 of the bytes that arrived.
+
+    Legacy-lane record ids are "offset:crc" or "0:offset:crc", where crc is
+    dq_crc32 (zlib's CRC-32) of exactly the row sent. Segmented and ORDS
+    segment ids ("segment:offset:sequence") carry no CRC and never match.
+    """
+    crc = refused.get("received_crc32")
+    record_id = refused.get("record_id")
+    return (type(crc) is int and isinstance(record_id, str) and ":" in record_id
+            and record_id.rsplit(":", 1)[1] == str(crc))
+
+
 def holds_refused_copy(refused: dict, held: dict | None) -> tuple[str, str] | None:
     """(match, finding) when the held record accounts for one refused copy, else None.
 
@@ -143,10 +160,11 @@ def holds_refused_copy(refused: dict, held: dict | None) -> tuple[str, str] | No
       the identity with other bytes proves nothing about this copy.
     - SAME_BYTES: ADD holds, under another generation of the same queue (a
       re-blocked row gets a new generation), the claimed digest, or the
-      received digest under the same record id. The received digest alone
+      received digest under the same record id when that record id names the
+      bytes that arrived (_names_received_bytes). The received digest alone
       says what arrived, not which record it was, so it may be another
-      record's bytes; with the record id too (a legacy record id carries the
-      row's CRC-32) it is the same record re-sent after its digest was damaged.
+      record's bytes; a record id that carries their CRC-32 shows they are
+      that record, re-sent after its digest was damaged.
 
     The finding says what was damaged: COPY_INTACT (nothing; ADD failed or
     refused for another reason), SENT_BYTES_CHANGED or DIGEST_CHANGED. A copy
@@ -164,7 +182,8 @@ def holds_refused_copy(refused: dict, held: dict | None) -> tuple[str, str] | No
     if held_identity == refused_identity and digest in {claimed, received}:
         match = "SAME_IDENTITY"
     elif (held_identity[0] == refused_identity[0] and held_identity[1] != refused_identity[1]
-          and (digest == claimed or (digest == received and held_identity[2] == refused_identity[2]))):
+          and (digest == claimed or (digest == received and held_identity[2] == refused_identity[2]
+                                     and _names_received_bytes(refused)))):
         match = "SAME_BYTES"
     else:
         return None
@@ -201,7 +220,7 @@ def find_held_copy(session: Session, connector: Connector,
             QueueEvidence.queue_generation != identity[1], QueueEvidence.payload_digest == claimed,
         ).order_by(QueueEvidence.id).limit(1)))
     received = _digest(refused.get("received_digest"))
-    if received is not None and received != claimed:
+    if received is not None and received != claimed and _names_received_bytes(refused):
         candidates.append(session.scalar(select(QueueEvidence).where(
             QueueEvidence.connector_id == connector.id, QueueEvidence.queue == identity[0],
             QueueEvidence.queue_generation != identity[1], QueueEvidence.record_id == identity[2],
