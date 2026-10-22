@@ -4852,6 +4852,14 @@ static void start_websocket(void)
          * closes under its lock and reconnects itself. */
         .enable_close_reconnect = true,
         .crt_bundle_attach = esp_crt_bundle_attach,
+#ifndef ZONE_LITE_HIKVISION
+        /* ZKT 2.7.7: every 2.7.3 to 2.7.5 device reported this task with
+         * about 740 B of the component's default 4 KiB left: it runs the TLS
+         * reads and handshakes and our event handler, which logs. Internal
+         * RAM (the component creates the task), allocated by each client
+         * start, after the delivery worker stacks are reserved. */
+        .task_stack = ADD_WEBSOCKET_TASK_STACK,
+#endif
     };
     s_client = esp_websocket_client_init(&config);
     if (!s_client) {

@@ -154,6 +154,8 @@ void add_connector_storage_ready(void);
 bool add_connector_repair_command_inbox(void);
 bool add_connector_command_inbox_merge_pending(void);
 bool add_connector_boot_health_ready(void);
+/* ZKT 2.7.7: the ADD WebSocket client's task stack (bytes). */
+#define ADD_WEBSOCKET_TASK_STACK 6144
 /* Exact ZKT bridge/writer local proof; never Oracle or remote HIL acceptance. */
 bool add_connector_local_boot_health_ready(void);
 const char *add_connector_local_boot_health_error(void);
