@@ -267,6 +267,20 @@ def test_unheld_queue_evidence_refusal_needs_review_however_old(db, fleet):
     rows = {item["alert_id"]: item for item in preview(client)["rows"]}
     assert (rows[row.id]["class"], rows[row.id]["default_selected"]) == ("REVIEW", False)
     assert "not yet held by ADD" in rows[row.id]["rationale"]
+    # The operator is told the 2.6.x path ADD cannot match: a row settled by ORDS delivery.
+    assert "delivered it to Oracle" in rows[row.id]["rationale"]
+
+
+def test_refusals_from_before_identity_tracking_keep_the_old_cleanup_rule(db, fleet):
+    row = fleet["rejection"]
+    old = (utc_now() - timedelta(days=3)).isoformat()
+    row.details = {"message_type": "queue_evidence", "types": {"queue_evidence": {
+        "category": "SCHEMA_INVALID", "count": 3, "first_at": old, "last_at": old, "boot_id": "earlier-boot",
+        "pending": [], "untracked_refusals": 0, "legacy_refusals": 3}}}
+    db.commit()
+    client, _headers = admin_client(db)
+    rows = {item["alert_id"]: item for item in preview(client)["rows"]}
+    assert (rows[row.id]["class"], rows[row.id]["default_selected"]) == ("CONDITION_CLEARED", True)
 
 
 def test_current_rejection_is_never_a_cleanup_candidate(db, fleet):

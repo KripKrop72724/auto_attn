@@ -50,7 +50,9 @@ from zk_add.attendance_batches import (
     review_attendance_quarantine,
     settle_attendance_batch,
 )
-from zk_add.queue_evidence import QueueEvidenceRequest, evidence_ack, preserve_queue_evidence, refused_copy
+from zk_add.queue_evidence import (
+    QueueEvidenceRequest, evidence_ack, held_record, preserve_queue_evidence, refused_copy,
+)
 from zk_add.models import QueueEvidence
 from zk_add.crypto import decrypt_json
 from zk_add.crypto import cnic_lookup, decrypt_cnic, decrypt_text, mask_cnic, normalize_cnic
@@ -4725,8 +4727,7 @@ def persist_envelope(connector_pk: int, envelope: Envelope) -> EnvelopeOutcome |
             evidence = preserve_queue_evidence(
                 db, connector, QueueEvidenceRequest.model_validate(envelope.payload)
             )
-            held_evidence = {"queue": evidence.queue, "queue_generation": evidence.queue_generation,
-                             "record_id": evidence.record_id, "payload_digest": evidence.payload_digest}
+            held_evidence = held_record(evidence)
             ack_payload = evidence_ack(evidence, connector, envelope.message_id)
             event_payload = {"connector_id": connector.connector_id,
                              "receipt_id": evidence.receipt_id, "disposition": evidence.disposition}

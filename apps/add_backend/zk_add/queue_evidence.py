@@ -17,6 +17,7 @@ from sqlalchemy.orm import Session
 
 from zk_add.crypto import encrypt_json
 from zk_add.models import Connector, QueueEvidence
+from zk_add.rejection import EvidenceRejected
 
 
 class EvidenceProvenance(BaseModel):
@@ -44,6 +45,13 @@ MAX_RECORD_BYTES = 8192
 BASE64_INVALID = "QUEUE_EVIDENCE_BASE64_INVALID"
 LENGTH_INVALID = "QUEUE_EVIDENCE_LENGTH_INVALID"
 DIGEST_MISMATCH = "QUEUE_EVIDENCE_DIGEST_MISMATCH"
+# preserve_queue_evidence() refusals of a copy whose bytes did verify.
+IDENTITY_REUSED = "QUEUE_EVIDENCE_IDENTITY_REUSED"
+CONNECTOR_MISMATCH = "QUEUE_EVIDENCE_CONNECTOR_MISMATCH"
+# The device and ADD disagree about what this record is: ADD already holds
+# other bytes or provenance under its identity. Nothing ADD accepts later can
+# show which one the device meant, so only an operator resolves it.
+OPERATOR_ONLY_REASONS = frozenset({IDENTITY_REUSED})
 
 
 def _identity_field(name: str):
@@ -118,9 +126,103 @@ def evidence_identity(facts: dict | None) -> tuple[str, str, str] | None:
     return identity if all(isinstance(part, str) and part for part in identity) else None
 
 
+def _digest(value: object) -> str | None:
+    return value if isinstance(value, str) and re.fullmatch(DIGEST_PATTERN, value) else None
+
+
+def holds_refused_copy(refused: dict, held: dict | None) -> tuple[str, str] | None:
+    """(match, finding) when the held record accounts for one refused copy, else None.
+
+    ``refused`` is a pending copy: its identity, the digest the ESP claimed and
+    the digest of the bytes that arrived. ``held`` is a record ADD holds: its
+    identity and verified payload_digest. Only two things show that ADD now
+    holds what the refused copy carried:
+
+    - SAME_IDENTITY: ADD holds that identity with the claimed digest (the bytes
+      the ESP hashed) or the received digest (the bytes that arrived). Holding
+      the identity with other bytes proves nothing about this copy.
+    - SAME_BYTES: ADD holds the claimed digest under another generation of the
+      same queue (a re-blocked row gets a new generation). Only the claimed
+      digest counts here: the received digest says what arrived, not which
+      record it was, so it may be another record's bytes.
+
+    The finding says what was damaged: COPY_INTACT (nothing; ADD failed or
+    refused for another reason), SENT_BYTES_CHANGED or DIGEST_CHANGED. A copy
+    whose bytes and digest both differ from the held record is never held.
+    """
+    if not isinstance(refused, dict) or not isinstance(held, dict):
+        return None
+    if refused.get("reason") in OPERATOR_ONLY_REASONS:
+        return None
+    refused_identity, held_identity = evidence_identity(refused), evidence_identity(held)
+    digest = _digest(held.get("payload_digest"))
+    claimed, received = _digest(refused.get("claimed_digest")), _digest(refused.get("received_digest"))
+    if refused_identity is None or held_identity is None or digest is None:
+        return None
+    if held_identity == refused_identity and digest in {claimed, received}:
+        match = "SAME_IDENTITY"
+    elif (held_identity[0] == refused_identity[0] and held_identity[1] != refused_identity[1]
+          and digest == claimed):
+        match = "SAME_BYTES"
+    else:
+        return None
+    if digest == claimed == received:
+        return match, "COPY_INTACT"
+    return match, "SENT_BYTES_CHANGED" if digest == claimed else "DIGEST_CHANGED"
+
+
+def held_record(row: QueueEvidence) -> dict:
+    """What a refused copy is matched against: never the bytes."""
+    return {"queue": row.queue, "queue_generation": row.queue_generation, "record_id": row.record_id,
+            "payload_digest": row.payload_digest, "receipt_id": row.receipt_id}
+
+
+def find_held_copy(session: Session, connector: Connector,
+                   refused: dict) -> tuple[dict, tuple[str, str]] | None:
+    """A record ADD already holds that accounts for a copy refused just now.
+
+    Sockets overlap on reconnect, so the honest copy can commit and be
+    acknowledged before the refusal of a damaged one is recorded; the device
+    then never sends that record again. The caller holds the connector lock,
+    as every acceptance does.
+    """
+    identity = evidence_identity(refused)
+    if identity is None or refused.get("reason") in OPERATOR_ONLY_REASONS:
+        return None
+    candidates = [session.scalar(select(QueueEvidence).where(
+        QueueEvidence.connector_id == connector.id, QueueEvidence.queue == identity[0],
+        QueueEvidence.queue_generation == identity[1], QueueEvidence.record_id == identity[2]))]
+    claimed = _digest(refused.get("claimed_digest"))
+    if claimed is not None:
+        candidates.append(session.scalar(select(QueueEvidence).where(
+            QueueEvidence.connector_id == connector.id, QueueEvidence.queue == identity[0],
+            QueueEvidence.queue_generation != identity[1], QueueEvidence.payload_digest == claimed,
+        ).order_by(QueueEvidence.id).limit(1)))
+    for row in candidates:
+        if row is not None:
+            held = held_record(row)
+            result = holds_refused_copy(refused, held)
+            if result is not None:
+                return held, result
+    return None
+
+
+def unheld_evidence(entry: object) -> tuple[int, int]:
+    """(refused copies ADD does not hold yet, refusals it cannot match) in one rejection entry.
+
+    Refusals recorded before identities were tracked (``legacy_refusals``)
+    are not counted: they keep the rule they were written under.
+    """
+    if not isinstance(entry, dict):
+        return 0, 0
+    pending = entry.get("pending")
+    return (len([item for item in pending if isinstance(item, dict)]) if isinstance(pending, list) else 0,
+            int(entry.get("untracked_refusals") or 0))
+
+
 def preserve_queue_evidence(session: Session, connector: Connector, request: QueueEvidenceRequest) -> QueueEvidence:
     if request.connector_id != connector.connector_id:
-        raise ValueError("Queue evidence connector ownership mismatch")
+        raise EvidenceRejected(CONNECTOR_MISMATCH, "Queue evidence connector ownership mismatch")
     provenance = request.provenance.model_dump()
     provenance_digest = hashlib.sha256(json.dumps(provenance, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     scope = select(QueueEvidence).where(
@@ -152,7 +254,8 @@ def preserve_queue_evidence(session: Session, connector: Connector, request: Que
                 raise
     if (existing.payload_digest != request.payload_digest or
             existing.provenance_digest != provenance_digest):
-        raise ValueError("Queue evidence identity was reused with different bytes or provenance")
+        raise EvidenceRejected(IDENTITY_REUSED,
+                               "Queue evidence identity was reused with different bytes or provenance")
     return existing
 
 

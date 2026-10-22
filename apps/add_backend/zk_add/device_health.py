@@ -20,6 +20,7 @@ from sqlalchemy.orm import Session
 
 from zk_add.hil_startup import PHASES as HIL_STARTUP_PHASES, STORAGE_COUNTERS, STORAGE_ERRORS
 from zk_add.models import Connector, DeviceAlert, DeviceTelemetry, ZKTDevice
+from zk_add.queue_evidence import OPERATOR_ONLY_REASONS, unheld_evidence
 from zk_add.settings import settings
 from zk_add.time_utils import ensure_utc, parse_datetime, utc_now
 
@@ -84,10 +85,13 @@ POLICY = {
         55, True, "POSITIVE", "Clears when the Hikvision terminal is online and its last check succeeded.",
         RULE),
     "DEVICE_MESSAGE_REJECTED": Policy(
-        60, True, "REJECTION", "Clears when ADD accepts the next message of each rejected type; a refused "
-        "queue_evidence clears only once ADD holds every record it refused.", RULE),
+        60, True, "REJECTION", "Clears when ADD accepts the next message of each rejected type. A refused "
+        "queue_evidence clears only once ADD holds each refused copy's bytes; an identity conflict, an "
+        "unreadable or over-limit refusal, or a record the device settled another way (such as a 2.6.x ORDS "
+        "delivery) needs an operator to verify the device and resolve it.", RULE),
     "ADD_MESSAGE_PROCESSING_FAILED": Policy(
-        65, False, "REJECTION", "Clears when ADD processes the next message of each failed type.", RULE),
+        65, False, "REJECTION", "Clears when ADD processes the next message of each failed type; a "
+        "queue_evidence clears only once ADD holds each copy it could not process.", RULE),
     "HIK_LIGHT_RECONCILE_BLOCKED": Policy(
         70, True, "POSITIVE", "Clears when the Hikvision history audit is scanning or complete.", WARNING),
     "OTA_DEVICE_ROLLED_BACK": Policy(
@@ -519,18 +523,14 @@ def _rejection_entries(row: DeviceAlert) -> dict[str, dict]:
         "first_at": row.first_seen_at, "last_at": row.last_seen_at}}
 
 
-def unheld_evidence(entry: object) -> tuple[int, int]:
-    """(refused records ADD does not hold yet, refusals it cannot match)."""
-    if not isinstance(entry, dict):
-        return 0, 0
-    pending = entry.get("pending")
-    return (len([item for item in pending if isinstance(item, dict)]) if isinstance(pending, list) else 0,
-            int(entry.get("untracked_refusals") or 0))
-
-
 def _unheld_summary(entry: dict) -> str:
     pending, untracked = unheld_evidence(entry)
-    parts = ([f"{pending} refused record{'s' if pending != 1 else ''} not yet held"] if pending else []) + (
+    conflicts = len([item for item in entry.get("pending") or [] if isinstance(item, dict)
+                     and item.get("reason") in OPERATOR_ONLY_REASONS])
+    conflict_note = " (1 is an identity conflict)" if conflicts == 1 else (
+        f" ({conflicts} are identity conflicts)" if conflicts else "")
+    parts = ([f"{pending} refused record{'s' if pending != 1 else ''} not yet held{conflict_note}"]
+             if pending else []) + (
         [f"{untracked} unmatched refusal{'s' if untracked != 1 else ''}"] if untracked else [])
     return "; " + ", ".join(parts) if parts else ""
 
