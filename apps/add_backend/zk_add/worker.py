@@ -62,6 +62,7 @@ from zk_add.service import (
     upsert_alert,
 )
 from zk_add.attendance_recovery import advance_attendance_recovery_jobs
+from zk_add.checkin_notify import note_delivered_cnic
 from zk_add.device_health import apply_device_health
 from zk_add.settings import settings
 from zk_add.time_utils import ensure_utc, utc_now
@@ -387,6 +388,7 @@ async def _safe_attendance_repair_loop(stop: asyncio.Event) -> None:
 
 
 async def maintenance_loop(stop: asyncio.Event) -> None:
+    from zk_add.checkin_notify import notify_loop
     from zk_add.zkt_custody_runtime import run_custody_processor
 
     tasks = [
@@ -396,6 +398,7 @@ async def maintenance_loop(stop: asyncio.Event) -> None:
         asyncio.create_task(_ords_audit_loop(stop)),
         asyncio.create_task(_attendance_repair_loop(stop)),
         asyncio.create_task(_safe_attendance_repair_loop(stop)),
+        asyncio.create_task(notify_loop(stop, publish=browser_events.publish)),
     ]
     try:
         await stop.wait()
@@ -1645,6 +1648,7 @@ def apply_ords_confirmation(
     *,
     claimed_id: int,
     path: str,
+    delivered_cnic: str | None = None,
 ) -> None:
     row = session.get(OrdsOutbox, claimed_id)
     if row is None:
@@ -1653,6 +1657,8 @@ def apply_ords_confirmation(
     event = session.get(AttendanceEvent, row.attendance_event_id) if row.attendance_event_id else None
     if event and not generic_confirmation_allowed(session, event):
         return
+    if event is not None:
+        note_delivered_cnic(session, event.id, delivered_cnic)
     confirmed_at = utc_now()
     row.status = "ACKED_CHECK"
     row.acknowledged_at = confirmed_at
@@ -1730,6 +1736,7 @@ def apply_ords_delivery_result(
     body: object,
     transport_error: str | None,
     response_parsed: bool,
+    delivered_cnic: str | None = None,
 ) -> None:
     row = session.get(OrdsOutbox, claimed_id)
     if row is None:
@@ -1752,6 +1759,10 @@ def apply_ords_delivery_result(
         row.next_attempt_at = None
         row.last_error = None
         if event:
+            # Only Oracle's acceptance of THIS request proves it stored this
+            # CNIC; 409 "already exists" may hold an earlier copy's CNIC.
+            if status in {200, 201}:
+                note_delivered_cnic(session, event.id, delivered_cnic)
             event.ords_status = "ACKED"
             event.oracle_confirmed_at = confirmed_at
             event.oracle_confirmation_path = "ADD_DELIVERY"
@@ -1823,12 +1834,19 @@ def apply_ords_batch_results(
     membership_failure: tuple[int | None, str | None, bool] | None,
     results: list[tuple[int, int, int | None, object, str | None, bool]],
 ) -> None:
+    # The CNIC each claim sent (or would have sent) to Oracle. A membership
+    # confirmation only proves the punch ID exists, so there it is evidence
+    # for "CNIC uncertain", never a different CNIC to notify.
+    delivered = {
+        claim[0]: claim[1].get("cnic") if isinstance(claim[1], dict) else None for claim in claims
+    }
     with session_scope() as session:
         for claimed_id in confirmed_claim_ids:
             apply_ords_confirmation(
                 session,
                 claimed_id=claimed_id,
                 path="ORDS_MEMBERSHIP_CHECK",
+                delivered_cnic=delivered.get(claimed_id),
             )
         if membership_failure is not None:
             failure_status, failure_error, failure_parsed = membership_failure
@@ -1848,6 +1866,7 @@ def apply_ords_batch_results(
                 body=body,
                 transport_error=error,
                 response_parsed=parsed,
+                delivered_cnic=delivered.get(row_id),
             )
 
 
