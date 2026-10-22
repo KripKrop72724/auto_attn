@@ -42,7 +42,7 @@ STARTUP_PHASES = frozenset(HIL_STARTUP_PHASES - {"READY"}) | {"BRIDGE_VALIDATION
 WORKFLOW_OWNED_CODES = frozenset({
     "ADMIN_REVOKE_OVERDUE", "ATTENDANCE_EVENT_QUARANTINED", "ATTENDANCE_REPAIR_NEEDS_ATTENTION",
     "ATTENDANCE_REPAIR_STALLED", "ORDS_DELIVERY_FAILED", "DUPLICATE_USER_CNIC",
-    "ORACLE_RECEIPT_CONNECTOR_MISMATCH", "HISTORY_BACKFILL_BLOCKED",
+    "ORACLE_RECEIPT_CONNECTOR_MISMATCH", "HISTORY_BACKFILL_BLOCKED", "CHECKIN_NOTIFY_DEGRADED",
 })
 DIAGNOSTICS_CODES = ("ESP_DURABILITY_FAULT", "ESP_DELIVERY_WORKER_FAULT")
 
@@ -114,6 +114,8 @@ POLICY = {
         104, False, "POSITIVE", "Clears when history backfill is running or complete."),
     "ORDS_DELIVERY_FAILED": Policy(105, False, "LATCHED", "Clears when Oracle delivery succeeds."),
     "ORDS_EVENT_REJECTED": Policy(105, False, "LATCHED", "Clears through the Oracle rejection review."),
+    "CHECKIN_NOTIFY_DEGRADED": Policy(
+        105, False, "LATCHED", "Clears when employee check-in notifications are delivered again."),
     "ATTENDANCE_EVENT_QUARANTINED": Policy(
         106, False, "LATCHED", "Clears when the quarantined attendance events are released."),
     "ATTENDANCE_TIMESTAMP_QUARANTINED": Policy(
