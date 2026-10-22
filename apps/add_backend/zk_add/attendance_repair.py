@@ -2094,10 +2094,10 @@ def _attach_source_dependency(
             ReconciliationJob.status.not_in(RECONCILIATION_TERMINAL_STATES),
         )
     )
-    if (active is not None and active.status == "NEEDS_ATTENTION"
-            and active.error_code in COVERAGE_FINALISATION_HOLDS):
-        # Sealing this job is held on committed source evidence; waiting on it
-        # cannot certify the repair's source. An operator retries or cancels it.
+    if active is not None and active.error_code in COVERAGE_FINALISATION_HOLDS:
+        # Sealing this job is held on committed source evidence (a paused job
+        # keeps that code); waiting on it cannot certify the repair's source.
+        # An operator retries or cancels it.
         raise RepairError(
             f"The device's source reconciliation {active.job_id} is held ({active.error_code}); "
             "retry or cancel it before preparing a repair.",

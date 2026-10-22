@@ -126,6 +126,10 @@ POLICY = {
         108, False, "LATCHED", "Clears through a source coverage review."),
     "ADD_SOURCE_GENERATION_LINEAGE_DIVERGED": Policy(
         108, False, "LATCHED", "Clears through a source coverage review."),
+    "ADD_SOURCE_COVERAGE_UNVERIFIED": Policy(
+        108, False, "LATCHED", "Clears through a source coverage review."),
+    "ADD_SOURCE_TAIL_STALE_GENERATION": Policy(
+        108, False, "POSITIVE", "Clears when ADD commits a tail in the current coverage generation."),
     "TERMINAL_SOURCE_EXCEPTION": Policy(108, False, "LATCHED", "Clears through a source exception review."),
     "USER_DELETION_JOB_INCOMPLETE": Policy(
         109, False, "LATCHED", "Clears when the user deletion job completes."),
