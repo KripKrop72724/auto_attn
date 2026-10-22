@@ -1166,10 +1166,29 @@ def update_heartbeat(
             elif audit and audit.state in {"SCANNING", "COMPLETE"}:
                 resolve_alert(session, connector, code="HIK_LIGHT_RECONCILE_BLOCKED")
             clock = payload.terminal.clock_sample if payload.terminal else None
+            # The sample's sampled_epoch is the ESP's own clock. The envelope's
+            # sent_at uses that clock too, so ADD's receive time measures the
+            # ESP's error. Re-base the sample on ADD time when the ESP is off by
+            # more than two minutes; otherwise an ESP that is 77 minutes slow
+            # reads as a terminal that is 77 minutes fast (LF-ZONE-BLD1-01).
+            from zk_add.hikvision_clock import esp_clock_offset_seconds
+            esp_offset = esp_clock_offset_seconds(now, device_sent_at)
+            zkt_payload["esp_clock_offset_seconds"] = esp_offset
+            sampled_epoch = (clock.sampled_epoch + (esp_offset if esp_offset is not None and abs(esp_offset) > 120
+                                                    else 0)) if clock else None
+            if esp_offset is not None and abs(esp_offset) > 120:
+                upsert_alert(
+                    session, connector, code="ESP_CLOCK_SKEW", severity="WARNING",
+                    message=("The ESP clock differs from ADD time by more than two minutes; terminal clock "
+                             "checks are corrected for it. Do not change the terminal clock for this."),
+                    details={"esp_offset_seconds": esp_offset},
+                )
+            elif esp_offset is not None:
+                resolve_alert(session, connector, code="ESP_CLOCK_SKEW")
             # A missing/stale sample must not leave the previous clock looking live.
-            if clock and 0 <= now.timestamp() - clock.sampled_epoch <= 180:
+            if clock and 0 <= now.timestamp() - sampled_epoch <= 180:
                 zkt_payload["device_time"] = datetime.fromtimestamp(clock.device_epoch, timezone.utc).isoformat()
-                zkt_payload["device_time_sampled_at"] = datetime.fromtimestamp(clock.sampled_epoch, timezone.utc).isoformat()
+                zkt_payload["device_time_sampled_at"] = datetime.fromtimestamp(sampled_epoch, timezone.utc).isoformat()
             else:
                 zkt.sampled_device_time = None
                 zkt.device_time_sampled_at = None

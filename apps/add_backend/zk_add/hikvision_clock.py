@@ -2,6 +2,8 @@
 from datetime import datetime
 from pydantic import BaseModel, Field
 
+from zk_add.time_utils import ensure_utc
+
 
 class HikvisionClockSample(BaseModel):
     device_epoch: int = Field(ge=1_577_836_800, le=4_102_444_799, strict=True)
@@ -22,3 +24,14 @@ def clock_evidence(sample: HikvisionClockSample | None, event_time: datetime,
         return "UNKNOWN", None
     drift = sample.drift_seconds
     return ("OK" if abs(drift) <= 120 else "DRIFTED"), drift
+
+
+def esp_clock_offset_seconds(received_at: datetime, sent_at: datetime | None) -> int | None:
+    """ADD receive time minus the ESP's own envelope time; positive means the ESP is slow.
+
+    Only an envelope built at send time (a heartbeat) measures the ESP clock.
+    """
+    if sent_at is None:
+        return None
+    offset = (ensure_utc(received_at) - ensure_utc(sent_at)).total_seconds()
+    return int(round(offset)) if abs(offset) <= 366 * 86400 else None
