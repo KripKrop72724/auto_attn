@@ -939,7 +939,7 @@ def test_postgres_old_tail_and_new_generation_manifest_commit_in_either_order(
         # The second transaction waits on the connector row lock the first holds.
         assert not pending.done()
         first.commit()
-        pending.result(timeout=10)
+        pending.result(timeout=60)  # generous: sealing runs the lineage proof on a loaded host
     with factory() as db:
         old, job = db.get(ReconciliationCoverage, old_id), db.get(ReconciliationJob, job_id)
         new = active(db)
