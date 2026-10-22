@@ -1039,6 +1039,32 @@ def test_suspect_cnic_raises_alert_and_operator_cnic_cleans_name(db):
     assert alert.state != "OPEN"
 
 
+def test_cleaning_a_suspect_name_keeps_its_shift_worker_marker(db):
+    """Correctness 6: "Ali-S-A4230111028815" must not silently lose its -S marker."""
+    from zk_add.web import serialize_user
+
+    assert suspect_cnic_name("Ali Khan-S-42301-1102881-5").shift_worker is True
+    assert suspect_cnic_name("A.Saleem-A4230111028815").shift_worker is False
+    db.autoflush = False
+    connector = connector_fixture(db)
+    make_writable(connector)
+    snapshot_names(db, connector, [("57", "04050", "Ali-S-A4230111028815")])
+    ali = db.scalar(select(DeviceUser).where(DeviceUser.user_id == "04050"))
+    assert ali.shift_worker is False  # the unparsed name never set the flag
+    shown = serialize_user(ali, zkt=connector.zkt_device)
+    assert shown["suggested_display_name"] == "Ali" and shown["suggested_shift_worker"] is True
+    command = update_device_user_command(
+        db, connector=connector, user=ali,
+        display_name="Ali-S-A4230111028815", cnic="4230111028815",
+        shift_worker=False, privilege=0, expected_version=ali.row_version,
+        idempotency_key="ali-shift-marker-kept", actor="StateHealthAdmin",
+    )
+    wire = serialize_command(command)
+    assert wire["desired_state"]["display_name"] == "Ali"
+    assert wire["desired_state"]["shift_worker"] is True
+    assert wire["payload"]["name"] == "Ali-S-4230111028815"
+
+
 def queue_current(sessions, event_id, key):
     """Approve today's CNIC for a punch with no record, and queue it (decision saved)."""
     with sessions() as db:

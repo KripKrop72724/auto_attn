@@ -193,3 +193,73 @@ def test_invalid_clock_approval_is_quarantined_under_postgres_guards(dump_row):
 
 def engine_begin(sessions):
     return sessions.kw["bind"].begin()
+
+
+def test_automatic_release_takes_over_a_stopped_direct_approval_under_postgres_guards(dump_row):
+    """The installed hold triggers let ADD's own release deliver once a direct approval stopped.
+
+    The stopped approval is never replaced afterwards: ADD's release owns the punch.
+    """
+    from zk_add.crypto import cnic_lookup, encrypt_cnic
+    from zk_add.service import release_synced_cnic_attendance_event
+
+    sessions, engine, event_id = dump_row
+    apply(engine, "20261012_0053_reconciled_record_uid_sources.py")
+    with sessions() as db:
+        direct.create(db, actor="operator", request=start(event_id, "takeover", send_now=True))
+        db.commit()
+    with sessions() as db:
+        direct.advance_once(db)
+        db.commit()
+        assert db.scalar(select(Decision)) is not None
+    corrected = "3520255555551"
+    with sessions() as db:
+        # HR corrects today's CNIC; the retained record at the punch time agrees.
+        event = db.get(AttendanceEvent, event_id)
+        user = db.get(DeviceUser, event.device_user_id)
+        user.cnic_encrypted, user.cnic_lookup_hash = encrypt_cnic(corrected), cnic_lookup(corrected)
+        # The fixture's interval across the dump punch (the newest record).
+        record = db.scalars(select(AttendanceIdentityHistory).order_by(AttendanceIdentityHistory.id.desc())).first()
+        record.cnic_encrypted, record.cnic_lookup_hash = user.cnic_encrypted, user.cnic_lookup_hash
+        db.commit()
+    with sessions() as db:
+        event = db.get(AttendanceEvent, event_id)
+        connector = db.get(Connector, event.connector_id)
+        assert direct.approved_payload(db, event, connector, db.scalar(select(Decision))) is None
+    assert delivery.split_claims(worker.claim_ords_batch(5)) == ([], [])
+    with sessions() as db:
+        event = db.get(AttendanceEvent, event_id)
+        assert event.ords_status == "BLOCKED_IDENTITY"
+        zkt = db.get(Connector, event.connector_id).zkt_device
+        user = db.get(DeviceUser, event.device_user_id)
+        assert release_synced_cnic_attendance_event(db, zkt=zkt, user=user, row=event)
+        db.commit()
+    normal, forced = delivery.split_claims(worker.claim_ords_batch(5))
+    assert forced == [] and len(normal) == 1
+    assert normal[0][1]["cnic"] == corrected
+    with sessions() as db:
+        assert db.scalar(select(OrdsOutbox)).status == "IN_FLIGHT"
+        row = direct.preview(db, [event_id])["rows"][0]
+        assert row["exclusion"] == "ALREADY_DELIVERING" and row["replaces_stopped_approval"] is False
+
+
+def test_pre_lock_checks_and_locked_recheck_agree_under_postgres(dump_row):
+    """The automatic-release answer computed before the locks is reused only while unchanged."""
+    sessions, engine, event_id = dump_row
+    apply(engine, "20261012_0053_reconciled_record_uid_sources.py")
+    calls = []
+    real = direct.auto_release_preview
+
+    def counted(*args, **kwargs):
+        calls.append(1)
+        return real(*args, **kwargs)
+
+    direct.auto_release_preview = counted
+    try:
+        with sessions() as db:
+            direct.create(db, actor="operator", request=start(event_id, "pre-lock"))
+            db.commit()
+            assert db.scalar(select(Item)).error_code == "AUTO_RELEASE_PENDING"
+    finally:
+        direct.auto_release_preview = real
+    assert len(calls) == 1  # computed once, before the scheduler lock

@@ -44,6 +44,11 @@ def main() -> None:
         request_properties(spec, "/api/v2/attendance-direct-ords", "post")
     )
     assert {"event_ids"}.issubset(request_properties(spec, "/api/v2/attendance-direct-ords/preview", "post"))
+    # Each CNIC choice is bound to the evidence the dialog showed, and a
+    # punch-time CNIC another active user holds needs its own confirmation.
+    choice = spec["components"]["schemas"]["DirectOrdsCnicChoice"]
+    assert {"event_id", "choice", "evidence_digest", "held_by_other_confirmed"}.issubset(choice["properties"])
+    assert {"event_id", "choice", "evidence_digest"}.issubset(choice["required"])
     assert "get" in paths["/api/v1/device-health/shadow"]
     assert {"connector_ids"}.issubset(request_properties(spec, "/api/v1/device-health/cleanup/preview", "post"))
     assert {"connector_ids", "digest", "expires_at", "signature", "alert_ids", "error_fix_connector_ids", "reason",
