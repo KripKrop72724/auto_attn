@@ -100,23 +100,27 @@ minutes earlier.
   that the other OTA slot holds a qualified predecessor. Any 2.7.x download
   writes that slot, so every later 2.6.15 boot reports
   `STORAGE_DIRECT_ROLLBACK_IMAGE_UNQUALIFIED`, never runs its persistence
-  probe and reports DEGRADED until a 2.7.x install succeeds. Zero I/O counters
-  on such a boot are therefore not a passed probe. `ESP_DURABILITY_FAULT` and
-  `ESP_LOCAL_FAILURE` get error code `OTA_ROLLBACK_SLOT_RESIDUE`
-  ("persistence unverified - OTA rollback slot residue ... persistence probe
-  not run") only when all of these hold: firmware 2.6.15 with application
-  digest `832c0c3d...`, LED source exactly `zone_lite.c:3196` (and no later
-  source), that upgrade error, `recovery_complete` true, every write, read,
-  probe and legacy counter 0, no error code or operation and no fault class on
-  this boot; no storage I/O fault in the last reported counters of any earlier
-  boot in the last 14 days; and ADD's own record that a 2.7.x deployment wrote
-  bytes after this ESP's last successful 2.6.15 install (a connector row is one
-  ESP: a replacement is a new connector). Its tier follows the latched-LED
-  policy: `2.6.15:zone_lite.c:3196` is in the default
-  `ADD_DEVICE_HEALTH_LATCHED_LED_SOURCES`, so it is shown at
-  `ADD_DEVICE_HEALTH_LATCHED_LED_TIER` (WARNING); remove it to keep DEGRADED.
-  Any I/O failure removes the latch. Holds are unchanged: the alert stays open
-  and gating.
+  probe and reports DEGRADED until a 2.7.x install succeeds. ADD names that
+  cause but keeps the tier DEGRADED: zero I/O counters on such a boot are not
+  a passed probe, 2.6.15 reports only the first latch's source (a later
+  `LOCAL_FAILURE` on the same boot is invisible), and its legacy-queue reads
+  and writes can fail without touching the counters. `ESP_DURABILITY_FAULT`
+  and `ESP_LOCAL_FAILURE` get error code `OTA_ROLLBACK_SLOT_RESIDUE`
+  ("persistence unverified - OTA rollback slot residue ... the persistence
+  probe did not run") only when all of these hold: firmware 2.6.15 with
+  application digest `832c0c3d...`, LED source exactly `zone_lite.c:3196`
+  (and no later source reported), that upgrade error, `recovery_complete`
+  true, every write, read, probe and legacy counter 0, no error code or
+  operation and no fault class on this boot; no storage I/O fault in the
+  last reported counters of any earlier boot in the last 14 days; and ADD's
+  own record that a 2.7.x deployment wrote bytes after this ESP's last
+  successful 2.6.15 install (a connector row is one ESP: a replacement is a
+  new connector). Any I/O failure removes the label. The latched-LED policy
+  (`ADD_DEVICE_HEALTH_LATCHED_LED_SOURCES`) does not apply to it, tiers and
+  holds are unchanged, and the alert stays open and gating. An ESP with an
+  I/O fault on an earlier boot in the window (MULTAN-02 had EIO write
+  failures on 15 October) shows the generic durability fault until that boot
+  is 14 days old.
 - **Interrupted target boot.** For a 2.6.0-2.6.15 ESP, a return to the
   previous firmware is labelled `TARGET_BOOT_INTERRUPTED` (error code
   `OTA_TARGET_BOOT_INTERRUPTED`) when the new image never reported
