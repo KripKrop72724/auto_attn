@@ -281,6 +281,120 @@ def test_dump_guard_admits_only_a_retained_interval_release(force_pg):
         assert event.ords_status == "PENDING" and not event.manual_release_required
 
 
+def _proposed_synced(conn, event_id, user_id):
+    """add_auto_synced_cnic_verified's verdict on the release the application would write."""
+    return conn.execute(text("""
+        SELECT add_auto_synced_cnic_verified(jsonb_populate_record(
+          NULL::add_attendance_events,
+          to_jsonb(e) || jsonb_build_object(
+            'device_user_id', u.id,
+            'identity_snapshot_id', z.identity_snapshot_id,
+            'identity_resolution_status', 'RESOLVED_SYNCED_CNIC',
+            'identity_repair_reason', 'VERIFIED_SYNCED_CNIC',
+            'cnic_lookup_hash', u.cnic_lookup_hash,
+            'cnic_encrypted', u.cnic_encrypted)))
+        FROM add_attendance_events e
+        JOIN add_device_users u ON u.id = :user_id
+        JOIN add_zkt_devices z ON z.id = e.zkt_device_id
+        WHERE e.id = :event_id
+    """), {"event_id": event_id, "user_id": user_id}).scalar()
+
+
+OTHER_HOLDER = "UPDATE add_attendance_identity_history SET cnic_lookup_hash = repeat('0', 64)"
+CAPTURED_CNIC_CASES = {
+    # (statement after the punch-time interval names another CNIC, verdict)
+    "punch_time_interval_names_another_cnic": ("", False),
+    "that_interval_is_revoked": ("UPDATE add_attendance_identity_history SET revoked = true", True),
+    "that_interval_has_no_cnic": (
+        "UPDATE add_attendance_identity_history SET cnic_lookup_hash = NULL", True
+    ),
+    "that_interval_ends_before_the_punch": (
+        "UPDATE add_attendance_identity_history "
+        "SET observed_until = observed_from + INTERVAL '1 minute'", True
+    ),
+    # A live capture carries the punch-time CNIC itself.
+    "live_capture": ("UPDATE add_attendance_events SET source = 'LIVE'", True),
+}
+
+
+def test_captured_cnic_guard_refuses_a_pre_26_record_of_a_reassigned_user_id(force_pg):
+    """Safety review: 2.4.12/2.5.2 fill a dump record's CNIC from the user table
+    when they read the log, so after user ID 1007 changed hands the record
+    carries the new holder's CNIC. A punch-time interval naming another CNIC
+    must keep it held, in the application and in the database guard."""
+    sessions, _, _ = force_pg
+    engine = sessions.kw["bind"]
+    event_id, user_id = _held_dump(sessions)
+    with engine.begin() as conn:
+        conn.execute(text("""
+            UPDATE add_attendance_events e SET captured_cnic_lookup_hash = u.cnic_lookup_hash
+            FROM add_device_users u WHERE e.id = :event_id AND u.id = :user_id
+        """), {"event_id": event_id, "user_id": user_id})
+    for filename in EARLIER_GUARDS:
+        _apply(engine, filename)
+    with engine.connect() as conn:
+        assert _proposed_synced(conn, event_id, user_id) is True
+        conn.execute(text(OTHER_HOLDER))
+        # Before 0056 the guard admitted the other holder's punch.
+        assert _proposed_synced(conn, event_id, user_id) is True
+        conn.rollback()
+
+    _apply(engine, DUMP_GUARD)
+    with engine.connect() as conn:
+        assert _proposed_synced(conn, event_id, user_id) is True  # same CNIC at punch time
+    for name, (statement, verdict) in CAPTURED_CNIC_CASES.items():
+        with engine.connect() as conn:
+            conn.execute(text(OTHER_HOLDER))
+            if statement:
+                conn.execute(text(statement))
+            assert _proposed_synced(conn, event_id, user_id) is verdict, name
+            conn.rollback()
+
+    with engine.begin() as conn:
+        conn.execute(text(OTHER_HOLDER))
+    with sessions() as db:
+        event = db.get(AttendanceEvent, event_id)
+        connector = db.get(Connector, event.connector_id)
+        zkt, user = connector.zkt_device, db.get(DeviceUser, user_id)
+        assert not synced_cnic_identity_proven(
+            db, connector, zkt, user, event, allow_reconcile_batch=True
+        )
+        assert release_synced_cnic_attendance(
+            db, zkt=zkt, user=user,
+            dump_release=DumpIdentityRelease(held_since=None, remaining=10),
+        ) == 0
+        db.commit()
+        assert db.get(AttendanceEvent, event_id).ords_status == "BLOCKED_IDENTITY"
+    # The trigger: a raw release of that punch cannot reach delivery either.
+    with pytest.raises(DBAPIError, match="explicit administrator approval"):
+        with engine.begin() as conn:
+            conn.execute(text("""
+                UPDATE add_attendance_events e SET ords_status = 'PENDING',
+                  manual_release_required = false, device_user_id = u.id,
+                  identity_snapshot_id = z.identity_snapshot_id,
+                  identity_resolution_status = 'RESOLVED_SYNCED_CNIC',
+                  identity_repair_reason = 'VERIFIED_SYNCED_CNIC',
+                  cnic_lookup_hash = u.cnic_lookup_hash, cnic_encrypted = u.cnic_encrypted
+                FROM add_device_users u, add_zkt_devices z
+                WHERE e.id = :event_id AND u.id = :user_id AND z.id = e.zkt_device_id
+            """), {"event_id": event_id, "user_id": user_id})
+
+    with engine.begin() as conn:
+        conn.execute(text(
+            "UPDATE add_attendance_identity_history h SET cnic_lookup_hash = u.cnic_lookup_hash "
+            "FROM add_device_users u WHERE u.id = :user_id"
+        ), {"user_id": user_id})
+    with sessions() as db:
+        zkt = db.get(Connector, db.get(AttendanceEvent, event_id).connector_id).zkt_device
+        assert release_synced_cnic_attendance(
+            db, zkt=zkt, user=db.get(DeviceUser, user_id),
+        ) == 1
+        db.commit()
+    with sessions() as db:
+        event = db.get(AttendanceEvent, event_id)
+        assert event.ords_status == "PENDING" and not event.manual_release_required
+
+
 def _snapshot(db, connector, key, observed_at):
     replace_user_snapshot(
         db, connector=connector,

@@ -64,6 +64,7 @@ from zk_add.schemas import (
 from zk_add.service import (
     DumpIdentityRelease,
     dump_release_outlook,
+    synced_cnic_proof_kind,
     ingest_attendance,
     release_synced_cnic_attendance_event,
     replace_user_snapshot,
@@ -93,7 +94,10 @@ def auto_zone(monkeypatch):
     )
 
 
-def _snapshot(db, connector, key, observed_at, *, cnic=CNIC, stable=True):
+def _snapshot(db, connector, key, observed_at, *, cnic=CNIC, stable=True, state=False):
+    """state: send the per-user state fingerprint, which every firmware
+    generation derives from the user record including its name (and CNIC);
+    a string also stands for another state field, such as the privilege."""
     replace_user_snapshot(
         db, connector=connector,
         snapshot=UserSnapshotRequest(
@@ -101,6 +105,10 @@ def _snapshot(db, connector, key, observed_at, *, cnic=CNIC, stable=True):
             users=[UserSnapshotRow(
                 uid="69", user_id="11", name=f"Synced Employee-{cnic}",
                 terminal_identity_fingerprint=FP,
+                terminal_state_fingerprint=(
+                    hashlib.sha256(f"{cnic}{'' if state is True else state}".encode()).hexdigest()
+                    if state else None
+                ),
             )],
         ),
     )
@@ -396,6 +404,68 @@ def test_cnic_changed_after_the_punch_keeps_the_punch_time_identity(db, auto_zon
     # The punch-time interval exists, but its CNIC is not the current one.
     assert evidence is not None and evidence.cnic_hash == histories[0].cnic_lookup_hash
     assert row.ords_status == "BLOCKED_IDENTITY" and row.cnic_lookup_hash is None
+
+
+@pytest.mark.parametrize("source", ["DUMP_RECONNECT", "FULL_HISTORY", "RECONCILE_15M"])
+@pytest.mark.parametrize("reassigned", [True, False])
+def test_a_pre_26_record_never_takes_the_new_holders_cnic(db, source, reassigned):
+    """Safety review: 2.4.12/2.5.2 fill a dump or reconcile record's CNIC from
+    the user table when they read the log. If user 11 changed hands since the
+    punch, that captured CNIC is the new holder's and the punch stays held."""
+    connector = _connector(db)
+    now = utc_now()
+    later_cnic = OTHER_CNIC if reassigned else CNIC
+    # Otherwise the same holder's privilege changed: the roster still changed
+    # after the punch, so ingest holds the dump either way.
+    later_state = True if reassigned else "privilege"
+    _snapshot(db, connector, "s0", now - timedelta(minutes=60), state=True)
+    _snapshot(db, connector, "s1", now - timedelta(minutes=45), state=True)
+    _snapshot(db, connector, "s2", now - timedelta(minutes=30), cnic=later_cnic, state=later_state)
+    incoming = _dump(
+        f"pre26-{source}", now - timedelta(minutes=55), now - timedelta(minutes=1),
+        source=source,
+    ).model_copy(update={"raw_name": f"Synced Employee-{later_cnic}"})
+    row = _ingest_held(db, connector, incoming)
+    assert row.captured_cnic_lookup_hash is not None
+    _snapshot(db, connector, "s3", utc_now(), cnic=later_cnic, state=later_state)
+    user = db.scalar(select(DeviceUser).where(DeviceUser.user_id == "11"))
+    if reassigned:
+        assert row.ords_status == "BLOCKED_IDENTITY" and row.cnic_lookup_hash is None
+        assert synced_cnic_proof_kind(
+            db, connector, connector.zkt_device, user, row, allow_reconcile_batch=True
+        ) is None
+    else:
+        # The same holder throughout: released on its captured CNIC, as before.
+        assert row.ords_status == "PENDING"
+        assert row.identity_resolution_status == "RESOLVED_SYNCED_CNIC"
+        assert decrypt_cnic(row.cnic_encrypted) == CNIC
+        assert delivery_proof_valid(db, row, connector)
+
+
+def test_a_released_pre_26_record_is_held_again_before_oracle_once_its_user_id_changes_hands(
+    db, monkeypatch,
+):
+    connector = _connector(db)
+    now = utc_now()
+    _snapshot(db, connector, "s0", now - timedelta(minutes=60), state=True)
+    _snapshot(db, connector, "s1", now - timedelta(minutes=45), state=True)
+    row = _ingest_held(db, connector, _dump(
+        "pre26-inflight", now - timedelta(minutes=55), now - timedelta(minutes=1),
+    ).model_copy(update={"raw_name": f"Synced Employee-{OTHER_CNIC}"}))
+    # Captured with OTHER_CNIC while the roster still shows CNIC: never released.
+    _snapshot(db, connector, "s2", now - timedelta(minutes=30), state=True)
+    assert row.ords_status == "BLOCKED_IDENTITY"
+    # Released on an earlier build that trusted the captured CNIC alone.
+    _snapshot(db, connector, "s3", now - timedelta(minutes=20), cnic=OTHER_CNIC, state=True)
+    user = db.scalar(select(DeviceUser).where(DeviceUser.user_id == "11"))
+    row.device_user_id, row.identity_snapshot_id = user.id, connector.zkt_device.identity_snapshot_id
+    row.identity_resolution_status, row.identity_repair_reason = (
+        "RESOLVED_SYNCED_CNIC", "VERIFIED_SYNCED_CNIC"
+    )
+    row.cnic_encrypted, row.cnic_lookup_hash = user.cnic_encrypted, user.cnic_lookup_hash
+    row.ords_status, row.manual_release_required = "PENDING", False
+    db.flush()
+    assert not delivery_proof_valid(db, row, connector)
 
 
 def test_auto_release_is_capped_per_connector_snapshot(db, auto_zone, monkeypatch):

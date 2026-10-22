@@ -11,6 +11,13 @@ continuity never qualifies such a row. The application additionally limits
 automatic use to recent punches and holds in zones the owner enabled, bracketed
 by close roster snapshots, under per-snapshot and hourly caps.
 
+It also tightens add_auto_synced_cnic_verified. Firmware before 2.6 (2.4.12,
+2.5.2) fills a dump or reconcile record's CNIC from the user table when it
+reads the log, so after the user ID changed hands that captured CNIC is the
+new holder's. A non-live punch is no longer released on its captured CNIC
+when an unrevoked retained interval shows a different, known CNIC for that
+terminal user ID at punch time.
+
 Only CREATE OR REPLACE FUNCTION: no table is altered, scanned, locked or
 backfilled.
 """
@@ -190,11 +197,65 @@ def upgrade() -> None:
                     ('EVENT','BLOCKED_IDENTITY','TERMINAL_DUPLICATE'))
             ), false)
         $$;
+        CREATE OR REPLACE FUNCTION add_auto_synced_cnic_verified(e add_attendance_events)
+        RETURNS boolean LANGUAGE sql STABLE AS $$
+          SELECT COALESCE(
+            e.identity_resolution_status = 'RESOLVED_SYNCED_CNIC'
+            AND e.identity_repair_reason = 'VERIFIED_SYNCED_CNIC'
+            AND e.cnic_lookup_hash IS NOT NULL
+            AND e.cnic_encrypted IS NOT NULL
+            AND e.clock_quality = 'OK'
+            AND e.device_event_time >= TIMESTAMPTZ '2010-01-01 00:00:00+00'
+            AND e.device_event_time <= e.captured_at + INTERVAL '1 day'
+            AND EXISTS (
+              SELECT 1 FROM add_device_users u
+              JOIN add_zkt_devices z ON z.id = u.zkt_device_id
+              WHERE u.id = e.device_user_id
+                AND u.zkt_device_id = e.zkt_device_id
+                AND u.user_id = e.user_id
+                AND u.lifecycle_state = 'ACTIVE' AND u.present
+                AND u.identity_conflict_code IS NULL
+                AND u.cnic_lookup_hash = e.cnic_lookup_hash
+                AND u.cnic_encrypted IS NOT NULL
+                AND u.snapshot_revision = z.identity_snapshot_revision
+                AND z.snapshot_complete AND z.identity_snapshot_stable
+                AND z.identity_snapshot_id = e.identity_snapshot_id
+                AND z.confirmed_serial = z.serial
+                AND e.device_serial = z.confirmed_serial
+                AND z.identity_snapshot_observed_at IS NOT NULL
+                AND ((e.captured_cnic_lookup_hash = u.cnic_lookup_hash
+                    -- 0056: a pre-2.6 dump or reconcile record carries the
+                    -- CNIC the terminal had when it read the log. A retained
+                    -- interval with another known CNIC for this user ID at
+                    -- punch time proves the user ID changed hands since.
+                    AND (e.source IN ('LIVE','LIVE_POLL') OR NOT EXISTS (
+                      SELECT 1 FROM add_attendance_identity_history h
+                      WHERE h.zkt_device_id = z.id
+                        AND h.terminal_serial = e.device_serial
+                        AND h.user_id = e.user_id
+                        AND NOT h.revoked
+                        AND h.cnic_lookup_hash IS NOT NULL
+                        AND h.cnic_lookup_hash <> u.cnic_lookup_hash
+                        AND h.observed_from <= e.device_event_time
+                        AND h.observed_until >= e.device_event_time
+                    )))
+                  OR (e.captured_cnic_lookup_hash IS NULL
+                    AND e.source IN ('LIVE','LIVE_POLL')
+                    AND (e.display_name IS NULL OR btrim(e.display_name) = ''
+                      OR lower(btrim(e.display_name)) = lower(btrim(u.display_name)))
+                    AND e.captured_at >= e.device_event_time
+                    AND e.captured_at - e.device_event_time <= INTERVAL '10 minutes'
+                    AND z.last_identity_change_at IS NOT NULL
+                    AND e.device_event_time >= z.last_identity_change_at
+                    AND z.identity_snapshot_observed_at >= e.captured_at))
+            ), false)
+        $$;
     """)
 
 
 def downgrade() -> None:
     # Keep verified releases intact if application code rolls back. Earlier
-    # application code never proposes this release, and the added case still
-    # needs the full retained-interval match.
+    # application code never proposes the dump release, and the added case
+    # still needs the full retained-interval match. The stricter captured-CNIC
+    # guard stays: it only holds punches proven to belong to another CNIC.
     pass

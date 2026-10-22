@@ -141,6 +141,19 @@ found already present, are released there only up to
 waits for the chunk's acknowledgement; the next roster snapshot releases the
 rest.
 
+## Captured CNIC on firmware before 2.6
+
+2.4.12 and 2.5.2 fill a dump or reconcile record's CNIC from the terminal's
+user table when they read the log, not when the employee punched (2.6.x
+clears it). If the user ID changed hands in between, that captured CNIC is
+the new holder's, and the synced-CNIC release used to send the punch under
+it. A non-live punch is now released on its captured CNIC only when no
+unrevoked retained interval shows a different, known CNIC for that terminal
+user ID at punch time. The same migration applies this to
+`add_auto_synced_cnic_verified`, and the pre-send check holds such a punch
+again if an earlier build released it. Live punches carry the punch-time
+CNIC and are unchanged; so are punches with no retained interval.
+
 ## What stays held
 
 - Rows with no retained interval covering the punch: new-hire first punches,
@@ -151,3 +164,5 @@ rest.
 - Rows ADD received more than 10 minutes after the firmware read them.
 - Rows with a mismatched UID, fingerprint or record UID, or a saved record
   from another connector.
+- Pre-2.6 dump and reconcile rows whose captured CNIC is not the CNIC a
+  retained interval shows for that user ID at punch time.

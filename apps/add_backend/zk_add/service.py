@@ -3304,6 +3304,10 @@ def synced_cnic_proof_kind(
     except Exception:
         return None
     if row.captured_cnic_lookup_hash == user.cnic_lookup_hash:
+        if row.source not in {"LIVE", "LIVE_POLL"} and punch_time_cnic_conflict(
+            session, zkt=zkt, user=user, row=row
+        ):
+            return None
         return "CAPTURED_CNIC"
     if (
         row.source in {"LIVE", "LIVE_POLL"}
@@ -3359,6 +3363,33 @@ def synced_cnic_proof_kind(
     ):
         return evidence.proof["source"]["kind"]
     return None
+
+
+def punch_time_cnic_conflict(
+    session: Session, *, zkt: ZKTDevice, user: DeviceUser, row: AttendanceEvent,
+) -> bool:
+    """A retained interval shows another CNIC for this terminal user at punch time.
+
+    Firmware before 2.6 (2.4.12, 2.5.2) fills a dump or reconcile record's
+    CNIC from the user table when it reads the log, not when the employee
+    punched. If the user ID changed hands since, that captured CNIC is the
+    new holder's. Only positive evidence counts: an unrevoked interval with a
+    different, known CNIC covering the punch. A live capture carries the
+    punch-time CNIC and is not checked here. Mirrors migration 0056's
+    add_auto_synced_cnic_verified.
+    """
+    from zk_add.models import AttendanceIdentityHistory
+
+    return session.scalar(select(AttendanceIdentityHistory.id).where(
+        AttendanceIdentityHistory.zkt_device_id == zkt.id,
+        AttendanceIdentityHistory.terminal_serial == row.device_serial,
+        AttendanceIdentityHistory.user_id == row.user_id,
+        AttendanceIdentityHistory.revoked.is_(False),
+        AttendanceIdentityHistory.cnic_lookup_hash.is_not(None),
+        AttendanceIdentityHistory.cnic_lookup_hash != user.cnic_lookup_hash,
+        AttendanceIdentityHistory.observed_from <= row.device_event_time,
+        AttendanceIdentityHistory.observed_until >= row.device_event_time,
+    ).limit(1)) is not None
 
 
 DUMP_AUTO_RELEASE_ACTOR = "system:identity-dump-auto-release"
