@@ -787,6 +787,14 @@ def _campaign_scope(
     return release, connectors, eligible, excluded
 
 
+def campaign_warnings(session: Session, connector: Connector, release: FirmwareRelease) -> list[dict[str, Any]]:
+    """Owner-overridable warnings for one eligible ESP: its stability, repeated interrupted boots."""
+    from zk_add.esp_stability import stability_warnings
+    from zk_add.ota_interruption import repeated_interruption_warnings
+
+    return [*stability_warnings(session, connector), *repeated_interruption_warnings(session, connector, release)]
+
+
 def preview_campaign_scope(
     session: Session,
     *,
@@ -824,8 +832,8 @@ def preview_campaign_scope(
             "ota_state": row.ota_state,
         }
 
-    from zk_add.esp_stability import stability_warnings, warnings_digest
-    warnings = [warning for row in eligible for warning in stability_warnings(session, row)]
+    from zk_add.esp_stability import warnings_digest
+    warnings = [warning for row in eligible for warning in campaign_warnings(session, row, release)]
     return {
         "scope_token": token,
         "expires_at": expires_at,
@@ -1065,8 +1073,8 @@ def create_campaign(
     if session.scalar(select(FirmwareCampaign).where(
         FirmwareCampaign.zone_id == zone_id, FirmwareCampaign.status.in_(["ACTIVE", "PAUSED"]))):
         raise ValueError("This zone already has an active or paused firmware campaign.")
-    from zk_add.esp_stability import stability_warnings, warnings_digest
-    warnings = {row.id: stability_warnings(session, row) for row in eligible}
+    from zk_add.esp_stability import warnings_digest
+    warnings = {row.id: campaign_warnings(session, row, release) for row in eligible}
     flagged = [warning for rows in warnings.values() for warning in rows]
     if flagged and not override_stability_warnings:
         raise ValueError("ESP stability warnings need the owner's override: "
@@ -1142,8 +1150,16 @@ def assignment_for_connector(session: Session, *, connector: Connector, public_b
         pending_offer = True
     held = None
     if not pending_offer:
-        from zk_add.ota_interruption import awaiting_retry_offer
+        from zk_add.ota_interruption import assignment_needs_serializing, awaiting_retry_offer, lock_for_assignment
         held = awaiting_retry_offer(session, deployment)
+        if held is not None or assignment_needs_serializing(connector, deployment):
+            # Connector, then deployment: the heartbeat that records a 2.6.x
+            # download stop and campaign control take the same locks, so a
+            # grant is never issued from a stale read of either.
+            deployment = lock_for_assignment(session, connector, deployment)
+            if deployment is None:
+                return None
+            held = awaiting_retry_offer(session, deployment)
 
     def refused(reason: str) -> None:
         """A refusal; a held 2.6.x download fails closed with it instead of waiting for a re-offer."""
@@ -1232,7 +1248,7 @@ def assignment_for_connector(session: Session, *, connector: Connector, public_b
         # Only a deployment with a recorded 2.6.x download interruption is
         # ever withheld here, and only for its bounded backoff.
         from zk_add.ota_interruption import download_retry_hold
-        if download_retry_hold(session, deployment):
+        if download_retry_hold(session, deployment, held):
             return None
     token = secrets.token_urlsafe(32)
     session.add(FirmwareDownloadGrant(token_hash=hashlib.sha256(token.encode()).hexdigest(),
@@ -1253,15 +1269,22 @@ def control_campaign(session: Session, *, campaign_public_id: str, action: str,
                      reason: str) -> tuple[FirmwareCampaign, int]:
     """Pause, resume or cancel one campaign; returns it and the held downloads failed.
 
-    The campaign's deployments are locked before the campaign, the order
-    record_progress and the owner's retry use, and the deployments to cancel
-    are read only after both locks: a retry committed meanwhile is cancelled
-    with the rest, and a retry still running waits for this control.
+    Locks follow the order everywhere else (connector, deployment, campaign):
+    the connectors of downloads that may be held for a re-offer (their
+    heartbeat and assignment take the same lock), then the campaign's
+    deployments, then the campaign. The deployments to cancel are read only
+    after the locks: a retry committed meanwhile is cancelled with the rest,
+    and a retry still running waits for this control.
     """
     campaign_row = session.scalar(select(FirmwareCampaign.id).where(
         FirmwareCampaign.campaign_id == campaign_public_id))
     if campaign_row is None:
         raise LookupError("Firmware campaign not found.")
+    session.scalars(select(Connector.id).where(Connector.id.in_(
+        select(FirmwareDeployment.connector_id).where(
+            FirmwareDeployment.campaign_id == campaign_row,
+            FirmwareDeployment.status.in_(["OFFERED", "DOWNLOADING"]))))
+        .order_by(Connector.id).with_for_update()).all()
     session.scalars(select(FirmwareDeployment.id).where(FirmwareDeployment.campaign_id == campaign_row)
                     .order_by(FirmwareDeployment.id).with_for_update()).all()
     campaign = session.scalar(select(FirmwareCampaign).where(FirmwareCampaign.id == campaign_row)
@@ -1882,7 +1905,11 @@ def resolve_download(session: Session, token: str) -> tuple[FirmwareRelease, Pat
     if grant is None:
         raise ValueError("Firmware download grant is invalid or expired.")
     deployment = session.get(FirmwareDeployment, grant.deployment_id)
-    release = session.get(FirmwareRelease, deployment.release_id) if deployment else None
+    if deployment is None or deployment.status in TERMINAL_DEPLOYMENT_STATES:
+        # A failed, cancelled, rolled-back or superseded attempt is never
+        # written further, whatever grant it still holds.
+        raise ValueError("Firmware deployment is no longer active.")
+    release = session.get(FirmwareRelease, deployment.release_id)
     if release is None or release.state not in {"AVAILABLE", "HIL_ONLY"}:
         raise ValueError("Firmware release is unavailable.")
     if release.version in RECOVERY_RELEASE_IDS and deployment.status not in RECOVERY_OFFERABLE_STATES:

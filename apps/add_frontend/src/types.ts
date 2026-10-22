@@ -262,7 +262,7 @@ export interface FirmwareScopePreview {
 }
 
 export interface FirmwareStabilityWarning {
-  code: 'ESP_RESET_RATE_HIGH' | 'ESP_UPTIME_SHORT' | string
+  code: 'ESP_RESET_RATE_HIGH' | 'ESP_UPTIME_SHORT' | 'TARGET_BOOT_INTERRUPTED_REPEATEDLY' | string
   connector_id: string
   display_name?: string | null
   message: string
@@ -1195,15 +1195,36 @@ export interface FirmwareRollbackDiagnosis {
   reconcile_at_reset?: { running: boolean | null; last_target_activity: string | null }
 }
 
+// Campaign detail's hint only; the owner's dialog reads FirmwareRetryPreflight.
 export interface FirmwareRetryView {
   available: boolean
   refusal: string | null
   interrupted_boots: number
   limit: number
-  stability_warnings: FirmwareStabilityWarning[]
-  stability_warnings_digest?: string
   // Other PENDING deployments that resuming the campaign also offers.
   pending_deployments?: number
+}
+
+// The ESP's current storage and queue state, shown with the retry.
+export interface FirmwareRetryEspState {
+  connected: boolean
+  firmware_version: string | null
+  boot_id: string | null
+  storage_reported: boolean
+  storage_durability: string | null
+  storage_io_faults: Record<string, unknown> | null
+  diagnostics_at: string | null
+  outbox_depth: number | null
+  last_heartbeat_at: string | null
+}
+
+export interface FirmwareRetryPreflight extends FirmwareRetryView {
+  campaign_id: string
+  deployment_id: string
+  target_version: string
+  stability_warnings: FirmwareStabilityWarning[]
+  stability_warnings_digest: string
+  esp_state: FirmwareRetryEspState | null
 }
 
 export interface FirmwareDeployment {

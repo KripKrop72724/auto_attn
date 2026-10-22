@@ -557,6 +557,15 @@ def prepare_maintenance_tick(
     except Exception:
         # Offline marking must not starve deletion, delivery or recovery work.
         logger.exception("Stale connector sweep failed")
+    try:
+        from zk_add.ota_interruption import expire_held_downloads
+
+        # A 2.6.x download held for a re-offer whose ESP went quiet fails
+        # closed here instead of keeping its zone and nationwide upgrade slots.
+        with session_scope() as session:
+            expire_held_downloads(session, now=now)
+    except Exception:
+        logger.exception("Held firmware download sweep failed")
     with session_scope() as session:
         advance_user_deletion_jobs(session)
         repair_missing_terminal_provenance(session)

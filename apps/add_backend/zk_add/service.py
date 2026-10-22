@@ -453,6 +453,34 @@ def _flag_target_return(session: Session, connector: Connector, *, code: str, me
     )
 
 
+def _device_return_in_scope(session: Session, deployment, *, running_version: str | None) -> bool:
+    from zk_add.ota import FirmwareRelease, _versions_match
+    from zk_add.ota_interruption import return_in_scope
+
+    return (deployment is not None and deployment.status == "BOOTED_PENDING"
+            and _versions_match(running_version, deployment.previous_version)
+            and not _versions_match(running_version, deployment.target_version)
+            and return_in_scope(deployment, session.get(FirmwareRelease, deployment.release_id)))
+
+
+def device_reported_return_candidate(
+    session: Session, *, connector: Connector, deployment_public_id: str,
+    running_version: str | None, error_code: str | None,
+) -> bool:
+    """A cheap, lock-free scope check; every other progress report keeps the unchanged path.
+
+    record_device_reported_return re-checks the same conditions under its locks.
+    """
+    from zk_add.ota import FirmwareDeployment
+
+    if connector.firmware_family != "zkt" or (error_code or "").strip().upper() != "BOOTLOADER_ROLLBACK":
+        return False
+    deployment = session.scalar(select(FirmwareDeployment).where(
+        FirmwareDeployment.deployment_id == deployment_public_id,
+        FirmwareDeployment.connector_id == connector.id))
+    return _device_return_in_scope(session, deployment, running_version=running_version)
+
+
 def record_device_reported_return(
     session: Session, *, connector: Connector, deployment_public_id: str, bytes_written: int,
     running_version: str | None, running_partition: str | None, image_sha256: str | None,
@@ -466,27 +494,31 @@ def record_device_reported_return(
     caller records it unchanged. Raises ReturnEvidencePending (a 409 the ESP
     repeats every 60 s) while the return boot has sent no heartbeat yet, for
     at most RETURN_REPORT_WAIT_SECONDS after the target's last report.
+
+    The connector is locked before the deployment, the order of the
+    WebSocket heartbeat that can observe the same return, so the two never
+    deadlock; the heartbeat then waits for this report's commit.
     """
-    from zk_add.ota import FirmwareDeployment, FirmwareRelease, _versions_match, record_progress
+    from zk_add.ota import FirmwareDeployment, record_progress
     from zk_add.ota_interruption import (
         TARGET_BOOT_INTERRUPTED,
         ReturnEvidencePending,
         device_return_evidence,
         interrupted_message,
-        return_in_scope,
         return_report_may_wait,
     )
 
     if connector.firmware_family != "zkt" or (error_code or "").strip().upper() != "BOOTLOADER_ROLLBACK":
         return None
+    # Re-read under the lock: the return boot's first heartbeat may have
+    # committed a newer boot_id since this request authenticated.
+    session.scalar(select(Connector).where(Connector.id == connector.id).with_for_update()
+                   .execution_options(populate_existing=True))
     deployment = session.scalar(select(FirmwareDeployment).where(
         FirmwareDeployment.deployment_id == deployment_public_id,
         FirmwareDeployment.connector_id == connector.id,
     ).with_for_update().execution_options(populate_existing=True))
-    if (deployment is None or deployment.status != "BOOTED_PENDING"
-            or not _versions_match(running_version, deployment.previous_version)
-            or _versions_match(running_version, deployment.target_version)
-            or not return_in_scope(deployment, session.get(FirmwareRelease, deployment.release_id))):
+    if not _device_return_in_scope(session, deployment, running_version=running_version):
         return None
     evidence = device_return_evidence(session, connector=connector, deployment=deployment)
     if evidence is None:

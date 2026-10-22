@@ -5718,11 +5718,14 @@ async def firmware_progress(
             db.commit()
             return JSONResponse(legacy, status_code=202 if legacy.get("awaiting_signed_capability") else 200)
         deployment = None
-        if body.state == "ROLLED_BACK":
-            from zk_add.service import record_device_reported_return
+        from zk_add.service import device_reported_return_candidate, record_device_reported_return
 
+        if body.state == "ROLLED_BACK" and device_reported_return_candidate(
+                db, connector=connector, deployment_public_id=deployment_id,
+                running_version=body.running_version, error_code=body.error_code):
             # A 2.6.x return report gets the heartbeat path's evidence and
             # classification; its 7-day reset scan runs off the event loop.
+            # Every other report keeps the unchanged synchronous path.
             deployment = await run_in_threadpool(
                 record_device_reported_return, db, connector=connector, deployment_public_id=deployment_id,
                 bytes_written=body.bytes_written, running_version=body.running_version,
@@ -5903,6 +5906,27 @@ async def start_firmware_campaign(
         {"campaign_id": result["campaign_id"], "status": result["status"], "zone_id": body.zone_id},
     )
     return result
+
+
+@app.get("/api/v1/firmware/campaigns/{campaign_id}/retry-target")
+def preview_firmware_campaign_retry_target(
+    campaign_id: str,
+    deployment_id: str = Query(min_length=1, max_length=100),
+    auth: tuple[Session, AdminContext] = Depends(require_admin),
+):
+    """What the owner reviews before "Retry same target": refusal, stability warnings, ESP state.
+
+    Read-only; the 7-day stability scan runs only here and in the retry itself.
+    """
+    from zk_add.ota_interruption import retry_preflight
+
+    db, _context = auth
+    try:
+        return retry_preflight(db, campaign_public_id=campaign_id, deployment_public_id=deployment_id)
+    except LookupError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
 
 
 # Registered before the generic {action} route, which would otherwise match.

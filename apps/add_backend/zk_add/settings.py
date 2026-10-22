@@ -64,13 +64,9 @@ class AddSettings(BaseSettings):
     restart_loop_boots: int = Field(default=4, ge=3, le=50)
     # A 2.6.15 LED latch from these lock-contention sources, with zero I/O
     # errors and verified storage in the same sample, is shown at this tier.
-    # zone_lite.c:3196 is the OTA rollback-slot residue latch: it also needs
-    # ADD's record of the 2.7.x download and 14 clean days of earlier boots.
-    # Remove a source to keep it DEGRADED. The alert stays OPEN, HIGH and
-    # gating either way.
+    # The alert stays OPEN, HIGH and gating either way.
     device_health_latched_led_tier: Literal["DEGRADED", "WARNING"] = "WARNING"
-    device_health_latched_led_sources: str = (
-        "2.6.15:add_connector.c:3764,2.6.15:add_connector.c:3787,2.6.15:zone_lite.c:3196")
+    device_health_latched_led_sources: str = "2.6.15:add_connector.c:3764,2.6.15:add_connector.c:3787"
     # The stranded-alert cleanup still needs a signed preview, a password
     # step-up and a typed confirmation; false disables its apply step.
     device_health_cleanup_apply_enabled: bool = True
@@ -150,6 +146,11 @@ class AddSettings(BaseSettings):
     firmware_store_path: str = "/firmware"
     firmware_public_base_url: str = "https://autoattn.slichealth.com"
     firmware_download_grant_seconds: int = 15 * 60
+    # Kill switch for resuming a stalled 2.6.0-2.6.15 download inside the same
+    # deployment (bounded backoff, at most three attempts). Off: every such
+    # stop fails the deployment closed and pauses the campaign, as before.
+    # The resume has not run on a device yet; enable it for a HIL first.
+    firmware_download_resume_enabled: bool = False
     firmware_signing_public_key_pem_b64: str | None = None
     comm_key_management_enabled: bool = False
     comm_key_reveal_enabled: bool = False

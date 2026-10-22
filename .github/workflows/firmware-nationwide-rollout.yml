@@ -25,11 +25,11 @@ on:
         required: true
         default: false
         type: boolean
-      override_stability_warnings:
-        description: Owner override of ADD's ESP stability warnings (reset rate, short uptime)
-        required: true
-        default: false
-        type: boolean
+      reviewed_stability_warnings:
+        description: Owner-reviewed ESP stability warnings, comma-separated ZONE_ID=digest pairs from ADD's preflight
+        required: false
+        default: ''
+        type: string
 
 permissions:
   contents: read
@@ -79,6 +79,8 @@ jobs:
         shell: powershell
         env:
           ADD_ADMIN_PASSWORD: ${{ secrets.ADD_CANARY_ADMIN_PASSWORD }}
+          # Passed through the environment, never interpolated into the script.
+          REVIEWED_STABILITY_WARNINGS: ${{ inputs.reviewed_stability_warnings }}
         run: |
           $ErrorActionPreference = 'Stop'
           if (-not $env:ADD_ADMIN_PASSWORD) { throw 'ADD_CANARY_ADMIN_PASSWORD is not configured.' }
@@ -89,4 +91,4 @@ jobs:
             -AdminPassword $env:ADD_ADMIN_PASSWORD `
             -BatchSize '${{ inputs.batch_size }}' `
             -DeferOfflineZones:('${{ inputs.defer_offline_zones }}' -eq 'true') `
-            -OverrideStabilityWarnings:('${{ inputs.override_stability_warnings }}' -eq 'true')
+            -ReviewedStabilityWarnings @([string]$env:REVIEWED_STABILITY_WARNINGS -split ',')

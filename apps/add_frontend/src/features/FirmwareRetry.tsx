@@ -1,10 +1,12 @@
-import { useState } from 'react'
-import { api } from '../api'
+import { useEffect, useState } from 'react'
+import { api, queryString } from '../api'
 import { Dialog, dateTime, type useToast } from '../App'
 import { Icon } from '../Icon'
 import type {
   FirmwareCampaign,
   FirmwareDeployment,
+  FirmwareRetryEspState,
+  FirmwareRetryPreflight,
   FirmwareRollbackDiagnosis,
   FirmwareStabilityWarning,
 } from '../types'
@@ -131,6 +133,41 @@ export function RollbackEvidence({ diagnosis }: { diagnosis: FirmwareRollbackDia
   )
 }
 
+function EspState({ state }: { state: FirmwareRetryEspState }) {
+  const faults = state.storage_io_faults ? Object.entries(state.storage_io_faults) : []
+  return (
+    <section className="firmware-rollback-evidence" aria-label="Current ESP state">
+      <h4>Current ESP state</h4>
+      <dl>
+        <div>
+          <dt>Connection</dt>
+          <dd>
+            {state.connected ? 'Online' : 'Offline'} · {state.firmware_version || 'unknown firmware'}
+          </dd>
+        </div>
+        <div>
+          <dt>Storage</dt>
+          <dd>
+            {!state.storage_reported
+              ? 'Not reported'
+              : faults.length
+                ? `I/O faults: ${faults.map(([name, value]) => `${name}=${String(value)}`).join(', ')}`
+                : `${state.storage_durability || 'Unknown'} · no I/O faults reported`}
+          </dd>
+        </div>
+        <div>
+          <dt>Queue</dt>
+          <dd>
+            {state.outbox_depth === null
+              ? 'No heartbeat on this boot'
+              : `${state.outbox_depth} queued at ${state.last_heartbeat_at ? dateTime(state.last_heartbeat_at) : 'the last heartbeat'}`}
+          </dd>
+        </div>
+      </dl>
+    </section>
+  )
+}
+
 export function RetryTargetDialog({
   campaign,
   deployment,
@@ -144,21 +181,43 @@ export function RetryTargetDialog({
   onChanged: () => Promise<void>
   toast: Toast
 }) {
-  const warnings = deployment.retry?.stability_warnings || []
-  const pending = deployment.retry?.pending_deployments ?? 0
+  const [preflight, setPreflight] = useState<FirmwareRetryPreflight | null>(null)
+  const [preflightError, setPreflightError] = useState('')
   const [reason, setReason] = useState('')
   const [confirmation, setConfirmation] = useState('')
   const [password, setPassword] = useState('')
   const [override, setOverride] = useState(false)
+  const [pendingConfirmed, setPendingConfirmed] = useState(false)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
+  useEffect(() => {
+    let active = true
+    // The 7-day stability scan runs only when the owner opens this dialog.
+    api<FirmwareRetryPreflight>(
+      `/api/v1/firmware/campaigns/${campaign.campaign_id}/retry-target${queryString({ deployment_id: deployment.deployment_id })}`,
+    )
+      .then((value) => {
+        if (active) setPreflight(value)
+      })
+      .catch((reason: unknown) => {
+        if (active) setPreflightError(reason instanceof Error ? reason.message : 'The retry check failed.')
+      })
+    return () => {
+      active = false
+    }
+  }, [campaign.campaign_id, deployment.deployment_id])
+  const warnings = preflight?.stability_warnings || []
+  const pending = preflight?.pending_deployments ?? 0
   const valid =
+    Boolean(preflight?.available) &&
     reason.trim().length >= 10 &&
     confirmation === deployment.target_version &&
     Boolean(password) &&
     (!warnings.length || override) &&
+    (!pending || pendingConfirmed) &&
     !busy
   const retry = async () => {
+    if (!preflight) return
     setBusy(true)
     setError('')
     try {
@@ -170,10 +229,9 @@ export function RetryTargetDialog({
           typed_confirmation: confirmation,
           password,
           override_stability_warnings: override,
-          ...(override && deployment.retry?.stability_warnings_digest
-            ? { stability_warnings_digest: deployment.retry.stability_warnings_digest }
-            : {}),
-          resume_pending_deployments: pending,
+          ...(override && warnings.length ? { stability_warnings_digest: preflight.stability_warnings_digest } : {}),
+          // Only the number the owner confirmed; the server refuses any other.
+          resume_pending_deployments: pendingConfirmed ? pending : 0,
         }),
       })
       setPassword('')
@@ -203,17 +261,40 @@ export function RetryTargetDialog({
             <h3>One new attempt, through every admission check.</h3>
             <p>
               The ESP reset before it confirmed the new image. Retry only after checking its power,
-              its reset history and that its queue still delivers;{' '}
-              {deployment.retry?.limit ?? 2} interrupted boots of one release stop retries until a
-              UART capture is taken.
+              its reset history and its current storage and queue state below;{' '}
+              {preflight?.limit ?? deployment.retry?.limit ?? 2} interrupted boots of one release stop
+              retries until a UART capture is taken.
             </p>
           </div>
         </div>
+        {!preflight && !preflightError && (
+          <div className="message pattern-waiting" role="status">
+            <Icon name="info" />
+            Checking the ESP and its reset history…
+          </div>
+        )}
+        {(preflightError || (preflight && !preflight.available)) && (
+          <div className="message pattern-blocked" role="alert">
+            <Icon name="alert" />
+            {preflightError || preflight?.refusal || 'Retry is not available.'}
+          </div>
+        )}
+        {preflight?.esp_state && <EspState state={preflight.esp_state} />}
         {pending > 0 && (
           <div className="message pattern-waiting" role="status">
             <Icon name="info" />
-            Retrying resumes the campaign, which also offers its {pending} other pending
-            deployment{pending === 1 ? '' : 's'}, one at a time before this retry.
+            <div>
+              Retrying resumes the campaign, which also offers its {pending} other pending
+              deployment{pending === 1 ? '' : 's'}, one at a time before this retry.
+              <label className="firmware-override">
+                <input
+                  type="checkbox"
+                  checked={pendingConfirmed}
+                  onChange={(event) => setPendingConfirmed(event.target.checked)}
+                />{' '}
+                Also offer the {pending} pending deployment{pending === 1 ? '' : 's'}
+              </label>
+            </div>
           </div>
         )}
         <StabilityWarnings warnings={warnings} override={override} onOverride={setOverride} />

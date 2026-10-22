@@ -466,9 +466,12 @@ def classify_led_latch(led_state: str | None, evidence: dict | None, *, storage_
 # holds a qualified predecessor (2.4.12 to 2.6.14). Any 2.7.x download writes
 # that slot, so every later 2.6.15 boot latches LOCAL_FAILURE, never runs its
 # persistence probe and reports durability DEGRADED until a 2.7.x install
-# succeeds. Zero I/O counters on such a boot are not a passed probe, so the
-# latch also needs ADD's own record of the 2.7.x download and a clean storage
-# history; its tier follows the owner's latched-LED policy.
+# succeeds. This latch only names that cause (error code and message); the
+# tier stays DEGRADED. Zero I/O counters on such a boot are not a passed
+# probe: 2.6.15 keeps the first latch's source, so a later LOCAL_FAILURE on
+# the same boot is invisible, and its legacy-queue reads and writes fail
+# without touching the counters. The label also needs ADD's own record of
+# the 2.7.x download and a clean storage history.
 ROLLBACK_SLOT_RESIDUE = "OTA_ROLLBACK_SLOT_RESIDUE"
 RESIDUE_FIRMWARE_VERSION = "2.6.15"
 RESIDUE_APPLICATION_SHA256 = "832c0c3d8dac6e41d7cd0a9d4fbe4508e4f66982fa5ddeceaca4dc5adcbd80d6"
@@ -506,7 +509,8 @@ def rollback_slot_residue_candidate(evidence: dict | None, firmware_version: str
     )
 
 
-def _storage_fault(storage: dict) -> dict | None:
+def storage_io_fault(storage: dict) -> dict | None:
+    """Reported storage I/O faults (counters, error fields, fault class); latch sources and upgrade state are not."""
     faults = {name: storage[name] for name in STORAGE_COUNTERS
               if type(storage.get(name)) is int and storage[name] > 0}
     faults.update({name: storage[name] for name in RESIDUE_ERROR_FIELDS if _reported(storage.get(name))})
@@ -542,7 +546,7 @@ def rollback_slot_residue_history(session: Session, connector: Connector, *, now
             if not isinstance(storage, dict) or not any(name in storage for name in STORAGE_COUNTERS):
                 unreported += 1
                 continue
-            fault = _storage_fault(storage)
+            fault = storage_io_fault(storage)
             if fault:
                 faults.append({"boot_id": boot_id, "at": ensure_utc(created_at).isoformat(), **fault})
     return {"boot_id": connector.boot_id, "checked_at": now.isoformat(), "days": RESIDUE_HISTORY_DAYS,
@@ -665,13 +669,6 @@ def _latched_led_tier(details: dict) -> str | None:
     return settings.device_health_latched_led_tier
 
 
-def _residue_tier() -> str:
-    """The owner's latched-LED policy: listed sources take its tier, others stay DEGRADED."""
-    if f"{RESIDUE_FIRMWARE_VERSION}:{RESIDUE_LED_SOURCE}" not in latched_led_sources():
-        return DEGRADED
-    return settings.device_health_latched_led_tier
-
-
 def _rule_tier(row: DeviceAlert, connector: Connector, currency: str, *, now: datetime,
                link: dict) -> str | None:
     details = row.details or {}
@@ -682,14 +679,14 @@ def _rule_tier(row: DeviceAlert, connector: Connector, currency: str, *, now: da
             # until one of its boots verifies or fails storage.
             return WARNING if diagnostics_reporting(connector) == "NOT_REPORTED_BY_FIRMWARE" else DEGRADED
         if _residue(details):
-            return _residue_tier()  # persistence unverified - OTA rollback slot residue
+            # Persistence unverified - OTA rollback slot residue: a label, not
+            # verified storage, so the tier stays DEGRADED.
+            return DEGRADED
         return _latched_led_tier(details) or DEGRADED
     if row.code == "ESP_DELIVERY_WORKER_FAULT":
         return WARNING if currency == PREVIOUS_BOOT else DEGRADED
     if row.code == "ESP_LOCAL_FAILURE":
         if (details.get("latch") or {}).get("kind") == "LED_LATCH_STORAGE_VERIFIED":
-            return WARNING
-        if _residue(details) and _residue_tier() == WARNING:
             return WARNING
         return _latched_led_tier(details) or (WARNING if currency == HELD else DEGRADED)
     if row.code == "HIK_CAPTURE_UNHEALTHY":
@@ -744,9 +741,10 @@ def _evidence_summary(row: DeviceAlert) -> str | None:
         history = latch.get("history") or {}
         return (f"Persistence unverified - OTA rollback slot residue: {latch.get('source')} on "
                 f"{latch.get('firmware_version')} after {residue.get('target_version') or '2.7.x'} wrote "
-                f"{residue.get('bytes_written') or 'some'} bytes to the other slot; no storage I/O errors on this "
-                f"boot or in {history.get('days') or RESIDUE_HISTORY_DAYS} days of earlier boots, persistence "
-                "probe not run" + (f" ({summary})" if summary else "") + ".")[:300]
+                f"{residue.get('bytes_written') or 'some'} bytes to the other slot; no storage I/O counters on "
+                f"this boot or in {history.get('days') or RESIDUE_HISTORY_DAYS} days of earlier boots, but the "
+                "persistence probe did not run and later latches on this boot are not reported"
+                + (f" ({summary})" if summary else "") + ".")[:300]
     diagnosis = details.get("diagnosis")
     if row.code == "OTA_DEVICE_ROLLED_BACK" and isinstance(diagnosis, dict) and diagnosis.get("summary"):
         return str(diagnosis["summary"])[:300]
