@@ -76,7 +76,7 @@ if ($ImageRole -eq 'factory') {
             }
         }
     }
-    $validatorPython = (Get-Command python -CommandType Application -ErrorAction Stop).Source
+    $validatorPython = (Get-Command python -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
     $validationPreference = $ErrorActionPreference
     $validationExit = -1
     try {

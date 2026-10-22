@@ -7,6 +7,7 @@ $vault = Join-Path $work 'vault'
 $output = Join-Path $work 'output'
 New-Item -ItemType Directory -Path $unsigned -Force | Out-Null
 $signer = Join-Path $root 'deploy/add/bootstrap-firmware-signing.ps1'
+$originalPath = $env:PATH
 try {
     $failed = $false
     try {
@@ -24,6 +25,19 @@ try {
     [IO.File]::WriteAllBytes((Join-Path $unsigned 'zone_lite.bin'), [byte[]]@(0,1,2,3))
     $before = @{}
     Get-ChildItem $vault -File | ForEach-Object { $before[$_.Name] = (Get-FileHash $_.FullName).Hash }
+    # The production runner has both a real Python and another PATH match.
+    # Keep the real interpreter first and add a second, unusable application.
+    # Validation must execute the first application rather than concatenate
+    # all discovered paths into one command name.
+    $duplicate = Join-Path $work 'second-python'
+    New-Item -ItemType Directory -Path $duplicate | Out-Null
+    $windowsHost = [Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT
+    $duplicatePython = Join-Path $duplicate 'python'
+    [IO.File]::WriteAllText($duplicatePython, "#!/bin/sh`nexit 0`n")
+    if (-not $windowsHost) { & chmod +x $duplicatePython }
+    $env:PATH = $originalPath + [IO.Path]::PathSeparator + $duplicate
+    if (@(Get-Command python -CommandType Application -All).Count -lt 2) { throw 'Multiple-Python fixture was not installed' }
+    if ($windowsHost -and @(Get-Command python -CommandType Application).Count -lt 2) { throw 'Windows extensionless-Python ambiguity was not reproduced' }
     $failed = $false
     try {
         & $signer -VaultDirectory $vault -UnsignedDirectory $unsigned -OutputDirectory $output `
@@ -39,9 +53,12 @@ try {
           -DeviceMac 'ac:27:6e:a3:16:d4' -GitSha ('a' * 40) -ImageRole usb-wifi-rescue-seed
     } catch { $failed = $_.Exception.Message -match 'HIL-only for the exact spare' }
     if (-not $failed) { throw 'Original-device signing scope guard failed' }
-    Write-Output 'PASS: no replacement vault, invalid image refused before key access, spare-only HIL scope'
+    Write-Output 'PASS: multiple Python applications, no replacement vault, invalid image refused before key access, spare-only HIL scope'
     # The invalid-artifact test intentionally made Python return 1. GitHub's
     # PowerShell wrapper propagates LASTEXITCODE even after the refusal was
     # caught and all assertions passed, so clear only that expected test code.
     $global:LASTEXITCODE = 0
-} finally { Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue }
+} finally {
+    $env:PATH = $originalPath
+    Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
+}
