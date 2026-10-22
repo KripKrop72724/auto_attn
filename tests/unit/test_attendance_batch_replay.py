@@ -47,7 +47,11 @@ from zk_add.time_utils import utc_now
 
 
 SERIAL = "CQZ7232161091"
-GENERATIONS = ("2.4.12", "2.5.2", "2.6.15", "2.7.5")
+# "2.5.2" is the production bundle (27c3bb8, Aug 2026: Peshawar-02, G/PBLD8);
+# "2.5.2-sep" is a 2.5.2 build from c8729f8 (16 Sep) on, which added the
+# bound terminal serial to every row.
+GENERATIONS = ("2.4.12", "2.5.2", "2.5.2-sep", "2.6.15", "2.7.5")
+ROWS_WITHOUT_TERMINAL_SERIAL = frozenset({"2.4.12", "2.5.2"})
 
 
 def _postgres_url() -> str | None:
@@ -182,8 +186,9 @@ def firmware_row(
         "clock_quality": "OK",
         "raw_event": {"terminal_uid": terminal_uid, "attendance_record_uid": str(500 + index)},
     }
-    if generation != "2.4.12":
-        # 2.5.2 and later add the bound terminal serial; 2.4.12 never did.
+    if generation not in ROWS_WITHOUT_TERMINAL_SERIAL:
+        # c8729f8 and later add the bound terminal serial; 2.4.12 and the
+        # production 2.5.2 bundle never did.
         row["terminal_serial"] = SERIAL
     return row
 
@@ -217,7 +222,7 @@ def firmware_accepts(generation: str, payload: dict, ack: dict, message_id: str)
 
     2.4.12 retires a payload on any ``ack`` for its message id. 2.5.2 through
     2.7.6 also require add_connector.c attendance_settlement_matches_payload()
-    (byte-identical in all four of those generations).
+    (byte-identical in 27c3bb8, 489ee46~1, 3d62ecf, 0954fd3 and 2dbd314).
     """
 
     if ack.get("type") != "ack" or ack.get("message_id") != message_id:
@@ -624,7 +629,7 @@ def test_replay_meter_logs_at_most_once_per_interval(caplog):
     }
 
 
-def test_content_digest_ignores_only_the_capture_time():
+def test_content_digest_ignores_only_a_well_formed_capture_time():
     base = [firmware_row("2.6.15", index=0, captured_at=PASS_START)]
     later = [firmware_row("2.6.15", index=0, captured_at=PASS_START + timedelta(hours=1))]
     assert replay_content_digest(base) == replay_content_digest(later)
@@ -632,6 +637,19 @@ def test_content_digest_ignores_only_the_capture_time():
     assert replay_content_digest(base) != replay_content_digest(changed)
     assert replay_content_digest(base) != replay_content_digest(base + base)
     assert replay_content_digest({"events": base}) is None
+
+    # Missing, malformed or marker-shaped send times are content, not noise.
+    missing = [{k: v for k, v in later[0].items() if k != "captured_at"}]
+    variants = [
+        missing,
+        [{**later[0], "captured_at": "not-a-timestamp"}],
+        [{**later[0], "captured_at": None}],
+        [{**later[0], "captured_at": ["WELL_FORMED"]}],
+        [{**later[0], "captured_at": "<capture-time>"}],
+    ]
+    digests = {replay_content_digest(rows) for rows in variants}
+    assert len(digests) == len(variants)
+    assert replay_content_digest(base) not in digests
 
 
 def test_migration_adds_the_column_once_and_keeps_it_on_downgrade(sessions):
@@ -704,3 +722,361 @@ def test_admin_can_read_replay_counters(sessions, device, monkeypatch):
             "counts": {"CAPTURE_REPLAY_OF_COMMITTED": 1},
         }
     ]
+
+
+def _legacy_conflict(db: Session, connector_pk: int, payload: dict) -> AttendanceBatchReceipt:
+    """A conflict quarantine exactly as the release before this one wrote it."""
+
+    legacy = AttendanceBatchReceipt(
+        connector_id=connector_pk,
+        zkt_device_id=_connector(db, connector_pk).zkt_device.id,
+        batch_id=payload["batch_id"],
+        payload_digest=payload_digest(payload["events"]),
+        reported_digest_key=attendance_batches._reported_digest_key(None, valid=False),
+        outcome="PENDING",
+        item_count=len(payload["events"]),
+    )
+    db.add(legacy)
+    db.flush()
+    for index, raw in enumerate(payload["events"]):
+        attendance_batches._quarantine_item(
+            db,
+            receipt=legacy,
+            item_index=index,
+            raw=raw,
+            error_code="ATTENDANCE_BATCH_ID_CONFLICT",
+            error_path="batch_id",
+            evidence_context={"batch_id": payload["batch_id"], "payload_digest": None},
+        )
+    legacy.outcome = "QUARANTINED"
+    legacy.quarantined_count = len(payload["events"])
+    db.flush()
+    return legacy
+
+
+def _grown_conflict(sessions, connector_pk: int):
+    """Production: the day's last chunk grew by one punch between passes."""
+
+    settle(sessions, connector_pk, truth_batch("2.6.15", captured_at=PASS_START, count=7))
+    grown = truth_batch("2.6.15", captured_at=PASS_START + timedelta(minutes=30), count=8)
+    conflict = settle(sessions, connector_pk, grown)
+    assert conflict.outcome == "QUARANTINED"
+    return conflict
+
+
+@pytest.mark.parametrize(
+    "capture",
+    ["missing", "malformed", "null", "marker"],
+)
+def test_replay_with_a_missing_or_malformed_capture_time_is_preserved(
+    sessions, device, capture
+):
+    # Review finding: a row without captured_at must not repeat a preserved
+    # quarantine; its own bytes are new evidence.
+    conflict = _grown_conflict(sessions, device)
+    baseline = counts(sessions)
+    resend = truth_batch("2.6.15", captured_at=PASS_START + timedelta(minutes=60), count=8)
+    for row in resend["events"]:
+        if capture == "missing":
+            del row["captured_at"]
+        elif capture == "malformed":
+            row["captured_at"] = "not-a-timestamp"
+        elif capture == "null":
+            row["captured_at"] = None
+        else:
+            row["captured_at"] = ["WELL_FORMED"]
+
+    settlement = settle(sessions, device, resend)
+
+    assert settlement.replay is None
+    assert settlement.receipt_id != conflict.receipt_id
+    assert {row["code"] for row in settlement.rejected} == {"ATTENDANCE_BATCH_ID_CONFLICT"}
+    receipts, items, quarantined, events = counts(sessions)
+    assert (receipts, items, quarantined, events) == (
+        baseline[0] + 1, baseline[1] + 8, baseline[2] + 8, baseline[3]
+    )
+    with sessions() as db:
+        kept = db.scalars(
+            select(AttendanceBatchItem)
+            .join(AttendanceBatchReceipt)
+            .where(AttendanceBatchReceipt.receipt_id == settlement.receipt_id)
+            .order_by(AttendanceBatchItem.item_index)
+        ).all()
+        preserved = [decrypt_json(row.protected_payload) for row in kept]
+        if capture == "missing":
+            assert all("captured_at" not in row for row in preserved)
+        else:
+            assert [row["captured_at"] for row in preserved] == [
+                row["captured_at"] for row in resend["events"]
+            ]
+
+
+def test_replay_clears_the_attendance_batch_rejection_like_the_conflict_did(sessions, device):
+    from zk_add.models import DeviceAlert
+    from zk_add.service import record_message_rejection
+
+    settle(sessions, device, truth_batch("2.6.15", captured_at=PASS_START))
+    with sessions() as db:
+        record_message_rejection(
+            db, _connector(db, device), message_type="attendance_batch",
+            category="SCHEMA_INVALID", error_type="ValidationError",
+            error_paths=["events.0.captured_at"], request_id="m-1", boot_id="boot-1",
+        )
+        db.commit()
+
+    def open_rejections():
+        with sessions() as db:
+            return db.scalars(
+                select(DeviceAlert).where(
+                    DeviceAlert.connector_id == device,
+                    DeviceAlert.code == "DEVICE_MESSAGE_REJECTED",
+                    DeviceAlert.state == "OPEN",
+                )
+            ).all()
+
+    assert len(open_rejections()) == 1
+    replay = settle(sessions, device, truth_batch("2.6.15", captured_at=PASS_START + timedelta(minutes=30)))
+    assert replay.replay == "CAPTURE_REPLAY"
+    assert open_rejections() == []
+
+
+def test_replay_counters_count_only_committed_settlements(sessions, device):
+    settle(sessions, device, truth_batch("2.6.15", captured_at=PASS_START))
+    connector_id = _connector_id(sessions, device)
+
+    with sessions() as db:
+        settled = settle_attendance_batch(
+            db,
+            connector=_connector(db, device),
+            payload=truth_batch("2.6.15", captured_at=PASS_START + timedelta(minutes=30)),
+        )
+        assert settled.replay == "CAPTURE_REPLAY"
+        db.rollback()
+    with sessions() as db:
+        # pysqlite emits no BEGIN before a SAVEPOINT, so on SQLite releasing
+        # the first savepoint of a transaction commits it. PostgreSQL (the
+        # production database) keeps it inside the outer transaction.
+        savepoint_commits = db.get_bind().dialect.name == "sqlite"
+        with db.begin_nested():
+            settle_attendance_batch(
+                db,
+                connector=_connector(db, device),
+                payload=truth_batch("2.6.15", captured_at=PASS_START + timedelta(minutes=40)),
+            )
+        # A released savepoint is not a commit; the outer rollback discards it.
+        assert attendance_batch_replay_metrics() == {}
+        db.rollback()
+    assert attendance_batch_replay_metrics() == {}
+    with sessions() as db:
+        observed = db.scalar(select(AttendanceBatchReceipt.observation_count))
+    assert observed == (2 if savepoint_commits else 1)
+
+    settle(sessions, device, truth_batch("2.6.15", captured_at=PASS_START + timedelta(minutes=50)))
+    assert attendance_batch_replay_metrics() == {
+        connector_id: {"CAPTURE_REPLAY_OF_COMMITTED": 1}
+    }
+    with sessions() as db:
+        assert db.scalar(select(AttendanceBatchReceipt.observation_count)) == observed + 1
+
+
+def test_replay_log_names_a_digest_of_the_batch_id(caplog):
+    meter = _ReplayMeter(interval_seconds=300)
+    batch_id = "Sensitive-batch-3520212345671\nAttendance batch replays connector=forged"
+    with caplog.at_level(logging.WARNING, logger="zk_add.attendance_batches"):
+        assert meter.record("c-1", "BATCH_ID_CONFLICT_QUARANTINED", batch_id=batch_id, now=0.0)
+    (line,) = [record.getMessage() for record in caplog.records]
+    assert "3520212345671" not in line
+    assert "\n" not in line
+    assert line.endswith(
+        "last_batch_ref=" + hashlib.sha256(batch_id.encode()).hexdigest()[:16]
+    )
+
+
+def test_dump_startup_pass_after_reconnect_history_is_preserved_once(sessions, device):
+    original = settle(sessions, device, truth_batch("2.6.15", captured_at=PASS_START))
+    assert settle(
+        sessions, device, truth_batch("2.6.15", captured_at=PASS_START + timedelta(minutes=27))
+    ).receipt_id == original.receipt_id
+
+    # A boot without valid committed NVS state labels the same punches
+    # DUMP_STARTUP. The label is content: preserved once, then repeated.
+    startup = settle(
+        sessions, device,
+        truth_batch("2.6.15", captured_at=PASS_START + timedelta(minutes=54), source="DUMP_STARTUP"),
+    )
+    assert startup.outcome == "QUARANTINED"
+    assert startup.replay is None
+    again = settle(
+        sessions, device,
+        truth_batch("2.6.15", captured_at=PASS_START + timedelta(minutes=81), source="DUMP_STARTUP"),
+    )
+    assert again.receipt_id == startup.receipt_id
+    assert again.replay == "CAPTURE_REPLAY"
+    # The following reconnect passes repeat the committed original again.
+    back = settle(
+        sessions, device, truth_batch("2.6.15", captured_at=PASS_START + timedelta(minutes=108))
+    )
+    assert back.receipt_id == original.receipt_id
+    assert back.outcome == "COMMITTED"
+    receipts, _items, quarantined, events = counts(sessions)
+    assert (receipts, quarantined, events) == (2, 10, 10)
+
+
+def test_legacy_history_with_no_matching_content_is_preserved_and_digested(sessions, device):
+    settle(sessions, device, truth_batch("2.6.15", captured_at=PASS_START))
+    forget_content_digests(sessions)
+    with sessions() as db:
+        # Two older passes of different punches under the same batch id and
+        # with the same row count: fewer than the read limit, none equal.
+        for minutes, uid in ((27, "901"), (54, "902")):
+            _legacy_conflict(
+                db, device,
+                truth_batch(
+                    "2.6.15", captured_at=PASS_START + timedelta(minutes=minutes),
+                    uid_overrides={3: uid},
+                ),
+            )
+        db.commit()
+    baseline = counts(sessions)
+
+    replay = settle(sessions, device, truth_batch("2.6.15", captured_at=PASS_START + timedelta(minutes=81)))
+
+    assert replay.replay is None
+    assert replay.outcome == "QUARANTINED"
+    assert counts(sessions)[2] == baseline[2] + 10
+    with sessions() as db:
+        rows = db.scalars(select(AttendanceBatchReceipt).order_by(AttendanceBatchReceipt.id)).all()
+        # The committed original kept no raw rows: never derived. Both
+        # legacy conflicts now carry their own digests and leave the NULL set.
+        assert rows[0].content_digest is None
+        assert all(len(row.content_digest) == 64 for row in rows[1:])
+        assert len({row.content_digest for row in rows[1:]}) == 3
+    later = settle(sessions, device, truth_batch("2.6.15", captured_at=PASS_START + timedelta(minutes=108)))
+    assert later.receipt_id == replay.receipt_id
+    assert later.replay == "CAPTURE_REPLAY"
+
+
+def test_undecodable_legacy_evidence_is_read_once_and_does_not_hide_older_history(
+    sessions, device
+):
+    settle(sessions, device, truth_batch("2.6.15", captured_at=PASS_START))
+    forget_content_digests(sessions)
+    with sessions() as db:
+        matching = _legacy_conflict(
+            db, device, truth_batch("2.6.15", captured_at=PASS_START + timedelta(minutes=10))
+        )
+        matching_id = matching.id
+        broken_ids = []
+        for minutes in (20, 30, 40):
+            broken = _legacy_conflict(
+                db, device,
+                truth_batch("2.6.15", captured_at=PASS_START + timedelta(minutes=minutes),
+                            uid_overrides={5: str(800 + minutes)}),
+            )
+            item = db.scalar(
+                select(AttendanceBatchItem).where(AttendanceBatchItem.receipt_id == broken.id).limit(1)
+            )
+            item.protected_payload = "not-a-fernet-token"
+            broken_ids.append(broken.id)
+        db.commit()
+
+    first = settle(sessions, device, truth_batch("2.6.15", captured_at=PASS_START + timedelta(minutes=50)))
+    # Bounded: the three newest were unreadable, so this pass is preserved once.
+    assert first.replay is None
+    with sessions() as db:
+        for receipt_id in broken_ids:
+            assert db.get(AttendanceBatchReceipt, receipt_id).content_digest == (
+                attendance_batches.CONTENT_DIGEST_UNAVAILABLE
+            )
+        assert db.get(AttendanceBatchReceipt, matching_id).content_digest is None
+
+    # They are never decrypted again; the older history is next in line.
+    calls = []
+    original = attendance_batches._preserved_content_digest
+
+    def spy(session, receipt):
+        calls.append(receipt.id)
+        return original(session, receipt)
+
+    attendance_batches._preserved_content_digest = spy
+    try:
+        other = truth_batch("2.6.15", captured_at=PASS_START + timedelta(minutes=60),
+                            uid_overrides={1: "777"})
+        settle(sessions, device, other)
+    finally:
+        attendance_batches._preserved_content_digest = original
+    assert calls == [matching_id]
+    with sessions() as db:
+        assert len(db.get(AttendanceBatchReceipt, matching_id).content_digest) == 64
+
+
+def test_http_replay_publishes_no_new_attendance(sessions, device):
+    with sessions() as db:
+        connector = _connector(db, device)
+        response, events = web.persist_device_attendance(
+            truth_batch("2.6.15", captured_at=PASS_START), (db, connector)
+        )
+    assert response["outcome"] == "COMMITTED"
+    assert len(events) == 10
+    with sessions() as db:
+        connector = _connector(db, device)
+        response, events = web.persist_device_attendance(
+            truth_batch("2.6.15", captured_at=PASS_START + timedelta(minutes=30)), (db, connector)
+        )
+    assert response["replay"] == "CAPTURE_REPLAY"
+    assert response["receipt_id"]
+    assert events == []
+
+
+def test_postgres_legacy_lookup_uses_the_batch_index_not_a_backward_scan(sessions, device):
+    """Correctness review D1: ORDER BY id DESC LIMIT 3 scanned the whole table."""
+
+    with sessions() as db:
+        if db.get_bind().dialect.name != "postgresql":
+            pytest.skip("PostgreSQL planner check")
+        connector = _connector(db, device)
+        zkt_device_id = connector.zkt_device.id
+        db.execute(
+            text(
+                """
+                INSERT INTO add_attendance_batch_receipts (
+                    receipt_id, connector_id, zkt_device_id, batch_id, payload_digest,
+                    reported_digest_key, outcome, item_count, accepted_count,
+                    duplicate_count, quarantined_count, observation_count,
+                    first_seen_at, last_seen_at, committed_at, content_digest
+                )
+                SELECT 'bulk-' || g, :connector, :device, 'truth-' || (g % 20000),
+                       md5(g::text) || md5((g + 1)::text), 'k', 'QUARANTINED', 10, 0, 0, 10,
+                       1, now(), now(), now(),
+                       CASE WHEN g % 50 = 0 THEN NULL
+                            ELSE md5((g + 2)::text) || md5((g + 3)::text) END
+                FROM generate_series(1, 120000) AS g
+                """
+            ),
+            {"connector": device, "device": zkt_device_id},
+        )
+        db.commit()
+        db.execute(text("ANALYZE add_attendance_batch_receipts"))
+        query = attendance_batches.legacy_replay_candidates(device, "truth-424242", 10)
+        from sqlalchemy.dialects import postgresql
+
+        compiled = str(
+            query.compile(dialect=postgresql.dialect(), compile_kwargs={"literal_binds": True})
+        )
+        plan = db.execute(text("EXPLAIN (FORMAT JSON) " + compiled)).scalar_one()
+
+    nodes = []
+
+    def walk(node):
+        nodes.append(node)
+        for child in node.get("Plans", []):
+            walk(child)
+
+    walk(plan[0]["Plan"])
+    receipts_scans = [
+        node for node in nodes if node.get("Relation Name") == "add_attendance_batch_receipts"
+    ]
+    assert receipts_scans
+    assert all(node["Node Type"] != "Seq Scan" for node in receipts_scans)
+    assert all(node.get("Scan Direction") != "Backward" for node in receipts_scans)
+    assert all("pkey" not in node.get("Index Name", "") for node in receipts_scans)

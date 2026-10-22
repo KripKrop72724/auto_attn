@@ -3987,7 +3987,9 @@ def persist_device_attendance(
     db, connector = auth
     settlement = settle_attendance_batch(db, connector=connector, payload=body)
     db.commit()
-    for event_uid in settlement.accepted_event_uids:
+    # A retry or replay repeats an earlier receipt and accepted nothing new.
+    accepted_now = () if settlement.duplicate_batch else settlement.accepted_event_uids
+    for event_uid in accepted_now:
         events.append(("attendance", {"connector_id": connector.connector_id, "event_uid": event_uid}))
     response = settlement.response()
 
