@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 import secrets
+import threading
+import time
 from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Any
 
+from cryptography.fernet import InvalidToken
 from pydantic import ValidationError
 from sqlalchemy import case, func, select
 from sqlalchemy.orm import Session
@@ -34,6 +38,21 @@ from zk_add.time_utils import utc_now
 MAX_BATCH_EVENTS = 100
 _HEX_64 = re.compile(r"^[0-9a-f]{64}$")
 
+logger = logging.getLogger(__name__)
+
+# Every ZKT firmware generation (2.4.12 through 2.7.6) writes the moment it
+# serialised a row into ``captured_at``. Reconcile batches are named after
+# their first punch ("truth-<event_uid>") and are rebuilt on every truth pass,
+# so a re-send of the same punches under the same batch id differs from the
+# settled batch in this one field.
+CAPTURE_VOLATILE_FIELDS = frozenset({"captured_at"})
+_CONTENT_DIGEST_SCHEMA = "attendance-batch-content-1"
+# Receipts committed before content digests existed are compared through their
+# own encrypted evidence; only the newest few are read per replay.
+_LEGACY_COMPARE_LIMIT = 3
+_COMMITTED_OUTCOMES = ("COMMITTED", "COMMITTED_WITH_DUPLICATES")
+REPLAY_LOG_INTERVAL_SECONDS = 300.0
+
 
 def _json_default(value: object) -> str:
     if isinstance(value, (date, datetime)):
@@ -57,6 +76,93 @@ def payload_digest(events: object) -> str:
 
 def _item_digest(value: object) -> str:
     return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def replay_content_digest(events: object) -> str | None:
+    """Digest a batch's events without the fields firmware rewrites per send."""
+
+    if not isinstance(events, list):
+        return None
+    return payload_digest(
+        {
+            "schema": _CONTENT_DIGEST_SCHEMA,
+            "events": [
+                {
+                    key: value
+                    for key, value in item.items()
+                    if key not in CAPTURE_VOLATILE_FIELDS
+                }
+                if isinstance(item, dict)
+                else item
+                for item in events
+            ],
+        }
+    )
+
+
+class _ReplayMeter:
+    """Per-connector replay counters with at most one log line per interval."""
+
+    def __init__(self, interval_seconds: float = REPLAY_LOG_INTERVAL_SECONDS) -> None:
+        self.interval_seconds = interval_seconds
+        self._lock = threading.Lock()
+        self._totals: dict[str, dict[str, int]] = {}
+        self._window: dict[str, dict[str, int]] = {}
+        self._last_logged: dict[str, float] = {}
+
+    def record(
+        self,
+        connector_id: str,
+        kind: str,
+        *,
+        batch_id: str,
+        now: float | None = None,
+    ) -> bool:
+        observed = time.monotonic() if now is None else now
+        with self._lock:
+            totals = self._totals.setdefault(connector_id, {})
+            totals[kind] = totals.get(kind, 0) + 1
+            window = self._window.setdefault(connector_id, {})
+            window[kind] = window.get(kind, 0) + 1
+            last = self._last_logged.get(connector_id)
+            if last is not None and observed - last < self.interval_seconds:
+                return False
+            self._last_logged[connector_id] = observed
+            counts = dict(sorted(window.items()))
+            self._window[connector_id] = {}
+            lifetime = dict(sorted(totals.items()))
+        logger.warning(
+            "Attendance batch replays connector=%s interval_seconds=%d "
+            "counts=%s process_totals=%s last_batch_id=%s",
+            connector_id,
+            int(self.interval_seconds),
+            counts,
+            lifetime,
+            batch_id[:120],
+        )
+        return True
+
+    def snapshot(self) -> dict[str, dict[str, int]]:
+        with self._lock:
+            return {
+                connector_id: dict(counts)
+                for connector_id, counts in self._totals.items()
+            }
+
+    def reset(self) -> None:
+        with self._lock:
+            self._totals.clear()
+            self._window.clear()
+            self._last_logged.clear()
+
+
+replay_meter = _ReplayMeter()
+
+
+def attendance_batch_replay_metrics() -> dict[str, dict[str, int]]:
+    """Counters since process start, keyed by connector and replay kind."""
+
+    return replay_meter.snapshot()
 
 
 def _reported_digest_key(value: object, *, valid: bool) -> str:
@@ -99,6 +205,8 @@ class AttendanceBatchSettlement:
     duplicate_total: int
     quarantined_total: int
     duplicate_batch: bool = False
+    # EXACT_RETRY or CAPTURE_REPLAY when this ACK repeats an earlier receipt.
+    replay: str | None = None
 
     @property
     def accepted_count(self) -> int:
@@ -113,7 +221,7 @@ class AttendanceBatchSettlement:
         return self.quarantined_total
 
     def response(self) -> dict[str, Any]:
-        return {
+        response = {
             "ok": True,
             "receipt_id": self.receipt_id,
             "batch_id": self.batch_id,
@@ -127,6 +235,11 @@ class AttendanceBatchSettlement:
             "rejected": self.rejected,
             "duplicate_batch": self.duplicate_batch,
         }
+        if self.replay is not None:
+            # Additive: deployed firmware matches batch_id, the counts and the
+            # outcome, and ignores unknown fields.
+            response["replay"] = self.replay
+        return response
 
     def ack(self, *, message_id: str, sequence: int) -> dict[str, Any]:
         # Deployed firmware accepts this as an ordinary ACK and ignores all
@@ -145,6 +258,7 @@ def _settlement_from_receipt(
     receipt: AttendanceBatchReceipt,
     *,
     duplicate_batch: bool,
+    replay: str | None = None,
 ) -> AttendanceBatchSettlement:
     items = session.scalars(
         select(AttendanceBatchItem)
@@ -180,6 +294,7 @@ def _settlement_from_receipt(
         duplicate_total=receipt.duplicate_count,
         quarantined_total=receipt.quarantined_count,
         duplicate_batch=duplicate_batch,
+        replay=replay,
     )
 
 
@@ -192,6 +307,7 @@ def _create_receipt(
     reported_digest: str | None,
     reported_digest_key: str,
     item_count: int,
+    content_digest: str | None,
 ) -> AttendanceBatchReceipt:
     if connector.zkt_device is None:
         raise ValueError("Connector has no assigned ZKT device.")
@@ -208,6 +324,7 @@ def _create_receipt(
         first_seen_at=now,
         last_seen_at=now,
         committed_at=now,
+        content_digest=content_digest,
     )
     session.add(receipt)
     session.flush()
@@ -309,6 +426,137 @@ def _finish_receipt(
     return _settlement_from_receipt(session, receipt, duplicate_batch=False)
 
 
+def _preserved_content_digest(
+    session: Session,
+    receipt: AttendanceBatchReceipt,
+) -> str | None:
+    """Rebuild a quarantined receipt's content digest from its own evidence.
+
+    Every input row of a batch-level quarantine was encrypted verbatim with a
+    ``__batch_context`` annotation. Anything that cannot be rebuilt exactly
+    returns None and is never treated as a match.
+    """
+
+    items = session.scalars(
+        select(AttendanceBatchItem)
+        .where(AttendanceBatchItem.receipt_id == receipt.id)
+        .order_by(AttendanceBatchItem.item_index.asc())
+    ).all()
+    if (
+        len(items) != receipt.item_count
+        or [row.item_index for row in items] != list(range(receipt.item_count))
+        or any(
+            row.disposition != "QUARANTINED" or not row.protected_payload
+            for row in items
+        )
+    ):
+        return None
+    events: list[object] = []
+    for row in items:
+        try:
+            preserved = decrypt_json(row.protected_payload)
+        except (InvalidToken, ValueError):
+            return None
+        raw = {key: value for key, value in preserved.items() if key != "__batch_context"}
+        # A non-object input was stored as {"value": input}; that wrapper is
+        # ambiguous, and no attendance row has this shape.
+        if not raw or set(raw) == {"value"}:
+            return None
+        if _item_digest(raw) != row.payload_digest:
+            return None
+        events.append(raw)
+    return replay_content_digest(events)
+
+
+def _replayed_receipt(
+    session: Session,
+    *,
+    connector: Connector,
+    batch_id: str,
+    content_digest: str,
+    item_count: int,
+) -> AttendanceBatchReceipt | None:
+    """Find the settled receipt whose events this batch repeats exactly.
+
+    Only ``captured_at`` may differ. A committed original is preferred over an
+    earlier conflict quarantine of the same content.
+    """
+
+    prior = session.scalar(
+        select(AttendanceBatchReceipt)
+        .where(
+            AttendanceBatchReceipt.connector_id == connector.id,
+            AttendanceBatchReceipt.batch_id == batch_id,
+            AttendanceBatchReceipt.content_digest == content_digest,
+        )
+        .order_by(
+            case(
+                (AttendanceBatchReceipt.outcome.in_(_COMMITTED_OUTCOMES), 0),
+                else_=1,
+            ),
+            AttendanceBatchReceipt.id.asc(),
+        )
+        .limit(1)
+    )
+    if prior is not None:
+        return prior
+    # Receipts written before content digests existed: a batch-level
+    # quarantine kept every row encrypted, so its digest can be derived and
+    # stored. A committed receipt kept no raw rows and is never assumed equal.
+    legacy = session.scalars(
+        select(AttendanceBatchReceipt)
+        .where(
+            AttendanceBatchReceipt.connector_id == connector.id,
+            AttendanceBatchReceipt.batch_id == batch_id,
+            AttendanceBatchReceipt.content_digest.is_(None),
+            AttendanceBatchReceipt.outcome == "QUARANTINED",
+            AttendanceBatchReceipt.item_count == item_count,
+            AttendanceBatchReceipt.quarantined_count == item_count,
+        )
+        .order_by(AttendanceBatchReceipt.id.desc())
+        .limit(_LEGACY_COMPARE_LIMIT)
+    ).all()
+    for candidate in legacy:
+        derived = _preserved_content_digest(session, candidate)
+        if derived is None:
+            continue
+        candidate.content_digest = derived
+        if derived == content_digest:
+            return candidate
+    return None
+
+
+def _replay_rows_valid(
+    session: Session,
+    receipt: AttendanceBatchReceipt,
+    raw_events: list[object],
+) -> bool:
+    """A replayed row may repeat an accepted settlement only if it is valid.
+
+    Rows the receipt quarantined repeat that quarantine; their evidence is
+    already preserved under the receipt.
+    """
+
+    settled = dict(
+        session.execute(
+            select(AttendanceBatchItem.item_index, AttendanceBatchItem.event_uid).where(
+                AttendanceBatchItem.receipt_id == receipt.id,
+                AttendanceBatchItem.disposition.in_(("ACCEPTED", "DUPLICATE")),
+            )
+        ).all()
+    )
+    for index, raw in enumerate(raw_events):
+        if index not in settled:
+            continue
+        try:
+            parsed = AttendanceEventIn.model_validate(raw)
+        except ValidationError:
+            return False
+        if parsed.event_uid != settled[index]:
+            return False
+    return True
+
+
 def settle_attendance_batch(
     session: Session,
     *,
@@ -352,10 +600,19 @@ def settle_attendance_batch(
             AttendanceBatchReceipt.reported_digest_key == reported_digest_key,
         )
     )
+    content_digest = replay_content_digest(raw_events)
     if existing is not None:
         existing.observation_count += 1
         existing.last_seen_at = utc_now()
-        return _settlement_from_receipt(session, existing, duplicate_batch=True)
+        if existing.content_digest is None and content_digest is not None:
+            # Identical events: this payload is the receipt's own content.
+            existing.content_digest = content_digest
+        replay_meter.record(
+            connector.connector_id, "EXACT_RETRY", batch_id=batch_id
+        )
+        return _settlement_from_receipt(
+            session, existing, duplicate_batch=True, replay="EXACT_RETRY"
+        )
 
     batch_id_conflict = session.scalar(
         select(AttendanceBatchReceipt.id).where(
@@ -364,6 +621,36 @@ def settle_attendance_batch(
             AttendanceBatchReceipt.payload_digest != digest,
         )
     )
+    if (
+        batch_id_conflict is not None
+        and content_digest is not None
+        and isinstance(payload, dict)
+        and batch_id_valid
+        and isinstance(raw_events, list)
+        and 1 <= len(raw_events) <= MAX_BATCH_EVENTS
+        # A device-reported digest must equal the ACK digest, which a replay
+        # of another receipt cannot satisfy; no deployed firmware reports one.
+        and reported_value is None
+    ):
+        prior = _replayed_receipt(
+            session,
+            connector=connector,
+            batch_id=batch_id,
+            content_digest=content_digest,
+            item_count=item_count,
+        )
+        if prior is not None and _replay_rows_valid(session, prior, raw_events):
+            prior.observation_count += 1
+            prior.last_seen_at = utc_now()
+            kind = (
+                "CAPTURE_REPLAY_OF_COMMITTED"
+                if prior.outcome in _COMMITTED_OUTCOMES
+                else "CAPTURE_REPLAY_OF_QUARANTINE"
+            )
+            replay_meter.record(connector.connector_id, kind, batch_id=batch_id)
+            return _settlement_from_receipt(
+                session, prior, duplicate_batch=True, replay="CAPTURE_REPLAY"
+            )
     receipt = _create_receipt(
         session,
         connector=connector,
@@ -372,6 +659,7 @@ def settle_attendance_batch(
         reported_digest=reported_digest,
         reported_digest_key=reported_digest_key,
         item_count=item_count,
+        content_digest=content_digest,
     )
 
     batch_error: tuple[str, str | None] | None = None
@@ -383,6 +671,9 @@ def settle_attendance_batch(
         batch_error = ("ATTENDANCE_BATCH_EVENT_COUNT_INVALID", "events")
     elif batch_id_conflict is not None:
         batch_error = ("ATTENDANCE_BATCH_ID_CONFLICT", "batch_id")
+        replay_meter.record(
+            connector.connector_id, "BATCH_ID_CONFLICT_QUARANTINED", batch_id=batch_id
+        )
     elif reported_value is not None and (
         not reported_digest_valid
         or not secrets.compare_digest(digest, reported_digest or "")

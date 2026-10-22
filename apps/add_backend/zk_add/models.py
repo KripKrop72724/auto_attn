@@ -679,6 +679,11 @@ class AttendanceBatchReceipt(Base):
     first_seen_at: Mapped[datetime] = utc_column()
     last_seen_at: Mapped[datetime] = utc_column()
     committed_at: Mapped[datetime] = utc_column()
+    # Digest of the batch's events without the firmware's per-send
+    # ``captured_at`` (attendance_batches.replay_content_digest). It is NULL on
+    # receipts committed before it existed until a replay derives it from the
+    # receipt's own preserved evidence.
+    content_digest: Mapped[str | None] = mapped_column(String(64))
 
 
 class AttendanceBatchItem(Base):
