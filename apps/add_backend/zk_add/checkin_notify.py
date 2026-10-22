@@ -372,6 +372,9 @@ class SendJob:
     token: int
     cnic: str = field(repr=False)
     masked: str | None
+    # The punch time Oracle stored (EVENT_TIMESTAMP), so a late push still
+    # tells the employee when the attendance was recorded.
+    checkin_time: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -573,7 +576,9 @@ def claim_batch(limit: int | None = None, *, now: datetime | None = None) -> Cla
                 row.last_attempt_at = now
                 row.next_attempt_at = None
                 row.lease_expires_at = now + timedelta(seconds=_lease_seconds())
-                jobs.append(SendJob(row.id, row.attempt_count, cnic, masked_last4(row.cnic_last4)))
+                jobs.append(
+                    SendJob(row.id, row.attempt_count, cnic, masked_last4(row.cnic_last4), row.punch_time)
+                )
             # Later rows of this batch must see this decision when coalescing.
             session.flush()
         return Claim(jobs, processed=len(rows), route=route, revision=control.revision)
@@ -599,9 +604,17 @@ def _retry_after(response: httpx.Response) -> float | None:
         return None
 
 
-def request_body(cnic: str) -> bytes:
+def checkin_time_text(punch: datetime) -> str:
+    """The punch time in Pakistan time as the HRM API expects it."""
+    return ensure_utc(punch).astimezone(PKT).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def request_body(cnic: str, checkin_time: datetime | None = None) -> bytes:
     value: int | str = int(cnic) if settings.checkin_notify_cnic_json_type == "number" else cnic
-    return json.dumps({"cnic": value}, separators=(",", ":")).encode()
+    body: dict[str, int | str] = {"cnic": value}
+    if checkin_time is not None and settings.checkin_notify_send_checkin_time:
+        body["checkin_time"] = checkin_time_text(checkin_time)
+    return json.dumps(body, separators=(",", ":")).encode()
 
 
 async def post_notification(
@@ -613,7 +626,7 @@ async def post_notification(
     }
     try:
         response = await asyncio.wait_for(
-            client.post(url, content=request_body(job.cnic), headers=headers),
+            client.post(url, content=request_body(job.cnic, job.checkin_time), headers=headers),
             timeout=_host_budget_seconds(),
         )
     except (httpx.ConnectError, httpx.ConnectTimeout) as exc:

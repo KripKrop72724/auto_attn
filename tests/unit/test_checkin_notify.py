@@ -9,7 +9,7 @@ from __future__ import annotations
 import ast
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 import hashlib
 import importlib.util
 import json
@@ -498,9 +498,10 @@ def test_worker_posts_cnic_as_a_json_number_with_the_key_header(store):
     assert request.method == "POST"
     assert request.headers["X-Api-Key"] == SYNTHETIC_KEY
     assert request.headers["Content-Type"] == "application/json"
-    assert request.content == b'{"cnic":3520212345671}'
-    assert json.loads(request.content) == {"cnic": 3520212345671}
     row = row_for(sessions, event_id)
+    checkin = notify.checkin_time_text(row.punch_time)
+    assert request.content == b'{"cnic":3520212345671,"checkin_time":"%s"}' % checkin.encode()
+    assert json.loads(request.content) == {"cnic": 3520212345671, "checkin_time": checkin}
     assert row.status == "SENT" and row.sent_at and row.last_http_status == 200
     # Nothing is sent twice.
     deliver(recorder)
@@ -513,7 +514,44 @@ def test_string_cnic_body_is_a_setting(store, monkeypatch):
     confirm(sessions, punch(sessions))
     recorder = Recorder()
     deliver(recorder)
-    assert recorder.requests[0].content == b'{"cnic":"3520212345671"}'
+    assert json.loads(recorder.requests[0].content)["cnic"] == "3520212345671"
+
+
+def test_checkin_time_is_the_punch_time_in_pakistan_time():
+    # 04:05 UTC is 09:05 PKT; Pakistan has no daylight saving.
+    punch_utc = datetime(2026, 10, 22, 4, 5, 0, tzinfo=timezone.utc)
+    assert notify.checkin_time_text(punch_utc) == "2026-10-22 09:05:00"
+    # 19:30 UTC is already the next day in Pakistan.
+    late = datetime(2026, 10, 21, 19, 30, 7, tzinfo=timezone.utc)
+    assert notify.checkin_time_text(late) == "2026-10-22 00:30:07"
+    assert json.loads(notify.request_body("3520212345671", punch_utc)) == {
+        "cnic": 3520212345671,
+        "checkin_time": "2026-10-22 09:05:00",
+    }
+
+
+def test_a_late_push_still_carries_the_original_punch_time(store):
+    sessions, _ = store
+    event_id = punch(sessions, minutes_ago=180)  # Confirmed by Oracle three hours later.
+    confirm(sessions, event_id)
+    recorder = Recorder()
+    deliver(recorder)
+    row = row_for(sessions, event_id)
+    sent = json.loads(recorder.requests[0].content)
+    assert sent["checkin_time"] == notify.checkin_time_text(row.punch_time)
+    expected = (utc_now() - timedelta(minutes=180)).astimezone(timezone(timedelta(hours=5)))
+    assert abs(
+        datetime.strptime(sent["checkin_time"], "%Y-%m-%d %H:%M:%S") - expected.replace(tzinfo=None)
+    ) < timedelta(minutes=1)
+
+
+def test_checkin_time_can_be_left_out_by_setting(store, monkeypatch):
+    sessions, _ = store
+    monkeypatch.setattr(settings, "checkin_notify_send_checkin_time", False)
+    confirm(sessions, punch(sessions))
+    recorder = Recorder()
+    deliver(recorder)
+    assert json.loads(recorder.requests[0].content) == {"cnic": 3520212345671}
 
 
 def test_retryable_failures_back_off_with_jitter_then_give_up(store, monkeypatch):
@@ -679,7 +717,8 @@ def test_a_request_that_never_left_falls_back_to_the_public_host(store, error):
     fallback = hosts.requests[1]
     assert str(fallback.url) == FALLBACK_URL
     assert fallback.headers["X-Api-Key"] == SYNTHETIC_KEY  # Same key on both hosts.
-    assert fallback.content == hosts.requests[0].content == b'{"cnic":3520212345671}'
+    assert fallback.content == hosts.requests[0].content
+    assert json.loads(fallback.content)["cnic"] == 3520212345671
     row = row_for(sessions, event_id)
     assert (row.status, row.host_used, row.attempt_count) == ("SENT", "FALLBACK", 1)
     assert "primary unreachable" in row.detail
