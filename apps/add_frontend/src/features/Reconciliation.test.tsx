@@ -568,6 +568,85 @@ describe('Reviewed source-exception continuation', () => {
     expect(screen.queryByText('Terminal newest record not yet written')).toBeNull()
   })
 
+  it('shows a held newest-record punch and the later reads of its slot', async () => {
+    const held: SourceException = {
+      ...sourceException,
+      source_kind: 'TAIL',
+      ordinal: 15380,
+      disposition: 'IDENTITY_UNRESOLVED',
+      error_code: 'TERMINAL_NEWEST_RECORD_UNCONFIRMED',
+      observed_uid: '17',
+      observed_user_id: '44',
+      oracle_action: 'HELD_IDENTITY_EVIDENCE_REQUIRED',
+      source_condition: 'TERMINAL_NEWEST_RECORD_UNCONFIRMED',
+      operator_reason:
+        'The terminal returned these bytes from its newest slot. ADD holds them instead of sending a punch that may belong to someone else.',
+      slot_receipts: [
+        {
+          manifest_id: 9001,
+          source_kind: 'TAIL',
+          job_id: null,
+          raw_record_digest: 'e'.repeat(64),
+          disposition: 'EVENT',
+          decodes_as_punch: true,
+          punch_received: false,
+          observed_at: '2026-10-21T08:15:00Z',
+        },
+      ],
+    }
+    const base = reconciliationFetch()
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = new URL(String(input), 'https://add.test').pathname
+      if (path === `/api/v1/source-exceptions/${sourceException.id}`) return json(held)
+      const response = await base(input, init)
+      const body = await response.json()
+      if (path === '/api/v1/source-exceptions') body.rows = [{ ...held, slot_receipts: undefined }]
+      return json(body)
+    }))
+    window.history.replaceState(
+      null,
+      '',
+      `/reconciliation?tab=source-exceptions&job_id=${job().job_id}&device_id=${device.connector_id}`,
+    )
+    render(<Harness />)
+
+    const row = await screen.findByRole('listitem')
+    expect(within(row).getByText(/Newest-record punch held until LIVE capture or a reconcile confirms it/)).toBeTruthy()
+    fireEvent.click(within(row).getByRole('button', { name: 'Inspect' }))
+    expect(
+      await screen.findByRole('heading', { name: 'Held: newest-record punch not confirmed' }),
+    ).toBeTruthy()
+    expect(screen.getByText(/ADD holds them instead of sending a punch/)).toBeTruthy()
+    const reads = screen.getByRole('region', { name: 'Reads of this slot' })
+    expect(within(reads).getByText(/Decodes as a punch ADD has not received/)).toBeTruthy()
+    expect(screen.getByText(/It does not settle this slot or read its punch/)).toBeTruthy()
+    expect(screen.queryByText('Held for verified historical identity')).toBeNull()
+  })
+
+  it('holds a job whose newest-record slot has a punch ADD has not received', async () => {
+    const pending = assurance({
+      state: 'NEWEST_PUNCH_UNRECEIVED', reviewed: 1, open: 1, newest_punch_unreceived: 1,
+    })
+    const base = reconciliationFetch()
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = new URL(String(input), 'https://add.test').pathname
+      const response = await base(input, init)
+      const body = await response.json()
+      if (path === '/api/v1/reconciliations') {
+        body.rows = [{ ...job(pending), status: 'NEEDS_ATTENTION', phase: 'FINAL_ASSURANCE',
+          wait_reason: 'SOURCE_NEWEST_PUNCH_UNRECEIVED', error_code: 'SOURCE_NEWEST_PUNCH_UNRECEIVED' }]
+      }
+      return json(body)
+    }))
+    render(<Harness />)
+
+    expect(await screen.findByText('Terminal punch not yet received')).toBeTruthy()
+    expect(screen.getByText(/1 terminal newest-record slot holds a punch ADD has not received/)).toBeTruthy()
+    expect(screen.queryByRole('button', { name: /^Retry$/ })).toBeNull()
+    expect(screen.getByRole('button', { name: 'Inspect held source records' })).toBeTruthy()
+  })
+
+
   it('redirects the retired employee-repair deep link to Attendance review', async () => {
     window.history.replaceState(
       null,

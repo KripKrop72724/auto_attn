@@ -107,7 +107,15 @@ const humanize = (value?: string | null) =>
     .replace(/^./, (letter) => letter.toUpperCase())
 
 const sourceEvidencePending = (state: SourceExceptionAssurance['state']) =>
-  state === 'REVIEW_REQUIRED' || state === 'IDENTITY_EVIDENCE_REQUIRED' || state === 'INTERPRETATION_REQUIRED'
+  state === 'REVIEW_REQUIRED' || state === 'IDENTITY_EVIDENCE_REQUIRED' || state === 'INTERPRETATION_REQUIRED' ||
+  state === 'NEWEST_PUNCH_UNRECEIVED'
+
+const newestPunchCopy = (count: number) =>
+  `${count.toLocaleString()} terminal newest-record slot${count === 1 ? ' holds' : 's hold'} a punch ADD has not received; a review cannot exclude ${count === 1 ? 'it' : 'them'}. Assurance resumes automatically if LIVE capture delivers the same punch. Otherwise cancel this job and run another complete reconcile after the next punch.`
+
+const newestCondition = (row: SourceException) =>
+  row.source_condition === 'TERMINAL_NEWEST_RECORD_UNSETTLED' ||
+  row.source_condition === 'TERMINAL_NEWEST_RECORD_UNCONFIRMED'
 
 const reconciliationEtaLabel = (job: ReconciliationJob) => {
   if (job.eta.high_seconds != null)
@@ -528,6 +536,8 @@ function JobDetailDrawer({
                       ? 'Source interpretation pending'
                       : job.source_exception_assurance.state === 'IDENTITY_EVIDENCE_REQUIRED'
                       ? 'Historical identity evidence required'
+                      : job.source_exception_assurance.state === 'NEWEST_PUNCH_UNRECEIVED'
+                      ? 'Terminal punch not yet received'
                       : job.source_exception_assurance.state === 'REVIEW_REQUIRED'
                       ? `${job.source_exception_assurance.open.toLocaleString()} source review${job.source_exception_assurance.open === 1 ? '' : 's'} remaining`
                       : job.source_exception_assurance.state === 'SCOPE_MISMATCH'
@@ -543,6 +553,8 @@ function JobDetailDrawer({
                     source exceptions reviewed. Original evidence remains immutable.
                     {job.source_exception_assurance.state === 'IDENTITY_EVIDENCE_REQUIRED' &&
                       ' Review notes cannot resolve missing identity or certify Oracle delivery.'}
+                    {job.source_exception_assurance.state === 'NEWEST_PUNCH_UNRECEIVED' &&
+                      ` ${newestPunchCopy(job.source_exception_assurance.newest_punch_unreceived ?? 1)}`}
                     </>}
                   </p>
                   {sourceEvidencePending(job.source_exception_assurance.state) && job.source_exception_assurance.state !== 'INTERPRETATION_REQUIRED' && (
@@ -719,7 +731,9 @@ function SourceExceptionDrawer({
           ),
         )
         toast.notice(
-          row.disposition === 'IDENTITY_UNRESOLVED'
+          newestCondition(row)
+            ? 'Review recorded. It does not settle this terminal newest-record slot or read its punch.'
+            : row.disposition === 'IDENTITY_UNRESOLVED'
             ? 'Review recorded. The identity hold remains until verified correction evidence is available.'
             : 'Source review recorded. When the certified cohort is complete, assurance resumes automatically from its existing checkpoint.',
         )
@@ -790,6 +804,8 @@ function SourceExceptionDrawer({
               <div>
                 <h3>{row.source_condition === 'TERMINAL_NEWEST_RECORD_CORRECTED'
                   ? 'Corrected from an unwritten newest record'
+                  : row.source_condition === 'TERMINAL_NEWEST_RECORD_UNCONFIRMED'
+                  ? 'Held: newest-record punch not confirmed'
                   : row.source_condition === 'TERMINAL_NEWEST_RECORD_UNSETTLED'
                   ? 'Terminal newest record not yet written'
                   : row.disposition === 'IDENTITY_UNRESOLVED'
@@ -799,6 +815,8 @@ function SourceExceptionDrawer({
                   ADD preserved this terminal ordinal as immutable evidence.
                   {row.source_condition === 'TERMINAL_NEWEST_RECORD_CORRECTED'
                     ? ` ${row.operator_reason || 'A source time correction was made from bytes that were not the punch in this slot. HR must verify the corrected punch.'}`
+                    : row.source_condition === 'TERMINAL_NEWEST_RECORD_UNCONFIRMED'
+                    ? ` ${row.operator_reason || 'These bytes decode as a punch no capture has delivered. ADD holds them until LIVE capture or a later reconcile confirms the punch.'}`
                     : row.source_condition === 'TERMINAL_NEWEST_RECORD_UNSETTLED'
                     ? ` ${row.operator_reason || 'These bytes were read before the terminal wrote this slot. They are not a punch.'}`
                     : row.disposition === 'IDENTITY_UNRESOLVED'
@@ -855,7 +873,9 @@ function SourceExceptionDrawer({
                 <div>
                   <h3>Review history</h3>
                   <p>
-                    {row.disposition === 'IDENTITY_UNRESOLVED'
+                    {newestCondition(row)
+                      ? 'Review records that the row was seen. It does not settle this slot or read its punch; only a later complete reconcile does.'
+                      : row.disposition === 'IDENTITY_UNRESOLVED'
                       ? 'Review records an investigation note; the identity hold and original source evidence remain.'
                       : 'Review accepts this fail-closed exclusion; the preserved source record itself never changes.'}
                   </p>
@@ -875,6 +895,35 @@ function SourceExceptionDrawer({
                 </p>
               )}
             </section>
+            {!!row.slot_receipts?.length && (
+              <section className="exception-review-section" aria-label="Reads of this slot">
+                <div className="panel-header">
+                  <div>
+                    <h3>Reads of this slot</h3>
+                    <p>
+                      Verified reads of this ordinal kept as evidence. None of them was sent to
+                      Oracle from here.
+                    </p>
+                  </div>
+                </div>
+                {row.slot_receipts.map((receipt) => (
+                  <article key={receipt.manifest_id} className="exception-review">
+                    <strong>{humanize(receipt.source_kind)}</strong>
+                    <span>{dateTime(receipt.observed_at)}</span>
+                    <p>
+                      {receipt.punch_received === false
+                        ? 'Decodes as a punch ADD has not received.'
+                        : receipt.punch_received
+                        ? 'Decodes as a punch ADD has received from another capture.'
+                        : receipt.decodes_as_punch
+                        ? 'Its stored interpretation cannot be read; treated as a punch ADD has not received.'
+                        : `No punch (${humanize(receipt.disposition)}).`}{' '}
+                      <code>{receipt.raw_record_digest.slice(0, 16)}</code>
+                    </p>
+                  </article>
+                ))}
+              </section>
+            )}
             {revealed && (
               <section className="revealed-evidence" aria-live="polite">
                 <div className="panel-header">
@@ -2041,6 +2090,7 @@ export function ReconciliationView({
                   sourceAssurance.state === 'REVIEW_REQUIRED' ||
                   sourceAssurance.state === 'IDENTITY_EVIDENCE_REQUIRED' ||
                   sourceAssurance.state === 'INTERPRETATION_REQUIRED' ||
+                  sourceAssurance.state === 'NEWEST_PUNCH_UNRECEIVED' ||
                   sourceAssurance.state === 'SCOPE_MISMATCH'
                 const controls: Array<'pause' | 'resume' | 'cancel' | 'retry'> =
                   []
@@ -2185,6 +2235,8 @@ export function ReconciliationView({
                               ? 'Source interpretation pending'
                               : sourceAssurance.state === 'IDENTITY_EVIDENCE_REQUIRED'
                               ? 'Historical identity evidence required'
+                              : sourceAssurance.state === 'NEWEST_PUNCH_UNRECEIVED'
+                              ? 'Terminal punch not yet received'
                               : sourceAssurance.state === 'REVIEW_REQUIRED'
                               ? `${sourceAssurance.open.toLocaleString()} source review${sourceAssurance.open === 1 ? '' : 's'} remaining`
                               : sourceAssurance.state === 'SCOPE_MISMATCH'
@@ -2203,6 +2255,8 @@ export function ReconciliationView({
                           exceptions reviewed; original evidence remains preserved.
                           {sourceAssurance.state === 'IDENTITY_EVIDENCE_REQUIRED' &&
                             ' Review notes cannot resolve the identity hold.'}
+                          {sourceAssurance.state === 'NEWEST_PUNCH_UNRECEIVED' &&
+                            ` ${newestPunchCopy(sourceAssurance.newest_punch_unreceived ?? 1)}`}
                           </>}
                         </span>
                       </div>
@@ -2235,7 +2289,8 @@ export function ReconciliationView({
                           exception{sourceAssurance.open === 1 ? '' : 's'}
                         </button>
                       )}
-                      {sourceAssurance.state === 'IDENTITY_EVIDENCE_REQUIRED' && (
+                      {(sourceAssurance.state === 'IDENTITY_EVIDENCE_REQUIRED' ||
+                        sourceAssurance.state === 'NEWEST_PUNCH_UNRECEIVED') && (
                         <button className="button primary" onClick={() => reviewJobExceptions(job)}>
                           Inspect held source records
                         </button>
@@ -2402,18 +2457,26 @@ export function ReconciliationView({
                   <h3>
                     {scopedAssurance.state === 'IDENTITY_EVIDENCE_REQUIRED'
                       ? 'Historical identity evidence required'
+                      : scopedAssurance.state === 'NEWEST_PUNCH_UNRECEIVED'
+                      ? 'Terminal punch not yet received'
                       : scopedAssurance.state === 'REVIEW_REQUIRED'
+
                       ? `${scopedAssurance.open.toLocaleString()} certified review${scopedAssurance.open === 1 ? '' : 's'} remaining`
                       : scopedAssurance.state === 'SCOPE_MISMATCH'
                         ? 'Certified exception scope needs investigation'
                         : 'All certified exclusions reviewed'}
                   </h3>
                   <p>
+                    {scopedAssurance.state === 'NEWEST_PUNCH_UNRECEIVED' ? (
+                      newestPunchCopy(scopedAssurance.newest_punch_unreceived ?? 1)
+                    ) : <>
                     Source evidence has advanced through checkpoint{' '}
                     {(exceptionScope.cutoff_count ?? 0).toLocaleString()}. When
                     the open count reaches zero, final assurance resumes
                     automatically without a terminal rescan.
+                    </>}
                   </p>
+
                 </div>
               </div>
             )}
@@ -2666,6 +2729,9 @@ export function ReconciliationView({
                     <small>{row.error_code || 'No error code'}</small>
                     {row.source_condition === 'TERMINAL_NEWEST_RECORD_UNSETTLED' && (
                       <small>Newest record read before the terminal wrote it; not a punch</small>
+                    )}
+                    {row.source_condition === 'TERMINAL_NEWEST_RECORD_UNCONFIRMED' && (
+                      <small>Newest-record punch held until LIVE capture or a reconcile confirms it</small>
                     )}
                     {row.source_condition === 'TERMINAL_NEWEST_RECORD_CORRECTED' && (
                       <small>Corrected from an unwritten newest record; HR must verify the punch</small>
