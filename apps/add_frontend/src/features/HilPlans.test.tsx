@@ -45,23 +45,34 @@ const plan = (overrides: Partial<HilPlan>): HilPlan => ({
 })
 
 let plans: HilPlan[] = []
+let approvalFailures = 0
 const calls = (suffix: string) => vi.mocked(fetch).mock.calls.filter(([url]) => String(url).endsWith(suffix))
+const approvals = () => vi.mocked(fetch).mock.calls.filter(([url, init]) => String(url).endsWith('/api/v1/firmware/hil-plans') && init?.method === 'POST')
 
 beforeEach(() => {
   plans = []
+  approvalFailures = 0
   vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input)
     if (url.endsWith('/api/v1/firmware/hil-plans') && (!init?.method || init.method === 'GET')) return json({ rows: plans })
     if (url.endsWith('/hil-plans/preview')) {
       return json({
         release: { release_id: 'zone-lite-2.7.6', version: '2.7.6', image_sha256: 'b'.repeat(64), application_sha256: 'e'.repeat(64) },
-        stages: [[{ zone_id: 'ZONE-SLICTOWER-13FL', connector_id: T13.connector_id, display_name: 'SLICTOWER 13FL', location: 'SLICTOWER', connected: true },
-          { zone_id: 'ZONE-PESHAWAR-02', connector_id: P02.connector_id, display_name: 'Peshawar 02', location: 'PESHAWAR', connected: false }]],
-        plan_digest: 'd'.repeat(64), expires_in_hours: 72, stage_timeout_minutes: 360,
+        stages: [[{ zone_id: 'ZONE-SLICTOWER-13FL', connector_id: T13.connector_id, display_name: 'SLICTOWER 13FL', location: 'SLICTOWER', connected: true, accepted_holds: ['ESP_DURABILITY_FAULT', 'ESP_PRESERVATION_UNVERIFIED'] },
+          { zone_id: 'ZONE-PESHAWAR-02', connector_id: P02.connector_id, display_name: 'Peshawar 02', location: 'PESHAWAR', connected: false, accepted_holds: [] }]],
+        plan_digest: 'd'.repeat(64), expires_in_hours: 72, stage_timeout_minutes: 360, soak_minutes: 30,
+        window_start_hour: 10, window_end_hour: 16,
+        slot_holders: [{ connector_id: 'lahore', zone_id: 'ZONE-LAHORE-02', display_name: 'Lahore 02', status: 'RECONCILING', campaign_status: 'CANCELLED', location: 'LAHORE' }],
       })
     }
-    if (url.endsWith('/api/v1/firmware/hil-plans')) return json(plan({ stage_count: 1 }), 201)
-    if (url.endsWith('/cancel')) return json({ detail: 'Cancel refused: deployment x is OFFERED.' }, 409)
+    if (url.endsWith('/api/v1/firmware/hil-plans')) {
+      if (approvalFailures > 0) {
+        approvalFailures -= 1
+        return json({ detail: 'The connection was reset.' }, 503)
+      }
+      return json(plan({ stage_count: 1 }), 201)
+    }
+    if (url.endsWith('/cancel')) return json({ plan_id: 'a'.repeat(32), status: 'CANCELLED' })
     return json({ plan_id: 'a'.repeat(32), status: 'PAUSED' })
   }))
 })
@@ -104,8 +115,12 @@ describe('staged HIL plans', () => {
     expect(await screen.findByText(/Peshawar 02 \(PESHAWAR, offline\)/, undefined, slow)).toBeTruthy()
     expect(JSON.parse(String(calls('/hil-plans/preview')[0][1]?.body))).toEqual({
       release_id: 'zone-lite-2.7.6', stages: [['ZONE-SLICTOWER-13FL', 'ZONE-PESHAWAR-02']],
-      expires_in_hours: 72, stage_timeout_minutes: 360,
+      expires_in_hours: 72, stage_timeout_minutes: 360, soak_minutes: 30, window_start_hour: 10, window_end_hour: 16,
     })
+    // The owner sees exactly which existing conditions the approval accepts, and who holds the slots.
+    expect(screen.getByText(/SLICTOWER 13FL: ESP_DURABILITY_FAULT, ESP_PRESERVATION_UNVERIFIED/)).toBeTruthy()
+    expect(screen.getByText(/Lahore 02 \(RECONCILING, campaign cancelled\)/)).toBeTruthy()
+    expect(screen.getByText(/then 30 minutes on its new boot/).textContent).toContain('10:00–16:00 Pakistan time')
     fireEvent.change(screen.getByLabelText(/Audited reason/), { target: { value: 'Owner approved staged HIL' } })
     fireEvent.change(screen.getByLabelText(/Type exact version/), { target: { value: '2.7.6' } })
     expect(approve.disabled).toBe(true)
@@ -113,12 +128,37 @@ describe('staged HIL plans', () => {
     expect(approve.disabled).toBe(false)
     fireEvent.click(approve)
     await waitFor(() => expect(notices.notice).toHaveBeenCalled(), slow)
-    const posted = vi.mocked(fetch).mock.calls.filter(([url, init]) => String(url).endsWith('/api/v1/firmware/hil-plans') && init?.method === 'POST')
-    expect(posted).toHaveLength(1)
-    const body = JSON.parse(String(posted[0][1]?.body))
+    expect(approvals()).toHaveLength(1)
+    const body = JSON.parse(String(approvals()[0][1]?.body))
     expect(body).toMatchObject({ release_id: 'zone-lite-2.7.6', stages: [['ZONE-SLICTOWER-13FL', 'ZONE-PESHAWAR-02']],
-      plan_digest: 'd'.repeat(64), password: 'owner-password', typed_confirmation: '2.7.6', reason: 'Owner approved staged HIL' })
+      plan_digest: 'd'.repeat(64), password: 'owner-password', typed_confirmation: '2.7.6', reason: 'Owner approved staged HIL',
+      soak_minutes: 30, window_start_hour: 10, window_end_hour: 16 })
     expect(body.idempotency_key).toMatch(/^hil-plan:/)
+  }, 30_000)
+
+  it('retries a failed approval with the same idempotency key', async () => {
+    approvalFailures = 1
+    const notices = toast()
+    render(<HilPlansPanel releases={[release]} devices={devices} hilEnabled revision={0} toast={notices} />)
+    await waitFor(() => expect(calls('/api/v1/firmware/hil-plans')).toHaveLength(1), slow)
+    fireEvent.click(screen.getByRole('button', { name: /New staged plan/ }))
+    fireEvent.change(screen.getByLabelText('HIL-only release'), { target: { value: 'zone-lite-2.7.6' } })
+    fireEvent.change(screen.getByLabelText('Stage 1 device 1'), { target: { value: 'ZONE-SLICTOWER-13FL' } })
+    fireEvent.click(screen.getByRole('button', { name: /Preview exact plan/ }))
+    expect(await screen.findByText(/Pinned plan/, undefined, slow)).toBeTruthy()
+    const fill = () => {
+      fireEvent.change(screen.getByLabelText(/Audited reason/), { target: { value: 'Owner approved staged HIL' } })
+      fireEvent.change(screen.getByLabelText(/Type exact version/), { target: { value: '2.7.6' } })
+      fireEvent.change(screen.getByLabelText('Administrator password'), { target: { value: 'owner-password' } })
+      fireEvent.click(screen.getByRole('button', { name: /Approve staged plan/ }))
+    }
+    fill()
+    expect((await screen.findByRole('alert', undefined, slow)).textContent).toContain('connection was reset')
+    fill()
+    await waitFor(() => expect(notices.notice).toHaveBeenCalled(), slow)
+    const keys = approvals().map(([, init]) => JSON.parse(String(init?.body)).idempotency_key)
+    expect(keys).toHaveLength(2)
+    expect(keys[0]).toBe(keys[1])
   }, 30_000)
 
   it('a changed stage invalidates the preview', async () => {
@@ -133,14 +173,24 @@ describe('staged HIL plans', () => {
     expect(screen.queryByText(/Pinned plan/)).toBeNull()
   }, 30_000)
 
-  it('shows the server refusal when cancelling while a deployment is offered', async () => {
+  it('cancels at once and says an installation in progress continues under its campaign', async () => {
     plans = [plan({})]
-    render(<HilPlansPanel releases={[release]} devices={devices} hilEnabled revision={0} toast={toast()} />)
+    const notices = toast()
+    render(<HilPlansPanel releases={[release]} devices={devices} hilEnabled revision={0} toast={notices} />)
     fireEvent.click(await screen.findByRole('button', { name: /Cancel plan/ }, slow))
+    expect(screen.getByText(/A device already receiving bytes is never interrupted/)).toBeTruthy()
     fireEvent.change(screen.getByLabelText(/Audited reason/), { target: { value: 'Owner cancels this plan' } })
     fireEvent.change(screen.getByLabelText('Administrator password'), { target: { value: 'owner-password' } })
     fireEvent.click(screen.getByRole('button', { name: 'Confirm cancel' }))
-    expect((await screen.findByRole('alert', undefined, slow)).textContent).toContain('OFFERED')
+    await waitFor(() => expect(notices.notice).toHaveBeenCalledWith('Staged HIL plan cancelled with an audit entry.'), slow)
     expect(JSON.parse(String(calls('/cancel')[0][1]?.body))).toEqual({ reason: 'Owner cancels this plan', password: 'owner-password' })
+  }, 30_000)
+
+  it('pause says unoffered stage devices are held too', async () => {
+    plans = [plan({ soak_minutes: 30, window_start_hour: 10, window_end_hour: 16 })]
+    render(<HilPlansPanel releases={[release]} devices={devices} hilEnabled revision={0} toast={toast()} />)
+    expect(await screen.findByText(/Soak 30 min · stage timeout 360 min · stages start 10:00–16:00 Pakistan time/, undefined, slow)).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: /Pause/ }))
+    expect(screen.getByText(/Stage devices that were never offered bytes are held too/)).toBeTruthy()
   }, 30_000)
 })

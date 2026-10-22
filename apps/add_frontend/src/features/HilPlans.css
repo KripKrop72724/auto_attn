@@ -23,3 +23,5 @@
   .hil-plan-stage-row, .hil-plan-limits { grid-template-columns: minmax(0, 1fr); }
   .hil-plan-stages li { grid-template-columns: minmax(0, 1fr); }
 }
+.hil-plan-preview .message { margin-top: 8px; }
+.hil-plan-preview ul { margin: 4px 0 0; padding-left: 18px; }

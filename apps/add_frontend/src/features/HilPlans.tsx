@@ -21,6 +21,17 @@ export interface HilPlanDevice {
   error_code?: string | null
   connected?: boolean
   firmware_version?: string | null
+  /** Holds the owner accepted at approval; any other hold halts the plan. */
+  accepted_holds?: string[]
+}
+
+export interface HilPlanSlotHolder {
+  connector_id: string
+  zone_id?: string | null
+  display_name?: string | null
+  status: string
+  campaign_status: string
+  location: string | null
 }
 
 export interface HilPlan {
@@ -32,6 +43,9 @@ export interface HilPlan {
   approved_at: string
   expires_at: string
   stage_timeout_minutes: number
+  soak_minutes?: number
+  window_start_hour?: number
+  window_end_hour?: number
   current_stage: number
   stage_count: number
   waiting_reason: string | null
@@ -46,10 +60,29 @@ interface HilPlanPreview {
   plan_digest: string
   expires_in_hours: number
   stage_timeout_minutes: number
+  soak_minutes: number
+  window_start_hour: number
+  window_end_hour: number
+  slot_holders: HilPlanSlotHolder[]
 }
 
 const openStates = new Set(['RUNNING', 'PAUSED'])
 const message = (reason: unknown, fallback: string) => (reason instanceof Error ? reason.message : fallback)
+const hour = (value: number) => `${String(value).padStart(2, '0')}:00`
+const controlCopy: Record<PlanAction, { title: string; body: string }> = {
+  pause: {
+    title: 'No further stage starts while paused.',
+    body: 'Stage devices that were never offered bytes are held too. A device already receiving bytes continues to its end, and a failure still halts the plan.',
+  },
+  resume: {
+    title: 'The plan continues from its saved stage.',
+    body: 'Held stage devices are released and the current stage timer starts again.',
+  },
+  cancel: {
+    title: 'Cancellation ends this approval at once.',
+    body: 'Campaigns that never offered bytes are cancelled. A device already receiving bytes is never interrupted: it continues under its own campaign, which you manage from the campaign list.',
+  },
+}
 
 function PlanControlDialog({ plan, action, onClose, onChanged, toast }: {
   plan: HilPlan
@@ -87,8 +120,8 @@ function PlanControlDialog({ plan, action, onClose, onChanged, toast }: {
         <div className={`info-copy pattern-${action === 'cancel' ? 'blocked' : 'waiting'}`}>
           <Icon name={action === 'cancel' ? 'alert' : 'shield'} />
           <div>
-            <h3>{action === 'cancel' ? 'Cancellation ends this approval.' : action === 'pause' ? 'No further stage starts while paused.' : 'The plan continues from its saved stage.'}</h3>
-            <p>Only campaigns that never offered bytes are stopped. A deployment that is offered or downloading is never cancelled by a plan; cancellation waits until it settles.</p>
+            <h3>{controlCopy[action].title}</h3>
+            <p>{controlCopy[action].body}</p>
           </div>
         </div>
         <label>Audited reason<textarea value={reason} onChange={(event) => setReason(event.target.value)} maxLength={200} placeholder="10–200 characters" /></label>
@@ -117,7 +150,12 @@ export function HilPlanCreator({ releases, devices, onClose, onCreated, toast }:
   const [stages, setStages] = useState<string[][]>([['', '']])
   const [expiresInHours, setExpiresInHours] = useState(72)
   const [stageTimeout, setStageTimeout] = useState(360)
+  const [soakMinutes, setSoakMinutes] = useState(30)
+  const [windowStart, setWindowStart] = useState(10)
+  const [windowEnd, setWindowEnd] = useState(16)
   const [preview, setPreview] = useState<HilPlanPreview | null>(null)
+  // One key per previewed plan: a retried approval returns the same plan.
+  const [approvalKey, setApprovalKey] = useState('')
   const [reason, setReason] = useState('')
   const [confirmation, setConfirmation] = useState('')
   const [password, setPassword] = useState('')
@@ -141,12 +179,16 @@ export function HilPlanCreator({ releases, devices, onClose, onCreated, toast }:
   }
   const setZone = (stageIndex: number, slot: number, zone: string) =>
     change(() => setStages((current) => current.map((stage, index) => index === stageIndex ? stage.map((value, position) => position === slot ? zone : value) : stage)))
-  const requestBody = () => ({ release_id: releaseId, stages: chosen, expires_in_hours: expiresInHours, stage_timeout_minutes: stageTimeout })
+  const requestBody = () => ({
+    release_id: releaseId, stages: chosen, expires_in_hours: expiresInHours, stage_timeout_minutes: stageTimeout,
+    soak_minutes: soakMinutes, window_start_hour: windowStart, window_end_hour: windowEnd,
+  })
   const runPreview = async () => {
     setBusy(true)
     setError('')
     try {
       setPreview(await api<HilPlanPreview>('/api/v1/firmware/hil-plans/preview', { method: 'POST', body: JSON.stringify(requestBody()) }))
+      setApprovalKey(idempotency('hil-plan'))
     } catch (reason) {
       setError(message(reason, 'The plan could not be previewed.'))
     } finally {
@@ -163,7 +205,7 @@ export function HilPlanCreator({ releases, devices, onClose, onCreated, toast }:
         method: 'POST',
         body: JSON.stringify({
           ...requestBody(), reason: reason.trim(), typed_confirmation: confirmation, password,
-          plan_digest: preview.plan_digest, idempotency_key: idempotency('hil-plan'),
+          plan_digest: preview.plan_digest, idempotency_key: approvalKey,
         }),
       })
       toast.notice(`Staged HIL plan approved: ${plan.stage_count} stage${plan.stage_count === 1 ? '' : 's'}; ADD starts stage 1 when its slots are free.`)
@@ -178,7 +220,7 @@ export function HilPlanCreator({ releases, devices, onClose, onCreated, toast }:
     }
   }
   const complete = chosen.length > 0 && chosen.every((stage) => stage.length > 0)
-  const valid = Boolean(preview && release && reason.trim().length >= 10 && confirmation === release.version && password && !busy)
+  const valid = Boolean(preview && approvalKey && release && reason.trim().length >= 10 && confirmation === release.version && password && !busy)
   return (
     <Dialog titleId="hil-plan-create-title" title="Approve a staged HIL plan"
       description="One approval with password step-up. ADD then starts each stage through the normal preflight and campaign checks, and halts on anything other than success."
@@ -209,6 +251,9 @@ export function HilPlanCreator({ releases, devices, onClose, onCreated, toast }:
         <div className="hil-plan-limits">
           <label>Approval expires after (hours)<input type="number" min={1} max={72} value={expiresInHours} onChange={(event) => change(() => setExpiresInHours(Number(event.target.value)))} /></label>
           <label>Stage timeout (minutes)<input type="number" min={30} max={1440} value={stageTimeout} onChange={(event) => change(() => setStageTimeout(Number(event.target.value)))} /></label>
+          <label>Soak after each install (minutes)<input type="number" min={10} max={720} value={soakMinutes} onChange={(event) => change(() => setSoakMinutes(Number(event.target.value)))} /></label>
+          <label>Stages start from (hour, Pakistan time)<input type="number" min={0} max={23} value={windowStart} onChange={(event) => change(() => setWindowStart(Number(event.target.value)))} /></label>
+          <label>Stages start before (hour, Pakistan time)<input type="number" min={1} max={24} value={windowEnd} onChange={(event) => change(() => setWindowEnd(Number(event.target.value)))} /></label>
         </div>
         {!preview && <button type="button" className="button secondary" disabled={!release || !complete || busy} onClick={() => void runPreview()}><Icon name="search" /> {busy ? 'Checking every stage…' : 'Preview exact plan'}</button>}
         {preview && (
@@ -220,6 +265,23 @@ export function HilPlanCreator({ releases, devices, onClose, onCreated, toast }:
                 <li key={index}>Stage {index + 1}: {stage.map((device) => `${device.display_name || device.zone_id} (${device.location}${device.connected ? '' : ', offline'})`).join(' + ')}</li>
               ))}
             </ol>
+            <p>Each stage advances after every device reports SUCCEEDED and then {preview.soak_minutes} minutes on its new boot with healthy storage, a connected terminal and attendance delivery. Stages start {hour(preview.window_start_hour)}–{hour(preview.window_end_hour)} Pakistan time.</p>
+            {preview.stages.flat().some((device) => device.accepted_holds?.length) && (
+              <div className="message pattern-waiting">
+                <Icon name="alert" />
+                <div>
+                  <strong>You accept these existing device conditions.</strong> Any other hold, or one of these raised again after the install, halts the plan.
+                  <ul>
+                    {preview.stages.flat().filter((device) => device.accepted_holds?.length).map((device) => (
+                      <li key={device.zone_id}>{device.display_name || device.zone_id}: {device.accepted_holds?.join(', ')}</li>
+                    ))}
+                  </ul>
+                </div>
+              </div>
+            )}
+            {preview.slot_holders.length > 0 && (
+              <p>Upgrade slots held now: {preview.slot_holders.map((holder) => `${holder.display_name || holder.zone_id || holder.connector_id} (${holder.status}, campaign ${holder.campaign_status.toLowerCase()})`).join('; ')}. Stages wait while these hold their slots.</p>
+            )}
           </section>
         )}
         <label>Audited reason<textarea value={reason} onChange={(event) => setReason(event.target.value)} maxLength={500} placeholder="Why should ADD run these stages? At least 10 characters." /></label>
@@ -267,7 +329,7 @@ export function HilPlansPanel({ releases, devices, hilEnabled, revision, toast, 
       <div className="panel-header">
         <div>
           <h2 id="hil-plans-title">Staged HIL plans</h2>
-          <p>One owner approval; ADD starts each stage and halts on any failure, hold, refusal or timeout.</p>
+          <p>One owner approval; ADD starts each stage, waits for each install to settle, and halts on any failure, new hold, refusal or timeout.</p>
         </div>
         <button className="button primary" disabled={!hilEnabled || open} title={open ? 'Finish or cancel the open plan first' : undefined} onClick={() => setCreatorOpen(true)}>
           <Icon name="plus" /> New staged plan
@@ -281,6 +343,9 @@ export function HilPlansPanel({ releases, devices, hilEnabled, revision, toast, 
             <span>
               <strong>ZKT Zone Lite {plan.release.version} · stage {plan.current_stage} of {plan.stage_count}</strong>
               <small>Approved by {plan.approved_by} {dateTime(plan.approved_at)} · expires {dateTime(plan.expires_at)} · plan {plan.plan_id.slice(0, 8)}</small>
+              {plan.soak_minutes !== undefined && plan.window_start_hour !== undefined && plan.window_end_hour !== undefined && (
+                <small>Soak {plan.soak_minutes} min · stage timeout {plan.stage_timeout_minutes} min · stages start {hour(plan.window_start_hour)}–{hour(plan.window_end_hour)} Pakistan time</small>
+              )}
             </span>
             <StatusBadge state={plan.status} live={plan.status === 'RUNNING'} />
           </header>
