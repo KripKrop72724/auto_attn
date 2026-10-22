@@ -68,7 +68,7 @@ last seen, evidence and the condition that clears it. Currency is one of:
 | `ESP_LOCAL_FAILURE` | DEGRADED; WARNING when latched with verified storage, or held after a 2.5.2 boot-time failure | yes | the LED reports healthy, or at reboot |
 | `HIK_CAPTURE_UNHEALTHY` | DEGRADED for storage; otherwise WARNING (network only once disconnected) | yes | the terminal is online and its checks succeed |
 | `DEVICE_MESSAGE_REJECTED` | DEGRADED for a current heartbeat or custody rejection; otherwise WARNING | yes; no once only unheld `queue_evidence` copies remain after a later acceptance | ADD accepts the next message of each rejected type; for `queue_evidence`, ADD holds each refused copy or an operator resolves it (see below) |
-| `ADD_MESSAGE_PROCESSING_FAILED` | DEGRADED after 120 s of failed heartbeats; WARNING after 3 failures over 5 min | no | ADD processes the next message of each type |
+| `ADD_MESSAGE_PROCESSING_FAILED` | DEGRADED after 120 s of failed heartbeats; WARNING after 3 failures over 5 min, or while a `queue_evidence` copy ADD could not process is not yet held | no | ADD processes the next message of each type; for `queue_evidence`, ADD holds each copy or an operator resolves it |
 | `HIK_LIGHT_RECONCILE_BLOCKED` | WARNING | yes | the history audit scans or completes |
 | `OTA_DEVICE_ROLLED_BACK`, `OTA_DEVICE_REPORTED_FAILURE` | WARNING | yes | a later deployment to the device succeeds |
 | `ZKT_CONNECTION_FLAPPING` | WARNING | yes | three consecutive successful connections |
@@ -129,24 +129,40 @@ minutes earlier.
   another record whose bytes match what arrived does not hold it. Each hold
   is kept in `evidence_resolutions` with a finding (`COPY_INTACT`,
   `SENT_BYTES_CHANGED` or `DIGEST_CHANGED`) and both byte counts.
+  Provenance is not compared across generations. Every firmware sender takes
+  `terminal_serial` from the row's own `device_serial`, so equal bytes name
+  the same terminal. What can differ is the reason and whether the serial is
+  sent, which depend on how the row was read. A row read right after a
+  cut-off row is never parsed (`MALFORMED`, no serial), while the same row
+  re-blocked or sent by storage recovery may be parsed (`LEGACY_RECOVERY`).
 - A refusal recorded after ADD already holds the copy (a reconnect overlap)
   opens nothing: its alert is written and closed at once as `EVIDENCE_HELD`,
-  or, when other rejected types keep the alert open, only the hold is added.
-  The rejection log entry is written either way.
+  or, when other rejected types or other refused copies keep the alert open,
+  only the hold is added. The rest of the entry is left as it was: it does
+  not become current again, and a hold a later acceptance lifted stays
+  lifted. The rejection log entry is written either way.
 - The first `queue_evidence` ADD accepts after a refusal used to close the
   entry. Now it stamps `later_acceptance_at` on what it does not hold. From
   then on that entry is not current and not gating: no HIL or factory hold,
   as before. It stays open as a WARNING until ADD holds each copy or an
   operator verifies the device and resolves it, and cleanup lists it as
-  Needs review. A new refusal of that type makes it current and gating again.
+  Needs review. A new refusal of that type that ADD does not already hold
+  makes it current and gating again.
+- An ADD-side failure (`ADD_MESSAGE_PROCESSING_FAILED`, for example
+  `DATABASE_UNAVAILABLE`) on a `queue_evidence` is tracked the same way. While
+  a copy is not held it is a WARNING that never gates.
 - Only an operator can account for: an identity conflict; a refusal with no
   readable identity or beyond 16 pending copies; and a record the device
   settled without sending evidence again, such as a 2.6.x ORDS row delivered
   to Oracle on retry (its receipt names only the event, so ADD cannot match
-  it to the refused bytes). A device that keeps resending a conflicting copy
-  keeps the entry current, so it cannot be resolved until the device stops.
-  A refusal that no later acceptance follows keeps its hold, as before;
-  cleanup lists it as Needs review instead of Condition cleared.
+  it to the refused bytes). A conflicting copy refused again for another
+  reason, such as a damaged connector id or provenance, stays a conflict. While a record
+  has a pending conflict, no refused copy of it is held automatically. A
+  device that keeps resending a conflicting copy keeps the entry current, so
+  it cannot be resolved until the device stops. A refusal that no later
+  acceptance follows keeps its hold, as before, however old it is; cleanup
+  lists it as Needs review instead of Condition cleared. See
+  [Refused queue_evidence ADD does not hold](#refused-queue_evidence-add-does-not-hold).
   Refusals recorded before this tracking keep the old rule: any accepted
   `queue_evidence` clears them.
 - Every heartbeat's telemetry row stores `payload._add_health` with the mode,
@@ -180,6 +196,32 @@ characters and an idempotency key. Both are audited with before and after.
 - **Re-evaluate device error** (`POST /api/v1/devices/{id}/clear-error`). It
   sets the stored device error to the derived value. It is refused while an
   active alert still backs the code, or if the code changed since you looked.
+
+## Refused queue_evidence ADD does not hold
+
+A `DEVICE_MESSAGE_REJECTED` or `ADD_MESSAGE_PROCESSING_FAILED` alert whose
+summary says "refused record(s) not yet held" stays open until ADD holds each
+copy or an operator resolves it. It does not close on its own with time.
+
+1. Open the alert and read `details.types.queue_evidence.pending`. Each
+   copy names its `queue`, `queue_generation`, `record_id`, `reason`, the
+   claimed and received digests and `last_at`.
+2. Check whether the device still sends it. Device logs with code
+   `DEVICE_MESSAGE_REJECTED` carry `context.evidence.record_id`. If the
+   same record is still refused, the entry stays current and cannot be
+   resolved yet. Treat a repeat on one board as a hardware or power check,
+   as for MULTAN-02.
+3. Check what ADD holds: `GET /api/v1/devices/{connector_id}/queue-evidence`
+   lists the queue, generation, record id and digest of every held record.
+4. For an `ords` or `ords_legacy` copy, confirm in Oracle (read-only) whether
+   the row's event was delivered. A 2.6.x device sends delivered ORDS rows
+   to Oracle, not to ADD.
+5. For `QUEUE_EVIDENCE_IDENTITY_REUSED`, do not resolve until the device's
+   source row has been examined: ADD and the device disagree about what the
+   record is. Escalate to the firmware owner.
+6. Resolve with a reason that names what you verified for each copy
+   (**Resolve with reason**, step-up). Do not resolve a copy you could not
+   account for.
 
 ## Stranded-alert cleanup
 
@@ -240,7 +282,10 @@ last heartbeat, such as offline devices.
    or restart. The legacy writers own lifecycle again from the next heartbeat
    (15 s). Binding, evidence, the new resolutions, operator actions and the
    cleanup keep working. After any restart, the sweep waits 90 s before
-   marking a device offline.
+   marking a device offline. The rejection writers follow the derived rule
+   for refused `queue_evidence` copies: a rejection left only with copies
+   after a later acceptance sets no device error. They never overwrite
+   `QUARANTINED_DUPLICATE_SERIAL`.
 2. **Image rollback.** The previous image ignores the new detail keys, resets
    lifecycle on the next heartbeat, and treats acknowledged rows as open.
    Alerts with the new codes stay open with no lifecycle effect; acknowledge

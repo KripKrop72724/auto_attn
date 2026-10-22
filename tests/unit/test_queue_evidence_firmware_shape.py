@@ -16,12 +16,14 @@ MESSAGE_REJECTED and keeps its source row, and the rejection stays open until
 ADD holds what that copy carried: the same identity with the digest the ESP
 claimed or the digest of the bytes that arrived, or, under another generation
 of the same queue, the claimed digest or the received digest with the same
-record id. An acceptance from another lane, the same identity with other
-bytes, or another record whose bytes match what arrived does not hold it, and
-an identity conflict needs an operator. A refusal of a copy ADD already holds
-(a reconnect overlap) leaves nothing open. The first acceptance after a
-refusal, which used to close it, still lifts its HIL and factory hold; what
-ADD does not hold stays open as a warning for an operator.
+record id, each with the same provenance. An acceptance from another lane,
+the same identity with other bytes, or another record whose bytes match what
+arrived does not hold it, and an identity conflict needs an operator, as does
+every refused copy of a record in conflict. A refusal of a copy ADD already
+holds (a reconnect overlap) leaves nothing open and re-arms nothing. The
+first acceptance after a refusal, which used to close it, still lifts its HIL
+and factory hold; what ADD does not hold stays open as a warning for an
+operator, also with ADD_DEVICE_HEALTH_DERIVED_ENABLED=false.
 MULTAN-02 (zone-lite-2.6.15) had four such refusals on 8 and 21 Oct 2026. ADD
 recorded no identity for them then, so whether each record was held later
 cannot be shown from ADD's records alone.
@@ -52,7 +54,9 @@ import zk_add.web as add_web
 from zk_add.db import Base
 from zk_add.device_health import evaluate_health
 from zk_add.models import Connector, DeviceAlert, DeviceLog, QueueEvidence
-from zk_add.queue_evidence import BASE64_INVALID, DIGEST_MISMATCH, IDENTITY_REUSED, LATER_ACCEPTANCE, LENGTH_INVALID
+from zk_add.queue_evidence import (
+    BASE64_INVALID, CONNECTOR_MISMATCH, DIGEST_MISMATCH, IDENTITY_REUSED, LATER_ACCEPTANCE, LENGTH_INVALID,
+)
 from zk_add.realtime import BrowserEventHub
 from zk_add.schemas import Envelope
 from zk_add.service import MAX_EVIDENCE_RESOLUTIONS, MAX_PENDING_EVIDENCE, MAX_REJECTION_TYPES, onboard_connector
@@ -1041,3 +1045,181 @@ def test_a_2615_ords_row_delivered_to_oracle_instead_waits_for_an_operator(devic
     alert, entry = rejection_entry(sessions, connector_pk)
     assert alert.state == "OPEN" and pending_identities(entry) == [identity(ords)]
     assert "1 refused record not yet held" in summary(sessions, connector_pk)
+
+
+def test_a_conflicting_copy_refused_again_for_another_reason_stays_a_conflict(device_stream):
+    """ADD holds the conflicting bytes under another generation; the device resends the conflicting
+    copy and this time its connector id is damaged. Only an operator may account for it."""
+    sessions, connector_pk, connector_id = device_stream
+    original = legacy_payload(connector_id, MALFORMED_ROW, queue="blocked_legacy", generation=218, offset=0)
+    held(connector_pk, connector_id, original, 8)
+    conflict_bytes = MALFORMED_ROW + b"-DIFFERENT-PUNCH"
+    held(connector_pk, connector_id, legacy_payload(
+        connector_id, conflict_bytes, queue="blocked_legacy", generation=416, offset=0), 9)
+    conflict = other_bytes(original, conflict_bytes)
+    refused(connector_pk, connector_id, conflict, 10)
+    refused(connector_pk, connector_id, {**conflict, "connector_id": "ANOTHER-CONNECTOR"}, 11)
+    alert, entry = rejection_entry(sessions, connector_pk)
+    assert alert.state == "OPEN" and resolutions(alert) == []
+    [pending] = entry["pending"]
+    assert (pending["reason"], pending["count"], pending["request_id"]) == (IDENTITY_REUSED, 2, f"{BOOT_ID}-11")
+    assert entry["error_reason"] == CONNECTOR_MISMATCH  # why the latest copy was refused
+    assert hold(sessions, connector_pk)["reason"] == ("DEGRADED", "CURRENT", True, False)
+    # Nothing ADD accepts later accounts for it.
+    held(connector_pk, connector_id, original, 12)
+    held(connector_pk, connector_id, legacy_payload(connector_id), 13)
+    alert, entry = rejection_entry(sessions, connector_pk)
+    assert alert.state == "OPEN" and [item["reason"] for item in entry["pending"]] == [IDENTITY_REUSED]
+    assert resolutions(alert) == []
+
+
+def test_no_refused_copy_of_a_record_in_conflict_is_held_automatically(device_stream):
+    """ADD and the device disagree about the record, so its copies wait for an operator together."""
+    sessions, connector_pk, connector_id = device_stream
+    original = legacy_payload(connector_id)
+    held(connector_pk, connector_id, original, 8)
+    conflict = {**original, "provenance": {**original["provenance"], "terminal_serial": "ANOTHER-TERMINAL"}}
+    refused(connector_pk, connector_id, conflict, 9)
+    # The conflicting copy again with its provenance damaged, then a damaged copy of the held bytes:
+    # ADD holds these bytes under this identity, yet neither is held.
+    refused(connector_pk, connector_id, {**conflict, "provenance": {**conflict["provenance"], "reason": "MALFORMEX"}},
+            10)
+    refused(connector_pk, connector_id, corrupt_base64_character(original), 11)
+    alert, entry = rejection_entry(sessions, connector_pk)
+    assert alert.state == "OPEN" and resolutions(alert) == []
+    assert [(item["reason"], item["count"]) for item in entry["pending"]] == [
+        (IDENTITY_REUSED, 2), (DIGEST_MISMATCH, 1)]
+    held(connector_pk, connector_id, original, 12)  # a replay of what ADD holds
+    alert, entry = rejection_entry(sessions, connector_pk)
+    assert alert.state == "OPEN" and len(entry["pending"]) == 2 and resolutions(alert) == []
+    assert "2 refused records not yet held (1 is an identity conflict)" in summary(sessions, connector_pk)
+
+
+def test_a_refusal_of_a_held_copy_leaves_a_released_entry_as_it_was(device_stream):
+    """Reconnect overlap after a later acceptance lifted the hold: the hold stays lifted."""
+    sessions, connector_pk, connector_id = device_stream
+    blocked = legacy_payload(connector_id, MALFORMED_ROW, queue="blocked_legacy", generation=218, offset=0)
+    refused(connector_pk, connector_id, corrupt_base64_character(blocked), 8)
+    other = legacy_payload(connector_id)
+    held(connector_pk, connector_id, other, 9)
+    before, entry_before = rejection_entry(sessions, connector_pk)
+    released = hold(sessions, connector_pk)
+    assert (released["last_error_code"], released["reason"]) == (None, ("WARNING", "LATCHED", False, True))
+    # The old socket's damaged copy of `other`, which ADD already holds, is refused now.
+    refused(connector_pk, connector_id, corrupt_base64_character(other), 7)
+    alert, entry = rejection_entry(sessions, connector_pk)
+    assert (alert.id, alert.state, alert.message) == (before.id, "OPEN", before.message)
+    assert entry == entry_before  # neither current again nor counted
+    assert resolutions(alert) == [(other["record_id"], "SAME_IDENTITY", "SENT_BYTES_CHANGED")]
+    assert hold(sessions, connector_pk) == released
+    assert hold(sessions, connector_pk)["known_hold"] != "CONNECTOR_ERROR_REQUIRES_REVIEW"
+    # A refusal ADD does not hold still makes it current and gating again.
+    third = legacy_payload(connector_id, MALFORMED_ROW + b"3", queue="blocked_legacy", generation=218, offset=3)
+    refused(connector_pk, connector_id, corrupt_base64_character(third), 10)
+    _alert, entry = rejection_entry(sessions, connector_pk)
+    assert LATER_ACCEPTANCE not in entry
+    assert hold(sessions, connector_pk)["last_error_code"] == "DEVICE_MESSAGE_REJECTED"
+
+
+def test_a_reblocked_row_holds_its_refused_copy_whatever_its_provenance_says(device_stream):
+    """Every firmware sender takes terminal_serial from the row's own device_serial, so equal bytes
+    name one terminal. How the row was read sets the rest: read right after a cut-off row it is
+    never parsed (MALFORMED, no serial); re-blocked, the same bytes parse (LEGACY_RECOVERY)."""
+    sessions, connector_pk, connector_id = device_stream
+    row = json.dumps({"device_event_time": "2026-10-21T12:30:00+05:00", "device_serial": SERIAL, "punch": "0",
+                      "user_id": "17"}, separators=(",", ":")).encode()
+    record_id = f"0:0:{zlib.crc32(row)}"
+    unparsed = firmware_payload(connector_id, "blocked_legacy", f"{INSTANCE}-legacy-218", record_id, row,
+                                "MALFORMED")
+    refused(connector_pk, connector_id, corrupt_base64_character(unparsed), 8)
+    parsed = firmware_payload(connector_id, "blocked_legacy", f"{INSTANCE}-legacy-416", record_id, row,
+                              "LEGACY_RECOVERY", SERIAL)
+    held(connector_pk, connector_id, parsed, 9)
+    alert, entry = rejection_entry(sessions, connector_pk)
+    assert entry is None and alert.state == "RESOLVED"
+    assert resolutions(alert) == [(record_id, "SAME_BYTES", "SENT_BYTES_CHANGED")]
+
+
+def test_an_add_side_failure_not_yet_held_is_a_warning_that_never_gates(device_stream, monkeypatch):
+    """A 2.6.x ORDS row ADD could not take, then delivered to Oracle instead: visible until an operator."""
+    sessions, connector_pk, connector_id = device_stream
+    ords = legacy_payload(connector_id, MALFORMED_ROW, queue="ords_legacy", generation=44, offset=16)
+    real = add_web.preserve_queue_evidence
+
+    def unavailable(*_args, **_kwargs):
+        raise sqlalchemy.exc.OperationalError("SELECT 1", {}, Exception("lock timeout"))
+
+    def failure() -> tuple:
+        with sessions() as db:
+            connector = db.get(Connector, connector_pk)
+            health = evaluate_health(db, connector)
+            [reason] = [item for item in health.reasons + health.other_active_alerts
+                        if item.code == "ADD_MESSAGE_PROCESSING_FAILED"]
+            return (reason in health.reasons, reason.tier, reason.currency, reason.gating,
+                    reason.operator["resolvable"], connector.last_error_code, _known_hold(db, connector))
+
+    monkeypatch.setattr(add_web, "preserve_queue_evidence", unavailable)
+    refused(connector_pk, connector_id, ords, 8)
+    monkeypatch.setattr(add_web, "preserve_queue_evidence", real)
+    listed, tier, currency, gating, resolvable, error, known = failure()
+    assert (listed, tier, currency, gating, resolvable, error) == (True, "WARNING", "CURRENT", False, False, None)
+    assert known != "CONNECTOR_ERROR_REQUIRES_REVIEW"
+    held(connector_pk, connector_id, legacy_payload(connector_id), 9)  # another lane; the row is never resent
+    listed, tier, currency, gating, resolvable, error, known = failure()
+    assert (listed, tier, currency, gating, resolvable, error) == (True, "WARNING", "LATCHED", False, True, None)
+    alert, entry = rejection_entry(sessions, connector_pk, "ADD_MESSAGE_PROCESSING_FAILED")
+    assert alert.state == "OPEN" and pending_identities(entry) == [identity(ords)]
+
+
+def stored_state(sessions, connector_pk: int) -> tuple[str, str | None]:
+    with sessions() as db:
+        connector = db.get(Connector, connector_pk)
+        return connector.lifecycle_state, connector.last_error_code
+
+
+def test_legacy_writers_lift_and_keep_lifted_the_hold_like_the_derived_model(device_stream, monkeypatch):
+    """ADD_DEVICE_HEALTH_DERIVED_ENABLED=false: the rejection writers own lifecycle and the device error."""
+    monkeypatch.setattr(settings, "device_health_derived_enabled", False)
+    sessions, connector_pk, connector_id = device_stream
+    blocked = legacy_payload(connector_id, MALFORMED_ROW, queue="blocked_legacy", generation=218, offset=0)
+    refused(connector_pk, connector_id, corrupt_base64_character(blocked), 8)
+    assert stored_state(sessions, connector_pk) == ("DEGRADED", "DEVICE_MESSAGE_REJECTED")
+    other = legacy_payload(connector_id)
+    held(connector_pk, connector_id, other, 9)
+    assert stored_state(sessions, connector_pk) == ("ONLINE", None)
+    assert rejection_entry(sessions, connector_pk)[0].state == "OPEN"
+    refused(connector_pk, connector_id, corrupt_base64_character(other), 7)  # overlap of a held copy
+    assert stored_state(sessions, connector_pk) == ("ONLINE", None)
+    third = legacy_payload(connector_id, MALFORMED_ROW + b"3", queue="blocked_legacy", generation=218, offset=3)
+    refused(connector_pk, connector_id, corrupt_base64_character(third), 10)
+    assert stored_state(sessions, connector_pk) == ("DEGRADED", "DEVICE_MESSAGE_REJECTED")
+    held(connector_pk, connector_id, blocked, 11)
+    held(connector_pk, connector_id, third, 12)
+    assert stored_state(sessions, connector_pk) == ("ONLINE", None)
+    assert rejection_entry(sessions, connector_pk)[0].state == "RESOLVED"
+    # A refusal ADD already holds opens nothing and clears a device error it would have set.
+    with sessions() as db:
+        connector = db.get(Connector, connector_pk)
+        connector.lifecycle_state, connector.last_error_code = "DEGRADED", "DEVICE_MESSAGE_REJECTED"
+        db.commit()
+    refused(connector_pk, connector_id, corrupt_base64_character(third), 13)
+    assert rejection_entry(sessions, connector_pk)[0].state == "RESOLVED"
+    assert stored_state(sessions, connector_pk) == ("ONLINE", None)
+
+
+def test_legacy_writers_never_overwrite_a_duplicate_serial_quarantine(device_stream, monkeypatch):
+    monkeypatch.setattr(settings, "device_health_derived_enabled", False)
+    sessions, connector_pk, connector_id = device_stream
+    with sessions() as db:
+        db.get(Connector, connector_pk).lifecycle_state = "QUARANTINED_DUPLICATE_SERIAL"
+        db.commit()
+    honest = legacy_payload(connector_id)
+    refused(connector_pk, connector_id, corrupt_base64_character(honest), 8)
+    assert stored_state(sessions, connector_pk) == ("QUARANTINED_DUPLICATE_SERIAL", "DEVICE_MESSAGE_REJECTED")
+    held(connector_pk, connector_id, honest, 9)
+    assert stored_state(sessions, connector_pk) == ("QUARANTINED_DUPLICATE_SERIAL", None)
+    with sessions() as db:
+        db.get(Connector, connector_pk).last_error_code = "DEVICE_MESSAGE_REJECTED"
+        db.commit()
+    refused(connector_pk, connector_id, corrupt_base64_character(honest), 10)  # held at once
+    assert stored_state(sessions, connector_pk) == ("QUARANTINED_DUPLICATE_SERIAL", None)

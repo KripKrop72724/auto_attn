@@ -92,7 +92,7 @@ POLICY = {
     "ADD_MESSAGE_PROCESSING_FAILED": Policy(
         65, False, "REJECTION", "Clears when ADD processes the next message of each failed type; a "
         "queue_evidence clears only once ADD holds each copy it could not process, or an operator "
-        "resolves it.", RULE),
+        "resolves it, and stays a warning until then.", RULE),
     "HIK_LIGHT_RECONCILE_BLOCKED": Policy(
         70, True, "POSITIVE", "Clears when the Hikvision history audit is scanning or complete.", WARNING),
     "OTA_DEVICE_ROLLED_BACK": Policy(
@@ -555,14 +555,22 @@ def _entry_current(entry: dict, now: datetime) -> bool:
     return age is not None and age <= settings.message_rejection_current_seconds
 
 
-def _rejection_gating(row: DeviceAlert, policy: Policy) -> bool:
-    """A rejection left with only refused copies ADD does not hold after a
-    later acceptance no longer holds HIL or factory work: that acceptance
-    used to close it. It stays open, as a warning, for an operator."""
-    if not policy.gating or row.code not in {"DEVICE_MESSAGE_REJECTED", "ADD_MESSAGE_PROCESSING_FAILED"}:
-        return policy.gating
+def rejection_holds(row: DeviceAlert) -> bool:
+    """Whether an open rejection still holds HIL or factory work.
+
+    A rejection left with only refused copies ADD does not hold after a
+    later acceptance no longer does: that acceptance used to close it. It
+    stays open, as a warning, for an operator. The legacy lifecycle writers
+    (ADD_DEVICE_HEALTH_DERIVED_ENABLED=false) follow the same rule.
+    """
     entries = _rejection_entries(row)
     return not (entries and all(custody_only(entry) for entry in entries.values()))
+
+
+def _rejection_gating(row: DeviceAlert, policy: Policy) -> bool:
+    if not policy.gating or row.code not in {"DEVICE_MESSAGE_REJECTED", "ADD_MESSAGE_PROCESSING_FAILED"}:
+        return policy.gating
+    return rejection_holds(row)
 
 
 def _refreshed_by_last_heartbeat(row: DeviceAlert, connector: Connector) -> bool:
@@ -644,6 +652,10 @@ def _rule_tier(row: DeviceAlert, connector: Connector, currency: str, *, now: da
             if (int(entry.get("count") or 0) >= settings.message_failure_warning_count and first and last
                     and (last - first).total_seconds() >= settings.message_failure_warning_seconds):
                 return WARNING
+        if any(unheld_evidence(entry) != (0, 0) for entry in entries.values()):
+            # Bytes the device sent that ADD has not taken custody of stay a
+            # visible warning (never gating: this code is ADD's own failure).
+            return WARNING
         return None
     return DEGRADED  # a RULE code without a rule fails closed
 
