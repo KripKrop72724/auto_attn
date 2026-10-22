@@ -28,9 +28,18 @@
     "unsigned-rescue-sdkconfig.txt": "91b2c947183eac0537ff7caf05c4f1a53300d00d5817ae39cdca8c58ce63cea6",
     "repair-and-original.bin": "db5edcd8d8afda8d7de3e3000235491b385b00b8acad307a8465fe43767bdae8"
   },
-  "repair_source_sha256": {
-    "rescue_main.c": "0d23508434d2c81fd94dfa23d2106a8fc2a3eceb9012ffd52dbac89e1c7ea92b",
-    "wifi_keys.c": "19d8c6ab952028f664d25b837b449f1c5bff8bcf9dd015330003f8985875b854",
-    "nvs_snapshot.c": "e574dd59472916ae1b1cc334800a8c841ff7c3b0a8604567515c5a2a836cf1fd"
-  }
+  "repair_source_files": [
+    {
+      "path": "rescue_main.c",
+      "sha256": "0d23508434d2c81fd94dfa23d2106a8fc2a3eceb9012ffd52dbac89e1c7ea92b"
+    },
+    {
+      "path": "wifi_keys.c",
+      "sha256": "19d8c6ab952028f664d25b837b449f1c5bff8bcf9dd015330003f8985875b854"
+    },
+    {
+      "path": "nvs_snapshot.c",
+      "sha256": "e574dd59472916ae1b1cc334800a8c841ff7c3b0a8604567515c5a2a836cf1fd"
+    }
+  ]
 }
