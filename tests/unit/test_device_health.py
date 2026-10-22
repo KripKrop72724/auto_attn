@@ -259,6 +259,8 @@ def test_terminal_link_hikvision_starting_and_esp_disconnected(db):
 DYNAMIC_ALERT_CODES = {
     "clock_alert": {"ZKT_CLOCK_DRIFT", "HIK_CLOCK_DRIFT"},
     "code": {"ESP_FATAL", "ESP_LOCAL_FAILURE", "ESP_DURABILITY_FAULT", "ESP_DELIVERY_WORKER_FAULT"},
+    # A held source-coverage seal raises one of these (reconciliation._finalisation_plan).
+    "plan.alert": {"ADD_SOURCE_GENERATION_LINEAGE_DIVERGED", "ADD_SOURCE_COVERAGE_UNVERIFIED"},
 }
 
 

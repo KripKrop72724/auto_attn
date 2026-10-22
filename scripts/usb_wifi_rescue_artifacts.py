@@ -72,6 +72,10 @@ def validate_package(directory: Path, role: str) -> dict:
                  'CONFIG_APP_ANTI_ROLLBACK=y'}
     if not required <= sdk or forbidden & sdk:
         raise ValueError('Unexpected rescue security configuration')
+    stack = next((line.split('=', 1)[1] for line in sdk
+                  if line.startswith('CONFIG_ESP_MAIN_TASK_STACK_SIZE=')), '0')
+    if not stack.isdecimal() or int(stack) < 8192:
+        raise ValueError('Insufficient encrypted-NVS main task stack')
     image = (directory / 'zone_lite.bin').read_bytes()
     if b'SLIC_WIFI_RESCUE_UNSIGNED_TEST_ONLY' in image:
         raise ValueError('Unsigned test image must never be fleet signed')

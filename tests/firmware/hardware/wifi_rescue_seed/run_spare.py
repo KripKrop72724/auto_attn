@@ -72,7 +72,8 @@ def main():
     if b'SLIC_WIFI_RESCUE_UNSIGNED_TEST_ONLY' not in rescue:
         raise RuntimeError('Not the unsigned spare-only test application')
     args.output.mkdir(parents=True, exist_ok=False)
-    entry = struct.pack('<I20sII', 2, b'\xff'*20, 2, zlib.crc32(struct.pack('<I', 2)) ^ 0xffffffff)
+    # Match esp_rom_crc32_le(UINT32_MAX, &ota_seq, 4), including its initial CRC.
+    entry = struct.pack('<I20sII', 2, b'\xff'*20, 2, zlib.crc32(struct.pack('<I', 2), 0xffffffff))
     ota = entry + b'\xff'*(4096-len(entry))
     fixture = bytearray(b'\xff' * H['STORAGE_SIZE'])
     sentinel = hashlib.sha256(b'ADD Wi-Fi rescue attendance fixture v1').digest()*128

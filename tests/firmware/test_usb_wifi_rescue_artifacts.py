@@ -75,7 +75,13 @@ def test_signing_validation_rejects_missing_hmac_security_and_unsigned_variant(t
               'CONFIG_SECURE_SIGNED_ON_UPDATE=y\nCONFIG_NVS_ENCRYPTION=y\n'
               'CONFIG_NVS_SEC_KEY_PROTECT_USING_HMAC=y\nCONFIG_NVS_SEC_HMAC_EFUSE_KEY_ID=0\n'
               'CONFIG_PARTITION_TABLE_OFFSET=0x10000\nCONFIG_ESPTOOLPY_FLASHSIZE_16MB=y\n'
-              'CONFIG_SECURE_ROM_DL_MODE_ENABLED=y\nCONFIG_SECURE_ENABLE_SECURE_ROM_DL_MODE=y')
+              'CONFIG_SECURE_ROM_DL_MODE_ENABLED=y\nCONFIG_SECURE_ENABLE_SECURE_ROM_DL_MODE=y\n'
+              'CONFIG_ESP_MAIN_TASK_STACK_SIZE=16384')
+    (tmp_path / 'sdkconfig').write_text(config)
+    for size in ['3584', '0', 'invalid']:
+        (tmp_path / 'sdkconfig').write_text(config.replace('STACK_SIZE=16384', 'STACK_SIZE=' + size))
+        with pytest.raises(ValueError, match='main task stack'):
+            validate_package(tmp_path, 'usb-wifi-rescue')
     (tmp_path / 'sdkconfig').write_text(config)
     assert validate_package(tmp_path, 'usb-wifi-rescue')['hil_only']
     for bad in [config.replace('CONFIG_NVS_SEC_HMAC_EFUSE_KEY_ID=0', 'CONFIG_NVS_SEC_HMAC_EFUSE_KEY_ID=1'),
