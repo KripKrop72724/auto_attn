@@ -2051,6 +2051,7 @@ class AttendanceRepairWorkerHeartbeat(Base):
 # drift checks always see the complete production metadata.
 from zk_add import ota as _ota_models  # noqa: E402,F401
 from zk_add import provisioning as _provisioning_models  # noqa: E402,F401
+from zk_add import hil_plans as _hil_plan_models  # noqa: E402,F401
 
 
 class QueueEvidence(Base):

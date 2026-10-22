@@ -5930,6 +5930,121 @@ async def revoke_firmware_release(
     return {"release_id": release_id, "state": release.state}
 
 
+# One-approval staged HIL plans (owner decision, 21 October 2026). The plan's
+# approval replaces only each campaign's interactive password prompt; ADD
+# creates every campaign through the same preflight and creation path.
+from zk_add import hil_plans as _hil_plans  # noqa: E402
+from typing import Annotated as _Annotated  # noqa: E402
+
+_ZoneId = _Annotated[str, _Field(min_length=1, max_length=100)]
+
+
+class _HilPlanPreviewIn(_BaseModel):
+    model_config = _ConfigDict(extra="forbid")
+    release_id: str = _Field(min_length=1, max_length=100)
+    stages: list[_Annotated[list[_ZoneId], _Field(min_length=1, max_length=_hil_plans.MAX_STAGE_DEVICES)]] = _Field(
+        min_length=1, max_length=_hil_plans.MAX_STAGES)
+    expires_in_hours: int = _Field(default=_hil_plans.DEFAULT_EXPIRY_HOURS, ge=1, le=_hil_plans.MAX_EXPIRY_HOURS)
+    stage_timeout_minutes: int = _Field(default=_hil_plans.DEFAULT_STAGE_TIMEOUT_MINUTES,
+                                        ge=_hil_plans.MIN_STAGE_TIMEOUT_MINUTES,
+                                        le=_hil_plans.MAX_STAGE_TIMEOUT_MINUTES)
+
+
+class _HilPlanApproveIn(_HilPlanPreviewIn):
+    reason: str = _Field(min_length=10, max_length=500)
+    typed_confirmation: str = _Field(min_length=1, max_length=80)
+    password: str = _Field(min_length=1, max_length=512)
+    plan_digest: str = _Field(pattern=r"^[0-9a-f]{64}$")
+    idempotency_key: str = _Field(min_length=8, max_length=120)
+
+
+@app.get("/api/v1/firmware/hil-plans")
+def list_firmware_hil_plans(
+    limit: int = Query(default=20, ge=1, le=100),
+    auth: tuple[Session, AdminContext] = Depends(require_admin),
+):
+    db, _ = auth
+    return {"rows": _hil_plans.plan_rows(db, limit=limit), "hil_enabled": settings.firmware_hil_enabled}
+
+
+@app.post("/api/v1/firmware/hil-plans/preview")
+def preview_firmware_hil_plan(
+    body: _HilPlanPreviewIn,
+    auth: tuple[Session, AdminContext] = Depends(require_admin),
+):
+    db, _ = auth
+    try:
+        return _hil_plans.resolve_plan(db, release_public_id=body.release_id, stages=body.stages,
+                                       expires_in_hours=body.expires_in_hours,
+                                       stage_timeout_minutes=body.stage_timeout_minutes)
+    except (ValueError, RuntimeError) as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    finally:
+        # A preview never writes; drop anything the release store sync touched.
+        db.rollback()
+
+
+@app.post("/api/v1/firmware/hil-plans", status_code=201)
+async def approve_firmware_hil_plan(
+    body: _HilPlanApproveIn,
+    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+):
+    db, context = auth
+    require_step_up(body.password, db, context)
+    try:
+        plan, created = _hil_plans.create_plan(
+            db, release_public_id=body.release_id, stages=body.stages, reason=body.reason,
+            typed_confirmation=body.typed_confirmation, plan_digest=body.plan_digest,
+            actor=context.username, idempotency_key=body.idempotency_key,
+            expires_in_hours=body.expires_in_hours, stage_timeout_minutes=body.stage_timeout_minutes)
+    except (ValueError, RuntimeError) as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    except IntegrityError as error:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="Another HIL plan was approved at the same time.") from error
+    if created:
+        _append_audit(db, actor=context.username, action="FIRMWARE_HIL_PLAN_APPROVED",
+                      target_type="firmware_hil_plan", target_id=plan.plan_id, outcome=plan.status,
+                      after={"plan_id": plan.plan_id, "release_id": plan.release_public_id,
+                             "image_sha256": plan.image_sha256, "application_sha256": plan.application_sha256,
+                             "plan_digest": plan.plan_digest, "stages": plan.stages, "reason": body.reason,
+                             "expires_at": plan.expires_at.isoformat(),
+                             "stage_timeout_minutes": body.stage_timeout_minutes})
+    db.commit()
+    await browser_events.publish("firmware", {"hil_plan": {"plan_id": plan.plan_id, "status": plan.status}})
+    return {**_hil_plans.serialize_plan(db, plan), "created": created}
+
+
+@app.get("/api/v1/firmware/hil-plans/{plan_id}")
+def get_firmware_hil_plan(plan_id: str, auth: tuple[Session, AdminContext] = Depends(require_admin)):
+    db, _ = auth
+    row = _hil_plans.plan_detail(db, plan_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="HIL plan not found.")
+    return row
+
+
+@app.post("/api/v1/firmware/hil-plans/{plan_id}/{action}")
+async def control_firmware_hil_plan(
+    plan_id: str,
+    action: _Literal["pause", "resume", "cancel"],
+    body: _FirmwareControlIn,
+    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+):
+    db, context = auth
+    require_step_up(body.password, db, context)
+    try:
+        result = _hil_plans.control_plan(db, plan_id=plan_id, action=action, actor=context.username,
+                                         reason=body.reason)
+    except LookupError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    db.commit()
+    await browser_events.publish("firmware", {"hil_plan": result})
+    return result
+
+
 # Physical provisioning is isolated in an additive router so the existing
 # device, attendance and OTA paths remain unchanged when the feature is dark.
 from zk_add.provisioning_api import router as provisioning_router  # noqa: E402

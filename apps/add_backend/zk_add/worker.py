@@ -387,10 +387,13 @@ async def _safe_attendance_repair_loop(stop: asyncio.Event) -> None:
 
 
 async def maintenance_loop(stop: asyncio.Event) -> None:
+    from zk_add.hil_plans import run_hil_plan_loop
     from zk_add.zkt_custody_runtime import run_custody_processor
 
     tasks = [
         asyncio.create_task(run_custody_processor(stop, publish=browser_events.publish)),
+        # Staged HIL plans: row-locked, idempotent steps from durable state.
+        asyncio.create_task(run_hil_plan_loop(stop)),
         asyncio.create_task(_control_plane_loop(stop)),
         asyncio.create_task(_ords_delivery_loop(stop)),
         asyncio.create_task(_ords_audit_loop(stop)),
