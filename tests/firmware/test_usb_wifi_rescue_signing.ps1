@@ -40,4 +40,8 @@ try {
     } catch { $failed = $_.Exception.Message -match 'HIL-only for the exact spare' }
     if (-not $failed) { throw 'Original-device signing scope guard failed' }
     Write-Output 'PASS: no replacement vault, invalid image refused before key access, spare-only HIL scope'
+    # The invalid-artifact test intentionally made Python return 1. GitHub's
+    # PowerShell wrapper propagates LASTEXITCODE even after the refusal was
+    # caught and all assertions passed, so clear only that expected test code.
+    $global:LASTEXITCODE = 0
 } finally { Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue }
