@@ -801,3 +801,27 @@ def test_a_copy_naming_another_connector_is_held_by_its_honest_retry(device_stre
     held(connector_pk, connector_id, honest, 9)
     alert, entry = rejection_entry(sessions, connector_pk)
     assert entry is None and resolutions(alert) == [(honest["record_id"], "SAME_IDENTITY", "COPY_INTACT")]
+
+
+def test_a_2615_ords_row_delivered_to_oracle_instead_waits_for_an_operator(device_stream):
+    """2.6.x re-runs oracle_send_live() on retry: once the user maps, the row goes to ORDS, not ADD.
+
+    Its Oracle receipt names only the event_uid. ADD cannot tie that to the
+    refused copy's digest, and the uid inside the bytes that arrived may be
+    another record's, so the refusal stays for an operator to verify.
+    """
+    sessions, connector_pk, connector_id = device_stream
+    event_uid = hashlib.sha256(b"ords-event").hexdigest()
+    row = json.dumps({"event_uid": event_uid, "user_id": "17", "event_time": "2026-10-21T12:30:00+05:00"},
+                     separators=(",", ":")).encode()
+    queue, generation, record_id, reason, _serial = FIRMWARE_SHAPES["ords_segmented"]
+    ords = firmware_payload(connector_id, queue, generation, record_id, row, reason)
+    refused(connector_pk, connector_id, corrupt_base64_character(ords), 8)
+    receipt = wire_text(connector_id, {"confirmation_path": "FIRMWARE_LIVE",
+                                       "oracle_observed_at": "2026-10-21T12:31:00Z", "event_uids": [event_uid]},
+                        9).replace('"type":"queue_evidence"', '"type":"oracle_receipt_batch"')
+    [reply] = deliver(connector_pk, connector_id, receipt).received
+    assert reply.get("type") != "error", reply
+    alert, entry = rejection_entry(sessions, connector_pk)
+    assert alert.state == "OPEN" and pending_identities(entry) == [identity(ords)]
+    assert "1 refused record not yet held" in summary(sessions, connector_pk)
