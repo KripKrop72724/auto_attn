@@ -223,6 +223,8 @@ $button.Add_Click({
         Show-Line "Saving to: $script:folder"
         Show-Line 'Preparing the bundled Espressif 5.1 security check. No Python or downloads needed.'
         $tool = Get-BundledSecurityTool
+        Copy-Item -LiteralPath (Join-Path $script:toolDir 'LICENSE') -Destination (Join-Path $script:folder 'esptool-LICENSE.txt')
+        'Espressif esptool 5.1.0 source: https://github.com/espressif/esptool/tree/v5.1.0' | Set-Content (Join-Path $script:folder 'esptool-source.txt')
         $candidates = @(Get-CimInstance Win32_PnPEntity -Filter "PNPClass='Ports'" | Where-Object { $_.Name -match '\(COM\d+\)' -and $_.DeviceID -match 'VID_303A&PID_1001' })
         if ($candidates.Count -eq 1) {
             $com = [regex]::Match($candidates[0].Name, '\((COM\d+)\)').Groups[1].Value
