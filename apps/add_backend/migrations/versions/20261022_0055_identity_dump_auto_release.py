@@ -8,13 +8,17 @@ the hold when the batch's user ID, UID and 64-character fingerprint match one
 retained, unrevoked CNIC interval covering the punch, for the same terminal
 serial and released user, whose CNIC is the current one. Whole-roster
 continuity never qualifies such a row. The application additionally limits
-automatic use to recent holds and a per-snapshot cap.
+automatic use to recent punches and holds in zones the owner enabled, bracketed
+by close roster snapshots, under per-snapshot and hourly caps.
+
+Only CREATE OR REPLACE FUNCTION: no table is altered, scanned, locked or
+backfilled.
 """
 
 from alembic import op
 
-revision = "20261021_0054_dump_release"
-down_revision = "20261012_0053"
+revision = "20261022_0055_dump_release"
+down_revision = "20261022_0054"
 branch_labels = None
 depends_on = None
 
@@ -64,7 +68,7 @@ def upgrade() -> None:
                       AND epoch.terminal_generation = saved.generation))
               )
               OR (
-                -- 0054: a legacy reconnect/startup dump row with no saved
+                -- 0055: a legacy reconnect/startup dump row with no saved
                 -- terminal record from any connector. Its batch identifiers
                 -- must match one retained, fingerprint-bound interval of the
                 -- released user and CNIC at punch time. Whole-roster

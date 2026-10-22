@@ -48,7 +48,7 @@ EARLIER_GUARDS = (
     "20260929_0041_legacy_reconcile_cnic_guard.py",
     "20261012_0053_reconciled_record_uid_sources.py",
 )
-DUMP_GUARD = "20261021_0054_identity_dump_auto_release.py"
+DUMP_GUARD = "20261022_0055_identity_dump_auto_release.py"
 FP = "a" * 64
 ADMIN = "StateHealthAdmin"
 
