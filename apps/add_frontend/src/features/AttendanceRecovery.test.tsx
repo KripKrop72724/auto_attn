@@ -34,13 +34,16 @@ describe('missing outbox detail', () => {
 })
 
 describe('missing outbox tone', () => {
-  it('stays positive when only identity-held rows lack an outbox', () => {
+  it('stays positive when only held or review rows lack an outbox', () => {
     expect(withoutOutboxTone(delivery({ held_without_outbox: 74838, review_without_outbox: 0 }))).toBe('positive')
+    // ZKT invalid-time quarantines never get an outbox; the Source review tile
+    // already flags them, so they must not keep this tile amber for good.
+    expect(withoutOutboxTone(delivery({ held_without_outbox: 74838, review_without_outbox: 143 }))).toBe('positive')
     expect(withoutOutboxTone(undefined)).toBe('positive')
   })
 
-  it('turns amber for a real gap or any review row', () => {
+  it('turns amber for a real gap, whatever else lacks an outbox', () => {
     expect(withoutOutboxTone(delivery({ missing_outbox: 1 }))).toBe('warning')
-    expect(withoutOutboxTone(delivery({ held_without_outbox: 74838, review_without_outbox: 307 }))).toBe('warning')
+    expect(withoutOutboxTone(delivery({ missing_outbox: 1, held_without_outbox: 74838, review_without_outbox: 143 }))).toBe('warning')
   })
 })

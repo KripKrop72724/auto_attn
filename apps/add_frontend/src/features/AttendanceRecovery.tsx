@@ -28,7 +28,10 @@ function formatDate(value: string | null) {
 // Identity-held and review-quarantined punches get no Oracle work item until
 // they are released, so they are named beside the missing count, never inside
 // it. Review rows (non-identity quarantines and unknown states) are never
-// called held, and they keep the tile amber so an unknown state is not hidden.
+// called held. Only a real gap colours this tile: every review row is also
+// counted by the Source review tile, which turns critical, and ZKT invalid-time
+// quarantines never get an outbox, so colouring this tile for them would keep
+// it amber for good and hide a new gap.
 type RecoveryDelivery = AttendanceRecoverySummary['delivery']
 
 export function withoutOutboxDetail(delivery?: RecoveryDelivery) {
@@ -43,7 +46,7 @@ export function withoutOutboxDetail(delivery?: RecoveryDelivery) {
 }
 
 export function withoutOutboxTone(delivery?: RecoveryDelivery): 'positive' | 'warning' {
-  return delivery?.missing_outbox || delivery?.review_without_outbox ? 'warning' : 'positive'
+  return delivery?.missing_outbox ? 'warning' : 'positive'
 }
 
 export function AttendanceRecovery({ revision, toast }: { revision: number; toast: Toast }) {
