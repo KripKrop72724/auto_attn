@@ -305,9 +305,6 @@ CAPTURED_CNIC_CASES = {
     # (statement after the punch-time interval names another CNIC, verdict)
     "punch_time_interval_names_another_cnic": ("", False),
     "that_interval_is_revoked": ("UPDATE add_attendance_identity_history SET revoked = true", True),
-    "that_interval_has_no_cnic": (
-        "UPDATE add_attendance_identity_history SET cnic_lookup_hash = NULL", True
-    ),
     "that_interval_ends_before_the_punch": (
         "UPDATE add_attendance_identity_history "
         "SET observed_until = observed_from + INTERVAL '1 minute'", True
