@@ -13,6 +13,12 @@ Every CNIC choice echoes the digest of the evidence the administrator saw in
 the read-only preview; a choice made against evidence that has since changed
 is skipped, never applied to the new evidence. Sending a punch-time CNIC that
 another active terminal user holds today needs its own explicit confirmation.
+
+A direct approval that stopped (its evidence changed) hands the punch back to
+ADD's own release only if nothing under it can be in Oracle with another
+CNIC: ordinary delivery treats Oracle's "already stored" reply as success
+without a content check, so a punch whose stopped approval may already have
+POSTed a different CNIC is held for review instead (PREVIOUS_POST_UNCERTAIN).
 """
 
 from dataclasses import dataclass, replace
@@ -34,6 +40,7 @@ from zk_add.attendance_release_safety import (
     NAME_DIFFERS,
     NONE,
     PUNCH_TIME_CNIC_HELD_BY_OTHER,
+    RECORDS_TRUNCATED,
     PunchTimeIdentity,
     approval_tokens,
     auto_release_preview,
@@ -93,9 +100,17 @@ REASONS = {
         "Choose which CNIC to send."
     ),
     "CNIC_CONFLICT": (
-        "ADD's records show another CNIC or another person for this terminal user ID at "
-        "punch time. It is never sent by hand; confirm with HR who punched. The punch "
-        "stays saved and held in ADD."
+        "ADD's records show another CNIC or another person for this terminal user ID at or "
+        "near the punch time, and nothing close enough to the punch says which. It is never "
+        "sent by hand; confirm with HR who punched. The punch stays saved and held in ADD."
+    ),
+    "IDENTITY_CONFLICT_UNRESOLVED": (
+        "Two active terminal users have this CNIC and the duplicate is not resolved. Resolve "
+        "it in ADD Users first; the punch stays saved and held in ADD."
+    ),
+    "PUNCH_TIME_RECORDS_TOO_MANY": (
+        "ADD holds too many identity records for this user ID at the punch time to check "
+        "them all. No Oracle send was made; the punch stays saved and held in ADD."
     ),
     "PUNCH_TIME_CNIC_UNREADABLE": (
         "The CNIC ADD retained for the punch time cannot be read. No Oracle send was made."
@@ -126,9 +141,13 @@ REASONS = {
     ),
     "PREVIOUS_POST_UNCERTAIN": (
         "An earlier approval for this punch may already have reached Oracle with another "
-        "identity. It cannot be replaced by hand; review the Oracle record first."
+        "identity. It cannot be replaced by hand or released automatically; review the "
+        "Oracle record first."
     ),
 }
+# A stopped approval may have POSTed another CNIC; ADD's own release is held.
+TAKEOVER = "TAKEOVER"
+TAKEOVER_UNCERTAIN = "PREVIOUS_POST_UNCERTAIN"
 
 
 @dataclass(frozen=True)
@@ -177,8 +196,8 @@ def choices_for(punch: PunchTimeIdentity) -> tuple[str, ...]:
         # Today's CNIC only for the same terminal user record whose CNIC was edited.
         return (PUNCH_TIME, CURRENT) if punch.continuity else (PUNCH_TIME,)
     if punch.state == CHANGED_NEAR_PUNCH:
-        # The nearest record's CNIC when that record is usable; today's CNIC
-        # only when the record on the other side of the punch holds it.
+        # The old CNIC only from today's own record that ended just before
+        # the punch; today's only when its record started just after it.
         return tuple(
             option for option, allowed in (
                 (PUNCH_TIME, punch.interval is not None), (CURRENT, punch.current_nearby),
@@ -226,7 +245,12 @@ def _resolve(event, users, identity_for, *, choice=None) -> Resolution:
             choice=choice if choice in {PUNCH_TIME, CURRENT} else None,
         )
     if punch.state == CONFLICT:
-        return Resolution(user, None, None, current_cnic, "CNIC_CONFLICT", punch_time=punch)
+        error = (
+            "IDENTITY_CONFLICT_UNRESOLVED" if IDENTITY_CONFLICT_UNRESOLVED in punch.signals
+            else "PUNCH_TIME_RECORDS_TOO_MANY" if RECORDS_TRUNCATED in punch.signals
+            else "CNIC_CONFLICT"
+        )
+        return Resolution(user, None, None, current_cnic, error, punch_time=punch)
     choices = choices_for(punch)
     if choice == PUNCH_TIME and PUNCH_TIME in choices:
         return _punch_time_resolution(user, current_cnic, punch, punch.interval, choice=choice, choices=choices)
@@ -282,6 +306,11 @@ def _identity_finders(session, events, users_by_event):
     }
 
 
+def _no_identity(_user, _current_hash) -> PunchTimeIdentity:
+    """Records not loaded (a saved CNIC decides): never guess today's CNIC."""
+    return PunchTimeIdentity(CONFLICT)
+
+
 def _revalidate(session, event, saved: dict, users=None) -> Resolution:
     """Re-derive a saved approval's identity at queueing and at delivery.
 
@@ -331,17 +360,42 @@ def _revalidate(session, event, saved: dict, users=None) -> Resolution:
     return resolution
 
 
+def _confirmed(event) -> bool:
+    """Oracle already holds it: the ledger never offers it for a manual send."""
+    return bool(event.oracle_confirmed_at or (event.ords_status or "").startswith("ACK"))
+
+
+def _has_saved_cnic(event) -> bool:
+    return bool(safe_cnic(event.cnic_encrypted))
+
+
 def identity_hints_for_page(session, events):
-    """Tell the ledger which rows have a usable synced identity in bounded queries."""
+    """Tell the ledger which rows have a usable synced identity in bounded queries.
+
+    Punch-time records are read only for rows a manual send could still
+    decide (not confirmed, no CNIC saved with the punch); the send dialog
+    polls this list during a run.
+    """
     from zk_add.worker import event_uid_is_valid
 
     if not events:
         return {}
     users_by_event = _users_by_event(session, events)
-    finders = _identity_finders(session, events, users_by_event)
+    undecided = [event for event in events if not _confirmed(event) and not _has_saved_cnic(event)]
+    finders = _identity_finders(session, undecided, users_by_event) if undecided else {}
     hints = {}
     for event in events:
-        resolution = _resolve(event, users_by_event[event.id], finders[event.id])
+        if _confirmed(event):
+            user, saved_cnic, current_cnic, _error = _current_and_saved(event, users_by_event[event.id])
+            hints[event.id] = {
+                "eligible": False,
+                "cnic_source": "SAVED_PUNCH" if saved_cnic else "SYNCED_USER" if current_cnic else None,
+                "exclusion": "ALREADY_CONFIRMED",
+                "punch_time_cnic": None,
+                "cnic_choice_required": False,
+            }
+            continue
+        resolution = _resolve(event, users_by_event[event.id], finders.get(event.id) or _no_identity)
         error = resolution.error
         if error == "CNIC_CHOICE_REQUIRED":
             error = None  # The administrator chooses in the send dialog.
@@ -446,18 +500,74 @@ def _released_automatically_after(event, decision) -> bool:
     )
 
 
+def _posted_cnic_is_todays_release(event, decision) -> bool:
+    """The stopped approval's payload carries the CNIC ADD's own release now sends.
+
+    Oracle keeps the first stored row for an event UID; if that row carries
+    the same CNIC, the automatic release names the same person.
+    """
+    try:
+        posted = normalize_cnic(decrypt_json(decision.payload_encrypted).get("cnic"))
+    except Exception:
+        return False
+    released = safe_cnic(event.cnic_encrypted)
+    return bool(posted and released and posted == released and cnic_lookup(posted) == event.cnic_lookup_hash)
+
+
+def automatic_takeover(session, event, decision) -> str | None:
+    """May ordinary delivery own a punch whose direct approval stopped?
+
+    None: the approval still owns the punch, or ADD's own proof has not
+    released it since the approval was saved. ``TAKEOVER``: the automatic
+    proof (and database guard) released it after the approval stopped, so the
+    punch must not stay held forever behind a stale approval.
+    ``PREVIOUS_POST_UNCERTAIN``: the stopped approval may already have POSTed
+    a different CNIC. Ordinary delivery treats Oracle's 409 ("already
+    stored") as success with no content check, so it would certify the
+    automatic CNIC while Oracle keeps the posted one: the punch is held for
+    review instead. Nothing here retries the approval itself.
+    """
+    if decision is None or not _released_automatically_after(event, decision):
+        return None
+    if approved_payload(session, event, session.get(Connector, event.connector_id), decision) is not None:
+        return None
+    if _post_attempted(session, decision) and not _posted_cnic_is_todays_release(event, decision):
+        return TAKEOVER_UNCERTAIN
+    return TAKEOVER
+
+
 def superseded_by_automatic_release(session, event, decision) -> bool:
     """ADD's own proof released this punch after a stopped direct approval.
 
     A direct approval that no longer validates must not keep the punch held
     forever: once ADD's automatic identity proof (and the database guard)
     released the punch after that approval was saved, ordinary delivery owns
-    it again. The automatic path is unchanged; this only stops a stale manual
-    approval from overriding it.
+    it again, unless the approval may already have POSTed another CNIC (see
+    ``automatic_takeover``). The automatic path is unchanged; this only stops
+    a stale manual approval from overriding it.
     """
-    if not _released_automatically_after(event, decision):
-        return False
-    return approved_payload(session, event, session.get(Connector, event.connector_id), decision) is None
+    return automatic_takeover(session, event, decision) == TAKEOVER
+
+
+def hold_uncertain_takeover(session, event, outbox, decision) -> None:
+    """Keep a punch whose stopped approval may be in Oracle under another CNIC.
+
+    QUARANTINED_IDENTITY_CONFLICT is a review state the snapshot release
+    never touches, so the punch does not loop through BLOCKED_IDENTITY and an
+    automatic release every snapshot. The approval's item says why.
+    """
+    outbox.status = event.ords_status = "QUARANTINED_IDENTITY_CONFLICT"
+    outbox.next_attempt_at = None
+    outbox.last_error = TAKEOVER_UNCERTAIN
+    item = (
+        session.get(Item, decision.item_id, with_for_update=True, populate_existing=True)
+        if decision.item_id else None
+    )
+    if item is not None:
+        item.status, item.error_code = "NEEDS_REVIEW", TAKEOVER_UNCERTAIN
+        item.completed_at = item.completed_at or utc_now()
+        item.result = {**(item.result or {}), "reason": REASONS[TAKEOVER_UNCERTAIN], "needs_attention": True}
+        item.updated_at = utc_now()
 
 
 def _post_attempted(session, decision) -> bool:
@@ -471,15 +581,36 @@ def _post_attempted(session, decision) -> bool:
     return item is None or bool((item.result or {}).get("direct_post_attempts"))
 
 
+def _stopped_and_held(session, event, decision) -> bool:
+    """The approval stopped and ADD holds the punch; nothing would resume it.
+
+    Its run item was closed for review while the punch is held for identity,
+    so the worker never claims it. Only the duplicate-CNIC restore can
+    resume it, and a new explicit approval that wins the row lock first
+    supersedes it instead.
+    """
+    item = session.get(Item, decision.item_id) if decision.item_id else None
+    return bool(
+        item is not None and item.status == "NEEDS_REVIEW"
+        and event.ords_status in {"BLOCKED_IDENTITY", "WAITING_FOR_SNAPSHOT"}
+    )
+
+
 def _replacement_block(session, event, decision, outbox, connector) -> str | None:
     """Why a saved direct approval may not be replaced; None when it may.
 
-    Only an approval that can no longer deliver, that ADD's own release has
-    not taken over, and that never POSTed to Oracle may be replaced: a POST
-    may have stored the earlier identity in Oracle, and a replacement's first
-    content check would otherwise POST a different identity for the same
-    event UID.
+    Only an approval that can no longer deliver (it no longer validates, or
+    it stopped and ADD holds the punch), that ADD's own release has not taken
+    over, and that never POSTed to Oracle may be replaced: a POST may have
+    stored the earlier identity in Oracle, and a replacement's first content
+    check would otherwise POST a different identity for the same event UID.
     """
+    if (
+        decision.proof.get("policy") == POLICY
+        and event.ords_status == "QUARANTINED_IDENTITY_CONFLICT"
+        and outbox is not None and outbox.last_error == TAKEOVER_UNCERTAIN
+    ):
+        return TAKEOVER_UNCERTAIN
     if not (
         decision.proof.get("policy") == POLICY
         and event.ords_status in REPLACEABLE_STATUSES
@@ -487,7 +618,10 @@ def _replacement_block(session, event, decision, outbox, connector) -> str | Non
         and event.oracle_confirmed_at is None
         and connector is not None
         and not _released_automatically_after(event, decision)
-        and approved_payload(session, event, connector, decision) is None
+        and (
+            _stopped_and_held(session, event, decision)
+            or approved_payload(session, event, connector, decision) is None
+        )
     ):
         return "ALREADY_DELIVERING"
     if _post_attempted(session, decision):
@@ -713,10 +847,14 @@ def preview(session, event_ids) -> dict:
             "punch_time_cnic_masked": mask_cnic(punch.cnic) if other_cnic else None,
             "punch_time_display_name": punch.display_name if other_cnic else None,
             # COVERING_RECORD, BRIDGED_GAP (a break between two identical
-            # records) or NEAREST_RECORD (no record covers the punch).
+            # records) or RECORD_BEFORE_PUNCH (today's own record of the old
+            # CNIC ended just before an uncovered punch).
             "punch_time_cnic_basis": punch.basis if other_cnic else None,
             "record_position": punch.position if punch else None,
             "first_observed_at": punch.first_observed_at if punch else None,
+            # An uncovered punch: when the record before it ended and the one after it started.
+            "record_before_ended_at": punch.record_before_until if punch else None,
+            "record_after_started_at": punch.record_after_from if punch else None,
             "punch_display_name": event.display_name if punch and NAME_DIFFERS in punch.signals else None,
             "other_cnics_masked": other_cnics_masked(punch, current_hash) if punch else [],
             "evidence_signals": signals,
@@ -829,6 +967,13 @@ def create(session, *, actor: str, request):
         if check.error is None or check.error in {"CNIC_CHOICE_REQUIRED", "AUTO_RELEASE_PENDING"}
     }
     _lock_scheduler(session)
+    # Everything read before the lock (terminal users, identity records,
+    # outboxes, earlier approvals and their items) is read again from the
+    # database, not from the session's identity map: a snapshot or delivery
+    # that committed meanwhile must decide the checks below. Pending writes
+    # are flushed first so nothing of this transaction is lost.
+    session.flush()
+    session.expire_all()
     previous = _existing_run(session, actor=actor, request=request, request_digest=request_digest)
     if previous:
         return previous
@@ -1059,7 +1204,20 @@ def _observe(session, job):
                 item.status, item.completed_at = "CONFIRMED", utc_now()
             elif superseded_by_automatic_release(session, event, decision):
                 item.status, item.error_code, item.completed_at = "SKIPPED", "AUTO_RELEASED", utc_now()
-                item.result = {**item.result, "reason": REASONS["AUTO_RELEASED"], "needs_attention": False}
+                item.result = {
+                    **item.result, "reason": REASONS["AUTO_RELEASED"],
+                    # A POST under this approval carried the same CNIC; still shown.
+                    "needs_attention": bool(item.result.get("direct_post_attempts")),
+                }
+        elif (
+            event.ords_status == "QUARANTINED_IDENTITY_CONFLICT"
+            and (outbox := session.scalar(
+                select(OrdsOutbox).where(OrdsOutbox.attendance_event_id == event.id)
+            )) is not None
+            and outbox.last_error == TAKEOVER_UNCERTAIN
+        ):
+            item.status, item.error_code, item.completed_at = "NEEDS_REVIEW", TAKEOVER_UNCERTAIN, utc_now()
+            item.result = {**item.result, "reason": REASONS[TAKEOVER_UNCERTAIN], "needs_attention": True}
         elif not (event_uid_is_valid(event.event_uid) or potentially_recoverable(event.event_uid)):
             outbox = session.scalar(
                 select(OrdsOutbox)

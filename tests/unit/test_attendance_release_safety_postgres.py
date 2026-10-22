@@ -263,3 +263,83 @@ def test_pre_lock_checks_and_locked_recheck_agree_under_postgres(dump_row):
     finally:
         direct.auto_release_preview = real
     assert len(calls) == 1  # computed once, before the scheduler lock
+
+
+def test_takeover_after_a_post_with_another_cnic_is_held_under_postgres_guards(dump_row):
+    """Both reviews, finding 1/4, on PostgreSQL: a possibly-posted other CNIC is never certified.
+
+    The approval may have POSTed the CNIC it sent; HR then corrected today's
+    CNIC and the installed guards let ADD's own proof release the punch.
+    Ordinary delivery is not given the punch (a 409 would be recorded as
+    ACKED while Oracle keeps the posted CNIC): it is held for review.
+    """
+    from zk_add.crypto import cnic_lookup, encrypt_cnic
+    from zk_add.service import release_synced_cnic_attendance_event
+
+    sessions, engine, event_id = dump_row
+    apply(engine, "20261012_0053_reconciled_record_uid_sources.py")
+    with sessions() as db:
+        direct.create(db, actor="operator", request=start(event_id, "posted", send_now=True))
+        db.commit()
+    with sessions() as db:
+        direct.advance_once(db)
+        db.commit()
+    with sessions() as db:
+        decision = db.scalar(select(Decision))
+        item = db.get(Item, decision.item_id)
+        item.result = {**item.result, "direct_post_attempts": 1}
+        corrected = "3520255555551"
+        event = db.get(AttendanceEvent, event_id)
+        user = db.get(DeviceUser, event.device_user_id)
+        user.cnic_encrypted, user.cnic_lookup_hash = encrypt_cnic(corrected), cnic_lookup(corrected)
+        record = db.scalars(select(AttendanceIdentityHistory).order_by(AttendanceIdentityHistory.id.desc())).first()
+        record.cnic_encrypted, record.cnic_lookup_hash = user.cnic_encrypted, user.cnic_lookup_hash
+        db.commit()
+    assert delivery.split_claims(worker.claim_ords_batch(5)) == ([], [])
+    with sessions() as db:
+        event = db.get(AttendanceEvent, event_id)
+        assert event.ords_status == "BLOCKED_IDENTITY"
+        zkt = db.get(Connector, event.connector_id).zkt_device
+        user = db.get(DeviceUser, event.device_user_id)
+        assert release_synced_cnic_attendance_event(db, zkt=zkt, user=user, row=event)
+        db.commit()
+    assert delivery.split_claims(worker.claim_ords_batch(5)) == ([], [])
+    with sessions() as db:
+        event, outbox = db.get(AttendanceEvent, event_id), db.scalar(select(OrdsOutbox))
+        assert event.ords_status == outbox.status == "QUARANTINED_IDENTITY_CONFLICT"
+        assert outbox.last_error == "PREVIOUS_POST_UNCERTAIN" and event.oracle_confirmed_at is None
+        item = db.get(Item, db.scalar(select(Decision)).item_id)
+        assert item.status == "NEEDS_REVIEW" and item.error_code == "PREVIOUS_POST_UNCERTAIN"
+        assert direct.preview(db, [event_id])["rows"][0]["exclusion"] == "PREVIOUS_POST_UNCERTAIN"
+
+
+def test_tolerated_read_failures_never_abort_the_callers_transaction(dump_row, monkeypatch):
+    """Safety review 5: a failing statement inside a tolerated read runs in a savepoint.
+
+    Without it PostgreSQL aborts the whole transaction (a delivery claim
+    batch, an approval), and every later statement in it fails.
+    """
+    from zk_add import identity_conflicts, service
+
+    sessions, _engine, event_id = dump_row
+
+    def broken(session, *_args, **_kwargs):
+        session.execute(text("SELECT add_function_that_does_not_exist()"))
+
+    monkeypatch.setattr(identity_conflicts, "valid_resolution_for_user", broken)
+    monkeypatch.setattr(service, "synced_cnic_identity_proven", broken)
+    with sessions() as db:
+        event = db.get(AttendanceEvent, event_id)
+        user = db.get(DeviceUser, event.device_user_id)
+        user.identity_conflict_code = "DUPLICATE_CNIC"
+        db.flush()
+        evidence = safety.load_punch_evidence(db, [event], {event.id: user})[event.id]
+        assert evidence.conflict_resolved is False
+        user.identity_conflict_code = None
+        db.flush()
+        assert safety.auto_release_preview(db, event, user=user)["proof"] is False
+        # The transaction is still usable.
+        assert db.scalar(select(AttendanceEvent.ords_status).where(AttendanceEvent.id == event_id)) == (
+            "BLOCKED_IDENTITY"
+        )
+        db.rollback()

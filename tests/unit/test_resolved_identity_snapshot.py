@@ -1,6 +1,7 @@
 """Unchanged approved aliases remain valid through routine terminal snapshots."""
 
 from copy import deepcopy
+from datetime import timedelta
 from time import monotonic
 from uuid import uuid4
 
@@ -16,7 +17,7 @@ from test_attendance_force_postgres import (
 )
 from zk_add import attendance_direct_ords as direct
 from zk_add.attendance_direct_ords_schemas import DirectOrdsStartRequest
-from zk_add.crypto import decrypt_json, encrypt_cnic
+from zk_add.crypto import cnic_lookup, decrypt_json, encrypt_cnic, encrypt_text
 from zk_add.identity_conflicts import (
     build_identity_conflict_report,
     create_same_employee_resolution,
@@ -25,6 +26,7 @@ from zk_add.identity_conflicts import (
 from zk_add.models import (
     AttendanceEvent,
     AttendanceForceReleaseDecision,
+    AttendanceIdentityHistory,
     AttendanceRecoveryItem,
     AttendanceRecoveryJob,
     AuditChainHead,
@@ -186,6 +188,84 @@ def test_fresh_snapshot_recovers_only_the_unchanged_prior_alias_approval(db):
     assert len(db.scalars(select(AuditEvent).where(
         AuditEvent.action == "ATTENDANCE_DIRECT_ORDS_APPROVAL_REVALIDATED"
     )).all()) == 1
+
+
+PUNCH_TIME_CNIC = "3520299999991"
+
+
+def blocked_punch_time_approval(db):
+    """A punch-time CNIC approval for a resolved alias, then held by a duplicate-CNIC block.
+
+    The retained record at the punch time names another CNIC (edited on the
+    terminal since); the administrator chose that punch-time CNIC.
+    """
+    connector = connector_fixture(db)
+    make_writable(connector)
+    snapshot(db, connector)
+    approve_alias_group(db, connector)
+    punch = event(event_uid="d" * 64, user_id="1001", uid="1")
+    ingest_attendance(db, connector=connector, events=[punch])
+    row = db.scalar(select(AttendanceEvent).where(AttendanceEvent.event_uid == punch.event_uid))
+    row.ords_status = "BLOCKED_IDENTITY"
+    row.cnic_encrypted = row.cnic_lookup_hash = row.cnic_last4 = None
+    user = db.scalar(select(DeviceUser).where(DeviceUser.user_id == "1001"))
+    zkt = connector.zkt_device
+    db.add(AttendanceIdentityHistory(
+        zkt_device_id=zkt.id, device_user_id=user.id, terminal_serial=row.device_serial,
+        user_id="1001", uid="1", fingerprint="f" * 64,
+        cnic_encrypted=encrypt_cnic(PUNCH_TIME_CNIC), cnic_lookup_hash=cnic_lookup(PUNCH_TIME_CNIC),
+        display_name_encrypted=encrypt_text("Same Person then"),
+        first_snapshot_id=zkt.identity_snapshot_id, last_snapshot_id=zkt.identity_snapshot_id,
+        last_revision=zkt.identity_snapshot_revision,
+        observed_from=row.device_event_time - timedelta(days=3),
+        observed_until=row.device_event_time + timedelta(hours=1), closed=True,
+    ))
+    db.flush()
+    seen = direct.preview(db, [row.id])["rows"][0]
+    assert seen["punch_time_cnic"] == "DIFFERS" and seen["exclusion"] is None
+    direct.create(db, actor="operator", request=DirectOrdsStartRequest(
+        event_ids=[row.id], reason="Reviewed punch-time CNIC", password="test-password",
+        idempotency_key=str(uuid4()),
+        cnic_choices=[{"event_id": row.id, "choice": "PUNCH_TIME", "evidence_digest": seen["evidence_digest"]}],
+    ))
+    direct.advance_once(db)
+    db.flush()
+    decision = db.scalar(select(AttendanceForceReleaseDecision))
+    assert decision.proof["cnic_source"] == direct.PUNCH_TIME_SOURCE
+    assert block_undelivered_attendance(db, zkt=zkt, user=user) == 1
+    direct.advance_once(db)
+    db.flush()
+    item = db.get(AttendanceRecoveryItem, decision.item_id)
+    assert row.ords_status == "BLOCKED_IDENTITY" and item.status == "NEEDS_REVIEW"
+    return connector, row, decision, item
+
+
+def test_fresh_snapshot_recovers_a_resolved_alias_punch_time_approval(db):
+    """Correctness 2: a punch-time approval held by a resolved duplicate was stuck forever.
+
+    The restore skipped it and the dialog refused to replace it
+    (ALREADY_DELIVERING). The restore now resumes it after the same full
+    re-check of its retained record, holder and payload.
+    """
+    db.autoflush = False
+    connector, row, decision, item = blocked_punch_time_approval(db)
+    payload = decrypt_json(decision.payload_encrypted)
+    assert payload["cnic"] == PUNCH_TIME_CNIC
+
+    snapshot(db, connector)
+
+    assert row.ords_status == db.scalar(select(OrdsOutbox)).status == "PENDING"
+    assert item.status == "WAITING_ORACLE" and item.error_code is None
+    assert direct.approved_payload(db, row, connector, decision) == payload
+
+
+def test_a_held_punch_time_approval_can_be_replaced_before_any_snapshot(db):
+    """Without waiting for the restore, an administrator may replace the never-POSTed approval."""
+    db.autoflush = False
+    connector, row, decision, _item = blocked_punch_time_approval(db)
+    assert direct.approved_payload(db, row, connector, decision) is not None
+    again = direct.preview(db, [row.id])["rows"][0]
+    assert again["exclusion"] is None and again["replaces_stopped_approval"] is True
 
 
 def test_alias_approval_recovery_commits_with_postgres_guard_and_row_locks(force_pg):

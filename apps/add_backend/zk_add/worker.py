@@ -946,11 +946,18 @@ def claim_ords_batch(limit: int) -> list[tuple[int, dict, int, bool]]:
                 else None
             )
             from zk_add.attendance_manual_guard import delivery_authorized, decision_for
-            from zk_add.attendance_direct_ords import superseded_by_automatic_release
+            from zk_add.attendance_direct_ords import (
+                TAKEOVER,
+                TAKEOVER_UNCERTAIN,
+                automatic_takeover,
+                hold_uncertain_takeover,
+            )
             decision = decision_for(session, event) if event else None
             # A stopped direct approval never blocks ADD's own later automatic
-            # release: ordinary delivery below owns that punch again.
-            automatic_owner = bool(decision and superseded_by_automatic_release(session, event, decision))
+            # release: ordinary delivery below owns that punch again, unless
+            # the approval may already have POSTed another CNIC.
+            takeover = automatic_takeover(session, event, decision) if decision else None
+            automatic_owner = takeover == TAKEOVER
             if decision and decision.proof.get("policy") == "manual-direct-ords-v1" and not automatic_owner:
                 connector = session.get(Connector, event.connector_id)
                 from zk_add.attendance_force_release import delivery_payload
@@ -961,6 +968,11 @@ def claim_ords_batch(limit: int) -> list[tuple[int, dict, int, bool]]:
                     row.status = event.ords_status = "QUARANTINED_INVALID_DEVICE_TIME"
                     row.last_error = "The punch time is invalid; it is never sent to Oracle."
                     row.next_attempt_at = None
+                    continue
+                if takeover == TAKEOVER_UNCERTAIN:
+                    # Oracle may hold the approval's CNIC; a 409 to the
+                    # automatic payload would certify another person.
+                    hold_uncertain_takeover(session, event, row, decision)
                     continue
                 candidate_payload = delivery_payload(session, event, connector)
                 if candidate_payload is None:

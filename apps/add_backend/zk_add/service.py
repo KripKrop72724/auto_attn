@@ -3750,7 +3750,9 @@ def restore_resolved_alias_direct_approvals(
             or "terminal" not in decision.proof
             or decision.proof["terminal"] != row.device_serial
             or decision.proof.get("hardware_id") != connector.hardware_id
-            or decision.proof.get("cnic_source") not in {"SYNCED_USER", "SAVED_PUNCH"}
+            # A punch-time approval is restored too: approved_payload re-checks
+            # its retained record, new evidence and another holder of its CNIC.
+            or decision.proof.get("cnic_source") not in {"SYNCED_USER", "SAVED_PUNCH", direct.PUNCH_TIME_SOURCE}
             or decision.proof.get("current_user_key") != user.user_key
             or item.connector_id != row.connector_id
             or direct.approved_payload(session, row, connector, decision) is None

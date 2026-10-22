@@ -15,14 +15,24 @@ ADD retained about that user ID, not only from the current roster:
   after the punch time,
 * the terminal user the punch was linked to at ingest,
 * the name saved with the punch, and
-* when nothing covers the punch, the nearest retained interval before and
-  after it (and whether the punch precedes ADD's first record of the user ID).
+* when nothing covers the punch, the retained interval that ended just before
+  it and the one that started just after it (and whether the punch precedes
+  ADD's first record of the user ID).
 
 Any other CNIC (or another person with an unknown CNIC) in that evidence is a
-conflict. Only evidence that names exactly one CNIC at punch time can supply
-that CNIC; today's CNIC is used without asking only when ADD's own records at
-punch time show nothing else. A punch in a break between two records of the
-same terminal user with the same other CNIC takes that CNIC, as if covered.
+conflict, and so is an unresolved duplicate CNIC. Only evidence that names
+exactly one CNIC at punch time can supply that CNIC; today's CNIC is used
+without asking only when ADD's own records at punch time show nothing else.
+
+A punch in a break between two records of the same terminal user with the same
+CNIC takes that CNIC, as if covered (today's CNIC only for today's terminal
+user record). When the records around an uncovered punch disagree, a CNIC is
+offered only from a record that is close to the punch in time: the old CNIC
+only from today's own terminal user record that ended at most
+``NEAR_RECORD_GAP`` before the punch with no deletion in between, and today's
+CNIC only when its record started at most ``NEAR_RECORD_GAP`` after the punch.
+A record on one side only (before ADD's first record, after its last) never
+supplies another CNIC, and never lets today's CNIC override it.
 """
 
 from __future__ import annotations
@@ -57,8 +67,10 @@ TIME_REFUSALS = frozenset({CLOCK_INVALID, TIME_IMPOSSIBLE})
 MATCHES_CURRENT = "MATCHES_CURRENT"  # ADD's records at punch time show only today's CNIC
 DIFFERS = "DIFFERS"  # they name exactly one other CNIC (Toheed: edited on the terminal 19 Oct)
 CONFLICT = "CONFLICT"  # another CNIC or person, but not one usable CNIC: never sent by hand
-CHANGED_NEAR_PUNCH = "CHANGED_NEAR_PUNCH"  # no record at punch time; the nearest one holds another CNIC
-AMBIGUOUS = "AMBIGUOUS"  # records exist but do not prove today's CNIC (revoked, other UID, open conflict)
+# No record covers the punch; the old CNIC's record ended before it and
+# today's started after it, so the CNIC changed around the punch.
+CHANGED_NEAR_PUNCH = "CHANGED_NEAR_PUNCH"
+AMBIGUOUS = "AMBIGUOUS"  # records exist but do not prove today's CNIC (revoked, other UID, other user)
 NONE = "NONE"  # no record at all (pre-history, a new hire's first punches, no CNIC then)
 
 # Evidence notes shown to the administrator. They never carry a CNIC.
@@ -77,15 +89,22 @@ PUNCH_TIME_CNIC_HELD_BY_OTHER = "PUNCH_TIME_CNIC_HELD_BY_OTHER"
 # ID reused before ADD's history began cannot be detected.
 PUNCH_BEFORE_FIRST_OBSERVATION = "PUNCH_BEFORE_FIRST_OBSERVATION"
 # No record covers the punch, but the records just before and after it are
-# the same terminal user with the same other CNIC (a break, not a change).
+# the same terminal user with the same CNIC (a break, not a change).
 GAP_BRIDGED_SAME_CNIC = "GAP_BRIDGED_SAME_CNIC"
 # The name saved with the punch is not today's user's name.
 NAME_DIFFERS = "NAME_DIFFERS"
+# The terminal user holding the record before the punch was deleted between
+# that record's end and the punch: that record says nothing about the punch.
+RECORD_HOLDER_DELETED_BEFORE_PUNCH = "RECORD_HOLDER_DELETED_BEFORE_PUNCH"
 # Signals that stop "matches today's CNIC" without naming another CNIC.
 SOFT_SIGNALS = frozenset({
     REVOKED_RECORD, OTHER_UID_RECORD, PREVIOUS_HOLDER_DELETED, PUNCH_LINKED_TO_OTHER_USER,
     UID_DIFFERS, IDENTITY_CONFLICT_UNRESOLVED,
 })
+# Signals that refuse a manual send outright (CONFLICT) whatever else is seen:
+# two active terminal users claim today's CNIC and nobody resolved it, or ADD
+# cannot read every record at the punch time.
+REFUSING_SIGNALS = frozenset({IDENTITY_CONFLICT_UNRESOLVED, RECORDS_TRUNCATED})
 
 # Where a punch that no record covers sits in the user ID's retained history.
 NO_RECORDS = "NO_RECORDS"
@@ -96,13 +115,25 @@ AFTER_LAST_RECORD = "AFTER_LAST_RECORD"
 # How a single other punch-time CNIC is known.
 COVERING_RECORD = "COVERING_RECORD"
 BRIDGED_GAP = "BRIDGED_GAP"
-NEAREST_RECORD = "NEAREST_RECORD"
+# Today's own terminal user record held it until at most NEAR_RECORD_GAP
+# before the punch; today's CNIC was first recorded after the punch.
+RECORD_BEFORE_PUNCH = "RECORD_BEFORE_PUNCH"
+
+# How close to an uncovered punch a record must end (or start) to be offered
+# as evidence of who held the user ID: one missed 15-minute user snapshot
+# closes every interval, so a routine break between records is up to about
+# 30 minutes long.
+NEAR_RECORD_GAP = timedelta(minutes=30)
 
 # Saved with an approval that sends a punch-time CNIC another active terminal
 # user holds today; a later approval check stops if this appears unaccepted.
 HELD_BY_OTHER_TOKEN = "HELD_BY_OTHER"
 
 HELD_FOR_SNAPSHOT = frozenset({"BLOCKED_IDENTITY", "WAITING_FOR_SNAPSHOT"})
+# Identity resolution states the automatic proof (synced_cnic_identity_proven) accepts.
+AUTO_RELEASE_RESOLUTION_STATUSES = frozenset({
+    "BLOCKED_IDENTITY", "WAITING_FOR_SNAPSHOT", "BLOCKED_PROVENANCE", "RESOLVED_SYNCED_CNIC",
+})
 KEY_CHUNK = 50
 CHUNK_ROW_LIMIT = 5000
 PER_KEY_LIMIT = 500
@@ -155,7 +186,8 @@ class PunchEvidence:
     covering: list = field(default_factory=list)
     before: History | None = None
     after: History | None = None
-    tombstones: list = field(default_factory=list)
+    tombstones: list = field(default_factory=list)  # deleted at or after the punch
+    earlier_deletions: list = field(default_factory=list)  # deleted before the punch
     prior_user: DeviceUser | SimpleNamespace | None = None
     truncated: bool = False
     conflict_resolved: bool = False
@@ -176,8 +208,12 @@ class PunchTimeIdentity:
     uid_matches_current: bool = True
     position: str | None = None  # where an uncovered punch sits among the retained records
     first_observed_at: object = None  # BEFORE_FIRST_RECORD: when ADD first recorded the user ID
-    basis: str | None = None  # how ``cnic_hash`` is known (COVERING_RECORD, BRIDGED_GAP, NEAREST_RECORD)
-    current_nearby: bool = False  # CHANGED_NEAR_PUNCH: the record on the other side holds today's CNIC
+    basis: str | None = None  # how ``cnic_hash`` is known (COVERING_RECORD, BRIDGED_GAP, RECORD_BEFORE_PUNCH)
+    # CHANGED_NEAR_PUNCH: today's CNIC was recorded within NEAR_RECORD_GAP after the punch.
+    current_nearby: bool = False
+    # Uncovered punch: when the record before it ended and the record after it started.
+    record_before_until: object = None
+    record_after_from: object = None
 
     @property
     def cnic(self) -> str | None:
@@ -216,6 +252,19 @@ def _name_key(value: str | None) -> str:
 def names_differ(saved: str | None, current: str | None) -> bool:
     saved_key, current_key = _name_key(saved), _name_key(current)
     return bool(saved_key and current_key and saved_key != current_key)
+
+
+def _isolated(session: Session, read):
+    """Run a read whose failure the caller tolerates without spoiling its transaction.
+
+    On PostgreSQL a failed statement aborts the whole transaction (a delivery
+    claim batch, a snapshot). A savepoint confines it; SQLite has no such
+    abort, and its driver does not nest transactions reliably.
+    """
+    if session.get_bind().dialect.name == "postgresql":
+        with session.begin_nested():
+            return read()
+    return read()
 
 
 def _bridges(before: History, after: History, uid_ok) -> bool:
@@ -270,40 +319,94 @@ def _neighbours(session: Session, windows: dict, *, before: bool) -> dict:
     }
 
 
-def _intervals(session: Session, windows: dict) -> tuple[dict, set]:
-    """Intervals overlapping each key's own time window, bounded per key."""
-    tolerance = _tolerance()
-    found: dict = defaultdict(list)
-    truncated: set = set()
+ORDERING = (
+    History.zkt_device_id, History.terminal_serial, History.user_id,
+    History.observed_from, History.id,
+)
 
-    def window(key, low, high):
-        return and_(
-            _key_match(key), History.observed_from <= high,
-            History.observed_until >= low - tolerance,
-        )
 
-    ordering = (
-        History.zkt_device_id, History.terminal_serial, History.user_id,
-        History.observed_from, History.id,
+@dataclass
+class _Span:
+    """One terminal user ID's punches read as one time window."""
+
+    key: tuple
+    times: list  # the punch times, sorted
+    rows: list = field(default_factory=list)
+    before: History | None = None
+    after: History | None = None
+    truncated: bool = False
+
+    @property
+    def low(self):
+        return self.times[0]
+
+    @property
+    def high(self):
+        return self.times[-1]
+
+
+def _window(key, low, high):
+    return and_(
+        _key_match(key), History.observed_from <= high,
+        History.observed_until >= low - _tolerance(),
     )
+
+
+def _read_span(session: Session, span: _Span) -> list[_Span]:
+    """Read one terminal user ID's window, halving it until each part reads in full.
+
+    A long selection for one user ID can overlap hundreds of intervals (every
+    incomplete snapshot closes them all). Splitting by punch time keeps each
+    read bounded; only a single punch time overlapping more than
+    ``PER_KEY_LIMIT`` intervals is unprovable.
+    """
     rows = session.scalars(
-        select(History).where(or_(*[window(key, *bounds) for key, bounds in windows.items()]))
-        .order_by(*ordering).limit(CHUNK_ROW_LIMIT + 1)
+        select(History).where(_window(span.key, span.low, span.high))
+        .order_by(*ORDERING).limit(PER_KEY_LIMIT + 1)
     ).all()
-    if len(rows) <= CHUNK_ROW_LIMIT:
-        for row in rows:
-            found[(row.zkt_device_id, row.terminal_serial, row.user_id)].append(row)
-        return found, truncated
-    # Unusually many intervals: read each key on its own, and treat a key
-    # that still overflows as unprovable rather than reading a partial list.
-    for key, bounds in windows.items():
+    distinct = sorted(set(span.times))
+    if len(rows) > PER_KEY_LIMIT and len(distinct) > 1:
+        pivot = distinct[len(distinct) // 2]
+        return [
+            part
+            for times in (
+                [when for when in span.times if when < pivot],
+                [when for when in span.times if when >= pivot],
+            )
+            for part in _read_span(session, _Span(span.key, times))
+        ]
+    span.rows = rows[:PER_KEY_LIMIT]
+    span.truncated = len(rows) > PER_KEY_LIMIT
+    bounds = {span.key: (span.low, span.high)}
+    span.before = _neighbours(session, bounds, before=True).get(span.key)
+    span.after = _neighbours(session, bounds, before=False).get(span.key)
+    return [span]
+
+
+def _read_spans(session: Session, spans: list[_Span]) -> list[_Span]:
+    """Intervals and neighbours for many terminal user IDs, in bounded batches."""
+    done: list[_Span] = []
+    for start in range(0, len(spans), KEY_CHUNK):
+        chunk = spans[start:start + KEY_CHUNK]
+        windows = {span.key: (span.low, span.high) for span in chunk}
         rows = session.scalars(
-            select(History).where(window(key, *bounds)).order_by(*ordering).limit(PER_KEY_LIMIT + 1)
+            select(History).where(or_(*[_window(key, *bounds) for key, bounds in windows.items()]))
+            .order_by(*ORDERING).limit(CHUNK_ROW_LIMIT + 1)
         ).all()
-        if len(rows) > PER_KEY_LIMIT:
-            truncated.add(key)
-        found[key] = rows[:PER_KEY_LIMIT]
-    return found, truncated
+        if len(rows) > CHUNK_ROW_LIMIT:
+            # Unusually many intervals: read each terminal user ID on its own.
+            for span in chunk:
+                done.extend(_read_span(session, span))
+            continue
+        by_key: dict = defaultdict(list)
+        for row in rows:
+            by_key[(row.zkt_device_id, row.terminal_serial, row.user_id)].append(row)
+        before = _neighbours(session, windows, before=True)
+        after = _neighbours(session, windows, before=False)
+        for span in chunk:
+            span.rows, span.before, span.after = by_key.get(span.key, []), before.get(span.key), after.get(span.key)
+            done.append(span)
+    return done
 
 
 def load_punch_evidence(session: Session, events, users: dict) -> dict[int, PunchEvidence]:
@@ -311,29 +414,19 @@ def load_punch_evidence(session: Session, events, users: dict) -> dict[int, Punc
 
     ``users`` maps an event id to the single current active terminal user
     (or None). Queries are chunked by terminal user ID, each with its own
-    time window, so a wide selection never reads a truncated interval list.
+    time window, and a window too large to read in full is split by punch
+    time, so a wide selection never reads a truncated interval list.
     """
     evidence = {event.id: PunchEvidence() for event in events}
-    windows: dict = {}
+    times: dict = defaultdict(list)
     for event in events:
         key = _event_key(event)
-        if key is None:
-            continue
-        when = ensure_utc(event.device_event_time)
-        low, high = windows.get(key, (when, when))
-        windows[key] = (min(low, when), max(high, when))
-    keys = sorted(windows)
-    intervals: dict = {}
-    before: dict = {}
-    after: dict = {}
-    truncated: set = set()
-    for start in range(0, len(keys), KEY_CHUNK):
-        chunk = {key: windows[key] for key in keys[start:start + KEY_CHUNK]}
-        found, overflow = _intervals(session, chunk)
-        intervals.update(found)
-        truncated |= overflow
-        before.update(_neighbours(session, chunk, before=True))
-        after.update(_neighbours(session, chunk, before=False))
+        if key is not None:
+            times[key].append(ensure_utc(event.device_event_time))
+    span_for: dict = {}
+    for span in _read_spans(session, [_Span(key, sorted(values)) for key, values in sorted(times.items())]):
+        for when in span.times:
+            span_for[(span.key, when)] = span
 
     # Deleted identities that held the same user ID or UID.
     tombstone_keys = set()
@@ -380,27 +473,30 @@ def load_punch_evidence(session: Session, events, users: dict) -> dict[int, Punc
         key = _event_key(event)
         if key is not None:
             when = ensure_utc(event.device_event_time)
-            rows = intervals.get(key, [])
+            span = span_for[(key, when)]
+            rows = span.rows
             item.covering = sorted((row for row in rows if _covers(row, when, tolerance)), key=lambda row: row.id)
-            item.truncated = key in truncated or len(item.covering) > MAX_COVERING
+            item.truncated = span.truncated or len(item.covering) > MAX_COVERING
             earlier = [row for row in rows if ensure_utc(row.observed_until) < when]
             later = [row for row in rows if ensure_utc(row.observed_from) > when]
-            if key in before:
-                earlier.append(before[key])
-            if key in after:
-                later.append(after[key])
+            if span.before is not None:
+                earlier.append(span.before)
+            if span.after is not None:
+                later.append(span.after)
             item.before = max(earlier, key=lambda row: (ensure_utc(row.observed_until), row.id), default=None)
             item.after = min(later, key=lambda row: (ensure_utc(row.observed_from), row.id), default=None)
         if event.device_event_time is not None:
             when = ensure_utc(event.device_event_time)
             uids = {event.uid, user.uid if user else None} - {None, ""}
-            item.tombstones = [
+            deleted = [
                 row for row in tombstones.get(event.zkt_device_id, [])
                 if (row.user_id == event.user_id or row.uid in uids)
                 and row.device_serial in {event.device_serial, None, ""}
                 and (user is None or row.device_user_id != user.id)
-                and row.created_at is not None and ensure_utc(row.created_at) >= when
+                and row.created_at is not None
             ]
+            item.tombstones = [row for row in deleted if ensure_utc(row.created_at) >= when]
+            item.earlier_deletions = [row for row in deleted if ensure_utc(row.created_at) < when]
         if user is not None and event.device_user_id and event.device_user_id != user.id:
             item.prior_user = prior.get(event.device_user_id)
             if item.prior_user is None:
@@ -423,11 +519,54 @@ def _conflict_resolved(session: Session, user: DeviceUser) -> bool:
     if zkt is None:
         return False
     try:
-        resolution = valid_resolution_for_user(session, zkt=zkt, user=user)
+        # Called inside delivery claims: a failure must not abort that batch.
+        resolution = _isolated(session, lambda: valid_resolution_for_user(session, zkt=zkt, user=user))
     except Exception:
         log.exception("Identity conflict resolution could not be read for user %s", user.id)
         return False
     return bool(resolution and resolution.resolution_type == RESOLUTION_SAME_EMPLOYEE)
+
+
+def _todays_record(row, user) -> bool:
+    """A record of today's own terminal user row and UID (an in-place edit keeps both)."""
+    return bool(user is not None and row.device_user_id == user.id and row.uid == user.uid)
+
+
+def _change_around_punch(event, user, before, after, earlier_deletions, uid_ok):
+    """What an uncovered punch between the old CNIC's record and today's may use.
+
+    Returns (record of the old CNIC to offer or None, offer today's CNIC,
+    the old record's holder was deleted before the punch).
+
+    Who punched depends on when the CNIC changed, which ADD never saw. So:
+
+    * the old CNIC is offered only from today's own terminal user record
+      (the CNIC was edited in place, like Toheed's) that ended at most
+      NEAR_RECORD_GAP before the punch, with no deletion of its holder since;
+    * today's CNIC is offered only when its record started at most
+      NEAR_RECORD_GAP after the punch;
+    * another terminal user's record that ended just before the punch means
+      someone else may have punched: nothing is offered (a conflict).
+
+    Neither near the punch is also a conflict.
+    """
+    when = ensure_utc(event.device_event_time)
+    tolerance = _tolerance()
+    ended = ensure_utc(before.observed_until)
+    refuted = any(
+        row.device_user_id == before.device_user_id
+        and ended - tolerance <= ensure_utc(row.created_at) < when
+        for row in earlier_deletions
+    )
+    old_near = when - ended <= NEAR_RECORD_GAP and not refuted
+    old_usable = old_near and not before.revoked and uid_ok(before) and _todays_record(before, user)
+    if old_near and not old_usable:
+        return None, False, refuted
+    current_near = bool(
+        ensure_utc(after.observed_from) - when <= NEAR_RECORD_GAP
+        and not after.revoked and uid_ok(after)
+    )
+    return (before if old_usable else None), current_near, refuted
 
 
 def classify(event, user, current_hash: str | None, evidence: PunchEvidence) -> PunchTimeIdentity:
@@ -477,10 +616,10 @@ def classify(event, user, current_hash: str | None, evidence: PunchEvidence) -> 
     if user is not None and names_differ(event.display_name, user.display_name):
         # Soft evidence: the name saved with the punch is someone else's name.
         signals.add(NAME_DIFFERS)
-    position = first_observed_at = None
-    bridged: tuple = ()
-    nearest = None  # the one record near the punch naming another CNIC
-    current_nearby = False
+    position = first_observed_at = before_until = after_from = None
+    bridged: tuple = ()  # the same terminal user and CNIC on both sides of a break
+    old_record = None  # CHANGED_NEAR_PUNCH: today's own record of the old CNIC, just before
+    current_nearby = False  # CHANGED_NEAR_PUNCH: today's CNIC recorded just after
     if not covering and not captured:
         before, after = evidence.before, evidence.after
         position = (
@@ -489,35 +628,46 @@ def classify(event, user, current_hash: str | None, evidence: PunchEvidence) -> 
             else AFTER_LAST_RECORD if before is not None
             else NO_RECORDS
         )
+        before_until = ensure_utc(before.observed_until) if before is not None else None
+        after_from = ensure_utc(after.observed_from) if after is not None else None
         if position == BEFORE_FIRST_RECORD and event.device_event_time is not None:
-            first_observed_at = ensure_utc(after.observed_from)
+            first_observed_at = after_from
             if first_observed_at - ensure_utc(event.device_event_time) > _tolerance():
                 signals.add(PUNCH_BEFORE_FIRST_OBSERVATION)
-        near = [row for row in (before, after) if row is not None and row.cnic_lookup_hash != current_hash]
-        current_nearby = any(
-            row is not None and row.cnic_lookup_hash == current_hash for row in (before, after)
-        )
-        for row in near:
+        others = [row for row in (before, after) if row is not None and row.cnic_lookup_hash != current_hash]
+        for row in others:
             hashes.add(row.cnic_lookup_hash)
             sources.append((row.cnic_lookup_hash, row))
             signals.add(CNIC_CHANGED_NEAR_PUNCH)
-        if position == BETWEEN_RECORDS and before.cnic_lookup_hash != current_hash and _bridges(
-            before, after, uid_ok,
-        ):
-            bridged = (before, after)
-            signals.add(GAP_BRIDGED_SAME_CNIC)
-            signals.discard(CNIC_CHANGED_NEAR_PUNCH)
-        elif len({row.cnic_lookup_hash for row in near}) == 1:
-            usable = [row for row in near if not row.revoked and uid_ok(row)]
-            nearest = usable[0] if len(usable) == len(near) else None
+        if position == BETWEEN_RECORDS and _bridges(before, after, uid_ok):
+            if before.cnic_lookup_hash != current_hash:
+                bridged = (before, after)
+                signals.add(GAP_BRIDGED_SAME_CNIC)
+                signals.discard(CNIC_CHANGED_NEAR_PUNCH)
+            elif _todays_record(before, user):
+                # Today's own terminal user record, today's CNIC, both sides.
+                bridged = (before, after)
+                signals.add(GAP_BRIDGED_SAME_CNIC)
+        elif position == BETWEEN_RECORDS and others == [before]:
+            # The old CNIC before the punch, today's after it: the CNIC was
+            # changed around the punch. Offer only what is near the punch.
+            old_record, current_nearby, refuted = _change_around_punch(
+                event, user, before, after, evidence.earlier_deletions, uid_ok,
+            )
+            if refuted:
+                signals.add(RECORD_HOLDER_DELETED_BEFORE_PUNCH)
+        # Anything else naming another CNIC around an uncovered punch (a
+        # record on one side only, today's CNIC before and another after,
+        # two other CNICs) offers nothing and is refused below.
     ids = tuple(row.id for row in covering) + tuple(row.id for row in bridged)
     good = [row for row in covering if not row.revoked and uid_ok(row)] + list(bridged)
     common = dict(
         evidence_hashes=frozenset(hashes), unknown_holder=unknown_holder,
         history_ids=ids, good_intervals=tuple(good), sources=tuple(sources),
         uid_matches_current=uid_matches, position=position, first_observed_at=first_observed_at,
+        record_before_until=before_until, record_after_from=after_from,
     )
-    if RECORDS_TRUNCATED in signals:
+    if signals & REFUSING_SIGNALS:
         return PunchTimeIdentity(CONFLICT, signals=frozenset(signals), **common)
 
     good_hashes = {row.cnic_lookup_hash for row in good}
@@ -536,22 +686,21 @@ def classify(event, user, current_hash: str | None, evidence: PunchEvidence) -> 
             )
         return PunchTimeIdentity(CONFLICT, signals=frozenset(signals), **common)
     if unknown_holder or hashes - {current_hash}:
-        # One other CNIC on the nearest record and nothing else: the CNIC may
-        # have changed around the punch. Two other CNICs near the punch, or
-        # any other holder, is a conflict: today's CNIC is not near it at all.
-        # Today's CNIC is offered only when the record on the other side of
-        # the punch holds it (the records disagree); the other CNIC only from a
-        # usable record. With neither, nothing can be chosen: a conflict.
+        # The old CNIC's record ended before the punch and today's started
+        # after it, and nothing else names anyone: offer what is near the
+        # punch (see _change_around_punch). Any other holder, another CNIC
+        # with no record on the other side, or nothing near enough to offer
+        # is a conflict, never sent by hand.
         if (
             CNIC_CHANGED_NEAR_PUNCH in signals and len(hashes - {current_hash}) == 1
             and not unknown_holder
             and not signals & {CAPTURED_CNIC_DIFFERS, PREVIOUS_HOLDER_DELETED, PUNCH_LINKED_TO_OTHER_USER}
-            and (current_nearby or nearest is not None)
+            and (current_nearby or old_record is not None)
         ):
             return PunchTimeIdentity(
                 CHANGED_NEAR_PUNCH, signals=frozenset(signals),
-                cnic_hash=nearest.cnic_lookup_hash if nearest is not None else None,
-                interval=nearest, basis=NEAREST_RECORD if nearest is not None else None,
+                cnic_hash=old_record.cnic_lookup_hash if old_record is not None else None,
+                interval=old_record, basis=RECORD_BEFORE_PUNCH if old_record is not None else None,
                 current_nearby=current_nearby, **common,
             )
         return PunchTimeIdentity(CONFLICT, signals=frozenset(signals), **common)
@@ -655,7 +804,6 @@ def auto_release_preview(
     within 15 minutes). A punch whose punch-time records contradict today's
     CNIC is never "awaiting": ADD cannot release it automatically.
     """
-    from zk_add.attendance_identity_evidence import source_evidence
     from zk_add.service import synced_cnic_identity_proven
 
     result = {
@@ -681,7 +829,10 @@ def auto_release_preview(
             return result
         user = users[0]
     try:
-        result["proof"] = bool(synced_cnic_identity_proven(session, connector, zkt, user, event))
+        # Runs inside delivery claims and approvals: a failure must not abort them.
+        result["proof"] = bool(_isolated(
+            session, lambda: synced_cnic_identity_proven(session, connector, zkt, user, event),
+        ))
     except Exception:
         # Unreadable retained data: the snapshot's own release fails the same
         # way, so nothing is released automatically.
@@ -693,25 +844,51 @@ def auto_release_preview(
         )
         result["at_next_snapshot"] = result["database_guard"] != "REJECTED"
         return result
+    result["awaiting_snapshot"] = _awaiting_snapshot(session, event, connector, zkt, user, identity)
+    return result
+
+
+def _awaiting_snapshot(session: Session, event, connector, zkt, user, identity) -> bool:
+    """The punch arrived after the latest snapshot and the next one can still prove it.
+
+    Only the preconditions the automatic proof (``synced_cnic_identity_proven``)
+    checks that a new snapshot cannot change are required, so a punch the
+    next snapshot can never release does not ask for "send now".
+    """
+    from zk_add.attendance_identity_evidence import source_evidence
+    from zk_add.service import AUTO_SYNC_LIVE_EVENT_AGE
+
     live = event.source in {"LIVE", "LIVE_POLL"}
-    provable = (
-        not event.captured_cnic_lookup_hash
-        or event.captured_cnic_lookup_hash == user.cnic_lookup_hash
-    )
-    if not live and identity is not None:
-        provable = provable and identity.state in {MATCHES_CURRENT, NONE} and not contradiction_tokens(
-            identity, user.cnic_lookup_hash,
-        )
     snapshot_at = zkt.identity_snapshot_observed_at
-    result["awaiting_snapshot"] = bool(
-        provable
+    if not (
+        (not event.captured_cnic_lookup_hash or event.captured_cnic_lookup_hash == user.cnic_lookup_hash)
         and user.present and user.cnic_lookup_hash and not user.identity_conflict_code
         and zkt.snapshot_complete and zkt.identity_snapshot_stable
+        and zkt.confirmed_serial and zkt.confirmed_serial == zkt.serial
+        and event.device_serial == zkt.confirmed_serial
         and event.clock_quality == "OK"
+        and event.identity_resolution_status in AUTO_RELEASE_RESOLUTION_STATUSES
         and (snapshot_at is None or ensure_utc(event.captured_at) > ensure_utc(snapshot_at))
-        and (live or source_evidence(session, event, connector) is not None)
-    )
-    return result
+    ):
+        return False
+    if identity is not None and (
+        identity.state not in {MATCHES_CURRENT, NONE}
+        or contradiction_tokens(identity, user.cnic_lookup_hash)
+    ):
+        # ADD's records name someone else at punch time: never "about to release".
+        return False
+    if live:
+        # The LIVE proof: the roster unchanged since before the punch, the
+        # saved name today's name, and captured within minutes of the punch.
+        changed_at = zkt.last_identity_change_at
+        age = ensure_utc(event.captured_at) - ensure_utc(event.device_event_time)
+        return bool(
+            changed_at is not None
+            and ensure_utc(event.device_event_time) >= ensure_utc(changed_at)
+            and (not event.display_name or event.display_name.casefold() == (user.display_name or "").casefold())
+            and timedelta(0) <= age <= AUTO_SYNC_LIVE_EVENT_AGE
+        )
+    return source_evidence(session, event, connector) is not None
 
 
 CNIC_FORMAT_ALERT = "USER_CNIC_FORMAT_SUSPECT"

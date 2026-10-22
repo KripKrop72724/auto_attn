@@ -3455,19 +3455,30 @@ IDENTITY_RELEASE_HINTS = {
         "must choose which CNIC to use; the punch-time CNIC is the default."
     ),
     "PUNCH_TIME_CNIC_CONFLICT": (
-        "ADD's records show another CNIC or another person for this user ID at punch time "
-        "(see other_cnics_masked and evidence_signals). A manual send refuses this punch."
+        "ADD's records show another CNIC or another person for this user ID at or near the "
+        "punch time, and nothing close enough to the punch says which (see "
+        "other_cnics_masked, evidence_signals, record_before_ended_at and "
+        "record_after_started_at). A manual send refuses this punch."
+    ),
+    "IDENTITY_CONFLICT_UNRESOLVED": (
+        "Two active terminal users have today's CNIC and the duplicate is not resolved. A "
+        "manual send refuses this punch until it is resolved in ADD Users."
     ),
     "PUNCH_TIME_CNIC_CHANGED_NEARBY": (
-        "No record covers the punch time, and the nearest record before or after it holds "
-        "another CNIC. A manual send asks for this punch on its own: the nearest record's "
-        "CNIC, or today's CNIC only when the record on the other side holds it. Choose only "
-        "after HR confirms who held the user ID."
+        "No record covers the punch time: the old CNIC's record ended before it and today's "
+        "started after it (see record_before_ended_at and record_after_started_at). A manual "
+        "send asks for this punch on its own and offers only a record within 30 minutes of "
+        "the punch: the old CNIC from today's own terminal user record, today's CNIC from "
+        "its first record. Choose only after HR confirms who held the user ID."
     ),
     "PUNCH_TIME_CNIC_BRIDGED_GAP": (
         "No record covers the punch time, but the records just before and after it are the "
-        "same terminal user with the same other CNIC. A manual send treats that CNIC as the "
+        "same terminal user with the same CNIC. A manual send treats that CNIC as the "
         "punch-time CNIC."
+    ),
+    "RECORD_HOLDER_DELETED_BEFORE_PUNCH": (
+        "The terminal user on the record before the punch was deleted before the punch, so "
+        "that record says nothing about who punched."
     ),
     "PUNCH_BEFORE_FIRST_OBSERVATION": (
         "The punch is older than ADD's first record of this terminal user ID (see "
@@ -3477,8 +3488,8 @@ IDENTITY_RELEASE_HINTS = {
         "The name saved with the punch is not today's user's name. Confirm with HR who punched."
     ),
     "PUNCH_TIME_CNIC_AMBIGUOUS": (
-        "The records at punch time are revoked, belong to another terminal UID, or the user "
-        "has an unresolved identity conflict. They do not prove today's CNIC."
+        "The records at punch time are revoked, belong to another terminal UID or terminal "
+        "user, or the punch was linked to another user. They do not prove today's CNIC."
     ),
     "NO_PUNCH_TIME_IDENTITY": (
         "ADD has no identity record for this user ID at punch time. Today's CNIC may only be "
@@ -3498,9 +3509,11 @@ def _identity_release_safety(
         CONFLICT,
         DIFFERS,
         GAP_BRIDGED_SAME_CNIC,
+        IDENTITY_CONFLICT_UNRESOLVED,
         NAME_DIFFERS,
         NONE,
         PUNCH_BEFORE_FIRST_OBSERVATION,
+        RECORD_HOLDER_DELETED_BEFORE_PUNCH,
         auto_release_preview,
         database_guard_state,
         other_cnics_masked,
@@ -3546,7 +3559,9 @@ def _identity_release_safety(
     if punch_code:
         codes.append(punch_code)
     for signal, code in (
+        (IDENTITY_CONFLICT_UNRESOLVED, "IDENTITY_CONFLICT_UNRESOLVED"),
         (GAP_BRIDGED_SAME_CNIC, "PUNCH_TIME_CNIC_BRIDGED_GAP"),
+        (RECORD_HOLDER_DELETED_BEFORE_PUNCH, "RECORD_HOLDER_DELETED_BEFORE_PUNCH"),
         (PUNCH_BEFORE_FIRST_OBSERVATION, "PUNCH_BEFORE_FIRST_OBSERVATION"),
         (NAME_DIFFERS, "NAME_DIFFERS"),
     ):
@@ -3561,13 +3576,15 @@ def _identity_release_safety(
         "saved_terminal_record": saved_record,
         "punch_time_cnic": {
             "state": punch.state,
-            # The single other CNIC at or near the punch (DIFFERS, or the
-            # nearest record for CHANGED_NEAR_PUNCH), masked.
+            # The single other CNIC at or near the punch (DIFFERS, or today's
+            # own record that ended just before it for CHANGED_NEAR_PUNCH), masked.
             "cnic_masked": mask_cnic(punch.cnic) if other_cnic and punch.cnic else None,
             "display_name": punch.display_name if other_cnic else None,
             "basis": punch.basis if other_cnic else None,
             "record_position": punch.position,
             "first_observed_at": punch.first_observed_at,
+            "record_before_ended_at": punch.record_before_until,
+            "record_after_started_at": punch.record_after_from,
             "history_ids": list(punch.history_ids),
             "other_cnics_masked": other_cnics_masked(punch, current_hash),
             "evidence_signals": sorted(punch.signals),
