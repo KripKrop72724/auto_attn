@@ -26,12 +26,13 @@ const SIGNAL_TEXT: Record<string, string> = {
   PUNCH_LINKED_TO_OTHER_USER: 'the punch was linked to another terminal user',
   UID_DIFFERS: "the punch's terminal UID is not today's user's UID",
   IDENTITY_CONFLICT_UNRESOLVED: 'this user has an unresolved identity conflict',
-  CNIC_CHANGED_NEAR_PUNCH: 'the nearest record before or after the punch holds another CNIC',
+  CNIC_CHANGED_NEAR_PUNCH: 'a record just before or after the punch holds another CNIC',
   RECORDS_TRUNCATED: 'too many identity records to check',
   PUNCH_TIME_CNIC_HELD_BY_OTHER: 'another active terminal user has the punch-time CNIC today',
   PUNCH_BEFORE_FIRST_OBSERVATION: "the punch is older than ADD's first record of this user ID",
-  GAP_BRIDGED_SAME_CNIC: 'no record covers the punch; the records just before and after it hold the same other CNIC',
+  GAP_BRIDGED_SAME_CNIC: 'no record covers the punch; the records just before and after it are one terminal user with the same CNIC',
   NAME_DIFFERS: "the name saved with the punch is not today's user's name",
+  RECORD_HOLDER_DELETED_BEFORE_PUNCH: 'the terminal user on the record before the punch was deleted before it',
 }
 /** Plain-language evidence for one punch; masked CNICs only. */
 export function evidenceText(row: DirectOrdsPreviewRow) {
@@ -99,19 +100,31 @@ const groupLabel = (group: DirectSendGroup) => {
   const row = group.rows[0]
   return `${row.display_name || `User ${row.user_id}`} · user ${row.user_id}${row.device_serial ? ` · ${row.device_serial}` : ''} · ${count(group.rows.length)} · ${span(group.rows)}`
 }
+/** When the records around an uncovered punch end and start; never which one is "nearest". */
+const recordEdges = (row: DirectOrdsPreviewRow) => [
+  row.record_before_ended_at ? `the old CNIC's record ended ${dateTime(row.record_before_ended_at)}` : '',
+  row.record_after_started_at ? `today's CNIC was first recorded ${dateTime(row.record_after_started_at)}` : '',
+].filter(Boolean).join('; ')
 const confirmReason = (row: DirectOrdsPreviewRow) => {
-  if (row.punch_time_cnic === 'CHANGED_NEAR_PUNCH') return 'No record covers the punch time and the nearest record holds another CNIC.'
+  if (row.punch_time_cnic === 'CHANGED_NEAR_PUNCH') {
+    const edges = recordEdges(row)
+    return `No record covers the punch time; the CNIC changed around it${edges ? ` (${edges}, punch ${dateTime(row.device_event_time)})` : ''}. Only a record within 30 minutes of the punch is offered.`
+  }
   if (row.punch_time_cnic !== 'NONE') return "ADD's records at the punch time do not prove today's CNIC."
   if (row.record_position === 'BEFORE_FIRST_RECORD') {
     return `These punches are older than ADD's first record of this user ID${row.first_observed_at ? ` (${dateTime(row.first_observed_at)})` : ''}; a user ID reused before then cannot be detected.`
   }
-  if (row.record_position === 'BETWEEN_RECORDS') return "No record covers the punch time; the records before and after it hold today's CNIC."
+  if (row.record_position === 'BETWEEN_RECORDS') return "No record covers the punch time, and the records around it are not one terminal user record holding today's CNIC throughout."
   if (row.record_position === 'AFTER_LAST_RECORD') return "The punch is after ADD's last record of this user ID."
   return 'ADD has no identity record for this user ID.'
 }
-const otherCnicLabel = (row: DirectOrdsPreviewRow) => row.punch_time_cnic_basis === 'NEAREST_RECORD'
-  ? 'CNIC on the nearest record' : row.punch_time_cnic_basis === 'BRIDGED_GAP'
+const otherCnicLabel = (row: DirectOrdsPreviewRow) => row.punch_time_cnic_basis === 'RECORD_BEFORE_PUNCH'
+  ? `CNIC on today's terminal user record until ${row.record_before_ended_at ? dateTime(row.record_before_ended_at) : 'just before the punch'}`
+  : row.punch_time_cnic_basis === 'BRIDGED_GAP'
     ? 'CNIC at punch time (records before and after it)' : 'CNIC at punch time'
+const todayLabel = (row: DirectOrdsPreviewRow) => row.punch_time_cnic === 'CHANGED_NEAR_PUNCH' && row.record_after_started_at
+  ? `Today's CNIC ${row.current_cnic_masked} (recorded from ${dateTime(row.record_after_started_at)})`
+  : `Today's CNIC ${row.current_cnic_masked}`
 
 export function DirectOrdsSend({ selected, clearSelection, refresh, openRequest, selectControl }: {
   selected: AttendanceEvent[]; clearSelection: () => void; refresh: () => void; openRequest: number; selectControl?: ReactNode;
@@ -255,7 +268,7 @@ export function DirectOrdsSend({ selected, clearSelection, refresh, openRequest,
       {checks === null && <p className="message pattern-waiting" role="status">Checking punch times, CNICs and automatic releases…</p>}
       {checksError && <p className="message pattern-blocked" role="alert">ADD could not load the punch checks ({checksError}). If you approve, ADD still skips every punch that needs a decision.</p>}
       {decisions.refused.length > 0 && <section className="attendance-direct-check pattern-blocked" aria-label="Punches that cannot be sent"><strong>{count(decisions.refused.length)} cannot be sent</strong><ul>{decisions.refused.slice(0, 50).map((row) => <li key={row.event_id}>{rowLabel(row)} · {row.exclusion_reason || humanizeStatus(row.exclusion || '')}{row.exclusion === 'CNIC_CONFLICT' && evidenceText(row) ? ` (${evidenceText(row)})` : ''}</li>)}</ul>{decisions.refused.length > 50 && <small>And {count(decisions.refused.length - 50)} more that cannot be sent.</small>}</section>}
-      {decisions.choose.length > 0 && <section className="attendance-direct-check pattern-waiting" aria-label="CNIC changed since the punch"><strong>CNIC changed since {decisions.choose.reduce((total, group) => total + group.rows.length, 0) === 1 ? 'this punch' : 'these punches'}</strong><small>The terminal held a different CNIC for this user ID at or near punch time. ADD sends the punch-time CNIC unless you choose today's. Today's CNIC is offered only for the same terminal user record, or when the record on the other side of the punch holds it. Nothing is preselected where ADD's records disagree.</small>{decisions.choose.map((group) => { const row = group.rows[0]; const choice = decisions.chosen(group); const notes = evidenceText(row); return <fieldset key={group.key}><legend>{groupLabel(group)}</legend>{row.punch_time_cnic_held_by_other && <small className="attention-copy">Another active terminal user has the punch-time CNIC today. Choosing it confirms that HR verified this employee, not that user, punched.</small>}{row.punch_time_cnic === 'CHANGED_NEAR_PUNCH' && <small>{confirmReason(row)}{notes ? ` Evidence: ${notes}.` : ''}</small>}{row.cnic_choices.includes('PUNCH_TIME') && <label><input type="radio" name={`cnic-${group.key}`} checked={choice === 'PUNCH_TIME'} onChange={() => setChoices((current) => ({ ...current, [group.key]: 'PUNCH_TIME' }))} /> {otherCnicLabel(row)} {row.punch_time_cnic_masked}{row.punch_time_display_name ? ` (${row.punch_time_display_name})` : ''}{row.default_cnic_choice === 'PUNCH_TIME' ? ' · recommended' : ''}</label>}{row.cnic_choices.includes('CURRENT') && <label><input type="radio" name={`cnic-${group.key}`} checked={choice === 'CURRENT'} onChange={() => setChoices((current) => ({ ...current, [group.key]: 'CURRENT' }))} /> Today's CNIC {row.current_cnic_masked}</label>}{!choice && <small>No CNIC chosen; {group.rows.length === 1 ? 'this punch is' : 'these punches are'} skipped.</small>}</fieldset> })}</section>}
+      {decisions.choose.length > 0 && <section className="attendance-direct-check pattern-waiting" aria-label="CNIC changed since the punch"><strong>CNIC changed since {decisions.choose.reduce((total, group) => total + group.rows.length, 0) === 1 ? 'this punch' : 'these punches'}</strong><small>The terminal held a different CNIC for this user ID at or near punch time. ADD sends the punch-time CNIC unless you choose today's. Today's CNIC is offered only for the same terminal user record. Where no record covers the punch, only a record within 30 minutes of it is offered and nothing is preselected.</small>{decisions.choose.map((group) => { const row = group.rows[0]; const choice = decisions.chosen(group); const notes = evidenceText(row); return <fieldset key={group.key}><legend>{groupLabel(group)}</legend>{row.punch_time_cnic_held_by_other && <small className="attention-copy">Another active terminal user has the punch-time CNIC today. Choosing it confirms that HR verified this employee, not that user, punched.</small>}{row.punch_time_cnic === 'CHANGED_NEAR_PUNCH' && <small>{confirmReason(row)}{notes ? ` Evidence: ${notes}.` : ''}</small>}{row.cnic_choices.includes('PUNCH_TIME') && <label><input type="radio" name={`cnic-${group.key}`} checked={choice === 'PUNCH_TIME'} onChange={() => setChoices((current) => ({ ...current, [group.key]: 'PUNCH_TIME' }))} /> {otherCnicLabel(row)} {row.punch_time_cnic_masked}{row.punch_time_display_name ? ` (${row.punch_time_display_name})` : ''}{row.default_cnic_choice === 'PUNCH_TIME' ? ' · recommended' : ''}</label>}{row.cnic_choices.includes('CURRENT') && <label><input type="radio" name={`cnic-${group.key}`} checked={choice === 'CURRENT'} onChange={() => setChoices((current) => ({ ...current, [group.key]: 'CURRENT' }))} /> {todayLabel(row)}</label>}{!choice && <small>No CNIC chosen; {group.rows.length === 1 ? 'this punch is' : 'these punches are'} skipped.</small>}</fieldset> })}</section>}
       {decisions.confirm.length > 0 && <section className="attendance-direct-check pattern-waiting" aria-label="Confirm today's CNIC"><strong>Confirm today's CNIC</strong><small>Tick only after HR confirmed the same employee held the terminal user ID at the punch time. Unticked punches are skipped.</small>{decisions.confirm.map((group) => { const row = group.rows[0]; const notes = evidenceText(row); return <label key={group.key} className="check-field"><input type="checkbox" checked={Boolean(confirmed[group.key])} onChange={(event) => { const checked = event.target.checked; setConfirmed((current) => ({ ...current, [group.key]: checked })) }} /><span><strong>Use today's CNIC {row.current_cnic_masked} for {groupLabel(group)}</strong><small>{confirmReason(row)}{notes ? ` Evidence: ${notes}.` : ''}</small></span></label> })}</section>}
       {decisions.autoSoon.length > 0 && <label className="check-field attendance-direct-check"><input type="checkbox" checked={sendNow} onChange={(event) => setSendNow(event.target.checked)} /><span><strong>Send {count(decisions.autoSoon.length)} now anyway</strong><small>ADD's own identity proof releases {decisions.autoSoon.filter((row) => row.auto_release_at_next_snapshot).length} at the next user snapshot and re-checks {decisions.autoSoon.filter((row) => !row.auto_release_at_next_snapshot).length} then (normally within 15 minutes). Unticked punches are skipped and keep waiting for that release.</small></span></label>}
       {decisions.replacing > 0 && <p className="message pattern-waiting">{count(decisions.replacing)} replace an earlier approval that stopped before anything was sent to Oracle.</p>}

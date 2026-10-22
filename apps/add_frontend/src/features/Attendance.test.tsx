@@ -595,7 +595,7 @@ describe('Live attendance workspace', () => {
     const preview = { rows: [
       previewRow({ event_id: 21, user_id: '100', display_name: 'Babar', punch_time_cnic: 'CONFLICT', exclusion: 'CNIC_CONFLICT', exclusion_reason: "ADD's records show another CNIC or another person for this terminal user ID at punch time.", other_cnics_masked: ['*****-****777-1'], evidence_signals: ['OTHER_UID_RECORD'] }),
       previewRow({ event_id: 22, user_id: '3980', display_name: 'Toheed', punch_time_cnic: 'DIFFERS', punch_time_cnic_masked: '*****-****609-0', punch_time_cnic_held_by_other: true, evidence_signals: ['PUNCH_TIME_CNIC_HELD_BY_OTHER'], cnic_choice_required: true, cnic_choices: ['PUNCH_TIME', 'CURRENT'], default_cnic_choice: null, decision_kind: 'CHOOSE_CNIC', decision_group: 'choose|1|3980|aaaa|1' }),
-      previewRow({ event_id: 23, user_id: '3980', display_name: 'Toheed', punch_time_cnic: 'CHANGED_NEAR_PUNCH', other_cnics_masked: ['*****-****609-0'], evidence_signals: ['CNIC_CHANGED_NEAR_PUNCH'], cnic_choice_required: true, cnic_choices: ['CURRENT'], decision_kind: 'CONFIRM_TODAY', decision_group: 'row|23' }),
+      previewRow({ event_id: 23, user_id: '3980', display_name: 'Toheed', punch_time_cnic: 'CHANGED_NEAR_PUNCH', other_cnics_masked: ['*****-****609-0'], evidence_signals: ['CNIC_CHANGED_NEAR_PUNCH'], record_before_ended_at: '2026-09-25T09:00:00Z', record_after_started_at: '2026-10-19T08:01:00Z', cnic_choice_required: true, cnic_choices: ['CURRENT'], decision_kind: 'CONFIRM_TODAY', decision_group: 'row|23' }),
     ], missing_event_ids: [], counts: { selected: 3, refused: 1, cnic_choice_required: 2, auto_release_soon: 0 } }
     const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const path = String(input)
@@ -620,7 +620,9 @@ describe('Live attendance workspace', () => {
     expect((within(changed).getByLabelText(/CNIC at punch time/) as HTMLInputElement).checked).toBe(false)
     expect((within(changed).getByLabelText(/Today's CNIC/) as HTMLInputElement).checked).toBe(false)
     const confirm = within(dialog).getByRole('region', { name: "Confirm today's CNIC" })
-    expect(confirm.textContent).toMatch(/nearest record holds another CNIC.*other CNIC on record: \*{5}-\*{4}609-0/)
+    // The old record ended weeks before the punch: only today's CNIC is offered, with both edges shown.
+    expect(confirm.textContent).toMatch(/CNIC changed around it \(the old CNIC's record ended .+; today's CNIC was first recorded .+\)\. Only a record within 30 minutes of the punch is offered\..*other CNIC on record: \*{5}-\*{4}609-0/)
+    expect(dialog.textContent).not.toMatch(/nearest/i)
     expect(dialog.textContent).toMatch(/3 punches will be skipped; 0 punches will be approved/)
     fireEvent.click(within(changed).getByLabelText(/CNIC at punch time/))
     fireEvent.change(screen.getByLabelText('Reason for sending'), { target: { value: 'HR confirmed Toheed punched' } })
@@ -636,7 +638,7 @@ describe('Live attendance workspace', () => {
   it('asks per punch, with nothing preselected, when the records around a punch disagree', () => {
     const gap = previewRow({
       event_id: 600, user_id: '3980', display_name: 'Toheed', punch_time_cnic: 'CHANGED_NEAR_PUNCH',
-      punch_time_cnic_masked: '*****-****609-0', punch_time_cnic_basis: 'NEAREST_RECORD', record_position: 'BETWEEN_RECORDS',
+      punch_time_cnic_masked: '*****-****609-0', punch_time_cnic_basis: 'RECORD_BEFORE_PUNCH', record_position: 'BETWEEN_RECORDS',
       cnic_choice_required: true, cnic_choices: ['PUNCH_TIME', 'CURRENT'], default_cnic_choice: null,
       decision_kind: 'CHOOSE_CNIC', decision_group: 'row|600', evidence_digest: '6'.repeat(64),
     })
@@ -646,6 +648,35 @@ describe('Live attendance workspace', () => {
     expect(result.skipped).toBe(1)
     result = directSendDecisions([gap], { 'row|600': 'PUNCH_TIME' }, {}, false)
     expect(result.cnicChoices).toEqual([{ event_id: 600, choice: 'PUNCH_TIME', evidence_digest: '6'.repeat(64), held_by_other_confirmed: false }])
+  })
+
+  it('labels a CNIC change around a punch by when each record ended and started, with nothing selected', async () => {
+    const hint = { eligible: true, cnic_source: 'SYNCED_USER' as const, exclusion: null, punch_time_cnic: 'CHANGED_NEAR_PUNCH' as const, cnic_choice_required: true }
+    const rows = [event({ id: 41, event_uid: 'edited', display_name: 'Toheed', user_id: '3980', cnic_masked: null, ords_status: 'BLOCKED_IDENTITY', direct_ords_identity: hint })]
+    const preview = { rows: [previewRow({
+      event_id: 41, user_id: '3980', display_name: 'Toheed', device_event_time: '2026-10-19T08:00:00Z',
+      punch_time_cnic: 'CHANGED_NEAR_PUNCH', punch_time_cnic_masked: '*****-****609-0', punch_time_cnic_basis: 'RECORD_BEFORE_PUNCH',
+      record_position: 'BETWEEN_RECORDS', record_before_ended_at: '2026-10-19T07:57:00Z', record_after_started_at: '2026-10-19T08:10:00Z',
+      current_cnic_masked: '*****-****609-2', cnic_choice_required: true, cnic_choices: ['PUNCH_TIME', 'CURRENT'], default_cnic_choice: null,
+      decision_kind: 'CHOOSE_CNIC', decision_group: 'row|41',
+    })], missing_event_ids: [], counts: { selected: 1, refused: 0, cnic_choice_required: 1, auto_release_soon: 0 } }
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const path = String(input)
+      if (path === '/api/v2/attendance-direct-ords/preview') return response(preview)
+      if (path.includes('/api/v2/attendance-direct-ords')) return response({ rows: [], next_cursor: null })
+      return response({ rows, next_cursor: null })
+    }))
+    render(<AttendanceView {...attendanceProps} />)
+    await screen.findByRole('article', { name: /Toheed/i })
+    fireEvent.click(screen.getByLabelText('Select loaded punches'))
+    fireEvent.click(screen.getByRole('button', { name: 'Send 1 punch' }))
+    const changed = await within(screen.getByRole('dialog')).findByRole('region', { name: 'CNIC changed since the punch' })
+    const old = within(changed).getByLabelText(/CNIC on today's terminal user record until/) as HTMLInputElement
+    const today = within(changed).getByLabelText(/Today's CNIC \*{5}-\*{4}609-2 \(recorded from /) as HTMLInputElement
+    expect(old.checked).toBe(false)
+    expect(today.checked).toBe(false)
+    expect(changed.textContent).toMatch(/the old CNIC's record ended .+; today's CNIC was first recorded .+, punch /)
+    expect(changed.textContent).not.toMatch(/nearest/i)
   })
 
   it('never sends a choice without the evidence it was made on', () => {
