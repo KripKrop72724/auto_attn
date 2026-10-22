@@ -12,7 +12,7 @@ $form.Text = 'SLIC Attendance - USB Wi-Fi repair'
 $form.Size = New-Object Drawing.Size(760,600)
 $form.StartPosition = 'CenterScreen'
 $label = New-Object Windows.Forms.Label
-$label.Text = "Connect the Lahore ESP by USB, then click Start repair.`r`nKeep USB connected until the result appears. Attendance storage is preserved."
+$label.Text = "Connect the Lahore ESP by USB, then click Start repair.`r`nFollow the USB instructions shown here. Attendance storage is preserved."
 $label.Location = New-Object Drawing.Point(15,15)
 $label.Size = New-Object Drawing.Size(710,55)
 $form.Controls.Add($label)
@@ -86,6 +86,7 @@ function Assert-SecurityProfile([string]$Report) {
     }
 }
 function Capture-Repair {
+    $label.Text = "Unplug and reconnect the ESP USB cable now.`r`nThen leave it connected and wait for the result."
     Say 'The repair is installed. Unplug and reconnect the ESP USB cable now.'
     Say 'Waiting for the ESP to check its data and restart the original firmware...'
     $deadline = (Get-Date).AddSeconds(210)
@@ -140,6 +141,7 @@ $form.Add_Shown({
 $button.Add_Click({
     $script:active = $true
     $button.Enabled = $false
+    $label.Text = "Repair in progress. Keep the USB cable connected.`r`nThe window will tell you when to reconnect it."
     $script:extract = Join-Path ([IO.Path]::GetTempPath()) ('SLIC-Wifi-' + [guid]::NewGuid().ToString('N'))
     try {
         $script:folder = Join-Path ([Environment]::GetFolderPath('Desktop')) ('SLIC-WiFi-Repair-' + (Get-Date -Format yyyyMMdd-HHmmss) + '-' + [guid]::NewGuid().ToString('N').Substring(0,6))
