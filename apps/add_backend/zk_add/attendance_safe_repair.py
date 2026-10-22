@@ -540,17 +540,19 @@ def _apply(session: Session, job: Job, item: Item) -> None:
 def delivery_proof_valid(session: Session, event: AttendanceEvent, connector: Connector) -> bool:
     """Final pre-send check for repaired identity; changing evidence cannot silently pass."""
     if event.identity_resolution_status == "RESOLVED_SYNCED_CNIC":
-        from zk_add.service import synced_cnic_identity_proven
+        from zk_add.service import dump_identity_release_enabled, synced_cnic_identity_proven
 
         zkt = connector.zkt_device
         user = session.get(DeviceUser, event.device_user_id) if event.device_user_id else None
         # Recheck whichever proof released it, including a legacy dump row's
-        # authenticated batch. The rollout window limits releases, not proof.
+        # authenticated batch. The rollout window limits releases, not proof;
+        # the owner's switch withdraws the batch proof before Oracle too.
         return bool(
             zkt and user and event.identity_snapshot_id == zkt.identity_snapshot_id
             and event.cnic_lookup_hash == user.cnic_lookup_hash
             and synced_cnic_identity_proven(
-                session, connector, zkt, user, event, allow_reconcile_batch=True
+                session, connector, zkt, user, event,
+                allow_reconcile_batch=dump_identity_release_enabled(),
             )
         )
     if event.identity_resolution_status != "RESOLVED_RETAINED_IDENTITY":

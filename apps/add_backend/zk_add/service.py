@@ -1757,10 +1757,11 @@ def _replace_user_snapshot(
             AttendanceEvent.ords_status.in_(("BLOCKED_IDENTITY", "WAITING_FOR_SNAPSHOT")),
         ).distinct()).all()
         if held_user_ids:
-            # Legacy dump rows held since the rollout window opened can use
-            # their authenticated batch proof, capped per snapshot. Older
-            # holds need the owner's audited backlog release.
-            dump_release = dump_identity_auto_release()
+            # In zones the owner enabled, legacy dump rows held within the
+            # rollout window can use their authenticated batch proof, capped
+            # per snapshot. Older holds need the owner's audited backlog
+            # release. The proof check runs once per held punch either way.
+            dump_release = dump_identity_auto_release(connector)
             for row in session.scalars(select(DeviceUser).where(
                 DeviceUser.zkt_device_id == zkt.id,
                 DeviceUser.user_id.in_(held_user_ids),
@@ -1769,7 +1770,9 @@ def _replace_user_snapshot(
                 release_synced_cnic_attendance(
                     session, zkt=zkt, user=row, dump_release=dump_release
                 )
-            if dump_release is not None and dump_release.released_ids:
+            if dump_release is not None and (
+                dump_release.released_ids or dump_release.rereleased_ids
+            ):
                 append_audit(
                     session,
                     actor=DUMP_AUTO_RELEASE_ACTOR,
@@ -1779,9 +1782,14 @@ def _replace_user_snapshot(
                     outcome="RELEASED",
                     after={
                         "snapshot_id": snapshot_record.snapshot_id,
-                        "proof": "AUTHENTICATED_RECONCILE_BATCH",
+                        "zone_id": connector.zone_id,
+                        "proof": DUMP_RELEASE_PROOF,
                         "released": len(dump_release.released_ids),
                         "event_ids": dump_release.released_ids,
+                        # Released before, then re-held by delivery because
+                        # this newer snapshot arrived first. Separate cap.
+                        "rereleased": len(dump_release.rereleased_ids),
+                        "rereleased_event_ids": dump_release.rereleased_ids,
                         "window_hours": settings.attendance_dump_identity_auto_release_hours,
                         "batch_cap": settings.attendance_dump_identity_auto_release_batch,
                     },
@@ -3251,6 +3259,23 @@ def synced_cnic_identity_proven(
     terminal record (AUTHENTICATED_RECONCILE_BATCH). That proof always needs a
     retained, fingerprint-bound interval whose CNIC is the user's current one.
     """
+    return synced_cnic_proof_kind(
+        session, connector, zkt, user, row, allow_reconcile_batch=allow_reconcile_batch
+    ) is not None
+
+
+def synced_cnic_proof_kind(
+    session: Session, connector: Connector, zkt: ZKTDevice,
+    user: DeviceUser, row: AttendanceEvent, *, allow_reconcile_batch: bool = False,
+) -> str | None:
+    """The synced-CNIC proof that holds for this punch, or None.
+
+    "CAPTURED_CNIC" or "LIVE_ROSTER" for a punch captured with its identity;
+    otherwise the authenticated source of a terminal reconcile record, such
+    as "SAVED_TERMINAL_RECORD" or "AUTHENTICATED_RECONCILE_BATCH". Allowing
+    the batch proof never changes the verdict for a row another source
+    proves: source_evidence offers it only when no other source applies.
+    """
     if not (
         zkt.snapshot_complete and zkt.identity_snapshot_stable
         and zkt.identity_snapshot_observed_at and zkt.confirmed_serial == zkt.serial
@@ -3268,15 +3293,15 @@ def synced_cnic_identity_proven(
         and (not row.captured_cnic_lookup_hash
              or row.captured_cnic_lookup_hash == user.cnic_lookup_hash)
     ):
-        return False
+        return None
     try:
         cnic = decrypt_cnic(user.cnic_encrypted)
         if not cnic or cnic_lookup(cnic) != user.cnic_lookup_hash:
-            return False
+            return None
     except Exception:
-        return False
+        return None
     if row.captured_cnic_lookup_hash == user.cnic_lookup_hash:
-        return True
+        return "CAPTURED_CNIC"
     if (
         row.source in {"LIVE", "LIVE_POLL"}
             and zkt.last_identity_change_at is not None
@@ -3287,7 +3312,7 @@ def synced_cnic_identity_proven(
             and ensure_utc(zkt.identity_snapshot_observed_at)
             >= ensure_utc(row.captured_at)
     ):
-        return True
+        return "LIVE_ROSTER"
     # A reconciled ID-only record needs its own authenticated source and proof
     # that the same CNIC covered the punch time. A later roster observation
     # alone cannot attribute a historical punch to this employee.
@@ -3295,7 +3320,7 @@ def synced_cnic_identity_proven(
         row.source not in TERMINAL_RECONCILE_SOURCES
         or not row.uid or row.uid != user.uid or row.connector_id != connector.id
     ):
-        return False
+        return None
     from zk_add.attendance_identity_evidence import identity_evidence
     from zk_add.models import AttendanceIdentityHistory
 
@@ -3307,7 +3332,7 @@ def synced_cnic_identity_proven(
         and evidence.proof["source"]["kind"] == "AUTHENTICATED_RECONCILE_BATCH"
         and evidence.proof["kind"] not in {"RETAINED_INTERVAL", "RETAINED_EQUIVALENT_INTERVALS"}
     ):
-        return False
+        return None
     if evidence and evidence.proof["kind"] == "LEGACY_CONTINUITY":
         # A revoked or conflicting interval cannot be bypassed by the older
         # aggregate roster proof. Use that fallback only when no per-user
@@ -3321,48 +3346,111 @@ def synced_cnic_identity_proven(
             AttendanceIdentityHistory.observed_until >= row.device_event_time,
         ).limit(1))
         if prior_interval is not None:
-            return False
-    return bool(
+            return None
+    if (
         evidence and evidence.proof["kind"] in {
             "RETAINED_INTERVAL", "RETAINED_EQUIVALENT_INTERVALS", "LEGACY_CONTINUITY"
         }
         and evidence.user_id == user.id
         and evidence.cnic_hash == user.cnic_lookup_hash
-    )
+    ):
+        return evidence.proof["source"]["kind"]
+    return None
 
 
 DUMP_AUTO_RELEASE_ACTOR = "system:identity-dump-auto-release"
+DUMP_RELEASE_PROOF = "AUTHENTICATED_RECONCILE_BATCH"
+
+
+def dump_identity_release_enabled() -> bool:
+    """The owner's switch for AUTHENTICATED_RECONCILE_BATCH everywhere."""
+    return bool(settings.attendance_dump_identity_release_enabled)
+
+
+def dump_auto_release_zone_enabled(zone_id: str | None) -> bool:
+    zones = {
+        value.strip()
+        for value in settings.attendance_dump_identity_auto_release_zones.split(",")
+        if value.strip()
+    }
+    return bool(zone_id) and ("*" in zones or zone_id in zones)
+
+
+def previously_synced_cnic_release(row: AttendanceEvent) -> bool:
+    """A held row that a synced-CNIC proof released before.
+
+    Delivery re-holds such a row when a newer roster snapshot arrives before
+    Oracle acknowledges it; it is not new backlog.
+    """
+    return (
+        row.identity_resolution_status == "RESOLVED_SYNCED_CNIC"
+        and row.identity_repair_reason == "VERIFIED_SYNCED_CNIC"
+    )
 
 
 @dataclass
 class DumpIdentityRelease:
     """Permission to release legacy dump rows on AUTHENTICATED_RECONCILE_BATCH.
 
-    held_since: rows ADD received earlier stay held (None: no age limit, used
-    only by the owner's audited backlog release). A row this proof released
-    before and delivery re-held is not new backlog. remaining caps releases.
+    held_since: new holds ADD received earlier stay held (None: no age limit,
+    used only by the owner's audited backlog release). remaining caps new
+    holds; rereleases_remaining separately caps rows a synced-CNIC proof
+    released before and delivery re-held, so a re-hold cannot use up the new
+    hold cap or loop without bound. A row an administrator approved for a
+    manual or forced send keeps that custody and is never admitted.
     """
 
     held_since: datetime | None
     remaining: int
+    rereleases_remaining: int = 0
     released_ids: list[int] = field(default_factory=list)
+    rereleased_ids: list[int] = field(default_factory=list)
 
-    def admits(self, row: AttendanceEvent) -> bool:
-        if self.remaining <= 0 or row.source not in DUMP_RECONCILE_SOURCES:
+    def admits(self, session: Session, row: AttendanceEvent) -> bool:
+        if not dump_identity_release_enabled() or row.source not in DUMP_RECONCILE_SOURCES:
             return False
-        if self.held_since is None or row.identity_resolution_status == "RESOLVED_SYNCED_CNIC":
-            return True
-        return bool(row.received_at and ensure_utc(row.received_at) >= self.held_since)
+        if previously_synced_cnic_release(row):
+            if self.rereleases_remaining <= 0:
+                return False
+        elif self.remaining <= 0 or not (
+            self.held_since is None
+            or (row.received_at and ensure_utc(row.received_at) >= self.held_since)
+        ):
+            return False
+        from zk_add.attendance_manual_guard import decision_for
+
+        return decision_for(session, row) is None
+
+    def record(self, row: AttendanceEvent, *, rerelease: bool) -> None:
+        if rerelease:
+            self.rereleases_remaining -= 1
+            self.rereleased_ids.append(row.id)
+        else:
+            self.remaining -= 1
+            self.released_ids.append(row.id)
 
 
-def dump_identity_auto_release(now: datetime | None = None) -> DumpIdentityRelease | None:
-    """The automatic rollout policy for one connector snapshot, or None when off."""
+def dump_identity_auto_release(
+    connector: Connector, now: datetime | None = None,
+) -> DumpIdentityRelease | None:
+    """The automatic policy for one connector snapshot, or None when off.
+
+    Off unless the proof is enabled, the connector's zone is listed in
+    ADD_ATTENDANCE_DUMP_IDENTITY_AUTO_RELEASE_ZONES, and the window and cap
+    are positive.
+    """
     hours = settings.attendance_dump_identity_auto_release_hours
     cap = settings.attendance_dump_identity_auto_release_batch
-    if hours <= 0 or cap <= 0:
+    if (
+        hours <= 0 or cap <= 0 or not dump_identity_release_enabled()
+        or connector.firmware_family == "hikvision"
+        or not dump_auto_release_zone_enabled(connector.zone_id)
+    ):
         return None
     return DumpIdentityRelease(
-        held_since=ensure_utc(now or utc_now()) - timedelta(hours=hours), remaining=cap
+        held_since=ensure_utc(now or utc_now()) - timedelta(hours=hours),
+        remaining=cap,
+        rereleases_remaining=cap,
     )
 
 
@@ -3374,28 +3462,74 @@ def synced_cnic_release_proof(
 
     Returns "SYNCED_CNIC" for the established proofs, or
     "AUTHENTICATED_RECONCILE_BATCH" when only the dump-row proof applies and
-    dump_release admits the row. Both must also pass the installed database
-    guard, so a preview counts exactly what a release would change.
+    dump_release admits the row. The punch is evaluated once. Both must also
+    pass the installed database guard, so a preview counts exactly what a
+    release would change.
     """
     if row.ords_status not in {"BLOCKED_IDENTITY", "WAITING_FOR_SNAPSHOT"}:
         return None
-    proof = None
-    if synced_cnic_identity_proven(session, zkt.connector, zkt, user, row):
-        proof = "SYNCED_CNIC"
-    elif (
-        dump_release is not None and dump_release.admits(row)
-        and synced_cnic_identity_proven(
-            session, zkt.connector, zkt, user, row, allow_reconcile_batch=True
-        )
-    ):
-        proof = "AUTHENTICATED_RECONCILE_BATCH"
-    if proof is None:
+    kind = synced_cnic_proof_kind(
+        session, zkt.connector, zkt, user, row,
+        allow_reconcile_batch=dump_release is not None and dump_release.admits(session, row),
+    )
+    if kind is None:
         return None
     from zk_add.attendance_auto_release_guard import database_synced_cnic_release_proven
 
     if not database_synced_cnic_release_proven(session, row=row, zkt=zkt, user=user):
         return None
-    return proof
+    return DUMP_RELEASE_PROOF if kind == DUMP_RELEASE_PROOF else "SYNCED_CNIC"
+
+
+def dump_release_outlook(session: Session, event: AttendanceEvent) -> dict:
+    """Read-only: whether only the dump-row proof can release this held punch, and how.
+
+    release_path is "AUTOMATIC_SNAPSHOT_RELEASE" when a later roster snapshot
+    releases it on its own (subject to the per-snapshot cap), or
+    "OWNER_BACKLOG_RELEASE" when only the owner's zone release can. A manual
+    send of such a punch would bypass the stronger proof.
+    """
+    result = {
+        "proof": None,
+        "proof_passes": False,
+        "release_path": None,
+        "automatic_zone_enabled": False,
+        "window_hours": settings.attendance_dump_identity_auto_release_hours,
+    }
+    if (
+        event.source not in DUMP_RECONCILE_SOURCES
+        or event.ords_status not in {"BLOCKED_IDENTITY", "WAITING_FOR_SNAPSHOT"}
+        or not dump_identity_release_enabled()
+    ):
+        return result
+    connector = session.get(Connector, event.connector_id)
+    zkt = connector.zkt_device if connector else None
+    if zkt is None:
+        return result
+    result["automatic_zone_enabled"] = dump_auto_release_zone_enabled(connector.zone_id)
+    users = session.scalars(select(DeviceUser).where(
+        DeviceUser.zkt_device_id == zkt.id,
+        DeviceUser.user_id == event.user_id,
+        DeviceUser.lifecycle_state == "ACTIVE",
+    ).limit(2)).all()
+    if len(users) != 1:
+        return result
+    unlimited = DumpIdentityRelease(held_since=None, remaining=1, rereleases_remaining=1)
+    if synced_cnic_release_proof(
+        session, zkt=zkt, user=users[0], row=event, dump_release=unlimited
+    ) != DUMP_RELEASE_PROOF:
+        return result
+    automatic = dump_identity_auto_release(connector)
+    result.update(
+        proof=DUMP_RELEASE_PROOF,
+        proof_passes=True,
+        release_path=(
+            "AUTOMATIC_SNAPSHOT_RELEASE"
+            if automatic is not None and automatic.admits(session, event)
+            else "OWNER_BACKLOG_RELEASE"
+        ),
+    )
+    return result
 
 
 def release_synced_cnic_attendance(
@@ -3432,14 +3566,19 @@ def release_synced_cnic_attendance_event(
     dump_release: DumpIdentityRelease | None = None,
 ) -> bool:
     """Use the same retained proof for newly ingested punches and backlog repair."""
+    outbox = _attendance_ords_outbox(session, row)
+    if outbox is not None and outbox.status == "IN_FLIGHT":
+        # Only a stale read sees a held punch with a claim in flight. Leave
+        # it to the delivery result; never return it to the send queue.
+        return False
+    rerelease = previously_synced_cnic_release(row)
     proof = synced_cnic_release_proof(
         session, zkt=zkt, user=user, row=row, dump_release=dump_release
     )
     if proof is None:
         return False
-    if proof == "AUTHENTICATED_RECONCILE_BATCH":
-        dump_release.remaining -= 1
-        dump_release.released_ids.append(row.id)
+    if proof == DUMP_RELEASE_PROOF:
+        dump_release.record(row, rerelease=rerelease)
     row.device_user_id = user.id
     row.identity_snapshot_id = zkt.identity_snapshot_id
     row.identity_resolution_status = "RESOLVED_SYNCED_CNIC"
@@ -3454,6 +3593,11 @@ def release_synced_cnic_attendance_event(
     outbox, _ = ensure_attendance_ords_outbox(session, row, status="PENDING")
     outbox.next_attempt_at = None
     outbox.last_error = None
+    if proof == DUMP_RELEASE_PROOF:
+        # Recovered history: the per-connector background lane, so a large
+        # release never queues ahead of live punches. The Oracle capture type
+        # still comes from the event's own source.
+        outbox.delivery_type = "FULL_HISTORY"
     return True
 
 
@@ -3470,18 +3614,7 @@ def _ords_delivery_type_for_event(row: AttendanceEvent) -> str:
     return "FULL_HISTORY"
 
 
-def ensure_attendance_ords_outbox(
-    session: Session,
-    row: AttendanceEvent,
-    *,
-    status: str | None = None,
-) -> tuple[OrdsOutbox, bool]:
-    """Create the single durable ORDS row for an attendance event.
-
-    This helper is deliberately idempotent and is used by both normal
-    ingestion repairs and the historical sweep.  It never creates an ORDS
-    delivery row for a second time and never changes an acknowledged row.
-    """
+def _attendance_ords_outbox(session: Session, row: AttendanceEvent) -> OrdsOutbox | None:
     # The backlog sweep can release a held row and revisit its delivery state
     # in the same transaction. Sessions with autoflush disabled cannot see the
     # first pending INSERT through a SELECT, so reuse it before querying.
@@ -3497,6 +3630,22 @@ def ensure_attendance_ords_outbox(
         outbox = session.scalar(
             select(OrdsOutbox).where(OrdsOutbox.attendance_event_id == row.id)
         )
+    return outbox
+
+
+def ensure_attendance_ords_outbox(
+    session: Session,
+    row: AttendanceEvent,
+    *,
+    status: str | None = None,
+) -> tuple[OrdsOutbox, bool]:
+    """Create the single durable ORDS row for an attendance event.
+
+    This helper is deliberately idempotent and is used by both normal
+    ingestion repairs and the historical sweep.  It never creates an ORDS
+    delivery row for a second time and never changes an acknowledged row.
+    """
+    outbox = _attendance_ords_outbox(session, row)
     created = outbox is None
     if outbox is None:
         outbox = OrdsOutbox(

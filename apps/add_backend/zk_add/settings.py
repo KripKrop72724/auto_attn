@@ -76,14 +76,25 @@ class AddSettings(BaseSettings):
     user_integrity_interval_seconds: int = 30
     identity_snapshot_gate_enabled: bool = False
     identity_snapshot_capture_tolerance_seconds: int = 5
-    # A legacy reconnect/startup dump row without a saved terminal record is
-    # released automatically at a later roster snapshot only when ADD held it
-    # within this many hours, and at most this many rows per connector per
-    # snapshot (0 turns the automatic release off). Older holds need the
-    # owner's audited backlog release, which uses the same proof.
+    # A legacy reconnect/startup dump row without a saved terminal record can
+    # be released on its authenticated batch and retained CNIC interval
+    # (AUTHENTICATED_RECONCILE_BATCH). false withdraws that proof everywhere:
+    # no automatic or owner release, and the pre-send check holds rows it
+    # released that Oracle has not yet acknowledged.
+    attendance_dump_identity_release_enabled: bool = True
+    # Automatic release at a later roster snapshot runs only for these zone
+    # IDs (comma-separated; "*" for every zone; empty: none, the default),
+    # only for rows ADD held within the window (0 hours: off), and at most
+    # the batch cap per connector per snapshot. Older holds need the owner's
+    # audited backlog release, which uses the same proof.
+    attendance_dump_identity_auto_release_zones: str = ""
     attendance_dump_identity_auto_release_hours: int = Field(default=72, ge=0, le=14 * 24)
-    attendance_dump_identity_auto_release_batch: int = Field(default=200, ge=0, le=2000)
-    attendance_identity_backlog_batch_size: int = Field(default=200, ge=1, le=1000)
+    attendance_dump_identity_auto_release_batch: int = Field(default=100, ge=0, le=500)
+    # The owner's backlog release locks and checks this many rows per worker
+    # transaction, and queues no more while this many of its released rows
+    # still wait for Oracle.
+    attendance_identity_backlog_batch_size: int = Field(default=25, ge=1, le=200)
+    attendance_identity_backlog_in_flight_limit: int = Field(default=100, ge=1, le=1000)
     identity_repair_sla_seconds: int = 60
     reconciliation_enabled: bool = False
     reconciliation_self_healing_enabled: bool = False

@@ -8,6 +8,7 @@ Older holds wait for the owner's audited per-zone release.
 
 import base64
 import hashlib
+from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -21,16 +22,20 @@ from test_add_backend import (
     make_writable,
 )
 from test_reconciliation import (
+    RAW_RECORD,
+    _certify_one_record_baseline,
     _raw_record,
     reconciliation_db as reconciliation_db,
 )
 from zk_add import attendance_identity_backlog as backlog
+from zk_add import worker
 from zk_add.attendance_identity_evidence import identity_evidence
 from zk_add.attendance_safe_repair import delivery_proof_valid
 from zk_add.crypto import decrypt_cnic
 from zk_add.models import (
     AttendanceEvent,
     AttendanceIdentityHistory,
+    AttendanceRecoveryItem,
     AttendanceRecoveryJob,
     AuditEvent,
     DeviceUser,
@@ -40,6 +45,7 @@ from zk_add.models import (
 from zk_add.reconciliation import (
     apply_reconciliation_anchor,
     apply_reconciliation_chunk,
+    apply_source_tail_chunk,
     create_reconciliation_job,
     reconciliation_chain_digest,
     reconciliation_chunk_digest,
@@ -49,11 +55,15 @@ from zk_add.schemas import (
     ReconciliationAnchorRequest,
     ReconciliationChunkRequest,
     ReconciliationSourceRecord,
+    SourceTailChunkRequest,
     UserSnapshotRequest,
     UserSnapshotRow,
 )
 from zk_add.service import (
+    DumpIdentityRelease,
+    dump_release_outlook,
     ingest_attendance,
+    release_synced_cnic_attendance_event,
     replace_user_snapshot,
     repair_attendance_delivery_backlog,
 )
@@ -62,14 +72,23 @@ from zk_add.time_utils import ensure_utc, utc_now
 
 FP = "a" * 64
 OTHER_CNIC = "3520212345672"
+ADMIN = "StateHealthAdmin"
 
 
-def _connector(db):
+def _connector(db, **kwargs):
     db.autoflush = False
-    connector = connector_fixture(db)
+    connector = connector_fixture(db, **kwargs)
     make_writable(connector)
     connector.zkt_device.confirmed_serial = connector.zkt_device.serial
     return connector
+
+
+@pytest.fixture()
+def auto_zone(monkeypatch):
+    """The owner enabled automatic release for the test zone."""
+    monkeypatch.setattr(
+        settings, "attendance_dump_identity_auto_release_zones", "ZONE-SLICTOWER-3FL"
+    )
 
 
 def _snapshot(db, connector, key, observed_at, *, cnic=CNIC, stable=True):
@@ -87,10 +106,10 @@ def _snapshot(db, connector, key, observed_at, *, cnic=CNIC, stable=True):
 
 
 def _dump(seed, when, captured, *, uid="69", fingerprint=FP, source="DUMP_RECONNECT",
-          record_uid="29139"):
+          record_uid="29139", serial=SERIAL):
     return AttendanceEventIn(
         event_uid=hashlib.sha256(seed.encode()).hexdigest(), uid=uid, user_id="11",
-        terminal_serial=SERIAL, terminal_identity_fingerprint=fingerprint,
+        terminal_serial=serial, terminal_identity_fingerprint=fingerprint,
         device_event_time=when, captured_at=captured, source=source,
         clock_quality="OK", punch=0, raw_event={"attendance_record_uid": record_uid},
     )
@@ -121,9 +140,90 @@ def _audits(db, action):
     ).all()
 
 
+def _outbox(db, row):
+    return db.scalar(select(OrdsOutbox).where(OrdsOutbox.attendance_event_id == row.id))
+
+
+def _old_hold(db, connector, seed, *, days=4, source="DUMP_RECONNECT", serial=SERIAL):
+    """A dump ADD received and held `days` ago, before any rollout window."""
+    captured = utc_now() - timedelta(days=days)
+    row = _ingest_held(db, connector, _dump(
+        seed, captured - timedelta(minutes=3), captured, source=source, serial=serial,
+    ))
+    row.received_at = captured + timedelta(seconds=20)
+    db.flush()
+    return row
+
+
+def _check(db, zone_id, *, actor=ADMIN, limit=500, now=None):
+    """Run the owner's zone check page by page; return its first page and sums."""
+    first = backlog.preview_page(db, zone_id=zone_id, actor=actor, limit=limit, now=now)
+    page, totals = first, {}
+    while True:
+        for group in page["groups"]:
+            entry = totals.setdefault(
+                (group["connector_id"], group["source"], group["age"]),
+                {"held": 0, "provable": 0},
+            )
+            entry["held"] += group["held"]
+            entry["provable"] += group["provable"]
+        if page["next_after_id"] is None:
+            return first, totals
+        page = backlog.preview_page(
+            db, zone_id=zone_id, actor=actor, after_id=page["next_after_id"], limit=limit,
+            as_of=first["as_of"], until_id=first["until_id"],
+            window_hours=first["window_hours"],
+        )
+
+
+def _approve(db, zone_id, *, key, check=None, groups=None, approved=None, held=None,
+             actor=ADMIN, **overrides):
+    first, totals = check or _check(db, zone_id, actor=actor)
+    chosen = list(totals) if groups is None else groups
+    approval = first["approval"]
+    arguments = {
+        "actor": actor, "zone_id": zone_id, "reason": "Owner backlog release",
+        "typed_confirmation": f"RELEASE {zone_id}", "idempotency_key": key,
+        "scope": approval["scope"],
+        "expires_at": datetime.fromisoformat(approval["expires_at"]),
+        "signature": approval["signature"],
+        "groups": [
+            {"connector_id": connector_id, "source": source, "age": age}
+            for connector_id, source, age in chosen
+        ],
+        "approved_count": approved if approved is not None else max(
+            1, sum(totals[group]["provable"] for group in chosen)
+        ),
+        "previewed_held": held if held is not None else max(
+            1, sum(totals[group]["held"] for group in chosen)
+        ),
+        **overrides,
+    }
+    return backlog.create_release(db, **arguments)
+
+
+def _deliver(db, monkeypatch, limit=10):
+    """Run one delivery claim against the test session."""
+    monkeypatch.setattr(worker, "session_scope", lambda: nullcontext(db))
+    claims = worker.claim_ords_batch(limit)
+    db.flush()
+    return claims
+
+
+def _acknowledge(db, *rows):
+    for row in rows:
+        row.ords_status = "ACKED"
+        _outbox(db, row).status = "ACKED"
+    db.flush()
+
+
+def _run(db, job):
+    return backlog.serialize(db, job)
+
+
 @pytest.mark.parametrize("punch", ["after_last_snapshot", "between_snapshots"])
 @pytest.mark.parametrize("source", ["DUMP_RECONNECT", "DUMP_STARTUP"])
-def test_held_dump_row_is_released_by_the_next_snapshot(db, punch, source):
+def test_held_dump_row_is_released_by_the_next_snapshot(db, auto_zone, punch, source):
     connector = _connector(db)
     now = utc_now()
     _snapshot(db, connector, "s0", now - timedelta(minutes=40))
@@ -131,6 +231,10 @@ def test_held_dump_row_is_released_by_the_next_snapshot(db, punch, source):
     when = now - timedelta(minutes=20 if punch == "after_last_snapshot" else 35)
     row = _ingest_held(
         db, connector, _dump("kh-1", when, now - timedelta(minutes=1), source=source)
+    )
+    # Ingest never uses the batch proof; the evidence says what will release it.
+    assert dump_release_outlook(db, row)["release_path"] == (
+        None if punch == "after_last_snapshot" else "AUTOMATIC_SNAPSHOT_RELEASE"
     )
 
     _snapshot(db, connector, "s2", utc_now())
@@ -144,6 +248,8 @@ def test_held_dump_row_is_released_by_the_next_snapshot(db, punch, source):
     assert not row.manual_release_required
     assert row.raw_event == {"attendance_record_uid": "29139"}
     assert _outbox_count(db, row) == 1
+    # Recovered history uses the background lane, never ahead of live punches.
+    assert _outbox(db, row).delivery_type == "FULL_HISTORY"
     evidence = identity_evidence(db, row, connector, allow_reconcile_batch=True)
     assert evidence.proof["kind"] == "RETAINED_INTERVAL"
     assert evidence.proof["source"]["kind"] == "AUTHENTICATED_RECONCILE_BATCH"
@@ -155,7 +261,34 @@ def test_held_dump_row_is_released_by_the_next_snapshot(db, punch, source):
     assert audit.actor == "system:identity-dump-auto-release"
     assert audit.target_id == connector.connector_id
     assert audit.after["event_ids"] == [row.id]
+    assert audit.after["rereleased_event_ids"] == []
+    assert audit.after["zone_id"] == connector.zone_id
     assert audit.after["proof"] == "AUTHENTICATED_RECONCILE_BATCH"
+
+
+@pytest.mark.parametrize("zones", ["", "ZONE-ELSEWHERE"])
+def test_automatic_release_is_off_until_the_owner_lists_the_zone(db, monkeypatch, zones):
+    monkeypatch.setattr(settings, "attendance_dump_identity_auto_release_zones", zones)
+    connector = _connector(db)
+    now = utc_now()
+    _snapshot(db, connector, "s0", now - timedelta(minutes=40))
+    _snapshot(db, connector, "s1", now - timedelta(minutes=25))
+    row = _ingest_held(
+        db, connector, _dump("dark", now - timedelta(minutes=20), now - timedelta(minutes=1))
+    )
+    _snapshot(db, connector, "s2", utc_now())
+    assert row.ords_status == "BLOCKED_IDENTITY" and row.cnic_lookup_hash is None
+    assert not _audits(db, "ATTENDANCE_DUMP_IDENTITY_AUTO_RELEASED")
+    # The evidence shows that only the owner's zone release can send it.
+    outlook = dump_release_outlook(db, row)
+    assert outlook["proof_passes"] and outlook["proof"] == "AUTHENTICATED_RECONCILE_BATCH"
+    assert outlook["release_path"] == "OWNER_BACKLOG_RELEASE"
+    assert not outlook["automatic_zone_enabled"]
+
+    monkeypatch.setattr(settings, "attendance_dump_identity_auto_release_zones", "*")
+    assert dump_release_outlook(db, row)["release_path"] == "AUTOMATIC_SNAPSHOT_RELEASE"
+    _snapshot(db, connector, "s3", utc_now())
+    assert row.ords_status == "PENDING"
 
 
 @pytest.mark.parametrize(
@@ -165,7 +298,7 @@ def test_held_dump_row_is_released_by_the_next_snapshot(db, punch, source):
         "foreign_saved_record", "partial_snapshot_gap",
     ],
 )
-def test_held_dump_row_without_retained_proof_stays_held(db, blocker):
+def test_held_dump_row_without_retained_proof_stays_held(db, auto_zone, blocker):
     connector = _connector(db)
     zkt = connector.zkt_device
     now = utc_now()
@@ -225,17 +358,22 @@ def test_held_dump_row_without_retained_proof_stays_held(db, blocker):
     assert row.manual_release_required
     assert _outbox_count(db, row) == 0
     assert not _audits(db, "ATTENDANCE_DUMP_IDENTITY_AUTO_RELEASED")
-    # The owner's backlog release uses the same proof and keeps it held too.
-    job = backlog.create_release(
-        db, actor="StateHealthAdmin", zone_id=connector.zone_id, reason="Backlog check",
-        typed_confirmation=f"RELEASE {connector.zone_id}", idempotency_key=f"key-{blocker}",
-    )
+    assert not dump_release_outlook(db, row)["proof_passes"]
+    # The owner's check counts it as held, not releasable. Even an approval
+    # forced through for it re-checks the same proof and keeps it held.
+    check = _check(db, connector.zone_id)
+    assert sum(entry["provable"] for entry in check[1].values()) == 0
+    assert sum(entry["held"] for entry in check[1].values()) == 1
+    job = _approve(db, connector.zone_id, key=f"key-{blocker}", check=check, approved=1)
     assert backlog.advance_once(db) == 1
     assert row.ords_status == "BLOCKED_IDENTITY" and row.cnic_lookup_hash is None
-    assert job.succeeded_count == 0 and job.skipped_count == 1
+    assert backlog.advance_once(db) == 0
+    run = _run(db, job)
+    assert job.status == "COMPLETED"
+    assert (run["released"], run["kept_held"], run["delivered"]) == (0, 1, 0)
 
 
-def test_cnic_changed_after_the_punch_keeps_the_punch_time_identity(db):
+def test_cnic_changed_after_the_punch_keeps_the_punch_time_identity(db, auto_zone):
     """Toheed: the fingerprint stays the same when only the CNIC is edited."""
     connector = _connector(db)
     now = utc_now()
@@ -256,7 +394,7 @@ def test_cnic_changed_after_the_punch_keeps_the_punch_time_identity(db):
     assert row.ords_status == "BLOCKED_IDENTITY" and row.cnic_lookup_hash is None
 
 
-def test_auto_release_is_capped_per_connector_snapshot(db, monkeypatch):
+def test_auto_release_is_capped_per_connector_snapshot(db, auto_zone, monkeypatch):
     monkeypatch.setattr(settings, "attendance_dump_identity_auto_release_batch", 2)
     connector = _connector(db)
     now = utc_now()
@@ -278,58 +416,387 @@ def test_auto_release_is_capped_per_connector_snapshot(db, monkeypatch):
     ]
 
 
-def test_old_hold_waits_for_the_owner_backlog_release(db):
+def test_a_reheld_release_has_its_own_cap_and_never_overrides_manual_custody(
+    db, auto_zone, monkeypatch,
+):
+    monkeypatch.setattr(settings, "attendance_dump_identity_auto_release_batch", 1)
     connector = _connector(db)
     now = utc_now()
     _snapshot(db, connector, "s0", now - timedelta(days=5))
-    captured = now - timedelta(days=4)
-    row = _ingest_held(
-        db, connector, _dump("old", captured - timedelta(minutes=3), captured)
-    )
-    # ADD received this dump four days ago, before the rollout window.
-    row.received_at = captured + timedelta(seconds=20)
+    # Evaluated first, so a refusal there must not be what spends the cap.
+    manual, reheld = (_old_hold(db, connector, seed) for seed in ("manual", "reheld"))
+    _snapshot(db, connector, "s1", now - timedelta(minutes=25))
+    new = [
+        _ingest_held(db, connector, _dump(
+            f"new-{index}", now - timedelta(minutes=20 - index), now - timedelta(minutes=1)
+        ))
+        for index in range(2)
+    ]
+    # The owner released both old holds; delivery then re-held them because
+    # a newer roster snapshot arrived before Oracle acknowledged them.
+    job = _approve(db, connector.zone_id, key="cap-split",
+                   groups=[(connector.connector_id, "DUMP_RECONNECT", "UP_TO_7_DAYS")])
+    backlog.advance_once(db)
+    for row in (reheld, manual):
+        assert row.ords_status == "PENDING"
+        row.ords_status = _outbox(db, row).status = "BLOCKED_IDENTITY"
+    backlog.stop(db, job, actor=ADMIN)
     db.flush()
+    # An administrator has taken one of them into a manual send.
+    from zk_add import attendance_manual_guard
+
+    real = attendance_manual_guard.decision_for
+    monkeypatch.setattr(
+        attendance_manual_guard, "decision_for",
+        lambda session, row: object() if row.id == manual.id else real(session, row),
+    )
+
+    _snapshot(db, connector, "s2", utc_now())
+
+    # The re-hold does not use up the new-hold cap of one.
+    assert reheld.ords_status == "PENDING"
+    assert [row.ords_status for row in new] == ["PENDING", "BLOCKED_IDENTITY"]
+    assert manual.ords_status == "BLOCKED_IDENTITY"
+    [audit] = _audits(db, "ATTENDANCE_DUMP_IDENTITY_AUTO_RELEASED")
+    assert audit.after["event_ids"] == [new[0].id]
+    assert audit.after["rereleased_event_ids"] == [reheld.id]
+
+
+def test_turning_the_proof_off_withdraws_it_before_oracle_and_pauses_releases(
+    db, auto_zone, monkeypatch,
+):
+    connector = _connector(db)
+    now = utc_now()
+    _snapshot(db, connector, "s0", now - timedelta(days=5))
+    old = _old_hold(db, connector, "switch-old")
+    _snapshot(db, connector, "s1", now - timedelta(minutes=25))
+    recent = _ingest_held(
+        db, connector, _dump("switch-new", now - timedelta(minutes=20), now - timedelta(minutes=1))
+    )
+    _snapshot(db, connector, "s2", utc_now())
+    assert recent.ords_status == "PENDING"
+    job = _approve(db, connector.zone_id, key="switch-1",
+                   groups=[(connector.connector_id, "DUMP_RECONNECT", "UP_TO_7_DAYS")])
+
+    monkeypatch.setattr(settings, "attendance_dump_identity_release_enabled", False)
+
+    # Released but not yet sent: the pre-send check now refuses it.
+    assert not delivery_proof_valid(db, recent, connector)
+    assert _deliver(db, monkeypatch) == []
+    assert recent.ords_status == "BLOCKED_IDENTITY"
+    # The owner's running release pauses; nothing new is approved.
+    assert backlog.advance_once(db) == 0
+    assert old.ords_status == "BLOCKED_IDENTITY"
+    assert _run(db, job)["paused"] is True
+    with pytest.raises(backlog.RecoveryError) as refused:
+        _approve(db, connector.zone_id, key="switch-2")
+    assert refused.value.code == "RELEASE_PROOF_DISABLED"
+    # Snapshots no longer release on the dump proof, even a re-held row.
+    _snapshot(db, connector, "s3", utc_now())
+    assert recent.ords_status == "BLOCKED_IDENTITY"
+    assert dump_release_outlook(db, recent)["proof"] is None
+
+    monkeypatch.setattr(settings, "attendance_dump_identity_release_enabled", True)
+    assert backlog.advance_once(db) == 1
+    assert old.ords_status == "PENDING"
+
+
+def test_old_hold_waits_for_the_owner_backlog_release(db, auto_zone, monkeypatch):
+    connector = _connector(db)
+    now = utc_now()
+    _snapshot(db, connector, "s0", now - timedelta(days=5))
+    row = _old_hold(db, connector, "old")
 
     _snapshot(db, connector, "s1", utc_now())
     assert row.ords_status == "BLOCKED_IDENTITY" and row.cnic_lookup_hash is None
     assert not _audits(db, "ATTENDANCE_DUMP_IDENTITY_AUTO_RELEASED")
+    assert dump_release_outlook(db, row)["release_path"] == "OWNER_BACKLOG_RELEASE"
     # The periodic delivery sweep never uses the dump proof either.
     repair_attendance_delivery_backlog(db, limit=100)
     assert row.ords_status == "BLOCKED_IDENTITY"
 
-    preview = backlog.preview_page(db, zone_id=connector.zone_id)
-    assert preview["held_total"] == 1 and preview["next_after_id"] is None
-    group = next(
-        g for g in preview["groups"] if g["source"] == "DUMP_RECONNECT" and g["held"]
-    )
-    assert group == {"source": "DUMP_RECONNECT", "age": "UP_TO_7_DAYS", "held": 1, "provable": 1}
-    assert row.ords_status == "BLOCKED_IDENTITY"  # the preview is read-only
+    first, totals = check = _check(db, connector.zone_id)
+    assert first["held_total"] == 1 and first["next_after_id"] is None
+    assert first["until_id"] == row.id and first["approval"]["signature"]
+    assert totals == {
+        (connector.connector_id, "DUMP_RECONNECT", "UP_TO_7_DAYS"): {"held": 1, "provable": 1}
+    }
+    assert row.ords_status == "BLOCKED_IDENTITY"  # the check is read-only
 
-    job = backlog.create_release(
-        db, actor="StateHealthAdmin", zone_id=connector.zone_id, reason="Owner backlog",
-        typed_confirmation=f"RELEASE {connector.zone_id}", idempotency_key="old-hold-1",
-    )
+    job = _approve(db, connector.zone_id, key="old-hold-1", check=check)
     assert job.status == "RELEASING" and job.requested_count == 1
     assert backlog.advance_once(db) == 1
     assert row.ords_status == "PENDING" and row.identity_resolution_status == "RESOLVED_SYNCED_CNIC"
     assert decrypt_cnic(row.cnic_encrypted) == CNIC and _outbox_count(db, row) == 1
+    assert _outbox(db, row).delivery_type == "FULL_HISTORY"
     assert delivery_proof_valid(db, row, connector)
+    # Released is not delivered: the run stays open until Oracle confirms it.
     assert backlog.advance_once(db) == 0
-    assert job.status == "COMPLETED" and job.succeeded_count == 1
+    assert job.status == "RELEASING"
+    assert _run(db, job)["released"] == 1 and _run(db, job)["waiting_oracle"] == 1
+    [claim] = _deliver(db, monkeypatch)
+    _acknowledge(db, row)
+    backlog.advance_once(db)
+    assert job.status == "COMPLETED"
+    run = _run(db, job)
+    assert (run["approved"], run["released"], run["delivered"], run["waiting_oracle"]) == (
+        1, 1, 1, 0
+    )
     [approved] = _audits(db, "ATTENDANCE_IDENTITY_BACKLOG_RELEASE_APPROVED")
-    assert approved.target_id == connector.zone_id and approved.after["held"] == 1
+    assert approved.target_id == connector.zone_id
+    assert approved.after["approved_count"] == 1 and approved.after["held_at_approval"] == 1
+    assert approved.after["until_event_id"] == row.id
     [batch] = _audits(db, "ATTENDANCE_IDENTITY_BACKLOG_RELEASE_BATCH")
-    assert batch.after["event_ids"] == [row.id] and batch.actor == "StateHealthAdmin"
-    assert _audits(db, "ATTENDANCE_IDENTITY_BACKLOG_RELEASE_COMPLETED")
+    assert batch.after["event_ids"] == [row.id] and batch.actor == ADMIN
+    [completed] = _audits(db, "ATTENDANCE_IDENTITY_BACKLOG_RELEASE_COMPLETED")
+    assert completed.after["delivered"] == 1
 
-    # Delivery re-held it after a later snapshot: not new backlog.
-    row.ords_status = "BLOCKED_IDENTITY"
-    db.flush()
-    _snapshot(db, connector, "s2", utc_now())
+
+def test_backlog_follows_a_punch_reheld_by_a_newer_snapshot(db, monkeypatch):
+    """Automatic release is off here: only the run itself can send it again."""
+    connector = _connector(db)
+    zkt = connector.zkt_device
+    _snapshot(db, connector, "s0", utc_now() - timedelta(days=5))
+    row = _old_hold(db, connector, "rehold")
+    _snapshot(db, connector, "s1", utc_now())
+    job = _approve(db, connector.zone_id, key="rehold-1")
+    assert backlog.advance_once(db) == 1
     assert row.ords_status == "PENDING"
 
+    # The routine roster snapshot arrives before Oracle delivery.
+    _snapshot(db, connector, "s2", utc_now())
+    assert _deliver(db, monkeypatch) == []
+    assert row.ords_status == "BLOCKED_IDENTITY"
+    _snapshot(db, connector, "s3", utc_now())
+    assert row.ords_status == "BLOCKED_IDENTITY"  # the zone is not enabled
 
-def test_zero_window_turns_automatic_release_off(db, monkeypatch):
+    backlog.advance_once(db)
+    assert row.ords_status == "PENDING"
+    assert row.identity_snapshot_id == zkt.identity_snapshot_id
+    assert job.status == "RELEASING"
+    [claim] = _deliver(db, monkeypatch)
+    _acknowledge(db, row)
+    backlog.advance_once(db)
+    assert job.status == "COMPLETED"
+    run = _run(db, job)
+    assert (run["released"], run["delivered"], run["kept_held"]) == (1, 1, 0)
+    batches = _audits(db, "ATTENDANCE_IDENTITY_BACKLOG_RELEASE_BATCH")
+    assert [audit.after["requeued_event_ids"] for audit in batches] == [[], [row.id]]
+    item = db.scalar(select(AttendanceRecoveryItem).where(
+        AttendanceRecoveryItem.attendance_event_id == row.id
+    ))
+    assert item.status == "DELIVERED" and item.attempt_count == 2
+
+
+def test_a_reheld_punch_whose_proof_no_longer_passes_is_kept_held(db, monkeypatch):
+    connector = _connector(db)
+    _snapshot(db, connector, "s0", utc_now() - timedelta(days=5))
+    row = _old_hold(db, connector, "lost-proof")
+    _snapshot(db, connector, "s1", utc_now())
+    job = _approve(db, connector.zone_id, key="lost-1")
+    backlog.advance_once(db)
+    # HR changed the CNIC before Oracle delivery; the punch-time CNIC differs.
+    for attempt in range(backlog.REHOLD_ATTEMPTS):
+        _snapshot(db, connector, f"s-cnic-{attempt}", utc_now(), cnic=OTHER_CNIC)
+        _deliver(db, monkeypatch)
+        assert row.ords_status == "BLOCKED_IDENTITY"
+        backlog.advance_once(db)
+        assert row.ords_status == "BLOCKED_IDENTITY"
+    assert job.status == "COMPLETED"
+    run = _run(db, job)
+    assert (run["released"], run["delivered"], run["kept_held"]) == (1, 0, 1)
+
+
+def test_backlog_paces_releases_to_oracle_acknowledgements(db, monkeypatch):
+    monkeypatch.setattr(settings, "attendance_identity_backlog_in_flight_limit", 2)
+    connector = _connector(db)
+    _snapshot(db, connector, "s0", utc_now() - timedelta(days=5))
+    rows = [_old_hold(db, connector, f"pace-{index}") for index in range(5)]
+    _snapshot(db, connector, "s1", utc_now())
+    job = _approve(db, connector.zone_id, key="pace-1")
+    assert job.requested_count == 5
+    assert backlog.advance_once(db) == 2
+    assert backlog.advance_once(db) == 0  # two still wait for Oracle
+    assert [row.ords_status for row in rows].count("PENDING") == 2
+    assert len(_deliver(db, monkeypatch)) == 2
+    _acknowledge(db, *[row for row in rows if row.ords_status == "PENDING"])
+    assert backlog.advance_once(db) == 2
+    assert [row.ords_status for row in rows].count("BLOCKED_IDENTITY") == 1
+
+
+def test_released_backlog_never_queues_ahead_of_a_live_punch(db, monkeypatch):
+    connector = _connector(db)
+    _snapshot(db, connector, "s0", utc_now() - timedelta(days=5))
+    rows = [_old_hold(db, connector, f"lane-{index}") for index in range(3)]
+    _snapshot(db, connector, "s1", utc_now())
+    _approve(db, connector.zone_id, key="lane-1")
+    backlog.advance_once(db)
+    assert [row.ords_status for row in rows] == ["PENDING"] * 3
+    live = AttendanceEventIn(
+        event_uid=hashlib.sha256(b"lane-live").hexdigest(), uid="69", user_id="11",
+        terminal_serial=SERIAL, terminal_identity_fingerprint=FP,
+        raw_name=f"Synced Employee-{CNIC}",
+        device_event_time=utc_now() - timedelta(seconds=5), captured_at=utc_now(),
+        source="LIVE", clock_quality="OK", punch=0, raw_event={},
+    )
+    ingest_attendance(db, connector=connector, events=[live])
+    db.flush()
+    live_row = db.scalar(select(AttendanceEvent).where(AttendanceEvent.event_uid == live.event_uid))
+    assert live_row.ords_status == "PENDING"
+    assert {_outbox(db, row).delivery_type for row in rows} == {"FULL_HISTORY"}
+    [claim] = _deliver(db, monkeypatch, limit=1)
+    assert db.get(OrdsOutbox, claim[0]).attendance_event_id == live_row.id
+
+
+def test_a_held_punch_with_a_claim_in_flight_is_never_requeued(db):
+    connector = _connector(db)
+    _snapshot(db, connector, "s0", utc_now() - timedelta(days=5))
+    row = _old_hold(db, connector, "in-flight")
+    _snapshot(db, connector, "s1", utc_now())
+    outbox = OrdsOutbox(attendance_event_id=row.id, status="BLOCKED_IDENTITY",
+                        delivery_type="CURRENT_RECONCILE")
+    db.add(outbox)
+    db.flush()
+    # What a stale read sees after another transaction released and claimed it.
+    outbox.status = "IN_FLIGHT"
+    user = db.scalar(select(DeviceUser).where(DeviceUser.user_id == "11"))
+    assert not release_synced_cnic_attendance_event(
+        db, zkt=connector.zkt_device, user=user, row=row,
+        dump_release=DumpIdentityRelease(held_since=None, remaining=1, rereleases_remaining=1),
+    )
+    assert row.ords_status == "BLOCKED_IDENTITY" and _outbox(db, row).status == "IN_FLIGHT"
+
+
+def test_approval_is_bound_to_the_signed_check(db, monkeypatch):
+    connector = _connector(db)
+    _snapshot(db, connector, "s0", utc_now() - timedelta(days=45))
+    week = _old_hold(db, connector, "bound-week")
+    month = _old_hold(db, connector, "bound-month", days=40)
+    startup = _old_hold(db, connector, "bound-startup", source="DUMP_STARTUP")
+    _snapshot(db, connector, "s1", utc_now() - timedelta(minutes=5))
+    check = _check(db, connector.zone_id)
+    first, totals = check
+    key = connector.connector_id
+    assert totals == {
+        (key, "DUMP_RECONNECT", "OLDER"): {"held": 1, "provable": 1},
+        (key, "DUMP_RECONNECT", "UP_TO_7_DAYS"): {"held": 1, "provable": 1},
+        (key, "DUMP_STARTUP", "UP_TO_7_DAYS"): {"held": 1, "provable": 1},
+    }
+
+    def refused(code, **arguments):
+        with pytest.raises(backlog.RecoveryError) as error:
+            _approve(db, connector.zone_id, check=check, **arguments)
+        assert error.value.code == code
+
+    scope = first["approval"]["scope"]
+    refused("PREVIEW_INVALID", key="bound-a", scope={**scope, "until_id": scope["until_id"] + 9})
+    refused("PREVIEW_INVALID", key="bound-b", actor="SomeoneElse")
+    # The check counted fewer held punches in these groups than are held now.
+    refused("ZONE_CHANGED", key="bound-c", held=1, approved=1)
+    refused("APPROVED_COUNT_INVALID", key="bound-d", approved=4)
+    stale = _check(db, connector.zone_id, now=utc_now() - backlog.PREVIEW_VALID)
+    with pytest.raises(backlog.RecoveryError) as expired:
+        _approve(db, connector.zone_id, key="bound-e", check=stale)
+    assert expired.value.code == "PREVIEW_EXPIRED"
+
+    # A reconnect dump held after the check; the next snapshot makes it
+    # provable, but it is outside the approved check.
+    later = _ingest_held(db, connector, _dump(
+        "bound-later", utc_now() - timedelta(seconds=30), utc_now(),
+    ))
+    _snapshot(db, connector, "s2", utc_now())
+    assert later.ords_status == "BLOCKED_IDENTITY"
+    assert dump_release_outlook(db, later)["proof_passes"]
+    chosen = [
+        (key, "DUMP_RECONNECT", "UP_TO_7_DAYS"),
+        (key, "DUMP_RECONNECT", "AUTOMATIC_WINDOW"),
+        (key, "DUMP_STARTUP", "UP_TO_7_DAYS"),
+    ]
+    job = _approve(db, connector.zone_id, key="bound-ok", check=check, groups=chosen,
+                   approved=2, held=2)
+    assert [group["age"] for group in job.scope["groups"]] == [
+        "AUTOMATIC_WINDOW", "UP_TO_7_DAYS", "UP_TO_7_DAYS"
+    ]
+    while backlog.advance_once(db):
+        pass
+    # The over-30-days group was not chosen; the later hold is past the check.
+    assert week.ords_status == "PENDING" and startup.ords_status == "PENDING"
+    assert month.ords_status == "BLOCKED_IDENTITY"
+    assert later.ords_status == "BLOCKED_IDENTITY"
+    assert job.cursor == first["until_id"] and job.eligible_count == 2
+
+
+def test_backlog_stops_at_the_approved_count(db, monkeypatch):
+    connector = _connector(db)
+    _snapshot(db, connector, "s0", utc_now() - timedelta(days=5))
+    rows = [_old_hold(db, connector, f"count-{index}") for index in range(3)]
+    _snapshot(db, connector, "s1", utc_now())
+    first, totals = check = _check(db, connector.zone_id)
+    assert sum(entry["provable"] for entry in totals.values()) == 3
+    job = _approve(db, connector.zone_id, key="count-1", check=check, approved=2)
+    while backlog.advance_once(db):
+        pass
+    assert [row.ords_status for row in rows] == ["PENDING", "PENDING", "BLOCKED_IDENTITY"]
+    _deliver(db, monkeypatch)
+    _acknowledge(db, *rows[:2])
+    backlog.advance_once(db)
+    assert job.status == "COMPLETED" and rows[2].ords_status == "BLOCKED_IDENTITY"
+    assert _run(db, job)["delivered"] == 2 and job.cursor == first["until_id"]
+
+
+def test_zone_terminal_changes_refuse_the_approval_or_hold_the_moved_punches(db):
+    connector = _connector(db)
+    _snapshot(db, connector, "s0", utc_now() - timedelta(days=5))
+    row = _old_hold(db, connector, "moved")
+    _snapshot(db, connector, "s1", utc_now())
+    check = _check(db, connector.zone_id)
+    # A terminal joined the zone after the check.
+    added = connector_fixture(db, hardware_id="e0:72:a1:d6:f3:77", expected_serial="ADDED")
+    with pytest.raises(backlog.RecoveryError) as changed:
+        _approve(db, connector.zone_id, key="moved-a", check=check)
+    assert changed.value.code == "ZONE_CHANGED"
+    added.zone_id = "ZONE-ELSEWHERE"
+    db.flush()
+    job = _approve(db, connector.zone_id, key="moved-b", check=check)
+    # The approved terminal moved to another zone before the batch ran.
+    connector.zone_id = "ZONE-ELSEWHERE"
+    db.flush()
+    assert backlog.advance_once(db) == 1
+    assert row.ords_status == "BLOCKED_IDENTITY"
+    assert job.status == "COMPLETED" and _run(db, job)["kept_held"] == 1
+
+
+def test_a_multi_terminal_zone_releases_only_the_chosen_terminal(db):
+    first_connector = _connector(db)
+    second = _connector(db, hardware_id="e0:72:a1:d6:f3:55", expected_serial="ADZV211860254")
+    second.zkt_device.serial = second.zkt_device.confirmed_serial = "ADZV211860254"
+    terminals = {
+        first_connector.id: (first_connector, SERIAL, CNIC),
+        second.id: (second, "ADZV211860254", OTHER_CNIC),
+    }
+    for connector, _serial, cnic in terminals.values():
+        _snapshot(db, connector, f"{connector.id}-s0", utc_now() - timedelta(days=5), cnic=cnic)
+    rows = {
+        connector.id: _old_hold(db, connector, f"multi-{connector.id}", serial=serial)
+        for connector, serial, _cnic in terminals.values()
+    }
+    for connector, _serial, cnic in terminals.values():
+        _snapshot(db, connector, f"{connector.id}-s1", utc_now(), cnic=cnic)
+    first, totals = check = _check(db, first_connector.zone_id)
+    assert first["approval"]["scope"]["connectors"] == sorted(
+        [first_connector.connector_id, second.connector_id]
+    )
+    assert {group[0] for group in totals} == {first_connector.connector_id, second.connector_id}
+    assert all(entry == {"held": 1, "provable": 1} for entry in totals.values())
+    chosen = [group for group in totals if group[0] == second.connector_id]
+    job = _approve(db, first_connector.zone_id, key="multi-1", check=check, groups=chosen)
+    backlog.advance_once(db)
+    assert rows[second.id].ords_status == "PENDING"
+    assert rows[first_connector.id].ords_status == "BLOCKED_IDENTITY"
+    assert job.scope["connector_keys"] == [second.connector_id]
+
+
+def test_zero_window_turns_automatic_release_off(db, auto_zone, monkeypatch):
     monkeypatch.setattr(settings, "attendance_dump_identity_auto_release_hours", 0)
     connector = _connector(db)
     now = utc_now()
@@ -340,13 +807,13 @@ def test_zero_window_turns_automatic_release_off(db, monkeypatch):
     )
     _snapshot(db, connector, "s2", utc_now())
     assert row.ords_status == "BLOCKED_IDENTITY"
-    preview = backlog.preview_page(db, zone_id=connector.zone_id)
-    assert {"source": "DUMP_RECONNECT", "age": "UP_TO_7_DAYS", "held": 1, "provable": 1} in (
-        preview["groups"]
-    )
+    _first, totals = _check(db, connector.zone_id)
+    assert totals == {
+        (connector.connector_id, "DUMP_RECONNECT", "UP_TO_7_DAYS"): {"held": 1, "provable": 1}
+    }
 
 
-def test_preview_pages_are_bounded_and_read_only(db):
+def test_preview_pages_are_bounded_frozen_and_read_only(db):
     connector = _connector(db)
     now = utc_now()
     _snapshot(db, connector, "s0", now - timedelta(minutes=40))
@@ -358,22 +825,27 @@ def test_preview_pages_are_bounded_and_read_only(db):
         ))
         for index, source in enumerate(("DUMP_RECONNECT", "DUMP_STARTUP"))
     ]
-    first = backlog.preview_page(db, zone_id=connector.zone_id, limit=1)
+    first = backlog.preview_page(db, zone_id=connector.zone_id, actor=ADMIN, limit=1)
     assert first["scanned"] == 1 and first["next_after_id"] == rows[0].id
-    assert first["held_total"] == 2
+    assert first["held_total"] == 2 and first["until_id"] == rows[1].id
+    # A punch held after the check started is not part of it.
+    _ingest_held(db, connector, _dump("page-later", now - timedelta(minutes=2), now))
     second = backlog.preview_page(
-        db, zone_id=connector.zone_id, after_id=first["next_after_id"], limit=1
+        db, zone_id=connector.zone_id, actor=ADMIN, after_id=first["next_after_id"], limit=1,
+        as_of=first["as_of"], until_id=first["until_id"], window_hours=first["window_hours"],
     )
     assert second["scanned"] == 1 and second["next_after_id"] is None
-    assert "totals" not in second
+    assert "totals" not in second and "approval" not in second
     # Before the next snapshot no interval covers these punches yet.
     for page in (first, second):
         assert sum(g["provable"] for g in page["groups"]) == 0
         assert sum(g["held"] for g in page["groups"] if g["age"] == "AUTOMATIC_WINDOW") == 1
+    assert not first["automatic_zone_enabled"] and first["release_enabled"]
     assert [row.ords_status for row in rows] == ["BLOCKED_IDENTITY"] * 2
+    db.flush()
     assert not db.dirty and not db.new
     with pytest.raises(backlog.RecoveryError):
-        backlog.preview_page(db, zone_id="NO-SUCH-ZONE")
+        backlog.preview_page(db, zone_id="NO-SUCH-ZONE", actor=ADMIN)
 
 
 def _admin_client(db):
@@ -396,43 +868,67 @@ def _admin_client(db):
     return client, {"X-CSRF-Token": admin.csrf_token}
 
 
-def test_backlog_release_api_requires_owner_step_up_and_confirmation(db):
+def test_backlog_release_api_requires_owner_step_up_and_the_signed_check(db):
     connector = _connector(db)
-    now = utc_now()
-    _snapshot(db, connector, "s0", now - timedelta(days=5))
-    captured = now - timedelta(days=4)
-    row = _ingest_held(db, connector, _dump("api", captured - timedelta(minutes=3), captured))
-    row.received_at = captured + timedelta(seconds=20)
+    _snapshot(db, connector, "s0", utc_now() - timedelta(days=5))
+    row = _old_hold(db, connector, "api")
     _snapshot(db, connector, "s1", utc_now())
     assert row.ords_status == "BLOCKED_IDENTITY"
     client, headers = _admin_client(db)
     zone = connector.zone_id
     root = "/api/v2/attendance-identity-backlog"
+
+    first = client.get(f"{root}/preview", params={"zone_id": zone})
+    assert first.status_code == 200, first.text
+    preview = first.json()
+    assert preview["held_total"] == 1 and preview["next_after_id"] is None
+    [group] = preview["groups"]
+    assert group == {
+        "connector_id": connector.connector_id, "source": "DUMP_RECONNECT",
+        "age": "UP_TO_7_DAYS", "held": 1, "provable": 1,
+    }
+    page = client.get(f"{root}/preview", params={
+        "zone_id": zone, "after_id": 0, "as_of": preview["as_of"],
+        "until_id": preview["until_id"], "window_hours": preview["window_hours"],
+    })
+    assert page.status_code == 200 and "approval" not in page.json()
+    approval = preview["approval"]
     body = {
         "zone_id": zone, "reason": "Release the reviewed Karachi backlog",
         "typed_confirmation": f"RELEASE {zone}", "password": "correct-password",
         "idempotency_key": "api-release-0001",
+        "scope": approval["scope"], "expires_at": approval["expires_at"],
+        "signature": approval["signature"],
+        "groups": [{key: group[key] for key in ("connector_id", "source", "age")}],
+        "approved_count": 1, "previewed_held": 1,
     }
 
-    preview = client.get(f"{root}/preview", params={"zone_id": zone})
-    assert preview.status_code == 200 and preview.json()["held_total"] == 1
     assert client.post(f"{root}/releases", json=body).status_code == 403  # no CSRF
     assert client.post(
         f"{root}/releases", json={**body, "password": "wrong"}, headers=headers
     ).status_code == 403
-    mistyped = client.post(
-        f"{root}/releases", json={**body, "typed_confirmation": "RELEASE"}, headers=headers
-    )
-    assert mistyped.status_code == 409
-    assert mistyped.json()["detail"]["code"] == "CONFIRMATION_MISMATCH"
+    for change, code in (
+        ({"typed_confirmation": "RELEASE"}, "CONFIRMATION_MISMATCH"),
+        ({"scope": {**approval["scope"], "until_id": 0}}, "PREVIEW_INVALID"),
+        ({"signature": "0" * 64}, "PREVIEW_INVALID"),
+    ):
+        refused = client.post(f"{root}/releases", json={**body, **change}, headers=headers)
+        assert refused.status_code == 409, refused.text
+        assert refused.json()["detail"]["code"] == code
+    missing = {key: value for key, value in body.items() if key != "scope"}
+    assert client.post(f"{root}/releases", json=missing, headers=headers).status_code == 422
     assert not db.scalar(select(func.count(AttendanceRecoveryJob.id)))
 
     started = client.post(f"{root}/releases", json=body, headers=headers)
     assert started.status_code == 202, started.text
     job = started.json()
-    assert job["status"] == "RELEASING" and job["held_at_approval"] == 1
+    assert job["status"] == "RELEASING" and job["approved"] == 1 and job["released"] == 0
     again = client.post(f"{root}/releases", json=body, headers=headers)
     assert again.json()["job_id"] == job["job_id"]
+    conflict = client.post(
+        f"{root}/releases", json={**body, "approved_count": 1, "groups": []}, headers=headers
+    )
+    assert conflict.status_code == 422
     second = client.post(
         f"{root}/releases", json={**body, "idempotency_key": "api-release-0002"}, headers=headers
     )
@@ -457,6 +953,26 @@ def test_backlog_release_api_requires_owner_step_up_and_confirmation(db):
     assert restarted.status_code == 202
     assert backlog.advance_once(db) == 1
     assert row.ords_status == "PENDING"
+    run = client.get(f"{root}/releases/{restarted.json()['job_id']}").json()
+    assert (run["released"], run["waiting_oracle"], run["delivered"]) == (1, 1, 0)
+
+
+def test_identity_evidence_shows_how_a_dump_hold_can_be_released(db, monkeypatch):
+    connector = _connector(db)
+    _snapshot(db, connector, "s0", utc_now() - timedelta(days=5))
+    row = _old_hold(db, connector, "evidence")
+    _snapshot(db, connector, "s1", utc_now())
+    client, _headers = _admin_client(db)
+    url = f"/api/v2/attendance/{row.id}/identity-evidence"
+    report = client.get(url).json()
+    assert report["auto_release_eligible"] is False
+    assert report["dump_release"]["proof_passes"] is True
+    assert report["dump_release"]["release_path"] == "OWNER_BACKLOG_RELEASE"
+    monkeypatch.setattr(settings, "attendance_dump_identity_auto_release_zones", "*")
+    monkeypatch.setattr(settings, "attendance_dump_identity_auto_release_hours", 7 * 24)
+    assert client.get(url).json()["dump_release"]["release_path"] == (
+        "AUTOMATIC_SNAPSHOT_RELEASE"
+    )
 
 
 def _chunk_record(ordinal, event, *, observed_uid="7"):
@@ -568,3 +1084,78 @@ def test_baseline_chunk_releases_covered_history_and_held_dump_rows(reconciliati
     assert still_held.ords_status == "BLOCKED_IDENTITY" and still_held.cnic_lookup_hash is None
     assert chunk.blocked_identity_count == 1
     assert chunk.already_present_count == 1
+
+
+def test_tail_chunk_releases_a_held_dump_row_it_links(reconciliation_db):
+    db, connector = reconciliation_db
+    coverage = _certify_one_record_baseline(db, connector)
+    db.autoflush = False
+    start = utc_now() - timedelta(minutes=5)
+    for index in range(2):
+        replace_user_snapshot(
+            db, connector=connector,
+            snapshot=UserSnapshotRequest(
+                snapshot_id=f"tail-{index}", complete=True, stable=True,
+                observed_at=start + timedelta(minutes=index),
+                users=[UserSnapshotRow(
+                    uid="7", user_id="1007", name=f"Ayesha-{CNIC}",
+                    terminal_identity_fingerprint=FP,
+                )],
+            ),
+        )
+    when = start + timedelta(seconds=11)
+
+    def event(source, captured_at):
+        return AttendanceEventIn(
+            event_uid=hashlib.sha256(b"tail-dump").hexdigest(), uid="7", user_id="1007",
+            terminal_serial=SERIAL, terminal_identity_fingerprint=FP,
+            device_event_time=when, captured_at=captured_at, source=source,
+            clock_quality="OK", punch=0, raw_event={"attendance_record_uid": "7"},
+        )
+
+    # A legacy dump held this punch; the certified tail reads it again.
+    ingest_attendance(
+        db, connector=connector, events=[event("DUMP_RECONNECT", when + timedelta(minutes=2))]
+    )
+    db.flush()
+    held_dump = db.scalar(select(AttendanceEvent).where(
+        AttendanceEvent.event_uid == hashlib.sha256(b"tail-dump").hexdigest()
+    ))
+    assert held_dump.ords_status == "BLOCKED_IDENTITY"
+    raw = _raw_record(uid=7, hour=14, minute=1)
+    connector.zkt_device.attendance_count = 2
+    draft = SourceTailChunkRequest(
+        terminal_serial=SERIAL, terminal_generation=coverage.terminal_generation,
+        record_size=len(RAW_RECORD), start_ordinal=1, end_ordinal=2, latest_terminal_count=2,
+        chunk_digest="0" * 64, previous_chain_digest=coverage.source_committed_chain_digest,
+        resulting_chain_digest="0" * 64,
+        records=[ReconciliationSourceRecord(
+            ordinal=1, raw_record_digest=hashlib.sha256(raw).hexdigest(),
+            terminal_record_key=hashlib.sha256(b"tail-dump-record").hexdigest(),
+            occurrence_index=1, disposition="EVENT",
+            raw_record_b64=base64.b64encode(raw).decode(), raw_timestamp=1,
+            observed_uid="7", observed_user_id="1007",
+            event=event("CURRENT_RECONCILE", utc_now()),
+        )],
+    )
+    digest = reconciliation_chunk_digest(draft)
+    _coverage, chunk, duplicate, error_code = apply_source_tail_chunk(
+        db, connector=connector, payload=draft.model_copy(update={
+            "chunk_digest": digest,
+            "resulting_chain_digest": reconciliation_chain_digest(
+                coverage.source_committed_chain_digest, start_ordinal=1, end_ordinal=2,
+                chunk_digest=digest,
+            ),
+        }),
+    )
+    db.flush()
+    assert error_code is None and chunk is not None and not duplicate
+    assert db.scalar(select(TerminalRecordManifest.id).where(
+        TerminalRecordManifest.attendance_event_id == held_dump.id
+    )) is not None
+    # Released in the tail's own transaction on its saved record, not later.
+    assert held_dump.ords_status == "PENDING"
+    assert held_dump.identity_resolution_status == "RESOLVED_SYNCED_CNIC"
+    assert decrypt_cnic(held_dump.cnic_encrypted) == CNIC
+    # The saved-record proof keeps its usual lane; only the batch proof moves.
+    assert _outbox(db, held_dump).delivery_type == "CURRENT_RECONCILE"

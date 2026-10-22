@@ -679,13 +679,23 @@ def recheck_direct_ords_legacy(
 def preview_identity_backlog(
     zone_id: str = Query(min_length=1, max_length=100),
     after_id: int = Query(default=0, ge=0),
-    limit: int = Query(default=500, ge=1, le=identity_backlog.PREVIEW_PAGE_MAX),
+    limit: int = Query(default=200, ge=1, le=identity_backlog.PREVIEW_PAGE_MAX),
+    as_of: str | None = Query(default=None, max_length=64),
+    until_id: int | None = Query(default=None, ge=0),
+    window_hours: int | None = Query(default=None, ge=0, le=14 * 24),
     auth: tuple[Session, AdminContext] = Depends(require_admin),
 ):
-    """Read-only count of a zone's held dump punches the release proof would accept."""
-    db, _context = auth
+    """Read-only count of a zone's held dump punches the release proof would accept.
+
+    The first page freezes and signs the check; later pages pass its as_of,
+    until_id and window_hours back. One page runs at a time across ADD.
+    """
+    db, context = auth
     try:
-        return identity_backlog.preview_page(db, zone_id=zone_id, after_id=after_id, limit=limit)
+        return identity_backlog.preview_page(
+            db, zone_id=zone_id, actor=context.username, after_id=after_id, limit=limit,
+            as_of=as_of, until_id=until_id, window_hours=window_hours,
+        )
     except RecoveryError as exc:
         raise HTTPException(status_code=409, detail={"code": exc.code, "message": str(exc)}) from exc
 
@@ -706,7 +716,7 @@ def list_identity_backlog_releases(
     if zone_id:
         rows = [row for row in rows if row.scope["request"]["zone_id"] == zone_id][:limit]
     return {
-        "rows": [identity_backlog.serialize(row) for row in rows],
+        "rows": [identity_backlog.serialize(db, row) for row in rows],
         "confirmation": identity_backlog.confirmation_phrase(zone_id) if zone_id else None,
     }
 
@@ -724,10 +734,14 @@ def start_identity_backlog_release(
         job = identity_backlog.create_release(
             db, actor=context.username, zone_id=body.zone_id, reason=body.reason,
             typed_confirmation=body.typed_confirmation, idempotency_key=body.idempotency_key,
+            scope=body.scope.model_dump(), expires_at=body.expires_at,
+            signature=body.signature,
+            groups=[group.model_dump() for group in body.groups],
+            approved_count=body.approved_count, previewed_held=body.previewed_held,
             ip_address=client_ip(request),
         )
         db.flush()
-        return identity_backlog.serialize(job)
+        return identity_backlog.serialize(db, job)
     except RecoveryError as exc:
         raise HTTPException(status_code=409, detail={"code": exc.code, "message": str(exc)}) from exc
 
@@ -744,7 +758,7 @@ def get_identity_backlog_release(
     job_id: str, auth: tuple[Session, AdminContext] = Depends(require_admin),
 ):
     db, _context = auth
-    return identity_backlog.serialize(_identity_backlog_job(db, job_id))
+    return identity_backlog.serialize(db, _identity_backlog_job(db, job_id))
 
 
 @app.post("/api/v2/attendance-identity-backlog/releases/{job_id}/stop")
@@ -761,7 +775,7 @@ def stop_identity_backlog_release(
         ip_address=client_ip(request),
     )
     db.flush()
-    return identity_backlog.serialize(job)
+    return identity_backlog.serialize(db, job)
 
 
 @app.post("/api/v2/attendance-force-releases", status_code=202)
@@ -3288,7 +3302,7 @@ def attendance_identity_evidence_report(
         source_evidence,
     )
     from zk_add.models import AttendanceIdentityHistory, TerminalRecordManifest, TerminalSourceEpoch
-    from zk_add.service import synced_cnic_identity_proven
+    from zk_add.service import dump_release_outlook, synced_cnic_identity_proven
 
     db, _context = auth
     event = db.get(AttendanceEvent, event_id)
@@ -3364,6 +3378,9 @@ def attendance_identity_evidence_report(
         "clock_quality": event.clock_quality,
         "source": event.source,
         "source_proof": source["kind"] if source else None,
+        # A legacy dump row only the authenticated batch proof can release:
+        # whether a later snapshot or only the owner's zone release will.
+        "dump_release": dump_release_outlook(db, event),
         "manifest_disposition": manifest.disposition if manifest else None,
         "manifest_canonical_source": manifest.canonical_source if manifest else None,
         "manifest_owner_matches": bool(

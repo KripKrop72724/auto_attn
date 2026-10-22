@@ -842,6 +842,21 @@ def _release_source_synced_attendance(session, *, connector, events) -> set[int]
     if not candidates:
         return set()
     session.flush()
+    # A roster snapshot or the owner's backlog release may have released one
+    # of these rows since this chunk loaded it. Lock and re-read them; a row
+    # another transaction holds is left to it (it is not released twice).
+    candidates = [
+        row for row in session.scalars(
+            select(AttendanceEvent)
+            .where(AttendanceEvent.id.in_([row.id for row in candidates]))
+            .order_by(AttendanceEvent.id)
+            .with_for_update(skip_locked=True)
+            .execution_options(populate_existing=True)
+        ).all()
+        if row.ords_status in {"BLOCKED_IDENTITY", "WAITING_FOR_SNAPSHOT"}
+    ]
+    if not candidates:
+        return set()
     from zk_add.models import DeviceUser
     from zk_add.service import release_synced_cnic_attendance_event
 
