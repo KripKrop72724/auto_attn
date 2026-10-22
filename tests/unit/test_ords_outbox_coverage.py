@@ -18,6 +18,7 @@ from sqlalchemy.pool import StaticPool
 
 from test_add_backend import connector_fixture, event, make_writable, snapshot_user
 from zk_add import web
+from zk_add.attendance_manual_guard import generic_confirmation_allowed
 from zk_add.attendance_recovery import (
     advance_attendance_recovery_jobs,
     build_recovery_preview,
@@ -25,13 +26,26 @@ from zk_add.attendance_recovery import (
     recovery_summary,
 )
 from zk_add.db import Base
-from zk_add.models import AttendanceEvent, Connector, OrdsOutbox
-from zk_add.ords_outbox_coverage import ords_outbox_coverage, outbox_coverage_bucket
-from zk_add.schemas import AttendanceRecoveryFilter
+from zk_add.models import (
+    AttendanceEvent,
+    AttendanceForceReleaseDecision,
+    AttendanceRecoveryItem,
+    AttendanceRecoveryJob,
+    Connector,
+    OracleReceipt,
+    OrdsOutbox,
+)
+from zk_add.ords_outbox_coverage import (
+    IDENTITY_HELD_WITHOUT_OUTBOX_STATUSES,
+    ords_outbox_coverage,
+    outbox_coverage_bucket,
+)
+from zk_add.schemas import AttendanceRecoveryFilter, OracleReceiptBatchRequest
 from zk_add.security import ADMIN_COOKIE, create_admin_session, hash_admin_password
 from zk_add.service import (
     ensure_attendance_ords_outbox,
     ingest_attendance,
+    record_oracle_receipts,
     repair_attendance_delivery_backlog,
 )
 from zk_add.settings import settings
@@ -169,6 +183,60 @@ def test_every_status_has_one_coverage_bucket(status, bucket):
     assert outbox_coverage_bucket(status) == bucket
 
 
+@pytest.mark.parametrize(
+    ("status", "bucket"),
+    [
+        # Force release and Direct ORDS create the outbox with the decision, so
+        # a decided hold without one is a lost work item, not a hold.
+        ("BLOCKED_IDENTITY", "missing"),
+        ("QUARANTINED_IDENTITY_REUSE", "missing"),
+        ("WAITING_FOR_SNAPSHOT", "missing"),
+        ("PENDING", "missing"),
+        # A decision never folds a review state into missing or held.
+        ("QUARANTINED_INVALID_DEVICE_TIME", "review"),
+        ("SOME_FUTURE_STATE", "review"),
+    ],
+)
+def test_a_release_decision_moves_only_held_rows_to_missing(status, bucket):
+    assert outbox_coverage_bucket(status, release_decided=True) == bucket
+
+
+def _decide(db: Session, row: AttendanceEvent) -> None:
+    """Record a Force release decision without its outbox: a lost work item."""
+    job = AttendanceRecoveryJob(
+        action="FORCE_RELEASE",
+        actor="test-admin",
+        reason="Test approval whose outbox row is missing.",
+        idempotency_key=uuid4().hex,
+        candidate_digest="0" * 64,
+    )
+    db.add(job)
+    db.flush()
+    item = AttendanceRecoveryItem(
+        job_id=job.id,
+        source_kind="ATTENDANCE_EVENT",
+        source_ref=row.event_uid,
+        attendance_event_id=row.id,
+        expected_state_digest="0" * 64,
+        lane="IDENTITY_HELD",
+    )
+    db.add(item)
+    db.flush()
+    db.add(AttendanceForceReleaseDecision(
+        item_id=item.id,
+        attendance_event_id=row.id,
+        job_id=job.id,
+        actor="test-admin",
+        reason_encrypted="sealed",
+        proof={},
+        prior_state_encrypted="sealed",
+        payload_encrypted="sealed",
+        payload_digest="0" * 64,
+        operation_id=str(uuid4()),
+    ))
+    db.flush()
+
+
 def test_held_and_quarantined_rows_are_not_reported_as_missing_outbox(db: Session):
     rows = _fleet(db)
 
@@ -177,6 +245,7 @@ def test_held_and_quarantined_rows_are_not_reported_as_missing_outbox(db: Sessio
         "missing_outbox": 0,
         "held_without_outbox": 1,
         "review_without_outbox": 2,
+        "decided_held_without_outbox": 0,
         "without_outbox_total": 3,
         "without_outbox_by_status": {
             "BLOCKED_IDENTITY": 1,
@@ -376,3 +445,107 @@ def test_deliverable_states_the_sweep_skips_stay_missing_until_rebuild_outbox(db
     assert coverage["missing_outbox"] == 0
     assert coverage["held_without_outbox"] == 1
     assert coverage["review_without_outbox"] == 2
+
+
+def test_a_held_punch_with_a_release_decision_but_no_outbox_is_missing(db: Session):
+    """A stuck approval must not hide inside the held count."""
+    rows = _fleet(db)
+    held = rows["held"]
+    # Two decisions for one punch still count it once; a decided punch that
+    # has its outbox is not a gap.
+    _decide(db, held)
+    _decide(db, held)
+    _decide(db, rows["queued"])
+    assert held.ords_status == "BLOCKED_IDENTITY" and _outbox(db, held) is None
+
+    coverage = ords_outbox_coverage(db)
+    assert coverage["missing_outbox"] == 1
+    assert coverage["decided_held_without_outbox"] == 1
+    assert coverage["held_without_outbox"] == 0
+    assert coverage["review_without_outbox"] == 2
+    assert coverage["without_outbox_total"] == 3
+    assert coverage["without_outbox_by_status"]["BLOCKED_IDENTITY"] == 1
+    metrics = ords_delivery_metrics(db)
+    assert metrics["missing_outbox"] == metrics["decided_held_without_outbox"] == 1
+    assert recovery_summary(db)["delivery"]["missing_outbox"] == 1
+
+    # The sweep never queues a punch that still needs approval, so the gap
+    # stays visible until someone investigates it.
+    for _ in range(2):
+        repair_attendance_delivery_backlog(db, limit=10)
+        db.flush()
+    assert held.ords_status == "BLOCKED_IDENTITY" and _outbox(db, held) is None
+    assert ords_outbox_coverage(db)["decided_held_without_outbox"] == 1
+
+
+def test_recovery_tiles_use_the_same_identity_hold_set_as_the_split(db: Session):
+    """WAITING_FOR_SNAPSHOT is held on both tiles, and every review row without
+    an outbox is also on the Source review tile."""
+    rows = _fleet(db)
+    rows["held"].ords_status = "WAITING_FOR_SNAPSHOT"
+    db.flush()
+
+    delivery = recovery_summary(db)["delivery"]
+    assert delivery["identity_held"] == 1
+    assert delivery["held_without_outbox"] == 1
+    # c (invalid time) and e (unknown state).
+    assert delivery["review_without_outbox"] == 2
+    assert delivery["permanent_review"] == 2
+    assert delivery["missing_outbox"] == 0
+
+
+def test_held_punches_with_a_terminal_receipt_exist_with_and_without_an_outbox(db: Session):
+    """A legacy terminal may already have posted a held punch to Oracle.
+
+    A receipt that arrives with a punch that has no CNIC gives it a receipt
+    outbox, which the worker blocks with the punch (a held placeholder). A
+    receipt that arrives after the punch is held is kept as evidence only. The
+    documented receipt join must find both, not only the outbox-less one.
+    """
+    connector = connector_fixture(db)
+    make_writable(connector)
+    snapshot_user(db, connector)
+    early, late = "f" * 64, "9" * 64
+
+    def receipt(event_uid: str) -> tuple[int, int, int]:
+        return record_oracle_receipts(db, connector=connector, batch=OracleReceiptBatchRequest(
+            confirmation_path="FIRMWARE_RECONCILE",
+            oracle_observed_at=utc_now(),
+            event_uids=[event_uid],
+        ))
+
+    assert receipt(early) == (0, 1, 0)
+    accepted, _ = ingest_attendance(db, connector=connector, events=[
+        event(event_uid=early, user_id="unknown", uid="99"),
+        event(event_uid=late, user_id="unknown", uid="98"),
+    ])
+    assert len(accepted) == 2
+    db.flush()
+    early_row, late_row = _row(db, early), _row(db, late)
+    early_outbox = _outbox(db, early_row)
+    assert early_row.ords_status == "FIRMWARE_RECEIPT_UNVERIFIED"
+    assert early_outbox is not None and early_outbox.status == "FIRMWARE_RECEIPT_UNVERIFIED"
+    # worker.claim_firmware_receipt_audit_batch blocks both without approval.
+    assert not generic_confirmation_allowed(db, early_row)
+    early_row.ords_status = early_outbox.status = "BLOCKED_IDENTITY"
+    db.flush()
+
+    assert late_row.ords_status == "BLOCKED_IDENTITY" and _outbox(db, late_row) is None
+    assert receipt(late) == (0, 1, 0)
+    db.flush()
+    assert late_row.ords_status == "BLOCKED_IDENTITY" and _outbox(db, late_row) is None
+
+    coverage = ords_outbox_coverage(db)
+    assert coverage["missing_outbox"] == 0
+    # Only the late-receipt punch lacks a row; the placeholder is not counted.
+    assert coverage["held_without_outbox"] == 1
+    held_with_receipt = db.execute(
+        select(AttendanceEvent.id, OrdsOutbox.id)
+        .join(OracleReceipt, OracleReceipt.attendance_event_id == AttendanceEvent.id)
+        .outerjoin(OrdsOutbox, OrdsOutbox.attendance_event_id == AttendanceEvent.id)
+        .where(AttendanceEvent.ords_status.in_(tuple(IDENTITY_HELD_WITHOUT_OUTBOX_STATUSES)))
+    ).all()
+    assert {(event_id, outbox_id is not None) for event_id, outbox_id in held_with_receipt} == {
+        (early_row.id, True),
+        (late_row.id, False),
+    }

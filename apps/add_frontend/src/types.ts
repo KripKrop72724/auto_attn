@@ -601,6 +601,7 @@ export interface Overview {
     missing_outbox?: number
     held_without_outbox?: number
     review_without_outbox?: number
+    decided_held_without_outbox?: number
     without_outbox_total?: number
     without_outbox_by_status?: Record<string, number>
   }

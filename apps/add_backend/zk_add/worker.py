@@ -243,11 +243,13 @@ def ords_delivery_metrics(session: Session, *, outbox_coverage: dict | None = No
         "membership_reverify": membership_reverify,
         "oldest_backlog_at": oldest_backlog_at,
         "last_attempt_at": last_attempt_at,
-        # Only deliverable punches without an outbox row are missing; identity
-        # holds and review quarantines get no Oracle work item by design.
+        # Only deliverable punches, and held punches that already have a
+        # release decision, are missing an outbox row; other identity holds
+        # and review quarantines get no Oracle work item by design.
         "missing_outbox": coverage["missing_outbox"],
         "held_without_outbox": coverage["held_without_outbox"],
         "review_without_outbox": coverage["review_without_outbox"],
+        "decided_held_without_outbox": coverage["decided_held_without_outbox"],
         "without_outbox_total": coverage["without_outbox_total"],
         "without_outbox_by_status": coverage["without_outbox_by_status"],
         "historical_sweep": {

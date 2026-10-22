@@ -36,7 +36,10 @@ from zk_add.models import (
     AuditEvent,
 )
 from zk_add.hikvision_evidence import HikvisionEvidence
-from zk_add.ords_outbox_coverage import ords_outbox_coverage
+from zk_add.ords_outbox_coverage import (
+    IDENTITY_HELD_WITHOUT_OUTBOX_STATUSES,
+    ords_outbox_coverage,
+)
 from zk_add.ords_states import (
     ORDS_ACKNOWLEDGED_STATUSES,
     ORDS_ACTIVE_STATUSES,
@@ -606,14 +609,19 @@ def recovery_summary(session: Session, *, outbox_coverage: dict | None = None) -
     safe_statuses = {"PENDING", "FAILED_RETRYABLE", "RETRYING"}
     safe = sum(status_counts.get(status, 0) for status in safe_statuses)
     active_in_flight = status_counts.get("IN_FLIGHT", 0)
-    identity = sum(status_counts.get(status, 0) for status in ORDS_IDENTITY_HELD_STATUSES)
+    # The same identity-hold set as the outbox coverage split, so a
+    # WAITING_FOR_SNAPSHOT event is "held" on both tiles. Source review counts
+    # every other state, including firmware-receipt and membership checks that
+    # are still being verified; an outbox-less one of those is also counted as
+    # Missing outbox, because the worker verifies only through an outbox row.
+    identity = sum(status_counts.get(status, 0) for status in IDENTITY_HELD_WITHOUT_OUTBOX_STATUSES)
     review = sum(
         count
         for status, count in status_counts.items()
         if status not in (
             safe_statuses
             | {"IN_FLIGHT"}
-            | ORDS_IDENTITY_HELD_STATUSES
+            | IDENTITY_HELD_WITHOUT_OUTBOX_STATUSES
             | ORDS_ACKNOWLEDGED_STATUSES
         )
     )
@@ -643,8 +651,8 @@ def recovery_summary(session: Session, *, outbox_coverage: dict | None = None) -
         "allowed_zones": [z.strip() for z in settings.attendance_recovery_allowed_zones.split(",") if z.strip()],
         "delivery": {
             "safe_retryable": safe,
-            # Deliverable rows to rebuild; identity holds and review
-            # quarantines have no outbox by design and are counted apart.
+            # Deliverable rows (and decided holds) without an outbox; identity
+            # holds and review quarantines are counted apart.
             "missing_outbox": coverage["missing_outbox"],
             "held_without_outbox": coverage["held_without_outbox"],
             "review_without_outbox": coverage["review_without_outbox"],
