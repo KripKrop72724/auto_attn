@@ -1961,3 +1961,19 @@ def test_pre_reconcile_check_lists_recovery_epoch_copies_of_newest_reads(source_
     listed = {row["id"]: row for row in list_evidence(session, connector, newest=True, limit=50)["rows"]}
     assert listed[copies[3].id]["newest_read_observed"] is True
     assert copies[2].id not in listed
+
+
+def test_a_failing_filled_slot_check_never_blocks_tail_custody(source_db, monkeypatch):
+    session, connector, _ = source_db
+    coverage, _, _ = first_tail(session, connector, junk(3, "zero"))
+
+    def broken(*args, **kwargs):
+        raise RuntimeError("advisory check failed")
+
+    monkeypatch.setattr(newest_slot, "note_filled_newest_slot", broken)
+    monkeypatch.setattr(newest_slot, "refresh_alerts", broken)
+    request = tail_request(session, coverage, [P4.row(4), junk(5, "zero")], latest=6)
+    _, chunk, _, error = service.apply_source_tail_chunk(session, connector=connector, payload=request)
+    session.commit()
+    assert error is None and chunk is not None and coverage.source_committed_cursor == 6
+    assert service.refresh_all_reconciliation_assurance(session) == []

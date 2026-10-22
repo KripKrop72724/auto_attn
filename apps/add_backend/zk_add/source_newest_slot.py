@@ -65,6 +65,7 @@ import base64
 import binascii
 import hashlib
 import json
+import logging
 from collections import defaultdict
 from datetime import datetime, timedelta
 
@@ -88,6 +89,8 @@ from zk_add.models import (
 )
 from zk_add.time_utils import ensure_utc, utc_now
 
+
+logger = logging.getLogger(__name__)
 
 # Operator-facing conditions. Stored reader codes stay exactly as the reader sent them.
 UNSETTLED_CONDITION = "TERMINAL_NEWEST_RECORD_UNSETTLED"
@@ -1349,6 +1352,16 @@ def refresh_alerts(session: Session, *, connector: Connector | None = None) -> i
                           details={key: value for key, value in details.items()
                                    if key in {"job_id", "coverage_id"}})
     return changed
+
+
+def run_advisory(session: Session, label: str, check, **kwargs):
+    """Run an advisory alert check in a savepoint: its failure never blocks custody or assurance."""
+    try:
+        with session.begin_nested():
+            return check(session, **kwargs)
+    except Exception:  # noqa: BLE001 - the check only raises or clears an alert.
+        logger.exception("ADD newest-slot %s check failed; custody and assurance continue", label)
+        return None
 
 
 # --- Tail replays -------------------------------------------------------------

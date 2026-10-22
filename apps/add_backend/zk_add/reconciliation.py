@@ -1447,7 +1447,7 @@ def apply_reconciliation_chunk(
         ], details={"job_id": job.job_id})
     if settled_manifests:
         # A settled slot may clear the unreceived-punch alert.
-        newest_slot.refresh_alerts(session, connector=connector)
+        newest_slot.run_advisory(session, "alert refresh", newest_slot.refresh_alerts, connector=connector)
     from zk_add.zkt_custody_work import attach_source_work
     attach_source_work(session, connector, raw_manifests)
     released = _release_source_synced_attendance(
@@ -2815,7 +2815,8 @@ def apply_source_tail_chunk(
         ], details={"coverage_id": coverage.coverage_id})
     newest_slot.note_lineage_newest(session, connector, pairs=lineage_newest, coverage=coverage)
     # The terminal has written the slot the previous read saw as its newest.
-    newest_slot.note_filled_newest_slot(session, connector=connector, coverage=coverage, payload=payload)
+    newest_slot.run_advisory(session, "filled-slot", newest_slot.note_filled_newest_slot,
+                             connector=connector, coverage=coverage, payload=payload)
     if exceptions:
         coverage.capture_state = "SOURCE_CAPTURE_CERTIFIED_WITH_EXCEPTIONS"
         upsert_alert(
@@ -3520,7 +3521,7 @@ def refresh_all_reconciliation_assurance(session: Session) -> list[dict]:
             )
     # A newest-record slot clears from its alert once ADD accounts for it,
     # for example when LIVE capture delivers its punch late.
-    newest_slot.refresh_alerts(session)
+    newest_slot.run_advisory(session, "alert refresh", newest_slot.refresh_alerts)
     return updates
 
 
