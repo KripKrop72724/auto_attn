@@ -45,6 +45,8 @@ jobs:
           persist-credentials: false
       - name: Inspect protected provisioning readiness without exposing credentials
         shell: powershell
+        env:
+          ADD_FACTORY_HIL_RECEIPT_PATH: ${{ vars.ADD_FACTORY_HIL_RECEIPT_PATH }}
         run: ./deploy/add/inspect-provisioning.ps1
   inspect:
     if: github.ref == 'refs/heads/main' && inputs.provisioning_inspect != true

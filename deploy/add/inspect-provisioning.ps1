@@ -36,4 +36,14 @@ if (Test-Path -LiteralPath $vaultManifest -PathType Leaf) {
     $v = Get-Content -LiteralPath $vaultManifest -Raw | ConvertFrom-Json
     $publicMetadata = [ordered]@{manifest_present=$true; active_keys=@($v.keys | Where-Object {$_.state -eq 'ACTIVE'}).Count; public_keys=@(Get-ChildItem -LiteralPath $vault -Filter '*public.pem' -File).Count}
 }
-[ordered]@{configuration_present=$true;provisioning_enabled=($map['ADD_PROVISIONING_ENABLED'] -eq 'true');presence=$presence;stores=$stores;provisioner_image_present=($images.Count -gt 0);provisioner_containers=$containers;signing_vault=$publicMetadata} | ConvertTo-Json -Depth 7
+$receipts = @()
+$receiptRoot = $env:ADD_FACTORY_HIL_RECEIPT_PATH
+if ($receiptRoot -and (Test-Path -LiteralPath $receiptRoot -PathType Container)) {
+    foreach ($receiptFile in Get-ChildItem -LiteralPath $receiptRoot -Filter '*.json' -File) {
+        $receipt = Get-Content -LiteralPath $receiptFile.FullName -Raw | ConvertFrom-Json
+        $required = @('blank_device_secure_boot','managed_device_no_efuse_reburn','legacy_root_attested','foreign_root_rejected','all_ranges_readback_verified','power_loss_recovered','same_mac_resumed','different_mac_rejected','signed_onboarding_verified','terminal_binding_read_only_gate','storage_outbox_preserved')
+        $missing = @($required | Where-Object { $receipt.checks.$_ -ne $true })
+        $receipts += [ordered]@{receipt_sha256=(Get-FileHash $receiptFile.FullName -Algorithm SHA256).Hash.ToLowerInvariant();bundle_id=$receipt.bundle_id;manifest_sha256=$receipt.manifest_sha256;status=$receipt.status;missing_checks=$missing}
+    }
+}
+[ordered]@{configuration_present=$true;provisioning_enabled=($map['ADD_PROVISIONING_ENABLED'] -eq 'true');presence=$presence;stores=$stores;provisioner_image_present=($images.Count -gt 0);provisioner_containers=$containers;signing_vault=$publicMetadata;factory_receipt_directory_present=([bool]($receiptRoot -and (Test-Path -LiteralPath $receiptRoot -PathType Container)));factory_receipts=$receipts} | ConvertTo-Json -Depth 7
