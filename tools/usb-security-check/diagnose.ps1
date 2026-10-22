@@ -37,9 +37,9 @@ $form.Add_Shown({
         try {
             $tool = Get-BundledSecurityTool
             $version = & $tool version 2>&1 | Out-String
-            Write-Output $version
+            [Console]::Out.WriteLine($version)
             if ($LASTEXITCODE -ne 0 -or $version -notmatch '5\.1\.0') { throw 'Bundled offline esptool smoke test failed.' }
-        } catch { Write-Output $_; $script:smokeFailed = $true }
+        } catch { [Console]::Out.WriteLine(($_ | Out-String)); $script:smokeFailed = $true }
         $script:smokeTimer = New-Object Windows.Forms.Timer
         $script:smokeTimer.Interval = 500
         $script:smokeTimer.Add_Tick({ $script:smokeTimer.Stop(); $form.Close() })
