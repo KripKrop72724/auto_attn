@@ -578,6 +578,32 @@ def test_superseded_session_starts_nothing_after_4001(backend, caplog):
     assert (new_end["end"], new_end["processed"], new_end["unprocessed"]) == ("connection_lost", "1", "0")
 
 
+def test_superseded_session_end_never_marks_the_live_connector_disconnected(backend):
+    # LF-ZONE-BLD1-01 read OFFLINE seconds after a heartbeat: the old socket's
+    # cleanup recorded "disconnected" after the ESP's newer socket connected.
+    async def scenario():
+        old = FakeWebSocket()
+        first = backend.gate(1)
+        old_stream = asyncio.create_task(add_web.device_stream(old))
+        old.feed(1)
+        await until(lambda: backend.started == [1])
+        new = FakeWebSocket()
+        new_stream = asyncio.create_task(add_web.device_stream(new))
+        await until(lambda: old.closes == [(4001, "Superseded by a newer connector session")])
+        await until(lambda: [state for state, _ in backend.connected] == [True, True])
+        first.set()
+        await asyncio.wait_for(old_stream, 3)
+        await asyncio.sleep(0.05)
+        # The superseded session ends while the newer one is live: no False.
+        assert [state for state, _ in backend.connected] == [True, True]
+        new.disconnect()
+        await asyncio.wait_for(new_stream, 3)
+        # The current session's own end still records the disconnection.
+        assert [state for state, _ in backend.connected] == [True, True, False]
+
+    asyncio.run(scenario())
+
+
 def test_superseded_session_sends_no_follow_ups_to_the_newer_socket(backend, monkeypatch):
     command = {"type": "command", "command_id": "command-1", "command_type": "SYNC_TIME"}
     backend.commands = [command]

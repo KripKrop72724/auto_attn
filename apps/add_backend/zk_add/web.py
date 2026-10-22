@@ -4278,15 +4278,20 @@ async def device_stream(websocket: WebSocket):
     finally:
         try:
             await session.stop()
+            # A session superseded by the same ESP's newer socket must not mark
+            # the connector disconnected: the newer session is live, and the
+            # flag would otherwise read OFFLINE until its next message.
+            still_current = connector_hub.current(connector_id) is websocket
             await connector_hub.disconnect(connector_id, websocket)
-            try:
-                await asyncio.to_thread(set_stream_connected, connector_pk, False)
-            except Exception as exc:
-                logger.warning(
-                    "ADD device stream could not record its disconnection connector_id=%s error_type=%s",
-                    connector_id, type(exc).__name__,
-                )
-            await browser_events.publish("device", {"connector_id": connector_id, "connected": False})
+            if still_current:
+                try:
+                    await asyncio.to_thread(set_stream_connected, connector_pk, False)
+                except Exception as exc:
+                    logger.warning(
+                        "ADD device stream could not record its disconnection connector_id=%s error_type=%s",
+                        connector_id, type(exc).__name__,
+                    )
+                await browser_events.publish("device", {"connector_id": connector_id, "connected": False})
         finally:
             # Even a cleanup cut short by cancellation reports the session.
             session.log_end()
