@@ -35,7 +35,7 @@ concurrency:
 
 jobs:
   provisioning-inspect:
-    if: inputs.provisioning_inspect == true
+    if: github.ref == 'refs/heads/main' && inputs.provisioning_inspect == true
     runs-on: [self-hosted, Windows, X64]
     environment: add-production
     timeout-minutes: 5

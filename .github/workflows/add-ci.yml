@@ -25,6 +25,7 @@ jobs:
         shell: powershell
         run: |
           if ($PSVersionTable.PSVersion.Major -ne 5) { throw 'Expected Windows PowerShell 5.1' }
+          ./tests/firmware/test_provisioning_inspection.ps1
           ./tests/firmware/test_hil_publication.ps1
           ./tests/firmware/test_hil_publication.ps1 -BridgeVersion 2.6.17
           ./tests/firmware/test_hil_publication.ps1 -BridgeVersion 2.6.18
@@ -53,6 +54,9 @@ jobs:
           persist-credentials: false
       - name: Enforce ADD and Zone Lite consolidation
         run: python3 scripts/check_repository_contract.py
+      - name: Verify protected provisioning inspection omits secret values
+        shell: pwsh
+        run: ./tests/firmware/test_provisioning_inspection.ps1
       - name: Exercise immutable ordered HIL publication
         shell: pwsh
         run: |
@@ -78,6 +82,7 @@ jobs:
         run: |
           $productionScripts = @(
             'deploy/add/deploy.ps1',
+            'deploy/add/inspect-provisioning.ps1',
             'deploy/add/collect-diagnostics.ps1',
             'deploy/add/Invoke-NationwideFirmwareRollout.ps1'
           )
