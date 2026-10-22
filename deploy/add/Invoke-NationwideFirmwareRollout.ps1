@@ -7,7 +7,11 @@ param(
     [string]$AdminUsername = 'StateHealthAdmin',
     [ValidateRange(1, 5)][int]$BatchSize = 1,
     [ValidateRange(15, 240)][int]$BatchTimeoutMinutes = 90,
-    [switch]$DeferOfflineZones
+    [switch]$DeferOfflineZones,
+    # The owner's explicit override of ADD's ESP stability warnings (reset
+    # rate, short uptime). Without it a zone with warnings halts the rollout
+    # before its campaign is created.
+    [switch]$OverrideStabilityWarnings
 )
 
 $ErrorActionPreference = 'Stop'
@@ -316,7 +320,18 @@ try {
                         "offline=$($scope.counts.offline)."
                     )
                 }
-                $createdCampaign = Invoke-AddApi -Method POST -Path '/api/v1/firmware/campaigns' -Body @{
+                $stabilityWarnings = @($scope.stability_warnings | Where-Object { $null -ne $_ })
+                if ($stabilityWarnings.Count -gt 0) {
+                    $stabilityDetail = ($stabilityWarnings | ForEach-Object { [string]$_.message }) -join ' '
+                    if (-not $OverrideStabilityWarnings) {
+                        throw (
+                            "Zone $zoneId has ESP stability warnings: $stabilityDetail " +
+                            'Rerun with -OverrideStabilityWarnings only after the owner reviews them.'
+                        )
+                    }
+                    Write-Warning "Owner override of ESP stability warnings for zone ${zoneId}: $stabilityDetail"
+                }
+                $campaignBody = @{
                     release_id = $release.release_id
                     zone_id = $zoneId
                     reason = "Nationwide COMM Key recovery rollout $Version; batch $([int]($offset / $BatchSize) + 1)."
@@ -325,6 +340,11 @@ try {
                     scope_token = [string]$scope.scope_token
                     idempotency_key = "nationwide-$Version-$zoneId-$([guid]::NewGuid().ToString('N'))"
                 }
+                if ($stabilityWarnings.Count -gt 0) {
+                    $campaignBody.override_stability_warnings = $true
+                    $campaignBody.stability_warnings_digest = [string]$scope.stability_warnings_digest
+                }
+                $createdCampaign = Invoke-AddApi -Method POST -Path '/api/v1/firmware/campaigns' -Body $campaignBody
                 if ([int]$createdCampaign.eligible -lt 1) { throw "Zone $zoneId has no eligible deployment." }
                 $created += [pscustomobject]@{ campaign_id = $createdCampaign.campaign_id; zone_id = $zoneId; status = 'ACTIVE' }
             }

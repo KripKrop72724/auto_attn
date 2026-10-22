@@ -117,6 +117,7 @@ const firmwareScopeSchema = z.object({
         .passthrough(),
     )
     .default([]),
+  stability_warnings_digest: z.string().optional(),
 })
 const firmwareCampaignCreatedSchema = z.object({
   campaign_id: z.string().min(1),
@@ -493,9 +494,11 @@ function CampaignDetailDrawer({
                           <dt>
                             {deployment.status === 'PENDING'
                               ? 'Hold'
-                              : activeDeploymentStates.includes(deployment.status)
+                              : deployment.error_code === 'DOWNLOAD_INTERRUPTED'
                                 ? 'Last interruption'
-                                : 'Failure'}
+                                : activeDeploymentStates.includes(deployment.status)
+                                  ? 'Last report'
+                                  : 'Failure'}
                           </dt>
                           <dd>
                             {deployment.error_code} ·{' '}
@@ -819,6 +822,9 @@ function CampaignCreator({
             scope_token: scope.scope_token,
             idempotency_key: idempotency('firmware-campaign'),
             override_stability_warnings: overrideStability,
+            ...(overrideStability && scope.stability_warnings_digest
+              ? { stability_warnings_digest: scope.stability_warnings_digest }
+              : {}),
           }),
         }),
       )

@@ -1000,6 +1000,7 @@ describe('State Life ADD interface', () => {
           eligible: [device],
           excluded: [],
           stability_warnings: [warning],
+          stability_warnings_digest: 'b'.repeat(64),
         })
       }
       return base(input, init)
@@ -1028,7 +1029,10 @@ describe('State Life ADD interface', () => {
     const campaignCall = fetchMock.mock.calls.find(
       ([input, init]) => String(input).endsWith('/api/v1/firmware/campaigns') && init?.method === 'POST',
     )
-    expect(JSON.parse(String(campaignCall?.[1]?.body))).toMatchObject({ override_stability_warnings: true })
+    expect(JSON.parse(String(campaignCall?.[1]?.body))).toMatchObject({
+      override_stability_warnings: true,
+      stability_warnings_digest: 'b'.repeat(64),
+    })
   })
 
   it('returns to the login screen when any request reports an expired session', async () => {

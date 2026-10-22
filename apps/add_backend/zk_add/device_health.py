@@ -464,9 +464,11 @@ def classify_led_latch(led_state: str | None, evidence: dict | None, *, storage_
 
 # Signed 2.6.15 checks at boot (zone_lite.c:3196) that the other OTA slot
 # holds a qualified predecessor (2.4.12 to 2.6.14). Any 2.7.x download writes
-# that slot, so every later 2.6.15 boot latches LOCAL_FAILURE, never verifies
-# persistence and reports durability DEGRADED until a 2.7.x install succeeds,
-# with no storage I/O fault behind it.
+# that slot, so every later 2.6.15 boot latches LOCAL_FAILURE, never runs its
+# persistence probe and reports durability DEGRADED until a 2.7.x install
+# succeeds. Zero I/O counters on such a boot are not a passed probe, so the
+# latch also needs ADD's own record of the 2.7.x download and a clean storage
+# history; its tier follows the owner's latched-LED policy.
 ROLLBACK_SLOT_RESIDUE = "OTA_ROLLBACK_SLOT_RESIDUE"
 RESIDUE_FIRMWARE_VERSION = "2.6.15"
 RESIDUE_APPLICATION_SHA256 = "832c0c3d8dac6e41d7cd0a9d4fbe4508e4f66982fa5ddeceaca4dc5adcbd80d6"
@@ -474,6 +476,10 @@ RESIDUE_LED_SOURCE = "zone_lite.c:3196"
 RESIDUE_UPGRADE_ERROR = "STORAGE_DIRECT_ROLLBACK_IMAGE_UNQUALIFIED"
 RESIDUE_ERROR_FIELDS = ("error_code", "error_operation", "persistence_probe_error", "persistence_probe_operation",
                         "legacy_error_code", "legacy_error_operation", "legacy_error_queue")
+# Earlier boots whose last reported storage counters show any I/O fault in
+# this window keep DEGRADED (MULTAN-02 had EIO write failures on 15 Oct).
+RESIDUE_HISTORY_DAYS = 14
+RESIDUE_HISTORY_CHUNK = 500
 
 
 def rollback_slot_residue_candidate(evidence: dict | None, firmware_version: str | None) -> bool:
@@ -500,13 +506,58 @@ def rollback_slot_residue_candidate(evidence: dict | None, firmware_version: str
     )
 
 
-def rollback_slot_residue_latch(record: dict | None) -> dict | None:
-    """The latch, only with ADD's own record of the 2.7.x download that wrote the slot."""
-    if not record:
+def _storage_fault(storage: dict) -> dict | None:
+    faults = {name: storage[name] for name in STORAGE_COUNTERS
+              if type(storage.get(name)) is int and storage[name] > 0}
+    faults.update({name: storage[name] for name in RESIDUE_ERROR_FIELDS if _reported(storage.get(name))})
+    if storage.get("fault_class") not in (None, "NONE"):
+        faults["fault_class"] = storage["fault_class"]
+    return faults or None
+
+
+def rollback_slot_residue_history(session: Session, connector: Connector, *, now: datetime | None = None) -> dict:
+    """Storage I/O faults reported by this ESP's earlier boots in the last RESIDUE_HISTORY_DAYS.
+
+    Counters accumulate per boot, so each earlier boot's last heartbeat is
+    read. A boot whose firmware reported no storage counters is counted, not
+    treated as a fault. The current boot is checked by the latch's own gates.
+    """
+    from sqlalchemy import func
+
+    now = now or utc_now()
+    statement = select(func.max(DeviceTelemetry.id)).where(
+        DeviceTelemetry.connector_id == connector.id,
+        DeviceTelemetry.created_at >= now - timedelta(days=RESIDUE_HISTORY_DAYS),
+        DeviceTelemetry.boot_id.is_not(None))
+    if connector.boot_id:
+        statement = statement.where(DeviceTelemetry.boot_id != connector.boot_id)
+    last_ids = sorted(row for row in session.scalars(statement.group_by(DeviceTelemetry.boot_id)) if row)
+    faults, unreported = [], 0
+    for offset in range(0, len(last_ids), RESIDUE_HISTORY_CHUNK):
+        for row_id, boot_id, created_at, payload in session.execute(select(
+                DeviceTelemetry.id, DeviceTelemetry.boot_id, DeviceTelemetry.created_at, DeviceTelemetry.payload,
+        ).where(DeviceTelemetry.id.in_(last_ids[offset:offset + RESIDUE_HISTORY_CHUNK]))):
+            diagnostics = (payload or {}).get("diagnostics") if isinstance(payload, dict) else None
+            storage = diagnostics.get("storage") if isinstance(diagnostics, dict) else None
+            if not isinstance(storage, dict) or not any(name in storage for name in STORAGE_COUNTERS):
+                unreported += 1
+                continue
+            fault = _storage_fault(storage)
+            if fault:
+                faults.append({"boot_id": boot_id, "at": ensure_utc(created_at).isoformat(), **fault})
+    return {"boot_id": connector.boot_id, "checked_at": now.isoformat(), "days": RESIDUE_HISTORY_DAYS,
+            "boots_checked": len(last_ids), "boots_without_storage_counters": unreported,
+            "faults": faults[:10], "clean": not faults}
+
+
+def rollback_slot_residue_latch(record: dict | None, history: dict | None) -> dict | None:
+    """The latch, only with ADD's own record of the 2.7.x download and a clean storage history."""
+    if not record or not history or not history.get("clean"):
         return None
     return {"kind": ROLLBACK_SLOT_RESIDUE, "source": RESIDUE_LED_SOURCE,
             "firmware_version": RESIDUE_FIRMWARE_VERSION, "upgrade_error": RESIDUE_UPGRADE_ERROR,
-            "residue": record}
+            "residue": record, "history": {key: history.get(key) for key in (
+                "days", "boots_checked", "boots_without_storage_counters")}}
 
 
 def _residue(details: dict) -> bool:
@@ -614,6 +665,13 @@ def _latched_led_tier(details: dict) -> str | None:
     return settings.device_health_latched_led_tier
 
 
+def _residue_tier() -> str:
+    """The owner's latched-LED policy: listed sources take its tier, others stay DEGRADED."""
+    if f"{RESIDUE_FIRMWARE_VERSION}:{RESIDUE_LED_SOURCE}" not in latched_led_sources():
+        return DEGRADED
+    return settings.device_health_latched_led_tier
+
+
 def _rule_tier(row: DeviceAlert, connector: Connector, currency: str, *, now: datetime,
                link: dict) -> str | None:
     details = row.details or {}
@@ -624,12 +682,14 @@ def _rule_tier(row: DeviceAlert, connector: Connector, currency: str, *, now: da
             # until one of its boots verifies or fails storage.
             return WARNING if diagnostics_reporting(connector) == "NOT_REPORTED_BY_FIRMWARE" else DEGRADED
         if _residue(details):
-            return WARNING  # persistence unverified - OTA rollback slot residue
+            return _residue_tier()  # persistence unverified - OTA rollback slot residue
         return _latched_led_tier(details) or DEGRADED
     if row.code == "ESP_DELIVERY_WORKER_FAULT":
         return WARNING if currency == PREVIOUS_BOOT else DEGRADED
     if row.code == "ESP_LOCAL_FAILURE":
-        if (details.get("latch") or {}).get("kind") in {"LED_LATCH_STORAGE_VERIFIED", ROLLBACK_SLOT_RESIDUE}:
+        if (details.get("latch") or {}).get("kind") == "LED_LATCH_STORAGE_VERIFIED":
+            return WARNING
+        if _residue(details) and _residue_tier() == WARNING:
             return WARNING
         return _latched_led_tier(details) or (WARNING if currency == HELD else DEGRADED)
     if row.code == "HIK_CAPTURE_UNHEALTHY":
@@ -681,10 +741,12 @@ def _evidence_summary(row: DeviceAlert) -> str | None:
     latch = details.get("latch")
     if _residue(details):
         residue = latch.get("residue") or {}
+        history = latch.get("history") or {}
         return (f"Persistence unverified - OTA rollback slot residue: {latch.get('source')} on "
                 f"{latch.get('firmware_version')} after {residue.get('target_version') or '2.7.x'} wrote "
-                f"{residue.get('bytes_written') or 'some'} bytes to the other slot; no storage I/O errors"
-                + (f" ({summary})" if summary else "") + ".")[:300]
+                f"{residue.get('bytes_written') or 'some'} bytes to the other slot; no storage I/O errors on this "
+                f"boot or in {history.get('days') or RESIDUE_HISTORY_DAYS} days of earlier boots, persistence "
+                "probe not run" + (f" ({summary})" if summary else "") + ".")[:300]
     diagnosis = details.get("diagnosis")
     if row.code == "OTA_DEVICE_ROLLED_BACK" and isinstance(diagnosis, dict) and diagnosis.get("summary"):
         return str(diagnosis["summary"])[:300]

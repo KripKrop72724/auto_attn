@@ -22,7 +22,7 @@ const diagnosis: FirmwareRollbackDiagnosis = {
     telemetry_received: 0,
   },
   previous_firmware_resets: { resets: 46, boot_ids: 47, online_hours: 30, reset_rate_per_online_hour: 1.533, days: 7 },
-  terminal: { time_sync_after_new_boot_seconds: 22, answered_within_30_seconds: true },
+  terminal: { time_sync_after_new_boot_seconds: 22, answered_within_30_seconds: true, bound: 'upper', source: 'received_at' },
   location_resets: {
     location: 'MULTAN', peers_checked: 1, window_seconds: 120, complete: true,
     resets: [],
@@ -50,6 +50,7 @@ const deployment: FirmwareDeployment = {
   rollback_diagnosis: diagnosis,
   retry: {
     available: true, refusal: null, interrupted_boots: 1, limit: 2,
+    stability_warnings_digest: 'a'.repeat(64), pending_deployments: 0,
     stability_warnings: [{
       code: 'ESP_UPTIME_SHORT', connector_id: '06d8706c-8b9e-4a48-b8c7-a76d16da6ed4',
       message: 'Multan 02: the ESP has been up 12 min (the warning threshold is 30 min).',
@@ -73,7 +74,7 @@ describe('interrupted target boot', () => {
     expect(screen.getByRole('heading', { name: 'Target boot interrupted' })).toBeTruthy()
     expect(screen.getByText('20 s to 53 s')).toBeTruthy()
     expect(screen.getByText(/46 in 30 online hours over 7 days/)).toBeTruthy()
-    expect(screen.getByText(/Time sync 22 s after the new boot \(within 30 s\)/)).toBeTruthy()
+    expect(screen.getByText(/Time sync received 22 s after the new boot \(within 30 s\)/)).toBeTruthy()
     expect(screen.getByText(/None of 1 at MULTAN/)).toBeTruthy()
     expect(screen.getByText('Unknown')).toBeTruthy()
     expect(document.body.textContent).not.toMatch(/power suspected/i)
@@ -116,9 +117,49 @@ describe('interrupted target boot', () => {
       typed_confirmation: '2.7.5',
       password: 'local-step-up-value',
       override_stability_warnings: true,
+      stability_warnings_digest: 'a'.repeat(64),
+      resume_pending_deployments: 0,
     })
     expect(onChanged).toHaveBeenCalled()
     expect(notice).toHaveBeenCalledWith(expect.stringMatching(/2\.7\.5 attempt for Multan 02 is queued/))
+  })
+
+  it('says how many pending deployments the retry also resumes and confirms that number', async () => {
+    const fetchMock = vi.fn(async () => response({
+      campaign_id: 'campaign-multan-02', status: 'ACTIVE', deployment_id: 'retry-1',
+      retry_of: 'deployment-multan-02', connector_id: deployment.connector_id,
+      stability_warnings_overridden: [], resumed_pending_deployments: 2,
+    }))
+    vi.stubGlobal('fetch', fetchMock)
+    const onClose = vi.fn()
+    render(
+      <RetryTargetDialog
+        campaign={campaign}
+        deployment={{ ...deployment, retry: { ...deployment.retry!, stability_warnings: [], pending_deployments: 2 } }}
+        onClose={onClose}
+        onChanged={async () => undefined}
+        toast={{ notice: vi.fn() }}
+      />,
+    )
+    expect(screen.getByText(/also offers its 2 other pending deployments/)).toBeTruthy()
+    fireEvent.change(screen.getByLabelText('Audited reason'), { target: { value: 'Site replaced the ESP supply.' } })
+    fireEvent.change(screen.getByLabelText(/Type exact version/), { target: { value: '2.7.5' } })
+    fireEvent.change(screen.getByLabelText('Administrator password'), { target: { value: 'local-step-up-value' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Retry same target' }))
+    await waitFor(() => expect(onClose).toHaveBeenCalled())
+    const [, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit]
+    const body = JSON.parse(String(init.body))
+    expect(body.resume_pending_deployments).toBe(2)
+    expect(body.override_stability_warnings).toBe(false)
+    expect(body).not.toHaveProperty('stability_warnings_digest')
+  })
+
+  it('shows an inconsistent time sync without a figure', () => {
+    render(<RollbackEvidence diagnosis={{
+      ...diagnosis,
+      terminal: { time_sync_after_new_boot_seconds: null, answered_within_30_seconds: null, source: 'inconsistent' },
+    }} />)
+    expect(screen.getByText('Time sync timing inconsistent with the boot estimate')).toBeTruthy()
   })
 
   it('keeps the dialog open with the server refusal', async () => {

@@ -25,6 +25,11 @@ on:
         required: true
         default: false
         type: boolean
+      override_stability_warnings:
+        description: Owner override of ADD's ESP stability warnings (reset rate, short uptime)
+        required: true
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -83,4 +88,5 @@ jobs:
             -CanaryCampaignId '${{ inputs.canary_campaign_id }}' `
             -AdminPassword $env:ADD_ADMIN_PASSWORD `
             -BatchSize '${{ inputs.batch_size }}' `
-            -DeferOfflineZones:('${{ inputs.defer_offline_zones }}' -eq 'true')
+            -DeferOfflineZones:('${{ inputs.defer_offline_zones }}' -eq 'true') `
+            -OverrideStabilityWarnings:('${{ inputs.override_stability_warnings }}' -eq 'true')

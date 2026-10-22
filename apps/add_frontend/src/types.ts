@@ -257,6 +257,8 @@ export interface FirmwareScopePreview {
   excluded: Array<Pick<Device, 'connector_id' | 'display_name' | 'zone_id' | 'hardware_id' | 'connected' | 'firmware_version' | 'ota_state'> & { reason: string }>
   // Owner-overridable ESP reset-rate and uptime warnings; never part of the signed scope.
   stability_warnings?: FirmwareStabilityWarning[]
+  // An override must name this digest, so it covers exactly the warnings shown.
+  stability_warnings_digest?: string
 }
 
 export interface FirmwareStabilityWarning {
@@ -1176,7 +1178,13 @@ export interface FirmwareRollbackDiagnosis {
     reset_rate_per_online_hour: number
     days: number
   }
-  terminal?: { time_sync_after_new_boot_seconds: number | null; answered_within_30_seconds: boolean | null }
+  // ADD's receipt of the terminal's time sync: an upper bound on when it answered.
+  terminal?: {
+    time_sync_after_new_boot_seconds: number | null
+    answered_within_30_seconds: boolean | null
+    bound?: 'upper' | null
+    source?: 'received_at' | 'inconsistent' | null
+  }
   location_resets?: {
     location: string | null
     peers_checked: number
@@ -1193,6 +1201,9 @@ export interface FirmwareRetryView {
   interrupted_boots: number
   limit: number
   stability_warnings: FirmwareStabilityWarning[]
+  stability_warnings_digest?: string
+  // Other PENDING deployments that resuming the campaign also offers.
+  pending_deployments?: number
 }
 
 export interface FirmwareDeployment {

@@ -4,16 +4,19 @@ Evidence only. A boot count, online time or a neighbour's reset never names a
 cause: 2.6.x firmware does not report why it reset, so ADD cannot tell a
 crash from a brownout or an external power/EN reset. Telemetry is retained
 for settings.telemetry_retention_days (30), so a 7-day window is complete
-unless the connector was onboarded more recently.
+unless the connector was onboarded more recently. Reboots ADD itself caused
+(an OTA's READY_TO_BOOT restart, a dispatched ESP_REBOOT) are not resets.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 from datetime import datetime, timedelta
 
 from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
-from zk_add.models import Connector, DeviceTelemetry
+from zk_add.models import Connector, DeviceCommand, DeviceTelemetry
 from zk_add.time_utils import ensure_utc, utc_now
 
 HISTORY_DAYS = 7
@@ -28,6 +31,7 @@ PEER_RESET_WINDOW_SECONDS = 120
 # Seven days at the 15 s heartbeat is about 40,000 samples.
 SAMPLE_LIMIT = 200_000
 PAYLOAD_CHUNK = 500
+ESP_REBOOT_COMMAND = "ESP_REBOOT"
 
 
 def _versions_match(value: str | None, version: str | None) -> bool:
@@ -36,16 +40,9 @@ def _versions_match(value: str | None, version: str | None) -> bool:
     return bool(version) and match(value, version)
 
 
-def boot_history(session: Session, connector: Connector, *, until: datetime,
-                 firmware_version: str | None = None, days: int = HISTORY_DAYS) -> dict:
-    """Distinct boots and online time in [until - days, until].
-
-    resets counts every boot after the first one in the window: the first boot
-    may be a planned power-on and is not evidence of a reset. The rate divides
-    by at least one online hour so a handful of samples cannot inflate it.
-    """
-    until = ensure_utc(until)
-    since = until - timedelta(days=days)
+def _boot_sequence(session: Session, connector: Connector, *, since: datetime,
+                   until: datetime) -> tuple[list[dict], int]:
+    """Boots in [since, until] in order of their first sample, with online time and firmware."""
     rows = session.execute(
         select(DeviceTelemetry.id, DeviceTelemetry.boot_id, DeviceTelemetry.created_at)
         .where(DeviceTelemetry.connector_id == connector.id, DeviceTelemetry.created_at >= since,
@@ -58,30 +55,87 @@ def boot_history(session: Session, connector: Connector, *, until: datetime,
         created_at = ensure_utc(created_at)
         boot = boots.get(boot_id)
         if boot is None:
-            boots[boot_id] = {"first_id": row_id, "last_at": created_at, "online": 0.0}
+            boots[boot_id] = {"boot_id": boot_id, "first_id": row_id, "first_at": created_at,
+                              "last_at": created_at, "online": 0.0, "version": None}
             continue
         gap = (created_at - boot["last_at"]).total_seconds()
         if 0 <= gap <= ONLINE_GAP_SECONDS:
             boot["online"] += gap
         boot["last_at"] = created_at
-    if firmware_version and boots:
-        first_ids = [boot["first_id"] for boot in boots.values()]
-        versions: dict[int, str | None] = {}
-        for offset in range(0, len(first_ids), PAYLOAD_CHUNK):
-            for row_id, payload in session.execute(select(DeviceTelemetry.id, DeviceTelemetry.payload).where(
-                    DeviceTelemetry.id.in_(first_ids[offset:offset + PAYLOAD_CHUNK]))):
-                versions[row_id] = (payload or {}).get("firmware_version") if isinstance(payload, dict) else None
-        boots = {boot_id: boot for boot_id, boot in boots.items()
-                 if _versions_match(versions.get(boot["first_id"]), firmware_version)}
-    online_hours = sum(boot["online"] for boot in boots.values()) / 3600
-    resets = max(0, len(boots) - 1)
+    sequence = list(boots.values())
+    first_ids = [boot["first_id"] for boot in sequence]
+    versions: dict[int, str | None] = {}
+    for offset in range(0, len(first_ids), PAYLOAD_CHUNK):
+        for row_id, payload in session.execute(select(DeviceTelemetry.id, DeviceTelemetry.payload).where(
+                DeviceTelemetry.id.in_(first_ids[offset:offset + PAYLOAD_CHUNK]))):
+            versions[row_id] = (payload or {}).get("firmware_version") if isinstance(payload, dict) else None
+    for boot in sequence:
+        boot["version"] = versions.get(boot["first_id"])
+    return sequence, len(rows)
+
+
+def _add_reboots(session: Session, connector: Connector, *, since: datetime,
+                 until: datetime) -> list[tuple[datetime, str | None]]:
+    """Restarts ADD caused: READY_TO_BOOT reports (with the target booted next) and dispatched ESP_REBOOTs."""
+    from zk_add.ota import FirmwareDeployment, FirmwareEvent
+
+    reboots = [(ensure_utc(at), target) for at, target in session.execute(
+        select(FirmwareEvent.created_at, FirmwareDeployment.target_version)
+        .join(FirmwareDeployment, FirmwareDeployment.id == FirmwareEvent.deployment_id)
+        .where(FirmwareDeployment.connector_id == connector.id, FirmwareEvent.state == "READY_TO_BOOT",
+               FirmwareEvent.created_at >= since, FirmwareEvent.created_at <= until))]
+    reboots += [(ensure_utc(at), None) for at in session.scalars(
+        select(DeviceCommand.dispatched_at).where(
+            DeviceCommand.connector_id == connector.id, DeviceCommand.command_type == ESP_REBOOT_COMMAND,
+            DeviceCommand.dispatched_at.is_not(None), DeviceCommand.dispatched_at >= since,
+            DeviceCommand.dispatched_at <= until))]
+    return sorted(reboots, key=lambda item: item[0])
+
+
+def _between(reboots: list[tuple[datetime, str | None]], previous: dict, current: dict) -> list[str | None]:
+    return [target for at, target in reboots if previous["first_at"] <= at <= current["first_at"]]
+
+
+def _summarize(sequence: list[dict], reboots: list[tuple[datetime, str | None]], *, since: datetime,
+               until: datetime, days: int, firmware_version: str | None, samples: int) -> dict:
+    """resets counts a boot only when the boot before it ran the same firmware and ADD caused no
+    restart in between: the first boot of the window may be a planned power-on, and an OTA's own
+    restart, the target boot and its return are not resets of the firmware being measured."""
+    def matches(boot: dict) -> bool:
+        return not firmware_version or _versions_match(boot["version"], firmware_version)
+
+    resets = commanded = version_changes = 0
+    for previous, current in zip(sequence, sequence[1:]):
+        if not matches(current):
+            continue
+        if not matches(previous):
+            version_changes += 1
+        elif _between(reboots, previous, current):
+            commanded += 1
+        else:
+            resets += 1
+    counted = [boot for boot in sequence if matches(boot)]
+    online_hours = sum(boot["online"] for boot in counted) / 3600
     return {
         "window_started_at": since.isoformat(), "window_ended_at": until.isoformat(), "days": days,
-        "firmware_version": firmware_version, "boot_ids": len(boots), "resets": resets,
+        "firmware_version": firmware_version, "boot_ids": len(counted), "resets": resets,
+        "add_restarts_excluded": commanded, "firmware_changes_excluded": version_changes,
         "online_hours": round(online_hours, 2),
+        # At least one online hour, so a handful of samples cannot inflate it.
         "reset_rate_per_online_hour": round(resets / max(online_hours, 1.0), 3),
-        "samples": len(rows), "complete": len(rows) < SAMPLE_LIMIT,
+        "samples": samples, "complete": samples < SAMPLE_LIMIT,
     }
+
+
+def boot_history(session: Session, connector: Connector, *, until: datetime,
+                 firmware_version: str | None = None, days: int = HISTORY_DAYS) -> dict:
+    """Distinct boots, resets and online time in [until - days, until]."""
+    until = ensure_utc(until)
+    since = until - timedelta(days=days)
+    sequence, samples = _boot_sequence(session, connector, since=since, until=until)
+    reboots = _add_reboots(session, connector, since=since, until=until)
+    return _summarize(sequence, reboots, since=since, until=until, days=days,
+                      firmware_version=firmware_version, samples=samples)
 
 
 def current_uptime_seconds(session: Session, connector: Connector, *, now: datetime | None = None) -> int | None:
@@ -97,12 +151,25 @@ def current_uptime_seconds(session: Session, connector: Connector, *, now: datet
     return int(max(0.0, row.uptime_seconds + (now - ensure_utc(row.created_at)).total_seconds()))
 
 
+def _started_by_add(sequence: list[dict], reboots: list[tuple[datetime, str | None]], boot_id: str | None) -> bool:
+    """Whether ADD's own restart started this boot: an ESP_REBOOT, or an OTA whose target it runs."""
+    for previous, current in zip(sequence, sequence[1:]):
+        if current["boot_id"] == boot_id:
+            return any(target is None or _versions_match(current["version"], target)
+                       for target in _between(reboots, previous, current))
+    return False
+
+
 def stability_warnings(session: Session, connector: Connector, *, now: datetime | None = None) -> list[dict]:
     """Owner-overridable preflight warnings for one connector (A3); never a verdict."""
-    now = now or utc_now()
-    warnings = []
+    now = ensure_utc(now or utc_now())
+    since = now - timedelta(days=HISTORY_DAYS)
+    sequence, samples = _boot_sequence(session, connector, since=since, until=now)
+    reboots = _add_reboots(session, connector, since=since, until=now)
     version = connector.firmware_version
-    history = boot_history(session, connector, until=now, firmware_version=version)
+    history = _summarize(sequence, reboots, since=since, until=now, days=HISTORY_DAYS,
+                         firmware_version=version, samples=samples)
+    warnings = []
     rate = history["reset_rate_per_online_hour"]
     if rate > RESET_RATE_WARNING_PER_HOUR:
         warnings.append({
@@ -115,15 +182,22 @@ def stability_warnings(session: Session, connector: Connector, *, now: datetime 
                         f"{RESET_RATE_WARNING_PER_HOUR}/h)."),
         })
     uptime = current_uptime_seconds(session, connector, now=now)
-    if uptime is not None and uptime < MINIMUM_UPTIME_SECONDS:
+    if (uptime is not None and uptime < MINIMUM_UPTIME_SECONDS
+            and not _started_by_add(sequence, reboots, connector.boot_id)):
         warnings.append({
             "code": "ESP_UPTIME_SHORT", "connector_id": connector.connector_id,
             "display_name": connector.display_name, "uptime_seconds": uptime,
             "threshold_seconds": MINIMUM_UPTIME_SECONDS,
-            "message": (f"{connector.display_name}: the ESP has been up {uptime // 60} min "
-                        f"(the warning threshold is {MINIMUM_UPTIME_SECONDS // 60} min)."),
+            "message": (f"{connector.display_name}: the ESP has been up {uptime // 60} min since a reset ADD "
+                        f"did not cause (the warning threshold is {MINIMUM_UPTIME_SECONDS // 60} min)."),
         })
     return warnings
+
+
+def warnings_digest(warnings: list[dict]) -> str:
+    """Binds an owner's override to the warnings shown: which ESP, which rule; not the live figures."""
+    keys = sorted({(str(warning.get("connector_id")), str(warning.get("code"))) for warning in warnings})
+    return hashlib.sha256(json.dumps(keys, separators=(",", ":")).encode()).hexdigest()
 
 
 def location_peers(session: Session, connector: Connector) -> tuple[str | None, list[Connector]]:

@@ -18,6 +18,7 @@ from zk_add.device_health import (
     ROLLBACK_SLOT_RESIDUE,
     classify_led_latch,
     rollback_slot_residue_candidate,
+    rollback_slot_residue_history,
     rollback_slot_residue_latch,
     diagnostics_evidence,
     diagnostics_reporting,
@@ -304,16 +305,16 @@ def apply_ota_heartbeat_diagnostics(
         session, connector=connector, deployment=deployment, payload=payload,
     )
     if evidence is not None:
-        from zk_add.ota_interruption import TARGET_BOOT_INTERRUPTED, diagnose_return, interrupted_message
+        # The ESP's own BOOTLOADER_ROLLBACK report may have been recorded
+        # while this heartbeat was read: label and alert only a transition
+        # this heartbeat makes.
+        locked = session.scalar(select(FirmwareDeployment).where(FirmwareDeployment.id == deployment.id)
+                                .with_for_update().execution_options(populate_existing=True))
+        if locked is None or locked.status not in {"BOOTED_PENDING", "RECONCILING"}:
+            return
+        diagnosis = _diagnose_target_return(session, connector, deployment, evidence)
+        from zk_add.ota_interruption import TARGET_BOOT_INTERRUPTED, interrupted_message
 
-        # Evidence and classification read the deployment before it leaves
-        # BOOTED_PENDING; neither can start another attempt.
-        try:
-            diagnosis = diagnose_return(session, connector=connector, deployment=deployment,
-                                        return_evidence=evidence)
-        except (ArithmeticError, KeyError, TypeError, ValueError):
-            # Missing evidence never blocks the existing fail-closed return.
-            diagnosis = {"classification": "UNCLASSIFIED", "unclassified_reasons": ["EVIDENCE_UNAVAILABLE"]}
         interrupted = diagnosis["classification"] == TARGET_BOOT_INTERRUPTED
         rollback_code = TARGET_BOOT_INTERRUPTED if interrupted else "PREVIOUS_FIRMWARE_OBSERVED"
         rollback_message = interrupted_message(diagnosis) if interrupted else (
@@ -331,14 +332,8 @@ def apply_ota_heartbeat_diagnostics(
             error_code=rollback_code, error_message=rollback_message,
             event_details={"return_evidence": evidence, "diagnosis": diagnosis},
         )
-        connector.last_error_code = f"OTA_{rollback_code}"
-        connector.last_error_message = rollback_message
-        upsert_alert(
-            session, connector, code="OTA_DEVICE_ROLLED_BACK", severity="HIGH",
-            message=rollback_message, details={
-                **evidence, "classification": diagnosis["classification"], "diagnosis": diagnosis,
-            },
-        )
+        _flag_target_return(session, connector, code=rollback_code, message=rollback_message,
+                            evidence=evidence, diagnosis=diagnosis)
         return
 
     # A heartbeat for another target, or a heartbeat with no OTA evidence,
@@ -381,34 +376,41 @@ def apply_ota_heartbeat_diagnostics(
             and _local_boot_is_waiting(payload, release)):
         connector.ota_state = "UPDATING"
         return
-    from zk_add.ota_interruption import DOWNLOAD_RETRIES_EXHAUSTED, download_interruption
+    from zk_add.ota_interruption import download_interruption
 
     interruption = download_interruption(
         session, connector=connector, deployment=deployment, release=release,
         payload=payload, error_code=error_code, runtime_state=runtime_state,
     )
-    if interruption is not None and interruption["decision"] != "EXHAUSTED":
-        # 2.6.0-2.6.15 resume this deployment from their durable journal when
-        # it is offered again; the end-to-end signature and digest checks
-        # still gate boot selection.
+    if interruption is not None and interruption["decision"] in {"WAIT", "RETRY_SCHEDULED"}:
+        # 2.6.0-2.6.15 resume this deployment when it is offered again; the
+        # end-to-end signature and digest checks still gate boot selection.
         connector.ota_state = "UPDATING"
         return
-    bounded_bytes = min(
-        release.image_size,
-        max(deployment.bytes_written, ota.bytes_written),
-    )
     error_message = OTA_FAILURE_MESSAGES.get(
         error_code,
         "The ESP reported a fail-closed OTA error.",
     )
     if interruption is not None:
-        error_code, error_message = DOWNLOAD_RETRIES_EXHAUSTED, interruption["message"]
+        error_code, error_message = interruption["error_code"], interruption["message"]
+    fail_ota_deployment(
+        session, connector=connector, deployment=deployment, error_code=error_code,
+        error_message=error_message, runtime_state=runtime_state,
+        bytes_written=min(release.image_size, max(deployment.bytes_written, ota.bytes_written)),
+    )
+
+
+def fail_ota_deployment(session: Session, *, connector: Connector, deployment, error_code: str,
+                        error_message: str, runtime_state: str, bytes_written: int | None = None) -> None:
+    """Fail an active deployment closed: FAILED, the campaign paused, the ESP's OTA blocked, an alert."""
+    from zk_add.ota import record_progress
+
     record_progress(
         session,
         connector=connector,
         deployment_public_id=deployment.deployment_id,
         state="FAILED",
-        bytes_written=bounded_bytes,
+        bytes_written=deployment.bytes_written if bytes_written is None else bytes_written,
         error_code=error_code,
         error_message=error_message,
     )
@@ -427,6 +429,88 @@ def apply_ota_heartbeat_diagnostics(
             "target_version": deployment.target_version,
         },
     )
+
+
+def _diagnose_target_return(session: Session, connector: Connector, deployment, evidence: dict) -> dict:
+    """Classification and rollback evidence; missing evidence never blocks the fail-closed return."""
+    from zk_add.ota_interruption import diagnose_return
+
+    try:
+        return diagnose_return(session, connector=connector, deployment=deployment, return_evidence=evidence)
+    except (ArithmeticError, KeyError, TypeError, ValueError):
+        return {"classification": "UNCLASSIFIED", "unclassified_reasons": ["EVIDENCE_UNAVAILABLE"]}
+
+
+def _flag_target_return(session: Session, connector: Connector, *, code: str, message: str,
+                        evidence: dict, diagnosis: dict) -> None:
+    connector.last_error_code = f"OTA_{code}"
+    connector.last_error_message = message
+    upsert_alert(
+        session, connector, code="OTA_DEVICE_ROLLED_BACK", severity="HIGH",
+        message=message, details={
+            **evidence, "classification": diagnosis["classification"], "diagnosis": diagnosis,
+        },
+    )
+
+
+def record_device_reported_return(
+    session: Session, *, connector: Connector, deployment_public_id: str, bytes_written: int,
+    running_version: str | None, running_partition: str | None, image_sha256: str | None,
+    error_code: str | None, error_message: str | None,
+):
+    """A 2.6.0-2.6.15 ESP's own ROLLED_BACK BOOTLOADER_ROLLBACK report from an unconfirmed target boot.
+
+    The same evidence and classification as the heartbeat-inferred return, so
+    which of the two reaches ADD first no longer decides the label, the alert
+    or the owner's retry. None when the report is outside that scope: the
+    caller records it unchanged. Raises ReturnEvidencePending (a 409 the ESP
+    repeats every 60 s) while the return boot has sent no heartbeat yet, for
+    at most RETURN_REPORT_WAIT_SECONDS after the target's last report.
+    """
+    from zk_add.ota import FirmwareDeployment, FirmwareRelease, _versions_match, record_progress
+    from zk_add.ota_interruption import (
+        TARGET_BOOT_INTERRUPTED,
+        ReturnEvidencePending,
+        device_return_evidence,
+        interrupted_message,
+        return_in_scope,
+        return_report_may_wait,
+    )
+
+    if connector.firmware_family != "zkt" or (error_code or "").strip().upper() != "BOOTLOADER_ROLLBACK":
+        return None
+    deployment = session.scalar(select(FirmwareDeployment).where(
+        FirmwareDeployment.deployment_id == deployment_public_id,
+        FirmwareDeployment.connector_id == connector.id,
+    ).with_for_update().execution_options(populate_existing=True))
+    if (deployment is None or deployment.status != "BOOTED_PENDING"
+            or not _versions_match(running_version, deployment.previous_version)
+            or _versions_match(running_version, deployment.target_version)
+            or not return_in_scope(deployment, session.get(FirmwareRelease, deployment.release_id))):
+        return None
+    evidence = device_return_evidence(session, connector=connector, deployment=deployment)
+    if evidence is None:
+        if return_report_may_wait(session, deployment):
+            raise ReturnEvidencePending(
+                "RETURN_EVIDENCE_PENDING: ADD records this return once the return boot's first heartbeat "
+                "arrives; repeat the report.")
+        return None
+    diagnosis = _diagnose_target_return(session, connector, deployment, evidence)
+    interrupted = diagnosis["classification"] == TARGET_BOOT_INTERRUPTED
+    code = TARGET_BOOT_INTERRUPTED if interrupted else "BOOTLOADER_ROLLBACK"
+    message = interrupted_message(diagnosis) if interrupted else (
+        error_message or "The ESP reported that its bootloader returned to the previous firmware before the "
+        "new image was confirmed; the reset cause was not reported. The campaign remains paused for review.")
+    record_progress(
+        session, connector=connector, deployment_public_id=deployment.deployment_id,
+        state="ROLLED_BACK", bytes_written=bytes_written, running_version=running_version,
+        running_partition=running_partition, image_sha256=image_sha256,
+        error_code=code, error_message=message,
+        event_details={"return_evidence": evidence, "diagnosis": diagnosis,
+                       "device_error_code": "BOOTLOADER_ROLLBACK", "device_error_message": error_message},
+    )
+    _flag_target_return(session, connector, code=code, message=message, evidence=evidence, diagnosis=diagnosis)
+    return deployment
 
 
 def user_snapshot_state_hash(snapshot: UserSnapshotRequest) -> str:
@@ -789,12 +873,21 @@ def apply_firmware_diagnostics(session: Session, connector: Connector, payload: 
                       resolution={"kind": "CONDITION_CLEARED"}, touch_last_seen=False)
     latch = classify_led_latch(payload.led_state, evidence, storage_verified=storage_verified,
                                workers_verified=workers_verified, firmware_version=connector.firmware_version)
+    residue_history = None
     if latch is None and rollback_slot_residue_candidate(evidence, connector.firmware_version):
         from zk_add.ota_interruption import rollback_slot_residue_record
 
-        # Every device gate held; the latch also needs ADD's own record that a
-        # 2.7.x download wrote the other slot after the last 2.6.15 install.
-        latch = rollback_slot_residue_latch(rollback_slot_residue_record(session, connector))
+        # Every device gate held on this boot; the latch also needs ADD's own
+        # record that a 2.7.x download wrote the other slot after the last
+        # 2.6.15 install, and no storage I/O fault on the ESP's earlier boots.
+        residue_record = rollback_slot_residue_record(session, connector)
+        if residue_record:
+            durability = open_alert_row(session, connector, "ESP_DURABILITY_FAULT")
+            cached = (durability.details or {}).get("residue_history") if durability is not None else None
+            # Earlier boots cannot change, so one check per boot suffices.
+            residue_history = (cached if isinstance(cached, dict) and cached.get("boot_id") == connector.boot_id
+                               else rollback_slot_residue_history(session, connector, now=now))
+        latch = rollback_slot_residue_latch(residue_record, residue_history)
     for code, failed, verified, message in (
         ("ESP_DURABILITY_FAULT", storage_failed, storage_verified,
          "Attendance preservation needs recovery; connectivity alone does not confirm durable storage."),
@@ -818,6 +911,8 @@ def apply_firmware_diagnostics(session: Session, connector: Connector, payload: 
                 "boot_first_seen_at": previous["boot_first_seen_at"] if same_boot else now.isoformat(),
                 "evidence": record,
                 **({"latch": latch} if latch and code == "ESP_DURABILITY_FAULT" else {}),
+                **({"residue_history": residue_history}
+                   if residue_history and code == "ESP_DURABILITY_FAULT" else {}),
             })
         elif verified:
             resolution = {"kind": "VERIFIED"}

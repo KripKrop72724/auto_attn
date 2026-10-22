@@ -917,6 +917,11 @@ class TemporaryAdminLease(Base):
 
 class DeviceTelemetry(Base):
     __tablename__ = "add_device_telemetry"
+    # Time-window reads for one ESP (reset history, rollback evidence, peer
+    # resets) without scanning its whole 30-day retention.
+    __table_args__ = (
+        Index("ix_add_device_telemetry_connector_created", "connector_id", "created_at"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     connector_id: Mapped[int] = mapped_column(ForeignKey("add_connectors.id"), index=True)

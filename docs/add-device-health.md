@@ -99,27 +99,41 @@ minutes earlier.
 - **Rollback-slot residue.** Signed 2.6.15 checks at boot (`zone_lite.c:3196`)
   that the other OTA slot holds a qualified predecessor. Any 2.7.x download
   writes that slot, so every later 2.6.15 boot reports
-  `STORAGE_DIRECT_ROLLBACK_IMAGE_UNQUALIFIED`, never verifies persistence and
-  reports DEGRADED until a 2.7.x install succeeds. `ESP_DURABILITY_FAULT` and
-  `ESP_LOCAL_FAILURE` become a gating WARNING with error code
-  `OTA_ROLLBACK_SLOT_RESIDUE` ("persistence unverified - OTA rollback slot
-  residue") only when all of these hold: firmware 2.6.15 with application
+  `STORAGE_DIRECT_ROLLBACK_IMAGE_UNQUALIFIED`, never runs its persistence
+  probe and reports DEGRADED until a 2.7.x install succeeds. Zero I/O counters
+  on such a boot are therefore not a passed probe. `ESP_DURABILITY_FAULT` and
+  `ESP_LOCAL_FAILURE` get error code `OTA_ROLLBACK_SLOT_RESIDUE`
+  ("persistence unverified - OTA rollback slot residue ... persistence probe
+  not run") only when all of these hold: firmware 2.6.15 with application
   digest `832c0c3d...`, LED source exactly `zone_lite.c:3196` (and no later
   source), that upgrade error, `recovery_complete` true, every write, read,
-  probe and legacy counter 0, no error code or operation, no fault class, and
-  ADD's own record that a 2.7.x deployment wrote bytes after the ESP's last
-  successful 2.6.15 install. Any I/O failure removes the latch and keeps
-  DEGRADED. Holds are unchanged.
-- **Interrupted target boot.** A heartbeat-observed return to the previous
-  firmware is labelled `TARGET_BOOT_INTERRUPTED` (error code
+  probe and legacy counter 0, no error code or operation and no fault class on
+  this boot; no storage I/O fault in the last reported counters of any earlier
+  boot in the last 14 days; and ADD's own record that a 2.7.x deployment wrote
+  bytes after this ESP's last successful 2.6.15 install (a connector row is one
+  ESP: a replacement is a new connector). Its tier follows the latched-LED
+  policy: `2.6.15:zone_lite.c:3196` is in the default
+  `ADD_DEVICE_HEALTH_LATCHED_LED_SOURCES`, so it is shown at
+  `ADD_DEVICE_HEALTH_LATCHED_LED_TIER` (WARNING); remove it to keep DEGRADED.
+  Any I/O failure removes the latch. Holds are unchanged: the alert stays open
+  and gating.
+- **Interrupted target boot.** For a 2.6.0-2.6.15 ESP, a return to the
+  previous firmware is labelled `TARGET_BOOT_INTERRUPTED` (error code
   `OTA_TARGET_BOOT_INTERRUPTED`) when the new image never reported
-  confirmation, `RUNTIME_HEALTHY` or a failure, and ran at most 5 minutes.
-  Otherwise it stays `PREVIOUS_FIRMWARE_OBSERVED`. Both record the rollback
-  evidence: the target's estimated lifetime and last progress report, any
-  target-boot logs and heartbeats, the ESP's resets per online hour on the old
-  firmware over 7 days, the terminal's first time sync after the new boot, other
-  ESP resets at the same location within ±120 s and whether a reconcile was
-  running. The evidence never names a cause.
+  confirmation, `RUNTIME_HEALTHY` or a failure, and ran less than 5 minutes.
+  ADD reads the same evidence whether it saw the return in two heartbeats or
+  the ESP reported `ROLLED_BACK BOOTLOADER_ROLLBACK` first (that report waits,
+  with a 409 the ESP repeats every 60 s, up to 10 minutes for the return
+  boot's first heartbeat). Otherwise the return stays
+  `PREVIOUS_FIRMWARE_OBSERVED` (heartbeats) or `BOOTLOADER_ROLLBACK` (the
+  ESP's report). Returns to 2.4.12, 2.5.2, 2.6.16+ or 2.7.x, and targets with
+  their own return evidence (journal bridges, 2.7.0, recovery images, 2.7.6)
+  are never classified. The evidence records the target's estimated lifetime
+  and last progress report, any target-boot logs and heartbeats, the ESP's
+  resets per online hour on the old firmware over 7 days (restarts ADD caused
+  excluded), when ADD received the terminal's first time sync after the new
+  boot (an upper bound), other ESP resets at the same location within ±120 s
+  and whether a reconcile was running. The evidence never names a cause.
 
 ## Evidence ADD records
 

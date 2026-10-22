@@ -99,9 +99,11 @@ export function RollbackEvidence({ diagnosis }: { diagnosis: FirmwareRollbackDia
               <dt>Terminal after the reset</dt>
               <dd>
                 {terminal.time_sync_after_new_boot_seconds === null
-                  ? 'No time sync observed'
-                  : `Time sync ${terminal.time_sync_after_new_boot_seconds} s after the new boot${
-                      terminal.answered_within_30_seconds ? ' (within 30 s)' : ''
+                  ? terminal.source === 'inconsistent'
+                    ? 'Time sync timing inconsistent with the boot estimate'
+                    : 'No time sync observed'
+                  : `Time sync received ${terminal.time_sync_after_new_boot_seconds} s after the new boot${
+                      terminal.answered_within_30_seconds ? ' (within 30 s)' : ' (an upper bound)'
                     }`}
               </dd>
             </div>
@@ -143,6 +145,7 @@ export function RetryTargetDialog({
   toast: Toast
 }) {
   const warnings = deployment.retry?.stability_warnings || []
+  const pending = deployment.retry?.pending_deployments ?? 0
   const [reason, setReason] = useState('')
   const [confirmation, setConfirmation] = useState('')
   const [password, setPassword] = useState('')
@@ -167,6 +170,10 @@ export function RetryTargetDialog({
           typed_confirmation: confirmation,
           password,
           override_stability_warnings: override,
+          ...(override && deployment.retry?.stability_warnings_digest
+            ? { stability_warnings_digest: deployment.retry.stability_warnings_digest }
+            : {}),
+          resume_pending_deployments: pending,
         }),
       })
       setPassword('')
@@ -195,12 +202,20 @@ export function RetryTargetDialog({
           <div>
             <h3>One new attempt, through every admission check.</h3>
             <p>
-              The ESP reset before it confirmed the new image. Retry only after checking its power
-              and reset history; {deployment.retry?.limit ?? 2} interrupted boots of one release stop
-              retries until a UART capture is taken.
+              The ESP reset before it confirmed the new image. Retry only after checking its power,
+              its reset history and that its queue still delivers;{' '}
+              {deployment.retry?.limit ?? 2} interrupted boots of one release stop retries until a
+              UART capture is taken.
             </p>
           </div>
         </div>
+        {pending > 0 && (
+          <div className="message pattern-waiting" role="status">
+            <Icon name="info" />
+            Retrying resumes the campaign, which also offers its {pending} other pending
+            deployment{pending === 1 ? '' : 's'}, one at a time before this retry.
+          </div>
+        )}
         <StabilityWarnings warnings={warnings} override={override} onOverride={setOverride} />
         <label>
           Audited reason

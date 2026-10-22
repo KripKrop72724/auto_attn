@@ -64,9 +64,13 @@ class AddSettings(BaseSettings):
     restart_loop_boots: int = Field(default=4, ge=3, le=50)
     # A 2.6.15 LED latch from these lock-contention sources, with zero I/O
     # errors and verified storage in the same sample, is shown at this tier.
-    # The alert stays OPEN, HIGH and gating either way.
+    # zone_lite.c:3196 is the OTA rollback-slot residue latch: it also needs
+    # ADD's record of the 2.7.x download and 14 clean days of earlier boots.
+    # Remove a source to keep it DEGRADED. The alert stays OPEN, HIGH and
+    # gating either way.
     device_health_latched_led_tier: Literal["DEGRADED", "WARNING"] = "WARNING"
-    device_health_latched_led_sources: str = "2.6.15:add_connector.c:3764,2.6.15:add_connector.c:3787"
+    device_health_latched_led_sources: str = (
+        "2.6.15:add_connector.c:3764,2.6.15:add_connector.c:3787,2.6.15:zone_lite.c:3196")
     # The stranded-alert cleanup still needs a signed preview, a password
     # step-up and a typed confirmation; false disables its apply step.
     device_health_cleanup_apply_enabled: bool = True
