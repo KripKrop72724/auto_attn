@@ -31,7 +31,8 @@ from zk_add.hikvision_reconciliation import (
     terminal_answering,
 )
 from zk_add.db import Base
-from zk_add.models import AttendanceEvent, Connector, ReconciliationJob, ZKTDevice
+from zk_add.models import AttendanceEvent, Connector, OrdsOutbox, ReconciliationJob, ZKTDevice
+from zk_add.reconciliation import serialize_job
 from zk_add.settings import settings
 from zk_add.time_utils import utc_now
 
@@ -143,6 +144,11 @@ def attendance_serials(session):
     return sorted(row.sequence for row in session.scalars(select(AttendanceEvent)))
 
 
+def history_serials(session):
+    return {int(row.source_event_id) for row in session.scalars(select(HikvisionEvidence).where(
+        HikvisionEvidence.channel == "HISTORY"))}
+
+
 @pytest.mark.parametrize("exclusive", [False, True])
 def test_tail_resumes_after_the_poll_anchor_and_keeps_following(db, exclusive):
     session, connector = db
@@ -159,8 +165,11 @@ def test_tail_resumes_after_the_poll_anchor_and_keeps_following(db, exclusive):
     drive(session, connector, job, terminal_log(ANCHOR + 95), exclusive=exclusive)
     data = session.get(HikvisionReconciliationState, job.id).data
     assert data["caught_up"] and data["last_serial"] == ANCHOR + 95
-    # Every distinct serial read once: the overlap (20, or 19 when exclusive) plus 95 new.
-    assert data["records"] == 95 + (19 if exclusive else 20) and data["anchor_returned"] is True
+    # Every distinct serial read once. Only the 95 after the anchor are new;
+    # the re-read overlap (20, or 19 when exclusive) is reported apart.
+    assert data["records"] == 95 and data["overlap_records"] == (19 if exclusive else 20)
+    assert job.scanned_count == 95 + data["overlap_records"] and data["anchor_returned"] is True
+    assert data["boundary_serial"] == ANCHOR - (18 if exclusive else 19) and data["stepbacks"] == 0
     assert data["fact_conflicts"] == 0 and not job.review_required
     # The re-read overlap is deduplicated; only the 95 new punches became attendance.
     new = list(range(ANCHOR + 1, ANCHOR + 96))
@@ -209,7 +218,7 @@ def test_unretained_resume_point_is_a_safety_hold(db, log):
     assert job.status == "NEEDS_ATTENTION" and job.error_code == "TAIL_RESUME_POINT_NOT_RETAINED"
     # Raw custody of what the terminal returned is kept; the resume point never advances.
     data = session.get(HikvisionReconciliationState, job.id).data
-    assert data["last_serial"] is None and data["pages"] == 0 and "request" not in data
+    assert data["last_serial"] is None and data["records"] == 0 and "request" not in data
 
 
 def test_disordered_or_out_of_scope_page_is_a_safety_hold(db):
@@ -259,23 +268,98 @@ def test_twice_executed_open_ended_request_is_acknowledged_without_rewinding(db)
     assert message["request"]["AcsEventCond"]["beginSerialNo"] == ANCHOR - 19
 
 
-def test_tail_ends_without_certification_once_the_esp_poll_works_again(db):
+def poll_health(**overrides):
+    return {"hikvision_health": {"poll_error": 0, "poll_stage": "events", "poll_http_status": 200,
+                                 "consecutive_poll_failures": 0, "last_successful_poll_epoch": 1792600000,
+                                 "durable_poll_cursor": ANCHOR + 10, **overrides}}
+
+
+def follow(session, connector, job, last):
+    expire_follow_interval(session, job)
+    drive(session, connector, job, terminal_log(last))
+
+
+def test_tail_ends_without_certification_only_on_proof_the_esp_poll_works_again(db):
     session, connector = db
     job = tail_job(session, connector)
     drive(session, connector, job, terminal_log(ANCHOR + 10))
     terminal = connector.zkt_device
-    terminal.capability_profile = {"hikvision_health": {"poll_error": 0, "durable_poll_cursor": ANCHOR + 12}}
-    expire_follow_interval(session, job)
-    drive(session, connector, job, terminal_log(ANCHOR + 11))
+    terminal.last_seen_at = utc_now()
+    terminal.capability_profile = poll_health()
+    follow(session, connector, job, ANCHOR + 10)
+    # One successful poll observed is not two.
+    assert job.status == "RUNNING"
+    terminal.capability_profile = poll_health(last_successful_poll_epoch=1792600010)
+    follow(session, connector, job, ANCHOR + 10)
+    # Two successful polls, but none has delivered a record past the stall yet.
+    assert job.status == "RUNNING"
+    held_by_poll(session, connector, [ANCHOR + 11])
+    terminal.capability_profile = poll_health(last_successful_poll_epoch=1792600020,
+                                              durable_poll_cursor=ANCHOR + 12)
+    follow(session, connector, job, ANCHOR + 11)
     # The ESP cursor is ahead of what the tail holds: ending now could leave a gap.
     assert job.status == "RUNNING"
-    expire_follow_interval(session, job)
-    drive(session, connector, job, terminal_log(ANCHOR + 14))
+    terminal.capability_profile = poll_health(last_successful_poll_epoch=1792600030,
+                                              durable_poll_cursor=ANCHOR + 12)
+    follow(session, connector, job, ANCHOR + 12)
     assert job.status == "COMPLETED" and job.completion_outcome == "LIVE_POLL_RESTORED"
     assert not job.capture_certificate and not job.capture_certified_at and not job.oracle_certificate
     state = session.get(HikvisionReconciliationState, job.id).data
     assert tail_operator_status(job, state)[0] == "TAIL_RECOVERY_ENDED"
     assert assignment(session, job, connector) is None
+    summary = serialize_job(session, job)
+    assert summary["assurance_outcome"] == "NOT_CERTIFIED"
+    assert summary["terminal"]["cutoff_serial"] is None and summary["recent_tail"]["coverage_certified"] is False
+
+
+@pytest.mark.parametrize("health,seen_ago", [
+    # The heartbeat an ESP sends during the first poll after a boot: poll_error
+    # is its zero-initialised value and the cursor is the still-mismatching one.
+    ({"poll_error": 0, "poll_stage": "checkpoint", "poll_http_status": 0, "consecutive_poll_failures": 0,
+      "last_successful_poll_epoch": 0, "durable_poll_cursor": ANCHOR}, 0),
+    # Firmware without a failure counter never proves recovery.
+    ({"poll_error": 0, "poll_stage": "events", "poll_http_status": 200, "last_successful_poll_epoch": 1,
+      "durable_poll_cursor": ANCHOR}, 0),
+    # Still failing at the events stage (HIK_BINDING).
+    ({"poll_error": 6, "poll_stage": "events", "poll_http_status": 200, "consecutive_poll_failures": 3280,
+      "last_successful_poll_epoch": 0, "durable_poll_cursor": ANCHOR}, 0),
+    # A healthy-looking but stale heartbeat.
+    (poll_health()["hikvision_health"], 10_000),
+])
+def test_boot_failing_or_stale_health_never_ends_the_tail(db, health, seen_ago):
+    session, connector = db
+    job = tail_job(session, connector)
+    drive(session, connector, job, terminal_log(ANCHOR + 10))
+    held_by_poll(session, connector, [ANCHOR + 11])
+    terminal = connector.zkt_device
+    for step in range(4):
+        terminal.last_seen_at = utc_now() - timedelta(seconds=seen_ago)
+        epoch = health.get("last_successful_poll_epoch")
+        terminal.capability_profile = {"hikvision_health": {
+            **health, "last_successful_poll_epoch": epoch + step if epoch else epoch}}
+        follow(session, connector, job, ANCHOR + 11)
+    assert job.status == "RUNNING" and job.completion_outcome is None
+
+
+def test_ended_tail_reports_held_conflicts(db):
+    session, connector = db
+    job = tail_job(session, connector)
+    log = [record(s) for s in range(ANCHOR - 100, ANCHOR - 2)]
+    log += [record(s, employee="00222", time="2026-10-19T07:10:00+05:00") for s in range(ANCHOR - 2, ANCHOR + 12)]
+    drive(session, connector, job, log)
+    held_by_poll(session, connector, [ANCHOR + 13])
+    terminal = connector.zkt_device
+    log += [record(ANCHOR + 12, employee="00222", time="2026-10-19T07:10:00+05:00")]
+    for step in range(2):
+        terminal.last_seen_at = utc_now()
+        terminal.capability_profile = poll_health(last_successful_poll_epoch=1792600000 + step,
+                                                  durable_poll_cursor=ANCHOR + 12)
+        expire_follow_interval(session, job)
+        drive(session, connector, job, log)
+    assert job.status == "COMPLETED" and job.review_required
+    summary = serialize_job(session, job)
+    assert summary["assurance_outcome"] == "NOT_CERTIFIED"
+    assert "3 changed terminal serial(s) remain held for source review" in summary["operator_message"]
 
 
 def test_resume_point_uses_only_gap_free_custody(db):
@@ -300,16 +384,30 @@ def test_resume_point_uses_only_gap_free_custody(db):
     # move the resume point past them.
     held_by_poll(session, connector, range(700, 706))
     assert recent_tail_scope(session, connector)["anchor_serial"] == 101
-    # An earlier tail job's contiguous progress does move it.
-    job = ReconciliationJob(connector_id=connector.id, zkt_device_id=connector.zkt_device.id, actor="t",
-                            reason="t", idempotency_key="old-tail", request_digest="c" * 64,
-                            terminal_serial="terminal", mode=MODE, status="CANCELLED")
-    session.add(job)
-    session.flush()
-    session.add(HikvisionReconciliationState(job_id=job.id, source_epoch="verified-epoch",
-                                             data={"scope": TAIL_SCOPE, "last_serial": 450}))
-    session.flush()
-    assert recent_tail_scope(session, connector)["anchor_serial"] == 450
+    # An earlier break is listed for the operator; only a full audit covers it.
+    held_by_poll(session, connector, [50])
+    scope = recent_tail_scope(session, connector)
+    assert scope["anchor_serial"] == 101 and scope["earlier_breaks"] == [50]
+    assert scope["poll_top_serial"] == 705
+
+    def old_tail(key, begin, last):
+        job = ReconciliationJob(connector_id=connector.id, zkt_device_id=connector.zkt_device.id, actor="t",
+                                reason="t", idempotency_key=key, request_digest="c" * 64,
+                                terminal_serial="terminal", mode=MODE, status="CANCELLED")
+        session.add(job)
+        session.flush()
+        session.add(HikvisionReconciliationState(job_id=job.id, source_epoch="verified-epoch",
+                                                 data={"scope": TAIL_SCOPE, "begin_serial": begin,
+                                                       "last_serial": last}))
+        session.flush()
+
+    # A tail job that began after the resume point does not bridge the gap.
+    old_tail("late-tail", 300, 900)
+    assert recent_tail_scope(session, connector)["anchor_serial"] == 101
+    # One that read contiguously from at or before it does move it, and then
+    # the later one continues from there.
+    old_tail("old-tail", 82, 450)
+    assert recent_tail_scope(session, connector)["anchor_serial"] == 900
 
 
 def test_preflight_treats_an_anchor_mismatch_terminal_as_answering(db, monkeypatch):
@@ -327,12 +425,15 @@ def test_preflight_treats_an_anchor_mismatch_terminal_as_answering(db, monkeypat
         "poll_error": 6, "poll_stage": "events", "poll_http_status": 200}}
     result = preflight(session, connector)
     assert terminal_answering(terminal)
-    assert result["ready_now"] and result["recent_tail"] == {
-        "eligible": True, "anchor_serial": ANCHOR, "begin_serial": ANCHOR - 19, "reason": None}
+    # Only the recent tail may run against it: a certifying audit still waits.
+    assert not result["ready_now"] and result["waitable_blockers"][0]["code"] == "WAITING_FOR_DEVICE"
+    assert result["recent_tail"] == {"eligible": True, "ready_now": True, "anchor_serial": ANCHOR,
+                                     "begin_serial": ANCHOR - 19, "earlier_breaks": [], "reason": None}
+    assert preflight(session, connector, TAIL_SCOPE)["ready_now"]
     # An unreachable terminal (network timeout) still waits.
     terminal.capability_profile = {"hikvision_health": {
         "poll_error": 2, "poll_stage": "identity", "poll_http_status": 0}}
-    assert preflight(session, connector)["waitable_blockers"][0]["code"] == "WAITING_FOR_DEVICE"
+    assert preflight(session, connector, TAIL_SCOPE)["waitable_blockers"][0]["code"] == "WAITING_FOR_DEVICE"
     terminal.capability_profile = {"hikvision_health": {
         "poll_error": 6, "poll_stage": "events", "poll_http_status": 200}}
     terminal.last_seen_at = utc_now() - timedelta(seconds=settings.offline_after_seconds + 5)
@@ -344,7 +445,7 @@ def test_preflight_treats_an_anchor_mismatch_terminal_as_answering(db, monkeypat
                                   terminal_serial="terminal", mode=MODE, status="RUNNING"))
     session.flush()
     assert preflight(session, connector)["recent_tail"] == {
-        "eligible": False, "anchor_serial": None, "begin_serial": None,
+        "eligible": False, "ready_now": False, "anchor_serial": None, "begin_serial": None, "earlier_breaks": [],
         "reason": "Finish or cancel this device's active reconciliation first."}
 
 
@@ -397,7 +498,7 @@ def test_following_tail_holds_no_scan_slot_and_skips_backlog_pause(db, monkeypat
 
 
 def test_create_and_serialize_recent_tail_job(db, monkeypatch):
-    from zk_add.reconciliation import _hikvision_tail_job, create_reconciliation_job, serialize_job
+    from zk_add.reconciliation import create_reconciliation_job, hikvision_tail_job
 
     session, connector = db
     monkeypatch.setattr(settings, "reconciliation_enabled", True)
@@ -409,7 +510,7 @@ def test_create_and_serialize_recent_tail_job(db, monkeypatch):
         create_reconciliation_job(session, **{**args, "confirmation": "RECONCILE d FROM START"})
     job = create_reconciliation_job(session, **args)
     session.commit()
-    assert _hikvision_tail_job(session, job)
+    assert hikvision_tail_job(session, job)
     summary = serialize_job(session, job)
     assert summary["scope"] == TAIL_SCOPE
     assert summary["recent_tail"]["anchor_serial"] == ANCHOR
@@ -418,3 +519,181 @@ def test_create_and_serialize_recent_tail_job(db, monkeypatch):
     connector.firmware_family = "zkt"
     with pytest.raises(ValueError, match="Hikvision"):
         create_reconciliation_job(session, **{**args, "idempotency_key": "zkt-tail"})
+
+
+def test_reuse_below_the_resume_point_steps_back_until_a_held_record_matches(db):
+    # The terminal lost 30 unsaved events and reused serials from ANCHOR-29:
+    # the 20-record overlap alone would never read ANCHOR-29..ANCHOR-20.
+    session, connector = db
+    job = tail_job(session, connector, poll_serials=range(ANCHOR - 100, ANCHOR + 1))
+    log = [record(s) for s in range(ANCHOR - 100, ANCHOR - 29)]
+    log += [record(s, employee="00333", time="2026-10-19T07:10:00+05:00") for s in range(ANCHOR - 29, ANCHOR + 41)]
+    drive(session, connector, job, log)
+    data = session.get(HikvisionReconciliationState, job.id).data
+    assert data["stepbacks"] == 1 and data["boundary_serial"] == ANCHOR - 39
+    assert set(range(ANCHOR - 29, ANCHOR - 19)) <= history_serials(session)
+    assert data["fact_conflicts"] == 30 and job.review_required and job.status == "RUNNING"
+    # Only serials after the anchor are new records.
+    assert data["records"] == 40 and data["overlap_records"] == 40
+
+
+def test_reuse_without_a_matching_record_within_the_bound_is_a_safety_hold(db):
+    session, connector = db
+    job = tail_job(session, connector, poll_serials=range(ANCHOR - 300, ANCHOR + 1))
+    log = [record(s, employee="00333", time="2026-10-19T07:10:00+05:00") for s in range(ANCHOR - 400, ANCHOR + 5)]
+    for _ in range(20):
+        message = assignment(session, job, connector)
+        if message is None:
+            break
+        apply_page(session, connector, reply(message, log))
+        if job.status == "NEEDS_ATTENTION":
+            break
+    data = session.get(HikvisionReconciliationState, job.id).data
+    assert job.error_code == "TAIL_REUSE_BEFORE_RESUME_POINT" and data["stepbacks"] == 10
+    assert data["last_serial"] is None and data["records"] == 0
+
+
+def test_zero_new_records_is_reported_as_zero(db):
+    # Nothing after the anchor (or new punches numbered below the resume
+    # point): the doc's "escalate a zero-record catch-up" check must fire.
+    session, connector = db
+    job = tail_job(session, connector)
+    drive(session, connector, job, terminal_log(ANCHOR))
+    data = session.get(HikvisionReconciliationState, job.id).data
+    assert data["caught_up"] and data["records"] == 0 and data["overlap_records"] == 20
+    summary = serialize_job(session, job)
+    assert summary["recent_tail"]["records"] == 0 and summary["recent_tail"]["overlap_records"] == 20
+    assert "with 0 new record(s) after serial 597801" in summary["operator_message"]
+
+
+def test_oracle_confirmed_versions_keep_their_status_when_a_serial_was_reused(db):
+    session, connector = db
+    job = tail_job(session, connector)
+    confirmed_at = utc_now()
+    for event in session.scalars(select(AttendanceEvent)):
+        event.ords_status, event.oracle_confirmed_at = "CONFIRMED", confirmed_at
+    for outbox in session.scalars(select(OrdsOutbox)):
+        outbox.status = "CONFIRMED"
+    session.flush()
+    log = [record(s) for s in range(ANCHOR - 100, ANCHOR - 7)]
+    log += [record(s, employee="00222", time="2026-10-19T07:10:00+05:00") for s in range(ANCHOR - 7, ANCHOR + 5)]
+    drive(session, connector, job, log)
+    data = session.get(HikvisionReconciliationState, job.id).data
+    held = session.scalars(select(AttendanceEvent).where(AttendanceEvent.sequence >= ANCHOR - 7,
+                                                         AttendanceEvent.sequence <= ANCHOR)).all()
+    assert {row.ords_status for row in held} == {"CONFIRMED"}
+    assert {row.status for row in session.scalars(select(OrdsOutbox).where(
+        OrdsOutbox.attendance_event_id.in_([row.id for row in held])))} == {"CONFIRMED"}
+    # The conflict itself stays recorded for review on both evidence rows.
+    assert data["fact_conflicts"] == 8 and data["confirmed_conflicts"] == 8
+    assert "already confirmed in Oracle and keep that status" in job.error_message
+    assert session.scalar(select(func.count()).select_from(HikvisionEvidence).where(
+        HikvisionEvidence.disposition == "SOURCE_FACT_CONFLICT")) == 16
+
+
+def test_new_tail_punches_use_the_current_reconcile_lane(db):
+    session, connector = db
+    job = tail_job(session, connector)
+    drive(session, connector, job, terminal_log(ANCHOR + 3))
+    lanes = dict(session.execute(select(AttendanceEvent.sequence, OrdsOutbox.delivery_type).join(
+        OrdsOutbox, OrdsOutbox.attendance_event_id == AttendanceEvent.id)).all())
+    assert {lanes[s] for s in range(ANCHOR + 1, ANCHOR + 4)} == {"CURRENT_RECONCILE"}
+    assert {lanes[s] for s in range(ANCHOR - 30, ANCHOR + 1)} == {"LIVE"}
+
+
+def test_idle_follow_pages_add_no_rows_and_a_late_replay_keeps_its_records(db):
+    from zk_add.hikvision_reconciliation import HikvisionReconciliationPage
+
+    session, connector = db
+    job = tail_job(session, connector)
+    drive(session, connector, job, terminal_log(ANCHOR + 10))
+    pages = session.scalar(select(func.count()).select_from(HikvisionReconciliationPage))
+    progress = job.last_progress_at
+    expire_follow_interval(session, job)
+    idle = assignment(session, job, connector)
+    apply_page(session, connector, reply(idle, terminal_log(ANCHOR + 10)))
+    data = session.get(HikvisionReconciliationState, job.id).data
+    assert session.scalar(select(func.count()).select_from(HikvisionReconciliationPage)) == pages
+    assert job.last_progress_at == progress and data["last_page_at"] and data["pages"] > 0
+    # The ESP's queued second copy of that request runs after a new punch.
+    assert apply_page(session, connector, reply(idle, terminal_log(ANCHOR + 11)))["durable"]
+    assert ANCHOR + 11 in history_serials(session)
+    assert session.get(HikvisionReconciliationState, job.id).data["last_serial"] == ANCHOR + 10
+    # A malformed replay is acknowledged but nothing out of scope is kept.
+    bad = reply(idle, terminal_log(ANCHOR + 12))
+    bad["response"]["AcsEvent"]["searchID"] = "other"
+    assert apply_page(session, connector, bad)["durable"]
+    assert ANCHOR + 12 not in history_serials(session)
+
+
+def answering(connector):
+    connector.connected = connector.active = True
+    terminal = connector.zkt_device
+    terminal.online, terminal.last_seen_at = False, utc_now()
+    terminal.capability_profile = {"hikvision_health": {
+        "poll_error": 6, "poll_stage": "events", "poll_http_status": 200}}
+
+
+def test_catch_up_is_paced_while_the_history_backlog_is_over_its_limit(db, monkeypatch):
+    from zk_add.reconciliation import assignment_rows
+
+    session, connector = db
+    monkeypatch.setattr(settings, "reconciliation_enabled", True)
+    job = tail_job(session, connector)
+    answering(connector)
+    session.add(OrdsOutbox(delivery_type="FULL_HISTORY", status="PENDING"))
+    monkeypatch.setattr(settings, "reconciliation_history_backlog_pause", 1)
+    [(_, message)] = assignment_rows(session)
+    apply_page(session, connector, reply(message, terminal_log(ANCHOR + 95)))
+    # One page per follow interval while ORDS drains history.
+    assert assignment_rows(session) == [] and job.phase == "SCANNING_TERMINAL"
+    state = session.get(HikvisionReconciliationState, job.id)
+    state.data = {**state.data, "last_page_at": (utc_now() - timedelta(seconds=16)).isoformat()}
+    session.flush()
+    [(_, message)] = assignment_rows(session)
+    apply_page(session, connector, reply(message, terminal_log(ANCHOR + 95)))
+    # Without a backlog the catch-up is not paced.
+    monkeypatch.setattr(settings, "reconciliation_history_backlog_pause", 10)
+    assert [m["job_id"] for _, m in assignment_rows(session)] == [job.job_id]
+
+
+def test_attendance_repair_never_waits_on_a_recent_tail(db):
+    from types import SimpleNamespace
+
+    from zk_add.attendance_repair import RepairError, _attach_source_dependency
+
+    session, connector = db
+    job = tail_job(session, connector)
+    job.status = "RUNNING"
+    session.flush()
+    with pytest.raises(RepairError) as raised:
+        _attach_source_dependency(session, job=SimpleNamespace(), connector=connector)
+    assert raised.value.code == "SOURCE_DEPENDENCY_UNAVAILABLE" and job.job_id in str(raised.value)
+
+
+def test_resume_point_query_at_production_volume(db):
+    # BLD1 holds hundreds of thousands of POLL records; the dialog's preflight
+    # must still answer quickly on PostgreSQL.
+    import time
+
+    session, connector = db
+    if session.bind.dialect.name != "postgresql":
+        pytest.skip("PostgreSQL volume check")
+    policy(session, connector)
+    session.execute(text("""
+        INSERT INTO add_hikvision_evidence (connector_id, terminal_serial, source_epoch, observation_sha256,
+            event_uid, immutable_digest, source_event_id, channel, disposition, raw_encrypted, captured_epoch,
+            created_at)
+        SELECT :connector, 'terminal', 'verified-epoch', md5(s::text) || md5((s + 1)::text),
+               substr(md5('uid' || s::text) || md5('uid2' || s::text), 1, 64), md5('facts' || s::text),
+               s::text, 'POLL', 'ATTENDANCE', 'x', 1792500000, now()
+        FROM generate_series(1, 300000) AS s
+        WHERE s NOT IN (150000, 299000)
+    """), {"connector": connector.id})
+    session.execute(text("ANALYZE add_hikvision_evidence"))
+    started = time.monotonic()
+    scope = recent_tail_scope(session, connector)
+    elapsed = time.monotonic() - started
+    assert scope["anchor_serial"] == 298999 and scope["earlier_breaks"] == [149999]
+    assert elapsed < 10, elapsed
+    print(f"resume-point query over 300k POLL rows: {elapsed:.2f}s")

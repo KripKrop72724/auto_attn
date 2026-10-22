@@ -181,10 +181,10 @@ def _active_or_new_source_epoch(
     return epoch
 
 
-def preflight_reconciliation(session: Session, connector: Connector) -> dict:
+def preflight_reconciliation(session: Session, connector: Connector, scope: str | None = None) -> dict:
     if connector.firmware_family == "hikvision":
         from zk_add.hikvision_reconciliation import preflight
-        return preflight(session, connector)
+        return preflight(session, connector, scope)
     hard: list[dict[str, str]] = []
     waitable: list[dict[str, str]] = []
     zkt = connector.zkt_device
@@ -378,7 +378,7 @@ def create_reconciliation_job(
         "ACTIVE_USERS": "ACTIVE USERS", "RECENT_TAIL": "RECENT TAIL"}.get(scope, "FROM START")
     if confirmation != expected:
         raise ValueError(f"Type {expected} exactly to confirm this operation.")
-    preflight = preflight_reconciliation(session, connector)
+    preflight = preflight_reconciliation(session, connector, scope)
     if preflight["hard_blockers"]:
         raise ValueError(preflight["hard_blockers"][0]["message"])
     active = session.scalar(
@@ -2532,7 +2532,7 @@ def refresh_all_reconciliation_assurance(session: Session) -> list[dict]:
     return updates
 
 
-def _hikvision_tail_job(session: Session, job: ReconciliationJob) -> bool:
+def hikvision_tail_job(session: Session, job: ReconciliationJob) -> bool:
     if job.mode != "HIKVISION_SERIAL_HISTORY":
         return False
     from zk_add.hikvision_reconciliation import TAIL_SCOPE, HikvisionReconciliationState
@@ -2591,12 +2591,14 @@ def assignment_rows(session: Session) -> list[tuple[str, dict]]:
             else settings.reconciliation_history_backlog_pause
         )
         # A recent-tail job is a device's only capture path while its own poll
-        # is blocked; at one 20-record page per cycle it cannot flood ORDS.
-        if history_backlog >= backlog_limit and not _hikvision_tail_job(session, job):
+        # is blocked, and its new punches use the current-reconcile lane. It is
+        # not paused by the history backlog; its catch-up is paced instead.
+        tail = hikvision_tail_job(session, job)
+        if history_backlog >= backlog_limit and not tail:
             job.phase = "WAITING_FOR_SAFE_WINDOW"
             job.wait_reason = "HISTORY_BACKLOG_BACKPRESSURE"
             continue
-        preflight = preflight_reconciliation(session, connector)
+        preflight = preflight_reconciliation(session, connector, "RECENT_TAIL" if tail else None)
         if preflight["hard_blockers"]:
             _safety_hold(
                 session,
@@ -2620,7 +2622,7 @@ def assignment_rows(session: Session) -> list[tuple[str, dict]]:
             continue
         if job.mode == "HIKVISION_SERIAL_HISTORY":
             from zk_add.hikvision_reconciliation import tail_waiting_to_follow
-            if tail_waiting_to_follow(session, job):
+            if tail_waiting_to_follow(session, job, paced=history_backlog >= backlog_limit):
                 continue
         if slots_owned >= slot_limit:
             job.phase = "WAITING_FOR_CAPACITY"
@@ -3015,7 +3017,9 @@ def serialize_job(session: Session, job: ReconciliationJob, *, include_events: b
                                 "chain_digest": checkpoint.get("chain_digest"),
                                 "last_progress_at": job.last_progress_at}
         result["recovery"]["source_epoch_id"] = hik_state.source_epoch if hik_state else None
-        result["terminal"].update(first_serial=source.get("first_serial"), cutoff_serial=source.get("last_serial"))
+        # A recent tail's last serial is how far it has read, not a certified cutoff.
+        result["terminal"].update(first_serial=source.get("first_serial"),
+                                  cutoff_serial=None if result["scope"] == "RECENT_TAIL" else source.get("last_serial"))
     if include_events:
         result["events"] = [
             {"state": row.state, "details": row.details, "created_at": row.created_at}
@@ -3661,6 +3665,10 @@ def _assurance_outcome(job: ReconciliationJob) -> str | None:
 
     if job.status != "COMPLETED":
         return "REVIEW_REQUIRED" if job.status == "NEEDS_ATTENTION" else None
+    if job.completion_outcome == "LIVE_POLL_RESTORED":
+        # A Hikvision recent tail ends when the ESP poll recovers; it never
+        # certifies source coverage or Oracle membership.
+        return "NOT_CERTIFIED"
     if job.completion_outcome == "CERTIFIED_WITH_CORRECTED_SOURCE_EXCEPTIONS":
         return "COMPLETED_WITH_CORRECTIONS"
     if job.completion_outcome == "COMPLETED_WITH_IDENTITY_HOLDS":

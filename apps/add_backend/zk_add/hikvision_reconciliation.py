@@ -41,6 +41,11 @@ TAIL_PHASE = "TAIL"
 TAIL_OVERLAP_RECORDS = 20
 TAIL_PAGE_RECORDS = 20
 TAIL_FOLLOW_SECONDS = 15
+# A first page whose earliest record ADD did not hold with the same facts steps
+# back one page at a time, at most this often, to find where continuity holds.
+TAIL_MAX_STEPBACKS = 10
+TAIL_LISTED_BREAKS = 5
+TAIL_RECENT_REQUESTS = 4
 MAX_SOURCE_SERIAL = 3_000_000_000
 # This exact profile must pass the live employee-filter/serial-seek qualification.
 EMPLOYEE_FILTER_PROFILE = "ds-k1t342efwx-v3.3.5-220310-poll5-pilot-v1"
@@ -190,40 +195,59 @@ def _poll_custody(model, connector, policy) -> tuple:
     )
 
 
-def _gap_free_tail_serial(session, connector, policy) -> int | None:
-    """The highest serial ADD holds through gap-free custody for this source.
+def _poll_breaks(session, connector, policy) -> tuple[int | None, list[int]]:
+    """ADD's newest POLL serial and the serials after which its next one is missing.
+
+    The poll reads every event serial in order, so a missing next serial below
+    its newest record means its checkpoint restarted further on (a reinstalled
+    or reset ESP starts at the terminal's newest records). Newest break first.
+    """
+    serial = cast(HikvisionEvidence.source_event_id, BigInteger)
+    top = session.scalar(select(func.max(serial)).where(*_poll_custody(HikvisionEvidence, connector, policy)))
+    if not top:
+        return None, []
+    following = aliased(HikvisionEvidence)
+    breaks = session.scalars(select(serial).distinct().where(
+        *_poll_custody(HikvisionEvidence, connector, policy),
+        serial < top,
+        ~exists().where(*_poll_custody(following, connector, policy),
+                        cast(following.source_event_id, BigInteger) == serial + 1),
+    ).order_by(serial.desc()).limit(TAIL_LISTED_BREAKS + 1)).all()
+    return int(top), [int(value) for value in breaks]
+
+
+def _tail_resume(session, connector, policy) -> tuple[int | None, list[int], int | None]:
+    """The resume point, the earlier POLL breaks it leaves behind, and ADD's newest POLL serial.
 
     Only the ESP's checkpointed POLL channel and earlier tail jobs qualify. A
     live stream can drop events while disconnected, and employee-filtered
     history is not contiguous, so neither may move the resume point forward.
-    The poll reads every event serial in order, so a missing next serial below
-    its newest record means its checkpoint restarted further on (a reinstalled
-    or reset ESP starts at the terminal's newest records). Resume at the latest
-    such break: anything after it may never have been read.
+    Resume at the latest POLL break: anything after it may never have been
+    read. Earlier breaks are listed for the operator; only a full terminal audit
+    covers them.
     """
-    serial = cast(HikvisionEvidence.source_event_id, BigInteger)
-    top = session.scalar(select(func.max(serial)).where(*_poll_custody(HikvisionEvidence, connector, policy)))
-    best = None
-    if top:
-        following = aliased(HikvisionEvidence)
-        broken = session.scalar(select(func.max(serial)).where(
-            *_poll_custody(HikvisionEvidence, connector, policy),
-            serial < top,
-            ~exists().where(*_poll_custody(following, connector, policy),
-                            cast(following.source_event_id, BigInteger) == serial + 1),
-        ))
-        best = int(broken if broken else top)
+    top, breaks = _poll_breaks(session, connector, policy)
+    if not top:
+        return None, [], None
+    best = breaks[0] if breaks else top
+    spans = []
     for data, epoch, serial in session.execute(
         select(HikvisionReconciliationState.data, HikvisionReconciliationState.source_epoch,
                ReconciliationJob.terminal_serial)
         .join(HikvisionReconciliationState, HikvisionReconciliationState.job_id == ReconciliationJob.id)
         .where(ReconciliationJob.connector_id == connector.id, ReconciliationJob.mode == MODE)
     ).all():
-        last = (data or {}).get("last_serial")
-        if ((data or {}).get("scope") == TAIL_SCOPE and epoch == policy.source_epoch
-                and serial == policy.terminal_serial and type(last) is int and last > 0):
-            best = max(best or 0, last)
-    return best
+        data = data or {}
+        begin, last = data.get("begin_serial"), data.get("last_serial")
+        if (data.get("scope") == TAIL_SCOPE and epoch == policy.source_epoch and serial == policy.terminal_serial
+                and type(begin) is int and type(last) is int and 0 < begin <= last):
+            spans.append((begin, last))
+    # An earlier tail job read every serial from its begin to its last, so it
+    # extends custody only when it began at or before the current resume point.
+    for begin, last in sorted(spans):
+        if begin <= best + 1 and last > best:
+            best = last
+    return best, [value for value in breaks[1:] if value < best][:TAIL_LISTED_BREAKS], top
 
 
 def recent_tail_scope(session, connector) -> dict:
@@ -232,26 +256,38 @@ def recent_tail_scope(session, connector) -> dict:
     if (not policy or not policy.enabled or not policy.source_epoch or not terminal
             or policy.terminal_serial != terminal.confirmed_serial):
         raise ValueError("Approve the Hikvision source profile first.")
-    anchor = _gap_free_tail_serial(session, connector, policy)
+    anchor, earlier_breaks, top = _tail_resume(session, connector, policy)
     if not anchor:
         raise ValueError(
             "ADD holds no checkpointed live-poll record for this terminal; use a full terminal audit instead."
         )
+    cursor = ((terminal.capability_profile or {}).get("hikvision_health") or {}).get("durable_poll_cursor")
     return {
         "scope": TAIL_SCOPE,
         "phase": TAIL_PHASE,
         "anchor_serial": anchor,
         "begin_serial": max(1, anchor - TAIL_OVERLAP_RECORDS + 1),
+        "earlier_breaks": earlier_breaks,
+        # Proof that the ESP poll works again needs a POLL record beyond
+        # everything it (or its queue) could have read before it stalled.
+        "poll_top_serial": max(top or 0, cursor if type(cursor) is int else 0, anchor),
+        "boundary_serial": None,
+        "stepbacks": 0,
         "last_serial": None,
         "last_facts": None,
         "pages": 0,
         "records": 0,
+        "overlap_records": 0,
         "fact_conflicts": 0,
+        "confirmed_conflicts": 0,
         "continuity_conflicts": 0,
         "anchor_returned": None,
         "caught_up": False,
         "caught_up_at": None,
         "follow_after": None,
+        "last_page_at": None,
+        "poll_ok_epoch": None,
+        "recent_requests": [],
     }
 
 
@@ -260,8 +296,78 @@ def _immutable_facts(row: dict) -> list:
             row.get("employeeNoString") or None, row.get("time")]
 
 
-def _apply_tail_page(session, connector, job, data, request, page, rows, count, total, evidence_ids):
-    """One open-ended serial page. Validation failures raise CoverageError."""
+def _held_before(session, evidence_id, fresh: bool) -> str:
+    """CONFLICT, MATCHED (ADD already held these exact facts) or NEW."""
+    evidence = session.get(HikvisionEvidence, evidence_id) if evidence_id else None
+    if evidence is None or evidence.event_uid is None:
+        return "NEW"
+    if evidence.disposition == "SOURCE_FACT_CONFLICT":
+        return "CONFLICT"
+    if not fresh:
+        return "MATCHED"
+    earlier = session.scalar(select(HikvisionEvidence.id).where(
+        HikvisionEvidence.connector_id == evidence.connector_id,
+        HikvisionEvidence.event_uid == evidence.event_uid,
+        HikvisionEvidence.id != evidence.id,
+        HikvisionEvidence.immutable_digest == evidence.immutable_digest,
+    ).limit(1))
+    return "MATCHED" if earlier else "NEW"
+
+
+def _live_poll_restored(session, connector, data, now) -> bool:
+    """Positive proof that the ESP's own checkpointed poll captures again.
+
+    A heartbeat sent before the first poll after an ESP boot reports
+    poll_error 0 (its zero-initialised value) with the loaded, still
+    mismatching cursor, so poll_error alone proves nothing. This needs a fresh
+    heartbeat showing a successful events-stage poll with no failures, a
+    successful-poll time that advanced since an earlier check (two separate
+    successful polls), a durable cursor this job already covers, and a POLL
+    record beyond anything the stalled poll could have read.
+    """
+    from zk_add.settings import settings
+
+    terminal = connector.zkt_device
+    health = ((terminal.capability_profile or {}) if terminal else {}).get("hikvision_health") or {}
+    seen_at = terminal.last_seen_at if terminal else None
+    epoch = health.get("last_successful_poll_epoch")
+    healthy = (
+        seen_at is not None
+        and 0 <= (now - ensure_utc(seen_at)).total_seconds() <= settings.offline_after_seconds
+        and health.get("poll_error") == 0
+        and health.get("poll_stage") in {"events", "checkpoint_commit"}
+        and health.get("poll_http_status") == 200
+        and health.get("consecutive_poll_failures") == 0
+        and type(epoch) is int and epoch > 0
+    )
+    if not healthy:
+        data["poll_ok_epoch"] = None
+        return False
+    previous = data.get("poll_ok_epoch")
+    if type(previous) is not int or epoch < previous:
+        data["poll_ok_epoch"] = epoch
+        return False
+    if epoch == previous:
+        return False
+    cursor = health.get("durable_poll_cursor")
+    if not (type(cursor) is int and data.get("last_serial") and 0 < cursor <= data["last_serial"]):
+        return False
+    policy = session.get(HikvisionPolicy, connector.id)
+    if not policy:
+        return False
+    serial = cast(HikvisionEvidence.source_event_id, BigInteger)
+    return session.scalar(select(HikvisionEvidence.id).where(
+        *_poll_custody(HikvisionEvidence, connector, policy),
+        serial > (data.get("poll_top_serial") or data["anchor_serial"]),
+    ).limit(1)) is not None
+
+
+def _apply_tail_page(session, connector, job, data, request, page, rows, count, total, evidence_ids, fresh):
+    """One open-ended serial page. Validation failures raise CoverageError.
+
+    Returns True for an idle follow page (caught up, nothing new), which needs
+    no page row and is not progress.
+    """
     begin, end = request["beginSerialNo"], request["endSerialNo"]
     status = page.get("responseStatusStrg")
     complete = count == total
@@ -274,112 +380,152 @@ def _apply_tail_page(session, connector, job, data, request, page, rows, count, 
         if type(serial) is not int or not begin <= serial <= end or serial <= previous:
             raise CoverageError("SERIAL_REUSE_ORDER_OR_SCOPE_CONFLICT")
         previous = serial
+    now = utc_now()
+    data["pages"] = data.get("pages", 0) + 1
+    data["last_page_at"] = now.isoformat()
     last = data.get("last_serial")
+    anchor = data["anchor_serial"]
     if last is None:
         # The first page must still show the serials ADD resumed from. An empty
         # or later-starting answer means the terminal no longer retains them
         # (cleared, replaced or renumbered): continuity cannot be shown.
-        anchor = data["anchor_serial"]
         if not rows or rows[0]["serialNo"] > anchor:
             raise CoverageError("TAIL_RESUME_POINT_NOT_RETAINED")
+        # Its earliest record must be one ADD already held with the same facts.
+        # Otherwise the terminal may have reused serials from below the resume
+        # point, and new punches there would never be read: step back a page.
+        if _held_before(session, evidence_ids[0], fresh[0]) != "MATCHED":
+            if data.get("stepbacks", 0) >= TAIL_MAX_STEPBACKS or data["begin_serial"] <= 1:
+                raise CoverageError("TAIL_REUSE_BEFORE_RESUME_POINT")
+            data["stepbacks"] = data.get("stepbacks", 0) + 1
+            data["begin_serial"] = max(1, data["begin_serial"] - TAIL_PAGE_RECORDS)
+            data["follow_after"] = None
+            return False
+        data["boundary_serial"] = rows[0]["serialNo"]
         data["anchor_returned"] = any(row["serialNo"] == anchor for row in rows)
     elif rows and rows[0]["serialNo"] == last and _immutable_facts(rows[0]) != data.get("last_facts"):
         # Inclusive terminals return the predecessor again. Changed facts mean
         # the serial was reused; the evidence layer already holds both records.
         data["continuity_conflicts"] = data.get("continuity_conflicts", 0) + 1
-    # evidence_ids is aligned with rows. Count each serial once: an inclusive
-    # terminal returns the previous page's last record again.
-    new_ids = [evidence_id for row, evidence_id in zip(rows, evidence_ids)
-               if evidence_id and (last is None or row["serialNo"] > last)]
-    conflicts = session.scalar(select(func.count(HikvisionEvidence.id)).where(
+    # Count each serial once: an inclusive terminal returns the previous page's
+    # last record again. Re-read serials up to the anchor are not new punches.
+    high_water = last if last is not None else -1
+    first_read = [(row, evidence_id) for row, evidence_id in zip(rows, evidence_ids)
+                  if row["serialNo"] > high_water]
+    if not complete and not first_read:
+        raise CoverageError("TAIL_PAGE_NO_PROGRESS")
+    overlap = sum(1 for row, _ in first_read if row["serialNo"] <= anchor)
+    new_ids = [evidence_id for _, evidence_id in first_read if evidence_id]
+    conflicted = session.scalars(select(HikvisionEvidence.event_uid).where(
         HikvisionEvidence.id.in_(new_ids),
         HikvisionEvidence.disposition == "SOURCE_FACT_CONFLICT",
-    )) if new_ids else 0
-    if conflicts:
-        data["fact_conflicts"] = data.get("fact_conflicts", 0) + conflicts
+    )).all() if new_ids else []
+    if conflicted:
+        data["fact_conflicts"] = data.get("fact_conflicts", 0) + len(conflicted)
+        data["confirmed_conflicts"] = data.get("confirmed_conflicts", 0) + (session.scalar(
+            select(func.count(AttendanceEvent.id)).where(
+                AttendanceEvent.event_uid.in_([uid for uid in conflicted if uid]),
+                AttendanceEvent.oracle_confirmed_at.is_not(None),
+            )) or 0)
     if data.get("fact_conflicts") or data.get("continuity_conflicts"):
         job.review_required = True
+        confirmed = data.get("confirmed_conflicts", 0)
         job.error_message = (
             f"{data.get('fact_conflicts', 0) + data.get('continuity_conflicts', 0):,} terminal serial(s) "
             "now carry different facts than the record ADD already held; both versions are preserved "
             "and held for source review."
+            + (f" {confirmed:,} earlier version(s) were already confirmed in Oracle and keep that status."
+               if confirmed else "")
         )
-    new = [row for row in rows if last is None or row["serialNo"] > last]
     if rows:
-        data["last_serial"] = rows[-1]["serialNo"]
+        data["last_serial"] = max(rows[-1]["serialNo"], high_water)
         data["last_facts"] = _immutable_facts(rows[-1])
-    data["pages"] = data.get("pages", 0) + 1
-    data["records"] = data.get("records", 0) + len(new)
-    job.scanned_count = job.add_durable_count = data["records"]
-    now = utc_now()
+    data["overlap_records"] = data.get("overlap_records", 0) + overlap
+    data["records"] = data.get("records", 0) + len(first_read) - overlap
+    job.scanned_count = job.add_durable_count = data["overlap_records"] + data["records"]
     data["caught_up"] = complete
     if complete:
         data["caught_up_at"] = now.isoformat()
         data["follow_after"] = (now + timedelta(seconds=TAIL_FOLLOW_SECONDS)).isoformat()
     else:
         data["follow_after"] = None
-    terminal = connector.zkt_device
-    health = ((terminal.capability_profile or {}) if terminal else {}).get("hikvision_health") or {}
-    cursor = health.get("durable_poll_cursor")
-    if (complete and health.get("poll_error") == 0 and type(cursor) is int and data.get("last_serial")
-            and 0 < cursor <= data["last_serial"]):
+    if complete and _live_poll_restored(session, connector, data, now):
         # The ESP's own checkpointed poll works again and resumes at or below
         # what this job already holds, so ending here leaves no gap.
         data["phase"] = "SEALED"
         job.status = job.phase = "COMPLETED"
         job.completion_outcome = "LIVE_POLL_RESTORED"
         job.completed_at = now
+    return last is not None and not first_read
 
 
-def tail_waiting_to_follow(session, job) -> bool:
-    """A caught-up tail job between checks asks nothing of the ESP.
+def tail_waiting_to_follow(session, job, *, paced: bool = False) -> bool:
+    """A tail job between checks asks nothing of the ESP, so it holds no scan slot.
 
-    It therefore holds no device scan slot, so following one terminal's tail
-    for days never delays another device's reconciliation.
+    Following one terminal's tail for days therefore never delays another
+    device's reconciliation. While the ORDS history backlog is over its pause
+    limit (paced), a catch-up also reads at most one page per follow interval.
     """
     state = session.get(HikvisionReconciliationState, job.id)
     data = (state.data or {}) if state else {}
-    follow_after = data.get("follow_after")
-    if (data.get("scope") != TAIL_SCOPE or data.get("phase") == "SEALED" or data.get("request")
-            or not follow_after or parse_datetime(follow_after) <= utc_now()):
+    if data.get("scope") != TAIL_SCOPE or data.get("phase") == "SEALED" or data.get("request"):
         return False
-    job.status = "RUNNING"
-    job.phase = "FOLLOWING_TERMINAL_TAIL"
-    job.wait_reason = None
-    return True
+    now = utc_now()
+    follow_after = data.get("follow_after")
+    if follow_after and parse_datetime(follow_after) > now:
+        job.status = "RUNNING"
+        job.phase = "FOLLOWING_TERMINAL_TAIL"
+        job.wait_reason = None
+        return True
+    last_page_at = data.get("last_page_at")
+    if (paced and not data.get("caught_up") and last_page_at
+            and parse_datetime(last_page_at) + timedelta(seconds=TAIL_FOLLOW_SECONDS) > now):
+        job.status = "RUNNING"
+        job.phase = "SCANNING_TERMINAL"
+        job.wait_reason = None
+        return True
+    return False
 
 
 def tail_summary(data: dict) -> dict:
     return {
         "anchor_serial": data.get("anchor_serial"),
         "begin_serial": data.get("begin_serial"),
+        "boundary_serial": data.get("boundary_serial"),
+        "earlier_breaks": data.get("earlier_breaks") or [],
         "last_serial": data.get("last_serial"),
         "anchor_returned": data.get("anchor_returned"),
         "pages": data.get("pages", 0),
         "records": data.get("records", 0),
+        "overlap_records": data.get("overlap_records", 0),
         "fact_conflicts": data.get("fact_conflicts", 0),
+        "confirmed_conflicts": data.get("confirmed_conflicts", 0),
         "continuity_conflicts": data.get("continuity_conflicts", 0),
         "caught_up": bool(data.get("caught_up")),
         "caught_up_at": data.get("caught_up_at"),
+        "last_page_at": data.get("last_page_at"),
         "coverage_certified": False,
     }
 
 
 def tail_operator_status(job, data: dict) -> tuple[str, str] | None:
     """Tail jobs never certify coverage; never show the certified wording."""
+    held = data.get("fact_conflicts", 0) + data.get("continuity_conflicts", 0)
+    review = (f" {held:,} changed terminal serial(s) remain held for source review." if held else "")
     if job.status == "COMPLETED":
         return ("TAIL_RECOVERY_ENDED",
                 "Recent-tail recovery ended because the ESP's own checkpointed poll works again. "
-                "No full-history coverage was certified.")
+                "No full-history coverage was certified." + review)
     if job.status in {"RUNNING", "QUEUED"} and data.get("caught_up"):
         return ("FOLLOWING_TERMINAL_TAIL",
-                f"Caught up to terminal serial {data.get('last_serial')}; ADD checks for new punches every "
+                f"Caught up to terminal serial {data.get('last_serial')} with {data.get('records', 0):,} new "
+                f"record(s) after serial {data.get('anchor_serial')}; ADD checks for new punches every "
                 f"{TAIL_FOLLOW_SECONDS} seconds until it is cancelled or the ESP poll recovers. "
-                "No full-history coverage is certified.")
+                "No full-history coverage is certified." + review)
     return None
 
 
-def preflight(session, connector):
+def preflight(session, connector, scope=None):
     from zk_add.settings import settings
 
     hard, waiting = [], []
@@ -420,7 +566,11 @@ def preflight(session, connector):
                 "message": "Approve the Hikvision source profile first.",
             }
         )
-    if not connector.connected or not terminal or not (terminal.online or terminal_answering(terminal)):
+    # Only a recent tail may run against a terminal that answers the ESP but
+    # fails its saved-anchor check; every certifying scope needs it ONLINE.
+    answering = bool(terminal and (terminal.online or terminal_answering(terminal)))
+    if not connector.connected or not terminal or not (
+            terminal.online or (scope == TAIL_SCOPE and answering)):
         waiting.append(
             {"code": "WAITING_FOR_DEVICE", "message": "Waiting for the terminal and ESP."}
         )
@@ -444,10 +594,12 @@ def preflight(session, connector):
         if active_job is not None:
             raise ValueError("Finish or cancel this device's active reconciliation first.")
         tail = recent_tail_scope(session, connector)
-        tail_scope = {"eligible": not hard, "anchor_serial": tail["anchor_serial"],
-                      "begin_serial": tail["begin_serial"], "reason": None}
+        tail_scope = {"eligible": not hard, "ready_now": not hard and connector.connected and answering,
+                      "anchor_serial": tail["anchor_serial"], "begin_serial": tail["begin_serial"],
+                      "earlier_breaks": tail["earlier_breaks"], "reason": None}
     except ValueError as exc:
-        tail_scope = {"eligible": False, "anchor_serial": None, "begin_serial": None, "reason": str(exc)}
+        tail_scope = {"eligible": False, "ready_now": False, "anchor_serial": None, "begin_serial": None,
+                      "earlier_breaks": [], "reason": str(exc)}
     return {
         "active_user_history": active_scope,
         "recent_tail": tail_scope,
@@ -586,12 +738,21 @@ def apply_page(session: Session, connector, payload: dict):
             HikvisionReconciliationPage.job_id == job.id, HikvisionReconciliationPage.token == token
         )
     )
+    current = state.data or {}
+    if current.get("scope") == TAIL_SCOPE and token and token != current.get("token"):
+        recent = next((item for item in current.get("recent_requests") or [] if item.get("token") == token),
+                      None)
+        if old or recent:
+            # An open-ended tail request executed twice (the ESP keeps one
+            # queued copy) legitimately differs once new punches arrive. The
+            # first answer already moved the job on; keep the second answer's
+            # records as evidence without moving the job again.
+            if recent and (old is None or old.response_digest != digest):
+                _preserve_tail_replay(session, connector, job, state, recent["cond"], response)
+            return {"job_id": job.job_id, "token": token, "durable": True}
     if old:
-        if old.response_digest != digest and (state.data or {}).get("scope") != TAIL_SCOPE:
+        if old.response_digest != digest:
             raise ValueError("HIKVISION_PAGE_REPLAY_CONFLICT")
-        # An open-ended tail request executed twice (the ESP keeps one queued
-        # copy) legitimately differs once new punches arrive: the first answer
-        # already moved the job on, and the next page re-reads from its end.
         return {"job_id": job.job_id, "token": token, "durable": True}
     if job.status not in {"RUNNING", "QUEUED"}:
         raise ValueError("HIKVISION_JOB_NOT_RUNNABLE")
@@ -640,37 +801,21 @@ def apply_page(session: Session, connector, payload: dict):
         return {"job_id": job.job_id, "token": token, "durable": True}
     # Preserve raw observations before interpreting record fields. Invalid-time or
     # identity records remain evidenced and do not stop later valid source records.
-    for raw in (
-        [] if phase in {"SCOPE_FIRST", "SCOPE_LAST", "SCOPE_VERIFY", "SCOPE_EMPTY_VERIFY"} else rows
-    ):
-        text = json.dumps(raw, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
-        sha = hashlib.sha256(text.encode()).hexdigest()
-        preserve_observation(
-            session,
-            connector,
-            ObservationIn(
-                schema_version=1,
-                source_protocol="hikvision-isapi-v1",
-                terminal_serial=job.terminal_serial,
-                source_epoch=state.source_epoch,
-                observation_sha256=sha,
-                channel="HISTORY",
-                raw=text,
-                captured_epoch=int(utc_now().timestamp()),
-            ),
-        )
-        evidence_ids.append(
-            session.scalar(
-                select(HikvisionEvidence.id).where(
-                    HikvisionEvidence.connector_id == connector.id,
-                    HikvisionEvidence.observation_sha256 == sha,
-                )
-            )
-        )
+    evidence_ids, fresh = _preserve_rows(
+        session, connector, job, state,
+        [] if phase in {"SCOPE_FIRST", "SCOPE_LAST", "SCOPE_VERIFY", "SCOPE_EMPTY_VERIFY"} else rows,
+        current_after=data.get("anchor_serial") if phase == TAIL_PHASE else None,
+    )
     phase = data["phase"]
+    idle = False
+    if phase == TAIL_PHASE:
+        # A late second execution of this request is recognised by its token.
+        data["recent_requests"] = [*(data.get("recent_requests") or [])[-(TAIL_RECENT_REQUESTS - 1):],
+                                   {"token": token, "cond": request}]
     try:
         if phase == TAIL_PHASE:
-            _apply_tail_page(session, connector, job, data, request, page, rows, count, total, evidence_ids)
+            idle = _apply_tail_page(session, connector, job, data, request, page, rows, count, total,
+                                    evidence_ids, fresh)
         elif (
             phase in {"SCOPE_FIRST", "SCOPE_EMPTY_VERIFY"}
             and count == 0
@@ -824,19 +969,81 @@ def apply_page(session: Session, connector, payload: dict):
         data.pop("token", None)
         state.data = data
         job.next_retry_at = None
-        job.last_progress_at = utc_now()
-    session.add(
-        HikvisionReconciliationPage(
-            job_id=job.id,
-            token=token,
-            response_digest=digest,
-            evidence_ids=evidence_ids,
-            phase=phase,
+        if not idle:
+            job.last_progress_at = utc_now()
+    if not idle:
+        # An idle follow page (caught up, nothing new) adds no page row: a
+        # following tail would otherwise write one every 15 seconds for days.
+        # A late replay of it is still recognised through recent_requests.
+        session.add(
+            HikvisionReconciliationPage(
+                job_id=job.id,
+                token=token,
+                response_digest=digest,
+                evidence_ids=evidence_ids,
+                phase=phase,
+            )
         )
-    )
     session.flush()
     refresh_assurance(session, job)
     return {"job_id": job.job_id, "token": token, "durable": True}
+
+
+def _preserve_rows(session, connector, job, state, rows, *, current_after=None):
+    """Preserve each row as HISTORY evidence; returns evidence ids and whether each was new.
+
+    Tail records after the resume point are the terminal's current punches,
+    missed only because its own poll stalled; they use the current-reconcile
+    ORDS lane instead of queueing behind retained-history backfill.
+    """
+    evidence_ids, fresh = [], []
+    for raw in rows:
+        text = json.dumps(raw, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+        sha = hashlib.sha256(text.encode()).hexdigest()
+        lookup = select(HikvisionEvidence.id).where(
+            HikvisionEvidence.connector_id == connector.id,
+            HikvisionEvidence.observation_sha256 == sha,
+        )
+        existed = session.scalar(lookup)
+        serial = raw.get("serialNo") if isinstance(raw, dict) else None
+        current = current_after is not None and type(serial) is int and serial > current_after
+        preserve_observation(
+            session,
+            connector,
+            ObservationIn(
+                schema_version=1,
+                source_protocol="hikvision-isapi-v1",
+                terminal_serial=job.terminal_serial,
+                source_epoch=state.source_epoch,
+                observation_sha256=sha,
+                channel="HISTORY",
+                raw=text,
+                captured_epoch=int(utc_now().timestamp()),
+            ),
+            delivery_type="CURRENT_RECONCILE" if current else None,
+        )
+        evidence_ids.append(existed or session.scalar(lookup))
+        fresh.append(existed is None)
+    return evidence_ids, fresh
+
+
+def _preserve_tail_replay(session, connector, job, state, cond, response):
+    """Keep a second execution's records as evidence when they fit the original request."""
+    page = response.get("AcsEvent")
+    rows = page.get("InfoList") if isinstance(page, dict) else None
+    count = page.get("numOfMatches") if isinstance(page, dict) else None
+    if (not isinstance(rows, list) or type(count) is not int or count != len(rows)
+            or count > cond.get("maxResults", 0) or page.get("searchID") != cond.get("searchID")):
+        return
+    previous = cond["beginSerialNo"] - 1
+    for row in rows:
+        serial = row.get("serialNo") if isinstance(row, dict) else None
+        if type(serial) is not int or not cond["beginSerialNo"] <= serial <= cond["endSerialNo"] or serial <= previous:
+            return
+        previous = serial
+    _preserve_rows(session, connector, job, state, rows,
+                   current_after=(state.data or {}).get("anchor_serial"))
+    session.flush()
 
 
 def refresh_assurance(session, job):
