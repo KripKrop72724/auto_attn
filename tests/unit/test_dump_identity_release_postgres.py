@@ -1,7 +1,7 @@
 """PostgreSQL: the 0054 hold guard admits a dump row only with its retained interval."""
 
 import hashlib
-from datetime import timedelta
+from datetime import datetime, timedelta
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 
@@ -20,10 +20,13 @@ from zk_add.models import (
     AttendanceEvent,
     AttendanceIdentityHistory,
     AttendanceRecoveryJob,
+    AuditEvent,
     Connector,
     DeviceUser,
     OrdsOutbox,
+    TerminalRecordManifest,
 )
+from zk_add.reconciliation import _release_source_synced_attendance
 from zk_add.schemas import AttendanceEventIn, UserSnapshotRequest, UserSnapshotRow
 from zk_add.service import (
     DumpIdentityRelease,
@@ -32,6 +35,7 @@ from zk_add.service import (
     replace_user_snapshot,
     synced_cnic_identity_proven,
 )
+from zk_add.settings import settings
 from zk_add.time_utils import utc_now
 
 VERSIONS = Path(__file__).parents[2] / "apps/add_backend/migrations/versions"
@@ -46,6 +50,40 @@ EARLIER_GUARDS = (
 )
 DUMP_GUARD = "20261021_0054_identity_dump_auto_release.py"
 FP = "a" * 64
+ADMIN = "StateHealthAdmin"
+
+
+def _approve_whole_zone(db, zone, key, *, approved=None):
+    """The owner's check, page by page, then an approval of every group."""
+    first = backlog.preview_page(db, zone_id=zone, actor=ADMIN)
+    page, groups = first, {}
+    while True:
+        for group in page["groups"]:
+            entry = groups.setdefault(
+                (group["connector_id"], group["source"], group["age"]), [0, 0]
+            )
+            entry[0] += group["held"]
+            entry[1] += group["provable"]
+        if page["next_after_id"] is None:
+            break
+        page = backlog.preview_page(
+            db, zone_id=zone, actor=ADMIN, after_id=page["next_after_id"],
+            as_of=first["as_of"], until_id=first["until_id"],
+            window_hours=first["window_hours"],
+        )
+    approval = first["approval"]
+    return groups, backlog.create_release(
+        db, actor=ADMIN, zone_id=zone, reason="Owner backlog release",
+        typed_confirmation=f"RELEASE {zone}", idempotency_key=key,
+        scope=approval["scope"], expires_at=datetime.fromisoformat(approval["expires_at"]),
+        signature=approval["signature"],
+        groups=[
+            {"connector_id": connector_id, "source": source, "age": age}
+            for connector_id, source, age in groups
+        ],
+        approved_count=approved or max(1, sum(entry[1] for entry in groups.values())),
+        previewed_held=max(1, sum(entry[0] for entry in groups.values())),
+    )
 
 
 def _apply(engine, filename):
@@ -238,32 +276,36 @@ def test_dump_guard_admits_only_a_retained_interval_release(force_pg):
         assert event.ords_status == "PENDING" and not event.manual_release_required
 
 
-def test_snapshot_and_owner_backlog_release_pass_the_installed_guard(force_pg):
+def _snapshot(db, connector, key, observed_at):
+    replace_user_snapshot(
+        db, connector=connector,
+        snapshot=UserSnapshotRequest(
+            snapshot_id=key, complete=True, stable=True, observed_at=observed_at,
+            users=[UserSnapshotRow(
+                uid="7", user_id="1007", name="Test Person-3520212345671",
+                terminal_identity_fingerprint=FP,
+            )],
+        ),
+    )
+
+
+def _dump(seed, when, captured):
+    return AttendanceEventIn(
+        event_uid=hashlib.sha256(seed.encode()).hexdigest(), uid="7", user_id="1007",
+        terminal_serial="TEST-REPAIR-SERIAL", terminal_identity_fingerprint=FP,
+        device_event_time=when, captured_at=captured, source="DUMP_RECONNECT",
+        clock_quality="OK", punch=0, raw_event={"attendance_record_uid": "28943"},
+    )
+
+
+def test_snapshot_and_owner_backlog_release_pass_the_installed_guard(force_pg, monkeypatch):
+    monkeypatch.setattr(settings, "attendance_dump_identity_auto_release_zones", "*")
     sessions, _, _ = force_pg
     engine = sessions.kw["bind"]
     for filename in (*EARLIER_GUARDS, DUMP_GUARD):
         _apply(engine, filename)
     now = utc_now()
-
-    def snapshot(db, connector, key, observed_at):
-        replace_user_snapshot(
-            db, connector=connector,
-            snapshot=UserSnapshotRequest(
-                snapshot_id=key, complete=True, stable=True, observed_at=observed_at,
-                users=[UserSnapshotRow(
-                    uid="7", user_id="1007", name="Test Person-3520212345671",
-                    terminal_identity_fingerprint=FP,
-                )],
-            ),
-        )
-
-    def dump(seed, when, captured):
-        return AttendanceEventIn(
-            event_uid=hashlib.sha256(seed.encode()).hexdigest(), uid="7", user_id="1007",
-            terminal_serial="TEST-REPAIR-SERIAL", terminal_identity_fingerprint=FP,
-            device_event_time=when, captured_at=captured, source="DUMP_RECONNECT",
-            clock_quality="OK", punch=0, raw_event={"attendance_record_uid": "28943"},
-        )
+    snapshot, dump = _snapshot, _dump
 
     recent = dump("pg-recent", now - timedelta(minutes=20), now - timedelta(minutes=1))
     old = dump("pg-old", now - timedelta(days=4), now - timedelta(days=4) + timedelta(minutes=3))
@@ -300,12 +342,8 @@ def test_snapshot_and_owner_backlog_release_pass_the_installed_guard(force_pg):
 
     with sessions() as db:
         zone = db.scalar(select(Connector)).zone_id
-        preview = backlog.preview_page(db, zone_id=zone)
-        assert sum(g["provable"] for g in preview["groups"]) == 1
-        backlog.create_release(
-            db, actor="StateHealthAdmin", zone_id=zone, reason="Owner backlog release",
-            typed_confirmation=f"RELEASE {zone}", idempotency_key="pg-backlog-0001",
-        )
+        groups, _job = _approve_whole_zone(db, zone, "pg-backlog-0001")
+        assert sum(entry[1] for entry in groups.values()) == 1
         db.commit()
     # A snapshot transaction holding the row: the batch waits, never skips it.
     with sessions() as holder:
@@ -328,7 +366,124 @@ def test_snapshot_and_owner_backlog_release_pass_the_installed_guard(force_pg):
             db.commit()
     assert status(old.event_uid) == ("PENDING", False)
     with sessions() as db:
+        row = db.scalar(select(AttendanceEvent).where(AttendanceEvent.event_uid == old.event_uid))
+        outbox = db.scalar(select(OrdsOutbox).where(OrdsOutbox.attendance_event_id == row.id))
+        assert outbox.delivery_type == "FULL_HISTORY"
+        # Oracle acknowledges it; only then is the run finished.
+        row.ords_status = outbox.status = "ACKED"
+        db.commit()
+    with sessions() as db:
+        backlog.advance_once(db)
+        db.commit()
+    with sessions() as db:
         job = db.scalar(select(AttendanceRecoveryJob).where(
             AttendanceRecoveryJob.action == backlog.ACTION
         ))
-        assert job.status == "COMPLETED" and job.succeeded_count == 1
+        assert job.status == "COMPLETED"
+        assert backlog.serialize(db, job)["delivered"] == 1
+
+
+def test_a_snapshot_release_and_the_owner_batch_never_release_a_punch_twice(
+    force_pg, monkeypatch,
+):
+    monkeypatch.setattr(settings, "attendance_dump_identity_auto_release_zones", "*")
+    sessions, _, _ = force_pg
+    engine = sessions.kw["bind"]
+    for filename in (*EARLIER_GUARDS, DUMP_GUARD):
+        _apply(engine, filename)
+    now = utc_now()
+    recent = _dump("pg-race", now - timedelta(minutes=20), now - timedelta(minutes=1))
+    with sessions() as db:
+        connector = db.scalar(select(Connector))
+        _snapshot(db, connector, "race-s0", now - timedelta(minutes=40))
+        _snapshot(db, connector, "race-s1", now - timedelta(minutes=25))
+        ingest_attendance(db, connector=connector, events=[recent])
+        db.commit()
+    with sessions() as db:
+        # The owner approved the zone while the punch waited for its snapshot.
+        _approve_whole_zone(db, db.scalar(select(Connector)).zone_id, "pg-race-1", approved=1)
+        db.commit()
+    with sessions() as snapshot_db:
+        _snapshot(snapshot_db, snapshot_db.scalar(select(Connector)), "race-s2", utc_now())
+        snapshot_db.flush()
+        # The snapshot holds the released row: the batch waits, never passes it.
+        with sessions() as db:
+            assert backlog.advance_once(db) == 0
+            db.commit()
+        snapshot_db.commit()
+    with sessions() as db:
+        backlog.advance_once(db)
+        db.commit()
+    with sessions() as db:
+        row = db.scalar(select(AttendanceEvent).where(AttendanceEvent.event_uid == recent.event_uid))
+        assert row.ords_status == "PENDING"
+        assert db.scalar(select(func.count(OrdsOutbox.id)).where(
+            OrdsOutbox.attendance_event_id == row.id
+        )) == 1
+        [audit] = db.scalars(select(AuditEvent).where(
+            AuditEvent.action == "ATTENDANCE_DUMP_IDENTITY_AUTO_RELEASED"
+        )).all()
+        assert audit.after["event_ids"] == [row.id]
+        job = db.scalar(select(AttendanceRecoveryJob).where(
+            AttendanceRecoveryJob.action == backlog.ACTION
+        ))
+        assert job.status == "COMPLETED"
+        assert backlog.serialize(db, job)["released"] == 0
+
+
+def test_chunk_release_rereads_a_row_another_transaction_released(force_pg):
+    sessions, _, _ = force_pg
+    engine = sessions.kw["bind"]
+    event_id, user_id = _held_dump(sessions)
+    for filename in (*EARLIER_GUARDS, DUMP_GUARD):
+        _apply(engine, filename)
+    with sessions() as db:
+        event = db.get(AttendanceEvent, event_id)
+        # A full-history read linked the terminal's own saved record.
+        db.add(TerminalRecordManifest(
+            connector_id=event.connector_id, zkt_device_id=event.zkt_device_id,
+            terminal_serial=event.device_serial, generation=1, ordinal=0,
+            source_kind="BASELINE", canonical_source=True, record_size=40,
+            raw_record_digest="b" * 64, terminal_record_key="c" * 64, occurrence_index=1,
+            attendance_event_id=event.id, disposition="EVENT", observed_uid=event.uid,
+            observed_user_id=event.user_id,
+        ))
+        db.commit()
+    with sessions() as chunk_db:
+        stale = chunk_db.get(AttendanceEvent, event_id)
+        connector = chunk_db.get(Connector, stale.connector_id)
+        assert stale.ords_status == "BLOCKED_IDENTITY"
+        with sessions() as other:
+            zkt = other.get(Connector, stale.connector_id).zkt_device
+            assert release_synced_cnic_attendance(
+                other, zkt=zkt, user=other.get(DeviceUser, user_id)
+            ) == 1
+            released_at = other.get(AttendanceEvent, event_id).identity_resolved_at
+            other.commit()
+        # The chunk still holds its earlier, held copy of the row.
+        assert stale.ords_status == "BLOCKED_IDENTITY"
+        assert _release_source_synced_attendance(
+            chunk_db, connector=connector, events=[stale]
+        ) == set()
+        assert stale.ords_status == "PENDING"
+        chunk_db.commit()
+    with sessions() as db:
+        event = db.get(AttendanceEvent, event_id)
+        assert event.identity_resolved_at == released_at
+        assert db.scalar(select(func.count(OrdsOutbox.id)).where(
+            OrdsOutbox.attendance_event_id == event_id
+        )) == 1
+
+
+def test_one_zone_check_page_runs_at_a_time(force_pg):
+    sessions, _, _ = force_pg
+    with sessions() as first:
+        zone = first.scalar(select(Connector)).zone_id
+        backlog.preview_page(first, zone_id=zone, actor=ADMIN)
+        with sessions() as second:
+            with pytest.raises(backlog.RecoveryError) as busy:
+                backlog.preview_page(second, zone_id=zone, actor=ADMIN)
+            assert busy.value.code == "PREVIEW_BUSY"
+        first.rollback()
+    with sessions() as second:
+        assert backlog.preview_page(second, zone_id=zone, actor=ADMIN)["zone_id"] == zone
