@@ -445,6 +445,24 @@ def test_stage_timeout_halts_a_stalled_installation(plan_store, monkeypatch):
     assert_halted(scope, plan_id, "STAGE_TIMEOUT")
 
 
+def test_an_unsettled_installation_on_a_stage_device_halts(plan_store):
+    scope = plan_store
+    plan_id = approve(scope, [["ZONE-PESHAWAR-02"], ["ZONE-SLICTOWER-3FL"]])
+    tick(scope)
+    install(scope, "P02")
+    # An operator's 3FL campaign offered bytes and was then cancelled: the
+    # ESP may still be installing, so the guard keeps its slot unsettled.
+    manual_offer(scope, "3FL")
+    with scope() as session:
+        deployment = deployment_for(session, "3FL")
+        deployment.status = "CANCELLED"
+        session.get(FirmwareCampaign, deployment.campaign_id).status = "CANCELLED"
+    tick(scope)  # stage one succeeded
+    tick(scope)  # stage two is held, not started
+    assert_halted(scope, plan_id, "DEVICE_INSTALLATION_UNSETTLED", alerted="3FL")
+    assert [row.zone_id for row in campaigns(scope, plan_id)] == ["ZONE-PESHAWAR-02"]
+
+
 # --------------------------------------------------------------------------
 # Guard and slot contention
 
@@ -858,3 +876,26 @@ def test_openapi_exposes_the_plan_contract():
     for path in ("/api/v1/firmware/hil-plans", "/api/v1/firmware/hil-plans/preview",
                  "/api/v1/firmware/hil-plans/{plan_id}", "/api/v1/firmware/hil-plans/{plan_id}/{action}"):
         assert path in spec["paths"]
+
+
+def test_the_maintenance_loop_publishes_plan_steps_and_failures(monkeypatch):
+    import asyncio
+    from zk_add.realtime import browser_events
+    published = []
+
+    async def publish(topic, payload):
+        published.append((topic, payload))
+    monkeypatch.setattr(browser_events, "publish", publish)
+    monkeypatch.setattr(hil_plans, "tick", lambda: [{"plan_id": "p", "status": "HALTED"},
+                                                    {"plan_pk": 1, "error": "STEP_FAILED"}])
+
+    async def run():
+        stop = asyncio.Event()
+        task = asyncio.create_task(hil_plans.run_hil_plan_loop(stop, interval=0.01))
+        await asyncio.sleep(0.05)
+        stop.set()
+        await task
+    asyncio.run(run())
+    assert ("firmware", {"hil_plan": {"plan_id": "p", "status": "HALTED"}}) in published
+    assert any(topic == "backend_error" and payload["code"] == "HIL_PLAN_STEP_FAILED"
+               for topic, payload in published)
