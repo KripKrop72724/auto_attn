@@ -288,15 +288,15 @@ def ensure_control(session: Session, *, lock: bool = False) -> CheckinNotifyCont
     row = session.scalar(statement.with_for_update() if lock else statement)
     if row is not None:
         return row
-    mode = settings.checkin_notify_default_mode
+    mode = settings.checkin_notify_mode
     try:
         with session.begin_nested():
             session.add(
                 CheckinNotifyControl(
                     id=1,
                     mode=mode if mode in MODES else "PILOT",
-                    punch_policy=settings.checkin_notify_default_punch_policy,
-                    pilot_zone_ids=_csv(settings.checkin_notify_default_pilot_zone_ids),
+                    punch_policy=settings.checkin_notify_punch_policy,
+                    pilot_zone_ids=_csv(settings.checkin_notify_pilot_zone_ids),
                     pilot_cnics=[],
                     revision=1,
                     consecutive_failures=0,
@@ -1015,7 +1015,7 @@ def health(session: Session, *, now: datetime | None = None) -> dict:
     )
     oldest_age = int((now - ensure_utc(oldest)).total_seconds()) if oldest else 0
     configured = notify_configured()
-    mode = control.mode if control else settings.checkin_notify_default_mode
+    mode = control.mode if control else settings.checkin_notify_mode
     paused = bool(control and control.paused_until and ensure_utc(control.paused_until) > now)
     if not configured:
         state = "NOT_CONFIGURED"
@@ -1033,7 +1033,7 @@ def health(session: Session, *, now: datetime | None = None) -> dict:
         "state": state,
         "configured": configured,
         "mode": mode,
-        "punch_policy": control.punch_policy if control else settings.checkin_notify_default_punch_policy,
+        "punch_policy": control.punch_policy if control else settings.checkin_notify_punch_policy,
         "pilot_zone_count": len(control.pilot_zone_ids or []) if control else 0,
         "pilot_cnic_count": len(control.pilot_cnics or []) if control else 0,
         "last_success_at": control.last_success_at if control else None,
@@ -1093,14 +1093,14 @@ class CheckinNotifySettingsRequest(BaseModel):
     add_pilot_cnics: list[str] = Field(default_factory=list, max_length=50)
     remove_pilot_cnic_ids: list[str] = Field(default_factory=list, max_length=200)
     expected_revision: int | None = None
-    reason: str = Field(min_length=3, max_length=300)
+    reason: str = Field(min_length=10, max_length=300)
     password: SecretStr
 
 
 class CheckinNotifyRetryRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    reason: str = Field(min_length=3, max_length=300)
+    reason: str = Field(min_length=10, max_length=300)
     password: SecretStr
 
 

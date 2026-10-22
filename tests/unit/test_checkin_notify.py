@@ -66,8 +66,8 @@ def store(monkeypatch):
     monkeypatch.setattr(settings, "checkin_notify_url", None)
     monkeypatch.setattr(settings, "checkin_notify_fallback_url", FALLBACK_URL)
     monkeypatch.setattr(settings, "checkin_notify_api_key", SYNTHETIC_KEY)
-    monkeypatch.setattr(settings, "checkin_notify_default_mode", "ALL")
-    monkeypatch.setattr(settings, "checkin_notify_default_pilot_zone_ids", "")
+    monkeypatch.setattr(settings, "checkin_notify_mode", "ALL")
+    monkeypatch.setattr(settings, "checkin_notify_pilot_zone_ids", "")
     monkeypatch.setattr(settings, "checkin_notify_rate_per_second", 50.0)
     engine = create_engine(
         "sqlite+pysqlite:///:memory:",

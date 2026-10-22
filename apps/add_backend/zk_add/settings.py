@@ -146,7 +146,8 @@ class AddSettings(BaseSettings):
     # sent only after Oracle confirms the punch. Nothing is sent without the
     # API key (NOT_CONFIGURED). The live mode (OFF / PILOT / ALL), punch policy
     # and pilot allowlist are stored in the database and changed by an
-    # administrator at runtime; the defaults below seed that row once. The
+    # administrator at runtime; ADD_CHECKIN_NOTIFY_MODE, _PUNCH_POLICY and
+    # _PILOT_ZONE_IDS only seed that row the first time the feature runs. The
     # owner's rollout is ALL zones at once, so ALL is the default.
     # The URL defaults to the host of ADD_ORDS_BASE_URL (the internal ORDS
     # host) plus CHECKIN_NOTIFY_PATH. The fallback (public) host is used only
@@ -156,9 +157,9 @@ class AddSettings(BaseSettings):
     checkin_notify_fallback_url: str | None = CHECKIN_NOTIFY_FALLBACK_URL
     checkin_notify_api_key: str | None = None
     checkin_notify_cnic_json_type: Literal["number", "string"] = "number"
-    checkin_notify_default_mode: Literal["OFF", "PILOT", "ALL"] = "ALL"
-    checkin_notify_default_punch_policy: Literal["ALL_PUNCHES", "FIRST_PER_DAY"] = "ALL_PUNCHES"
-    checkin_notify_default_pilot_zone_ids: str = ""
+    checkin_notify_mode: Literal["OFF", "PILOT", "ALL"] = "ALL"
+    checkin_notify_punch_policy: Literal["ALL_PUNCHES", "FIRST_PER_DAY"] = "ALL_PUNCHES"
+    checkin_notify_pilot_zone_ids: str = ""
     checkin_notify_timeout_seconds: float = Field(default=10.0, ge=1.0, le=60.0)
     checkin_notify_connect_timeout_seconds: float = Field(default=5.0, ge=0.5, le=30.0)
     checkin_notify_primary_reprobe_seconds: int = Field(default=600, ge=30, le=24 * 60 * 60)
