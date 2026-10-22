@@ -217,6 +217,8 @@ from zk_add.attendance_recovery import (
 )
 from zk_add.time_utils import ensure_utc, parse_datetime, utc_now
 from zk_add.reconciliation import (
+    SOURCE_TAIL_STALE_GENERATION,
+    coverage_authority_payload,
     source_epoch_uuid,
     apply_reconciliation_assignment_release,
     apply_reconciliation_anchor,
@@ -4652,6 +4654,7 @@ def persist_envelope(connector_pk: int, envelope: Envelope) -> EnvelopeOutcome |
     authoritative_coverage_payload = None
     send_commands_after_ack = False
     connector_id_to_flush = None
+    stale_generation_tail = False
     with session_scope() as db:
         # Separate sockets may overlap during reconnect. Serialize sequence checks
         # and acceptance for the same connector before acknowledging either socket.
@@ -4992,11 +4995,19 @@ def persist_envelope(connector_pk: int, envelope: Envelope) -> EnvelopeOutcome |
                 "exception_count": chunk.exception_count if chunk is not None else 0,
                 "raw_preserved_count": chunk.raw_preserved_count if chunk is not None else 0,
             }
+            if error_code == SOURCE_TAIL_STALE_GENERATION:
+                # The device tails a retired generation. Its message is not a
+                # rejection (no DEGRADED, no last_error_code): it needs ADD's
+                # current coverage, exactly like the manifest authority path.
+                authoritative_coverage_payload = coverage_authority_payload(db, coverage)
+                stale_generation_tail = True
         else:
             event_payload = {"connector_id": connector.connector_id, "type": envelope.type}
         # The same transaction that accepted the message clears its type's
         # rejection; a replayed duplicate returned above proves nothing new.
-        resolve_message_rejection(db, connector, message_type=envelope.type)
+        # A stale-generation tail committed nothing, so it clears nothing.
+        if not stale_generation_tail:
+            resolve_message_rejection(db, connector, message_type=envelope.type)
     return EnvelopeOutcome(
         ack=ack_payload or {"type": "ack", "message_id": envelope.message_id, "seq": envelope.seq},
         event=event_payload or {},

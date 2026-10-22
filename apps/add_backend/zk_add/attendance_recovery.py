@@ -1468,6 +1468,20 @@ def _create_timestamp_correction(session: Session, job: AttendanceRecoveryJob, i
         existing_correction = session.scalar(select(AttendanceSourceCorrection).join(HikvisionEvidence,
             HikvisionEvidence.id == AttendanceSourceCorrection.hikvision_evidence_id).where(
             HikvisionEvidence.event_uid == evidence.event_uid, AttendanceSourceCorrection.status == "CREATED"))
+    if item.source_kind == "ZKT_MANIFEST" and not existing_correction:
+        # A recovery epoch or a new connector generation holds the same terminal
+        # record again under a new manifest row. The record is its terminal,
+        # serial, ordinal and raw bytes: one correction for it is enough, and a
+        # second would deliver a second derived punch.
+        manifest = session.get(TerminalRecordManifest, item.manifest_id)
+        existing_correction = session.scalar(select(AttendanceSourceCorrection).join(TerminalRecordManifest,
+            TerminalRecordManifest.id == AttendanceSourceCorrection.manifest_id).where(
+            TerminalRecordManifest.zkt_device_id == manifest.zkt_device_id,
+            TerminalRecordManifest.terminal_serial == manifest.terminal_serial,
+            TerminalRecordManifest.ordinal == manifest.ordinal,
+            TerminalRecordManifest.raw_record_digest == manifest.raw_record_digest,
+            AttendanceSourceCorrection.status == "CREATED",
+        ).order_by(AttendanceSourceCorrection.id.asc()).limit(1))
     if existing_correction:
         item.attempt_count += 1
         _mark_item(item, status="SKIPPED", outcome="ALREADY_CORRECTED", result={"correction_id": existing_correction.correction_id})
