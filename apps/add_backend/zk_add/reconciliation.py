@@ -2274,7 +2274,7 @@ def _note_stale_generation_tail(session, *, connector, coverage, payload) -> Non
     if utc_now() - since < STALE_TAIL_ALERT_AFTER:
         return
     from zk_add.service import upsert_alert
-    upsert_alert(session, connector, code=STALE_TAIL_ALERT, severity="HIGH", message=(
+    upsert_alert(session, connector, code="ADD_SOURCE_TAIL_STALE_GENERATION", severity="HIGH", message=(
         f"The device has kept sending generation {payload.terminal_generation} tails since {since.isoformat()} "
         f"and has not adopted ADD's generation {coverage.terminal_generation} coverage, so tail custody has "
         "stopped. Check its storage diagnostics and source coverage log."),
