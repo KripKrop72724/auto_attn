@@ -51,6 +51,8 @@ SYNTHETIC_KEY = "synthetic-test-only-notify-credential"
 CNIC = "3520212345671"
 OTHER_CNIC = "3520299999991"
 ROOT = Path(__file__).resolve().parents[2]
+PRIMARY_URL = "https://ords.example.invalid/ords/slic_hrm/ESS_APIS/attendance_checkin_notify"
+FALLBACK_URL = "https://public.example.invalid/ords/slic_hrm/ESS_APIS/attendance_checkin_notify"
 
 
 @pytest.fixture()
@@ -62,6 +64,7 @@ def store(monkeypatch):
         settings, "ords_base_url", "https://ords.example.invalid/ords/slic_hrm/raw_attn_capture_event"
     )
     monkeypatch.setattr(settings, "checkin_notify_url", None)
+    monkeypatch.setattr(settings, "checkin_notify_fallback_url", FALLBACK_URL)
     monkeypatch.setattr(settings, "checkin_notify_api_key", SYNTHETIC_KEY)
     monkeypatch.setattr(settings, "checkin_notify_default_mode", "ALL")
     monkeypatch.setattr(settings, "checkin_notify_default_pilot_zone_ids", "")
@@ -199,6 +202,28 @@ def move_back(sessions, event_id: int, **fields) -> None:
 # --------------------------------------------------------------------------
 
 
+def test_fallback_defaults_to_the_public_host_and_is_dropped_when_it_equals_the_primary(monkeypatch):
+    from zk_add.settings import AddSettings
+
+    assert AddSettings.model_fields["checkin_notify_fallback_url"].default == (
+        "https://eclaim2.slichealth.com/ords/slic_hrm/ESS_APIS/attendance_checkin_notify"
+    )
+    monkeypatch.setattr(settings, "checkin_notify_url", None)
+    monkeypatch.setattr(
+        settings, "ords_base_url", "https://local.slichealth.com/ords/slic_hrm/raw_attn_capture_event"
+    )
+    monkeypatch.setattr(settings, "checkin_notify_fallback_url", FALLBACK_URL)
+    assert settings.resolved_checkin_notify_fallback_url == FALLBACK_URL
+    monkeypatch.setattr(
+        settings, "checkin_notify_fallback_url",
+        "https://local.slichealth.com/ords/slic_hrm/ESS_APIS/attendance_checkin_notify",
+    )
+    assert settings.resolved_checkin_notify_fallback_url is None
+    for disabled in ("", "not a url"):
+        monkeypatch.setattr(settings, "checkin_notify_fallback_url", disabled)
+        assert settings.resolved_checkin_notify_fallback_url is None
+
+
 def test_url_defaults_to_the_internal_ords_host_and_an_explicit_url_wins(monkeypatch):
     monkeypatch.setattr(settings, "checkin_notify_url", None)
     monkeypatch.setattr(
@@ -245,11 +270,12 @@ def test_membership_and_firmware_receipt_confirmations_record_rows(store):
     sessions, connector_id = store
     checked = punch(sessions)
     firmware = punch(sessions, status="FIRMWARE_RECEIPT_VERIFYING")
+    checked_outbox = outbox_id(sessions, checked)
     with sessions() as db:
-        db.get(OrdsOutbox, outbox_id(sessions, checked)).status = "IN_FLIGHT"
+        db.get(OrdsOutbox, checked_outbox).status = "IN_FLIGHT"
         db.commit()
-    claims = [(outbox_id(sessions, checked), {"cnic": CNIC}, connector_id, False)]
-    worker.apply_ords_batch_results(claims, [outbox_id(sessions, checked)], None, [])
+    claims = [(checked_outbox, {"cnic": CNIC}, connector_id, False)]
+    worker.apply_ords_batch_results(claims, [checked_outbox], None, [])
     worker.apply_firmware_receipt_audit_results(
         [(outbox_id(sessions, firmware), "f" * 64, connector_id)], set(),
         status=200, transport_error=None, response_parsed=True,
@@ -275,14 +301,18 @@ def test_reverification_and_repeat_confirmation_never_create_another_row(store):
     # Confirmed before the feature existed: no row, and re-verification must
     # not create one.
     before = punch(sessions, status="ACKED_CHECK")
+    # Look the outbox row up first: the in-memory test database shares one
+    # connection, so a nested session would roll back the delete below.
+    before_outbox = outbox_id(sessions, before)
     with sessions() as db:
         db.execute(text("DELETE FROM add_attendance_checkin_notifications"))
         event = db.get(AttendanceEvent, before)
         event.ords_status = "MEMBERSHIP_REVERIFYING"
-        db.get(OrdsOutbox, outbox_id(sessions, before)).status = "MEMBERSHIP_REVERIFYING"
+        db.get(OrdsOutbox, before_outbox).status = "MEMBERSHIP_REVERIFYING"
         db.commit()
+    assert rows(sessions) == []
     worker.apply_confirmed_membership_audit_results(
-        [(outbox_id(sessions, before), "a" * 64, connector_id)], set(),
+        [(before_outbox, "a" * 64, connector_id)], set(),
         status=200, transport_error=None, response_parsed=True,
     )
     with sessions() as db:
@@ -391,8 +421,9 @@ def test_string_cnic_body_is_a_setting(store, monkeypatch):
     assert recorder.requests[0].content == b'{"cnic":"3520212345671"}'
 
 
-def test_retryable_failures_back_off_with_jitter_then_give_up(store):
+def test_retryable_failures_back_off_with_jitter_then_give_up(store, monkeypatch):
     sessions, _ = store
+    monkeypatch.setattr(settings, "checkin_notify_fallback_url", None)  # One host only.
     event_id = punch(sessions)
     confirm(sessions, event_id)
     recorder = Recorder(httpx.Response(503), httpx.Response(429), httpx.ConnectError("down"))
@@ -413,7 +444,7 @@ def test_retryable_failures_back_off_with_jitter_then_give_up(store):
     deliver(recorder)
     row = row_for(sessions, event_id)
     assert (row.status, row.reason, row.detail) == (
-        "FAILED", "RETRY_WINDOW_EXHAUSTED", "TRANSPORT_CONNECTERROR"
+        "FAILED", "RETRY_WINDOW_EXHAUSTED", "TRANSPORT_CONNECT_ERROR"
     )
     assert len(recorder.requests) == 3
 
@@ -434,6 +465,232 @@ def test_timeouts_are_retried(store):
     deliver(Recorder(httpx.ReadTimeout("slow")))
     row = row_for(sessions, event_id)
     assert (row.status, row.reason) == ("RETRYING", "TRANSPORT_TIMEOUT")
+
+
+# --------------------------------------------------------------------------
+# Two hosts: fall back ONLY when the request provably never reached a server
+# --------------------------------------------------------------------------
+
+
+class Hosts:
+    """A mock transport answering per host from a scripted list of outcomes."""
+
+    def __init__(self, primary=(), fallback=()):
+        self.script = {"ords.example.invalid": list(primary), "public.example.invalid": list(fallback)}
+        self.requests: list[httpx.Request] = []
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        self.requests.append(request)
+        outcomes = self.script[request.url.host]
+        outcome = outcomes.pop(0) if len(outcomes) > 1 else (
+            outcomes[0] if outcomes else httpx.Response(200, json={"success": True})
+        )
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    @property
+    def hosts(self) -> list[str]:
+        return [request.url.host for request in self.requests]
+
+
+def deliver_hosts(hosts: Hosts) -> notify.Claim:
+    return asyncio.run(notify.deliver_once(transport=httpx.MockTransport(hosts)))
+
+
+NEVER_SENT = {
+    "dns_failure": httpx.ConnectError("[Errno -2] Name or service not known"),
+    "connection_refused": httpx.ConnectError("[Errno 111] Connection refused"),
+    "connect_timeout": httpx.ConnectTimeout("timed out while connecting"),
+    "tls_handshake_failure": httpx.ConnectError("[SSL: CERTIFICATE_VERIFY_FAILED] handshake failed"),
+}
+MAYBE_DELIVERED = {
+    "read_timeout": httpx.ReadTimeout("no response in time"),
+    "write_timeout": httpx.WriteTimeout("request body stalled"),
+    "reset_after_send": httpx.ReadError("[Errno 104] Connection reset by peer"),
+    "disconnect_without_response": httpx.RemoteProtocolError(
+        "Server disconnected without sending a response."
+    ),
+    "http_503": httpx.Response(503),
+    "http_500": httpx.Response(500),
+    "http_404": httpx.Response(404),
+    "http_401": httpx.Response(401),
+}
+
+
+@pytest.mark.parametrize("error", NEVER_SENT.values(), ids=NEVER_SENT.keys())
+def test_a_request_that_never_left_falls_back_to_the_public_host(store, error):
+    sessions, _ = store
+    event_id = punch(sessions)
+    confirm(sessions, event_id)
+    hosts = Hosts(primary=[error])
+    deliver_hosts(hosts)
+    assert hosts.hosts == ["ords.example.invalid", "public.example.invalid"]
+    fallback = hosts.requests[1]
+    assert str(fallback.url) == FALLBACK_URL
+    assert fallback.headers["X-Api-Key"] == SYNTHETIC_KEY  # Same key on both hosts.
+    assert fallback.content == hosts.requests[0].content == b'{"cnic":3520212345671}'
+    row = row_for(sessions, event_id)
+    assert (row.status, row.host_used, row.attempt_count) == ("SENT", "FALLBACK", 1)
+    assert "primary unreachable" in row.detail
+
+
+@pytest.mark.parametrize("outcome", MAYBE_DELIVERED.values(), ids=MAYBE_DELIVERED.keys())
+def test_a_request_that_may_have_been_delivered_never_falls_back(store, outcome):
+    sessions, _ = store
+    event_id = punch(sessions)
+    confirm(sessions, event_id)
+    hosts = Hosts(primary=[outcome])
+    deliver_hosts(hosts)
+    assert hosts.hosts == ["ords.example.invalid"]  # Never repeated on the public host.
+    row = row_for(sessions, event_id)
+    assert row.host_used == "PRIMARY" and row.status in {"RETRYING", "FAILED"}
+
+
+def test_an_overall_attempt_timeout_never_falls_back(store, monkeypatch):
+    sessions, _ = store
+    event_id = punch(sessions)
+    confirm(sessions, event_id)
+    monkeypatch.setattr(notify, "_host_budget_seconds", lambda: 0.05)
+
+    async def slow(request: httpx.Request) -> httpx.Response:
+        await asyncio.sleep(1)
+        return httpx.Response(200)
+
+    seen: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.host)
+        return await slow(request)
+
+    asyncio.run(notify.deliver_once(transport=httpx.MockTransport(handler)))
+    assert seen == ["ords.example.invalid"]
+    row = row_for(sessions, event_id)
+    assert (row.status, row.reason, row.host_used) == ("RETRYING", "TRANSPORT_TIMEOUT", "PRIMARY")
+
+
+def test_both_hosts_unreachable_is_retried_later(store):
+    sessions, _ = store
+    event_id = punch(sessions)
+    confirm(sessions, event_id)
+    hosts = Hosts(primary=[NEVER_SENT["dns_failure"]], fallback=[NEVER_SENT["connection_refused"]])
+    deliver_hosts(hosts)
+    row = row_for(sessions, event_id)
+    assert (row.status, row.reason) == ("RETRYING", "TRANSPORT_ALL_HOSTS_UNREACHABLE")
+    assert hosts.hosts == ["ords.example.invalid", "public.example.invalid"]
+
+
+def test_the_host_that_answered_is_sticky_and_the_primary_is_reprobed(store):
+    sessions, _ = store
+    first = punch(sessions, cnic=CNIC)
+    confirm(sessions, first)
+    hosts = Hosts(primary=[NEVER_SENT["connection_refused"]])
+    deliver_hosts(hosts)
+    with sessions() as db:
+        control = db.get(CheckinNotifyControl, 1)
+        assert control.preferred_host == "FALLBACK" and control.primary_reprobe_at is not None
+    # While the primary is out, the public host is used first: no wasted attempt.
+    second = punch(sessions, cnic=OTHER_CNIC)
+    confirm(sessions, second)
+    hosts = Hosts(primary=[httpx.Response(500)])
+    deliver_hosts(hosts)
+    assert hosts.hosts == ["public.example.invalid"]
+    assert row_for(sessions, second).host_used == "FALLBACK"
+    # At the re-probe time the primary is tried first again and becomes preferred.
+    with sessions() as db:
+        db.get(CheckinNotifyControl, 1).primary_reprobe_at = utc_now() - timedelta(seconds=1)
+        db.commit()
+    third = punch(sessions, cnic="3520211111111")
+    confirm(sessions, third)
+    hosts = Hosts()
+    deliver_hosts(hosts)
+    assert hosts.hosts == ["ords.example.invalid"]
+    with sessions() as db:
+        control = db.get(CheckinNotifyControl, 1)
+        assert control.preferred_host == "PRIMARY" and control.primary_reprobe_at is None
+    assert row_for(sessions, third).host_used == "PRIMARY"
+
+
+def test_without_a_fallback_only_the_primary_is_used(store, monkeypatch):
+    sessions, _ = store
+    monkeypatch.setattr(settings, "checkin_notify_fallback_url", None)
+    event_id = punch(sessions)
+    confirm(sessions, event_id)
+    hosts = Hosts(primary=[NEVER_SENT["dns_failure"]])
+    deliver_hosts(hosts)
+    assert hosts.hosts == ["ords.example.invalid"]
+    assert row_for(sessions, event_id).reason == "TRANSPORT_CONNECT_ERROR"
+
+
+async def _local_server(handler):
+    server = await asyncio.start_server(handler, "127.0.0.1", 0)
+    return server, server.sockets[0].getsockname()[1]
+
+
+def _real_post(url: str, *, timeout: float = 2.0) -> notify.SendResult:
+    """One attempt through httpx's real network stack against 127.0.0.1 only."""
+    job = notify.SendJob(1, 1, CNIC, None)
+
+    async def run():
+        async with httpx.AsyncClient(timeout=httpx.Timeout(timeout, connect=timeout)) as client:
+            return await notify.post_notification(client, url, job, host="PRIMARY")
+
+    return asyncio.run(run())
+
+
+def test_real_connection_refused_and_tls_failures_are_classified_as_never_sent(monkeypatch):
+    import socket
+
+    monkeypatch.setattr(settings, "checkin_notify_api_key", SYNTHETIC_KEY)
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        closed_port = probe.getsockname()[1]
+    refused = _real_post(f"http://127.0.0.1:{closed_port}/notify")
+    assert refused.not_sent and refused.category == "TRANSPORT_CONNECT_ERROR"
+
+    async def tls_against_plain_server():
+        async def plain(reader, writer):
+            await reader.read(64)  # The TLS ClientHello.
+            writer.write(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
+            await writer.drain()
+            writer.close()
+
+        server, port = await _local_server(plain)
+        async with server:
+            async with httpx.AsyncClient(timeout=2.0) as client:
+                return await notify.post_notification(
+                    client, f"https://127.0.0.1:{port}/notify",
+                    notify.SendJob(1, 1, CNIC, None), host="PRIMARY",
+                )
+
+    tls = asyncio.run(tls_against_plain_server())
+    assert tls.not_sent and tls.category == "TRANSPORT_CONNECT_ERROR"
+
+
+def test_real_reset_after_send_and_read_timeout_are_classified_as_maybe_delivered(monkeypatch):
+    monkeypatch.setattr(settings, "checkin_notify_api_key", SYNTHETIC_KEY)
+
+    async def run(behaviour):
+        async def handler(reader, writer):
+            await reader.readuntil(b"\r\n\r\n")  # The request reached the server.
+            if behaviour == "close":
+                writer.close()
+                return
+            await asyncio.sleep(1.5)
+            writer.close()
+
+        server, port = await _local_server(handler)
+        async with server:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(0.5, connect=2.0)) as client:
+                return await notify.post_notification(
+                    client, f"http://127.0.0.1:{port}/notify",
+                    notify.SendJob(1, 1, CNIC, None), host="PRIMARY",
+                )
+
+    closed = asyncio.run(run("close"))
+    assert not closed.not_sent and closed.outcome == "RETRY"
+    slow = asyncio.run(run("sleep"))
+    assert not slow.not_sent and slow.category == "TRANSPORT_TIMEOUT"
 
 
 def test_other_client_errors_fail_without_retry_or_pausing(store):

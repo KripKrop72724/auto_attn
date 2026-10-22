@@ -391,7 +391,11 @@ class AttendanceEvent(Base):
     boot_id: Mapped[str | None] = mapped_column(String(100), index=True)
     sequence: Mapped[int | None] = mapped_column(BigInteger)
     raw_event: Mapped[dict] = mapped_column(JSON, default=dict)
-    ords_status: Mapped[str] = mapped_column(String(40), default="PENDING", index=True)
+    # active_history: the check-in notification hook compares the prior value
+    # to tell a first Oracle confirmation from a re-verification.
+    ords_status: Mapped[str] = mapped_column(
+        String(40), default="PENDING", index=True, active_history=True
+    )
     oracle_confirmed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), index=True
     )

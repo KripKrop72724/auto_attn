@@ -929,7 +929,7 @@ def feature_started_at(session: Session) -> datetime | None:
 
 def pill(event: AttendanceEvent, row: Notification | None, started_at: datetime | None) -> dict:
     if row is None:
-        if event.ords_status not in STILL_CONFIRMED_STATUSES or not event.oracle_confirmed_at:
+        if event.ords_status not in STILL_CONFIRMED_STATUSES:
             reason = "AWAITING_ORACLE"
         elif started_at is None or ensure_utc(event.device_event_time) < started_at:
             reason = "BEFORE_FEATURE"
