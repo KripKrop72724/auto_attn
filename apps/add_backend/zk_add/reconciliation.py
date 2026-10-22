@@ -2618,6 +2618,10 @@ def assignment_rows(session: Session) -> list[tuple[str, dict]]:
                 job.phase = "RECOVERING_AFTER_INTERRUPTION"
                 job.wait_reason = job.wait_reason or "TRANSIENT_STEP_RETRY"
             continue
+        if job.mode == "HIKVISION_SERIAL_HISTORY":
+            from zk_add.hikvision_reconciliation import tail_waiting_to_follow
+            if tail_waiting_to_follow(session, job):
+                continue
         if slots_owned >= slot_limit:
             job.phase = "WAITING_FOR_CAPACITY"
             job.wait_reason = "WAITING_FOR_SCAN_SLOT"

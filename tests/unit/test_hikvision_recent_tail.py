@@ -295,6 +295,11 @@ def test_resume_point_uses_only_gap_free_custody(db):
         channel="STREAM", raw=raw, captured_epoch=1792500000))
     session.flush()
     assert recent_tail_scope(session, connector)["anchor_serial"] == 101
+    # A reinstalled or reset ESP restarts its poll at the terminal's newest
+    # records. Serials 102 to 699 were never read, so the newer run does not
+    # move the resume point past them.
+    held_by_poll(session, connector, range(700, 706))
+    assert recent_tail_scope(session, connector)["anchor_serial"] == 101
     # An earlier tail job's contiguous progress does move it.
     job = ReconciliationJob(connector_id=connector.id, zkt_device_id=connector.zkt_device.id, actor="t",
                             reason="t", idempotency_key="old-tail", request_digest="c" * 64,
@@ -341,6 +346,54 @@ def test_preflight_treats_an_anchor_mismatch_terminal_as_answering(db, monkeypat
     assert preflight(session, connector)["recent_tail"] == {
         "eligible": False, "anchor_serial": None, "begin_serial": None,
         "reason": "Finish or cancel this device's active reconciliation first."}
+
+
+def test_following_tail_holds_no_scan_slot_and_skips_backlog_pause(db, monkeypatch):
+    from zk_add.hikvision_delivery import HikvisionPolicy
+    from zk_add.models import OrdsOutbox
+    from zk_add.reconciliation import assignment_rows
+
+    session, connector = db
+    monkeypatch.setattr(settings, "reconciliation_enabled", True)
+    monkeypatch.setattr(settings, "reconciliation_device_concurrency", 1)
+    following = tail_job(session, connector)
+    drive(session, connector, following, terminal_log(ANCHOR + 5))
+    connector.connected = connector.active = True
+    terminal = connector.zkt_device
+    terminal.online, terminal.last_seen_at = False, utc_now()
+    terminal.capability_profile = {"hikvision_health": {
+        "poll_error": 6, "poll_stage": "events", "poll_http_status": 200}}
+    # Another device's full audit, queued later, needs the only scan slot.
+    other = Connector(connector_id="h2", hardware_id="00:11:22:33:44:66", zone_id="z", zone_name="z",
+                      device_id="d2", display_name="d2", firmware_family="hikvision",
+                      terminal_vendor="hikvision", terminal_protocol="isapi", connected=True, active=True)
+    session.add(other)
+    session.flush()
+    other.zkt_device = ZKTDevice(connector_id=other.id, serial="terminal-2", confirmed_serial="terminal-2",
+                                 online=True)
+    session.add(HikvisionPolicy(connector_id=other.id, enabled=True, source_epoch="epoch-2",
+                                terminal_serial="terminal-2", profile_id="test", success_codes=[[5, 75]],
+                                excluded_codes=[[5, 21]]))
+    session.flush()
+    audit = ReconciliationJob(connector_id=other.id, zkt_device_id=other.zkt_device.id, actor="t", reason="t",
+                              idempotency_key="other-audit", request_digest="e" * 64,
+                              terminal_serial="terminal-2", mode=MODE, status="QUEUED",
+                              requested_at=utc_now() + timedelta(seconds=1))
+    session.add(audit)
+    session.flush()
+    initialize(session, audit, other)
+    session.flush()
+    # Between checks the caught-up tail asks nothing of its ESP, so it leaves
+    # the slot to the other device.
+    assert [message["job_id"] for _, message in assignment_rows(session)] == [audit.job_id]
+    assert following.phase == "FOLLOWING_TERMINAL_TAIL" and following.wait_reason is None
+    # With the ORDS history backlog over its pause limit, the full audit waits
+    # but the tail, the terminal's only capture path, keeps following.
+    session.add(OrdsOutbox(delivery_type="FULL_HISTORY", status="PENDING"))
+    monkeypatch.setattr(settings, "reconciliation_history_backlog_pause", 1)
+    expire_follow_interval(session, following)
+    assert [message["job_id"] for _, message in assignment_rows(session)] == [following.job_id]
+    assert audit.wait_reason == "HISTORY_BACKLOG_BACKPRESSURE"
 
 
 def test_create_and_serialize_recent_tail_job(db, monkeypatch):

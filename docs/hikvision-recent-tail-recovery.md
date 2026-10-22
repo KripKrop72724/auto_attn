@@ -13,6 +13,11 @@ every 3.1.x and bld1fix image runs, including while the poll is failing.
   job. Live-stream records do not count, because a stream can drop events while
   it is disconnected. Employee-filtered history does not count either, because
   it is not contiguous.
+- The poll reads every event serial in order. If a serial is missing below the
+  poll's newest record, the ESP's checkpoint restarted further on, for example
+  after a reinstall or a reset. ADD then resumes at the latest such break, so
+  serials the poll never read are not skipped. A break that is only a gap in
+  the terminal's own numbering costs a longer re-read, nothing more.
 - Each page asks for 20 records from the last serial already seen, up to the
   maximum serial. The terminal may treat `beginSerialNo` as inclusive or as
   exclusive; either way no record is skipped.
@@ -34,6 +39,8 @@ every 3.1.x and bld1fix image runs, including while the poll is failing.
   cleared, the terminal was replaced, or serials were renumbered.
 - It is exempt from the history-backlog intake gate, because it adds at most one
   20-record page per ESP poll cycle.
+- Between its 15-second checks it holds no device scan slot. Following one
+  terminal for days therefore never delays another device's reconciliation.
 
 The Hikvision preflight now treats the terminal as reachable when the ESP's last
 check reached the event search with HTTP 200 (`poll_stage=events`). Firmware
@@ -72,6 +79,15 @@ G04600476.
 - **The ESP showed OFFLINE although its heartbeats were current.** When an ESP
   reconnects, the old socket's cleanup could still record the connector as
   disconnected. Only the current socket now records a disconnection.
+- **22 Oct, 17:24 PKT:** the ESP came back (boot `f9dc7485`) after about 15.5
+  hours of silence. Its clock is now within 1 second of ADD, and its storage
+  reports healthy with no error code. The anchor mismatch is unchanged: all 110
+  reports between 21 Oct 16:20 and 22 Oct 17:47 PKT, before and after the
+  reboot, carry the same expected and observed digests. The terminal therefore
+  keeps returning one fixed, different record at serial 597801; the mismatch is
+  not transient. The stream is replaying late-September history again. On each
+  reconnect, about every 40 seconds, the connector reads connected for about
+  0.5 seconds and then disconnected, which is the race fixed here.
 
 Recovery: run **Recent tail** once. It resumes at serial 597782. If the terminal
 reused serials 597794 to 597801 after the power loss, those serials are held for

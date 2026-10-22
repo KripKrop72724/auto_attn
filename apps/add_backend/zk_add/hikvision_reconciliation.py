@@ -6,8 +6,9 @@ import hashlib
 import json
 from uuid import uuid4
 
-from sqlalchemy import BigInteger, ForeignKey, Integer, JSON, String, UniqueConstraint, cast, func, select
-from sqlalchemy.orm import Mapped, Session, mapped_column
+from sqlalchemy import (BigInteger, ForeignKey, Integer, JSON, String, UniqueConstraint, cast, exists, func,
+                        select)
+from sqlalchemy.orm import Mapped, Session, aliased, mapped_column
 
 from zk_add.db import Base
 from zk_add.hikvision_delivery import HikvisionPolicy
@@ -179,21 +180,39 @@ def terminal_answering(terminal, now=None) -> bool:
             and health.get("poll_http_status") == 200 and health.get("poll_error") in {0, 6})
 
 
+def _poll_custody(model, connector, policy) -> tuple:
+    return (
+        model.connector_id == connector.id,
+        model.terminal_serial == policy.terminal_serial,
+        model.source_epoch == policy.source_epoch,
+        model.channel == "POLL",
+        model.event_uid.is_not(None),
+    )
+
+
 def _gap_free_tail_serial(session, connector, policy) -> int | None:
     """The highest serial ADD holds through gap-free custody for this source.
 
     Only the ESP's checkpointed POLL channel and earlier tail jobs qualify. A
     live stream can drop events while disconnected, and employee-filtered
     history is not contiguous, so neither may move the resume point forward.
+    The poll reads every event serial in order, so a missing next serial below
+    its newest record means its checkpoint restarted further on (a reinstalled
+    or reset ESP starts at the terminal's newest records). Resume at the latest
+    such break: anything after it may never have been read.
     """
-    poll = session.scalar(select(func.max(cast(HikvisionEvidence.source_event_id, BigInteger))).where(
-        HikvisionEvidence.connector_id == connector.id,
-        HikvisionEvidence.terminal_serial == policy.terminal_serial,
-        HikvisionEvidence.source_epoch == policy.source_epoch,
-        HikvisionEvidence.channel == "POLL",
-        HikvisionEvidence.event_uid.is_not(None),
-    ))
-    best = int(poll) if poll else None
+    serial = cast(HikvisionEvidence.source_event_id, BigInteger)
+    top = session.scalar(select(func.max(serial)).where(*_poll_custody(HikvisionEvidence, connector, policy)))
+    best = None
+    if top:
+        following = aliased(HikvisionEvidence)
+        broken = session.scalar(select(func.max(serial)).where(
+            *_poll_custody(HikvisionEvidence, connector, policy),
+            serial < top,
+            ~exists().where(*_poll_custody(following, connector, policy),
+                            cast(following.source_event_id, BigInteger) == serial + 1),
+        ))
+        best = int(broken if broken else top)
     for data, epoch, serial in session.execute(
         select(HikvisionReconciliationState.data, HikvisionReconciliationState.source_epoch,
                ReconciliationJob.terminal_serial)
@@ -310,6 +329,24 @@ def _apply_tail_page(session, connector, job, data, request, page, rows, count, 
         job.status = job.phase = "COMPLETED"
         job.completion_outcome = "LIVE_POLL_RESTORED"
         job.completed_at = now
+
+
+def tail_waiting_to_follow(session, job) -> bool:
+    """A caught-up tail job between checks asks nothing of the ESP.
+
+    It therefore holds no device scan slot, so following one terminal's tail
+    for days never delays another device's reconciliation.
+    """
+    state = session.get(HikvisionReconciliationState, job.id)
+    data = (state.data or {}) if state else {}
+    follow_after = data.get("follow_after")
+    if (data.get("scope") != TAIL_SCOPE or data.get("phase") == "SEALED" or data.get("request")
+            or not follow_after or parse_datetime(follow_after) <= utc_now()):
+        return False
+    job.status = "RUNNING"
+    job.phase = "FOLLOWING_TERMINAL_TAIL"
+    job.wait_reason = None
+    return True
 
 
 def tail_summary(data: dict) -> dict:
