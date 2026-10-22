@@ -976,10 +976,13 @@ _Static_assert((unsigned)LED_QUEUE_COUNT == SX_QUEUE_COUNT, "the LED's reclaim q
 #define SX_PRODUCTION_ROLE false
 #endif
 
+/* PSRAM, once: the gate's inputs and the texts the reports carry, off the
+ * OTA task's stack (its deepest path is a TLS handshake). */
 typedef struct {
     sx_repair_t repair;
     sx_inventory_t inventory;
     sx_runtime_t runtime;
+    char message[240], context[480], status[48];
 } sx_inputs_t;
 
 static struct {
@@ -1015,11 +1018,16 @@ static bool sx_passive_slot_ok(void)
     return ok;
 }
 
-/* Every input of the gate now, and the store's fingerprint. */
-static bool sx_collect(sx_input_t *in, sx_store_t *store)
+static sx_inputs_t *sx_buffers(void)
 {
     if (!s_sx.inputs) s_sx.inputs = heap_caps_calloc(1, sizeof(*s_sx.inputs), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    sx_inputs_t *b = s_sx.inputs;
+    return s_sx.inputs;
+}
+
+/* Every input of the gate now, and the store's fingerprint. */
+static __attribute__((noinline)) bool sx_collect(sx_input_t *in, sx_store_t *store)
+{
+    sx_inputs_t *b = sx_buffers();
     if (!b) return false;
     (void)storage_repair_exception_repair(&b->repair);
     (void)storage_repair_exception_inventory(&b->inventory);
@@ -1148,7 +1156,7 @@ typedef enum { SX_STEP_WAIT = 0, SX_STEP_CONFIRMED, SX_STEP_FAILED } sx_step_t;
  * (once), the evidence ADD stores, the receipted BOOTED_PENDING ADD allows,
  * the gate again with the store unchanged and the budget left, then valid,
  * the record CONFIRMED, the journal RECONCILING. */
-static sx_step_t sx_confirm_step(const boot_confirm_t *progress, uint32_t stepped_s)
+static __attribute__((noinline)) sx_step_t sx_confirm_step(const boot_confirm_t *progress, uint32_t stepped_s)
 {
     sx_input_t in;
     sx_store_t store;
@@ -1179,8 +1187,8 @@ static sx_step_t sx_confirm_step(const boot_confirm_t *progress, uint32_t steppe
         }
         s_sx.confirming_written = true;
     }
-    char message[240], context[480];
-    sx_evidence(&in, message, sizeof(message), context, sizeof(context));
+    char *message = s_sx.inputs->message, *context = s_sx.inputs->context;
+    sx_evidence(&in, message, sizeof(s_sx.inputs->message), context, sizeof(s_sx.inputs->context));
     if (!s_sx.evidence_logged) {
         s_sx.evidence_logged = add_connector_log_acknowledged("WARN", "storage", "STORAGE_REPAIR_EXCEPTION_EVIDENCE",
                                                               message, context, SX_EVIDENCE_ACK_MS);
@@ -1285,8 +1293,10 @@ static bool sx_report_ended(sx_record_t *record)
     const char *code = record->state == SX_STATE_UNHEALTHY ? "STORAGE_REPAIR_EXCEPTION_UNHEALTHY" :
                                                              "STORAGE_REPAIR_EXCEPTION_UNREPAIRED";
     if (!strcmp(s_journal.state, "RECONCILING") && s_journal.deployment_id[0]) {
-        char message[160];
-        snprintf(message, sizeof(message), "%s after %u round boot(s), %u restart(s), %u crash(es); last outcome %s",
+        sx_inputs_t *b = sx_buffers();
+        if (!b) return false;
+        char *message = b->message;
+        snprintf(message, sizeof(b->message), "%s after %u round boot(s), %u restart(s), %u crash(es); last outcome %s",
                  sx_state_name((sx_state_t)record->state), (unsigned)record->round_boots, (unsigned)record->restarts,
                  (unsigned)record->crashes, sx_outcome_name((sx_outcome_t)record->reason));
         cJSON *receipt = NULL;
@@ -1304,7 +1314,7 @@ static bool sx_report_ended(sx_record_t *record)
 
 /* Every OTA turn after the boot check, on an image confirmed under the
  * exception: the controlled restart, the retries, UNREPAIRED, UNHEALTHY. */
-static void sx_after_confirm_step(void)
+static __attribute__((noinline)) void sx_after_confirm_step(void)
 {
     if (!storage_repair_exception_active()) return;
     sx_record_t record;
@@ -1347,19 +1357,20 @@ static void sx_after_confirm_step(void)
  * certified) reports its status with a checked receipt; when ADD has ended
  * the deployment the journal is cleared so OTA is never blocked for good
  * (critique 5). True when the journal no longer waits. */
-static bool sx_reconciling_report(void)
+static __attribute__((noinline)) bool sx_reconciling_report(void)
 {
     sx_record_t record;
-    if (!storage_repair_exception_active() || !storage_repair_exception_record(&record)) return false;
-    char status[48];
-    snprintf(status, sizeof(status), "%s %s", sx_state_name((sx_state_t)record.state),
+    sx_inputs_t *b = sx_buffers();
+    if (!b || !storage_repair_exception_active() || !storage_repair_exception_record(&record)) return false;
+    char *status = b->status;
+    snprintf(status, sizeof(b->status), "%s %s", sx_state_name((sx_state_t)record.state),
              sx_outcome_name((sx_outcome_t)record.reason));
     uint32_t up = uptime_s();
     if (!strcmp(status, s_sx.reconciling_status) && s_sx.reconciling_reported_s &&
         up - s_sx.reconciling_reported_s < SX_RECONCILING_REPORT_SECONDS)
         return false;
-    char message[240];
-    snprintf(message, sizeof(message), "confirmed under the storage exception: %s; %u round boot(s); waiting for "
+    char *message = b->message;
+    snprintf(message, sizeof(b->message), "confirmed under the storage exception: %s; %u round boot(s); waiting for "
              "storage health and certified source coverage", status, (unsigned)record.round_boots);
     cJSON *receipt = NULL;
     bool reported = report_progress("RECONCILING", "STORAGE_REPAIR_EXCEPTION", message, &receipt);

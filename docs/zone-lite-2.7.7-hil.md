@@ -126,6 +126,9 @@ back as 2.7.6.
 
 **Stacks** (both boots): `websocket_task` at least 2,048 B free or absent
 from the 16 tasks closest to overflow; `ipc0` and `ipc1` at least 768 B;
+`ota_manager` (12 KiB) at least 1,024 B free on the unconfirmed boot (the
+exception's sequence adds about 350 B to its deepest path, a TLS handshake
+under a receipted progress report: measured with `-fstack-usage`);
 `ZMD_STACK_RESERVE_OK`, never `..._FAILED`; no "Could not start ADD WebSocket
 client"; `internal.min_free` and the largest internal block against 2.7.6 on
 the same device (P02's 2.7.6 runtime largest: 63,488 B; 2.7.7 needs about
