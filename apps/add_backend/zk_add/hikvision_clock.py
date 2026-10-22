@@ -35,3 +35,21 @@ def esp_clock_offset_seconds(received_at: datetime, sent_at: datetime | None) ->
         return None
     offset = (ensure_utc(received_at) - ensure_utc(sent_at)).total_seconds()
     return int(round(offset)) if abs(offset) <= 366 * 86400 else None
+
+
+ESP_OFFSET_WINDOW = 3
+ESP_OFFSET_AGREEMENT_SECONDS = 30
+
+
+def stable_esp_offset(offsets: list) -> int | None:
+    """The ESP clock offset recent heartbeats agree on, or None while unproven.
+
+    Each measurement uses ADD's processing time, so a heartbeat that waited in
+    a queue or a socket buffer only ever adds to its offset. The smallest
+    recent offset is therefore the closest to the truth, and the two smallest
+    must agree before ADD acts on it.
+    """
+    values = sorted(value for value in offsets if type(value) is int)
+    if len(values) < 2 or values[1] - values[0] > ESP_OFFSET_AGREEMENT_SECONDS:
+        return None
+    return values[0]

@@ -604,6 +604,41 @@ def test_superseded_session_end_never_marks_the_live_connector_disconnected(back
     asyncio.run(scenario())
 
 
+def test_disconnect_write_racing_a_reconnect_leaves_the_connector_connected(backend, monkeypatch):
+    # The old socket drops on its own while it is still the registered one, so
+    # it records "disconnected"; the ESP's newer socket connects and records
+    # "connected" before that write commits. The live session must win.
+    entered, release = threading.Event(), threading.Event()
+    record = backend.set_connected
+
+    def slow_disconnect(connector_pk, connected):
+        if not connected and not entered.is_set():
+            entered.set()
+            assert release.wait(5), "test never released the disconnect write"
+        return record(connector_pk, connected)
+
+    monkeypatch.setattr(add_web, "set_stream_connected", slow_disconnect)
+
+    async def scenario():
+        old = FakeWebSocket()
+        old_stream = asyncio.create_task(add_web.device_stream(old))
+        await until(lambda: [state for state, _ in backend.connected] == [True])
+        old.disconnect()
+        await until(entered.is_set)
+        new = FakeWebSocket()
+        new_stream = asyncio.create_task(add_web.device_stream(new))
+        await until(lambda: [state for state, _ in backend.connected] == [True, True])
+        release.set()
+        await asyncio.wait_for(old_stream, 3)
+        # The late False is followed by True for the registered newer socket.
+        assert [state for state, _ in backend.connected] == [True, True, False, True]
+        new.disconnect()
+        await asyncio.wait_for(new_stream, 3)
+        assert [state for state, _ in backend.connected][-1] is False
+
+    asyncio.run(scenario())
+
+
 def test_superseded_session_sends_no_follow_ups_to_the_newer_socket(backend, monkeypatch):
     command = {"type": "command", "command_id": "command-1", "command_type": "SYNC_TIME"}
     backend.commands = [command]

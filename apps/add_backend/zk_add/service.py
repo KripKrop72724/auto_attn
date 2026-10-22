@@ -1167,12 +1167,19 @@ def update_heartbeat(
                 resolve_alert(session, connector, code="HIK_LIGHT_RECONCILE_BLOCKED")
             clock = payload.terminal.clock_sample if payload.terminal else None
             # The sample's sampled_epoch is the ESP's own clock. The envelope's
-            # sent_at uses that clock too, so ADD's receive time measures the
-            # ESP's error. Re-base the sample on ADD time when the ESP is off by
-            # more than two minutes; otherwise an ESP that is 77 minutes slow
-            # reads as a terminal that is 77 minutes fast (LF-ZONE-BLD1-01).
-            from zk_add.hikvision_clock import esp_clock_offset_seconds
-            esp_offset = esp_clock_offset_seconds(now, device_sent_at)
+            # sent_at uses that clock too, so ADD's time measures the ESP's
+            # error. When the ESP is off by more than two minutes, re-base the
+            # sample on ADD time. Before this, ADD discarded every sample from
+            # an ESP 77 minutes slow as stale, while the firmware's own clock
+            # log read the correct terminal as 77 minutes fast (LF-ZONE-BLD1-01).
+            from zk_add.hikvision_clock import ESP_OFFSET_WINDOW, esp_clock_offset_seconds, stable_esp_offset
+            measured = esp_clock_offset_seconds(now, device_sent_at)
+            offsets = list(((zkt.capability_profile or {}).get("esp_clock_offsets") or [])[-(ESP_OFFSET_WINDOW - 1):])
+            if measured is not None:
+                offsets.append(measured)
+                zkt.capability_profile = {**(zkt.capability_profile or {}), "esp_clock_offsets": offsets}
+            # A single late heartbeat neither raises the alert nor shifts the sample.
+            esp_offset = stable_esp_offset(offsets) if measured is not None else None
             zkt_payload["esp_clock_offset_seconds"] = esp_offset
             sampled_epoch = (clock.sampled_epoch + (esp_offset if esp_offset is not None and abs(esp_offset) > 120
                                                     else 0)) if clock else None
@@ -1186,6 +1193,8 @@ def update_heartbeat(
             elif esp_offset is not None:
                 resolve_alert(session, connector, code="ESP_CLOCK_SKEW")
             # A missing/stale sample must not leave the previous clock looking live.
+            # Freshness is judged on ADD's processing time, so a heartbeat that
+            # waited behind a burst fails it rather than shifting the sample.
             if clock and 0 <= now.timestamp() - sampled_epoch <= 180:
                 zkt_payload["device_time"] = datetime.fromtimestamp(clock.device_epoch, timezone.utc).isoformat()
                 zkt_payload["device_time_sampled_at"] = datetime.fromtimestamp(sampled_epoch, timezone.utc).isoformat()
