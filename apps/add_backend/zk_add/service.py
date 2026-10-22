@@ -1706,9 +1706,6 @@ def _replace_user_snapshot(
     resolved_conflicts = reconcile_device_user_identity_conflicts(
         session, connector=connector, zkt=zkt
     )
-    from zk_add.attendance_release_safety import refresh_cnic_format_alert
-
-    refresh_cnic_format_alert(session, connector, zkt)
     affected = {
         row.id: row
         for row in [*identity_changed, *resolved_conflicts]
@@ -1741,6 +1738,8 @@ def _replace_user_snapshot(
             )
     from zk_add.attendance_identity_evidence import record_identity_observation
     session.flush()
+    # After the flush so a user this snapshot removed or fixed is not counted.
+    refresh_cnic_format_alert_safely(session, connector, zkt)
     record_identity_observation(
         session,
         connector,
@@ -1854,6 +1853,24 @@ def reconcile_device_user_identity_conflicts(
         for row in rows
         if row.id in previously_conflicted and row.identity_conflict_code is None
     ]
+
+
+def refresh_cnic_format_alert_safely(session: Session, connector: Connector, zkt: ZKTDevice) -> None:
+    """A data-quality note must never fail the user snapshot that carries it."""
+    from zk_add.attendance_release_safety import refresh_cnic_format_alert
+
+    try:
+        if session.get_bind().dialect.name == "postgresql":
+            with session.begin_nested():
+                refresh_cnic_format_alert(session, connector, zkt)
+        else:
+            refresh_cnic_format_alert(session, connector, zkt)
+    except Exception:
+        import logging
+
+        logging.getLogger(__name__).exception(
+            "CNIC format alert refresh failed for connector %s", connector.id,
+        )
 
 
 def persist_identity_tombstone(

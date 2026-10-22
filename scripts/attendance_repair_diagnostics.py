@@ -423,8 +423,7 @@ def direct_approval_guard_shape(session, event, connector, decision):
         flags["saved_decision_is_current"] = bool(current_decision and current_decision.id == decision.id)
         from zk_add.attendance_release_safety import time_refusal
 
-        choice, legacy = direct._choice_in(proof)
-        resolution = direct._known_identity(session, event, choice=choice, legacy=legacy)
+        resolution = direct._revalidate(session, event, proof)
         user, cnic, current_cnic = resolution.user, resolution.cnic, resolution.current_cnic
         source, error = resolution.source, resolution.error
         flags["known_current_user"] = user is not None
@@ -432,7 +431,7 @@ def direct_approval_guard_shape(session, event, connector, decision):
             current_cnic is not None and error not in {"UNKNOWN_USER", "CNIC_MISSING"}
         )
         flags["punch_time_valid"] = time_refusal(event) is None
-        # False when the punch-time CNIC now contradicts this approval's choice.
+        # False when ADD's punch-time records now contradict the approved CNIC.
         flags["cnic_choice_consistent"] = error is None
         try:
             payload = decrypt_json(decision.payload_encrypted)

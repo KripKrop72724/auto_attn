@@ -4,33 +4,83 @@ A manual send overrides ADD's delivery holds, so it must never be the step
 that delivers an impossible time or silently attributes an older punch to
 whoever holds the terminal user ID today. Nothing here writes attendance or
 changes the automatic identity proof; it only reads and reuses it.
+
+Who held a terminal user ID when a punch happened is judged from everything
+ADD retained about that user ID, not only from the current roster:
+
+* retained identity intervals covering the punch time (including revoked ones
+  and ones recorded for another terminal UID),
+* the CNIC hash the terminal itself captured with the punch,
+* deleted identities (tombstones) for the same user ID or UID removed at or
+  after the punch time,
+* the terminal user the punch was linked to at ingest, and
+* when nothing covers the punch, the nearest retained interval before and
+  after it.
+
+Any other CNIC (or another person with an unknown CNIC) in that evidence is a
+conflict. Only evidence that names exactly one CNIC at punch time can supply
+that CNIC; today's CNIC is used without asking only when ADD's own records at
+punch time show nothing else.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import logging
+from collections import defaultdict
+from dataclasses import dataclass, field
 from datetime import timedelta
+from types import SimpleNamespace
 
-from sqlalchemy import select, tuple_
-from sqlalchemy.orm import Session
+from sqlalchemy import and_, func, or_, select, tuple_
+from sqlalchemy.orm import Session, aliased
 
-from zk_add.crypto import decrypt_cnic, decrypt_text, normalize_cnic
-from zk_add.models import AttendanceIdentityHistory, Connector, DeviceUser
+from zk_add.crypto import decrypt_cnic, decrypt_text, mask_cnic, normalize_cnic
+from zk_add.models import (
+    AttendanceIdentityHistory as History,
+    Connector,
+    DeviceUser,
+    IdentityTombstone,
+)
 from zk_add.settings import settings
 from zk_add.time_utils import ensure_utc, utc_now
+
+log = logging.getLogger(__name__)
 
 CLOCK_INVALID = "CLOCK_INVALID"
 TIME_IMPOSSIBLE = "TIME_IMPOSSIBLE"
 TIME_REFUSALS = frozenset({CLOCK_INVALID, TIME_IMPOSSIBLE})
 
 # Which CNIC the terminal held for this user ID when the punch happened.
-MATCHES_CURRENT = "MATCHES_CURRENT"  # every retained interval has today's CNIC
-DIFFERS = "DIFFERS"  # one retained CNIC, different from today's (Toheed, 19 Oct)
-AMBIGUOUS = "AMBIGUOUS"  # several CNICs, revoked or unreadable intervals
-NONE = "NONE"  # no interval covers the punch (pre-history, new hire, no CNIC)
+MATCHES_CURRENT = "MATCHES_CURRENT"  # ADD's records at punch time show only today's CNIC
+DIFFERS = "DIFFERS"  # they name exactly one other CNIC (Toheed: edited on the terminal 19 Oct)
+CONFLICT = "CONFLICT"  # another CNIC or person, but not one usable CNIC: never sent by hand
+CHANGED_NEAR_PUNCH = "CHANGED_NEAR_PUNCH"  # no record at punch time; the nearest one holds another CNIC
+AMBIGUOUS = "AMBIGUOUS"  # records exist but do not prove today's CNIC (revoked, other UID, open conflict)
+NONE = "NONE"  # no record at all (pre-history, a new hire's first punches, no CNIC then)
+
+# Evidence notes shown to the administrator. They never carry a CNIC.
+REVOKED_RECORD = "REVOKED_RECORD"
+OTHER_UID_RECORD = "OTHER_UID_RECORD"
+CAPTURED_CNIC_DIFFERS = "CAPTURED_CNIC_DIFFERS"
+CAPTURED_CNIC_MATCHES = "CAPTURED_CNIC_MATCHES"
+PREVIOUS_HOLDER_DELETED = "PREVIOUS_HOLDER_DELETED"
+PUNCH_LINKED_TO_OTHER_USER = "PUNCH_LINKED_TO_OTHER_USER"
+UID_DIFFERS = "UID_DIFFERS"
+IDENTITY_CONFLICT_UNRESOLVED = "IDENTITY_CONFLICT_UNRESOLVED"
+CNIC_CHANGED_NEAR_PUNCH = "CNIC_CHANGED_NEAR_PUNCH"
+RECORDS_TRUNCATED = "RECORDS_TRUNCATED"
+PUNCH_TIME_CNIC_HELD_BY_OTHER = "PUNCH_TIME_CNIC_HELD_BY_OTHER"
+# Signals that stop "matches today's CNIC" without naming another CNIC.
+SOFT_SIGNALS = frozenset({
+    REVOKED_RECORD, OTHER_UID_RECORD, PREVIOUS_HOLDER_DELETED, PUNCH_LINKED_TO_OTHER_USER,
+    UID_DIFFERS, IDENTITY_CONFLICT_UNRESOLVED,
+})
 
 HELD_FOR_SNAPSHOT = frozenset({"BLOCKED_IDENTITY", "WAITING_FOR_SNAPSHOT"})
-MAX_INTERVALS = 100
+KEY_CHUNK = 50
+CHUNK_ROW_LIMIT = 5000
+PER_KEY_LIMIT = 500
+MAX_COVERING = 100
 
 
 def time_refusal(event) -> str | None:
@@ -57,123 +107,410 @@ def time_refusal(event) -> str | None:
     return None
 
 
+def safe_cnic(encrypted: str | None) -> str | None:
+    """Decrypt a CNIC without ever failing the caller's transaction."""
+    try:
+        return normalize_cnic(decrypt_cnic(encrypted))
+    except Exception:
+        return None
+
+
+def safe_text(encrypted: str | None) -> str | None:
+    try:
+        return decrypt_text(encrypted)
+    except Exception:
+        return None
+
+
+@dataclass
+class PunchEvidence:
+    """Everything ADD retained about who held a terminal user ID at one punch."""
+
+    covering: list = field(default_factory=list)
+    before: History | None = None
+    after: History | None = None
+    tombstones: list = field(default_factory=list)
+    prior_user: DeviceUser | SimpleNamespace | None = None
+    truncated: bool = False
+    conflict_resolved: bool = False
+
+
 @dataclass(frozen=True)
 class PunchTimeIdentity:
     state: str
-    cnic: str | None = None  # the single retained punch-time CNIC (DIFFERS only)
-    cnic_hash: str | None = None
-    display_name: str | None = None
+    cnic_hash: str | None = None  # the single punch-time CNIC hash (DIFFERS)
+    interval: History | None = None  # the retained interval that names it (DIFFERS)
+    evidence_hashes: frozenset = frozenset()  # every CNIC hash seen at or near punch time
+    unknown_holder: bool = False  # another person whose CNIC ADD never had
+    signals: frozenset = frozenset()
+    continuity: bool = False  # DIFFERS: the same terminal user record, only its CNIC changed
     history_ids: tuple[int, ...] = ()
+    good_intervals: tuple = ()  # non-revoked intervals for the punch's UID at punch time
+    sources: tuple = ()  # (cnic hash, object with cnic_encrypted) for masked display
+    uid_matches_current: bool = True
+
+    @property
+    def cnic(self) -> str | None:
+        """The punch-time CNIC (DIFFERS only); None when it cannot be read."""
+        if self.interval is None:
+            return None
+        value = safe_cnic(self.interval.cnic_encrypted)
+        from zk_add.crypto import cnic_lookup
+
+        return value if value and cnic_lookup(value) == self.cnic_hash else None
+
+    @property
+    def display_name(self) -> str | None:
+        return safe_text(self.interval.display_name_encrypted) if self.interval is not None else None
 
 
-def _covers(history: AttendanceIdentityHistory, when, tolerance: timedelta) -> bool:
+def _covers(history: History, when, tolerance: timedelta) -> bool:
     until = ensure_utc(history.observed_until)
     return ensure_utc(history.observed_from) <= when and (
         until >= when or (not history.closed and until >= when - tolerance)
     )
 
 
-def _readable_cnic(history: AttendanceIdentityHistory) -> str | None:
-    from zk_add.attendance_identity_evidence import valid_cnic
+def _tolerance() -> timedelta:
+    return timedelta(seconds=settings.identity_snapshot_capture_tolerance_seconds)
 
-    if not valid_cnic(history.cnic_encrypted, history.cnic_lookup_hash):
+
+def _event_key(event):
+    if not (event.zkt_device_id and event.device_serial and event.user_id and event.device_event_time):
         return None
-    return normalize_cnic(decrypt_cnic(history.cnic_encrypted))
+    return (event.zkt_device_id, event.device_serial, event.user_id)
 
 
-def classify_punch_time(
-    event, intervals, current_cnic_hash: str | None, *, verify: bool = True,
-) -> PunchTimeIdentity:
-    """Compare the CNIC(s) retained for the punch time with today's CNIC.
-
-    Intervals are matched by terminal, serial and user ID. A revoked interval
-    or one for another UID still counts as evidence that the identity changed,
-    but only a retained interval for the punch's own UID can supply a CNIC.
-    ``verify=False`` compares lookup hashes only, for bounded ledger hints.
-    """
-    if event.device_event_time is None:
-        return PunchTimeIdentity(NONE)
-    when = ensure_utc(event.device_event_time)
-    tolerance = timedelta(seconds=settings.identity_snapshot_capture_tolerance_seconds)
-    covering = sorted(
-        (row for row in intervals if _covers(row, when, tolerance)), key=lambda row: row.id,
-    )
-    if not covering:
-        return PunchTimeIdentity(NONE)
-    ids = tuple(row.id for row in covering)
-    if len(covering) > MAX_INTERVALS or any(
-        verify and _readable_cnic(row) is None for row in covering
-    ):
-        return PunchTimeIdentity(AMBIGUOUS, history_ids=ids)
-    hashes = {row.cnic_lookup_hash for row in covering}
-    if current_cnic_hash and hashes == {current_cnic_hash}:
-        return PunchTimeIdentity(MATCHES_CURRENT, history_ids=ids)
-    retained = [
-        row for row in covering
-        if not row.revoked and (not event.uid or row.uid == event.uid)
-    ]
-    if len(hashes) != 1 or not retained:
-        return PunchTimeIdentity(AMBIGUOUS, history_ids=ids)
-    chosen = retained[-1]
-    return PunchTimeIdentity(
-        DIFFERS,
-        cnic=_readable_cnic(chosen) if verify else None,
-        cnic_hash=chosen.cnic_lookup_hash,
-        display_name=decrypt_text(chosen.display_name_encrypted) if verify else None,
-        history_ids=ids,
+def _key_match(key):
+    return and_(
+        History.zkt_device_id == key[0],
+        History.terminal_serial == key[1],
+        History.user_id == key[2],
     )
 
 
-def _interval_query(keys):
-    return select(AttendanceIdentityHistory).where(
-        tuple_(
-            AttendanceIdentityHistory.zkt_device_id,
-            AttendanceIdentityHistory.terminal_serial,
-            AttendanceIdentityHistory.user_id,
-        ).in_(keys)
+def _neighbours(session: Session, windows: dict, *, before: bool) -> dict:
+    """The nearest interval ending before (or starting after) each key's window."""
+    tolerance = _tolerance()
+    partition = (History.zkt_device_id, History.terminal_serial, History.user_id)
+    if before:
+        order = (History.observed_until.desc(), History.id.desc())
+        bounds = [
+            and_(_key_match(key), History.observed_until < low - tolerance)
+            for key, (low, _high) in windows.items()
+        ]
+    else:
+        order = (History.observed_from.asc(), History.id.asc())
+        bounds = [
+            and_(_key_match(key), History.observed_from > high)
+            for key, (_low, high) in windows.items()
+        ]
+    ranked = select(
+        History, func.row_number().over(partition_by=partition, order_by=order).label("rank")
+    ).where(or_(*bounds)).subquery()
+    nearest = aliased(History, ranked)
+    return {
+        (row.zkt_device_id, row.terminal_serial, row.user_id): row
+        for row in session.scalars(select(nearest).where(ranked.c.rank == 1)).all()
+    }
+
+
+def _intervals(session: Session, windows: dict) -> tuple[dict, set]:
+    """Intervals overlapping each key's own time window, bounded per key."""
+    tolerance = _tolerance()
+    found: dict = defaultdict(list)
+    truncated: set = set()
+
+    def window(key, low, high):
+        return and_(
+            _key_match(key), History.observed_from <= high,
+            History.observed_until >= low - tolerance,
+        )
+
+    ordering = (
+        History.zkt_device_id, History.terminal_serial, History.user_id,
+        History.observed_from, History.id,
     )
-
-
-def _overlapping(query, earliest, latest):
-    """Only intervals that can cover a punch between ``earliest`` and ``latest``."""
-    tolerance = timedelta(seconds=settings.identity_snapshot_capture_tolerance_seconds)
-    return query.where(
-        AttendanceIdentityHistory.observed_from <= latest,
-        AttendanceIdentityHistory.observed_until >= earliest - tolerance,
-    )
-
-
-def punch_time_identity(session: Session, event, current_cnic_hash: str | None) -> PunchTimeIdentity:
-    if not (
-        event.zkt_device_id and event.device_serial and event.user_id
-        and event.device_event_time is not None
-    ):
-        return PunchTimeIdentity(NONE)
-    when = ensure_utc(event.device_event_time)
-    intervals = session.scalars(
-        _overlapping(
-            _interval_query([(event.zkt_device_id, event.device_serial, event.user_id)]), when, when,
-        ).order_by(AttendanceIdentityHistory.id).limit(MAX_INTERVALS + 1)
+    rows = session.scalars(
+        select(History).where(or_(*[window(key, *bounds) for key, bounds in windows.items()]))
+        .order_by(*ordering).limit(CHUNK_ROW_LIMIT + 1)
     ).all()
-    return classify_punch_time(event, intervals, current_cnic_hash)
+    if len(rows) <= CHUNK_ROW_LIMIT:
+        for row in rows:
+            found[(row.zkt_device_id, row.terminal_serial, row.user_id)].append(row)
+        return found, truncated
+    # Unusually many intervals: read each key on its own, and treat a key
+    # that still overflows as unprovable rather than reading a partial list.
+    for key, bounds in windows.items():
+        rows = session.scalars(
+            select(History).where(window(key, *bounds)).order_by(*ordering).limit(PER_KEY_LIMIT + 1)
+        ).all()
+        if len(rows) > PER_KEY_LIMIT:
+            truncated.add(key)
+        found[key] = rows[:PER_KEY_LIMIT]
+    return found, truncated
 
 
-def intervals_for_page(session: Session, events) -> dict[tuple, list[AttendanceIdentityHistory]]:
-    """Retained intervals for a ledger page in bounded, chunked queries."""
-    rows = [
-        row for row in events
-        if row.zkt_device_id and row.device_serial and row.user_id and row.device_event_time
-    ]
-    found: dict[tuple, list[AttendanceIdentityHistory]] = {}
-    if not rows:
-        return found
-    keys = sorted({(row.zkt_device_id, row.device_serial, row.user_id) for row in rows})
-    times = [ensure_utc(row.device_event_time) for row in rows]
-    for start in range(0, len(keys), 200):
-        query = _overlapping(_interval_query(keys[start:start + 200]), min(times), max(times))
-        for row in session.scalars(query.limit(20 * MAX_INTERVALS)).all():
-            found.setdefault((row.zkt_device_id, row.terminal_serial, row.user_id), []).append(row)
-    return found
+def load_punch_evidence(session: Session, events, users: dict) -> dict[int, PunchEvidence]:
+    """Bounded, batched evidence for many punches.
+
+    ``users`` maps an event id to the single current active terminal user
+    (or None). Queries are chunked by terminal user ID, each with its own
+    time window, so a wide selection never reads a truncated interval list.
+    """
+    evidence = {event.id: PunchEvidence() for event in events}
+    windows: dict = {}
+    for event in events:
+        key = _event_key(event)
+        if key is None:
+            continue
+        when = ensure_utc(event.device_event_time)
+        low, high = windows.get(key, (when, when))
+        windows[key] = (min(low, when), max(high, when))
+    keys = sorted(windows)
+    intervals: dict = {}
+    before: dict = {}
+    after: dict = {}
+    truncated: set = set()
+    for start in range(0, len(keys), KEY_CHUNK):
+        chunk = {key: windows[key] for key in keys[start:start + KEY_CHUNK]}
+        found, overflow = _intervals(session, chunk)
+        intervals.update(found)
+        truncated |= overflow
+        before.update(_neighbours(session, chunk, before=True))
+        after.update(_neighbours(session, chunk, before=False))
+
+    # Deleted identities that held the same user ID or UID.
+    tombstone_keys = set()
+    for event in events:
+        if not event.zkt_device_id:
+            continue
+        tombstone_keys.add((event.zkt_device_id, "user_id", event.user_id))
+        user = users.get(event.id)
+        for uid in {event.uid, user.uid if user else None} - {None, ""}:
+            tombstone_keys.add((event.zkt_device_id, "uid", uid))
+    tombstones: dict = defaultdict(list)
+    by_user_id = sorted((zkt, value) for zkt, kind, value in tombstone_keys if kind == "user_id" and value)
+    by_uid = sorted((zkt, value) for zkt, kind, value in tombstone_keys if kind == "uid")
+    for start in range(0, max(len(by_user_id), len(by_uid)), 200):
+        conditions = []
+        if by_user_id[start:start + 200]:
+            conditions.append(tuple_(IdentityTombstone.zkt_device_id, IdentityTombstone.user_id).in_(
+                by_user_id[start:start + 200]))
+        if by_uid[start:start + 200]:
+            conditions.append(tuple_(IdentityTombstone.zkt_device_id, IdentityTombstone.uid).in_(
+                by_uid[start:start + 200]))
+        for row in session.scalars(
+            select(IdentityTombstone).where(or_(*conditions)).order_by(IdentityTombstone.id)
+        ).all():
+            tombstones[row.zkt_device_id].append(row)
+
+    prior_ids = sorted({
+        event.device_user_id for event in events
+        if event.device_user_id and users.get(event.id) is not None
+        and event.device_user_id != users[event.id].id
+    })
+    prior = {
+        row.id: row for start in range(0, len(prior_ids), 500)
+        for row in session.scalars(
+            select(DeviceUser).where(DeviceUser.id.in_(prior_ids[start:start + 500]))
+        ).all()
+    }
+
+    resolved: dict = {}
+    tolerance = _tolerance()
+    for event in events:
+        item = evidence[event.id]
+        user = users.get(event.id)
+        key = _event_key(event)
+        if key is not None:
+            when = ensure_utc(event.device_event_time)
+            rows = intervals.get(key, [])
+            item.covering = sorted((row for row in rows if _covers(row, when, tolerance)), key=lambda row: row.id)
+            item.truncated = key in truncated or len(item.covering) > MAX_COVERING
+            earlier = [row for row in rows if ensure_utc(row.observed_until) < when]
+            later = [row for row in rows if ensure_utc(row.observed_from) > when]
+            if key in before:
+                earlier.append(before[key])
+            if key in after:
+                later.append(after[key])
+            item.before = max(earlier, key=lambda row: (ensure_utc(row.observed_until), row.id), default=None)
+            item.after = min(later, key=lambda row: (ensure_utc(row.observed_from), row.id), default=None)
+        if event.device_event_time is not None:
+            when = ensure_utc(event.device_event_time)
+            uids = {event.uid, user.uid if user else None} - {None, ""}
+            item.tombstones = [
+                row for row in tombstones.get(event.zkt_device_id, [])
+                if (row.user_id == event.user_id or row.uid in uids)
+                and row.device_serial in {event.device_serial, None, ""}
+                and (user is None or row.device_user_id != user.id)
+                and row.created_at is not None and ensure_utc(row.created_at) >= when
+            ]
+        if user is not None and event.device_user_id and event.device_user_id != user.id:
+            item.prior_user = prior.get(event.device_user_id)
+            if item.prior_user is None:
+                # The linked terminal user row is gone: another person, CNIC unknown.
+                item.prior_user = SimpleNamespace(
+                    id=event.device_user_id, cnic_lookup_hash=None, cnic_encrypted=None,
+                )
+        if user is not None and user.identity_conflict_code:
+            if user.id not in resolved:
+                resolved[user.id] = _conflict_resolved(session, user)
+            item.conflict_resolved = resolved[user.id]
+    return evidence
+
+
+def _conflict_resolved(session: Session, user: DeviceUser) -> bool:
+    from zk_add.identity_conflicts import RESOLUTION_SAME_EMPLOYEE, valid_resolution_for_user
+    from zk_add.models import ZKTDevice
+
+    zkt = session.get(ZKTDevice, user.zkt_device_id)
+    if zkt is None:
+        return False
+    try:
+        resolution = valid_resolution_for_user(session, zkt=zkt, user=user)
+    except Exception:
+        log.exception("Identity conflict resolution could not be read for user %s", user.id)
+        return False
+    return bool(resolution and resolution.resolution_type == RESOLUTION_SAME_EMPLOYEE)
+
+
+def classify(event, user, current_hash: str | None, evidence: PunchEvidence) -> PunchTimeIdentity:
+    """Name the CNIC ADD's records show for the punch time, or why it cannot."""
+    covering = evidence.covering
+    signals: set = set()
+    hashes: set = set()
+    unknown_holder = False
+    sources: list = []
+    uid_matches = bool(user is None or not event.uid or not user.uid or event.uid == user.uid)
+    if not uid_matches:
+        signals.add(UID_DIFFERS)
+    if user is not None and user.identity_conflict_code and not evidence.conflict_resolved:
+        signals.add(IDENTITY_CONFLICT_UNRESOLVED)
+    if evidence.truncated:
+        signals.add(RECORDS_TRUNCATED)
+
+    def uid_ok(row) -> bool:
+        return not event.uid or row.uid == event.uid
+
+    for row in covering:
+        hashes.add(row.cnic_lookup_hash)
+        sources.append((row.cnic_lookup_hash, row))
+        if row.revoked:
+            signals.add(REVOKED_RECORD)
+        if not uid_ok(row):
+            signals.add(OTHER_UID_RECORD)
+    captured = event.captured_cnic_lookup_hash
+    if captured:
+        hashes.add(captured)
+        signals.add(CAPTURED_CNIC_MATCHES if captured == current_hash else CAPTURED_CNIC_DIFFERS)
+    for row in evidence.tombstones:
+        signals.add(PREVIOUS_HOLDER_DELETED)
+        if row.cnic_lookup_hash:
+            hashes.add(row.cnic_lookup_hash)
+            sources.append((row.cnic_lookup_hash, row))
+        else:
+            unknown_holder = True
+    prior = evidence.prior_user
+    if prior is not None:
+        signals.add(PUNCH_LINKED_TO_OTHER_USER)
+        if prior.cnic_lookup_hash:
+            hashes.add(prior.cnic_lookup_hash)
+            sources.append((prior.cnic_lookup_hash, prior))
+        else:
+            unknown_holder = True
+    if not covering and not captured:
+        for row in (evidence.before, evidence.after):
+            if row is not None and row.cnic_lookup_hash != current_hash:
+                hashes.add(row.cnic_lookup_hash)
+                sources.append((row.cnic_lookup_hash, row))
+                signals.add(CNIC_CHANGED_NEAR_PUNCH)
+    ids = tuple(row.id for row in covering)
+    good = [row for row in covering if not row.revoked and uid_ok(row)]
+    common = dict(
+        evidence_hashes=frozenset(hashes), unknown_holder=unknown_holder,
+        history_ids=ids, good_intervals=tuple(good), sources=tuple(sources),
+        uid_matches_current=uid_matches,
+    )
+    if RECORDS_TRUNCATED in signals:
+        return PunchTimeIdentity(CONFLICT, signals=frozenset(signals), **common)
+
+    good_hashes = {row.cnic_lookup_hash for row in good}
+    if len(good_hashes) == 1 and next(iter(good_hashes)) != current_hash:
+        punch_hash = next(iter(good_hashes))
+        if hashes == {punch_hash} and not unknown_holder:
+            chosen = max(good, key=lambda row: row.id)
+            continuity = bool(
+                user is not None and uid_matches and prior is None and not evidence.tombstones
+                and all(row.device_user_id == user.id and row.uid == user.uid for row in good)
+            )
+            return PunchTimeIdentity(
+                DIFFERS, cnic_hash=punch_hash, interval=chosen,
+                signals=frozenset(signals), continuity=continuity, **common,
+            )
+        return PunchTimeIdentity(CONFLICT, signals=frozenset(signals), **common)
+    if unknown_holder or hashes - {current_hash}:
+        if CNIC_CHANGED_NEAR_PUNCH in signals and not unknown_holder and not (
+            signals & {CAPTURED_CNIC_DIFFERS, PREVIOUS_HOLDER_DELETED, PUNCH_LINKED_TO_OTHER_USER}
+        ):
+            return PunchTimeIdentity(CHANGED_NEAR_PUNCH, signals=frozenset(signals), **common)
+        return PunchTimeIdentity(CONFLICT, signals=frozenset(signals), **common)
+    proven = bool(good) or captured == current_hash
+    if proven and not signals & SOFT_SIGNALS:
+        return PunchTimeIdentity(MATCHES_CURRENT, signals=frozenset(signals), **common)
+    if covering or signals & SOFT_SIGNALS:
+        return PunchTimeIdentity(AMBIGUOUS, signals=frozenset(signals), **common)
+    return PunchTimeIdentity(NONE, signals=frozenset(signals), **common)
+
+
+def contradiction_tokens(identity: PunchTimeIdentity, sent_hash: str | None) -> frozenset:
+    """Evidence against sending ``sent_hash``; an approval stores what it accepted.
+
+    A revoked or other-UID record with the same CNIC is not a contradiction:
+    it does not name anyone else, and a resolved duplicate-CNIC restore
+    depends on that.
+    """
+    tokens = {f"CNIC:{value}" for value in identity.evidence_hashes if value and value != sent_hash}
+    if identity.unknown_holder:
+        tokens.add("UNKNOWN_HOLDER")
+    for signal in (IDENTITY_CONFLICT_UNRESOLVED, RECORDS_TRUNCATED):
+        if signal in identity.signals:
+            tokens.add(signal)
+    return frozenset(tokens)
+
+
+def other_cnics_masked(identity: PunchTimeIdentity, current_hash: str | None) -> list[str]:
+    """Masked CNICs (never full) of every other identity in the punch-time evidence."""
+    from zk_add.crypto import cnic_lookup
+
+    shown: dict[str, str] = {}
+    for value, row in identity.sources:
+        if not value or value == current_hash or value in shown:
+            continue
+        cnic = safe_cnic(row.cnic_encrypted)
+        shown[value] = (mask_cnic(cnic) if cnic and cnic_lookup(cnic) == value else None) or "unreadable"
+    return sorted(shown.values())
+
+
+def punch_cnics_held_elsewhere(session: Session, pairs) -> set[tuple[str, int]]:
+    """(hash, user id) pairs whose punch-time CNIC another active terminal user holds today."""
+    hashes = sorted({value for value, _user_id in pairs if value})
+    holders: dict = defaultdict(set)
+    for start in range(0, len(hashes), 500):
+        for value, user_id in session.execute(
+            select(DeviceUser.cnic_lookup_hash, DeviceUser.id).where(
+                DeviceUser.cnic_lookup_hash.in_(hashes[start:start + 500]),
+                DeviceUser.present.is_(True),
+                DeviceUser.lifecycle_state == "ACTIVE",
+            )
+        ).all():
+            holders[value].add(user_id)
+    return {(value, user_id) for value, user_id in pairs if holders.get(value, set()) - {user_id}}
+
+
+def single_event_identity(session: Session, event, user, current_hash: str | None) -> PunchTimeIdentity:
+    evidence = load_punch_evidence(session, [event], {event.id: user})[event.id]
+    return classify(event, user, current_hash, evidence)
 
 
 def database_guard_state(session: Session, *, event, zkt, user) -> str:
@@ -197,13 +534,18 @@ def database_guard_state(session: Session, *, event, zkt, user) -> str:
     return "ACCEPTED" if accepted else "REJECTED"
 
 
-def auto_release_preview(session: Session, event, *, include_guard: bool = True) -> dict:
+def auto_release_preview(
+    session: Session, event, *, user=None, identity: PunchTimeIdentity | None = None,
+    include_guard: bool = True,
+) -> dict:
     """Would ADD's own proof release this held punch without an administrator?
 
-    ``at_next_snapshot``: the automatic proof (and the database guard) passes
-    now, so the next user snapshot releases it. ``awaiting_snapshot``: the
-    punch arrived after the latest snapshot and ADD checks it again at the
-    next one (normally within 15 minutes).
+    ``at_next_snapshot``: the automatic proof passes now and the database
+    guard does not reject it (an unreadable guard counts as pending), so the
+    next user snapshot releases it. ``awaiting_snapshot``: the punch arrived
+    after the latest snapshot and the next one can still prove it (normally
+    within 15 minutes). A punch whose punch-time records contradict today's
+    CNIC is never "awaiting": ADD cannot release it automatically.
     """
     from zk_add.attendance_identity_evidence import source_evidence
     from zk_add.service import synced_cnic_identity_proven
@@ -221,36 +563,50 @@ def auto_release_preview(session: Session, event, *, include_guard: bool = True)
     zkt = connector.zkt_device if connector else None
     if zkt is None:
         return result
-    users = session.scalars(select(DeviceUser).where(
-        DeviceUser.zkt_device_id == zkt.id,
-        DeviceUser.user_id == event.user_id,
-        DeviceUser.lifecycle_state == "ACTIVE",
-    ).limit(2)).all()
-    if len(users) != 1:
-        return result
-    user = users[0]
-    result["proof"] = bool(synced_cnic_identity_proven(session, connector, zkt, user, event))
+    if user is None:
+        users = session.scalars(select(DeviceUser).where(
+            DeviceUser.zkt_device_id == zkt.id,
+            DeviceUser.user_id == event.user_id,
+            DeviceUser.lifecycle_state == "ACTIVE",
+        ).limit(2)).all()
+        if len(users) != 1:
+            return result
+        user = users[0]
+    try:
+        result["proof"] = bool(synced_cnic_identity_proven(session, connector, zkt, user, event))
+    except Exception:
+        # Unreadable retained data: the snapshot's own release fails the same
+        # way, so nothing is released automatically.
+        log.exception("Automatic identity proof could not be evaluated for event %s", event.id)
     if result["proof"]:
         result["database_guard"] = (
             database_guard_state(session, event=event, zkt=zkt, user=user)
             if include_guard else "NOT_CHECKED"
         )
-        result["at_next_snapshot"] = result["database_guard"] in {
-            "ACCEPTED", "NOT_APPLICABLE", "NOT_CHECKED",
-        }
+        result["at_next_snapshot"] = result["database_guard"] != "REJECTED"
         return result
+    live = event.source in {"LIVE", "LIVE_POLL"}
+    provable = (
+        not event.captured_cnic_lookup_hash
+        or event.captured_cnic_lookup_hash == user.cnic_lookup_hash
+    )
+    if not live and identity is not None:
+        provable = provable and identity.state in {MATCHES_CURRENT, NONE} and not contradiction_tokens(
+            identity, user.cnic_lookup_hash,
+        )
     snapshot_at = zkt.identity_snapshot_observed_at
     result["awaiting_snapshot"] = bool(
-        user.present and user.cnic_lookup_hash and not user.identity_conflict_code
+        provable
+        and user.present and user.cnic_lookup_hash and not user.identity_conflict_code
         and zkt.snapshot_complete and zkt.identity_snapshot_stable
         and event.clock_quality == "OK"
         and (snapshot_at is None or ensure_utc(event.captured_at) > ensure_utc(snapshot_at))
-        and (
-            event.source in {"LIVE", "LIVE_POLL"}
-            or source_evidence(session, event, connector) is not None
-        )
+        and (live or source_evidence(session, event, connector) is not None)
     )
     return result
+
+
+CNIC_FORMAT_ALERT = "USER_CNIC_FORMAT_SUSPECT"
 
 
 def refresh_cnic_format_alert(session: Session, connector: Connector, zkt) -> int:
@@ -258,9 +614,12 @@ def refresh_cnic_format_alert(session: Session, connector: Connector, zkt) -> in
 
     Such a user has no CNIC in ADD, so every punch is held. The alert names
     terminal user IDs only; the suspect digits are never parsed or stored.
+    It is an INFO data-quality note with no health effect, and an unchanged
+    set of users does not refresh it, so it never appears as a new warning
+    inside a firmware HIL observation window.
     """
     from zk_add.identity import suspect_cnic_name
-    from zk_add.service import resolve_alert, upsert_alert
+    from zk_add.service import open_alert_row, resolve_alert, upsert_alert
 
     suspect_user_ids = sorted(
         user.user_id
@@ -270,23 +629,28 @@ def refresh_cnic_format_alert(session: Session, connector: Connector, zkt) -> in
             DeviceUser.present.is_(True),
             DeviceUser.cnic_lookup_hash.is_(None),
         )).all()
-        if suspect_cnic_name(decrypt_text(user.machine_name_encrypted))
+        if suspect_cnic_name(safe_text(user.machine_name_encrypted))
     )
     if suspect_user_ids:
-        upsert_alert(
-            session,
-            connector,
-            code="USER_CNIC_FORMAT_SUSPECT",
-            severity="WARNING",
-            message=(
-                "A terminal user name contains a CNIC in a format ADD cannot use "
-                "(for example a letter before the 13 digits, or dashes). Their punches "
-                "stay held. Confirm the CNIC with HR and set it in ADD Users."
-            ),
-            details={"affected_users": len(suspect_user_ids), "user_ids": suspect_user_ids[:50]},
-        )
+        details = {"affected_users": len(suspect_user_ids), "user_ids": suspect_user_ids[:50]}
+        current = open_alert_row(session, connector, CNIC_FORMAT_ALERT)
+        if current is None or (current.details or {}).get("user_ids") != details["user_ids"] or (
+            (current.details or {}).get("affected_users") != details["affected_users"]
+        ):
+            upsert_alert(
+                session,
+                connector,
+                code=CNIC_FORMAT_ALERT,
+                severity="INFO",
+                message=(
+                    "A terminal user name contains a CNIC in a format ADD cannot use "
+                    "(for example a letter before the 13 digits, or dashes). Their punches "
+                    "stay held. Confirm the CNIC with HR and set it in ADD Users."
+                ),
+                details=details,
+            )
     else:
-        resolve_alert(session, connector, code="USER_CNIC_FORMAT_SUSPECT")
+        resolve_alert(session, connector, code=CNIC_FORMAT_ALERT, touch_last_seen=False)
     return len(suspect_user_ids)
 
 
@@ -296,5 +660,5 @@ def suspect_user_count(users) -> int:
     return sum(
         1 for user in users
         if not user.cnic_lookup_hash
-        and suspect_cnic_name(decrypt_text(user.machine_name_encrypted))
+        and suspect_cnic_name(safe_text(user.machine_name_encrypted))
     )

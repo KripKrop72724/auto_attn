@@ -938,8 +938,12 @@ def claim_ords_batch(limit: int) -> list[tuple[int, dict, int, bool]]:
                 else None
             )
             from zk_add.attendance_manual_guard import delivery_authorized, decision_for
+            from zk_add.attendance_direct_ords import superseded_by_automatic_release
             decision = decision_for(session, event) if event else None
-            if decision and decision.proof.get("policy") == "manual-direct-ords-v1":
+            # A stopped direct approval never blocks ADD's own later automatic
+            # release: ordinary delivery below owns that punch again.
+            automatic_owner = bool(decision and superseded_by_automatic_release(session, event, decision))
+            if decision and decision.proof.get("policy") == "manual-direct-ords-v1" and not automatic_owner:
                 connector = session.get(Connector, event.connector_id)
                 from zk_add.attendance_force_release import delivery_payload
                 from zk_add.attendance_release_safety import time_refusal
@@ -1022,7 +1026,7 @@ def claim_ords_batch(limit: int) -> list[tuple[int, dict, int, bool]]:
                 )
                 continue
             candidate_payload = oracle_payload(connector, zkt, event, cnic)
-            if decision_for(session, event):
+            if decision_for(session, event) and not automatic_owner:
                 from zk_add.attendance_force_release import delivery_payload
                 candidate_payload = delivery_payload(session, event, connector)
                 if candidate_payload is None:

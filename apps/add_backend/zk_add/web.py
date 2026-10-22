@@ -3398,12 +3398,25 @@ IDENTITY_RELEASE_HINTS = {
         "No saved terminal record yet: a full-history or tail read must link this punch "
         "to the terminal's own attendance log before ADD can prove its source."
     ),
+    "DATABASE_GUARD_UNAVAILABLE": (
+        "ADD's proof passes but the database guard could not be read. Treat the punch as "
+        "about to be released automatically."
+    ),
     "PUNCH_TIME_CNIC_DIFFERS": (
         "The terminal held a different CNIC for this user ID at punch time. A manual send "
         "must choose which CNIC to use; the punch-time CNIC is the default."
     ),
+    "PUNCH_TIME_CNIC_CONFLICT": (
+        "ADD's records show another CNIC or another person for this user ID at punch time "
+        "(see other_cnics_masked and evidence_signals). A manual send refuses this punch."
+    ),
+    "PUNCH_TIME_CNIC_CHANGED_NEARBY": (
+        "No record covers the punch time, and the nearest record before or after it holds "
+        "another CNIC. Today's CNIC may only be sent after HR confirms who held the user ID."
+    ),
     "PUNCH_TIME_CNIC_AMBIGUOUS": (
-        "Several or revoked identity records cover the punch time. ADD cannot name one CNIC."
+        "The records at punch time are revoked, belong to another terminal UID, or the user "
+        "has an unresolved identity conflict. They do not prove today's CNIC."
     ),
     "NO_PUNCH_TIME_IDENTITY": (
         "ADD has no identity record for this user ID at punch time. Today's CNIC may only be "
@@ -3419,28 +3432,29 @@ def _identity_release_safety(
     from zk_add.attendance_identity_evidence import TERMINAL_RECONCILE_SOURCES
     from zk_add.attendance_release_safety import (
         AMBIGUOUS,
+        CHANGED_NEAR_PUNCH,
+        CONFLICT,
         DIFFERS,
         NONE,
         auto_release_preview,
         database_guard_state,
-        punch_time_identity,
+        other_cnics_masked,
+        safe_cnic,
+        single_event_identity,
         time_refusal,
     )
 
-    try:
-        current_cnic = normalize_cnic(decrypt_cnic(user.cnic_encrypted)) if user else None
-    except Exception:
-        current_cnic = None
-    punch = punch_time_identity(
-        db, event, cnic_lookup(current_cnic) if current_cnic else None,
-    )
+    current_cnic = safe_cnic(user.cnic_encrypted) if user else None
+    current_hash = cnic_lookup(current_cnic) if current_cnic else None
+    punch = single_event_identity(db, event, user, current_hash)
     guard = (
         database_guard_state(db, event=event, zkt=zkt, user=user)
         if connector and zkt and user else "NOT_CHECKED"
     )
-    release = auto_release_preview(db, event, include_guard=False)
+    release = auto_release_preview(db, event, identity=punch, include_guard=False)
     at_next_snapshot = bool(
-        release["held"] and auto_release_eligible and guard in {"ACCEPTED", "NOT_APPLICABLE"}
+        release["held"] and auto_release_eligible
+        and guard in {"ACCEPTED", "NOT_APPLICABLE", "UNAVAILABLE"}
     )
     saved_record = manifest is not None
     codes = []
@@ -3453,10 +3467,14 @@ def _identity_release_safety(
         codes.append("AWAITING_NEXT_SNAPSHOT")
     if auto_release_eligible and guard == "REJECTED":
         codes.append("DATABASE_GUARD_REJECTS")
+    if auto_release_eligible and guard == "UNAVAILABLE":
+        codes.append("DATABASE_GUARD_UNAVAILABLE")
     if not saved_record and source is None and event.source in TERMINAL_RECONCILE_SOURCES:
         codes.append("NO_SAVED_TERMINAL_RECORD")
     punch_code = {
         DIFFERS: "PUNCH_TIME_CNIC_DIFFERS",
+        CONFLICT: "PUNCH_TIME_CNIC_CONFLICT",
+        CHANGED_NEAR_PUNCH: "PUNCH_TIME_CNIC_CHANGED_NEARBY",
         AMBIGUOUS: "PUNCH_TIME_CNIC_AMBIGUOUS",
         NONE: "NO_PUNCH_TIME_IDENTITY",
     }.get(punch.state)
@@ -3470,9 +3488,12 @@ def _identity_release_safety(
         "saved_terminal_record": saved_record,
         "punch_time_cnic": {
             "state": punch.state,
-            "cnic_masked": mask_cnic(punch.cnic) if punch.cnic else None,
-            "display_name": punch.display_name,
+            "cnic_masked": mask_cnic(punch.cnic) if punch.state == DIFFERS and punch.cnic else None,
+            "display_name": punch.display_name if punch.state == DIFFERS else None,
             "history_ids": list(punch.history_ids),
+            "other_cnics_masked": other_cnics_masked(punch, current_hash),
+            "evidence_signals": sorted(punch.signals),
+            "uid_matches_current": punch.uid_matches_current,
         },
         "current_cnic_masked": mask_cnic(current_cnic),
         "punch_time_cnic_matches_current": punch.state == "MATCHES_CURRENT",

@@ -131,6 +131,7 @@ def register_intent(session, *, connector, event, outbox, alias, verification_sc
 
 
 def _current(session, intent, row):
+    from zk_add.attendance_direct_ords import superseded_by_automatic_release
     from zk_add.attendance_manual_guard import decision_for, delivery_authorized
     from zk_add.attendance_recovery import _terminal_provenance_verified
     from zk_add.attendance_safe_repair import delivery_proof_valid
@@ -148,7 +149,9 @@ def _current(session, intent, row):
             or event.event_uid != alias.occurrence_id or not connector.zkt_device
             or not _occurrence_bound(session, connector, alias)
             or not _terminal_provenance_verified(event, connector)
-            or not delivery_authorized(session, event) or decision_for(session, event) is not None
+            or not delivery_authorized(session, event)
+            or not (decision_for(session, event) is None or superseded_by_automatic_release(
+                session, event, decision_for(session, event)))
             or event.identity_resolution_status not in VERIFIED_IDENTITY_RESOLUTION_STATUSES
             or not delivery_proof_valid(session, event, connector)
             or event.clock_quality == "INVALID"

@@ -67,6 +67,22 @@ def held_event(sessions):
         return event.id
 
 
+def add_interval(db, event, *, cnic, start, end, closed=True, revoked=False, uid=None, name="Retained name"):
+    user = db.scalar(select(DeviceUser).where(DeviceUser.user_id == event.user_id))
+    zkt = db.get(Connector, event.connector_id).zkt_device
+    db.add(AttendanceIdentityHistory(
+        zkt_device_id=zkt.id, device_user_id=user.id, terminal_serial=event.device_serial,
+        user_id=event.user_id, uid=uid or event.uid, fingerprint="f" * 64,
+        cnic_encrypted=encrypt_cnic(cnic), cnic_lookup_hash=cnic_lookup(cnic),
+        display_name_encrypted=encrypt_text(name),
+        first_snapshot_id=zkt.identity_snapshot_id, last_snapshot_id=zkt.identity_snapshot_id,
+        last_revision=zkt.identity_snapshot_revision,
+        observed_from=event.device_event_time + start, observed_until=event.device_event_time + end,
+        closed=closed, revoked=revoked,
+    ))
+    db.flush()
+
+
 def add_punch_time_interval(db, event, *, cnic=PUNCH_CNIC, uid=None, revoked=False):
     """The terminal's retained identity for the user ID across the punch time."""
     user = db.scalar(select(DeviceUser).where(DeviceUser.user_id == event.user_id))
@@ -83,6 +99,12 @@ def add_punch_time_interval(db, event, *, cnic=PUNCH_CNIC, uid=None, revoked=Fal
         closed=True, revoked=revoked,
     ))
     db.flush()
+
+
+def punch_time_record(db):
+    return db.scalar(select(AttendanceIdentityHistory).where(
+        AttendanceIdentityHistory.cnic_lookup_hash == cnic_lookup(PUNCH_CNIC),
+    ))
 
 
 @pytest.mark.parametrize("when, quality, expected", [
@@ -268,12 +290,18 @@ def test_choices_and_send_now_must_name_selected_punches():
 
 
 @pytest.mark.parametrize("interval", ["revoked", "other_uid", "two_cnics"])
-def test_ambiguous_punch_time_identity_offers_only_explicit_current(store, interval):
+def test_another_cnic_at_punch_time_is_refused_never_sent_as_today(store, interval):
+    """Safety review 1: user ID 100 was Ali (another UID, CNIC P) at punch time and is now Babar.
+
+    The only evidence names a different CNIC, so neither a bulk "today's CNIC"
+    tick nor an explicit CURRENT choice may send Babar's CNIC for Ali's punch.
+    """
     sessions, _connector_id, _uid = store
     event_id = held_event(sessions)
     with sessions() as db:
         event = db.get(AttendanceEvent, event_id)
         if interval == "revoked":
+            # A Toheed-style old interval revoked by a transient duplicate-CNIC conflict.
             add_punch_time_interval(db, event, revoked=True)
         elif interval == "other_uid":
             add_punch_time_interval(db, event, uid="99")
@@ -282,12 +310,252 @@ def test_ambiguous_punch_time_identity_offers_only_explicit_current(store, inter
             add_punch_time_interval(db, event, cnic="3520255555551")
         db.commit()
     with sessions() as db:
+        event = db.get(AttendanceEvent, event_id)
+        hint = direct.identity_hints_for_page(db, [event])[event_id]
+        assert hint["eligible"] is False and hint["exclusion"] == "CNIC_CONFLICT"
         row = direct.preview(db, [event_id])["rows"][0]
-        assert row["punch_time_cnic"] == "AMBIGUOUS"
+        assert row["punch_time_cnic"] == "CONFLICT"
+        assert row["exclusion"] == "CNIC_CONFLICT" and "another CNIC" in row["exclusion_reason"]
+        assert row["cnic_choices"] == [] and row["default_cnic_choice"] is None
+        assert row["decision_kind"] is None
+        assert mask_cnic(PUNCH_CNIC) in row["other_cnics_masked"]
+        assert PUNCH_CNIC not in str(row)
+        if interval == "other_uid":
+            assert "OTHER_UID_RECORD" in row["evidence_signals"]
+        for choice in ("CURRENT", "PUNCH_TIME"):
+            direct.create(db, actor="operator", request=start(event_id, key=f"conflict-{choice}", choice=choice))
+            db.commit()
+        items = db.scalars(select(Item)).all()
+        assert [item.error_code for item in items] == ["CNIC_CONFLICT", "CNIC_CONFLICT"]
+        assert all(item.result["payload_encrypted"] is None for item in items)
+        assert db.scalar(select(Decision)) is None
+
+
+def test_revoked_interval_with_todays_cnic_needs_an_explicit_per_punch_choice(store):
+    """Safety review 3: a revoked record never counts as "matches today's CNIC"."""
+    sessions, _connector_id, _uid = store
+    event_id = held_event(sessions)
+    with sessions() as db:
+        add_punch_time_interval(db, db.get(AttendanceEvent, event_id), cnic=CORRECT_CNIC, revoked=True)
+        db.commit()
+    with sessions() as db:
+        row = direct.preview(db, [event_id])["rows"][0]
+        assert row["punch_time_cnic"] == "AMBIGUOUS" and row["cnic_choice_required"] is True
         assert row["cnic_choices"] == ["CURRENT"] and row["default_cnic_choice"] is None
-        direct.create(db, actor="operator", request=start(event_id, key="punch", choice="PUNCH_TIME"))
+        assert row["evidence_signals"] == ["REVOKED_RECORD"]
+        # Confirmed one punch at a time, never in a terminal-wide bulk tick.
+        assert row["decision_kind"] == "CONFIRM_TODAY" and row["decision_group"] == f"row|{event_id}"
+        direct.create(db, actor="operator", request=start(event_id, key="revoked-no-choice"))
         db.commit()
         assert db.scalar(select(Item)).error_code == "CNIC_CHOICE_REQUIRED"
+
+
+def test_unresolved_identity_conflict_is_shown_and_needs_explicit_choice(store):
+    sessions, _connector_id, _uid = store
+    event_id = held_event(sessions)
+    with sessions() as db:
+        event = db.get(AttendanceEvent, event_id)
+        add_punch_time_interval(db, event, cnic=CORRECT_CNIC)
+        db.scalar(select(DeviceUser)).identity_conflict_code = "DUPLICATE_USER_CNIC"
+        db.commit()
+    with sessions() as db:
+        row = direct.preview(db, [event_id])["rows"][0]
+        assert row["punch_time_cnic"] == "AMBIGUOUS"
+        assert row["identity_conflict_code"] == "DUPLICATE_USER_CNIC"
+        assert "IDENTITY_CONFLICT_UNRESOLVED" in row["evidence_signals"]
+        assert row["decision_group"] == f"row|{event_id}"
+
+
+@pytest.mark.parametrize("with_interval", [True, False])
+def test_terminal_captured_cnic_that_differs_from_today_refuses_the_send(store, with_interval):
+    """Safety review 2 / correctness 2: the terminal's own captured CNIC is evidence.
+
+    Toheed's 19 Oct edit: LIVE punches captured as …609-0 from the cached
+    roster while the new …609-2 interval covers them.
+    """
+    sessions, _connector_id, _uid = store
+    event_id = held_event(sessions)
+    with sessions() as db:
+        event = db.get(AttendanceEvent, event_id)
+        event.captured_cnic_lookup_hash = cnic_lookup(PUNCH_CNIC)
+        if with_interval:
+            add_punch_time_interval(db, event, cnic=CORRECT_CNIC)
+        db.commit()
+    with sessions() as db:
+        row = direct.preview(db, [event_id])["rows"][0]
+        assert row["punch_time_cnic"] == "CONFLICT" and row["exclusion"] == "CNIC_CONFLICT"
+        assert "CAPTURED_CNIC_DIFFERS" in row["evidence_signals"]
+        direct.create(db, actor="operator", request=start(event_id, key="captured", choice="CURRENT", send_now=True))
+        db.commit()
+        assert db.scalar(select(Item)).error_code == "CNIC_CONFLICT"
+
+
+def test_terminal_captured_cnic_equal_to_today_matches_without_a_choice(store):
+    sessions, _connector_id, _uid = store
+    event_id = held_event(sessions)
+    with sessions() as db:
+        db.get(AttendanceEvent, event_id).captured_cnic_lookup_hash = cnic_lookup(CORRECT_CNIC)
+        db.commit()
+    with sessions() as db:
+        row = direct.preview(db, [event_id])["rows"][0]
+        assert row["punch_time_cnic"] == "MATCHES_CURRENT" and row["cnic_choice_required"] is False
+
+
+@pytest.mark.parametrize("evidence", ["tombstone", "tombstone_no_cnic", "linked_user"])
+def test_another_holder_of_the_user_id_at_punch_time_refuses_the_send(store, evidence):
+    """A deleted identity, or the terminal user the punch was linked to at ingest."""
+    from zk_add.models import IdentityTombstone
+
+    sessions, _connector_id, _uid = store
+    event_id = held_event(sessions)
+    with sessions() as db:
+        event = db.get(AttendanceEvent, event_id)
+        zkt = db.get(Connector, event.connector_id).zkt_device
+        other = DeviceUser(
+            zkt_device_id=zkt.id, user_key="previous-holder", uid="99", user_id=event.user_id,
+            display_name="Previous holder", cnic_encrypted=encrypt_cnic(PUNCH_CNIC),
+            cnic_lookup_hash=cnic_lookup(PUNCH_CNIC), present=False, lifecycle_state="DELETED",
+        )
+        db.add(other)
+        db.flush()
+        if evidence == "linked_user":
+            event.device_user_id = other.id
+        else:
+            db.add(IdentityTombstone(
+                zkt_device_id=zkt.id, device_user_id=other.id, device_serial=zkt.serial,
+                uid="99", user_id=event.user_id, display_name_encrypted=encrypt_text("Previous holder"),
+                cnic_encrypted=None if evidence == "tombstone_no_cnic" else encrypt_cnic(PUNCH_CNIC),
+                cnic_lookup_hash=None if evidence == "tombstone_no_cnic" else cnic_lookup(PUNCH_CNIC),
+            ))
+        db.commit()
+    with sessions() as db:
+        row = direct.preview(db, [event_id])["rows"][0]
+        assert row["punch_time_cnic"] == "CONFLICT" and row["exclusion"] == "CNIC_CONFLICT"
+        assert ("PUNCH_LINKED_TO_OTHER_USER" if evidence == "linked_user" else "PREVIOUS_HOLDER_DELETED") in (
+            row["evidence_signals"]
+        )
+
+
+def test_a_holder_deleted_before_the_punch_is_not_evidence(store):
+    from zk_add.models import IdentityTombstone
+
+    sessions, _connector_id, _uid = store
+    event_id = held_event(sessions)
+    with sessions() as db:
+        event = db.get(AttendanceEvent, event_id)
+        zkt = db.get(Connector, event.connector_id).zkt_device
+        db.add(IdentityTombstone(
+            zkt_device_id=zkt.id, device_user_id=db.scalar(select(DeviceUser)).id + 100,
+            device_serial=zkt.serial, uid="99", user_id=event.user_id,
+            display_name_encrypted=encrypt_text("Earlier holder"),
+            cnic_encrypted=encrypt_cnic(PUNCH_CNIC), cnic_lookup_hash=cnic_lookup(PUNCH_CNIC),
+            created_at=event.device_event_time - timedelta(days=30),
+        ))
+        db.commit()
+    with sessions() as db:
+        assert direct.preview(db, [event_id])["rows"][0]["punch_time_cnic"] == "NONE"
+
+
+def test_punch_in_a_gap_between_different_cnics_is_confirmed_per_punch(store):
+    """Correctness 4: a CNIC edited between two snapshots leaves the punch in a gap."""
+    sessions, _connector_id, _uid = store
+    event_id = held_event(sessions)
+    with sessions() as db:
+        event = db.get(AttendanceEvent, event_id)
+        add_interval(db, event, cnic=PUNCH_CNIC, start=-timedelta(days=5), end=-timedelta(minutes=1))
+        add_interval(db, event, cnic=CORRECT_CNIC, start=timedelta(minutes=2), end=timedelta(days=1), closed=False)
+        db.commit()
+    with sessions() as db:
+        row = direct.preview(db, [event_id])["rows"][0]
+        assert row["punch_time_cnic"] == "CHANGED_NEAR_PUNCH"
+        assert row["cnic_choices"] == ["CURRENT"] and row["default_cnic_choice"] is None
+        assert row["other_cnics_masked"] == [mask_cnic(PUNCH_CNIC)]
+        assert row["decision_kind"] == "CONFIRM_TODAY" and row["decision_group"] == f"row|{event_id}"
+
+
+def test_no_record_rows_are_confirmed_once_per_terminal_user_id(store):
+    sessions, _connector_id, _uid = store
+    event_id = held_event(sessions)
+    with sessions() as db:
+        row = direct.preview(db, [event_id])["rows"][0]
+        assert row["punch_time_cnic"] == "NONE"
+        assert row["decision_kind"] == "CONFIRM_TODAY"
+        assert row["decision_group"] == f"today|{row['zkt_device_id']}|{row['user_id']}"
+
+
+def test_punch_time_default_is_withheld_when_another_active_user_holds_that_cnic(store):
+    """Safety review 6: the old CNIC may be a colleague's real CNIC."""
+    sessions, _connector_id, _uid = store
+    event_id = held_event(sessions)
+    with sessions() as db:
+        event = db.get(AttendanceEvent, event_id)
+        add_punch_time_interval(db, event)
+        db.add(DeviceUser(
+            zkt_device_id=event.zkt_device_id, user_key="colleague", uid="8", user_id="1008",
+            display_name="Colleague", cnic_encrypted=encrypt_cnic(PUNCH_CNIC),
+            cnic_lookup_hash=cnic_lookup(PUNCH_CNIC), present=True, lifecycle_state="ACTIVE",
+        ))
+        db.commit()
+    with sessions() as db:
+        row = direct.preview(db, [event_id])["rows"][0]
+        assert row["punch_time_cnic"] == "DIFFERS"
+        assert row["punch_time_cnic_held_by_other"] is True
+        assert "PUNCH_TIME_CNIC_HELD_BY_OTHER" in row["evidence_signals"]
+        assert row["cnic_choices"] == ["PUNCH_TIME", "CURRENT"]
+        assert row["default_cnic_choice"] is None and row["decision_kind"] == "CHOOSE_CNIC"
+
+
+def test_punch_time_cnic_of_another_terminal_record_does_not_offer_today(store):
+    """A deleted and re-added terminal user is another record: only its own CNIC is offered."""
+    sessions, _connector_id, _uid = store
+    event_id = held_event(sessions)
+    with sessions() as db:
+        event = db.get(AttendanceEvent, event_id)
+        previous = DeviceUser(
+            zkt_device_id=event.zkt_device_id, user_key="re-enrolled", uid=event.uid,
+            user_id=event.user_id, display_name="Earlier record", present=False, lifecycle_state="DELETED",
+        )
+        db.add(previous)
+        db.flush()
+        add_punch_time_interval(db, event)
+        punch_time_record(db).device_user_id = previous.id
+        db.commit()
+    with sessions() as db:
+        row = direct.preview(db, [event_id])["rows"][0]
+        assert row["punch_time_cnic"] == "DIFFERS" and row["cnic_choices"] == ["PUNCH_TIME"]
+        direct.create(db, actor="operator", request=start(event_id, key="re-enrolled", choice="CURRENT"))
+        db.commit()
+        assert db.scalar(select(Item)).error_code == "CNIC_CHOICE_REQUIRED"
+
+
+def test_punch_time_send_uses_the_punch_name_never_todays(store):
+    """Correctness 7: an interval without a name falls back to the punch's own name."""
+    sessions, _connector_id, _uid = store
+    event_id = held_event(sessions)
+    with sessions() as db:
+        event = db.get(AttendanceEvent, event_id)
+        event.display_name = "Name on the punch"
+        add_punch_time_interval(db, event)
+        punch_time_record(db).display_name_encrypted = None
+        db.commit()
+    with sessions() as db:
+        direct.create(db, actor="operator", request=start(event_id, key="punch-name", choice="PUNCH_TIME"))
+        db.commit()
+        item = db.scalar(select(Item))
+        assert item.status == "READY"
+        from zk_add.crypto import decrypt_json
+
+        payload = decrypt_json(item.result["payload_encrypted"])
+        assert payload["cnic"] == PUNCH_CNIC and payload["employee_name"] == "Name on the punch"
+    with sessions() as db:
+        event = db.get(AttendanceEvent, event_id)
+        event.display_name = None
+        db.commit()
+    with sessions() as db:
+        direct.create(db, actor="operator", request=start(event_id, key="no-name", choice="PUNCH_TIME"))
+        db.commit()
+        latest = db.scalars(select(Item).order_by(Item.id.desc())).first()
+        assert latest.error_code == "PUNCH_TIME_NAME_MISSING"
 
 
 def test_punch_time_interval_matching_today_needs_no_choice(store):
@@ -467,7 +735,7 @@ def test_suspect_cnic_raises_alert_and_operator_cnic_cleans_name(db):
         ("56", "04049", "Bilal-3520212345671"),
     ])
     alert = db.scalar(select(DeviceAlert).where(DeviceAlert.code == "USER_CNIC_FORMAT_SUSPECT"))
-    assert alert.state == "OPEN" and alert.severity == "WARNING"
+    assert alert.state == "OPEN" and alert.severity == "INFO"
     assert alert.details == {"affected_users": 1, "user_ids": ["04048"]}
     assert "4230111028815" not in str(alert.details) + alert.message
     saleem = db.scalar(select(DeviceUser).where(DeviceUser.user_id == "04048"))
@@ -496,3 +764,316 @@ def test_suspect_cnic_raises_alert_and_operator_cnic_cleans_name(db):
     ])
     db.refresh(alert)
     assert alert.state != "OPEN"
+
+
+def queue_current(sessions, event_id, key):
+    """Approve today's CNIC for a punch with no record, and queue it (decision saved)."""
+    with sessions() as db:
+        direct.create(db, actor="operator", request=start(event_id, key=key, choice="CURRENT", send_now=True))
+        db.commit()
+    with sessions() as db:
+        direct.advance_once(db)
+        db.commit()
+        assert db.scalar(select(Decision)) is not None
+
+
+def ticks(sessions, count):
+    """Scheduler ticks, each in its own committed transaction as in production."""
+    for _ in range(count):
+        with sessions() as db:
+            direct.advance_once(db)
+            db.commit()
+
+
+def approved(db, event_id, decision=None):
+    event = db.get(AttendanceEvent, event_id)
+    decision = decision or db.scalars(select(Decision).order_by(Decision.id.desc())).first()
+    return direct.approved_payload(db, event, db.get(Connector, event.connector_id), decision)
+
+
+def test_better_evidence_for_the_same_cnic_never_stops_an_approval(store):
+    """Both reviews, finding 4/1: the next snapshot covers the punch with today's CNIC.
+
+    The payload is identical, so the approval keeps delivering (as on main)
+    instead of being blocked forever.
+    """
+    sessions, _connector_id, _uid = store
+    event_id = held_event(sessions)
+    queue_current(sessions, event_id, "improves")
+    with sessions() as db:
+        assert approved(db, event_id)["cnic"] == CORRECT_CNIC
+        add_punch_time_interval(db, db.get(AttendanceEvent, event_id), cnic=CORRECT_CNIC)
+        db.commit()
+    with sessions() as db:
+        assert approved(db, event_id)["cnic"] == CORRECT_CNIC
+    normal, forced = delivery.split_claims(worker.claim_ords_batch(5))
+    assert normal == [] and len(forced) == 1
+    assert forced[0]["payload"]["cnic"] == CORRECT_CNIC
+
+
+def test_better_evidence_before_queueing_still_queues(store):
+    sessions, _connector_id, _uid = store
+    event_id = held_event(sessions)
+    with sessions() as db:
+        direct.create(db, actor="operator", request=start(event_id, key="ready", choice="CURRENT", send_now=True))
+        add_punch_time_interval(db, db.get(AttendanceEvent, event_id), cnic=CORRECT_CNIC)
+        db.commit()
+    with sessions() as db:
+        direct.advance_once(db)
+        db.commit()
+        assert db.scalar(select(Item)).status == "WAITING_ORACLE"
+
+
+def test_new_contradicting_evidence_stops_an_approval_and_it_can_be_replaced(store):
+    """Owner question 3: a stopped approval no longer blocks a new explicit approval."""
+    sessions, _connector_id, _uid = store
+    event_id = held_event(sessions)
+    queue_current(sessions, event_id, "stopped")
+    with sessions() as db:
+        # A backfilled snapshot shows the terminal held another CNIC then.
+        add_punch_time_interval(db, db.get(AttendanceEvent, event_id))
+        db.commit()
+    with sessions() as db:
+        assert approved(db, event_id) is None
+    assert delivery.split_claims(worker.claim_ords_batch(5)) == ([], [])
+    with sessions() as db:
+        assert db.get(AttendanceEvent, event_id).ords_status == "BLOCKED_IDENTITY"
+        row = direct.preview(db, [event_id])["rows"][0]
+        assert row["exclusion"] is None and row["replaces_stopped_approval"] is True
+        assert row["punch_time_cnic"] == "DIFFERS"
+        direct.create(db, actor="operator", request=start(event_id, key="replacement", choice="PUNCH_TIME"))
+        db.commit()
+    ticks(sessions, 2)
+    with sessions() as db:
+        decisions = db.scalars(select(Decision).order_by(Decision.id)).all()
+        assert len(decisions) == 2
+        assert approved(db, event_id, decisions[-1])["cnic"] == PUNCH_CNIC
+        items = {item.job_id: item for item in db.scalars(select(Item)).all()}
+        first, second = (items[decision.job_id] for decision in decisions)
+        assert first.status in {"NEEDS_REVIEW", "SKIPPED"}
+        assert second.status == "WAITING_ORACLE"
+        assert db.get(AttendanceEvent, event_id).ords_status == "PENDING"
+
+
+def test_a_waiting_item_is_closed_when_a_later_approval_replaces_it(store):
+    sessions, _connector_id, _uid = store
+    event_id = held_event(sessions)
+    queue_current(sessions, event_id, "first")
+    with sessions() as db:
+        add_punch_time_interval(db, db.get(AttendanceEvent, event_id))
+        db.commit()
+    with sessions() as db:
+        direct.create(db, actor="operator", request=start(event_id, key="second", choice="PUNCH_TIME"))
+        db.commit()
+    ticks(sessions, 3)
+    with sessions() as db:
+        first = db.scalar(select(Item).where(Item.job_id == min(item.job_id for item in db.scalars(select(Item)))))
+        assert first.status == "SKIPPED" and first.error_code == "SUPERSEDED"
+
+
+def test_pending_punch_time_approval_survives_an_hr_cnic_correction(store):
+    """Toheed: HR confirms …609-0, so today's CNIC is corrected to the punch-time CNIC."""
+    sessions, _connector_id, _uid = store
+    event_id = held_event(sessions)
+    with sessions() as db:
+        add_punch_time_interval(db, db.get(AttendanceEvent, event_id))
+        direct.create(db, actor="operator", request=start(event_id, key="toheed", choice="PUNCH_TIME"))
+        db.commit()
+    with sessions() as db:
+        direct.advance_once(db)
+        db.commit()
+    with sessions() as db:
+        user = db.scalar(select(DeviceUser))
+        user.cnic_encrypted, user.cnic_lookup_hash = encrypt_cnic(PUNCH_CNIC), cnic_lookup(PUNCH_CNIC)
+        db.commit()
+    with sessions() as db:
+        assert approved(db, event_id)["cnic"] == PUNCH_CNIC
+
+
+def test_todays_cnic_approval_stops_when_todays_cnic_changes(store):
+    sessions, _connector_id, _uid = store
+    event_id = held_event(sessions)
+    queue_current(sessions, event_id, "today-changes")
+    with sessions() as db:
+        user = db.scalar(select(DeviceUser))
+        user.cnic_encrypted, user.cnic_lookup_hash = encrypt_cnic(PUNCH_CNIC), cnic_lookup(PUNCH_CNIC)
+        db.commit()
+    with sessions() as db:
+        assert approved(db, event_id) is None
+
+
+def test_automatic_release_takes_over_a_stopped_direct_approval(store):
+    """Safety review 4: ADD's own proof must be able to deliver once an approval stopped.
+
+    Before, the stale decision blocked the punch after every automatic
+    release (a 15-minute loop that never delivered).
+    """
+    from zk_add.service import release_synced_cnic_attendance_event
+
+    sessions, _connector_id, _uid = store
+    event_id = held_event(sessions)
+    queue_current(sessions, event_id, "takeover")
+    corrected = "3520255555551"
+    with sessions() as db:
+        user = db.scalar(select(DeviceUser))
+        user.cnic_encrypted, user.cnic_lookup_hash = encrypt_cnic(corrected), cnic_lookup(corrected)
+        db.commit()
+    assert delivery.split_claims(worker.claim_ords_batch(5)) == ([], [])
+    with sessions() as db:
+        event = db.get(AttendanceEvent, event_id)
+        assert event.ords_status == "BLOCKED_IDENTITY"
+        # The terminal's own capture now proves the corrected CNIC.
+        event.captured_cnic_lookup_hash = cnic_lookup(corrected)
+        zkt = db.get(Connector, event.connector_id).zkt_device
+        assert release_synced_cnic_attendance_event(db, zkt=zkt, user=db.scalar(select(DeviceUser)), row=event)
+        db.commit()
+    normal, forced = delivery.split_claims(worker.claim_ords_batch(5))
+    assert forced == [] and len(normal) == 1
+    assert normal[0][1]["cnic"] == corrected
+    with sessions() as db:
+        assert db.scalar(select(OrdsOutbox)).status == "IN_FLIGHT"
+        event = db.get(AttendanceEvent, event_id)
+        event.ords_status, event.oracle_confirmed_at = "ACKED_CHECK", utc_now()
+        db.commit()
+    with sessions() as db:
+        assert db.scalar(select(Item)).status == "WAITING_ORACLE"
+        direct.advance_once(db)
+        db.commit()
+        item = db.scalar(select(Item))
+        assert item.status == "SKIPPED" and item.error_code == "AUTO_RELEASED"
+
+
+def test_a_valid_direct_approval_is_not_taken_over(store):
+    from zk_add.attendance_direct_ords import superseded_by_automatic_release
+
+    sessions, _connector_id, _uid = store
+    event_id = held_event(sessions)
+    queue_current(sessions, event_id, "still-valid")
+    with sessions() as db:
+        event = db.get(AttendanceEvent, event_id)
+        assert superseded_by_automatic_release(db, event, db.scalar(select(Decision))) is False
+
+
+def test_punch_whose_records_contradict_today_is_never_awaiting_a_snapshot(store):
+    """Correctness 5: such a row can never release automatically, so no "send now" prompt."""
+    sessions, _connector_id, _uid = store
+    event_id = held_event(sessions)
+    with sessions() as db:
+        event = db.get(AttendanceEvent, event_id)
+        add_punch_time_interval(db, event)
+        zkt = db.get(Connector, event.connector_id).zkt_device
+        event.captured_at = event.received_at = zkt.identity_snapshot_observed_at + timedelta(minutes=1)
+        db.commit()
+    with sessions() as db:
+        row = direct.preview(db, [event_id])["rows"][0]
+        assert row["punch_time_cnic"] == "DIFFERS"
+        assert row["awaiting_next_snapshot"] is False and row["auto_release_at_next_snapshot"] is False
+
+
+def test_unreadable_database_guard_still_requires_send_now(store, monkeypatch):
+    """Safety review 7: a guard probe failure never removes the "send now" gate."""
+    from zk_add import attendance_release_safety as safety
+
+    sessions, _connector_id, _uid = store
+    event_id = held_event(sessions)
+    with sessions() as db:
+        db.get(AttendanceEvent, event_id).captured_cnic_lookup_hash = db.scalar(select(DeviceUser)).cnic_lookup_hash
+        db.commit()
+    monkeypatch.setattr(safety, "database_guard_state", lambda *_args, **_kwargs: "UNAVAILABLE")
+    with sessions() as db:
+        row = direct.preview(db, [event_id])["rows"][0]
+        assert row["database_guard"] == "UNAVAILABLE"
+        assert row["auto_release_at_next_snapshot"] is True
+        direct.create(db, actor="operator", request=start(event_id, key="guard-unavailable"))
+        db.commit()
+        assert db.scalar(select(Item)).error_code == "AUTO_RELEASE_PENDING"
+
+
+def test_unreadable_retained_name_never_breaks_delivery_claims(store):
+    """Correctness 6: a corrupt encrypted name must not abort the worker's claim transaction."""
+    sessions, _connector_id, _uid = store
+    event_id = held_event(sessions)
+    with sessions() as db:
+        add_punch_time_interval(db, db.get(AttendanceEvent, event_id))
+        direct.create(db, actor="operator", request=start(event_id, key="corrupt", choice="PUNCH_TIME"))
+        db.commit()
+    with sessions() as db:
+        direct.advance_once(db)
+        db.commit()
+    with sessions() as db:
+        punch_time_record(db).display_name_encrypted = "not-a-fernet-token"
+        db.commit()
+    # The name changed, so the frozen approval no longer matches: held, not crashed.
+    assert delivery.split_claims(worker.claim_ords_batch(5)) == ([], [])
+    with sessions() as db:
+        assert db.get(AttendanceEvent, event_id).ords_status == "BLOCKED_IDENTITY"
+        assert direct.preview(db, [event_id])["rows"][0]["punch_time_cnic"] == "DIFFERS"
+
+
+def test_many_intervals_never_give_a_truncated_answer(store, monkeypatch):
+    """Both reviews (ledger hints): bounded per terminal user ID, unprovable when overflowing."""
+    from zk_add import attendance_release_safety as safety
+
+    sessions, _connector_id, _uid = store
+    event_id = held_event(sessions)
+    with sessions() as db:
+        event = db.get(AttendanceEvent, event_id)
+        for _ in range(4):  # overlapping duplicates after snapshot backfills
+            add_punch_time_interval(db, event)
+        db.commit()
+    monkeypatch.setattr(safety, "CHUNK_ROW_LIMIT", 3)
+    with sessions() as db:
+        event = db.get(AttendanceEvent, event_id)
+        assert direct.identity_hints_for_page(db, [event])[event_id]["punch_time_cnic"] == "DIFFERS"
+    monkeypatch.setattr(safety, "PER_KEY_LIMIT", 2)
+    with sessions() as db:
+        event = db.get(AttendanceEvent, event_id)
+        hint = direct.identity_hints_for_page(db, [event])[event_id]
+        assert hint["punch_time_cnic"] == "CONFLICT" and hint["eligible"] is False
+
+
+def test_cnic_format_alert_is_info_and_not_refreshed_while_unchanged(db):
+    """Safety review 5: a running HIL observation must not see a new WARNING every snapshot."""
+    from zk_add.hil_observation import _review
+
+    db.autoflush = False
+    connector = connector_fixture(db)
+    make_writable(connector)
+    snapshot_names(db, connector, [("55", "04048", "A.Saleem-A4230111028815")])
+    alert = db.scalar(select(DeviceAlert).where(DeviceAlert.code == "USER_CNIC_FORMAT_SUSPECT"))
+    seen = alert.last_seen_at
+    snapshot_names(db, connector, [("55", "04048", "A.Saleem-A4230111028815")])
+    db.refresh(alert)
+    assert alert.severity == "INFO" and alert.last_seen_at == seen
+    review = _review([], [alert], [], preservation_verified=True)
+    assert review["unclassified_alert_ids"] == [] and review["adverse_alert_ids"] == []
+
+
+def test_cnic_format_alert_clears_in_the_snapshot_that_removes_the_user(db):
+    """Correctness 8: the refresh reads this snapshot's users, not the previous ones."""
+    db.autoflush = False
+    connector = connector_fixture(db)
+    make_writable(connector)
+    snapshot_names(db, connector, [
+        ("55", "04048", "A.Saleem-A4230111028815"), ("56", "04049", "Bilal-3520212345671"),
+    ])
+    alert = db.scalar(select(DeviceAlert).where(DeviceAlert.code == "USER_CNIC_FORMAT_SUSPECT"))
+    assert alert.state == "OPEN"
+    snapshot_names(db, connector, [("56", "04049", "Bilal-3520212345671")])
+    db.refresh(alert)
+    assert alert.state != "OPEN"
+
+
+def test_unreadable_terminal_name_never_fails_a_user_snapshot(db, monkeypatch):
+    from zk_add import attendance_release_safety as safety
+
+    db.autoflush = False
+    connector = connector_fixture(db)
+    make_writable(connector)
+
+    def broken(_value):
+        raise ValueError("corrupt ciphertext")
+
+    monkeypatch.setattr(safety, "decrypt_text", broken)
+    snapshot_names(db, connector, [("55", "04048", "A.Saleem-A4230111028815")])
+    assert db.scalar(select(DeviceUser).where(DeviceUser.user_id == "04048")) is not None
