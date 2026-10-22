@@ -412,9 +412,9 @@ def _evaluate(
             return Decision("SKIP", "INVALID_CLOCK")
         if now - punch > _window():
             return Decision("SKIP", "OLD_PUNCH")
-    if row.retry_deadline_at and row.attempt_count > row.attempt_base and now > ensure_utc(
-        row.retry_deadline_at
-    ):
+    if row.retry_deadline_at and now > ensure_utc(row.retry_deadline_at):
+        # Also covers rows that waited out a long pause without an attempt:
+        # a message hours after the punch is noise, not a confirmation.
         return Decision("FAIL", "RETRY_WINDOW_EXHAUSTED")
     if control.mode == "PILOT":
         connector = session.get(Connector, row.connector_id)

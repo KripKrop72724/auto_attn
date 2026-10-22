@@ -64,7 +64,7 @@ New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
 $secretValues = @()
 foreach ($entry in $environment.GetEnumerator()) {
     if (
-        $entry.Key -match '(?i)(PASSWORD|SECRET|TOKEN|HASH|FERNET|PRIVATE|CREDENTIAL)' -and
+        $entry.Key -match '(?i)(PASSWORD|SECRET|TOKEN|HASH|FERNET|PRIVATE|CREDENTIAL|API_KEY)' -and
         -not [string]::IsNullOrWhiteSpace([string]$entry.Value) -and
         ([string]$entry.Value).Length -ge 6
     ) {

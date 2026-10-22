@@ -31,6 +31,9 @@ def test_the_key_is_wired_like_the_ords_password_and_stays_optional() -> None:
     ).group(1)
     assert '"ADD_CHECKIN_NOTIFY_API_KEY"' in redacted
     assert '-cnotin @("OFF", "PILOT", "ALL")' in deploy
+    diagnostics = (ROOT / "deploy/add/collect-diagnostics.ps1").read_text(encoding="utf-8")
+    pattern = re.search(r"\$entry\.Key -match '\(\?i\)\(([A-Z_|]+)\)'", diagnostics).group(1)
+    assert re.search(pattern, "ADD_CHECKIN_NOTIFY_API_KEY")
 
 
 def test_the_api_service_receives_the_protected_environment_file() -> None:

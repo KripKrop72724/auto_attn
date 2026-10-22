@@ -449,6 +449,19 @@ def test_retryable_failures_back_off_with_jitter_then_give_up(store, monkeypatch
     assert len(recorder.requests) == 3
 
 
+def test_a_row_that_waited_past_the_retry_window_fails_without_sending(store):
+    sessions, _ = store
+    event_id = punch(sessions)
+    confirm(sessions, event_id)
+    # For example the circuit stayed open for the whole retry window.
+    move_back(sessions, event_id, retry_deadline_at=utc_now() - timedelta(seconds=1))
+    recorder = Recorder()
+    deliver(recorder)
+    assert recorder.requests == []
+    row = row_for(sessions, event_id)
+    assert (row.status, row.reason, row.attempt_count) == ("FAILED", "RETRY_WINDOW_EXHAUSTED", 0)
+
+
 def test_backoff_is_exponential_bounded_and_jittered(monkeypatch):
     rng = random.Random(7)
     delays = [notify.backoff_seconds(attempt, rng=rng) for attempt in range(1, 12)]
