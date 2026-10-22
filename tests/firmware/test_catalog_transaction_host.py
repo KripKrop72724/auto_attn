@@ -36,6 +36,8 @@ static int load(void *c,ft_checkpoint_t *cp){(void)c;*cp=saved;return saved.vers
 static bool commit(void *c,const ft_checkpoint_t *cp){(void)c;if(++nvs_calls==nvs_fail){if(uncertain)saved=*cp;return false;}saved=*cp;return true;}
 static const ft_port_t catalog_transaction_port={load,commit,NULL};
 static void led_status_fault(int state){assert(state==1);}
+/* ZKT 2.7.7: incidents with their captured errno (classified by the LED). */
+#define led_status_fault_errno(state, error) ((void)(error), led_status_fault(state))
 ''' + recovery + activation + r'''
 static void seed(const char *path,const char *data){FILE *f=fopen(path,"w");assert(f && fputs(data,f)>=0);assert(!fflush(f) && !fsync(fileno(f)) && !fclose(f));}
 static bool content(const char *path,const char *wanted){FILE *f=fopen(path,"r");if(!f)return false;char buf[32]={0};size_t n=fread(buf,1,31,f);assert(!fclose(f));return n==strlen(wanted) && !strcmp(buf,wanted);}

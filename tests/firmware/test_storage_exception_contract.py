@@ -28,7 +28,7 @@ CONFIRM = block(OTA, "static bool confirm_or_report_rollback(void)", "#if define
 
 
 def test_the_exception_marks_valid_only_after_record_evidence_receipt_and_recheck() -> None:
-    step = block(EXCEPTION, "static sx_step_t sx_confirm_step(", "/* Before the ordinary path marks the image valid")
+    step = block(EXCEPTION, "sx_step_t sx_confirm_step(", "/* Before the ordinary path marks the image valid")
     order = [step.index(marker) for marker in (
         "sx_window_step(&s_sx.window, verdict",
         "SX_BUDGET_MARGIN_SECONDS",
@@ -36,7 +36,7 @@ def test_the_exception_marks_valid_only_after_record_evidence_receipt_and_rechec
         'add_connector_log_acknowledged("WARN", "storage", "STORAGE_REPAIR_EXCEPTION_EVIDENCE"',
         'report_progress("BOOTED_PENDING", "STORAGE_REPAIR_EXCEPTION"',
         "ota_progress_receipt_exception(receipt",
-        "!sx_window_same(&s_sx.window, &store)",
+        "!sx_window_same(&s_sx.window, &store)) last = SX_STORE_CHANGED",
         "progress->active_seconds + spent >= BOOT_CONFIRM_ACTIVE_SECONDS",
         "esp_ota_mark_app_valid_cancel_rollback()",
         "sx_store_record(SX_STATE_CONFIRMED)",
