@@ -1,7 +1,11 @@
 # Zone Lite 2.7.7: confirm first under a narrow storage exception
 
-Status: design, first round, for review. Nothing here is implemented yet.
+Status: implemented on `release/zkt-2.7.7` (version not bumped yet), with the
+first review round's two critiques folded in: section 13 lists every point,
+what changed and what was rejected and why. Where sections 1 to 11 and section
+13 disagree, section 13 is what the code does. Nothing has run on a device.
 Branch `release/zkt-2.7.7` from `origin/main` 2dbd314 (2.7.6 merged, #401).
+The HIL runbook is [zone-lite-2.7.7-hil.md](zone-lite-2.7.7-hil.md).
 
 Owner decision, 21 October 2026, on 2.7.6's open decision 3
 ([zone-lite-2.7.6-last-resort-reformat.md](zone-lite-2.7.6-last-resort-reformat.md),
@@ -194,8 +198,9 @@ ADD source coverage with the cursor at the terminal's attendance count.
 While it is not ready, `ota_task` loops back before `fetch_assignment`: a
 deployment stuck in `RECONCILING` blocks every further OTA to that device,
 and ADD cannot cancel a `RECONCILING` deployment (campaign cancel touches
-only `PENDING`, `OFFERED` and `DOWNLOADING`; only revoking the release ends
-it).
+only `PENDING`, `OFFERED` and `DOWNLOADING`; revoking the release only pauses
+campaigns: nothing in ADD moves a `RECONCILING` deployment, only the device
+does; section 13, H3).
 
 **The OTA path of 2.7.7** (not the 2.6.17 bridge, not the 2.7.0 writer, so
 `uses_local_boot_confirmation()` is false), call by call:
@@ -826,13 +831,21 @@ NVS layout.
 
 **Residual risks:**
 
-- After confirmation there is no way back to the pre-2.7.5 image: a store
-  the round cannot repair stays wedged on 2.7.7 until a later release, with
-  punches going to ADD live or staying on the terminal. 4.5 keeps that
-  device OTA-capable.
-- The gate trusts the boot's report and the inventory; the runtime writes
-  nothing to a store without room in between, and the confirmed boot surveys
-  the store afresh before it decides anything (R12).
+- After confirmation there is no way back to the pre-2.7.5 image (the OTA
+  floor refuses it, section 13 item 1): a store the round cannot repair stays
+  wedged on 2.7.7 until a later release, with punches going to ADD live or
+  staying on the terminal. 4.5 keeps that device OTA-capable.
+- The gate trusts the boot's report and the inventory. The runtime does write
+  to the store in between (the probe, outbox restores, compaction, cursors;
+  section 13 item 9): the probe is held on boots that may use the exception,
+  and every other program or erase of the store restarts the 120 s window.
+- An ADD action that ends a `RECONCILING` deployment does not exist: a
+  healthy exception device whose source coverage never certifies holds its
+  reservation (and P06's location) until an operator gets coverage certified
+  (section 13 item 5).
+- 13FL: its 3.8 MB `blocked_identity.jsonl` with about 15,000 unreadable
+  spans may not finish 2.7.4's inventory in its 180 s budget; an incomplete
+  scan refuses (`INVENTORY_UNEXPLAINED`) and the image rolls back.
 - S3's store-write cause depends on classifying the `LOCAL_FAILURE` sites
   correctly; a site left as "other" makes the gate refuse (safe), a site
   wrongly marked store-write could let an unrelated fault pass. The contract
@@ -848,3 +861,187 @@ NVS layout.
 - Everything else of 2.7.6 section 15 (decisions 5 and 6, torn erases,
   waiting spans) is unchanged.
 - None of this has run on a device.
+
+## 12. Timeline of the unconfirmed boot (M6)
+
+| t (P02, 21 October) | What |
+|---|---|
+| 0 | boot; the repair (2.7.5's run, about 21 s, then the exposure) |
+| about +25 s | `storage_init` returns; the area test and the probe hold are decided; the 900 s budget starts |
+| +60 s | 2.7.4's inventory starts (180 s budget); on P02 it finished at about +2 min |
+| until then | the gate says `EVALUATING` `INVENTORY_PENDING` (unknown: it neither refuses nor opens the window) |
+| inventory done | the window opens if every term holds; any refusal closes it, any program or erase of the store restarts it |
+| window + 120 s | the sequence: the record `CONFIRMING`, the evidence log (10 s acknowledgement), the receipted `BOOTED_PENDING` (signed HTTPS, 15 s at most), the re-check; a sequence that does not finish is tried again at most every 30 s |
+| earliest about +4 to +5 min | `esp_ota_mark_app_valid_cancel_rollback()`; never when less than 90 s of the budget is left before the sequence, or when the budget is spent at the re-check |
+| then | the controlled restart at a capture safepoint (30 min at most, then regardless); the next boot runs the round |
+
+## 13. Review round 1 (21 to 22 October 2026): resolutions
+
+Two critiques: the first (14 defects, numbered 1 to 14 below) and a
+device-lens one (H1 to H4, M1 to M7, L1, L2). Every point is listed; **A** is
+accepted and implemented, **P** partly, **R** rejected, each with the reason.
+
+### 13.1 The first critique
+
+1. **A. The OTA floor.** `zj_ota_before_download` refuses every target below
+   2.7.6 (`sx_version_redo_aware`) with `STORAGE_REDO_FLOOR` once the reclaim
+   journal has any flag, round or block, any sector of the redo area is not
+   erased (a foreign one too), the image confirmed under the exception, or
+   the store stays unmounted (`storage_repair_ota_floor`). It is checked
+   before the legacy evidence and before the unmounted-store survey
+   fallback. ADD's `_redo_floor_exclusion` does the same from the heartbeat
+   (`storage.repair.reclaim.ota_floor`, `ota.confirm_reason`, a confirmed
+   `ota.storage_exception.state`), so ADD never offers 2.5.2, 2.6.25 or
+   2.6.27 to such a device. CLAIMED is never cleared, so the floor is
+   permanent once anything was written to the area (the critique's
+   "simplest").
+2. **A. Decision 5 (c) on exception images.** When the exception's record
+   says confirmed and the boot's last run leaves queue spans waiting for byte
+   sources, the VFS stays off that boot (`STORAGE_REPAIR_EXCEPTION_WAITING`;
+   outcome `WAITING`, retryable). Live punches go to ADD or stay on the
+   terminal; OTA works through the survey fallback under the floor.
+3. **A. The area test, and a bench run before P02.** On a boot the exception
+   could use (the gate's repair terms hold with the test assumed to pass),
+   the glue journals CLAIMED first and then programs, verifies, erases and
+   re-verifies one free sector (`srx_area_test`); the gate requires
+   `PASSED`. The harness cuts at each of its writes: the area stays `READY`,
+   never `FOREIGN` (it would read `FOREIGN` without CLAIMED first). The
+   runbook makes a bench ESP32-S3 with the in-tree P02 field store, power
+   cuts included, a prerequisite of P02's campaign.
+4. **A. The proof's model.** `reclaim-p02field` keeps the image tag and only
+   flips `pending_verify`; the guard's state carries over (`REPORT_ONLY`, no
+   retry); a manifest still active refuses (`MANIFEST`). The numbers of 1.3
+   and 6.2 came from the deleted prototype with a changed tag; the in-tree
+   model replaces them (CI at 8 MiB: 0 usable, about 67 custody, 1,816
+   excluded, 68 weak magic, 38 pages short, then `REPAIRED`).
+5. **P. A `RECONCILING` that never certifies.** An exception deployment that
+   waits in `RECONCILING` posts its status with a checked receipt (when it
+   changes, at most every 15 min) and clears its journal when ADD's receipt
+   says the deployment ended (`FAILED`, `ROLLED_BACK`, `CANCELLED`,
+   `SUPERSEDED`, `RELEASE_REVOKED`); `UNREPAIRED` and `UNHEALTHY` (H4) end it
+   `FAILED` from the device. **Rejected: "allow `fetch_assignment` once
+   `ROUND_DONE`".** ADD itself holds every new offer to a device whose own
+   deployment is still active (`pending_offer_hold` counts the device's own
+   reservation: `NATIONWIDE_LOCATION_BUSY`), so the poll would get nothing.
+   A healthy P02 without certified coverage keeps the existing remedy (retry
+   `f69322c1`, or cancel it and request a new full reconciliation); an ADD
+   action that ends a `RECONCILING` deployment is an ADD change of its own
+   (section 11).
+6. **P. "OTA path proven".** Added: the capability ADD accepted on this
+   boot, the passive slot (present, not the running one, an OTA slot, a
+   predecessor whose exact digest the release knows), 16 KiB of largest
+   internal block, and OTA polling without the WebSocket after 10 min out of
+   ADD's reach on an exception image. **Rejected: a ranged, authenticated
+   GET of an image header.** ADD issues a download grant only with an offered
+   assignment and there is none while the device is `BOOTED_PENDING`; a
+   probe-grant endpoint would be new ADD API. The same TLS stack and signed
+   HTTPS run in the receipted `BOOTED_PENDING` and the capability report the
+   gate requires. A restart after N failed WebSocket starts was not added
+   (the decoupling covers the same failure).
+7. **A. S2, S3 and a vanished custody file.** The probe and `qs` errors are
+   judged as (operation, errno) pairs; every custody file the repair reported
+   must be in the inventory with at least its size (`CUSTODY_MISSING`).
+8. **A. The unreadable set.** The inventory records the unreadable spans'
+   count, first, last and an order-free digest; the repair the same for the
+   held spans; the gate requires equality and no byte lost otherwise.
+9. **P. The runtime writes the wedged store.** The probe is held on boots
+   that may use the exception (it fails at its capacity check with ENOSPC and
+   writes nothing); the window's fingerprint is SPIFFS's used and total bytes
+   **and every program and erase of the VFS's SPIFFS** (its HAL is wrapped at
+   link time), re-checked immediately before `mark_app_valid`. The other
+   writers (outbox restore and compaction, cursors, backups) are not
+   suppressed: a write of theirs restarts the window, which is safe (a
+   refusal rolls back as 2.7.6). The inventory is not re-run: with no store
+   write since the window opened, its unreadable set cannot have changed by
+   a write.
+10. **A. A broken image that wedged its own store.** The first survey's
+    erased pages must be short of the run's target (`ARRIVED_WITH_ROOM`).
+11. **A. The hold on the round boot.** An exception image's runs take custody
+    blocks only when every custody file was held (`custody_needs_hold`);
+    otherwise `short` `hold`, nothing written, retryable (harnessed).
+    Recommendation kept: C1 is not relaxed for 13FL.
+12. **A. Durable evidence.** Before the image may confirm, ADD must store an
+    ack-waited log `STORAGE_REPAIR_EXCEPTION_EVIDENCE` with a structured
+    context (a `duplicate` acknowledgement does not count), and accept the
+    `BOOTED_PENDING` with a receipt that echoes `error_code`; event details
+    keep `error_message`.
+13. **A. Never invalidate a valid image.** On the non-local path, for every
+    image: `READY_TO_BOOT` on a `VALID` running partition goes straight to
+    `RECONCILING`, and the loop's rollback runs only when the image is not
+    valid. The bridge and writer local proofs are 2.7.0's design and are left
+    as they are.
+14. **P. Traps.** A dedicated restart wait with no progress reports, the
+    restart counted in the record before the safepoint is claimed and an
+    unconditional restart once claimed; `UNREPAIRED` and `UNHEALTHY` in a fixed
+    order (record, receipted `FAILED`, journal cleared, record reported),
+    resumed by the next boot; `CONFIRMING` marked `ABANDONED` before a
+    rollback. **Rejected: quiescing the store's owners before the restart.**
+    2.7.x's non-journal owners have no quiesce protocol; the restart is at a
+    capture safepoint, as every 2.7.x OTA restart is, and is no worse than a
+    power cut, which 2.7.5 and 2.7.6 are built and harnessed for.
+
+### 13.2 The device-lens critique
+
+- **H1, P.** A `LOCAL_FAILURE` incident now carries the errno captured at its
+  failing call: ENOSPC counts as room; EIO on a read of a reclaim queue counts
+  as a held read, with the queue and where the read started (the gate also
+  requires that start at or before the last held span). Classified: the
+  attendance appends and the live fallback after them, the blocked-to-pending
+  transfer, the pending and outbox generation restores, the command inbox
+  append, recovery and rewrite, the catalog stage, replace and recovery, the
+  outbox compaction, settles and bulk append, the ORDS legacy read (queue and
+  offset), the blocked and quarantine reads and settles, and the queue
+  store's periodic verification (by its (operation, errno) pair). Every other
+  site stays ordinary and the gate refuses on it. **Rejected: reading P02's
+  2.7.6 heartbeats first.** ADD keeps only a device's latest heartbeat
+  diagnostics; P02 has reported 2.5.2 since 13:45 on 21 October, so the
+  13:29 to 13:45 LED sources are gone. The first 2.7.7 boot reports the
+  gate's reason, the failing terms and the LED's first and last source, and
+  a refusal costs only the rollback 2.7.6 already does.
+- **H2, A.** (operation, errno) pairs; EIO and every read operation refuse.
+- **H3, P.** The receipt carries `storage_exception_allowed` (release
+  `AVAILABLE` or `HIL_ONLY`, campaign `ACTIVE`), and the gate requires it:
+  pausing the campaign is ADD's veto. **Rejected: a per-campaign opt-in**
+  (a schema migration; the P02 campaign targets P02 alone). Documented: a
+  release an exception device runs is never revoked; 2.7.8's contract lists
+  2.7.7 under the retry rule while 2.7.7 is `HIL_ONLY`.
+- **H4, A.** `UNHEALTHY` after 30 min of failing storage terms with ADD
+  reachable on a `ROUND_DONE` image; one exception target at a time, 13FL only
+  after P02 is `SUCCEEDED` or `FAILED`; P06 (the same location) waits while
+  P02's deployment is active.
+- **M1, A.** As item 12.
+- **M2, A.** None of the exception's reasons touches `s_last_error`
+  (contract test); they ride in `ota.storage_exception` and on the
+  deployment's message.
+- **M3, A.** As item 14.
+- **M4, A.** As item 13, independent of the exception's record.
+- **M5, A.** The fallback comes before the queue store's lock; D4 is read
+  once per boot (a busy store is asked again at most once a minute); the
+  runbook runs a real OTA out of a confirmed-but-unrepaired 2.7.7, mounted
+  and unmounted.
+- **M6, A.** A busy lock is unknown (neither refuses nor advances the
+  window); the sequence starts only with 90 s of budget left and re-checks
+  the budget right before `mark_app_valid`; `CONFIRMING` is written once;
+  section 12 has the timeline. The inventory's 180 s budget is unchanged
+  (13FL's risk, section 11).
+- **M7, P.** The bench run of item 3; the record counts boots that a panic,
+  watchdog or brownout ended after confirmation, reports them and stops
+  retries. A crash loop of a confirmed image outside the repair is bounded
+  only by the image itself, as for every confirmed image (residual).
+- **L1, A.** 6 KiB is allocated by each client start (the first start and
+  `restart_transport`), not each automatic reconnect; the old task's stack is
+  freed by the idle task, so `restart_transport` can briefly need two
+  blocks; judge the margin against the fleet's runtime minimum; the HIL
+  criterion accepts `websocket_task` absent from the 16 closest-to-overflow
+  tasks; `sdkconfig.zkt.defaults` applies to every ZKT role CI builds
+  (production, direct, recovery, writer, bridge).
+- **L2, A.** The per-object counters live in the run's arena; blocks with
+  more than one reason count as `mixed`; `excluded_file` is sent only when
+  printable and at most 32 characters, and ADD drops an unreadable one alone.
+
+### 13.3 Owner decisions after the review
+
+- **13FL and the hold:** C1 kept (both critiques recommend it).
+- **IPC stack:** raised to 1,792 B (+1 KiB of internal RAM).
+- **Retry restarts:** three in all, kept: with decision 5 (c), a round boot
+  that leaves spans waiting is the likeliest retryable outcome.

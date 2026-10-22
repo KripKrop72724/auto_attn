@@ -5704,6 +5704,16 @@ static void p02field_prepare(void)
         p02field_custody_blocks(p02field_custody, gain);
     }
     free(gain);
+    /* P02FIELD_IMAGE=<path>: the store as P02's 2.7.5 boot left it, the
+     * hidden-header model at 8 MiB, for the runbook's bench run (an image of
+     * the 8 MiB storage partition, written raw at 0x7A0000). */
+    const char *image = getenv("P02FIELD_IMAGE");
+    if (image && p02field_variant == P02F_HIDDEN && flash_size == 8U * 1024U * 1024U) {
+        FILE *out = fopen(image, "wb");
+        CHECK(out && fwrite(flash, 1, flash_size, out) == flash_size && fclose(out) == 0,
+              "p02field: could not write %s", image);
+        printf("p02field: the store as P02's 2.7.5 boot left it written to %s\n", image);
+    }
     srr_config_t config = config_2770(true);
     uint32_t checked = round_checks;
     logged_count = 0;
