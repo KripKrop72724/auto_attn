@@ -12,14 +12,14 @@ const scope = { zone_id: 'ZONE-KHI', as_of: '2026-10-21T10:00:00+00:00', until_i
 const run: BacklogRun = {
   job_id: 'backlog-run-1', zone_id: 'ZONE-KHI', status: 'RELEASING', paused: false, actor: 'StateHealthAdmin',
   reason: 'Reviewed Karachi backlog', connectors: ['karachi-1'], checked_at: scope.as_of, approved: 2, released: 1,
-  delivered: 0, waiting_oracle: 1, kept_held: 0, needs_review: 0,
+  delivered: 0, waiting_oracle: 1, kept_held: 0, left_to_snapshot: 0, needs_review: 0, waiting_reason: null,
   created_at: '2026-10-21T10:00:00Z', updated_at: '2026-10-21T10:00:00Z', completed_at: null,
 }
 const response = (value: unknown, status = 200) => new Response(JSON.stringify(value), { status, headers: { 'Content-Type': 'application/json' } })
 const toast = { notice: vi.fn(), error: vi.fn() }
 afterEach(() => { cleanup(); vi.unstubAllGlobals(); toast.notice.mockReset() })
 
-function mock({ busyOnce = false, releaseEnabled = true, paused = false } = {}) {
+function mock({ busyOnce = false, releaseEnabled = true, paused = false, runs = [] as BacklogRun[] } = {}) {
   let busy = busyOnce
   const fetch = vi.fn(async (path: string, init?: RequestInit) => {
     const url = new URL(path, 'https://add.test')
@@ -35,16 +35,19 @@ function mock({ busyOnce = false, releaseEnabled = true, paused = false } = {}) 
         devices: [{ connector_id: 'karachi-1', name: 'Karachi gate' }, { connector_id: 'karachi-2', name: 'Karachi lift' }],
         groups: first
           ? [
-            { connector_id: 'karachi-1', source: 'DUMP_RECONNECT', age: 'UP_TO_7_DAYS', held: 2, provable: 1 },
-            { connector_id: 'karachi-2', source: 'DUMP_RECONNECT', age: 'UP_TO_7_DAYS', held: 1, provable: 1 },
+            { connector_id: 'karachi-1', source: 'DUMP_RECONNECT', age: 'UP_TO_7_DAYS', held: 2, provable: 1, next_snapshot: 0 },
+            { connector_id: 'karachi-2', source: 'DUMP_RECONNECT', age: 'UP_TO_7_DAYS', held: 2, provable: 1, next_snapshot: 1 },
           ]
-          : [{ connector_id: 'karachi-1', source: 'DUMP_STARTUP', age: 'OLDER', held: 1, provable: 1 }],
-        ...(first ? { held_total: 4, approval: { scope, expires_at: '2026-10-21T22:00:00+00:00', signature: 'f'.repeat(64) } } : {}),
+          : [{ connector_id: 'karachi-1', source: 'DUMP_STARTUP', age: 'OLDER', held: 1, provable: 1, next_snapshot: 0 }],
+        ...(first ? {
+          held_total: 5, reheld_outside_check: 2,
+          approval: { scope, expires_at: '2026-10-21T22:00:00+00:00', signature: 'f'.repeat(64) },
+        } : {}),
       })
     }
-    if (url.pathname.endsWith('/stop')) return response({ ...run, status: 'STOPPED' })
+    if (url.pathname.endsWith('/stop')) return response({ ...run, status: 'STOPPED_FOLLOWING' })
     if (url.pathname.endsWith('/releases') && init?.method === 'POST') return response({ ...run, paused }, 202)
-    if (url.pathname.endsWith('/releases')) return response({ rows: [], confirmation: 'RELEASE ZONE-KHI' })
+    if (url.pathname.endsWith('/releases')) return response({ rows: runs, confirmation: 'RELEASE ZONE-KHI' })
     return response({ ...run, paused })
   })
   vi.stubGlobal('fetch', fetch)
@@ -73,6 +76,9 @@ it('checks a frozen zone page by page, then releases only the chosen groups', as
   expect(within(table).getAllByText('Karachi gate')).toHaveLength(2)
   expect(within(table).getByText('Over 30 days')).toBeTruthy()
   expect(screen.getByText('Stay held').closest('.metric-card')?.textContent).toContain('1')
+  // Another proof releases one of them at the next user list, not this action.
+  expect(screen.getByText('Next user list', { selector: '.metric-card *' }).closest('.metric-card')?.textContent).toContain('1')
+  screen.getByText('2 punches released earlier and held again by delivery are not part of this check. The release or user list that sent them checks them again.')
   screen.getByRole('button', { name: 'Release 3 punches' })
 
   // Leave out the over-30-days group of the gate terminal.
@@ -92,7 +98,7 @@ it('checks a frozen zone page by page, then releases only the chosen groups', as
   const body = JSON.parse(String(post?.[1]?.body))
   expect(body).toMatchObject({
     zone_id: 'ZONE-KHI', reason: 'Reviewed Karachi backlog', typed_confirmation: 'RELEASE ZONE-KHI', password: 'secret',
-    scope, signature: 'f'.repeat(64), expires_at: '2026-10-21T22:00:00+00:00', approved_count: 2, previewed_held: 3,
+    scope, signature: 'f'.repeat(64), expires_at: '2026-10-21T22:00:00+00:00', approved_count: 2, previewed_held: 4,
   })
   expect(body.groups).toEqual([
     { connector_id: 'karachi-1', source: 'DUMP_RECONNECT', age: 'UP_TO_7_DAYS' },
@@ -104,8 +110,12 @@ it('checks a frozen zone page by page, then releases only the chosen groups', as
   fireEvent.click(screen.getByRole('button', { name: 'Stop' }))
   const stop = screen.getByRole('dialog')
   fireEvent.change(within(stop).getByLabelText('Administrator password'), { target: { value: 'secret' } })
+  expect(stop.textContent).toContain('ADD keeps following them to Oracle')
   fireEvent.click(within(stop).getByRole('button', { name: 'Stop release' }))
-  await screen.findByRole('heading', { name: 'Stopped' })
+  await screen.findByRole('heading', { name: 'Stopped: following released punches to Oracle' })
+  // No Stop again, and no new approval while it still follows its punches.
+  expect(screen.queryByRole('button', { name: 'Stop' })).toBeNull()
+  expect((screen.getByRole('button', { name: /^Release \d+ punch/ }) as HTMLButtonElement).disabled).toBe(true)
   await waitFor(() => expect(toast.notice).toHaveBeenCalledTimes(2))
 }, 20000)
 
@@ -121,4 +131,13 @@ it('cannot approve while the server has the release proof turned off', async () 
   await checkZone(fetch)
   expect(screen.getByRole('alert').textContent).toContain('turned off on this server')
   expect((screen.getByRole('button', { name: 'Release 3 punches' }) as HTMLButtonElement).disabled).toBe(true)
+})
+
+it('shows why a running release waits and what it left to the next user list', async () => {
+  mock({ runs: [{ ...run, waiting_reason: 'WAITING_FOR_COMPLETE_ROSTER', left_to_snapshot: 3 }] })
+  render(<IdentityBacklogRelease devices={devices} toast={toast} />)
+  fireEvent.change(screen.getByLabelText('Zone'), { target: { value: 'ZONE-KHI' } })
+  const status = await screen.findByRole('status')
+  expect(status.textContent).toContain('3 left to the next user list')
+  expect(status.textContent).toContain('Waiting for a complete user list from a chosen terminal')
 })
