@@ -42,7 +42,7 @@ jobs:
           python - <<'PY'
           import json
           checks = json.load(open('/tmp/rescue-checks.json'))['check_runs']
-          for name in ('repository-contract', 'windows-publication', 'firmware', 'backend', 'frontend', 'oracle-projection', 'containers'):
+          for name in ('repository-contract', 'windows-publication', 'firmware', 'backend', 'backend-static', 'frontend', 'oracle-projection', 'containers'):
               matches = [r for r in checks if r['name'] == name and r['app']['slug'] == 'github-actions']
               if not matches or max(matches, key=lambda r: r['id'])['conclusion'] != 'success':
                   raise SystemExit('Exact main CI gate is not green: ' + name)
