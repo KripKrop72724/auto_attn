@@ -4598,7 +4598,6 @@ def persist_envelope(connector_pk: int, envelope: Envelope) -> EnvelopeOutcome |
     authoritative_coverage_payload = None
     coverage_before_ack_payload = None
     ack_coverage_payload = None
-    tail_refused = False
     send_commands_after_ack = False
     connector_id_to_flush = None
     with session_scope() as db:
@@ -4916,10 +4915,12 @@ def persist_envelope(connector_pk: int, envelope: Envelope) -> EnvelopeOutcome |
             # The ESP is extending a certificate ADD no longer holds, or holds
             # under another epoch. A plain rejection would leave its state
             # unchanged and it would resend the same range every interval.
-            ack_payload = tail_refusal.ack
-            event_payload = tail_refusal.event
-            coverage_before_ack_payload = tail_refusal.coverage
-            tail_refused = True
+            # The refusal committed no evidence, so it clears no rejection.
+            return EnvelopeOutcome(
+                ack=tail_refusal.ack,
+                event=tail_refusal.event,
+                coverage_before_ack=tail_refusal.coverage,
+            )
         elif envelope.type == "source_tail_chunk":
             tail = SourceTailChunkRequest.model_validate(envelope.payload)
             coverage, chunk, duplicate, error_code = apply_source_tail_chunk(
@@ -4969,9 +4970,7 @@ def persist_envelope(connector_pk: int, envelope: Envelope) -> EnvelopeOutcome |
             event_payload = {"connector_id": connector.connector_id, "type": envelope.type}
         # The same transaction that accepted the message clears its type's
         # rejection; a replayed duplicate returned above proves nothing new.
-        # A refused tail committed no evidence, so it clears nothing.
-        if not tail_refused:
-            resolve_message_rejection(db, connector, message_type=envelope.type)
+        resolve_message_rejection(db, connector, message_type=envelope.type)
     return EnvelopeOutcome(
         ack=ack_payload or {"type": "ack", "message_id": envelope.message_id, "seq": envelope.seq},
         event=event_payload or {},
