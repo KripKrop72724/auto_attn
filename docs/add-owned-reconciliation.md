@@ -43,6 +43,7 @@ preserved source epoch while transient reads resume from the existing cursor.
 - Once ADD acknowledges a complete source certificate, firmware persists the certified cutoff and retires legacy historical/full-dump sweeps.
 - The normal audit then examines only new append-tail ordinals in bounded groups, waits for an exact atomic ADD acknowledgement, and advances its NVS cursor. A terminal count regression invalidates coverage fail-closed.
 - ADD's active source checkpoint overrides the ESP's local cursor after every reconnect. A local-ahead cursor is safely replayed from ADD; an absent or inactive certificate disables tail advancement.
+- Every Zone Lite generation keeps a `source_coverage` push in a queue of one and applies it only between loop steps. A push that arrives while the ESP waits for a tail's ACK (for example the connect bootstrap's, when the tail was sent during the bootstrap) would be applied after that ACK and step the cursor back to the older value it carries. So whenever a session has sent a push that no ACKed tail has followed yet, ADD follows the next ACKed tail (committed or duplicate) with its coverage as of that ACK, which replaces the queued push. It repeats what ADD already committed.
 
 ## Failure semantics
 

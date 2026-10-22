@@ -239,7 +239,11 @@ from zk_add.source_exceptions import (
     review_source_exception,
     source_exception_detail,
 )
-from zk_add.source_tail_authority import inactive_coverage_push, refuse_tail_without_authority
+from zk_add.source_tail_authority import (
+    active_coverage_push,
+    inactive_coverage_push,
+    refuse_tail_without_authority,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -4341,6 +4345,7 @@ async def open_device_stream(session: DeviceStreamSession, connector_pk: int, co
             if not session.should_stop():
                 await session.close(1011, "Source coverage delivery failed")
             return False
+        session.coverage_push_outstanding = True
     try:
         await send_pending_commands(connector_id, only_to=session.websocket)
     except Exception as exc:
@@ -4578,6 +4583,9 @@ class EnvelopeOutcome:
     commands_for: str | None = None
     coverage: dict | None = None
     provisioning: dict | None = None
+    # ADD's coverage as of an ACKed tail. Sent only to a session that still
+    # owes it one: see send_envelope_follow_ups.
+    tail_coverage: dict | None = None
 
 
 def persist_envelope(connector_pk: int, envelope: Envelope) -> EnvelopeOutcome | None:
@@ -4586,6 +4594,7 @@ def persist_envelope(connector_pk: int, envelope: Envelope) -> EnvelopeOutcome |
     event_payload = None
     ack_payload = None
     authoritative_coverage_payload = None
+    tail_coverage_payload = None
     send_commands_after_ack = False
     connector_id_to_flush = None
     with session_scope() as db:
@@ -4913,6 +4922,8 @@ def persist_envelope(connector_pk: int, envelope: Envelope) -> EnvelopeOutcome |
                 authoritative_coverage_payload = inactive_coverage_push(
                     connector, terminal_serial=tail.terminal_serial
                 )
+            elif error_code is None and coverage.active:
+                tail_coverage_payload = active_coverage_push(db, coverage)
             event_payload = {
                 "connector_id": connector.connector_id,
                 "coverage_id": coverage.coverage_id,
@@ -4954,6 +4965,7 @@ def persist_envelope(connector_pk: int, envelope: Envelope) -> EnvelopeOutcome |
         commands_for=connector_id_to_flush if send_commands_after_ack else None,
         coverage=authoritative_coverage_payload,
         provisioning=provisioning_payload,
+        tail_coverage=tail_coverage_payload,
     )
 
 
@@ -4993,7 +5005,24 @@ async def send_envelope_follow_ups(
     if outcome.commands_for:
         await send_pending_commands(outcome.commands_for, only_to=only_to)
     if outcome.coverage is not None:
-        await websocket.send_json(outcome.coverage)
+        sent = await websocket.send_json(outcome.coverage)
+        if sent is not False and isinstance(websocket, DeviceStreamSession):
+            websocket.coverage_push_outstanding = True
+    elif (
+        outcome.tail_coverage is not None
+        and isinstance(websocket, DeviceStreamSession)
+        and websocket.coverage_push_outstanding
+    ):
+        # Every Zone Lite generation keeps one source_coverage push in a queue
+        # of one and applies it only between loop steps. A push that arrived
+        # while the ESP waited for this tail's ACK is applied after the ACK and
+        # rewinds the cursor to the older one it carries ("Local tail cursor was
+        # ahead of ADD"). The next tail then resends a committed range: a
+        # connect bootstrap did this on PESHAWAR-06 and SLICTOWER-3FL. ADD's
+        # coverage as of this ACK replaces the queued push before it is
+        # applied. It repeats what the ACK said, so it certifies nothing.
+        if await websocket.send_json(outcome.tail_coverage) is not False:
+            websocket.coverage_push_outstanding = False
     await publish_envelope_events(envelope, outcome)
 
 

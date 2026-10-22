@@ -240,6 +240,9 @@ class DeviceStreamSession:
         self.last_message_at: float | None = None
         self.slowest: tuple[str, float] | None = None
         self.end: dict[str, Any] | None = None
+        # A source_coverage push sent on this socket that no ACKed source tail
+        # has followed yet (web.send_envelope_follow_ups).
+        self.coverage_push_outstanding = False
         self.transport = transport_facts(websocket)
         if self.transport is not None:
             self.transport.connector_id = connector_id
