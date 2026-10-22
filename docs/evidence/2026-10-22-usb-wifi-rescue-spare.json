@@ -1,0 +1,36 @@
+{
+  "mac": "14:c1:9f:46:ae:1c",
+  "purpose": "unsigned_spare_wifi_rescue_experiment",
+  "efuse_burns_performed": false,
+  "signed_lahore_recovery_qualified": false,
+  "factory_acceptance": "NOT_ASSERTED",
+  "seed_application_sha256": "00fdc487e50241a9a925d7df0dc9725f0fc560901bddd8d85572c4bbfecb9c96",
+  "rescue_file_sha256": "0a82e0fb51a8a77e2191e24ee5252b817db28931d4aabb98622e3a488f1fe341",
+  "storage_unchanged": true,
+  "original_application_unchanged": true,
+  "security_unchanged": true,
+  "other_settings_unchanged": true,
+  "wifi_repaired": true,
+  "returned_original": true,
+  "complete_original_flash_restored_and_verified": true,
+  "idf": "5.5.3",
+  "limits": [
+    "Unsigned, unencrypted synthetic spare test only; not a customer release or factory acceptance receipt.",
+    "No Secure Boot, Secure Download or encrypted NVS qualification asserted.",
+    "Storage is a synthetic raw fixture; independent AP visibility remains unverified."
+  ],
+  "files_sha256": {
+    "unsigned-seed.bin": "e2eb18ebd27fba846a633c88e5d6dd34f88cf738f403dad26e0771fc4aaebe1b",
+    "result.json": "1b7af8dd04c2d73f7fbd33d0963b9d7d200317ffc5620d7b213f8b77458beda1",
+    "unsigned-rescue.bin": "0a82e0fb51a8a77e2191e24ee5252b817db28931d4aabb98622e3a488f1fe341",
+    "seed-before.bin": "490bd9555953daeec3793b5fa0a04ce30c44e52a893fdcca89587244d4dfee72",
+    "usb-operations.txt": "f532a1ff505664bb15d7274b6aa364a508a20cc50b9e11ed78138a48e00efda6",
+    "unsigned-rescue-sdkconfig.txt": "91b2c947183eac0537ff7caf05c4f1a53300d00d5817ae39cdca8c58ce63cea6",
+    "repair-and-original.bin": "db5edcd8d8afda8d7de3e3000235491b385b00b8acad307a8465fe43767bdae8"
+  },
+  "repair_source_sha256": {
+    "rescue_main.c": "0d23508434d2c81fd94dfa23d2106a8fc2a3eceb9012ffd52dbac89e1c7ea92b",
+    "wifi_keys.c": "19d8c6ab952028f664d25b837b449f1c5bff8bcf9dd015330003f8985875b854",
+    "nvs_snapshot.c": "e574dd59472916ae1b1cc334800a8c841ff7c3b0a8604567515c5a2a836cf1fd"
+  }
+}
