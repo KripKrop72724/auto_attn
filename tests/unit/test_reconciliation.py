@@ -2145,7 +2145,8 @@ def test_source_epoch_commit_ack_and_bootstrap_are_bound(reconciliation_db, monk
     # with ADD's bound coverage so the reader resyncs instead of looping.
     stale = web.persist_envelope(pk, envelope.model_copy(update={"seq": 3, "payload": bad_payload}))
     assert stale.ack["type"] == "error" and stale.ack["code"] == "SOURCE_TAIL_EPOCH_STALE"
-    assert stale.coverage["source_epoch"] == expected and stale.coverage["source_committed_cursor"] == 2
+    assert stale.coverage_before_ack["source_epoch"] == expected
+    assert stale.coverage_before_ack["source_committed_cursor"] == 2
     with Session(session.bind) as db:
         current = db.get(ReconciliationCoverage, coverage.id)
         assert current.active and current.source_committed_cursor == 2

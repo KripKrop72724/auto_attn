@@ -253,9 +253,9 @@ def test_p06_tail_after_coverage_invalidation_stops_the_esp_instead_of_looping(w
         outcome = wire.send(stale)
         assert outcome.ack == {"type": "error", "message_id": outcome.ack["message_id"],
             "message_type": "source_tail_chunk", "code": SOURCE_TAIL_COVERAGE_INACTIVE, "duplicate": False}
-        _assert_firmware_parses(outcome.coverage, active=False)
-        assert outcome.coverage["terminal_generation"] == P06_GENERATION
-        assert outcome.coverage["source_committed_cursor"] == 0
+        _assert_firmware_parses(outcome.coverage_before_ack, active=False)
+        assert outcome.coverage_before_ack["terminal_generation"] == P06_GENERATION
+        assert outcome.coverage_before_ack["source_committed_cursor"] == 0
     # Nothing was accounted, certified or delivered from the refused range.
     assert tuple(wire.count(model) for model in (SourceTailChunk, TerminalRecordManifest, AttendanceEvent)) == before
     with wire.factory() as db:
@@ -277,14 +277,14 @@ def test_tail_that_invalidates_coverage_also_withdraws_the_esp_certificate(wire)
         diverged = _tail(db, wire.coverage(db), previous="f" * 64)
     outcome = wire.send(diverged)
     assert outcome.ack["type"] == "error" and outcome.ack["code"] == "SOURCE_TAIL_CHAIN_DIVERGED"
-    _assert_firmware_parses(outcome.coverage, active=False)
+    _assert_firmware_parses(outcome.coverage_before_ack, active=False)
     with wire.factory() as db:
         assert not wire.coverage(db).active
     # A copy still in flight, or sent before the push was applied, is answered
     # the same way instead of being rejected every interval.
     retry = wire.send(diverged)
     assert retry.ack["code"] == SOURCE_TAIL_COVERAGE_INACTIVE
-    _assert_firmware_parses(retry.coverage, active=False)
+    _assert_firmware_parses(retry.coverage_before_ack, active=False)
     assert wire.count(SourceTailChunk) == 0
 
 
@@ -297,11 +297,11 @@ def test_stale_epoch_in_the_same_generation_resyncs_to_add_coverage(wire):
         epoch = source_epoch_uuid(db, coverage)
         outcome = wire.send(_tail(db, coverage, epoch=str(uuid4())))
     assert outcome.ack["code"] == SOURCE_TAIL_EPOCH_STALE and outcome.ack["type"] == "error"
-    _assert_firmware_parses(outcome.coverage, active=True)
-    assert outcome.coverage["source_epoch"] == epoch
-    assert outcome.coverage["source_committed_cursor"] == 4
-    assert outcome.coverage["source_committed_chain_digest"] == before[2]
-    assert outcome.coverage["terminal_generation"] == P06_GENERATION
+    _assert_firmware_parses(outcome.coverage_before_ack, active=True)
+    assert outcome.coverage_before_ack["source_epoch"] == epoch
+    assert outcome.coverage_before_ack["source_committed_cursor"] == 4
+    assert outcome.coverage_before_ack["source_committed_chain_digest"] == before[2]
+    assert outcome.coverage_before_ack["terminal_generation"] == P06_GENERATION
     with wire.factory() as db:
         coverage = wire.coverage(db)
         assert (coverage.active, coverage.source_committed_cursor,
@@ -319,7 +319,7 @@ def test_missing_required_epoch_is_answered_with_add_coverage(wire):
         epoch = source_epoch_uuid(db, wire.coverage(db))
         outcome = wire.send(_tail(db, wire.coverage(db), epoch=None))
     assert outcome.ack["code"] == SOURCE_TAIL_EPOCH_STALE
-    assert outcome.coverage["source_epoch"] == epoch
+    assert outcome.coverage_before_ack["source_epoch"] == epoch
 
 
 def test_only_stale_certificates_are_answered_here(wire):
@@ -368,13 +368,13 @@ def test_p06_replay_divergence_withdraws_the_certificate_and_retries_are_answere
     outcome = wire.send(replay)
     assert outcome.ack["type"] == "error" and outcome.ack["code"] == "SOURCE_TAIL_REPLAY_DIVERGED"
     # The same reply withdraws the ESP's certificate, so it stops resending.
-    _assert_firmware_parses(outcome.coverage, active=False)
-    assert outcome.coverage["terminal_generation"] == P06_GENERATION
+    _assert_firmware_parses(outcome.coverage_before_ack, active=False)
+    assert outcome.coverage_before_ack["terminal_generation"] == P06_GENERATION
     # A retry already in flight is answered, never rejected at the coverage lookup.
     for _ in range(2):
         retry = wire.send(replay)
         assert retry.ack["code"] == SOURCE_TAIL_COVERAGE_INACTIVE
-        _assert_firmware_parses(retry.coverage, active=False)
+        _assert_firmware_parses(retry.coverage_before_ack, active=False)
     assert tuple(wire.count(model) for model in (SourceTailChunk, TerminalRecordManifest, AttendanceEvent)) == before
     with wire.factory() as db:
         current = wire.coverage(db)

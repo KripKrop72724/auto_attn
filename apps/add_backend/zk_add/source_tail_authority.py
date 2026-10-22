@@ -20,13 +20,16 @@ Two of those refusals have nothing to do with the records:
   generation, but the reader names another epoch, or none where one is
   required.
 
-Both are answered here before any evidence is read. ADD sends a structured
-error ACK followed by the same coverage push a reconnect sends: the inactive
-placeholder stops the reader's tail, and the active coverage moves it to
-ADD's committed cursor, chain and epoch. Nothing is committed. No ordinal is
-accounted, no certificate grows, and coverage is not changed. Every other
-refusal keeps the ordinary path, where evidence refusals stay refusals. A tail
-in a different generation is left to that path as well.
+Both are answered here before any evidence is read. ADD sends the same
+coverage push a reconnect sends, then a structured error ACK (the push goes
+first so the reader has queued it before the ACK releases its tail step): the
+inactive placeholder stops the reader's tail, and the active coverage moves it
+to ADD's committed cursor, chain and epoch. No evidence is committed: no
+ordinal is accounted, no certificate grows, and coverage is not changed. The
+transaction keeps only the message sequence and one WARN device log row, and
+it does not clear an open rejection alert. Every other refusal keeps the
+ordinary path, where evidence refusals stay refusals. A tail in a different
+generation is left to that path as well.
 """
 from __future__ import annotations
 
