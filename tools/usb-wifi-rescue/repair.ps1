@@ -171,9 +171,12 @@ $button.Add_Click({
         $scan = (& netsh.exe wlan show networks mode=bssid 2>&1 | Out-String)
         $scan | Set-Content (Join-Path $script:folder 'wifi-networks.txt') -Encoding UTF8
         $success = $serialText -match 'SLIC_WIFI_RESCUE_RESULT status=SUCCESS changed=[01] other_keys_unchanged=1 storage_unchanged=1' -and $serialText -match 'SLIC_WIFI_RESCUE_RETURNING_ORIGINAL' -and $serialText -match 'Loaded app from partition at offset 0x520000'
-        $ap = $serialText -match 'access point enabled' -or $scan -match 'SLIC\s+ATTENDANCE'
+        # A nearby attendance ESP must not count as this device's setup AP.
+        # Keep the complete Wi-Fi scan in the logs, and require this USB
+        # device's own portal-enable message for the positive result.
+        $ap = $serialText -match 'access point enabled'
         if ($success -and $ap) {
-            $result = 'Wi-Fi repair verified. Attendance storage and other settings checked unchanged. The setup access point was observed. Connect to SLIC ATTENDANCE and open http://192.168.254.1 to enter the correct Wi-Fi details.'
+            $result = 'Wi-Fi repair verified. Attendance storage and other settings checked unchanged. The ESP reported its setup access point enabled. Connect to SLIC ATTENDANCE and open http://192.168.254.1 to enter the correct Wi-Fi details.'
         } elseif ($success) {
             $result = 'Wi-Fi settings repaired and attendance storage checked unchanged. Setup Wi-Fi was not confirmed by this computer. Send the saved ZIP to support.'
         } else {

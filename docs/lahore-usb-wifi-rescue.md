@@ -1,7 +1,20 @@
-# Lahore USB Wi-Fi recovery experiment
+# Lahore USB Wi-Fi recovery
 
-Status: experimental source and spare tests; **no qualified repair executable**.
-The delivered `SLIC-USB-Security-Check-v1.3.exe` remains read-only.
+Status: the bounded `SLIC-Lahore2-WiFi-Repair-v1.0.exe` is qualified against
+the actual fleet-signed candidate on the secured spare. The earlier
+`SLIC-USB-Security-Check-v1.3.exe` remains read-only.
+
+Measured evidence is in
+`docs/evidence/2026-10-23-usb-wifi-rescue-locked-spare.json`. Source commit
+`701f2de9c3a64e8bdfda7b1f8d529c25c75dd08e` passed all eight exact-source ADD
+CI gates and protected signing run `39825492611`. The Windows EXE bundles
+esptool 5.1.0 and the signed rescue; it needs no Python installation or download.
+
+The original Lahore ESP has not been flashed here. Actual setup AP visibility
+and access on the original remain field checks: the GUI captures the connected
+device's portal-enable message and a full Windows Wi-Fi scan. A nearby SLIC
+network alone cannot produce a positive AP result. The lab qualification does
+not claim independent radio visibility or factory acceptance.
 
 The original ESP `ac:27:6e:a3:16:d4` reports Secure Download Mode, Secure Boot
 enabled, no flash encryption, HMAC_UP in key block 0, three secure-boot digests,
@@ -71,5 +84,27 @@ NVS and the original security profile on the spare. Enrolling that spare's
 HMAC/Secure Boot/Secure Download fuses is irreversible and needs explicit human
 authorization. No eFuse burn belongs in the customer installer. Test failure,
 power interruption and successful return to the original application; retain
-raw evidence. Independent AP visibility and setup access must also be checked.
-Never represent an unsigned spare test as passing that qualification.
+raw evidence. Check independent AP visibility and setup access on the original
+in the field; the requested USB EXE is the available field inspection method.
+Never represent an unsigned spare test as passing secured-device qualification.
+
+## Completed secured-spare qualification
+
+The human explicitly approved irreversible spare-only security enrollment.
+The spare was enrolled with the existing ADD keys before the repair tests;
+the customer installer contains no enrollment operation. Its security profile
+remained `0xc5`, HMAC block 0, three secure-boot digests, flash encryption off.
+
+The actual signed rescue repaired the empty SSID, preserved every other
+logical NVS entry and the full 8 MiB synthetic attendance fixture, and returned
+to the retained signed application. Repeating the repair made no settings
+change. A physical USB power cycle between the two OTA selection-sector
+writes booted the backup rescue at `0x2a0000`, preserved the same data and
+returned to the retained application at `0x520000`. NVS write failures are
+covered by compiled C tests; this is not a claim of physical interruption at
+every possible NVS write boundary. Raw transcripts and hashes are retained.
+
+An earlier signed test predecessor overflowed its default main-task stack
+while creating encrypted fixtures. That failed run was retained separately;
+the corrected 16 KiB test predecessor and actual rebuilt signed pair passed
+the complete qualification. Signing validation now rejects insufficient stacks.
