@@ -537,10 +537,11 @@ def _preserved_content_digest(
 def legacy_replay_candidates(connector_pk: int, batch_id: str, item_count: int):
     """Pre-digest batch-level quarantines of this batch id, ids only.
 
-    No ORDER BY/LIMIT: with ``ORDER BY id DESC LIMIT n`` PostgreSQL walks the
-    primary key backwards and filters the whole receipts table whenever fewer
-    than n rows match. Unordered, the (connector_id, batch_id) index bounds
-    the read and the caller picks the newest in Python.
+    No ORDER BY/LIMIT: ``ORDER BY id DESC LIMIT n`` lets the planner choose a
+    backward primary-key walk that filters the receipts table when fewer than
+    n rows match. Unordered, the (connector_id, batch_id) prefix of the
+    receipt identity index or the batch_id index bounds the read, and the
+    caller picks the newest in Python.
     """
 
     return select(AttendanceBatchReceipt.id).where(

@@ -4786,13 +4786,17 @@ def persist_envelope(connector_pk: int, envelope: Envelope) -> EnvelopeOutcome |
             settlement = settle_attendance_batch(
                 db, connector=connector, payload=envelope.payload
             )
+            # A retry or replay repeats an earlier receipt (its ACK carries
+            # that receipt's counts); this message settled no new rows.
+            repeated = settlement.duplicate_batch
             event_payload = {
                 "connector_id": connector.connector_id,
                 "receipt_id": settlement.receipt_id,
                 "outcome": settlement.outcome,
-                "accepted": settlement.accepted_count,
-                "duplicates": settlement.duplicate_count,
-                "quarantined": settlement.quarantined_count,
+                "accepted": 0 if repeated else settlement.accepted_count,
+                "duplicates": 0 if repeated else settlement.duplicate_count,
+                "quarantined": 0 if repeated else settlement.quarantined_count,
+                "duplicate_batch": repeated,
             }
             ack_payload = settlement.ack(
                 message_id=envelope.message_id, sequence=envelope.seq

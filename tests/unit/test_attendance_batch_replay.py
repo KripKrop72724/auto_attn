@@ -1,11 +1,12 @@
 """Firmware truth passes that re-send settled batches with a new capture time.
 
 Production shape (22 Oct 2026): ZONE-LAHORE-02 and ZONE-MULTAN-02 (2.6.15),
-ZONE-PESHAWAR-06 (2.7.5) and ZONE-PESHAWAR-02 (2.5.2) re-run a forced truth
-reconcile every 15-30 minutes. Each pass rebuilds the month as
-"truth-<first event_uid>" batches of ten rows whose only change is
-``captured_at``. ADD quarantined every pass as ATTENDANCE_BATCH_ID_CONFLICT
-(1,577 rows per pass on Lahore-02, ~38,000 rows that day fleet-wide).
+ZONE-PESHAWAR-06 (2.7.5), ZONE-PESHAWAR-02 (2.5.2) and ZONE-SLICTOWER-3FL
+(2.7.2) re-run a forced truth reconcile every 20-90 minutes. Each pass
+rebuilds the month as "truth-<first event_uid>" batches of ten rows whose only
+change is ``captured_at``. ADD quarantined every pass as
+ATTENDANCE_BATCH_ID_CONFLICT (1,577 rows per pass on Lahore-02, about 3,000 on
+SLICTOWER-3FL; 1.6M conflict rows in the store by 22 Oct).
 """
 
 from __future__ import annotations
@@ -49,8 +50,9 @@ from zk_add.time_utils import utc_now
 SERIAL = "CQZ7232161091"
 # "2.5.2" is the production bundle (27c3bb8, Aug 2026: Peshawar-02, G/PBLD8);
 # "2.5.2-sep" is a 2.5.2 build from c8729f8 (16 Sep) on, which added the
-# bound terminal serial to every row.
-GENERATIONS = ("2.4.12", "2.5.2", "2.5.2-sep", "2.6.15", "2.7.5")
+# bound terminal serial to every row. 2.7.2 (cd95432, SLICTOWER-3FL) has the
+# same add_attendance_json_row() and ACK check as 2.7.5 and 2.7.6.
+GENERATIONS = ("2.4.12", "2.5.2", "2.5.2-sep", "2.6.15", "2.7.2", "2.7.5")
 ROWS_WITHOUT_TERMINAL_SERIAL = frozenset({"2.4.12", "2.5.2"})
 
 
@@ -600,13 +602,21 @@ def test_websocket_ack_for_a_replayed_truth_batch(sessions, device, generation, 
     first_payload = truth_batch(generation, captured_at=PASS_START)
     _envelope, first = send(first_payload)
     assert firmware_accepts(generation, first_payload, first.ack, "m-1")
+    assert (first.event["accepted"], first.event["duplicate_batch"]) == (10, False)
     baseline = counts(sessions)
     for minutes in (27, 54, 81):
         payload = truth_batch(generation, captured_at=PASS_START + timedelta(minutes=minutes))
         envelope, outcome = send(payload)
         assert outcome.ack["receipt_id"] == first.ack["receipt_id"]
         assert outcome.ack["duplicate_batch"] is True
+        assert outcome.ack["accepted"] == 10
         assert firmware_accepts(generation, payload, outcome.ack, envelope.message_id)
+        # The browser event reports what this message settled: nothing new.
+        assert outcome.event["receipt_id"] == first.ack["receipt_id"]
+        assert outcome.event["duplicate_batch"] is True
+        assert (
+            outcome.event["accepted"], outcome.event["duplicates"], outcome.event["quarantined"]
+        ) == (0, 0, 0)
     assert counts(sessions) == baseline
 
 
@@ -1049,13 +1059,20 @@ def test_http_replay_publishes_no_new_attendance(sessions, device):
 
 
 def test_postgres_legacy_lookup_uses_the_batch_index_not_a_backward_scan(sessions, device):
-    """Correctness review D1: ORDER BY id DESC LIMIT 3 scanned the whole table."""
+    """The pre-digest lookup is bounded by the (connector, batch) index.
+
+    It runs while persist_envelope holds the connector row FOR UPDATE, so it
+    must never become a primary-key walk or a sequential scan.
+    """
 
     with sessions() as db:
         if db.get_bind().dialect.name != "postgresql":
             pytest.skip("PostgreSQL planner check")
         connector = _connector(db, device)
         zkt_device_id = connector.zkt_device.id
+        # Bulk setup only; the module's 30 s statement limit still guards the
+        # lookup itself.
+        db.execute(text("SET LOCAL statement_timeout = 0"))
         db.execute(
             text(
                 """
@@ -1065,12 +1082,12 @@ def test_postgres_legacy_lookup_uses_the_batch_index_not_a_backward_scan(session
                     duplicate_count, quarantined_count, observation_count,
                     first_seen_at, last_seen_at, committed_at, content_digest
                 )
-                SELECT 'bulk-' || g, :connector, :device, 'truth-' || (g % 20000),
+                SELECT 'bulk-' || g, :connector, :device, 'truth-' || (g % 12000),
                        md5(g::text) || md5((g + 1)::text), 'k', 'QUARANTINED', 10, 0, 0, 10,
                        1, now(), now(), now(),
                        CASE WHEN g % 50 = 0 THEN NULL
                             ELSE md5((g + 2)::text) || md5((g + 3)::text) END
-                FROM generate_series(1, 120000) AS g
+                FROM generate_series(1, 60000) AS g
                 """
             ),
             {"connector": device, "device": zkt_device_id},

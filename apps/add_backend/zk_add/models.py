@@ -686,7 +686,8 @@ class AttendanceBatchReceipt(Base):
     # Digest of the batch's events without the firmware's per-send
     # ``captured_at`` (attendance_batches.replay_content_digest). It is NULL on
     # receipts committed before it existed until a replay derives it from the
-    # receipt's own preserved evidence.
+    # receipt's own preserved evidence, or "UNAVAILABLE" once that evidence
+    # was read and could not be rebuilt exactly.
     content_digest: Mapped[str | None] = mapped_column(String(64))
 
 
