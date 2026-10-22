@@ -235,6 +235,9 @@ static bool s_started;
 static bool s_connected;
 static bool s_connected_edge;
 static bool s_ack_matched;
+/* ZKT 2.7.7: ADD marked the matched acknowledgement a duplicate (a replayed
+ * sequence: nothing was stored this time). */
+static bool s_ack_duplicate;
 static bool s_waiting_evidence;
 static bool s_waiting_hikvision;
 static char s_hikvision_expected[65];
@@ -685,7 +688,11 @@ static bool send_payload_and_wait_for_ack(
     bool awakened = sent && xSemaphoreTake(s_ack_sem, ack_timeout) == pdTRUE;
     bool acknowledged = false;
     if (awakened && xSemaphoreTake(s_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
-        acknowledged = s_ack_matched;
+        /* ZKT 2.7.7: a waited log is evidence only when ADD stored it now
+         * (ingest_logs commits before the acknowledgement); a duplicate
+         * acknowledgement stored nothing. */
+        acknowledged = s_ack_matched && !(s_ack_duplicate && !strcmp(type, "log"));
+        s_ack_duplicate = false;
         if (acknowledged && reconcile_ack_out) {
             *reconcile_ack_out = s_reconcile_chunk_ack;
         }
@@ -940,13 +947,18 @@ static bool recover_catalog_transaction_locked(void)
 #if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
     if (catalog_owner_required()) return catalog_owner_recover();
 #endif
+    errno = 0;
     bool ok = ft_recover(ADD_IDENTITY_CATALOG_PATH, ADD_IDENTITY_CATALOG_COMMIT_PATH,
         ADD_IDENTITY_CATALOG_BACKUP_PATH, catalog_transaction_port);
     // Only a fully written producer stage is renamed to the canonical commit
     // path. A first installation interrupted before prepare can finish here.
-    if (!ok) ok = ft_replace(ADD_IDENTITY_CATALOG_PATH, ADD_IDENTITY_CATALOG_COMMIT_PATH,
-        ADD_IDENTITY_CATALOG_BACKUP_PATH, ADD_IDENTITY_CATALOG_MAX_BYTES, catalog_transaction_port);
-    if (!ok) led_status_fault(LED_STATUS_LOCAL_FAILURE);
+    if (!ok) {
+        errno = 0;
+        ok = ft_replace(ADD_IDENTITY_CATALOG_PATH, ADD_IDENTITY_CATALOG_COMMIT_PATH,
+            ADD_IDENTITY_CATALOG_BACKUP_PATH, ADD_IDENTITY_CATALOG_MAX_BYTES, catalog_transaction_port);
+    }
+    /* ZKT 2.7.7: the errno of the failed transaction (ENOSPC: room). */
+    if (!ok) led_status_fault_errno(LED_STATUS_LOCAL_FAILURE, errno);
     return ok;
 }
 
@@ -965,7 +977,7 @@ static FILE *create_catalog_stage(const char *path)
     qs_local_end_file(file != NULL, captured, path);
     if (!file) {
         s_catalog_writer_failure_reason = "stage_open_failed";
-        led_status_fault(LED_STATUS_LOCAL_FAILURE);
+        led_status_fault_errno(LED_STATUS_LOCAL_FAILURE, captured);
     }
     return file;
 }
@@ -990,10 +1002,11 @@ static bool write_encrypted_json_line(FILE *file, cJSON *value)
     }
     bool ok = admitted && fprintf(file, "%s\n", encrypted) == (int)bytes &&
         fflush(file) == 0 && fsync(fileno(file)) == 0;
+    int captured = ok || !admitted ? 0 : errno;
     if (admitted && !ok) s_catalog_writer_failure_reason = "stage_write_failed";
     if (admitted) qs_local_end_file(ok, ok ? 0 : errno, "identity_catalog_stage");
     if (!ok && (!bounded || admitted || (errno != ENOSPC && errno != EBUSY)))
-        led_status_fault(LED_STATUS_LOCAL_FAILURE);
+        led_status_fault_errno(LED_STATUS_LOCAL_FAILURE, captured);
     free(plain);
     free(encrypted);
     return ok;
@@ -1372,9 +1385,10 @@ static bool activate_identity_catalog(const char *staged_path)
     errno = 0;
     if (remove(ADD_IDENTITY_CATALOG_COMMIT_PATH) != 0 && errno != ENOENT) return false;
     if (rename(staged_path, ADD_IDENTITY_CATALOG_COMMIT_PATH) != 0) return false;
+    errno = 0;
     bool ok = ft_replace(ADD_IDENTITY_CATALOG_PATH, ADD_IDENTITY_CATALOG_COMMIT_PATH,
         ADD_IDENTITY_CATALOG_BACKUP_PATH, ADD_IDENTITY_CATALOG_MAX_BYTES, catalog_transaction_port);
-    if (!ok) led_status_fault(LED_STATUS_LOCAL_FAILURE);
+    if (!ok) led_status_fault_errno(LED_STATUS_LOCAL_FAILURE, errno);
     return ok;
 }
 
@@ -2234,9 +2248,10 @@ static bool command_journal_recover_locked(void)
     if (catalog_owner_required())
         return command_owner_recover((uint64_t)esp_timer_get_time() + 30000000ULL);
 #endif
+    errno = 0;
     bool ok = ft_recover(ADD_COMMAND_INBOX_PATH, ADD_COMMAND_INBOX_TMP_PATH,
         ADD_COMMAND_INBOX_BACKUP_PATH, command_transaction_port);
-    if (!ok) led_status_fault(LED_STATUS_LOCAL_FAILURE);
+    if (!ok) led_status_fault_errno(LED_STATUS_LOCAL_FAILURE, errno);
     return ok;
 }
 
@@ -2300,8 +2315,9 @@ static bool command_journal_append(cJSON *root, const char *command_id)
     bool ok = file && fprintf(file, "%s\n", line) > 0 && fflush(file) == 0 &&
               fsync(fileno(file)) == 0;
     if (file && fclose(file) != 0) ok = false;
+    int captured = ok || !admitted ? 0 : errno;
     if (admitted) qs_local_end_file(ok, ok ? 0 : errno, ADD_COMMAND_INBOX_PATH);
-    if (!ok) led_status_fault(LED_STATUS_LOCAL_FAILURE);
+    if (!ok) led_status_fault_errno(LED_STATUS_LOCAL_FAILURE, captured);
     free(line);
     free(plain);
     xSemaphoreGive(s_command_lock);
@@ -2465,6 +2481,7 @@ static void parse_inbound(const char *data, size_t len)
         cJSON *message_id = cJSON_GetObjectItemCaseSensitive(root, "message_id");
         if (cJSON_IsString(message_id) && xSemaphoreTake(s_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
             if (strcmp(s_waiting_ack, message_id->valuestring) == 0) {
+                s_ack_duplicate = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(root, "duplicate"));
                 memset(&s_reconcile_chunk_ack, 0, sizeof(s_reconcile_chunk_ack));
                 memset(&s_source_tail_ack, 0, sizeof(s_source_tail_ack));
                 memset(
@@ -3307,19 +3324,19 @@ static bool restore_outbox_if_needed(add_outbox_t *outbox)
 {
     struct stat st;
     if (stat(outbox->path, &st) == 0) return true;
-    if (errno != ENOENT) { led_status_fault(LED_STATUS_LOCAL_FAILURE); return false; }
+    if (errno != ENOENT) { led_status_fault_errno(LED_STATUS_LOCAL_FAILURE, errno); return false; }
     const char *generations[] = {outbox->backup_path, outbox->tmp_path};
     for (size_t i = 0; i < 2; i++) {
         if (stat(generations[i], &st) == 0) {
             if (rename(generations[i], outbox->path) != 0) {
-                led_status_fault(LED_STATUS_LOCAL_FAILURE);
+                led_status_fault_errno(LED_STATUS_LOCAL_FAILURE, errno);
                 return false;
             }
             outbox->depth_known = false;
             lq_invalidate_empty(&outbox->legacy);
             return true;
         }
-        if (errno != ENOENT) { led_status_fault(LED_STATUS_LOCAL_FAILURE); return false; }
+        if (errno != ENOENT) { led_status_fault_errno(LED_STATUS_LOCAL_FAILURE, errno); return false; }
     }
     // Each surviving generation is streamed independently. Existence of a
     // newer active file is never permission to discard an older backup/temp.
@@ -3439,7 +3456,8 @@ static bool read_outbox_row_locked(add_outbox_t *outbox, char *line, off_t *row_
     if (outbox->depth_known && !outbox->depth) return false;
     dq_result_t result = lq_peek(&outbox->legacy, line, ADD_OUTBOX_LINE_BYTES, &outbox->pending_token);
     if (result == DQ_EMPTY) {
-        if (!compact_outbox_locked(outbox, true)) led_status_fault(LED_STATUS_LOCAL_FAILURE);
+        errno = 0;
+        if (!compact_outbox_locked(outbox, true)) led_status_fault_errno(LED_STATUS_LOCAL_FAILURE, errno);
         return false;
     }
     if (result != DQ_OK) {
@@ -4349,7 +4367,7 @@ bool add_connector_enqueue_attendance_bulk(const char *const *payloads, size_t c
         if (ok) s_bulk_outbox.depth += written;
         else {
             s_bulk_outbox.depth_known = false;
-            led_status_fault(LED_STATUS_LOCAL_FAILURE);
+            led_status_fault_errno(LED_STATUS_LOCAL_FAILURE, admitted ? captured_error : 0);
         }
         xSemaphoreGive(s_bulk_outbox.lock);
         if (ok && written > 0) {
@@ -4550,12 +4568,15 @@ static void outbox_task(void *arg)
             bool preserved = have_identity && add_connector_transfer_queue_evidence(
                 evidence_queue, generation, record_id, line, raw_length, NULL, "MALFORMED");
             s_add_worker_operation = ADD_WORKER_COMMITTING;
+            int settle_error = 0;
             if (preserved) {
+                errno = 0;
                 if (segmented) preserved = qs_settle(lanes[selected], &token) == DQ_OK;
                 else preserved = settle_legacy_delivery(outbox, &legacy_token, true);
+                settle_error = preserved ? 0 : errno;
             }
             // Failed custody transfer leaves the exact original row in place.
-            if (!preserved) led_status_fault(LED_STATUS_LOCAL_FAILURE);
+            if (!preserved) led_status_fault_errno(LED_STATUS_LOCAL_FAILURE, settle_error);
             ds_complete(&scheduler, (unsigned)selected, monotonic_ms(), preserved, esp_random());
             continue;
         }
@@ -4578,9 +4599,10 @@ static void outbox_task(void *arg)
         s_add_worker_operation = ADD_WORKER_COMMITTING;
         bool committed = false;
         if (acknowledged) {
+            errno = 0;
             if (segmented) committed = qs_settle(lanes[selected], &token) == DQ_OK;
             else committed = settle_legacy_delivery(outbox, &legacy_token, false);
-            if (!committed) led_status_fault(LED_STATUS_LOCAL_FAILURE);
+            if (!committed) led_status_fault_errno(LED_STATUS_LOCAL_FAILURE, errno);
         }
         if (committed) s_outbox_progress_ms = (uint32_t)monotonic_ms();
         ds_complete(&scheduler, (unsigned)selected, monotonic_ms(), committed, esp_random());
@@ -5008,50 +5030,67 @@ bool add_connector_boot_health_ready(void)
         s_heartbeat_task_handle && add_connector_delivery_healthy() &&
         hikvision_boot_health_ready();
 #else
-    bool ready = false;
-    if (!storage_upgrade_ready() || !zj_runtime_boot_ready()) return false;
+    return add_connector_boot_health_blockers() == 0;
+#endif
+}
+
+#ifndef ZONE_LITE_HIKVISION
+/* ZKT 2.7.7: the terms of add_connector_boot_health_ready, each named
+ * (storage_exception.h, SX_H_*), so the confirm-first exception can except
+ * exactly the storage terms it bounds. The same conditions as before:
+ * boot health is ready exactly when no bit is set. */
+uint32_t add_connector_boot_health_blockers(void)
+{
+    uint32_t blockers = 0;
+    if (!storage_upgrade_ready()) blockers |= SX_H_STORAGE_UPGRADE;
+    if (!zj_runtime_boot_ready()) blockers |= SX_H_JOURNAL_RUNTIME;
     // An authenticated control connection and healthy workers cannot attest
     // to safe attendance preservation when local storage is degraded.
     size_t storage_total = 0, storage_used = 0;
     qs_health_t storage_health = qs_health();
     const char *led = led_status_current_name();
-    if (esp_spiffs_info(NULL, &storage_total, &storage_used) != ESP_OK ||
-        !storage_health.observed || !storage_health.recovery_complete ||
-        !storage_health.persistence_verified || storage_health.last_error || storage_health.persistence_probe_error ||
-        !strcmp(led, "LOCAL_FAILURE") || !strcmp(led, "FATAL")) return false;
-    if (s_lock && xSemaphoreTake(s_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
-        time_t now = time(NULL);
-        bool authenticated_stability_elapsed =
-            s_zkt.stability_since_epoch > 1700000000 &&
-            now >= s_zkt.stability_since_epoch &&
-            ((uint64_t)(now - s_zkt.stability_since_epoch) * 1000ULL) >=
-                ZONE_LITE_RECOVERY_STABILITY_MS;
-        bool stable_terminal_session =
-            strcmp(s_zkt.connection_state, "ONLINE") == 0 ||
-            (strcmp(s_zkt.connection_state, "RECOVERING") == 0 &&
-             authenticated_stability_elapsed);
-        // A complete authenticated terminal snapshot is sufficient to prove
-        // the running image when a saturated preservation partition cannot
-        // stage the optional ADD alias catalog. Oracle truth remains
-        // independently fail-closed for every unresolved identity.
-        bool identity_ready = s_identity_catalog_generation > 0 ||
-            (s_zkt.user_count > 0 && s_zkt.user_record_size > 0);
-        ready = s_connected
-            && s_outbox_task_handle && s_heartbeat_task_handle && s_outbox_buffer_ready
-            && !s_worker_start_failed && s_ords_worker_started
-            && s_ords_worker_operation != ADD_WORKER_RESOURCE
-            && (uint32_t)((uint32_t)monotonic_ms() - s_ords_worker_tick_ms) < 90000U
-            && (uint32_t)((uint32_t)monotonic_ms() - s_outbox_tick_ms) < 90000U
-            && identity_ready
-            && s_zkt.online
-            && stable_terminal_session
-            && s_zkt.user_count >= 0
-            && s_zkt.attendance_count >= 0;
-        xSemaphoreGive(s_lock);
-    }
-    return ready;
-#endif
+    if (esp_spiffs_info(NULL, &storage_total, &storage_used) != ESP_OK) blockers |= SX_H_SPIFFS_INFO;
+    if (!storage_health.observed) blockers |= SX_H_QS_OBSERVED;
+    if (!storage_health.recovery_complete) blockers |= SX_H_QS_RECOVERY;
+    if (!storage_health.persistence_verified) blockers |= SX_H_QS_PERSISTENCE;
+    if (storage_health.last_error) blockers |= SX_H_QS_LAST_ERROR;
+    if (storage_health.persistence_probe_error) blockers |= SX_H_QS_PROBE_ERROR;
+    if (!strcmp(led, "LOCAL_FAILURE")) blockers |= SX_H_LED_LOCAL_FAILURE;
+    if (!strcmp(led, "FATAL")) blockers |= SX_H_LED_FATAL;
+    if (!s_lock || xSemaphoreTake(s_lock, pdMS_TO_TICKS(100)) != pdTRUE) return blockers | SX_H_LOCK;
+    time_t now = time(NULL);
+    bool authenticated_stability_elapsed =
+        s_zkt.stability_since_epoch > 1700000000 &&
+        now >= s_zkt.stability_since_epoch &&
+        ((uint64_t)(now - s_zkt.stability_since_epoch) * 1000ULL) >=
+            ZONE_LITE_RECOVERY_STABILITY_MS;
+    bool stable_terminal_session =
+        strcmp(s_zkt.connection_state, "ONLINE") == 0 ||
+        (strcmp(s_zkt.connection_state, "RECOVERING") == 0 &&
+         authenticated_stability_elapsed);
+    // A complete authenticated terminal snapshot is sufficient to prove
+    // the running image when a saturated preservation partition cannot
+    // stage the optional ADD alias catalog. Oracle truth remains
+    // independently fail-closed for every unresolved identity.
+    bool identity_ready = s_identity_catalog_generation > 0 ||
+        (s_zkt.user_count > 0 && s_zkt.user_record_size > 0);
+    if (!s_connected) blockers |= SX_H_ADD_CONNECTED;
+    if (!s_outbox_task_handle) blockers |= SX_H_OUTBOX_TASK;
+    if (!s_heartbeat_task_handle) blockers |= SX_H_HEARTBEAT_TASK;
+    if (!s_outbox_buffer_ready) blockers |= SX_H_OUTBOX_BUFFER;
+    if (s_worker_start_failed) blockers |= SX_H_WORKER_START;
+    if (!s_ords_worker_started) blockers |= SX_H_ORDS_STARTED;
+    if (s_ords_worker_operation == ADD_WORKER_RESOURCE) blockers |= SX_H_ORDS_RESOURCE;
+    if ((uint32_t)((uint32_t)monotonic_ms() - s_ords_worker_tick_ms) >= 90000U) blockers |= SX_H_ORDS_TICK;
+    if ((uint32_t)((uint32_t)monotonic_ms() - s_outbox_tick_ms) >= 90000U) blockers |= SX_H_OUTBOX_TICK;
+    if (!identity_ready) blockers |= SX_H_IDENTITY;
+    if (!s_zkt.online) blockers |= SX_H_TERMINAL_ONLINE;
+    if (!stable_terminal_session) blockers |= SX_H_TERMINAL_STABLE;
+    if (!(s_zkt.user_count >= 0 && s_zkt.attendance_count >= 0)) blockers |= SX_H_TERMINAL_COUNTS;
+    xSemaphoreGive(s_lock);
+    return blockers;
 }
+#endif
 
 bool add_connector_ota_reconcile_ready(void)
 {
@@ -5367,12 +5406,13 @@ bool add_connector_command_complete(const char *command_id)
     free(line);
     if (ok) ok = ft_replace(ADD_COMMAND_INBOX_PATH, ADD_COMMAND_INBOX_TMP_PATH,
         ADD_COMMAND_INBOX_BACKUP_PATH, ADD_COMMAND_INBOX_MAX_BYTES, command_transaction_port);
+    int captured = ok || !admitted ? 0 : errno;
     // Never remove a staged generation after an uncertain NVS commit.
     if (admitted) qs_local_end_file(ok, ok ? 0 : errno, ADD_COMMAND_INBOX_PATH);
     if (ok) {
         if (strcmp(s_running_command_id, command_id) == 0) s_running_command_id[0] = '\0';
         command_unmark_queued_locked(command_id);
-    } else led_status_fault(LED_STATUS_LOCAL_FAILURE);
+    } else led_status_fault_errno(LED_STATUS_LOCAL_FAILURE, captured);
     xSemaphoreGive(s_command_lock);
     return ok;
 }
@@ -5720,6 +5760,29 @@ bool add_connector_log(
     char *json = cJSON_PrintUnformatted(payload);
     cJSON_Delete(payload);
     bool ok = json && add_connector_send_payload("log", json);
+    free(json);
+    return ok;
+}
+
+/* ZKT 2.7.7: a log ADD has stored when this returns true (a non-duplicate
+ * acknowledgement of this envelope), with a structured context. The ADD
+ * acknowledgement lock is waited for at most 5 s. */
+bool add_connector_log_acknowledged(const char *level, const char *subsystem, const char *code, const char *message,
+                                    const char *context_json, uint32_t timeout_ms)
+{
+    cJSON *payload = cJSON_CreateObject();
+    cJSON *context = context_json ? cJSON_Parse(context_json) : cJSON_CreateObject();
+    bool valid = payload && cJSON_IsObject(context) &&
+        cJSON_AddStringToObject(payload, "level", level ? level : "INFO") &&
+        cJSON_AddStringToObject(payload, "subsystem", subsystem ? subsystem : "firmware") &&
+        (!code || cJSON_AddStringToObject(payload, "code", code)) &&
+        cJSON_AddStringToObject(payload, "message", message ? message : "") &&
+        cJSON_AddItemToObject(payload, "context", context);
+    if (!valid || !cJSON_GetObjectItemCaseSensitive(payload, "context")) cJSON_Delete(context);
+    char *json = valid ? cJSON_PrintUnformatted(payload) : NULL;
+    cJSON_Delete(payload);
+    bool ok = json && send_payload_and_wait_for_ack("log", json, pdMS_TO_TICKS(5000), pdMS_TO_TICKS(timeout_ms), NULL,
+                                                    NULL, NULL);
     free(json);
     return ok;
 }

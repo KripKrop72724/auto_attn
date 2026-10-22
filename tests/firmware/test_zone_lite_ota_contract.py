@@ -70,7 +70,8 @@ def test_running_image_digest_is_cached_before_delivery_workers_start() -> None:
 def test_ota_http_response_buffers_do_not_consume_task_stack() -> None:
     text = (FIRMWARE / "main" / "ota_manager.c").read_text(encoding="utf-8")
     assert "char response_data[OTA_HTTP_RESPONSE_BYTES]" not in text
-    assert text.count("calloc(1, OTA_HTTP_RESPONSE_BYTES)") == 2
+    # ZKT 2.7.7: the storage exception's receipted progress report is the third.
+    assert text.count("calloc(1, OTA_HTTP_RESPONSE_BYTES)") == 3
     assert text.count("free(response_data)") >= 4
     assert "#define OTA_HTTP_TRANSPORT_BUFFER_BYTES 4096" in text
     assert ".buffer_size = OTA_HTTP_TRANSPORT_BUFFER_BYTES" in text
@@ -103,11 +104,12 @@ def test_direct_ota_tls_buffers_can_use_psram_after_worker_startup() -> None:
 
 def test_ota_capability_is_retried_until_add_acknowledges_it() -> None:
     text = (FIRMWARE / "main" / "ota_manager.c").read_text(encoding="utf-8")
-    assert "bool capability_reported = false;" in text
-    assert "if (!capability_reported)" in text
-    assert "capability_reported = report_capability();" in text
-    assert "capability_reported && !s_busy" in text
-    assert "capability_reported = report_capability();" in text
+    # ZKT 2.7.7: one flag per boot, shared with the storage exception's gate
+    # (the capability ADD accepted on this boot is one of its terms).
+    assert "static bool s_capability_reported;" in text
+    assert "if (!s_capability_reported)" in text
+    assert "s_capability_reported = report_capability();" in text
+    assert "s_capability_reported && !s_busy" in text
 
 
 def test_ota_success_is_durable_and_same_version_is_never_downloaded_again() -> None:

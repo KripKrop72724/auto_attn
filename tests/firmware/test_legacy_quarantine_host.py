@@ -41,6 +41,11 @@ static bool legacy_pending_commit(void *context,const lq_checkpoint_t *cp){asser
 static int xSemaphoreTake(int *m,int timeout){(void)timeout;assert(!*m);*m=1;return 1;}
 static void xSemaphoreGive(int *m){assert(*m);*m=0;}
 static void led_status_fault(int status){assert(status==1);faults++;}
+/* ZKT 2.7.7: incidents with their captured errno (classified by the LED). */
+#define led_status_fault_errno(code, error) ((void)(error), led_status_fault(code))
+#define led_status_fault_read(code, error, queue, offset) ((void)(error), (void)(queue), (void)(offset), led_status_fault(code))
+typedef int led_queue_t;
+enum { LED_QUEUE_PENDING, LED_QUEUE_BLOCKED, LED_QUEUE_CORRUPT_ORDS };
 static unsigned failure_reports;
 static void report_queue_read_failure(const char *queue,const char *stage,dq_result_t result,int error,long cursor,
  const char *path){(void)error;(void)cursor;(void)path;assert(strstr(queue,"quarantine") && !strcmp(stage,"read"));

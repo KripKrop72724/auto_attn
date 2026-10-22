@@ -34,3 +34,26 @@ bool ota_progress_receipt_matches(const cJSON *reply, const char *deployment_id,
          !same(reply, "rollback_application_sha256", running_digest))) return false;
     return true;
 }
+
+bool ota_progress_receipt_exception(const cJSON *reply, const char *deployment_id, const char *target_version,
+    const char *running_digest)
+{
+    if (!ota_progress_receipt_matches(reply, deployment_id, "BOOTED_PENDING", target_version, running_digest)) return false;
+    const cJSON *state = cJSON_GetObjectItemCaseSensitive(reply, "state");
+    return cJSON_IsString(state) && !strcmp(state->valuestring, "BOOTED_PENDING") &&
+        cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(reply, "confirm")) &&
+        same(reply, "error_code", "STORAGE_REPAIR_EXCEPTION") &&
+        cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(reply, "storage_exception_allowed"));
+}
+
+bool ota_progress_receipt_terminal(const cJSON *reply, const char *deployment_id, const char *target_version)
+{
+    static const char *const ended[] = {"FAILED", "ROLLED_BACK", "CANCELLED", "SUPERSEDED", "RELEASE_REVOKED"};
+    const cJSON *schema = cJSON_GetObjectItemCaseSensitive(reply, "schema_version");
+    const cJSON *state = cJSON_GetObjectItemCaseSensitive(reply, "state");
+    if (!reply || !cJSON_IsNumber(schema) || schema->valuedouble != 1 || !cJSON_IsString(state) ||
+        !same(reply, "deployment_id", deployment_id) || !same(reply, "target_version", target_version)) return false;
+    for (size_t i = 0; i < sizeof(ended) / sizeof(ended[0]); ++i)
+        if (!strcmp(state->valuestring, ended[i])) return true;
+    return false;
+}

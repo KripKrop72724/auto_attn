@@ -50,6 +50,8 @@ static bool add_connector_is_connected(void) { return false; }
 static bool deliver_attendance_payloads_acknowledged(const char *const *payloads,size_t count)
 { (void)payloads;(void)count;assert(!held);return false; }
 static void led_status_fault(int code) { assert(code==LED_STATUS_LOCAL_FAILURE); }
+/* ZKT 2.7.7: incidents with their captured errno (classified by the LED). */
+#define led_status_fault_errno(code, error) ((void)(error), led_status_fault(code))
 static void refresh_capacity_deadline_on_progress(const add_outbox_t *outbox,uint32_t *depth,int64_t *until)
 { (void)outbox;(void)depth;(void)until;assert(held); }
 static bool compact_outbox_locked(add_outbox_t *outbox,bool force) { (void)outbox;(void)force;assert(held);return true; }

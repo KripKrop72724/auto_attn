@@ -36,6 +36,9 @@ if(NOT ZONE_LITE_FAMILY STREQUAL "hikvision" AND NOT ZONE_LITE_STORAGE_RECOVERY 
     idf_component_get_property(zone_lite_spiffs_dir spiffs COMPONENT_DIR)
     target_include_directories(${COMPONENT_LIB} PRIVATE "${zone_lite_spiffs_dir}" "${zone_lite_spiffs_dir}/spiffs/src")
     target_compile_definitions(${COMPONENT_LIB} PRIVATE ZONE_LITE_STORAGE_REPAIR=1)
+    # ZKT 2.7.7: every program and erase of the VFS's SPIFFS is counted
+    # (storage_repair.c), the confirm-first exception's store fingerprint.
+    target_link_libraries(${COMPONENT_LIB} INTERFACE "-Wl,--wrap=spiffs_api_write" "-Wl,--wrap=spiffs_api_erase")
 endif()
 # The one-shot recovery image is its own exact role. It never confirms itself
 # and always returns to the signed 2.5.2 predecessor; no other version may

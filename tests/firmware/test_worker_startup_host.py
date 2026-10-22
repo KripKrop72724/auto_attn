@@ -162,6 +162,11 @@ static unsigned recovery_steps;
 static void local_failure_recovery_step(void){++recovery_steps;}
 #endif
 static void led_status_fault(int state){assert(state>=1 && state<=3);++faults;if(state==LED_STATUS_LOCAL_FAILURE)++local_faults;}
+#if !ZONE_LITE_HIKVISION
+/* ZKT 2.7.7: the incident's cause from the queue store's own error. */
+#define led_status_fault_errno(state, error) ((void)(error), led_status_fault(state))
+static int storage_fault_errno(const qs_health_t *health){return health->last_error;}
+#endif
 static void vTaskDelay(unsigned ms){if(gateway_created)++capture_ticks;now+=ms;if(now>=stop_at)longjmp(done,1);}
 static void launch(void)
 {

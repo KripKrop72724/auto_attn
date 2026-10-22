@@ -28,6 +28,8 @@ typedef struct { durable_queue_t queue; SemaphoreHandle_t mutex; qs_lane_t lane;
 static lane_t lanes[QS_COUNT];
 static SemaphoreHandle_t budget_lock;
 static qs_health_t health;
+/* ZKT 2.7.7: qs_hold_probe. */
+static volatile bool probe_held;
 static lf_state_t legacy_health;
 static storage_budget_t budget;
 static char storage_generation[33];
@@ -449,7 +451,7 @@ bool qs_verify_persistence(void)
     if (!ok) file_error = EIO;
     if (ok) {
         stage = "persistence_capacity";
-        ok = storage_budget_admit(&budget, health.total_bytes, health.used_bytes, 4096, SB_RECOVERY);
+        ok = !probe_held && storage_budget_admit(&budget, health.total_bytes, health.used_bytes, 4096, SB_RECOVERY);
         if (!ok) file_error = ENOSPC;
     }
     FILE *f = NULL;
@@ -698,11 +700,20 @@ bool qs_snapshot(qs_lane_t lane, uint32_t *depth)
 qs_health_t qs_health(void)
 {
     qs_health_t snapshot = {0};
-    if (budget_lock && xSemaphoreTake(budget_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
-        snapshot = qs_local_health_locked(); xSemaphoreGive(budget_lock);
-    }
+    (void)qs_health_known(&snapshot);
     return snapshot;
 }
+bool qs_health_known(qs_health_t *out)
+{
+    qs_health_t snapshot = {0};
+    bool known = budget_lock && xSemaphoreTake(budget_lock, pdMS_TO_TICKS(100)) == pdTRUE;
+    if (known) {
+        snapshot = qs_local_health_locked(); xSemaphoreGive(budget_lock);
+    }
+    if (out) *out = snapshot;
+    return known;
+}
+void qs_hold_probe(bool hold) { probe_held = hold; }
 qs_health_t qs_local_health_locked(void)
 {
     (void)measure();

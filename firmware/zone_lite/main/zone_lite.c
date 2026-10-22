@@ -3205,17 +3205,27 @@ static bool append_line_policy(const char *path, const char *line, qs_admission_
 {
     if (!path || !line) return false;
 #if defined(ZONE_LITE_QUEUE_OWNER) && ZONE_LITE_QUEUE_OWNER
+    /* ZKT 2.7.7: on false, errno is the failed write's (0 when there was no
+     * write or its errno is not known): the LED classifies the incident by
+     * it (led_status_fault_errno). */
     if (legacy_attendance_owner_required()) {
         if (strcmp(path, PENDING_PATH) && strcmp(path, BLOCKED_PATH)) return false;
-        return zol_append(!strcmp(path, PENDING_PATH) ? ZOL_PENDING : ZOL_BLOCKED,
+        bool appended = zol_append(!strcmp(path, PENDING_PATH) ? ZOL_PENDING : ZOL_BLOCKED,
             line, strlen(line), policy) == DQ_OK;
+        if (!appended) errno = 0;
+        return appended;
     }
 #endif
     if (storage_upgrade_segmented_writes() && (!strcmp(path, PENDING_PATH) || !strcmp(path, BLOCKED_PATH))) {
-        return qs_append_with_policy(!strcmp(path, PENDING_PATH) ? QS_ORDS : QS_BLOCKED,
+        bool appended = qs_append_with_policy(!strcmp(path, PENDING_PATH) ? QS_ORDS : QS_BLOCKED,
             line, strlen(line), policy) == DQ_OK;
+        if (!appended) errno = 0;
+        return appended;
     }
-    if (!qs_local_begin(policy, strlen(line) + 1)) return false;
+    if (!qs_local_begin(policy, strlen(line) + 1)) {
+        errno = 0;
+        return false;
+    }
     if (!strcmp(path, PENDING_PATH)) lq_invalidate_empty(&g_legacy_pending);
     if (!strcmp(path, BLOCKED_PATH)) lq_invalidate_empty(&g_legacy_blocked);
     errno = 0;
@@ -3226,6 +3236,7 @@ static bool append_line_policy(const char *path, const char *line, qs_admission_
     if (f && fclose(f) != 0) { ok = false; if (!error) error = errno; }
     qs_local_end_file(ok, error, path);
     if (!ok) ESP_LOGE(TAG, "Durable append failed for %s errno=%d", path, error);
+    errno = ok ? 0 : error;
     return ok;
 }
 
@@ -3316,17 +3327,17 @@ static bool restore_pending_backup_if_needed(void)
     lq_invalidate_empty(&g_legacy_pending);
     struct stat st;
     if (stat(PENDING_PATH, &st) == 0) return true;
-    if (errno != ENOENT) { led_status_fault(LED_STATUS_LOCAL_FAILURE); return false; }
+    if (errno != ENOENT) { led_status_fault_errno(LED_STATUS_LOCAL_FAILURE, errno); return false; }
     const char *generations[] = {PENDING_BACKUP_PATH, PENDING_TMP_PATH};
     for (size_t i = 0; i < 2; i++) {
         if (stat(generations[i], &st) == 0) {
             if (rename(generations[i], PENDING_PATH) != 0) {
-                led_status_fault(LED_STATUS_LOCAL_FAILURE);
+                led_status_fault_errno(LED_STATUS_LOCAL_FAILURE, errno);
                 return false;
             }
             return true;
         }
-        if (errno != ENOENT) { led_status_fault(LED_STATUS_LOCAL_FAILURE); return false; }
+        if (errno != ENOENT) { led_status_fault_errno(LED_STATUS_LOCAL_FAILURE, errno); return false; }
     }
     // Older and temporary files remain independent recoverable generations.
     return true;
@@ -3441,13 +3452,15 @@ static bool recover_blocked_events_from_snapshot(const user_table_t *users, size
         cJSON_AddStringToObject(root, "employee_name", user->employee_name) &&
         cJSON_AddBoolToObject(root, "raw_punch", user->raw_punch);
     char *output = ok ? cJSON_PrintUnformatted(root) : NULL;
+    errno = 0;
     ok = output && append_line(PENDING_PATH, output);
     if (ok) ok = settle_blocked_locked(&token, false);
+    int captured = ok ? 0 : errno;
     free(output); cJSON_Delete(root);
     if (ok && recovered_out) *recovered_out = 1;
     if (ok) ESP_LOGI(TAG, "BLOCKED_IDENTITY_REPAIRED: one record durably transferred");
     xSemaphoreGive(g_storage_lock);
-    if (!ok) led_status_fault(LED_STATUS_LOCAL_FAILURE);
+    if (!ok) led_status_fault_errno(LED_STATUS_LOCAL_FAILURE, captured);
     return ok;
 }
 
@@ -3500,6 +3513,22 @@ static bool storage_mount_allowed(void)
 #endif
 }
 
+/* ZKT 2.7.7: ENOSPC when the queue store's failure only says "no room" (the
+ * probe's and the last error's operation with its errno, as the
+ * confirm-first exception reads them), else 0: the LED's cause. */
+static inline int storage_fault_errno(const qs_health_t *health)
+{
+#if defined(ZONE_LITE_STORAGE_REPAIR) && ZONE_LITE_STORAGE_REPAIR
+    bool probe_room = !health->persistence_probe_error ||
+        sx_probe_error_room(health->persistence_probe_operation, health->persistence_probe_error);
+    bool last_room = !health->last_error || sx_last_error_room(health->last_operation, health->last_error);
+    return probe_room && last_room && (health->last_error || health->persistence_probe_error) ? ENOSPC : 0;
+#else
+    (void)health;
+    return 0;
+#endif
+}
+
 static void storage_init(void)
 {
 #if defined(ZONE_LITE_STORAGE_REPAIR) && ZONE_LITE_STORAGE_REPAIR
@@ -3542,6 +3571,11 @@ static void storage_init(void)
     }
 #endif
     if (!storage_upgrade_init()) led_status_fault(LED_STATUS_LOCAL_FAILURE);
+#if defined(ZONE_LITE_STORAGE_REPAIR) && ZONE_LITE_STORAGE_REPAIR
+    /* ZKT 2.7.7: a boot that may use the confirm-first exception writes
+     * nothing to its wedged store to prove it (critique 9). */
+    qs_hold_probe(storage_repair_hold_probe());
+#endif
     g_queue_store_ready = qs_init();
     if (!g_queue_store_ready) led_status_fault(LED_STATUS_LOCAL_FAILURE);
 #if defined(ZONE_LITE_HIKVISION) && ZONE_LITE_HIKVISION
@@ -3779,6 +3813,10 @@ static bool add_send_attendance_event_acknowledged(
     return ok;
 }
 
+/* ZKT 2.7.7: the errno of the last failed attendance append (the capture
+ * owner's), so the live fallback's incident carries the append's cause. */
+static int g_enqueue_storage_errno;
+
 static bool recover_live_event_after_storage_error(
     const attendance_event_t *event,
     const char *capturetype,
@@ -3816,7 +3854,7 @@ static bool recover_live_event_after_storage_error(
     // A bounded lock wait can expire while another worker owns healthy storage.
     // An acknowledged live event has ADD custody and unchanged ZKT source truth;
     // reserve the persistent fault latch for an actual local storage failure.
-    if (storage_fault) led_status_fault(LED_STATUS_LOCAL_FAILURE);
+    if (storage_fault) led_status_fault_errno(LED_STATUS_LOCAL_FAILURE, g_enqueue_storage_errno);
     char message[224];
     snprintf(
         message,
@@ -3943,6 +3981,7 @@ static enqueue_result_t enqueue_event_to_files(
     const attendance_event_t *event,
     const char *capturetype)
 {
+    g_enqueue_storage_errno = 0;
     if (seen_contains(event->event_uid)) {
         return ENQUEUE_DUPLICATE;
     }
@@ -3956,8 +3995,9 @@ static enqueue_result_t enqueue_event_to_files(
     enqueue_result_t result = ENQUEUE_PENDING;
     if (event->cnic[0] == '\0') {
         if (!append_line_policy(BLOCKED_PATH, json, policy)) {
+            g_enqueue_storage_errno = errno;
             free(json);
-            led_status_fault(LED_STATUS_LOCAL_FAILURE);
+            led_status_fault_errno(LED_STATUS_LOCAL_FAILURE, g_enqueue_storage_errno);
             return ENQUEUE_STORAGE_ERROR;
         }
         led_status_fault(LED_STATUS_BLOCKED_IDENTITY);
@@ -3967,8 +4007,9 @@ static enqueue_result_t enqueue_event_to_files(
         }
     } else {
         if (!append_line_policy(PENDING_PATH, json, policy)) {
+            g_enqueue_storage_errno = errno;
             free(json);
-            led_status_fault(LED_STATUS_LOCAL_FAILURE);
+            led_status_fault_errno(LED_STATUS_LOCAL_FAILURE, g_enqueue_storage_errno);
             return ENQUEUE_STORAGE_ERROR;
         }
         led_status_set_backlog(true);
@@ -3989,6 +4030,7 @@ static enqueue_result_t enqueue_event(const attendance_event_t *event, const cha
     if (!owned && (!g_storage_lock || xSemaphoreTake(g_storage_lock, pdMS_TO_TICKS(2000)) != pdTRUE)) {
         ESP_LOGE(TAG, "Could not lock durable attendance outbox");
         bool storage_fault = !g_storage_lock;
+        g_enqueue_storage_errno = 0;
         if (recover_live_event_after_storage_error(
                 event,
                 capturetype,
@@ -7567,12 +7609,15 @@ static bool add_enqueue_json_receipts(
     return ok;
 }
 
-static void ords_drain_preserved_deferred(const char *stage, int error_code)
+/* ZKT 2.7.7: `read_error` is the errno of a failed read of /pending.jsonl
+ * that started at byte `read_offset` (the LED's held-read cause; 0 for any
+ * other deferral). */
+static void ords_drain_deferred(const char *stage, int error_code, int read_error, uint32_t read_offset)
 {
     int64_t now_ms = uptime_ms();
     g_ords_drain_retry_not_before_ms = now_ms + ZONE_LITE_ORDS_STORAGE_RETRY_DELAY_MS;
     led_status_set_backlog(true);
-    led_status_fault(LED_STATUS_LOCAL_FAILURE);
+    led_status_fault_read(LED_STATUS_LOCAL_FAILURE, read_error, LED_QUEUE_PENDING, read_offset);
     ESP_LOGW(
         TAG,
         "ORDS delivery deferred at %s because a storage resource was unavailable errno=%d; preserved records remain recoverable",
@@ -7594,6 +7639,11 @@ static void ords_drain_preserved_deferred(const char *stage, int error_code)
             message);
         g_ords_storage_last_log_ms = now_ms;
     }
+}
+
+static void ords_drain_preserved_deferred(const char *stage, int error_code)
+{
+    ords_drain_deferred(stage, error_code, 0, 0);
 }
 
 static char (*g_legacy_drain_buffer)[MAX_EVENT_JSON];
@@ -7811,15 +7861,29 @@ static void oracle_drain_pending(bool live_first)
     bool binary_head = false;
     dq_result_t read = g_legacy_pending.ready && g_legacy_pending.empty_cached ? DQ_EMPTY :
         restore_pending_backup_if_needed() ? DQ_OK : DQ_IO;
+    /* ZKT 2.7.7: a failed read's errno and where it started (the LED's
+     * held-read cause). */
+    int read_errno = 0;
+    uint32_t read_offset = 0;
     if (read == DQ_OK && !g_legacy_pending.ready) {
         lq_port_t port = {legacy_pending_load, legacy_pending_commit, NULL};
+        errno = 0;
         read = lq_open_step(&g_legacy_pending, PENDING_PATH, port);
+        if (read != DQ_OK && read != DQ_PENDING) {
+            read_errno = errno;
+            read_offset = g_legacy_pending.recovery_offset;
+        }
     }
     legacy_queue_t scan = g_legacy_pending;
     size_t limit = g_legacy_probe_head ? 1 : LEGACY_ORDS_SLICE_RECORDS;
     while (read == DQ_OK && count < limit) {
         events[count] = g_legacy_drain_buffer[count];
+        errno = 0;
         read = lq_peek(&scan, events[count], MAX_EVENT_JSON, &tokens[count]);
+        if (read != DQ_OK && read != DQ_EMPTY && read != DQ_PENDING) {
+            read_errno = errno;
+            read_offset = scan.checkpoint.offset;
+        }
         if (read != DQ_OK) break;
         bool binary = tokens[count].evidence_required || memchr(events[count], 0, tokens[count].end - tokens[count].offset) != NULL;
         if (binary && count) break;
@@ -7852,7 +7916,7 @@ static void oracle_drain_pending(bool live_first)
                 if (qs_snapshot(QS_ORDS, &depth) && depth == 0) led_status_set_backlog(false);
             }
         }
-        else if (read != DQ_PENDING) ords_drain_preserved_deferred("legacy-read", EIO);
+        else if (read != DQ_PENDING) ords_drain_deferred("legacy-read", EIO, read_errno, read_offset);
         xSemaphoreGive(g_ords_outbox_gate);
         return;
     }
@@ -7985,7 +8049,14 @@ static void blocked_evidence_slice(void)
     }
     if (read != DQ_OK) {
         if (read != DQ_EMPTY && read != DQ_PENDING) {
-            led_status_fault(LED_STATUS_LOCAL_FAILURE);
+            /* ZKT 2.7.7: a legacy read of the blocked queue that failed with
+             * EIO may be a span the boot repair holds (13FL). */
+            bool opened = g_legacy_blocked.ready;
+            if (segmented || strcmp(g_blocked_read_stage, opened ? "peek" : "open"))
+                led_status_fault(LED_STATUS_LOCAL_FAILURE);
+            else
+                led_status_fault_read(LED_STATUS_LOCAL_FAILURE, g_blocked_read_error, LED_QUEUE_BLOCKED,
+                                      opened ? g_legacy_blocked.checkpoint.offset : g_legacy_blocked.recovery_offset);
             if (segmented) report_queue_read_failure("segmented_blocked", "peek", read, errno, -1L, NULL);
             else report_queue_read_failure("identity_blocked", g_blocked_read_stage, read, g_blocked_read_error,
                                            (long)g_legacy_blocked.checkpoint.offset, BLOCKED_PATH);
@@ -8012,6 +8083,7 @@ static void blocked_evidence_slice(void)
     cJSON_Delete(root);
     add_connector_report_ords_worker(ADD_WORKER_COMMITTING);
     if (preserved) {
+        errno = 0;
         if (segmented) preserved = qs_settle(QS_BLOCKED, &segmented_token) == DQ_OK;
 #if defined(ZONE_LITE_QUEUE_OWNER) && ZONE_LITE_QUEUE_OWNER
         else if (legacy_attendance_owner_required())
@@ -8021,7 +8093,7 @@ static void blocked_evidence_slice(void)
             preserved = settle_blocked_locked(&legacy_token, true);
             xSemaphoreGive(g_storage_lock);
         } else preserved = false;
-        if (!preserved) led_status_fault(LED_STATUS_LOCAL_FAILURE);
+        if (!preserved) led_status_fault_errno(LED_STATUS_LOCAL_FAILURE, errno);
     }
 }
 
@@ -8132,11 +8204,16 @@ static void legacy_quarantine_slice(void)
     unsigned lane = g_quarantine_lane++ % 3U;
     lq_token_t token;
     size_t length = 0;
+    errno = 0;
     dq_result_t read = read_quarantine_delivery(lane, g_blocked_drain_buffer, DQ_MAX_RECORD_BYTES + 1, &length, &token);
     if (read != DQ_OK) {
         if (read != DQ_EMPTY && read != DQ_PENDING) {
             int error = errno;
-            led_status_fault(LED_STATUS_LOCAL_FAILURE);
+            /* ZKT 2.7.7: the queue and where its read started (lanes are
+             * corrupt_ords.jsonl, add_corrupt.jsonl, add_corrupt.bak). */
+            const legacy_queue_t *queue = &g_legacy_quarantine[lane];
+            led_status_fault_read(LED_STATUS_LOCAL_FAILURE, error, (led_queue_t)(LED_QUEUE_CORRUPT_ORDS + lane),
+                                  queue->ready ? queue->checkpoint.offset : queue->recovery_offset);
             report_queue_read_failure(names[lane], "read", read, error, -1L, NULL);
         }
         return;
@@ -8151,8 +8228,9 @@ static void legacy_quarantine_slice(void)
         g_blocked_drain_buffer, length, NULL, "LEGACY_RECOVERY");
     add_connector_report_ords_worker(ADD_WORKER_COMMITTING);
     if (!preserved) return;
+    errno = 0;
     dq_result_t committed = settle_quarantine_delivery(lane, &token);
-    if (committed != DQ_OK && committed != DQ_PENDING) led_status_fault(LED_STATUS_LOCAL_FAILURE);
+    if (committed != DQ_OK && committed != DQ_PENDING) led_status_fault_errno(LED_STATUS_LOCAL_FAILURE, errno);
 }
 
 static void ords_uploader_task(void *arg)
@@ -10983,7 +11061,10 @@ void app_main(void)
         if (g_queue_store_ready) {
             bool recovered = qs_recover_step();
             if (recovered) {
-                if (!qs_verify_persistence() && qs_health().last_error) led_status_fault(LED_STATUS_LOCAL_FAILURE);
+                if (!qs_verify_persistence()) {
+                    qs_health_t verified = qs_health();
+                    if (verified.last_error) led_status_fault_errno(LED_STATUS_LOCAL_FAILURE, storage_fault_errno(&verified));
+                }
             } else if (qs_health().last_error) {
                 /* With a fault pending, verification is the recovery check. */
                 (void)qs_verify_persistence();

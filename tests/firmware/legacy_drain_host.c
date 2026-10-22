@@ -70,6 +70,8 @@ static int xSemaphoreTake(int *lock,unsigned timeout)
 static void xSemaphoreGive(int *lock) { assert(*lock);*lock=0; }
 static void led_status_set_backlog(bool pending) { (void)pending; }
 static void led_status_fault(int state) { (void)state;faults++; }
+/* ZKT 2.7.7: the incident's captured errno (classified by the LED). */
+#define led_status_fault_errno(state, error) ((void)(error), led_status_fault(state))
 static bool fail_restore_rename, fail_restore_stat;
 static int restore_rename(const char *from, const char *to)
 { if(fail_restore_rename){errno=EIO;return -1;}return rename(from,to); }
@@ -82,6 +84,9 @@ static int restore_stat(const char *path,struct stat *st)
 #undef stat
 static void ords_drain_preserved_deferred(const char *stage,int error)
 { assert(!storage_lock);(void)stage;(void)error;faults++; }
+/* ZKT 2.7.7: a deferral of a failed read names its errno and offset. */
+static void ords_drain_deferred(const char *stage,int error,int read_error,uint32_t read_offset)
+{ (void)read_error;(void)read_offset;ords_drain_preserved_deferred(stage,error); }
 static int legacy_pending_load(void *context,lq_checkpoint_t *cp)
 { (void)context;*cp=durable;return exists?1:0; }
 static bool legacy_pending_commit(void *context,const lq_checkpoint_t *cp)

@@ -30,6 +30,19 @@
 #include "boot_confirm.h"
 #include "storage_recovery.h"
 #include "zone_config.h"
+#if defined(ZONE_LITE_STORAGE_REPAIR) && ZONE_LITE_STORAGE_REPAIR
+/* ZKT 2.7.7: the confirm-first storage exception (storage_exception.h). */
+#include "esp_heap_caps.h"
+#include "esp_spiffs.h"
+#include "led_status.h"
+#include "queue_store.h"
+#include "storage_exception.h"
+#include "storage_repair.h"
+#include "upgrade_guard.h"
+#define OTA_STORAGE_EXCEPTION 1
+#else
+#define OTA_STORAGE_EXCEPTION 0
+#endif
 #if !defined(ZONE_LITE_HIKVISION) || !ZONE_LITE_HIKVISION
 #include "zkt_ota_guard.h"
 #include "zkt_storage_owner.h"
@@ -93,6 +106,8 @@ static uint64_t s_failed_boot_ticket;
 
 static void wait_for_capture_safepoint(void);
 static bool acknowledge_pending_success(void);
+/* The capability ADD accepted on this boot (also a term of the 2.7.7 gate). */
+static bool s_capability_reported;
 #if defined(ZONE_LITE_FACTORY_TRIAL_IMAGE)
 static bool report_factory_trial(void);
 #endif
@@ -399,6 +414,39 @@ static bool report_state(const char *state, const char *error)
     cJSON_Delete(root);
     return ok;
 }
+
+#if OTA_STORAGE_EXCEPTION
+/* ZKT 2.7.7: a progress report with an operator-visible message whose
+ * receipt the caller checks (the exception's BOOTED_PENDING, RECONCILING and
+ * terminal FAILED reports; never for the bridge or writer roles). */
+static bool report_progress(const char *state, const char *error, const char *message, cJSON **receipt_out)
+{
+    if (receipt_out) *receipt_out = NULL;
+    s_progress_attempts++;
+    if (!s_journal.deployment_id[0]) return false;
+    char path[160];
+    snprintf(path, sizeof(path), "/device/v2/firmware/deployments/%s/progress", s_journal.deployment_id);
+    cJSON *root = cJSON_CreateObject();
+    bool valid = root && cJSON_AddStringToObject(root, "state", state) &&
+        cJSON_AddNumberToObject(root, "bytes_written", (double)s_journal.bytes_written) &&
+        add_running_image_evidence(root) && (!error || !error[0] || cJSON_AddStringToObject(root, "error_code", error)) &&
+        (!message || !message[0] || cJSON_AddStringToObject(root, "error_message", message));
+    char *body = valid ? cJSON_PrintUnformatted(root) : NULL;
+    cJSON_Delete(root);
+    char *data = body ? calloc(1, OTA_HTTP_RESPONSE_BYTES) : NULL;
+    ota_response_t response = {.data = data, .capacity = OTA_HTTP_RESPONSE_BYTES};
+    int status = 0;
+    bool ok = data && signed_request("POST", path, body, &response, &status) && status >= 200 && status < 300;
+    s_progress_last_http_status = status;
+    if (ok) {
+        s_progress_successes++;
+        if (receipt_out) *receipt_out = cJSON_Parse(data);
+    }
+    free(data);
+    free(body);
+    return ok;
+}
+#endif
 
 static bool report_capability(void)
 {
@@ -903,6 +951,458 @@ static bool confirm_local_boot(void)
     return false;
 }
 
+static bool running_state_is(esp_ota_img_states_t wanted)
+{
+    esp_ota_img_states_t state;
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    return running && esp_ota_get_state_partition(running, &state) == ESP_OK && state == wanted;
+}
+
+#if OTA_STORAGE_EXCEPTION
+/* ---- ZKT 2.7.7: the confirm-first storage exception ------------------------
+ * Owner decision D3 (a), 21 October 2026; docs/zone-lite-2.7.7-confirm-first.md.
+ * storage_exception.c decides; this glue collects its inputs, runs the
+ * confirmation sequence and what follows it. None of its reasons ever reaches
+ * s_last_error (M2): ADD turns an active deployment's last_error into FAILED. */
+#define SX_EVIDENCE_ACK_MS 10000U
+#define SX_LOG_SECONDS 60U
+/* A RECONCILING report of an exception deployment: when its status changes,
+ * else at most this often (each is an ADD event row). */
+#define SX_RECONCILING_REPORT_SECONDS (15U * 60U)
+_Static_assert((unsigned)LED_QUEUE_COUNT == SX_QUEUE_COUNT, "the LED's reclaim queues are the gate's");
+#if defined(ZONE_LITE_DIRECT_LEGACY_UPGRADE) && ZONE_LITE_DIRECT_LEGACY_UPGRADE && !defined(ZONE_LITE_QUETTA_DIAGNOSTIC)
+#define SX_PRODUCTION_ROLE true
+#else
+#define SX_PRODUCTION_ROLE false
+#endif
+
+typedef struct {
+    sx_repair_t repair;
+    sx_inventory_t inventory;
+    sx_runtime_t runtime;
+} sx_inputs_t;
+
+static struct {
+    sx_inputs_t *inputs;          /* PSRAM, once */
+    sx_state_t state;             /* this unconfirmed boot's gate */
+    sx_reason_t reason;
+    uint32_t since_s, blockers, unhealthy_since_s, reconciling_reported_s, attempt_s;
+    int8_t passive;               /* -1 unknown */
+    bool evaluated, confirming_written, evidence_logged;
+    sx_window_t window;
+    uint32_t logged_s;
+    sx_reason_t logged_reason;
+    char reconciling_status[48];
+} s_sx = {.passive = -1};
+
+static uint32_t uptime_s(void) { return (uint32_t)(esp_timer_get_time() / 1000000); }
+
+/* The passive slot exists, is not the running one and holds a predecessor
+ * whose exact signed digest this release knows (critique 6). Hashed once. */
+static bool sx_passive_slot_ok(void)
+{
+    if (s_sx.passive >= 0) return s_sx.passive;
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    const esp_partition_t *other = esp_ota_get_next_update_partition(NULL);
+    esp_app_desc_t description;
+    uint8_t digest[32];
+    bool ok = running && other && running->address != other->address &&
+        (other->subtype == ESP_PARTITION_SUBTYPE_APP_OTA_0 || other->subtype == ESP_PARTITION_SUBTYPE_APP_OTA_1) &&
+        esp_ota_get_partition_description(other, &description) == ESP_OK &&
+        !strcmp(description.project_name, "zone_lite") && esp_partition_get_sha256(other, digest) == ESP_OK &&
+        ug_direct_predecessor_matches(description.version, digest);
+    s_sx.passive = ok ? 1 : 0;
+    return ok;
+}
+
+/* Every input of the gate now, and the store's fingerprint. */
+static bool sx_collect(sx_input_t *in, sx_store_t *store)
+{
+    if (!s_sx.inputs) s_sx.inputs = heap_caps_calloc(1, sizeof(*s_sx.inputs), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    sx_inputs_t *b = s_sx.inputs;
+    if (!b) return false;
+    (void)storage_repair_exception_repair(&b->repair);
+    (void)storage_repair_exception_inventory(&b->inventory);
+    sx_runtime_t *rt = &b->runtime;
+    memset(rt, 0, sizeof(*rt));
+    qs_health_t health;
+    rt->qs_known = qs_health_known(&health);
+    rt->qs_observed = health.observed;
+    rt->qs_available = health.available;
+    rt->last_error = health.last_error;
+    rt->last_operation = health.last_operation;
+    rt->probe_error = health.persistence_probe_error;
+    rt->probe_operation = health.persistence_probe_operation;
+    led_local_causes_t causes;
+    led_status_local_causes(&causes);
+    rt->led_known = causes.known;
+    rt->led_fatal = causes.fatal;
+    rt->local_failures = causes.incidents;
+    rt->room_failures = causes.room;
+    rt->held_read_failures = causes.held_reads;
+    rt->held_read_queues = causes.held_queues;
+    memcpy(rt->held_read_last, causes.held_last, sizeof(rt->held_read_last));
+    size_t total = 0, used = 0;
+    rt->spiffs_mounted = esp_spiffs_mounted(NULL) && esp_spiffs_info(NULL, &total, &used) == ESP_OK;
+    rt->spiffs_used = (uint32_t)used;
+    rt->spiffs_total = (uint32_t)total;
+    uint32_t blockers = add_connector_boot_health_blockers();
+    rt->health_known = !(blockers & SX_H_LOCK);
+    rt->health_blockers = blockers & ~(uint32_t)SX_H_LOCK;
+    s_sx.blockers = rt->health_blockers;
+    rt->add_connected = add_connector_is_connected();
+    rt->capability_accepted = s_capability_reported;
+    rt->ota_precheck_ok = zj_ota_precheck_cached();
+    rt->passive_slot_ok = sx_passive_slot_ok();
+    rt->internal_largest = (uint32_t)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+    const esp_app_desc_t *app = esp_app_get_description();
+    sx_record_t record;
+    memset(in, 0, sizeof(*in));
+    in->production_role = SX_PRODUCTION_ROLE;
+    in->running_pending = running_state_is(ESP_OTA_IMG_PENDING_VERIFY);
+    in->ota_deployment = app && s_journal.deployment_id[0] && !strcmp(s_journal.state, "READY_TO_BOOT") &&
+        !strcmp(app->version, s_journal.target_version) && cache_running_image_digest() &&
+        !strcmp(s_running_image_digest, s_journal.image_sha256);
+    in->record_terminal = storage_repair_exception_record(&record) &&
+        sx_record_ended(&record, sx_deployment_crc(s_journal.deployment_id));
+    in->repair = &b->repair;
+    in->inventory = &b->inventory;
+    in->runtime = rt;
+    store->used = (uint32_t)used;
+    store->total = (uint32_t)total;
+    store->writes = storage_repair_store_writes();
+    return true;
+}
+
+/* The gate's state for the heartbeat, and a log line when its reason
+ * changes (at most once a minute) or it first holds. */
+static void sx_note(sx_reason_t reason)
+{
+    uint32_t now = uptime_s();
+    sx_state_t state = reason == SX_OK ? SX_STATE_ELIGIBLE :
+        reason == SX_STABILIZING || reason == SX_STORE_CHANGED ? SX_STATE_ELIGIBLE :
+        sx_reason_unknown(reason) ? SX_STATE_EVALUATING : SX_STATE_REFUSED;
+    if (!s_sx.evaluated || state != s_sx.state || reason != s_sx.reason) s_sx.since_s = now;
+    s_sx.evaluated = true;
+    s_sx.state = state;
+    s_sx.reason = reason;
+    if (reason == s_sx.logged_reason || (s_sx.logged_s && now - s_sx.logged_s < SX_LOG_SECONDS)) return;
+    char message[160];
+    snprintf(message, sizeof(message), "%s: %s; boot-health terms failing 0x%08lx", sx_state_name(state),
+             sx_reason_name(reason), (unsigned long)s_sx.blockers);
+    (void)add_connector_log(state == SX_STATE_REFUSED ? "WARN" : "INFO", "storage",
+                            state == SX_STATE_REFUSED ? "STORAGE_REPAIR_EXCEPTION_REFUSED" :
+                                                        "STORAGE_REPAIR_EXCEPTION_ELIGIBLE", message);
+    s_sx.logged_s = now;
+    s_sx.logged_reason = reason;
+}
+
+/* The evidence ADD stores before the image confirms (R14). */
+static void sx_evidence(const sx_input_t *in, char *message, size_t message_bytes, char *context, size_t context_bytes)
+{
+    const sx_repair_t *r = in->repair;
+    const sx_repair_file_t *held = NULL;
+    for (uint32_t i = 0; i < r->file_count && i < SX_REPAIR_FILES && !held; ++i)
+        if (r->file[i].blocked_spans) held = &r->file[i];
+    snprintf(message, message_bytes,
+             "%s %s; %lu pages short; custody %lu blocks, %lu droppable pages; %lu spans held%s%s; probe %s %d",
+             r->result, r->error_stage, (unsigned long)r->want, (unsigned long)r->custody_blocks,
+             (unsigned long)r->custody_gain, (unsigned long)(held ? held->blocked_spans : 0), held ? " in " : "",
+             held ? held->name : "", in->runtime->probe_operation ? in->runtime->probe_operation : "none",
+             in->runtime->probe_error);
+    snprintf(context, context_bytes,
+             "{\"deployment_id\":\"%s\",\"want\":%lu,\"custody_gain\":%lu,\"custody_blocks\":%lu,"
+             "\"erased_at_mount\":%lu,\"held_spans\":%lu,\"held_offset\":%lu,\"held_last\":%lu,\"held_digest\":%lu,"
+             "\"local_failures\":%lu,\"room_failures\":%lu,\"held_reads\":%lu,\"health_blockers\":%lu,"
+             "\"store_used\":%lu,\"store_writes\":%lu,\"internal_largest\":%lu}",
+             s_journal.deployment_id, (unsigned long)r->want, (unsigned long)r->custody_gain,
+             (unsigned long)r->custody_blocks, (unsigned long)r->erased_at_mount,
+             (unsigned long)(held ? held->blocked_spans : 0), (unsigned long)(held ? held->blocked_offset : 0),
+             (unsigned long)(held ? held->blocked_last : 0), (unsigned long)(held ? held->blocked_digest : 0),
+             (unsigned long)in->runtime->local_failures, (unsigned long)in->runtime->room_failures,
+             (unsigned long)in->runtime->held_read_failures, (unsigned long)in->runtime->health_blockers,
+             (unsigned long)in->runtime->spiffs_used, (unsigned long)s_sx.window.store.writes,
+             (unsigned long)in->runtime->internal_largest);
+}
+
+static bool sx_store_record(sx_state_t state)
+{
+    sx_record_t record = {0};
+    (void)storage_repair_exception_record(&record);
+    uint32_t crc = sx_deployment_crc(s_journal.deployment_id), tag = storage_repair_image_tag();
+    if (record.deployment_crc != crc || record.image_tag != tag) memset(&record, 0, sizeof(record));
+    record.state = (uint8_t)state;
+    record.deployment_crc = crc;
+    record.image_tag = tag;
+    if (s_sx.inputs) {
+        record.want = s_sx.inputs->repair.want;
+        record.custody_gain = s_sx.inputs->repair.custody_gain;
+    }
+    return storage_repair_exception_store(&record);
+}
+
+typedef enum { SX_STEP_WAIT = 0, SX_STEP_CONFIRMED, SX_STEP_FAILED } sx_step_t;
+
+/* One pass of the gate inside the confirmation loop, and the confirmation
+ * when it has held SX_STABLE_SECONDS (section 4.1): the record CONFIRMING
+ * (once), the evidence ADD stores, the receipted BOOTED_PENDING ADD allows,
+ * the gate again with the store unchanged and the budget left, then valid,
+ * the record CONFIRMED, the journal RECONCILING. */
+static sx_step_t sx_confirm_step(const boot_confirm_t *progress, uint32_t stepped_s)
+{
+    sx_input_t in;
+    sx_store_t store;
+    if (!sx_collect(&in, &store)) return SX_STEP_WAIT;
+    sx_reason_t verdict = sx_evaluate(&in);
+    if (verdict == SX_CAPABILITY && in.runtime->add_connected) {
+        s_capability_reported = report_capability();
+        s_sx.inputs->runtime.capability_accepted = s_capability_reported;
+        verdict = sx_evaluate(&in);
+    }
+    sx_reason_t step = sx_window_step(&s_sx.window, verdict, uptime_s(), &store);
+    sx_note(step);
+    if (step != SX_OK) return SX_STEP_WAIT;
+    /* A sequence that did not finish is tried again at most every 30 s. */
+    uint32_t up = uptime_s();
+    if (s_sx.attempt_s && up - s_sx.attempt_s < 30U) return SX_STEP_WAIT;
+    s_sx.attempt_s = up ? up : 1;
+    if (progress->active_seconds + SX_BUDGET_MARGIN_SECONDS > BOOT_CONFIRM_ACTIVE_SECONDS ||
+        progress->elapsed_seconds + SX_BUDGET_MARGIN_SECONDS > BOOT_CONFIRM_MAX_SECONDS) {
+        sx_note(SX_BUDGET);
+        return SX_STEP_WAIT;
+    }
+    s_sx.state = SX_STATE_CONFIRMING;
+    if (!s_sx.confirming_written) {
+        if (!sx_store_record(SX_STATE_CONFIRMING)) {
+            sx_note(SX_NVS_RECORD);
+            return SX_STEP_WAIT;
+        }
+        s_sx.confirming_written = true;
+    }
+    char message[240], context[480];
+    sx_evidence(&in, message, sizeof(message), context, sizeof(context));
+    if (!s_sx.evidence_logged) {
+        s_sx.evidence_logged = add_connector_log_acknowledged("WARN", "storage", "STORAGE_REPAIR_EXCEPTION_EVIDENCE",
+                                                              message, context, SX_EVIDENCE_ACK_MS);
+        if (!s_sx.evidence_logged) {
+            sx_note(SX_EVIDENCE_UNACKED);
+            return SX_STEP_WAIT;
+        }
+    }
+    cJSON *receipt = NULL;
+    bool accepted = report_progress("BOOTED_PENDING", "STORAGE_REPAIR_EXCEPTION", message, &receipt) &&
+        ota_progress_receipt_exception(receipt, s_journal.deployment_id, s_journal.target_version,
+                                       s_running_image_digest);
+    cJSON_Delete(receipt);
+    if (!accepted) {
+        sx_note(SX_RECEIPT);
+        return SX_STEP_WAIT;
+    }
+    /* The last look: the gate holds now, nothing wrote the store since the
+     * window opened, and the budget is not spent (M6). */
+    uint32_t spent = uptime_s() - stepped_s;
+    if (!sx_collect(&in, &store) || (verdict = sx_evaluate(&in)) != SX_OK || !sx_window_same(&s_sx.window, &store) ||
+        progress->active_seconds + spent >= BOOT_CONFIRM_ACTIVE_SECONDS ||
+        progress->elapsed_seconds + spent >= BOOT_CONFIRM_MAX_SECONDS) {
+        s_sx.window.open = false;
+        sx_note(verdict != SX_OK ? verdict : !sx_window_same(&s_sx.window, &store) ? SX_STORE_CHANGED : SX_BUDGET);
+        return SX_STEP_WAIT;
+    }
+    if (esp_ota_mark_app_valid_cancel_rollback() != ESP_OK) {
+        (void)sx_store_record(SX_STATE_ABANDONED);
+        sx_note(SX_MARK_VALID);
+        return SX_STEP_FAILED;
+    }
+    s_sx.state = SX_STATE_CONFIRMED;
+    /* A cut from here on boots a valid image: the record CONFIRMING already
+     * means confirmed there, and READY_TO_BOOT on a valid image reconciles. */
+    if (!sx_store_record(SX_STATE_CONFIRMED))
+        (void)add_connector_log("ERROR", "storage", "STORAGE_REPAIR_EXCEPTION_RECORD", "the CONFIRMED record failed");
+    strlcpy(s_journal.state, "RECONCILING", sizeof(s_journal.state));
+    (void)save_journal();
+    receipt = NULL;
+    (void)report_progress("RECONCILING", "STORAGE_REPAIR_EXCEPTION", "confirmed under the storage exception; one "
+                          "restart at a capture safepoint, then the reformat round", &receipt);
+    cJSON_Delete(receipt);
+    (void)add_connector_log("WARN", "storage", "STORAGE_REPAIR_EXCEPTION_CONFIRMED", message);
+    return SX_STEP_CONFIRMED;
+}
+
+/* Before the ordinary path marks the image valid: a CONFIRMING record this
+ * boot wrote must not make the next boot an exception boot. */
+static bool sx_ordinary_confirmation(void)
+{
+    if (!s_sx.confirming_written) return true;
+    if (!sx_store_record(SX_STATE_NONE)) return false;
+    s_sx.confirming_written = false;
+    return true;
+}
+
+/* The budget ran out: a CONFIRMING record is abandoned before the rollback
+ * (critique 14), and the deployment says why. */
+static void sx_rollback_note(char *message, size_t bytes)
+{
+    if (s_sx.confirming_written) (void)sx_store_record(SX_STATE_ABANDONED);
+    if (s_sx.evaluated) snprintf(message, bytes, "storage exception %s: %s", sx_state_name(s_sx.state),
+                                 sx_reason_name(s_sx.reason));
+}
+
+/* The controlled restart (M3): counted in the record before the safepoint
+ * is claimed, no progress report while it waits, and once claimed the ESP
+ * restarts whatever happens. */
+static void sx_restart(sx_record_t *record)
+{
+    time_t now = time(NULL);
+    record->restarts++;
+    record->restart_epoch = now >= 1700000000 ? (uint32_t)now : 0;
+    if (!storage_repair_exception_store(record)) return;
+    char message[96];
+    snprintf(message, sizeof(message), "controlled restart %u of %u for the reformat round",
+             (unsigned)record->restarts, (unsigned)SX_MAX_RESTARTS);
+    (void)add_connector_log("WARN", "storage", "STORAGE_REPAIR_EXCEPTION_RESTART", message);
+    int64_t started = esp_timer_get_time() / 1000000;
+    for (;;) {
+        int64_t waited = esp_timer_get_time() / 1000000 - started;
+        if (waited < OTA_SAFEPOINT_MAX_SECONDS ? add_connector_claim_ota_restart()
+                                               : add_connector_claim_ota_restart_after_wait())
+            break;
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+    vTaskDelay(pdMS_TO_TICKS(500));
+    esp_restart();
+}
+
+/* The exception ended (UNREPAIRED, UNHEALTHY): the record first, then FAILED
+ * with a checked receipt, then the journal cleared, then the record marked
+ * reported. A boot that finds the record ended and the journal RECONCILING
+ * resumes here (critique 14). */
+static bool sx_report_ended(sx_record_t *record)
+{
+    const char *code = record->state == SX_STATE_UNHEALTHY ? "STORAGE_REPAIR_EXCEPTION_UNHEALTHY" :
+                                                             "STORAGE_REPAIR_EXCEPTION_UNREPAIRED";
+    if (!strcmp(s_journal.state, "RECONCILING") && s_journal.deployment_id[0]) {
+        char message[160];
+        snprintf(message, sizeof(message), "%s after %u round boot(s), %u restart(s), %u crash(es); last outcome %s",
+                 sx_state_name((sx_state_t)record->state), (unsigned)record->round_boots, (unsigned)record->restarts,
+                 (unsigned)record->crashes, sx_outcome_name((sx_outcome_t)record->reason));
+        cJSON *receipt = NULL;
+        bool reported = report_progress("FAILED", code, message, &receipt) &&
+            (ota_progress_receipt_matches(receipt, s_journal.deployment_id, "FAILED", s_journal.target_version,
+                                          s_running_image_digest) ||
+             ota_progress_receipt_terminal(receipt, s_journal.deployment_id, s_journal.target_version));
+        cJSON_Delete(receipt);
+        if (!reported || !clear_journal()) return false;
+        (void)add_connector_log("ERROR", "storage", code, message);
+    }
+    record->reported = 1;
+    return storage_repair_exception_store(record);
+}
+
+/* Every OTA turn after the boot check, on an image confirmed under the
+ * exception: the controlled restart, the retries, UNREPAIRED, UNHEALTHY. */
+static void sx_after_confirm_step(void)
+{
+    if (!storage_repair_exception_active()) return;
+    sx_record_t record;
+    if (!storage_repair_exception_record(&record)) return;
+    if (sx_record_ended(&record, record.deployment_crc) && !record.reported) {
+        (void)sx_report_ended(&record);
+        return;
+    }
+    uint32_t wait = 0;
+    time_t now = time(NULL);
+    sx_next_t next = sx_next_step(&record, now >= 1700000000, now >= 1700000000 ? (uint32_t)now : 0, &wait);
+    if (next == SX_NEXT_RESTART) {
+        sx_restart(&record);
+        return;
+    }
+    if (next == SX_NEXT_UNREPAIRED) {
+        record.state = SX_STATE_UNREPAIRED;
+        if (storage_repair_exception_store(&record)) (void)sx_report_ended(&record);
+        return;
+    }
+    /* Round done, the store still failing its storage terms with ADD
+     * reachable: after SX_UNHEALTHY_SECONDS the deployment ends FAILED (H4). */
+    if (record.state != SX_STATE_ROUND_DONE || strcmp(s_journal.state, "RECONCILING") || !add_connector_is_connected()) {
+        s_sx.unhealthy_since_s = 0;
+        return;
+    }
+    uint32_t blockers = add_connector_boot_health_blockers();
+    bool failing = !(blockers & SX_H_LOCK) &&
+        (blockers & (SX_HEALTH_EXCEPTED | SX_H_SPIFFS_INFO | SX_H_QS_OBSERVED | SX_H_STORAGE_UPGRADE));
+    uint32_t up = uptime_s();
+    if (!failing) s_sx.unhealthy_since_s = 0;
+    else if (!s_sx.unhealthy_since_s) s_sx.unhealthy_since_s = up ? up : 1;
+    else if (up - s_sx.unhealthy_since_s >= SX_UNHEALTHY_SECONDS) {
+        record.state = SX_STATE_UNHEALTHY;
+        if (storage_repair_exception_store(&record)) (void)sx_report_ended(&record);
+    }
+}
+
+/* An exception deployment waiting in RECONCILING (source coverage not yet
+ * certified) reports its status with a checked receipt; when ADD has ended
+ * the deployment the journal is cleared so OTA is never blocked for good
+ * (critique 5). True when the journal no longer waits. */
+static bool sx_reconciling_report(void)
+{
+    sx_record_t record;
+    if (!storage_repair_exception_active() || !storage_repair_exception_record(&record)) return false;
+    char status[48];
+    snprintf(status, sizeof(status), "%s %s", sx_state_name((sx_state_t)record.state),
+             sx_outcome_name((sx_outcome_t)record.reason));
+    uint32_t up = uptime_s();
+    if (!strcmp(status, s_sx.reconciling_status) && s_sx.reconciling_reported_s &&
+        up - s_sx.reconciling_reported_s < SX_RECONCILING_REPORT_SECONDS)
+        return false;
+    char message[240];
+    snprintf(message, sizeof(message), "confirmed under the storage exception: %s; %u round boot(s); waiting for "
+             "storage health and certified source coverage", status, (unsigned)record.round_boots);
+    cJSON *receipt = NULL;
+    bool reported = report_progress("RECONCILING", "STORAGE_REPAIR_EXCEPTION", message, &receipt);
+    bool ended = reported && ota_progress_receipt_terminal(receipt, s_journal.deployment_id, s_journal.target_version);
+    cJSON_Delete(receipt);
+    if (reported) {
+        strlcpy(s_sx.reconciling_status, status, sizeof(s_sx.reconciling_status));
+        s_sx.reconciling_reported_s = up ? up : 1;
+    }
+    if (!ended || !clear_journal()) return false;
+    (void)add_connector_log("WARN", "storage", "STORAGE_REPAIR_EXCEPTION_DEPLOYMENT_ENDED",
+                            "ADD ended the exception deployment; the OTA journal is clear");
+    return true;
+}
+
+static void sx_append_telemetry(cJSON *ota)
+{
+    sx_record_t record;
+    bool have = storage_repair_exception_record(&record) && record.image_tag == storage_repair_image_tag();
+    bool active = storage_repair_exception_active();
+    if (!s_sx.evaluated && !active && !have) return;
+    cJSON *sx = cJSON_AddObjectToObject(ota, "storage_exception");
+    if (!sx) return;
+    sx_state_t state = s_sx.evaluated && !active ? s_sx.state : have ? (sx_state_t)record.state : SX_STATE_NONE;
+    const char *reason = s_sx.evaluated && !active ? sx_reason_name(s_sx.reason) :
+        have && record.state == SX_STATE_ROUND_SHORT ? sx_outcome_name((sx_outcome_t)record.reason) : NULL;
+    bool ok = cJSON_AddStringToObject(sx, "state", sx_state_name(state)) &&
+        (!reason || cJSON_AddStringToObject(sx, "reason", reason)) &&
+        (!s_sx.evaluated || active || cJSON_AddNumberToObject(sx, "since_seconds", uptime_s() - s_sx.since_s)) &&
+        (!have || (cJSON_AddNumberToObject(sx, "restarts", record.restarts) &&
+                   cJSON_AddNumberToObject(sx, "round_boots", record.round_boots) &&
+                   cJSON_AddNumberToObject(sx, "crashes", record.crashes)));
+    if (ok && active) ok = cJSON_AddStringToObject(ota, "confirm_reason", "STORAGE_REPAIR_EXCEPTION") != NULL;
+    if (ok && s_sx.evaluated && !active && s_sx.blockers) {
+        cJSON *list = cJSON_AddArrayToObject(ota, "boot_health_blockers");
+        for (uint32_t bit = 1; list && bit && bit <= SX_H_TERMINAL_COUNTS; bit <<= 1) {
+            if (!(s_sx.blockers & bit)) continue;
+            cJSON *name = cJSON_CreateString(sx_health_name(bit));
+            if (!name || !cJSON_AddItemToArray(list, name)) {
+                cJSON_Delete(name);
+                break;
+            }
+        }
+    }
+}
+#endif
+
 static bool confirm_or_report_rollback(void)
 {
     const esp_app_desc_t *running = esp_app_get_description();
@@ -916,6 +1416,18 @@ static bool confirm_or_report_rollback(void)
     }
     if (local_pending) return report_local_boot_confirmation();
     if (uses_local_boot_confirmation()) return confirm_local_boot();
+    /* ZKT 2.7.7 (critiques 13, M4): READY_TO_BOOT on an image that is
+     * already valid (a reset after it marked itself valid, before the
+     * journal said RECONCILING) goes straight to RECONCILING: the loop below
+     * could time out and invalidate it, handing a store that may have had
+     * custody windows to an image that cannot read the redo area. */
+    if (running_state_is(ESP_OTA_IMG_VALID)) {
+        strlcpy(s_journal.state, "RECONCILING", sizeof(s_journal.state));
+        if (!save_journal()) return false;
+        (void)report_state("RECONCILING", NULL);
+        (void)acknowledge_pending_success();
+        return true;
+    }
     /* OTA_BOOT_CONFIRM_SECONDS of accountable time, paused while a healthy-
      * looking image only waits on the site, within a hard cap. */
     _Static_assert(BOOT_CONFIRM_ACTIVE_SECONDS == OTA_BOOT_CONFIRM_SECONDS, "one confirmation budget");
@@ -933,6 +1445,21 @@ static bool confirm_or_report_rollback(void)
             last_health_report = now;
         }
         bool boot_health_ready = add_acknowledged && add_connector_boot_health_ready();
+#if OTA_STORAGE_EXCEPTION
+        /* ZKT 2.7.7: full boot health still wins; otherwise the narrow gate.
+         * Its sequence never changes the budget below. */
+        if (add_acknowledged && !boot_health_ready) {
+            sx_step_t exception = sx_confirm_step(&progress, (uint32_t)now);
+            if (exception == SX_STEP_CONFIRMED) {
+                s_boot_health_checks++;
+                return true;
+            }
+            if (exception == SX_STEP_FAILED) {
+                verdict = BOOT_CONFIRM_EXPIRED;
+                break;
+            }
+        }
+#endif
         s_boot_health_checks++;
         s_boot_health_last_ready = boot_health_ready;
         boot_confirm_input_t input = {
@@ -945,6 +1472,12 @@ static bool confirm_or_report_rollback(void)
         s_boot_confirm = progress;
         if (verdict == BOOT_CONFIRM_EXPIRED || verdict == BOOT_CONFIRM_CAPPED) break;
         if (verdict == BOOT_CONFIRM_ACCEPT) {
+#if OTA_STORAGE_EXCEPTION
+            if (!sx_ordinary_confirmation()) {
+                vTaskDelay(pdMS_TO_TICKS(5000));
+                continue;
+            }
+#endif
             if (!report_state("BOOTED_PENDING", "RUNTIME_HEALTHY")) {
                 vTaskDelay(pdMS_TO_TICKS(5000));
                 continue;
@@ -963,7 +1496,18 @@ static bool confirm_or_report_rollback(void)
         }
         if (add_acknowledged &&
             now - last_health_report >= OTA_BOOT_HEALTH_REPORT_SECONDS) {
+#if OTA_STORAGE_EXCEPTION
+            /* ZKT 2.7.7: the operator sees the gate's state on the deployment. */
+            char status[96] = "";
+            if (s_sx.evaluated)
+                snprintf(status, sizeof(status), "storage exception %s: %s for %lu s", sx_state_name(s_sx.state),
+                         sx_reason_name(s_sx.reason), (unsigned long)(uptime_s() - s_sx.since_s));
+            cJSON *receipt = NULL;
+            (void)report_progress("BOOTED_PENDING", "WAITING_FOR_RUNTIME_HEALTH", status, &receipt);
+            cJSON_Delete(receipt);
+#else
             (void)report_state("BOOTED_PENDING", "WAITING_FOR_RUNTIME_HEALTH");
+#endif
             last_health_report = now;
         }
         vTaskDelay(pdMS_TO_TICKS(5000));
@@ -971,8 +1515,19 @@ static bool confirm_or_report_rollback(void)
     ESP_LOGE(TAG, "New image not confirmed (%s): %lu s accountable, %lu s waiting on the site",
              boot_confirm_verdict_name(verdict), (unsigned long)progress.active_seconds,
              (unsigned long)progress.paused_seconds);
+#if OTA_STORAGE_EXCEPTION
+    char why[96] = "";
+    sx_rollback_note(why, sizeof(why));
+    cJSON *receipt = NULL;
+    (void)report_progress("FAILED", verdict == BOOT_CONFIRM_CAPPED ? "BOOT_CONFIRM_CAP" : "BOOT_HEALTH_TIMEOUT", why,
+                          &receipt);
+    cJSON_Delete(receipt);
+#else
     (void)report_state("FAILED", verdict == BOOT_CONFIRM_CAPPED ? "BOOT_CONFIRM_CAP" : "BOOT_HEALTH_TIMEOUT");
-    (void)esp_ota_mark_app_invalid_rollback_and_reboot();
+#endif
+    /* Never a valid image (critique 13, M4): only an unconfirmed one rolls
+     * back. */
+    if (!running_state_is(ESP_OTA_IMG_VALID)) (void)esp_ota_mark_app_invalid_rollback_and_reboot();
     return false;
 }
 
@@ -1056,7 +1611,11 @@ static bool acknowledge_pending_success(void)
         if (!report_state("ROLLED_BACK", "RUNNING_VERSION_MISMATCH")) return false;
         return clear_journal();
     }
+#if OTA_STORAGE_EXCEPTION
+    if (!add_connector_ota_reconcile_ready()) return sx_reconciling_report();
+#else
     if (!add_connector_ota_reconcile_ready()) return false;
+#endif
     // Retry the preceding transition if its acknowledgement was lost.
     if (!report_state("RECONCILING", NULL)) return false;
     if (!report_state("SUCCEEDED", NULL)) {
@@ -1072,7 +1631,7 @@ static void ota_task(void *argument)
 {
     (void)argument;
     bool boot_checked = false;
-    bool capability_reported = false;
+    int64_t add_seen_us = esp_timer_get_time();
     while (true) {
         if (atomic_flag_test_and_set_explicit(&s_control_owner, memory_order_acquire)) {
             vTaskDelay(pdMS_TO_TICKS(1000));
@@ -1099,16 +1658,27 @@ static void ota_task(void *argument)
                 vTaskDelay(pdMS_TO_TICKS(OTA_POLL_MS)); continue;
             }
         }
-        if (add_connector_is_connected()) {
-            if (!capability_reported) {
-                capability_reported = report_capability();
-                if (capability_reported) {
+        bool reachable = add_connector_is_connected();
+        if (reachable) add_seen_us = esp_timer_get_time();
+#if OTA_STORAGE_EXCEPTION
+        sx_after_confirm_step();
+        /* An exception image out of ADD's WebSocket this long still polls OTA
+         * (signed HTTPS needs no WebSocket): a failed reconnect must not cut
+         * a device with no rollback off from its fix (critique 6). */
+        if (!reachable && storage_repair_exception_active() &&
+            esp_timer_get_time() - add_seen_us >= (int64_t)SX_OTA_WITHOUT_ADD_SECONDS * 1000000LL)
+            reachable = true;
+#endif
+        if (reachable) {
+            if (!s_capability_reported) {
+                s_capability_reported = report_capability();
+                if (s_capability_reported) {
                     ESP_LOGI(TAG, "ADD accepted OTA capability; connector is OTA ready");
                 } else {
                     ESP_LOGW(TAG, "ADD OTA capability report failed; retrying in %u ms", OTA_POLL_MS);
                 }
             }
-            if (capability_reported && !s_busy) {
+            if (s_capability_reported && !s_busy) {
                 if (!acknowledge_pending_success()) {
                     atomic_flag_clear_explicit(&s_control_owner, memory_order_release);
                     vTaskDelay(pdMS_TO_TICKS(OTA_POLL_MS));
@@ -1242,6 +1812,9 @@ void ota_manager_append_telemetry(cJSON *heartbeat)
             cJSON_AddNumberToObject(ota, "boot_confirm_paused_seconds", s_boot_confirm.paused_seconds) &&
             cJSON_AddNumberToObject(ota, "boot_confirm_elapsed_seconds", s_boot_confirm.elapsed_seconds);
     }
+#if OTA_STORAGE_EXCEPTION
+    if (valid) sx_append_telemetry(ota);
+#endif
     if (valid && cJSON_AddItemToObject(heartbeat, "ota", ota)) return;
     cJSON_Delete(ota);
 }

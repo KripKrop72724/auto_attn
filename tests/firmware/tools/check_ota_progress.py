@@ -87,6 +87,43 @@ int main(void)
   assert(!ok || allocations<point);
  }
  cJSON_InitHooks(NULL);cJSON_Delete(request);
+ /* ZKT 2.7.7: the confirm-first storage exception's receipt (H3, critique 12):
+  * confirm, the echoed code and ADD's permission, all three, for this exact
+  * deployment and image; and the terminal receipt that clears the journal. */
+ const char *ok_exception="{\"schema_version\":1,\"deployment_id\":\"synthetic-deployment\",\"state\":\"BOOTED_PENDING\","
+  "\"target_version\":\"2.7.0\",\"application_sha256\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\","
+  "\"confirm\":true,\"error_code\":\"STORAGE_REPAIR_EXCEPTION\",\"storage_exception_allowed\":true}";
+ reply=cJSON_Parse(ok_exception);assert(reply);
+ assert(ota_progress_receipt_exception(reply,s_journal.deployment_id,"2.7.0",s_running_image_digest));
+ assert(!ota_progress_receipt_exception(reply,"other-deployment","2.7.0",s_running_image_digest));
+ assert(!ota_progress_receipt_exception(reply,s_journal.deployment_id,"2.7.1",s_running_image_digest));
+ char other_digest[65];memset(other_digest,'d',64);other_digest[64]=0;
+ assert(!ota_progress_receipt_exception(reply,s_journal.deployment_id,"2.7.0",other_digest));
+ const char *withheld[][2]={{"confirm","false"},{"storage_exception_allowed","false"},
+  {"error_code","\"WAITING_FOR_RUNTIME_HEALTH\""},{"state","\"RECONCILING\""}};
+ for(unsigned i=0;i<sizeof(withheld)/sizeof(withheld[0]);++i){
+  cJSON *altered=cJSON_Duplicate(reply,1);assert(altered);
+  cJSON_ReplaceItemInObjectCaseSensitive(altered,withheld[i][0],cJSON_Parse(withheld[i][1]));
+  assert(!ota_progress_receipt_exception(altered,s_journal.deployment_id,"2.7.0",s_running_image_digest));
+  cJSON_Delete(altered);
+ }
+ cJSON_DeleteItemFromObjectCaseSensitive(reply,"storage_exception_allowed"); /* an ADD without 2.7.7 */
+ assert(!ota_progress_receipt_exception(reply,s_journal.deployment_id,"2.7.0",s_running_image_digest));
+ assert(!ota_progress_receipt_terminal(reply,s_journal.deployment_id,"2.7.0"));
+ const char *ended[]={"FAILED","ROLLED_BACK","CANCELLED","SUPERSEDED","RELEASE_REVOKED"};
+ for(unsigned i=0;i<sizeof(ended)/sizeof(ended[0]);++i){
+  cJSON_ReplaceItemInObjectCaseSensitive(reply,"state",cJSON_CreateString(ended[i]));
+  assert(ota_progress_receipt_terminal(reply,s_journal.deployment_id,"2.7.0"));
+  assert(!ota_progress_receipt_terminal(reply,"other-deployment","2.7.0"));
+  assert(!ota_progress_receipt_terminal(reply,s_journal.deployment_id,"2.6.0"));
+ }
+ const char *open[]={"RECONCILING","SUCCEEDED","BOOTED_PENDING"};
+ for(unsigned i=0;i<sizeof(open)/sizeof(open[0]);++i){
+  cJSON_ReplaceItemInObjectCaseSensitive(reply,"state",cJSON_CreateString(open[i]));
+  assert(!ota_progress_receipt_terminal(reply,s_journal.deployment_id,"2.7.0"));
+ }
+ cJSON_Delete(reply);
+ assert(!ota_progress_receipt_terminal(NULL,s_journal.deployment_id,"2.7.0"));
  puts("OTA HTTP acceptance, exact deployment/image binding and allocation faults passed");
 }
 '''

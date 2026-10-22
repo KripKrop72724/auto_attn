@@ -29,7 +29,7 @@ static int ack_lock,ack_sem,state_lock;
 static int *s_ack_wait_lock=&ack_lock,*s_ack_sem=&ack_sem,*s_lock=&state_lock;
 static atomic_bool s_background_ack_waiting;
 static atomic_uint_least32_t s_background_ack_since_ms;
-static bool s_ack_matched,fail_lock,fail_send,fail_ack,interleave;
+static bool s_ack_matched,s_ack_duplicate,fail_lock,fail_send,fail_ack,interleave;
 static char s_waiting_ack[80];
 static bool s_waiting_zkt_custody;
 static uint8_t s_zkt_custody_receipt[32];
@@ -76,6 +76,14 @@ int main(void)
     // Unsigned elapsed arithmetic also handles the monotonic counter wrapping.
     atomic_store(&s_background_ack_since_ms,UINT32_MAX-50);now=100;
     assert(!send_payload_and_wait_for_ack("direct","{}",10,10,NULL,NULL,NULL));
+    // ZKT 2.7.7: a waited log counts only when ADD stored it (not a duplicate).
+    atomic_store(&s_background_ack_waiting,false);now=100;
+    s_ack_duplicate=true;
+    assert(!send_payload_and_wait_for_ack("log","{}",10,10,NULL,NULL,NULL));
+    assert(!s_ack_duplicate && !ack_lock);
+    s_ack_duplicate=true;
+    assert(send_payload_and_wait_for_ack("heartbeat","{}",10,10,NULL,NULL,NULL));
+    assert(send_payload_and_wait_for_ack("log","{}",10,10,NULL,NULL,NULL));
     return 0;
 }
 '''

@@ -154,6 +154,14 @@ void add_connector_storage_ready(void);
 bool add_connector_repair_command_inbox(void);
 bool add_connector_command_inbox_merge_pending(void);
 bool add_connector_boot_health_ready(void);
+/* ZKT 2.7.7: the failing terms of add_connector_boot_health_ready (SX_H_*
+ * bits of storage_exception.h; SX_H_LOCK when its lock was busy). Not in the
+ * Hikvision family. */
+uint32_t add_connector_boot_health_blockers(void);
+/* ZKT 2.7.7: a log that ADD stored (a non-duplicate acknowledgement), with a
+ * structured context (a JSON object, or NULL). */
+bool add_connector_log_acknowledged(const char *level, const char *subsystem, const char *code, const char *message,
+                                    const char *context_json, uint32_t timeout_ms);
 /* ZKT 2.7.7: the ADD WebSocket client's task stack (bytes). */
 #define ADD_WEBSOCKET_TASK_STACK 6144
 /* Exact ZKT bridge/writer local proof; never Oracle or remote HIL acceptance. */

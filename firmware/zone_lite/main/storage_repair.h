@@ -15,8 +15,10 @@
  * gap evidence go to ADD from the ADD outbox task, and the result rides on
  * every heartbeat as diagnostics.storage.repair. */
 #include <stdbool.h>
+#include <stdint.h>
 
 #include "cJSON.h"
+#include "storage_exception.h"
 
 void storage_repair_boot(void);
 /* ZKT 2.7.6: false when a block the last-resort reformat left open could be
@@ -32,3 +34,41 @@ bool storage_repair_append(cJSON *storage);
 /* A runtime storage fault (EIO, ENOENT on an existing file, EBADMSG, ENOSPC,
  * a failed probe): recorded once per boot for the next boot's report. */
 void storage_repair_note_damage(int error);
+
+/* ---- ZKT 2.7.7: the confirm-first storage exception's glue ----------------
+ * (storage_exception.h holds the decision; docs/zone-lite-2.7.7-confirm-first.md)
+ * Storage-repair builds only. */
+/* The boot repair's merged report as the gate reads it, with this boot's
+ * facts (the private mount, the VFS mount rule, the attempts guard, the redo
+ * area's program/erase test, the gap records ADD has not acknowledged). */
+bool storage_repair_exception_repair(sx_repair_t *out);
+/* 2.7.4's inventory as the gate reads it; false while it has not finished. */
+bool storage_repair_exception_inventory(sx_inventory_t *out);
+/* The exception's NVS record (storage_repair/exception) as this boot left it
+ * (after a round boot's update); false when there is none. */
+bool storage_repair_exception_record(sx_record_t *out);
+/* Seals, stores and reads back the record; true only when the read-back
+ * matches (the gate's D5). */
+bool storage_repair_exception_store(sx_record_t *record);
+/* This boot runs an image that confirmed under the exception (the record
+ * says so and the running image is valid). */
+bool storage_repair_exception_active(void);
+/* The first word of the running image's app_elf_sha256 (confirmation keeps
+ * it), and whether the running image is unconfirmed. */
+uint32_t storage_repair_image_tag(void);
+bool storage_repair_running_pending(void);
+/* Programs and erases the VFS's SPIFFS has made since boot (the stable
+ * window's store fingerprint, with SPIFFS's used and total bytes). */
+uint32_t storage_repair_store_writes(void);
+/* This unconfirmed boot may use the exception (its repair deferred for room
+ * only and the redo area passed its test): the persistence probe writes
+ * nothing this boot (queue_store.h, qs_hold_probe). */
+bool storage_repair_hold_probe(void);
+/* The OTA floor (critique 1): this device's redo area or reclaim journal
+ * holds anything, or the image confirmed under the exception, or the store
+ * stays unmounted: only an image that reads the redo area may be installed. */
+bool storage_repair_ota_floor(void);
+/* The boot repair's survey of every object header: false when it did not
+ * run; `journal_names` whether any header (visible or hidden) is a journal
+ * file's (the OTA guard's evidence while the VFS is unmounted). */
+bool storage_repair_survey(bool *journal_names);

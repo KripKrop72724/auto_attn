@@ -29,6 +29,7 @@ def test_idle_boot_proves_both_stores_without_clearing_existing_fault(tmp_path, 
 #define SB_RECOVERY 2
 typedef int nvs_handle_t;
 static qs_health_t health;
+static volatile bool probe_held; /* ZKT 2.7.7: never held here */
 static int budget, budget_lock=1, fail_fs, fail_nvs, corrupt_nvs, writes;
 static unsigned char stored[32];
 static bool storage_upgrade_ready(void){return true;}

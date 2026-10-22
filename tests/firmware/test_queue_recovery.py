@@ -62,4 +62,8 @@ def test_supervisor_runs_recovery_and_boot_health_still_requires_it() -> None:
     connector = (MAIN / "add_connector.c").read_text()
     ready = connector[connector.index("bool add_connector_boot_health_ready(void)"):]
     ready = ready[:ready.index("\n}\n")]
+    assert "return add_connector_boot_health_blockers() == 0;" in ready
+    # ZKT 2.7.7: the same terms, each named; ready exactly when none fails.
+    ready = connector[connector.index("uint32_t add_connector_boot_health_blockers(void)\n{"):]
+    ready = ready[:ready.index("\n}\n")]
     assert 'storage_health.last_error' in ready and '!strcmp(led, "LOCAL_FAILURE")' in ready
