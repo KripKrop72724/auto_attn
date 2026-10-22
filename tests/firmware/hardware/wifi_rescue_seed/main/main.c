@@ -6,6 +6,7 @@
 #include "esp_efuse_table.h"
 #include "esp_secure_boot.h"
 #include "esp_mac.h"
+#include "esp_partition.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "nvs.h"
@@ -26,6 +27,16 @@ void app_main(void)
     }
 #endif
     ESP_ERROR_CHECK(nvs_flash_init());
+    const esp_partition_t *storage = esp_partition_find_first(ESP_PARTITION_TYPE_DATA,
+        ESP_PARTITION_SUBTYPE_DATA_SPIFFS, "storage");
+    if (!storage || storage->address != 0x7a0000 || storage->size != 0x800000) {
+        printf("SEED_REFUSED storage_layout\n"); return;
+    }
+    uint8_t storage_hash[32];
+    ESP_ERROR_CHECK(esp_partition_get_sha256(storage, storage_hash));
+    printf("SLIC_RESCUE_SEED_STORAGE_SHA256=");
+    for (size_t i = 0; i < sizeof(storage_hash); ++i) printf("%02x", storage_hash[i]);
+    printf("\n");
     nvs_handle_t h;
     ESP_ERROR_CHECK(nvs_open("zone_cfg", NVS_READWRITE, &h));
     uint8_t seeded = 0;
