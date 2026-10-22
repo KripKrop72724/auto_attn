@@ -5941,57 +5941,54 @@ async def firmware_progress(
     auth: tuple[Session, Connector] = Depends(_require_ota_connector),
 ):
     db, connector = auth
-
-    def persist():
+    try:
         # Connector, then deployment, then campaign: the order of the
-        # WebSocket heartbeat and of campaign control, so a progress report
-        # racing an owner's pause or cancel (or this ESP's own heartbeat)
-        # waits instead of deadlocking. The wait, the legacy bridge's locks
-        # and a 2.6.x return's 7-day reset scan stay off the event loop.
+        # WebSocket heartbeat and of campaign control, so a report racing an
+        # owner's pause or cancel (or this ESP's own heartbeat) waits instead
+        # of deadlocking. Every report already took this row lock when it
+        # committed its ota_state; it is only taken first now.
         db.execute(_select(Connector.id).where(Connector.id == connector.id).with_for_update())
-        try:
-            from zk_add.legacy_bld5_bridge import accept_legacy_progress
+        from zk_add.legacy_bld5_bridge import accept_legacy_progress
 
-            legacy = accept_legacy_progress(
-                db, connector=connector, deployment_id=deployment_id, report=body.model_dump(),
+        legacy = accept_legacy_progress(
+            db, connector=connector, deployment_id=deployment_id, report=body.model_dump(),
+        )
+        if legacy is not None:
+            db.commit()
+            return JSONResponse(legacy, status_code=202 if legacy.get("awaiting_signed_capability") else 200)
+        deployment = None
+        from zk_add.service import device_reported_return_candidate, record_device_reported_return
+
+        if body.state == "ROLLED_BACK" and device_reported_return_candidate(
+                db, connector=connector, deployment_public_id=deployment_id,
+                running_version=body.running_version, error_code=body.error_code):
+            # A 2.6.x return report gets the heartbeat path's evidence and
+            # classification; its 7-day reset scan runs off the event loop.
+            # Every other report keeps the unchanged synchronous path.
+            deployment = await run_in_threadpool(
+                record_device_reported_return, db, connector=connector, deployment_public_id=deployment_id,
+                bytes_written=body.bytes_written, running_version=body.running_version,
+                running_partition=body.running_partition, image_sha256=body.image_sha256,
+                error_code=body.error_code, error_message=body.error_message,
             )
-            if legacy is not None:
-                db.commit()
-                return JSONResponse(legacy, status_code=202 if legacy.get("awaiting_signed_capability") else 200)
-            deployment = None
-            from zk_add.service import device_reported_return_candidate, record_device_reported_return
-
-            if body.state == "ROLLED_BACK" and device_reported_return_candidate(
-                    db, connector=connector, deployment_public_id=deployment_id,
-                    running_version=body.running_version, error_code=body.error_code):
-                # A 2.6.x return report gets the heartbeat path's evidence and
-                # classification; every other report is recorded unchanged.
-                deployment = record_device_reported_return(
-                    db, connector=connector, deployment_public_id=deployment_id,
-                    bytes_written=body.bytes_written, running_version=body.running_version,
-                    running_partition=body.running_partition, image_sha256=body.image_sha256,
-                    error_code=body.error_code, error_message=body.error_message,
-                )
-            if deployment is None:
-                deployment = _record_firmware_progress(
-                    db,
-                    connector=connector,
-                    deployment_public_id=deployment_id,
-                    state=body.state,
-                    bytes_written=body.bytes_written,
-                    running_version=body.running_version,
-                    running_partition=body.running_partition,
-                    image_sha256=body.image_sha256,
-                    error_code=body.error_code,
-                    error_message=body.error_message,
-                )
-        except ValueError as error:
-            raise HTTPException(status_code=409, detail=str(error)) from error
-        receipt = _firmware_progress_receipt(db, deployment, requested_state=body.state)
-        db.commit()
-        return receipt
-
-    return await run_in_threadpool(persist)
+        if deployment is None:
+            deployment = _record_firmware_progress(
+                db,
+                connector=connector,
+                deployment_public_id=deployment_id,
+                state=body.state,
+                bytes_written=body.bytes_written,
+                running_version=body.running_version,
+                running_partition=body.running_partition,
+                image_sha256=body.image_sha256,
+                error_code=body.error_code,
+                error_message=body.error_message,
+            )
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    receipt = _firmware_progress_receipt(db, deployment, requested_state=body.state)
+    db.commit()
+    return receipt
 
 
 def _firmware_chunks(path: _Path, start: int, end: int):

@@ -1474,22 +1474,17 @@ def test_a_delayed_sample_of_the_pre_install_boot_is_not_a_fast_return(db):
     assert db.get(FirmwareDeployment, deployment.id).status == "BOOTED_PENDING"
 
 
-def test_every_progress_report_is_recorded_off_the_event_loop_and_unchanged_out_of_scope(db, monkeypatch):
+def test_reports_outside_the_return_scope_stay_on_the_synchronous_path(db, monkeypatch):
     from zk_add import web
 
     _rel, device, _run, deployment = booted_target(db, previous="2.5.2", target="2.7.5")
-    original, calls = web.run_in_threadpool, []
 
-    async def recording(function, *args, **kwargs):
-        calls.append(function.__name__)
-        return await original(function, *args, **kwargs)
+    async def no_thread(*_args, **_kwargs):
+        raise AssertionError("an out-of-scope progress report left the request's thread")
 
-    # The report locks its connector first and may wait for it: never on the
-    # event loop that serves every device WebSocket.
-    monkeypatch.setattr(web, "run_in_threadpool", recording)
+    monkeypatch.setattr(web, "run_in_threadpool", no_thread)
     response = progress(device_client(db, device), deployment, previous="2.5.2")
     assert response.status_code == 200, response.text
-    assert calls == ["persist"]
     db.expire_all()
     deployment = db.get(FirmwareDeployment, deployment.id)
     assert (deployment.status, deployment.error_code) == ("ROLLED_BACK", "BOOTLOADER_ROLLBACK")
