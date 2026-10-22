@@ -21,9 +21,10 @@ keeps such a read fail-closed:
 
 * A tail's newest read that decodes as a punch no capture has delivered is
   held, not ingested: its row is ``IDENTITY_UNRESOLVED`` with the code
-  ``TERMINAL_NEWEST_RECORD_UNCONFIRMED`` and its claim stays encrypted. LIVE
-  capture delivering the same punch, or a later read of the same bytes while
-  later records exist, confirms it.
+  ``TERMINAL_NEWEST_RECORD_UNCONFIRMED`` and its claim stays encrypted. If
+  LIVE capture delivers the same punch, that delivery stands and accounts for
+  the row; a later read of the same bytes while later records exist settles
+  and ingests it.
 * An attendance event whose only source evidence is an unconfirmed tail newest
   read is never released automatically, by force release or by direct ORDS.
 
@@ -133,9 +134,9 @@ UNCONFIRMED_REASON = (
     "The terminal returned these bytes from its newest slot, which it may not yet have "
     "written. They decode as a punch that no capture has delivered to ADD, so ADD holds them "
     "instead of sending a punch that may belong to someone else or never happened. Nothing "
-    "was sent to Oracle and they cannot be corrected. LIVE capture delivering the same punch, "
-    "or a later complete source reconcile that reads the same bytes while later records "
-    "exist, confirms the punch; a reconcile that reads other bytes replaces this row."
+    "was sent to Oracle and they cannot be corrected. If LIVE capture delivers the same punch, "
+    "that delivery stands. A later complete source reconcile that reads the same bytes while "
+    "later records exist ingests the punch; one that reads other bytes replaces this row."
 )
 CORRECTED_REASON = (
     "A source time correction was created from this row before ADD recognised it as the "
