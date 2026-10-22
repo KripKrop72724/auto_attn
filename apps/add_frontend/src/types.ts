@@ -1210,6 +1210,8 @@ export interface DeviceUser {
   cnic_format_suspect?: boolean
   cnic_format_suspect_reason?: 'LETTER_BEFORE_DIGITS' | 'SEPARATED_DIGITS' | 'UNSUPPORTED_SEPARATOR' | null
   suggested_display_name?: string | null
+  /** The unparsed name carried the "-S" shift-worker marker; the edit dialog keeps it. */
+  suggested_shift_worker?: boolean
 }
 
 export interface AttendanceRepairCohortCandidate {
@@ -1668,12 +1670,31 @@ export interface HistoricalIdentityReport {
   unassigned_groups?: HistoricalIdentityCandidate[]
 }
 
-export type PunchTimeCnicState = 'MATCHES_CURRENT' | 'DIFFERS' | 'AMBIGUOUS' | 'NONE'
+export type PunchTimeCnicState = 'MATCHES_CURRENT' | 'DIFFERS' | 'CONFLICT' | 'CHANGED_NEAR_PUNCH' | 'AMBIGUOUS' | 'NONE'
 export type DirectOrdsCnicChoice = 'PUNCH_TIME' | 'CURRENT'
+/** One administrator CNIC decision, bound to the evidence the dialog showed. */
+export interface DirectOrdsCnicDecision {
+  event_id: number
+  choice: DirectOrdsCnicChoice
+  /** The preview's evidence_digest; ADD skips the choice if the evidence changed. */
+  evidence_digest: string
+  /** Required to send a punch-time CNIC another active terminal user holds today. */
+  held_by_other_confirmed: boolean
+}
+/** Evidence notes about who held the terminal user ID at punch time; they never carry a CNIC. */
+export type PunchTimeEvidenceSignal =
+  | 'REVOKED_RECORD' | 'OTHER_UID_RECORD' | 'CAPTURED_CNIC_DIFFERS' | 'CAPTURED_CNIC_MATCHES'
+  | 'PREVIOUS_HOLDER_DELETED' | 'PUNCH_LINKED_TO_OTHER_USER' | 'UID_DIFFERS' | 'IDENTITY_CONFLICT_UNRESOLVED'
+  | 'CNIC_CHANGED_NEAR_PUNCH' | 'RECORDS_TRUNCATED' | 'PUNCH_TIME_CNIC_HELD_BY_OTHER'
+  | 'PUNCH_BEFORE_FIRST_OBSERVATION' | 'GAP_BRIDGED_SAME_CNIC' | 'NAME_DIFFERS'
+/** Where a punch that no identity record covers sits in ADD's records of the user ID. */
+export type PunchTimeRecordPosition = 'NO_RECORDS' | 'BEFORE_FIRST_RECORD' | 'BETWEEN_RECORDS' | 'AFTER_LAST_RECORD'
 
 /** Read-only checks shown before an administrator approves a direct Oracle send. */
 export interface DirectOrdsPreviewRow {
   event_id: number
+  zkt_device_id?: number | null
+  device_serial?: string | null
   user_id: string
   display_name: string | null
   device_event_time: string
@@ -1683,14 +1704,33 @@ export interface DirectOrdsPreviewRow {
   punch_time_cnic: PunchTimeCnicState | null
   punch_time_cnic_masked: string | null
   punch_time_display_name: string | null
+  /** How the other CNIC is known: a record covering the punch, records on both sides of a break, or the nearest record. */
+  punch_time_cnic_basis?: 'COVERING_RECORD' | 'BRIDGED_GAP' | 'NEAREST_RECORD' | null
+  record_position?: PunchTimeRecordPosition | null
+  /** BEFORE_FIRST_RECORD: when ADD first recorded this terminal user ID. */
+  first_observed_at?: string | null
+  /** NAME_DIFFERS: the name saved with the punch. */
+  punch_display_name?: string | null
+  /** Masked CNICs of anyone else ADD's records show at or near the punch time. */
+  other_cnics_masked?: string[]
+  evidence_signals?: PunchTimeEvidenceSignal[]
   current_cnic_masked: string | null
   uid_matches_current: boolean
+  identity_conflict_code?: string | null
+  punch_time_cnic_held_by_other?: boolean
   cnic_choice_required: boolean
   cnic_choices: DirectOrdsCnicChoice[]
   default_cnic_choice: DirectOrdsCnicChoice | null
+  /** CHOOSE_CNIC: radio per group; CONFIRM_TODAY: an explicit tick per group. */
+  decision_kind?: 'CHOOSE_CNIC' | 'CONFIRM_TODAY' | null
+  /** Rows with identical evidence share one decision; mixed evidence is one row per group. */
+  decision_group?: string | null
   auto_release_at_next_snapshot: boolean
   awaiting_next_snapshot: boolean
   database_guard: string
+  replaces_stopped_approval?: boolean
+  /** Echoed with a CNIC choice so ADD can refuse a choice made on older evidence. */
+  evidence_digest?: string | null
 }
 
 export interface DirectOrdsPreview {
@@ -1705,7 +1745,7 @@ export interface AttendanceEvent {
   direct_ords_identity?: {
     eligible: boolean
     cnic_source: 'SAVED_PUNCH' | 'SYNCED_USER' | null
-    exclusion: 'UNKNOWN_USER' | 'CNIC_MISSING' | 'INVALID_EVENT_UID' | 'CLOCK_INVALID' | 'TIME_IMPOSSIBLE' | null
+    exclusion: 'UNKNOWN_USER' | 'CNIC_MISSING' | 'INVALID_EVENT_UID' | 'CLOCK_INVALID' | 'TIME_IMPOSSIBLE' | 'CNIC_CONFLICT' | null
     /** Which CNIC the terminal held for this user ID at the punch time. */
     punch_time_cnic?: PunchTimeCnicState | null
     /** The send dialog must ask which CNIC to use; ADD never picks today's by user ID alone. */

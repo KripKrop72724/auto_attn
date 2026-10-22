@@ -180,6 +180,31 @@ describe('Selected-terminal users workspace', () => {
     expect(body.cnic).toBe('4230111028815')
   })
 
+  it('keeps the shift-worker marker of a suspect name when the CNIC is set', async () => {
+    const ali = user({
+      user_id: '04050', uid: '57', display_name: 'Ali-S-A4230111028815', cnic_masked: null,
+      cnic_available: false, identity_complete: false, machine_name_preview: 'Ali-S-A4230111028815',
+      cnic_format_suspect: true, cnic_format_suspect_reason: 'LETTER_BEFORE_DIGITS',
+      suggested_display_name: 'Ali', suggested_shift_worker: true, shift_worker: false,
+    })
+    const fetchMock = vi.fn(async () => response({ command }))
+    vi.stubGlobal('fetch', fetchMock)
+    function DialogHarness() {
+      const toast = useToast()
+      return <UserOperationDialog state={{ mode: 'edit', user: ali }} device={device} onClose={() => {}} onCommand={() => {}} toast={toast} />
+    }
+    render(<DialogHarness />)
+    expect((screen.getByLabelText(/Shift worker/) as HTMLInputElement).checked).toBe(true)
+    fireEvent.change(screen.getByLabelText('Replacement CNIC (required for missing CNIC)'), { target: { value: '4230111028815' } })
+    expect(screen.getByText('Ali-S-4230111028815')).toBeTruthy()
+    fireEvent.change(screen.getByLabelText('Confirm administrator password'), { target: { value: 'test-password' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm operation' }))
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled())
+    const body = JSON.parse(String((fetchMock.mock.calls[0] as unknown as [string, RequestInit])[1].body))
+    expect(body.display_name).toBe('Ali')
+    expect(body.shift_worker).toBe(true)
+  })
+
   it('opens the exact missing-CNIC employee from an attendance review deep link', async () => {
     const missingCnic = user({
       id: 10,

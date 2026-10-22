@@ -31,7 +31,8 @@ export function UserOperationDialog({
     (suspectName && user?.suggested_display_name) || user?.display_name || '',
   )
   const [cnic, setCnic] = useState('')
-  const [shiftWorker, setShiftWorker] = useState(user?.shift_worker || false)
+  // The unparsed name's "-S" marker never set the flag; keep it rather than drop it with the suffix.
+  const [shiftWorker, setShiftWorker] = useState(user?.shift_worker || Boolean(suspectName && user?.suggested_shift_worker))
   const [privilege, setPrivilege] = useState<0 | 14>(user?.privilege || 0)
   const [userIdOverride, setUserIdOverride] = useState('')
   const [password, setPassword] = useState('')

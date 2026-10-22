@@ -9,6 +9,8 @@ import type {
   Device,
 } from '../types'
 import { AttendanceView } from './Attendance'
+import { directSendDecisions } from './DirectOrdsSend'
+import type { DirectOrdsPreviewRow } from '../types'
 
 const device: Device = {
   connector_id: 'connector-one', hardware_id: 'hw-one', zone_id: 'ZONE-ONE', zone_name: 'Islamabad',
@@ -450,8 +452,8 @@ describe('Live attendance workspace', () => {
     })
     const preview = { rows: [
       check({ event_id: 11, user_id: '48384', display_name: 'Dr Farzana', exclusion: 'TIME_IMPOSSIBLE', exclusion_reason: 'The punch time is impossible. It is never sent to Oracle.' }),
-      check({ event_id: 12, user_id: '3980', display_name: 'Toheed', cnic_source: null, punch_time_cnic: 'DIFFERS', punch_time_cnic_masked: '*****-****609-0', cnic_choice_required: true, cnic_choices: ['PUNCH_TIME', 'CURRENT'], default_cnic_choice: 'PUNCH_TIME' }),
-      check({ event_id: 13, user_id: '04048', display_name: 'A.Saleem', cnic_source: null, punch_time_cnic: 'NONE', cnic_choice_required: true, cnic_choices: ['CURRENT'] }),
+      check({ event_id: 12, user_id: '3980', display_name: 'Toheed', cnic_source: null, punch_time_cnic: 'DIFFERS', punch_time_cnic_masked: '*****-****609-0', cnic_choice_required: true, cnic_choices: ['PUNCH_TIME', 'CURRENT'], default_cnic_choice: 'PUNCH_TIME', decision_kind: 'CHOOSE_CNIC', decision_group: 'choose|0f3a', evidence_digest: '1'.repeat(64) }),
+      check({ event_id: 13, user_id: '04048', display_name: 'A.Saleem', cnic_source: null, punch_time_cnic: 'NONE', record_position: 'NO_RECORDS', cnic_choice_required: true, cnic_choices: ['CURRENT'], decision_kind: 'CONFIRM_TODAY', decision_group: 'today|5be1', evidence_digest: '2'.repeat(64) }),
       check({ event_id: 14, user_id: '1008', display_name: 'Bilal', auto_release_at_next_snapshot: true, database_guard: 'ACCEPTED' }),
     ], missing_event_ids: [], counts: { selected: 4, refused: 1, cnic_choice_required: 2, auto_release_soon: 1 } }
     const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -488,12 +490,16 @@ describe('Live attendance workspace', () => {
       const call = fetchMock.mock.calls.find(([path, init]) => String(path) === '/api/v2/attendance-direct-ords' && init?.method === 'POST')
       return JSON.parse(String(call?.[1]?.body))
     }
-    fireEvent.click(within(dialog).getByLabelText(/Use today's CNIC for 1 punch/))
+    fireEvent.click(within(dialog).getByLabelText(/Use today's CNIC \*{5}-\*{4}609-2 for A\.Saleem · user 04048 · 1 punch/))
     fireEvent.click(within(dialog).getByLabelText(/Send 1 punch now anyway/))
     fireEvent.click(today)
     const body = await submitted()
     expect(body.event_ids).toEqual([11, 12, 13, 14])
-    expect(body.cnic_choices).toEqual([{ event_id: 12, choice: 'CURRENT' }, { event_id: 13, choice: 'CURRENT' }])
+    // Each choice echoes the evidence the dialog showed.
+    expect(body.cnic_choices).toEqual([
+      { event_id: 12, choice: 'CURRENT', evidence_digest: '1'.repeat(64), held_by_other_confirmed: false },
+      { event_id: 13, choice: 'CURRENT', evidence_digest: '2'.repeat(64), held_by_other_confirmed: false },
+    ])
     expect(body.send_now_event_ids).toEqual([14])
   })
 
@@ -505,6 +511,7 @@ describe('Live attendance workspace', () => {
       punch_time_cnic_masked: '*****-****609-0', punch_time_display_name: 'Toheed', current_cnic_masked: '*****-****609-2',
       uid_matches_current: true, cnic_choice_required: true, cnic_choices: ['PUNCH_TIME', 'CURRENT'], default_cnic_choice: 'PUNCH_TIME',
       auto_release_at_next_snapshot: false, awaiting_next_snapshot: false, database_guard: 'NOT_CHECKED',
+      evidence_digest: '1'.repeat(64),
     }], missing_event_ids: [], counts: { selected: 1, refused: 0, cnic_choice_required: 1, auto_release_soon: 0 } }
     const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const path = String(input)
@@ -529,8 +536,152 @@ describe('Live attendance workspace', () => {
     await screen.findByText('Preparing delivery')
     const call = fetchMock.mock.calls.find(([path, init]) => String(path) === '/api/v2/attendance-direct-ords' && init?.method === 'POST')
     const body = JSON.parse(String(call?.[1]?.body))
-    expect(body.cnic_choices).toEqual([{ event_id: 12, choice: 'PUNCH_TIME' }])
+    expect(body.cnic_choices).toEqual([{ event_id: 12, choice: 'PUNCH_TIME', evidence_digest: '1'.repeat(64), held_by_other_confirmed: false }])
     expect(body.send_now_event_ids).toEqual([])
+  })
+
+  const previewRow = (overrides: Partial<DirectOrdsPreviewRow>): DirectOrdsPreviewRow => ({
+    event_id: 0, zkt_device_id: 1, device_serial: 'KHI-3FL', user_id: '1', display_name: 'Someone',
+    device_event_time: '2026-10-09T04:00:00Z', exclusion: null, exclusion_reason: null, cnic_source: null,
+    punch_time_cnic: null, punch_time_cnic_masked: null, punch_time_display_name: null, other_cnics_masked: [],
+    evidence_signals: [], current_cnic_masked: '*****-****609-2', uid_matches_current: true,
+    identity_conflict_code: null, punch_time_cnic_held_by_other: false, cnic_choice_required: false,
+    cnic_choices: [], default_cnic_choice: null, decision_kind: null, decision_group: null,
+    auto_release_at_next_snapshot: false, awaiting_next_snapshot: false, database_guard: 'NOT_CHECKED',
+    replaces_stopped_approval: false, evidence_digest: 'e'.repeat(64), ...overrides,
+  })
+
+  it('decides per group of identical evidence and never decides a punch unseen', () => {
+    const toheed = Array.from({ length: 60 }, (_, index) => previewRow({
+      event_id: 100 + index, user_id: '3980', display_name: 'Toheed', punch_time_cnic: 'DIFFERS',
+      punch_time_cnic_masked: '*****-****609-0', cnic_choice_required: true, cnic_choices: ['PUNCH_TIME', 'CURRENT'],
+      default_cnic_choice: 'PUNCH_TIME', decision_kind: 'CHOOSE_CNIC', decision_group: 'choose|1|3980|aaaa|0',
+    }))
+    const colleague = previewRow({
+      event_id: 200, user_id: '4001', punch_time_cnic: 'DIFFERS', punch_time_cnic_masked: '*****-****111-1',
+      punch_time_cnic_held_by_other: true, cnic_choice_required: true, cnic_choices: ['PUNCH_TIME', 'CURRENT'],
+      default_cnic_choice: null, decision_kind: 'CHOOSE_CNIC', decision_group: 'choose|1|4001|bbbb|1',
+    })
+    const saleem = [301, 302].map((event_id) => previewRow({
+      event_id, user_id: '04048', punch_time_cnic: 'NONE', cnic_choice_required: true, cnic_choices: ['CURRENT'],
+      decision_kind: 'CONFIRM_TODAY', decision_group: 'today|1|04048',
+    }))
+    const gap = previewRow({
+      event_id: 400, user_id: '3980', punch_time_cnic: 'CHANGED_NEAR_PUNCH', cnic_choice_required: true,
+      cnic_choices: ['CURRENT'], other_cnics_masked: ['*****-****609-0'], evidence_signals: ['CNIC_CHANGED_NEAR_PUNCH'],
+      decision_kind: 'CONFIRM_TODAY', decision_group: 'row|400',
+    })
+    const conflict = previewRow({ event_id: 500, punch_time_cnic: 'CONFLICT', exclusion: 'CNIC_CONFLICT', exclusion_reason: 'Another CNIC.' })
+    const rows = [...toheed, colleague, ...saleem, gap, conflict]
+    let result = directSendDecisions(rows, {}, {}, false)
+    expect(result.choose.map((group) => group.rows.length)).toEqual([60, 1])
+    expect(result.confirm.map((group) => group.key)).toEqual(['today|1|04048', 'row|400'])
+    expect(result.cnicChoices).toHaveLength(60)
+    expect(result.cnicChoices.every((item) => item.choice === 'PUNCH_TIME')).toBe(true)
+    expect(result.skipped).toBe(5)  // the colleague's punch, A.Saleem's two, the gap and the conflict
+    result = directSendDecisions(rows, { 'choose|1|4001|bbbb|1': 'CURRENT' }, { 'today|1|04048': true }, false)
+    expect(result.cnicChoices.filter((item) => item.choice === 'CURRENT').map((item) => item.event_id)).toEqual([200, 301, 302])
+    expect(result.skipped).toBe(2)
+  })
+
+  it('shows refused identities with the other CNIC and asks before using a CNIC another user holds', async () => {
+    // The ledger's hints were loaded earlier; the dialog's checks are current.
+    const hint = { eligible: true, cnic_source: 'SYNCED_USER' as const, exclusion: null, punch_time_cnic: 'NONE' as const, cnic_choice_required: true }
+    const rows = [
+      event({ id: 21, event_uid: 'conflict', display_name: 'Babar', user_id: '100', cnic_masked: null, ords_status: 'BLOCKED_IDENTITY', direct_ords_identity: hint }),
+      event({ id: 22, event_uid: 'colleague', display_name: 'Toheed', user_id: '3980', cnic_masked: null, ords_status: 'BLOCKED_IDENTITY', direct_ords_identity: hint }),
+      event({ id: 23, event_uid: 'gap', display_name: 'Toheed', user_id: '3980', cnic_masked: null, ords_status: 'BLOCKED_IDENTITY', direct_ords_identity: hint }),
+    ]
+    const preview = { rows: [
+      previewRow({ event_id: 21, user_id: '100', display_name: 'Babar', punch_time_cnic: 'CONFLICT', exclusion: 'CNIC_CONFLICT', exclusion_reason: "ADD's records show another CNIC or another person for this terminal user ID at punch time.", other_cnics_masked: ['*****-****777-1'], evidence_signals: ['OTHER_UID_RECORD'] }),
+      previewRow({ event_id: 22, user_id: '3980', display_name: 'Toheed', punch_time_cnic: 'DIFFERS', punch_time_cnic_masked: '*****-****609-0', punch_time_cnic_held_by_other: true, evidence_signals: ['PUNCH_TIME_CNIC_HELD_BY_OTHER'], cnic_choice_required: true, cnic_choices: ['PUNCH_TIME', 'CURRENT'], default_cnic_choice: null, decision_kind: 'CHOOSE_CNIC', decision_group: 'choose|1|3980|aaaa|1' }),
+      previewRow({ event_id: 23, user_id: '3980', display_name: 'Toheed', punch_time_cnic: 'CHANGED_NEAR_PUNCH', other_cnics_masked: ['*****-****609-0'], evidence_signals: ['CNIC_CHANGED_NEAR_PUNCH'], cnic_choice_required: true, cnic_choices: ['CURRENT'], decision_kind: 'CONFIRM_TODAY', decision_group: 'row|23' }),
+    ], missing_event_ids: [], counts: { selected: 3, refused: 1, cnic_choice_required: 2, auto_release_soon: 0 } }
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = String(input)
+      if (path === '/api/v2/attendance-direct-ords/preview') return response(preview)
+      if (path === '/api/v2/attendance-direct-ords' && init?.method === 'POST') return response({
+        job_id: 'conflict-run', status: 'RUNNING', created_at: '2026-10-21T09:00:00Z', actor: 'operator',
+        selected: 3, ready: 1, waiting: 0, confirmed: 0, skipped: 2, attention: 0,
+      }, 202)
+      if (path.includes('/api/v2/attendance-direct-ords')) return response({ rows: [], next_cursor: null })
+      return response({ rows, next_cursor: null })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    render(<AttendanceView {...attendanceProps} />)
+    await screen.findByRole('article', { name: /Babar/i })
+    fireEvent.click(screen.getByLabelText('Select loaded punches'))
+    fireEvent.click(screen.getByRole('button', { name: 'Send 3 punches' }))
+    const dialog = screen.getByRole('dialog')
+    const refused = await within(dialog).findByRole('region', { name: 'Punches that cannot be sent' })
+    expect(refused.textContent).toMatch(/Babar.*another CNIC or another person.*\*{5}-\*{4}777-1/)
+    const changed = within(dialog).getByRole('region', { name: 'CNIC changed since the punch' })
+    expect(changed.textContent).toMatch(/Another active terminal user has the punch-time CNIC today/)
+    expect((within(changed).getByLabelText(/CNIC at punch time/) as HTMLInputElement).checked).toBe(false)
+    expect((within(changed).getByLabelText(/Today's CNIC/) as HTMLInputElement).checked).toBe(false)
+    const confirm = within(dialog).getByRole('region', { name: "Confirm today's CNIC" })
+    expect(confirm.textContent).toMatch(/nearest record holds another CNIC.*other CNIC on record: \*{5}-\*{4}609-0/)
+    expect(dialog.textContent).toMatch(/3 punches will be skipped; 0 punches will be approved/)
+    fireEvent.click(within(changed).getByLabelText(/CNIC at punch time/))
+    fireEvent.change(screen.getByLabelText('Reason for sending'), { target: { value: 'HR confirmed Toheed punched' } })
+    fireEvent.change(screen.getByLabelText('Administrator password'), { target: { value: 'test-password' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Approve and send 3 punches' }))
+    await screen.findByText('Preparing delivery')
+    const call = fetchMock.mock.calls.find(([path, init]) => String(path) === '/api/v2/attendance-direct-ords' && init?.method === 'POST')
+    const body = JSON.parse(String(call?.[1]?.body))
+    // Choosing the punch-time CNIC another user holds is the explicit confirmation ADD requires.
+    expect(body.cnic_choices).toEqual([{ event_id: 22, choice: 'PUNCH_TIME', evidence_digest: 'e'.repeat(64), held_by_other_confirmed: true }])
+  })
+
+  it('asks per punch, with nothing preselected, when the records around a punch disagree', () => {
+    const gap = previewRow({
+      event_id: 600, user_id: '3980', display_name: 'Toheed', punch_time_cnic: 'CHANGED_NEAR_PUNCH',
+      punch_time_cnic_masked: '*****-****609-0', punch_time_cnic_basis: 'NEAREST_RECORD', record_position: 'BETWEEN_RECORDS',
+      cnic_choice_required: true, cnic_choices: ['PUNCH_TIME', 'CURRENT'], default_cnic_choice: null,
+      decision_kind: 'CHOOSE_CNIC', decision_group: 'row|600', evidence_digest: '6'.repeat(64),
+    })
+    let result = directSendDecisions([gap], {}, {}, false)
+    expect(result.choose).toHaveLength(1)
+    expect(result.cnicChoices).toEqual([])
+    expect(result.skipped).toBe(1)
+    result = directSendDecisions([gap], { 'row|600': 'PUNCH_TIME' }, {}, false)
+    expect(result.cnicChoices).toEqual([{ event_id: 600, choice: 'PUNCH_TIME', evidence_digest: '6'.repeat(64), held_by_other_confirmed: false }])
+  })
+
+  it('never sends a choice without the evidence it was made on', () => {
+    const old = previewRow({
+      event_id: 700, user_id: '04048', punch_time_cnic: 'NONE', cnic_choice_required: true, cnic_choices: ['CURRENT'],
+      decision_kind: 'CONFIRM_TODAY', decision_group: 'today|aa', evidence_digest: null,
+    })
+    const result = directSendDecisions([old], {}, { 'today|aa': true }, false)
+    expect(result.cnicChoices).toEqual([])
+    expect(result.skipped).toBe(1)
+  })
+
+  it('explains punches older than ADD\'s first record and confirms them apart', async () => {
+    const hint = { eligible: true, cnic_source: 'SYNCED_USER' as const, exclusion: null, punch_time_cnic: 'NONE' as const, cnic_choice_required: true }
+    const rows = [
+      event({ id: 31, event_uid: 'early', display_name: 'A.Saleem', user_id: '04048', cnic_masked: null, ords_status: 'BLOCKED_IDENTITY', direct_ords_identity: hint }),
+      event({ id: 32, event_uid: 'named', display_name: 'A.Saleem', user_id: '04048', cnic_masked: null, ords_status: 'BLOCKED_IDENTITY', direct_ords_identity: hint }),
+    ]
+    const preview = { rows: [
+      previewRow({ event_id: 31, user_id: '04048', display_name: 'A.Saleem', punch_time_cnic: 'NONE', record_position: 'BEFORE_FIRST_RECORD', first_observed_at: '2026-10-21T06:00:00Z', evidence_signals: ['PUNCH_BEFORE_FIRST_OBSERVATION'], cnic_choice_required: true, cnic_choices: ['CURRENT'], decision_kind: 'CONFIRM_TODAY', decision_group: 'today|early' }),
+      previewRow({ event_id: 32, user_id: '04048', display_name: 'A.Saleem', punch_time_cnic: 'NONE', record_position: 'BETWEEN_RECORDS', evidence_signals: ['NAME_DIFFERS'], punch_display_name: 'Someone Else', cnic_choice_required: true, cnic_choices: ['CURRENT'], decision_kind: 'CONFIRM_TODAY', decision_group: 'row|32' }),
+    ], missing_event_ids: [], counts: { selected: 2, refused: 0, cnic_choice_required: 2, auto_release_soon: 0 } }
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const path = String(input)
+      if (path === '/api/v2/attendance-direct-ords/preview') return response(preview)
+      if (path.includes('/api/v2/attendance-direct-ords')) return response({ rows: [], next_cursor: null })
+      return response({ rows, next_cursor: null })
+    }))
+    render(<AttendanceView {...attendanceProps} />)
+    await screen.findAllByRole('article', { name: /A\.Saleem/i })
+    fireEvent.click(screen.getByLabelText('Select loaded punches'))
+    fireEvent.click(screen.getByRole('button', { name: 'Send 2 punches' }))
+    const confirm = await within(screen.getByRole('dialog')).findByRole('region', { name: "Confirm today's CNIC" })
+    expect(within(confirm).getAllByRole('checkbox')).toHaveLength(2)
+    expect(confirm.textContent).toMatch(/older than ADD's first record of this user ID/)
+    expect(confirm.textContent).toMatch(/name saved with the punch: Someone Else/)
   })
 
   it('keeps a punch without a usable current user CNIC out of manual selection', async () => {
