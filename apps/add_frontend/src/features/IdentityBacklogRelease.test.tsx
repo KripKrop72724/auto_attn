@@ -78,13 +78,14 @@ it('checks a frozen zone page by page, then releases only the chosen groups', as
   expect(screen.getByText('Stay held').closest('.metric-card')?.textContent).toContain('1')
   // Another proof releases one of them at the next user list, not this action.
   expect(screen.getByText('Next user list', { selector: '.metric-card *' }).closest('.metric-card')?.textContent).toContain('1')
-  screen.getByText('2 punches released earlier and held again by delivery are not part of this check. The release or user list that sent them checks them again.')
+  screen.getByText('2 punches released earlier and held again are not part of this check. This release never takes them in.')
   screen.getByRole('button', { name: 'Release 3 punches' })
 
   // Leave out the over-30-days group of the gate terminal.
   fireEvent.click(screen.getByRole('checkbox', { name: 'Release Karachi gate, Startup recovery, Over 30 days' }))
   fireEvent.click(screen.getByRole('button', { name: 'Release 2 punches' }))
   const dialog = screen.getByRole('dialog')
+  expect(dialog.textContent).toContain('Only punches of the 2 chosen groups that are held when you approve')
   const approve = within(dialog).getByRole('button', { name: 'Approve 2 punches' }) as HTMLButtonElement
   fireEvent.change(within(dialog).getByLabelText('Reason for release'), { target: { value: 'Reviewed Karachi backlog' } })
   fireEvent.change(within(dialog).getByLabelText('Administrator password'), { target: { value: 'secret' } })
@@ -134,10 +135,12 @@ it('cannot approve while the server has the release proof turned off', async () 
 })
 
 it('shows why a running release waits and what it left to the next user list', async () => {
-  mock({ runs: [{ ...run, waiting_reason: 'WAITING_FOR_COMPLETE_ROSTER', left_to_snapshot: 3 }] })
+  mock({ runs: [{ ...run, waiting_reason: 'WAITING_FOR_COMPLETE_ROSTER', left_to_snapshot: 3, no_longer_held: 2 }] })
   render(<IdentityBacklogRelease devices={devices} toast={toast} />)
   fireEvent.change(screen.getByLabelText('Zone'), { target: { value: 'ZONE-KHI' } })
   const status = await screen.findByRole('status')
   expect(status.textContent).toContain('3 left to the next user list')
+  // Approved punches another path released before the run reached them.
+  expect(status.textContent).toContain('2 no longer held when reached')
   expect(status.textContent).toContain('Waiting for a complete user list from a chosen terminal')
 })

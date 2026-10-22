@@ -17,16 +17,19 @@ whose proof fails stays held.
 
 Only the dump proof (AUTHENTICATED_RECONCILE_BATCH) is used here. A punch
 another proof can release is left to the next roster snapshot, which already
-applies those proofs. The scope is the zone's held dump punches never
-released before: a punch a proof released and delivery held again belongs
-to whatever released it, so a release never takes in punches that were on
-their way to Oracle when the owner checked the zone. While a chosen
-terminal's roster is incomplete, unstable or being replaced, the release
-waits instead of passing punches it could not check.
+applies those proofs. The check covers the zone's held dump punches that no
+proof released before: a punch released and then held again (by delivery or
+a guard) belongs to whatever released it. The approval freezes the exact
+punches of the chosen groups that are held at that moment; the run never
+takes in any other punch, and one released elsewhere meanwhile is counted
+as no longer held. While a chosen terminal's roster is incomplete, unstable
+or being replaced, the release waits instead of passing punches it could
+not check.
 """
 
 from __future__ import annotations
 
+import hashlib
 from datetime import datetime, timedelta
 
 from sqlalchemy import and_, case, func, not_, or_, select, text
@@ -67,7 +70,7 @@ from zk_add.settings import settings
 from zk_add.time_utils import ensure_utc, utc_now
 
 ACTION = "IDENTITY_BACKLOG_RELEASE"
-POLICY = "identity-dump-backlog-v3"
+POLICY = "identity-dump-backlog-v4"
 # Deliberately not QUEUED/RUNNING/STOPPING: the generic recovery advancer and
 # other recovery jobs' connector checks own those.
 RELEASING = "RELEASING"
@@ -107,11 +110,19 @@ def zone_connectors(session: Session, zone_id: str, *, lock: bool = False) -> li
     return [row for row in session.scalars(query).all() if row.zkt_device is not None]
 
 
-def _previously_released():
-    """SQL form of service.previously_synced_cnic_release."""
-    return and_(
-        func.coalesce(AttendanceEvent.identity_resolution_status, "") == "RESOLVED_SYNCED_CNIC",
-        func.coalesce(AttendanceEvent.identity_repair_reason, "") == "VERIFIED_SYNCED_CNIC",
+def _released_before():
+    """A held row some proof released before and delivery or a guard held again.
+
+    Every identity release stamps identity_repaired_at; the synced-CNIC
+    markers (service.previously_synced_cnic_release) are checked as well.
+    """
+    return or_(
+        AttendanceEvent.identity_repaired_at.is_not(None),
+        and_(
+            func.coalesce(AttendanceEvent.identity_resolution_status, "")
+            == "RESOLVED_SYNCED_CNIC",
+            func.coalesce(AttendanceEvent.identity_repair_reason, "") == "VERIFIED_SYNCED_CNIC",
+        ),
     )
 
 
@@ -121,8 +132,38 @@ def _held_dump_rows(connector_ids: list[int]):
         AttendanceEvent.connector_id.in_(connector_ids),
         AttendanceEvent.ords_status.in_(HELD),
         AttendanceEvent.source.in_(DUMP_SOURCES),
-        not_(_previously_released()),
+        not_(_released_before()),
     )
+
+
+def _id_ranges(ids: list[int]) -> list[list[int]]:
+    """Sorted punch IDs as inclusive [first, last] runs, compact for a job scope."""
+    ranges: list[list[int]] = []
+    for value in sorted(ids):
+        if ranges and value == ranges[-1][1] + 1:
+            ranges[-1][1] = value
+        else:
+            ranges.append([value, value])
+    return ranges
+
+
+def _members_after(ranges: list, cursor: int, limit: int) -> list[int]:
+    """The next approved punch IDs after the cursor, in ID order."""
+    found: list[int] = []
+    for first, last in ranges:
+        if last <= cursor:
+            continue
+        value = max(int(first), cursor + 1)
+        while value <= last and len(found) < limit:
+            found.append(value)
+            value += 1
+        if len(found) >= limit:
+            break
+    return found
+
+
+def _members_digest(ids: list[int]) -> str:
+    return hashlib.sha256(",".join(str(value) for value in sorted(ids)).encode()).hexdigest()
 
 
 def _bucket(received_at: datetime | None, as_of: datetime, window_hours: int) -> str:
@@ -330,7 +371,7 @@ def preview_page(
                 AttendanceEvent.connector_id.in_(list(by_id)),
                 AttendanceEvent.ords_status.in_(HELD),
                 AttendanceEvent.source.in_(DUMP_SOURCES),
-                _previously_released(),
+                _released_before(),
             )
         ) or 0
         result["totals"] = [
@@ -459,13 +500,17 @@ def create_release(
             "The approved count must be between 1 and the punches held in the chosen groups.",
             "APPROVED_COUNT_INVALID",
         )
-    held_now = session.scalar(
-        select(func.count(AttendanceEvent.id)).where(
+    # The approval freezes exactly which punches the run may release: those
+    # of the chosen groups held and never released at this moment.
+    member_ids = list(session.scalars(
+        select(AttendanceEvent.id).where(
             *_held_dump_rows(list(ids_by_key.values())),
             AttendanceEvent.id <= until_id,
             _group_filter(chosen, ids_by_key, as_of, window_hours),
-        )
-    ) or 0
+        ).order_by(AttendanceEvent.id)
+    ).all())
+    held_now = len(member_ids)
+    members_digest = _members_digest(member_ids)
     if held_now > previewed_held:
         raise RecoveryError(
             "More punches are held in the chosen groups than when you checked. "
@@ -489,6 +534,9 @@ def create_release(
         },
         "previewed_held": previewed_held,
         "held_at_approval": held_now,
+        # The frozen punches, as inclusive ID runs, and their digest.
+        "members": _id_ranges(member_ids),
+        "members_digest": members_digest,
         "batch_size": settings.attendance_identity_backlog_batch_size,
         "in_flight_limit": settings.attendance_identity_backlog_in_flight_limit,
     }
@@ -538,6 +586,7 @@ def create_release(
             "approved_count": approved_count,
             "previewed_held": previewed_held,
             "held_at_approval": held_now,
+            "members_digest": members_digest,
         },
     )
     return job
@@ -651,7 +700,11 @@ def _open_items(session: Session, job: Job) -> int:
 
 
 def _release_batch(session: Session, job: Job, zkts: dict, limit: int | None):
-    """One paced batch of the approved scan. Returns (evaluated, released, kept, left, waiting).
+    """One paced batch of the frozen approved punches.
+
+    Returns (evaluated, released, kept, left, gone, waiting). gone: approved
+    punches no longer held and never-released when reached (for example a
+    roster snapshot released them meanwhile); they are passed, not checked.
 
     The cursor only passes punches whose proof was checked against a
     complete, stable roster that did not change while it ran. Otherwise the
@@ -663,13 +716,14 @@ def _release_batch(session: Session, job: Job, zkts: dict, limit: int | None):
     released: list[int] = []
     kept: list[int] = []
     left: list[int] = []
+    gone: list[int] = []
     waiting = None
     evaluated = 0
     if job.cursor >= until_id:
-        return evaluated, released, kept, left, waiting
+        return evaluated, released, kept, left, gone, waiting
     if job.eligible_count >= job.requested_count:
         job.cursor = until_id  # The approved count is reached.
-        return evaluated, released, kept, left, waiting
+        return evaluated, released, kept, left, gone, waiting
     batch = max(1, min(limit or int(scope.get("batch_size") or 25), 200))
     budget = min(
         batch,
@@ -677,21 +731,22 @@ def _release_batch(session: Session, job: Job, zkts: dict, limit: int | None):
         job.requested_count - job.eligible_count,
     )
     if budget <= 0:
-        return evaluated, released, kept, left, waiting
+        return evaluated, released, kept, left, gone, waiting
+    # Only the punches frozen at approval; never any other.
+    candidates = _members_after(scope.get("members") or [], job.cursor, budget)
+    if not candidates:
+        job.cursor = until_id
+        return evaluated, released, kept, left, gone, waiting
     ids_by_key = dict(zip(scope["connector_keys"], scope["connector_ids"]))
     pending = (
         *_held_dump_rows(list(scope["connector_ids"])),
-        AttendanceEvent.id > job.cursor,
-        AttendanceEvent.id <= until_id,
+        AttendanceEvent.id.in_(candidates),
         _group_filter(scope["groups"], ids_by_key, _parse_as_of(scope["as_of"]),
                       int(scope["window_hours"])),
     )
-    candidates = session.scalars(
-        select(AttendanceEvent.id).where(*pending).order_by(AttendanceEvent.id).limit(budget)
-    ).all()
-    if not candidates:
-        job.cursor = until_id
-        return evaluated, released, kept, left, waiting
+    # Committed state, without locks: an approved punch another path
+    # released (or that left the hold) since the approval is passed.
+    still_held = set(session.scalars(select(AttendanceEvent.id).where(*pending)).all())
     # A snapshot, chunk or delivery transaction may hold some rows. Skip
     # locks to avoid deadlocks, but stop before the first unavailable row so
     # the cursor never passes an unevaluated punch.
@@ -699,7 +754,7 @@ def _release_batch(session: Session, job: Job, zkts: dict, limit: int | None):
         row.id: row
         for row in session.scalars(
             select(AttendanceEvent)
-            .where(*pending, AttendanceEvent.id.in_(candidates))
+            .where(*pending)
             .order_by(AttendanceEvent.id)
             .with_for_update(skip_locked=True)
             .execution_options(populate_existing=True)
@@ -708,9 +763,13 @@ def _release_batch(session: Session, job: Job, zkts: dict, limit: int | None):
     users: dict = {}
     checked = None
     for event_id in candidates:
+        if event_id not in still_held:
+            gone.append(event_id)
+            checked = event_id
+            continue
         row = locked.get(event_id)
         if row is None:
-            break
+            break  # Locked elsewhere, or released between the two reads.
         zkt = _job_zkt(session, job, row.connector_id, zkts)
         user = None
         if zkt is not None:
@@ -758,14 +817,18 @@ def _release_batch(session: Session, job: Job, zkts: dict, limit: int | None):
     job.eligible_count += len(released)
     job.skipped_count += len(kept)
     job.excluded_count += len(left)
-    return evaluated, released, kept, left, waiting
+    # review_count is otherwise unused by this action: approved punches no
+    # longer held when the run reached them.
+    job.review_count += len(gone)
+    return evaluated, released, kept, left, gone, waiting
 
 
 def advance_once(session: Session, *, limit: int | None = None) -> int:
     """Advance the least recently served zone release by one paced batch.
 
-    Returns the number of new punches evaluated (0 when nothing new ran).
-    A stopped release only follows the punches it already released.
+    Returns the number of approved punches evaluated or passed as no longer
+    held (0 when nothing new ran). A stopped release only follows the
+    punches it already released.
     """
     if not dump_identity_release_enabled():
         return 0  # Paused by the owner's switch; nothing is released.
@@ -785,11 +848,13 @@ def advance_once(session: Session, *, limit: int | None = None) -> int:
     job.updated_at = now
     zkts: dict = {}
     rereleased = _follow_up(session, job, now, zkts)
-    evaluated, released, kept, left, waiting = 0, [], [], [], None
+    evaluated, released, kept, left, gone, waiting = 0, [], [], [], [], None
     if job.status == RELEASING:
-        evaluated, released, kept, left, waiting = _release_batch(session, job, zkts, limit)
+        evaluated, released, kept, left, gone, waiting = _release_batch(
+            session, job, zkts, limit
+        )
     job.last_error = waiting
-    if released or kept or left or rereleased:
+    if released or kept or left or gone or rereleased:
         append_audit(
             session,
             actor=job.actor,
@@ -811,6 +876,9 @@ def advance_once(session: Session, *, limit: int | None = None) -> int:
                 # Another proof passes: the next roster snapshot releases them.
                 "left_to_snapshot": len(left),
                 "left_to_snapshot_event_ids": left,
+                # Approved, but released elsewhere or no longer held when reached.
+                "no_longer_held": len(gone),
+                "no_longer_held_event_ids": gone,
                 "cursor": job.cursor,
             },
             request_id=f"{job.job_id}:{job.cursor}:{job.eligible_count}:{job.succeeded_count}",
@@ -834,7 +902,7 @@ def advance_once(session: Session, *, limit: int | None = None) -> int:
             after={"job_id": job.job_id, "stopped": stopped, **_counts(session, job)},
             request_id=f"{job.job_id}:completed",
         )
-    return evaluated
+    return evaluated + len(gone)
 
 
 def _counts(session: Session, job: Job) -> dict:
@@ -849,6 +917,7 @@ def _counts(session: Session, job: Job) -> dict:
         "waiting_oracle": by_status.get(WAITING, 0) + by_status.get(REHELD, 0),
         "kept_held": job.skipped_count + by_status.get("KEPT_HELD", 0),
         "left_to_snapshot": job.excluded_count,
+        "no_longer_held": job.review_count,
         "needs_review": by_status.get("NEEDS_REVIEW", 0),
     }
 

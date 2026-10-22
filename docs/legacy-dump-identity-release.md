@@ -99,16 +99,20 @@ will release it.
    - **Can be released**: the dump proof passes now;
    - **Next user list**: another proof passes; the next roster snapshot
      releases them, not this action.
-   The check changes nothing. Punches released earlier and held again by
-   delivery are shown separately and are not part of the check: whatever
-   released them checks them again.
+   The check changes nothing. Punches some proof released earlier that were
+   then held again (by delivery or a guard) are shown separately and are not
+   part of the check or of any release from it.
 2. Choose the groups, then **Release N punches**, give a reason, type
    `RELEASE <zone id>` and enter the administrator password.
-3. The worker releases at most the approved number, from the chosen groups
-   and up to the highest punch ID of the check, in batches of
+3. The approval freezes exactly the punches of the chosen groups, up to the
+   highest punch ID of the check, that are held and never released at that
+   moment (their ID runs and digest are kept on the run and in the approval
+   audit). It is refused if more are held than the check counted. The worker
+   releases at most the approved number of them, in batches of
    `..._BACKLOG_BATCH_SIZE`, re-checking every punch with the same proof and
-   database guard. Punches held after the check, and punches released and
-   held again since, are never included.
+   database guard. A frozen punch that another path released, or that left
+   the hold, before the run reaches it is passed and counted as "no longer
+   held". No other punch is ever included.
 4. If a chosen terminal's user list is partial or unstable, its serial awaits
    confirmation, or a new user list arrives while a batch runs, the release
    waits and checks those punches again; it never passes them. A long wait

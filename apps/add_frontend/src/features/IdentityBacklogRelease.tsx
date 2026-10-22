@@ -22,7 +22,7 @@ type Check = {
 export type BacklogRun = {
   job_id: string; zone_id: string; status: string; paused: boolean; waiting_reason: string | null; actor: string
   reason: string; connectors: string[]; checked_at: string | null; approved: number; released: number; delivered: number
-  waiting_oracle: number; kept_held: number; left_to_snapshot: number; needs_review: number; created_at: string
+  waiting_oracle: number; kept_held: number; left_to_snapshot: number; no_longer_held?: number; needs_review: number; created_at: string
   updated_at: string; completed_at: string | null
 }
 type Toast = { notice: (text: string) => void; error: (text: string) => void }
@@ -204,7 +204,7 @@ export function IdentityBacklogRelease({ devices, toast }: { devices: Device[]; 
           {nextSnapshot > 0 && <Metric label="Next user list" value={nextSnapshot} icon="list" detail="Another proof releases these" />}
           <Metric label="Stay held" value={held - provable - nextSnapshot} icon="alert" detail="Need other evidence or review" tone={held - provable - nextSnapshot ? 'warning' : 'neutral'} />
         </div>
-        {result.reheld > 0 && <p>{punches(result.reheld)} released earlier and held again by delivery are not part of this check. The release or user list that sent them checks them again.</p>}
+        {result.reheld > 0 && <p>{punches(result.reheld)} released earlier and held again are not part of this check. This release never takes them in.</p>}
         {!result.releaseEnabled && <p className="message pattern-blocked" role="alert">The release proof is turned off on this server. Nothing can be released.</p>}
         {result.groups.length > 0 ? <table className="identity-backlog-table">
           <caption>Choose the groups to release. Counts are frozen at the check.</caption>
@@ -226,7 +226,7 @@ export function IdentityBacklogRelease({ devices, toast }: { devices: Device[]; 
       </>}
       {run && <div className="safe-repair-run" role="status" aria-live="polite">
         <div className="safe-repair-heading"><h3>{run.paused ? 'Paused: release proof turned off' : runLabel[run.status] || run.status}</h3><span>Approved by {run.actor} · {dateTime(run.created_at)}</span></div>
-        <p>{run.delivered.toLocaleString()} confirmed by Oracle · {run.waiting_oracle.toLocaleString()} waiting for Oracle · {run.released.toLocaleString()} of {run.approved.toLocaleString()} approved released · {run.kept_held.toLocaleString()} kept held{run.left_to_snapshot ? ` · ${run.left_to_snapshot.toLocaleString()} left to the next user list` : ''}{run.needs_review ? ` · ${run.needs_review.toLocaleString()} need review` : ''}</p>
+        <p>{run.delivered.toLocaleString()} confirmed by Oracle · {run.waiting_oracle.toLocaleString()} waiting for Oracle · {run.released.toLocaleString()} of {run.approved.toLocaleString()} approved released · {run.kept_held.toLocaleString()} kept held{run.left_to_snapshot ? ` · ${run.left_to_snapshot.toLocaleString()} left to the next user list` : ''}{run.no_longer_held ? ` · ${run.no_longer_held.toLocaleString()} no longer held when reached` : ''}{run.needs_review ? ` · ${run.needs_review.toLocaleString()} need review` : ''}</p>
         {run.waiting_reason && <p>{waitingLabel[run.waiting_reason] || run.waiting_reason}</p>}
         <p>{run.reason}</p>
         {releasing && <div className="safe-repair-actions"><button className="button secondary" type="button" onClick={() => { setDialog('STOP'); setError('') }}>Stop</button><span>You can close this page. The release continues on ADD.</span></div>}
@@ -236,7 +236,7 @@ export function IdentityBacklogRelease({ devices, toast }: { devices: Device[]; 
       titleId="identity-backlog-title"
       title={dialog === 'START' ? `Release up to ${punches(selectedProvable)}` : 'Stop this release'}
       description={dialog === 'START'
-        ? `Only the ${selected.length === 1 ? 'chosen group' : `${selected.length} chosen groups`} of this check, and no more than ${punches(selectedProvable)}. ADD checks every punch again, with the same proof, as it releases it. A punch that no longer matches stays held.`
+        ? `Only punches of the ${selected.length === 1 ? 'chosen group' : `${selected.length} chosen groups`} that are held when you approve, and no more than ${punches(selectedProvable)}. ADD checks every punch again, with the same proof, as it releases it. A punch that no longer matches stays held.`
         : 'No more punches are released. Punches already released stay released: ADD keeps following them to Oracle and checks again any that delivery holds. The rest stay held.'}
       onClose={closeDialog}
     ><form className="dialog-body" onSubmit={submit}>

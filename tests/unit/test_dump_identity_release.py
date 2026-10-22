@@ -1287,6 +1287,65 @@ def test_owner_release_takes_only_punches_held_and_never_released_at_the_check(
     assert again["held_total"] == 0 and again["reheld_outside_check"] == 1
 
 
+def test_owner_release_is_frozen_to_the_punches_held_at_the_approval(db):
+    """Review finding: membership was re-evaluated live, so a punch that joined
+    the hold after the approval could be released in place of a checked one."""
+    connector = _connector(db)
+    zkt = connector.zkt_device
+    _snapshot(db, connector, "s0", utc_now() - timedelta(days=5))
+    outside, elsewhere, approved, repaired = (
+        _old_hold(db, connector, f"frozen-{name}")
+        for name in ("outside", "elsewhere", "approved", "repaired")
+    )
+    _snapshot(db, connector, "s1", utc_now())
+    # Another proof (safe repair here) released this one before and delivery
+    # held it again: it belongs to that release, not to this check.
+    repaired.identity_resolution_status = "RESOLVED_RETAINED_IDENTITY"
+    repaired.identity_repaired_at = utc_now() - timedelta(hours=1)
+    # Out of the hold during the check and the approval.
+    outside.ords_status = "QUARANTINED_MISSING_TERMINAL_PROVENANCE"
+    db.flush()
+    first, totals = check = _check(db, connector.zone_id)
+    assert first["held_total"] == 2 and first["reheld_outside_check"] == 1
+    job = _approve(db, connector.zone_id, key="frozen-2", check=check)
+    assert job.requested_count == 2 and job.scope["held_at_approval"] == 2
+    assert backlog._members_after(job.scope["members"], 0, 10) == [elsewhere.id, approved.id]
+    [approval] = _audits(db, "ATTENDANCE_IDENTITY_BACKLOG_RELEASE_APPROVED")
+    assert approval.after["members_digest"] == job.scope["members_digest"]
+
+    # After the approval: the quarantined punch is held again and its proof
+    # passes, and a roster-snapshot release reaches an approved punch first.
+    outside.ords_status = "BLOCKED_IDENTITY"
+    db.flush()
+    assert dump_release_outlook(db, outside)["proof_passes"]
+    user = db.scalar(select(DeviceUser).where(DeviceUser.user_id == "11"))
+    assert release_synced_cnic_attendance_event(
+        db, zkt=zkt, user=user, row=elsewhere,
+        dump_release=DumpIdentityRelease(held_since=None, remaining=1, rereleases_remaining=1),
+    )
+    db.flush()
+    while backlog.advance_once(db):
+        pass
+    assert approved.ords_status == "PENDING"
+    assert outside.ords_status == "BLOCKED_IDENTITY"  # never part of this run
+    assert repaired.ords_status == "BLOCKED_IDENTITY"
+    run = _run(db, job)
+    assert (run["released"], run["no_longer_held"], run["kept_held"]) == (1, 1, 0)
+    [batch] = _audits(db, "ATTENDANCE_IDENTITY_BACKLOG_RELEASE_BATCH")
+    assert batch.after["event_ids"] == [approved.id]
+    assert batch.after["no_longer_held_event_ids"] == [elsewhere.id]
+
+
+def test_frozen_members_are_stored_as_id_runs():
+    runs = backlog._id_ranges([8, 1, 2, 3, 5, 7])
+    assert runs == [[1, 3], [5, 5], [7, 8]]
+    assert backlog._members_after(runs, 0, 2) == [1, 2]
+    assert backlog._members_after(runs, 2, 3) == [3, 5, 7]
+    assert backlog._members_after(runs, 6, 10) == [7, 8]
+    assert backlog._members_after(runs, 8, 10) == []
+    assert backlog._members_after([], 0, 10) == []
+
+
 def test_owner_release_uses_only_the_dump_proof(db):
     """A punch another proof releases is left to the roster snapshot that applies it."""
     connector = _connector(db)
