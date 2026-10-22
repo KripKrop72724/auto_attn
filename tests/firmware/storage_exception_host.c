@@ -427,6 +427,9 @@ static int restarts(void)
     EXPECT(sx_next_step(&r, false, 0, &wait) == SX_NEXT_RESTART);
     r = at(SX_STATE_CONFIRMED, 0, 1, 0, t0);
     EXPECT(sx_next_step(&r, true, t0 + 10, &wait) == SX_NEXT_UNREPAIRED);
+    /* The CONFIRMED record failed to write: CONFIRMING on the valid image. */
+    r = at(SX_STATE_CONFIRMING, 0, 0, 0, 0);
+    EXPECT(sx_next_step(&r, true, t0, &wait) == SX_NEXT_RESTART);
     /* A round boot that could not record its outcome. */
     r = at(SX_STATE_CONFIRMED, 0, 1, 1, t0);
     EXPECT(sx_next_step(&r, true, t0 + 10, &wait) == SX_NEXT_UNREPAIRED);
@@ -459,7 +462,7 @@ static int restarts(void)
     /* Ended or other states: nothing (the caller resumes an UNREPAIRED report). */
     r = at(SX_STATE_UNREPAIRED, 0, 1, 1, t0);
     EXPECT(sx_next_step(&r, true, t0, &wait) == SX_NEXT_NONE);
-    r = at(SX_STATE_CONFIRMING, 0, 0, 0, 0);
+    r = at(SX_STATE_ABANDONED, 0, 0, 0, 0);
     EXPECT(sx_next_step(&r, true, t0, &wait) == SX_NEXT_NONE);
     sx_record_t invalid = r;
     invalid.crc ^= 1;

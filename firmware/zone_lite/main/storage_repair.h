@@ -53,6 +53,9 @@ bool storage_repair_exception_store(sx_record_t *record);
 /* This boot runs an image that confirmed under the exception (the record
  * says so and the running image is valid). */
 bool storage_repair_exception_active(void);
+/* The image has just marked itself valid under the exception: from now on
+ * this boot is an exception image's (the restart, the floor). */
+void storage_repair_exception_mark_confirmed(void);
 /* The first word of the running image's app_elf_sha256 (confirmation keeps
  * it), and whether the running image is unconfirmed. */
 uint32_t storage_repair_image_tag(void);

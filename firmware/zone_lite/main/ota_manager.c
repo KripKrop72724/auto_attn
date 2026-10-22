@@ -1201,11 +1201,14 @@ static sx_step_t sx_confirm_step(const boot_confirm_t *progress, uint32_t steppe
     /* The last look: the gate holds now, nothing wrote the store since the
      * window opened, and the budget is not spent (M6). */
     uint32_t spent = uptime_s() - stepped_s;
-    if (!sx_collect(&in, &store) || (verdict = sx_evaluate(&in)) != SX_OK || !sx_window_same(&s_sx.window, &store) ||
-        progress->active_seconds + spent >= BOOT_CONFIRM_ACTIVE_SECONDS ||
-        progress->elapsed_seconds + spent >= BOOT_CONFIRM_MAX_SECONDS) {
+    sx_reason_t last = !sx_collect(&in, &store) ? SX_STORAGE_UNKNOWN : sx_evaluate(&in);
+    if (last == SX_OK && !sx_window_same(&s_sx.window, &store)) last = SX_STORE_CHANGED;
+    if (last == SX_OK && (progress->active_seconds + spent >= BOOT_CONFIRM_ACTIVE_SECONDS ||
+                          progress->elapsed_seconds + spent >= BOOT_CONFIRM_MAX_SECONDS))
+        last = SX_BUDGET;
+    if (last != SX_OK) {
         s_sx.window.open = false;
-        sx_note(verdict != SX_OK ? verdict : !sx_window_same(&s_sx.window, &store) ? SX_STORE_CHANGED : SX_BUDGET);
+        sx_note(last);
         return SX_STEP_WAIT;
     }
     if (esp_ota_mark_app_valid_cancel_rollback() != ESP_OK) {
@@ -1214,6 +1217,7 @@ static sx_step_t sx_confirm_step(const boot_confirm_t *progress, uint32_t steppe
         return SX_STEP_FAILED;
     }
     s_sx.state = SX_STATE_CONFIRMED;
+    storage_repair_exception_mark_confirmed();
     /* A cut from here on boots a valid image: the record CONFIRMING already
      * means confirmed there, and READY_TO_BOOT on a valid image reconciles. */
     if (!sx_store_record(SX_STATE_CONFIRMED))

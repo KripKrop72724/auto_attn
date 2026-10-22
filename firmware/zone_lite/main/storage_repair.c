@@ -643,6 +643,11 @@ bool storage_repair_exception_record(sx_record_t *out)
 }
 
 bool storage_repair_exception_active(void) { return s_exception_active; }
+void storage_repair_exception_mark_confirmed(void)
+{
+    s_exception_active = true;
+    s_ota_floor = true;
+}
 uint32_t storage_repair_image_tag(void) { return s_image_tag; }
 bool storage_repair_running_pending(void) { return s_running_pending; }
 uint32_t storage_repair_store_writes(void) { return atomic_load(&s_store_writes); }

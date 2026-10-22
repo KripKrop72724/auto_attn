@@ -383,8 +383,10 @@ sx_next_t sx_next_step(const sx_record_t *record, bool time_known, uint32_t now_
     if (wait_s) *wait_s = 0;
     if (!sx_record_valid(record)) return SX_NEXT_NONE;
     sx_state_t state = (sx_state_t)record->state;
-    if (state == SX_STATE_CONFIRMED && !record->round_boots) {
-        /* The confirming boot: its one restart, at a capture safepoint. */
+    if ((state == SX_STATE_CONFIRMED || state == SX_STATE_CONFIRMING) && !record->round_boots) {
+        /* The confirming boot: its one restart, at a capture safepoint (also
+         * when the CONFIRMED record could not be written: CONFIRMING on a
+         * valid image is confirmed). */
         return record->restarts ? SX_NEXT_UNREPAIRED : SX_NEXT_RESTART;
     }
     if (state != SX_STATE_ROUND_SHORT && state != SX_STATE_CONFIRMED) return SX_NEXT_NONE;
