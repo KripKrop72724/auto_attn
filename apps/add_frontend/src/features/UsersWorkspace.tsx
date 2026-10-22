@@ -774,7 +774,7 @@ export function UsersView({
         <div className="user-directory-cell user-person" data-label="Identity">
           <label className="user-select-hit"><input className="user-select" type="checkbox" aria-label={`Select ${user.display_name} for bulk deletion`} checked={selectedUserKeys.has(user.user_key)} disabled={!rowCanDelete || validatingSelection} onChange={(event) => toggleUser(user.user_key, event.target.checked)} /><span className="sr-only">Select user</span></label>
           <span className="avatar">{user.display_name.slice(0, 2).toUpperCase()}</span>
-          <span><strong>{user.display_name}</strong><small>{user.identity_conflict_code ? identityConflictText(user) : user.cnic_masked || 'CNIC missing · punches blocked until enriched'}</small></span>
+          <span><strong>{user.display_name}</strong><small>{user.identity_conflict_code ? identityConflictText(user) : user.cnic_masked || (user.cnic_format_suspect ? 'CNIC typed in an unsupported format · confirm with HR, then edit' : 'CNIC missing · punches blocked until enriched')}</small></span>
         </div>
         <div className="user-directory-cell" data-label="Terminal record"><strong>User {user.user_id}</strong><small>UID {user.uid} · version {user.row_version}</small><code>{user.machine_name_preview || 'No machine preview'}</code></div>
         <div className="user-directory-cell user-state-stack" data-label="Role and state">{user.privilege === 14 ? <StatusBadge state="ADMINISTRATOR" /> : <strong>Regular user</strong>}{user.current_command_state ? <StatusBadge state={user.current_command_state} /> : <small>{user.shift_worker ? 'Shift worker' : 'Standard worker'}</small>}</div>

@@ -42,13 +42,15 @@ def content_check_facts(proof, payload):
 
 
 def split_claims(claims):
+    from zk_add.attendance_direct_ords import superseded_by_automatic_release
+
     ordinary, forced = [], []
     with session_scope() as session:
         for claim in claims:
             row = session.get(OrdsOutbox, claim[0])
             event = session.get(AttendanceEvent, row.attendance_event_id) if row else None
             decision = decision_for(session, event) if event else None
-            if decision is None:
+            if decision is None or superseded_by_automatic_release(session, event, decision):
                 ordinary.append(claim)
                 continue
             connector = session.get(Connector, event.connector_id)

@@ -955,11 +955,34 @@ def claim_ords_batch(limit: int) -> list[tuple[int, dict, int, bool]]:
                 else None
             )
             from zk_add.attendance_manual_guard import delivery_authorized, decision_for
+            from zk_add.attendance_direct_ords import (
+                TAKEOVER,
+                TAKEOVER_UNCERTAIN,
+                automatic_takeover,
+                hold_uncertain_takeover,
+            )
             decision = decision_for(session, event) if event else None
-            if decision and decision.proof.get("policy") == "manual-direct-ords-v1":
+            # A stopped direct approval never blocks ADD's own later automatic
+            # release: ordinary delivery below owns that punch again, unless
+            # the approval may already have POSTed another CNIC.
+            takeover = automatic_takeover(session, event, decision) if decision else None
+            automatic_owner = takeover == TAKEOVER
+            if decision and decision.proof.get("policy") == "manual-direct-ords-v1" and not automatic_owner:
                 connector = session.get(Connector, event.connector_id)
                 from zk_add.attendance_force_release import delivery_payload
+                from zk_add.attendance_release_safety import time_refusal
 
+                if time_refusal(event):
+                    # An administrator approval never makes an impossible time true.
+                    row.status = event.ords_status = "QUARANTINED_INVALID_DEVICE_TIME"
+                    row.last_error = "The punch time is invalid; it is never sent to Oracle."
+                    row.next_attempt_at = None
+                    continue
+                if takeover == TAKEOVER_UNCERTAIN:
+                    # Oracle may hold the approval's CNIC; a 409 to the
+                    # automatic payload would certify another person.
+                    hold_uncertain_takeover(session, event, row, decision)
+                    continue
                 candidate_payload = delivery_payload(session, event, connector)
                 if candidate_payload is None:
                     row.status = event.ords_status = "BLOCKED_IDENTITY"
@@ -1032,7 +1055,7 @@ def claim_ords_batch(limit: int) -> list[tuple[int, dict, int, bool]]:
                 )
                 continue
             candidate_payload = oracle_payload(connector, zkt, event, cnic)
-            if decision_for(session, event):
+            if decision_for(session, event) and not automatic_owner:
                 from zk_add.attendance_force_release import delivery_payload
                 candidate_payload = delivery_payload(session, event, connector)
                 if candidate_payload is None:
