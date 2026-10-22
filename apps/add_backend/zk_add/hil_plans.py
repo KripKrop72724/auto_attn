@@ -404,21 +404,27 @@ def _stage_campaigns(session: Session, plan: FirmwareHilPlan, stage: int):
 def _plan_campaigns(session: Session, plan: FirmwareHilPlan):
     from zk_add.ota import FirmwareCampaign
     return list(session.scalars(select(FirmwareCampaign).where(FirmwareCampaign.actor == plan_actor(plan))
-                                .order_by(FirmwareCampaign.id).with_for_update()
-                                .execution_options(populate_existing=True)))
+                                .order_by(FirmwareCampaign.id).execution_options(populate_existing=True)))
 
 
 def _never_offered_campaigns(session: Session, plan: FirmwareHilPlan):
-    """Plan campaigns whose every deployment is still PENDING and never offered."""
-    from zk_add.ota import FirmwareDeployment
+    """Plan campaigns whose every deployment is still PENDING and never offered.
+
+    Locks each deployment before its campaign, the order record_progress uses.
+    """
+    from zk_add.ota import FirmwareCampaign, FirmwareDeployment
     result = []
     for campaign in _plan_campaigns(session, plan):
         if campaign.status not in {"ACTIVE", "PAUSED"}:
             continue
         deployments = list(session.scalars(select(FirmwareDeployment).where(
-            FirmwareDeployment.campaign_id == campaign.id).with_for_update()
+            FirmwareDeployment.campaign_id == campaign.id).order_by(FirmwareDeployment.id).with_for_update()
             .execution_options(populate_existing=True)))
-        if deployments and all(row.status == "PENDING" and row.offered_at is None for row in deployments):
+        if not deployments or not all(row.status == "PENDING" and row.offered_at is None for row in deployments):
+            continue
+        campaign = session.scalar(select(FirmwareCampaign).where(FirmwareCampaign.id == campaign.id)
+                                  .with_for_update().execution_options(populate_existing=True))
+        if campaign.status in {"ACTIVE", "PAUSED"}:
             result.append((campaign, deployments))
     return result
 
@@ -748,8 +754,8 @@ def control_plan(session: Session, *, plan_id: str, action: str, actor: str, rea
         campaigns = _plan_campaigns(session, plan)
         in_flight = list(session.scalars(select(FirmwareDeployment).where(
             FirmwareDeployment.campaign_id.in_([row.id for row in campaigns]),
-            FirmwareDeployment.status.in_(CANCEL_REFUSED_STATES)).with_for_update()
-            .execution_options(populate_existing=True))) if campaigns else []
+            FirmwareDeployment.status.in_(CANCEL_REFUSED_STATES)).order_by(FirmwareDeployment.id)
+            .with_for_update().execution_options(populate_existing=True))) if campaigns else []
         if in_flight:
             raise ValueError("Cancel refused: deployment " + ", ".join(
                 f"{row.deployment_id} is {row.status}" for row in in_flight)
