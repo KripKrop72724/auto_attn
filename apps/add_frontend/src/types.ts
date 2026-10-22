@@ -696,6 +696,7 @@ export interface SourceException {
     | 'TERMINAL_NEWEST_RECORD_UNSETTLED'
     | 'TERMINAL_NEWEST_RECORD_UNCONFIRMED'
     | 'TERMINAL_NEWEST_RECORD_CORRECTED'
+    | 'TERMINAL_NEWEST_RECORD_OUT_OF_ORDER'
     | null
   operator_reason?: string | null
   source_correction_ids?: string[]

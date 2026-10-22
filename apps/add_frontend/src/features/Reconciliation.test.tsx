@@ -623,6 +623,44 @@ describe('Reviewed source-exception continuation', () => {
     expect(screen.queryByText('Held for verified historical identity')).toBeNull()
   })
 
+  it('shows confirmed newest-record bytes out of time order as a reviewable exclusion', async () => {
+    const outOfOrder: SourceException = {
+      ...sourceException,
+      source_kind: 'TAIL',
+      ordinal: 15381,
+      disposition: 'IDENTITY_UNRESOLVED',
+      error_code: 'TERMINAL_NEWEST_RECORD_UNCONFIRMED',
+      oracle_action: 'EXCLUDED_FAIL_CLOSED',
+      source_condition: 'TERMINAL_NEWEST_RECORD_OUT_OF_ORDER',
+      operator_reason:
+        'A complete reconcile read the same bytes again while later records existed, but their time does not lie between the punches before and after it.',
+    }
+    const base = reconciliationFetch()
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = new URL(String(input), 'https://add.test').pathname
+      if (path === `/api/v1/source-exceptions/${sourceException.id}`) return json(outOfOrder)
+      const response = await base(input, init)
+      const body = await response.json()
+      if (path === '/api/v1/source-exceptions') body.rows = [outOfOrder]
+      return json(body)
+    }))
+    window.history.replaceState(
+      null,
+      '',
+      `/reconciliation?tab=source-exceptions&job_id=${job().job_id}&device_id=${device.connector_id}`,
+    )
+    render(<Harness />)
+
+    const row = await screen.findByRole('listitem')
+    expect(within(row).getByText(/Newest-record bytes out of time order; excluded for review/)).toBeTruthy()
+    fireEvent.click(within(row).getByRole('button', { name: 'Inspect' }))
+    expect(
+      await screen.findByRole('heading', { name: 'Excluded: newest-record bytes out of time order' }),
+    ).toBeTruthy()
+    expect(screen.getByText(/does not lie between the punches before and after it/)).toBeTruthy()
+    expect(screen.queryByText('Held for verified historical identity')).toBeNull()
+  })
+
   it('holds a job whose newest-record slot has a punch ADD has not received', async () => {
     const pending = assurance({
       state: 'NEWEST_PUNCH_UNRECEIVED', reviewed: 1, open: 1, newest_punch_unreceived: 1,

@@ -151,8 +151,11 @@ POLICY = {
         "newest terminal record."),
     "TERMINAL_NEWEST_RECORD_PUNCH_UNRECEIVED": Policy(
         108, False, "LATCHED",
-        "Clears when an operator resolves it after a complete source reconcile reads the slot or LIVE "
-        "capture delivers the punch."),
+        "Clears by itself once ADD accounts for every listed slot: a complete source reconcile reads it "
+        "while later records exist, or LIVE capture delivers its punch."),
+    "TERMINAL_NEWEST_RECORD_RELEASE_HELD": Policy(
+        108, False, "LATCHED",
+        "Clears by itself once every listed punch is released or confirmed by a complete source reconcile."),
     "USER_DELETION_JOB_INCOMPLETE": Policy(
         109, False, "LATCHED", "Clears when the user deletion job completes."),
     "DUPLICATE_USER_CNIC": Policy(109, False, "LATCHED", "Clears when the duplicate CNIC is resolved."),

@@ -16,42 +16,48 @@ Lite generation that runs source tails:
 
 So a read of the newest slot says nothing about the punch the slot will hold,
 and identity bytes read there may belong to someone else. A tail chunk reports
-the count it read against, so its newest read is observed, not assumed. ADD
-keeps such a read fail-closed:
+the count it read against, so its newest read is observed. A baseline's final
+ordinal is assumed to be such a read: firmware anchors the cutoff at the
+latest count and no chunk reports the count it was read against.
 
-* A tail's newest read that decodes as a punch no capture has delivered is
-  held, not ingested: its row is ``IDENTITY_UNRESOLVED`` with the code
-  ``TERMINAL_NEWEST_RECORD_UNCONFIRMED`` and its claim stays encrypted. If
-  LIVE capture delivers the same punch, that delivery stands and accounts for
-  the row; a later read of the same bytes while later records exist settles
-  and ingests it.
-* An attendance event whose only source evidence is an unconfirmed tail newest
-  read is never released automatically, by force release or by direct ORDS.
+ADD keeps such reads fail-closed:
 
-A baseline's final ordinal is only assumed to be the newest slot: no chunk
-reports the count it was read against. It is labelled and settled like a
-newest read, but a punch read there is ingested as before.
+* A newest read (tail or baseline final ordinal) that decodes as a punch no
+  capture has delivered is held, not ingested: its row is
+  ``IDENTITY_UNRESOLVED`` with the code ``TERMINAL_NEWEST_RECORD_UNCONFIRMED``,
+  its claim stays encrypted and the HIGH unreceived-punch alert is raised. If
+  LIVE capture delivers the same punch, that delivery stands.
+* An attendance event whose only source evidence is a newest read, or a read a
+  reconcile has since replaced, is never released automatically, by force
+  release or by direct ORDS. The automatic path raises an alert when it holds
+  one back.
+* After a tail moves past a newest read, its next tail shows the terminal has
+  written that slot. When no LIVE punch ADD holds can be the one that filled
+  it, ADD raises the unreceived-punch alert so an operator runs a reconcile.
 
 Only a complete source reconcile in the same terminal generation and source
-epoch, reading the ordinal while later records existed, changes such a row,
-and only through receipts that reconcile commits:
+epoch, reading the ordinal while later records existed (anywhere but its own
+final ordinal), changes such a row, through receipts that reconcile commits:
 
 * different bytes settle the slot: the fresh read becomes the canonical row
   through ordinary ingestion (event-UID de-duplication against LIVE rows and
-  every identity rule still apply) and the unsettled read stays as
-  non-canonical evidence. A read that delivered a punch is settled this way
-  only when the same job read its bytes at an earlier ordinal, which proves it
-  was a byte copy of that record; otherwise the reconcile stops for review;
+  every identity rule still apply) and the earlier read stays as
+  non-canonical evidence. When the earlier read had delivered a punch that no
+  other evidence holds, or carries a source time correction, the reconcile
+  still settles the slot and raises a CRITICAL alert for HR to verify that
+  punch, which is held back from every guarded release path;
 * identical bytes confirm the row as a genuine record and are kept as a
-  non-canonical re-read receipt; a held punch is then settled and ingested;
+  non-canonical re-read receipt. A held punch confirmed this way is settled
+  and ingested when its time lies between its neighbours' punches; otherwise
+  it stays excluded as an out-of-order record for review;
 * a re-read at the reconcile's own final ordinal is again a possible
-  newest-slot read, and is kept only as a non-canonical re-read receipt.
+  newest-slot read, and is kept only as a non-canonical re-read receipt. One
+  that decodes as a punch ADD has not received holds the job's assurance.
 
-A row that already carries a source time correction is never settled: the
-correction derived a punch from bytes that were not the slot's punch, so the
-reconcile stops and raises an alert for HR to verify that punch. A tail
-replayed after a cursor rewind never changes a canonical row; its reads are
-kept as receipts and a punch ADD has not received raises an alert.
+A tail replayed after a cursor rewind never changes a canonical row; its reads
+made while later records existed are kept as receipts. A new terminal
+generation compares its reads with the previous generation's ledger, except
+where that ledger holds a newest read.
 """
 from __future__ import annotations
 
@@ -72,6 +78,7 @@ from zk_add.models import (
     AttendanceSourceCorrection,
     AuditEvent,
     Connector,
+    DeviceAlert,
     ReconciliationCoverage,
     ReconciliationEvent,
     ReconciliationJob,
@@ -79,13 +86,14 @@ from zk_add.models import (
     TerminalRecordManifest,
     TerminalRecordReview,
 )
-from zk_add.time_utils import ensure_utc
+from zk_add.time_utils import ensure_utc, utc_now
 
 
 # Operator-facing conditions. Stored reader codes stay exactly as the reader sent them.
 UNSETTLED_CONDITION = "TERMINAL_NEWEST_RECORD_UNSETTLED"
 UNCONFIRMED_CONDITION = "TERMINAL_NEWEST_RECORD_UNCONFIRMED"
 CORRECTED_CONDITION = "TERMINAL_NEWEST_RECORD_CORRECTED"
+OUT_OF_ORDER_CONDITION = "TERMINAL_NEWEST_RECORD_OUT_OF_ORDER"
 # ADD's own code on a held newest-slot punch (the reader's claim stays encrypted).
 HELD_CODE = UNCONFIRMED_CONDITION
 REPLAY_SUPERSEDED_CODE = "SOURCE_TAIL_REPLAY_SUPERSEDED"
@@ -93,32 +101,41 @@ REPLAY_SUPERSEDED_CODE = "SOURCE_TAIL_REPLAY_SUPERSEDED"
 SETTLED_STATE = "SOURCE_NEWEST_RECORD_SETTLED"
 CONFIRMED_STATE = "SOURCE_NEWEST_RECORD_CONFIRMED"
 REREAD_STATE = "SOURCE_NEWEST_RECORD_REREAD"
+HELD_STATE = "SOURCE_NEWEST_RECORD_HELD"
+OUT_OF_ORDER_STATE = "SOURCE_NEWEST_RECORD_OUT_OF_ORDER"
+LINEAGE_STATE = "SOURCE_NEWEST_RECORD_LINEAGE"
 PROBE_REQUEUED_STATE = "SOURCE_DIVERGENCE_NEWEST_RECORD"
-# Reconciliation safety holds, the source-exception assurance state and alerts.
-CORRECTED_HOLD = "SOURCE_NEWEST_RECORD_CORRECTED"
+# Reconciliation safety holds and the source-exception assurance state.
 OPEN_JOB_HOLD = "SOURCE_NEWEST_RECORD_JOB_OPEN"
-CHANGED_HOLD = "SOURCE_NEWEST_RECORD_CHANGED"
 PUNCH_PENDING_HOLD = "SOURCE_NEWEST_PUNCH_UNRECEIVED"
 PUNCH_PENDING_STATE = "NEWEST_PUNCH_UNRECEIVED"
+# Alerts.
 CORRECTED_ALERT = "TERMINAL_NEWEST_RECORD_CORRECTED"
 CHANGED_ALERT = "TERMINAL_NEWEST_RECORD_CHANGED"
 UNRECEIVED_ALERT = "TERMINAL_NEWEST_RECORD_PUNCH_UNRECEIVED"
+RELEASE_HELD_ALERT = "TERMINAL_NEWEST_RECORD_RELEASE_HELD"
 PROBE_SUPERSEDED_STATE = "SUPERSEDED_BY_NEWEST_RECORD_RULE"
+# Why a slot is on the unreceived-punch alert.
+HELD_CAUSE = "HELD_NEWEST_READ"
+FILLED_CAUSE = "SLOT_FILLED_UNSEEN"
 # Non-canonical receipts: a reconcile's re-read of a newest-slot row, and a
 # verified tail replay's read of a committed newest-slot row.
 REREAD_SOURCE_KIND = "BASELINE_REREAD"
 REPLAY_SOURCE_KIND = "TAIL_REPLAY"
 RECEIPT_SOURCE_KINDS = (REREAD_SOURCE_KIND, REPLAY_SOURCE_KIND)
+# Source kinds of a terminal read; a non-canonical one was replaced by a settlement.
+READ_SOURCE_KINDS = ("TAIL", "BASELINE", "RECOVERY_PREFIX")
 # The interpretation a newest-slot claim was stored under.
 GUARD_VERSION = "zkt-newest-slot-guard-1"
 EXCEPTION_DISPOSITIONS = frozenset({"INVALID_TIME", "MALFORMED", "IDENTITY_UNRESOLVED"})
-# Rows that delivered no attendance of their own: a fail-closed exception
-# (including a held punch), or a byte copy of an earlier record that only links
-# that record's event. Raw custody rows are never settled: their interpretation
-# belongs to custody.
+# Rows labelled as unsettled newest reads in the exception inspector.
 SETTLEABLE_DISPOSITIONS = EXCEPTION_DISPOSITIONS | {"TERMINAL_DUPLICATE"}
+PARSED_DISPOSITIONS = frozenset({"EVENT", "BLOCKED_IDENTITY", "TERMINAL_DUPLICATE"})
 LIVE_SOURCES = frozenset({"LIVE", "LIVE_POLL"})
-ALERT_ORDINAL_LIMIT = 50
+RELEASE_BLOCKED_STATUSES = frozenset({"BLOCKED_IDENTITY", "WAITING_FOR_SNAPSHOT"})
+# Entries an open alert keeps; its count and oldest ordinal cover the rest.
+ALERT_SLOT_LIMIT = 200
+ALERT_REFRESH_LIMIT = 100
 OPERATOR_REASON = (
     "The terminal reported this ordinal as its newest record before it had written the "
     "record. These bytes are not the punch in this slot: nothing was sent to Oracle and they "
@@ -135,14 +152,25 @@ UNCONFIRMED_REASON = (
     "written. They decode as a punch that no capture has delivered to ADD, so ADD holds them "
     "instead of sending a punch that may belong to someone else or never happened. Nothing "
     "was sent to Oracle and they cannot be corrected. If LIVE capture delivers the same punch, "
-    "that delivery stands. A later complete source reconcile that reads the same bytes while "
-    "later records exist ingests the punch; one that reads other bytes replaces this row."
+    "that delivery stands. A later complete source reconcile that reads this slot while later "
+    "records exist ingests the punch when it reads the same bytes, or replaces this row."
 )
 CORRECTED_REASON = (
     "A source time correction was created from this row before ADD recognised it as the "
     "terminal's unwritten newest record. Its bytes are not the punch in this slot, so the "
-    "corrected punch may belong to someone else. HR must verify that punch. ADD will not "
-    "settle this slot automatically; a reconcile that reads different bytes here stops."
+    "corrected punch may belong to someone else. HR must verify that punch."
+)
+OUT_OF_ORDER_REASON = (
+    "A complete reconcile read the same bytes again while later records existed, so the "
+    "terminal really holds them in this slot, but their time does not lie between the "
+    "punches before and after it. They may be stale bytes the terminal never overwrote, with "
+    "another person's identity, so ADD did not ingest them. Nothing was sent to Oracle. "
+    "Review the row; it cannot be corrected."
+)
+UNRECEIVED_MESSAGE = (
+    "A terminal newest-record slot holds, or may hold, a punch ADD has not received. Run a "
+    "complete source reconcile after the next punch on this terminal so ADD reads the slot "
+    "while a later record exists. LIVE capture delivering the same punch also clears a slot."
 )
 
 
@@ -238,7 +266,9 @@ def newest_read_ids(session: Session, rows, *, observed_only: bool = False) -> s
     Reconciliation only settles canonical tail rows into baseline rows away
     from a job's final ordinal, so a settled row is never included either.
     """
-    rows = list(rows)
+    rows = [row for row in rows if row.disposition != "RAW_PRESERVED"]
+    if not rows:
+        return set()
     by_id = {row.id: row for row in rows}
     reads = _stored_reads(session, rows)
     found: dict[int, TerminalRecordManifest] = {}
@@ -287,7 +317,7 @@ def newest_read_ids(session: Session, rows, *, observed_only: bool = False) -> s
 
 
 def unsettled_newest_ids(session: Session, rows) -> set[int]:
-    """Newest-slot rows that produced no attendance of their own, so a re-read may settle them."""
+    """Newest-slot rows that produced no attendance of their own, as the inspector labels them."""
     return newest_read_ids(
         session, [row for row in rows if row.disposition in SETTLEABLE_DISPOSITIONS]
     )
@@ -297,31 +327,71 @@ def is_unsettled_newest(session: Session, row: TerminalRecordManifest) -> bool:
     return row.id in unsettled_newest_ids(session, [row])
 
 
+def out_of_order_ids(session: Session, rows) -> set[int]:
+    """Held rows a reconcile confirmed but left excluded because their time is out of order.
+
+    A held row is always a newest read; once a re-read with identical bytes
+    while later records existed confirms it, it is no longer one. Such a row
+    was not settled because its punch time did not lie between its
+    neighbours'. It is an ordinary reviewable exception, never a pending punch.
+    """
+    held = [row for row in rows if is_held(row)]
+    if not held:
+        return set()
+    return {row.id for row in held} - newest_read_ids(session, held)
+
+
 def newest_only_event_ids(session: Session, events) -> set[int]:
-    """Attendance events whose only source evidence is an unconfirmed tail newest read.
+    """Attendance events whose only source evidence is a newest read or a replaced read.
 
     A LIVE capture is independent evidence of its own punch. Any other event
-    linked only from canonical rows that a tail read as the terminal's newest
-    slot is not proof of a punch, and may carry someone else's identity bytes.
-    A baseline's final ordinal is only assumed to be that slot and keeps the
-    ordinary release rules.
+    whose every source row is a read of the terminal's newest slot (observed
+    by a tail or assumed at a baseline's final ordinal, and not confirmed
+    since), or a read a reconcile has since replaced with the slot's real
+    record, is not proof of a punch and may carry someone else's identity
+    bytes. An event derived by a source time correction from such a row is
+    treated the same way.
     """
     ids = {event.id for event in events
            if event is not None and event.id is not None and event.source not in LIVE_SOURCES}
     if not ids:
         return set()
-    rows = session.scalars(select(TerminalRecordManifest).where(
+    linked: dict[int, list[TerminalRecordManifest]] = defaultdict(list)
+    for row in session.scalars(select(TerminalRecordManifest).where(
         TerminalRecordManifest.attendance_event_id.in_(ids),
-        TerminalRecordManifest.canonical_source == True,  # noqa: E712
+        or_(TerminalRecordManifest.canonical_source == True,  # noqa: E712
+            TerminalRecordManifest.source_kind.in_(READ_SOURCE_KINDS)),
+    )).all():
+        linked[row.attendance_event_id].append(row)
+    derived: dict[int, list[TerminalRecordManifest]] = defaultdict(list)
+    corrections = session.execute(select(
+        AttendanceSourceCorrection.derived_attendance_event_id, AttendanceSourceCorrection.manifest_id,
+    ).where(
+        AttendanceSourceCorrection.derived_attendance_event_id.in_(ids),
+        AttendanceSourceCorrection.status == "CREATED",
+        AttendanceSourceCorrection.manifest_id.is_not(None),
     )).all()
+    if corrections:
+        sources = {row.id: row for row in session.scalars(select(TerminalRecordManifest).where(
+            TerminalRecordManifest.id.in_({manifest_id for _, manifest_id in corrections}))).all()}
+        for event_id, manifest_id in corrections:
+            if manifest_id in sources:
+                derived[event_id].append(sources[manifest_id])
+    rows = [row for items in (*linked.values(), *derived.values()) for row in items]
     if not rows:
         return set()
-    newest = newest_read_ids(
-        session, [row for row in rows if row.disposition != "RAW_PRESERVED"], observed_only=True)
-    linked: dict[int, list[int]] = defaultdict(list)
-    for row in rows:
-        linked[row.attendance_event_id].append(row.id)
-    return {event_id for event_id, row_ids in linked.items() if all(row_id in newest for row_id in row_ids)}
+    newest = newest_read_ids(session, [row for row in rows if row.canonical_source])
+
+    def unproven(row: TerminalRecordManifest) -> bool:
+        if row.disposition == "RAW_PRESERVED":
+            return False
+        return not row.canonical_source or row.id in newest
+
+    return {
+        event_id for event_id in ids
+        if (items := [*linked.get(event_id, []), *derived.get(event_id, [])])
+        and all(unproven(row) for row in items)
+    }
 
 
 def claim_evidence(source, *, reason: str) -> dict:
@@ -372,6 +442,15 @@ def source_punch(source) -> dict | None:
     return source.event.model_dump(mode="json")
 
 
+def _punch_time(value) -> datetime | None:
+    if isinstance(value, datetime):
+        return ensure_utc(value)
+    try:
+        return ensure_utc(datetime.fromisoformat(str(value).replace("Z", "+00:00")))
+    except (TypeError, ValueError):
+        return None
+
+
 def received_events(session: Session, *, connector_id: int, zkt_device_id: int, punches: dict) -> dict:
     """For each claimed punch, the event of this terminal binding that already holds it, or None.
 
@@ -391,17 +470,14 @@ def received_events(session: Session, *, connector_id: int, zkt_device_id: int, 
         same = False
         if (row is not None and row.connector_id == connector_id and row.zkt_device_id == zkt_device_id
                 and row.user_id == punch.get("user_id")):
-            try:
-                same = ensure_utc(row.device_event_time) == ensure_utc(
-                    datetime.fromisoformat(str(punch["device_event_time"]).replace("Z", "+00:00")))
-            except (TypeError, ValueError):
-                same = False
+            claimed = _punch_time(punch.get("device_event_time"))
+            same = claimed is not None and ensure_utc(row.device_event_time) == claimed
         found[key] = row.id if same else None
     return found
 
 
 def held_newest_uids(session: Session, *, records, newest_ordinal: int | None) -> dict[int, str]:
-    """A tail's newest reads that decode as a punch no capture delivered: ``{ordinal: event_uid}``.
+    """Newest reads that decode as a punch no capture delivered: ``{ordinal: event_uid}``.
 
     A punch already held by ADD (normally LIVE capture, or an earlier record
     of this read that the newest slot copies) is linked as before.
@@ -467,64 +543,106 @@ def same_source_read(prior: TerminalRecordManifest, source) -> bool:
     )
 
 
-def copy_proven(session: Session, *, job: ReconciliationJob, prior: TerminalRecordManifest, records,
-                start_ordinal: int) -> bool:
-    """Whether this job read ``prior``'s bytes at an earlier ordinal, proving them a byte copy.
+def _source_time(source) -> datetime | None:
+    from zk_add import reconciliation as rec
 
-    Every canonical row below the chunk's start is this job's own read: each
-    either matched it byte for byte or was settled by it.
+    if (source.event is None or source.disposition not in {"EVENT", "BLOCKED_IDENTITY"}
+            or rec._source_identity_missing(source)):
+        return None
+    return ensure_utc(source.event.device_event_time)
+
+
+def in_time_order(session: Session, *, job: ReconciliationJob, ordinal: int, source, records) -> bool:
+    """Whether a confirmed newest-slot punch lies between its neighbours' punch times.
+
+    The nearest decodable punch below and above the ordinal comes from this
+    chunk, else from the epoch's canonical rows. A missing neighbour leaves
+    that side open. A terminal that never rewrote a stale slot would return
+    an older punch there, possibly another person's, which fails this check.
     """
-    if any(source.ordinal < prior.ordinal and source.raw_record_digest == prior.raw_record_digest
-           for source in records):
-        return True
-    return session.scalar(select(TerminalRecordManifest.id).where(
-        TerminalRecordManifest.zkt_device_id == job.zkt_device_id,
-        TerminalRecordManifest.generation == job.terminal_generation,
-        _epoch_clause(TerminalRecordManifest.source_epoch_id, job.source_epoch_id),
+    punch_time = _source_time(source)
+    if punch_time is None:
+        return False
+    timed = [(row.ordinal, value) for row in records if (value := _source_time(row)) is not None]
+    lower = max(((o, t) for o, t in timed if o < ordinal), default=None)
+    upper = min(((o, t) for o, t in timed if o > ordinal), default=None)
+
+    def canonical(bound):
+        statement = (
+            select(AttendanceEvent.device_event_time)
+            .join(TerminalRecordManifest, TerminalRecordManifest.attendance_event_id == AttendanceEvent.id)
+            .where(
+                TerminalRecordManifest.zkt_device_id == job.zkt_device_id,
+                TerminalRecordManifest.generation == job.terminal_generation,
+                _epoch_clause(TerminalRecordManifest.source_epoch_id, job.source_epoch_id),
+                TerminalRecordManifest.canonical_source == True,  # noqa: E712
+                TerminalRecordManifest.disposition.in_(PARSED_DISPOSITIONS),
+            )
+        )
+        if bound == "lower":
+            statement = statement.where(TerminalRecordManifest.ordinal < ordinal).order_by(
+                TerminalRecordManifest.ordinal.desc())
+        else:
+            statement = statement.where(TerminalRecordManifest.ordinal > ordinal).order_by(
+                TerminalRecordManifest.ordinal.asc())
+        value = session.scalar(statement.limit(1))
+        return ensure_utc(value) if value is not None else None
+
+    low = lower[1] if lower is not None else canonical("lower")
+    high = upper[1] if upper is not None else canonical("upper")
+    return (low is None or low <= punch_time) and (high is None or punch_time <= high)
+
+
+def orphaned_events(session: Session, pairs, *, records=()) -> dict[int, int]:
+    """``{prior_id: event_id}`` for replaced reads that delivered a punch nothing else holds.
+
+    A punch is held elsewhere when LIVE captured it, the fresh read decodes to
+    the same event, or a canonical row at another ordinal links it (the
+    newest read was then a byte copy of that record), including a row the
+    same chunk is about to store from ``records``.
+    """
+    pairs = [(prior, source) for prior, source in pairs if prior.attendance_event_id is not None]
+    read_elsewhere = {(source.event.event_uid, source.ordinal) for source in records if source.event is not None}
+    if not pairs:
+        return {}
+    event_ids = {prior.attendance_event_id for prior, _ in pairs}
+    events = {row.id: row for row in session.scalars(
+        select(AttendanceEvent).where(AttendanceEvent.id.in_(event_ids))).all()}
+    linked: dict[int, set[int]] = defaultdict(set)
+    for event_id, ordinal in session.execute(select(
+        TerminalRecordManifest.attendance_event_id, TerminalRecordManifest.ordinal,
+    ).where(
+        TerminalRecordManifest.attendance_event_id.in_(event_ids),
         TerminalRecordManifest.canonical_source == True,  # noqa: E712
-        TerminalRecordManifest.ordinal < min(start_ordinal, prior.ordinal),
-        TerminalRecordManifest.raw_record_digest == prior.raw_record_digest,
-    ).limit(1)) is not None
+    )).all():
+        linked[event_id].add(ordinal)
+    found = {}
+    for prior, source in pairs:
+        event = events.get(prior.attendance_event_id)
+        if event is None or event.source in LIVE_SOURCES:
+            continue
+        if source is not None and source.event is not None and source.event.event_uid == event.event_uid:
+            continue
+        # A copy of the same read at the same ordinal (a recovery epoch's) is not other evidence.
+        if linked.get(event.id, set()) - {prior.ordinal}:
+            continue
+        if any(uid == event.event_uid and ordinal != prior.ordinal for uid, ordinal in read_elsewhere):
+            continue
+        found[prior.id] = event.id
+    return found
 
 
-def settlement_block(
+def open_job_block(
     session: Session, *, job: ReconciliationJob, priors: list[TerminalRecordManifest],
 ) -> tuple[str, str, dict] | None:
     """Why a reconcile chunk must not settle these rows, if it must not.
 
-    A live source time correction derived a punch from bytes that were not
-    the slot's punch; settling would leave that punch live while its row left
-    every canonical scope. A recovery-epoch copy carries the corrections of
-    the read it copies. Another open, capture-certified job in the same epoch
-    sealed these rows into its exception cohort; settling would break that
-    seal. Either way the chunk is not committed.
+    Another open, capture-certified job in the same epoch sealed these rows
+    into its exception cohort; settling would break that seal while that job
+    is still being assured. The chunk is not committed.
     """
-    from zk_add.reconciliation import TERMINAL_JOB_STATES
-
-    corrected = corrections_by_row(session, priors)
-    if corrected:
-        rows = sorted((prior for prior in priors if prior.id in corrected), key=lambda row: row.ordinal)
-        return CORRECTED_HOLD, (
-            "A re-read changed a terminal newest-record row that already has a source time "
-            "correction. The corrected punch was derived from bytes that were not this slot's "
-            "punch; HR must verify it before this reconcile can continue."
-        ), {
-            "ordinals": [row.ordinal for row in rows],
-            "manifest_ids": [row.id for row in rows],
-            "correction_ids": [cid for row in rows for cid in corrected[row.id]],
-        }
     lowest = min(prior.ordinal for prior in priors)
-    sealed = session.scalar(
-        select(ReconciliationJob.job_id).where(
-            ReconciliationJob.zkt_device_id == job.zkt_device_id,
-            ReconciliationJob.terminal_generation == job.terminal_generation,
-            _epoch_clause(ReconciliationJob.source_epoch_id, job.source_epoch_id),
-            ReconciliationJob.id != job.id,
-            ReconciliationJob.capture_certified_at.is_not(None),
-            ReconciliationJob.status.not_in(TERMINAL_JOB_STATES),
-            ReconciliationJob.cutoff_count > lowest,
-        ).order_by(ReconciliationJob.id.asc()).limit(1)
-    )
+    sealed = other_open_certified_job(session, job, below=lowest)
     if sealed is not None:
         return OPEN_JOB_HOLD, (
             "Another open reconciliation sealed these terminal newest-record rows into its "
@@ -533,28 +651,21 @@ def settlement_block(
     return None
 
 
-def changed_block(changed: list[tuple[TerminalRecordManifest, object]]) -> tuple[str, str, dict]:
-    """The hold for newest-slot reads that delivered a punch and now read differently.
+def other_open_certified_job(session: Session, job: ReconciliationJob, *, below: int | None = None) -> str | None:
+    """Another open, capture-certified job of the same terminal epoch, by job ID."""
+    from zk_add.reconciliation import TERMINAL_JOB_STATES
 
-    Such a read was ingested (or linked) as attendance before ADD recognised
-    the newest slot, and nothing proves it a byte copy of an earlier record.
-    Neither a settlement nor a source-change recovery may decide whose punch
-    it was.
-    """
-    rows = sorted(changed, key=lambda item: item[0].ordinal)
-    return CHANGED_HOLD, (
-        "A terminal newest-record row that delivered or held a punch read differently once later "
-        "records existed, and this reconcile did not read its bytes at an earlier ordinal. The "
-        "punch ADD took from it may not be this slot's punch; HR must verify it before this "
-        "reconcile can continue."
-    ), {
-        "ordinals": [prior.ordinal for prior, _ in rows],
-        "manifest_ids": [prior.id for prior, _ in rows],
-        "dispositions": [prior.disposition for prior, _ in rows],
-        "attendance_event_ids": [prior.attendance_event_id for prior, _ in rows],
-        "committed_raw_record_digests": [prior.raw_record_digest for prior, _ in rows],
-        "reread_raw_record_digests": [source.raw_record_digest for _, source in rows],
-    }
+    statement = select(ReconciliationJob.job_id).where(
+        ReconciliationJob.zkt_device_id == job.zkt_device_id,
+        ReconciliationJob.terminal_generation == job.terminal_generation,
+        _epoch_clause(ReconciliationJob.source_epoch_id, job.source_epoch_id),
+        ReconciliationJob.id != job.id,
+        ReconciliationJob.capture_certified_at.is_not(None),
+        ReconciliationJob.status.not_in(TERMINAL_JOB_STATES),
+    )
+    if below is not None:
+        statement = statement.where(ReconciliationJob.cutoff_count > below)
+    return session.scalar(statement.order_by(ReconciliationJob.id.asc()).limit(1))
 
 
 def retire(session: Session, prior: TerminalRecordManifest) -> None:
@@ -574,6 +685,8 @@ def record_settlement(
     chunk_id: int,
     prior: TerminalRecordManifest,
     settled: TerminalRecordManifest,
+    orphaned_event_id: int | None = None,
+    correction_ids: list[str] | None = None,
 ) -> dict:
     """The audit trail of one settled slot, written after the settled row is stored."""
     reviews = session.scalars(
@@ -598,7 +711,13 @@ def record_settlement(
         "settled_raw_record_digest": settled.raw_record_digest,
         "settled_disposition": settled.disposition,
         "settled_attendance_event_id": settled.attendance_event_id,
+        "confirmed_identical": prior.raw_record_digest == settled.raw_record_digest,
     }
+    if orphaned_event_id is not None:
+        # The punch ADD took from these bytes has no other source evidence.
+        details["unverified_attendance_event_id"] = orphaned_event_id
+    if correction_ids:
+        details["unverified_correction_ids"] = list(correction_ids)
     append_audit(
         session,
         actor="system:source-reconciliation",
@@ -671,33 +790,545 @@ def unreceived_ordinals(session: Session, *, connector: Connector, records) -> l
     return sorted(ordinal for ordinal, event_id in found.items() if event_id is None)
 
 
-def alert_unreceived(session: Session, connector: Connector, *, cause: str, ordinals, details: dict) -> None:
-    """Latch one alert per device naming every slot with a punch ADD has not received."""
-    from zk_add.service import open_alert_row, upsert_alert
+# --- Alerts -----------------------------------------------------------------
 
-    previous = open_alert_row(session, connector, UNRECEIVED_ALERT)
-    known = list((previous.details or {}).get("ordinals", [])) if previous is not None else []
-    merged = sorted({*known, *ordinals})[-ALERT_ORDINAL_LIMIT:]
+
+def _locked_alert(session: Session, connector: Connector, code: str) -> DeviceAlert | None:
+    """The connector's open alert for ``code``, row-locked so merges never drop entries."""
+    from zk_add.service import open_alert_row
+
+    row = open_alert_row(session, connector, code)
+    if row is None or row.id is None:
+        return row
+    return session.scalar(
+        select(DeviceAlert).where(DeviceAlert.id == row.id).with_for_update()
+        .execution_options(populate_existing=True)
+    )
+
+
+def _slot_key(entry: dict) -> tuple:
+    return (entry.get("generation"), entry.get("source_epoch_id"), entry.get("ordinal"))
+
+
+def _bounded(entries: list[dict], *, key, overflow: int) -> dict:
+    """Keep the oldest entries an alert can show; the count and overflow cover the rest."""
+    entries = sorted(entries, key=key)
+    kept = entries[:ALERT_SLOT_LIMIT]
+    return {"kept": kept, "overflow": overflow + max(0, len(entries) - len(kept))}
+
+
+def _write_unreceived(session: Session, connector: Connector, alert, slots: list[dict], *,
+                      overflow: int, details: dict) -> None:
+    from zk_add.service import resolve_alert, upsert_alert
+
+    if not slots and not overflow:
+        if alert is not None:
+            resolve_alert(session, connector, code=UNRECEIVED_ALERT, touch_last_seen=False,
+                          resolution={"kind": "NEWEST_RECORD_SLOTS_ACCOUNTED"})
+        return
+    bounded = _bounded(slots, key=lambda entry: (entry.get("ordinal") or 0, _slot_key(entry)), overflow=overflow)
+    kept = bounded["kept"]
     upsert_alert(
         session,
         connector,
         code="TERMINAL_NEWEST_RECORD_PUNCH_UNRECEIVED",
         severity="HIGH",
-        message=(
-            "The terminal's newest-record slot holds a punch ADD has not received. Run a complete "
-            "source reconcile after the next punch on this terminal so ADD reads the slot while a "
-            "later record exists; LIVE capture delivering the same punch also confirms it."
-        ),
+        message=UNRECEIVED_MESSAGE,
         details={
-            "failure_category": UNRECEIVED_ALERT,
-            "cause": cause,
-            "ordinals": merged,
             **details,
+            "failure_category": UNRECEIVED_ALERT,
+            "slots": kept,
+            "ordinals": sorted({entry["ordinal"] for entry in kept}),
+            "slot_count": len(kept) + bounded["overflow"],
+            "slots_not_listed": bounded["overflow"],
+            "oldest_ordinal": min((entry["ordinal"] for entry in kept), default=None),
             "inspector_path": (
                 "/reconciliation?tab=source-exceptions&device_id=" f"{connector.connector_id}"
             ),
         },
     )
+
+
+def alert_unreceived(session: Session, connector: Connector, *, cause: str, slots: list[dict],
+                     details: dict | None = None) -> None:
+    """Latch one alert per device naming every slot that holds, or may hold, a missed punch.
+
+    ``slots`` are ``{ordinal, generation, source_epoch_id}`` plus optional
+    evidence. Entries merge by slot, so repeated evidence for one slot is one
+    entry. The assurance refresh drops a slot once ADD accounts for it.
+    """
+    if not slots:
+        return
+    alert = _locked_alert(session, connector, UNRECEIVED_ALERT)
+    previous = (alert.details or {}) if alert is not None else {}
+    merged = {_slot_key(entry): dict(entry) for entry in previous.get("slots", []) if isinstance(entry, dict)}
+    now = utc_now().isoformat()
+    for entry in slots:
+        key = _slot_key(entry)
+        current = merged.get(key, {"first_seen_at": now})
+        causes = sorted({*current.get("causes", []), cause})
+        merged[key] = {**current, **entry, "causes": causes}
+    extra = {key: value for key, value in previous.items() if key in {"job_id", "coverage_id"}}
+    extra.update(details or {})
+    _write_unreceived(session, connector, alert, list(merged.values()),
+                      overflow=int(previous.get("slots_not_listed") or 0), details=extra)
+
+
+def _hr_details(session: Session, connector: Connector, code: str, details: dict) -> dict:
+    """Details for a CRITICAL HR alert, merged under a row lock with the open alert's."""
+    alert = _locked_alert(session, connector, code)
+    previous = (alert.details or {}) if alert is not None else {}
+    merged: dict[str, list] = {}
+    for key in ("manifest_ids", "attendance_event_ids", "correction_ids", "ordinals", "job_ids"):
+        values = [*previous.get(key, []), *details.get(key, [])]
+        merged[key] = sorted({value for value in values if value is not None}, key=str)[:ALERT_SLOT_LIMIT]
+    return {
+        **{key: value for key, value in details.items() if key not in merged},
+        **merged,
+        "failure_category": code,
+        "inspector_path": "/reconciliation?tab=source-exceptions&device_id=" f"{connector.connector_id}",
+    }
+
+
+CHANGED_MESSAGE = (
+    "A terminal newest-record row that delivered a punch read differently once later records "
+    "existed. The punch ADD took from it may not be the slot's punch and may belong to someone "
+    "else; no other source evidence holds it, and ADD holds it back from every guarded release "
+    "path. HR must verify it."
+)
+CORRECTED_MESSAGE = (
+    "A source time correction was made from a terminal newest-record row that a later read "
+    "showed was not the slot's punch. HR must verify the corrected punch; ADD holds it back "
+    "from every guarded release path."
+)
+
+
+def alert_changed(session: Session, connector: Connector, *, rows: list[tuple[TerminalRecordManifest, int]],
+                  job_id: str | None = None, coverage_id: str | None = None) -> None:
+    from zk_add.service import upsert_alert
+
+    if not rows:
+        return
+    upsert_alert(session, connector, code="TERMINAL_NEWEST_RECORD_CHANGED", severity="CRITICAL",
+                 message=CHANGED_MESSAGE, details=_hr_details(session, connector, CHANGED_ALERT, {
+                     "manifest_ids": [prior.id for prior, _ in rows],
+                     "attendance_event_ids": [event_id for _, event_id in rows],
+                     "ordinals": [prior.ordinal for prior, _ in rows],
+                     "job_ids": [job_id] if job_id else [],
+                     **({"coverage_id": coverage_id} if coverage_id else {}),
+                 }))
+
+
+def alert_corrected(session: Session, connector: Connector, *, corrected: dict[int, list[str]],
+                    rows: list[TerminalRecordManifest], job_id: str | None = None) -> None:
+    from zk_add.service import upsert_alert
+
+    if not corrected:
+        return
+    by_id = {row.id: row for row in rows}
+    upsert_alert(session, connector, code="TERMINAL_NEWEST_RECORD_CORRECTED", severity="CRITICAL",
+                 message=CORRECTED_MESSAGE, details=_hr_details(session, connector, CORRECTED_ALERT, {
+                     "manifest_ids": sorted(corrected),
+                     "correction_ids": [cid for ids in corrected.values() for cid in ids],
+                     "ordinals": [by_id[row_id].ordinal for row_id in corrected if row_id in by_id],
+                     "job_ids": [job_id] if job_id else [],
+                 }))
+
+
+def alert_release_held(session: Session, connector: Connector, event: AttendanceEvent) -> None:
+    """Say that automatic release held back a punch read only from a newest slot."""
+    from zk_add.service import upsert_alert
+
+    alert = _locked_alert(session, connector, RELEASE_HELD_ALERT)
+    previous = (alert.details or {}) if alert is not None else {}
+    ids = sorted({*previous.get("attendance_event_ids", []), event.id})
+    if alert is not None and ids == sorted(previous.get("attendance_event_ids", [])):
+        return
+    kept = ids[:ALERT_SLOT_LIMIT]
+    not_listed = int(previous.get("events_not_listed") or 0) + len(ids) - len(kept)
+    upsert_alert(session, connector, code="TERMINAL_NEWEST_RECORD_RELEASE_HELD", severity="HIGH", message=(
+        "Automatic release held back identity-blocked punches whose only source is a read of the "
+        "terminal's newest slot, or a read a reconcile replaced. Their identity bytes may belong to "
+        "someone else. A complete source reconcile that confirms the slot releases them normally."
+    ), details={
+        "failure_category": RELEASE_HELD_ALERT,
+        "attendance_event_ids": kept,
+        "event_count": len(kept) + not_listed,
+        "events_not_listed": not_listed,
+    })
+
+
+# --- Slot evaluation --------------------------------------------------------
+
+
+def _evaluate_slots(
+    session: Session, *, connector_id: int, zkt_device_id: int,
+    holders: dict[int, list[tuple[TerminalRecordManifest, bool]]],
+    canonical: dict[int, TerminalRecordManifest],
+) -> tuple[set[int], set[int]]:
+    """``(pending_ordinals, received_event_ids)`` for slots with newest-slot claims.
+
+    ``holders`` maps an ordinal to rows whose read decodes a claim at that
+    slot, each marked authoritative when it was read while later records
+    existed (a tail replay receipt). ``canonical`` maps the ordinal to its
+    canonical row, which is authoritative once it is no longer a newest read.
+
+    With an authoritative read, the slot holds that read: it is pending only
+    when such a read decodes to a punch ADD has not received. Otherwise the
+    slot is accounted for when a claim decodes to a punch LIVE capture holds
+    and no canonical row at another ordinal holds it (which would make the
+    read a byte copy of that record), and pending when any claim decodes to a
+    punch ADD has not received or cannot be read.
+    """
+    rows = list(canonical.values())
+    canonical_newest = (
+        newest_read_ids(session, rows) | {row.id for row in rows if is_held(row)}
+    ) - out_of_order_ids(session, rows)
+    punches: dict[tuple, dict] = {}
+    unreadable: dict[int, list[bool]] = defaultdict(list)
+    for ordinal, items in holders.items():
+        for holder, authoritative in items:
+            readable, punch = claimed_punch(holder)
+            if not readable:
+                unreadable[ordinal].append(authoritative)
+            elif punch is not None:
+                punches[(ordinal, holder.id, authoritative)] = punch
+    found = received_events(
+        session, connector_id=connector_id, zkt_device_id=zkt_device_id, punches=punches,
+    ) if punches else {}
+    event_ids = {event_id for event_id in found.values() if event_id is not None}
+    linked: dict[int, set[int]] = defaultdict(set)
+    live: set[int] = set()
+    if event_ids:
+        for event_id, ordinal in session.execute(select(
+            TerminalRecordManifest.attendance_event_id, TerminalRecordManifest.ordinal,
+        ).where(
+            TerminalRecordManifest.attendance_event_id.in_(event_ids),
+            TerminalRecordManifest.zkt_device_id == zkt_device_id,
+            TerminalRecordManifest.canonical_source == True,  # noqa: E712
+        )).all():
+            linked[event_id].add(ordinal)
+        live = set(session.scalars(select(AttendanceEvent.id).where(
+            AttendanceEvent.id.in_(event_ids), AttendanceEvent.source.in_(LIVE_SOURCES))).all())
+    pending: set[int] = set()
+    for ordinal in set(holders) | set(canonical):
+        row = canonical.get(ordinal)
+        claims = [(key, event_id) for key, event_id in found.items() if key[0] == ordinal]
+        authoritative_claims = [(key, event_id) for key, event_id in claims if key[2]]
+        authoritative_row = row is not None and row.id not in canonical_newest
+        if authoritative_row or authoritative_claims or any(unreadable.get(ordinal, [])):
+            # The slot's content is known; only an authoritative unreceived punch is pending.
+            if (any(event_id is None for _, event_id in authoritative_claims)
+                    or any(unreadable.get(ordinal, []))):
+                pending.add(ordinal)
+            continue
+        genuine = any(
+            event_id is not None and event_id in live and not (linked[event_id] - {ordinal})
+            for _, event_id in claims
+        )
+        if genuine:
+            continue
+        if any(event_id is None for _, event_id in claims) or unreadable.get(ordinal):
+            pending.add(ordinal)
+    return pending, event_ids
+
+
+def _canonical_rows(session: Session, *, zkt_device_id: int, generation: int, epoch_id, ordinals):
+    ordinals = set(ordinals)
+    if not ordinals:
+        return {}
+    return {row.ordinal: row for row in session.scalars(select(TerminalRecordManifest).where(
+        TerminalRecordManifest.zkt_device_id == zkt_device_id,
+        TerminalRecordManifest.generation == generation,
+        _epoch_clause(TerminalRecordManifest.source_epoch_id, epoch_id),
+        TerminalRecordManifest.canonical_source == True,  # noqa: E712
+        TerminalRecordManifest.ordinal.in_(ordinals),
+    )).all()}
+
+
+def newest_evidence(session: Session, job: ReconciliationJob, manifests) -> dict:
+    """Newest-slot punch evidence for a job's certified range.
+
+    ``held`` are cohort rows ADD held as unconfirmed punches; they resolve
+    once their slot is accounted for. ``out_of_order`` are confirmed held
+    rows left excluded; they are ordinary reviewable exceptions.
+    ``pending_ordinals`` are slots below the cutoff for which ADD holds
+    evidence of a punch it has not received: a held punch, this job's re-read
+    of its own final ordinal (whatever row it re-read), or a tail replay read
+    while a later record existed. ``pending_ids`` are cohort rows at those
+    slots; a review cannot exclude them. ``received_event_ids`` are events
+    that independently hold such a punch; they join the job's Oracle
+    membership.
+    """
+    manifests = list(manifests)
+    cutoff = job.cutoff_count or 0
+    held_rows = [row for row in manifests if is_held(row)]
+    out_of_order = out_of_order_ids(session, held_rows)
+    held = {row.id for row in held_rows} - out_of_order
+    holders: dict[int, list[tuple[TerminalRecordManifest, bool]]] = defaultdict(list)
+    for row in held_rows:
+        if row.id in held:
+            holders[row.ordinal].append((row, False))
+    if cutoff:
+        for receipt in session.scalars(select(TerminalRecordManifest).where(
+            TerminalRecordManifest.zkt_device_id == job.zkt_device_id,
+            TerminalRecordManifest.generation == job.terminal_generation,
+            _epoch_clause(TerminalRecordManifest.source_epoch_id, job.source_epoch_id),
+            TerminalRecordManifest.canonical_source == False,  # noqa: E712
+            TerminalRecordManifest.interpretation_version == GUARD_VERSION,
+            TerminalRecordManifest.ordinal < cutoff,
+            or_(
+                and_(TerminalRecordManifest.source_kind == REREAD_SOURCE_KIND,
+                     TerminalRecordManifest.job_id == job.id,
+                     TerminalRecordManifest.ordinal == cutoff - 1),
+                TerminalRecordManifest.source_kind == REPLAY_SOURCE_KIND,
+            ),
+        ).order_by(TerminalRecordManifest.id.asc())).all():
+            holders[receipt.ordinal].append((receipt, receipt.source_kind == REPLAY_SOURCE_KIND))
+    if not holders:
+        return {"held": held, "out_of_order": out_of_order, "pending_ordinals": set(),
+                "pending_ids": set(), "received_event_ids": set()}
+    # The slot is judged by its current canonical row: a later job that
+    # settled it read the slot while later records existed.
+    canonical = _canonical_rows(session, zkt_device_id=job.zkt_device_id, generation=job.terminal_generation,
+                                epoch_id=job.source_epoch_id, ordinals=holders)
+    pending, received = _evaluate_slots(
+        session, connector_id=job.connector_id, zkt_device_id=job.zkt_device_id,
+        holders=holders, canonical=canonical,
+    )
+    return {
+        "held": held,
+        "out_of_order": out_of_order,
+        "pending_ordinals": pending,
+        "pending_ids": {row.id for row in manifests if row.ordinal in pending},
+        "received_event_ids": received,
+    }
+
+
+def slot_pending(session: Session, *, connector_id: int, zkt_device_id: int, generation: int,
+                 epoch_id, ordinals) -> set[int]:
+    """Device-level: the given slots that still hold evidence of a punch ADD has not received."""
+    ordinals = set(ordinals)
+    if not ordinals:
+        return set()
+    holders: dict[int, list[tuple[TerminalRecordManifest, bool]]] = defaultdict(list)
+    canonical = _canonical_rows(session, zkt_device_id=zkt_device_id, generation=generation,
+                                epoch_id=epoch_id, ordinals=ordinals)
+    stale = out_of_order_ids(session, list(canonical.values()))
+    for ordinal, row in canonical.items():
+        if is_held(row) and row.id not in stale:
+            holders[ordinal].append((row, False))
+    for receipt, cutoff in session.execute(
+        select(TerminalRecordManifest, ReconciliationJob.cutoff_count)
+        .outerjoin(ReconciliationJob, ReconciliationJob.id == TerminalRecordManifest.job_id)
+        .where(
+            TerminalRecordManifest.zkt_device_id == zkt_device_id,
+            TerminalRecordManifest.generation == generation,
+            _epoch_clause(TerminalRecordManifest.source_epoch_id, epoch_id),
+            TerminalRecordManifest.canonical_source == False,  # noqa: E712
+            TerminalRecordManifest.interpretation_version == GUARD_VERSION,
+            TerminalRecordManifest.source_kind.in_(RECEIPT_SOURCE_KINDS),
+            TerminalRecordManifest.ordinal.in_(ordinals),
+        )
+    ).all():
+        if receipt.source_kind == REPLAY_SOURCE_KIND:
+            holders[receipt.ordinal].append((receipt, True))
+        elif cutoff is not None and receipt.ordinal + 1 == cutoff:
+            holders[receipt.ordinal].append((receipt, False))
+    if not holders:
+        return set()
+    pending, _ = _evaluate_slots(session, connector_id=connector_id, zkt_device_id=zkt_device_id,
+                                 holders=holders, canonical=canonical)
+    return pending & ordinals
+
+
+# --- Detecting a filled slot after a tail ------------------------------------
+
+
+def _event_time_bound(session: Session, *, zkt_device_id, generation, epoch_id, below: int):
+    value = session.scalar(
+        select(AttendanceEvent.device_event_time)
+        .join(TerminalRecordManifest, TerminalRecordManifest.attendance_event_id == AttendanceEvent.id)
+        .where(
+            TerminalRecordManifest.zkt_device_id == zkt_device_id,
+            TerminalRecordManifest.generation == generation,
+            _epoch_clause(TerminalRecordManifest.source_epoch_id, epoch_id),
+            TerminalRecordManifest.canonical_source == True,  # noqa: E712
+            TerminalRecordManifest.disposition.in_(PARSED_DISPOSITIONS),
+            TerminalRecordManifest.ordinal < below,
+        )
+        .order_by(TerminalRecordManifest.ordinal.desc())
+        .limit(1)
+    )
+    return ensure_utc(value) if value is not None else None
+
+
+def _unlinked_captures(session: Session, *, connector_id: int, zkt_device_id: int, after, before) -> int:
+    """Captured punches of this binding inside the window that no canonical source row holds.
+
+    LIVE capture is the usual one; older firmware also delivers punches in
+    reconnect dumps and periodic reconcile batches. A punch some source read
+    created and only a replaced read still links is not an independent
+    capture.
+    """
+    canonical = select(TerminalRecordManifest.id).where(
+        TerminalRecordManifest.attendance_event_id == AttendanceEvent.id,
+        TerminalRecordManifest.canonical_source == True,  # noqa: E712
+    ).exists()
+    any_read = select(TerminalRecordManifest.id).where(
+        TerminalRecordManifest.attendance_event_id == AttendanceEvent.id,
+    ).exists()
+    statement = select(AttendanceEvent.id).where(
+        AttendanceEvent.connector_id == connector_id,
+        AttendanceEvent.zkt_device_id == zkt_device_id,
+        AttendanceEvent.source != "FULL_HISTORY",
+        ~canonical,
+        or_(AttendanceEvent.source.in_(LIVE_SOURCES), ~any_read),
+    )
+    if after is not None:
+        statement = statement.where(AttendanceEvent.device_event_time >= after)
+    if before is not None:
+        statement = statement.where(AttendanceEvent.device_event_time <= before)
+    return len(session.scalars(statement.limit(2)).all())
+
+
+def note_filled_newest_slot(
+    session: Session, *, connector: Connector, coverage: ReconciliationCoverage, payload,
+) -> dict | None:
+    """After a tail moves past a newest read, check that LIVE delivered the punch that filled it.
+
+    A tail that starts at ``s`` shows the terminal now holds records past
+    ``s - 1``. When ``s - 1`` was read as the newest slot, the terminal has
+    written it since with the next punch, which no source read has seen.
+    That punch lies between the punch before the slot and the first punch
+    this tail read. When no captured punch of this binding in that window is
+    unaccounted for by a source row, capture may have missed it, and ADD
+    raises the unreceived-punch alert so an operator reconciles. Clock faults
+    can raise it spuriously; they never hide a source row.
+    """
+    ordinal = payload.start_ordinal - 1
+    zkt = connector.zkt_device
+    if ordinal < 0 or zkt is None:
+        return None
+    row = session.scalar(select(TerminalRecordManifest).where(
+        TerminalRecordManifest.zkt_device_id == zkt.id,
+        TerminalRecordManifest.generation == payload.terminal_generation,
+        _epoch_clause(TerminalRecordManifest.source_epoch_id, coverage.source_epoch_id),
+        TerminalRecordManifest.canonical_source == True,  # noqa: E712
+        TerminalRecordManifest.ordinal == ordinal,
+    ))
+    if row is None or row.disposition == "RAW_PRESERVED" or (
+            row.id not in newest_read_ids(session, [row]) and not is_held(row)):
+        return None
+    if row.attendance_event_id is not None:
+        # The read linked a LIVE punch no other ordinal holds: the slot was
+        # already written with it when the tail read it.
+        event = session.get(AttendanceEvent, row.attendance_event_id)
+        others = session.scalar(select(TerminalRecordManifest.id).where(
+            TerminalRecordManifest.attendance_event_id == row.attendance_event_id,
+            TerminalRecordManifest.canonical_source == True,  # noqa: E712
+            TerminalRecordManifest.id != row.id,
+        ).limit(1))
+        if event is not None and event.source in LIVE_SOURCES and others is None:
+            return None
+    after = _event_time_bound(session, zkt_device_id=zkt.id, generation=payload.terminal_generation,
+                              epoch_id=coverage.source_epoch_id, below=ordinal)
+    newest = payload.latest_terminal_count - 1
+    times = [value for source in payload.records
+             if source.ordinal != newest and (value := _source_time(source)) is not None]
+    before = min(times) if times else None
+    if after is None and before is None:
+        return None
+    if _unlinked_captures(session, connector_id=connector.id, zkt_device_id=zkt.id,
+                          after=after, before=before):
+        return None
+    slot = {
+        "ordinal": ordinal, "generation": payload.terminal_generation,
+        "source_epoch_id": coverage.source_epoch_id, "manifest_id": row.id,
+        "after": after.isoformat() if after else None, "before": before.isoformat() if before else None,
+    }
+    alert_unreceived(session, connector, cause=FILLED_CAUSE, slots=[slot],
+                     details={"coverage_id": coverage.coverage_id})
+    return slot
+
+
+def refresh_alerts(session: Session, *, connector: Connector | None = None) -> int:
+    """Re-evaluate open newest-record alerts; drop accounted slots and resolve empty alerts.
+
+    Bounded per call. A slot clears when its evidence is accounted for (see
+    ``slot_pending``), when a reconcile replaced or confirmed its newest read,
+    or, for a slot inferred filled after a tail, when a LIVE punch in its
+    window arrives. Release entries clear once the punch is no longer held or
+    no longer rests only on a newest read.
+    """
+    from zk_add.service import resolve_alert
+
+    statement = select(DeviceAlert).where(
+        DeviceAlert.code.in_((UNRECEIVED_ALERT, RELEASE_HELD_ALERT)), DeviceAlert.state == "OPEN",
+    )
+    if connector is not None:
+        statement = statement.where(DeviceAlert.connector_id == connector.id)
+    changed = 0
+    for alert in session.scalars(statement.order_by(DeviceAlert.id.asc()).limit(ALERT_REFRESH_LIMIT)).all():
+        owner = connector if connector is not None else session.get(Connector, alert.connector_id)
+        zkt = owner.zkt_device if owner is not None else None
+        if owner is None or zkt is None:
+            continue
+        details = alert.details or {}
+        if alert.code == RELEASE_HELD_ALERT:
+            ids = [value for value in details.get("attendance_event_ids", []) if isinstance(value, int)]
+            events = session.scalars(select(AttendanceEvent).where(AttendanceEvent.id.in_(ids))).all() if ids else []
+            still = newest_only_event_ids(
+                session, [event for event in events if event.ords_status in RELEASE_BLOCKED_STATUSES])
+            if set(ids) == still:
+                continue
+            changed += 1
+            if not still and not details.get("events_not_listed"):
+                resolve_alert(session, owner, code=RELEASE_HELD_ALERT, touch_last_seen=False,
+                              resolution={"kind": "NEWEST_RECORD_PUNCHES_NO_LONGER_HELD"})
+            else:
+                alert.details = {**details, "attendance_event_ids": sorted(still),
+                                 "event_count": len(still) + int(details.get("events_not_listed") or 0)}
+            continue
+        slots = [entry for entry in details.get("slots", []) if isinstance(entry, dict)
+                 and isinstance(entry.get("ordinal"), int)]
+        remaining = []
+        by_scope: dict[tuple, list[dict]] = defaultdict(list)
+        for entry in slots:
+            by_scope[(entry.get("generation"), entry.get("source_epoch_id"))].append(entry)
+        for (generation, epoch_id), entries in by_scope.items():
+            if generation is None:
+                remaining.extend(entries)
+                continue
+            ordinals = {entry["ordinal"] for entry in entries}
+            pending = slot_pending(session, connector_id=owner.id, zkt_device_id=zkt.id, generation=generation,
+                                   epoch_id=epoch_id, ordinals=ordinals)
+            canonical = _canonical_rows(session, zkt_device_id=zkt.id, generation=generation,
+                                        epoch_id=epoch_id, ordinals=ordinals)
+            still_newest = newest_read_ids(session, list(canonical.values())) | {
+                row.id for row in canonical.values() if is_held(row)}
+            for entry in entries:
+                row = canonical.get(entry["ordinal"])
+                causes = set(entry.get("causes", []))
+                if entry["ordinal"] in pending:
+                    remaining.append(entry)
+                    continue
+                if FILLED_CAUSE in causes and row is not None and row.id in still_newest:
+                    window = [_punch_time(entry.get("after")) if entry.get("after") else None,
+                              _punch_time(entry.get("before")) if entry.get("before") else None]
+                    if not _unlinked_captures(session, connector_id=owner.id, zkt_device_id=zkt.id,
+                                              after=window[0], before=window[1]):
+                        remaining.append(entry)
+        if len(remaining) == len(slots):
+            continue
+        changed += 1
+        _write_unreceived(session, owner, alert, remaining, overflow=int(details.get("slots_not_listed") or 0),
+                          details={key: value for key, value in details.items()
+                                   if key in {"job_id", "coverage_id"}})
+    return changed
+
+
+# --- Tail replays -------------------------------------------------------------
 
 
 def _replay_attendance_conflict(
@@ -735,6 +1366,7 @@ def _replay_attendance_conflict(
 
 def _record_superseded_replay(
     session: Session, *, connector: Connector, coverage: ReconciliationCoverage, payload, differing,
+    confirming,
 ) -> None:
     """A durable, idempotent record of a replay answered with ADD's unchanged coverage.
 
@@ -744,7 +1376,6 @@ def _record_superseded_replay(
     reconcile's own receipt settles a slot.
     """
     from zk_add.reconciliation import _event
-    from zk_add.service import upsert_alert
 
     key = "tail-replay-superseded:" + hashlib.sha256(json.dumps(
         [coverage.id, payload.start_ordinal, payload.end_ordinal, payload.chunk_digest,
@@ -760,10 +1391,10 @@ def _record_superseded_replay(
     ).limit(1)) is not None:
         return
     # Only a read made while a later record existed is the slot's content.
-    settled_reads = [source for _, source in differing
+    settled_reads = [(prior, source) for prior, source in [*differing, *confirming]
                      if not read_was_newest(source.ordinal, payload.latest_terminal_count)]
     receipts = {}
-    for source in settled_reads:
+    for _, source in settled_reads:
         receipts[source.ordinal] = _receipt(
             kind=REPLAY_SOURCE_KIND, job_id=None, chunk_id=None, connector_id=connector.id,
             zkt_device_id=coverage.zkt_device_id, terminal_serial=coverage.terminal_serial,
@@ -773,7 +1404,9 @@ def _record_superseded_replay(
         session.add(receipts[source.ordinal])
     if receipts:
         session.flush()
-    unreceived = unreceived_ordinals(session, connector=connector, records=settled_reads)
+    unreceived = unreceived_ordinals(session, connector=connector, records=[source for _, source in settled_reads])
+    orphans = orphaned_events(session, [(prior, source) for prior, source in differing
+                                        if source.ordinal in receipts])
     details = {
         "coverage_id": coverage.coverage_id,
         "start_ordinal": payload.start_ordinal,
@@ -788,13 +1421,15 @@ def _record_superseded_replay(
             {
                 "ordinal": prior.ordinal,
                 "manifest_id": prior.id,
+                "committed_disposition": prior.disposition,
                 "committed_raw_record_digest": prior.raw_record_digest,
                 "replayed_raw_record_digest": source.raw_record_digest,
                 "replay_read_newest": read_was_newest(source.ordinal, payload.latest_terminal_count),
                 "receipt_manifest_id": receipts[source.ordinal].id if source.ordinal in receipts else None,
                 "punch_unreceived": source.ordinal in unreceived,
+                "unverified_attendance_event_id": orphans.get(prior.id),
             }
-            for prior, source in differing
+            for prior, source in [*differing, *confirming]
         ],
     }
     if job is not None:
@@ -810,32 +1445,20 @@ def _record_superseded_replay(
         request_id=key,
     )
     if unreceived:
-        alert_unreceived(session, connector, cause=REPLAY_SOURCE_KIND, ordinals=unreceived, details={
-            "coverage_id": coverage.coverage_id,
-            "receipt_manifest_ids": [receipts[ordinal].id for ordinal in unreceived],
-        })
+        alert_unreceived(session, connector, cause=REPLAY_SOURCE_KIND, slots=[
+            {"ordinal": ordinal, "generation": payload.terminal_generation,
+             "source_epoch_id": coverage.source_epoch_id, "manifest_id": receipts[ordinal].id}
+            for ordinal in unreceived
+        ], details={"coverage_id": coverage.coverage_id})
+    priors = [prior for prior, _ in differing]
+    if orphans:
+        alert_changed(session, connector, rows=[(prior, orphans[prior.id]) for prior in priors if prior.id in orphans],
+                      coverage_id=coverage.coverage_id)
     # A replay that read the slot while a later record existed proves the
     # slot holds other bytes than the ones a correction was derived from.
-    corrected = corrections_by_row(session, [
-        prior for prior, source in differing
-        if not read_was_newest(source.ordinal, payload.latest_terminal_count)
-    ])
-    if corrected:
-        upsert_alert(
-            session,
-            connector,
-            code="TERMINAL_NEWEST_RECORD_CORRECTED",
-            severity="CRITICAL",
-            message=(
-                "A source time correction was made from a terminal newest-record row that a "
-                "later read showed was not the slot's punch. HR must verify the corrected punch."
-            ),
-            details={
-                "failure_category": CORRECTED_HOLD,
-                "manifest_ids": sorted(corrected),
-                "correction_ids": [cid for ids in corrected.values() for cid in ids],
-            },
-        )
+    alert_corrected(session, connector, corrected=corrections_by_row(session, [
+        prior for prior, source in differing if source.ordinal in receipts
+    ]), rows=priors)
 
 
 def judge_tail_replay(
@@ -852,14 +1475,15 @@ def judge_tail_replay(
     delivered after a later commit) rewinds a reader's cursor. Its next tail
     re-reads a committed range, usually ending further on, and its formerly
     newest slot now holds the real punch. That is not a source mutation. It
-    is benign when every committed canonical row in the overlap matches the
-    replay except rows that are themselves unsettled newest-slot reads, and
+    is benign when every committed canonical row in the overlap holds the
+    replay's raw bytes except rows that are themselves newest-slot reads, and
     the replay makes no claim the ordinary tail path would refuse.
 
-    The replay never changes a canonical row, cursor or chain. Its differing
-    reads are kept as receipts (see ``_record_superseded_replay``); a
-    complete reconcile settles such rows through its own receipts. Returns
-    ``None`` when benign, otherwise the invalidation code.
+    The replay never changes a canonical row, cursor or chain. Its reads of
+    newest-slot rows made while a later record existed are kept as receipts
+    (see ``_record_superseded_replay``); a complete reconcile settles such
+    rows through its own receipts. Returns ``None`` when benign, otherwise
+    the invalidation code.
     """
     from zk_add import reconciliation as rec
 
@@ -898,79 +1522,119 @@ def judge_tail_replay(
     }
     if len(committed) != stop - start:
         return "SOURCE_TAIL_REPLAY_DIVERGED"
-    unsettled = unsettled_newest_ids(session, committed.values())
+    newest = newest_read_ids(session, committed.values()) | {
+        row.id for row in committed.values() if is_held(row)}
     differing = []
+    confirming = []
     for source in payload.records:
         if source.ordinal >= stop:
             break
         prior = committed[source.ordinal]
         if same_source_read(prior, source):
+            if is_held(prior) and not read_was_newest(source.ordinal, payload.latest_terminal_count):
+                # The held punch read again while a later record existed.
+                confirming.append((prior, source))
             continue
-        if prior.id not in unsettled or prior.record_size != payload.record_size:
+        if (prior.id not in newest or prior.record_size != payload.record_size
+                or prior.raw_record_digest == source.raw_record_digest
+                or "RAW_PRESERVED" in {prior.disposition, source.disposition}):
             return "SOURCE_TAIL_REPLAY_DIVERGED"
         differing.append((prior, source))
     code = _replay_attendance_conflict(
-        session, connector=connector, coverage=coverage, records=[source for _, source in differing],
+        session, connector=connector, coverage=coverage,
+        records=[source for _, source in [*differing, *confirming]],
     )
     if code is not None:
         return code
     _record_superseded_replay(
         session, connector=connector, coverage=coverage, payload=payload, differing=differing,
+        confirming=confirming,
     )
     return None
 
 
-def cohort_newest_evidence(
-    session: Session, job: ReconciliationJob, manifests,
-) -> tuple[set[int], set[int], set[int]]:
-    """``(held, pending, received_event_ids)`` for a job's certified exception cohort.
+# --- Generation lineage -----------------------------------------------------------
 
-    ``held`` rows are newest-slot reads ADD held as unconfirmed punches.
-    ``pending`` rows are cohort rows for which ADD holds evidence of a punch
-    it has not received: a held punch, this job's re-read of its own final
-    ordinal, or a tail replay read while a later record existed. A review
-    cannot exclude such a row. ``received_event_ids`` are the events that
-    independently hold such a punch; they join the job's Oracle membership.
+
+def ledger_newest_ids(session: Session, rows) -> set[int]:
+    """Rows of an older generation's ledger that are newest reads (or held punches)."""
+    rows = [row for row in rows if row.disposition != "RAW_PRESERVED"]
+    return newest_read_ids(session, rows) | {row.id for row in rows if is_held(row)}
+
+
+def ledger_newest_ordinals(session: Session, *, zkt_device_id: int, generation: int, epoch_id, stop: int) -> set[int]:
+    """Ordinals below ``stop`` whose canonical row in that ledger is a newest read.
+
+    Candidates are the ordinals any tail of that terminal generation read as
+    its newest slot and every job's final ordinal; ``newest_read_ids`` then
+    decides from each row's own receipt, so a recovery copy and a confirmed
+    row are judged correctly.
     """
-    manifests = list(manifests)
-    held = {row.id for row in manifests if is_held(row)}
-    cutoff = job.cutoff_count or 0
-    by_ordinal = {row.ordinal: row for row in manifests}
-    punches: dict[tuple[int, int], dict] = {}
-    unreadable: set[int] = set()
+    candidates = set(session.scalars(select(SourceTailChunk.end_ordinal - 1).where(
+        SourceTailChunk.zkt_device_id == zkt_device_id,
+        SourceTailChunk.generation == generation,
+        SourceTailChunk.latest_terminal_count == SourceTailChunk.end_ordinal,
+        SourceTailChunk.end_ordinal <= stop,
+    )).all())
+    candidates |= {cutoff - 1 for cutoff in session.scalars(select(ReconciliationJob.cutoff_count).where(
+        ReconciliationJob.zkt_device_id == zkt_device_id,
+        ReconciliationJob.terminal_generation == generation,
+        ReconciliationJob.cutoff_count.is_not(None),
+        ReconciliationJob.cutoff_count <= stop,
+    )).all() if cutoff}
+    held = set(session.scalars(select(TerminalRecordManifest.ordinal).where(
+        TerminalRecordManifest.zkt_device_id == zkt_device_id,
+        TerminalRecordManifest.generation == generation,
+        _epoch_clause(TerminalRecordManifest.source_epoch_id, epoch_id),
+        TerminalRecordManifest.canonical_source == True,  # noqa: E712
+        TerminalRecordManifest.error_code == HELD_CODE,
+        TerminalRecordManifest.ordinal < stop,
+    )).all())
+    candidates = {ordinal for ordinal in candidates | held if 0 <= ordinal < stop}
+    if not candidates:
+        return set()
+    rows = _canonical_rows(session, zkt_device_id=zkt_device_id, generation=generation, epoch_id=epoch_id,
+                           ordinals=candidates)
+    newest = ledger_newest_ids(session, rows.values())
+    return {ordinal for ordinal, row in rows.items() if row.id in newest}
 
-    def take(row_id: int, holder: TerminalRecordManifest) -> None:
-        readable, punch = claimed_punch(holder)
-        if not readable:
-            unreadable.add(row_id)
-        elif punch is not None:
-            punches[(row_id, holder.id)] = punch
 
-    for row in manifests:
-        if row.id in held:
-            take(row.id, row)
-    if by_ordinal:
-        for receipt in session.scalars(select(TerminalRecordManifest).where(
-            TerminalRecordManifest.zkt_device_id == job.zkt_device_id,
-            TerminalRecordManifest.generation == job.terminal_generation,
-            _epoch_clause(TerminalRecordManifest.source_epoch_id, job.source_epoch_id),
-            TerminalRecordManifest.canonical_source == False,  # noqa: E712
-            TerminalRecordManifest.interpretation_version == GUARD_VERSION,
-            TerminalRecordManifest.ordinal < cutoff,
-            or_(
-                and_(TerminalRecordManifest.source_kind == REREAD_SOURCE_KIND,
-                     TerminalRecordManifest.job_id == job.id),
-                TerminalRecordManifest.source_kind == REPLAY_SOURCE_KIND,
-            ),
-        ).order_by(TerminalRecordManifest.id.asc())).all():
-            if receipt.ordinal in by_ordinal:
-                take(by_ordinal[receipt.ordinal].id, receipt)
-    found = received_events(
-        session, connector_id=job.connector_id, zkt_device_id=job.zkt_device_id, punches=punches,
-    ) if punches else {}
-    pending = unreadable | {row_id for (row_id, _), event_id in found.items() if event_id is None}
-    events = {event_id for event_id in found.values() if event_id is not None}
-    return held, pending, events
+def note_lineage_newest(session: Session, connector: Connector, *, pairs, job: ReconciliationJob | None = None,
+                        coverage: ReconciliationCoverage | None = None) -> None:
+    """Record reads that differ from an older generation's newest-slot rows, and alert HR when needed.
+
+    The newer read is the slot's record. The older row stays in its ledger
+    unchanged; a punch ADD took from it with no other evidence is flagged.
+    """
+    if not pairs:
+        return
+    from zk_add.reconciliation import _event
+
+    orphans = orphaned_events(session, pairs)
+    details = {"rows": [
+        {"ordinal": prior.ordinal, "previous_manifest_id": prior.id, "previous_generation": prior.generation,
+         "previous_disposition": prior.disposition, "previous_raw_record_digest": prior.raw_record_digest,
+         "raw_record_digest": source.raw_record_digest,
+         "unverified_attendance_event_id": orphans.get(prior.id)}
+        for prior, source in sorted(pairs, key=lambda item: item[0].ordinal)
+    ]}
+    if job is not None:
+        _event(session, job, LINEAGE_STATE, details)
+    else:
+        append_audit(session, actor="system:source-reconciliation", action=LINEAGE_STATE,
+                     target_type="reconciliation_coverage",
+                     target_id=coverage.coverage_id if coverage is not None else "unknown",
+                     outcome="SUCCESS", after=details)
+    priors = [prior for prior, _ in pairs]
+    if orphans:
+        alert_changed(session, connector, rows=[(prior, orphans[prior.id]) for prior in priors if prior.id in orphans],
+                      job_id=job.job_id if job is not None else None,
+                      coverage_id=coverage.coverage_id if coverage is not None else None)
+    alert_corrected(session, connector, corrected=corrections_by_row(session, priors), rows=priors,
+                    job_id=job.job_id if job is not None else None)
+
+
+# --- Sealed cohorts and inspection -------------------------------------------------
 
 
 def sealed_cohort(session: Session, job: ReconciliationJob, manifests, *, dispositions) -> list:

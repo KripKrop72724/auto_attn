@@ -32,7 +32,6 @@ from zk_add.models import (
     AuditEvent,
     Connector,
     DeviceAlert,
-    ReconciliationChunk,
     ReconciliationCoverage,
     ReconciliationDivergence,
     ReconciliationEvent,
@@ -648,7 +647,9 @@ def test_reread_at_the_jobs_own_final_ordinal_is_kept_only_as_a_receipt(source_d
     assert job.quarantined_count == 1
     assert job.capture_certificate["unconfirmed_newest_ordinals"] == [3]
     alert = session.scalar(select(DeviceAlert).where(DeviceAlert.code == newest_slot.UNRECEIVED_ALERT))
-    assert alert.details["ordinals"] == [3] and alert.details["receipt_manifest_ids"] == [receipt.id]
+    assert alert.details["ordinals"] == [3]
+    assert [(slot["manifest_id"], slot["causes"]) for slot in alert.details["slots"]] == [
+        (receipt.id, [newest_slot.REREAD_SOURCE_KIND])]
     assert service.source_exception_assurance(session, job)["state"] == newest_slot.PUNCH_PENDING_STATE
 
 
@@ -735,7 +736,7 @@ def test_identical_reread_confirms_a_genuine_newest_record(source_db):
     assert later.phase == "VERIFYING_SOURCE_CHANGE"
 
 
-def test_corrected_newest_row_is_never_settled_and_raises_an_alert(source_db):
+def test_corrected_newest_row_settles_and_alerts_hr_without_stopping(source_db):
     session, connector, _ = source_db
     coverage, before, _ = first_tail(session, connector, junk(3, "copied_identity_bad_time"))
     prior = canonical(session, 3)
@@ -745,6 +746,8 @@ def test_corrected_newest_row_is_never_settled_and_raises_an_alert(source_db):
         (3, newest_slot.CORRECTED_CONDITION, [correction.correction_id])]
     assert "HR must verify" in listed[0]["operator_reason"]
     assert 3 not in {row["ordinal"] for row in list_source_exceptions(session, corrected=False)["rows"]}
+    # The corrected punch rests only on newest-slot bytes: no guarded release path sends it.
+    assert newest_slot.newest_only_event_ids(session, [derived]) == {derived.id}
     # A rewound replay shows the slot now holds P3: rows stay, HR is alerted.
     _, _, _, error = replay(session, connector, coverage, before,
                             [P1.row(1), P2.row(2), P3.row(3), P4.row(4), junk(5, "zero")], latest=6)
@@ -755,20 +758,24 @@ def test_corrected_newest_row_is_never_settled_and_raises_an_alert(source_db):
     session.delete(alert)
     session.commit()
     events_before = session.scalar(select(func.count(AttendanceEvent.id)))
-    # A reconcile that reads P3 there stops instead of hiding the corrected punch.
+    # A reconcile that reads P3 there settles the slot and keeps going: the
+    # stop it used to make had no exit and protected nothing.
     job = anchor_job(session, connector, cutoff=6)
     commit_chunk(session, connector, job, history(P0, P1, P2, P3, P4, junk(5, "zero")))
-    assert (job.status, job.error_code) == ("NEEDS_ATTENTION", newest_slot.CORRECTED_HOLD)
-    assert job.committed_next_ordinal == 0
-    assert session.scalar(select(func.count(ReconciliationChunk.id)).where(ReconciliationChunk.job_id == job.id)) == 0
-    assert canonical(session, 3).id == prior.id
-    assert session.scalar(select(func.count(AttendanceEvent.id))) == events_before
+    assert job.status != "NEEDS_ATTENTION" and job.committed_next_ordinal == 6
+    assert canonical(session, 3).raw_record_digest == P3.row(3).raw_record_digest
+    assert not session.get(TerminalRecordManifest, prior.id).canonical_source
+    assert session.scalar(select(func.count(AttendanceEvent.id))) == events_before + 2  # P3 and P4
     assert session.get(AttendanceSourceCorrection, correction.id).status == "CREATED"
-    hold = session.scalar(select(ReconciliationEvent).where(
-        ReconciliationEvent.job_id == job.id, ReconciliationEvent.state == newest_slot.CORRECTED_HOLD))
-    assert hold.details["correction_ids"] == [correction.correction_id]
+    settlement = session.scalar(select(ReconciliationEvent).where(
+        ReconciliationEvent.job_id == job.id, ReconciliationEvent.state == newest_slot.SETTLED_STATE))
+    assert settlement.details["rows"][0]["unverified_correction_ids"] == [correction.correction_id]
     alert = session.scalar(select(DeviceAlert).where(DeviceAlert.code == newest_slot.CORRECTED_ALERT))
-    assert alert is not None and alert.details["job_id"] == job.job_id
+    assert alert.severity == "CRITICAL" and alert.details["job_ids"] == [job.job_id]
+    assert alert.details["correction_ids"] == [correction.correction_id]
+    # The corrected punch stays held back from every guarded release path.
+    assert newest_slot.newest_only_event_ids(session, [derived]) == {derived.id}
+
 
 
 def test_reviewed_newest_row_settles_and_its_review_stays_with_the_excluded_bytes(source_db):
@@ -984,7 +991,9 @@ def test_superseded_replay_keeps_a_missed_punch_as_evidence_and_alerts(source_db
         assert unreceived is None
     else:
         assert unreceived.severity == "HIGH"
-        assert (unreceived.details["ordinals"], unreceived.details["receipt_manifest_ids"]) == ([3], [receipt.id])
+        assert unreceived.details["ordinals"] == [3]
+        assert [(slot["manifest_id"], slot["causes"]) for slot in unreceived.details["slots"]] == [
+            (receipt.id, [newest_slot.REPLAY_SOURCE_KIND])]
     detail = source_exception_detail(session, canonical(session, 3))
     assert [(row["manifest_id"], row["source_kind"], row["punch_received"]) for row in detail["slot_receipts"]] == [
         (receipt.id, newest_slot.REPLAY_SOURCE_KIND, live_captured)]
@@ -1053,8 +1062,9 @@ def test_newest_slot_punch_no_capture_delivered_is_held_not_ingested(source_db, 
     assert newest_slot.claimed_punch(row)[1]["event_uid"] == stale.event_uid
     assert event_id(session, stale) is None
     held = alert(session, newest_slot.UNRECEIVED_ALERT)
-    assert (held.details["cause"], held.details["ordinals"], held.details["held_manifest_ids"]) == (
-        "TAIL", [3], [row.id])
+    assert held.details["ordinals"] == [3]
+    assert [(slot["manifest_id"], slot["causes"]) for slot in held.details["slots"]] == [
+        (row.id, [newest_slot.HELD_CAUSE])]
     listed = {item["ordinal"]: item for item in list_source_exceptions(session)["rows"]}
     assert listed[3]["source_condition"] == newest_slot.UNCONFIRMED_CONDITION
     assert "ADD holds them" in listed[3]["operator_reason"]
@@ -1067,6 +1077,10 @@ def test_newest_slot_punch_no_capture_delivered_is_held_not_ingested(source_db, 
             "manifest_id": row.id, "source_kind": "TAIL", "job_id": None,
             "raw_record_digest": row.raw_record_digest, "disposition": "EVENT",
             "decodes_as_punch": True, "punch_received": True, "observed_at": row.created_at}]
+        # The assurance refresh clears the slot from the alert once LIVE holds its punch.
+        service.refresh_all_reconciliation_assurance(session)
+        session.commit()
+        assert alert(session, newest_slot.UNRECEIVED_ALERT) is None
     events_before = session.scalar(select(func.count(AttendanceEvent.id)))
     # A later reconcile reads slot 3 while later records exist.
     third = P3.row(3) if later == "other_bytes" else stale.row(3)
@@ -1084,35 +1098,74 @@ def test_newest_slot_punch_no_capture_delivered_is_held_not_ingested(source_db, 
         assert event_id(session, stale) is None  # the held bytes were never a punch
     settlement = session.scalar(select(ReconciliationEvent).where(
         ReconciliationEvent.job_id == job.id, ReconciliationEvent.state == newest_slot.SETTLED_STATE))
-    assert [(item["ordinal"], item["superseded_error_code"]) for item in settlement.details["rows"]] == [
-        (3, newest_slot.HELD_CODE)]
+    assert [(item["ordinal"], item["superseded_error_code"], item["confirmed_identical"])
+            for item in settlement.details["rows"]] == [(3, newest_slot.HELD_CODE, later != "other_bytes")]
+    # The settled slot leaves the unreceived-punch alert; slot 4, the job's own
+    # final ordinal, read as junk and is not on it.
+    assert alert(session, newest_slot.UNRECEIVED_ALERT) is None
 
 
-def test_baseline_final_ordinal_is_assumed_newest_and_a_later_change_stops_for_review(source_db):
+def test_baseline_final_ordinal_punch_no_capture_delivered_is_held(source_db):
     """No chunk reports the count a baseline's final ordinal was read against.
 
-    The row is labelled and certified as possibly the newest slot, but its
-    punch is ingested and released under the ordinary rules. A later read of
-    other bytes there, while later records exist, stops for HR.
+    The read is assumed to be the newest slot: a punch there that no capture
+    has delivered is held exactly like a tail's newest read, and the job's
+    assurance waits for it. A later reconcile that reads the slot while later
+    records exist settles it.
     """
     session, connector, _ = source_db
     stale = Punch(uid=17, user_id="44", local=at(7))
     first = certify_baseline(session, connector, [P0.row(0, source="FULL_HISTORY"), stale.row(1)])
     row = canonical(session, 1)
+    assert (row.disposition, row.error_code, row.attendance_event_id) == (
+        "IDENTITY_UNRESOLVED", newest_slot.HELD_CODE, None)
+    assert event_id(session, stale) is None
+    assert first.capture_certificate["unconfirmed_newest_ordinals"] == [1]
+    assert newest_slot.HELD_STATE in job_states(session, first)
+    held = alert(session, newest_slot.UNRECEIVED_ALERT)
+    assert [(slot["ordinal"], slot["causes"]) for slot in held.details["slots"]] == [(1, [newest_slot.HELD_CAUSE])]
+    assurance = service.source_exception_assurance(session, first)
+    assert (assurance["state"], assurance["newest_held"], assurance["newest_punch_unreceived"]) == (
+        newest_slot.PUNCH_PENDING_STATE, 1, 1)
+    assert (first.status, first.error_code) == ("NEEDS_ATTENTION", newest_slot.PUNCH_PENDING_HOLD)
+    service.control_reconciliation_job(session, job=first, action="cancel", actor="operator",
+                                       reason="Reconcile after the next punch.", idempotency_key="cancel-held")
+    session.commit()
+    job = anchor_job(session, connector, cutoff=3)
+    commit_chunk(session, connector, job, history(P0, P1, junk(2, "zero")))
+    assert job.committed_next_ordinal == 3 and job.status != "NEEDS_ATTENTION"
+    assert canonical(session, 1).attendance_event_id == event_id(session, P1)
+    assert event_id(session, stale) is None  # the held bytes were never a punch
+    assert alert(session, newest_slot.UNRECEIVED_ALERT) is None
+
+
+def test_pre_deploy_baseline_final_punch_is_never_released_and_a_change_alerts_hr(source_db, monkeypatch):
+    """A baseline's final ordinal ingested stale bytes as a punch before ADD held such reads."""
+    session, connector, _ = source_db
+    stale = Punch(uid=17, user_id="44", local=at(7))
+    with monkeypatch.context() as before_deploy:
+        before_deploy.setattr(newest_slot, "held_newest_uids", lambda *args, **kwargs: {})
+        first = certify_baseline(session, connector, [P0.row(0, source="FULL_HISTORY"), stale.row(1)])
+    row = canonical(session, 1)
     event = session.get(AttendanceEvent, event_id(session, stale))
     assert row.attendance_event_id == event.id and not newest_slot.is_held(row)
     assert newest_slot.newest_read_ids(session, [row]) == {row.id}
-    assert newest_slot.newest_only_event_ids(session, [event]) == set()
-    assert first.capture_certificate["unconfirmed_newest_ordinals"] == [1]
-    assert alert(session, newest_slot.UNRECEIVED_ALERT) is None
+    # An assumed newest read is not proof of a punch either.
+    assert newest_slot.newest_only_event_ids(session, [event]) == {event.id}
     first.status = "COMPLETED"
     session.commit()
     job = anchor_job(session, connector, cutoff=3)
     commit_chunk(session, connector, job, history(P0, P1, junk(2, "zero")))
-    assert (job.status, job.error_code, job.committed_next_ordinal) == (
-        "NEEDS_ATTENTION", newest_slot.CHANGED_HOLD, 0)
+    # The slot settles; the stale punch has no other evidence, so HR is alerted.
+    assert (job.status, job.committed_next_ordinal) != ("NEEDS_ATTENTION", 0)
+    assert job.committed_next_ordinal == 3
     assert session.scalar(select(func.count(ReconciliationDivergence.id))) == 0
-    assert alert(session, newest_slot.CHANGED_ALERT).details["attendance_event_ids"] == [event.id]
+    assert canonical(session, 1).attendance_event_id == event_id(session, P1)
+    changed = alert(session, newest_slot.CHANGED_ALERT)
+    assert changed.severity == "CRITICAL"
+    assert (changed.details["attendance_event_ids"], changed.details["job_ids"]) == ([event.id], [job.job_id])
+    assert newest_slot.newest_only_event_ids(session, [event]) == {event.id}
+
 
 
 
@@ -1151,8 +1204,8 @@ def test_newest_slot_byte_copy_of_an_earlier_punch_settles_on_reconcile(source_d
         AttendanceEvent.event_uid == P3.event_uid)) == 1
 
 
-def test_changed_newest_row_that_delivered_a_punch_holds_instead_of_diverging(source_db):
-    """A newest-slot read linked an existing punch, is not a byte copy, and later reads differently."""
+def test_changed_newest_row_that_linked_a_live_punch_settles_without_alerting_hr(source_db):
+    """A newest-slot read linked a LIVE punch and later reads differently: LIVE still holds it."""
     from zk_add import web
     session, connector, _ = source_db
     stale = Punch(uid=17, user_id="44", local=at(7))
@@ -1162,22 +1215,39 @@ def test_changed_newest_row_that_delivered_a_punch_holds_instead_of_diverging(so
     assert (row.disposition, row.attendance_event_id) == ("EVENT", event_id(session, stale))
     job = anchor_job(session, connector, cutoff=5)
     payload = chunk_request(session, job, history(P0, P1, P2, P3, junk(4, "zero")))
-    # The HTTP chunk route answers a held chunk instead of failing.
     response, _ = web.persist_device_reconciliation_chunk(payload, (session, connector))
-    assert response == {
-        "ok": False, "job_id": job.job_id, "generation": payload.generation, "sequence": payload.sequence,
-        "committed_next_ordinal": 0, "resulting_chain_digest": payload.resulting_chain_digest,
-        "duplicate": False,
-    }
-    assert (job.status, job.error_code) == ("NEEDS_ATTENTION", newest_slot.CHANGED_HOLD)
+    assert response["ok"] is True and response["committed_next_ordinal"] == 5
     assert session.scalar(select(func.count(ReconciliationDivergence.id))) == 0
-    assert session.scalar(select(func.count(ReconciliationChunk.id)).where(ReconciliationChunk.job_id == job.id)) == 0
-    assert canonical(session, 3).id == row.id and event_id(session, P3) is None
-    hold = session.scalar(select(ReconciliationEvent).where(
-        ReconciliationEvent.job_id == job.id, ReconciliationEvent.state == newest_slot.CHANGED_HOLD))
-    assert (hold.details["ordinals"], hold.details["attendance_event_ids"]) == ([3], [event_id(session, stale)])
+    assert canonical(session, 3).attendance_event_id == event_id(session, P3)
+    assert not session.get(TerminalRecordManifest, row.id).canonical_source
+    assert alert(session, newest_slot.CHANGED_ALERT) is None
+    live = session.get(AttendanceEvent, event_id(session, stale))
+    assert newest_slot.newest_only_event_ids(session, [live]) == set()
+
+
+def test_changed_newest_row_whose_punch_nothing_else_holds_settles_and_alerts_hr(source_db):
+    """A pre-deploy newest read ingested a punch no capture holds; the slot later reads P3."""
+    session, connector, _ = source_db
+    stale = Punch(uid=17, user_id="44", local=at(7))
+    ingest_attendance(session, connector=connector, events=[stale.event("CURRENT_RECONCILE")])
+    session.commit()
+    first_tail(session, connector, stale.row(3))
+    row = canonical(session, 3)
+    event = session.get(AttendanceEvent, event_id(session, stale))
+    assert row.attendance_event_id == event.id
+    job = anchor_job(session, connector, cutoff=5)
+    commit_chunk(session, connector, job, history(P0, P1, P2, P3, junk(4, "zero")))
+    assert job.committed_next_ordinal == 5 and job.status != "NEEDS_ATTENTION"
+    assert canonical(session, 3).attendance_event_id == event_id(session, P3)
     changed = alert(session, newest_slot.CHANGED_ALERT)
-    assert changed.severity == "CRITICAL" and changed.details["job_id"] == job.job_id
+    assert changed.severity == "CRITICAL"
+    assert (changed.details["attendance_event_ids"], changed.details["ordinals"]) == ([event.id], [3])
+    settlement = session.scalar(select(ReconciliationEvent).where(
+        ReconciliationEvent.job_id == job.id, ReconciliationEvent.state == newest_slot.SETTLED_STATE))
+    assert settlement.details["rows"][0]["unverified_attendance_event_id"] == event.id
+    # Its only source row was replaced: it stays out of every guarded release path.
+    assert newest_slot.newest_only_event_ids(session, [event]) == {event.id}
+
 
 
 def test_events_only_read_from_a_newest_slot_are_never_released(source_db, monkeypatch):
@@ -1243,9 +1313,9 @@ def test_settling_a_completed_jobs_final_ordinal_keeps_its_sealed_cohort(source_
         key: before[key] for key in ("state", "total", "reviewed", "open", "cohort_digest")}
 
 
-def test_recovery_copy_of_a_corrected_read_is_never_settled(source_db):
+def test_recovery_copy_carries_the_corrections_of_the_read_it_copies(source_db):
     session, connector, _ = source_db
-    coverage, _, _ = first_tail(session, connector, junk(3, "copied_identity_bad_time"))
+    first_tail(session, connector, junk(3, "copied_identity_bad_time"))
     original = canonical(session, 3)
     correction, _ = correct(session, connector, original)
     epoch = session.scalar(select(TerminalSourceEpoch))
@@ -1264,12 +1334,12 @@ def test_recovery_copy_of_a_corrected_read_is_never_settled(source_db):
     }, source_epoch_id=replacement.id, source_kind="RECOVERY_PREFIX", canonical_source=True)
     session.add(copy)
     session.commit()
-    job = session.get(ReconciliationJob, coverage.job_id)
-    code, _, details = newest_slot.settlement_block(session, job=job, priors=[copy])
-    assert (code, details["correction_ids"]) == (newest_slot.CORRECTED_HOLD, [correction.correction_id])
+    # Settling the copy raises the HR alert for the original's correction.
+    assert newest_slot.corrections_by_row(session, [copy]) == {copy.id: [correction.correction_id]}
     listed = {item["id"]: item for item in list_source_exceptions(session)["rows"]}
     assert listed[copy.id]["source_condition"] == newest_slot.CORRECTED_CONDITION
     assert listed[copy.id]["source_correction_ids"] == [correction.correction_id]
+
 
 
 def test_divergence_probe_opened_on_a_newest_slot_row_requeues_its_chunk(source_db):
@@ -1409,3 +1479,450 @@ def test_source_evidence_lists_newest_slot_rows_for_a_pre_reconcile_check(source
              row["newest_read_observed"]) for row in listed] == [
         (3, "TAIL", "EVENT", True, True), (0, "BASELINE", "EVENT", True, False)]
     assert [row["ordinal"] for row in list_evidence(session, connector, limit=50)["rows"]] == [3, 2, 1, 0]
+
+
+# --- Review findings on 185f7a6 ------------------------------------------------
+
+
+@pytest.mark.parametrize("newest", ["byte_copy", "live_event"])
+def test_final_ordinal_reread_holds_assurance_whatever_row_it_reread(source_db, newest):
+    """The tail's newest slot linked a punch; P4 lands there during a quiet-window scan and LIVE misses it.
+
+    Neither row is a source exception, so the job has no exception cohort.
+    """
+    from types import SimpleNamespace
+
+    from zk_add.attendance_repair import RepairError, _attach_source_dependency
+    session, connector, _ = source_db
+    if newest == "byte_copy":
+        first_tail(session, connector, P2.row(3))
+        assert canonical(session, 3).disposition == "TERMINAL_DUPLICATE"
+    else:
+        live_capture(session, connector, P3)
+        first_tail(session, connector, P3.row(3))
+        assert canonical(session, 3).disposition in {"EVENT", "BLOCKED_IDENTITY"}
+    job = anchor_job(session, connector, cutoff=4)
+    chain = commit_chunk(session, connector, job, history(P0, P1, P2, P4.row(3, source="FULL_HISTORY")))
+    assert event_id(session, P4) is None and job.quarantined_count == 0
+    seal(session, connector, job, chain)
+    service.refresh_reconciliation_assurance(session, job)
+    session.commit()
+    assurance = service.source_exception_assurance(session, job)
+    assert (assurance["state"], assurance["total"], assurance["newest_punch_unreceived"]) == (
+        newest_slot.PUNCH_PENDING_STATE, 0, 1)
+    assert (job.status, job.error_code) == ("NEEDS_ATTENTION", newest_slot.PUNCH_PENDING_HOLD)
+    assert job.oracle_certified_at is None
+    # Neither a retry nor a resume reads the slot again, and a repair cannot wait on the job.
+    for action in ("retry", "resume"):
+        with pytest.raises(ValueError, match="newest-record slot"):
+            service.control_reconciliation_job(session, job=job, action=action, actor="operator",
+                                               reason="Try again", idempotency_key=f"{action}-pending")
+        session.rollback()
+    with pytest.raises(RepairError) as refused:
+        _attach_source_dependency(session, job=SimpleNamespace(job_id="repair", actor="operator"),
+                                  connector=connector)
+    assert refused.value.code == "SOURCE_DEPENDENCY_UNAVAILABLE"
+    session.rollback()
+    target = job.ords_target_count
+    # LIVE capture delivers P4 late: assurance resumes on its own and P4 joins the membership.
+    live_capture(session, connector, P4)
+    service.refresh_reconciliation_assurance(session, job)
+    session.commit()
+    assert service.source_exception_assurance(session, job)["state"] == "NONE"
+    assert job.error_code is None and job.status != "NEEDS_ATTENTION"
+    assert job.ords_target_count == target + 1
+    assert "SOURCE_NEWEST_PUNCH_ACCOUNTED" in job_states(session, job)
+
+
+def test_held_claim_is_disproved_by_a_reread_of_a_punch_live_delivered(source_db):
+    """The job's final ordinal is a held placeholder; its re-read shows the slot's LIVE-delivered punch."""
+    session, connector, _ = source_db
+    stale = Punch(uid=17, user_id="44", local=at(7))
+    first_tail(session, connector, stale.row(3))
+    assert newest_slot.is_held(canonical(session, 3))
+    live_capture(session, connector, P3)
+    job = anchor_job(session, connector, cutoff=4)
+    chain = commit_chunk(session, connector, job, history(P0, P1, P2, P3))
+    seal(session, connector, job, chain)
+    service.refresh_reconciliation_assurance(session, job)
+    session.commit()
+    assurance = service.source_exception_assurance(session, job)
+    assert (assurance["newest_held"], assurance["newest_punch_unreceived"]) == (1, 0)
+    assert assurance["state"] == "REVIEWED_EXCLUSIONS" and job.error_code != newest_slot.PUNCH_PENDING_HOLD
+    assert event_id(session, P3) in assurance["newest_received_event_ids"]
+    # The slot is accounted for, so it leaves the unreceived-punch alert.
+    service.refresh_all_reconciliation_assurance(session)
+    session.commit()
+    assert alert(session, newest_slot.UNRECEIVED_ALERT) is None
+
+
+def test_identical_held_bytes_out_of_time_order_stay_excluded_for_review(source_db):
+    """A terminal that never rewrote a stale slot: the same bytes read again, older than their neighbours."""
+    session, connector, _ = source_db
+    stale = Punch(uid=17, user_id="44", local=at(-30))
+    first_tail(session, connector, stale.row(3))
+    held = canonical(session, 3)
+    assert newest_slot.is_held(held)
+    job = anchor_job(session, connector, cutoff=5)
+    chain = commit_chunk(session, connector, job, history(P0, P1, P2, stale.row(3), junk(4, "zero")))
+    assert job.committed_next_ordinal == 5
+    assert canonical(session, 3).id == held.id and event_id(session, stale) is None
+    assert newest_slot.OUT_OF_ORDER_STATE in job_states(session, job)
+    assert newest_slot.out_of_order_ids(session, [held]) == {held.id}
+    listed = {row["ordinal"]: row for row in list_source_exceptions(session)["rows"]}
+    assert listed[3]["source_condition"] == newest_slot.OUT_OF_ORDER_CONDITION
+    assert "did not ingest them" in listed[3]["operator_reason"]
+    seal(session, connector, job, chain)
+    service.refresh_reconciliation_assurance(session, job)
+    session.commit()
+    # An ordinary reviewable exception: no identity hold and no pending punch.
+    assurance = service.source_exception_assurance(session, job)
+    assert (assurance["state"], assurance["identity_unresolved_open"], assurance["newest_punch_unreceived"]) == (
+        "REVIEW_REQUIRED", 0, 0)
+    for ordinal in (3, 4):
+        review_source_exception(session, row=canonical(session, ordinal), actor="operator",
+                                reason="Out-of-order and unwritten newest records", idempotency_key=f"review-{ordinal}")
+    session.commit()
+    service.refresh_reconciliation_assurance(session, job)
+    session.commit()
+    assert service.source_exception_assurance(session, job)["state"] == "REVIEWED_EXCLUSIONS"
+
+
+def test_identical_newest_bytes_with_another_key_keep_the_key_drift_hold(source_db):
+    session, connector, _ = source_db
+    stale = Punch(uid=17, user_id="44", local=at(7))
+    live_capture(session, connector, stale)
+    first_tail(session, connector, stale.row(3))
+    job = anchor_job(session, connector, cutoff=5)
+    drifted = stale.row(3).model_copy(update={"terminal_record_key": "f" * 64, "occurrence_index": 9})
+    commit_chunk(session, connector, job, history(P0, P1, P2, drifted, junk(4, "zero")))
+    assert (job.status, job.error_code) == ("NEEDS_ATTENTION", "SOURCE_DERIVED_KEY_DIVERGED")
+    assert alert(session, newest_slot.CHANGED_ALERT) is None
+
+
+def test_automatic_release_alerts_when_it_holds_back_a_newest_slot_punch(source_db, monkeypatch):
+    from zk_add.models import DeviceUser
+    from zk_add.service import release_synced_cnic_attendance_event
+    session, connector, _ = source_db
+    held = Punch(uid=99, user_id="44", local=at(7))
+    ingest_attendance(session, connector=connector, events=[held.event("CURRENT_RECONCILE")])
+    session.commit()
+    first_tail(session, connector, held.row(3))
+    event = session.get(AttendanceEvent, event_id(session, held))
+    monkeypatch.setattr("zk_add.service.synced_cnic_identity_proven", lambda *args: True)
+    monkeypatch.setattr("zk_add.attendance_auto_release_guard.database_synced_cnic_release_proven",
+                        lambda *args, **kwargs: True)
+    user = session.scalar(select(DeviceUser).where(DeviceUser.user_id == "44"))
+    assert release_synced_cnic_attendance_event(session, zkt=connector.zkt_device, user=user, row=event) is False
+    session.commit()
+    held_back = alert(session, newest_slot.RELEASE_HELD_ALERT)
+    assert held_back.severity == "HIGH"
+    assert (held_back.details["attendance_event_ids"], held_back.details["event_count"]) == ([event.id], 1)
+    # A reconcile confirms the read; the refresh clears the alert once the punch is no longer held back.
+    job = anchor_job(session, connector, cutoff=5)
+    commit_chunk(session, connector, job, history(P0, P1, P2, held, junk(4, "zero")))
+    service.refresh_all_reconciliation_assurance(session)
+    session.commit()
+    assert alert(session, newest_slot.RELEASE_HELD_ALERT) is None
+
+
+def test_settled_duplicate_whose_event_nothing_else_holds_alerts_hr(source_db, monkeypatch):
+    """Slot 2 was read without identity; the newest slot copied its bytes and created the event itself."""
+    session, connector, _ = source_db
+    live_capture(session, connector, P0)
+    baseline = certify_baseline(session, connector, [P0.row(0, source="FULL_HISTORY")])
+    baseline.status, baseline.phase = "COMPLETED", "COMPLETED"
+    coverage = active_coverage(session)
+    unresolved = P2.row(2).model_copy(update={"disposition": "IDENTITY_UNRESOLVED", "event": None,
+                                              "error_code": "HISTORICAL_IDENTITY_EVIDENCE_REQUIRED"})
+    with monkeypatch.context() as before_deploy:
+        before_deploy.setattr(newest_slot, "held_newest_uids", lambda *args, **kwargs: {})
+        request = tail_request(session, coverage, [P1.row(1), unresolved, P2.row(3)], latest=4)
+        assert service.apply_source_tail_chunk(session, connector=connector, payload=request)[3] is None
+    connector.zkt_device.attendance_count = 4
+    session.commit()
+    copy = canonical(session, 3)
+    event = session.get(AttendanceEvent, copy.attendance_event_id)
+    assert copy.disposition == "TERMINAL_DUPLICATE" and canonical(session, 2).attendance_event_id is None
+    job = anchor_job(session, connector, cutoff=5)
+    commit_chunk(session, connector, job, history(P0, P1, unresolved, P3, junk(4, "zero")))
+    assert canonical(session, 3).attendance_event_id == event_id(session, P3)
+    assert alert(session, newest_slot.CHANGED_ALERT).details["attendance_event_ids"] == [event.id]
+    # The event has no canonical source row left, and stays out of every guarded release path.
+    assert newest_slot.newest_only_event_ids(session, [event]) == {event.id}
+
+
+def test_newer_holds_are_not_retried_into_the_same_hold(source_db):
+    session, connector, _ = source_db
+    first_tail(session, connector, junk(3, "zero"))
+    sealed = anchor_job(session, connector, cutoff=4)
+    seal(session, connector, sealed, commit_chunk(
+        session, connector, sealed, history(P0, P1, P2, junk(3, "bare_timestamp"))))
+    other, _token, _created = onboard_connector(
+        session, hardware_id="e0:72:a1:d6:f3:44", zone_id="ZONE-MULTAN-01", zone_name="ZONE-MULTAN-01",
+        device_id="4", firmware_version="zone-lite-2.7.5", expected_serial="EARLIER-BINDING-2",
+        actor="test", ip_address="127.0.0.1",
+    )
+    session.flush()
+    sealed.connector_id = other.id
+    session.commit()
+    job = anchor_job(session, connector, cutoff=6)
+    commit_chunk(session, connector, job, history(P0, P1, P2, P3, P4, junk(5, "zero")))
+    assert job.error_code == newest_slot.OPEN_JOB_HOLD
+    for action in ("retry", "resume"):
+        with pytest.raises(ValueError, match="still open"):
+            service.control_reconciliation_job(session, job=job, action=action, actor="operator",
+                                               reason="Try again", idempotency_key=f"{action}-open")
+        session.rollback()
+    service.control_reconciliation_job(session, job=sealed, action="cancel", actor="operator",
+                                       reason="Superseded.", idempotency_key="cancel-sealed")
+    service.control_reconciliation_job(session, job=job, action="retry", actor="operator",
+                                       reason="The sealing job is closed.", idempotency_key="retry-open")
+    session.commit()
+    assert job.status == "QUEUED"
+
+
+def test_unreceived_alert_keeps_its_oldest_slots_and_a_count(source_db, monkeypatch):
+    session, connector, _ = source_db
+    monkeypatch.setattr(newest_slot, "ALERT_SLOT_LIMIT", 2)
+
+    def slots(*ordinals):
+        return [{"ordinal": ordinal, "generation": 1, "source_epoch_id": None} for ordinal in ordinals]
+
+    newest_slot.alert_unreceived(session, connector, cause=newest_slot.HELD_CAUSE, slots=slots(40, 7))
+    newest_slot.alert_unreceived(session, connector, cause=newest_slot.FILLED_CAUSE, slots=slots(90, 3, 7))
+    session.commit()
+    details = alert(session, newest_slot.UNRECEIVED_ALERT).details
+    assert details["ordinals"] == [3, 7] and details["oldest_ordinal"] == 3
+    assert (details["slot_count"], details["slots_not_listed"]) == (4, 2)
+    assert {slot["ordinal"]: slot["causes"] for slot in details["slots"]}[7] == sorted(
+        [newest_slot.FILLED_CAUSE, newest_slot.HELD_CAUSE])
+
+
+@pytest.mark.parametrize("live", [False, True])
+def test_tail_after_a_newest_read_alerts_when_no_live_punch_filled_the_slot(source_db, live):
+    """MULTAN-01: the punch that filled the tail's newest slot reached ADD only via LIVE, if at all."""
+    session, connector, _ = source_db
+    coverage, _, _ = first_tail(session, connector, junk(3, "zero"))
+    if live:
+        live_capture(session, connector, P3)
+    live_capture(session, connector, P4)
+    request = tail_request(session, coverage, [P4.row(4), junk(5, "zero")], latest=6)
+    assert service.apply_source_tail_chunk(session, connector=connector, payload=request)[3] is None
+    session.commit()
+    missed = alert(session, newest_slot.UNRECEIVED_ALERT)
+    if live:
+        assert missed is None
+        return
+    [slot] = missed.details["slots"]
+    assert (slot["ordinal"], slot["causes"]) == (3, [newest_slot.FILLED_CAUSE])
+    assert slot["after"] == P2.local.astimezone(timezone.utc).isoformat()
+    assert slot["before"] == P4.local.astimezone(timezone.utc).isoformat()
+    # A complete reconcile reads P3 there and the slot leaves the alert.
+    connector.zkt_device.attendance_count = 6
+    job = anchor_job(session, connector, cutoff=6)
+    commit_chunk(session, connector, job, history(P0, P1, P2, P3, P4, junk(5, "zero")))
+    assert canonical(session, 3).attendance_event_id == event_id(session, P3)
+    assert alert(session, newest_slot.UNRECEIVED_ALERT) is None
+
+
+def test_late_live_delivery_clears_a_filled_slot(source_db):
+    session, connector, _ = source_db
+    coverage, _, _ = first_tail(session, connector, junk(3, "zero"))
+    request = tail_request(session, coverage, [P4.row(4), junk(5, "zero")], latest=6)
+    assert service.apply_source_tail_chunk(session, connector=connector, payload=request)[3] is None
+    session.commit()
+    assert alert(session, newest_slot.UNRECEIVED_ALERT) is not None
+    live_capture(session, connector, P3)
+    service.refresh_all_reconciliation_assurance(session)
+    session.commit()
+    assert alert(session, newest_slot.UNRECEIVED_ALERT) is None
+
+
+def test_plain_divergence_in_the_same_chunk_still_alerts_hr(source_db):
+    session, connector, _ = source_db
+    stale = Punch(uid=17, user_id="44", local=at(7))
+    ingest_attendance(session, connector=connector, events=[stale.event("CURRENT_RECONCILE")])
+    session.commit()
+    first_tail(session, connector, stale.row(3))
+    event = session.get(AttendanceEvent, event_id(session, stale))
+    job = anchor_job(session, connector, cutoff=5)
+    changed = Punch(uid=17, user_id="44", local=at(3))
+    commit_chunk(session, connector, job, history(P0, P1, changed.row(2, source="FULL_HISTORY"), P3,
+                                                  junk(4, "zero")))
+    assert job.phase == "VERIFYING_SOURCE_CHANGE"
+    assert alert(session, newest_slot.CHANGED_ALERT).details["attendance_event_ids"] == [event.id]
+
+
+def test_replay_over_a_newest_row_that_delivered_a_punch_is_superseded_and_alerts_hr(source_db):
+    """The PESHAWAR-06 pattern with a newest read that had delivered a punch."""
+    session, connector, _ = source_db
+    stale = Punch(uid=17, user_id="44", local=at(7))
+    ingest_attendance(session, connector=connector, events=[stale.event("CURRENT_RECONCILE")])
+    session.commit()
+    coverage, before, _ = first_tail(session, connector, stale.row(3))
+    event = session.get(AttendanceEvent, event_id(session, stale))
+    result, _, _, error = replay(session, connector, coverage, before,
+                                 [P1.row(1), P2.row(2), P3.row(3), P4.row(4), junk(5, "zero")], latest=6)
+    assert error == newest_slot.REPLAY_SUPERSEDED_CODE and result.active
+    changed = alert(session, newest_slot.CHANGED_ALERT)
+    assert changed.severity == "CRITICAL" and changed.details["attendance_event_ids"] == [event.id]
+    assert canonical(session, 3).attendance_event_id == event.id  # the replay changes no row
+
+
+def test_replay_that_rereads_a_held_punch_while_later_records_exist_keeps_a_receipt(source_db):
+    session, connector, _ = source_db
+    coverage, before, _ = first_tail(session, connector, P3.row(3))
+    held = canonical(session, 3)
+    assert newest_slot.is_held(held)
+    alert_before = alert(session, newest_slot.UNRECEIVED_ALERT)
+    session.delete(alert_before)
+    session.commit()
+    _, _, _, error = replay(session, connector, coverage, before,
+                            [P1.row(1), P2.row(2), P3.row(3), P4.row(4), junk(5, "zero")], latest=6)
+    assert error == newest_slot.REPLAY_SUPERSEDED_CODE
+    [receipt] = [row for row in rows_at(session, 3) if not row.canonical_source]
+    assert (receipt.source_kind, receipt.raw_record_digest) == (newest_slot.REPLAY_SOURCE_KIND, held.raw_record_digest)
+    [slot] = alert(session, newest_slot.UNRECEIVED_ALERT).details["slots"]
+    assert (slot["ordinal"], slot["causes"]) == (3, [newest_slot.REPLAY_SOURCE_KIND])
+    # A reconcile reads the same bytes in time order: the punch is ingested and the alert clears.
+    job = anchor_job(session, connector, cutoff=6)
+    commit_chunk(session, connector, job, history(P0, P1, P2, P3, P4, junk(5, "zero")))
+    assert canonical(session, 3).attendance_event_id == event_id(session, P3)
+    assert alert(session, newest_slot.UNRECEIVED_ALERT) is None
+
+
+def test_concurrent_alert_merges_keep_every_slot(source_db):
+    session, connector, factory = source_db
+    if session.get_bind().dialect.name != "postgresql":
+        pytest.skip("Row locks between concurrent transactions need PostgreSQL")
+
+    def slot(ordinal):
+        return [{"ordinal": ordinal, "generation": 1, "source_epoch_id": None}]
+
+    newest_slot.alert_unreceived(session, connector, cause=newest_slot.HELD_CAUSE, slots=slot(1))
+    session.commit()
+
+    def merge(db, ordinal):
+        newest_slot.alert_unreceived(db, db.get(Connector, connector.id), cause=newest_slot.HELD_CAUSE,
+                                     slots=slot(ordinal))
+
+    with factory() as first, factory() as second, ThreadPoolExecutor(max_workers=1) as pool:
+        merge(first, 2)
+        pending = pool.submit(lambda: (merge(second, 3), second.commit()))
+        time.sleep(1)
+        assert not pending.done()
+        first.commit()
+        pending.result(timeout=30)
+    session.expire_all()
+    assert alert(session, newest_slot.UNRECEIVED_ALERT).details["ordinals"] == [1, 2, 3]
+
+
+def _second_generation(session, connector, *, cutoff, latest):
+    """MULTAN-01 e57a3a37: the connector re-onboarded while generation 1 kept tailing."""
+    connector.onboarding_generation = 2
+    connector.zkt_device.attendance_count = latest
+    job = service.create_reconciliation_job(
+        session, connector=connector, actor="operator", reason="Generation 2 baseline.",
+        confirmation="RECONCILE 1 FROM START", idempotency_key=f"generation-two-{uuid4().hex}",
+    )
+    service.apply_reconciliation_anchor(session, connector=connector, payload=ReconciliationAnchorRequest(
+        job_id=job.job_id, source_epoch=service.source_epoch_uuid(session, job),
+        generation=job.terminal_generation, terminal_serial=SERIAL,
+        terminal_generation=job.terminal_generation, cutoff_count=cutoff, latest_terminal_count=cutoff,
+        record_size=40, source_total_bytes=4 + cutoff * 40, first_anchor_digest=P0.row(0).raw_record_digest,
+    ))
+    session.commit()
+    assert job.terminal_generation == 2
+    return job
+
+
+P5 = Punch(uid=22, user_id="50", local=at(15))
+
+
+def test_new_generation_replaces_older_newest_slot_reads_without_lineage_divergence(source_db):
+    """Every generation-1 tail committed junk at its newest slot; generation 2 reads the punches there."""
+    session, connector, _ = source_db
+    coverage, _, _ = first_tail(session, connector, junk(3, "zero"))
+    live_capture(session, connector, P4)
+    request = tail_request(session, coverage, [P4.row(4), junk(5, "bare_timestamp")], latest=6)
+    assert service.apply_source_tail_chunk(session, connector=connector, payload=request)[3] is None
+    session.commit()
+    old_rows = {ordinal: canonical(session, ordinal) for ordinal in (3, 5)}
+    assert all(newest_slot.is_unsettled_newest(session, row) for row in old_rows.values())
+    job = _second_generation(session, connector, cutoff=5, latest=7)
+    _, chunk, _ = service.apply_reconciliation_chunk(session, connector=connector, payload=chunk_request(
+        session, job, history(P0, P1, P2, P3, P4)))
+    session.commit()
+    # Before this rule ordinal 3 opened a source divergence and looped to the recovery limit.
+    assert chunk is not None and job.phase != "VERIFYING_SOURCE_CHANGE"
+    assert session.scalar(select(func.count(ReconciliationDivergence.id))) == 0
+    assert newest_slot.LINEAGE_STATE in job_states(session, job)
+    assert event_id(session, P3) is not None  # the punch LIVE missed reaches ADD
+    service.apply_reconciliation_manifest(session, connector=connector, payload=ReconciliationManifestRequest(
+        job_id=job.job_id, source_epoch=service.source_epoch_uuid(session, job),
+        generation=job.terminal_generation, terminal_serial=SERIAL,
+        terminal_generation=job.terminal_generation, cutoff_count=5, latest_terminal_count=7,
+        final_chain_digest=chunk.resulting_chain_digest,
+    ))
+    session.commit()
+    sealed = job.capture_certificate["superseded_generation"]
+    assert sealed["outcome"] == service.GENERATION_SUPERSEDED
+    assert sealed["lineage"]["previous_newest_slot_reads"]["first_ordinals"] == [3]
+    assert sealed["lineage"]["compared_records"] == 4
+    # Generation 2 re-reads ordinal 5, which generation 1 committed as junk.
+    new = active_coverage(session)
+    assert new.terminal_generation == 2
+    _, tail_chunk, _, error = service.apply_source_tail_chunk(
+        session, connector=connector, payload=tail_request(session, new, [P5.row(5), junk(6, "zero")], latest=7))
+    session.commit()
+    assert error is None and tail_chunk is not None and new.active
+    assert old_rows[5].canonical_source  # the older ledger is never rewritten
+
+
+def test_divergence_probe_against_an_older_generation_newest_slot_requeues(source_db):
+    from zk_add.schemas import SourceProbeResultRequest
+    session, connector, _ = source_db
+    coverage, _, _ = first_tail(session, connector, junk(3, "zero"))
+    old = canonical(session, 3)
+    job = _second_generation(session, connector, cutoff=5, latest=5)
+    # Opened before this rule recognised the older generation's newest-slot rows.
+    service._begin_source_divergence(session, job=job, prior=old, source=P3.row(3))
+    session.commit()
+    service.apply_source_probe_result(session, connector=connector, payload=SourceProbeResultRequest(
+        job_id=job.job_id, source_epoch=service.source_epoch_uuid(session, job),
+        generation=job.terminal_generation, terminal_serial=SERIAL, latest_terminal_count=5,
+        record_size=40, ordinal=3, record=P3.row(3)))
+    session.commit()
+    assert session.scalar(select(ReconciliationDivergence.state)) == newest_slot.PROBE_SUPERSEDED_STATE
+    assert newest_slot.PROBE_REQUEUED_STATE in job_states(session, job)
+
+
+def test_pre_reconcile_check_lists_recovery_epoch_copies_of_newest_reads(source_db):
+    """MULTAN-01's epoch 46 is a recovery epoch: its newest-slot rows are RECOVERY_PREFIX copies."""
+    from zk_add.zkt_source_evidence import list_evidence
+    session, connector, _ = source_db
+    first_tail(session, connector, junk(3, "zero"))
+    original = canonical(session, 3)
+    epoch = session.scalar(select(TerminalSourceEpoch))
+    replacement = TerminalSourceEpoch(
+        zkt_device_id=epoch.zkt_device_id, terminal_generation=epoch.terminal_generation,
+        sequence=epoch.sequence + 1, state="ACTIVE", parent_epoch_id=epoch.id,
+        activated_at=utc_now(), created_at=utc_now(), updated_at=utc_now(),
+    )
+    session.add(replacement)
+    session.flush()
+    copies = {}
+    for ordinal in (2, 3):
+        row = canonical(session, ordinal) if ordinal != 3 else original
+        copies[ordinal] = TerminalRecordManifest(**{
+            column: getattr(row, column) for column in (
+                "connector_id", "zkt_device_id", "terminal_serial", "generation", "ordinal", "record_size",
+                "raw_record_digest", "terminal_record_key", "occurrence_index", "disposition",
+                "attendance_event_id", "protected_raw_record", "error_code", "raw_timestamp", "observed_uid")
+        }, source_epoch_id=replacement.id, source_kind="RECOVERY_PREFIX", canonical_source=True)
+        session.add(copies[ordinal])
+    session.commit()
+    listed = {row["id"]: row for row in list_evidence(session, connector, newest=True, limit=50)["rows"]}
+    assert listed[copies[3].id]["newest_read_observed"] is True
+    assert copies[2].id not in listed

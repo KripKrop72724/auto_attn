@@ -734,7 +734,7 @@ function SourceExceptionDrawer({
         toast.notice(
           newestCondition(row)
             ? 'Review recorded. It does not settle this terminal newest-record slot or read its punch.'
-            : row.disposition === 'IDENTITY_UNRESOLVED'
+            : row.disposition === 'IDENTITY_UNRESOLVED' && row.source_condition !== 'TERMINAL_NEWEST_RECORD_OUT_OF_ORDER'
             ? 'Review recorded. The identity hold remains until verified correction evidence is available.'
             : 'Source review recorded. When the certified cohort is complete, assurance resumes automatically from its existing checkpoint.',
         )
@@ -809,6 +809,8 @@ function SourceExceptionDrawer({
                   ? 'Held: newest-record punch not confirmed'
                   : row.source_condition === 'TERMINAL_NEWEST_RECORD_UNSETTLED'
                   ? 'Terminal newest record not yet written'
+                  : row.source_condition === 'TERMINAL_NEWEST_RECORD_OUT_OF_ORDER'
+                  ? 'Excluded: newest-record bytes out of time order'
                   : row.disposition === 'IDENTITY_UNRESOLVED'
                   ? 'Held for verified historical identity'
                   : 'Excluded from attendance and Oracle'}</h3>
@@ -820,6 +822,8 @@ function SourceExceptionDrawer({
                     ? ` ${row.operator_reason || 'These bytes decode as a punch no capture has delivered. ADD holds them until LIVE capture or a later reconcile confirms the punch.'}`
                     : row.source_condition === 'TERMINAL_NEWEST_RECORD_UNSETTLED'
                     ? ` ${row.operator_reason || 'These bytes were read before the terminal wrote this slot. They are not a punch.'}`
+                    : row.source_condition === 'TERMINAL_NEWEST_RECORD_OUT_OF_ORDER'
+                    ? ` ${row.operator_reason || 'The terminal holds these bytes, but their time does not lie between the punches around them. They may be stale bytes with another person\'s identity, so ADD did not ingest them. Review the row.'}`
                     : row.disposition === 'IDENTITY_UNRESOLVED'
                     ? ' Identity operations must establish an independently supported user reference. A historical attendance UID cannot identify the current enrollment owner. A review note does not resolve this hold or certify Oracle delivery.'
                     : ' Review never creates, edits, or deletes attendance. Completing every review in a certified job automatically resumes assurance for its valid records.'}
@@ -2745,6 +2749,9 @@ export function ReconciliationView({
                     )}
                     {row.source_condition === 'TERMINAL_NEWEST_RECORD_CORRECTED' && (
                       <small>Corrected from an unwritten newest record; HR must verify the punch</small>
+                    )}
+                    {row.source_condition === 'TERMINAL_NEWEST_RECORD_OUT_OF_ORDER' && (
+                      <small>Newest-record bytes out of time order; excluded for review</small>
                     )}
                   </div>
                   <div data-label="Observed identity">

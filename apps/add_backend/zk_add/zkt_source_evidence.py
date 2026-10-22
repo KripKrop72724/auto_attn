@@ -10,6 +10,7 @@ import hashlib
 import json
 
 from sqlalchemy import and_, or_, select
+from sqlalchemy.orm import aliased
 
 from zk_add.time_utils import ensure_utc
 from zk_add.audit import append_audit
@@ -32,9 +33,8 @@ def _scope(connector):
             TerminalRecordManifest.zkt_device_id == connector.zkt_device.id)
 
 
-def _newest_candidates():
-    """Canonical rows read as a tail's newest slot or as a baseline's final ordinal."""
-    manifest = TerminalRecordManifest
+def _newest_read(manifest):
+    """SQL: ``manifest`` was read as a tail's newest slot or as a baseline's final ordinal."""
     tail_newest = select(SourceTailChunk.id).join(
         ReconciliationCoverage, ReconciliationCoverage.id == SourceTailChunk.coverage_id,
     ).where(
@@ -49,11 +49,26 @@ def _newest_candidates():
         ReconciliationJob.id == manifest.job_id,
         ReconciliationJob.cutoff_count == manifest.ordinal + 1,
     ).exists()
+    return or_(and_(manifest.source_kind == "TAIL", tail_newest),
+               and_(manifest.source_kind == "BASELINE", baseline_final))
+
+
+def _newest_candidates():
+    """Canonical rows read as the newest slot, including a recovery epoch's copies of such reads."""
+    manifest = TerminalRecordManifest
+    original = aliased(TerminalRecordManifest)
+    copied = select(original.id).where(
+        original.zkt_device_id == manifest.zkt_device_id,
+        original.generation == manifest.generation,
+        original.ordinal == manifest.ordinal,
+        original.raw_record_digest == manifest.raw_record_digest,
+        original.id != manifest.id,
+        _newest_read(original),
+    ).exists()
     return and_(
         manifest.canonical_source == True,  # noqa: E712
         manifest.disposition != "RAW_PRESERVED",
-        or_(and_(manifest.source_kind == "TAIL", tail_newest),
-            and_(manifest.source_kind == "BASELINE", baseline_final)),
+        or_(_newest_read(manifest), and_(manifest.source_kind == "RECOVERY_PREFIX", copied)),
     )
 
 
