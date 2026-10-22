@@ -1726,6 +1726,41 @@ def test_tail_after_a_newest_read_alerts_when_no_live_punch_filled_the_slot(sour
     assert alert(session, newest_slot.UNRECEIVED_ALERT) is None
 
 
+def test_quiet_terminal_tails_see_only_newest_slots_and_captures_are_counted(source_db):
+    """One punch per tail interval: every tail reads only its unwritten newest slot.
+
+    No tail ever reads a punch, so ADD compares the slots filled since the
+    last genuine read with the captured punches in that window.
+    """
+    session, connector, _ = source_db
+    live_capture(session, connector, P0, P1)
+    baseline = certify_baseline(session, connector, [P0.row(0, source="FULL_HISTORY"), P1.row(1)])
+    baseline.status, baseline.phase = "COMPLETED", "COMPLETED"
+    coverage = active_coverage(session)
+    session.commit()
+
+    def tail(ordinal):
+        request = tail_request(session, coverage, [junk(ordinal, "zero")], latest=ordinal + 1)
+        assert service.apply_source_tail_chunk(session, connector=connector, payload=request)[3] is None
+        session.commit()
+
+    tail(2)                                  # slot 2 unwritten
+    live_capture(session, connector, P2)     # P2 fills slot 2
+    tail(3)                                  # reads only slot 3, unwritten
+    assert alert(session, newest_slot.UNRECEIVED_ALERT) is None
+    # P3 fills slot 3 but LIVE misses it. The window since the last genuine
+    # read (slot 1) holds two filled slots and only one capture.
+    tail(4)
+    missed = alert(session, newest_slot.UNRECEIVED_ALERT)
+    assert [(slot["ordinal"], slot["window_unseen"], slot["window_captured"])
+            for slot in missed.details["slots"]] == [(2, 2, 1), (3, 2, 1)]
+    # LIVE delivers P3 late: the window is accounted for and the alert clears.
+    live_capture(session, connector, P3)
+    service.refresh_all_reconciliation_assurance(session)
+    session.commit()
+    assert alert(session, newest_slot.UNRECEIVED_ALERT) is None
+
+
 def test_late_live_delivery_clears_a_filled_slot(source_db):
     session, connector, _ = source_db
     coverage, _, _ = first_tail(session, connector, junk(3, "zero"))

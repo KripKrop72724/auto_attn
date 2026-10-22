@@ -66,7 +66,7 @@ import binascii
 import hashlib
 import json
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from sqlalchemy import and_, or_, select
 from sqlalchemy.orm import Session
@@ -136,6 +136,10 @@ RELEASE_BLOCKED_STATUSES = frozenset({"BLOCKED_IDENTITY", "WAITING_FOR_SNAPSHOT"
 # Entries an open alert keeps; its count and oldest ordinal cover the rest.
 ALERT_SLOT_LIMIT = 200
 ALERT_REFRESH_LIMIT = 100
+# How far down a filled-slot check walks to the last genuine read, and the
+# terminal clock skew allowed when the window ends now.
+FILLED_WINDOW_LIMIT = 1000
+FILLED_CLOCK_SKEW = timedelta(minutes=5)
 OPERATOR_REASON = (
     "The terminal reported this ordinal as its newest record before it had written the "
     "record. These bytes are not the punch in this slot: nothing was sent to Oracle and they "
@@ -1145,31 +1149,14 @@ def slot_pending(session: Session, *, connector_id: int, zkt_device_id: int, gen
 # --- Detecting a filled slot after a tail ------------------------------------
 
 
-def _event_time_bound(session: Session, *, zkt_device_id, generation, epoch_id, below: int):
-    value = session.scalar(
-        select(AttendanceEvent.device_event_time)
-        .join(TerminalRecordManifest, TerminalRecordManifest.attendance_event_id == AttendanceEvent.id)
-        .where(
-            TerminalRecordManifest.zkt_device_id == zkt_device_id,
-            TerminalRecordManifest.generation == generation,
-            _epoch_clause(TerminalRecordManifest.source_epoch_id, epoch_id),
-            TerminalRecordManifest.canonical_source == True,  # noqa: E712
-            TerminalRecordManifest.disposition.in_(PARSED_DISPOSITIONS),
-            TerminalRecordManifest.ordinal < below,
-        )
-        .order_by(TerminalRecordManifest.ordinal.desc())
-        .limit(1)
-    )
-    return ensure_utc(value) if value is not None else None
-
-
-def _unlinked_captures(session: Session, *, connector_id: int, zkt_device_id: int, after, before) -> int:
-    """Captured punches of this binding inside the window that no canonical source row holds.
+def _unlinked_captures(session: Session, *, connector_id: int, zkt_device_id: int, after, before,
+                       limit: int) -> int:
+    """Captured punches of this binding inside the window that no canonical source row holds (up to ``limit``).
 
     LIVE capture is the usual one; older firmware also delivers punches in
     reconnect dumps and periodic reconcile batches. A punch some source read
     created and only a replaced read still links is not an independent
-    capture.
+    capture. A capture whose slot a source read saw is linked by that row.
     """
     canonical = select(TerminalRecordManifest.id).where(
         TerminalRecordManifest.attendance_event_id == AttendanceEvent.id,
@@ -1189,67 +1176,99 @@ def _unlinked_captures(session: Session, *, connector_id: int, zkt_device_id: in
         statement = statement.where(AttendanceEvent.device_event_time >= after)
     if before is not None:
         statement = statement.where(AttendanceEvent.device_event_time <= before)
-    return len(session.scalars(statement.limit(2)).all())
+    return len(session.scalars(statement.limit(limit)).all())
+
+
+def _live_genuine_ids(session: Session, rows) -> set[int]:
+    """Newest reads that linked a LIVE punch no other ordinal holds: the slot was already written."""
+    rows = [row for row in rows if row.attendance_event_id is not None]
+    if not rows:
+        return set()
+    event_ids = {row.attendance_event_id for row in rows}
+    live = set(session.scalars(select(AttendanceEvent.id).where(
+        AttendanceEvent.id.in_(event_ids), AttendanceEvent.source.in_(LIVE_SOURCES))).all())
+    linked: dict[int, set[int]] = defaultdict(set)
+    for event_id, ordinal in session.execute(select(
+        TerminalRecordManifest.attendance_event_id, TerminalRecordManifest.ordinal,
+    ).where(
+        TerminalRecordManifest.attendance_event_id.in_(live or {-1}),
+        TerminalRecordManifest.canonical_source == True,  # noqa: E712
+    )).all():
+        linked[event_id].add(ordinal)
+    return {row.id for row in rows
+            if row.attendance_event_id in live and not (linked[row.attendance_event_id] - {row.ordinal})}
+
+
+def _unseen_slots(session: Session, *, zkt_device_id: int, generation: int, epoch_id, through: int):
+    """``(unseen_ordinals, lower_bound_time)`` walking down from ``through``.
+
+    Unseen slots are newest reads the terminal has since filled with a punch
+    no source read saw. The walk stops at the nearest genuine read with a
+    punch time, which bounds the window from below, or after
+    ``FILLED_WINDOW_LIMIT`` rows.
+    """
+    rows = session.scalars(select(TerminalRecordManifest).where(
+        TerminalRecordManifest.zkt_device_id == zkt_device_id,
+        TerminalRecordManifest.generation == generation,
+        _epoch_clause(TerminalRecordManifest.source_epoch_id, epoch_id),
+        TerminalRecordManifest.canonical_source == True,  # noqa: E712
+        TerminalRecordManifest.ordinal <= through,
+        TerminalRecordManifest.ordinal >= through - FILLED_WINDOW_LIMIT,
+    ).order_by(TerminalRecordManifest.ordinal.desc())).all()
+    newest = ledger_newest_ids(session, rows) - _live_genuine_ids(session, rows) - out_of_order_ids(session, rows)
+    unseen: list[int] = []
+    for row in rows:
+        if row.id in newest:
+            unseen.append(row.ordinal)
+            continue
+        if row.attendance_event_id is not None and row.disposition in PARSED_DISPOSITIONS:
+            value = session.scalar(select(AttendanceEvent.device_event_time).where(
+                AttendanceEvent.id == row.attendance_event_id))
+            return unseen, (ensure_utc(value) if value is not None else None)
+    return unseen, None
 
 
 def note_filled_newest_slot(
     session: Session, *, connector: Connector, coverage: ReconciliationCoverage, payload,
-) -> dict | None:
-    """After a tail moves past a newest read, check that LIVE delivered the punch that filled it.
+) -> list[dict]:
+    """After a tail moves past a newest read, check that captures account for the filled slots.
 
-    A tail that starts at ``s`` shows the terminal now holds records past
+    A tail that starts at ``s`` shows the terminal holds records past
     ``s - 1``. When ``s - 1`` was read as the newest slot, the terminal has
-    written it since with the next punch, which no source read has seen.
-    That punch lies between the punch before the slot and the first punch
-    this tail read. When no captured punch of this binding in that window is
-    unaccounted for by a source row, capture may have missed it, and ADD
-    raises the unreceived-punch alert so an operator reconciles. Clock faults
-    can raise it spuriously; they never hide a source row.
+    written it since with the next punch, which no source read has seen; so
+    has every earlier newest read back to the last genuine read. Those
+    punches lie between the last genuine read's punch and the first punch
+    this tail read (or now). Each should be a captured punch of this binding
+    that no source row holds. When there are fewer such captures than unseen
+    slots, capture missed at least the difference, and ADD puts the unseen
+    slots on the unreceived-punch alert so an operator reconciles. Clock
+    faults can raise it spuriously; they never hide a source row.
     """
     ordinal = payload.start_ordinal - 1
     zkt = connector.zkt_device
     if ordinal < 0 or zkt is None:
-        return None
-    row = session.scalar(select(TerminalRecordManifest).where(
-        TerminalRecordManifest.zkt_device_id == zkt.id,
-        TerminalRecordManifest.generation == payload.terminal_generation,
-        _epoch_clause(TerminalRecordManifest.source_epoch_id, coverage.source_epoch_id),
-        TerminalRecordManifest.canonical_source == True,  # noqa: E712
-        TerminalRecordManifest.ordinal == ordinal,
-    ))
-    if row is None or row.disposition == "RAW_PRESERVED" or (
-            row.id not in newest_read_ids(session, [row]) and not is_held(row)):
-        return None
-    if row.attendance_event_id is not None:
-        # The read linked a LIVE punch no other ordinal holds: the slot was
-        # already written with it when the tail read it.
-        event = session.get(AttendanceEvent, row.attendance_event_id)
-        others = session.scalar(select(TerminalRecordManifest.id).where(
-            TerminalRecordManifest.attendance_event_id == row.attendance_event_id,
-            TerminalRecordManifest.canonical_source == True,  # noqa: E712
-            TerminalRecordManifest.id != row.id,
-        ).limit(1))
-        if event is not None and event.source in LIVE_SOURCES and others is None:
-            return None
-    after = _event_time_bound(session, zkt_device_id=zkt.id, generation=payload.terminal_generation,
-                              epoch_id=coverage.source_epoch_id, below=ordinal)
+        return []
+    unseen, after = _unseen_slots(session, zkt_device_id=zkt.id, generation=payload.terminal_generation,
+                                  epoch_id=coverage.source_epoch_id, through=ordinal)
+    if not unseen or unseen[0] != ordinal:
+        return []
     newest = payload.latest_terminal_count - 1
     times = [value for source in payload.records
              if source.ordinal != newest and (value := _source_time(source)) is not None]
-    before = min(times) if times else None
-    if after is None and before is None:
-        return None
-    if _unlinked_captures(session, connector_id=connector.id, zkt_device_id=zkt.id,
-                          after=after, before=before):
-        return None
-    slot = {
-        "ordinal": ordinal, "generation": payload.terminal_generation,
-        "source_epoch_id": coverage.source_epoch_id, "manifest_id": row.id,
-        "after": after.isoformat() if after else None, "before": before.isoformat() if before else None,
-    }
-    alert_unreceived(session, connector, cause=FILLED_CAUSE, slots=[slot],
+    # Without a later punch in this tail, the window ends now (plus a little
+    # terminal clock skew).
+    before = min(times) if times else utc_now() + FILLED_CLOCK_SKEW
+    captured = _unlinked_captures(session, connector_id=connector.id, zkt_device_id=zkt.id,
+                                  after=after, before=before, limit=len(unseen))
+    if captured >= len(unseen):
+        return []
+    window = {"after": after.isoformat() if after else None, "before": before.isoformat(),
+              "window_unseen": len(unseen), "window_captured": captured}
+    slots = [{"ordinal": value, "generation": payload.terminal_generation,
+              "source_epoch_id": coverage.source_epoch_id, **window} for value in sorted(unseen)]
+    alert_unreceived(session, connector, cause=FILLED_CAUSE, slots=slots,
                      details={"coverage_id": coverage.coverage_id})
-    return slot
+    return slots
 
 
 def refresh_alerts(session: Session, *, connector: Connector | None = None) -> int:
@@ -1305,20 +1324,24 @@ def refresh_alerts(session: Session, *, connector: Connector | None = None) -> i
                                    epoch_id=epoch_id, ordinals=ordinals)
             canonical = _canonical_rows(session, zkt_device_id=zkt.id, generation=generation,
                                         epoch_id=epoch_id, ordinals=ordinals)
-            still_newest = newest_read_ids(session, list(canonical.values())) | {
-                row.id for row in canonical.values() if is_held(row)}
+            rows = list(canonical.values())
+            still_unseen = {row.ordinal for row in rows if row.id in (
+                ledger_newest_ids(session, rows) - _live_genuine_ids(session, rows) - out_of_order_ids(session, rows))}
+            # Slots inferred filled are judged per window: enough captures there account for all of them.
+            windows: dict[tuple, list[dict]] = defaultdict(list)
             for entry in entries:
-                row = canonical.get(entry["ordinal"])
                 causes = set(entry.get("causes", []))
                 if entry["ordinal"] in pending:
                     remaining.append(entry)
-                    continue
-                if FILLED_CAUSE in causes and row is not None and row.id in still_newest:
-                    window = [_punch_time(entry.get("after")) if entry.get("after") else None,
-                              _punch_time(entry.get("before")) if entry.get("before") else None]
-                    if not _unlinked_captures(session, connector_id=owner.id, zkt_device_id=zkt.id,
-                                              after=window[0], before=window[1]):
-                        remaining.append(entry)
+                elif FILLED_CAUSE in causes and entry["ordinal"] in still_unseen:
+                    windows[(entry.get("after"), entry.get("before"))].append(entry)
+            for (after, before), members in windows.items():
+                captured = _unlinked_captures(
+                    session, connector_id=owner.id, zkt_device_id=zkt.id,
+                    after=_punch_time(after) if after else None, before=_punch_time(before) if before else None,
+                    limit=len(members))
+                if captured < len(members):
+                    remaining.extend(members)
         if len(remaining) == len(slots):
             continue
         changed += 1
