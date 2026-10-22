@@ -21,6 +21,7 @@ import httpx
 from sqlalchemy import select
 
 from zk_add.attendance_repair import _ords_request, _protected_digest
+from zk_add.checkin_notify import note_delivered_cnic
 from zk_add.crypto import decrypt_cnic, decrypt_json, encrypt_json
 from zk_add.db import session_scope
 from zk_add.models import (AttendanceEvent, Connector, OrdsOutbox, ZktOccurrenceAlias,
@@ -373,6 +374,7 @@ def persist_result(claim, classification, token=None):
                     response_digest=token.response_digest, verification_scope=MEMBERSHIP_SCOPE,
                     claim_attempt=claim["attempt"]))
             now = utc_now()
+            note_delivered_cnic(session, event.id, payload.get("cnic"))
             row.status = event.ords_status = "ACKED_CHECK"
             row.acknowledged_at = event.oracle_confirmed_at = now
             event.oracle_confirmation_path = "ADD_ZKT_UID_ONLY_V1"
@@ -393,6 +395,7 @@ def persist_result(claim, classification, token=None):
                     content_token=token, claim_attempt=claim["attempt"])
                 session.add(receipt)
             now = utc_now()
+            note_delivered_cnic(session, event.id, payload.get("cnic"))
             row.status = event.ords_status = "ACKED_CHECK"
             row.acknowledged_at = event.oracle_confirmed_at = now
             event.oracle_confirmation_path = "ADD_ZKT_PROJECTION_V2"

@@ -78,7 +78,8 @@ function Write-DockerFailureDiagnostics {
         foreach ($name in @(
             "ADD_POSTGRES_PASSWORD", "ADD_ADMIN_PASSWORD_HASH", "ADD_PII_FERNET_KEY",
             "ADD_PII_LOOKUP_KEY", "ADD_FLEET_ROOT_SECRET", "ADD_ORDS_PASSWORD",
-            "ADD_PROVISIONING_PAIRING_SECRET", "ADD_PROVISIONING_INTERNAL_TOKEN"
+            "ADD_PROVISIONING_PAIRING_SECRET", "ADD_PROVISIONING_INTERNAL_TOKEN",
+            "ADD_CHECKIN_NOTIFY_API_KEY"
         )) {
             if ($Environment.ContainsKey($name) -and $Environment[$name]) {
                 $material = $material.Replace([string]$Environment[$name], "***")
@@ -477,6 +478,19 @@ if (-not [string]::IsNullOrWhiteSpace($env:ADD_DEPLOY_ATTENDANCE_REPAIR_ORDS_USE
 }
 if (-not [string]::IsNullOrWhiteSpace($env:ADD_DEPLOY_ATTENDANCE_REPAIR_ORDS_PASSWORD)) {
     $environment["ADD_ATTENDANCE_REPAIR_ORDS_PASSWORD"] = $env:ADD_DEPLOY_ATTENDANCE_REPAIR_ORDS_PASSWORD
+}
+# Optional: the employee check-in notification stays NOT_CONFIGURED (sends
+# nothing) without its key, and the deployment still succeeds.
+if (-not [string]::IsNullOrWhiteSpace($env:ADD_DEPLOY_CHECKIN_NOTIFY_API_KEY)) {
+    $environment["ADD_CHECKIN_NOTIFY_API_KEY"] = $env:ADD_DEPLOY_CHECKIN_NOTIFY_API_KEY
+}
+# Seeds the runtime mode only the first time the feature runs; administrators
+# switch it afterwards from the Attendance page.
+if (-not [string]::IsNullOrWhiteSpace($env:ADD_DEPLOY_CHECKIN_NOTIFY_MODE)) {
+    if ($env:ADD_DEPLOY_CHECKIN_NOTIFY_MODE -cnotin @("OFF", "PILOT", "ALL")) {
+        throw "ADD_CHECKIN_NOTIFY_MODE must be OFF, PILOT or ALL."
+    }
+    $environment["ADD_CHECKIN_NOTIFY_MODE"] = $env:ADD_DEPLOY_CHECKIN_NOTIFY_MODE
 }
 if (-not [string]::IsNullOrWhiteSpace($env:ADD_DEPLOY_FIRMWARE_OTA_ENABLED)) {
     $environment["ADD_FIRMWARE_OTA_ENABLED"] = $env:ADD_DEPLOY_FIRMWARE_OTA_ENABLED
