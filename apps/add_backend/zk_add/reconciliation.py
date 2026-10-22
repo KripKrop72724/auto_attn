@@ -181,7 +181,7 @@ def _active_or_new_source_epoch(
     return epoch
 
 
-def preflight_reconciliation(session: Session, connector: Connector, scope: str | None = None) -> dict:
+def preflight_reconciliation(session: Session, connector: Connector, *, scope: str | None = None) -> dict:
     if connector.firmware_family == "hikvision":
         from zk_add.hikvision_reconciliation import preflight
         return preflight(session, connector, scope)
@@ -378,7 +378,7 @@ def create_reconciliation_job(
         "ACTIVE_USERS": "ACTIVE USERS", "RECENT_TAIL": "RECENT TAIL"}.get(scope, "FROM START")
     if confirmation != expected:
         raise ValueError(f"Type {expected} exactly to confirm this operation.")
-    preflight = preflight_reconciliation(session, connector, scope)
+    preflight = preflight_reconciliation(session, connector, scope=scope)
     if preflight["hard_blockers"]:
         raise ValueError(preflight["hard_blockers"][0]["message"])
     active = session.scalar(
@@ -2598,7 +2598,7 @@ def assignment_rows(session: Session) -> list[tuple[str, dict]]:
             job.phase = "WAITING_FOR_SAFE_WINDOW"
             job.wait_reason = "HISTORY_BACKLOG_BACKPRESSURE"
             continue
-        preflight = preflight_reconciliation(session, connector, "RECENT_TAIL" if tail else None)
+        preflight = preflight_reconciliation(session, connector, scope="RECENT_TAIL" if tail else None)
         if preflight["hard_blockers"]:
             _safety_hold(
                 session,
