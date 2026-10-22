@@ -238,6 +238,7 @@ def test_every_exact_commit_ci_gate_requires_every_add_ci_check_by_name():
         "factory-firmware-hil-candidate.yml",
         "firmware-extend-2-6-0-hil.yml",
         "firmware-hil-candidate.yml",
+        "firmware-key-bootstrap.yml",
     }
     for name, lines in gates.items():
         assert lines, name

@@ -552,4 +552,77 @@ describe('Hikvision reconciliation scope', () => {
       expect(JSON.parse(String(call?.[1]?.body))).toMatchObject({ scope, confirmation })
     })
   })
+
+  it.each([true, false])('offers recent-tail recovery only when ADD holds a resume point (%s)', async (eligible) => {
+    window.history.replaceState(null, '', '/reconciliation')
+    const hik = { ...device, firmware_family: 'hikvision' as const }
+    const fallback = reconciliationFetch()
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = new URL(String(input), 'https://add.test').pathname
+      if (path === `/api/v1/devices/${device.connector_id}`) return json(hik)
+      if (path.endsWith('/reconciliations/preflight')) return json({
+        eligible: true, ready_now: true, hard_blockers: [], waitable_blockers: [],
+        terminal: null, coverage: null, source_protocol: 'hikvision-isapi-v1',
+        recent_tail: eligible
+          ? { eligible: true, ready_now: true, anchor_serial: 597801, begin_serial: 597782,
+              earlier_breaks: [512000], reason: null }
+          : { eligible: false, anchor_serial: null, begin_serial: null,
+              reason: 'ADD holds no checkpointed live-poll record for this terminal; use a full terminal audit instead.' },
+      })
+      if (path.endsWith('/reconciliations/full-history')) return json(job())
+      return fallback(input, init)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    render(<Harness terminal={hik} />)
+    fireEvent.click(screen.getByRole('button', { name: 'Select terminal' }))
+    fireEvent.click(within(screen.getByRole('listbox')).getByRole('option'))
+    const start = await screen.findByRole('button', { name: 'Reconcile attendance' })
+    await waitFor(() => expect((start as HTMLButtonElement).disabled).toBe(false))
+    fireEvent.click(start)
+    fireEvent.change(screen.getByLabelText(/History scope/), { target: { value: 'RECENT_TAIL' } })
+    expect(await screen.findByText(eligible
+      ? /Resumes at terminal serial 597782.*break after serial 512000; only a full terminal audit covers those/
+      : /holds no checkpointed live-poll record/)).toBeTruthy()
+    const confirmation = `RECONCILE ${device.device_id} RECENT TAIL`
+    fireEvent.change(screen.getByLabelText('Audited reason'), { target: { value: 'Recover punches while the poll anchor is blocked' } })
+    fireEvent.change(screen.getByLabelText(new RegExp(`Type ${confirmation}`)), { target: { value: confirmation } })
+    fireEvent.change(screen.getByLabelText('Administrator password'), { target: { value: 'test-only-password' } })
+    const submit = screen.getByRole('button', { name: 'Start durable reconcile' }) as HTMLButtonElement
+    expect(submit.disabled).toBe(!eligible)
+    if (!eligible) return
+    fireEvent.click(submit)
+    await waitFor(() => {
+      const call = fetchMock.mock.calls.find(([input]) => String(input).endsWith('/reconciliations/full-history'))
+      expect(JSON.parse(String(call?.[1]?.body))).toMatchObject({ scope: 'RECENT_TAIL', confirmation })
+    })
+  })
+})
+
+describe('Hikvision recent-tail job card', () => {
+  afterEach(() => { cleanup(); vi.unstubAllGlobals() })
+
+  it('counts only records after the resume point as new', async () => {
+    const fallback = reconciliationFetch()
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const response = await fallback(input, init)
+      if (new URL(String(input), 'https://add.test').pathname !== '/api/v1/reconciliations') return response
+      const body = await response.json()
+      return json({
+        ...body,
+        rows: [{
+          ...body.rows[0],
+          mode: 'HIKVISION_SERIAL_HISTORY',
+          scope: 'RECENT_TAIL',
+          recent_tail: {
+            anchor_serial: 597801, begin_serial: 597782, boundary_serial: 597782, earlier_breaks: [],
+            last_serial: 597801, anchor_returned: true, pages: 2, records: 0, overlap_records: 20,
+            fact_conflicts: 0, confirmed_conflicts: 0, continuity_conflicts: 0, caught_up: true,
+            caught_up_at: '2026-10-22T15:00:00Z', last_page_at: '2026-10-22T15:00:00Z', coverage_certified: false,
+          },
+        }],
+      })
+    }))
+    render(<Harness />)
+    expect(await screen.findByText(/0 new records after serial 597801 · 20 held records re-read/)).toBeTruthy()
+  })
 })

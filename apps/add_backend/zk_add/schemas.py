@@ -859,7 +859,7 @@ class AttendanceBatchRequest(BaseModel):
 
 
 class ReconciliationCreateRequest(BaseModel):
-    scope: Literal["ALL_RECORDS", "ACTIVE_USERS"] = "ALL_RECORDS"
+    scope: Literal["ALL_RECORDS", "ACTIVE_USERS", "RECENT_TAIL"] = "ALL_RECORDS"
     reason: str = Field(min_length=10, max_length=500)
     confirmation: str = Field(min_length=10, max_length=180)
     password: str = Field(min_length=1, max_length=512)
@@ -885,6 +885,9 @@ class ReconciliationRetryExpectedState(BaseModel):
     application_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     diagnostics_sample_sequence: int = Field(ge=0)
     diagnostics_at: datetime
+    # terminal_generation is the job's own generation. The connector's binding
+    # generation can be newer after a re-onboard; pin it separately if wanted.
+    connector_generation: int | None = Field(default=None, ge=1)
 
     @field_validator("updated_at", "diagnostics_at")
     @classmethod

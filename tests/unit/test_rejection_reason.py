@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import ast
+import base64
 import copy
+import hashlib
 from pathlib import Path
 import pickle
 
@@ -18,6 +20,7 @@ from zk_add.rejection import (
     rejection_reason,
     rejection_site,
 )
+from zk_add.queue_evidence import QueueEvidenceRequest
 from zk_add.schemas import ReconciliationChunkRequest
 
 BACKEND = Path(reconciliation.__file__).resolve().parent
@@ -79,6 +82,22 @@ def test_schema_errors_keep_field_paths_instead_of_a_reason() -> None:
     error = _raised(ReconciliationChunkRequest.model_validate, {"job_id": CNIC})
     assert isinstance(error, ValidationError)
     assert (rejection_category(error), rejection_reason(error)) == ("SCHEMA_INVALID", None)
+
+
+@pytest.mark.parametrize(("change", "reason"), [
+    ({"payload_digest": "0" * 64}, "QUEUE_EVIDENCE_DIGEST_MISMATCH"),
+    ({"raw_b64": "AAAA\nAAAA"}, "QUEUE_EVIDENCE_BASE64_INVALID"),
+    ({"raw_b64": base64.b64encode(b"x" * 8193).decode()}, "QUEUE_EVIDENCE_LENGTH_INVALID"),
+])
+def test_queue_evidence_byte_checks_report_which_check_failed(change, reason) -> None:
+    raw = b"35202-1234567-1"
+    payload = {"connector_id": "c", "queue": "blocked_legacy", "queue_generation": "g-1", "record_id": "0:1:2",
+               "payload_digest": hashlib.sha256(raw).hexdigest(), "raw_b64": base64.b64encode(raw).decode(),
+               "provenance": {"reason": "MALFORMED", "encoding": "LEGACY_ROW"}, **change}
+    error = _raised(QueueEvidenceRequest.model_validate, payload)
+    assert isinstance(error, ValidationError)
+    assert (rejection_category(error), rejection_reason(error)) == ("SCHEMA_INVALID", reason)
+    assert CNIC not in str(error.errors(include_input=False, include_url=False))
 
 
 def test_site_is_the_innermost_add_code_location() -> None:

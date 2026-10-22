@@ -67,7 +67,7 @@ last seen, evidence and the condition that clears it. Currency is one of:
 | `HEARTBEAT_STALE` | DEGRADED | no | ADD accepts the next heartbeat |
 | `ESP_LOCAL_FAILURE` | DEGRADED; WARNING when latched with verified storage, or held after a 2.5.2 boot-time failure | yes | the LED reports healthy, or at reboot |
 | `HIK_CAPTURE_UNHEALTHY` | DEGRADED for storage; otherwise WARNING (network only once disconnected) | yes | the terminal is online and its checks succeed |
-| `DEVICE_MESSAGE_REJECTED` | DEGRADED for a current heartbeat or custody rejection; otherwise WARNING | yes | ADD accepts the next message of each rejected type |
+| `DEVICE_MESSAGE_REJECTED` | DEGRADED for a current heartbeat or custody rejection; otherwise WARNING | yes; no once only unheld `queue_evidence` copies remain after a later acceptance | ADD accepts the next message of each rejected type; for `queue_evidence`, ADD holds each refused copy or an operator resolves it (see below) |
 | `ADD_MESSAGE_PROCESSING_FAILED` | DEGRADED after 120 s of failed heartbeats; WARNING after 3 failures over 5 min | no | ADD processes the next message of each type |
 | `HIK_LIGHT_RECONCILE_BLOCKED` | WARNING | yes | the history audit scans or completes |
 | `OTA_DEVICE_ROLLED_BACK`, `OTA_DEVICE_REPORTED_FAILURE` | WARNING | yes | a later deployment to the device succeeds |
@@ -159,6 +159,41 @@ minutes earlier.
 - Rejected messages are tracked per type, with field paths but never values.
   Failures inside ADD are `ADD_MESSAGE_PROCESSING_FAILED`, not the device's
   fault. Rejected envelopes never refresh `last_seen_at`.
+- A refused `queue_evidence` records why (`QUEUE_EVIDENCE_DIGEST_MISMATCH`,
+  `_BASE64_INVALID`, `_LENGTH_INVALID`, `_IDENTITY_REUSED`,
+  `_CONNECTOR_MISMATCH`, or the ADD-side category) and the copy's queue,
+  generation, record id, claimed digest, and the received digest, size and
+  CRC-32. Never its bytes or provenance. The device still gets the same `MESSAGE_REJECTED`.
+- That entry stays open until ADD holds each refused copy:
+  - the same identity with the claimed digest or the received digest; or
+  - under another generation of the same queue (a re-blocked row), the
+    claimed digest, or the received digest with the same legacy record id
+    when that id ends with the CRC-32 of the bytes that arrived. Segmented
+    ids carry no CRC, so they never match this way.
+  An acceptance from another lane, the same identity with other bytes, or
+  another record whose bytes match what arrived does not hold it. Each hold
+  is kept in `evidence_resolutions` with a finding (`COPY_INTACT`,
+  `SENT_BYTES_CHANGED` or `DIGEST_CHANGED`) and both byte counts.
+- A refusal recorded after ADD already holds the copy (a reconnect overlap)
+  opens nothing: its alert is written and closed at once as `EVIDENCE_HELD`,
+  or, when other rejected types keep the alert open, only the hold is added.
+  The rejection log entry is written either way.
+- The first `queue_evidence` ADD accepts after a refusal used to close the
+  entry. Now it stamps `later_acceptance_at` on what it does not hold. From
+  then on that entry is not current and not gating: no HIL or factory hold,
+  as before. It stays open as a WARNING until ADD holds each copy or an
+  operator verifies the device and resolves it, and cleanup lists it as
+  Needs review. A new refusal of that type makes it current and gating again.
+- Only an operator can account for: an identity conflict; a refusal with no
+  readable identity or beyond 16 pending copies; and a record the device
+  settled without sending evidence again, such as a 2.6.x ORDS row delivered
+  to Oracle on retry (its receipt names only the event, so ADD cannot match
+  it to the refused bytes). A device that keeps resending a conflicting copy
+  keeps the entry current, so it cannot be resolved until the device stops.
+  A refusal that no later acceptance follows keeps its hold, as before;
+  cleanup lists it as Needs review instead of Condition cleared.
+  Refusals recorded before this tracking keep the old rule: any accepted
+  `queue_evidence` clears them.
 - Every heartbeat's telemetry row stores `payload._add_health` with the mode,
   lifecycle, derived lifecycle, tier, reasons (`CODE:TIER:CURRENCY`) and
   terminal link.
@@ -208,7 +243,7 @@ In ADD, open **Alerts → Stranded alert review**.
    - **Stale device error** (per device): the stored error no active alert
      backs.
    - **Needs review**: listed, never preselected. For example, an OTA failure
-     with no later success.
+     with no later success, or a refused `queue_evidence` ADD does not hold.
 
    Devices under HIL observation are blocked. Current conditions, same-boot
    held diagnostics and data codes never appear.
