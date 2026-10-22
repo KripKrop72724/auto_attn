@@ -7,8 +7,13 @@ punched" message to the employee's phone:
 POST <host>/ords/slic_hrm/ESS_APIS/attendance_checkin_notify
 X-Api-Key: <secret ADD_CHECKIN_NOTIFY_API_KEY>
 Content-Type: application/json
-{"cnic": <13-digit CNIC as a JSON number>}
+{"cnic": <13-digit CNIC as a JSON number>, "checkin_time": "2026-10-22 09:05:00"}
 ```
+
+`checkin_time` is the punch time Oracle stored (EVENT_TIMESTAMP) in Pakistan
+time, `YYYY-MM-DD HH:MM:SS`, so a delayed push still tells the employee when the
+attendance was recorded. `ADD_CHECKIN_NOTIFY_SEND_CHECKIN_TIME=false` leaves it
+out.
 
 The CNIC is the exact CNIC Oracle holds for that punch, sent as a JSON number
 (`ADD_CHECKIN_NOTIFY_CNIC_JSON_TYPE=string` sends it as a string). It is taken
