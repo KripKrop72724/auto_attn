@@ -157,6 +157,7 @@ class AddSettings(BaseSettings):
     checkin_notify_fallback_url: str | None = CHECKIN_NOTIFY_FALLBACK_URL
     checkin_notify_api_key: str | None = None
     checkin_notify_cnic_json_type: Literal["number", "string"] = "number"
+    checkin_notify_send_checkin_time: bool = True
     checkin_notify_mode: Literal["OFF", "PILOT", "ALL"] = "ALL"
     checkin_notify_punch_policy: Literal["ALL_PUNCHES", "FIRST_PER_DAY"] = "ALL_PUNCHES"
     checkin_notify_pilot_zone_ids: str = ""
