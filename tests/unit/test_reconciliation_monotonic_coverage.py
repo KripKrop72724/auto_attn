@@ -450,8 +450,13 @@ def test_postgres_source_epoch_change_committed_before_manifest_refuses_old_epoc
         assert db.get(ReconciliationJob, job_id).capture_certified_at is None
         assert db.get(ReconciliationCoverage, coverage_id).active is False
         assert db.scalar(select(func.count(ReconciliationCoverage.id))) == 1
-        # Recovery retained both original custody and its copied prefix.
-        assert db.scalar(select(func.count(TerminalRecordManifest.id))) == 18
+        # Recovery retained both original custody and its copied prefix. The
+        # identical re-read of the retained baseline's final ordinal, possibly
+        # its newest slot, stays as the receipt that confirms it.
+        assert db.scalar(select(func.count(TerminalRecordManifest.id)).where(
+            TerminalRecordManifest.canonical_source == True)) == 18  # noqa: E712
+        assert db.scalars(select(TerminalRecordManifest.ordinal).where(
+            TerminalRecordManifest.canonical_source == False)).all() == [4]  # noqa: E712
 
 
 def test_manifest_matching_current_authority_keeps_ordinary_positive_ack(reconciliation_db, monkeypatch):  # noqa: F811
