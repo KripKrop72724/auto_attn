@@ -97,7 +97,8 @@ class AddSettings(BaseSettings):
     # batch cap per connector per snapshot, and the hourly cap per connector
     # in any hour. Everything else needs the owner's audited backlog
     # release, which uses the same proof.
-    attendance_dump_identity_auto_release_zones: str = ""
+    # Owner decision (22 Oct 2026): automatic release in every zone.
+    attendance_dump_identity_auto_release_zones: str = "*"
     attendance_dump_identity_auto_release_hours: int = Field(default=72, ge=0, le=14 * 24)
     attendance_dump_identity_auto_release_batch: int = Field(default=100, ge=0, le=500)
     attendance_dump_identity_auto_release_hourly_cap: int = Field(default=200, ge=0, le=5000)

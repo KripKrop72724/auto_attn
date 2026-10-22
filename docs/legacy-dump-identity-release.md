@@ -46,7 +46,7 @@ Set them in the server's `.env.add` (commented defaults are in
 | Environment variable | Default | Meaning |
 |---|---|---|
 | `ADD_ATTENDANCE_DUMP_IDENTITY_RELEASE_ENABLED` | `true` | **Kill switch.** `false` withdraws the proof everywhere: no automatic release, running owner releases pause (also the ones only following punches to Oracle), no new owner release can be approved, and the pre-send check holds again every row it released that Oracle has not acknowledged. |
-| `ADD_ATTENDANCE_DUMP_IDENTITY_AUTO_RELEASE_ZONES` | empty | Zone IDs for automatic release, comma-separated; `*` for every zone. **Empty means automatic release is off everywhere.** |
+| `ADD_ATTENDANCE_DUMP_IDENTITY_AUTO_RELEASE_ZONES` | `*` | Zone IDs for automatic release, comma-separated; `*` (the default, by owner decision on 22 Oct 2026) for every zone. **Empty turns automatic release off everywhere.** |
 | `ADD_ATTENDANCE_DUMP_IDENTITY_AUTO_RELEASE_HOURS` | `72` | Window for automatic release; both the punch and ADD's hold of it must be newer. `0` turns automatic release off. |
 | `ADD_ATTENDANCE_DUMP_IDENTITY_AUTO_RELEASE_MAX_SNAPSHOT_GAP_MINUTES` | `60` | ADD's complete roster snapshots just before and just after the punch must be at most this far apart. |
 | `ADD_ATTENDANCE_DUMP_IDENTITY_AUTO_RELEASE_BATCH` | `100` | Automatic releases per connector per snapshot (re-releases have their own equal cap). |

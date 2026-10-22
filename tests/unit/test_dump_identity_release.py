@@ -628,6 +628,8 @@ def test_old_hold_waits_for_the_owner_backlog_release(db, auto_zone, monkeypatch
 
 def test_backlog_follows_a_punch_reheld_by_a_newer_snapshot(db, monkeypatch):
     """Automatic release is off here: only the run itself can send it again."""
+    # Automatic release would act on these punches; this test covers zones without it.
+    monkeypatch.setattr(settings, "attendance_dump_identity_auto_release_zones", "")
     connector = _connector(db)
     zkt = connector.zkt_device
     _snapshot(db, connector, "s0", utc_now() - timedelta(days=5))
@@ -742,6 +744,8 @@ def test_a_held_punch_with_a_claim_in_flight_is_never_requeued(db):
 
 
 def test_approval_is_bound_to_the_signed_check(db, monkeypatch):
+    # Automatic release would act on these punches; this test covers zones without it.
+    monkeypatch.setattr(settings, "attendance_dump_identity_auto_release_zones", "")
     connector = _connector(db)
     _snapshot(db, connector, "s0", utc_now() - timedelta(days=45))
     week = _old_hold(db, connector, "bound-week")
@@ -887,7 +891,9 @@ def test_zero_window_turns_automatic_release_off(db, auto_zone, monkeypatch):
     }
 
 
-def test_preview_pages_are_bounded_frozen_and_read_only(db):
+def test_preview_pages_are_bounded_frozen_and_read_only(db, monkeypatch):
+    # Automatic release would act on these punches; this test covers zones without it.
+    monkeypatch.setattr(settings, "attendance_dump_identity_auto_release_zones", "")
     connector = _connector(db)
     now = utc_now()
     _snapshot(db, connector, "s0", now - timedelta(minutes=40))
@@ -1559,6 +1565,8 @@ def test_stop_releases_nothing_more_but_follows_released_punches_to_oracle(db, m
 
 
 def test_a_punch_after_the_last_snapshot_shows_it_awaits_the_next_one(db, monkeypatch):
+    # Automatic release would act on these punches; this test covers zones without it.
+    monkeypatch.setattr(settings, "attendance_dump_identity_auto_release_zones", "")
     connector = _connector(db)
     now = utc_now()
     _snapshot(db, connector, "s0", now - timedelta(minutes=40))
