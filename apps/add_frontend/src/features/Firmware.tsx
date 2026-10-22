@@ -13,6 +13,7 @@ import {
 import { z } from 'zod'
 import './Firmware.css'
 import { hilAllowedTargets, hilDevice, hilDeviceMismatch, hilScopeLabel } from './hilTargets'
+import { HilPlansPanel } from './HilPlans'
 import { api, queryString } from '../api'
 import {
   Dialog,
@@ -2088,6 +2089,16 @@ export function FirmwareView({
             </div>
           )}
         </section>
+      )}
+      {section === 'campaigns' && (
+        <HilPlansPanel
+          releases={catalogReleases}
+          devices={devices}
+          hilEnabled={hilEnabled}
+          revision={revision}
+          toast={toast}
+          onChanged={() => loadCampaigns({ quiet: true })}
+        />
       )}
       {creatorOpen && (
         <CampaignCreator

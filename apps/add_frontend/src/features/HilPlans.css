@@ -1,0 +1,25 @@
+.hil-plans { margin-top: 16px; overflow: visible; }
+.hil-plans .panel-header { gap: 12px; }
+.hil-plans-empty { margin: 0; padding: 16px 20px; color: var(--text-tertiary); font-size: 13px; }
+.hil-plans > .message { margin: 12px 20px; }
+.hil-plan-card { display: grid; gap: 10px; padding: 16px 20px; border-top: 1px solid var(--border); background: var(--surface); }
+.hil-plan-card header { display: flex; flex-wrap: wrap; align-items: flex-start; justify-content: space-between; gap: 10px; }
+.hil-plan-card header > span { min-width: 0; display: grid; gap: 2px; }
+.hil-plan-card small { color: var(--text-tertiary); font-size: 12px; overflow-wrap: anywhere; }
+.hil-plan-card .message { margin: 0; overflow-wrap: anywhere; }
+.hil-plan-card .page-actions { justify-content: flex-start; }
+.hil-plan-stages { display: grid; gap: 6px; margin: 0; padding: 0; list-style: none; }
+.hil-plan-stages li { display: grid; grid-template-columns: 70px auto minmax(0, 1fr); align-items: center; gap: 10px; font-size: 13px; }
+.hil-plan-stages li > span:last-child { min-width: 0; color: var(--text-secondary); overflow-wrap: anywhere; }
+.hil-plan-creator { display: grid; gap: 14px; padding: 4px 0; }
+.hil-plan-creator fieldset { display: grid; gap: 10px; margin: 0; padding: 12px; border: 1px solid var(--border); border-radius: var(--radius-md); }
+.hil-plan-creator legend { padding: 0 4px; font-size: 13px; font-weight: 600; }
+.hil-plan-stage-row { display: grid; grid-template-columns: 70px repeat(2, minmax(0, 1fr)) auto; align-items: center; gap: 8px; }
+.hil-plan-limits { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.hil-plan-preview { padding: 12px; border: 1px solid var(--border); border-radius: var(--radius-md); background: var(--surface-subtle); font-size: 13px; overflow-wrap: anywhere; }
+.hil-plan-preview h3 { margin: 0 0 4px; font-size: 14px; }
+.hil-plan-preview p, .hil-plan-preview ol { margin: 4px 0 0; }
+@media (max-width: 640px) {
+  .hil-plan-stage-row, .hil-plan-limits { grid-template-columns: minmax(0, 1fr); }
+  .hil-plan-stages li { grid-template-columns: minmax(0, 1fr); }
+}

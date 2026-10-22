@@ -45,6 +45,20 @@ def main() -> None:
             "typed_confirmation", "password", "idempotency_key"}.issubset(
         request_properties(spec, "/api/v1/device-health/cleanup/apply", "post")
     )
+    # Staged HIL plans: preview is read-only; approval and every control
+    # require the password step-up and an audited reason.
+    assert "get" in paths["/api/v1/firmware/hil-plans"]
+    assert "get" in paths["/api/v1/firmware/hil-plans/{plan_id}"]
+    assert {"release_id", "stages", "expires_in_hours", "stage_timeout_minutes"}.issubset(
+        request_properties(spec, "/api/v1/firmware/hil-plans/preview", "post")
+    )
+    assert {"release_id", "stages", "reason", "typed_confirmation", "password", "plan_digest",
+            "idempotency_key", "expires_in_hours", "stage_timeout_minutes"}.issubset(
+        request_properties(spec, "/api/v1/firmware/hil-plans", "post")
+    )
+    assert {"reason", "password"}.issubset(
+        request_properties(spec, "/api/v1/firmware/hil-plans/{plan_id}/{action}", "post")
+    )
     print("Frontend OpenAPI safety contracts are synchronized.")
 
 

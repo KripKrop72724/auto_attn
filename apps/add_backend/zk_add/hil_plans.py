@@ -765,48 +765,68 @@ def control_plan(session: Session, *, plan_id: str, action: str, actor: str, rea
 # Views
 
 
-def serialize_plan(session: Session, plan: FirmwareHilPlan) -> dict:
-    stages = []
-    for index, stage in enumerate(plan.stages):
-        rows = _stage_campaigns(session, plan, index)
-        started = any(campaign is not None for _device, campaign, _deployment in rows)
-        if index < plan.current_stage or (plan.status == "COMPLETED"):
-            state = "SUCCEEDED"
-        elif index > plan.current_stage:
-            state = "QUEUED"
-        elif plan.status in TERMINAL_STATES:
-            state = plan.status
-        else:
-            state = "RUNNING" if started else "WAITING"
-        stages.append({
-            "index": index + 1, "status": state,
-            "devices": [{
-                **{key: device.get(key) for key in ("zone_id", "connector_id", "display_name", "location",
-                                                    "mac", "terminal_serial")},
-                "campaign_id": campaign.campaign_id if campaign else None,
-                "campaign_status": campaign.status if campaign else None,
-                "deployment_id": deployment.deployment_id if deployment else None,
-                "deployment_status": deployment.status if deployment else None,
-                "error_code": deployment.error_code if deployment else None,
-            } for device, campaign, deployment in rows],
+def _views(session: Session, plans: list[FirmwareHilPlan]) -> list[dict]:
+    """Serialize plans with two bounded queries for all of their campaigns."""
+    from zk_add.ota import FirmwareCampaign, FirmwareDeployment
+    if not plans:
+        return []
+    campaigns = {(row.actor, row.idempotency_key): row for row in session.scalars(
+        select(FirmwareCampaign).where(FirmwareCampaign.actor.in_([plan_actor(plan) for plan in plans])))}
+    latest: dict[int, Any] = {}
+    if campaigns:
+        for row in session.scalars(select(FirmwareDeployment).where(FirmwareDeployment.campaign_id.in_(
+                [campaign.id for campaign in campaigns.values()])).order_by(FirmwareDeployment.id)):
+            latest[row.campaign_id] = row
+    views = []
+    for plan in plans:
+        stages = []
+        for index, stage in enumerate(plan.stages):
+            rows = []
+            for device in stage:
+                campaign = campaigns.get((plan_actor(plan), campaign_key(plan, index, device["connector_id"])))
+                rows.append((device, campaign, latest.get(campaign.id) if campaign else None))
+            if index < plan.current_stage or plan.status == "COMPLETED":
+                state = "SUCCEEDED"
+            elif index > plan.current_stage:
+                state = "QUEUED"
+            elif plan.status in TERMINAL_STATES:
+                state = plan.status
+            else:
+                state = "RUNNING" if plan.stage_started_at is not None else "WAITING"
+            stages.append({
+                "index": index + 1, "status": state,
+                "devices": [{
+                    **{key: device.get(key) for key in ("zone_id", "connector_id", "display_name", "location",
+                                                        "mac", "terminal_serial")},
+                    "campaign_id": campaign.campaign_id if campaign else None,
+                    "campaign_status": campaign.status if campaign else None,
+                    "deployment_id": deployment.deployment_id if deployment else None,
+                    "deployment_status": deployment.status if deployment else None,
+                    "error_code": deployment.error_code if deployment else None,
+                } for device, campaign, deployment in rows],
+            })
+        views.append({
+            "plan_id": plan.plan_id, "status": plan.status,
+            "release": {"release_id": plan.release_public_id, "version": plan.release_version,
+                        "image_sha256": plan.image_sha256, "application_sha256": plan.application_sha256},
+            "plan_digest": plan.plan_digest, "reason": plan.reason, "approved_by": plan.approved_by,
+            "approved_at": plan.approved_at, "expires_at": plan.expires_at,
+            "stage_timeout_minutes": plan.stage_timeout_seconds // 60,
+            "current_stage": min(plan.current_stage + 1, len(plan.stages)), "stage_count": len(plan.stages),
+            "stage_entered_at": plan.stage_entered_at, "stage_started_at": plan.stage_started_at,
+            "waiting_reason": plan.waiting_reason, "halt_code": plan.halt_code, "halt_reason": plan.halt_reason,
+            "completed_at": plan.completed_at, "updated_at": plan.updated_at, "stages": stages,
         })
-    return {
-        "plan_id": plan.plan_id, "status": plan.status,
-        "release": {"release_id": plan.release_public_id, "version": plan.release_version,
-                    "image_sha256": plan.image_sha256, "application_sha256": plan.application_sha256},
-        "plan_digest": plan.plan_digest, "reason": plan.reason, "approved_by": plan.approved_by,
-        "approved_at": plan.approved_at, "expires_at": plan.expires_at,
-        "stage_timeout_minutes": plan.stage_timeout_seconds // 60,
-        "current_stage": min(plan.current_stage + 1, len(plan.stages)), "stage_count": len(plan.stages),
-        "stage_entered_at": plan.stage_entered_at, "stage_started_at": plan.stage_started_at,
-        "waiting_reason": plan.waiting_reason, "halt_code": plan.halt_code, "halt_reason": plan.halt_reason,
-        "completed_at": plan.completed_at, "updated_at": plan.updated_at, "stages": stages,
-    }
+    return views
+
+
+def serialize_plan(session: Session, plan: FirmwareHilPlan) -> dict:
+    return _views(session, [plan])[0]
 
 
 def plan_rows(session: Session, *, limit: int = 20) -> list[dict]:
-    plans = session.scalars(select(FirmwareHilPlan).order_by(FirmwareHilPlan.id.desc()).limit(limit))
-    return [serialize_plan(session, plan) for plan in plans]
+    return _views(session, list(session.scalars(
+        select(FirmwareHilPlan).order_by(FirmwareHilPlan.id.desc()).limit(limit))))
 
 
 def plan_detail(session: Session, plan_id: str) -> dict | None:
