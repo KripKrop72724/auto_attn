@@ -57,8 +57,37 @@ def _postgres_url() -> str | None:
     return url if url and url.startswith("postgresql") else None
 
 
+@pytest.fixture(scope="module")
+def postgres_engine():
+    url = _postgres_url()
+    if url is None:
+        yield None
+        return
+    schema = "batch_replay_test_" + uuid4().hex
+    admin = create_engine(url)
+    with admin.begin() as connection:
+        connection.execute(text(f'CREATE SCHEMA "{schema}"'))
+    engine = create_engine(
+        url,
+        connect_args={
+            "options": f"-csearch_path={schema} -clock_timeout=5000 -cstatement_timeout=30000"
+        },
+    )
+    try:
+        metadata = MetaData()
+        for table in Base.metadata.tables.values():
+            table.to_metadata(metadata)
+        metadata.create_all(engine)
+        yield engine
+    finally:
+        engine.dispose()
+        with admin.begin() as connection:
+            connection.execute(text(f'DROP SCHEMA "{schema}" CASCADE'))
+        admin.dispose()
+
+
 @pytest.fixture(params=["sqlite", "postgresql"])
-def sessions(request, monkeypatch):
+def sessions(request, monkeypatch, postgres_engine):
     monkeypatch.setattr(settings, "pii_fernet_key", Fernet.generate_key().decode())
     monkeypatch.setattr(settings, "pii_lookup_key", "test-lookup-key-with-enough-entropy")
     monkeypatch.setattr(
@@ -77,30 +106,13 @@ def sessions(request, monkeypatch):
         finally:
             engine.dispose()
         return
-    url = _postgres_url()
-    if url is None:
+    if postgres_engine is None:
         pytest.skip("Set ADD_SAFE_REPAIR_TEST_DATABASE_URL for PostgreSQL qualification")
-    schema = "batch_replay_test_" + uuid4().hex
-    admin = create_engine(url)
-    with admin.begin() as connection:
-        connection.execute(text(f'CREATE SCHEMA "{schema}"'))
-    engine = create_engine(
-        url,
-        connect_args={
-            "options": f"-csearch_path={schema} -clock_timeout=5000 -cstatement_timeout=30000"
-        },
-    )
-    try:
-        metadata = MetaData()
-        for table in Base.metadata.tables.values():
-            table.to_metadata(metadata)
-        metadata.create_all(engine)
-        yield sessionmaker(bind=engine, expire_on_commit=False, autoflush=False)
-    finally:
-        engine.dispose()
-        with admin.begin() as connection:
-            connection.execute(text(f'DROP SCHEMA "{schema}" CASCADE'))
-        admin.dispose()
+    # One disposable schema per module; every test starts from empty tables.
+    tables = ", ".join(f'"{name}"' for name in Base.metadata.tables)
+    with postgres_engine.begin() as connection:
+        connection.execute(text(f"TRUNCATE TABLE {tables} RESTART IDENTITY CASCADE"))
+    yield sessionmaker(bind=postgres_engine, expire_on_commit=False, autoflush=False)
 
 
 @pytest.fixture()
@@ -651,3 +663,44 @@ def test_migration_adds_the_column_once_and_keeps_it_on_downgrade(sessions):
             for column in inspect(connection).get_columns("add_attendance_batch_receipts")
         }
     assert columns["content_digest"]["nullable"] is True
+
+
+def test_admin_can_read_replay_counters(sessions, device, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    from zk_add.security import ADMIN_COOKIE, create_admin_session
+
+    monkeypatch.setattr(settings, "admin_username", "StateHealthAdmin")
+    settle(sessions, device, truth_batch("2.6.15", captured_at=PASS_START))
+    settle(sessions, device, truth_batch("2.6.15", captured_at=PASS_START + timedelta(minutes=30)))
+    with sessions() as db:
+        raw_session, _admin = create_admin_session(
+            db, username="StateHealthAdmin", ip_address="127.0.0.1", user_agent="pytest"
+        )
+        db.commit()
+
+    def request_session():
+        with sessions() as db:
+            try:
+                yield db
+                db.commit()
+            except Exception:
+                db.rollback()
+                raise
+
+    monkeypatch.setitem(web.app.dependency_overrides, web.get_db, request_session)
+    client = TestClient(web.app)
+    assert client.get("/api/v1/attendance-batch-replays").status_code == 401
+    client.cookies.set(ADMIN_COOKIE, raw_session)
+    response = client.get("/api/v1/attendance-batch-replays")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["scope"] == "PROCESS_SINCE_START"
+    assert body["rows"] == [
+        {
+            "connector_id": _connector_id(sessions, device),
+            "display_name": "ZONE-LAHORE-02",
+            "counts": {"CAPTURE_REPLAY_OF_COMMITTED": 1},
+        }
+    ]

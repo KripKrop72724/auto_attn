@@ -1904,6 +1904,39 @@ def attendance_quarantine(
     )
 
 
+@app.get("/api/v1/attendance-batch-replays")
+def attendance_batch_replays(
+    auth: tuple[Session, AdminContext] = Depends(require_admin),
+):
+    """Attendance batch replays this API process has settled since it started."""
+    from zk_add.attendance_batches import (
+        REPLAY_LOG_INTERVAL_SECONDS,
+        attendance_batch_replay_metrics,
+    )
+
+    db, _context = auth
+    metrics = attendance_batch_replay_metrics()
+    names = dict(
+        db.execute(
+            select(Connector.connector_id, Connector.display_name).where(
+                Connector.connector_id.in_(list(metrics))
+            )
+        ).all()
+    ) if metrics else {}
+    return {
+        "scope": "PROCESS_SINCE_START",
+        "log_interval_seconds": int(REPLAY_LOG_INTERVAL_SECONDS),
+        "rows": [
+            {
+                "connector_id": connector_id,
+                "display_name": names.get(connector_id),
+                "counts": counts,
+            }
+            for connector_id, counts in sorted(metrics.items())
+        ],
+    }
+
+
 @app.post("/api/v1/attendance-quarantine/{item_id}/review")
 def review_attendance_quarantine_endpoint(
     item_id: int,
