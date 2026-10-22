@@ -1,0 +1,166 @@
+{
+  "date": "2026-10-22",
+  "hardware": "ESP32-S3 revision v0.2, 16 MiB flash, 8 MiB octal PSRAM",
+  "mac": "14:c1:9f:46:ae:1c",
+  "idf": "5.5.3",
+  "baseline_source_commit": "2d212b01b022472004af51b86ba1f9a2c693c84f",
+  "patched_source_commit": "25c6932c9dc2d04c9ed0db0da39b8591fd16e330",
+  "original_backup": {
+    "mac": "14:c1:9f:46:ae:1c",
+    "port": "/dev/cu.usbmodem1101",
+    "flash_bytes": 16777216,
+    "sha256": "cd0f30ac9491da499eaf2167f07b5accf23cf6779c506110431aa766f346273e",
+    "bytes_read_over_usb": 655360,
+    "erased_tail_bytes_verified_on_device": 16121856,
+    "all_ranges_match_device_md5": true,
+    "writes_performed": false,
+    "efuse_burns_performed": false,
+    "tool": "esptool 5.1.0",
+    "reconstructed_md5": "4a2e37e004fe027e42c9778e42719a1b"
+  },
+  "reports": {
+    "baseline": {
+      "result": {
+        "schema_version": 1,
+        "purpose": "unsigned_spare_portal_regression_only",
+        "mac": "14:c1:9f:46:ae:1c",
+        "backup_sha256": "cd0f30ac9491da499eaf2167f07b5accf23cf6779c506110431aa766f346273e",
+        "application_sha256": "a5e38b30a8b55f721452aa30d314e9ec58ef644a0788ef3c1c87ad70f132886b",
+        "security_unchanged": true,
+        "storage_raw_fixture_unchanged": true,
+        "storage_md5_ranges": [
+          "1f6c76da17da9cf3c162fca034c42c40",
+          "2fdd6851b32ae931637d4845c037b550",
+          "2fdd6851b32ae931637d4845c037b550",
+          "2fdd6851b32ae931637d4845c037b550",
+          "2fdd6851b32ae931637d4845c037b550",
+          "2fdd6851b32ae931637d4845c037b550",
+          "2fdd6851b32ae931637d4845c037b550",
+          "c54f159ac16520abbaf78cb4bdca7f33"
+        ],
+        "cases_finished": true,
+        "cases_ap_active": {
+          "EMPTY": false,
+          "RE7": true
+        },
+        "case_expectations_met": true,
+        "factory_acceptance": "NOT_ASSERTED",
+        "efuse_burns_performed": false,
+        "signed_lahore_recovery_qualified": false
+      },
+      "serial_sha256": "04b10d1ba4e193dc4b7bea2b268896a3f22b874de568106db43887ed21fb3dbc",
+      "case_lines": [
+        "HIL_CASE EMPTY MAC=14:c1:9f:46:ae:1c",
+        "HIL_CONNECT_RESULT ESP_ERR_WIFI_SSID",
+        "HIL_RESULT case=EMPTY ap_active=0 ap_config=ESP_OK ssid=ESP_46AE1D",
+        "HIL_CASE RE7 MAC=14:c1:9f:46:ae:1c",
+        "HIL_CONNECT_RESULT ESP_OK",
+        "HIL_RESULT case=RE7 ap_active=1 ap_config=ESP_OK ssid=SLIC ATTENDANCE-AE1D"
+      ],
+      "independent_rf_visibility_verified": false
+    },
+    "patched": {
+      "result": {
+        "schema_version": 1,
+        "purpose": "unsigned_spare_portal_regression_only",
+        "mac": "14:c1:9f:46:ae:1c",
+        "backup_sha256": "cd0f30ac9491da499eaf2167f07b5accf23cf6779c506110431aa766f346273e",
+        "application_sha256": "5bccf2cc765b5947d86ac7a5d2025ae0553450a6cec57a02887de199d7a5e72b",
+        "security_unchanged": true,
+        "security_before": {
+          "flags": 0,
+          "flash_crypt_cnt": 0,
+          "key_purposes": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            12
+          ],
+          "chip_id": 9,
+          "api_version": 0,
+          "parsed_flags": {
+            "SECURE_BOOT_EN": false,
+            "SECURE_BOOT_AGGRESSIVE_REVOKE": false,
+            "SECURE_DOWNLOAD_ENABLE": false,
+            "SECURE_BOOT_KEY_REVOKE0": false,
+            "SECURE_BOOT_KEY_REVOKE1": false,
+            "SECURE_BOOT_KEY_REVOKE2": false,
+            "SOFT_DIS_JTAG": false,
+            "HARD_DIS_JTAG": false,
+            "DIS_USB": false,
+            "DIS_DOWNLOAD_DCACHE": false,
+            "DIS_DOWNLOAD_ICACHE": false
+          }
+        },
+        "security_after": {
+          "flags": 0,
+          "flash_crypt_cnt": 0,
+          "key_purposes": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            12
+          ],
+          "chip_id": 9,
+          "api_version": 0,
+          "parsed_flags": {
+            "SECURE_BOOT_EN": false,
+            "SECURE_BOOT_AGGRESSIVE_REVOKE": false,
+            "SECURE_DOWNLOAD_ENABLE": false,
+            "SECURE_BOOT_KEY_REVOKE0": false,
+            "SECURE_BOOT_KEY_REVOKE1": false,
+            "SECURE_BOOT_KEY_REVOKE2": false,
+            "SOFT_DIS_JTAG": false,
+            "HARD_DIS_JTAG": false,
+            "DIS_USB": false,
+            "DIS_DOWNLOAD_DCACHE": false,
+            "DIS_DOWNLOAD_ICACHE": false
+          }
+        },
+        "storage_raw_fixture_unchanged": true,
+        "storage_md5_ranges": [
+          "1f6c76da17da9cf3c162fca034c42c40",
+          "2fdd6851b32ae931637d4845c037b550",
+          "2fdd6851b32ae931637d4845c037b550",
+          "2fdd6851b32ae931637d4845c037b550",
+          "2fdd6851b32ae931637d4845c037b550",
+          "2fdd6851b32ae931637d4845c037b550",
+          "2fdd6851b32ae931637d4845c037b550",
+          "c54f159ac16520abbaf78cb4bdca7f33"
+        ],
+        "cases_finished": true,
+        "cases_ap_active": {
+          "EMPTY": true,
+          "RE7": true
+        },
+        "case_expectations_met": true,
+        "factory_acceptance": "NOT_ASSERTED",
+        "efuse_burns_performed": false,
+        "signed_lahore_recovery_qualified": false
+      },
+      "serial_sha256": "31c86020aca70170a1c511914215405808a6aa01dab0b45738c31908c30b1937",
+      "case_lines": [
+        "HIL_CASE EMPTY MAC=14:c1:9f:46:ae:1c",
+        "HIL_CONNECT_RESULT ESP_ERR_WIFI_SSID",
+        "HIL_RESULT case=EMPTY ap_active=1 ap_config=ESP_OK ssid=SLIC ATTENDANCE-AE1D",
+        "HIL_CASE RE7 MAC=14:c1:9f:46:ae:1c",
+        "HIL_CONNECT_RESULT ESP_OK",
+        "HIL_RESULT case=RE7 ap_active=1 ap_config=ESP_OK ssid=SLIC ATTENDANCE-AE1D"
+      ],
+      "independent_rf_visibility_verified": false
+    }
+  },
+  "limits": [
+    "Unsigned spare test only; Secure Boot and NVS encryption disabled.",
+    "Storage contains raw sentinels, not real attendance files.",
+    "Wi-Fi persistence API is stubbed; HTTP save and encrypted NVS repair are not tested.",
+    "Factory acceptance and signed Lahore USB recovery are not qualified.",
+    "A host Wi-Fi scan returned no networks; independent radio visibility was not established."
+  ]
+}

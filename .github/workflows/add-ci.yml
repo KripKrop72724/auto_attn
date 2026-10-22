@@ -16,7 +16,7 @@ concurrency:
 jobs:
   windows-publication:
     runs-on: windows-2022
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
         with:
@@ -38,11 +38,80 @@ jobs:
           ./tests/firmware/test_bld9_k50_hil_extension.ps1
           ./tests/firmware/test_backup_restore.ps1
           ./tests/firmware/test_deployed_firmware_contract.ps1
+          ./tests/firmware/test_usb_wifi_rescue_signing.ps1
+      - name: Verify USB rescue signing refusals in PowerShell Core
+        shell: pwsh
+        run: ./tests/firmware/test_usb_wifi_rescue_signing.ps1
+      - name: Verify repair USB identity and security guards
+        shell: powershell
+        run: ./tools/usb-wifi-rescue/test-guards.ps1
+      - name: Verify repair guards in PowerShell Core
+        shell: pwsh
+        run: ./tools/usb-wifi-rescue/test-guards.ps1
       - name: Verify pinned audit source after Windows checkout
         shell: powershell
         run: |
           python -c "import hashlib,pathlib; from scripts.invoke_factory_audit import AUDITOR_SHA256; digest=hashlib.sha256(pathlib.Path('scripts/audit_factory_bundle.py').read_bytes()).hexdigest(); raise SystemExit(0 if digest == AUDITOR_SHA256 else 'AUDITOR_CHECKOUT_HASH_MISMATCH')"
           if ($LASTEXITCODE -ne 0) { throw 'Pinned factory auditor checkout did not verify.' }
+
+      - name: Get digest-pinned Zig compiler
+        shell: powershell
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+          $archive = Join-Path $env:RUNNER_TEMP 'zig.zip'
+          Invoke-WebRequest -Uri 'https://ziglang.org/download/0.14.1/zig-x86_64-windows-0.14.1.zip' -OutFile $archive
+          if ((Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant() -ne '554f5378228923ffd558eac35e21af020c73789d87afeabf4bfd16f2e6feed2c') { throw 'Zig digest mismatch' }
+          Expand-Archive -LiteralPath $archive -DestinationPath $env:RUNNER_TEMP
+      - name: Verify tools and build offline executable
+        shell: powershell
+        run: |
+          $tools = Join-Path $env:RUNNER_TEMP 'security-tools.zip'
+          python tools/usb-security-check/prepare_tools.py $tools
+          if ($LASTEXITCODE -ne 0) { throw 'Tool verification failed' }
+          $zig = Join-Path $env:RUNNER_TEMP 'zig-x86_64-windows-0.14.1/zig.exe'
+          python tools/usb-security-check/build.py $zig $tools
+          if ($LASTEXITCODE -ne 0) { throw 'Windows build failed' }
+          python tools/usb-wifi-rescue/build_ui_test.py $zig $tools
+          if ($LASTEXITCODE -ne 0) { throw 'Disabled repair UI test build failed' }
+      - name: Exercise disabled repair GUI with no device access
+        shell: powershell
+        run: |
+          $process = Start-Process -FilePath (Join-Path $PWD 'dist/SLIC-WiFi-Repair-UI-TEST-ONLY.exe') -ArgumentList '--ui-smoke-test' -PassThru
+          if (-not $process.WaitForExit(60000)) { $process.Kill(); throw 'Repair GUI smoke test timed out' }
+          $process.Refresh()
+          if ($process.ExitCode -ne 0) { throw 'Repair GUI smoke test failed' }
+      - name: Verify serial logging with absent, busy and streaming USB devices
+        shell: powershell
+        run: ./tools/usb-security-check/test-collector.ps1
+      - name: Verify serial logging in PowerShell Core
+        shell: pwsh
+        run: ./tools/usb-security-check/test-collector.ps1
+      - name: Exercise native GUI, PowerShell GUI and bundled offline esptool
+        shell: powershell
+        run: |
+          $exe = Join-Path $PWD 'dist/SLIC-USB-Security-Check-v1.3.exe'
+          $process = Start-Process -FilePath $exe -ArgumentList '--ui-smoke-test' -PassThru
+          if (-not $process.WaitForExit(60000)) { $process.Kill(); throw 'GUI smoke test timed out' }
+          $process.Refresh()
+          if ($process.ExitCode -ne 0) { throw "GUI smoke test failed: $($process.ExitCode)" }
+          New-Item -ItemType Directory smoke-logs -Force | Out-Null
+          $desktop = [Environment]::GetFolderPath('Desktop')
+          foreach ($folder in @($desktop, $env:TEMP)) {
+            if ($folder -and (Test-Path $folder)) {
+              Get-ChildItem -LiteralPath $folder -Filter 'SLIC-Startup-*.txt' | Copy-Item -Destination smoke-logs
+            }
+          }
+          $content = (Get-ChildItem smoke-logs -File | Get-Content) -join "`n"
+          if ($content -notmatch 'Confirmed: diagnostic GUI reported its Shown event' -or $content -notmatch '5\.1\.0') { throw 'GUI/offline tool evidence missing' }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: SLIC-USB-Security-Check-v1.3-windows
+          retention-days: 7
+          path: |
+            dist/SLIC-USB-Security-Check-v1.3.exe
+            smoke-logs/
+            tools/usb-security-check/tool-metadata.json
 
   repository-contract:
     runs-on: ubuntu-latest
@@ -558,7 +627,7 @@ jobs:
 
   firmware-roles:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
         with:
@@ -587,6 +656,10 @@ jobs:
           python3 -c "import sys; d=open(sys.argv[1],'rb').read(); m=b'ZONE_STORAGE_CONTRACT_V2:LEGACY:READ=2:LANES=3F:BASE=2.4.12,2.5.2,2.6.6,2.6.7,2.6.8,2.6.9,2.6.10,2.6.12,2.6.13,2.6.14,2.6.15,2.7.2,2.7.3,2.7.4,2.7.5\0'; sys.exit(0 if d.count(m) == 1 and d.count(b'ZONE_STORAGE_CONTRACT_V') == 1 else 'direct contract marker is missing or ambiguous')" firmware/zone_lite/build-ci-direct/zone_lite.bin
       - name: Record the ESP-IDF image digest this runner built with
         run: docker image inspect espressif/idf:v5.5.3 --format '{{json .RepoDigests}}'
+      - name: Compile quarantined USB Wi-Fi rescue and synthetic predecessor
+        env:
+          SLIC_RESCUE_WIFI_PASSWORD: HIL-Recovery-Only
+        run: python3 scripts/build_usb_wifi_rescue.py --output build-ci-usb-rescue
 
   firmware:
     # This exact required check (HIL, signing and release gates match it by

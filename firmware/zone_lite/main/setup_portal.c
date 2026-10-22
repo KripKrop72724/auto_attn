@@ -776,6 +776,12 @@ esp_err_t setup_portal_prepare(setup_portal_station_visibility_cb_t visibility_c
                                                ESP_NETIF_CAPTIVEPORTAL_URI,
                                                (void *)captive_uri, strlen(captive_uri)),
                         TAG, "set captive portal DHCP option");
+    // Arm recovery before station events can run. An empty saved SSID makes
+    // esp_wifi_connect() fail without a STA_DISCONNECTED event, so waiting for
+    // that event can leave the setup AP permanently dormant. GOT_IP clears
+    // this clock through the normal handler when the station succeeds.
+    s_disconnected_since_ms = now_ms();
+    s_last_sta_retry_ms = s_disconnected_since_ms;
     return ESP_OK;
 }
 

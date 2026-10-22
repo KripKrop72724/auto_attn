@@ -54,6 +54,16 @@ def main() -> None:
             "typed_confirmation", "password", "idempotency_key"}.issubset(
         request_properties(spec, "/api/v1/device-health/cleanup/apply", "post")
     )
+    assert "get" in paths["/api/v1/checkin-notifications"]
+    assert {"mode", "punch_policy", "pilot_zone_ids", "add_pilot_cnics", "remove_pilot_cnic_ids",
+            "expected_revision", "reason", "password"}.issubset(
+        request_properties(spec, "/api/v1/checkin-notifications/settings", "put")
+    )
+    assert {"reason", "password"}.issubset(
+        request_properties(spec, "/api/v1/attendance/{event_id}/checkin-notification/retry", "post")
+    )
+    attendance_parameters = {row["name"] for row in paths["/api/v1/attendance"]["get"]["parameters"]}
+    assert "notify_status" in attendance_parameters
     print("Frontend OpenAPI safety contracts are synchronized.")
 
 
