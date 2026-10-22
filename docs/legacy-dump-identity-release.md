@@ -29,7 +29,7 @@ when all of these hold:
 
 Any saved terminal record decides instead of this proof. PostgreSQL enforces
 the same rule in `add_auto_reconciled_cnic_verified` (migration
-`20261022_0055_dump_release`, chained after `20261022_0054`). The migration
+`20261022_0056_dump_release`, chained after `20261022_0055`). The migration
 only replaces that function: no table is altered, scanned, locked or
 backfilled. A punch that fails any check stays held.
 

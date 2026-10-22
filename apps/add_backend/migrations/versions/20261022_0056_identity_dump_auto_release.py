@@ -17,8 +17,8 @@ backfilled.
 
 from alembic import op
 
-revision = "20261022_0055_dump_release"
-down_revision = "20261022_0054"
+revision = "20261022_0056_dump_release"
+down_revision = "20261022_0055"
 branch_labels = None
 depends_on = None
 
@@ -68,7 +68,7 @@ def upgrade() -> None:
                       AND epoch.terminal_generation = saved.generation))
               )
               OR (
-                -- 0055: a legacy reconnect/startup dump row with no saved
+                -- 0056: a legacy reconnect/startup dump row with no saved
                 -- terminal record from any connector. Its batch identifiers
                 -- must match one retained, fingerprint-bound interval of the
                 -- released user and CNIC at punch time. Whole-roster
