@@ -2234,7 +2234,6 @@ class AttendanceForceReleaseControl(Base):
     created_at: Mapped[datetime] = utc_column()
 
 
-
 class AttendanceCheckinNotification(Base):
     """Durable phone-notification outbox: at most one row per attendance punch.
 
