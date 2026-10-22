@@ -7160,6 +7160,80 @@ static void run_p02field_guard(uint32_t kib)
            "no round, no retry; with repairs stopped for the image, another image's tag would have run it\n", kib);
 }
 
+/* 2.7.7: every refusal rolls back exactly as 2.7.6 does. The unconfirmed
+ * 2.7.7 boot (and the glue's area test) leaves the store byte for byte as
+ * 2.7.6's unconfirmed boot leaves it, so the old image the bootloader takes
+ * after a refusal finds 2.7.6's store; the gate refuses an unheld custody
+ * file and a failed area test on that boot's own report; and the
+ * exception's round boot (critique 11) takes no custody block when its run
+ * could not hold every custody file: short "hold", nothing written, a
+ * retryable outcome. */
+static void run_p02field_refusals(uint32_t kib)
+{
+    p02field_variant = P02F_HIDDEN;
+    seed(64700 + kib);
+    nvs_clear();
+    format_flash(kib);
+    build_p02field();
+    p02_as_275();
+    snapshot_t built = snapshot_take();
+    srr_config_t c276 = config_2760(true), c277 = config_2770(true);
+    srr_report_t r276, r277;
+    repair_boot(&r276, &c276);
+    uint8_t *store276 = malloc(flash_size);
+    memcpy(store276, flash, flash_size);
+    snapshot_put(&built);
+    repair_boot(&r277, &c277);
+    CHECK(p02field_area_test() == SRX_TEST_PASSED, "p02field refusals: the area test");
+    uint32_t differ = 0;
+    for (uint32_t i = 0; i < flash_size; ++i) differ += store276[i] != flash[i];
+    CHECK(!differ && r276.result == r277.result && r277.result == SRR_RESULT_DEFERRED && !r277.reclaim.blocks,
+          "p02field refusals: the unconfirmed 2.7.7 boot left %u store bytes unlike 2.7.6's (%s, %s)", differ,
+          srr_result_name(r276.result), srr_result_name(r277.result));
+    CHECK(p02field_gate(&r277, SRX_TEST_PASSED) == SX_OK, "p02field refusals: the gate on the ordinary boot");
+    CHECK(p02field_gate(&r277, SRX_TEST_FAILED) == SX_AREA_TEST, "p02field refusals: a failed area test");
+    CHECK(p02field_gate(&r277, SRX_TEST_NO_SLOT) == SX_AREA_TEST, "p02field refusals: no slot for the area test");
+    snapshot_t unconfirmed = snapshot_take();
+    /* Too little memory to hold the queue: the gate refuses on the run's own
+     * report, and the store is again 2.7.6's. */
+    snapshot_put(&built);
+    srr_config_t starved = c277;
+    starved.hold_budget = 64U * 1024U;
+    srr_report_t r;
+    repair_boot(&r, &starved);
+    sx_reason_t gate = p02field_gate(&r, SRX_TEST_PASSED);
+    CHECK(r.files_unheld_custody > 0 && gate == SX_CUSTODY_UNHELD && !r.reclaim.blocks,
+          "p02field refusals: %u custody files unheld, the gate says %s", r.files_unheld_custody, sx_reason_name(gate));
+    /* The exception's round boot whose run cannot hold every custody file. */
+    snapshot_put(&unconfirmed);
+    srr_config_t round = config_2770(false);
+    round.hold_budget = 64U * 1024U;
+    uint8_t *before = malloc(flash_size);
+    memcpy(before, flash, flash_size);
+    uint32_t checked = round_checks;
+    repair_boot(&r, &round);
+    static sx_repair_t after;
+    sx_from_srr(&r, &after);
+    after.storage_allowed = !mount_blocked;
+    sx_outcome_t outcome = sx_round_outcome(&after);
+    uint32_t pending_records = 0, sources = 0, open = 0;
+    CHECK(!r.reclaim.blocks && round_checks == checked && !strcmp(r.reclaim.short_reason, "hold") &&
+              r.reclaim.held_out > 0 && outcome == SX_ROUND_HOLD && sx_outcome_retryable(outcome) && !r.gaps &&
+              !area_records(&pending_records, &sources, &open),
+          "p02field refusals: the unheld round boot took %u blocks, short %s (%u held out), outcome %s, %u gaps",
+          r.reclaim.blocks, r.reclaim.short_reason, r.reclaim.held_out, sx_outcome_name(outcome), r.gaps);
+    uint32_t written = 0;
+    for (uint32_t i = 0; i < flash_size; ++i) written += before[i] != flash[i];
+    CHECK(!written, "p02field refusals: the unheld round boot changed %u store bytes", written);
+    free(before);
+    free(store276);
+    snapshot_free(&built);
+    snapshot_free(&unconfirmed);
+    printf("p02field %u KiB refusals: the unconfirmed 2.7.7 boot leaves 2.7.6's store byte for byte; the gate refuses "
+           "an unheld custody file and a failed area test; the round boot without every custody file held takes no "
+           "block (short hold, retryable)\n", kib);
+}
+
 static void run_reclaim(uint32_t kib, const char *only)
 {
     const char *part = only && !strncmp(only, "reclaim-", 8) ? only + 8 : NULL;
@@ -7182,6 +7256,7 @@ static void run_reclaim(uint32_t kib, const char *only)
         run_reclaim_p02field(kib, P02F_MIN_GAIN);
         run_reclaim_p02field(kib, P02F_SHORT);
         run_p02field_guard(kib);
+        run_p02field_refusals(kib);
         p02field_variant = P02F_HIDDEN;
         run_reclaim_cuts("p02field confirmed", build_p02field, kib, false, AFTER_SAME, stride);
         if (kib >= 8192) {

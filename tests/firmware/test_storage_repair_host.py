@@ -90,6 +90,10 @@ def test_repair_against_esp_idf_spiffs_with_power_cuts(tmp_path: Path) -> None:
     assert "the attempts guard's state carries over to the round boot (same image tag)" in output
     assert "the redo area test cut at each of its" in output
     assert "p02field confirmed:" in output and "custody byte-exact, no gap" in output
+    # A refusal rolls back as 2.7.6: the unconfirmed 2.7.7 boot leaves 2.7.6's
+    # store byte for byte, and the round boot takes nothing without the hold.
+    assert "the unconfirmed 2.7.7 boot leaves 2.7.6's store byte for byte" in output
+    assert "takes no block (short hold, retryable)" in output
 
 
 def test_ci_runs_the_repair_harness_in_the_esp_idf_image() -> None:

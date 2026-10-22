@@ -195,6 +195,8 @@ sx_reason_t sx_runtime_verdict(const sx_repair_t *r, const sx_inventory_t *v, co
         if (!(rt->held_read_queues & (1U << q))) continue;
         const sx_repair_file_t *held = r ? repair_file(r, sx_queue_names[q] + 1) : NULL;
         if (!held || !held->blocked_spans) return SX_LED_CAUSE;
+        /* A read that starts past the last held span did not fail on one. */
+        if (rt->held_read_last[q] > held->blocked_last + SX_SPAN_BYTES - 1U) return SX_LED_CAUSE;
     }
     if (rt->held_read_queues >> SX_QUEUE_COUNT) return SX_LED_CAUSE;
     /* Every other boot-health term (3.7). */
@@ -223,20 +225,25 @@ sx_reason_t sx_evaluate(const sx_input_t *in)
 }
 
 /* ---- the stable window ------------------------------------------------------- */
-sx_reason_t sx_window_step(sx_window_t *w, sx_reason_t verdict, uint32_t now_s, uint32_t used, uint32_t total)
+bool sx_window_same(const sx_window_t *w, const sx_store_t *store)
 {
-    if (!w) return SX_STABILIZING;
+    return w && store && w->open && w->store.used == store->used && w->store.total == store->total &&
+        w->store.writes == store->writes;
+}
+
+sx_reason_t sx_window_step(sx_window_t *w, sx_reason_t verdict, uint32_t now_s, const sx_store_t *store)
+{
+    if (!w || !store) return SX_STABILIZING;
     if (sx_reason_unknown(verdict)) return verdict;
     if (verdict != SX_OK) {
         w->open = false;
         return verdict;
     }
-    if (!w->open || w->used != used || w->total != total) {
+    if (!sx_window_same(w, store)) {
         bool moved = w->open;
         w->open = true;
         w->since_s = now_s;
-        w->used = used;
-        w->total = total;
+        w->store = *store;
         return moved ? SX_STORE_CHANGED : SX_STABILIZING;
     }
     return now_s - w->since_s >= SX_STABLE_SECONDS ? SX_OK : SX_STABILIZING;
@@ -286,11 +293,29 @@ bool sx_record_confirmed(const sx_record_t *record, uint32_t image_tag)
     }
 }
 
+bool sx_exception_active(const sx_record_t *record, uint32_t image_tag, bool running_pending)
+{
+    return !running_pending && sx_record_confirmed(record, image_tag);
+}
+
 bool sx_record_ended(const sx_record_t *record, uint32_t deployment_crc)
 {
     return sx_record_valid(record) && record->deployment_crc == deployment_crc &&
         (record->state == SX_STATE_ABANDONED || record->state == SX_STATE_UNREPAIRED ||
          record->state == SX_STATE_UNHEALTHY);
+}
+
+/* ---- every boot ------------------------------------------------------------ */
+sx_boot_t sx_boot_action(const char *journal_state, bool running_pending, const sx_record_t *record,
+                         uint32_t image_tag, uint32_t deployment_crc)
+{
+    if (!journal_state || !journal_state[0]) return SX_BOOT_ORDINARY;
+    if (!strcmp(journal_state, "READY_TO_BOOT")) return running_pending ? SX_BOOT_CONFIRM : SX_BOOT_RECONCILE;
+    if (!strcmp(journal_state, "RECONCILING") && !running_pending && sx_record_valid(record) &&
+        record->image_tag == image_tag && sx_record_ended(record, deployment_crc) && !record->reported &&
+        (record->state == SX_STATE_UNREPAIRED || record->state == SX_STATE_UNHEALTHY))
+        return SX_BOOT_REPORT_ENDED;
+    return SX_BOOT_ORDINARY;
 }
 
 /* ---- after a round boot ----------------------------------------------------- */
@@ -329,6 +354,28 @@ sx_outcome_t sx_round_outcome(const sx_repair_t *a)
     if (same(a->result, "DEFERRED") || same(a->result, "NOT_RUN"))
         return a->pages_freed ? SX_ROUND_DEFERRED : SX_ROUND_FAILED;
     return SX_ROUND_FAILED;
+}
+
+bool sx_record_after_boot(sx_record_t *r, uint32_t image_tag, bool running_pending, bool previous_crashed,
+                          sx_outcome_t outcome)
+{
+    if (!sx_exception_active(r, image_tag, running_pending)) return false;
+    sx_state_t state = (sx_state_t)r->state;
+    bool round = state == SX_STATE_CONFIRMING || state == SX_STATE_CONFIRMED || state == SX_STATE_ROUND_SHORT;
+    if (!round && state != SX_STATE_ROUND_DONE) return false;
+    bool changed = false;
+    if (previous_crashed && r->crashes < UINT8_MAX) {
+        r->crashes++;
+        changed = true;
+    }
+    if (round) {
+        r->state = (uint8_t)(outcome == SX_ROUND_OK ? SX_STATE_ROUND_DONE : SX_STATE_ROUND_SHORT);
+        r->reason = (uint8_t)outcome;
+        if (r->round_boots < UINT8_MAX) r->round_boots++;
+        changed = true;
+    }
+    if (changed) sx_record_seal(r);
+    return changed;
 }
 
 sx_next_t sx_next_step(const sx_record_t *record, bool time_known, uint32_t now_epoch, uint32_t *wait_s)

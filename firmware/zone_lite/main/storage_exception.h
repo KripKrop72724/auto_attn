@@ -154,6 +154,10 @@ typedef struct {
     /* the LED's LOCAL_FAILURE incidents this boot, by cause (led_status.h) */
     bool led_known, led_fatal;
     uint32_t local_failures, room_failures, held_read_failures, held_read_queues;
+    /* per reclaim queue, the largest start offset of a read that failed
+     * with EIO: a read that starts past the last held span cannot have
+     * failed on one */
+    uint32_t held_read_last[SX_QUEUE_COUNT];
     /* the VFS: mounted, and SPIFFS's used and total bytes now */
     bool spiffs_mounted;
     uint32_t spiffs_used, spiffs_total;
@@ -222,15 +226,23 @@ bool sx_last_error_room(const char *operation, int error);
 
 /* ---- the stable window -------------------------------------------------- */
 typedef struct {
+    uint32_t used, total;          /* SPIFFS's used and total bytes */
+    uint32_t writes;               /* program and erase calls the VFS's SPIFFS made since boot */
+} sx_store_t;
+typedef struct {
     bool open;
     uint32_t since_s;              /* when every term first held (uptime seconds) */
-    uint32_t used, total;          /* the store's fingerprint then (SPIFFS used and total bytes) */
+    sx_store_t store;              /* the store's fingerprint then (critique 9) */
 } sx_window_t;
 /* One evaluation: SX_OK once the gate has held SX_STABLE_SECONDS with the
- * store unchanged; SX_STABILIZING before; the refusal (window closed);
+ * store unchanged (no byte written or erased, the same used and total
+ * bytes); SX_STABILIZING before; the refusal (window closed);
  * SX_STORE_CHANGED (window reopened) when the fingerprint moved. A reason
  * sx_reason_unknown() leaves the window as it is and returns itself. */
-sx_reason_t sx_window_step(sx_window_t *window, sx_reason_t verdict, uint32_t now_s, uint32_t used, uint32_t total);
+sx_reason_t sx_window_step(sx_window_t *window, sx_reason_t verdict, uint32_t now_s, const sx_store_t *store);
+/* The fingerprint the window opened on, unchanged now (the last check before
+ * the image marks itself valid). */
+bool sx_window_same(const sx_window_t *window, const sx_store_t *store);
 
 /* ---- the record (NVS storage_repair/exception) --------------------------- */
 #define SX_RECORD_VERSION 1U
@@ -255,9 +267,33 @@ bool sx_record_valid(const sx_record_t *record);
 uint32_t sx_deployment_crc(const char *deployment_id);
 /* The record belongs to this image and says it confirmed under the exception. */
 bool sx_record_confirmed(const sx_record_t *record, uint32_t image_tag);
+/* This boot runs an image that confirmed under the exception: the record
+ * says so and the running image is valid. On an unconfirmed boot such a
+ * record is stale (the same image of an earlier deployment that rolled back
+ * after CONFIRMING) and means nothing. */
+bool sx_exception_active(const sx_record_t *record, uint32_t image_tag, bool running_pending);
 /* The record ended this deployment's exception (ABANDONED, UNREPAIRED,
  * UNHEALTHY), so no second exception for it. */
 bool sx_record_ended(const sx_record_t *record, uint32_t deployment_crc);
+
+/* ---- every boot of a 2.7.7 image with an OTA journal (critiques 13, 14; M4) -- */
+typedef enum {
+    SX_BOOT_ORDINARY = 0, /* nothing of the exception: 2.7.6's path */
+    SX_BOOT_CONFIRM,      /* READY_TO_BOOT on an unconfirmed image: the confirmation loop (and the gate) */
+    SX_BOOT_RECONCILE,    /* READY_TO_BOOT on an image already valid: straight to RECONCILING, never the
+                             loop that could invalidate it */
+    SX_BOOT_REPORT_ENDED, /* the record ended the exception (UNREPAIRED, UNHEALTHY) and its FAILED report
+                             was not receipted: report it, then clear the journal */
+} sx_boot_t;
+/* `journal_state`: the OTA journal's state for this image's deployment
+ * (NULL or "" when none); `running_pending`: the running partition is
+ * ESP_OTA_IMG_PENDING_VERIFY. */
+sx_boot_t sx_boot_action(const char *journal_state, bool running_pending, const sx_record_t *record,
+                         uint32_t image_tag, uint32_t deployment_crc);
+/* Never: an image that is valid is never invalidated (the bootloader would
+ * hand a store that may have had custody windows to an image that cannot
+ * read the redo area). */
+static inline bool sx_may_invalidate(bool running_pending) { return running_pending; }
 
 /* ---- after a round boot ----------------------------------------------------- */
 typedef enum {
@@ -274,6 +310,13 @@ bool sx_outcome_retryable(sx_outcome_t outcome);
 /* The round boot's report (the confirmed boot's merged report): what it
  * achieved, and so whether another boot could do better. */
 sx_outcome_t sx_round_outcome(const sx_repair_t *after);
+/* A boot of an exception-confirmed image, after its repair: the outcome
+ * recorded (CONFIRMING, CONFIRMED or ROUND_SHORT become ROUND_DONE or
+ * ROUND_SHORT; ROUND_DONE stays), the round boots counted, and a previous
+ * boot that a panic, watchdog or brownout ended counted as a crash (M7).
+ * True when the record changed (the caller stores it). */
+bool sx_record_after_boot(sx_record_t *record, uint32_t image_tag, bool running_pending, bool previous_crashed,
+                          sx_outcome_t outcome);
 
 typedef enum {
     SX_NEXT_NONE = 0,     /* nothing to do (the round is done, or not this image's) */

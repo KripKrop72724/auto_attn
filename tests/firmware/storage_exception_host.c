@@ -254,6 +254,11 @@ static int gate_terms(void)
     EXPECT_REASON(sx_evaluate(&input), SX_LED_CAUSE);
     p02(); runtime.local_failures = 3; runtime.held_read_failures = 1; runtime.held_read_queues = 1U << 7;
     EXPECT_REASON(sx_evaluate(&input), SX_LED_CAUSE);
+    /* A held read must start at or before the last held span (H1): the
+     * last span's first byte to its last byte, not past it. */
+    p02(); runtime.local_failures = 3; runtime.held_read_failures = 1; runtime.held_read_queues = 1U << 0;
+    runtime.held_read_last[0] = (1968 + 50) * 251 + 250; EXPECT_REASON(sx_evaluate(&input), SX_OK);
+    runtime.held_read_last[0]++; EXPECT_REASON(sx_evaluate(&input), SX_LED_CAUSE);
     /* Every other boot-health term (3.7). */
     p02(); runtime.health_known = false; EXPECT_REASON(sx_evaluate(&input), SX_HEALTH_UNKNOWN);
     for (uint32_t bit = 1; bit <= SX_H_TERMINAL_COUNTS; bit <<= 1) {
@@ -276,25 +281,42 @@ static int gate_terms(void)
 static int window(void)
 {
     sx_window_t w = {0};
+    sx_store_t a = {.used = 5, .total = 9, .writes = 40}, z = {0};
     /* 119 s held: stabilizing; 120 s: eligible. */
-    EXPECT_REASON(sx_window_step(&w, SX_OK, 1000, 5, 9), SX_STABILIZING);
-    EXPECT_REASON(sx_window_step(&w, SX_OK, 1119, 5, 9), SX_STABILIZING);
-    EXPECT_REASON(sx_window_step(&w, SX_OK, 1120, 5, 9), SX_OK);
+    EXPECT_REASON(sx_window_step(&w, SX_OK, 1000, &a), SX_STABILIZING);
+    EXPECT_REASON(sx_window_step(&w, SX_OK, 1119, &a), SX_STABILIZING);
+    EXPECT_REASON(sx_window_step(&w, SX_OK, 1120, &a), SX_OK);
+    EXPECT(sx_window_same(&w, &a) && !sx_window_same(&w, &z) && !sx_window_same(NULL, &a));
     /* A lock that was busy neither refuses nor restarts the clock (M6). */
-    EXPECT_REASON(sx_window_step(&w, SX_STORAGE_UNKNOWN, 1121, 0, 0), SX_STORAGE_UNKNOWN);
-    EXPECT_REASON(sx_window_step(&w, SX_OK, 1122, 5, 9), SX_OK);
+    EXPECT_REASON(sx_window_step(&w, SX_STORAGE_UNKNOWN, 1121, &z), SX_STORAGE_UNKNOWN);
+    EXPECT_REASON(sx_window_step(&w, SX_HEALTH_UNKNOWN, 1121, &z), SX_HEALTH_UNKNOWN);
+    EXPECT_REASON(sx_window_step(&w, SX_OK, 1122, &a), SX_OK);
     /* A refusal closes it; the clock starts again. */
-    EXPECT_REASON(sx_window_step(&w, SX_LED_CAUSE, 1130, 5, 9), SX_LED_CAUSE);
-    EXPECT_REASON(sx_window_step(&w, SX_OK, 1131, 5, 9), SX_STABILIZING);
-    EXPECT_REASON(sx_window_step(&w, SX_OK, 1250, 5, 9), SX_STABILIZING);
-    EXPECT_REASON(sx_window_step(&w, SX_OK, 1251, 5, 9), SX_OK);
-    /* The store changed under the gate (critique 9): the clock restarts. */
-    EXPECT_REASON(sx_window_step(&w, SX_OK, 1260, 6, 9), SX_STORE_CHANGED);
-    EXPECT_REASON(sx_window_step(&w, SX_OK, 1379, 6, 9), SX_STABILIZING);
-    EXPECT_REASON(sx_window_step(&w, SX_OK, 1380, 6, 9), SX_OK);
+    EXPECT_REASON(sx_window_step(&w, SX_LED_CAUSE, 1130, &a), SX_LED_CAUSE);
+    EXPECT(!sx_window_same(&w, &a));
+    EXPECT_REASON(sx_window_step(&w, SX_OK, 1131, &a), SX_STABILIZING);
+    EXPECT_REASON(sx_window_step(&w, SX_OK, 1250, &a), SX_STABILIZING);
+    EXPECT_REASON(sx_window_step(&w, SX_OK, 1251, &a), SX_OK);
+    /* The store changed under the gate (critique 9): its used bytes, or a
+     * single program or erase of the VFS's SPIFFS (a rewrite of the same
+     * size, a deletion, a garbage collection): the clock restarts. */
+    sx_store_t b = a;
+    b.used = 6;
+    EXPECT_REASON(sx_window_step(&w, SX_OK, 1260, &b), SX_STORE_CHANGED);
+    EXPECT_REASON(sx_window_step(&w, SX_OK, 1379, &b), SX_STABILIZING);
+    EXPECT_REASON(sx_window_step(&w, SX_OK, 1380, &b), SX_OK);
+    sx_store_t c = b;
+    c.writes++;
+    EXPECT(!sx_window_same(&w, &c));
+    EXPECT_REASON(sx_window_step(&w, SX_OK, 1390, &c), SX_STORE_CHANGED);
+    EXPECT_REASON(sx_window_step(&w, SX_OK, 1510, &c), SX_OK);
+    c.total--;
+    EXPECT_REASON(sx_window_step(&w, SX_OK, 1511, &c), SX_STORE_CHANGED);
     /* An unknown before the window opened does not open it. */
     sx_window_t fresh = {0};
-    EXPECT_REASON(sx_window_step(&fresh, SX_INVENTORY_PENDING, 10, 5, 9), SX_INVENTORY_PENDING);
+    EXPECT_REASON(sx_window_step(&fresh, SX_INVENTORY_PENDING, 10, &a), SX_INVENTORY_PENDING);
+    EXPECT(!fresh.open);
+    EXPECT_REASON(sx_window_step(&fresh, SX_OK, 10, NULL), SX_STABILIZING);
     EXPECT(!fresh.open);
     return 0;
 }
@@ -446,55 +468,142 @@ static int restarts(void)
 }
 
 /* Power cuts at every write of the confirmation and after it, as the next
- * boot's decisions read them: no boot loop, and no way back to the old
- * image once the image is valid. The writes in order: the record
- * CONFIRMING, (otadata) valid, the record CONFIRMED, the journal
- * RECONCILING, the record's restart count, the restart. A cut while the
- * image is still PENDING_VERIFY rolls back (the bootloader); after it the
- * next boot is a confirmed round boot whatever the record says. */
+ * boots' decisions read them (critique 14, M3, M4, M7): the durable state is
+ * the otadata entry (pending or valid), the OTA journal and the record, and
+ * every boot decides from them alone through the module the firmware runs.
+ * The confirming boot writes, in order: the record CONFIRMING, otadata
+ * valid, the record CONFIRMED, the journal RECONCILING, the record's restart
+ * count (before the safepoint is claimed). Then the round boot records its
+ * outcome. A cut while the image is still pending rolls back (the
+ * bootloader) and the record is stale on any later pending boot; after
+ * otadata says valid nothing ever invalidates it, the next boot is a round
+ * boot, and the boots that follow are bounded: no boot loop. */
+typedef struct {
+    bool pending, old_image;
+    char journal[16];
+    sx_record_t record;
+} durable_t;
+
+static int boots_after(durable_t *d, uint32_t tag, uint32_t crc, sx_outcome_t round, bool *unrepaired)
+{
+    uint32_t now = 1800000000U;
+    *unrepaired = false;
+    for (unsigned boot = 0; boot < 32; ++boot) {
+        if (d->pending) {
+            /* Any reset of an unconfirmed image: the bootloader takes the old
+             * one, which ignores the record. */
+            d->old_image = true;
+            return 0;
+        }
+        sx_boot_t action = sx_boot_action(d->journal, d->pending, &d->record, tag, crc);
+        if (action == SX_BOOT_CONFIRM) return -1; /* a valid image never re-enters the loop */
+        if (action == SX_BOOT_RECONCILE) strcpy(d->journal, "RECONCILING");
+        /* The repair ran; its outcome is recorded on an exception image. */
+        (void)sx_record_after_boot(&d->record, tag, d->pending, false, round);
+        if (action == SX_BOOT_REPORT_ENDED || (sx_record_ended(&d->record, crc) && !d->record.reported)) {
+            d->record.reported = 1;
+            sx_record_seal(&d->record);
+            d->journal[0] = '\0';
+        }
+        uint32_t wait = 0;
+        sx_next_t next = sx_next_step(&d->record, true, now, &wait);
+        if (next == SX_NEXT_NONE) return (int)boot + 1;
+        if (next == SX_NEXT_UNREPAIRED) {
+            d->record.state = SX_STATE_UNREPAIRED;
+            sx_record_seal(&d->record);
+            *unrepaired = true;
+            continue; /* the next pass reports it and clears the journal */
+        }
+        if (next == SX_NEXT_WAIT) now += wait ? wait : 3600;
+        /* A controlled restart: counted before the claim. */
+        d->record.restarts++;
+        d->record.restart_epoch = now;
+        sx_record_seal(&d->record);
+    }
+    return -2; /* a boot loop */
+}
+
 static int cuts(void)
 {
-    const uint32_t tag = 0x27700001U;
-    for (int cut = 0; cut <= 6; ++cut) {
-        bool valid = cut >= 2;            /* esp_ota_mark_app_valid_cancel_rollback took */
-        sx_state_t written = cut >= 3 ? SX_STATE_CONFIRMED : cut >= 1 ? SX_STATE_CONFIRMING : SX_STATE_NONE;
-        sx_record_t r = {0};
-        r.state = (uint8_t)written;
-        r.image_tag = tag;
-        r.restarts = cut >= 5;
-        if (written != SX_STATE_NONE) sx_record_seal(&r);
-        if (!valid) {
-            /* Rolled back: the old image ignores the record; a later
-             * deployment of 2.7.7 sees it as another deployment's. */
-            EXPECT(!sx_record_ended(&r, sx_deployment_crc("next deployment")));
-            continue;
-        }
-        /* The round boot: the glue takes CONFIRMING or CONFIRMED on a valid
-         * image as confirmed, runs the round and records the outcome. */
-        EXPECT(sx_record_confirmed(&r, tag));
-        r.state = SX_STATE_ROUND_DONE;
-        r.round_boots = 1;
-        sx_record_seal(&r);
-        uint32_t wait;
-        EXPECT(sx_next_step(&r, true, 1800000000U, &wait) == SX_NEXT_NONE);
-        /* The same with the round short and retryable: one bounded restart
-         * chain, never more than SX_MAX_RESTARTS. */
-        r.state = SX_STATE_ROUND_SHORT;
-        r.reason = SX_ROUND_TIME;
-        r.restart_epoch = 1800000000U;
-        unsigned boots = 0;
-        for (;;) {
-            sx_record_seal(&r);
-            sx_next_t next = sx_next_step(&r, true, r.restart_epoch + 7 * 3600, &wait);
-            if (next != SX_NEXT_RESTART) {
-                EXPECT(next == SX_NEXT_UNREPAIRED);
-                break;
+    const uint32_t tag = 0x27700001U, crc = sx_deployment_crc("8f1c2a3b-0000-4000-8000-000000000001");
+    const sx_outcome_t outcomes[] = {SX_ROUND_OK, SX_ROUND_TIME, SX_ROUND_WAITING, SX_ROUND_MISMATCH};
+    for (size_t o = 0; o < sizeof(outcomes) / sizeof(outcomes[0]); ++o) {
+        for (int cut = 0; cut <= 5; ++cut) {
+            durable_t d = {.pending = true};
+            strcpy(d.journal, "READY_TO_BOOT");
+            if (cut >= 1) {
+                d.record.state = SX_STATE_CONFIRMING;
+                d.record.deployment_crc = crc;
+                d.record.image_tag = tag;
+                sx_record_seal(&d.record);
             }
-            EXPECT(++boots <= SX_MAX_RESTARTS);
-            r.restarts++;
-            r.round_boots++;
+            if (cut >= 2) d.pending = false;
+            if (cut >= 3) {
+                d.record.state = SX_STATE_CONFIRMED;
+                sx_record_seal(&d.record);
+            }
+            if (cut >= 4) strcpy(d.journal, "RECONCILING");
+            if (cut >= 5) {
+                d.record.restarts = 1;
+                sx_record_seal(&d.record);
+            }
+            bool unrepaired = false;
+            int boots = boots_after(&d, tag, crc, outcomes[o], &unrepaired);
+            EXPECT(boots >= 0);
+            if (cut < 2) {
+                /* Rolled back as 2.7.6; the record means nothing to a later
+                 * unconfirmed boot of the same image (another deployment). */
+                EXPECT(d.old_image);
+                EXPECT(!sx_exception_active(&d.record, tag, true));
+                EXPECT(!sx_record_ended(&d.record, sx_deployment_crc("next deployment")));
+                sx_record_t stale = d.record;
+                EXPECT(!sx_record_after_boot(&stale, tag, true, false, SX_ROUND_OK));
+                continue;
+            }
+            EXPECT(!d.old_image && !d.pending);
+            EXPECT(!strcmp(d.journal, outcomes[o] == SX_ROUND_OK ? "RECONCILING" : ""));
+            EXPECT(d.record.restarts <= SX_MAX_RESTARTS);
+            EXPECT(d.record.round_boots >= 1);
+            if (outcomes[o] == SX_ROUND_OK) {
+                EXPECT(d.record.state == SX_STATE_ROUND_DONE && !unrepaired && boots == 1);
+            } else {
+                EXPECT(d.record.state == SX_STATE_UNREPAIRED && unrepaired && d.record.reported);
+                if (outcomes[o] == SX_ROUND_MISMATCH) EXPECT(d.record.round_boots == 1);
+            }
         }
     }
+    /* The VALID-image rule on its own (M4): READY_TO_BOOT on a valid image
+     * reconciles whatever the record says, even with none. */
+    sx_record_t none = {0};
+    EXPECT(sx_boot_action("READY_TO_BOOT", false, &none, tag, crc) == SX_BOOT_RECONCILE);
+    EXPECT(sx_boot_action("READY_TO_BOOT", true, &none, tag, crc) == SX_BOOT_CONFIRM);
+    EXPECT(sx_boot_action("RECONCILING", false, &none, tag, crc) == SX_BOOT_ORDINARY);
+    EXPECT(sx_boot_action("", false, &none, tag, crc) == SX_BOOT_ORDINARY);
+    EXPECT(sx_boot_action(NULL, true, &none, tag, crc) == SX_BOOT_ORDINARY);
+    EXPECT(!sx_may_invalidate(false) && sx_may_invalidate(true));
+    /* An ended record resumes its FAILED report until receipted, for this
+     * image and deployment only. */
+    sx_record_t ended = {.state = SX_STATE_UNHEALTHY, .image_tag = tag, .deployment_crc = crc};
+    sx_record_seal(&ended);
+    EXPECT(sx_boot_action("RECONCILING", false, &ended, tag, crc) == SX_BOOT_REPORT_ENDED);
+    EXPECT(sx_boot_action("RECONCILING", false, &ended, tag + 1, crc) == SX_BOOT_ORDINARY);
+    EXPECT(sx_boot_action("RECONCILING", false, &ended, tag, crc + 1) == SX_BOOT_ORDINARY);
+    ended.reported = 1;
+    sx_record_seal(&ended);
+    EXPECT(sx_boot_action("RECONCILING", false, &ended, tag, crc) == SX_BOOT_ORDINARY);
+    /* Crashes after confirmation are counted and stop retries (M7). */
+    sx_record_t r = {.state = SX_STATE_CONFIRMED, .image_tag = tag, .deployment_crc = crc, .restarts = 1};
+    sx_record_seal(&r);
+    EXPECT(sx_record_after_boot(&r, tag, false, true, SX_ROUND_TIME));
+    EXPECT(r.crashes == 1 && r.state == SX_STATE_ROUND_SHORT && r.round_boots == 1 && sx_record_valid(&r));
+    uint32_t wait = 0;
+    EXPECT(sx_next_step(&r, true, 1900000000U, &wait) == SX_NEXT_UNREPAIRED);
+    r.state = SX_STATE_ROUND_DONE;
+    sx_record_seal(&r);
+    EXPECT(sx_record_after_boot(&r, tag, false, true, SX_ROUND_FAILED));
+    EXPECT(r.state == SX_STATE_ROUND_DONE && r.crashes == 2 && r.round_boots == 1);
+    EXPECT(!sx_record_after_boot(&r, tag, false, false, SX_ROUND_FAILED));
+    EXPECT(!sx_record_after_boot(&r, tag + 1, false, true, SX_ROUND_OK));
     return 0;
 }
 

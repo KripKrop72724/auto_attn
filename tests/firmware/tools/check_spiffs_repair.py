@@ -68,7 +68,9 @@ CI_RUNS = [["--seeds=3", "--organic=0"], ["cuts", "--seeds=12", "--first-seed=3"
            # 2.7.6 boot found it (21 October: 0 usable blocks, 67 custody, 1,817
            # excluded), the gate on that boot's own report, the confirmed
            # round (the same image tag), the worst case, too few custody pages,
-           # the attempts guard carried over, and cuts in the confirmed round.
+           # the attempts guard carried over, the refusals (2.7.6's store byte
+           # for byte, the round boot without the hold) and cuts in the
+           # confirmed round.
            ["reclaim-p02field", "--kib=8192"]]
 
 
