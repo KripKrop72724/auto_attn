@@ -1,11 +1,33 @@
 """A tail ADD cannot apply because the ESP's certificate is stale is answered, not looped.
 
 Production shape: ZONE-PESHAWAR-06 (zone-lite-2.7.5, connector generation 5,
-40-byte records). From about 13:22 UTC on 21 Oct 2026 every source_tail_chunk
-it sent was rejected with EVIDENCE_INVALID, and the tail audit retried the
-same range every interval. A ZKT reader changes its cursor, chain, epoch and
-generation only on a source_coverage push. A generic MESSAGE_REJECTED leaves
-it extending the same certificate for as long as its socket stays up.
+40-byte records), 21 Oct 2026, UTC:
+
+* 12:48:49 the ESP reconnects after the ADD deploy. ADD's connect bootstrap
+  pushes the identity catalog, then coverage committed to 94777.
+* 12:51:36 the ESP's tail 94777..94780 commits (94779 is INVALID_TIME), and
+  the ESP advances to 94780.
+* 12:52:03 the ESP applies the bootstrap push it had queued: "Local tail
+  cursor was ahead of ADD" (ADD_SOURCE_CHECKPOINT_REPLAY), back to 94777.
+* 13:07:09 its next tail starts at 94777 again. No punch arrived in between,
+  so it is the same range, but 94779 was the terminal's newest slot and read
+  back differently. ADD finds the committed chunk at 94777 with another digest
+  and invalidates coverage as SOURCE_TAIL_REPLAY_DIVERGED, without telling
+  the ESP.
+* 13:22:15 to 16:08:23 every tail is rejected as EVIDENCE_INVALID
+  (UNCLASSIFIED_VALUE_ERROR at apply_source_tail_chunk:1678, "no active
+  certified source coverage"), the same range every interval, until the
+  socket reconnects at 16:18.
+
+ZONE-SLICTOWER-3FL (2.7.2) repeated it on 22 Oct (07:06 reconnect, 07:21
+invalidation, 07:36 rejection), and ZONE-LAHORE-01 (2.6.15) on 12 Oct after a
+lost tail ACK. A ZKT reader changes its cursor, chain, epoch and generation
+only on a source_coverage push, so a generic MESSAGE_REJECTED leaves it
+extending the same certificate for as long as its socket stays up.
+
+Judging the rewound replay itself (benign when only unsettled newest-slot
+rows differ) belongs to the newest-slot work (SOURCE_TAIL_REPLAY_SUPERSEDED).
+These tests use replays that differ elsewhere, which stay divergences there.
 """
 from __future__ import annotations
 
@@ -67,7 +89,7 @@ def _peshawar_06(session, connector):
     return coverage
 
 
-def _tail(db, coverage, *, start=None, end=None, epoch="current", previous=None):
+def _tail(db, coverage, *, start=None, end=None, epoch="current", previous=None, latest=None, records=None):
     start = coverage.source_committed_cursor if start is None else start
     end = start + 3 if end is None else end
     draft = SourceTailChunkRequest(
@@ -77,16 +99,22 @@ def _tail(db, coverage, *, start=None, end=None, epoch="current", previous=None)
         record_size=40,
         start_ordinal=start,
         end_ordinal=end,
-        latest_terminal_count=end,
+        latest_terminal_count=end if latest is None else latest,
         chunk_digest="0" * 64,
         previous_chain_digest=previous or coverage.source_committed_chain_digest,
         resulting_chain_digest="0" * 64,
-        records=[_tail_source(ordinal, "EVENT" if ordinal == start else "INVALID_TIME",
-                              event=ordinal == start) for ordinal in range(start, end)],
+        records=records or [_tail_source(ordinal, "EVENT" if ordinal == start else "INVALID_TIME",
+                                         event=ordinal == start) for ordinal in range(start, end)],
     )
+    return _sealed(draft)
+
+
+def _sealed(draft):
+    """The chunk and chain digests the firmware computes for these records."""
     digest = reconciliation_chunk_digest(draft)
     return draft.model_copy(update={"chunk_digest": digest, "resulting_chain_digest": reconciliation_chain_digest(
-        draft.previous_chain_digest, start_ordinal=start, end_ordinal=end, chunk_digest=digest)})
+        draft.previous_chain_digest, start_ordinal=draft.start_ordinal, end_ordinal=draft.end_ordinal,
+        chunk_digest=digest)})
 
 
 @contextmanager
@@ -198,12 +226,13 @@ def _assert_firmware_parses(push, *, active):
         assert push["source_epoch"]
 
 
-def test_p06_tail_after_heartbeat_invalidation_stops_the_esp_instead_of_looping(wire):
+def test_p06_tail_after_coverage_invalidation_stops_the_esp_instead_of_looping(wire):
     with wire.factory() as db:
         accepted = wire.send(_tail(db, wire.coverage(db)))
     assert accepted.ack["type"] == "source_tail_ack" and accepted.ack["committed_next_ordinal"] == 4
-    # A heartbeat-side check invalidates the certificate fail-closed. Nothing
-    # tells the ESP, which keeps extending it from its saved cursor.
+    # Coverage is invalidated fail-closed outside the tail reply (here by a
+    # heartbeat count check). Nothing tells the ESP, which keeps extending its
+    # certificate from its saved cursor.
     with wire.factory() as db:
         zkt = wire.connector(db).zkt_device
         zkt.attendance_count = 0
@@ -211,8 +240,8 @@ def test_p06_tail_after_heartbeat_invalidation_stops_the_esp_instead_of_looping(
             db, zkt=zkt, previous_serial=SERIAL, previous_attendance_count=4)
         db.commit()
         stale = _tail(db, wire.coverage(db), start=4, end=7)
-    # This is the EVIDENCE_INVALID production saw: an unclassified ValueError
-    # at the coverage lookup, the same for every retry of the range.
+    # This is the EVIDENCE_INVALID production saw from 13:22: an unclassified
+    # ValueError at the coverage lookup, the same for every retry of the range.
     with wire.factory() as db, pytest.raises(ValueError) as refused:
         apply_source_tail_chunk(db, connector=wire.connector(db), payload=stale)
     assert rejection_category(refused.value) == "EVIDENCE_INVALID"
@@ -317,3 +346,41 @@ def test_only_stale_certificates_are_answered_here(wire):
     assert rejection_reason(refused.value) == "SOURCE_EVENT_CAPTURE_TYPE_INVALID"
     with wire.factory() as db:
         assert wire.coverage(db).active and wire.coverage(db).source_committed_cursor == 1
+
+
+
+def test_p06_replay_divergence_withdraws_the_certificate_and_retries_are_answered(wire):
+    """13:07 to 16:08: the invalidating replay, then a retry every tail interval."""
+    with wire.factory() as db:
+        coverage = wire.coverage(db)
+        start, chain = coverage.source_committed_cursor, coverage.source_committed_chain_digest
+        first = _tail(db, coverage)
+    committed = wire.send(first)
+    assert committed.ack["type"] == "source_tail_ack" and committed.ack["committed_next_ordinal"] == start + 3
+    before = tuple(wire.count(model) for model in (SourceTailChunk, TerminalRecordManifest, AttendanceEvent))
+    # The rewound ESP resends the committed range from 94777. Here a row that
+    # is not the newest slot differs, which stays a source divergence.
+    other = _tail_source(start + 40, "INVALID_TIME")
+    changed = first.records[0].model_copy(update={
+        "raw_record_b64": other.raw_record_b64, "raw_record_digest": other.raw_record_digest})
+    with wire.factory() as db:
+        replay = _tail(db, wire.coverage(db), start=start, previous=chain, records=[changed, *first.records[1:]])
+    outcome = wire.send(replay)
+    assert outcome.ack["type"] == "error" and outcome.ack["code"] == "SOURCE_TAIL_REPLAY_DIVERGED"
+    # The same reply withdraws the ESP's certificate, so it stops resending.
+    _assert_firmware_parses(outcome.coverage, active=False)
+    assert outcome.coverage["terminal_generation"] == P06_GENERATION
+    # A retry already in flight is answered, never rejected at the coverage lookup.
+    for _ in range(2):
+        retry = wire.send(replay)
+        assert retry.ack["code"] == SOURCE_TAIL_COVERAGE_INACTIVE
+        _assert_firmware_parses(retry.coverage, active=False)
+    assert tuple(wire.count(model) for model in (SourceTailChunk, TerminalRecordManifest, AttendanceEvent)) == before
+    with wire.factory() as db:
+        current = wire.coverage(db)
+        assert not current.active and current.invalidated_reason == "SOURCE_TAIL_REPLAY_DIVERGED"
+        assert current.source_committed_cursor == start + 3
+        assert db.scalar(select(DeviceAlert.id).where(DeviceAlert.code == "DEVICE_MESSAGE_REJECTED")) is None
+        assert db.scalar(select(DeviceAlert.id).where(
+            DeviceAlert.code == "ADD_SOURCE_COVERAGE_INVALIDATED", DeviceAlert.state == "OPEN")) is not None
+        assert wire.connector(db).last_error_code is None
