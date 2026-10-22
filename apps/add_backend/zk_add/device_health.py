@@ -20,6 +20,7 @@ from sqlalchemy.orm import Session
 
 from zk_add.hil_startup import PHASES as HIL_STARTUP_PHASES, STORAGE_COUNTERS, STORAGE_ERRORS
 from zk_add.models import Connector, DeviceAlert, DeviceTelemetry, ZKTDevice
+from zk_add.queue_evidence import OPERATOR_ONLY_REASONS, custody_only, unheld_evidence
 from zk_add.settings import settings
 from zk_add.time_utils import ensure_utc, parse_datetime, utc_now
 
@@ -84,9 +85,14 @@ POLICY = {
         55, True, "POSITIVE", "Clears when the Hikvision terminal is online and its last check succeeded.",
         RULE),
     "DEVICE_MESSAGE_REJECTED": Policy(
-        60, True, "REJECTION", "Clears when ADD accepts the next message of each rejected type.", RULE),
+        60, True, "REJECTION", "Clears when ADD accepts the next message of each rejected type. A refused "
+        "queue_evidence clears only once ADD holds each refused copy's bytes. Once ADD accepts a later "
+        "queue_evidence, copies it does not hold no longer hold HIL or factory work, but stay open as a "
+        "warning until an operator verifies the device and resolves them.", RULE),
     "ADD_MESSAGE_PROCESSING_FAILED": Policy(
-        65, False, "REJECTION", "Clears when ADD processes the next message of each failed type.", RULE),
+        65, False, "REJECTION", "Clears when ADD processes the next message of each failed type; a "
+        "queue_evidence clears only once ADD holds each copy it could not process, or an operator "
+        "resolves it.", RULE),
     "HIK_LIGHT_RECONCILE_BLOCKED": Policy(
         70, True, "POSITIVE", "Clears when the Hikvision history audit is scanning or complete.", WARNING),
     "OTA_DEVICE_ROLLED_BACK": Policy(
@@ -528,9 +534,35 @@ def _rejection_entries(row: DeviceAlert) -> dict[str, dict]:
         "first_at": row.first_seen_at, "last_at": row.last_seen_at}}
 
 
+def _unheld_summary(entry: dict) -> str:
+    pending, untracked = unheld_evidence(entry)
+    conflicts = len([item for item in entry.get("pending") or [] if isinstance(item, dict)
+                     and item.get("reason") in OPERATOR_ONLY_REASONS])
+    conflict_note = " (1 is an identity conflict)" if conflicts == 1 else (
+        f" ({conflicts} are identity conflicts)" if conflicts else "")
+    parts = ([f"{pending} refused record{'s' if pending != 1 else ''} not yet held{conflict_note}"]
+             if pending else []) + (
+        [f"{untracked} unmatched refusal{'s' if untracked != 1 else ''}"] if untracked else [])
+    if parts and custody_only(entry):
+        parts.append("no HIL or factory hold since a later acceptance")
+    return "; " + ", ".join(parts) if parts else ""
+
+
 def _entry_current(entry: dict, now: datetime) -> bool:
+    if custody_only(entry):
+        return False  # ADD accepted that type after this entry's latest refusal
     age = _age(now, _when(entry.get("last_at")))
     return age is not None and age <= settings.message_rejection_current_seconds
+
+
+def _rejection_gating(row: DeviceAlert, policy: Policy) -> bool:
+    """A rejection left with only refused copies ADD does not hold after a
+    later acceptance no longer holds HIL or factory work: that acceptance
+    used to close it. It stays open, as a warning, for an operator."""
+    if not policy.gating or row.code not in {"DEVICE_MESSAGE_REJECTED", "ADD_MESSAGE_PROCESSING_FAILED"}:
+        return policy.gating
+    entries = _rejection_entries(row)
+    return not (entries and all(custody_only(entry) for entry in entries.values()))
 
 
 def _refreshed_by_last_heartbeat(row: DeviceAlert, connector: Connector) -> bool:
@@ -638,7 +670,7 @@ def _evidence_summary(row: DeviceAlert) -> str | None:
     if not summary and row.code in {"DEVICE_MESSAGE_REJECTED", "ADD_MESSAGE_PROCESSING_FAILED"}:
         summary = "; ".join(
             f"{name} x{int(entry.get('count') or 1)} ({entry.get('category') or 'UNKNOWN'}"
-            f"{': ' + str(entry['error_reason']) if entry.get('error_reason') else ''})"
+            f"{': ' + str(entry['error_reason']) if entry.get('error_reason') else ''}{_unheld_summary(entry)})"
             for name, entry in sorted(_rejection_entries(row).items()))
     if not summary and row.code == "HIK_CAPTURE_UNHEALTHY" and details.get("reason"):
         summary = f"{details['reason']} (poll error {details.get('poll_error')})."
@@ -726,7 +758,8 @@ def alert_reason(row: DeviceAlert, connector: Connector, *, now: datetime, link:
     tier = _rule_tier(row, connector, currency, now=now, link=link) if policy.tier == RULE else policy.tier
     details = row.details or {}
     reason = Reason(
-        code=row.code, error_code=_error_code(row), tier=tier, currency=currency, gating=policy.gating,
+        code=row.code, error_code=_error_code(row), tier=tier, currency=currency,
+        gating=_rejection_gating(row, policy),
         severity=row.severity, message=row.message,
         since=_when(details.get("boot_first_seen_at")) or ensure_utc(row.first_seen_at),
         last_seen_at=ensure_utc(row.last_seen_at), clear_condition=policy.clear_condition,

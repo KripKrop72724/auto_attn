@@ -51,7 +51,9 @@ from zk_add.attendance_batches import (
     review_attendance_quarantine,
     settle_attendance_batch,
 )
-from zk_add.queue_evidence import QueueEvidenceRequest, evidence_ack, preserve_queue_evidence
+from zk_add.queue_evidence import (
+    QueueEvidenceRequest, evidence_ack, held_record, preserve_queue_evidence, refused_copy,
+)
 from zk_add.models import QueueEvidence
 from zk_add.crypto import decrypt_json
 from zk_add.crypto import cnic_lookup, decrypt_cnic, decrypt_text, mask_cnic, normalize_cnic
@@ -4648,13 +4650,17 @@ def record_envelope_rejection(connector_pk: int, envelope: Envelope, error: Exce
     from zk_add.rejection import rejection_category, rejection_reason, rejection_site
 
     category = rejection_category(error)
-    # Field locations only: rejected values can carry attendance or credentials.
-    error_paths = [".".join(str(part) for part in row.get("loc", ()))[:120]
-                   for row in error.errors(include_input=False, include_url=False)[:5]
-                   ] if isinstance(error, ValidationError) else []
+    # Field locations and pydantic error types only: rejected values can carry
+    # attendance or credentials, and neither of these ever includes one.
+    schema_errors = error.errors(include_input=False, include_url=False)[:5] \
+        if isinstance(error, ValidationError) else []
+    error_paths = [".".join(str(part) for part in row.get("loc", ()))[:120] for row in schema_errors]
+    error_types = [str(row.get("type"))[:80] for row in schema_errors]
     # A bounded code and the ADD code location, never the message or payload.
     error_reason = rejection_reason(error)
     error_site = rejection_site(error) if error_reason is not None else None
+    # Which custody record was refused, so its later acceptance can be proven.
+    evidence = refused_copy(envelope.payload) if envelope.type == "queue_evidence" else None
     with session_scope() as db:
         connector = db.scalar(select(Connector).where(Connector.id == connector_pk).with_for_update())
         if connector is None:
@@ -4662,13 +4668,18 @@ def record_envelope_rejection(connector_pk: int, envelope: Envelope, error: Exce
         alert = record_message_rejection(
             db, connector, message_type=envelope.type, category=category, error_type=error_type,
             error_paths=error_paths, request_id=envelope.message_id, boot_id=envelope.boot_id,
-            error_reason=error_reason, error_site=error_site)
+            error_reason=error_reason, error_site=error_site, error_types=error_types, evidence=evidence)
         if settings.device_health_derived_enabled:
             apply_device_health(db, connector, source="REJECTION")
-        else:
+        elif alert.state == "OPEN":
             connector.lifecycle_state = "DEGRADED"
             connector.last_error_code = alert.code
             connector.last_error_message = alert.message
+        elif connector.last_error_code == alert.code:
+            # A refused copy ADD already held closed its alert at once.
+            connector.lifecycle_state = "ONLINE"
+            connector.last_error_code = None
+            connector.last_error_message = None
         ingest_logs(
             db,
             connector=connector,
@@ -4682,9 +4693,10 @@ def record_envelope_rejection(connector_pk: int, envelope: Envelope, error: Exce
                     message=alert.message,
                     context={"message_type": envelope.type, "error_type": error_type,
                              "request_id": envelope.message_id, "error_category": category,
-                             "error_paths": error_paths,
+                             "error_paths": error_paths, "error_types": error_types,
                              **({"error_reason": error_reason, "error_site": error_site}
-                                if error_reason is not None else {})},
+                                if error_reason is not None else {}),
+                             **({"evidence": evidence} if evidence is not None else {})},
                     device_time=envelope.sent_at,
                 )
             ],
@@ -4710,6 +4722,7 @@ def persist_envelope(connector_pk: int, envelope: Envelope) -> EnvelopeOutcome |
     provisioning_payload = None
     event_payload = None
     ack_payload = None
+    held_evidence = None
     authoritative_coverage_payload = None
     coverage_before_ack_payload = None
     ack_coverage_payload = None
@@ -4852,6 +4865,7 @@ def persist_envelope(connector_pk: int, envelope: Envelope) -> EnvelopeOutcome |
             evidence = preserve_queue_evidence(
                 db, connector, QueueEvidenceRequest.model_validate(envelope.payload)
             )
+            held_evidence = held_record(evidence)
             ack_payload = evidence_ack(evidence, connector, envelope.message_id)
             event_payload = {"connector_id": connector.connector_id,
                              "receipt_id": evidence.receipt_id, "disposition": evidence.disposition}
@@ -5097,8 +5111,9 @@ def persist_envelope(connector_pk: int, envelope: Envelope) -> EnvelopeOutcome |
         # The same transaction that accepted the message clears its type's
         # rejection; a replayed duplicate returned above proves nothing new.
         # A stale-generation tail committed nothing, so it clears nothing.
+        # A refused queue_evidence clears only when this holds that record.
         if not stale_generation_tail:
-            resolve_message_rejection(db, connector, message_type=envelope.type)
+            resolve_message_rejection(db, connector, message_type=envelope.type, evidence=held_evidence)
     return EnvelopeOutcome(
         ack=ack_payload or {"type": "ack", "message_id": envelope.message_id, "seq": envelope.seq},
         event=event_payload or {},
