@@ -41,7 +41,11 @@ from zk_add import checkin_notify
 from zk_add import source_newest_slot as newest_slot
 from zk_add.attendance_cnic_link import cnic_not_linked_expression
 from zk_add.attendance_force_schemas import ForceCheckRequest, ForceStartRequest, ForceControlRequest, UserRefreshRequest
-from zk_add.attendance_direct_ords_schemas import DirectOrdsRecheckRequest, DirectOrdsStartRequest
+from zk_add.attendance_direct_ords_schemas import (
+    DirectOrdsPreviewRequest,
+    DirectOrdsRecheckRequest,
+    DirectOrdsStartRequest,
+)
 from zk_add.audit import append_audit
 from zk_add.hikvision_evidence import ObservationIn, preserve_observation
 from zk_add.schemas import HikvisionPolicyRequest, HikvisionWriteExceptionRequest
@@ -632,6 +636,16 @@ def list_direct_ords_runs(
         .order_by(AttendanceRecoveryJob.id.desc()).limit(limit)
     ).all()
     return {"rows": [direct_ords.serialize(db, row) for row in rows]}
+
+
+@app.post("/api/v2/attendance-direct-ords/preview")
+def preview_direct_ords_run(
+    body: DirectOrdsPreviewRequest,
+    auth: tuple[Session, AdminContext] = Depends(require_admin),
+):
+    """Read-only: refused punch times, CNIC choices and imminent automatic releases."""
+    db, _context = auth
+    return direct_ords.preview(db, body.event_ids)
 
 
 @app.post("/api/v2/attendance-direct-ords", status_code=202)
@@ -3427,6 +3441,14 @@ def attendance_identity_evidence_report(
 
     source = source_evidence(db, event, connector) if connector else None
     evidence = identity_evidence(db, event, connector) if connector else None
+    auto_release_eligible = bool(
+        connector and zkt and user
+        and synced_cnic_identity_proven(db, connector, zkt, user, event)
+    )
+    safety = _identity_release_safety(
+        db, event, connector=connector, zkt=zkt, user=user, manifest=manifest,
+        source=source, auto_release_eligible=auto_release_eligible,
+    )
     return {
         "event_id": event.id,
         "ords_status": event.ords_status,
@@ -3515,10 +3537,176 @@ def attendance_identity_evidence_report(
         "active_user_cnic_matches_history": bool(
             user and evidence and user.cnic_lookup_hash == evidence.cnic_hash
         ),
-        "auto_release_eligible": bool(
-            connector and zkt and user
-            and synced_cnic_identity_proven(db, connector, zkt, user, event)
-        ),
+        "auto_release_eligible": auto_release_eligible,
+        **safety,
+    }
+
+
+IDENTITY_RELEASE_HINTS = {
+    "CLOCK_INVALID": "The terminal clock was invalid for this punch. It can never be sent to Oracle.",
+    "TIME_IMPOSSIBLE": "The punch time is impossible. It can never be sent to Oracle.",
+    "AUTO_RELEASE_AT_NEXT_SNAPSHOT": (
+        "ADD's own proof and the database guard pass: the next user snapshot "
+        "(normally within 15 minutes) releases this punch. Do not send it by hand."
+    ),
+    "AWAITING_NEXT_SNAPSHOT": (
+        "This punch arrived after the latest user snapshot. ADD checks it again at the next "
+        "snapshot (normally within 15 minutes) and may release it automatically."
+    ),
+    "DATABASE_GUARD_REJECTS": (
+        "ADD's proof passes but the installed database guard would keep this punch held."
+    ),
+    "NO_SAVED_TERMINAL_RECORD": (
+        "No saved terminal record yet: a full-history or tail read must link this punch "
+        "to the terminal's own attendance log before ADD can prove its source."
+    ),
+    "DATABASE_GUARD_UNAVAILABLE": (
+        "ADD's proof passes but the database guard could not be read. Treat the punch as "
+        "about to be released automatically."
+    ),
+    "PUNCH_TIME_CNIC_DIFFERS": (
+        "The terminal held a different CNIC for this user ID at punch time. A manual send "
+        "must choose which CNIC to use; the punch-time CNIC is the default."
+    ),
+    "PUNCH_TIME_CNIC_CONFLICT": (
+        "ADD's records show another CNIC or another person for this user ID at or near the "
+        "punch time, and nothing close enough to the punch says which (see "
+        "other_cnics_masked, evidence_signals, record_before_ended_at and "
+        "record_after_started_at). A manual send refuses this punch."
+    ),
+    "IDENTITY_CONFLICT_UNRESOLVED": (
+        "Two active terminal users have today's CNIC and the duplicate is not resolved. A "
+        "manual send refuses this punch until it is resolved in ADD Users."
+    ),
+    "PUNCH_TIME_CNIC_CHANGED_NEARBY": (
+        "No record covers the punch time: the old CNIC's record ended before it and today's "
+        "started after it (see record_before_ended_at and record_after_started_at). A manual "
+        "send asks for this punch on its own and offers only a record within 30 minutes of "
+        "the punch: the old CNIC from today's own terminal user record, today's CNIC from "
+        "its first record. Choose only after HR confirms who held the user ID."
+    ),
+    "PUNCH_TIME_CNIC_BRIDGED_GAP": (
+        "No record covers the punch time, but the records just before and after it are the "
+        "same terminal user with the same CNIC. A manual send treats that CNIC as the "
+        "punch-time CNIC."
+    ),
+    "RECORD_HOLDER_DELETED_BEFORE_PUNCH": (
+        "The terminal user on the record before the punch was deleted before the punch, so "
+        "that record says nothing about who punched."
+    ),
+    "PUNCH_BEFORE_FIRST_OBSERVATION": (
+        "The punch is older than ADD's first record of this terminal user ID (see "
+        "first_observed_at). A user ID reused before then cannot be detected; confirm with HR."
+    ),
+    "NAME_DIFFERS": (
+        "The name saved with the punch is not today's user's name. Confirm with HR who punched."
+    ),
+    "PUNCH_TIME_CNIC_AMBIGUOUS": (
+        "The records at punch time are revoked, belong to another terminal UID or terminal "
+        "user, or the punch was linked to another user. They do not prove today's CNIC."
+    ),
+    "NO_PUNCH_TIME_IDENTITY": (
+        "ADD has no identity record for this user ID at punch time. Today's CNIC may only be "
+        "used after HR confirms the user ID belonged to the same employee then."
+    ),
+}
+
+
+def _identity_release_safety(
+    db, event, *, connector, zkt, user, manifest, source, auto_release_eligible,
+) -> dict:
+    """Read-only facts an administrator needs before overriding a hold by hand."""
+    from zk_add.attendance_identity_evidence import TERMINAL_RECONCILE_SOURCES
+    from zk_add.attendance_release_safety import (
+        AMBIGUOUS,
+        CHANGED_NEAR_PUNCH,
+        CONFLICT,
+        DIFFERS,
+        GAP_BRIDGED_SAME_CNIC,
+        IDENTITY_CONFLICT_UNRESOLVED,
+        NAME_DIFFERS,
+        NONE,
+        PUNCH_BEFORE_FIRST_OBSERVATION,
+        RECORD_HOLDER_DELETED_BEFORE_PUNCH,
+        auto_release_preview,
+        database_guard_state,
+        other_cnics_masked,
+        safe_cnic,
+        single_event_identity,
+        time_refusal,
+    )
+
+    current_cnic = safe_cnic(user.cnic_encrypted) if user else None
+    current_hash = cnic_lookup(current_cnic) if current_cnic else None
+    punch = single_event_identity(db, event, user, current_hash)
+    guard = (
+        database_guard_state(db, event=event, zkt=zkt, user=user)
+        if connector and zkt and user else "NOT_CHECKED"
+    )
+    release = auto_release_preview(db, event, identity=punch, include_guard=False)
+    at_next_snapshot = bool(
+        release["held"] and auto_release_eligible
+        and guard in {"ACCEPTED", "NOT_APPLICABLE", "UNAVAILABLE"}
+    )
+    saved_record = manifest is not None
+    codes = []
+    refusal = time_refusal(event)
+    if refusal:
+        codes.append(refusal)
+    if at_next_snapshot:
+        codes.append("AUTO_RELEASE_AT_NEXT_SNAPSHOT")
+    elif release["awaiting_snapshot"]:
+        codes.append("AWAITING_NEXT_SNAPSHOT")
+    if auto_release_eligible and guard == "REJECTED":
+        codes.append("DATABASE_GUARD_REJECTS")
+    if auto_release_eligible and guard == "UNAVAILABLE":
+        codes.append("DATABASE_GUARD_UNAVAILABLE")
+    if not saved_record and source is None and event.source in TERMINAL_RECONCILE_SOURCES:
+        codes.append("NO_SAVED_TERMINAL_RECORD")
+    punch_code = {
+        DIFFERS: "PUNCH_TIME_CNIC_DIFFERS",
+        CONFLICT: "PUNCH_TIME_CNIC_CONFLICT",
+        CHANGED_NEAR_PUNCH: "PUNCH_TIME_CNIC_CHANGED_NEARBY",
+        AMBIGUOUS: "PUNCH_TIME_CNIC_AMBIGUOUS",
+        NONE: "NO_PUNCH_TIME_IDENTITY",
+    }.get(punch.state)
+    if punch_code:
+        codes.append(punch_code)
+    for signal, code in (
+        (IDENTITY_CONFLICT_UNRESOLVED, "IDENTITY_CONFLICT_UNRESOLVED"),
+        (GAP_BRIDGED_SAME_CNIC, "PUNCH_TIME_CNIC_BRIDGED_GAP"),
+        (RECORD_HOLDER_DELETED_BEFORE_PUNCH, "RECORD_HOLDER_DELETED_BEFORE_PUNCH"),
+        (PUNCH_BEFORE_FIRST_OBSERVATION, "PUNCH_BEFORE_FIRST_OBSERVATION"),
+        (NAME_DIFFERS, "NAME_DIFFERS"),
+    ):
+        if signal in punch.signals:
+            codes.append(code)
+    other_cnic = bool(punch.cnic_hash and punch.interval is not None)
+    return {
+        "time_refusal": refusal,
+        "database_guard": guard,
+        "auto_release_at_next_snapshot": at_next_snapshot,
+        "awaiting_next_snapshot": release["awaiting_snapshot"],
+        "saved_terminal_record": saved_record,
+        "punch_time_cnic": {
+            "state": punch.state,
+            # The single other CNIC at or near the punch (DIFFERS, or today's
+            # own record that ended just before it for CHANGED_NEAR_PUNCH), masked.
+            "cnic_masked": mask_cnic(punch.cnic) if other_cnic and punch.cnic else None,
+            "display_name": punch.display_name if other_cnic else None,
+            "basis": punch.basis if other_cnic else None,
+            "record_position": punch.position,
+            "first_observed_at": punch.first_observed_at,
+            "record_before_ended_at": punch.record_before_until,
+            "record_after_started_at": punch.record_after_from,
+            "history_ids": list(punch.history_ids),
+            "other_cnics_masked": other_cnics_masked(punch, current_hash),
+            "evidence_signals": sorted(punch.signals),
+            "uid_matches_current": punch.uid_matches_current,
+        },
+        "current_cnic_masked": mask_cnic(current_cnic),
+        "punch_time_cnic_matches_current": punch.state == "MATCHES_CURRENT",
+        "hints": [{"code": code, "message": IDENTITY_RELEASE_HINTS[code]} for code in codes],
     }
 
 
@@ -5464,6 +5652,9 @@ def device_user_identity_integrity(
                 if member.id != user.id
             ]
     with_cnic = sum(bool(user.cnic_lookup_hash) for user in active)
+    from zk_add.attendance_release_safety import suspect_user_count
+
+    cnic_format_suspect = suspect_user_count(active)
     unresolved_groups = [
         group
         for group in duplicate_groups
@@ -5479,6 +5670,7 @@ def device_user_identity_integrity(
             "total_users": len(active),
             "with_cnic": with_cnic,
             "missing_cnic": len(active) - with_cnic,
+            "cnic_format_suspect_users": cnic_format_suspect,
             "duplicate_groups": len(duplicate_groups),
             "duplicate_users": sum(len(group) for group in duplicate_groups),
             "resolved_duplicate_groups": len(duplicate_groups) - len(unresolved_groups),
@@ -5499,8 +5691,12 @@ def serialize_user(
 ) -> dict:
     from zk_add.service import user_profile_is_writable
 
+    from zk_add.identity import suspect_cnic_name
+
     cnic = decrypt_cnic(row.cnic_encrypted)
     machine_name = decrypt_text(row.machine_name_encrypted) or ""
+    # Never parsed or used: an operator confirms the CNIC with HR first.
+    suspect = None if cnic else suspect_cnic_name(machine_name)
     if cnic and machine_name:
         machine_name = machine_name.replace(cnic, mask_cnic(cnic) or "[CNIC]")
     return {
@@ -5531,6 +5727,11 @@ def serialize_user(
         "machine_name_preview": machine_name or None,
         "current_command_state": "PENDING" if row.current_command_id else None,
         "read_only": bool(zkt and not user_profile_is_writable(zkt.connector, zkt)),
+        "cnic_format_suspect": suspect is not None,
+        "cnic_format_suspect_reason": suspect.reason if suspect else None,
+        "suggested_display_name": suspect.display_name if suspect and suspect.display_name else None,
+        # The unparsed name's "-S" marker; the edit dialog keeps it as the flag.
+        "suggested_shift_worker": bool(suspect and suspect.shift_worker),
     }
 
 

@@ -407,7 +407,7 @@ def direct_approval_guard_shape(session, event, connector, decision):
             "payload_digest_matches", "legacy_identity_proof", "terminal_present",
             "cnic_source_matches", "current_user_key_matches", "current_cnic_hash_matches",
             "frozen_payload_matches_current_payload", "approval_authorized",
-            "guard_evaluation_failed",
+            "guard_evaluation_failed", "punch_time_valid", "cnic_choice_consistent",
         )
     }
     flags["decision_present"] = decision is not None
@@ -421,9 +421,18 @@ def direct_approval_guard_shape(session, event, connector, decision):
         flags["immutable_facts_match"] = _immutable_facts(event) == proof.get("immutable_facts")
         current_decision = decision_for(session, event)
         flags["saved_decision_is_current"] = bool(current_decision and current_decision.id == decision.id)
-        user, cnic, source, current_cnic, error = direct._known_user_and_cnic(session, event)
+        from zk_add.attendance_release_safety import time_refusal
+
+        resolution = direct._revalidate(session, event, proof)
+        user, cnic, current_cnic = resolution.user, resolution.cnic, resolution.current_cnic
+        source, error = resolution.source, resolution.error
         flags["known_current_user"] = user is not None
-        flags["current_cnic_usable"] = error is None and current_cnic is not None
+        flags["current_cnic_usable"] = (
+            current_cnic is not None and error not in {"UNKNOWN_USER", "CNIC_MISSING"}
+        )
+        flags["punch_time_valid"] = time_refusal(event) is None
+        # False when ADD's punch-time records now contradict the approved CNIC.
+        flags["cnic_choice_consistent"] = error is None
         try:
             payload = decrypt_json(decision.payload_encrypted)
             flags["payload_readable"] = isinstance(payload, dict)
@@ -442,7 +451,7 @@ def direct_approval_guard_shape(session, event, connector, decision):
         )
         flags["frozen_payload_matches_current_payload"] = bool(
             payload is not None and terminal is not None and user is not None and cnic
-            and payload == direct._payload(connector, terminal, event, user, cnic, source)
+            and payload == direct._payload(connector, terminal, event, resolution)
         )
         flags["approval_authorized"] = direct.approved_payload(session, event, connector, decision) is not None
     except Exception:

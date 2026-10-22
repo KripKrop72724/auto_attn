@@ -45,7 +45,12 @@ from zk_add.crypto import (
     normalize_cnic,
 )
 from zk_add.attendance_identity_evidence import TERMINAL_RECONCILE_SOURCES
-from zk_add.identity import build_machine_name, parse_machine_name
+from zk_add.identity import (
+    build_machine_name,
+    clean_display_name,
+    parse_machine_name,
+    suspect_cnic_name,
+)
 from zk_add.identity_conflicts import (
     valid_identity_resolutions,
     valid_resolution_for_user,
@@ -1936,6 +1941,8 @@ def _replace_user_snapshot(
             )
     from zk_add.attendance_identity_evidence import record_identity_observation
     session.flush()
+    # After the flush so a user this snapshot removed or fixed is not counted.
+    refresh_cnic_format_alert_safely(session, connector, zkt)
     record_identity_observation(
         session,
         connector,
@@ -2085,6 +2092,24 @@ def reconcile_device_user_identity_conflicts(
         for row in rows
         if row.id in previously_conflicted and row.identity_conflict_code is None
     ]
+
+
+def refresh_cnic_format_alert_safely(session: Session, connector: Connector, zkt: ZKTDevice) -> None:
+    """A data-quality note must never fail the user snapshot that carries it."""
+    from zk_add.attendance_release_safety import refresh_cnic_format_alert
+
+    try:
+        if session.get_bind().dialect.name == "postgresql":
+            with session.begin_nested():
+                refresh_cnic_format_alert(session, connector, zkt)
+        else:
+            refresh_cnic_format_alert(session, connector, zkt)
+    except Exception:
+        import logging
+
+        logging.getLogger(__name__).exception(
+            "CNIC format alert refresh failed for connector %s", connector.id,
+        )
 
 
 def persist_identity_tombstone(
@@ -4350,7 +4375,9 @@ def restore_resolved_alias_direct_approvals(
             or "terminal" not in decision.proof
             or decision.proof["terminal"] != row.device_serial
             or decision.proof.get("hardware_id") != connector.hardware_id
-            or decision.proof.get("cnic_source") not in {"SYNCED_USER", "SAVED_PUNCH"}
+            # A punch-time approval is restored too: approved_payload re-checks
+            # its retained record, new evidence and another holder of its CNIC.
+            or decision.proof.get("cnic_source") not in {"SYNCED_USER", "SAVED_PUNCH", direct.PUNCH_TIME_SOURCE}
             or decision.proof.get("current_user_key") != user.user_key
             or item.connector_id != row.connector_id
             or direct.approved_payload(session, row, connector, decision) is None
@@ -5562,6 +5589,12 @@ def create_device_user_command(
         session, zkt=zkt, user_id_override=user_id_override
     )
     name_limit = int(zkt.capability_profile.get("name_bytes", 24))
+    # The CNIC is stored once, as the name suffix; a CNIC-like suffix typed
+    # into the name would otherwise be cut into the 24-byte terminal name.
+    # A "-S" shift-worker marker inside that suffix is kept as the flag.
+    suspect = suspect_cnic_name(display_name)
+    shift_worker = bool(shift_worker or (suspect and suspect.shift_worker))
+    display_name = clean_display_name(display_name) or display_name
     machine_name = build_machine_name(
         display_name=display_name,
         cnic=normalized_cnic,
@@ -5702,6 +5735,17 @@ def update_device_user_command(
         raise ValueError(duplicate_cnic_message(claims))
     next_display = " ".join((display_name or user.display_name).strip().split())
     next_shift = user.shift_worker if shift_worker is None else shift_worker
+    if cnic is not None:
+        # Setting a verified CNIC (e.g. for "A.Saleem-A4230111028815") must not
+        # keep the unparsed CNIC text in the name: the 24-byte terminal name
+        # would become "A.Saleem-A-<CNIC>". The unparsed name never set the
+        # shift-worker flag, so a "-S" marker in it is kept as the flag rather
+        # than silently dropped with the suffix.
+        suspect = suspect_cnic_name(next_display) or (
+            None if user.cnic_lookup_hash else suspect_cnic_name(decrypt_text(user.machine_name_encrypted))
+        )
+        next_display = clean_display_name(next_display) or next_display
+        next_shift = bool(next_shift or (suspect and suspect.shift_worker))
     next_privilege = user.privilege if privilege is None else privilege
     if (connector.firmware_family == "hikvision" and next_privilege != user.privilege
             and not zkt.capability_profile.get("user_role_write")):
