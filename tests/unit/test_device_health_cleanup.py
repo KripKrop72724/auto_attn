@@ -254,21 +254,41 @@ def test_health_switches_are_deployable_repository_variables():
     assert '$environment["ADD_DEVICE_HEALTH_${healthFlag}_ENABLED"] = $deployValue' in deploy
 
 
-def test_unheld_queue_evidence_refusal_needs_review_however_old(db, fleet):
+@pytest.mark.parametrize(("queue", "record_id", "oracle_note"), [
+    ("blocked_legacy", "0:0:2915066926", False),
+    # The path ADD cannot match: a 2.6.x ORDS row delivered to Oracle on retry.
+    ("ords_legacy", "16:3076897152", True),
+])
+def test_unheld_queue_evidence_refusal_needs_review_however_old(db, fleet, queue, record_id, oracle_note):
     row = fleet["rejection"]
     old = (utc_now() - timedelta(days=3)).isoformat()
     row.details = {"message_type": "queue_evidence", "types": {"queue_evidence": {
         "category": "SCHEMA_INVALID", "error_reason": "QUEUE_EVIDENCE_DIGEST_MISMATCH", "count": 1,
         "first_at": old, "last_at": old, "boot_id": "earlier-boot", "untracked_refusals": 0,
+        "pending": [{"queue": queue, "queue_generation": "0123456789abcdef0123456789abcdef-legacy-218",
+                     "record_id": record_id, "claimed_digest": "a" * 64, "received_digest": "b" * 64}]}}}
+    db.commit()
+    client, _headers = admin_client(db)
+    rows = {item["alert_id"]: item for item in preview(client)["rows"]}
+    assert (rows[row.id]["class"], rows[row.id]["default_selected"]) == ("REVIEW", False)
+    assert "not yet held by ADD" in rows[row.id]["rationale"]
+    assert ("delivered it to Oracle" in rows[row.id]["rationale"]) is oracle_note
+
+
+def test_custody_only_refusal_after_a_later_acceptance_needs_review(db, fleet):
+    """Not gating once ADD accepted later evidence, yet still listed for an operator, never preselected."""
+    row = fleet["rejection"]
+    recent = (utc_now() - timedelta(seconds=30)).isoformat()
+    row.details = {"message_type": "queue_evidence", "types": {"queue_evidence": {
+        "category": "SCHEMA_INVALID", "error_reason": "QUEUE_EVIDENCE_DIGEST_MISMATCH", "count": 1,
+        "first_at": recent, "last_at": recent, "boot_id": fleet["p02"].boot_id, "untracked_refusals": 0,
+        "later_acceptance_at": utc_now().isoformat(),
         "pending": [{"queue": "blocked_legacy", "queue_generation": "0123456789abcdef0123456789abcdef-legacy-218",
                      "record_id": "0:0:2915066926", "claimed_digest": "a" * 64, "received_digest": "b" * 64}]}}}
     db.commit()
     client, _headers = admin_client(db)
     rows = {item["alert_id"]: item for item in preview(client)["rows"]}
     assert (rows[row.id]["class"], rows[row.id]["default_selected"]) == ("REVIEW", False)
-    assert "not yet held by ADD" in rows[row.id]["rationale"]
-    # The operator is told the 2.6.x path ADD cannot match: a row settled by ORDS delivery.
-    assert "delivered it to Oracle" in rows[row.id]["rationale"]
 
 
 def test_refusals_from_before_identity_tracking_keep_the_old_cleanup_rule(db, fleet):

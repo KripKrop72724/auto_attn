@@ -14,10 +14,14 @@ certifies custody of bytes it cannot verify. The refusal records which check
 failed and which record was refused, never the bytes. The device gets only
 MESSAGE_REJECTED and keeps its source row, and the rejection stays open until
 ADD holds what that copy carried: the same identity with the digest the ESP
-claimed or the digest of the bytes that arrived, or the claimed digest under
-another generation of the same queue. An acceptance from another lane, the
-same identity with other bytes, or another record whose bytes match what
-arrived does not close it, and an identity conflict needs an operator.
+claimed or the digest of the bytes that arrived, or, under another generation
+of the same queue, the claimed digest or the received digest with the same
+record id. An acceptance from another lane, the same identity with other
+bytes, or another record whose bytes match what arrived does not hold it, and
+an identity conflict needs an operator. A refusal of a copy ADD already holds
+(a reconnect overlap) leaves nothing open. The first acceptance after a
+refusal, which used to close it, still lifts its HIL and factory hold; what
+ADD does not hold stays open as a warning for an operator.
 MULTAN-02 (zone-lite-2.6.15) had four such refusals on 8 and 21 Oct 2026. ADD
 recorded no identity for them then, so whether each record was held later
 cannot be shown from ADD's records alone.
@@ -34,6 +38,9 @@ import zlib
 from pathlib import Path
 from uuid import uuid4
 
+import threading
+from datetime import timedelta
+
 import pytest
 import sqlalchemy.exc
 from cryptography.fernet import Fernet
@@ -45,11 +52,13 @@ import zk_add.web as add_web
 from zk_add.db import Base
 from zk_add.device_health import evaluate_health
 from zk_add.models import Connector, DeviceAlert, DeviceLog, QueueEvidence
-from zk_add.queue_evidence import BASE64_INVALID, DIGEST_MISMATCH, IDENTITY_REUSED, LENGTH_INVALID
+from zk_add.queue_evidence import BASE64_INVALID, DIGEST_MISMATCH, IDENTITY_REUSED, LATER_ACCEPTANCE, LENGTH_INVALID
 from zk_add.realtime import BrowserEventHub
 from zk_add.schemas import Envelope
 from zk_add.service import MAX_EVIDENCE_RESOLUTIONS, MAX_PENDING_EVIDENCE, MAX_REJECTION_TYPES, onboard_connector
 from zk_add.settings import settings
+from zk_add.time_utils import utc_now
+from zk_add.zkt_hil_schedule import _known_hold
 
 ROOT = Path(__file__).resolve().parents[2]
 CONNECTOR_SOURCE = ROOT / "firmware" / "zone_lite" / "main" / "add_connector.c"
@@ -294,9 +303,10 @@ def evidence_rows(sessions) -> list[QueueEvidence]:
 
 def rejection_entry(sessions, connector_pk: int, code: str = "DEVICE_MESSAGE_REJECTED",
                     ) -> tuple[DeviceAlert | None, dict | None]:
+    """The latest alert of that code and its queue_evidence entry."""
     with sessions() as db:
         alert = db.scalar(select(DeviceAlert).where(DeviceAlert.connector_id == connector_pk,
-                                                    DeviceAlert.code == code))
+                                                    DeviceAlert.code == code).order_by(DeviceAlert.id.desc()).limit(1))
         if alert is None:
             return None, None
         return alert, ((alert.details or {}).get("types") or {}).get("queue_evidence")
@@ -315,6 +325,19 @@ def summary(sessions, connector_pk: int) -> str:
         health = evaluate_health(db, db.get(Connector, connector_pk))
         return next(reason.evidence_summary for reason in health.reasons + health.other_active_alerts
                     if reason.code == "DEVICE_MESSAGE_REJECTED")
+
+
+def hold(sessions, connector_pk: int) -> dict:
+    """What the HIL schedule and factory trial see, and the rejection's derived reason."""
+    with sessions() as db:
+        connector = db.get(Connector, connector_pk)
+        health = evaluate_health(db, connector)
+        reason = next((item for item in health.reasons + health.other_active_alerts
+                       if item.code == "DEVICE_MESSAGE_REJECTED"), None)
+        return {"last_error_code": connector.last_error_code, "known_hold": _known_hold(db, connector),
+                "derived_error": health.last_error_code,
+                "reason": None if reason is None else (reason.tier, reason.currency, reason.gating,
+                                                       reason.operator["resolvable"])}
 
 
 def corrupt_base64_character(payload: dict) -> dict:
@@ -693,23 +716,38 @@ def test_add_side_failure_then_the_retry_is_held_as_an_intact_copy(device_stream
 
 
 def test_refusal_recorded_after_its_record_is_held_is_resolved_at_once(device_stream):
-    """Reconnect overlap: the new socket's honest copy commits before the old socket's refusal."""
+    """Reconnect overlap: the new socket's honest copy commits before the old socket's refusal.
+
+    The device never sends that record again, so nothing may stay open for it:
+    no alert, no HIL or factory hold. The refusal is still on record.
+    """
     sessions, connector_pk, connector_id = device_stream
     honest = legacy_payload(connector_id)
     held(connector_pk, connector_id, honest, 8)
     refused(connector_pk, connector_id, corrupt_base64_character(honest), 7)
     alert, entry = rejection_entry(sessions, connector_pk)
-    assert alert.state == "OPEN" and (entry["pending"], entry["untracked_refusals"]) == ([], 0)
+    assert entry is None and alert.state == "RESOLVED"
+    assert (alert.details["resolution"]["kind"], alert.details["resolution"]["message_type"]) == (
+        "EVIDENCE_HELD", "queue_evidence")
+    assert alert.message == f"queue_evidence message was rejected (SCHEMA_INVALID: {DIGEST_MISMATCH})."
     [resolution] = alert.details["evidence_resolutions"]
     [row] = evidence_rows(sessions)
     assert (resolution["record_id"], resolution["match"], resolution["finding"], resolution["refused_request_id"],
             resolution["held_as"]["receipt_id"]) == (
         honest["record_id"], "SAME_IDENTITY", "SENT_BYTES_CHANGED", f"{BOOT_ID}-7", row.receipt_id)
-    assert "not yet held" not in summary(sessions, connector_pk)
-    # Nothing is left to hold, so the next acceptance closes it as before.
+    assert (resolution["received_bytes"], resolution["held_as"]["byte_count"]) == (len(HONEST_ROW),
+                                                                                 len(HONEST_ROW))
+    status = hold(sessions, connector_pk)
+    assert (status["last_error_code"], status["derived_error"], status["reason"]) == (None, None, None)
+    assert status["known_hold"] != "CONNECTOR_ERROR_REQUIRES_REVIEW"
+    with sessions() as db:
+        log = db.scalar(select(DeviceLog).where(DeviceLog.code == "DEVICE_MESSAGE_REJECTED"))
+        assert (log.context["error_reason"], log.context["evidence"]["record_id"]) == (
+            DIGEST_MISMATCH, honest["record_id"])
+    # A later acceptance finds nothing to close.
     held(connector_pk, connector_id, legacy_payload(connector_id, MALFORMED_ROW, offset=1), 9)
-    alert, _entry = rejection_entry(sessions, connector_pk)
-    assert alert.state == "RESOLVED" and len(alert.details["evidence_resolutions"]) == 1
+    with sessions() as db:
+        assert db.scalar(select(func.count()).select_from(DeviceAlert).where(DeviceAlert.state == "OPEN")) == 0
 
 
 def test_refusal_recorded_after_a_reblocked_copy_is_held_is_resolved_at_once(device_stream):
@@ -719,8 +757,163 @@ def test_refusal_recorded_after_a_reblocked_copy_is_held_is_resolved_at_once(dev
         connector_id, MALFORMED_ROW, queue="blocked_legacy", generation=416, offset=0), 8)
     refused(connector_pk, connector_id, corrupt_base64_character(first), 7)
     alert, entry = rejection_entry(sessions, connector_pk)
-    assert entry["pending"] == [] and resolutions(alert) == [(first["record_id"], "SAME_BYTES",
-                                                              "SENT_BYTES_CHANGED")]
+    assert entry is None and alert.state == "RESOLVED"
+    assert resolutions(alert) == [(first["record_id"], "SAME_BYTES", "SENT_BYTES_CHANGED")]
+
+
+def test_overlap_refusal_while_another_type_is_rejected_leaves_only_that_type(device_stream):
+    sessions, connector_pk, connector_id = device_stream
+    honest = legacy_payload(connector_id)
+    reject_other_type(connector_pk, connector_id, "attendance_batch", 6)
+    held(connector_pk, connector_id, honest, 8)
+    before, _entry = rejection_entry(sessions, connector_pk)
+    refused(connector_pk, connector_id, corrupt_base64_character(honest), 7)
+    alert, entry = rejection_entry(sessions, connector_pk)
+    assert alert.id == before.id and alert.state == "OPEN" and entry is None
+    assert list(alert.details["types"]) == ["attendance_batch"]
+    assert alert.message == before.message and alert.message.startswith("attendance_batch message was rejected")
+    assert resolutions(alert) == [(honest["record_id"], "SAME_IDENTITY", "SENT_BYTES_CHANGED")]
+    # The attendance_batch rejection still holds, as on main.
+    assert hold(sessions, connector_pk)["last_error_code"] == "DEVICE_MESSAGE_REJECTED"
+
+
+def test_a_damaged_digest_is_held_by_the_reblocked_row_under_the_same_record_id(device_stream):
+    """The digest, not the bytes, was damaged; the row is re-blocked under a new generation.
+
+    The received digest names the record only with its record id, which for a
+    legacy lane carries the row's CRC-32.
+    """
+    sessions, connector_pk, connector_id = device_stream
+    first = legacy_payload(connector_id, MALFORMED_ROW, queue="blocked_legacy", generation=218, offset=0)
+    flipped = ("0" if first["payload_digest"][0] != "0" else "1") + first["payload_digest"][1:]
+    refused(connector_pk, connector_id, {**first, "payload_digest": flipped}, 8)
+    # The same bytes at another record id of another generation are another record.
+    held(connector_pk, connector_id, legacy_payload(
+        connector_id, MALFORMED_ROW, queue="blocked_legacy", generation=300, offset=7), 9)
+    alert, entry = rejection_entry(sessions, connector_pk)
+    assert alert.state == "OPEN" and pending_identities(entry) == [identity(first)]
+    reblocked = legacy_payload(connector_id, MALFORMED_ROW, queue="blocked_legacy", generation=416, offset=0)
+    assert reblocked["record_id"] == first["record_id"]
+    held(connector_pk, connector_id, reblocked, 10)
+    alert, entry = rejection_entry(sessions, connector_pk)
+    assert entry is None and alert.state == "RESOLVED"
+    [resolution] = alert.details["evidence_resolutions"]
+    assert (resolution["held_as"]["queue_generation"], resolution["match"], resolution["finding"]) == (
+        reblocked["queue_generation"], "SAME_BYTES", "DIGEST_CHANGED")
+
+
+def test_a_damaged_digest_overlapping_its_reblocked_row_is_resolved_at_once(device_stream):
+    sessions, connector_pk, connector_id = device_stream
+    first = legacy_payload(connector_id, MALFORMED_ROW, queue="blocked_legacy", generation=218, offset=0)
+    held(connector_pk, connector_id, legacy_payload(
+        connector_id, MALFORMED_ROW, queue="blocked_legacy", generation=416, offset=0), 8)
+    flipped = ("0" if first["payload_digest"][0] != "0" else "1") + first["payload_digest"][1:]
+    refused(connector_pk, connector_id, {**first, "payload_digest": flipped}, 7)
+    alert, entry = rejection_entry(sessions, connector_pk)
+    assert entry is None and alert.state == "RESOLVED"
+    assert resolutions(alert) == [(first["record_id"], "SAME_BYTES", "DIGEST_CHANGED")]
+
+
+def test_a_later_acceptance_lifts_the_hold_but_keeps_the_unheld_copy_visible(device_stream):
+    """As before this tracking, the next accepted queue_evidence ends the HIL and factory hold."""
+    sessions, connector_pk, connector_id = device_stream
+    blocked = legacy_payload(connector_id, MALFORMED_ROW, queue="blocked_legacy", generation=218, offset=0)
+    refused(connector_pk, connector_id, corrupt_base64_character(blocked), 8)
+    current = hold(sessions, connector_pk)
+    assert (current["last_error_code"], current["known_hold"], current["derived_error"]) == (
+        "DEVICE_MESSAGE_REJECTED", "CONNECTOR_ERROR_REQUIRES_REVIEW", "DEVICE_MESSAGE_REJECTED")
+    assert current["reason"] == ("DEGRADED", "CURRENT", True, False)
+
+    held(connector_pk, connector_id, legacy_payload(connector_id), 9)
+    alert, entry = rejection_entry(sessions, connector_pk)
+    assert alert.state == "OPEN" and pending_identities(entry) == [identity(blocked)]
+    assert isinstance(entry[LATER_ACCEPTANCE], str)
+    released = hold(sessions, connector_pk)
+    assert (released["last_error_code"], released["derived_error"]) == (None, None)
+    assert released["known_hold"] != "CONNECTOR_ERROR_REQUIRES_REVIEW"
+    # Still visible as a warning an operator may resolve now.
+    assert released["reason"] == ("WARNING", "LATCHED", False, True)
+    assert "1 refused record not yet held, no HIL or factory hold" in summary(sessions, connector_pk)
+
+    # A further acceptance changes nothing; a new refusal makes it current and gating again.
+    held(connector_pk, connector_id, legacy_payload(connector_id, MALFORMED_ROW, offset=1), 10)
+    assert rejection_entry(sessions, connector_pk)[1][LATER_ACCEPTANCE] == entry[LATER_ACCEPTANCE]
+    other = legacy_payload(connector_id, MALFORMED_ROW + b"X", queue="blocked_legacy", generation=218, offset=2)
+    refused(connector_pk, connector_id, corrupt_base64_character(other), 11)
+    _alert, entry = rejection_entry(sessions, connector_pk)
+    assert LATER_ACCEPTANCE not in entry
+    assert sorted(pending_identities(entry)) == sorted([identity(blocked), identity(other)])
+    assert hold(sessions, connector_pk)["last_error_code"] == "DEVICE_MESSAGE_REJECTED"
+    # Holding both closes it.
+    held(connector_pk, connector_id, blocked, 12)
+    held(connector_pk, connector_id, other, 13)
+    alert, entry = rejection_entry(sessions, connector_pk)
+    assert entry is None and alert.state == "RESOLVED"
+    assert hold(sessions, connector_pk)["last_error_code"] is None
+
+
+def test_a_refusal_no_acceptance_follows_keeps_its_hold_however_old(device_stream):
+    """As before: only an acceptance, an operator or cleanup ends it. Cleanup now marks it Needs review."""
+    sessions, connector_pk, connector_id = device_stream
+    blocked = legacy_payload(connector_id, MALFORMED_ROW, queue="blocked_legacy", generation=218, offset=0)
+    refused(connector_pk, connector_id, corrupt_base64_character(blocked), 8)
+    with sessions() as db:
+        alert = db.scalar(select(DeviceAlert).where(DeviceAlert.code == "DEVICE_MESSAGE_REJECTED"))
+        old = (utc_now() - timedelta(days=3)).isoformat()
+        entry = alert.details["types"]["queue_evidence"]
+        alert.details = {**alert.details, "types": {"queue_evidence": {**entry, "last_at": old, "first_at": old}}}
+        db.get(Connector, connector_pk).boot_id = "e072a1000042-ffffffff"
+        db.commit()
+    aged = hold(sessions, connector_pk)
+    assert (aged["last_error_code"], aged["known_hold"]) == (
+        "DEVICE_MESSAGE_REJECTED", "CONNECTOR_ERROR_REQUIRES_REVIEW")
+    assert aged["reason"] == ("WARNING", "LATCHED", True, True)
+
+
+@pytest.mark.parametrize("acceptance_first", [True, False])
+def test_acceptance_racing_the_refusal_of_its_damaged_copy_never_leaves_a_hold(device_stream, acceptance_first):
+    """Two sockets at once (PostgreSQL): both paths serialize on the connector row lock.
+
+    Whichever commits first, ADD holds the record, no alert stays open and no
+    HIL or factory hold remains.
+    """
+    sessions, connector_pk, connector_id = device_stream
+    with sessions() as db:
+        if db.get_bind().dialect.name != "postgresql":
+            pytest.skip("SQLite runs one connection; the race needs PostgreSQL row locks")
+    rounds = 12
+    for index in range(rounds):
+        honest = legacy_payload(connector_id, MALFORMED_ROW + str(index).encode(), offset=index)
+        frames = [wire_text(connector_id, honest, 100 + 2 * index),
+                  wire_text(connector_id, corrupt_base64_character(honest), 101 + 2 * index)]
+        if not acceptance_first:
+            frames.reverse()
+        barrier = threading.Barrier(2)
+        errors: list[BaseException] = []
+
+        def run(frame: str) -> None:
+            try:
+                barrier.wait(timeout=10)
+                deliver(connector_pk, connector_id, frame)
+            except BaseException as exc:  # noqa: BLE001 - reported on the main thread
+                errors.append(exc)
+
+        threads = [threading.Thread(target=run, args=(frame,)) for frame in frames]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=60)
+        assert errors == [] and not any(thread.is_alive() for thread in threads)
+    rows = evidence_rows(sessions)
+    assert len(rows) == rounds
+    with sessions() as db:
+        alerts = db.scalars(select(DeviceAlert).where(DeviceAlert.code == "DEVICE_MESSAGE_REJECTED")).all()
+        assert [alert.state for alert in alerts if alert.state == "OPEN"] == []
+        held_records = sorted(item["record_id"] for alert in alerts
+                              for item in (alert.details or {}).get("evidence_resolutions") or [])
+    assert held_records == sorted(row.record_id for row in rows)
+    status = hold(sessions, connector_pk)
+    assert (status["last_error_code"], status["derived_error"]) == (None, None)
 
 
 def test_each_refused_copy_of_a_record_is_kept(device_stream):

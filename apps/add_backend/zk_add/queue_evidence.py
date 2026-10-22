@@ -141,10 +141,12 @@ def holds_refused_copy(refused: dict, held: dict | None) -> tuple[str, str] | No
     - SAME_IDENTITY: ADD holds that identity with the claimed digest (the bytes
       the ESP hashed) or the received digest (the bytes that arrived). Holding
       the identity with other bytes proves nothing about this copy.
-    - SAME_BYTES: ADD holds the claimed digest under another generation of the
-      same queue (a re-blocked row gets a new generation). Only the claimed
-      digest counts here: the received digest says what arrived, not which
-      record it was, so it may be another record's bytes.
+    - SAME_BYTES: ADD holds, under another generation of the same queue (a
+      re-blocked row gets a new generation), the claimed digest, or the
+      received digest under the same record id. The received digest alone
+      says what arrived, not which record it was, so it may be another
+      record's bytes; with the record id too (a legacy record id carries the
+      row's CRC-32) it is the same record re-sent after its digest was damaged.
 
     The finding says what was damaged: COPY_INTACT (nothing; ADD failed or
     refused for another reason), SENT_BYTES_CHANGED or DIGEST_CHANGED. A copy
@@ -162,7 +164,7 @@ def holds_refused_copy(refused: dict, held: dict | None) -> tuple[str, str] | No
     if held_identity == refused_identity and digest in {claimed, received}:
         match = "SAME_IDENTITY"
     elif (held_identity[0] == refused_identity[0] and held_identity[1] != refused_identity[1]
-          and digest == claimed):
+          and (digest == claimed or (digest == received and held_identity[2] == refused_identity[2]))):
         match = "SAME_BYTES"
     else:
         return None
@@ -174,7 +176,7 @@ def holds_refused_copy(refused: dict, held: dict | None) -> tuple[str, str] | No
 def held_record(row: QueueEvidence) -> dict:
     """What a refused copy is matched against: never the bytes."""
     return {"queue": row.queue, "queue_generation": row.queue_generation, "record_id": row.record_id,
-            "payload_digest": row.payload_digest, "receipt_id": row.receipt_id}
+            "payload_digest": row.payload_digest, "receipt_id": row.receipt_id, "byte_count": row.byte_count}
 
 
 def find_held_copy(session: Session, connector: Connector,
@@ -198,6 +200,13 @@ def find_held_copy(session: Session, connector: Connector,
             QueueEvidence.connector_id == connector.id, QueueEvidence.queue == identity[0],
             QueueEvidence.queue_generation != identity[1], QueueEvidence.payload_digest == claimed,
         ).order_by(QueueEvidence.id).limit(1)))
+    received = _digest(refused.get("received_digest"))
+    if received is not None and received != claimed:
+        candidates.append(session.scalar(select(QueueEvidence).where(
+            QueueEvidence.connector_id == connector.id, QueueEvidence.queue == identity[0],
+            QueueEvidence.queue_generation != identity[1], QueueEvidence.record_id == identity[2],
+            QueueEvidence.payload_digest == received,
+        ).order_by(QueueEvidence.id).limit(1)))
     for row in candidates:
         if row is not None:
             held = held_record(row)
@@ -218,6 +227,20 @@ def unheld_evidence(entry: object) -> tuple[int, int]:
     pending = entry.get("pending")
     return (len([item for item in pending if isinstance(item, dict)]) if isinstance(pending, list) else 0,
             int(entry.get("untracked_refusals") or 0))
+
+
+# Set on a rejection entry when ADD accepts a queue_evidence after its latest
+# refusal without holding every refused copy; a new refusal removes it. Before
+# identities were tracked, that acceptance closed the rejection. What is left
+# stays open for an operator to verify on the device, but like then it no
+# longer holds HIL or factory work (device_health).
+LATER_ACCEPTANCE = "later_acceptance_at"
+
+
+def custody_only(entry: object) -> bool:
+    """Whether a rejection entry is only refused copies ADD does not hold, left after a later acceptance."""
+    return (isinstance(entry, dict) and isinstance(entry.get(LATER_ACCEPTANCE), str)
+            and unheld_evidence(entry) != (0, 0))
 
 
 def preserve_queue_evidence(session: Session, connector: Connector, request: QueueEvidenceRequest) -> QueueEvidence:

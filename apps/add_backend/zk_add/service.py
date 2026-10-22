@@ -77,7 +77,9 @@ from zk_add.schemas import (
     OracleReceiptBatchRequest,
     UserSnapshotRequest,
 )
-from zk_add.queue_evidence import evidence_identity, find_held_copy, holds_refused_copy, unheld_evidence
+from zk_add.queue_evidence import (
+    LATER_ACCEPTANCE, custody_only, evidence_identity, find_held_copy, holds_refused_copy, unheld_evidence,
+)
 from zk_add.security import connector_token_hash
 from zk_add.settings import settings
 from zk_add.identity_states import (
@@ -5880,8 +5882,12 @@ def _evidence_resolution(refused: dict, held: dict, match: str, finding: str, no
         "queue": refused.get("queue"), "queue_generation": refused.get("queue_generation"),
         "record_id": refused.get("record_id"), "reason": refused.get("reason"),
         "refused_request_id": refused.get("request_id"), "refused_count": refused.get("count"),
+        # Byte counts, never bytes: what arrived beside what ADD holds shows a
+        # truncated copy apart from one corrupted in place.
+        "received_bytes": refused.get("received_bytes"),
         "held_as": {"queue": held.get("queue"), "queue_generation": held.get("queue_generation"),
-                    "record_id": held.get("record_id"), "receipt_id": held.get("receipt_id")},
+                    "record_id": held.get("record_id"), "receipt_id": held.get("receipt_id"),
+                    "byte_count": held.get("byte_count")},
         "match": match, "finding": finding, "at": now.isoformat(),
     }
 
@@ -5939,7 +5945,10 @@ def _settle_refused_evidence(entry: object, accepted: dict | None,
     Returns the entry still outstanding (None once nothing is), what was
     held, and whether the entry changed. holds_refused_copy() decides each
     copy. Refusals recorded before identities were tracked keep the old rule:
-    any accepted queue_evidence clears them.
+    any accepted queue_evidence clears them. The first acceptance after a
+    refusal also stamps LATER_ACCEPTANCE on what is left: that acceptance used
+    to close the rejection, so from then on the copies ADD does not hold stay
+    visible for an operator without holding HIL or factory work.
     """
     if not isinstance(entry, dict) or "pending" not in entry:
         return None, [], True
@@ -5954,7 +5963,10 @@ def _settle_refused_evidence(entry: object, accepted: dict | None,
     legacy = int(entry.get("legacy_refusals") or 0)
     if not kept and not int(entry.get("untracked_refusals") or 0):
         return None, held, True
-    return {**entry, "pending": kept, "legacy_refusals": 0}, held, bool(held) or legacy > 0
+    stamped = isinstance(entry.get(LATER_ACCEPTANCE), str)
+    outstanding = {**entry, "pending": kept, "legacy_refusals": 0,
+                   LATER_ACCEPTANCE: entry[LATER_ACCEPTANCE] if stamped else now.isoformat()}
+    return outstanding, held, bool(held) or legacy > 0 or not stamped
 
 
 def _evidence_resolutions(details: dict, added: list[dict]) -> list[dict]:
@@ -5989,6 +6001,11 @@ def record_message_rejection(
     A device-side rejection (the message itself is invalid) is
     DEVICE_MESSAGE_REJECTED. A failure inside ADD is
     ADD_MESSAGE_PROCESSING_FAILED, so the device is not blamed for it.
+
+    A refused queue_evidence copy that ADD already holds (a reconnect overlap)
+    leaves nothing open for its type: the refusal is still recorded, on an
+    alert closed at once as EVIDENCE_HELD unless other types keep it open.
+    The returned alert's state says which.
     """
     now = now or utc_now()
     device_side = category in DEVICE_REJECTION_CATEGORIES
@@ -6014,13 +6031,19 @@ def record_message_rejection(
         # Why the latest one was refused, so an unknown rejection is diagnosable.
         "error_reason": error_reason, "error_site": error_site, "error_types": (error_types or [])[:5],
     }
+    # A new refusal makes the entry live again, whatever was accepted before it.
+    refreshed.pop(LATER_ACCEPTANCE, None)
     resolved = []
+    held_at_once = False
     if message_type == "queue_evidence":
         tracked, resolution = _track_refused_evidence(
             session, connector, entry, evidence, reason=error_reason or category, request_id=request_id, now=now)
         refreshed.update(tracked)
         resolved = [resolution] if resolution is not None else []
-    types[message_type] = refreshed
+        held_at_once = (resolution is not None and unheld_evidence(refreshed) == (0, 0)
+                        and not int(refreshed.get("legacy_refusals") or 0))
+    if not held_at_once:
+        types[message_type] = refreshed
     while len(types) > MAX_REJECTION_TYPES:
         # An entry with refused copies ADD does not hold is never dropped to
         # make room: only holding them, or an operator, may close it.
@@ -6034,10 +6057,18 @@ def record_message_rejection(
     resolutions = _evidence_resolutions(previous, resolved)
     if resolutions:
         details["evidence_resolutions"] = resolutions
-    return upsert_alert(
+    if held_at_once and types and existing is not None:
+        # Other rejected types keep the alert open; it still describes them.
+        existing.details = {**previous, "types": types, "evidence_resolutions": resolutions}
+        return existing
+    row = upsert_alert(
         session, connector, code=code, severity="HIGH" if device_side else "WARNING", message=message,
         details=details,
     )
+    if held_at_once:
+        close_alert_row(row, resolution={"kind": "EVIDENCE_HELD", "message_type": message_type},
+                        touch_last_seen=False, now=now)
+    return row
 
 
 def resolve_message_rejection(
@@ -6052,11 +6083,14 @@ def resolve_message_rejection(
 
     A queue_evidence entry clears only once ADD holds every copy it refused
     (``evidence`` is the record just accepted: identity, digest and receipt)
-    and no refusal is left unmatched.
+    and no refusal is left unmatched. Until then the first acceptance after a
+    refusal leaves it custody only: open, but no longer holding HIL or
+    factory work, as when any acceptance closed it.
     """
     now = utc_now()
     changed = False
     resolved_codes = set()
+    released_codes = set()
     for row in session.scalars(
         select(DeviceAlert).where(
             DeviceAlert.connector_id == connector.id,
@@ -6086,6 +6120,8 @@ def resolve_message_rejection(
             details = {**details, "evidence_resolutions": _evidence_resolutions(details, held)}
         if remaining:
             row.details = {**details, "types": remaining}
+            if all(custody_only(entry) for entry in remaining.values()):
+                released_codes.add(row.code)
         else:
             row.details = {**details, "types": {}}
             close_alert_row(row, resolution={"kind": "MESSAGE_ACCEPTED", "message_type": message_type},
@@ -6094,7 +6130,7 @@ def resolve_message_rejection(
     if settings.device_health_derived_enabled:
         if changed and rederive:
             apply_device_health(session, connector, source="MESSAGE_ACCEPTED", now=now)
-    elif resolved_codes and connector.last_error_code in resolved_codes:
+    elif (resolved_codes | released_codes) and connector.last_error_code in resolved_codes | released_codes:
         connector.last_error_code = None
         connector.last_error_message = None
         if message_type != "heartbeat":  # the legacy heartbeat writers set its own lifecycle

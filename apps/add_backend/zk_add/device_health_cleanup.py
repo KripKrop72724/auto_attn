@@ -148,6 +148,13 @@ def _latest_deployment(session: Session, connector: Connector) -> str:
             f"{latest.status} in a {campaign.status if campaign else 'missing'} campaign.")
 
 
+def _refused_ords_row(entry: dict) -> bool:
+    """A refused ORDS-lane copy: 2.6.x retries that row through ORDS once its
+    user maps, so it may be in Oracle without ADD ever holding its evidence."""
+    return any(isinstance(item, dict) and item.get("queue") in {"ords", "ords_legacy"}
+               for item in entry.get("pending") or [])
+
+
 def _cleared(session: Session, connector: Connector, row: DeviceAlert, open_codes: set[str],
              now: datetime) -> tuple[str, bool, str] | None:
     """(class, preselected, rationale) when fresh evidence disproves the condition."""
@@ -181,12 +188,14 @@ def _cleared(session: Session, connector: Connector, row: DeviceAlert, open_code
     if code in {"DEVICE_MESSAGE_REJECTED", "ADD_MESSAGE_PROCESSING_FAILED"}:
         if alert_currency(row, connector, now=now) == CURRENT:
             return None
-        if any(unheld_evidence(entry) != (0, 0) for entry in _rejection_entries(row).values()):
+        unheld = [entry for entry in _rejection_entries(row).values() if unheld_evidence(entry) != (0, 0)]
+        if unheld:
             # Time passing proves nothing about custody: someone must check what
             # the device did with each refused record, then resolve it with a reason.
-            return REVIEW, False, ("Refused queue_evidence records are not yet held by ADD. Verify each on the "
-                                   "device before resolving: it may still hold the row, or (2.6.x ORDS) have "
-                                   "delivered it to Oracle without sending evidence again.")
+            return REVIEW, False, "Refused queue_evidence records are not yet held by ADD. Verify each on the " \
+                "device before resolving: it may still hold the row" + (
+                    ", or, for an ORDS row, have delivered it to Oracle without sending evidence again."
+                    if any(_refused_ords_row(entry) for entry in unheld) else ".")
         entries = _rejection_entries(row).values()
         old = all(not _entry_current(entry, now) and (
             (entry.get("boot_id") and entry.get("boot_id") != connector.boot_id)

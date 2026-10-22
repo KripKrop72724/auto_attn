@@ -4550,10 +4550,15 @@ def record_envelope_rejection(connector_pk: int, envelope: Envelope, error: Exce
             error_reason=error_reason, error_site=error_site, error_types=error_types, evidence=evidence)
         if settings.device_health_derived_enabled:
             apply_device_health(db, connector, source="REJECTION")
-        else:
+        elif alert.state == "OPEN":
             connector.lifecycle_state = "DEGRADED"
             connector.last_error_code = alert.code
             connector.last_error_message = alert.message
+        elif connector.last_error_code == alert.code:
+            # A refused copy ADD already held closed its alert at once.
+            connector.lifecycle_state = "ONLINE"
+            connector.last_error_code = None
+            connector.last_error_message = None
         ingest_logs(
             db,
             connector=connector,
