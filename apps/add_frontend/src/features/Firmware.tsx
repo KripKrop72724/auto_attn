@@ -13,6 +13,7 @@ import {
 import { z } from 'zod'
 import './Firmware.css'
 import { hilAllowedTargets, hilDevice, hilDeviceMismatch, hilScopeLabel } from './hilTargets'
+import { RetryTargetDialog, RollbackEvidence, StabilityWarnings } from './FirmwareRetry'
 import { api, queryString } from '../api'
 import {
   Dialog,
@@ -31,6 +32,7 @@ import type {
   Device,
   FirmwareCampaign,
   FirmwareCampaignTotals,
+  FirmwareDeployment,
   FirmwareListResponse,
   FirmwareRelease,
   FirmwareReleaseTotals,
@@ -108,6 +110,14 @@ const firmwareScopeSchema = z.object({
       })
       .passthrough(),
   ),
+  stability_warnings: z
+    .array(
+      z
+        .object({ code: z.string(), connector_id: z.string(), message: z.string() })
+        .passthrough(),
+    )
+    .default([]),
+  stability_warnings_digest: z.string().optional(),
 })
 const firmwareCampaignCreatedSchema = z.object({
   campaign_id: z.string().min(1),
@@ -298,12 +308,15 @@ function CampaignDetailDrawer({
   seed,
   onClose,
   onControl,
+  toast,
 }: {
   seed: FirmwareCampaign
   onClose: () => void
   onControl: (campaign: FirmwareCampaign, action: CampaignAction) => void
+  toast: Toast
 }) {
   const [campaign, setCampaign] = useState<FirmwareCampaign | null>(null)
+  const [retryTarget, setRetryTarget] = useState<FirmwareDeployment | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const load = useCallback(async () => {
@@ -478,7 +491,15 @@ function CampaignDetailDrawer({
                       </div>
                       {deployment.error_code && (
                         <div className="wide">
-                          <dt>Failure</dt>
+                          <dt>
+                            {deployment.status === 'PENDING'
+                              ? 'Hold'
+                              : deployment.error_code === 'DOWNLOAD_INTERRUPTED'
+                                ? 'Last interruption'
+                                : activeDeploymentStates.includes(deployment.status)
+                                  ? 'Last report'
+                                  : 'Failure'}
+                          </dt>
                           <dd>
                             {deployment.error_code} ·{' '}
                             {deployment.error_message ||
@@ -575,6 +596,26 @@ function CampaignDetailDrawer({
                         </>
                       )}
                     </dl>
+                    {deployment.rollback_diagnosis && (
+                      <RollbackEvidence diagnosis={deployment.rollback_diagnosis} />
+                    )}
+                    {deployment.retry && (
+                      <div className="firmware-retry-target">
+                        {deployment.retry.available && row.status === 'PAUSED' ? (
+                          <button
+                            className="button primary"
+                            onClick={() => setRetryTarget(deployment)}
+                          >
+                            <Icon name="refresh" /> Retry same target
+                          </button>
+                        ) : (
+                          <p>
+                            <Icon name="info" />{' '}
+                            {deployment.retry.refusal || 'Retry is not available.'}
+                          </p>
+                        )}
+                      </div>
+                    )}
                     {deployment.events.length > 0 && (
                       <ol>
                         {deployment.events.map((event, index) => (
@@ -634,6 +675,15 @@ function CampaignDetailDrawer({
           </>
         )}
       </div>
+      {retryTarget && (
+        <RetryTargetDialog
+          campaign={row}
+          deployment={retryTarget}
+          onClose={() => setRetryTarget(null)}
+          onChanged={load}
+          toast={toast}
+        />
+      )}
     </Dialog>
   )
 }
@@ -661,6 +711,7 @@ function CampaignCreator({
   const [confirmation, setConfirmation] = useState('')
   const [password, setPassword] = useState('')
   const [scope, setScope] = useState<FirmwareScopePreview | null>(null)
+  const [overrideStability, setOverrideStability] = useState(false)
   const [previewBusy, setPreviewBusy] = useState(false)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
@@ -698,9 +749,11 @@ function CampaignCreator({
   }, [scope])
   const resetScope = () => {
     setScope(null)
+    setOverrideStability(false)
     setConfirmation('')
     setPassword('')
   }
+  const stabilityWarnings = scope?.stability_warnings || []
   const chooseRelease = (value: string) => {
     setReleaseId(value)
     resetScope()
@@ -712,6 +765,7 @@ function CampaignCreator({
     if (!selectedRelease || !zoneId) return
     setPreviewBusy(true)
     setScope(null)
+    setOverrideStability(false)
     setError('')
     try {
       setScope(
@@ -744,6 +798,7 @@ function CampaignCreator({
       scope.release.release_id === selectedRelease.release_id &&
       scope.zone_id === zoneId &&
       scope.counts.eligible > 0 &&
+      (!stabilityWarnings.length || overrideStability) &&
       reason.trim().length >= 10 &&
       confirmation === selectedRelease.version &&
       password &&
@@ -766,6 +821,10 @@ function CampaignCreator({
             password,
             scope_token: scope.scope_token,
             idempotency_key: idempotency('firmware-campaign'),
+            override_stability_warnings: overrideStability,
+            ...(overrideStability && scope.stability_warnings_digest
+              ? { stability_warnings_digest: scope.stability_warnings_digest }
+              : {}),
           }),
         }),
       )
@@ -972,6 +1031,11 @@ function CampaignCreator({
                     ))}
                   </section>
                 </div>
+                <StabilityWarnings
+                  warnings={stabilityWarnings}
+                  override={overrideStability}
+                  onOverride={setOverrideStability}
+                />
                 <button
                   type="button"
                   className="button text-button"
@@ -2110,6 +2174,7 @@ export function FirmwareView({
             setCampaignDrawer(null)
             setCampaignControl({ campaign, action })
           }}
+          toast={toast}
         />
       )}
       {campaignControl && (

@@ -6,6 +6,7 @@ from uuid import uuid4
 import pytest
 from sqlalchemy import create_engine, select, text
 from sqlalchemy.orm import Session
+from sqlalchemy.pool import StaticPool
 
 from zk_add.models import AuditEvent, Base
 from zk_add.ota import FirmwareCampaign, FirmwareRelease
@@ -29,7 +30,10 @@ def database(request):
             "options": f"-csearch_path={schema} -clock_timeout=5000 -cstatement_timeout=30000",
         })
     else:
-        engine = create_engine("sqlite+pysqlite:///:memory:")
+        # The revoke runs its database work in a worker thread (it may lock
+        # a held download's rows), so the in-memory database is shared.
+        engine = create_engine("sqlite+pysqlite:///:memory:", connect_args={"check_same_thread": False},
+                               poolclass=StaticPool)
 
     def cleanup():
         engine.dispose()

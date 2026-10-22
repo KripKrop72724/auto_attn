@@ -272,3 +272,14 @@
   .firmware-channel-strip article, .firmware-release-card, .firmware-campaign-card, .firmware-deployment { border: 2px solid CanvasText; }
   .firmware-readiness-bar i, .firmware-campaign-progress i { forced-color-adjust: none; }
 }
+.firmware-rollback-evidence { display: grid; gap: 6px; margin: 10px 0 0; padding: 10px 12px; border: 1px solid var(--border); border-radius: var(--radius-md); }
+.firmware-rollback-evidence h4 { margin: 0; font-size: 13px; }
+.firmware-rollback-evidence p { margin: 0; color: var(--text-secondary); font-size: 12px; }
+.firmware-rollback-evidence dl { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px 12px; margin: 0; }
+.firmware-rollback-evidence dt { color: var(--text-tertiary); font-size: 12px; }
+.firmware-rollback-evidence dd { margin: 2px 0 0; overflow-wrap: anywhere; font-size: 13px; }
+.firmware-retry-target { display: flex; align-items: center; gap: 8px; margin: 10px 0 0; }
+.firmware-retry-target p { display: flex; align-items: center; gap: 6px; margin: 0; color: var(--text-secondary); font-size: 12px; }
+.firmware-stability-warnings ul { margin: 4px 0 6px; padding-left: 18px; }
+.firmware-override { display: flex; align-items: center; gap: 6px; font-weight: 500; }
+@media (max-width: 640px) { .firmware-rollback-evidence dl { grid-template-columns: minmax(0, 1fr); } }

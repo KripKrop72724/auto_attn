@@ -26,6 +26,20 @@ from zk_add.service import ingest_attendance
 from zk_add.zkt_source_evidence import list_evidence, reveal_evidence
 
 
+@pytest.fixture(autouse=True)
+def final_ordinal_written(monkeypatch):
+    """These scenarios read terminals whose final record was already written.
+
+    No reconcile chunk reports the count it was read against, so ADD treats a
+    job's final ordinal as possibly the terminal's unwritten newest slot and
+    holds a punch there that no capture delivered. test_source_newest_slot
+    covers that rule; here the final record is an ordinary punch.
+    """
+    from zk_add import source_newest_slot
+
+    monkeypatch.setattr(source_newest_slot, "baseline_newest_ordinal", lambda job: None)
+
+
 def missing_raw(kind):
     raw = bytearray(RAW_RECORD)
     if kind == "uid-only":

@@ -162,6 +162,22 @@ reservation guard allows two unsettled upgrades at a time.
 One target at a time; start the next only once the previous one is accepted
 or its failure is understood.
 
+Once ADD carries the interrupted-OTA change, a campaign's preview can show
+ESP stability warnings for the target: more than 0.5 resets per online hour
+on its current firmware over 7 days, or less than 30 minutes up since a reset
+ADD did not cause. (The repeated-interruption warning cannot appear for
+2.7.6: its returns are never classified `TARGET_BOOT_INTERRUPTED`.) The
+campaign then starts only with the owner's override ticked in the creation
+dialog, which covers exactly the warnings shown; read them before ticking
+it. Nothing else changes for 2.7.6: a 2.7.6 download that stops fails and
+pauses at once (it is never held for a re-offer), and a return from 2.7.6
+is never labelled `TARGET_BOOT_INTERRUPTED` or retried with "Retry same
+target"; read it as described under Rollback expectations. Two general
+changes also apply to it: a download grant of a deployment that already
+ended (failed, cancelled, rolled back) no longer serves bytes, and a
+campaign the owner paused or cancelled keeps that state and reason when the
+target later fails or rolls back.
+
 ### 1. Peshawar 02, from 2.5.2 (unconfirmed first boot)
 
 Before the campaign, note P02's last 2.5.2 heartbeat (store used, the ORDS

@@ -26,6 +26,7 @@ from uuid import uuid4
 
 from sqlalchemy import func, select, tuple_
 
+from zk_add import source_newest_slot as newest_slot
 from zk_add.attendance_force_release import _lock_scheduler
 from zk_add.attendance_legacy_uid import potentially_recoverable
 from zk_add.attendance_manual_guard import decision_for
@@ -737,7 +738,12 @@ def assess_many(
                 evidence_digests is not None and event.id in choices
                 and evidence_digests.get(event.id) != digest
             )
-            error = time_refusal(event) or ("CNIC_CHOICE_STALE" if stale else None) or resolution.error
+            error = time_refusal(event) or ("CNIC_CHOICE_STALE" if stale else None)
+            if not error and newest_slot.newest_only_event_ids(session, [event]):
+                # Bytes read from an unwritten newest slot may carry another person's
+                # identity, so no CNIC choice can make them sendable.
+                error = newest_slot.UNCONFIRMED_CONDITION
+            error = error or resolution.error
         if (
             error is None and resolution.source == PUNCH_TIME_SOURCE and held_elsewhere
             and event.id not in held_confirmed
@@ -1121,6 +1127,8 @@ def _queue(session, job, item):
     else:
         resolution = _revalidate(session, event, item.result)
         code = time_refusal(event) or resolution.error
+        if not code and newest_slot.newest_only_event_ids(session, [event]):
+            code = newest_slot.UNCONFIRMED_CONDITION
     if code:
         item.status, item.error_code, item.completed_at = "SKIPPED", code, utc_now()
         item.result = {"reason": _reason(code)}
