@@ -188,6 +188,11 @@ BREAKERS = {
     """,
     "receipt_lag": "UPDATE add_attendance_events "
                    "SET received_at = captured_at + INTERVAL '11 minutes'",
+    # The third case is for legacy dump rows only: another terminal reconcile
+    # source without a saved record never passes on its interval alone.
+    "full_history_source": "UPDATE add_attendance_events SET source = 'FULL_HISTORY'",
+    "current_reconcile_source": "UPDATE add_attendance_events SET source = 'CURRENT_RECONCILE'",
+    "reconcile_15m_source": "UPDATE add_attendance_events SET source = 'RECONCILE_15M'",
     "event_uid": "UPDATE add_attendance_events SET event_uid = upper(event_uid)",
     # Any saved record decides; this one is not canonical, so it proves nothing.
     "non_canonical_saved_record": """
@@ -487,3 +492,79 @@ def test_one_zone_check_page_runs_at_a_time(force_pg):
         first.rollback()
     with sessions() as second:
         assert backlog.preview_page(second, zone_id=zone, actor=ADMIN)["zone_id"] == zone
+
+
+@pytest.mark.parametrize("race", ["user_read", "guard"])
+def test_a_snapshot_committed_mid_batch_never_skips_an_approved_punch(
+    force_pg, monkeypatch, race,
+):
+    """The routine 15-minute snapshot commits while the owner's batch checks a punch."""
+    sessions, _, _ = force_pg
+    engine = sessions.kw["bind"]
+    for filename in (*EARLIER_GUARDS, DUMP_GUARD):
+        _apply(engine, filename)
+    now = utc_now()
+    old = _dump(f"mid-{race}", now - timedelta(days=4), now - timedelta(days=4) + timedelta(minutes=3))
+    with sessions() as db:
+        connector = db.scalar(select(Connector))
+        _snapshot(db, connector, "m-s0", now - timedelta(days=5))
+        ingest_attendance(db, connector=connector, events=[old])
+        db.flush()
+        row = db.scalar(select(AttendanceEvent).where(AttendanceEvent.event_uid == old.event_uid))
+        row.received_at = old.captured_at + timedelta(seconds=20)
+        db.commit()
+    with sessions() as db:
+        _snapshot(db, db.scalar(select(Connector)), "m-s1", utc_now())
+        db.commit()
+    with sessions() as db:
+        groups, _job = _approve_whole_zone(db, db.scalar(select(Connector)).zone_id, f"mid-{race}")
+        assert sum(entry[1] for entry in groups.values()) == 1
+        db.commit()
+
+    fired = []
+
+    def commit_snapshot():
+        if not fired:
+            fired.append(1)
+            with sessions() as other:
+                _snapshot(other, other.scalar(select(Connector)), "m-s2", utc_now())
+                other.commit()
+
+    if race == "user_read":
+        original = backlog._unique_user
+
+        def racing(session, cache, zkt_id, user_id):
+            commit_snapshot()  # after the terminal was read, before the user
+            return original(session, cache, zkt_id, user_id)
+
+        monkeypatch.setattr(backlog, "_unique_user", racing)
+    else:
+        original = backlog.release_synced_cnic_attendance_event
+
+        def racing(session, **arguments):
+            commit_snapshot()  # after both were read: the guard sees the new roster
+            return original(session, **arguments)
+
+        monkeypatch.setattr(backlog, "release_synced_cnic_attendance_event", racing)
+    with sessions() as db:
+        assert backlog.advance_once(db) == 0
+        db.commit()
+    with sessions() as db:
+        row = db.scalar(select(AttendanceEvent).where(AttendanceEvent.event_uid == old.event_uid))
+        job = db.scalar(select(AttendanceRecoveryJob).where(
+            AttendanceRecoveryJob.action == backlog.ACTION
+        ))
+        assert row.ords_status == "BLOCKED_IDENTITY" and job.cursor == 0
+        run = backlog.serialize(db, job)
+        assert run["kept_held"] == 0 and run["waiting_reason"] == "WAITING_FOR_ROSTER_UPDATE"
+    with sessions() as db:
+        assert backlog.advance_once(db) == 1
+        db.commit()
+    with sessions() as db:
+        row = db.scalar(select(AttendanceEvent).where(AttendanceEvent.event_uid == old.event_uid))
+        assert row.ords_status == "PENDING" and not row.manual_release_required
+        job = db.scalar(select(AttendanceRecoveryJob).where(
+            AttendanceRecoveryJob.action == backlog.ACTION
+        ))
+        run = backlog.serialize(db, job)
+        assert (run["released"], run["kept_held"], run["waiting_reason"]) == (1, 0, None)
