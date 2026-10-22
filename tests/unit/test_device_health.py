@@ -1156,7 +1156,10 @@ def test_each_processed_envelope_type_resolves_its_rejection(db, envelopes, mess
         "queue_evidence": queue_evidence_payload(connector),
         "unrecognized_probe": {},
     }
-    reject(connector, envelopes(connector, message_type, {}), ValueError("bad"))
+    # A refused queue_evidence clears only when ADD holds that record, so the
+    # refused copy here names the record the accepted one then holds.
+    refused = payloads[message_type] if message_type == "queue_evidence" else {}
+    reject(connector, envelopes(connector, message_type, refused), ValueError("bad"))
     reject(connector, envelopes(connector, "other_type", {}), ValueError("bad"))
     add_web.persist_envelope(connector.id, envelopes(connector, message_type, payloads[message_type]))
     row = alert_row(db, connector, "DEVICE_MESSAGE_REJECTED")

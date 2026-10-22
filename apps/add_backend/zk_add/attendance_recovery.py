@@ -55,6 +55,7 @@ from zk_add.service import (
 )
 from zk_add.identity_provenance import historical_identity_is_supported
 from zk_add.settings import settings
+from zk_add.source_newest_slot import UNSETTLED_CONDITION, is_unsettled_newest
 from zk_add.time_utils import ensure_utc, utc_now
 
 
@@ -1009,6 +1010,16 @@ def _correction_candidate(session: Session, source_kind: str, source_ref: str, c
             raise RecoveryError("The ZKT source exception is not eligible for correction.", "SOURCE_NOT_CORRECTABLE")
         if manifest.disposition == "MALFORMED" and "TIME" not in (manifest.error_code or "").upper():
             raise RecoveryError("Only timestamp-related malformed rows may be corrected.", "SOURCE_NOT_CORRECTABLE")
+        if is_unsettled_newest(session, manifest):
+            # These bytes were read before the terminal wrote the slot. The
+            # punch that fills it belongs to whoever punched next, so any
+            # identity in them would attribute that punch to the wrong person.
+            # A later complete reconcile settles the slot, or confirms these
+            # bytes as a genuine record, which makes it correctable again.
+            raise RecoveryError(
+                "This row is the terminal's unwritten newest record, not a punch, and cannot be corrected.",
+                UNSETTLED_CONDITION,
+            )
         user = _exact_device_user(session, manifest)
         if user is None:
             raise RecoveryError("The source identity is not uniquely backed by an active CNIC-bearing user.", "IDENTITY_HELD")

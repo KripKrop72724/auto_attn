@@ -222,6 +222,11 @@ class AddSettings(BaseSettings):
     firmware_store_path: str = "/firmware"
     firmware_public_base_url: str = "https://autoattn.slichealth.com"
     firmware_download_grant_seconds: int = 15 * 60
+    # Kill switch for resuming a stalled 2.6.0-2.6.15 download inside the same
+    # deployment (bounded backoff, at most three attempts). Off: every such
+    # stop fails the deployment closed and pauses the campaign, as before.
+    # The resume has not run on a device yet; enable it for a HIL first.
+    firmware_download_resume_enabled: bool = False
     firmware_signing_public_key_pem_b64: str | None = None
     comm_key_management_enabled: bool = False
     comm_key_reveal_enabled: bool = False

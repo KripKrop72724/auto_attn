@@ -32,6 +32,20 @@ from zk_add.settings import settings
 from zk_add.time_utils import ensure_utc, utc_now
 
 
+@pytest.fixture(autouse=True)
+def final_ordinal_written(monkeypatch):
+    """These scenarios read terminals whose final record was already written.
+
+    No reconcile chunk reports the count it was read against, so ADD treats a
+    job's final ordinal as possibly the terminal's unwritten newest slot and
+    holds a punch there that no capture delivered. test_source_newest_slot
+    covers that rule; here the final record is an ordinary punch.
+    """
+    from zk_add import source_newest_slot
+
+    monkeypatch.setattr(source_newest_slot, "baseline_newest_ordinal", lambda job: None)
+
+
 @pytest.fixture()
 def store(repair_store, monkeypatch):
     sessions, connector_id, user_key, event_uid = repair_store

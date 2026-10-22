@@ -70,9 +70,13 @@ def _hold_existing(session, row, code):
 
 
 def deliver_observation(
-    session: Session, connector: Connector, evidence, observation, raw_payload=None, *, clock_sample=None
+    session: Session, connector: Connector, evidence, observation, raw_payload=None, *, clock_sample=None,
+    delivery_type: str | None = None,
 ) -> None:
-    """Same transaction as raw custody; never call ORDS inside this transaction."""
+    """Same transaction as raw custody; never call ORDS inside this transaction.
+
+    delivery_type overrides the ORDS lane for a new attendance row only.
+    """
     from zk_add.service import attendance_device_time_is_plausible
 
     existing = (
@@ -85,7 +89,11 @@ def deliver_observation(
         else None
     )
     if evidence.disposition == "SOURCE_FACT_CONFLICT":
-        _hold_existing(session, existing, "QUARANTINED_SOURCE_CONFLICT")
+        # Oracle already confirmed the earlier version: ADD cannot withdraw it,
+        # and relabelling it held would misreport Oracle's state. Both evidence
+        # rows keep SOURCE_FACT_CONFLICT for source review.
+        if existing is None or existing.oracle_confirmed_at is None:
+            _hold_existing(session, existing, "QUARANTINED_SOURCE_CONFLICT")
         return
     if observation is None:
         return
@@ -223,7 +231,7 @@ def deliver_observation(
         OrdsOutbox(
             attendance_event_id=row.id,
             status=status,
-            delivery_type="LIVE" if evidence.channel == "POLL" else "FULL_HISTORY",
+            delivery_type=delivery_type or ("LIVE" if evidence.channel == "POLL" else "FULL_HISTORY"),
         )
     )
     evidence.disposition = (

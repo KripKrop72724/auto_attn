@@ -26,6 +26,7 @@ import { AnchoredLayer } from '../AnchoredLayer'
 import { AttendanceRecovery } from './AttendanceRecovery'
 import type {
   Device,
+  HikvisionHistoryScope,
   ReconciliationDivergenceDetail,
   ReconciliationDivergenceReveal,
   ReconciliationJob,
@@ -107,7 +108,15 @@ const humanize = (value?: string | null) =>
     .replace(/^./, (letter) => letter.toUpperCase())
 
 const sourceEvidencePending = (state: SourceExceptionAssurance['state']) =>
-  state === 'REVIEW_REQUIRED' || state === 'IDENTITY_EVIDENCE_REQUIRED' || state === 'INTERPRETATION_REQUIRED'
+  state === 'REVIEW_REQUIRED' || state === 'IDENTITY_EVIDENCE_REQUIRED' || state === 'INTERPRETATION_REQUIRED' ||
+  state === 'NEWEST_PUNCH_UNRECEIVED'
+
+const newestPunchCopy = (count: number) =>
+  `${count.toLocaleString()} terminal newest-record slot${count === 1 ? ' holds' : 's hold'} a punch ADD has not received; a review cannot exclude ${count === 1 ? 'it' : 'them'}. Assurance resumes automatically if LIVE capture delivers the same punch. Otherwise cancel this job and run another complete reconcile after the next punch.`
+
+const newestCondition = (row: SourceException) =>
+  row.source_condition === 'TERMINAL_NEWEST_RECORD_UNSETTLED' ||
+  row.source_condition === 'TERMINAL_NEWEST_RECORD_UNCONFIRMED'
 
 const reconciliationEtaLabel = (job: ReconciliationJob) => {
   if (job.eta.high_seconds != null)
@@ -528,6 +537,8 @@ function JobDetailDrawer({
                       ? 'Source interpretation pending'
                       : job.source_exception_assurance.state === 'IDENTITY_EVIDENCE_REQUIRED'
                       ? 'Historical identity evidence required'
+                      : job.source_exception_assurance.state === 'NEWEST_PUNCH_UNRECEIVED'
+                      ? 'Terminal punch not yet received'
                       : job.source_exception_assurance.state === 'REVIEW_REQUIRED'
                       ? `${job.source_exception_assurance.open.toLocaleString()} source review${job.source_exception_assurance.open === 1 ? '' : 's'} remaining`
                       : job.source_exception_assurance.state === 'SCOPE_MISMATCH'
@@ -543,6 +554,8 @@ function JobDetailDrawer({
                     source exceptions reviewed. Original evidence remains immutable.
                     {job.source_exception_assurance.state === 'IDENTITY_EVIDENCE_REQUIRED' &&
                       ' Review notes cannot resolve missing identity or certify Oracle delivery.'}
+                    {job.source_exception_assurance.state === 'NEWEST_PUNCH_UNRECEIVED' &&
+                      ` ${newestPunchCopy(job.source_exception_assurance.newest_punch_unreceived ?? 1)}`}
                     </>}
                   </p>
                   {sourceEvidencePending(job.source_exception_assurance.state) && job.source_exception_assurance.state !== 'INTERPRETATION_REQUIRED' && (
@@ -719,7 +732,9 @@ function SourceExceptionDrawer({
           ),
         )
         toast.notice(
-          row.disposition === 'IDENTITY_UNRESOLVED'
+          newestCondition(row)
+            ? 'Review recorded. It does not settle this terminal newest-record slot or read its punch.'
+            : row.disposition === 'IDENTITY_UNRESOLVED' && row.source_condition !== 'TERMINAL_NEWEST_RECORD_OUT_OF_ORDER'
             ? 'Review recorded. The identity hold remains until verified correction evidence is available.'
             : 'Source review recorded. When the certified cohort is complete, assurance resumes automatically from its existing checkpoint.',
         )
@@ -788,12 +803,28 @@ function SourceExceptionDrawer({
             <article className="info-copy pattern-blocked">
               <Icon name="shield" />
               <div>
-                <h3>{row.disposition === 'IDENTITY_UNRESOLVED'
+                <h3>{row.source_condition === 'TERMINAL_NEWEST_RECORD_CORRECTED'
+                  ? 'Corrected from an unwritten newest record'
+                  : row.source_condition === 'TERMINAL_NEWEST_RECORD_UNCONFIRMED'
+                  ? 'Held: newest-record punch not confirmed'
+                  : row.source_condition === 'TERMINAL_NEWEST_RECORD_UNSETTLED'
+                  ? 'Terminal newest record not yet written'
+                  : row.source_condition === 'TERMINAL_NEWEST_RECORD_OUT_OF_ORDER'
+                  ? 'Excluded: newest-record bytes out of time order'
+                  : row.disposition === 'IDENTITY_UNRESOLVED'
                   ? 'Held for verified historical identity'
                   : 'Excluded from attendance and Oracle'}</h3>
                 <p>
                   ADD preserved this terminal ordinal as immutable evidence.
-                  {row.disposition === 'IDENTITY_UNRESOLVED'
+                  {row.source_condition === 'TERMINAL_NEWEST_RECORD_CORRECTED'
+                    ? ` ${row.operator_reason || 'A source time correction was made from bytes that were not the punch in this slot. HR must verify the corrected punch.'}`
+                    : row.source_condition === 'TERMINAL_NEWEST_RECORD_UNCONFIRMED'
+                    ? ` ${row.operator_reason || 'These bytes decode as a punch no capture has delivered. ADD holds them until LIVE capture or a later reconcile confirms the punch.'}`
+                    : row.source_condition === 'TERMINAL_NEWEST_RECORD_UNSETTLED'
+                    ? ` ${row.operator_reason || 'These bytes were read before the terminal wrote this slot. They are not a punch.'}`
+                    : row.source_condition === 'TERMINAL_NEWEST_RECORD_OUT_OF_ORDER'
+                    ? ` ${row.operator_reason || 'The terminal holds these bytes, but their time does not lie between the punches around them. They may be stale bytes with another person\'s identity, so ADD did not ingest them. Review the row.'}`
+                    : row.disposition === 'IDENTITY_UNRESOLVED'
                     ? ' Identity operations must establish an independently supported user reference. A historical attendance UID cannot identify the current enrollment owner. A review note does not resolve this hold or certify Oracle delivery.'
                     : ' Review never creates, edits, or deletes attendance. Completing every review in a certified job automatically resumes assurance for its valid records.'}
                 </p>
@@ -847,7 +878,9 @@ function SourceExceptionDrawer({
                 <div>
                   <h3>Review history</h3>
                   <p>
-                    {row.disposition === 'IDENTITY_UNRESOLVED'
+                    {newestCondition(row)
+                      ? 'Review records that the row was seen. It does not settle this slot or read its punch; only a later complete reconcile does.'
+                      : row.disposition === 'IDENTITY_UNRESOLVED'
                       ? 'Review records an investigation note; the identity hold and original source evidence remain.'
                       : 'Review accepts this fail-closed exclusion; the preserved source record itself never changes.'}
                   </p>
@@ -867,6 +900,35 @@ function SourceExceptionDrawer({
                 </p>
               )}
             </section>
+            {!!row.slot_receipts?.length && (
+              <section className="exception-review-section" aria-label="Reads of this slot">
+                <div className="panel-header">
+                  <div>
+                    <h3>Reads of this slot</h3>
+                    <p>
+                      Verified reads of this ordinal kept as evidence. None of them was sent to
+                      Oracle from here.
+                    </p>
+                  </div>
+                </div>
+                {row.slot_receipts.map((receipt) => (
+                  <article key={receipt.manifest_id} className="exception-review">
+                    <strong>{humanize(receipt.source_kind)}</strong>
+                    <span>{dateTime(receipt.observed_at)}</span>
+                    <p>
+                      {receipt.punch_received === false
+                        ? 'Decodes as a punch ADD has not received.'
+                        : receipt.punch_received
+                        ? 'Decodes as a punch ADD has received from another capture.'
+                        : receipt.decodes_as_punch
+                        ? 'Its stored interpretation cannot be read; treated as a punch ADD has not received.'
+                        : `No punch (${humanize(receipt.disposition)}).`}{' '}
+                      <code>{receipt.raw_record_digest.slice(0, 16)}</code>
+                    </p>
+                  </article>
+                ))}
+              </section>
+            )}
             {revealed && (
               <section className="revealed-evidence" aria-live="polite">
                 <div className="panel-header">
@@ -1219,7 +1281,7 @@ export function ReconciliationView({
   const [preflightLoading, setPreflightLoading] = useState(false)
   const [preflightError, setPreflightError] = useState('')
   const [dialog, setDialog] = useState<ReconciliationDialogState>(null)
-  const [historyScope, setHistoryScope] = useState<'ACTIVE_USERS' | 'ALL_RECORDS'>('ACTIVE_USERS')
+  const [historyScope, setHistoryScope] = useState<HikvisionHistoryScope>('ACTIVE_USERS')
   const [jobDrawer, setJobDrawer] = useState<ReconciliationJob | null>(null)
   const jobDrawerReturnFocusRef = useRef<HTMLButtonElement>(null)
   const [divergenceDrawerId, setDivergenceDrawerId] = useState<string | null>(
@@ -1537,7 +1599,9 @@ export function ReconciliationView({
       toast.notice(
         selected.firmware_family === 'hikvision' && historyScope === 'ACTIVE_USERS'
           ? 'Active-user history queued. ADD freezes the current user list and preserves resumable checkpoints.'
-          : 'Full terminal reconciliation queued. ADD now owns its checkpoint.',
+          : selected.firmware_family === 'hikvision' && historyScope === 'RECENT_TAIL'
+            ? 'Recent-tail recovery queued. ADD resumes from its last held serial and keeps following new punches.'
+            : 'Full terminal reconciliation queued. ADD now owns its checkpoint.',
       )
       await loadJobs({ quiet: true })
     } catch (error) {
@@ -1582,11 +1646,14 @@ export function ReconciliationView({
 
   const isHikvision = selected?.firmware_family === 'hikvision'
   const activeUsersOnly = isHikvision && historyScope === 'ACTIVE_USERS'
-  const startConfirmation = `RECONCILE ${selected?.device_id} ${activeUsersOnly ? 'ACTIVE USERS' : 'FROM START'}`
+  const recentTail = isHikvision && historyScope === 'RECENT_TAIL'
+  const startConfirmation = `RECONCILE ${selected?.device_id} ${
+    activeUsersOnly ? 'ACTIVE USERS' : recentTail ? 'RECENT TAIL' : 'FROM START'}`
   const canOpenStart = Boolean(selected && enabled && preflight?.eligible)
   const canStart = Boolean(
     canOpenStart &&
       (!activeUsersOnly || preflight?.active_user_history?.eligible !== false) &&
+      (!recentTail || preflight?.recent_tail?.eligible === true) &&
       reason.trim().length >= 10 &&
       password &&
       confirmation === startConfirmation,
@@ -2007,7 +2074,9 @@ export function ReconciliationView({
             <div className="reconciliation-job-list" aria-live="polite">
               {rows.map((job) => {
                 const cutoff = job.terminal.cutoff_count || 0
-                const capturePercent = job.scope === 'ACTIVE_USERS' && job.active_user_scope?.user_count
+                const capturePercent = job.scope === 'RECENT_TAIL'
+                  ? job.recent_tail?.caught_up ? 100 : 0
+                  : job.scope === 'ACTIVE_USERS' && job.active_user_scope?.user_count
                   ? job.capture_certified_at ? 100 : Math.min(99, Math.round(100 * job.active_user_scope.completed_users / job.active_user_scope.user_count))
                   : cutoff ? Math.min(
                       100,
@@ -2033,6 +2102,7 @@ export function ReconciliationView({
                   sourceAssurance.state === 'REVIEW_REQUIRED' ||
                   sourceAssurance.state === 'IDENTITY_EVIDENCE_REQUIRED' ||
                   sourceAssurance.state === 'INTERPRETATION_REQUIRED' ||
+                  sourceAssurance.state === 'NEWEST_PUNCH_UNRECEIVED' ||
                   sourceAssurance.state === 'SCOPE_MISMATCH'
                 const controls: Array<'pause' | 'resume' | 'cancel' | 'retry'> =
                   []
@@ -2065,7 +2135,9 @@ export function ReconciliationView({
                         <h3>{job.connector?.display_name || job.job_id}</h3>
                         {job.mode === 'HIKVISION_SERIAL_HISTORY' && <p>{job.scope === 'ACTIVE_USERS'
                           ? `Active-user history · ${job.active_user_scope?.completed_users ?? 0}/${job.active_user_scope?.user_count ?? 0} users verified · excludes former users`
-                          : 'Full terminal audit · all records'}</p>}
+                          : job.scope === 'RECENT_TAIL'
+                            ? `Recent tail · from serial ${job.recent_tail?.begin_serial ?? '?'} · last ${job.recent_tail?.last_serial ?? 'pending'} · ${job.recent_tail?.records ?? 0} new records after serial ${job.recent_tail?.anchor_serial ?? '?'} · ${job.recent_tail?.overlap_records ?? 0} held records re-read${job.recent_tail?.fact_conflicts ? ` · ${job.recent_tail.fact_conflicts} changed serials held for review` : ''} · no coverage certificate`
+                            : 'Full terminal audit · all records'}</p>}
                         <small>
                           {job.terminal.serial || 'serial pending'} · requested{' '}
                           {dateTime(job.requested_at)}
@@ -2177,6 +2249,8 @@ export function ReconciliationView({
                               ? 'Source interpretation pending'
                               : sourceAssurance.state === 'IDENTITY_EVIDENCE_REQUIRED'
                               ? 'Historical identity evidence required'
+                              : sourceAssurance.state === 'NEWEST_PUNCH_UNRECEIVED'
+                              ? 'Terminal punch not yet received'
                               : sourceAssurance.state === 'REVIEW_REQUIRED'
                               ? `${sourceAssurance.open.toLocaleString()} source review${sourceAssurance.open === 1 ? '' : 's'} remaining`
                               : sourceAssurance.state === 'SCOPE_MISMATCH'
@@ -2195,6 +2269,8 @@ export function ReconciliationView({
                           exceptions reviewed; original evidence remains preserved.
                           {sourceAssurance.state === 'IDENTITY_EVIDENCE_REQUIRED' &&
                             ' Review notes cannot resolve the identity hold.'}
+                          {sourceAssurance.state === 'NEWEST_PUNCH_UNRECEIVED' &&
+                            ` ${newestPunchCopy(sourceAssurance.newest_punch_unreceived ?? 1)}`}
                           </>}
                         </span>
                       </div>
@@ -2227,7 +2303,8 @@ export function ReconciliationView({
                           exception{sourceAssurance.open === 1 ? '' : 's'}
                         </button>
                       )}
-                      {sourceAssurance.state === 'IDENTITY_EVIDENCE_REQUIRED' && (
+                      {(sourceAssurance.state === 'IDENTITY_EVIDENCE_REQUIRED' ||
+                        sourceAssurance.state === 'NEWEST_PUNCH_UNRECEIVED') && (
                         <button className="button primary" onClick={() => reviewJobExceptions(job)}>
                           Inspect held source records
                         </button>
@@ -2394,18 +2471,26 @@ export function ReconciliationView({
                   <h3>
                     {scopedAssurance.state === 'IDENTITY_EVIDENCE_REQUIRED'
                       ? 'Historical identity evidence required'
+                      : scopedAssurance.state === 'NEWEST_PUNCH_UNRECEIVED'
+                      ? 'Terminal punch not yet received'
                       : scopedAssurance.state === 'REVIEW_REQUIRED'
+
                       ? `${scopedAssurance.open.toLocaleString()} certified review${scopedAssurance.open === 1 ? '' : 's'} remaining`
                       : scopedAssurance.state === 'SCOPE_MISMATCH'
                         ? 'Certified exception scope needs investigation'
                         : 'All certified exclusions reviewed'}
                   </h3>
                   <p>
+                    {scopedAssurance.state === 'NEWEST_PUNCH_UNRECEIVED' ? (
+                      newestPunchCopy(scopedAssurance.newest_punch_unreceived ?? 1)
+                    ) : <>
                     Source evidence has advanced through checkpoint{' '}
                     {(exceptionScope.cutoff_count ?? 0).toLocaleString()}. When
                     the open count reaches zero, final assurance resumes
                     automatically without a terminal rescan.
+                    </>}
                   </p>
+
                 </div>
               </div>
             )}
@@ -2656,6 +2741,18 @@ export function ReconciliationView({
                   <div data-label="Exception">
                     <StatusBadge state={row.disposition} />
                     <small>{row.error_code || 'No error code'}</small>
+                    {row.source_condition === 'TERMINAL_NEWEST_RECORD_UNSETTLED' && (
+                      <small>Newest record read before the terminal wrote it; not a punch</small>
+                    )}
+                    {row.source_condition === 'TERMINAL_NEWEST_RECORD_UNCONFIRMED' && (
+                      <small>Newest-record punch held until LIVE capture or a reconcile confirms it</small>
+                    )}
+                    {row.source_condition === 'TERMINAL_NEWEST_RECORD_CORRECTED' && (
+                      <small>Corrected from an unwritten newest record; HR must verify the punch</small>
+                    )}
+                    {row.source_condition === 'TERMINAL_NEWEST_RECORD_OUT_OF_ORDER' && (
+                      <small>Newest-record bytes out of time order; excluded for review</small>
+                    )}
                   </div>
                   <div data-label="Observed identity">
                     <strong>Attendance UID {row.observed_uid || '—'}</strong>
@@ -2772,18 +2869,24 @@ export function ReconciliationView({
               <label>
                 History scope
                 <select value={historyScope} onChange={(event) => {
-                  setHistoryScope(event.target.value as 'ACTIVE_USERS' | 'ALL_RECORDS')
+                  setHistoryScope(event.target.value as HikvisionHistoryScope)
                   setConfirmation('')
                 }}>
                   <option value="ACTIVE_USERS">Active users — all retained history (recommended)</option>
                   <option value="ALL_RECORDS">Full terminal audit — all records</option>
+                  <option value="RECENT_TAIL">Recent tail — resume after the last held punch and keep following</option>
                 </select>
+                {recentTail && preflight?.recent_tail && <p>{preflight.recent_tail.eligible
+                  ? `Resumes at terminal serial ${preflight.recent_tail.begin_serial} (re-reads up to serial ${preflight.recent_tail.anchor_serial}, the resume point: the last serial before the newest break in ADD's ESP-poll records). It steps back further if those records changed.${preflight.recent_tail.earlier_breaks?.length ? ` ADD's poll records also break after serial${preflight.recent_tail.earlier_breaks.length === 1 ? '' : 's'} ${preflight.recent_tail.earlier_breaks.join(', ')}; only a full terminal audit covers those.` : ''}${preflight.recent_tail.ready_now === false ? ' Waiting for the terminal and ESP.' : ''}`
+                  : preflight.recent_tail.reason}</p>}
                 {activeUsersOnly && preflight?.active_user_history && <p>{preflight.active_user_history.eligible
                   ? `${preflight.active_user_history.user_count} active users in the verified snapshot.`
                   : preflight.active_user_history.reason}</p>}
                 <small>{activeUsersOnly
                   ? 'Freezes the current complete user snapshot. Searches only those employees’ retained history; former users are excluded. Refresh terminal users first if the snapshot is older than 15 minutes. No records are deleted.'
-                  : 'Scans all retained terminal records, including former users and non-attendance events.'}</small>
+                  : recentTail
+                    ? 'For a terminal whose own poll is blocked: reads every record after the resume point, then checks for new punches every 15 seconds until cancelled or the ESP poll is proven to work again. Re-read records that changed are held for review. It never certifies coverage, and while it runs no other reconciliation can start on this device.'
+                    : 'Scans all retained terminal records, including former users and non-attendance events.'}</small>
               </label>
             )}
             <label>

@@ -25,7 +25,7 @@ backfilled.
 from alembic import op
 
 revision = "20261022_0056_dump_release"
-down_revision = "20261022_0055"
+down_revision = "20261021_ota_boot_retry"
 branch_labels = None
 depends_on = None
 

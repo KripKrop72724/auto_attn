@@ -1071,6 +1071,20 @@ def _chunk_record(ordinal, event, *, observed_uid="7"):
     )
 
 
+def _newest_slot_junk(ordinal):
+    """A terminal's unwritten newest slot reads as zero bytes (see
+    test_source_newest_slot.py); real baselines end on one."""
+    raw = bytes(40)
+    digest = hashlib.sha256(raw).hexdigest()
+    return ReconciliationSourceRecord(
+        ordinal=ordinal, raw_record_digest=digest,
+        terminal_record_key=hashlib.sha256(f"{SERIAL}:{digest}".encode()).hexdigest(),
+        occurrence_index=ordinal + 1, disposition="INVALID_TIME", event=None,
+        raw_record_b64=base64.b64encode(raw).decode(), error_code="IMPLAUSIBLE_TERMINAL_TIME",
+        raw_timestamp=0, observed_uid="0", observed_user_id=None,
+    )
+
+
 def _apply_baseline(db, connector, records):
     job = create_reconciliation_job(
         db, connector=connector, actor="operator", reason="Link saved terminal records.",
@@ -1152,6 +1166,8 @@ def test_baseline_chunk_releases_covered_history_and_held_dump_rows(
     )
     chunk = _apply_baseline(db, connector, [
         _chunk_record(0, history), _chunk_record(1, replay), _chunk_record(2, uncovered),
+        # The baseline's final ordinal is the unwritten newest slot.
+        _newest_slot_junk(3),
     ])
 
     rows = {
@@ -1227,10 +1243,12 @@ def test_tail_chunk_releases_a_held_dump_row_it_links(reconciliation_db):
     ))
     assert held_dump.ords_status == "BLOCKED_IDENTITY"
     raw = _raw_record(uid=7, hour=14, minute=1)
-    connector.zkt_device.attendance_count = 2
+    # A later record exists, so ordinal 1 is not the terminal's newest slot,
+    # which ADD never releases until a later read confirms it.
+    connector.zkt_device.attendance_count = 3
     draft = SourceTailChunkRequest(
         terminal_serial=SERIAL, terminal_generation=coverage.terminal_generation,
-        record_size=len(RAW_RECORD), start_ordinal=1, end_ordinal=2, latest_terminal_count=2,
+        record_size=len(RAW_RECORD), start_ordinal=1, end_ordinal=2, latest_terminal_count=3,
         chunk_digest="0" * 64, previous_chain_digest=coverage.source_committed_chain_digest,
         resulting_chain_digest="0" * 64,
         records=[ReconciliationSourceRecord(
