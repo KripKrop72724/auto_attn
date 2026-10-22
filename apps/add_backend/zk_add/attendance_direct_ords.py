@@ -94,7 +94,8 @@ REASONS = {
     ),
     "CNIC_CONFLICT": (
         "ADD's records show another CNIC or another person for this terminal user ID at "
-        "punch time. It is never sent by hand; correct the identity first."
+        "punch time. It is never sent by hand; confirm with HR who punched. The punch "
+        "stays saved and held in ADD."
     ),
     "PUNCH_TIME_CNIC_UNREADABLE": (
         "The CNIC ADD retained for the punch time cannot be read. No Oracle send was made."
