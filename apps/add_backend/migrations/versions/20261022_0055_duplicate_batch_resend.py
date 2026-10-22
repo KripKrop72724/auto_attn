@@ -15,8 +15,8 @@ NULL until a replay derives the value from the receipt's own evidence.
 from alembic import op
 import sqlalchemy as sa
 
-revision = "20261022_0054_batch_replay"
-down_revision = "20261012_0053"
+revision = "20261022_0055"
+down_revision = "20261022_0054"
 branch_labels = None
 depends_on = None
 

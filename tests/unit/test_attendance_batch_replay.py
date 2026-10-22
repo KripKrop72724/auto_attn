@@ -662,12 +662,12 @@ def test_migration_adds_the_column_once_and_keeps_it_on_downgrade(sessions):
 
     path = (
         Path(__file__).resolve().parents[2]
-        / "apps/add_backend/migrations/versions/20261022_0054_duplicate_batch_resend.py"
+        / "apps/add_backend/migrations/versions/20261022_0055_duplicate_batch_resend.py"
     )
     spec = importlib.util.spec_from_file_location("batch_replay_migration", path)
     migration = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(migration)
-    assert migration.down_revision == "20261012_0053"
+    assert (migration.revision, migration.down_revision) == ("20261022_0055", "20261022_0054")
     with sessions() as db:
         engine = db.get_bind()
     with engine.begin() as connection:
@@ -681,6 +681,26 @@ def test_migration_adds_the_column_once_and_keeps_it_on_downgrade(sessions):
             for column in inspect(connection).get_columns("add_attendance_batch_receipts")
         }
     assert columns["content_digest"]["nullable"] is True
+
+
+def test_migration_chain_has_one_head_through_this_revision():
+    # Review finding: main took 20261022_0054 (check-in notifications) while
+    # this branch also followed 20261012_0053. Two heads make the API
+    # container's "alembic upgrade head" fail before uvicorn starts.
+    from pathlib import Path
+
+    from alembic.config import Config
+    from alembic.script import ScriptDirectory
+
+    root = Path(__file__).resolve().parents[2] / "apps/add_backend"
+    config = Config(str(root / "alembic.ini"))
+    config.set_main_option("script_location", str(root / "migrations"))
+    script = ScriptDirectory.from_config(config)
+    heads = script.get_heads()
+    assert len(heads) == 1
+    chain = [revision.revision for revision in script.walk_revisions("base", heads[0])]
+    assert "20261022_0055" in chain
+    assert script.get_revision("20261022_0055").down_revision == "20261022_0054"
 
 
 def test_admin_can_read_replay_counters(sessions, device, monkeypatch):
