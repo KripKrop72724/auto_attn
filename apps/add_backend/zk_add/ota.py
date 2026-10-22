@@ -1148,7 +1148,7 @@ def assignment_for_connector(session: Session, *, connector: Connector, public_b
         if deployment is None or deployment.connector_id != connector.id:
             return None
         pending_offer = True
-    held = None
+    held, serialized = None, False
     if not pending_offer:
         from zk_add.ota_interruption import assignment_needs_serializing, awaiting_retry_offer, lock_for_assignment
         held = awaiting_retry_offer(session, deployment)
@@ -1159,6 +1159,7 @@ def assignment_for_connector(session: Session, *, connector: Connector, public_b
             deployment = lock_for_assignment(session, connector, deployment)
             if deployment is None:
                 return None
+            serialized = True
             held = awaiting_retry_offer(session, deployment)
 
     def refused(reason: str) -> None:
@@ -1250,9 +1251,9 @@ def assignment_for_connector(session: Session, *, connector: Connector, public_b
         from zk_add.ota_interruption import download_retry_hold
         if download_retry_hold(session, deployment, held):
             return None
-    elif not pending_offer:
-        # An interrupted download ADD already re-offered: the attempt limit
-        # and the resume window hold even when no heartbeat counted a stop.
+    elif serialized:
+        # An interrupted download ADD already re-offered: the grant bound and
+        # the resume window hold even when no heartbeat counted a stop.
         from zk_add.ota_interruption import resumed_attempt_refusal
         if resumed_attempt_refusal(session, connector, deployment):
             return None

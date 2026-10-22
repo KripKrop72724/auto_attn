@@ -389,11 +389,12 @@ def resumed_attempt_refusal(session: Session, connector: Connector, deployment: 
                             now: datetime | None = None) -> bool:
     """Fail closed, instead of granting, a poll for an interrupted download ADD already re-offered.
 
-    The caller passed every admission check and found no un-offered stop
+    The caller holds the connector and deployment locks (lock_for_assignment),
+    passed every admission check and found no un-offered stop
     (awaiting_retry_offer is None). 2.6.0-2.6.15 polls the assignment only
     while no attempt runs, so this poll means the latest resumed attempt
-    ended (or the ESP reset) before a heartbeat counted it: with the attempt
-    limit spent, the resume window closed or the switch off, the deployment
+    ended (or the ESP reset) before a heartbeat counted it: with the grant
+    bound reached, the resume window closed or the switch off, the deployment
     fails as a counted final stop would. False lets the caller grant it.
     """
     if deployment.status not in {"OFFERED", "DOWNLOADING"}:
@@ -410,19 +411,14 @@ def resumed_attempt_refusal(session: Session, connector: Connector, deployment: 
             reason = f"the {DOWNLOAD_RESUME_WINDOW_SECONDS // 60} min resume window after the first stop closed"
         if reason is None:
             return False
-    session.scalar(select(Connector.id).where(Connector.id == connector.id).with_for_update())
-    locked = session.scalar(select(FirmwareDeployment).where(FirmwareDeployment.id == deployment.id)
-                            .with_for_update().execution_options(populate_existing=True))
-    if locked is None or locked.status not in {"OFFERED", "DOWNLOADING"}:
-        return True  # it ended meanwhile; nothing to grant
     from zk_add.service import fail_ota_deployment
 
     message = (f"The resumable download stopped and the ESP asked for it again, but {reason}. The campaign is "
                "paused; check the site's network path to ADD before a new attempt." if code ==
                DOWNLOAD_RETRIES_EXHAUSTED else
                f"The resumable download stopped and ADD withdrew its re-offer: {reason}.")[:1000]
-    fail_ota_deployment(session, connector=connector, deployment=locked, error_code=code, error_message=message,
-                        runtime_state="DOWNLOADING")
+    fail_ota_deployment(session, connector=connector, deployment=deployment, error_code=code,
+                        error_message=message, runtime_state="DOWNLOADING")
     return True
 
 
