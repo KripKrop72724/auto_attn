@@ -34,17 +34,32 @@ preview mode.
   transport failures, and expired in-flight leases. Preview and approve a
   frozen batch; the worker queues each event through the existing one-row
   outbox contract.
-- **Missing outbox** counts only deliverable events without a delivery row.
-  The historical sweep rebuilds `PENDING`, `FAILED_RETRYABLE` and `RETRYING`
-  rows within one pass. An `IN_FLIGHT`, firmware-receipt or membership-check
-  event without a row stays missing until **Rebuild missing outbox** is
-  previewed and approved (it needs the preview and execution gates above), or
-  its loss is investigated. Identity holds
-  (`BLOCKED_IDENTITY`, `QUARANTINED_IDENTITY_REUSE`, `WAITING_FOR_SNAPSHOT`)
-  and review quarantines have no delivery row by design. The tile names them
-  as "held" and "for review" beside the count, not inside it, and turns amber
-  when any review row exists. A held count is ADD's queue, not Oracle: a
-  legacy terminal may already have posted the punch itself.
+- **Missing outbox** counts deliverable events without a delivery row, plus
+  held events that already have a Force release or Direct ORDS decision.
+  - The historical sweep rebuilds a `PENDING`, `FAILED_RETRYABLE` or
+    `RETRYING` row within one pass only when the event does not need manual
+    approval.
+  - An `IN_FLIGHT`, firmware-receipt or membership-check event without a row
+    stays missing until **Rebuild missing outbox** is previewed and approved
+    (it needs the preview and execution gates above), or its loss is
+    investigated.
+  - The sweep skips an event that needs manual approval, with or without a
+    decision, and **Rebuild missing outbox** skips one that has no approval.
+    Investigate such an event before any rebuild or release: Force release
+    and Direct ORDS create the row in the decision's own transaction, and no
+    code deletes outbox rows. The overview reports held events that have a
+    decision but no row as `decided_held_without_outbox` (expected 0).
+  - Identity holds without a decision (`BLOCKED_IDENTITY`,
+    `QUARANTINED_IDENTITY_REUSE`, `WAITING_FOR_SNAPSHOT`) and review
+    quarantines are not gaps. ZKT ingestion gives them no delivery row; other
+    held punches (Hikvision, journal, a ZKT punch that arrived with a firmware
+    receipt) keep a placeholder row and are not counted here at all.
+  - The tile names outbox-less holds as "held" and quarantines as "for review"
+    beside the count, not inside it. Only a real gap turns it amber; review
+    rows already turn **Source review** red.
+  - A held count is ADD's queue, not Oracle: a legacy terminal may already
+    have posted the punch, with or without a placeholder row. Only a read-only
+    `raw-captures/check` by `event_uid` settles whether Oracle has it.
 - **Identity held** is read-only. Exact terminal serial, UID, user ID,
   snapshot revision, active state, and authoritative CNIC evidence must agree
   before a held event can be reclassified into the safe lane. Name similarity
