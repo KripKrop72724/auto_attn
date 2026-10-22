@@ -1919,6 +1919,39 @@ def attendance_quarantine(
     )
 
 
+@app.get("/api/v1/attendance-batch-replays")
+def attendance_batch_replays(
+    auth: tuple[Session, AdminContext] = Depends(require_admin),
+):
+    """Attendance batch replays this API process has settled since it started."""
+    from zk_add.attendance_batches import (
+        REPLAY_LOG_INTERVAL_SECONDS,
+        attendance_batch_replay_metrics,
+    )
+
+    db, _context = auth
+    metrics = attendance_batch_replay_metrics()
+    names = dict(
+        db.execute(
+            select(Connector.connector_id, Connector.display_name).where(
+                Connector.connector_id.in_(list(metrics))
+            )
+        ).all()
+    ) if metrics else {}
+    return {
+        "scope": "PROCESS_SINCE_START",
+        "log_interval_seconds": int(REPLAY_LOG_INTERVAL_SECONDS),
+        "rows": [
+            {
+                "connector_id": connector_id,
+                "display_name": names.get(connector_id),
+                "counts": counts,
+            }
+            for connector_id, counts in sorted(metrics.items())
+        ],
+    }
+
+
 @app.post("/api/v1/attendance-quarantine/{item_id}/review")
 def review_attendance_quarantine_endpoint(
     item_id: int,
@@ -4028,7 +4061,9 @@ def persist_device_attendance(
     db, connector = auth
     settlement = settle_attendance_batch(db, connector=connector, payload=body)
     db.commit()
-    for event_uid in settlement.accepted_event_uids:
+    # A retry or replay repeats an earlier receipt and accepted nothing new.
+    accepted_now = () if settlement.duplicate_batch else settlement.accepted_event_uids
+    for event_uid in accepted_now:
         events.append(("attendance", {"connector_id": connector.connector_id, "event_uid": event_uid}))
     response = settlement.response()
 
@@ -4352,15 +4387,28 @@ async def device_stream(websocket: WebSocket):
     finally:
         try:
             await session.stop()
+            # A session superseded by the same ESP's newer socket must not mark
+            # the connector disconnected: the newer session is live, and the
+            # flag would otherwise read OFFLINE until its next message.
+            still_current = connector_hub.current(connector_id) is websocket
             await connector_hub.disconnect(connector_id, websocket)
-            try:
-                await asyncio.to_thread(set_stream_connected, connector_pk, False)
-            except Exception as exc:
-                logger.warning(
-                    "ADD device stream could not record its disconnection connector_id=%s error_type=%s",
-                    connector_id, type(exc).__name__,
-                )
-            await browser_events.publish("device", {"connector_id": connector_id, "connected": False})
+            if still_current:
+                try:
+                    await asyncio.to_thread(set_stream_connected, connector_pk, False)
+                    # The ESP may have registered its newer socket while this
+                    # write ran, and that socket's own connected write may have
+                    # committed first. Restore the flag for the live session.
+                    replaced = connector_hub.current(connector_id) is not None
+                    if replaced:
+                        await asyncio.to_thread(set_stream_connected, connector_pk, True)
+                except Exception as exc:
+                    replaced = False
+                    logger.warning(
+                        "ADD device stream could not record its disconnection connector_id=%s error_type=%s",
+                        connector_id, type(exc).__name__,
+                    )
+                if not replaced:
+                    await browser_events.publish("device", {"connector_id": connector_id, "connected": False})
         finally:
             # Even a cleanup cut short by cancellation reports the session.
             session.log_end()
@@ -4783,13 +4831,17 @@ def persist_envelope(connector_pk: int, envelope: Envelope) -> EnvelopeOutcome |
             settlement = settle_attendance_batch(
                 db, connector=connector, payload=envelope.payload
             )
+            # A retry or replay repeats an earlier receipt (its ACK carries
+            # that receipt's counts); this message settled no new rows.
+            repeated = settlement.duplicate_batch
             event_payload = {
                 "connector_id": connector.connector_id,
                 "receipt_id": settlement.receipt_id,
                 "outcome": settlement.outcome,
-                "accepted": settlement.accepted_count,
-                "duplicates": settlement.duplicate_count,
-                "quarantined": settlement.quarantined_count,
+                "accepted": 0 if repeated else settlement.accepted_count,
+                "duplicates": 0 if repeated else settlement.duplicate_count,
+                "quarantined": 0 if repeated else settlement.quarantined_count,
+                "duplicate_batch": repeated,
             }
             ack_payload = settlement.ack(
                 message_id=envelope.message_id, sequence=envelope.seq

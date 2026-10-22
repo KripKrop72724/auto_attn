@@ -114,6 +114,8 @@ POLICY = {
         102, False, "POSITIVE", "Clears when the terminal clock is within two minutes of trusted time."),
     "HIK_CLOCK_DRIFT": Policy(
         102, False, "POSITIVE", "Clears when the terminal clock is within two minutes of trusted time."),
+    "ESP_CLOCK_SKEW": Policy(
+        102, False, "POSITIVE", "Clears when the ESP's heartbeat clock is within two minutes of ADD time."),
     "USER_SNAPSHOT_TRUNCATED": Policy(
         103, False, "LATCHED", "Clears when a complete, stable user snapshot is received."),
     "HISTORY_BACKFILL_BLOCKED": Policy(
