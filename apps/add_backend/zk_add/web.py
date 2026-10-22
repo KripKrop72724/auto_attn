@@ -37,6 +37,7 @@ from zk_add import APP_VERSION
 from zk_add.hil_transport import TransportInterrupted, enforce_transport
 from zk_add import attendance_force_release as force_release
 from zk_add import attendance_direct_ords as direct_ords
+from zk_add import checkin_notify
 from zk_add import source_newest_slot as newest_slot
 from zk_add.attendance_cnic_link import cnic_not_linked_expression
 from zk_add.attendance_force_schemas import ForceCheckRequest, ForceStartRequest, ForceControlRequest, UserRefreshRequest
@@ -51,7 +52,9 @@ from zk_add.attendance_batches import (
     review_attendance_quarantine,
     settle_attendance_batch,
 )
-from zk_add.queue_evidence import QueueEvidenceRequest, evidence_ack, preserve_queue_evidence
+from zk_add.queue_evidence import (
+    QueueEvidenceRequest, evidence_ack, held_record, preserve_queue_evidence, refused_copy,
+)
 from zk_add.models import QueueEvidence
 from zk_add.crypto import decrypt_json
 from zk_add.crypto import cnic_lookup, decrypt_cnic, decrypt_text, mask_cnic, normalize_cnic
@@ -66,6 +69,7 @@ from zk_add.db import SessionLocal, init_db, session_scope
 from zk_add.device_session import DeviceStreamSession
 from zk_add.models import (
     AdminSession,
+    AttendanceCheckinNotification,
     AttendanceEvent,
     AttendanceRecoveryJob,
     Connector,
@@ -198,6 +202,7 @@ from zk_add.comm_keys import (
     serialize_operation as serialize_comm_key_operation,
 )
 from zk_add.worker import maintenance_loop, ords_delivery_metrics
+from zk_add.ords_outbox_coverage import ords_outbox_coverage
 from zk_add.attendance_repair import attendance_release_states, repair_worker_metrics
 from zk_add.attendance_recovery import (
     RecoveryError,
@@ -215,6 +220,8 @@ from zk_add.attendance_recovery import (
 )
 from zk_add.time_utils import ensure_utc, parse_datetime, utc_now
 from zk_add.reconciliation import (
+    SOURCE_TAIL_STALE_GENERATION,
+    coverage_authority_payload,
     source_epoch_uuid,
     apply_reconciliation_assignment_release,
     apply_reconciliation_anchor,
@@ -231,7 +238,6 @@ from zk_add.reconciliation import (
     refresh_reconciliations_for_source_exception,
     serialize_job,
     serialize_coverage,
-    source_coverage_payload,
     source_exception_assurance,
 )
 from zk_add.source_exceptions import (
@@ -240,6 +246,11 @@ from zk_add.source_exceptions import (
     reveal_source_exception,
     review_source_exception,
     source_exception_detail,
+)
+from zk_add.source_tail_authority import (
+    active_coverage_push,
+    inactive_coverage_push,
+    refuse_tail_without_authority,
 )
 
 
@@ -575,9 +586,12 @@ def session_info(auth: tuple[Session, AdminContext] = Depends(require_admin)):
 def overview(auth: tuple[Session, AdminContext] = Depends(require_admin)):
     db, _context = auth
     result = fleet_counts(db)
-    result["ords_delivery"] = ords_delivery_metrics(db)
+    # Both summaries report the same anti-join; run it once per request.
+    coverage = ords_outbox_coverage(db)
+    result["ords_delivery"] = ords_delivery_metrics(db, outbox_coverage=coverage)
     result["attendance_repair"] = repair_worker_metrics(db)
-    result["attendance_recovery"] = recovery_summary(db)
+    result["attendance_recovery"] = recovery_summary(db, outbox_coverage=coverage)
+    result["checkin_notifications"] = checkin_notify.overview(db)
     return result
 
 
@@ -1908,6 +1922,39 @@ def attendance_quarantine(
         cursor=cursor,
         limit=limit,
     )
+
+
+@app.get("/api/v1/attendance-batch-replays")
+def attendance_batch_replays(
+    auth: tuple[Session, AdminContext] = Depends(require_admin),
+):
+    """Attendance batch replays this API process has settled since it started."""
+    from zk_add.attendance_batches import (
+        REPLAY_LOG_INTERVAL_SECONDS,
+        attendance_batch_replay_metrics,
+    )
+
+    db, _context = auth
+    metrics = attendance_batch_replay_metrics()
+    names = dict(
+        db.execute(
+            select(Connector.connector_id, Connector.display_name).where(
+                Connector.connector_id.in_(list(metrics))
+            )
+        ).all()
+    ) if metrics else {}
+    return {
+        "scope": "PROCESS_SINCE_START",
+        "log_interval_seconds": int(REPLAY_LOG_INTERVAL_SECONDS),
+        "rows": [
+            {
+                "connector_id": connector_id,
+                "display_name": names.get(connector_id),
+                "counts": counts,
+            }
+            for connector_id, counts in sorted(metrics.items())
+        ],
+    }
 
 
 @app.post("/api/v1/attendance-quarantine/{item_id}/review")
@@ -3378,6 +3425,7 @@ def attendance(
     clock_quality: str | None = None,
     forced: bool = False,
     ords_status: list[str] = Query(default=[]),
+    notify_status: list[str] = Query(default=[]),
     cnic_present: bool | None = None,
     from_time: str | None = None,
     to_time: str | None = None,
@@ -3428,6 +3476,13 @@ def attendance(
                 AttendanceEvent.cnic_encrypted == "",
             )
         )
+    if notify_status:
+        if not set(notify_status) <= set(checkin_notify.PILL_FILTERS):
+            raise HTTPException(status_code=422, detail="Select valid phone notification statuses.")
+        statement = statement.outerjoin(
+            AttendanceCheckinNotification,
+            AttendanceCheckinNotification.attendance_event_id == AttendanceEvent.id,
+        ).where(checkin_notify.filter_condition(sorted(set(notify_status))))
     if ords_status:
         stored_statuses = set(ords_status) - {"CNIC_NOT_LINKED"}
         selected_states = [AttendanceEvent.ords_status.in_(stored_statuses)]
@@ -3459,6 +3514,7 @@ def attendance(
     release_states = attendance_release_states(db, page_rows)
     force_metadata = force_release.metadata_for_page(db, page_rows)
     direct_ords_identity = direct_ords.identity_hints_for_page(db, page_rows)
+    notifications = checkin_notify.pills_for_page(db, page_rows)
     return {
         "rows": [
             {
@@ -3470,14 +3526,64 @@ def attendance(
                 "force_release": force_metadata.get(row.id),
                 "direct_ords_identity": direct_ords_identity.get(row.id),
                 "cnic_not_linked": bool(results[index][1]),
+                "checkin_notification": notifications.get(row.id),
             }
             for index, row in enumerate(page_rows)
         ],
         "next_cursor": next_cursor,
+        # A compact summary for the first page; older pages do not repeat it.
+        "checkin_notifications": None if cursor else checkin_notify.overview(db),
         "status_options": db.scalars(
             select(AttendanceEvent.ords_status).distinct().order_by(AttendanceEvent.ords_status).limit(100)
         ).all() + ["CNIC_NOT_LINKED"],
     }
+
+
+@app.get("/api/v1/checkin-notifications")
+def checkin_notification_settings(auth: tuple[Session, AdminContext] = Depends(require_admin)):
+    """Mode, pilot allowlist, health and 24-hour counts of check-in notifications."""
+    db, _context = auth
+    return checkin_notify.describe_control(db)
+
+
+@app.put("/api/v1/checkin-notifications/settings")
+def update_checkin_notification_settings(
+    request: Request,
+    body: checkin_notify.CheckinNotifySettingsRequest,
+    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+):
+    """Switch OFF / PILOT / ALL at runtime; password step-up and audited."""
+    db, context = auth
+    require_step_up(body.password.get_secret_value(), db, context)
+    try:
+        result = checkin_notify.update_control(
+            db, body, actor=context.username, ip_address=client_ip(request)
+        )
+    except checkin_notify.CheckinNotifyError as error:
+        raise HTTPException(status_code=error.status, detail=error.detail) from error
+    db.commit()
+    return result
+
+
+@app.post("/api/v1/attendance/{event_id}/checkin-notification/retry")
+def retry_checkin_notification(
+    request: Request,
+    event_id: int,
+    body: checkin_notify.CheckinNotifyRetryRequest,
+    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+):
+    """Queue one failed notification again; password step-up and audited."""
+    db, context = auth
+    require_step_up(body.password.get_secret_value(), db, context)
+    try:
+        result = checkin_notify.retry_notification(
+            db, event_id=event_id, actor=context.username, reason=body.reason,
+            ip_address=client_ip(request),
+        )
+    except checkin_notify.CheckinNotifyError as error:
+        raise HTTPException(status_code=error.status, detail=error.detail) from error
+    db.commit()
+    return {"checkin_notification": result}
 
 
 @app.get("/api/v1/devices/{connector_id}/logs")
@@ -3962,7 +4068,9 @@ def persist_device_attendance(
     db, connector = auth
     settlement = settle_attendance_batch(db, connector=connector, payload=body)
     db.commit()
-    for event_uid in settlement.accepted_event_uids:
+    # A retry or replay repeats an earlier receipt and accepted nothing new.
+    accepted_now = () if settlement.duplicate_batch else settlement.accepted_event_uids
+    for event_uid in accepted_now:
         events.append(("attendance", {"connector_id": connector.connector_id, "event_uid": event_uid}))
     response = settlement.response()
 
@@ -4290,15 +4398,28 @@ async def device_stream(websocket: WebSocket):
     finally:
         try:
             await session.stop()
+            # A session superseded by the same ESP's newer socket must not mark
+            # the connector disconnected: the newer session is live, and the
+            # flag would otherwise read OFFLINE until its next message.
+            still_current = connector_hub.current(connector_id) is websocket
             await connector_hub.disconnect(connector_id, websocket)
-            try:
-                await asyncio.to_thread(set_stream_connected, connector_pk, False)
-            except Exception as exc:
-                logger.warning(
-                    "ADD device stream could not record its disconnection connector_id=%s error_type=%s",
-                    connector_id, type(exc).__name__,
-                )
-            await browser_events.publish("device", {"connector_id": connector_id, "connected": False})
+            if still_current:
+                try:
+                    await asyncio.to_thread(set_stream_connected, connector_pk, False)
+                    # The ESP may have registered its newer socket while this
+                    # write ran, and that socket's own connected write may have
+                    # committed first. Restore the flag for the live session.
+                    replaced = connector_hub.current(connector_id) is not None
+                    if replaced:
+                        await asyncio.to_thread(set_stream_connected, connector_pk, True)
+                except Exception as exc:
+                    replaced = False
+                    logger.warning(
+                        "ADD device stream could not record its disconnection connector_id=%s error_type=%s",
+                        connector_id, type(exc).__name__,
+                    )
+                if not replaced:
+                    await browser_events.publish("device", {"connector_id": connector_id, "connected": False})
         finally:
             # Even a cleanup cut short by cancellation reports the session.
             session.log_end()
@@ -4352,6 +4473,7 @@ async def open_device_stream(session: DeviceStreamSession, connector_pk: int, co
             if not session.should_stop():
                 await session.close(1011, "Source coverage delivery failed")
             return False
+        session.coverage_push_outstanding = True
     try:
         await send_pending_commands(connector_id, only_to=session.websocket)
     except Exception as exc:
@@ -4539,13 +4661,17 @@ def record_envelope_rejection(connector_pk: int, envelope: Envelope, error: Exce
     from zk_add.rejection import rejection_category, rejection_reason, rejection_site
 
     category = rejection_category(error)
-    # Field locations only: rejected values can carry attendance or credentials.
-    error_paths = [".".join(str(part) for part in row.get("loc", ()))[:120]
-                   for row in error.errors(include_input=False, include_url=False)[:5]
-                   ] if isinstance(error, ValidationError) else []
+    # Field locations and pydantic error types only: rejected values can carry
+    # attendance or credentials, and neither of these ever includes one.
+    schema_errors = error.errors(include_input=False, include_url=False)[:5] \
+        if isinstance(error, ValidationError) else []
+    error_paths = [".".join(str(part) for part in row.get("loc", ()))[:120] for row in schema_errors]
+    error_types = [str(row.get("type"))[:80] for row in schema_errors]
     # A bounded code and the ADD code location, never the message or payload.
     error_reason = rejection_reason(error)
     error_site = rejection_site(error) if error_reason is not None else None
+    # Which custody record was refused, so its later acceptance can be proven.
+    evidence = refused_copy(envelope.payload) if envelope.type == "queue_evidence" else None
     with session_scope() as db:
         connector = db.scalar(select(Connector).where(Connector.id == connector_pk).with_for_update())
         if connector is None:
@@ -4553,13 +4679,18 @@ def record_envelope_rejection(connector_pk: int, envelope: Envelope, error: Exce
         alert = record_message_rejection(
             db, connector, message_type=envelope.type, category=category, error_type=error_type,
             error_paths=error_paths, request_id=envelope.message_id, boot_id=envelope.boot_id,
-            error_reason=error_reason, error_site=error_site)
+            error_reason=error_reason, error_site=error_site, error_types=error_types, evidence=evidence)
         if settings.device_health_derived_enabled:
             apply_device_health(db, connector, source="REJECTION")
-        else:
+        elif alert.state == "OPEN":
             connector.lifecycle_state = "DEGRADED"
             connector.last_error_code = alert.code
             connector.last_error_message = alert.message
+        elif connector.last_error_code == alert.code:
+            # A refused copy ADD already held closed its alert at once.
+            connector.lifecycle_state = "ONLINE"
+            connector.last_error_code = None
+            connector.last_error_message = None
         ingest_logs(
             db,
             connector=connector,
@@ -4573,9 +4704,10 @@ def record_envelope_rejection(connector_pk: int, envelope: Envelope, error: Exce
                     message=alert.message,
                     context={"message_type": envelope.type, "error_type": error_type,
                              "request_id": envelope.message_id, "error_category": category,
-                             "error_paths": error_paths,
+                             "error_paths": error_paths, "error_types": error_types,
                              **({"error_reason": error_reason, "error_site": error_site}
-                                if error_reason is not None else {})},
+                                if error_reason is not None else {}),
+                             **({"evidence": evidence} if evidence is not None else {})},
                     device_time=envelope.sent_at,
                 )
             ],
@@ -4589,6 +4721,11 @@ class EnvelopeOutcome:
     commands_for: str | None = None
     coverage: dict | None = None
     provisioning: dict | None = None
+    # Sent before the ACK (send_coverage_before_ack). coverage_before_ack is a
+    # tail answer's own push; ack_coverage is ADD's coverage as of a positive
+    # tail or manifest ACK, sent only to a stream session that still owes one.
+    coverage_before_ack: dict | None = None
+    ack_coverage: dict | None = None
 
 
 def persist_envelope(connector_pk: int, envelope: Envelope) -> EnvelopeOutcome | None:
@@ -4596,9 +4733,13 @@ def persist_envelope(connector_pk: int, envelope: Envelope) -> EnvelopeOutcome |
     provisioning_payload = None
     event_payload = None
     ack_payload = None
+    held_evidence = None
     authoritative_coverage_payload = None
+    coverage_before_ack_payload = None
+    ack_coverage_payload = None
     send_commands_after_ack = False
     connector_id_to_flush = None
+    stale_generation_tail = False
     with session_scope() as db:
         # Separate sockets may overlap during reconnect. Serialize sequence checks
         # and acceptance for the same connector before acknowledging either socket.
@@ -4701,13 +4842,17 @@ def persist_envelope(connector_pk: int, envelope: Envelope) -> EnvelopeOutcome |
             settlement = settle_attendance_batch(
                 db, connector=connector, payload=envelope.payload
             )
+            # A retry or replay repeats an earlier receipt (its ACK carries
+            # that receipt's counts); this message settled no new rows.
+            repeated = settlement.duplicate_batch
             event_payload = {
                 "connector_id": connector.connector_id,
                 "receipt_id": settlement.receipt_id,
                 "outcome": settlement.outcome,
-                "accepted": settlement.accepted_count,
-                "duplicates": settlement.duplicate_count,
-                "quarantined": settlement.quarantined_count,
+                "accepted": 0 if repeated else settlement.accepted_count,
+                "duplicates": 0 if repeated else settlement.duplicate_count,
+                "quarantined": 0 if repeated else settlement.quarantined_count,
+                "duplicate_batch": repeated,
             }
             ack_payload = settlement.ack(
                 message_id=envelope.message_id, sequence=envelope.seq
@@ -4731,6 +4876,7 @@ def persist_envelope(connector_pk: int, envelope: Envelope) -> EnvelopeOutcome |
             evidence = preserve_queue_evidence(
                 db, connector, QueueEvidenceRequest.model_validate(envelope.payload)
             )
+            held_evidence = held_record(evidence)
             ack_payload = evidence_ack(evidence, connector, envelope.message_id)
             event_payload = {"connector_id": connector.connector_id,
                              "receipt_id": evidence.receipt_id, "disposition": evidence.disposition}
@@ -4867,6 +5013,12 @@ def persist_envelope(connector_pk: int, envelope: Envelope) -> EnvelopeOutcome |
                 "status": job.status,
                 "capture_certificate": job.capture_certificate or None,
             }
+            if ack_payload["type"] == "reconcile_manifest_ack":
+                # The reader installs this certificate on the ACK, then applies
+                # whatever push it queued meanwhile (send_coverage_before_ack).
+                certified = active_coverage(db, connector.zkt_device)
+                if certified is not None:
+                    ack_coverage_payload = active_coverage_push(db, certified)
         elif envelope.type == "source_probe_result":
             probe = SourceProbeResultRequest.model_validate(envelope.payload)
             job = apply_source_probe_result(db, connector=connector, payload=probe)
@@ -4902,6 +5054,18 @@ def persist_envelope(connector_pk: int, envelope: Envelope) -> EnvelopeOutcome |
                     "source_committed_chain_digest": "0" * 64,
                     "active": False,
                 }
+        elif envelope.type == "source_tail_chunk" and (
+            tail_refusal := refuse_tail_without_authority(db, connector=connector, envelope=envelope)
+        ) is not None:
+            # The ESP is extending a certificate ADD no longer holds, or holds
+            # under another epoch. A plain rejection would leave its state
+            # unchanged and it would resend the same range every interval.
+            # The refusal committed no evidence, so it clears no rejection.
+            return EnvelopeOutcome(
+                ack=tail_refusal.ack,
+                event=tail_refusal.event,
+                coverage_before_ack=tail_refusal.coverage,
+            )
         elif envelope.type == "source_tail_chunk":
             tail = SourceTailChunkRequest.model_validate(envelope.payload)
             coverage, chunk, duplicate, error_code = apply_source_tail_chunk(
@@ -4909,6 +5073,14 @@ def persist_envelope(connector_pk: int, envelope: Envelope) -> EnvelopeOutcome |
                 connector=connector,
                 payload=tail,
             )
+            if error_code and not coverage.active:
+                # This tail just invalidated the certificate it extended. The
+                # ESP drops its certificate only on a coverage push.
+                coverage_before_ack_payload = inactive_coverage_push(
+                    connector, terminal_serial=tail.terminal_serial
+                )
+            elif error_code is None and coverage.active:
+                ack_coverage_payload = active_coverage_push(db, coverage)
             event_payload = {
                 "connector_id": connector.connector_id,
                 "coverage_id": coverage.coverage_id,
@@ -4939,21 +5111,36 @@ def persist_envelope(connector_pk: int, envelope: Envelope) -> EnvelopeOutcome |
                 "exception_count": chunk.exception_count if chunk is not None else 0,
                 "raw_preserved_count": chunk.raw_preserved_count if chunk is not None else 0,
             }
-            if error_code == newest_slot.REPLAY_SUPERSEDED_CODE:
-                # A rewound reader resumes from ADD's unchanged committed cursor,
-                # in the same push a manifest handoff already sends every generation.
-                authoritative_coverage_payload = source_coverage_payload(db, coverage)
+            if error_code == SOURCE_TAIL_STALE_GENERATION:
+                # The device tails a retired generation. Its message is not a
+                # rejection (no DEGRADED, no last_error_code): it needs ADD's
+                # current coverage, exactly like the manifest authority path.
+                authoritative_coverage_payload = coverage_authority_payload(db, coverage)
+                stale_generation_tail = True
+            elif error_code == newest_slot.REPLAY_SUPERSEDED_CODE:
+                # A rewound reader replayed committed ordinals and differed only
+                # in newest-slot reads. Like a refused stale epoch, it resumes
+                # from ADD's unchanged committed cursor: the push goes before
+                # the error ACK so the reader applies it before its next tail.
+                # Its replay committed no tail evidence, so it clears nothing.
+                coverage_before_ack_payload = active_coverage_push(db, coverage)
+                stale_generation_tail = True
         else:
             event_payload = {"connector_id": connector.connector_id, "type": envelope.type}
         # The same transaction that accepted the message clears its type's
         # rejection; a replayed duplicate returned above proves nothing new.
-        resolve_message_rejection(db, connector, message_type=envelope.type)
+        # A stale-generation tail committed nothing, so it clears nothing.
+        # A refused queue_evidence clears only when this holds that record.
+        if not stale_generation_tail:
+            resolve_message_rejection(db, connector, message_type=envelope.type, evidence=held_evidence)
     return EnvelopeOutcome(
         ack=ack_payload or {"type": "ack", "message_id": envelope.message_id, "seq": envelope.seq},
         event=event_payload or {},
         commands_for=connector_id_to_flush if send_commands_after_ack else None,
         coverage=authoritative_coverage_payload,
         provisioning=provisioning_payload,
+        coverage_before_ack=coverage_before_ack_payload,
+        ack_coverage=ack_coverage_payload,
     )
 
 
@@ -4978,8 +5165,53 @@ async def accept_envelope(
         return None
     # The worker returns only after commit. No acknowledgement or browser success
     # can escape a failed transaction; reconnects replay the unacknowledged input.
+    await send_coverage_before_ack(envelope, outcome, websocket)
     await websocket.send_json(outcome.ack)
     return outcome
+
+
+async def send_coverage_before_ack(
+    envelope: Envelope,
+    outcome: EnvelopeOutcome,
+    websocket: WebSocket | DeviceStreamSession,
+) -> None:
+    """Put ADD's source coverage in the reader's queue before its ACK releases the waiting step.
+
+    Every Zone Lite generation keeps source_coverage pushes in a queue of one
+    (xQueueOverwrite) and applies the queued push only at the top of its main
+    loop, after the tail or manifest step that waits for this ACK returns. A
+    push sent while the reader waited (a connect bootstrap's, when the tail or
+    manifest was sent during the bootstrap) would otherwise be applied after
+    the ACK and step the reader back to the older cursor it carries ("Local
+    tail cursor was ahead of ADD"); its next tail then resends a committed
+    range. PESHAWAR-06 and SLICTOWER-3FL logged that step back before they
+    lost their coverage. The reader handles frames in order, so a push sent
+    first replaces the queued one before the ACK can release the step,
+    however the link delays either frame. Both pushes are ADD's committed
+    state after the commit the ACK reports: they certify nothing.
+    """
+    stream = isinstance(websocket, DeviceStreamSession)
+    if outcome.coverage_before_ack is not None:
+        push, owed = outcome.coverage_before_ack, True
+    elif outcome.ack_coverage is not None and stream and websocket.coverage_push_outstanding:
+        push, owed = outcome.ack_coverage, False
+    else:
+        return
+    try:
+        sent = await websocket.send_json(push)
+    except Exception as exc:
+        # The message is committed: its ACK must still go out and must never
+        # be answered as a rejection. The reader keeps its own cursor.
+        logger.error(
+            "ADD could not send source coverage before an ACK connector_id=%s "
+            "type=%s message_id=%s error_type=%s",
+            envelope.connector_id, envelope.type, envelope.message_id, type(exc).__name__,
+        )
+        return
+    if stream and sent is not False:
+        # A tail answer's own push is conservatively treated as still owed, so
+        # the next positive ACK repeats ADD's coverage once more.
+        websocket.coverage_push_outstanding = owed
 
 
 async def send_envelope_follow_ups(
@@ -4993,7 +5225,11 @@ async def send_envelope_follow_ups(
     if outcome.commands_for:
         await send_pending_commands(outcome.commands_for, only_to=only_to)
     if outcome.coverage is not None:
-        await websocket.send_json(outcome.coverage)
+        sent = await websocket.send_json(outcome.coverage)
+        if sent is not False and isinstance(websocket, DeviceStreamSession):
+            # It may sit in the reader's queue while a later tail or manifest
+            # waits for its ACK: see send_coverage_before_ack.
+            websocket.coverage_push_outstanding = True
     await publish_envelope_events(envelope, outcome)
 
 

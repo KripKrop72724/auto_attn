@@ -26,6 +26,7 @@ import { AnchoredLayer } from '../AnchoredLayer'
 import { AttendanceRecovery } from './AttendanceRecovery'
 import type {
   Device,
+  HikvisionHistoryScope,
   ReconciliationDivergenceDetail,
   ReconciliationDivergenceReveal,
   ReconciliationJob,
@@ -1276,7 +1277,7 @@ export function ReconciliationView({
   const [preflightLoading, setPreflightLoading] = useState(false)
   const [preflightError, setPreflightError] = useState('')
   const [dialog, setDialog] = useState<ReconciliationDialogState>(null)
-  const [historyScope, setHistoryScope] = useState<'ACTIVE_USERS' | 'ALL_RECORDS'>('ACTIVE_USERS')
+  const [historyScope, setHistoryScope] = useState<HikvisionHistoryScope>('ACTIVE_USERS')
   const [jobDrawer, setJobDrawer] = useState<ReconciliationJob | null>(null)
   const jobDrawerReturnFocusRef = useRef<HTMLButtonElement>(null)
   const [divergenceDrawerId, setDivergenceDrawerId] = useState<string | null>(
@@ -1594,7 +1595,9 @@ export function ReconciliationView({
       toast.notice(
         selected.firmware_family === 'hikvision' && historyScope === 'ACTIVE_USERS'
           ? 'Active-user history queued. ADD freezes the current user list and preserves resumable checkpoints.'
-          : 'Full terminal reconciliation queued. ADD now owns its checkpoint.',
+          : selected.firmware_family === 'hikvision' && historyScope === 'RECENT_TAIL'
+            ? 'Recent-tail recovery queued. ADD resumes from its last held serial and keeps following new punches.'
+            : 'Full terminal reconciliation queued. ADD now owns its checkpoint.',
       )
       await loadJobs({ quiet: true })
     } catch (error) {
@@ -1639,11 +1642,14 @@ export function ReconciliationView({
 
   const isHikvision = selected?.firmware_family === 'hikvision'
   const activeUsersOnly = isHikvision && historyScope === 'ACTIVE_USERS'
-  const startConfirmation = `RECONCILE ${selected?.device_id} ${activeUsersOnly ? 'ACTIVE USERS' : 'FROM START'}`
+  const recentTail = isHikvision && historyScope === 'RECENT_TAIL'
+  const startConfirmation = `RECONCILE ${selected?.device_id} ${
+    activeUsersOnly ? 'ACTIVE USERS' : recentTail ? 'RECENT TAIL' : 'FROM START'}`
   const canOpenStart = Boolean(selected && enabled && preflight?.eligible)
   const canStart = Boolean(
     canOpenStart &&
       (!activeUsersOnly || preflight?.active_user_history?.eligible !== false) &&
+      (!recentTail || preflight?.recent_tail?.eligible === true) &&
       reason.trim().length >= 10 &&
       password &&
       confirmation === startConfirmation,
@@ -2064,7 +2070,9 @@ export function ReconciliationView({
             <div className="reconciliation-job-list" aria-live="polite">
               {rows.map((job) => {
                 const cutoff = job.terminal.cutoff_count || 0
-                const capturePercent = job.scope === 'ACTIVE_USERS' && job.active_user_scope?.user_count
+                const capturePercent = job.scope === 'RECENT_TAIL'
+                  ? job.recent_tail?.caught_up ? 100 : 0
+                  : job.scope === 'ACTIVE_USERS' && job.active_user_scope?.user_count
                   ? job.capture_certified_at ? 100 : Math.min(99, Math.round(100 * job.active_user_scope.completed_users / job.active_user_scope.user_count))
                   : cutoff ? Math.min(
                       100,
@@ -2123,7 +2131,9 @@ export function ReconciliationView({
                         <h3>{job.connector?.display_name || job.job_id}</h3>
                         {job.mode === 'HIKVISION_SERIAL_HISTORY' && <p>{job.scope === 'ACTIVE_USERS'
                           ? `Active-user history · ${job.active_user_scope?.completed_users ?? 0}/${job.active_user_scope?.user_count ?? 0} users verified · excludes former users`
-                          : 'Full terminal audit · all records'}</p>}
+                          : job.scope === 'RECENT_TAIL'
+                            ? `Recent tail · from serial ${job.recent_tail?.begin_serial ?? '?'} · last ${job.recent_tail?.last_serial ?? 'pending'} · ${job.recent_tail?.records ?? 0} new records after serial ${job.recent_tail?.anchor_serial ?? '?'} · ${job.recent_tail?.overlap_records ?? 0} held records re-read${job.recent_tail?.fact_conflicts ? ` · ${job.recent_tail.fact_conflicts} changed serials held for review` : ''} · no coverage certificate`
+                            : 'Full terminal audit · all records'}</p>}
                         <small>
                           {job.terminal.serial || 'serial pending'} · requested{' '}
                           {dateTime(job.requested_at)}
@@ -2852,18 +2862,24 @@ export function ReconciliationView({
               <label>
                 History scope
                 <select value={historyScope} onChange={(event) => {
-                  setHistoryScope(event.target.value as 'ACTIVE_USERS' | 'ALL_RECORDS')
+                  setHistoryScope(event.target.value as HikvisionHistoryScope)
                   setConfirmation('')
                 }}>
                   <option value="ACTIVE_USERS">Active users — all retained history (recommended)</option>
                   <option value="ALL_RECORDS">Full terminal audit — all records</option>
+                  <option value="RECENT_TAIL">Recent tail — resume after the last held punch and keep following</option>
                 </select>
+                {recentTail && preflight?.recent_tail && <p>{preflight.recent_tail.eligible
+                  ? `Resumes at terminal serial ${preflight.recent_tail.begin_serial} (re-reads up to serial ${preflight.recent_tail.anchor_serial}, the resume point: the last serial before the newest break in ADD's ESP-poll records). It steps back further if those records changed.${preflight.recent_tail.earlier_breaks?.length ? ` ADD's poll records also break after serial${preflight.recent_tail.earlier_breaks.length === 1 ? '' : 's'} ${preflight.recent_tail.earlier_breaks.join(', ')}; only a full terminal audit covers those.` : ''}${preflight.recent_tail.ready_now === false ? ' Waiting for the terminal and ESP.' : ''}`
+                  : preflight.recent_tail.reason}</p>}
                 {activeUsersOnly && preflight?.active_user_history && <p>{preflight.active_user_history.eligible
                   ? `${preflight.active_user_history.user_count} active users in the verified snapshot.`
                   : preflight.active_user_history.reason}</p>}
                 <small>{activeUsersOnly
                   ? 'Freezes the current complete user snapshot. Searches only those employees’ retained history; former users are excluded. Refresh terminal users first if the snapshot is older than 15 minutes. No records are deleted.'
-                  : 'Scans all retained terminal records, including former users and non-attendance events.'}</small>
+                  : recentTail
+                    ? 'For a terminal whose own poll is blocked: reads every record after the resume point, then checks for new punches every 15 seconds until cancelled or the ESP poll is proven to work again. Re-read records that changed are held for review. It never certifies coverage, and while it runs no other reconciliation can start on this device.'
+                    : 'Scans all retained terminal records, including former users and non-attendance events.'}</small>
               </label>
             )}
             <label>

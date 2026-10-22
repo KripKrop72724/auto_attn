@@ -55,7 +55,8 @@ class ObservationIn(BaseModel):
         return value
 
 
-def preserve_observation(session: Session, connector: Connector, payload: ObservationIn) -> dict:
+def preserve_observation(session: Session, connector: Connector, payload: ObservationIn, *,
+                         delivery_type: str | None = None) -> dict:
     if connector.firmware_family != "hikvision":
         raise ValueError("FIRMWARE_FAMILY_MISMATCH")
     terminal = connector.zkt_device
@@ -78,7 +79,8 @@ def preserve_observation(session: Session, connector: Connector, payload: Observ
             except (SourceIdentityError, ProbeError, json.JSONDecodeError):
                 pass
             else:
-                deliver_observation(session, connector, existing, observation, data)
+                deliver_observation(session, connector, existing, observation, data,
+                                    delivery_type=delivery_type)
                 session.flush()
         return {"observation_sha256": payload.observation_sha256, "durable": True}
     observation = None
@@ -117,7 +119,8 @@ def preserve_observation(session: Session, connector: Connector, payload: Observ
     )
     session.add(evidence)
     session.flush()
-    deliver_observation(session, connector, evidence, observation, data, clock_sample=payload.clock_sample)
+    deliver_observation(session, connector, evidence, observation, data, clock_sample=payload.clock_sample,
+                        delivery_type=delivery_type)
     session.flush()
     # Caller sends this receipt only after the surrounding DB transaction commits.
     return {"observation_sha256": payload.observation_sha256, "durable": True}

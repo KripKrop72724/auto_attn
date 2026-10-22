@@ -542,7 +542,10 @@ def test_superseded_coverage_push_is_applied_by_every_firmware_generation(source
     assert outcome.ack["type"] == "error"
     assert outcome.ack["code"] == newest_slot.REPLAY_SUPERSEDED_CODE
     assert outcome.ack["committed_next_ordinal"] == 4
-    push = json.loads(json.dumps(outcome.coverage))
+    # The push goes before the error ACK (source_tail_authority), so the
+    # reader applies ADD's cursor before its next tail.
+    assert outcome.coverage is None
+    push = json.loads(json.dumps(outcome.coverage_before_ack))
     assert push["source_committed_cursor"] == 4
     assert push["source_committed_chain_digest"] == coverage.source_committed_chain_digest
 
@@ -565,10 +568,13 @@ def test_superseded_coverage_push_is_applied_by_every_firmware_generation(source
     assert 0 < len(push["terminal_serial"]) < 80
     assert number(push["terminal_generation"], 1) and number(push["source_committed_cursor"])
     assert all(char in "0123456789abcdef" for char in push["source_committed_chain_digest"])
-    # The same push a manifest handoff already sends to every generation.
+    # The same push a stale-epoch refusal and a manifest handoff already send
+    # to every generation.
+    from zk_add.source_tail_authority import active_coverage_push
     with factory() as db:
-        assert push == json.loads(json.dumps(service.source_coverage_payload(
-            db, db.get(ReconciliationCoverage, coverage.id))))
+        held = db.get(ReconciliationCoverage, coverage.id)
+        assert push == json.loads(json.dumps(active_coverage_push(db, held)))
+        assert push == json.loads(json.dumps(service.coverage_authority_payload(db, held)))
         connector_row = db.get(type(connector), connector.id)
         assert connector_row.lifecycle_state != "DEGRADED"
         assert db.scalar(select(TerminalRecordManifest.disposition).where(
