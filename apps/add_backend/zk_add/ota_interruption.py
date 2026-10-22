@@ -9,7 +9,9 @@ Nothing here reboots, re-installs or starts an attempt on its own:
   from its in-RAM byte count, after one from the journal's last 64 KiB
   checkpoint. ADD withholds that assignment (204) for a backoff, at most three
   download attempts within an hour of the first stop, and only while the
-  campaign stays ACTIVE and the release offerable. A third stop, a re-offer
+  campaign stays ACTIVE and the release offerable. Every grant after the first
+  stop counts as an attempt, so the limit holds even when no heartbeat counted
+  a stop before the ESP asked again. A third stop, a re-offer
   not taken within 15 minutes of its backoff, the closed window, an admission
   refusal, a pause, a cancel, a revoke or the switch turned off fails the
   deployment closed as before; the maintenance sweep does so for an ESP that
@@ -27,7 +29,9 @@ target with its own return evidence (the journal bridges, 2.7.0, the 2.6.24+
 recovery images and 2.7.6) keep the existing fail-closed path unchanged.
 
 Lock order, everywhere: connector, then deployment, then campaign (the
-WebSocket heartbeat locks its connector first).
+WebSocket heartbeat locks its connector first, record_progress and the HTTPS
+progress report lock it before the deployment). The assignment poll never
+waits for a row lock: it answers 204 instead.
 """
 from __future__ import annotations
 
@@ -36,6 +40,7 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from sqlalchemy import exists, func, select
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from zk_add.models import Connector, DeviceLog, DeviceTelemetry
@@ -65,6 +70,10 @@ RESUMABLE_RUNNING_VERSIONS = ((2, 6, 0), (2, 6, 15))
 OFFERABLE_RELEASE_STATES = frozenset({"AVAILABLE", "HIL_ONLY"})
 DOWNLOAD_ATTEMPT_LIMIT = 3
 DOWNLOAD_RETRY_BACKOFF_SECONDS = (120, 600)
+# Grants ADD issues after the first stop: the two resumed attempts, each
+# re-sent once when the ESP lost the assignment response. A hard bound that
+# holds even when no heartbeat counts a stop before the ESP asks again.
+RESUMED_GRANT_LIMIT = 2 * (DOWNLOAD_ATTEMPT_LIMIT - 1)
 # A re-offer the ESP has not taken this long after its backoff ended (HTTPS
 # failing while heartbeats arrive, an ESP that reset or went offline, or a
 # refusal ADD cannot name here) fails the deployment instead of holding the
@@ -144,6 +153,14 @@ def assignment_needs_serializing(connector: Connector, deployment: FirmwareDeplo
             and in_scope_version(deployment.previous_version))
 
 
+LOCK_NOT_AVAILABLE = "55P03"
+
+
+def _lock_not_available(error: OperationalError) -> bool:
+    original = getattr(error, "orig", None)
+    return (getattr(original, "sqlstate", None) or getattr(original, "pgcode", None)) == LOCK_NOT_AVAILABLE
+
+
 def lock_for_assignment(session: Session, connector: Connector,
                         deployment: FirmwareDeployment) -> FirmwareDeployment | None:
     """Lock the connector, then the deployment, and re-read both states.
@@ -152,11 +169,29 @@ def lock_for_assignment(session: Session, connector: Connector,
     grant and an interruption are never decided from each other's stale
     reads, and a pause, cancel or revoke that failed the held download first
     is seen here. None when the deployment or its campaign is no longer active.
+
+    Never waits: the poll runs on the event loop that serves every device
+    WebSocket and holds the fleet-wide assignment lock, so a row another
+    transaction holds (this ESP's own message, a campaign control) answers
+    204 at once and the ESP asks again on its next 60 s poll; a 204 leaves
+    its journal untouched.
     """
-    session.scalar(select(Connector).where(Connector.id == connector.id).with_for_update()
-                   .execution_options(populate_existing=True))
-    locked = session.scalar(select(FirmwareDeployment).where(FirmwareDeployment.id == deployment.id)
-                            .with_for_update().execution_options(populate_existing=True))
+    def lock() -> FirmwareDeployment | None:
+        session.scalar(select(Connector).where(Connector.id == connector.id).with_for_update(nowait=True)
+                       .execution_options(populate_existing=True))
+        return session.scalar(select(FirmwareDeployment).where(FirmwareDeployment.id == deployment.id)
+                              .with_for_update(nowait=True).execution_options(populate_existing=True))
+
+    if session.get_bind().dialect.name != "postgresql":
+        locked = lock()  # no row locks to wait for
+    else:
+        try:
+            with session.begin_nested():  # a refused lock rolls back only this savepoint
+                locked = lock()
+        except OperationalError as error:
+            if not _lock_not_available(error):
+                raise
+            return None
     if locked is None or locked.status not in ACTIVE_DEPLOYMENT_STATES:
         return None
     status = session.scalar(select(FirmwareCampaign.status).where(FirmwareCampaign.id == locked.campaign_id))
@@ -326,6 +361,71 @@ def awaiting_retry_offer(session: Session, deployment: FirmwareDeployment) -> Fi
     return None if granted is not None else latest
 
 
+def _first_interruption_at(session: Session, deployment: FirmwareDeployment) -> datetime | None:
+    first = session.scalar(select(func.min(FirmwareEvent.created_at)).where(
+        FirmwareEvent.deployment_id == deployment.id, FirmwareEvent.state == DOWNLOAD_INTERRUPTED))
+    return ensure_utc(first) if first is not None else None
+
+
+def _re_offers_spent(session: Session, deployment: FirmwareDeployment) -> str | None:
+    """Why ADD may grant this interrupted download no further attempt, or None.
+
+    Counts every grant issued after the first stop, whether or not a
+    heartbeat counted the previous attempt's stop before the ESP asked again,
+    so the bound holds without heartbeats too.
+    """
+    first = _first_interruption_at(session, deployment)
+    if first is None:
+        return None
+    granted = int(session.scalar(select(func.count(FirmwareDownloadGrant.id)).where(
+        FirmwareDownloadGrant.deployment_id == deployment.id, FirmwareDownloadGrant.created_at >= first)) or 0)
+    if granted >= RESUMED_GRANT_LIMIT:
+        return (f"ADD already issued the {RESUMED_GRANT_LIMIT} assignments allowed after the first stop (two "
+                "resumed attempts, each re-sent once)")
+    return None
+
+
+def resumed_attempt_refusal(session: Session, connector: Connector, deployment: FirmwareDeployment, *,
+                            now: datetime | None = None) -> bool:
+    """Fail closed, instead of granting, a poll for an interrupted download ADD already re-offered.
+
+    The caller passed every admission check and found no un-offered stop
+    (awaiting_retry_offer is None). 2.6.0-2.6.15 polls the assignment only
+    while no attempt runs, so this poll means the latest resumed attempt
+    ended (or the ESP reset) before a heartbeat counted it: with the attempt
+    limit spent, the resume window closed or the switch off, the deployment
+    fails as a counted final stop would. False lets the caller grant it.
+    """
+    if deployment.status not in {"OFFERED", "DOWNLOADING"}:
+        return False  # a downloaded, verified or booted attempt keeps its unchanged path
+    now = now or utc_now()
+    first = _first_interruption_at(session, deployment)
+    if first is None:
+        return False
+    if not resume_enabled():
+        reason, code = "download resume is turned off", DOWNLOAD_RETRY_WITHDRAWN
+    else:
+        reason, code = _re_offers_spent(session, deployment), DOWNLOAD_RETRIES_EXHAUSTED
+        if reason is None and now >= first + timedelta(seconds=DOWNLOAD_RESUME_WINDOW_SECONDS):
+            reason = f"the {DOWNLOAD_RESUME_WINDOW_SECONDS // 60} min resume window after the first stop closed"
+        if reason is None:
+            return False
+    session.scalar(select(Connector.id).where(Connector.id == connector.id).with_for_update())
+    locked = session.scalar(select(FirmwareDeployment).where(FirmwareDeployment.id == deployment.id)
+                            .with_for_update().execution_options(populate_existing=True))
+    if locked is None or locked.status not in {"OFFERED", "DOWNLOADING"}:
+        return True  # it ended meanwhile; nothing to grant
+    from zk_add.service import fail_ota_deployment
+
+    message = (f"The resumable download stopped and the ESP asked for it again, but {reason}. The campaign is "
+               "paused; check the site's network path to ADD before a new attempt." if code ==
+               DOWNLOAD_RETRIES_EXHAUSTED else
+               f"The resumable download stopped and ADD withdrew its re-offer: {reason}.")[:1000]
+    fail_ota_deployment(session, connector=connector, deployment=locked, error_code=code, error_message=message,
+                        runtime_state="DOWNLOADING")
+    return True
+
+
 def download_retry_hold(session: Session, deployment: FirmwareDeployment, latest: FirmwareEvent, *,
                         now: datetime | None = None) -> bool:
     """Withhold a held deployment's assignment, fail it closed, or record its one re-offer.
@@ -344,6 +444,10 @@ def download_retry_hold(session: Session, deployment: FirmwareDeployment, latest
         return True
     retry_after = _retry_after(latest)
     if now < retry_after:
+        return True
+    spent = _re_offers_spent(session, deployment)
+    if spent:
+        fail_held_download(session, deployment, reason=spent, error_code=DOWNLOAD_RETRIES_EXHAUSTED)
         return True
     details = latest.details or {}
     deployment.attempt_count += 1
@@ -376,6 +480,8 @@ def fail_held_download(session: Session, deployment: FirmwareDeployment, *, reas
             f"{details.get('bytes_written')} of {details.get('image_size')} bytes")
     message = (f"{stop} and {reason}. The campaign is paused; check the ESP's HTTPS path to ADD and its OTA "
                "admission before a new attempt." if error_code == DOWNLOAD_RETRY_NOT_TAKEN
+               else f"{stop} and {reason}. The campaign is paused; check the site's network path to ADD before "
+               "a new attempt." if error_code == DOWNLOAD_RETRIES_EXHAUSTED
                else f"{stop} and ADD withdrew its re-offer: {reason}.")[:1000]
     from zk_add.service import fail_ota_deployment
 
@@ -385,11 +491,18 @@ def fail_held_download(session: Session, deployment: FirmwareDeployment, *, reas
 
 
 def fail_held_downloads(session: Session, campaign_id: int, *, reason: str) -> int:
-    """Fail every held download of one campaign (pause, cancel, revoke)."""
+    """Fail every held download of one campaign (pause, cancel, revoke).
+
+    Only a deployment that is held on an unlocked read is locked (connector,
+    then deployment) and re-checked; every other attempt takes no row lock.
+    """
     rows = list(session.scalars(select(FirmwareDeployment).where(
         FirmwareDeployment.campaign_id == campaign_id,
-        FirmwareDeployment.status.in_(["OFFERED", "DOWNLOADING"])).order_by(FirmwareDeployment.id)))
-    return sum(1 for row in rows if fail_held_download(session, row, reason=reason))
+        FirmwareDeployment.status.in_(["OFFERED", "DOWNLOADING"]),
+        exists().where(FirmwareEvent.deployment_id == FirmwareDeployment.id,
+                       FirmwareEvent.state == DOWNLOAD_INTERRUPTED)).order_by(FirmwareDeployment.id)))
+    return sum(1 for row in rows
+               if awaiting_retry_offer(session, row) is not None and fail_held_download(session, row, reason=reason))
 
 
 def expire_held_downloads(session: Session, *, now: datetime | None = None,
@@ -521,6 +634,12 @@ def rollback_evidence(session: Session, *, connector: Connector, deployment: Fir
             "last_progress_state": last.state if last is not None else None,
             "last_progress_code": (last.details or {}).get("error_code") if last is not None else None,
             "progress_reports": len(booted),
+            # Any report of the boot, not only the last: a RUNTIME_HEALTHY
+            # ADD committed but the ESP never received is followed by WAITING
+            # again when health drops, and that boot was not interrupted early.
+            "reported_runtime_healthy": any((event.details or {}).get("error_code") == "RUNTIME_HEALTHY"
+                                            for event in booted),
+            "reported_reconciling": any(event.state == "RECONCILING" for event in booted),
             "estimated_lifetime_seconds": {
                 "min": round(lifetime_min) if lifetime_min is not None and lifetime_min >= 0 else None,
                 "max": round(lifetime_max) if lifetime_max is not None and lifetime_max >= 0 else None,
@@ -568,9 +687,9 @@ def classify_return(deployment: FirmwareDeployment, release: FirmwareRelease | N
         # 2.4.12 and 2.5.2 write through plain SPIFFS after a torn first boot
         # (owner decision 6); 2.6.16+ and 2.7.x report their own returns.
         reasons.append("PREVIOUS_FIRMWARE_OUT_OF_SCOPE")
-    if deployment.status != "BOOTED_PENDING":
+    if deployment.status != "BOOTED_PENDING" or target.get("reported_reconciling"):
         reasons.append("TARGET_REPORTED_CONFIRMATION")
-    if target["last_progress_code"] == "RUNTIME_HEALTHY":
+    if target["last_progress_code"] == "RUNTIME_HEALTHY" or target.get("reported_runtime_healthy"):
         reasons.append("TARGET_REPORTED_RUNTIME_HEALTHY")
     if target["failure_reports"]:
         reasons.append("TARGET_REPORTED_FAILURE")
@@ -718,10 +837,14 @@ def refreshed_diagnosis(session: Session, deployment: FirmwareDeployment, *, now
         return None
     resets = stored.get("previous_firmware_resets")
     location = stored.get("location_resets")
+    if not isinstance(resets, dict):
+        # No stored evidence (EVIDENCE_UNAVAILABLE): a detail view never runs
+        # the 7-day reset scan, so it shows what was stored.
+        return stored
     try:
         evidence = rollback_evidence(session, connector=connector, deployment=deployment,
                                      return_evidence=return_evidence, now=now,
-                                     previous_firmware_resets=resets if isinstance(resets, dict) else None,
+                                     previous_firmware_resets=resets,
                                      location_resets=(location if isinstance(location, dict)
                                                       and location.get("complete") is True else None))
     except (KeyError, TypeError, ValueError):
@@ -759,10 +882,52 @@ def _pending_others(session: Session, campaign: FirmwareCampaign) -> int:
 
 
 def _rollback_pause_reason(connector: Connector | None, deployment: FirmwareDeployment) -> str | None:
-    """The pause reason record_progress wrote when this deployment rolled back."""
+    """The pause reason record_progress wrote when this deployment rolled back.
+
+    record_progress keeps an earlier pause reason (the owner's hold, a
+    revoke) instead of writing this one, so the retry never lifts a pause
+    the rollback did not cause.
+    """
+    from zk_add.ota import deployment_pause_reason
+
     if connector is None:
         return None
-    return f"{connector.connector_id}: ROLLED_BACK ({deployment.error_code or 'UNKNOWN'})"
+    return deployment_pause_reason(connector, state="ROLLED_BACK", error_code=deployment.error_code)
+
+
+STORAGE_IO_FAULT_HISTORY = "ESP_STORAGE_IO_FAULT_HISTORY"
+
+
+def storage_history_warnings(session: Session, connector: Connector, *,
+                             now: datetime | None = None) -> list[dict]:
+    """An owner-overridable retry warning for storage I/O faults on the ESP's earlier boots.
+
+    The current boot's faults refuse the retry outright (retry_refusal); the
+    target's first boot repeats its storage work, so faults its earlier boots
+    reported in the last 14 days are shown and need the owner's override.
+    """
+    from zk_add.device_health import rollback_slot_residue_history
+
+    history = rollback_slot_residue_history(session, connector, now=now)
+    if history.get("clean"):
+        return []
+    faults = history.get("faults") or []
+    latest = max(faults, key=lambda fault: str(fault.get("at") or "")) if faults else {}
+    names = ", ".join(sorted(key for key in latest if key not in {"boot_id", "at"}))[:120]
+    return [{
+        "code": STORAGE_IO_FAULT_HISTORY, "connector_id": connector.connector_id,
+        "display_name": connector.display_name, "days": history.get("days"),
+        "boots_checked": history.get("boots_checked"), "faults": faults,
+        "message": (f"{connector.display_name}: {len(faults)}{'+' if len(faults) >= 10 else ''} earlier boot(s) "
+                    f"in the last {history.get('days')} days reported storage I/O faults (latest at "
+                    f"{latest.get('at') or 'an unknown time'}: {names or 'unnamed'}). The target's first boot "
+                    "repeats its storage work; check the ESP's storage and power before another attempt."),
+    }]
+
+
+def retry_warnings(session: Session, connector: Connector, *, now: datetime | None = None) -> list[dict]:
+    """Every owner-overridable warning the retry shows: stability (A3) and earlier storage I/O faults."""
+    return [*stability_warnings(session, connector, now=now), *storage_history_warnings(session, connector, now=now)]
 
 
 def esp_state(session: Session, connector: Connector | None) -> dict | None:
@@ -885,7 +1050,7 @@ def retry_preflight(session: Session, *, campaign_public_id: str, deployment_pub
         raise ValueError("Only a target boot that ADD classified TARGET_BOOT_INTERRUPTED can be retried.")
     refusal = retry_refusal(session, campaign, deployment)
     connector = session.get(Connector, deployment.connector_id)
-    warnings = stability_warnings(session, connector, now=now) if refusal is None and connector is not None else []
+    warnings = retry_warnings(session, connector, now=now) if refusal is None and connector is not None else []
     return {"campaign_id": campaign.campaign_id, "deployment_id": deployment.deployment_id,
             "target_version": deployment.target_version, "available": refusal is None, "refusal": refusal,
             "interrupted_boots": _interrupted_boots(session, connector_id=deployment.connector_id,
@@ -920,7 +1085,7 @@ def retry_interrupted_target(session: Session, *, campaign_public_id: str, deplo
         raise ValueError(f"Retrying resumes the campaign, which also offers its {pending} other pending "
                          "deployment(s); review and confirm that number.")
     connector = session.get(Connector, deployment.connector_id)
-    warnings = stability_warnings(session, connector, now=now)
+    warnings = retry_warnings(session, connector, now=now)
     if warnings and not override_stability_warnings:
         raise ValueError("ESP stability warnings need the owner's override: "
                          + " ".join(warning["message"] for warning in warnings))

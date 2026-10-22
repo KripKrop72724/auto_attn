@@ -5941,48 +5941,57 @@ async def firmware_progress(
     auth: tuple[Session, Connector] = Depends(_require_ota_connector),
 ):
     db, connector = auth
-    try:
-        from zk_add.legacy_bld5_bridge import accept_legacy_progress
 
-        legacy = accept_legacy_progress(
-            db, connector=connector, deployment_id=deployment_id, report=body.model_dump(),
-        )
-        if legacy is not None:
-            db.commit()
-            return JSONResponse(legacy, status_code=202 if legacy.get("awaiting_signed_capability") else 200)
-        deployment = None
-        from zk_add.service import device_reported_return_candidate, record_device_reported_return
+    def persist():
+        # Connector, then deployment, then campaign: the order of the
+        # WebSocket heartbeat and of campaign control, so a progress report
+        # racing an owner's pause or cancel (or this ESP's own heartbeat)
+        # waits instead of deadlocking. The wait, the legacy bridge's locks
+        # and a 2.6.x return's 7-day reset scan stay off the event loop.
+        db.execute(_select(Connector.id).where(Connector.id == connector.id).with_for_update())
+        try:
+            from zk_add.legacy_bld5_bridge import accept_legacy_progress
 
-        if body.state == "ROLLED_BACK" and device_reported_return_candidate(
-                db, connector=connector, deployment_public_id=deployment_id,
-                running_version=body.running_version, error_code=body.error_code):
-            # A 2.6.x return report gets the heartbeat path's evidence and
-            # classification; its 7-day reset scan runs off the event loop.
-            # Every other report keeps the unchanged synchronous path.
-            deployment = await run_in_threadpool(
-                record_device_reported_return, db, connector=connector, deployment_public_id=deployment_id,
-                bytes_written=body.bytes_written, running_version=body.running_version,
-                running_partition=body.running_partition, image_sha256=body.image_sha256,
-                error_code=body.error_code, error_message=body.error_message,
+            legacy = accept_legacy_progress(
+                db, connector=connector, deployment_id=deployment_id, report=body.model_dump(),
             )
-        if deployment is None:
-            deployment = _record_firmware_progress(
-                db,
-                connector=connector,
-                deployment_public_id=deployment_id,
-                state=body.state,
-                bytes_written=body.bytes_written,
-                running_version=body.running_version,
-                running_partition=body.running_partition,
-                image_sha256=body.image_sha256,
-                error_code=body.error_code,
-                error_message=body.error_message,
-            )
-    except ValueError as error:
-        raise HTTPException(status_code=409, detail=str(error)) from error
-    receipt = _firmware_progress_receipt(db, deployment, requested_state=body.state)
-    db.commit()
-    return receipt
+            if legacy is not None:
+                db.commit()
+                return JSONResponse(legacy, status_code=202 if legacy.get("awaiting_signed_capability") else 200)
+            deployment = None
+            from zk_add.service import device_reported_return_candidate, record_device_reported_return
+
+            if body.state == "ROLLED_BACK" and device_reported_return_candidate(
+                    db, connector=connector, deployment_public_id=deployment_id,
+                    running_version=body.running_version, error_code=body.error_code):
+                # A 2.6.x return report gets the heartbeat path's evidence and
+                # classification; every other report is recorded unchanged.
+                deployment = record_device_reported_return(
+                    db, connector=connector, deployment_public_id=deployment_id,
+                    bytes_written=body.bytes_written, running_version=body.running_version,
+                    running_partition=body.running_partition, image_sha256=body.image_sha256,
+                    error_code=body.error_code, error_message=body.error_message,
+                )
+            if deployment is None:
+                deployment = _record_firmware_progress(
+                    db,
+                    connector=connector,
+                    deployment_public_id=deployment_id,
+                    state=body.state,
+                    bytes_written=body.bytes_written,
+                    running_version=body.running_version,
+                    running_partition=body.running_partition,
+                    image_sha256=body.image_sha256,
+                    error_code=body.error_code,
+                    error_message=body.error_message,
+                )
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        receipt = _firmware_progress_receipt(db, deployment, requested_state=body.state)
+        db.commit()
+        return receipt
+
+    return await run_in_threadpool(persist)
 
 
 def _firmware_chunks(path: _Path, start: int, end: int):
@@ -6243,33 +6252,38 @@ async def revoke_firmware_release(
     body: _FirmwareControlIn,
     auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
 ):
-    db, context = auth
-    require_step_up(body.password, db, context)
-    release = db.scalar(_select(_FirmwareRelease).where(_FirmwareRelease.release_id == release_id))
-    if release is None:
-        raise HTTPException(status_code=404, detail="Firmware release not found.")
-    release.state = "REVOKED"
-    release.revoked_at = _ota_utc_now()
-    release.revoked_by = context.username
-    from zk_add.ota_interruption import fail_held_downloads
+    def persist():
+        # Failing a held download takes row locks; keep them off the event loop.
+        db, context = auth
+        require_step_up(body.password, db, context)
+        release = db.scalar(_select(_FirmwareRelease).where(_FirmwareRelease.release_id == release_id))
+        if release is None:
+            raise HTTPException(status_code=404, detail="Firmware release not found.")
+        release.state = "REVOKED"
+        release.revoked_at = _ota_utc_now()
+        release.revoked_by = context.username
+        from zk_add.ota_interruption import fail_held_downloads
 
-    for campaign in db.scalars(_select(_FirmwareCampaign).where(
-        _FirmwareCampaign.release_id == release.id,
-        _FirmwareCampaign.status.in_(["ACTIVE", "PAUSED"]))).all():
-        # A 2.6.x download held for a re-offer fails closed: nothing re-offers it.
-        fail_held_downloads(db, campaign.id, reason=f"the release was revoked ({body.reason})")
-        campaign.status = "PAUSED"
-        # The complete operator reason remains in the audit event below.
-        # Reserve the prefix within the column's 200-character bound too.
-        campaign.pause_reason = f"Release revoked: {body.reason}"[:200]
-    _append_audit(db, actor=context.username, action="FIRMWARE_RELEASE_REVOKED",
-                  target_type="firmware_release", target_id=release_id,
-                  outcome="REVOKED", after={"reason": body.reason})
-    db.commit()
+        for campaign in db.scalars(_select(_FirmwareCampaign).where(
+            _FirmwareCampaign.release_id == release.id,
+            _FirmwareCampaign.status.in_(["ACTIVE", "PAUSED"]))).all():
+            # A 2.6.x download held for a re-offer fails closed: nothing re-offers it.
+            fail_held_downloads(db, campaign.id, reason=f"the release was revoked ({body.reason})")
+            campaign.status = "PAUSED"
+            # The complete operator reason remains in the audit event below.
+            # Reserve the prefix within the column's 200-character bound too.
+            campaign.pause_reason = f"Release revoked: {body.reason}"[:200]
+        _append_audit(db, actor=context.username, action="FIRMWARE_RELEASE_REVOKED",
+                      target_type="firmware_release", target_id=release_id,
+                      outcome="REVOKED", after={"reason": body.reason})
+        db.commit()
+        return release.state
+
+    state = await run_in_threadpool(persist)
     await browser_events.publish(
-        "firmware", {"release_id": release_id, "state": release.state}
+        "firmware", {"release_id": release_id, "state": state}
     )
-    return {"release_id": release_id, "state": release.state}
+    return {"release_id": release_id, "state": state}
 
 
 # Physical provisioning is isolated in an additive router so the existing

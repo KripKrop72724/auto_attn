@@ -57,6 +57,7 @@ from zk_add.ota_interruption import (
     expire_held_downloads,
     retry_interrupted_target,
     retry_refusal,
+    retry_warnings,
 )
 from zk_add.schemas import HeartbeatPayload
 from zk_add.security import ADMIN_COOKIE, create_admin_session, hash_admin_password
@@ -1154,7 +1155,7 @@ def retry_arguments(db, run, deployment, device):
     return dict(campaign_public_id=run.campaign_id, deployment_public_id=deployment.deployment_id,
                 actor="StateHealthAdmin", reason="Site replaced the ESP power supply.", typed_confirmation="2.7.5",
                 override_stability_warnings=True,
-                stability_warnings_digest=warnings_digest(stability_warnings(db, db.get(Connector, device.id))))
+                stability_warnings_digest=warnings_digest(retry_warnings(db, db.get(Connector, device.id))))
 
 
 @pytest.mark.parametrize("db", ["postgres"], indirect=True)
@@ -1473,17 +1474,22 @@ def test_a_delayed_sample_of_the_pre_install_boot_is_not_a_fast_return(db):
     assert db.get(FirmwareDeployment, deployment.id).status == "BOOTED_PENDING"
 
 
-def test_reports_outside_the_return_scope_stay_on_the_synchronous_path(db, monkeypatch):
+def test_every_progress_report_is_recorded_off_the_event_loop_and_unchanged_out_of_scope(db, monkeypatch):
     from zk_add import web
 
     _rel, device, _run, deployment = booted_target(db, previous="2.5.2", target="2.7.5")
+    original, calls = web.run_in_threadpool, []
 
-    async def no_thread(*_args, **_kwargs):
-        raise AssertionError("an out-of-scope progress report left the request's thread")
+    async def recording(function, *args, **kwargs):
+        calls.append(function.__name__)
+        return await original(function, *args, **kwargs)
 
-    monkeypatch.setattr(web, "run_in_threadpool", no_thread)
+    # The report locks its connector first and may wait for it: never on the
+    # event loop that serves every device WebSocket.
+    monkeypatch.setattr(web, "run_in_threadpool", recording)
     response = progress(device_client(db, device), deployment, previous="2.5.2")
     assert response.status_code == 200, response.text
+    assert calls == ["persist"]
     db.expire_all()
     deployment = db.get(FirmwareDeployment, deployment.id)
     assert (deployment.status, deployment.error_code) == ("ROLLED_BACK", "BOOTLOADER_ROLLBACK")
@@ -1672,26 +1678,26 @@ def test_a_pause_waits_for_an_end_of_backoff_poll_that_locked_first(db, monkeypa
 
 
 @pytest.mark.parametrize("db", ["postgres"], indirect=True)
-def test_an_assignment_waits_for_the_heartbeat_that_records_a_stop(db):
+def test_an_assignment_never_waits_for_the_heartbeat_that_records_a_stop(db):
     _rel, device, _run, deployment = stalled(db)
     db.commit()
     out = {}
     with other_session(db) as heartbeat:
         connector = heartbeat.scalar(select(Connector).where(Connector.id == device.id).with_for_update())
-        thread = threading.Thread(target=end_of_backoff_poll, args=(db, device, out))
-        thread.start()
         try:
-            time.sleep(1.0)
-            assert out == {}  # the poll waits for the heartbeat's connector lock
+            started = time.monotonic()
+            end_of_backoff_poll(db, device, out)
+            # 204 at once: the poll neither waits on the event loop nor keeps
+            # the fleet-wide assignment lock while this ESP's heartbeat runs.
+            assert out == {"assignment": None} and time.monotonic() - started < 2.0
             beat(heartbeat, connector, stuck())  # records the stop and commits
         finally:
             heartbeat.rollback()
-            thread.join(30)
-    # The poll then sees the stop and withholds the assignment for its backoff.
-    assert out == {"assignment": None}
     db.expire_all()
     row = db.get(FirmwareDeployment, deployment.id)
     assert len(events(db, row, DOWNLOAD_INTERRUPTED)) == 1 and grants(db, row) == 1
+    # The next poll sees the stop and withholds the assignment for its backoff.
+    assert offer(db, db.get(Connector, device.id)) is None and grants(db, row) == 1
 
 
 @pytest.mark.parametrize("db", ["postgres"], indirect=True)
@@ -1804,4 +1810,341 @@ def test_the_migration_keeps_a_pre_created_index_and_never_builds_a_large_one(db
         assert index_valid() is True
     finally:
         with engine.begin() as connection:
+            connection.execute(text(module.OPERATOR_COMMAND.replace(" CONCURRENTLY", "")))
+
+
+# --- Third review: owner decisions survive, classification, bounds, lock order ----------------------
+
+
+OWNER_HOLD = "Owner hold: site power work, do not resume"
+
+
+@pytest.mark.parametrize("path", ["heartbeat", "device_report"])
+def test_an_owner_pause_survives_an_interrupted_return_and_refuses_the_retry(db, path):
+    _rel, device, run, deployment = booted_target(db)
+    # The owner pauses while 2.7.5 is at BOOTED_PENDING; the ESP then resets.
+    control_campaign(db, campaign_public_id=run.campaign_id, action="pause", reason=OWNER_HOLD)
+    db.commit()
+    if path == "heartbeat":
+        returned_heartbeat(db, device)
+    else:
+        assert progress(device_client(db, device), deployment).status_code == 200
+    db.expire_all()
+    row = db.get(FirmwareDeployment, deployment.id)
+    campaign_row = db.get(FirmwareCampaign, run.id)
+    assert (row.status, row.error_code) == ("ROLLED_BACK", TARGET_BOOT_INTERRUPTED)
+    assert (campaign_row.status, campaign_row.pause_reason) == ("PAUSED", OWNER_HOLD)
+    assert f"paused for another reason ({OWNER_HOLD})" in retry_refusal(db, campaign_row, row)
+    connector = db.get(Connector, device.id)
+    with pytest.raises(ValueError, match="paused for another reason"):
+        retry_interrupted_target(db, **retry_arguments(db, campaign_row, row, connector))
+    db.rollback()
+    assert db.get(FirmwareCampaign, run.id).status == "PAUSED"
+    assert db.scalar(select(func.count(FirmwareDeployment.id)).where(FirmwareDeployment.campaign_id == run.id)) == 1
+
+
+def test_a_pause_after_the_rollback_pause_also_refuses_the_retry(db):
+    _rel, device, run, deployment = booted_target(db)
+    returned_heartbeat(db, device)
+    assert retry_row(db, run, deployment)["retry"]["available"] is True
+    control_campaign(db, campaign_public_id=run.campaign_id, action="pause", reason=OWNER_HOLD)
+    db.commit()
+    assert f"paused for another reason ({OWNER_HOLD})" in retry_row(db, run, deployment)["retry"]["refusal"]
+
+
+@pytest.mark.parametrize("path", ["heartbeat", "device_report"])
+def test_a_cancelled_campaign_stays_cancelled_when_its_target_returns(db, path):
+    _rel, device, run, deployment = booted_target(db)
+    control_campaign(db, campaign_public_id=run.campaign_id, action="cancel", reason="Owner cancel mid-boot")
+    db.commit()
+    if path == "heartbeat":
+        # The heartbeat path reads only ACTIVE and PAUSED campaigns, as before.
+        returned_heartbeat(db, device)
+    else:
+        assert progress(device_client(db, device), deployment).status_code == 200
+    db.expire_all()
+    campaign_row = db.get(FirmwareCampaign, run.id)
+    row = db.get(FirmwareDeployment, deployment.id)
+    assert (campaign_row.status, campaign_row.pause_reason) == ("CANCELLED", "Owner cancel mid-boot")
+    if path == "device_report":
+        assert (row.status, row.error_code) == ("ROLLED_BACK", TARGET_BOOT_INTERRUPTED)
+        assert retry_refusal(db, campaign_row, row) == "A cancelled campaign cannot retry; start a new campaign."
+        assert retry_row(db, campaign_row, row)["retry"]["available"] is False
+
+
+@pytest.mark.parametrize("status,reason,expected", [
+    ("ACTIVE", None, ("PAUSED", "ESP-1: ROLLED_BACK (TARGET_BOOT_INTERRUPTED)")),
+    ("PAUSED", None, ("PAUSED", "ESP-1: ROLLED_BACK (TARGET_BOOT_INTERRUPTED)")),
+    # ADD's own earlier outcome for the same ESP (2.7.0: FAILED, then ROLLED_BACK) is updated.
+    ("PAUSED", "ESP-1: FAILED (BOOT_HEALTH_TIMEOUT)", ("PAUSED", "ESP-1: ROLLED_BACK (TARGET_BOOT_INTERRUPTED)")),
+    ("PAUSED", "ESP-2: FAILED (DOWNLOAD_INCOMPLETE)", ("PAUSED", "ESP-2: FAILED (DOWNLOAD_INCOMPLETE)")),
+    ("PAUSED", OWNER_HOLD, ("PAUSED", OWNER_HOLD)),
+    ("PAUSED", "ESP-1: owner note, keep paused", ("PAUSED", "ESP-1: owner note, keep paused")),
+    ("PAUSED", "Release revoked: key rotation", ("PAUSED", "Release revoked: key rotation")),
+    ("CANCELLED", "Owner cancel", ("CANCELLED", "Owner cancel")),
+])
+def test_a_deployment_outcome_never_overwrites_an_earlier_campaign_decision(status, reason, expected):
+    run = SimpleNamespace(status=status, pause_reason=reason, updated_at=None)
+    ota.pause_for_deployment_outcome(run, SimpleNamespace(connector_id="ESP-1"), state="ROLLED_BACK",
+                                     error_code=TARGET_BOOT_INTERRUPTED)
+    assert (run.status, run.pause_reason) == expected
+
+
+def test_a_target_that_once_reported_runtime_healthy_is_never_labelled_interrupted(db):
+    _rel, device, _run, deployment = booted_target(db)
+    first = events(db, deployment, "BOOTED_PENDING")[0]
+    # ADD committed RUNTIME_HEALTHY but the ESP never received it; health then
+    # dropped and the ESP reported WAITING again before it reset.
+    for offset, code in ((2, "RUNTIME_HEALTHY"), (4, "WAITING_FOR_RUNTIME_HEALTH")):
+        db.add(FirmwareEvent(deployment_id=deployment.id, state="BOOTED_PENDING",
+                             created_at=first.created_at + timedelta(seconds=offset),
+                             details={**first.details, "error_code": code}))
+    db.commit()
+    returned_heartbeat(db, device)
+    db.expire_all()
+    row = db.get(FirmwareDeployment, deployment.id)
+    assert (row.status, row.error_code) == ("ROLLED_BACK", "PREVIOUS_FIRMWARE_OBSERVED")
+    diagnosis = events(db, row, "ROLLED_BACK")[-1].details["diagnosis"]
+    assert diagnosis["target_boot"]["reported_runtime_healthy"] is True
+    assert "TARGET_REPORTED_RUNTIME_HEALTHY" in diagnosis["unclassified_reasons"]
+
+
+def test_campaign_detail_never_rescans_a_return_stored_without_evidence(db, monkeypatch):
+    from zk_add import ota_interruption
+
+    _rel, device, run, deployment = booted_target(db)
+    unavailable = {"classification": "UNCLASSIFIED", "unclassified_reasons": ["EVIDENCE_UNAVAILABLE"]}
+    monkeypatch.setattr(service, "_diagnose_target_return", lambda *_args, **_kwargs: dict(unavailable))
+    returned_heartbeat(db, device)
+
+    def no_rescan(*_args, **_kwargs):
+        raise AssertionError("campaign detail re-read 7 days of telemetry")
+
+    monkeypatch.setattr(ota_interruption, "boot_history", no_rescan)
+    monkeypatch.setattr(ota_interruption, "peer_resets", no_rescan)
+    assert retry_row(db, run, deployment)["rollback_diagnosis"] == unavailable
+
+
+def test_the_retry_shows_earlier_storage_io_faults_and_needs_the_override(db):
+    _rel, device, run, deployment = booted_target(db)
+    returned_heartbeat(db, device)
+    # MULTAN-02 reported EIO write failures on an earlier boot (15 Oct).
+    earlier_boot(db, device, days=6, storage=residue_storage(write_failures=3, error_code=5,
+                                                             error_operation="local_write_commit"))
+    client, headers = admin_client(db)
+    path = f"/api/v1/firmware/campaigns/{run.campaign_id}/retry-target"
+    review = client.get(path, params={"deployment_id": deployment.deployment_id}).json()
+    assert review["available"] is True
+    [history_warning] = [warning for warning in review["stability_warnings"]
+                         if warning["code"] == "ESP_STORAGE_IO_FAULT_HISTORY"]
+    assert history_warning["faults"][0]["boot_id"] == "earlier-6"
+    assert "write_failures" in history_warning["message"] and "14 days" in history_warning["message"]
+    # An override that covers only the stability warnings is stale.
+    stability_only = warnings_digest(stability_warnings(db, db.get(Connector, device.id)))
+    assert stability_only != review["stability_warnings_digest"]
+    stale = client.post(path, json=retry_body(deployment, override_stability_warnings=True,
+                                              stability_warnings_digest=stability_only), headers=headers)
+    assert stale.status_code == 409 and "changed since" in stale.json()["detail"]
+    accepted = client.post(path, json=retry_body(deployment, override_stability_warnings=True,
+                                                 stability_warnings_digest=review["stability_warnings_digest"]),
+                           headers=headers)
+    assert accepted.status_code == 200, accepted.text
+    db.expire_all()
+    retry = db.scalar(select(FirmwareDeployment).where(
+        FirmwareDeployment.deployment_id == accepted.json()["deployment_id"]))
+    [requested] = events(db, retry, "RETRY_REQUESTED")
+    assert "ESP_STORAGE_IO_FAULT_HISTORY" in {item["code"] for item in requested.details[
+        "stability_warnings_overridden"]}
+
+
+def poll_until_refused(db, device, deployment, limit=10):
+    granted = 0
+    while offer(db, device) is not None:
+        granted += 1
+        assert granted <= limit, "the resumed download was granted without a bound"
+    return granted
+
+
+def test_resumed_grants_are_bounded_when_no_heartbeat_counts_a_stop(db):
+    _rel, device, run, deployment = interrupted(db)
+    expire_backoff(db, deployment)
+    # Every resumed attempt ends before a heartbeat built after its grant
+    # arrives, so ADD never counts a stop; the ESP keeps asking.
+    assert poll_until_refused(db, device, deployment) == 4
+    assert grants(db, deployment) == 5  # the first attempt and four after its stop
+    assert (deployment.status, deployment.error_code) == ("FAILED", "DOWNLOAD_RETRIES_EXHAUSTED")
+    assert "4 assignments allowed after the first stop" in deployment.error_message
+    assert run.status == "PAUSED" and "DOWNLOAD_RETRIES_EXHAUSTED" in run.pause_reason
+    assert device.ota_state == "OTA_BLOCKED" and not reserved(db, deployment)
+
+
+def test_a_counted_stop_after_the_grant_bound_fails_at_the_end_of_its_backoff(db):
+    _rel, device, run, deployment = interrupted(db)
+    expire_backoff(db, deployment)
+    for _ in range(4):
+        assert offer(db, device) is not None
+    # Heartbeats built after the last grant count the second stop.
+    beat(db, device, stuck(written=425_984))
+    beat(db, device, stuck(written=425_984))
+    assert len(events(db, deployment, DOWNLOAD_INTERRUPTED)) == 2 and deployment.status == "DOWNLOADING"
+    expire_backoff(db, deployment)
+    assert offer(db, device) is None
+    assert (deployment.status, deployment.error_code) == ("FAILED", "DOWNLOAD_RETRIES_EXHAUSTED")
+    assert len(events(db, deployment, DOWNLOAD_RETRY_OFFERED)) == 1 and grants(db, deployment) == 5
+
+
+@pytest.mark.parametrize("change,code,text", [
+    ("window", "DOWNLOAD_RETRIES_EXHAUSTED", "60 min resume window"),
+    ("switch", DOWNLOAD_RETRY_WITHDRAWN, "download resume is turned off"),
+])
+def test_a_poll_after_the_window_or_with_the_switch_off_fails_a_re_offered_download(db, monkeypatch, change,
+                                                                                     code, text):
+    _rel, device, run, deployment = interrupted(db)
+    expire_backoff(db, deployment)
+    assert offer(db, device) is not None
+    if change == "window":
+        first = events(db, deployment, DOWNLOAD_INTERRUPTED)[0]
+        first.created_at = utc_now() - timedelta(minutes=61)
+        db.commit()
+    else:
+        monkeypatch.setattr(settings, "firmware_download_resume_enabled", False)
+    assert offer(db, device) is None
+    assert (deployment.status, deployment.error_code) == ("FAILED", code) and text in deployment.error_message
+    assert run.status == "PAUSED"
+
+
+def test_a_resumed_bound_never_touches_a_downloaded_attempt(db):
+    _rel, device, _run, deployment = interrupted(db)
+    expire_backoff(db, deployment)
+    for _ in range(4):
+        assert offer(db, device) is not None
+    deployment.status = "READY_TO_BOOT"
+    db.commit()
+    offer(db, device)
+    assert deployment.status == "READY_TO_BOOT"
+
+
+@pytest.mark.parametrize("db", ["postgres"], indirect=True)
+def test_a_pause_and_a_progress_report_never_deadlock(db):
+    rel = release(db)
+    device = esp(db, MULTAN_02, "ZONE-MULTAN-02")
+    device.ota_state = "OTA_READY"
+    run, deployment = campaign(db, rel, device, deployment_status="OFFERED", bytes_written=0)
+    db.commit()
+    reporter = other_session(db)
+    connector = reporter.get(Connector, device.id)
+    # The ESP's first 64 KiB checkpoint report: connector, then deployment;
+    # it moves ota_state to UPDATING.
+    ota.record_progress(reporter, connector=connector, deployment_public_id=deployment.deployment_id,
+                        state="DOWNLOADING", bytes_written=65_536)
+    out = {}
+
+    def pause():
+        with other_session(db) as session:
+            try:
+                control_campaign(session, campaign_public_id=run.campaign_id, action="pause",
+                                 reason="Owner pause during the download")
+                session.commit()
+                out["pause"] = "ok"
+            except Exception as error:  # noqa: BLE001 - the outcome is the assertion
+                session.rollback()
+                out["pause"] = repr(error)
+
+    thread = threading.Thread(target=pause)
+    thread.start()
+    time.sleep(1.0)
+    assert "pause" not in out  # the pause waits for the report's connector lock
+    try:
+        reporter.commit()
+        out["progress"] = "ok"
+    except Exception as error:  # noqa: BLE001 - the outcome is the assertion
+        reporter.rollback()
+        out["progress"] = repr(error)
+    finally:
+        reporter.close()
+    thread.join(30)
+    assert out == {"pause": "ok", "progress": "ok"}
+    db.expire_all()
+    assert db.get(FirmwareCampaign, run.id).status == "PAUSED"
+    assert db.get(FirmwareDeployment, deployment.id).status == "DOWNLOADING"
+
+
+@pytest.mark.parametrize("db", ["postgres"], indirect=True)
+def test_a_progress_report_locks_its_connector_before_anything_else(db, monkeypatch):
+    from zk_add import legacy_bld5_bridge
+
+    rel = release(db)
+    device = esp(db, MULTAN_02, "ZONE-MULTAN-02")
+    _run, deployment = campaign(db, rel, device, deployment_status="OFFERED", bytes_written=0)
+    db.commit()
+    reached, original = threading.Event(), legacy_bld5_bridge.accept_legacy_progress
+
+    def spy(*args, **kwargs):
+        reached.set()  # the first thing the report does after its connector lock
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(legacy_bld5_bridge, "accept_legacy_progress", spy)
+    holder, reporter = other_session(db), other_session(db)
+    holder.execute(select(Connector.id).where(Connector.id == device.id).with_for_update())
+    connector = reporter.get(Connector, device.id)
+
+    async def override():
+        return reporter, connector
+
+    app.dependency_overrides[_require_ota_connector] = override
+    client, out = TestClient(app), {}
+    thread = threading.Thread(target=lambda: out.setdefault("response", client.post(
+        f"/device/v2/firmware/deployments/{deployment.deployment_id}/progress",
+        json={"state": "DOWNLOADING", "bytes_written": 65_536})))
+    thread.start()
+    try:
+        time.sleep(1.0)
+        assert not reached.is_set()
+    finally:
+        holder.rollback()
+        holder.close()
+    thread.join(30)
+    reporter.close()
+    assert out["response"].status_code == 200, out["response"].text
+    assert reached.is_set()
+
+
+@pytest.mark.parametrize("db", ["postgres"], indirect=True)
+def test_the_migration_never_drops_an_invalid_index(db, caplog):
+    from alembic.migration import MigrationContext
+    from alembic.operations import Operations
+
+    module = migration_module()
+    engine = db.get_bind()
+    name = "ix_add_device_telemetry_connector_created"
+    with engine.begin() as connection:
+        connection.execute(text(f"DROP INDEX {name}"))
+    device = esp(db, MULTAN_02, "ZONE-MULTAN-02")
+    at = utc_now()
+    for sequence in (1, 2):  # duplicate keys: a concurrent unique build fails and stays INVALID
+        db.add(DeviceTelemetry(connector_id=device.id, boot_id="b", sequence=sequence, uptime_seconds=1,
+                               created_at=at, payload={}))
+    db.commit()
+    try:
+        with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as connection:
+            with pytest.raises(Exception):
+                connection.execute(text(f"CREATE UNIQUE INDEX CONCURRENTLY {name} ON add_device_telemetry "
+                                        "(connector_id, created_at)"))
+
+        def state():
+            with engine.connect() as connection:
+                return connection.execute(text(
+                    "SELECT i.indisvalid, i.indisunique FROM pg_index i WHERE i.indexrelid = to_regclass(:name)"),
+                    {"name": name}).first()
+
+        assert tuple(state()) == (False, True)
+        with caplog.at_level(logging.WARNING, logger="alembic"), engine.begin() as connection, \
+                Operations.context(MigrationContext.configure(connection)):
+            module.upgrade()
+        assert tuple(state()) == (False, True)  # left for the operator, never dropped
+        assert "DROP INDEX CONCURRENTLY IF EXISTS" in caplog.text and "pg_stat_progress_create_index" in caplog.text
+    finally:
+        with engine.begin() as connection:
+            connection.execute(text(f"DROP INDEX IF EXISTS {name}"))
+            connection.execute(text("DELETE FROM add_device_telemetry"))
             connection.execute(text(module.OPERATOR_COMMAND.replace(" CONCURRENTLY", "")))

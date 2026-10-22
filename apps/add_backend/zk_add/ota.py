@@ -1250,6 +1250,12 @@ def assignment_for_connector(session: Session, *, connector: Connector, public_b
         from zk_add.ota_interruption import download_retry_hold
         if download_retry_hold(session, deployment, held):
             return None
+    elif not pending_offer:
+        # An interrupted download ADD already re-offered: the attempt limit
+        # and the resume window hold even when no heartbeat counted a stop.
+        from zk_add.ota_interruption import resumed_attempt_refusal
+        if resumed_attempt_refusal(session, connector, deployment):
+            return None
     token = secrets.token_urlsafe(32)
     session.add(FirmwareDownloadGrant(token_hash=hashlib.sha256(token.encode()).hexdigest(),
         deployment_id=deployment.id, connector_id=connector.id,
@@ -1312,6 +1318,36 @@ def control_campaign(session: Session, *, campaign_public_id: str, action: str,
     return campaign, failed
 
 
+_DEPLOYMENT_OUTCOME_REASON = re.compile(r"(?:FAILED|ROLLED_BACK) \([^()]*\)")
+
+
+def deployment_pause_reason(connector: Connector, *, state: str, error_code: str | None) -> str:
+    """The pause reason ADD writes when one ESP's deployment fails or rolls back."""
+    return f"{connector.connector_id}: {state} ({error_code or 'UNKNOWN'})"
+
+
+def pause_for_deployment_outcome(campaign: FirmwareCampaign, connector: Connector, *, state: str,
+                                 error_code: str | None) -> None:
+    """Pause the campaign for a FAILED or ROLLED_BACK deployment without undoing an earlier decision.
+
+    A cancelled campaign stays cancelled: the deployment, its event and the
+    alert carry the outcome. A campaign already paused keeps its reason (the
+    owner's hold, a revoke, another ESP's failure) unless that reason is
+    ADD's own earlier outcome for this same ESP, so the first reason stays
+    visible and the owner's retry cannot lift a pause it did not cause.
+    """
+    if campaign.status == "CANCELLED":
+        return
+    if campaign.status == "PAUSED" and campaign.pause_reason:
+        prefix = f"{connector.connector_id}: "
+        if not (campaign.pause_reason.startswith(prefix)
+                and _DEPLOYMENT_OUTCOME_REASON.fullmatch(campaign.pause_reason[len(prefix):])):
+            return
+    campaign.status = "PAUSED"
+    campaign.pause_reason = deployment_pause_reason(connector, state=state, error_code=error_code)
+    campaign.updated_at = utc_now()
+
+
 def record_progress(
     session: Session,
     *,
@@ -1329,6 +1365,11 @@ def record_progress(
     """Apply one checked transition; event_details (server-side evidence only) joins its event."""
     if state not in ACTIVE_DEPLOYMENT_STATES | TERMINAL_DEPLOYMENT_STATES:
         raise ValueError("Unknown firmware deployment state.")
+    # Connector, then deployment, then campaign: the order of the WebSocket
+    # heartbeat and of campaign control. This transition also updates the
+    # connector's ota_state, so taking that row last could deadlock with a
+    # pause or cancel. A lock this transaction already holds is not waited on.
+    session.execute(select(Connector.id).where(Connector.id == connector.id).with_for_update())
     deployment = session.scalar(select(FirmwareDeployment).where(
         FirmwareDeployment.deployment_id == deployment_public_id,
         FirmwareDeployment.connector_id == connector.id).with_for_update().execution_options(populate_existing=True))
@@ -1388,9 +1429,7 @@ def record_progress(
         deployment.completed_at = utc_now()
     campaign = session.get(FirmwareCampaign, deployment.campaign_id)
     if state in {"FAILED", "ROLLED_BACK"} and campaign is not None:
-        campaign.status = "PAUSED"
-        campaign.pause_reason = f"{connector.connector_id}: {state} ({error_code or 'UNKNOWN'})"
-        campaign.updated_at = utc_now()
+        pause_for_deployment_outcome(campaign, connector, state=state, error_code=error_code)
     connector.ota_state = ("OTA_READY" if state == "SUCCEEDED" else
                            "ROLLBACK_REQUIRED" if state == "ROLLED_BACK" else
                            "UPDATING" if state in ACTIVE_DEPLOYMENT_STATES else connector.ota_state)
