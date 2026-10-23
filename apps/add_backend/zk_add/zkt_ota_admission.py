@@ -1,8 +1,8 @@
-"""Serialize assignment reservations and enforce the approved ZKT fleet limits.
+"""Serialize ZKT assignment and offer firmware only to the exact fleet targets.
 
 This is an additional negative guard, never qualification or release authority.
-The first registered bridge/writer activates these limits for subsequent ZKT
-offers, including older releases competing for the same terminals and slots.
+The first registered bridge/writer activates it for subsequent ZKT offers. It
+no longer limits how many ESPs upgrade at once (owner decision, 23 Oct 2026).
 """
 from sqlalchemy import and_, or_, select, text
 
@@ -94,8 +94,15 @@ def try_assignment_lock(session, connector):
 
 
 def pending_offer_hold(session, connector, release=None):
+    """Offer only to an exact, online fleet target; never limit how many upgrade at once.
+
+    The owner removed the nationwide concurrency limits on 23 Oct 2026 (two
+    upgrading ESPs at most, one per physical location), so every campaign's
+    devices upgrade in parallel. ``reservation_snapshot`` still explains which
+    ESPs hold an unsettled offer, but no longer blocks another offer.
+    """
     from zk_add.ota import FirmwareRelease
-    from zk_add.zkt274_bld9_k50 import offer_location, reserved_location
+    from zk_add.zkt274_bld9_k50 import offer_location
 
     if connector.firmware_family != "zkt":
         return None
@@ -104,31 +111,10 @@ def pending_offer_hold(session, connector, release=None):
     if journal_release is None:
         return None
     target = BY_ID.get(connector.connector_id)
-    if target is not None and target_matches(target.identity, connector):
-        location = target.location
-    else:
-        # Outside the 17, only the one reviewed K50 with its exact signed 2.4.12
-        # bridge or 2.7.4 may queue for a slot, under the same limits.
-        location = offer_location(release, connector)
-        if location is None:
-            return "NATIONWIDE_EXACT_TARGET_REQUIRED"
+    # Outside the 17, only the one reviewed K50 with its exact signed 2.4.12
+    # bridge or 2.7.4 may be offered.
+    if not (target is not None and target_matches(target.identity, connector)) and offer_location(release, connector) is None:
+        return "NATIONWIDE_EXACT_TARGET_REQUIRED"
     if not connector.connected:
         return "NATIONWIDE_TARGET_OFFLINE"
-    # Paused campaigns, offline connectors and any older ZKT image still occupy
-    # their reservation. An administrative cancellation after offering bytes is
-    # not evidence that the ESP stopped. Only a later verified installation
-    # settles that uncertainty. Multiple attempts on one ESP reserve one slot.
-    snapshot = reservation_snapshot(session)
-    if not snapshot["scan_complete"]:
-        return "NATIONWIDE_RESERVATION_SCAN_LIMIT"
-    occupied = {row["connector_id"] for row in snapshot["reservations"] if not row["later_installation"]}
-    if len(occupied) >= 2:
-        return "NATIONWIDE_TWO_UPGRADE_RESERVATIONS"
-    for connector_id in sorted(occupied):
-        other = BY_ID.get(connector_id)
-        other_location = other.location if other is not None else reserved_location(connector_id)
-        if other_location is None:
-            return "NATIONWIDE_ACTIVE_LOCATION_UNKNOWN"
-        if other_location == location:
-            return "NATIONWIDE_LOCATION_BUSY"
     return None

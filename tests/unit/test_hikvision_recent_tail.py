@@ -506,10 +506,13 @@ def test_create_and_serialize_recent_tail_job(db, monkeypatch):
     held_by_poll(session, connector, [ANCHOR])
     args = dict(connector=connector, actor="test", reason="BLD1 poll anchor is blocked",
                 confirmation="RECONCILE d RECENT TAIL", idempotency_key="tail-key", scope=TAIL_SCOPE)
-    with pytest.raises(ValueError, match="RECONCILE d RECENT TAIL"):
-        create_reconciliation_job(session, **{**args, "confirmation": "RECONCILE d FROM START"})
-    job = create_reconciliation_job(session, **args)
+    # One click: a stale typed confirmation is ignored, and a replay without
+    # one returns the same job.
+    job = create_reconciliation_job(session, **{**args, "confirmation": "RECONCILE d FROM START"})
     session.commit()
+    assert create_reconciliation_job(
+        session, connector=connector, actor="test", idempotency_key="tail-key", scope=TAIL_SCOPE,
+    ).job_id == job.job_id
     assert hikvision_tail_job(session, job)
     summary = serialize_job(session, job)
     assert summary["scope"] == TAIL_SCOPE

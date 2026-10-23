@@ -310,7 +310,7 @@ jobs:
                 -Method Get `
                 -Uri (
                   "$env:ADD_BASE_URL/api/v1/reconciliations" +
-                  "?connector_id=$($row.connector_id)&status_group=COMPLETED&limit=20"
+                  "?connector_id=$($row.connector_id)&status_group=COMPLETED&include_archived=true&limit=20"
                 ) `
                 -WebSession $session `
                 -TimeoutSec 30

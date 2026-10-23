@@ -190,23 +190,22 @@ const fetchStub = (
         }],
       })
     }
-    if (path.endsWith('/api/v1/firmware/campaigns') && init?.method === 'POST') {
+    if (path.endsWith('/api/v1/firmware/campaigns/bulk') && init?.method === 'POST') {
+      const body = JSON.parse(String(init.body))
       return response({
-        campaign_id: 'campaign-one',
-        status: 'ACTIVE',
-        eligible: 1,
-        legacy_skipped: 0,
-      }, 201)
-    }
-    if (path.endsWith('/api/v1/firmware/campaigns/preflight')) {
-      return response({
-        scope_token: 'signed-test-scope-token-with-sufficient-length',
-        expires_at: '2099-07-27T12:05:00Z',
-        release: { release_id: 'release-2-2-4', version: '2.2.4', state: 'HIL_ONLY' },
-        zone_id: device.zone_id,
-        counts: { candidates: 1, eligible: 1, excluded: 0, offline: 0 },
-        eligible: [device],
-        excluded: [],
+        release_id: body.release_id,
+        created: body.zone_ids.length,
+        results: body.zone_ids.map((zone_id: string) => ({
+          zone_id,
+          outcome: 'CREATED',
+          campaign_id: 'campaign-one',
+          status: 'ACTIVE',
+          message: null,
+          stability_warnings: [],
+          eligible: 1,
+          fleet_hold: null,
+          closed: [],
+        })),
       })
     }
     if (path.startsWith('/api/v1/firmware/campaigns') && (init?.method ?? 'GET') === 'GET') {
@@ -929,7 +928,7 @@ describe('State Life ADD interface', () => {
     })
   })
 
-  it('starts an exact-target HIL firmware campaign with step-up confirmation', async () => {
+  it('updates firmware in the selected zones with one click and no password, reason or typed version', async () => {
     // Finish the lazy module's test-time transform before timing interactions.
     // The browser suite exercises route loading from the production bundle.
     await import('./features/Firmware')
@@ -939,48 +938,37 @@ describe('State Life ADD interface', () => {
     await screen.findByRole('heading', { name: 'Fleet', level: 1 })
     fireEvent.click(screen.getByRole('button', { name: 'Firmware' }))
     expect(await screen.findByRole('heading', { name: 'Firmware', level: 1 })).toBeTruthy()
-    const newCampaign = screen.getByRole('button', { name: 'New campaign' }) as HTMLButtonElement
-    await waitFor(() => expect(newCampaign.disabled).toBe(false))
-    fireEvent.click(newCampaign)
+    const update = screen.getByRole('button', { name: 'Update firmware' }) as HTMLButtonElement
+    await waitFor(() => expect(update.disabled).toBe(false))
+    fireEvent.click(update)
 
-    fireEvent.change(screen.getByLabelText('Release channel'), {
-      target: { value: 'release-2-2-4' },
-    })
-    expect(await screen.findByText(/Exact-device HIL quarantine/)).toBeTruthy()
-    expect((screen.getByLabelText('Zone') as HTMLSelectElement).value).toBe(device.zone_id)
-    expect((screen.getByLabelText('Zone') as HTMLSelectElement).disabled).toBe(true)
-    fireEvent.change(screen.getByLabelText('Audited reason'), {
-      target: { value: 'Pilot SWAT deployment validation' },
-    })
-    fireEvent.change(screen.getByLabelText(/Type exact version/), {
-      target: { value: '2.2.4' },
-    })
-    const password = screen.getByLabelText('Administrator password') as HTMLInputElement
-    fireEvent.change(password, { target: { value: 'local-step-up-value' } })
-    fireEvent.click(screen.getByRole('button', { name: /preview eligible and excluded devices/i }))
-    expect(await screen.findByRole('heading', { name: 'Eligible devices' })).toBeTruthy()
-    fireEvent.click(screen.getByRole('button', { name: /start sequential rollout/i }))
+    // The newest publishable release is preselected; only its HIL target's zone is offered.
+    expect((screen.getByLabelText('Release') as HTMLSelectElement).value).toBe('release-2-2-4')
+    expect(screen.queryByLabelText('Administrator password')).toBeNull()
+    expect(screen.queryByLabelText('Audited reason')).toBeNull()
+    expect(screen.queryByLabelText(/Type exact version/)).toBeNull()
+    const start = screen.getByRole('button', { name: 'Update 0 zones' }) as HTMLButtonElement
+    expect(start.disabled).toBe(true)
+    fireEvent.click(screen.getByRole('button', { name: 'Select all eligible' }))
+    expect((screen.getByRole('checkbox', { name: new RegExp(device.zone_id) }) as HTMLInputElement).checked).toBe(true)
+    fireEvent.click(screen.getByRole('button', { name: 'Update 1 zone' }))
 
-    expect(await screen.findByText(/campaign created for 1 eligible device/i)).toBeTruthy()
-    const campaignCall = fetchMock.mock.calls.find(
-      ([input, init]) =>
-        String(input).endsWith('/api/v1/firmware/campaigns') && init?.method === 'POST',
+    expect(await screen.findByText(/1 device queued/)).toBeTruthy()
+    const bulkCalls = fetchMock.mock.calls.filter(
+      ([input, init]) => String(input).endsWith('/api/v1/firmware/campaigns/bulk') && init?.method === 'POST',
     )
-    expect(campaignCall).toBeTruthy()
-    expect(JSON.parse(String(campaignCall?.[1]?.body))).toMatchObject({
+    expect(bulkCalls).toHaveLength(1)
+    const body = JSON.parse(String(bulkCalls[0]?.[1]?.body))
+    expect(body).toEqual({
       release_id: 'release-2-2-4',
-      zone_id: device.zone_id,
-      reason: 'Pilot SWAT deployment validation',
-      typed_confirmation: '2.2.4',
-      password: 'local-step-up-value',
-      scope_token: 'signed-test-scope-token-with-sufficient-length',
+      zone_ids: [device.zone_id],
+      idempotency_key: expect.stringMatching(/^firmware-bulk:/),
     })
-    expect(JSON.parse(String(campaignCall?.[1]?.body)).idempotency_key).toMatch(/^firmware-campaign:/)
-    expect(screen.queryByRole('dialog', { name: 'Create firmware campaign' })).toBeNull()
-    expect(document.body.textContent).not.toContain('local-step-up-value')
+    // The old single-zone flow (preflight, then create) is not used.
+    expect(fetchMock.mock.calls.some(([input]) => String(input).endsWith('/campaigns/preflight'))).toBe(false)
   })
 
-  it('requires the owner override before starting a campaign with ESP stability warnings', async () => {
+  it('shows stability warnings and a waiting offline device as information after a one-click update', async () => {
     await import('./features/Firmware')
     const base = fetchStub()
     const warning = {
@@ -990,17 +978,14 @@ describe('State Life ADD interface', () => {
       message: `${device.display_name}: 46 ESP resets in 30 online hours on 2.6.15 over 7 days (1.53/h; the warning threshold is 0.5/h).`,
     }
     const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-      if (String(input).endsWith('/api/v1/firmware/campaigns/preflight')) {
+      if (String(input).endsWith('/api/v1/firmware/campaigns/bulk')) {
         return response({
-          scope_token: 'signed-test-scope-token-with-sufficient-length',
-          expires_at: '2099-07-27T12:05:00Z',
-          release: { release_id: 'release-2-2-4', version: '2.2.4', state: 'HIL_ONLY' },
-          zone_id: device.zone_id,
-          counts: { candidates: 1, eligible: 1, excluded: 0, offline: 0 },
-          eligible: [device],
-          excluded: [],
-          stability_warnings: [warning],
-          stability_warnings_digest: 'b'.repeat(64),
+          release_id: 'release-2-2-4',
+          created: 1,
+          results: [{
+            zone_id: device.zone_id, outcome: 'CREATED', campaign_id: 'campaign-one', status: 'ACTIVE', message: null,
+            stability_warnings: [warning], eligible: 1, fleet_hold: 'NATIONWIDE_TARGET_OFFLINE', closed: [],
+          }],
         })
       }
       return base(input, init)
@@ -1010,29 +995,14 @@ describe('State Life ADD interface', () => {
     await screen.findByRole('heading', { name: 'Fleet', level: 1 })
     fireEvent.click(screen.getByRole('button', { name: 'Firmware' }))
     expect(await screen.findByRole('heading', { name: 'Firmware', level: 1 })).toBeTruthy()
-    const newCampaign = screen.getByRole('button', { name: 'New campaign' }) as HTMLButtonElement
-    await waitFor(() => expect(newCampaign.disabled).toBe(false))
-    fireEvent.click(newCampaign)
-    fireEvent.change(screen.getByLabelText('Release channel'), { target: { value: 'release-2-2-4' } })
-    expect(await screen.findByText(/Exact-device HIL quarantine/)).toBeTruthy()
-    fireEvent.change(screen.getByLabelText('Audited reason'), { target: { value: 'Retry after the power fix' } })
-    fireEvent.change(screen.getByLabelText(/Type exact version/), { target: { value: '2.2.4' } })
-    fireEvent.change(screen.getByLabelText('Administrator password'), { target: { value: 'local-step-up-value' } })
-    fireEvent.click(screen.getByRole('button', { name: /preview eligible and excluded devices/i }))
+    const update = screen.getByRole('button', { name: 'Update firmware' }) as HTMLButtonElement
+    await waitFor(() => expect(update.disabled).toBe(false))
+    fireEvent.click(update)
+    fireEvent.click(screen.getByRole('checkbox', { name: new RegExp(device.zone_id) }))
+    fireEvent.click(screen.getByRole('button', { name: 'Update 1 zone' }))
     expect(await screen.findByText(/46 ESP resets in 30 online hours/)).toBeTruthy()
-    const start = screen.getByRole('button', { name: /start sequential rollout/i }) as HTMLButtonElement
-    expect(start.disabled).toBe(true)
-    fireEvent.click(screen.getByLabelText(/Override the stability warnings/))
-    await waitFor(() => expect(start.disabled).toBe(false))
-    fireEvent.click(start)
-    expect(await screen.findByText(/campaign created for 1 eligible device/i)).toBeTruthy()
-    const campaignCall = fetchMock.mock.calls.find(
-      ([input, init]) => String(input).endsWith('/api/v1/firmware/campaigns') && init?.method === 'POST',
-    )
-    expect(JSON.parse(String(campaignCall?.[1]?.body))).toMatchObject({
-      override_stability_warnings: true,
-      stability_warnings_digest: 'b'.repeat(64),
-    })
+    expect(screen.getByText(/Created; waiting for the device to come online/)).toBeTruthy()
+    expect(screen.queryByLabelText(/Override the stability warnings/)).toBeNull()
   })
 
   it('returns to the login screen when any request reports an expired session', async () => {

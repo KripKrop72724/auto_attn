@@ -39,10 +39,11 @@ from zk_add import attendance_force_release as force_release
 from zk_add import attendance_direct_ords as direct_ords
 from zk_add import checkin_notify
 from zk_add import source_newest_slot as newest_slot
-from zk_add.attendance_cnic_link import cnic_not_linked_expression
+from zk_add.attendance_cnic_link import cnic_not_linked_expression, unknown_synced_cnic_expression
 from zk_add.attendance_force_schemas import ForceCheckRequest, ForceStartRequest, ForceControlRequest, UserRefreshRequest
 from zk_add.attendance_direct_ords_schemas import (
     DirectOrdsPreviewRequest,
+    DirectOrdsQuickReleaseRequest,
     DirectOrdsRecheckRequest,
     DirectOrdsStartRequest,
 )
@@ -129,6 +130,9 @@ from zk_add.schemas import (
     ReconciliationAssignmentReleaseRequest,
     ReconciliationAnchorRequest,
     ReconciliationChunkRequest,
+    ReconciliationArchiveRequest,
+    ReconciliationBulkCreateRequest,
+    ReconciliationClearHistoryRequest,
     ReconciliationControlRequest,
     ReconciliationCreateRequest,
     ReconciliationManifestRequest,
@@ -234,7 +238,11 @@ from zk_add.reconciliation import (
     apply_source_tail_chunk,
     apply_source_probe_result,
     active_coverage,
+    archive_reconciliation_job,
+    cancel_and_archive_reconciliation_job,
+    clear_reconciliation_history,
     control_reconciliation_job,
+    create_bulk_reconciliation_jobs,
     create_reconciliation_job,
     preflight_reconciliation,
     reconciliation_manifest_authority,
@@ -636,6 +644,56 @@ def list_direct_ords_runs(
         .order_by(AttendanceRecoveryJob.id.desc()).limit(limit)
     ).all()
     return {"rows": [direct_ords.serialize(db, row) for row in rows]}
+
+
+# The ledger's "select all" covers this many punches; larger backlogs release in rounds.
+UNKNOWN_SYNCED_ID_LIMIT = 10_000
+
+
+@app.get("/api/v2/attendance-direct-ords/unknown-synced")
+def unknown_synced_summary(auth: tuple[Session, AdminContext] = Depends(require_admin)):
+    """Count and IDs of held "Unknown identity · CNIC on synced user" punches."""
+    db, _context = auth
+    condition = unknown_synced_cnic_expression()
+    devices = db.execute(
+        select(Connector.connector_id, Connector.display_name, Connector.zone_id, func.count(AttendanceEvent.id))
+        .join(Connector, Connector.id == AttendanceEvent.connector_id)
+        .where(condition)
+        .group_by(Connector.connector_id, Connector.display_name, Connector.zone_id)
+        .order_by(func.count(AttendanceEvent.id).desc())
+    ).all()
+    total = sum(row[3] for row in devices)
+    event_ids = direct_ords.unknown_synced_event_ids(db, limit=UNKNOWN_SYNCED_ID_LIMIT)
+    return {
+        "count": total,
+        "devices": [
+            {"connector_id": connector_id, "display_name": name, "zone_id": zone_id, "count": count}
+            for connector_id, name, zone_id, count in devices
+        ],
+        "event_ids": event_ids,
+        "truncated": total > len(event_ids),
+    }
+
+
+@app.post("/api/v2/attendance-direct-ords/quick-release", status_code=202)
+def quick_release_direct_ords(
+    body: DirectOrdsQuickReleaseRequest,
+    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+):
+    """One click, no reason or password: send selected unknown-identity punches now."""
+    db, context = auth
+    try:
+        job, not_matching = direct_ords.quick_release(
+            db, actor=context.username, event_ids=body.event_ids, idempotency_key=body.idempotency_key,
+        )
+        db.flush()
+    except RecoveryError as exc:
+        raise HTTPException(status_code=409, detail={"code": exc.code, "message": str(exc)}) from exc
+    return {
+        **direct_ords.serialize(db, job),
+        "not_matching": not_matching,
+        "skipped_by_reason": direct_ords.skipped_by_reason(db, job),
+    }
 
 
 @app.post("/api/v2/attendance-direct-ords/preview")
@@ -1784,16 +1842,15 @@ async def start_full_history_reconciliation(
     body: ReconciliationCreateRequest,
     auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
 ):
+    # One click: the admin session and CSRF token authorize it; reason,
+    # confirmation and password are no longer asked for.
     db, context = auth
-    require_step_up(body.password, db, context)
     connector = connector_or_404(db, connector_id)
     try:
         job = create_reconciliation_job(
             db,
             connector=connector,
             actor=context.username,
-            reason=body.reason,
-            confirmation=body.confirmation,
             idempotency_key=body.idempotency_key,
             scope=body.scope,
         )
@@ -1806,6 +1863,51 @@ async def start_full_history_reconciliation(
     return serialize_job(db, job, include_events=True)
 
 
+@app.post("/api/v1/reconciliations/bulk")
+async def start_bulk_reconciliation(
+    body: ReconciliationBulkCreateRequest,
+    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+):
+    db, context = auth
+
+    def create_all() -> dict:
+        created = create_bulk_reconciliation_jobs(
+            db,
+            connector_ids=body.connector_ids,
+            actor=context.username,
+            idempotency_key=body.idempotency_key,
+            scope=body.scope,
+        )
+        db.commit()
+        return created
+
+    # Up to 100 preflights and inserts: keep them off the event loop.
+    result = await run_in_threadpool(create_all)
+    for row in result["results"]:
+        if row["outcome"] == "CREATED":
+            await browser_events.publish(
+                "reconciliation", {"job_id": row["job_id"], "status": row["status"]}
+            )
+    return result
+
+
+@app.post("/api/v1/reconciliations/clear-history")
+async def clear_reconciliation_history_route(
+    body: ReconciliationClearHistoryRequest | None = None,
+    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+):
+    db, context = auth
+    # Committed batches over the whole history: keep them off the event loop.
+    result = await run_in_threadpool(
+        clear_reconciliation_history,
+        db,
+        actor=context.username,
+        request_id=body.idempotency_key if body else None,
+    )
+    await browser_events.publish("reconciliation", {"history_cleared": True})
+    return result
+
+
 @app.get("/api/v1/reconciliations")
 def list_reconciliations(
     connector_id: str | None = None,
@@ -1815,10 +1917,14 @@ def list_reconciliations(
     q: str | None = Query(default=None, max_length=120),
     cursor: int | None = Query(default=None, ge=1),
     limit: int = Query(default=100, ge=1, le=500),
+    include_archived: bool = False,
     auth: tuple[Session, AdminContext] = Depends(require_admin),
 ):
     db, _context = auth
-    clauses = []
+    # Archived jobs leave the dashboard and its totals; their evidence stays
+    # readable by job ID and by every check that uses it.
+    visible = [] if include_archived else [ReconciliationJob.archived_at.is_(None)]
+    clauses = [*visible]
     if connector_id:
         connector = connector_or_404(db, connector_id)
         clauses.append(ReconciliationJob.connector_id == connector.id)
@@ -1876,31 +1982,31 @@ def list_reconciliations(
     rows = fetched[:limit]
     next_cursor = rows[-1].id if len(fetched) > limit and rows else None
     totals = {
-        "all": int(db.scalar(select(func.count(ReconciliationJob.id))) or 0),
+        "all": int(db.scalar(select(func.count(ReconciliationJob.id)).where(*visible)) or 0),
         "active": int(
             db.scalar(
-                select(func.count(ReconciliationJob.id)).where(status_groups["ACTIVE"])
+                select(func.count(ReconciliationJob.id)).where(status_groups["ACTIVE"], *visible)
             )
             or 0
         ),
         "queued_waiting": int(
             db.scalar(
                 select(func.count(ReconciliationJob.id)).where(
-                    status_groups["QUEUED_WAITING"]
+                    status_groups["QUEUED_WAITING"], *visible
                 )
             )
             or 0
         ),
         "paused": int(
             db.scalar(
-                select(func.count(ReconciliationJob.id)).where(status_groups["PAUSED"])
+                select(func.count(ReconciliationJob.id)).where(status_groups["PAUSED"], *visible)
             )
             or 0
         ),
         "attention": int(
             db.scalar(
                 select(func.count(ReconciliationJob.id)).where(
-                    status_groups["ATTENTION"]
+                    status_groups["ATTENTION"], *visible
                 )
             )
             or 0
@@ -1908,7 +2014,7 @@ def list_reconciliations(
         "completed": int(
             db.scalar(
                 select(func.count(ReconciliationJob.id)).where(
-                    status_groups["COMPLETED"]
+                    status_groups["COMPLETED"], *visible
                 )
             )
             or 0
@@ -1916,7 +2022,7 @@ def list_reconciliations(
         "cancelled": int(
             db.scalar(
                 select(func.count(ReconciliationJob.id)).where(
-                    status_groups["CANCELLED"]
+                    status_groups["CANCELLED"], *visible
                 )
             )
             or 0
@@ -2463,6 +2569,51 @@ def reveal_reconciliation_divergence(
     }
 
 
+# Registered before the generic {action} route below, which would match first.
+@app.post("/api/v1/reconciliations/{job_id}/archive")
+async def archive_reconciliation(
+    job_id: str,
+    body: ReconciliationArchiveRequest | None = None,
+    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+):
+    db, context = auth
+    job = reconciliation_or_404(db, job_id)
+    try:
+        job = archive_reconciliation_job(
+            db, job=job, actor=context.username,
+            request_id=body.idempotency_key if body else None,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    db.commit()
+    await browser_events.publish(
+        "reconciliation", {"job_id": job.job_id, "status": job.status, "archived": True}
+    )
+    return serialize_job(db, job)
+
+
+@app.post("/api/v1/reconciliations/{job_id}/cancel-and-archive")
+async def cancel_and_archive_reconciliation(
+    job_id: str,
+    body: ReconciliationArchiveRequest | None = None,
+    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+):
+    db, context = auth
+    job = reconciliation_or_404(db, job_id)
+    try:
+        job = cancel_and_archive_reconciliation_job(
+            db, job=job, actor=context.username,
+            idempotency_key=(body.idempotency_key if body else None) or str(uuid4()),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    db.commit()
+    await browser_events.publish(
+        "reconciliation", {"job_id": job.job_id, "status": job.status, "archived": True}
+    )
+    return serialize_job(db, job)
+
+
 @app.post("/api/v1/reconciliations/{job_id}/{action}")
 async def control_reconciliation(
     job_id: str,
@@ -2472,8 +2623,8 @@ async def control_reconciliation(
 ):
     if action not in {"pause", "resume", "cancel", "retry"}:
         raise HTTPException(status_code=404, detail="Unknown reconciliation action.")
+    # One click: no reason or password. A guarded retry still binds expected_state.
     db, context = auth
-    require_step_up(body.password, db, context)
     job = reconciliation_or_404(db, job_id)
     try:
         job = control_reconciliation_job(
@@ -2481,7 +2632,6 @@ async def control_reconciliation(
             job=job,
             action=action,
             actor=context.username,
-            reason=body.reason,
             idempotency_key=body.idempotency_key,
             expected_state=body.expected_state,
         )
@@ -3722,6 +3872,7 @@ def attendance(
     ords_status: list[str] = Query(default=[]),
     notify_status: list[str] = Query(default=[]),
     cnic_present: bool | None = None,
+    unknown_synced_cnic: bool = False,
     from_time: str | None = None,
     to_time: str | None = None,
     cursor: int | None = None,
@@ -3771,6 +3922,8 @@ def attendance(
                 AttendanceEvent.cnic_encrypted == "",
             )
         )
+    if unknown_synced_cnic:
+        statement = statement.where(unknown_synced_cnic_expression())
     if notify_status:
         if not set(notify_status) <= set(checkin_notify.PILL_FILTERS):
             raise HTTPException(status_code=422, detail="Select valid phone notification statuses.")
@@ -5883,10 +6036,11 @@ def serialize_lease(row: TemporaryAdminLease | None) -> dict | None:
 # Firmware OTA routes are intentionally additive. Legacy connectors never call
 # these endpoints and remain supported by the existing device protocol.
 from pathlib import Path as _Path  # noqa: E402
-from typing import Literal as _Literal  # noqa: E402
+from typing import Annotated as _Annotated, Literal as _Literal  # noqa: E402
 
 from fastapi.responses import StreamingResponse as _StreamingResponse  # noqa: E402
 from pydantic import BaseModel as _BaseModel, Field as _Field, SecretStr as _SecretStr, ConfigDict as _ConfigDict  # noqa: E402
+from pydantic import field_validator as _field_validator  # noqa: E402
 from sqlalchemy import select as _select  # noqa: E402
 
 from zk_add.audit import append_audit as _append_audit  # noqa: E402
@@ -6108,9 +6262,11 @@ class _FirmwareProgressIn(_BaseModel):
 class _FirmwareCampaignIn(_BaseModel):
     release_id: str = _Field(min_length=1, max_length=100)
     zone_id: str = _Field(min_length=1, max_length=100)
-    reason: str = _Field(min_length=10, max_length=500)
-    typed_confirmation: str = _Field(min_length=1, max_length=80)
-    password: str = _Field(min_length=1, max_length=512)
+    # One click: no reason, typed version or password. Accepted (and ignored)
+    # so a dashboard tab opened before this change still works.
+    reason: str | None = _Field(default=None, max_length=500)
+    typed_confirmation: str | None = _Field(default=None, max_length=80)
+    password: str | None = _Field(default=None, max_length=512)
     scope_token: str = _Field(min_length=32, max_length=4096)
     idempotency_key: str = _Field(min_length=8, max_length=120)
     # Required when the preflight reports ESP stability warnings (A3), with
@@ -6125,12 +6281,27 @@ class _FirmwarePreflightIn(_BaseModel):
     zone_id: str = _Field(min_length=1, max_length=100)
 
 
+class _FirmwareBulkCampaignIn(_BaseModel):
+    model_config = _ConfigDict(extra="forbid")
+    release_id: str = _Field(min_length=1, max_length=100)
+    zone_ids: list[_Annotated[str, _Field(min_length=1, max_length=100)]] = _Field(min_length=1, max_length=30)
+    idempotency_key: str = _Field(min_length=8, max_length=120)
+
+    @_field_validator("zone_ids")
+    @classmethod
+    def _distinct_zones(cls, value: list[str]) -> list[str]:
+        if len(set(value)) != len(value):
+            raise ValueError("Each zone may appear once.")
+        return value
+
+
 class _FirmwareRetryTargetIn(_BaseModel):
     model_config = _ConfigDict(extra="forbid")
     deployment_id: str = _Field(min_length=1, max_length=100)
-    reason: str = _Field(min_length=10, max_length=200)
-    typed_confirmation: str = _Field(min_length=1, max_length=80)
-    password: str = _Field(min_length=1, max_length=512)
+    # One click; accepted and ignored for an older open dashboard tab.
+    reason: str | None = _Field(default=None, max_length=200)
+    typed_confirmation: str | None = _Field(default=None, max_length=80)
+    password: str | None = _Field(default=None, max_length=512)
     override_stability_warnings: bool = False
     stability_warnings_digest: str | None = _Field(default=None, pattern=r"^[0-9a-f]{64}$")
     # The campaign's other PENDING deployments that resuming it also offers.
@@ -6138,11 +6309,20 @@ class _FirmwareRetryTargetIn(_BaseModel):
 
 
 class _FirmwareControlIn(_BaseModel):
+    # Release revocation keeps its audited reason and step-up password.
     # FirmwareCampaign.pause_reason is deliberately bounded to 200 characters.
     # Validate at the API boundary so an overlong audit reason is a clear 422,
     # not a database error after the operator has already stepped up.
     reason: str = _Field(min_length=10, max_length=200)
     password: str = _Field(min_length=1, max_length=512)
+
+
+class _FirmwareCampaignControlIn(_BaseModel):
+    # Pause, resume and cancel are one click. An optional reason (still
+    # bounded by the 200-character pause_reason column) and a password from
+    # an older open tab are accepted; the password is ignored.
+    reason: str | None = _Field(default=None, max_length=200)
+    password: str | None = _Field(default=None, max_length=512)
 
 
 async def _require_ota_connector(
@@ -6384,6 +6564,7 @@ def list_firmware_campaigns(
     release_id: str | None = Query(default=None, max_length=100),
     cursor: int | None = Query(default=None, ge=1),
     limit: int | None = Query(default=None, ge=1, le=200),
+    include_archived: bool = False,
     auth: tuple[Session, AdminContext] = Depends(require_admin),
 ):
     db, _ = auth
@@ -6396,6 +6577,7 @@ def list_firmware_campaigns(
         cursor=cursor,
         limit=limit,
         include_deployments=view == "full",
+        include_archived=include_archived,
     )
     return {
         **result,
@@ -6441,14 +6623,14 @@ async def start_firmware_campaign(
         raise HTTPException(status_code=409, detail="Firmware OTA remains disabled until pilot acceptance.")
 
     def persist():
-        # Step-up hashing, the scope locks and the 7-day stability scans stay
-        # off the event loop that serves the device WebSockets.
+        # One click (session + CSRF): no step-up or typed version. The scope
+        # locks and the 7-day stability scans stay off the event loop that
+        # serves the device WebSockets.
         db, context = auth
-        require_step_up(body.password, db, context)
         try:
             campaign = _create_firmware_campaign(
                 db, release_public_id=body.release_id, zone_id=body.zone_id, reason=body.reason,
-                typed_confirmation=body.typed_confirmation, actor=context.username,
+                actor=context.username,
                 scope_token=body.scope_token, idempotency_key=body.idempotency_key,
                 override_stability_warnings=body.override_stability_warnings,
                 stability_warnings_digest=body.stability_warnings_digest,
@@ -6471,6 +6653,96 @@ async def start_firmware_campaign(
         "firmware",
         {"campaign_id": result["campaign_id"], "status": result["status"], "zone_id": body.zone_id},
     )
+    return result
+
+
+def _firmware_ota_open() -> None:
+    if not (settings.firmware_ota_enabled or settings.firmware_hil_enabled):
+        raise HTTPException(status_code=409, detail="Firmware OTA remains disabled until pilot acceptance.")
+
+
+@app.post("/api/v1/firmware/campaigns/bulk")
+async def start_firmware_campaigns_for_zones(
+    body: _FirmwareBulkCampaignIn,
+    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+):
+    """One click: one campaign per zone (each in its own savepoint) from a fresh scope preview.
+
+    Each zone reports CREATED, BUSY (a campaign with a queued or updating
+    device already runs there) or BLOCKED (the server's reason). Every OTA
+    guard is unchanged: a created campaign whose device is offline simply
+    waits.
+    """
+    from zk_add.firmware_campaigns import create_for_zones
+
+    _firmware_ota_open()
+
+    def persist():
+        db, context = auth
+        try:
+            result = create_for_zones(db, release_public_id=body.release_id, zone_ids=body.zone_ids,
+                                      actor=context.username, idempotency_key=body.idempotency_key)
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        db.commit()
+        return result
+
+    result = await run_in_threadpool(persist)
+    for row in result["results"]:
+        if row["outcome"] == "CREATED":
+            await browser_events.publish(
+                "firmware", {"campaign_id": row["campaign_id"], "status": row["status"], "zone_id": row["zone_id"]})
+        for closed in row["closed"]:
+            await browser_events.publish("firmware", closed)
+    return result
+
+
+@app.post("/api/v1/firmware/campaigns/archive-cancelled")
+async def archive_closed_firmware_campaigns(
+    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+):
+    """One click: hide every cancelled or completed campaign; their evidence is unchanged."""
+    from zk_add.firmware_campaigns import archive_closed
+
+    def persist():
+        db, context = auth
+        archived = archive_closed(db, actor=context.username)
+        if archived:
+            _append_audit(db, actor=context.username, action="FIRMWARE_CAMPAIGNS_ARCHIVED",
+                          target_type="firmware_campaigns", target_id=None, outcome="ARCHIVED",
+                          after={"archived": len(archived), "campaign_ids": archived[:500]})
+        db.commit()
+        return len(archived)
+
+    archived = await run_in_threadpool(persist)
+    if archived:
+        await browser_events.publish("firmware", {"archived": archived})
+    return {"archived": archived}
+
+
+@app.post("/api/v1/firmware/campaigns/clear-history")
+async def clear_firmware_campaign_history(
+    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+):
+    """One click: finish, cancel, then delete or archive old firmware attempts.
+
+    A campaign with a device mid-install in the last 6 hours keeps running
+    (reported in kept_running). Only campaigns that never offered anything
+    and are evidence for no other check are deleted; the rest are archived.
+    """
+    from zk_add.firmware_campaigns import clear_history
+
+    def persist():
+        db, context = auth
+        try:
+            result = clear_history(db, actor=context.username)
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        db.commit()
+        return result
+
+    result = await run_in_threadpool(persist)
+    await browser_events.publish("firmware", {"history_cleared": True})
     return result
 
 
@@ -6509,13 +6781,13 @@ async def retry_firmware_campaign_target(
         raise HTTPException(status_code=409, detail="Firmware OTA remains disabled until pilot acceptance.")
 
     def persist():
-        # Row locks and the 7-day stability scan stay off the event loop.
+        # One click (session + CSRF). Row locks and the 7-day stability scan
+        # stay off the event loop.
         db, context = auth
-        require_step_up(body.password, db, context)
         try:
             result = retry_interrupted_target(
                 db, campaign_public_id=campaign_id, deployment_public_id=body.deployment_id,
-                actor=context.username, reason=body.reason, typed_confirmation=body.typed_confirmation,
+                actor=context.username, reason=body.reason,
                 override_stability_warnings=body.override_stability_warnings,
                 stability_warnings_digest=body.stability_warnings_digest,
                 resume_pending_deployments=body.resume_pending_deployments,
@@ -6526,7 +6798,7 @@ async def retry_firmware_campaign_target(
             raise HTTPException(status_code=409, detail=str(error)) from error
         _append_audit(db, actor=context.username, action="FIRMWARE_CAMPAIGN_RETRY_TARGET",
                       target_type="firmware_campaign", target_id=campaign_id, outcome=result["status"],
-                      after={"reason": body.reason, "deployment_id": result["deployment_id"],
+                      after={"reason": body.reason or "One-click retry", "deployment_id": result["deployment_id"],
                              "retry_of": result["retry_of"], "connector_id": result["connector_id"],
                              "stability_warnings_overridden": result["stability_warnings_overridden"],
                              "resumed_pending_deployments": result["resumed_pending_deployments"]})
@@ -6538,29 +6810,70 @@ async def retry_firmware_campaign_target(
     return result
 
 
+# Registered before the generic {action} route, which would otherwise match.
+@app.post("/api/v1/firmware/campaigns/{campaign_id}/archive")
+async def archive_firmware_campaign(
+    campaign_id: str,
+    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+):
+    """One click: hide a cancelled or completed campaign. Idempotent; evidence is unchanged."""
+    from zk_add.firmware_campaigns import archive_campaign
+
+    def persist():
+        db, context = auth
+        try:
+            campaign, changed = archive_campaign(db, campaign_public_id=campaign_id, actor=context.username)
+        except LookupError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        if changed:
+            _append_audit(db, actor=context.username, action="FIRMWARE_CAMPAIGN_ARCHIVED",
+                          target_type="firmware_campaign", target_id=campaign_id, outcome=campaign.status,
+                          after={"zone_id": campaign.zone_id,
+                                 "archived_at": ensure_utc(campaign.archived_at).isoformat()})
+        result = {"campaign_id": campaign_id, "status": campaign.status,
+                  "archived_at": ensure_utc(campaign.archived_at), "archived_by": campaign.archived_by}
+        db.commit()
+        return result, changed
+
+    result, changed = await run_in_threadpool(persist)
+    if changed:
+        await browser_events.publish("firmware", {"campaign_id": campaign_id, "archived": True})
+    return result
+
+
 @app.post("/api/v1/firmware/campaigns/{campaign_id}/{action}")
 async def control_firmware_campaign(
     campaign_id: str,
     action: _Literal["pause", "resume", "cancel"],
-    body: _FirmwareControlIn,
+    body: _FirmwareCampaignControlIn | None = None,
     auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
 ):
     def persist():
-        # The control takes row locks; keep it off the event loop.
+        # One click (session + CSRF). The control takes row locks; keep it
+        # off the event loop. Pause only from ACTIVE, resume only from
+        # PAUSED, cancel only from ACTIVE or PAUSED: anything else is a 409.
         db, context = auth
-        require_step_up(body.password, db, context)
+        reason = getattr(body, "reason", None)
         try:
             campaign, failed = _control_firmware_campaign_state(
-                db, campaign_public_id=campaign_id, action=action, reason=body.reason)
+                db, campaign_public_id=campaign_id, action=action, reason=reason)
         except LookupError as error:
             raise HTTPException(status_code=404, detail=str(error)) from error
         except ValueError as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
         _append_audit(db, actor=context.username, action=f"FIRMWARE_CAMPAIGN_{action.upper()}",
                       target_type="firmware_campaign", target_id=campaign_id,
-                      outcome=campaign.status, after={"reason": body.reason,
+                      outcome=campaign.status, after={"reason": campaign.pause_reason or reason or "One click",
                                                       **({"held_downloads_failed": failed} if failed else {})})
-        db.commit()
+        try:
+            db.commit()
+        except IntegrityError as error:
+            # A resume raced another campaign into this zone (its partial unique index).
+            db.rollback()
+            raise HTTPException(status_code=409, detail="This zone already has another active or paused "
+                                                        "firmware campaign.") from error
         return campaign.status
 
     status = await run_in_threadpool(persist)

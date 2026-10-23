@@ -77,7 +77,7 @@ RESUMED_GRANT_LIMIT = 2 * (DOWNLOAD_ATTEMPT_LIMIT - 1)
 # A re-offer the ESP has not taken this long after its backoff ended (HTTPS
 # failing while heartbeats arrive, an ESP that reset or went offline, or a
 # refusal ADD cannot name here) fails the deployment instead of holding the
-# zone's and the nationwide upgrade slots.
+# zone.
 DOWNLOAD_RETRY_DEADLINE_SECONDS = 900
 # No re-offer at all once this long has passed since the first stop.
 DOWNLOAD_RESUME_WINDOW_SECONDS = 3600
@@ -508,7 +508,7 @@ def expire_held_downloads(session: Session, *, now: datetime | None = None,
     The assignment and heartbeat paths decide the same on the ESP's next
     request; this covers an ESP that reset or went offline during its
     backoff, a campaign paused by any path, and the switch turned off, so a
-    hold never keeps the zone's and the nationwide upgrade slots for long.
+    hold never keeps the zone busy for long.
     """
     now = now or utc_now()
     rows = list(session.scalars(select(FirmwareDeployment).where(
@@ -1058,21 +1058,23 @@ def retry_preflight(session: Session, *, campaign_public_id: str, deployment_pub
 
 
 def retry_interrupted_target(session: Session, *, campaign_public_id: str, deployment_public_id: str,
-                             actor: str, reason: str, typed_confirmation: str,
-                             override_stability_warnings: bool, stability_warnings_digest: str | None = None,
+                             actor: str, override_stability_warnings: bool, reason: str | None = None,
+                             typed_confirmation: str | None = None, stability_warnings_digest: str | None = None,
                              resume_pending_deployments: int = 0, now: datetime | None = None) -> dict:
-    """The owner's step-up retry: one new PENDING attempt in the same paused campaign.
+    """The owner's one-click retry: one new PENDING attempt in the same paused campaign.
 
-    The caller has already verified the owner's password. The new attempt is
-    then offered only through every ordinary admission check. Resuming the
-    campaign also offers its other PENDING deployments, so the owner confirms
-    their number, and overrides exactly the stability warnings they saw.
+    No typed version, reason or password: typed_confirmation is ignored. The
+    new attempt is offered only through every ordinary admission check.
+    Resuming the campaign also offers its other PENDING deployments, so the
+    request names their number (from the review), and overrides exactly the
+    stability warnings the review showed.
     """
     now = now or utc_now()
+    reason = (reason or "").strip() or "One-click retry of an interrupted target boot"
     campaign, deployment = _load_retry_target(session, campaign_public_id, deployment_public_id, lock=True)
     release = session.get(FirmwareRelease, deployment.release_id)
-    if release is None or typed_confirmation != release.version:
-        raise ValueError("Typed firmware version does not match the release.")
+    if release is None:
+        raise ValueError("The signed release is no longer available.")
     refusal = retry_refusal(session, campaign, deployment)
     if refusal:
         raise ValueError(refusal)

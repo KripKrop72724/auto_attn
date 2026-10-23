@@ -414,6 +414,43 @@ describe('Live attendance workspace', () => {
     expect(dialog.textContent).toMatch(/does not prove who owned the terminal user ID/i)
   })
 
+  it('lists unknown identities with a synced CNIC in one click and releases them without a reason or password', async () => {
+    const unknown = (id: number) => event({
+      id, event_uid: `unknown-${id}`, display_name: null, cnic_masked: null, ords_status: 'BLOCKED_IDENTITY',
+      direct_ords_identity: { eligible: true, cnic_source: 'SYNCED_USER', exclusion: null, punch_time_cnic: 'NONE', cnic_choice_required: true },
+    })
+    const fetchMock = vi.fn(async (path: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(path)
+      if (url === '/api/v2/attendance-direct-ords/unknown-synced') {
+        return response({ count: 3, devices: [{ connector_id: device.connector_id, display_name: device.display_name, zone_id: 'ZONE-ONE', count: 3 }], event_ids: [12, 11, 10], truncated: false })
+      }
+      if (url === '/api/v2/attendance-direct-ords/quick-release' && init?.method === 'POST') {
+        const ids = JSON.parse(String(init.body)).event_ids as number[]
+        return response({ job_id: 'quick-one', selected: ids.length, ready: ids.length - 1, skipped: 1, not_matching: 0, skipped_by_reason: { CNIC_CONFLICT: 1 } }, 202)
+      }
+      return response({ rows: url.includes('unknown_synced_cnic=true') ? [unknown(12), unknown(11), unknown(10)] : [event()], next_cursor: null })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    render(<AttendanceView {...attendanceProps} />)
+    await screen.findByRole('article', { name: /Ayesha Khan/i })
+    expect(fetchMock.mock.calls.some(([path]) => String(path).includes('unknown-synced'))).toBe(false)
+    fireEvent.click(screen.getByRole('button', { name: /Unknown identity · CNIC on synced user/i }))
+    expect(await screen.findByRole('button', { name: 'Release all 3 to Oracle' })).toBeTruthy()
+    await waitFor(() => expect(fetchMock.mock.calls.some(([path]) => String(path).includes('unknown_synced_cnic=true'))).toBe(true))
+    expect(await screen.findAllByRole('article', { name: /Unknown identity/i })).toHaveLength(3)
+    expect(screen.getByText(/SLICTOWER · 3rd Floor: 3/)).toBeTruthy()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Release all 3 to Oracle' }))
+    expect(await screen.findByText(/queued for Oracle/i)).toBeTruthy()
+    const post = fetchMock.mock.calls.find(([path, init]) => String(path) === '/api/v2/attendance-direct-ords/quick-release' && init?.method === 'POST')
+    const body = JSON.parse(String(post?.[1]?.body))
+    expect(body.event_ids).toEqual([12, 11, 10])
+    expect(body.idempotency_key).toMatch(/^quick-release/)
+    expect(Object.keys(body).sort()).toEqual(['event_ids', 'idempotency_key'])
+    expect(screen.getByText(/1 punch another CNIC or person on record/)).toBeTruthy()
+    expect(screen.queryByLabelText(/Administrator password/i)).toBeNull()
+  })
+
   it('marks impossible punch times and CNIC changes on held ledger rows', async () => {
     const invalid = event({
       ords_status: 'BLOCKED_IDENTITY', clock_quality: 'INVALID',

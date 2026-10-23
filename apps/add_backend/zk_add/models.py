@@ -1405,6 +1405,9 @@ class ReconciliationJob(Base):
     assignment_accepted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     assignment_heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     updated_at: Mapped[datetime] = utc_column()
+    # Hidden from the dashboards; the job's evidence stays readable by every check.
+    archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    archived_by: Mapped[str | None] = mapped_column(String(120))
 
 
 class TerminalSourceEpoch(Base):
