@@ -176,6 +176,9 @@ class FirmwareCampaign(Base):
     pause_reason: Mapped[str | None] = mapped_column(String(200))
     created_at: Mapped[Any] = utc_column()
     updated_at: Mapped[Any] = utc_column()
+    # Hidden from the dashboards; deployments and their evidence stay readable.
+    archived_at: Mapped[Any] = mapped_column(DateTime(timezone=True), nullable=True)
+    archived_by: Mapped[str | None] = mapped_column(String(120), nullable=True)
 
 
 class FirmwareDeployment(Base):
