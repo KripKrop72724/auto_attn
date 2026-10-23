@@ -248,7 +248,7 @@ def test_selected_image_is_never_offered_again_and_outcome_pauses(recovery_sessi
     assert session.get(FirmwareCampaign, run.id).status == "PAUSED"
 
 
-def test_peshawar_installs_are_serialized_once_a_journal_release_exists(recovery_session):
+def test_peshawar_installs_run_together_once_a_journal_release_exists(recovery_session):
     from zk_add import ota
     session, release, devices = recovery_session
     session.add(ota.FirmwareRelease(
@@ -261,9 +261,8 @@ def test_peshawar_installs_are_serialized_once_a_journal_release_exists(recovery
     start(session, release, ZONES[1])
     assert offer(session, devices[0]) is not None
     session.flush()
-    assert offer(session, devices[1]) is None  # one Peshawar install at a time
-    report(session, devices[0], "FAILED", "STORAGE_RECOVERY_COMPLETE")
-    session.flush()
+    # No per-location limit (owner decision, 23 Oct 2026): both Peshawar
+    # devices install at the same time.
     assert offer(session, devices[1]) is not None
 
 

@@ -139,7 +139,7 @@ def test_targets_start_independently_from_either_predecessor(platform):
         assert offer(session, device)["version"] == release.version
 
 
-def test_fleet_guard_paces_offers_once_journal_releases_exist(platform):
+def test_fleet_guard_offers_every_target_at_once_once_journal_releases_exist(platform):
     from zk_add import ota
     session, release, devices = platform
     session.add(ota.FirmwareRelease(
@@ -152,8 +152,8 @@ def test_fleet_guard_paces_offers_once_journal_releases_exist(platform):
         start(session, release, device.zone_id)
     assert offer(session, devices[0])["version"] == release.version
     assert offer(session, devices[2])["version"] == release.version
-    # A third unsettled upgrade waits for one of the first two to settle.
-    assert offer(session, devices[1]) is None
+    # No fleet-wide limit (owner decision, 23 Oct 2026): a third upgrade starts too.
+    assert offer(session, devices[1])["version"] == release.version
 
 
 def test_later_platform_images_upgrade_3fl_in_place_from_2_7_2(platform):
