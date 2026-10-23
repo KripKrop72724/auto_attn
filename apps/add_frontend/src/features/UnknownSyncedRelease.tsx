@@ -18,6 +18,13 @@ type Outcome = { sent: number; skipped: number; notMatching: number; reasons: Re
 const root = '/api/v2/attendance-direct-ords'
 // Each request is one audited run; ADD checks every punch before it is queued.
 const CHUNK = 200
+// While ADD's worker queues earlier runs it can answer ADD_BUSY (or a proxy a
+// 502-504); the same key is sent again, and ADD returns a run it already saved.
+const BUSY_RETRIES = 5
+const BUSY_DELAY_MS = 3000
+const retryable = (failure: unknown) => failure instanceof ApiError &&
+  (failure.code === 'ADD_BUSY' || [502, 503, 504].includes(failure.status))
+const pause = (milliseconds: number) => new Promise((resolve) => setTimeout(resolve, milliseconds))
 const punches = (value: number) => `${value.toLocaleString()} ${value === 1 ? 'punch' : 'punches'}`
 const SKIP_TEXT: Record<string, string> = {
   CNIC_CHOICE_REQUIRED: 'need a CNIC decision',
@@ -63,10 +70,20 @@ export function UnknownSyncedRelease({ active, onToggle, selectedIds, clearSelec
     setOutcome(null); setError(''); setProgress({ done: 0, total: ids.length })
     for (let start = 0; start < ids.length; start += CHUNK) {
       const chunk = ids.slice(start, start + CHUNK)
+      const key = idempotency('quick-release')
+      const send = async (attempt: number): Promise<QuickRun> => {
+        try {
+          return await api<QuickRun>(`${root}/quick-release`, {
+            method: 'POST', body: JSON.stringify({ event_ids: chunk, idempotency_key: key }),
+          })
+        } catch (failure) {
+          if (attempt >= BUSY_RETRIES || !retryable(failure)) throw failure
+          await pause(BUSY_DELAY_MS)
+          return send(attempt + 1)
+        }
+      }
       try {
-        const run = await api<QuickRun>(`${root}/quick-release`, {
-          method: 'POST', body: JSON.stringify({ event_ids: chunk, idempotency_key: idempotency('quick-release') }),
-        })
+        const run = await send(1)
         result.sent += run.ready
         result.skipped += run.skipped
         result.notMatching += run.not_matching

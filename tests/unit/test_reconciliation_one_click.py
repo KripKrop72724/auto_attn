@@ -8,6 +8,7 @@ import pytest
 from cryptography.fernet import Fernet
 from fastapi.testclient import TestClient
 from sqlalchemy import MetaData, create_engine, func, select, text
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 
@@ -295,7 +296,7 @@ def test_clear_history_cancels_deletes_bare_jobs_and_archives_evidence(db):
 
     result = clear_reconciliation_history(session, actor="ops", request_id="clear-history-0001", batch_size=2)
     assert result == {"cancelled": 1, "deleted": 4, "archived": 4, "kept_reasons": {
-        "SOURCE_COVERAGE": 2, "TERMINAL_RECORD_MANIFEST": 1, "RECOVERY_PARENT": 1}, "kept_running": {}}
+        "SOURCE_COVERAGE": 2, "TERMINAL_RECORD_MANIFEST": 1, "RECOVERY_PARENT": 1}, "kept_running": {}, "busy": 0}
     session.expire_all()
     remaining = {row.id: row for row in session.scalars(select(ReconciliationJob))}
     assert set(remaining) == {covered.id, manifested.id, kept_parent.id, kept_child.id, already.id}
@@ -310,7 +311,7 @@ def test_clear_history_cancels_deletes_bare_jobs_and_archives_evidence(db):
 
     assert clear_reconciliation_history(session, actor="ops", request_id="clear-history-0001") == result
     second = clear_reconciliation_history(session, actor="ops")
-    assert second == {"cancelled": 0, "deleted": 0, "archived": 0, "kept_reasons": {}, "kept_running": {}}
+    assert second == {"cancelled": 0, "deleted": 0, "archived": 0, "kept_reasons": {}, "kept_running": {}, "busy": 0}
     assert session.scalar(select(func.count(ReconciliationJob.id))) == 5
 
 
@@ -341,6 +342,79 @@ def test_clear_history_keeps_live_tail_capture_and_an_open_repair_source_running
     for job in (repair_source, tail):
         kept = session.get(ReconciliationJob, job.id)
         assert kept.status not in {"CANCELLED", "COMPLETED", "FAILED", "INVALIDATED"} and kept.archived_at is None
+
+
+class _LockTimeout(Exception):
+    sqlstate = "55P03"
+
+
+def _busy() -> OperationalError:
+    return OperationalError("SELECT ... FOR UPDATE", {}, _LockTimeout("canceling statement due to lock timeout"))
+
+
+def test_clear_history_skips_a_busy_job_and_the_next_call_finishes_it(db, monkeypatch):
+    from zk_add import reconciliation
+
+    session, connector = db
+    other = _eligible(session, mac="e0:72:a1:d6:f3:50", device_id="50", serial="ONECLICK0050")
+    busy_job = create_reconciliation_job(session, connector=connector, actor="test", idempotency_key="busy-0001")
+    free_job = create_reconciliation_job(session, connector=other, actor="test", idempotency_key="busy-0002")
+    session.commit()
+    real = reconciliation.control_reconciliation_job
+
+    def held(session, *, job, **kwargs):
+        if job.id == busy_job.id:
+            raise _busy()  # A device's own transaction holds this connector row.
+        return real(session, job=job, **kwargs)
+
+    monkeypatch.setattr(reconciliation, "control_reconciliation_job", held)
+    first = clear_reconciliation_history(session, actor="ops", request_id="busy-clear-0001")
+    assert (first["cancelled"], first["busy"]) == (1, 1)
+    session.expire_all()
+    assert session.get(ReconciliationJob, busy_job.id).status not in {"CANCELLED", "COMPLETED"}
+    assert session.get(ReconciliationJob, free_job.id) is None  # cancelled, then deleted as bare history
+
+    monkeypatch.setattr(reconciliation, "control_reconciliation_job", real)
+    second = clear_reconciliation_history(session, actor="ops", request_id="busy-clear-0002")
+    assert (second["cancelled"], second["busy"]) == (1, 0)
+    assert session.get(ReconciliationJob, busy_job.id) is None
+
+
+def test_clear_history_survives_a_real_postgres_lock_timeout(db):
+    session, connector = db
+    if session.get_bind().dialect.name != "postgresql":
+        pytest.skip("Row lock timeouts are PostgreSQL behaviour")
+    job = create_reconciliation_job(session, connector=connector, actor="test", idempotency_key="pg-busy-0001")
+    session.commit()
+    holder = Session(session.get_bind())
+    try:
+        # Another transaction (a device's heartbeat) holds the connector row.
+        holder.execute(text("SELECT id FROM add_connectors WHERE id = :id FOR UPDATE"), {"id": connector.id})
+        session.execute(text("SET lock_timeout = '300ms'"))
+        result = clear_reconciliation_history(session, actor="ops", request_id="pg-busy-clear-0001")
+        assert (result["cancelled"], result["busy"]) == (0, 1)
+    finally:
+        holder.rollback()
+        holder.close()
+    session.expire_all()
+    assert session.get(ReconciliationJob, job.id).status == "QUEUED"
+    finished = clear_reconciliation_history(session, actor="ops", request_id="pg-busy-clear-0002")
+    assert (finished["cancelled"], finished["busy"]) == (1, 0)
+
+
+def test_clear_history_route_answers_busy_not_500(db, monkeypatch):
+    from zk_add import web
+
+    session, _connector = db
+    client, headers = _client(session)
+
+    def busy(*_args, **_kwargs):
+        raise _busy()
+
+    monkeypatch.setattr(web, "clear_reconciliation_history", busy)
+    response = client.post("/api/v1/reconciliations/clear-history", headers=headers)
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "ADD_BUSY"
 
 
 def test_clear_history_route(db):

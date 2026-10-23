@@ -152,3 +152,34 @@ def test_quick_decisions_never_choose_between_people():
     assert [(choice.event_id, choice.choice) for choice in choices] == [(1, "CURRENT"), (2, "PUNCH_TIME")]
     assert all(choice.held_by_other_confirmed is False for choice in choices)
     assert send_now == [7]
+
+
+class _LockTimeout(Exception):
+    sqlstate = "55P03"
+
+
+def test_a_busy_scheduler_answers_add_busy_and_the_same_key_retries(store, monkeypatch):
+    from sqlalchemy.exc import OperationalError
+
+    sessions, _connector_id, _uid = store
+    event_id = unknown(sessions)
+    real = direct.create
+
+    def busy(*_args, **_kwargs):
+        # The worker's release tick held the scheduler lock past the wait.
+        raise OperationalError("SELECT ... FOR UPDATE", {}, _LockTimeout("canceling statement due to lock timeout"))
+
+    body = {"event_ids": [event_id], "idempotency_key": "quick-release-busy-1"}
+    with sessions() as db:
+        client, headers = client_for(db)
+        monkeypatch.setattr(direct, "create", busy)
+        response = client.post("/api/v2/attendance-direct-ords/quick-release", json=body, headers=headers)
+        assert response.status_code == 503
+        assert response.json()["detail"]["code"] == "ADD_BUSY"
+        db.rollback()
+        assert db.scalar(select(Item)) is None
+        monkeypatch.setattr(direct, "create", real)
+        retry = client.post("/api/v2/attendance-direct-ords/quick-release", json=body, headers=headers)
+        assert retry.status_code == 202, retry.text
+        assert retry.json()["ready"] == 1
+    app.dependency_overrides.clear()
