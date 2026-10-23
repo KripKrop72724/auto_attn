@@ -52,6 +52,7 @@ def main():
     parser.add_argument('--zig', required=True)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--resume-only', action='store_true', help='Capture the repair already installed by v1.1; no host flash operations')
+    parser.add_argument('--watch-setup', action='store_true', help='Keep recording while the operator saves site Wi-Fi on a phone')
     args = parser.parse_args()
     if args.output.exists():
         raise ValueError('Refusing to replace an existing executable')
@@ -78,6 +79,10 @@ def main():
                 package.writestr(name, data)
             package.writestr('rescue.bin', signed)
         payload = (Path(__file__).parent / 'repair.ps1').read_text()
+        if args.watch_setup:
+            if payload.count('[switch]$WatchSetup,') != 1:
+                raise ValueError('Setup-recording default cannot be safely embedded')
+            payload = payload.replace('[switch]$WatchSetup,', '[switch]$WatchSetup = $true,')
         if args.resume_only:
             if payload.count('[switch]$ResumeOnly)') != 1:
                 raise ValueError('Resume-only default cannot be safely embedded')

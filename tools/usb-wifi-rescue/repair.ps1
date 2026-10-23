@@ -1,4 +1,4 @@
-param([string]$ReadyFile, [string]$ToolArchive, [switch]$GuiSmokeTest, [switch]$ResumeOnly)
+param([string]$ReadyFile, [string]$ToolArchive, [switch]$GuiSmokeTest, [switch]$WatchSetup, [switch]$ResumeOnly)
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
@@ -26,6 +26,15 @@ if ($ResumeOnly) {
 $button.Location = New-Object Drawing.Point(15,80)
 $button.Size = New-Object Drawing.Size(180,35)
 $form.Controls.Add($button)
+$finishButton = New-Object Windows.Forms.Button
+$finishButton.Text = 'Finish and save logs'
+$finishButton.Location = New-Object Drawing.Point(210,80)
+$finishButton.Size = New-Object Drawing.Size(220,35)
+$finishButton.Enabled = $false
+$finishButton.Visible = [bool]$WatchSetup
+$finishButton.Add_Click({ $script:finishCapture = $true; $finishButton.Enabled = $false })
+$form.Controls.Add($finishButton)
+$script:finishCapture = $false
 $box = New-Object Windows.Forms.TextBox
 $box.Multiline = $true
 $box.ReadOnly = $true
@@ -168,9 +177,10 @@ function Capture-Repair([int]$WaitSeconds = 90, [int]$CaptureSeconds = 240, [int
     $serial = $null
     $next = Get-Date
     $firstOpen = $false
+    $setupAnnounced = $false
     $lastError = ''; $nextErrorLog = Get-Date
     try {
-        while ((Get-Date) -lt $deadline) {
+        while ((Get-Date) -lt $deadline -and -not $script:finishCapture) {
             try {
                 if (-not $serial) {
                     $device = Get-ExactUsbPort -AllowMissing
@@ -183,6 +193,11 @@ function Capture-Repair([int]$WaitSeconds = 90, [int]$CaptureSeconds = 240, [int
                         $deadline = (Get-Date).AddSeconds($CaptureSeconds)
                         $label.Text = "ESP USB detected. Keep it connected.`r`nChecking the repair, saved data and setup Wi-Fi (up to 4 minutes)."
                         Say 'ESP reconnected. Serial recorder is open. Keep USB connected.'
+                        if ($WatchSetup) {
+                            $finishButton.Enabled = $true
+                            $label.Text = "Keep USB connected. Setup Wi-Fi should appear in about 2 minutes.`r`nUse a phone or this PC to save site Wi-Fi. Keep this recorder running."
+                            Say 'Setup recording: use a phone or this PC for the setup page; keep USB connected. Recording can run for 15 minutes. After saving Wi-Fi and waiting two minutes, click Finish and save logs.'
+                        }
                     }
                 }
                 $count = $serial.BytesToRead
@@ -191,6 +206,11 @@ function Capture-Repair([int]$WaitSeconds = 90, [int]$CaptureSeconds = 240, [int
                     $count = $serial.Read($bytes,0,$bytes.Length)
                     $raw.Write($bytes,0,$count); $raw.Flush()
                     [void]$text.Append([Text.Encoding]::UTF8.GetString($bytes,0,$count))
+                    if ($WatchSetup -and $text.ToString().Contains('access point enabled') -and -not $setupAnnounced) {
+                        $setupAnnounced = $true
+                        $label.Text = "SETUP WI-FI READY: connect a phone or this PC to SLIC ATTENDANCE-16D5.`r`nOpen 192.168.254.1 and save the 2.4 GHz site Wi-Fi. Keep USB connected."
+                        Say 'Setup Wi-Fi is ready. On a phone or this PC open http://192.168.254.1 and save the correct 2.4 GHz network. Do not close this EXE or unplug USB. After saving, wait two minutes, then click Finish and save logs.'
+                    }
                 }
             } catch {
                 $detail = $_.Exception.GetType().FullName + ': ' + $_.Exception.Message
@@ -259,7 +279,7 @@ $button.Add_Click({
             $null = Run-Tool ('select-rescue-' + $offset) ($common + @('write-flash','--flash-size','16MB','--flash-mode','keep','--flash-freq','keep','--no-compress',$offset,'empty-sector.bin'))
         }
         }
-        $serialText = Capture-Repair
+        if ($WatchSetup) { $serialText = Capture-Repair -CaptureSeconds 900 } else { $serialText = Capture-Repair }
         $scan = (& netsh.exe wlan show networks mode=bssid 2>&1 | Out-String)
         $scan | Set-Content (Join-Path $script:folder 'wifi-networks.txt') -Encoding UTF8
         $success = $serialText -match 'SLIC_WIFI_RESCUE_RESULT status=SUCCESS changed=[01] other_keys_unchanged=1 storage_unchanged=1' -and $serialText -match 'SLIC_WIFI_RESCUE_RETURNING_ORIGINAL' -and $serialText -match 'Loaded app from partition at offset 0x520000'
@@ -274,6 +294,12 @@ $button.Add_Click({
         } else {
             $result = 'Repair could not be verified. Do not erase or re-provision the ESP. Send the saved ZIP to support.'
             if ($serialText.Length -eq 0) { $result += ' No serial bytes were received. See serial-detection.txt for USB/open errors and make sure all ESP power was removed before reconnecting WITHOUT BOOT.' }
+        }
+        if ($WatchSetup) {
+            $result = 'Setup-session recording complete. Send this ZIP to support to check the saved network and any red LED fault.'
+            if ($success) { $result += ' The one-shot repair verified attendance storage and other settings unchanged before returning to the original firmware.' }
+            if ($serialText -match 'Connecting to Wi-Fi SSID[ \t]*\r?\n') { $result += ' An empty Wi-Fi name was observed during this recording; router connectivity is not verified.' }
+            if ($serialText -match 'Validated and atomically saved a new Wi-Fi network') { $result += ' A setup-page save was captured; support must check the following reboot for successful connection.' }
         }
         $result | Set-Content (Join-Path $script:folder 'RESULT.txt') -Encoding UTF8
         Say $result

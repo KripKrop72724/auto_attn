@@ -69,4 +69,18 @@ try {
     $raw = [IO.File]::ReadAllBytes((Join-Path $script:folder 'serial.bin'))
     if ($text -ne "TEST SERIAL STREAM`r`n" -or [Convert]::ToBase64String($raw) -ne [Convert]::ToBase64String($script:payload)) { throw 'Serial bytes were lost or changed' }
     Write-Output 'PASS: actual capture preserves streamed raw bytes and decoded text'
+
+    # Setup recording must retain the save/reboot evidence and respond to the
+    # operator's Finish button without waiting for its fifteen-minute timeout.
+    $WatchSetup = $true
+    $finishButton = [pscustomobject]@{Enabled=$false}
+    $script:finishCapture = $false
+    $script:payload = [Text.Encoding]::UTF8.GetBytes("Wi-Fi setup access point enabled`r`nValidated and atomically saved a new Wi-Fi network`r`nConnecting to Wi-Fi SSID `r`n")
+    function Say([string]$Text) {
+        if ($Text.StartsWith('Setup Wi-Fi is ready.')) { $script:finishCapture = $true }
+    }
+    $timer = [Diagnostics.Stopwatch]::StartNew()
+    $text = Capture-Repair -WaitSeconds 1 -CaptureSeconds 900 -PowerOffPauseSeconds 0
+    if ($timer.Elapsed.TotalSeconds -gt 5 -or -not $finishButton.Enabled -or $text -notmatch 'Validated and atomically saved' -or $label.Text -notmatch 'SETUP WI-FI READY') { throw 'Setup recording lost save evidence, instructions, or Finish action' }
+    Write-Output 'PASS: setup-session capture retains save/reboot evidence and finishes on operator request'
 } finally { Remove-Item -LiteralPath $script:folder -Recurse -Force }
