@@ -65,7 +65,11 @@ custody blocks alone, `REPAIRED`, every file byte-exact, through power cuts.
 4. **One exception target at a time (H4).** P02 first; 13FL only after P02's
    deployment is `SUCCEEDED` or `FAILED`. While P02's deployment is active
    it holds one of the two nationwide reservations and its location
-   (Peshawar): Peshawar 06 waits.
+   (Peshawar): Peshawar 06 waits. ADD enforces this at the receipt (design
+   14.2 item 3): while another connector's exception deployment is active,
+   `storage_exception_allowed` is false and a second candidate refuses
+   `RECEIPT`; two candidates racing each other both refuse until one
+   campaign is paused.
 
 ## 1. Peshawar 02, from 2.5.2
 
@@ -99,8 +103,16 @@ back as 2.7.6.
    `storage_exception.h`): `LED_CAUSE` names an incident that was not a room
    refusal (`storage.local_failure_source` and `local_failure_last_source`
    say which site); `STORE_CHANGED` that something kept writing the store;
-   `RECEIPT` that ADD withheld it. Stop and report.
-5. `STORAGE_REPAIR_EXCEPTION_RESTART`, then the ESP restarts at a capture
+   `RECEIPT` that ADD withheld it; `HEARTBEAT_UNACKED` that ADD has not
+   acknowledged a heartbeat for 45 s (D2: the operator's view would be
+   stale - check the WebSocket path and ADD's logs). Stop and report.
+5. **The floor after a refusal** (design 14.2 item 2): a device that only
+   REFUSED and rolled back is *not* floored - its journal holds CLAIMED
+   alone and the area test left every slot erased - so ADD may still offer
+   2.6.25/2.6.27 if a recovery becomes necessary. Confirmation (step 3's
+   `RECONCILING`) floors it durably in ADD (`ota_floor_latched_at`, design
+   14.1 item 3), even across later rollback heartbeats.
+6. `STORAGE_REPAIR_EXCEPTION_RESTART`, then the ESP restarts at a capture
    safepoint (at most 30 min later).
 
 **The round boot:**
@@ -136,11 +148,22 @@ the same device (P02's 2.7.6 runtime largest: 63,488 B; 2.7.7 needs about
 
 ## 2. SLICTOWER 13FL, from 2.4.12
 
-Only after P02 has ended. Its first 2.7.7 boot says on its own report whether
-the exception can apply: `files_unheld_custody` must be 0 (the hold is kept:
-owner decision), `gaps` 0, and the inventory must finish in its 180 s budget
-over the 3.8 MB `blocked_identity.jsonl`. Otherwise it refuses and rolls back
-as 2.7.6, with the reason in the heartbeat.
+Only after P02 has ended, and only after the owner has decided C1 against
+13FL's sizes (design section 11 item 1): if its 3.8 MB blocked queue plus
+pending exceed the hold budget (about 4.3 MB), the first boot's refusal
+(`CUSTODY_UNHELD`) is knowable in advance and the campaign should not run
+until C1 is relaxed for its own round or the queue is drained another way.
+Its first 2.7.7 boot says on its own report whether the exception can apply:
+`files_unheld_custody` must be 0 (the hold is kept: owner decision), `gaps`
+0, and the inventory must finish over the 3.8 MB `blocked_identity.jsonl` -
+its budget on an exception-candidate boot is 180 s plus 20 ms per held span,
+capped at +300 s (design 14.2 item 5), about 480 s for 13FL's ~15,000 spans.
+Every custody file the repair reports, however small, keeps a slot in the
+inventory's report (design 14.2 item 6), so a cluttered directory alone no
+longer refuses `CUSTODY_MISSING`. Anything else refuses and rolls back as
+2.7.6, with the reason in the heartbeat; an expected first-boot refusal
+still teaches the real store's histogram, hold sizes and span count from
+the heartbeat's report.
 
 ## 3. Healthy devices, in place
 

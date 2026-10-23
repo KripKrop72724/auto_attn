@@ -858,7 +858,7 @@ def apply_firmware_diagnostics(session: Session, connector: Connector, payload: 
             evidence["worker_contract"] = "NOT_APPLICABLE_STORAGE_RECOVERY"
     connector.firmware_diagnostics = evidence
     connector.firmware_diagnostics_at = now if diagnostics else None
-    # ZKT 2.7.7 (round 1 review, defect 3): the redo-area OTA floor is latched
+    # ZKT 2.7.7 (design 14.1 item 3): the redo-area OTA floor is latched
     # the moment any heartbeat shows it; a device that rolls back to an image
     # whose heartbeats carry no evidence keeps it.
     if connector.ota_floor_latched_at is None:

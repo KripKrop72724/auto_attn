@@ -579,7 +579,7 @@ static void redo_recover(srr_config_t *config, bool timed)
         }
     }
     heap_caps_free(work);
-    /* 2.7.7, the OTA floor (critique 1; round 2 review, defect 2): anything
+    /* 2.7.7, the OTA floor (critique 1; design 14.2 item 2): anything
      * that proves custody bytes may be in the area or that a round has
      * written the store: a journal flag beyond CLAIMED, any round or block,
      * or any slot not erased (a foreign one, and a torn write of our own,
@@ -781,7 +781,7 @@ static void exception_after_boot(void)
      * inside the repair or its round (2.7.6's D5 scope: an erase that pulls
      * the supply down must not loop). A voltage dip during ordinary runtime
      * at a flaky-power site says nothing about the exception's machinery and
-     * must not end the controlled-restart budget (round 1 review, defect 4).
+     * must not end the controlled-restart budget (design 14.1 item 4).
      * A panic, watchdog or lockup is the image's own wherever it happened. */
     bool previous_in_repair = s_previous_known && !s_previous_returned;
     bool crashed = reason == ESP_RST_PANIC || reason == ESP_RST_INT_WDT || reason == ESP_RST_TASK_WDT ||

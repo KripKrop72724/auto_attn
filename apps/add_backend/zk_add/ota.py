@@ -611,7 +611,7 @@ def redo_floor_evidence(evidence: Any) -> bool:
     """ZKT 2.7.7: a heartbeat's diagnostics say the device's redo area or
     reclaim journal holds anything, or that it confirmed under the storage
     exception. service.latches this on the connector row the moment it is
-    seen (round 1 review, defect 3), because the device's next image may
+    seen (design 14.1 item 3), because the device's next image may
     report nothing at all."""
     if not isinstance(evidence, dict):
         return False
@@ -630,7 +630,7 @@ def _redo_floor_exclusion(release: FirmwareRelease, connector: Connector) -> str
     area would mount the store and erase custody kept in a record. The device
     refuses such a target itself; ADD does not offer it. The latch keeps the
     floor across rollbacks to images whose heartbeats carry no evidence
-    (round 1 review, defect 3); a later heartbeat never clears it."""
+    (design 14.1 item 3); a later heartbeat never clears it."""
     version = semantic_version(release.version)
     if connector.firmware_family != "zkt" or version is None or version >= REDO_AWARE_VERSION:
         return None
@@ -1513,12 +1513,12 @@ def record_progress(
     deployment.error_code = error_code
     deployment.error_message = error_message
     deployment.updated_at = utc_now()
-    # ZKT 2.7.7 (round 1 review, defect 3): a confirmation under the storage
+    # ZKT 2.7.7 (design 14.1 item 3): a confirmation under the storage
     # exception (RECONCILING), or its end after confirming, floors the device
     # durably - its redo area has held, or may hold, custody records. A
     # BOOTED_PENDING exception report does not: a refused boot writes nothing
     # the area test does not erase, and the device's own narrowed floor
-    # agrees (round 2 review, defect 2).
+    # agrees (design 14.2 item 2).
     if (connector.ota_floor_latched_at is None and state in {"RECONCILING", "FAILED"}
             and error_code in {STORAGE_EXCEPTION_CODE, "STORAGE_REPAIR_EXCEPTION_UNREPAIRED",
                                "STORAGE_REPAIR_EXCEPTION_UNHEALTHY"}):
@@ -1575,7 +1575,7 @@ def progress_receipt(session: Session, deployment: FirmwareDeployment, *, reques
         # ZKT 2.7.7 (H3): ADD's veto over the confirm-first storage exception.
         # The image may mark itself valid only while its release is offered
         # and its campaign active; pausing the campaign withholds it. One
-        # exception target at a time (H4, round 2 review, defect 3): a second
+        # exception target at a time (H4, design 14.2 item 3): a second
         # device cannot confirm while another's exception deployment is
         # active, or two confirmed devices waiting for certified coverage
         # would pin both nationwide reservation slots indefinitely.

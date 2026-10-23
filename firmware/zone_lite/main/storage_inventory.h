@@ -39,7 +39,7 @@ typedef struct {
     /* ZKT 2.7.7: one of the caller's priority names (the boot repair's
      * custody files), guaranteed a report slot ahead of merely larger files
      * so the confirm-first gate's CUSTODY_MISSING check never loses a small
-     * custody file to the cap (round 2 review, defect 6). */
+     * custody file to the cap (design 14.2 item 6). */
     bool priority;
 } si_file_t;
 

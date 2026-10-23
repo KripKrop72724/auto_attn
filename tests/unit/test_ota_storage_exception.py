@@ -160,7 +160,7 @@ def test_add_never_offers_an_image_that_cannot_read_the_redo_area(diagnostics, e
 
 
 def test_the_floor_latches_and_survives_a_rollback_heartbeat(session):
-    """Round 1 review, defect 3: the heartbeat-fresh check evaporates when the
+    """Design 14.1 item 3: the heartbeat-fresh check evaporates when the
     device rolls back to 2.5.2, whose heartbeats carry no evidence. The latch
     keeps the floor; no later heartbeat clears it."""
     from zk_add.service import apply_firmware_diagnostics
@@ -180,7 +180,7 @@ def test_the_floor_latches_and_survives_a_rollback_heartbeat(session):
 
 
 def test_a_refused_attempt_alone_never_latches_the_floor(session):
-    """Round 2 review, defect 2: a refused boot writes nothing but the area
+    """Design 14.2 item 2: a refused boot writes nothing but the area
     self-test's sector, which the test erases; the device's own narrowed
     floor reports false and ADD must not ban its recovery images."""
     from zk_add.service import apply_firmware_diagnostics
@@ -231,7 +231,7 @@ def _second_target(session, release, suffix="13fl"):
 
 
 def test_one_exception_target_at_a_time(session):
-    """H4, round 2 review, defect 3: a second device cannot confirm while
+    """H4, design 14.2 item 3: a second device cannot confirm while
     another's exception deployment is active, or two devices parked in
     RECONCILING awaiting coverage would pin both nationwide slots."""
     release, connector, campaign, deployment = _setup(session)

@@ -236,7 +236,7 @@ int main(int argc, char **argv)
     assert(find(&report, "blocked_identity.jsonl") && find(&report, "persistence-probe") &&
            find(&report, "pending_events.jsonl") && find(&report, "big.bin") && !find(&report, "acked_uids.txt"));
 
-    /* 2.7.7 (round 2 review, defect 6): a priority name (a repair-tracked
+    /* 2.7.7 (design 14.2 item 6): a priority name (a repair-tracked
      * custody file) keeps its slot ahead of merely larger readable files, so
      * the confirm-first gate's CUSTODY_MISSING check never loses a small
      * custody file to the cap. Unreadable files still come first, and a

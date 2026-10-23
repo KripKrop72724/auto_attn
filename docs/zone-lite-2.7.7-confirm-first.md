@@ -315,7 +315,7 @@ be explained by the deferral.
 | # | Term |
 |---|---|
 | D1 | the ADD WebSocket is connected (`add_connector_is_connected`; authenticated by the device token at the upgrade) |
-| D2 | a heartbeat that carried `ota.storage_exception.state` `ELIGIBLE` was acknowledged by ADD within the last 45 s (three heartbeat periods; new acknowledgement tracking, section 6.4) |
+| D2 | a heartbeat was acknowledged by ADD within the last 45 s (three heartbeat periods; new acknowledgement tracking, section 6.4). Every heartbeat of a boot whose gate is evaluating carries `ota.storage_exception`, so an acknowledged one proves ADD stored the state the operator reads (14.2 item 1 simplified "carried `ELIGIBLE`" to "any heartbeat": the ack handler cannot see the payload it acknowledged, and the evaluating boot's heartbeats all carry the exception) |
 | D3 | `BOOTED_PENDING` with `error_code` `STORAGE_REPAIR_EXCEPTION` was accepted with a receipt that `ota_progress_receipt_matches` (deployment, state `BOOTED_PENDING`, target version, `application_sha256` equal to the running digest) and `confirm` true. Revoking 2.7.7 in ADD therefore stops any exception not yet taken |
 | D4 | the OTA precheck passes now: `zj_ota_before_download`'s legacy-evidence check returns no error (read-only) |
 | D5 | NVS writes work: the exception record is written and read back (section 4.1, step 3) |
@@ -419,8 +419,12 @@ rules apply with nothing changed:
   when the previous round boot left the store unhealthy for a reason a boot
   can change: `short` `time` or `cap` after `pages_freed` above 0, the
   round's remount failed, `store_blocked`, or the area `UNREADABLE` or
-  `NO_MEMORY`; and only with the system time known and at least 1 h (second)
-  or 6 h (third) after the previous controlled restart.
+  `NO_MEMORY`; and only at least 1 h (second) or 6 h (third) after the
+  previous controlled restart. When the wall clock is unknown now or was
+  when the restart was counted (a network that blocks NTP), the same backoff
+  runs on the boot's own clock instead of waiting forever: the cap of three
+  still bounds the total, and a reset before the wait ends only repeats the
+  wait (14.2 item 4).
 - Never after `held_mismatch`, more gaps than before, an area `FOREIGN`,
   `ABSENT` or `OVERLAP`, the attempts guard (`REPORT_ONLY`), `short`
   `candidate` on the confirmed image (no custody block left to help) or a
@@ -428,6 +432,11 @@ rules apply with nothing changed:
 - Ordinary reboots (power cuts) run the repair as every boot does and are
   not counted. A repair that crashes, watchdogs or browns out every boot is
   stopped by 2.7.5's attempts guard (with 2.7.6's brownout rule).
+- The record's crash counter (M7) counts a panic, watchdog or lockup
+  wherever it happened, but a brownout only when it ended a boot inside the
+  repair or its round - 2.7.6's D5 scope. A voltage dip during ordinary
+  runtime at a flaky-power site says nothing about the exception's machinery
+  and must not end the controlled-restart budget (14.1 item 4).
 
 ### 4.5 When the round cannot repair the store
 
@@ -817,12 +826,17 @@ NVS layout.
 
 **For the owner:**
 
-1. **13FL and the hold.** The gate requires `files_unheld_custody` 0, as the
-   decision states. If 13FL's custody exceeds the hold budget, its first
-   2.7.7 boot reports `REFUSED` `CUSTODY_UNHELD` and rolls back. The round
+1. **13FL and the hold - decide before its campaign, not after a rollback.**
+   The gate requires `files_unheld_custody` 0, as the decision states. If
+   13FL's custody (its 3.8 MB blocked queue plus pending) exceeds the hold
+   budget, its first 2.7.7 boot reports `REFUSED` `CUSTODY_UNHELD` and rolls
+   back - a full 900 s outage, a rollback to 2.4.12 and flash churn whose
+   outcome is knowable beforehand from 13FL's heartbeat sizes. The round
    itself does not need the hold (2.7.6's "no holds at all" runs end
    `REPAIRED`); relaxing C1 to "every unheld custody file is a reclaim queue
-   with no unreadable byte" would be a decision for its own round.
+   with no unreadable byte" would be a decision for its own round. If C1 is
+   kept and the sizes do not fit, the runbook's 13FL section says what the
+   expected refusal is and what is learned from it (14.2 item 5).
 2. **The retry restarts** (4.4): three in all with 1 h and 6 h backoff, only
    after progress. One restart and no retries is narrower; the retries help
    only rare outcomes (time, cap, a remount, a blocked store).
@@ -832,9 +846,12 @@ NVS layout.
 **Residual risks:**
 
 - After confirmation there is no way back to the pre-2.7.5 image (the OTA
-  floor refuses it, section 13 item 1): a store the round cannot repair stays
-  wedged on 2.7.7 until a later release, with punches going to ADD live or
-  staying on the terminal. 4.5 keeps that device OTA-capable.
+  floor refuses it; 14.2 item 2 narrowed 13.1 item 1): a store the
+  round cannot repair stays wedged on 2.7.7 until a later release, with
+  punches going to ADD live or staying on the terminal. 4.5 keeps that
+  device OTA-capable. A merely REFUSED attempt no longer floors the device:
+  CLAIMED alone, with every slot of the discovered area erased, proves no
+  record was ever completed, so 2.6.25/2.6.27 stay available to it.
 - The gate trusts the boot's report and the inventory. The runtime does write
   to the store in between (the probe, outbox restores, compaction, cursors;
   section 13 item 9): the probe is held on boots that may use the exception,
@@ -843,9 +860,12 @@ NVS layout.
   healthy exception device whose source coverage never certifies holds its
   reservation (and P06's location) until an operator gets coverage certified
   (section 13 item 5).
-- 13FL: its 3.8 MB `blocked_identity.jsonl` with about 15,000 unreadable
-  spans may not finish 2.7.4's inventory in its 180 s budget; an incomplete
-  scan refuses (`INVENTORY_UNEXPLAINED`) and the image rolls back.
+- 13FL: its 3.8 MB `blocked_identity.jsonl` holds about 15,000 unreadable
+  spans. On a boot that may use the exception the inventory's budget now
+  grows 20 ms per held span, capped at +300 s (14.2 item 5), so the
+  scan is expected to finish; if the real per-span cost is worse than the
+  model, an incomplete scan still refuses (`INVENTORY_UNEXPLAINED`) and the
+  image rolls back.
 - S3's store-write cause depends on classifying the `LOCAL_FAILURE` sites
   correctly; a site left as "other" makes the gate refuse (safe), a site
   wrongly marked store-write could let an unrelated fault pass. The contract
@@ -868,7 +888,7 @@ NVS layout.
 |---|---|
 | 0 | boot; the repair (2.7.5's run, about 21 s, then the exposure) |
 | about +25 s | `storage_init` returns; the area test and the probe hold are decided; the 900 s budget starts |
-| +60 s | 2.7.4's inventory starts (180 s budget); on P02 it finished at about +2 min |
+| +60 s | 2.7.4's inventory starts (180 s budget, plus 20 ms per held span capped at +300 s on a boot whose probe is held: 13FL's ~15,000 spans); on P02 it finished at about +2 min |
 | until then | the gate says `EVALUATING` `INVENTORY_PENDING` (unknown: it neither refuses nor opens the window) |
 | inventory done | the window opens if every term holds; any refusal closes it, any program or erase of the store restarts it |
 | window + 120 s | the sequence: the record `CONFIRMING`, the evidence log (10 s acknowledgement), the receipted `BOOTED_PENDING` (signed HTTPS, 15 s at most), the re-check; a sequence that does not finish is tried again at most every 30 s |
@@ -894,7 +914,9 @@ accepted and implemented, **P** partly, **R** rejected, each with the reason.
    `ota.storage_exception.state`), so ADD never offers 2.5.2, 2.6.25 or
    2.6.27 to such a device. CLAIMED is never cleared, so the floor is
    permanent once anything was written to the area (the critique's
-   "simplest").
+   "simplest"). *Superseded in part by 14.2 item 2: CLAIMED alone,
+   with every slot of a fully discovered area erased, no longer floors; and
+   by 14.1 item 3: ADD latches the floor durably on the connector.*
 2. **A. Decision 5 (c) on exception images.** When the exception's record
    says confirmed and the boot's last run leaves queue spans waiting for byte
    sources, the VFS stays off that boot (`STORAGE_REPAIR_EXCEPTION_WAITING`;
@@ -1023,7 +1045,8 @@ accepted and implemented, **P** partly, **R** rejected, each with the reason.
   window); the sequence starts only with 90 s of budget left and re-checks
   the budget right before `mark_app_valid`; `CONFIRMING` is written once;
   section 12 has the timeline. The inventory's 180 s budget is unchanged
-  (13FL's risk, section 11).
+  (13FL's risk, section 11). *Superseded by 14.2 item 5: the budget
+  now scales with the held spans on exception-candidate boots.*
 - **M7, P.** The bench run of item 3; the record counts boots that a panic,
   watchdog or brownout ended after confirmation, reports them and stops
   retries. A crash loop of a confirmed image outside the repair is bounded
@@ -1045,3 +1068,114 @@ accepted and implemented, **P** partly, **R** rejected, each with the reason.
 - **IPC stack:** raised to 1,792 B (+1 KiB of internal RAM).
 - **Retry restarts:** three in all, kept: with decision 5 (c), a round boot
   that leaves spans waiting is the likeliest retryable outcome.
+
+## 14. Review round 2 (23 October 2026): resolutions
+
+Two critiques of the implementation at 3de0f19: a custody-lens one (five
+defects) and a device-lens one (six, two of them re-raises). Every point is
+listed; **A** is accepted and implemented, **P** partly, **R** rejected, each
+with the reason. The custody lens confirmed power loss at every confirmation
+step, the valid-image rule, the window's store fingerprint, the hold rule and
+the UNREPAIRED/UNHEALTHY ordering; the device lens confirmed the budget
+arithmetic, the record staleness rules, the ADD plumbing end to end and the
+stack change. Neither found a path that confirms a broken image or loses or
+duplicates a readable unsettled byte.
+
+### 14.1 The custody-lens critique (defects 1 to 5)
+
+1. **A (= 14.2 item 6). The inventory's 16-entry cap could permanently
+   refuse `CUSTODY_MISSING`.** See 14.2 item 6: priority slots for the
+   repair's custody files, and the harness's cluttered variants.
+2. **A (= 14.2 item 1). D2 specified but not implemented.** See 14.2 item 1.
+3. **A. ADD's redo floor was heartbeat-fresh.** A device that journaled
+   redo-area work and rolled back to 2.5.2 overwrote its diagnostics with
+   heartbeats carrying no `ota_floor`, and ADD would offer 2.6.25/2.6.27
+   again. ADD now latches the floor durably on the connector
+   (`ota_floor_latched_at`, migration 20261023_0058): set by any heartbeat
+   whose diagnostics show the floor and by the confirmation's own
+   `RECONCILING` or ended-`FAILED` progress reports, never cleared by a
+   later heartbeat. A `BOOTED_PENDING` exception report alone does not
+   latch, matching the device's narrowed floor (14.2 item 2): a refused
+   boot writes nothing the area self-test does not erase. **Rejected: the
+   alternative "write the reachability argument into 13.1 and call the ADD
+   check advisory".** The latch is one nullable column and makes the check
+   real; an unwritten invariant ADD cannot see is what this defect is.
+4. **P. A brownout anywhere after confirmation ended the restart budget.**
+   A brownout now counts as the image's crash only when it ended a boot
+   inside the repair or its round (2.7.6's D5 scope, read from the previous
+   boot's RTC breadcrumb); a panic, watchdog or lockup still counts
+   anywhere. **Rejected: "or not when the ended boot's round made
+   progress".** Progress does not make a mid-round brownout harmless - the
+   D5 rationale (an erase that pulls the supply down must not loop) applies
+   exactly there, and the narrower scope already spares the flaky-power
+   sites the defect names.
+5. **A. A transient NVS failure on the round boot could end the deployment
+   `UNREPAIRED` in the boot whose round `REPAIRED` the store.** Before
+   concluding `UNREPAIRED` from a `CONFIRMED` (or `CONFIRMING`) record, the
+   glue re-derives the outcome from this boot's own repair report
+   (`storage_repair_exception_repair`, `sx_round_outcome`,
+   `sx_record_after_boot`), stores it, and decides from that instead.
+
+### 14.2 The device-lens critique (defects 1 to 6)
+
+1. **A. D2 (heartbeat acknowledgement) is now code.** The heartbeat task
+   keeps the `message_id` of the heartbeat it last sent; the inbound ack
+   handler stamps the one ADD acknowledged (ADD answers every accepted
+   message with at least its default ack); the gate refuses
+   `HEARTBEAT_UNACKED` unless one was acknowledged within 45 s
+   (`SX_HEARTBEAT_ACK_SECONDS`, three 15 s heartbeat periods). The sent id
+   is cleared on transport loss. One simplification against the written
+   D2, recorded here: the term is "a heartbeat was acknowledged", not "a
+   heartbeat that carried `ELIGIBLE` was acknowledged" - the ack carries
+   only the id, and every heartbeat of an evaluating boot carries
+   `ota.storage_exception`, so the stored state is at most 45 s older than
+   the acknowledgement.
+2. **A. The permanent floor was latched before ADD's veto.** The floor is
+   narrowed to what is actually unsafe: a journal flag beyond CLAIMED, any
+   round or block, any redo slot not erased (foreign and torn writes
+   included), a confirmed exception, or an unmounted store. CLAIMED alone,
+   with every slot of a fully discovered area erased, proves no record was
+   ever completed (a torn record leaves a non-erased slot; a boot that
+   could not inspect the whole area keeps the floor), so a merely REFUSED
+   attempt no longer bans 2.6.25/2.6.27, the images that recovered both
+   Peshawar ESPs. **Rejected: keeping permanence with an owner sign-off in
+   section 11** - the narrowing is provably custody-safe and keeps the
+   fleet's one proven recovery remedy for the devices likeliest to need it.
+3. **A. H4's "one exception target at a time" is now enforced in ADD**, at
+   the receipt: `storage_exception_allowed` additionally requires that no
+   other connector's active deployment carries `STORAGE_REPAIR_EXCEPTION`.
+   Two candidates racing each other both refuse (safe; the operator pauses
+   one campaign), and a second target can confirm only once the first's
+   deployment ended.
+4. **A. The restart policy no longer waits forever on an unknown clock.**
+   When the wall clock is unknown now or was when the restart was counted
+   (`restart_epoch` 0), `sx_next_step` runs the same 1 h / 6 h backoff on
+   the boot's own clock (`uptime_s`). `SX_MAX_RESTARTS` bounds the total; a
+   reset before the wait ends only repeats the wait. The host test that
+   asserted the dead-end now asserts the bounded fallback. **Rejected:
+   counting WAIT verdicts in the record toward a bound** - every counted
+   WAIT is an NVS write on a device whose NVS the exception already leans
+   on, and the uptime backoff needs none.
+5. **P. 13FL's inventory budget.** On a boot that may use the exception
+   (the area test passed and the probe is held), the inventory's budget is
+   180 s plus 20 ms per span the boot repair holds, capped at +300 s -
+   known before the scan starts, bounded well inside the 900 s budget.
+   C1 versus 13FL's hold sizes is put to the owner as a pre-campaign
+   decision (section 11 item 1), and the runbook's 13FL section now says
+   what a refusal there means. **Rejected: closing a file's scan early when
+   its unreadable span set already equals the repair's held set** - that
+   duplicates C4's equality check inside the scan with a second
+   implementation that could drift from the one the gate trusts; the scaled
+   budget achieves the liveness without a second oracle.
+6. **A. A small custody file is guaranteed a report slot.** The inventory's
+   keep policy gains a middle tier: unreadable files first, then the
+   repair's custody names (passed by the firmware as priority names), then
+   the largest. The SPIFFS harness's cluttered variants build an 18-file
+   store where 16 files are larger than the one-row `/add_corrupt.bak` and
+   prove both directions: with the priority the gate's custody check
+   passes; with 2.7.6's size-only policy it would refuse `CUSTODY_MISSING`.
+   The P02 fit variant keeps P02's own six-file directory so the 8 MiB
+   histogram assertions stay faithful. **Rejected: evaluating C5 against
+   the scan's full name walk** - the walk's names live only inside the scan
+   task; the report is the one structure the gate, the heartbeat and the
+   operator all read, so the guarantee belongs there.

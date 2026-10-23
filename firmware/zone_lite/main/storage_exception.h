@@ -335,7 +335,7 @@ typedef enum {
  * UNREPAIRED. When the wall clock is unknown now or was when the restart was
  * counted (`restart_epoch` 0), the backoff runs on this boot's own clock
  * (`uptime_s`), so a device whose network blocks NTP still ends in a bounded
- * retry instead of waiting forever (round 2 review, defect 4).
+ * retry instead of waiting forever (design 14.2 item 4).
  * `*wait_s`: seconds until a WAIT may restart. */
 sx_next_t sx_next_step(const sx_record_t *record, bool time_known, uint32_t now_epoch, uint32_t uptime_s,
                        uint32_t *wait_s);

@@ -204,7 +204,7 @@ sx_reason_t sx_runtime_verdict(const sx_repair_t *r, const sx_inventory_t *v, co
     if (rt->health_blockers & ~(uint32_t)SX_HEALTH_EXCEPTED) return SX_HEALTH;
     /* ADD and the OTA path (D1, D2, D4, critique 6). */
     if (!rt->add_connected) return SX_ADD_DISCONNECTED;
-    /* D2 (round 2 review, defect 1): ADD acknowledged a heartbeat within
+    /* D2 (design 14.2 item 1): ADD acknowledged a heartbeat within
      * SX_HEARTBEAT_ACK_SECONDS. The log and the receipt prove the log and
      * HTTPS paths; the heartbeat is the channel that carries the floor, the
      * confirm reason and the exception diagnostics the operator reads. */
@@ -406,7 +406,7 @@ sx_next_t sx_next_step(const sx_record_t *record, bool time_known, uint32_t now_
         /* The wall clock is unknown now, or was when the restart was counted:
          * the backoff runs on this boot's own clock. SX_MAX_RESTARTS still
          * bounds the total, so a reset before the wait ends only repeats the
-         * wait; it can never loop (round 2 review, defect 4). */
+         * wait; it can never loop (design 14.2 item 4). */
         if (uptime_s >= backoff) return SX_NEXT_RESTART;
         if (wait_s) *wait_s = backoff - uptime_s;
         return SX_NEXT_WAIT;

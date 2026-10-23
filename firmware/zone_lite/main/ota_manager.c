@@ -1334,8 +1334,8 @@ static __attribute__((noinline)) void sx_after_confirm_step(void)
         (record.state == SX_STATE_CONFIRMED || record.state == SX_STATE_CONFIRMING)) {
         /* The round boot could not record its outcome (its NVS write failed):
          * before ending the deployment, re-derive the outcome from this
-         * boot's own repair report and store that instead (round 2 review,
-         * defect 5: the round may in fact have REPAIRED the store). */
+         * boot's own repair report and store that instead (design 14.1 item 5:
+         * the round may in fact have REPAIRED the store). */
         sx_inputs_t *b = sx_buffers();
         if (b && storage_repair_exception_repair(&b->repair) &&
             sx_record_after_boot(&record, storage_repair_image_tag(), storage_repair_running_pending(), false,

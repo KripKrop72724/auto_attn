@@ -16,7 +16,7 @@
  * yields to every storage user and stops at its budget. */
 #define SI_START_DELAY_MS (60 * 1000)
 #define SI_BUDGET_US (180LL * 1000LL * 1000LL)
-/* ZKT 2.7.7 (round 2 review, defect 5): on a boot that may use the
+/* ZKT 2.7.7 (design 14.2 item 5): on a boot that may use the
  * confirm-first exception, the budget grows with the spans the boot repair
  * holds (each costs a failed chunk and a failed span read, and a damaged
  * page can cost a search of the whole store), bounded well inside the 900 s

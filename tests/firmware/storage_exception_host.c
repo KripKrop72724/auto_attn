@@ -450,7 +450,7 @@ static int restarts(void)
     r = at(SX_STATE_ROUND_SHORT, SX_ROUND_STORE_BLOCKED, 3, 3, t0);
     EXPECT(sx_next_step(&r, true, t0 + 99 * 3600, 0, &wait) == SX_NEXT_UNREPAIRED);
     /* An unknown wall clock backs off on this boot's own clock instead of
-     * waiting forever (round 2 review, defect 4): the second restart after
+     * waiting forever (design 14.2 item 4): the second restart after
      * 1 h of uptime, the third after 6 h, and the cap still ends it. */
     r = at(SX_STATE_ROUND_SHORT, SX_ROUND_TIME, 1, 1, t0);
     EXPECT(sx_next_step(&r, false, 0, 0, &wait) == SX_NEXT_WAIT && wait == 3600);

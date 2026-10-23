@@ -5455,7 +5455,7 @@ static void build_p02field(void)
     model_file_t *live = new_model("/add_live.jsonl", true, false);
     model_file_t *outbox = new_model("/add_pending.jsonl", true, false);
     model_file_t *commands = new_model("/processed_commands.txt", false, true);
-    /* A real store's fuller directory (round 2 review, defect 6), in every
+    /* A real store's fuller directory (design 14.2 item 6), in every
      * variant but the P02 fit (P02's own directory had six files; the
      * histogram assertions keep that model faithful): the device reports at
      * most SX_INVENTORY_FILES files, so this store holds more than that,
@@ -5666,7 +5666,7 @@ static srx_test_t p02field_area_test(void)
  * keep(): unreadable files first, then the repair's custody names, then the
  * largest; SI_MAX_FILES slots), as storage_repair.c hands it to the gate.
  * The field store holds more files than the report, so this exercises the
- * cap the way P02's first 2.7.7 boot will (round 2 review, defect 6). */
+ * cap the way P02's first 2.7.7 boot will (design 14.2 item 6). */
 #define P02F_DIR_FILES 32U
 static uint32_t p02field_larger_files; /* listed files larger than /add_corrupt.bak */
 static bool p02field_priority(const sx_repair_t *r, const char *bare)
@@ -7179,7 +7179,7 @@ static void run_reclaim_p02field(uint32_t kib, uint32_t variant)
     CHECK(test == SRX_TEST_PASSED, "p02field: the area test %s", srx_test_name(test));
     if (variant == P02F_HIDDEN) p02field_area_test_cuts();
     sx_reason_t gate = p02field_gate(u, test);
-    /* The report cap is really exercised (round 2 review, defect 6) in the
+    /* The report cap is really exercised (design 14.2 item 6) in the
      * cluttered variants: the directory holds more files than the device
      * reports and enough files are larger than the one-row /add_corrupt.bak
      * that by size alone it would lose its slot. With the repair reporting
