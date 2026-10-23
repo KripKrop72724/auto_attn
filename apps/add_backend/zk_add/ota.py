@@ -1235,7 +1235,7 @@ def assignment_for_connector(session: Session, *, connector: Connector, public_b
         hold = pending_offer_hold(session, connector, release)
         if hold:
             deployment.error_code = hold
-            deployment.error_message = "Waiting for the nationwide ZKT upgrade slot and exact target checks."
+            deployment.error_message = "Waiting for the device to be online as an approved fleet target."
             return None
         details = {}
         if release.version == "2.7.0":
@@ -1869,8 +1869,8 @@ def _serialize_campaign(
         .order_by(Connector.id.asc())
         .limit(1)
     )
-    # A live campaign whose next device is held (for example by the
-    # nationwide ZKT upgrade slots) is waiting, not stuck: say why.
+    # A live campaign whose next device is held (for example while it is
+    # offline) is waiting, not stuck: say why.
     waiting = None
     if campaign.status == "ACTIVE" and not any(row["status"] in ACTIVE_DEPLOYMENT_STATES for row in deployments):
         queued = next((row for row in deployments if row["status"] == "PENDING"), None)

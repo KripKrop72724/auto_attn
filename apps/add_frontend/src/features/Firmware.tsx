@@ -169,15 +169,20 @@ function releaseZones(release: FirmwareRelease | null, devices: Device[]) {
   return ids.sort((left, right) => left.localeCompare(right)).map((id) => ({ id, name: named.get(id) || id }))
 }
 
-const waitingLabel = (code: string) =>
-  code.startsWith('NATIONWIDE_') ? 'Waiting for a fleet slot' : `Waiting: ${humanize(code)}`
+// There is no fleet-wide limit on simultaneous upgrades; a queued device
+// waits only while it is offline or is not an approved fleet target.
+const WAITING_TEXT: Record<string, string> = {
+  NATIONWIDE_TARGET_OFFLINE: 'Waiting for the device to come online',
+  NATIONWIDE_EXACT_TARGET_REQUIRED: 'Waiting: not an approved fleet target',
+}
+const waitingLabel = (code: string) => WAITING_TEXT[code] || `Waiting: ${humanize(code)}`
 
 function bulkOutcome(row: FirmwareBulkZoneResult) {
   if (row.outcome === 'CREATED' && row.fleet_hold)
     return {
-      badge: 'WAITING_FOR_FLEET_SLOT',
+      badge: 'CREATED',
       pattern: 'waiting',
-      text: `Created; waits for a nationwide upgrade slot (${humanize(row.fleet_hold).toLowerCase()}).`,
+      text: `Created; ${waitingLabel(row.fleet_hold).toLowerCase()}.`,
     }
   if (row.outcome === 'CREATED')
     return {

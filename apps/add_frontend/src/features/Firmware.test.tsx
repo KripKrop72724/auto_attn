@@ -32,8 +32,8 @@ const campaign = (changes: Partial<FirmwareCampaign>): FirmwareCampaign => ({
 const rows = [
   campaign({
     waiting: {
-      connector_id: 'connector-multan-02', display_name: 'Multan 02', code: 'NATIONWIDE_TWO_UPGRADE_RESERVATIONS',
-      message: 'Waiting for the nationwide ZKT upgrade slot and exact target checks.',
+      connector_id: 'connector-multan-02', display_name: 'Multan 02', code: 'NATIONWIDE_TARGET_OFFLINE',
+      message: 'Waiting for the device to be online as an approved fleet target.',
     },
   }),
   campaign({ campaign_id: 'campaign-cancelled', zone_id: 'ZONE-SWAT', zone_name: 'Swat', status: 'CANCELLED', counts: { CANCELLED: 1 } }),
@@ -82,10 +82,10 @@ afterEach(() => {
 })
 
 describe('one-click firmware campaign operations', () => {
-  it('shows a campaign waiting for a fleet slot', async () => {
+  it('shows a campaign waiting for its offline device', async () => {
     vi.stubGlobal('fetch', server())
     view()
-    expect(await screen.findByText('Waiting for a fleet slot')).toBeTruthy()
+    expect(await screen.findByText('Waiting for the device to come online')).toBeTruthy()
     expect(screen.getByText(/Show archived \(3\)/)).toBeTruthy()
   })
 
@@ -135,7 +135,7 @@ describe('one-click firmware campaign operations', () => {
     const fetchMock = server()
     vi.stubGlobal('fetch', fetchMock)
     view()
-    await screen.findByText('Waiting for a fleet slot')
+    await screen.findByText('Waiting for the device to come online')
     const lists = () => (fetchMock.mock.calls as unknown as Array<[string]>)
       .map(([path]) => path)
       .filter((path) => path.startsWith('/api/v1/firmware/campaigns?'))

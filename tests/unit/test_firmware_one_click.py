@@ -325,24 +325,24 @@ def test_bulk_needs_an_enabled_ota_channel(db, monkeypatch):
     assert db.scalar(select(func.count(FirmwareCampaign.id))) == 0
 
 
-def test_bulk_function_reports_a_waiting_fleet_slot_without_changing_it(db, monkeypatch):
+def test_bulk_function_reports_a_waiting_offline_device_without_changing_it(db, monkeypatch):
     rel = platform_release(db)
     device = esp(db, TARGETS[3], "ZONE-MULTAN-01")
     from zk_add import zkt_ota_admission
     monkeypatch.setattr(zkt_ota_admission, "pending_offer_hold",
-                        lambda _session, _connector, _release=None: "NATIONWIDE_TWO_UPGRADE_RESERVATIONS")
+                        lambda _session, _connector, _release=None: "NATIONWIDE_TARGET_OFFLINE")
     result = create_for_zones(db, release_public_id=rel.release_id, zone_ids=[device.zone_id],
                               actor="StateHealthAdmin", idempotency_key="bulk-waiting-0001")
     [row] = result["results"]
-    assert (row["outcome"], row["fleet_hold"]) == ("CREATED", "NATIONWIDE_TWO_UPGRADE_RESERVATIONS")
+    assert (row["outcome"], row["fleet_hold"]) == ("CREATED", "NATIONWIDE_TARGET_OFFLINE")
     deployment = db.scalar(select(FirmwareDeployment))
     assert (deployment.status, deployment.error_code) == ("PENDING", None)
     # The assignment path records the hold on the queued device; the list shows it as waiting.
-    deployment.error_code = "NATIONWIDE_TWO_UPGRADE_RESERVATIONS"
-    deployment.error_message = "Waiting for the nationwide ZKT upgrade slot and exact target checks."
+    deployment.error_code = "NATIONWIDE_TARGET_OFFLINE"
+    deployment.error_message = "Waiting for the device to be online as an approved fleet target."
     db.flush()
     [summary] = campaign_page(db, limit=10)["rows"]
-    assert summary["waiting"]["code"] == "NATIONWIDE_TWO_UPGRADE_RESERVATIONS"
+    assert summary["waiting"]["code"] == "NATIONWIDE_TARGET_OFFLINE"
     assert summary["waiting"]["connector_id"] == device.connector_id
 
 

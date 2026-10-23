@@ -968,7 +968,7 @@ describe('State Life ADD interface', () => {
     expect(fetchMock.mock.calls.some(([input]) => String(input).endsWith('/campaigns/preflight'))).toBe(false)
   })
 
-  it('shows stability warnings and a waiting fleet slot as information after a one-click update', async () => {
+  it('shows stability warnings and a waiting offline device as information after a one-click update', async () => {
     await import('./features/Firmware')
     const base = fetchStub()
     const warning = {
@@ -984,7 +984,7 @@ describe('State Life ADD interface', () => {
           created: 1,
           results: [{
             zone_id: device.zone_id, outcome: 'CREATED', campaign_id: 'campaign-one', status: 'ACTIVE', message: null,
-            stability_warnings: [warning], eligible: 1, fleet_hold: 'NATIONWIDE_TWO_UPGRADE_RESERVATIONS', closed: [],
+            stability_warnings: [warning], eligible: 1, fleet_hold: 'NATIONWIDE_TARGET_OFFLINE', closed: [],
           }],
         })
       }
@@ -1001,7 +1001,7 @@ describe('State Life ADD interface', () => {
     fireEvent.click(screen.getByRole('checkbox', { name: new RegExp(device.zone_id) }))
     fireEvent.click(screen.getByRole('button', { name: 'Update 1 zone' }))
     expect(await screen.findByText(/46 ESP resets in 30 online hours/)).toBeTruthy()
-    expect(screen.getByText(/waits for a nationwide upgrade slot/)).toBeTruthy()
+    expect(screen.getByText(/Created; waiting for the device to come online/)).toBeTruthy()
     expect(screen.queryByLabelText(/Override the stability warnings/)).toBeNull()
   })
 

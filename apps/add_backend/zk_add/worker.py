@@ -571,7 +571,7 @@ def prepare_maintenance_tick(
         from zk_add.ota_interruption import expire_held_downloads
 
         # A 2.6.x download held for a re-offer whose ESP went quiet fails
-        # closed here instead of keeping its zone and nationwide upgrade slots.
+        # closed here instead of keeping its zone busy.
         with session_scope() as session:
             expire_held_downloads(session, now=now)
     except Exception:

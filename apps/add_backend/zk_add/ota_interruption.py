@@ -77,7 +77,7 @@ RESUMED_GRANT_LIMIT = 2 * (DOWNLOAD_ATTEMPT_LIMIT - 1)
 # A re-offer the ESP has not taken this long after its backoff ended (HTTPS
 # failing while heartbeats arrive, an ESP that reset or went offline, or a
 # refusal ADD cannot name here) fails the deployment instead of holding the
-# zone's and the nationwide upgrade slots.
+# zone.
 DOWNLOAD_RETRY_DEADLINE_SECONDS = 900
 # No re-offer at all once this long has passed since the first stop.
 DOWNLOAD_RESUME_WINDOW_SECONDS = 3600
@@ -508,7 +508,7 @@ def expire_held_downloads(session: Session, *, now: datetime | None = None,
     The assignment and heartbeat paths decide the same on the ESP's next
     request; this covers an ESP that reset or went offline during its
     backoff, a campaign paused by any path, and the switch turned off, so a
-    hold never keeps the zone's and the nationwide upgrade slots for long.
+    hold never keeps the zone busy for long.
     """
     now = now or utc_now()
     rows = list(session.scalars(select(FirmwareDeployment).where(

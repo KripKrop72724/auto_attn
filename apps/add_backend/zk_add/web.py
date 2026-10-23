@@ -6571,8 +6571,8 @@ async def start_firmware_campaigns_for_zones(
 
     Each zone reports CREATED, BUSY (a campaign with a queued or updating
     device already runs there) or BLOCKED (the server's reason). Every OTA
-    guard is unchanged: a created campaign whose devices have no fleet slot
-    yet simply waits.
+    guard is unchanged: a created campaign whose device is offline simply
+    waits.
     """
     from zk_add.firmware_campaigns import create_for_zones
 

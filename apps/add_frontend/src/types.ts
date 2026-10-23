@@ -1174,8 +1174,8 @@ export interface FirmwareCampaign {
   actor: string
   reason: string
   deployments: FirmwareDeployment[]
-  // A live campaign whose next device is held (for example by the nationwide
-  // ZKT upgrade slots) is waiting, not stuck.
+  // A live campaign whose next device is held (for example while it is
+  // offline) is waiting, not stuck.
   waiting?: { connector_id: string | null; display_name: string | null; code: string; message: string | null } | null
   created_at: string
   updated_at: string

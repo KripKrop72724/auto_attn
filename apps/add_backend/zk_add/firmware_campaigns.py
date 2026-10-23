@@ -3,8 +3,8 @@
 None of this changes an OTA admission or safety guard. Every campaign is still
 created by ota.create_campaign from a fresh signed scope preview (zone
 serialization, HIL target order and schedule, stability override digest), and
-every offer still passes assignment_for_connector with the nationwide ZKT fleet
-limit. A campaign whose devices cannot get a fleet slot yet is created and
+every offer still passes assignment_for_connector. There is no fleet-wide limit
+on simultaneous upgrades; a campaign whose device is offline is created and
 waits (deployment PENDING), exactly like a campaign created on its own.
 
 Archiving only hides a finished campaign; its deployments, events and grants
