@@ -332,7 +332,7 @@ def test_bulk_function_reports_a_waiting_offline_device_without_changing_it(db, 
     monkeypatch.setattr(zkt_ota_admission, "pending_offer_hold",
                         lambda _session, _connector, _release=None: "NATIONWIDE_TARGET_OFFLINE")
     result = create_for_zones(db, release_public_id=rel.release_id, zone_ids=[device.zone_id],
-                              actor="StateHealthAdmin", idempotency_key="bulk-waiting-0001")
+                              actor="StateHealthAdmin", idempotency_key="wait-0001")
     [row] = result["results"]
     assert (row["outcome"], row["fleet_hold"]) == ("CREATED", "NATIONWIDE_TARGET_OFFLINE")
     deployment = db.scalar(select(FirmwareDeployment))
