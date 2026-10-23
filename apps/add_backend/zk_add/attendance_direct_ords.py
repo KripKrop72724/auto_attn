@@ -22,11 +22,14 @@ POSTed a different CNIC is held for review instead (PREVIOUS_POST_UNCERTAIN).
 """
 
 from dataclasses import dataclass, replace
+from types import SimpleNamespace
 from uuid import uuid4
 
 from sqlalchemy import func, select, tuple_
 
 from zk_add import source_newest_slot as newest_slot
+from zk_add.attendance_cnic_link import unknown_synced_cnic_expression
+from zk_add.attendance_direct_ords_schemas import DirectOrdsCnicChoice
 from zk_add.attendance_force_release import _lock_scheduler
 from zk_add.attendance_legacy_uid import potentially_recoverable
 from zk_add.attendance_manual_guard import decision_for
@@ -1071,6 +1074,78 @@ def create(session, *, actor: str, request):
         },
     )
     return job
+
+
+QUICK_REASON = "One-click release: unknown identity with a CNIC on the synced user"
+# Decisions the one-click release takes for the administrator. Everything
+# else (another CNIC or person near the punch, a CNIC another active user
+# holds, a record that does not prove today's CNIC) is skipped and stays held
+# for the per-punch send dialog.
+QUICK_DECISION_STATES = frozenset({DIFFERS, NONE})
+
+
+def quick_decisions(rows) -> tuple[list[DirectOrdsCnicChoice], list[int]]:
+    """The choices one click makes on the preview rows: never a guess between people.
+
+    The punch-time CNIC where ADD's records name exactly one other CNIC (the
+    send dialog's recommended choice), and today's synced CNIC only where ADD
+    holds no record at all for the user ID at the punch time. Punches ADD's
+    own proof releases at the next snapshot are sent now.
+    """
+    choices, send_now = [], []
+    for row in rows:
+        if row["exclusion"] is not None:
+            continue
+        if row["cnic_choice_required"]:
+            state, digest = row["punch_time_cnic"], row["evidence_digest"]
+            choice = None
+            if state == DIFFERS and row["default_cnic_choice"] == PUNCH_TIME:
+                choice = PUNCH_TIME
+            elif state == NONE and CURRENT in row["cnic_choices"] and NAME_DIFFERS not in row["evidence_signals"]:
+                choice = CURRENT
+            if choice is None or not digest:
+                continue
+            choices.append(DirectOrdsCnicChoice(event_id=row["event_id"], choice=choice, evidence_digest=digest))
+        if row["auto_release_at_next_snapshot"] or row["awaiting_next_snapshot"]:
+            send_now.append(row["event_id"])
+    return choices, send_now
+
+
+def unknown_synced_event_ids(session, event_ids=None, *, limit=None) -> list[int]:
+    """Punches still matching "Unknown identity · CNIC on synced user", newest first."""
+    query = select(AttendanceEvent.id).where(unknown_synced_cnic_expression())
+    if event_ids is not None:
+        query = query.where(AttendanceEvent.id.in_(sorted(set(event_ids))))
+    query = query.order_by(AttendanceEvent.id.desc())
+    return list(session.scalars(query.limit(limit) if limit else query).all())
+
+
+def quick_release(session, *, actor: str, event_ids, idempotency_key: str):
+    """One audited direct send of selected held punches, decided by ``quick_decisions``.
+
+    Only punches that still match the unknown-identity filter are sent; every
+    check of the send dialog still runs, and anything it refuses is skipped.
+    """
+    matching = sorted(unknown_synced_event_ids(session, event_ids))
+    if not matching:
+        raise RecoveryError(
+            "None of the selected punches is still an unknown identity with a CNIC on the synced user.",
+            "NOTHING_TO_RELEASE",
+        )
+    choices, send_now = quick_decisions(preview(session, matching)["rows"])
+    request = SimpleNamespace(
+        event_ids=matching, reason=QUICK_REASON, idempotency_key=idempotency_key,
+        cnic_choices=choices, send_now_event_ids=send_now,
+    )
+    job = create(session, actor=actor, request=request)
+    return job, len(set(event_ids)) - len(matching)
+
+
+def skipped_by_reason(session, job) -> dict[str, int]:
+    return dict(session.execute(
+        select(Item.error_code, func.count()).where(Item.job_id == job.id, Item.status == "SKIPPED")
+        .group_by(Item.error_code)
+    ).all())
 
 
 def approved_payload(session, event, connector, decision):

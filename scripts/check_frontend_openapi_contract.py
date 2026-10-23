@@ -63,6 +63,12 @@ def main() -> None:
         request_properties(spec, "/api/v2/attendance-direct-ords", "post")
     )
     assert {"event_ids"}.issubset(request_properties(spec, "/api/v2/attendance-direct-ords/preview", "post"))
+    # One click: the unknown-identity release takes no reason or password.
+    assert request_properties(spec, "/api/v2/attendance-direct-ords/quick-release", "post") == {
+        "event_ids", "idempotency_key",
+    }
+    assert "get" in paths["/api/v2/attendance-direct-ords/unknown-synced"]
+    assert "unknown_synced_cnic" in {row["name"] for row in paths["/api/v1/attendance"]["get"]["parameters"]}
     # Each CNIC choice is bound to the evidence the dialog showed, and a
     # punch-time CNIC another active user holds needs its own confirmation.
     choice = spec["components"]["schemas"]["DirectOrdsCnicChoice"]

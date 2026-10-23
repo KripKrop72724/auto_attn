@@ -22,6 +22,7 @@ import { AttendanceReleaseHistory } from './AttendanceRelease'
 import { CheckinNotifyPill, CheckinNotifySummary, notifyStatusLabels } from './CheckinNotification'
 import { DirectOrdsSend } from './DirectOrdsSend'
 import { IdentityBacklogRelease } from './IdentityBacklogRelease'
+import { UnknownSyncedRelease } from './UnknownSyncedRelease'
 
 type AttendanceRange = 'latest' | 'today' | 'last24' | 'custom'
 type AttendanceViewMode = 'all-events' | 'needs-review' | 'release-history'
@@ -38,6 +39,7 @@ type AttendanceFilters = {
   ords_statuses: string[]
   notify_statuses: CheckinNotificationStatus[]
   cnic_presence: string
+  unknown_synced: string
 }
 type AttendanceResponse = {
   rows: AttendanceEvent[]
@@ -50,7 +52,7 @@ type AttendanceResponse = {
 const emptyFilters: AttendanceFilters = {
   device_id: '', q: '', cnic: '', punch: '', clock_quality: '', source: '',
   from_time: '', to_time: '', forced: '',
-  ords_statuses: [], notify_statuses: [], cnic_presence: '',
+  ords_statuses: [], notify_statuses: [], cnic_presence: '', unknown_synced: '',
 }
 
 const notifyFilterOptions: CheckinNotificationStatus[] = ['NOTIFIED', 'PENDING', 'RETRYING', 'FAILED', 'NOT_SENT']
@@ -159,7 +161,7 @@ function AllAttendanceEvents({
   }, [filters.cnic, filters.from_time, filters.to_time])
 
   const requestPath = useCallback((cursor?: number) => {
-    const { ords_statuses, notify_statuses, cnic_presence, ...singleFilters } = filters
+    const { ords_statuses, notify_statuses, cnic_presence, unknown_synced, ...singleFilters } = filters
     const params = new URLSearchParams(queryString({
       ...singleFilters,
       from_time: pktInputToUtc(filters.from_time),
@@ -170,6 +172,7 @@ function AllAttendanceEvents({
     ords_statuses.forEach((status) => params.append('ords_status', status))
     notify_statuses.forEach((status) => params.append('notify_status', status))
     if (cnic_presence) params.set('cnic_present', String(cnic_presence === 'present'))
+    if (unknown_synced) params.set('unknown_synced_cnic', 'true')
     return `/api/v1/attendance?${params.toString()}`
   }, [filters, pageSize])
 
@@ -370,6 +373,7 @@ function AllAttendanceEvents({
     clock_quality: 'Clock', source: 'Capture', from_time: 'From', to_time: 'To',
     forced: 'Forced attendance',
     cnic_presence: 'CNIC',
+    unknown_synced: 'Unknown identity',
   }
   const connectionLabel = {
     connecting: 'Connecting', live: 'Realtime connected', reconnecting: 'Reconnecting', stale: 'Cached connection',
@@ -440,7 +444,7 @@ function AllAttendanceEvents({
         {activeFilterCount > 0 && (
           <div className="active-filter-bar" aria-label="Active attendance filters">
             <span>{activeFilterCount} active</span>
-            {filtered.map(([key, value]) => <button type="button" key={key} onClick={() => removeFilter(key)}>{filterLabels[key]}: {key === 'device_id' ? devices.find((device) => device.connector_id === value)?.display_name || value : key === 'source' ? captureLabel(value) : key === 'punch' ? punchLabel(value) : key === 'cnic_presence' ? value === 'missing' ? 'Missing' : 'Present' : value}<Icon name="x" /></button>)}
+            {filtered.map(([key, value]) => <button type="button" key={key} onClick={() => removeFilter(key)}>{filterLabels[key]}: {key === 'device_id' ? devices.find((device) => device.connector_id === value)?.display_name || value : key === 'source' ? captureLabel(value) : key === 'punch' ? punchLabel(value) : key === 'cnic_presence' ? value === 'missing' ? 'Missing' : 'Present' : key === 'unknown_synced' ? 'CNIC on synced user' : value}<Icon name="x" /></button>)}
             {filters.ords_statuses.map((status) => <button type="button" key={status} onClick={() => setFilters({ ...filters, ords_statuses: filters.ords_statuses.filter((item) => item !== status) })}>Oracle: {humanizeStatus(status)}<Icon name="x" /></button>)}
             {filters.notify_statuses.map((status) => <button type="button" key={`notify-${status}`} onClick={() => setFilters({ ...filters, notify_statuses: filters.notify_statuses.filter((item) => item !== status) })}>Phone: {notifyStatusLabels[status]}<Icon name="x" /></button>)}
             <button className="text-button" type="button" onClick={resetFilters}>Clear all</button>
@@ -449,6 +453,7 @@ function AllAttendanceEvents({
 
         {notifySummary && <CheckinNotifySummary summary={notifySummary} toast={toast} onChanged={() => void refreshFeed(true)} />}
         {(error || validationError) && <div className="message pattern-blocked operational-error" role="alert"><Icon name="alert" /><span>{validationError || error}</span><button className="button secondary" type="button" onClick={() => void replaceFeed()}>Retry</button></div>}
+        <UnknownSyncedRelease active={Boolean(filters.unknown_synced)} onToggle={() => { setSelected(new Map()); setFilters((current) => ({ ...current, unknown_synced: current.unknown_synced ? '' : 'true' })) }} selectedIds={[...selected.keys()]} clearSelection={() => setSelected(new Map())} refresh={refreshDirectProgress} />
         <DirectOrdsSend selected={[...selected.values()]} clearSelection={() => setSelected(new Map())} refresh={refreshDirectProgress} openRequest={singleSendRequest} selectControl={<label className="attendance-select-all"><input type="checkbox" checked={selectableRows.length > 0 && selectableRows.every((row) => selected.has(row.id))} disabled={!selectableRows.length || selected.size >= 500 && !selectableRows.every((row) => selected.has(row.id))} onChange={(event) => setSelected((current) => { const next = new Map(current); selectableRows.forEach((row) => { if (event.target.checked && next.size < 500) next.set(row.id, row); else if (!event.target.checked) next.delete(row.id) }); return next })} /> Select loaded punches</label>} />
         <div className="sr-only" aria-live="polite">{announcement}</div>
         <div ref={topSentinel} className="attendance-top-sentinel" aria-hidden="true" />

@@ -39,10 +39,11 @@ from zk_add import attendance_force_release as force_release
 from zk_add import attendance_direct_ords as direct_ords
 from zk_add import checkin_notify
 from zk_add import source_newest_slot as newest_slot
-from zk_add.attendance_cnic_link import cnic_not_linked_expression
+from zk_add.attendance_cnic_link import cnic_not_linked_expression, unknown_synced_cnic_expression
 from zk_add.attendance_force_schemas import ForceCheckRequest, ForceStartRequest, ForceControlRequest, UserRefreshRequest
 from zk_add.attendance_direct_ords_schemas import (
     DirectOrdsPreviewRequest,
+    DirectOrdsQuickReleaseRequest,
     DirectOrdsRecheckRequest,
     DirectOrdsStartRequest,
 )
@@ -636,6 +637,56 @@ def list_direct_ords_runs(
         .order_by(AttendanceRecoveryJob.id.desc()).limit(limit)
     ).all()
     return {"rows": [direct_ords.serialize(db, row) for row in rows]}
+
+
+# The ledger's "select all" covers this many punches; larger backlogs release in rounds.
+UNKNOWN_SYNCED_ID_LIMIT = 10_000
+
+
+@app.get("/api/v2/attendance-direct-ords/unknown-synced")
+def unknown_synced_summary(auth: tuple[Session, AdminContext] = Depends(require_admin)):
+    """Count and IDs of held "Unknown identity · CNIC on synced user" punches."""
+    db, _context = auth
+    condition = unknown_synced_cnic_expression()
+    devices = db.execute(
+        select(Connector.connector_id, Connector.display_name, Connector.zone_id, func.count(AttendanceEvent.id))
+        .join(Connector, Connector.id == AttendanceEvent.connector_id)
+        .where(condition)
+        .group_by(Connector.connector_id, Connector.display_name, Connector.zone_id)
+        .order_by(func.count(AttendanceEvent.id).desc())
+    ).all()
+    total = sum(row[3] for row in devices)
+    event_ids = direct_ords.unknown_synced_event_ids(db, limit=UNKNOWN_SYNCED_ID_LIMIT)
+    return {
+        "count": total,
+        "devices": [
+            {"connector_id": connector_id, "display_name": name, "zone_id": zone_id, "count": count}
+            for connector_id, name, zone_id, count in devices
+        ],
+        "event_ids": event_ids,
+        "truncated": total > len(event_ids),
+    }
+
+
+@app.post("/api/v2/attendance-direct-ords/quick-release", status_code=202)
+def quick_release_direct_ords(
+    body: DirectOrdsQuickReleaseRequest,
+    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+):
+    """One click, no reason or password: send selected unknown-identity punches now."""
+    db, context = auth
+    try:
+        job, not_matching = direct_ords.quick_release(
+            db, actor=context.username, event_ids=body.event_ids, idempotency_key=body.idempotency_key,
+        )
+        db.flush()
+    except RecoveryError as exc:
+        raise HTTPException(status_code=409, detail={"code": exc.code, "message": str(exc)}) from exc
+    return {
+        **direct_ords.serialize(db, job),
+        "not_matching": not_matching,
+        "skipped_by_reason": direct_ords.skipped_by_reason(db, job),
+    }
 
 
 @app.post("/api/v2/attendance-direct-ords/preview")
@@ -3722,6 +3773,7 @@ def attendance(
     ords_status: list[str] = Query(default=[]),
     notify_status: list[str] = Query(default=[]),
     cnic_present: bool | None = None,
+    unknown_synced_cnic: bool = False,
     from_time: str | None = None,
     to_time: str | None = None,
     cursor: int | None = None,
@@ -3771,6 +3823,8 @@ def attendance(
                 AttendanceEvent.cnic_encrypted == "",
             )
         )
+    if unknown_synced_cnic:
+        statement = statement.where(unknown_synced_cnic_expression())
     if notify_status:
         if not set(notify_status) <= set(checkin_notify.PILL_FILTERS):
             raise HTTPException(status_code=422, detail="Select valid phone notification statuses.")
