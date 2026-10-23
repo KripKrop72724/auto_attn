@@ -1108,6 +1108,8 @@ export interface ReconciliationClearHistoryResult {
   kept_reasons: Record<string, number>
   // Open jobs left running: Hikvision recent-tail capture, or an open attendance repair's source.
   kept_running?: Record<string, number>
+  // Jobs a busy database row held past the lock timeout; the next press finishes them.
+  busy?: number
 }
 
 export interface ReconciliationScheduler {
@@ -1236,6 +1238,8 @@ export interface FirmwareHistoryCleared {
   completed: number
   cancelled: number
   kept_running: Array<{ campaign_id: string; zone_id: string; connector: string | null; connector_id: string | null; state: string }>
+  // Campaigns a device's own transaction held past the lock timeout; counted in more.
+  busy?: number
   deleted: number
   archived: number
   more: boolean

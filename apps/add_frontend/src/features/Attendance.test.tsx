@@ -451,6 +451,36 @@ describe('Live attendance workspace', () => {
     expect(screen.queryByLabelText(/Administrator password/i)).toBeNull()
   })
 
+  it('retries a busy one-click release batch with the same key', async () => {
+    const unknown = event({
+      id: 21, event_uid: 'unknown-21', display_name: null, cnic_masked: null, ords_status: 'BLOCKED_IDENTITY',
+      direct_ords_identity: { eligible: true, cnic_source: 'SYNCED_USER', exclusion: null, punch_time_cnic: 'NONE', cnic_choice_required: true },
+    })
+    let attempts = 0
+    const fetchMock = vi.fn(async (path: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(path)
+      if (url === '/api/v2/attendance-direct-ords/unknown-synced') {
+        return response({ count: 1, devices: [], event_ids: [21], truncated: false })
+      }
+      if (url === '/api/v2/attendance-direct-ords/quick-release' && init?.method === 'POST') {
+        attempts += 1
+        if (attempts === 1) return response({ detail: { code: 'ADD_BUSY', message: 'ADD is busy delivering earlier punches. Retrying shortly.' } }, 503)
+        return response({ job_id: 'quick-busy', selected: 1, ready: 1, skipped: 0, not_matching: 0, skipped_by_reason: {} }, 202)
+      }
+      return response({ rows: [unknown], next_cursor: null })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    render(<AttendanceView {...attendanceProps} />)
+    fireEvent.click(await screen.findByRole('button', { name: /Unknown identity · CNIC on synced user/i }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Release all 1 to Oracle' }))
+    expect(await screen.findByText(/queued for Oracle/i, undefined, { timeout: 8000 })).toBeTruthy()
+    const posts = fetchMock.mock.calls.filter(([path, init]) => String(path) === '/api/v2/attendance-direct-ords/quick-release' && init?.method === 'POST')
+    expect(posts).toHaveLength(2)
+    const keys = posts.map(([, init]) => JSON.parse(String(init?.body)).idempotency_key)
+    expect(keys[0]).toBe(keys[1])
+    expect(screen.queryByText(/Stopped:/)).toBeNull()
+  }, 15000)
+
   it('marks impossible punch times and CNIC changes on held ledger rows', async () => {
     const invalid = event({
       ords_status: 'BLOCKED_IDENTITY', clock_quality: 'INVALID',

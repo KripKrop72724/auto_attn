@@ -18,10 +18,11 @@ from datetime import timedelta
 from typing import Any, Iterable
 
 from sqlalchemy import delete, select, update
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session
 
 from zk_add.audit import append_audit
+from zk_add.db import database_busy
 from zk_add.models import Connector
 from zk_add.ota import (
     ONE_CLICK_REASON,
@@ -319,7 +320,7 @@ def clear_history(session: Session, *, actor: str, now=None) -> dict[str, Any]:
     Bounded per call; calling it again finishes any remainder and is a no-op after.
     """
     now = now or utc_now()
-    completed, cancelled, kept = [], [], []
+    completed, cancelled, kept, busy = [], [], [], []
     live = list(session.scalars(select(FirmwareCampaign).where(FirmwareCampaign.status.in_(LIVE_STATES))
                                 .order_by(FirmwareCampaign.id).limit(HISTORY_LIMIT + 1)))
     more = len(live) > HISTORY_LIMIT
@@ -327,10 +328,19 @@ def clear_history(session: Session, *, actor: str, now=None) -> dict[str, Any]:
         deployments = list(session.scalars(select(FirmwareDeployment).where(
             FirmwareDeployment.campaign_id == campaign.id).order_by(FirmwareDeployment.id)
             .execution_options(populate_existing=True)))
-        if deployments and all(row.status == "SUCCEEDED" for row in deployments) and _complete(session, campaign):
-            _audit(session, actor, "FIRMWARE_CAMPAIGN_COMPLETED", campaign, source="clear-history")
-            completed.append(campaign.campaign_id)
-            continue
+        if deployments and all(row.status == "SUCCEEDED" for row in deployments):
+            try:
+                with session.begin_nested():
+                    done = _complete(session, campaign)
+            except OperationalError as error:
+                if not database_busy(error):
+                    raise
+                busy.append(campaign.campaign_id)  # A device's own transaction holds its row; next call.
+                continue
+            if done:
+                _audit(session, actor, "FIRMWARE_CAMPAIGN_COMPLETED", campaign, source="clear-history")
+                completed.append(campaign.campaign_id)
+                continue
         fresh = [row for row in deployments if row.status in MID_INSTALL_STATES
                  and row.updated_at is not None and ensure_utc(row.updated_at) >= now - MID_INSTALL_FRESH]
         if fresh:
@@ -345,6 +355,11 @@ def clear_history(session: Session, *, actor: str, now=None) -> dict[str, Any]:
                 _cancel(session, campaign, actor=actor, reason=CLEAR_REASON, source="clear-history")
         except ValueError:
             continue  # Its state changed meanwhile (for example it just completed).
+        except OperationalError as error:
+            if not database_busy(error):
+                raise
+            busy.append(campaign.campaign_id)  # A device's own transaction holds its row; next call.
+            continue
         cancelled.append(campaign.campaign_id)
     session.flush()
     closed = list(session.scalars(select(FirmwareCampaign).where(
@@ -363,11 +378,11 @@ def clear_history(session: Session, *, actor: str, now=None) -> dict[str, Any]:
             .values(archived_at=now, archived_by=actor).execution_options(synchronize_session=False)).rowcount or 0
     session.expire_all()
     result = {"completed": len(completed), "cancelled": len(cancelled), "kept_running": kept,
-              "deleted": deleted_count, "archived": archived_count, "more": more}
+              "busy": len(busy), "deleted": deleted_count, "archived": archived_count, "more": more or bool(busy)}
     append_audit(session, actor=actor, action="FIRMWARE_HISTORY_CLEARED", target_type="firmware_campaigns",
                  target_id=None, outcome="CLEARED",
                  after={**{key: value for key, value in result.items() if key != "kept_running"},
                         "kept_running": [row["campaign_id"] for row in kept],
-                        "completed_ids": completed[:200], "cancelled_ids": cancelled[:200],
+                        "completed_ids": completed[:200], "cancelled_ids": cancelled[:200], "busy_ids": busy[:200],
                         "deleted_ids": deleted[:200], "archived_ids": archived[:200]})
     return result

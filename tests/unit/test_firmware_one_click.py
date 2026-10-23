@@ -507,7 +507,7 @@ def test_clear_history_completes_cancels_keeps_deletes_and_archives(db):
     assert response.status_code == 200, response.text
     result = response.json()
     assert result == {
-        "completed": 1, "cancelled": 2, "deleted": 1, "archived": 7, "more": False,
+        "completed": 1, "cancelled": 2, "busy": 0, "deleted": 1, "archived": 7, "more": False,
         "kept_running": [{"campaign_id": fresh.campaign_id, "zone_id": fresh.zone_id, "connector": "fresh",
                           "connector_id": "connector-fresh", "state": "BOOTED_PENDING"}],
     }
@@ -547,6 +547,34 @@ def test_clear_history_never_deletes_a_writer_attempt(db):
     assert (result["deleted"], result["archived"]) == (0, 1)
     db.expire_all()
     assert db.get(FirmwareCampaign, row.id).archived_at is not None
+
+
+class _LockTimeout(Exception):
+    sqlstate = "55P03"
+
+
+def test_clear_history_skips_a_busy_campaign_for_the_next_call(db, monkeypatch):
+    from sqlalchemy.exc import OperationalError
+
+    from zk_add import firmware_campaigns
+
+    rel = plain_release(db)
+    device = plain_connector(db, "busy")
+    row, _ = campaign(db, rel, device.zone_id, deployments=[(device, "FAILED", True, None)])
+    real = firmware_campaigns._cancel
+
+    def held(*_args, **_kwargs):
+        # A device's own transaction holds its connector row past the lock timeout.
+        raise OperationalError("SELECT ... FOR UPDATE", {}, _LockTimeout("canceling statement due to lock timeout"))
+
+    monkeypatch.setattr(firmware_campaigns, "_cancel", held)
+    first = clear_history(db, actor="StateHealthAdmin")
+    assert (first["cancelled"], first["busy"], first["more"]) == (0, 1, True)
+    db.expire_all()
+    assert db.get(FirmwareCampaign, row.id).status == "ACTIVE"
+    monkeypatch.setattr(firmware_campaigns, "_cancel", real)
+    second = clear_history(db, actor="StateHealthAdmin")
+    assert (second["cancelled"], second["busy"], second["archived"]) == (1, 0, 1)
 
 
 def test_detail_serializes_archive_fields(db):

@@ -30,7 +30,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.concurrency import run_in_threadpool
 from sqlalchemy import and_, case, func, or_, select, text
-from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+from sqlalchemy.exc import IntegrityError, OperationalError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from zk_add import APP_VERSION
@@ -70,7 +70,7 @@ from zk_add.identity_conflicts import (
     valid_identity_resolutions,
 )
 from zk_add.identity_catalog import identity_catalog_messages
-from zk_add.db import SessionLocal, init_db, session_scope
+from zk_add.db import SessionLocal, database_busy, init_db, session_scope
 from zk_add.device_session import DeviceStreamSession
 from zk_add.models import (
     AdminSession,
@@ -689,6 +689,13 @@ def quick_release_direct_ords(
         db.flush()
     except RecoveryError as exc:
         raise HTTPException(status_code=409, detail={"code": exc.code, "message": str(exc)}) from exc
+    except OperationalError as exc:
+        if not database_busy(exc):
+            raise
+        # Nothing was saved; the dashboard retries this batch with the same key.
+        raise HTTPException(status_code=503, detail={
+            "code": "ADD_BUSY", "message": "ADD is busy delivering earlier punches. Retrying shortly.",
+        }) from exc
     return {
         **direct_ords.serialize(db, job),
         "not_matching": not_matching,
@@ -1898,12 +1905,20 @@ async def clear_reconciliation_history_route(
 ):
     db, context = auth
     # Committed batches over the whole history: keep them off the event loop.
-    result = await run_in_threadpool(
-        clear_reconciliation_history,
-        db,
-        actor=context.username,
-        request_id=body.idempotency_key if body else None,
-    )
+    try:
+        result = await run_in_threadpool(
+            clear_reconciliation_history,
+            db,
+            actor=context.username,
+            request_id=body.idempotency_key if body else None,
+        )
+    except OperationalError as exc:
+        if not database_busy(exc):
+            raise
+        # Batches already committed stay done; pressing again finishes the rest.
+        raise HTTPException(status_code=503, detail={
+            "code": "ADD_BUSY", "message": "ADD's database is busy. Press Clear reconcile history again to finish."
+        }) from exc
     await browser_events.publish("reconciliation", {"history_cleared": True})
     return result
 
@@ -6736,9 +6751,15 @@ async def clear_firmware_campaign_history(
         db, context = auth
         try:
             result = clear_history(db, actor=context.username)
+            db.commit()
         except ValueError as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
-        db.commit()
+        except OperationalError as error:
+            if not database_busy(error):
+                raise
+            raise HTTPException(status_code=503, detail={
+                "code": "ADD_BUSY", "message": "ADD's database is busy. Press Clear firmware history again.",
+            }) from error
         return result
 
     result = await run_in_threadpool(persist)

@@ -62,7 +62,7 @@ from zk_add.audit import append_audit
 from zk_add.crypto import (
     cnic_lookup, decrypt_cnic, decrypt_json, encrypt_json, encrypt_text, mask_cnic, normalize_cnic,
 )
-from zk_add.db import session_scope
+from zk_add.db import session_scope, wait_longer_for_locks
 from zk_add.models import (
     AttendanceEvent,
     AttendanceForceReleaseDecision as Decision,
@@ -82,6 +82,9 @@ from zk_add.time_utils import ensure_utc, utc_now
 ACTION = "MANUAL_DIRECT_ORDS"
 POLICY = "manual-direct-ords-v1"
 BATCH = 100
+# Below the 30 s statement timeout, so a wait for the scheduler lock fails as
+# a lock timeout (ADD_BUSY, retried by the dashboard) rather than a statement timeout.
+SCHEDULER_LOCK_WAIT_MS = 20_000
 ACTIVE = {"RUNNING", "WAITING_ORACLE"}
 
 PUNCH_TIME = "PUNCH_TIME"
@@ -975,6 +978,9 @@ def create(session, *, actor: str, request):
         for check in assess_many(session, unlocked, **decisions)
         if check.error is None or check.error in {"CNIC_CHOICE_REQUIRED", "AUTO_RELEASE_PENDING"}
     }
+    # The worker's release ticks hold the scheduler lock while they queue
+    # earlier approvals; wait for one tick instead of failing at the default.
+    wait_longer_for_locks(session, SCHEDULER_LOCK_WAIT_MS)
     _lock_scheduler(session)
     # Everything read before the lock (terminal users, identity records,
     # outboxes, earlier approvals and their items) is read again from the

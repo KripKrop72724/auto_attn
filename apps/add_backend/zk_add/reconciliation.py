@@ -11,7 +11,7 @@ import re
 from uuid import uuid4
 
 from sqlalchemy import and_, delete, func, or_, select
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session, aliased
 
 from zk_add import source_newest_slot as newest_slot
@@ -936,8 +936,11 @@ def clear_reconciliation_history(
     load-bearing references it; otherwise it is archived, so every proof that
     reads it keeps working. Work runs in committed batches so a long history
     never holds locks for long, and a second call finds nothing left to do.
-    Audit rows are never touched.
+    A job whose connector or row another transaction holds past the lock
+    timeout (a device's live traffic) is skipped and counted in busy; the
+    next call finishes it. Audit rows are never touched.
     """
+    from zk_add.db import database_busy
     from zk_add.models import AuditEvent
 
     commit = commit or session.commit
@@ -946,7 +949,8 @@ def clear_reconciliation_history(
         AuditEvent.action == HISTORY_CLEARED_ACTION, AuditEvent.request_id == request_id))
     if previous is not None:
         return dict(previous.after or {})
-    counts: dict = {"cancelled": 0, "deleted": 0, "archived": 0, "kept_reasons": {}, "kept_running": {}}
+    counts: dict = {"cancelled": 0, "deleted": 0, "archived": 0, "busy": 0, "kept_reasons": {}, "kept_running": {}}
+    busy_cancels = 0
     cancel_key = "clear-history-" + hashlib.sha256(request_id.encode()).hexdigest()[:48]
     last_id = 0
     while True:
@@ -964,12 +968,20 @@ def clear_reconciliation_history(
                 counts["kept_running"][keep] = counts["kept_running"].get(keep, 0) + 1
                 continue
             try:
-                job = control_reconciliation_job(
-                    session, job=job, action="cancel", actor=actor, idempotency_key=cancel_key,
-                    reason="Cancelled by clear reconcile history",
-                )
+                # A savepoint per job: a lock timeout on one busy connector
+                # rolls back only that job's cancel.
+                with session.begin_nested():
+                    job = control_reconciliation_job(
+                        session, job=job, action="cancel", actor=actor, idempotency_key=cancel_key,
+                        reason="Cancelled by clear reconcile history",
+                    )
             except ValueError:
                 continue  # It finished by itself meanwhile; the sweep below handles it.
+            except OperationalError as error:
+                if not database_busy(error):
+                    raise
+                busy_cancels += 1
+                continue
             counts["cancelled"] += int(job.status == "CANCELLED")
         commit()
     cursor: int | None = None
@@ -980,8 +992,9 @@ def clear_reconciliation_history(
         if cursor is not None:
             statement = statement.where(ReconciliationJob.id < cursor)
         # Newest first: a recovery child is handled before the parent it names.
+        # A row another transaction holds is left for the next call.
         batch = session.scalars(
-            statement.order_by(ReconciliationJob.id.desc()).limit(batch_size).with_for_update()
+            statement.order_by(ReconciliationJob.id.desc()).limit(batch_size).with_for_update(skip_locked=True)
         ).all()
         if not batch:
             break
@@ -1002,6 +1015,10 @@ def clear_reconciliation_history(
             except IntegrityError:
                 # Something began referencing these rows; keep them instead.
                 reasons.update({job_id: "REFERENCED" for job_id in deletable})
+            except OperationalError as error:
+                if not database_busy(error):
+                    raise
+                # Left unarchived for the next call, which deletes them.
             else:
                 counts["deleted"] += len(deletable)
                 gone = set(deletable)
@@ -1018,6 +1035,8 @@ def clear_reconciliation_history(
             counts["archived"] += 1
             counts["kept_reasons"][reason] = counts["kept_reasons"].get(reason, 0) + 1
         commit()
+    counts["busy"] = busy_cancels + int(session.scalar(select(func.count(ReconciliationJob.id)).where(
+        ReconciliationJob.status.in_(TERMINAL_JOB_STATES), ReconciliationJob.archived_at.is_(None))) or 0)
     append_audit(
         session,
         actor=actor,

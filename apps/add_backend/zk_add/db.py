@@ -4,8 +4,9 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
 
-from sqlalchemy import create_engine, event
+from sqlalchemy import create_engine, event, text
 from sqlalchemy.engine import Engine
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 from zk_add.settings import settings
@@ -13,6 +14,31 @@ from zk_add.settings import settings
 
 class Base(DeclarativeBase):
     pass
+
+
+# PostgreSQL: lock_not_available (a lock_timeout or NOWAIT refusal) and
+# query_canceled (statement_timeout).
+BUSY_SQLSTATES = frozenset({"55P03", "57014"})
+
+
+def database_busy(error: BaseException) -> bool:
+    """A row lock or statement ran out of time: the database is busy, not broken.
+
+    The operation can be retried; the transaction (or savepoint) that raised
+    it must be rolled back first.
+    """
+    original = getattr(error, "orig", None)
+    code = getattr(original, "sqlstate", None) or getattr(original, "pgcode", None)
+    return isinstance(error, OperationalError) and code in BUSY_SQLSTATES
+
+
+def wait_longer_for_locks(session: Session, milliseconds: int) -> None:
+    """Raise this transaction's lock_timeout (PostgreSQL only) for a lock a worker holds briefly.
+
+    SET LOCAL ends with the transaction. statement_timeout still bounds each statement.
+    """
+    if session.get_bind().dialect.name == "postgresql":
+        session.execute(text("SELECT set_config('lock_timeout', :value, true)"), {"value": f"{int(milliseconds)}ms"})
 
 
 def create_database_engine(database_url: str | None = None) -> Engine:
