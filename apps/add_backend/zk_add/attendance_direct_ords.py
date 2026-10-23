@@ -1125,7 +1125,15 @@ def quick_release(session, *, actor: str, event_ids, idempotency_key: str):
 
     Only punches that still match the unknown-identity filter are sent; every
     check of the send dialog still runs, and anything it refuses is skipped.
+    A retry with the same key returns the saved run before anything is
+    re-filtered: the first run may already have moved its punches out of hold.
     """
+    previous = session.scalar(select(Job).where(Job.idempotency_key == idempotency_key))
+    if previous is not None:
+        saved = set((previous.scope or {}).get("selected_event_ids") or [])
+        if previous.action != ACTION or previous.actor != actor or not saved <= set(event_ids):
+            raise RecoveryError("This request key belongs to another selection.", "IDEMPOTENCY_CONFLICT")
+        return previous, max(0, len(set(event_ids)) - previous.requested_count)
     matching = sorted(unknown_synced_event_ids(session, event_ids))
     if not matching:
         raise RecoveryError(

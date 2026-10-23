@@ -100,6 +100,18 @@ def test_quick_release_needs_no_reason_or_password_and_queues_the_synced_cnic(st
     with sessions() as db:
         assert db.get(AttendanceEvent, event_id).ords_status == "PENDING"
         assert db.scalar(select(Item)).status == "WAITING_ORACLE"
+        # A retry after a lost response returns the saved run, although the
+        # punch has left the hold and no longer matches the filter.
+        client, headers = client_for(db)
+        retry = client.post("/api/v2/attendance-direct-ords/quick-release", json=body, headers=headers)
+        assert retry.status_code == 202, retry.text
+        assert retry.json()["job_id"] == run["job_id"]
+        other = client.post("/api/v2/attendance-direct-ords/quick-release", headers=headers, json={
+            "event_ids": [event_id + 1], "idempotency_key": body["idempotency_key"],
+        })
+        assert other.status_code == 409
+        assert other.json()["detail"]["code"] == "IDEMPOTENCY_CONFLICT"
+    app.dependency_overrides.clear()
 
 
 def test_quick_release_refuses_punches_that_no_longer_match(store):
