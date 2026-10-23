@@ -48,6 +48,12 @@ jobs:
       - name: Verify repair guards in PowerShell Core
         shell: pwsh
         run: ./tools/usb-wifi-rescue/test-guards.ps1
+      - name: Verify real repair child-process results in Windows PowerShell 5.1
+        shell: powershell
+        run: ./tools/usb-wifi-rescue/test-process.ps1
+      - name: Verify real repair child-process results in PowerShell Core
+        shell: pwsh
+        run: ./tools/usb-wifi-rescue/test-process.ps1
       - name: Verify pinned audit source after Windows checkout
         shell: powershell
         run: |

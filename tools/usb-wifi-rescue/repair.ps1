@@ -56,27 +56,60 @@ function Get-ExactUsbPort {
     if ($devicesFound.Count -ne 1) { throw 'The expected ESP was not uniquely identified. Check its USB cable and close other serial programs, then run this tool again. No repair was started.' }
     return $devicesFound[0]
 }
-function Run-Tool([string]$Stage, [string[]]$Arguments) {
+function Run-Tool([string]$Stage, [string[]]$Arguments, [int]$TimeoutSeconds = 240) {
     $stdout = Join-Path $script:folder ($Stage + '.stdout.txt')
     $stderr = Join-Path $script:folder ($Stage + '.stderr.txt')
     # All arguments are generated from fixed choices, a COM-number match and
     # filenames in the private extraction directory. Never accept arbitrary CLI.
     $quoted = @($Arguments | ForEach-Object { '"' + $_ + '"' }) -join ' '
-    $process = Start-Process -FilePath $script:tool -ArgumentList $quoted -WorkingDirectory $script:extract -NoNewWindow -PassThru -RedirectStandardOutput $stdout -RedirectStandardError $stderr
-    $deadline = (Get-Date).AddMinutes(4)
-    $next = Get-Date
-    while (-not $process.HasExited) {
-        if ((Get-Date) -gt $deadline) { $process.Kill(); throw "USB operation timed out during $Stage. Keep the logs for support." }
-        if ((Get-Date) -ge $next) { Say "$Stage is running. Keep USB connected..."; $next = (Get-Date).AddSeconds(10) }
-        [Windows.Forms.Application]::DoEvents()
-        Start-Sleep -Milliseconds 100
-        $process.Refresh()
+    # Own the process handle from Start through WaitForExit. Start-Process's
+    # detached Process plus Refresh can lose ExitCode on Windows PowerShell,
+    # causing a successful security query to be mistaken for failure.
+    $info = New-Object Diagnostics.ProcessStartInfo
+    $info.FileName = $script:tool
+    $info.Arguments = $quoted
+    $info.WorkingDirectory = $script:extract
+    $info.UseShellExecute = $false
+    $info.CreateNoWindow = $true
+    $info.RedirectStandardOutput = $true
+    $info.RedirectStandardError = $true
+    $process = New-Object Diagnostics.Process
+    $process.StartInfo = $info
+    $outTask = $null; $errTask = $null
+    $outText = ''; $errText = ''; $exitCode = $null
+    $timedOut = $false; $started = $false
+    try {
+        if (-not $process.Start()) { throw "Could not start USB operation during $Stage." }
+        $started = $true
+        # Drain both pipes concurrently, including large flash progress output.
+        $outTask = $process.StandardOutput.ReadToEndAsync()
+        $errTask = $process.StandardError.ReadToEndAsync()
+        $timer = [Diagnostics.Stopwatch]::StartNew()
+        $next = Get-Date
+        while (-not $process.HasExited) {
+            if ($timer.Elapsed.TotalSeconds -ge $TimeoutSeconds) {
+                $timedOut = $true
+                $process.Kill()
+                break
+            }
+            if ((Get-Date) -ge $next) { Say "$Stage is running. Keep USB connected..."; $next = (Get-Date).AddSeconds(10) }
+            [Windows.Forms.Application]::DoEvents()
+            Start-Sleep -Milliseconds 100
+        }
+        $process.WaitForExit()
+        $exitCode = $process.ExitCode
+    } finally {
+        if ($started -and -not $process.HasExited) { $process.Kill(); $process.WaitForExit() }
+        if ($outTask) { $outText = $outTask.GetAwaiter().GetResult() }
+        if ($errTask) { $errText = $errTask.GetAwaiter().GetResult() }
+        [IO.File]::WriteAllText($stdout, $outText, (New-Object Text.UTF8Encoding($false)))
+        [IO.File]::WriteAllText($stderr, $errText, (New-Object Text.UTF8Encoding($false)))
+        @{ exit_code=$exitCode; timed_out=$timedOut } | ConvertTo-Json | Set-Content (Join-Path $script:folder ($Stage + '.process.json')) -Encoding UTF8
+        $process.Dispose()
     }
-    $process.WaitForExit()
-    $process.Refresh()
-    $text = (Get-Content -LiteralPath $stdout -Raw) + (Get-Content -LiteralPath $stderr -Raw)
-    if ($process.ExitCode -ne 0) { throw "USB operation failed during $Stage. Saved logs contain the details." }
-    return $text
+    if ($timedOut) { throw "USB operation timed out during $Stage. Keep the logs for support." }
+    if ($null -eq $exitCode -or $exitCode -ne 0) { throw "USB operation failed during $Stage (exit code $exitCode). Saved logs contain the details." }
+    return $outText + $errText
 }
 function Assert-SecurityProfile([string]$Report) {
     if ($Report -notmatch 'Secure Download Mode' -or $Report -notmatch 'Flags:\s+0x000000c5\b' -or
