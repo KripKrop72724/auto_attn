@@ -159,6 +159,94 @@ def test_add_never_offers_an_image_that_cannot_read_the_redo_area(diagnostics, e
     assert _redo_floor_exclusion(_release("2.5.2"), hikvision) is None
 
 
+def test_the_floor_latches_and_survives_a_rollback_heartbeat(session):
+    """Round 1 review, defect 3: the heartbeat-fresh check evaporates when the
+    device rolls back to 2.5.2, whose heartbeats carry no evidence. The latch
+    keeps the floor; no later heartbeat clears it."""
+    from zk_add.service import apply_firmware_diagnostics
+
+    release, connector, campaign, deployment = _setup(session)
+    assert connector.ota_floor_latched_at is None
+    apply_firmware_diagnostics(session, connector=connector, payload=HeartbeatPayload(
+        firmware_version="2.7.7", uptime_seconds=120,
+        diagnostics={"storage": {"repair": {"reclaim": {"area": "READY", "ota_floor": True}}}}))
+    assert connector.ota_floor_latched_at is not None
+    apply_firmware_diagnostics(session, connector=connector, payload=HeartbeatPayload(
+        firmware_version="2.5.2", uptime_seconds=30))
+    assert connector.ota_floor_latched_at is not None
+    assert (connector.firmware_diagnostics or {}).get("storage") is None
+    assert _redo_floor_exclusion(_release("2.6.27"), connector) == "STORAGE_REDO_FLOOR"
+    assert _redo_floor_exclusion(_release("2.7.6"), connector) is None
+
+
+def test_a_refused_attempt_alone_never_latches_the_floor(session):
+    """Round 2 review, defect 2: a refused boot writes nothing but the area
+    self-test's sector, which the test erases; the device's own narrowed
+    floor reports false and ADD must not ban its recovery images."""
+    from zk_add.service import apply_firmware_diagnostics
+
+    release, connector, campaign, deployment = _setup(session)
+    _progress(session, connector, deployment, "BOOTED_PENDING", STORAGE_EXCEPTION_CODE, EVIDENCE)
+    assert connector.ota_floor_latched_at is None
+    apply_firmware_diagnostics(session, connector=connector, payload=HeartbeatPayload(
+        firmware_version="2.7.7", uptime_seconds=300,
+        diagnostics={"storage": {"repair": {"reclaim": {"area": "READY", "ota_floor": False}}}},
+        ota={"state": "BOOTED_PENDING", "storage_exception": {"state": "REFUSED", "reason": "RECEIPT"}}))
+    assert connector.ota_floor_latched_at is None
+    _progress(session, connector, deployment, "ROLLED_BACK", "BOOT_HEALTH_TIMEOUT", "budget spent")
+    connector.firmware_diagnostics = None
+    assert _redo_floor_exclusion(_release("2.6.27"), connector) is None
+
+
+def test_a_confirmation_latches_the_floor_through_the_progress_report(session):
+    release, connector, campaign, deployment = _setup(session)
+    _progress(session, connector, deployment, "BOOTED_PENDING", STORAGE_EXCEPTION_CODE, EVIDENCE)
+    assert connector.ota_floor_latched_at is None
+    _progress(session, connector, deployment, "RECONCILING", STORAGE_EXCEPTION_CODE, "confirmed; one restart")
+    assert connector.ota_floor_latched_at is not None
+    connector.firmware_diagnostics = None
+    assert _redo_floor_exclusion(_release("2.6.25"), connector) == "STORAGE_REDO_FLOOR"
+
+
+def _second_target(session, release, suffix="13fl"):
+    connector = Connector(
+        connector_id=f"slictower-{suffix}", hardware_id=f"aa:bb:cc:dd:ee:{suffix[-2:]}", zone_id="ZONE-SLICTOWER",
+        zone_name="SLICTOWER", device_id="13", display_name=f"SLICTOWER {suffix}", firmware_version="2.4.12",
+        firmware_family="zkt")
+    session.add(connector)
+    session.flush()
+    campaign = FirmwareCampaign(
+        campaign_id=f"campaign-{suffix}", release_id=release.id, zone_id=connector.zone_id, status="ACTIVE",
+        actor="StateHealthAdmin", idempotency_key=f"campaign-{suffix}-key", reason=f"2.7.7 for {suffix}",
+        typed_confirmation="2.7.7", eligible_count=1, legacy_skipped_count=0)
+    session.add(campaign)
+    session.flush()
+    deployment = FirmwareDeployment(
+        deployment_id=f"deployment-{suffix}", campaign_id=campaign.id, release_id=release.id,
+        connector_id=connector.id, status="READY_TO_BOOT", bytes_written=1024, previous_version="2.4.12",
+        target_version="2.7.7")
+    session.add(deployment)
+    session.flush()
+    return connector, campaign, deployment
+
+
+def test_one_exception_target_at_a_time(session):
+    """H4, round 2 review, defect 3: a second device cannot confirm while
+    another's exception deployment is active, or two devices parked in
+    RECONCILING awaiting coverage would pin both nationwide slots."""
+    release, connector, campaign, deployment = _setup(session)
+    other_connector, other_campaign, other_deployment = _second_target(session, release)
+    _progress(session, connector, deployment, "BOOTED_PENDING", STORAGE_EXCEPTION_CODE, EVIDENCE)
+    _progress(session, connector, deployment, "RECONCILING", STORAGE_EXCEPTION_CODE, "confirmed")
+    _progress(session, other_connector, other_deployment, "BOOTED_PENDING", STORAGE_EXCEPTION_CODE, EVIDENCE)
+    receipt = progress_receipt(session, other_deployment, requested_state="BOOTED_PENDING")
+    assert receipt["confirm"] is True and receipt["storage_exception_allowed"] is False
+    # P02's deployment ends; 13FL's next report may confirm.
+    _progress(session, connector, deployment, "FAILED", "STORAGE_REPAIR_EXCEPTION_UNREPAIRED", "ended")
+    receipt = progress_receipt(session, other_deployment, requested_state="BOOTED_PENDING")
+    assert receipt["storage_exception_allowed"] is True
+
+
 def test_the_heartbeat_takes_the_exception_leniently():
     ota = OtaHeartbeatPayload.model_validate({
         "state": "READY_TO_BOOT", "target_version": "2.7.7",

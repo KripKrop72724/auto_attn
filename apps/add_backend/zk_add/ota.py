@@ -607,22 +607,34 @@ def _decode_scope_token(token: str) -> dict[str, Any]:
     return payload
 
 
-def _redo_floor_exclusion(release: FirmwareRelease, connector: Connector) -> str | None:
-    """ZKT 2.7.7, critique 1: once a device's redo area holds anything (or it
-    confirmed under the storage exception), an image that cannot read that
-    area would mount the store and erase custody kept in a record. The device
-    refuses such a target itself; ADD does not offer it."""
-    version = semantic_version(release.version)
-    if connector.firmware_family != "zkt" or version is None or version >= REDO_AWARE_VERSION:
-        return None
-    evidence = connector.firmware_diagnostics if isinstance(connector.firmware_diagnostics, dict) else {}
+def redo_floor_evidence(evidence: Any) -> bool:
+    """ZKT 2.7.7: a heartbeat's diagnostics say the device's redo area or
+    reclaim journal holds anything, or that it confirmed under the storage
+    exception. service.latches this on the connector row the moment it is
+    seen (round 1 review, defect 3), because the device's next image may
+    report nothing at all."""
+    if not isinstance(evidence, dict):
+        return False
     storage = evidence.get("storage") if isinstance(evidence.get("storage"), dict) else {}
     repair = storage.get("repair") if isinstance(storage.get("repair"), dict) else {}
     reclaim = repair.get("reclaim") if isinstance(repair.get("reclaim"), dict) else {}
     runtime = evidence.get("ota_runtime") if isinstance(evidence.get("ota_runtime"), dict) else {}
     exception = runtime.get("storage_exception") if isinstance(runtime.get("storage_exception"), dict) else {}
-    if (reclaim.get("ota_floor") is True or runtime.get("confirm_reason") == STORAGE_EXCEPTION_CODE
-            or exception.get("state") in STORAGE_EXCEPTION_CONFIRMED_STATES):
+    return (reclaim.get("ota_floor") is True or runtime.get("confirm_reason") == STORAGE_EXCEPTION_CODE
+            or exception.get("state") in STORAGE_EXCEPTION_CONFIRMED_STATES)
+
+
+def _redo_floor_exclusion(release: FirmwareRelease, connector: Connector) -> str | None:
+    """ZKT 2.7.7, critique 1: once a device's redo area holds anything (or it
+    confirmed under the storage exception), an image that cannot read that
+    area would mount the store and erase custody kept in a record. The device
+    refuses such a target itself; ADD does not offer it. The latch keeps the
+    floor across rollbacks to images whose heartbeats carry no evidence
+    (round 1 review, defect 3); a later heartbeat never clears it."""
+    version = semantic_version(release.version)
+    if connector.firmware_family != "zkt" or version is None or version >= REDO_AWARE_VERSION:
+        return None
+    if connector.ota_floor_latched_at is not None or redo_floor_evidence(connector.firmware_diagnostics):
         return "STORAGE_REDO_FLOOR"
     return None
 
@@ -1501,6 +1513,16 @@ def record_progress(
     deployment.error_code = error_code
     deployment.error_message = error_message
     deployment.updated_at = utc_now()
+    # ZKT 2.7.7 (round 1 review, defect 3): a confirmation under the storage
+    # exception (RECONCILING), or its end after confirming, floors the device
+    # durably - its redo area has held, or may hold, custody records. A
+    # BOOTED_PENDING exception report does not: a refused boot writes nothing
+    # the area test does not erase, and the device's own narrowed floor
+    # agrees (round 2 review, defect 2).
+    if (connector.ota_floor_latched_at is None and state in {"RECONCILING", "FAILED"}
+            and error_code in {STORAGE_EXCEPTION_CODE, "STORAGE_REPAIR_EXCEPTION_UNREPAIRED",
+                               "STORAGE_REPAIR_EXCEPTION_UNHEALTHY"}):
+        connector.ota_floor_latched_at = utc_now()
     session.add(FirmwareEvent(deployment_id=deployment.id, state=state,
                               details={
                                   "bytes_written": deployment.bytes_written,
@@ -1552,11 +1574,19 @@ def progress_receipt(session: Session, deployment: FirmwareDeployment, *, reques
     if requested_state == "BOOTED_PENDING" and deployment.error_code == STORAGE_EXCEPTION_CODE:
         # ZKT 2.7.7 (H3): ADD's veto over the confirm-first storage exception.
         # The image may mark itself valid only while its release is offered
-        # and its campaign active; pausing the campaign withholds it.
+        # and its campaign active; pausing the campaign withholds it. One
+        # exception target at a time (H4, round 2 review, defect 3): a second
+        # device cannot confirm while another's exception deployment is
+        # active, or two confirmed devices waiting for certified coverage
+        # would pin both nationwide reservation slots indefinitely.
         campaign = session.get(FirmwareCampaign, deployment.campaign_id)
+        other = session.scalar(select(FirmwareDeployment.id).where(
+            FirmwareDeployment.connector_id != deployment.connector_id,
+            FirmwareDeployment.error_code == STORAGE_EXCEPTION_CODE,
+            FirmwareDeployment.status.in_(ACTIVE_DEPLOYMENT_STATES)).limit(1))
         receipt["storage_exception_allowed"] = bool(
             receipt["confirm"] and release.state in {"AVAILABLE", "HIL_ONLY"}
-            and campaign is not None and campaign.status == "ACTIVE")
+            and campaign is not None and campaign.status == "ACTIVE" and other is None)
     if deployment.status == "ROLLED_BACK" and deployment.target_version == "2.7.0":
         event = session.scalar(select(FirmwareEvent).where(
             FirmwareEvent.deployment_id == deployment.id, FirmwareEvent.state == "ROLLED_BACK")

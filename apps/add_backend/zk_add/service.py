@@ -858,6 +858,13 @@ def apply_firmware_diagnostics(session: Session, connector: Connector, payload: 
             evidence["worker_contract"] = "NOT_APPLICABLE_STORAGE_RECOVERY"
     connector.firmware_diagnostics = evidence
     connector.firmware_diagnostics_at = now if diagnostics else None
+    # ZKT 2.7.7 (round 1 review, defect 3): the redo-area OTA floor is latched
+    # the moment any heartbeat shows it; a device that rolls back to an image
+    # whose heartbeats carry no evidence keeps it.
+    if connector.ota_floor_latched_at is None:
+        from zk_add.ota import redo_floor_evidence
+        if redo_floor_evidence(evidence):
+            connector.ota_floor_latched_at = now
     storage = diagnostics.storage if diagnostics else None
     journal_status = journal_storage_status(evidence or {}, payload.uptime_seconds)
     starting = diagnostics_starting(evidence or {}, payload.uptime_seconds)
