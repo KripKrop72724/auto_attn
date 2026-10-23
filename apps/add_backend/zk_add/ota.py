@@ -1577,8 +1577,10 @@ def progress_receipt(session: Session, deployment: FirmwareDeployment, *, reques
         # and its campaign active; pausing the campaign withholds it. One
         # exception target at a time (H4, design 14.2 item 3): a second
         # device cannot confirm while another's exception deployment is
-        # active, or two confirmed devices waiting for certified coverage
-        # would pin both nationwide reservation slots indefinitely.
+        # active. Two confirmed devices parked in RECONCILING awaiting
+        # certified coverage would be two wedged stores with no ADD action
+        # that ends either deployment, each blocking its own zone's OTA;
+        # the owner's rule keeps the operator on a single confirmation.
         campaign = session.get(FirmwareCampaign, deployment.campaign_id)
         other = session.scalar(select(FirmwareDeployment.id).where(
             FirmwareDeployment.connector_id != deployment.connector_id,

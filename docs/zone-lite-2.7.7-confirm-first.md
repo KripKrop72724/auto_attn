@@ -626,9 +626,10 @@ succeeds; the device's heartbeat shows `confirm_reason` too.
 ordinal 57,300 of 68,788 since 25 September, and the snapshot fix
 (bb5a61a, on `main` since 8 October, so in 2.7.6 and 2.7.7; its own example
 is P02's 68,788 count) never retries a held job by itself. So P02's
-deployment stays `RECONCILING` after a good round, holding one of the fleet
-reservation's two slots and blocking further OTA to P02, until the operator
-acts:
+deployment stays `RECONCILING` after a good round, blocking further OTA to
+P02 and any new campaign in P02's zone (the fleet-wide two-slot reservation
+and the per-location limit were removed by the owner on 23 October 2026, so
+no other zone is held back), until the operator acts:
 
 1. Before the campaign: cancel any leftover `ACTIVE` or `PAUSED` campaign in
    P02's zone; read P02's 2.7.6 heartbeats (13:29 to 13:45 UTC on 21
@@ -857,9 +858,11 @@ NVS layout.
   section 13 item 9): the probe is held on boots that may use the exception,
   and every other program or erase of the store restarts the 120 s window.
 - An ADD action that ends a `RECONCILING` deployment does not exist: a
-  healthy exception device whose source coverage never certifies holds its
-  reservation (and P06's location) until an operator gets coverage certified
-  (section 13 item 5).
+  healthy exception device whose source coverage never certifies keeps
+  blocking its own OTA and new campaigns in its own zone until an operator
+  gets coverage certified (section 13 item 5). No other zone is held: the
+  fleet-wide and per-location concurrency limits were removed by the owner
+  on 23 October 2026.
 - 13FL: its 3.8 MB `blocked_identity.jsonl` holds about 15,000 unreadable
   spans. On a boot that may use the exception the inventory's budget now
   grows 20 ms per held span, capped at +300 s (14.2 item 5), so the
@@ -874,7 +877,7 @@ NVS layout.
   may show E1 instead. Either way the confirmed rules take only the custody
   blocks, and the analytic bound does not depend on which.
 - Until P02's coverage job is resolved its 2.7.7 deployment stays
-  `RECONCILING` and holds a fleet reservation slot (7.2).
+  `RECONCILING`, blocking P02's own OTA and new campaigns in its zone (7.2).
 - The WebSocket stack adds 2 KiB to every reconnect's contiguous allocation;
   a device near its internal RAM floor could fail a reconnect that 2.7.6
   managed. HIL compares the largest internal block.
@@ -942,9 +945,9 @@ accepted and implemented, **P** partly, **R** rejected, each with the reason.
    says the deployment ended (`FAILED`, `ROLLED_BACK`, `CANCELLED`,
    `SUPERSEDED`, `RELEASE_REVOKED`); `UNREPAIRED` and `UNHEALTHY` (H4) end it
    `FAILED` from the device. **Rejected: "allow `fetch_assignment` once
-   `ROUND_DONE`".** ADD itself holds every new offer to a device whose own
-   deployment is still active (`pending_offer_hold` counts the device's own
-   reservation: `NATIONWIDE_LOCATION_BUSY`), so the poll would get nothing.
+   `ROUND_DONE`".** ADD itself never offers a new release to a device whose
+   own deployment is still active (`assignment_for_connector` returns only
+   that active deployment), so the poll would get nothing new.
    A healthy P02 without certified coverage keeps the existing remedy (retry
    `f69322c1`, or cancel it and request a new full reconciliation); an ADD
    action that ends a `RECONCILING` deployment is an ADD change of its own

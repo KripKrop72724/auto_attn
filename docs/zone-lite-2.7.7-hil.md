@@ -64,8 +64,9 @@ custody blocks alone, `REPAIRED`, every file byte-exact, through power cuts.
    exception refuse with `RECEIPT` (safe: the image rolls back as 2.7.6).
 4. **One exception target at a time (H4).** P02 first; 13FL only after P02's
    deployment is `SUCCEEDED` or `FAILED`. While P02's deployment is active
-   it holds one of the two nationwide reservations and its location
-   (Peshawar): Peshawar 06 waits. ADD enforces this at the receipt (design
+   it blocks new offers and campaigns only in P02's own zone; the fleet-wide
+   and per-location limits are gone (owner, 23 October 2026), so Peshawar 06
+   is not held back by it. ADD enforces H4 at the receipt (design
    14.2 item 3): while another connector's exception deployment is active,
    `storage_exception_allowed` is false and a second candidate refuses
    `RECEIPT`; two candidates racing each other both refuse until one
