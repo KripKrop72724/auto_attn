@@ -183,6 +183,9 @@ class FirmwareCampaign(Base):
     pause_reason: Mapped[str | None] = mapped_column(String(200))
     created_at: Mapped[Any] = utc_column()
     updated_at: Mapped[Any] = utc_column()
+    # Hidden from the dashboards; deployments and their evidence stay readable.
+    archived_at: Mapped[Any] = mapped_column(DateTime(timezone=True), nullable=True)
+    archived_by: Mapped[str | None] = mapped_column(String(120), nullable=True)
 
 
 class FirmwareDeployment(Base):
@@ -357,8 +360,8 @@ def _permitted_hil_targets(session: Session, release: FirmwareRelease) -> list[H
     if release.version in FLEET_PLATFORM_VERSIONS:
         # The 2.7 platform in the 2.6.15 fleet's legacy authority. Its exact
         # nationwide prefix starts each target independently, like the
-        # recovery image: the fleet reservation guard (at most two unsettled
-        # upgrades, one per location) and one-zone campaigns set the pace.
+        # recovery image, with no fleet-wide concurrency limit (removed by the
+        # owner on 23 Oct 2026); one-zone campaigns set the pace.
         # The shared ordered HIL configuration is untouched.
         if not settings.firmware_hil_enabled:
             raise ValueError("Ordered firmware HIL quarantine is disabled.")
@@ -817,6 +820,14 @@ def _campaign_scope(
     return release, connectors, eligible, excluded
 
 
+def campaign_warnings(session: Session, connector: Connector, release: FirmwareRelease) -> list[dict[str, Any]]:
+    """Owner-overridable warnings for one eligible ESP: its stability, repeated interrupted boots."""
+    from zk_add.esp_stability import stability_warnings
+    from zk_add.ota_interruption import repeated_interruption_warnings
+
+    return [*stability_warnings(session, connector), *repeated_interruption_warnings(session, connector, release)]
+
+
 def preview_campaign_scope(
     session: Session,
     *,
@@ -854,9 +865,15 @@ def preview_campaign_scope(
             "ota_state": row.ota_state,
         }
 
+    from zk_add.esp_stability import warnings_digest
+    warnings = [warning for row in eligible for warning in campaign_warnings(session, row, release)]
     return {
         "scope_token": token,
         "expires_at": expires_at,
+        # Owner-overridable; never part of the signed scope digest. The
+        # override must name this digest, so it covers exactly these warnings.
+        "stability_warnings": warnings,
+        "stability_warnings_digest": warnings_digest(warnings),
         "release": {
             "release_id": release.release_id,
             "version": release.version,
@@ -1045,17 +1062,29 @@ def sync_release_store(session: Session) -> None:
     session.flush()
 
 
+ONE_CLICK_REASON = "One-click firmware update"
+
+
 def create_campaign(
     session: Session,
     *,
     release_public_id: str,
     zone_id: str,
-    reason: str,
-    typed_confirmation: str,
     actor: str,
     scope_token: str,
     idempotency_key: str,
+    reason: str | None = None,
+    typed_confirmation: str | None = None,
+    override_stability_warnings: bool = False,
+    stability_warnings_digest: str | None = None,
 ) -> FirmwareCampaign:
+    """Create one zone's campaign from a fresh signed scope preview.
+
+    One click: no typed version or operator reason is required. The signed
+    scope token, nationwide schedule, zone serialization and stability
+    override digest remain the authority. typed_confirmation is ignored; the
+    stored value is the release version for the legacy NOT NULL column.
+    """
     replay = session.scalar(
         select(FirmwareCampaign).where(
             FirmwareCampaign.actor == actor,
@@ -1079,17 +1108,23 @@ def create_campaign(
         release_public_id=release_public_id,
         zone_id=zone_id,
     )
-    if typed_confirmation != release.version:
-        raise ValueError("Typed firmware version does not match the release.")
     nationwide = schedule(session, release)
     if nationwide and nationwide["reservation"]:
         raise ValueError("Nationwide HIL scope already has an unsettled reservation.")
     if session.scalar(select(FirmwareCampaign).where(
         FirmwareCampaign.zone_id == zone_id, FirmwareCampaign.status.in_(["ACTIVE", "PAUSED"]))):
         raise ValueError("This zone already has an active or paused firmware campaign.")
+    from zk_add.esp_stability import warnings_digest
+    warnings = {row.id: campaign_warnings(session, row, release) for row in eligible}
+    flagged = [warning for rows in warnings.values() for warning in rows]
+    if flagged and not override_stability_warnings:
+        raise ValueError("ESP stability warnings need the owner's override: "
+                         + " ".join(warning["message"] for warning in flagged))
+    if flagged and stability_warnings_digest != warnings_digest(flagged):
+        raise ValueError("The ESP stability warnings changed since the preview; preview the scope again.")
     campaign = FirmwareCampaign(campaign_id=secrets.token_hex(16), release_id=release.id, zone_id=zone_id,
-        actor=actor, idempotency_key=idempotency_key, reason=reason,
-        typed_confirmation=typed_confirmation, eligible_count=len(eligible),
+        actor=actor, idempotency_key=idempotency_key, reason=(reason or "").strip() or ONE_CLICK_REASON,
+        typed_confirmation=release.version, eligible_count=len(eligible),
         legacy_skipped_count=len(connectors) - len(eligible))
     session.add(campaign)
     session.flush()
@@ -1099,6 +1134,10 @@ def create_campaign(
             target_version=release.version)
         session.add(deployment)
         session.flush()
+        if warnings.get(connector.id):
+            session.add(FirmwareEvent(deployment_id=deployment.id, state="STABILITY_WARNINGS_OVERRIDDEN",
+                details={"actor": actor, "warnings": [
+                    {"code": warning["code"], "message": warning["message"]} for warning in warnings[connector.id]]}))
         reserve(session, release, campaign, deployment, nationwide)
         if release.version == "2.6.22":
             from zk_add.zkt_factory_trial import reserve_trial
@@ -1150,48 +1189,70 @@ def assignment_for_connector(session: Session, *, connector: Connector, public_b
         if deployment is None or deployment.connector_id != connector.id:
             return None
         pending_offer = True
+    held, serialized = None, False
+    if not pending_offer:
+        from zk_add.ota_interruption import assignment_needs_serializing, awaiting_retry_offer, lock_for_assignment
+        held = awaiting_retry_offer(session, deployment)
+        if held is not None or assignment_needs_serializing(connector, deployment):
+            # Connector, then deployment: the heartbeat that records a 2.6.x
+            # download stop and campaign control take the same locks, so a
+            # grant is never issued from a stale read of either.
+            deployment = lock_for_assignment(session, connector, deployment)
+            if deployment is None:
+                return None
+            serialized = True
+            held = awaiting_retry_offer(session, deployment)
+
+    def refused(reason: str) -> None:
+        """A refusal; a held 2.6.x download fails closed with it instead of waiting for a re-offer."""
+        if held is not None:
+            from zk_add.ota_interruption import fail_held_download
+            fail_held_download(session, deployment, reason=f"admission refused ({reason})")
+        return None
+
     release = session.get(FirmwareRelease, deployment.release_id)
     if release is None or release.state not in {"AVAILABLE", "HIL_ONLY"}:
-        return None
+        return refused("RELEASE_UNAVAILABLE")
     if release.version in RECOVERY_RELEASE_IDS and deployment.status not in RECOVERY_OFFERABLE_STATES:
         # A selected one-shot image is never re-offered after the device returns.
-        return None
+        return refused("RECOVERY_IMAGE_SELECTED")
     try:
         require_family_match(connector.firmware_family, release.manifest or {})
         if release.state == "AVAILABLE":
             require_production_qualification(release.manifest or {})
     except ValueError:
-        return None
+        return refused("RELEASE_NOT_QUALIFIED")
     if not version_at_least(connector.firmware_version, release.minimum_bootstrap_version):
-        return None
-    if _storage_predecessor_exclusion(session, release, connector, deployment_id=deployment.id):
-        return None
+        return refused("BOOTSTRAP_VERSION_TOO_OLD")
+    exclusion = _storage_predecessor_exclusion(session, release, connector, deployment_id=deployment.id)
+    if exclusion:
+        return refused(exclusion)
     try:
         bridge_target = _factory_3fl_bridge_target(release, connector.zone_id)
     except ValueError:
-        return None
+        return refused("FACTORY_BRIDGE_TARGET_INVALID")
     if bridge_target and _factory_3fl_bridge_exclusion(connector, bridge_target):
-        return None
+        return refused("FACTORY_BRIDGE_EXCLUDED")
     if release.state == "AVAILABLE" and not settings.firmware_ota_enabled:
-        return None
+        return refused("FIRMWARE_OTA_DISABLED")
     if release.state == "HIL_ONLY":
         try:
             permitted_targets = _permitted_hil_targets(session, release)
         except ValueError:
-            return None
+            return refused("HIL_TARGETS_INVALID")
         if permitted_targets:
             if not any(bld9_k50.admits(target, connector) for target in permitted_targets):
-                return None
+                return refused("HIL_TARGET_NOT_ADMITTED")
         else:
             target = str((release.manifest or {}).get("_hil_target_mac") or "").lower()
             configured = configured_hil_mac(release)
             if not settings.firmware_hil_enabled or not target or target != configured:
-                return None
+                return refused("HIL_TARGET_NOT_CONFIGURED")
             if connector.hardware_id.lower() != target:
-                return None
+                return refused("HIL_TARGET_MISMATCH")
     application_digest = _application_sha256(release)
     if application_digest is None:
-        return None
+        return refused("APPLICATION_DIGEST_MISSING")
     # A heartbeat version string is not boot, digest, or reconciliation evidence.
     # Only the checked progress transitions may complete this deployment.
     if release.version == "2.6.22":
@@ -1199,12 +1260,12 @@ def assignment_for_connector(session: Session, *, connector: Connector, public_b
         try:
             _trial(session, connector, deployment.deployment_id, require_new_boot=False)
         except ValueError:
-            return None
+            return refused("FACTORY_TRIAL_NOT_ADMITTED")
     if pending_offer:
         hold = pending_offer_hold(session, connector, release)
         if hold:
             deployment.error_code = hold
-            deployment.error_message = "Waiting for the nationwide ZKT upgrade slot and exact target checks."
+            deployment.error_message = "Waiting for the device to be online as an approved fleet target."
             return None
         details = {}
         if release.version == "2.7.0":
@@ -1222,8 +1283,20 @@ def assignment_for_connector(session: Session, *, connector: Connector, public_b
         from zk_add.zkt_reader_evidence import admitted_reader, current_reader_admission
         try:
             if admitted_reader(session, deployment, release) != current_reader_admission(release, connector):
-                return None
+                return refused("READER_ADMISSION_CHANGED")
         except ValueError:
+            return refused("READER_ADMISSION_INVALID")
+    if held is not None:
+        # Only a deployment with a recorded 2.6.x download interruption is
+        # ever withheld here, and only for its bounded backoff.
+        from zk_add.ota_interruption import download_retry_hold
+        if download_retry_hold(session, deployment, held):
+            return None
+    elif serialized:
+        # An interrupted download ADD already re-offered: the grant bound and
+        # the resume window hold even when no heartbeat counted a stop.
+        from zk_add.ota_interruption import resumed_attempt_refusal
+        if resumed_attempt_refusal(session, connector, deployment):
             return None
     token = secrets.token_urlsafe(32)
     session.add(FirmwareDownloadGrant(token_hash=hashlib.sha256(token.encode()).hexdigest(),
@@ -1235,6 +1308,130 @@ def assignment_for_connector(session: Session, *, connector: Connector, public_b
         "partition_layout": release.partition_layout,
         "firmware_family": release_family(release.manifest or {}),
         "download_url": f"{public_base}/device/v2/firmware/download/{token}"}
+
+
+CAMPAIGN_CONTROL_STATES = {"pause": "PAUSED", "resume": "ACTIVE", "cancel": "CANCELLED"}
+# The only campaign states each control may start from.
+CAMPAIGN_CONTROL_SOURCES = {"pause": {"ACTIVE"}, "resume": {"PAUSED"}, "cancel": {"ACTIVE", "PAUSED"}}
+CAMPAIGN_CONTROL_VERBS = {"pause": "paused", "resume": "resumed", "cancel": "cancelled"}
+CAMPAIGN_CONTROL_REASONS = {"pause": "Paused with one click", "resume": "Resumed with one click",
+                            "cancel": "Cancelled with one click"}
+
+
+def complete_if_succeeded(session: Session, campaign: FirmwareCampaign | None) -> bool:
+    """Mark an ACTIVE or PAUSED campaign COMPLETED once every deployment SUCCEEDED.
+
+    Nothing is left to offer, so COMPLETED frees the zone for the next
+    campaign. COMPLETED stays valid HIL, bridge and acceptance evidence
+    everywhere ACTIVE is (those checks accept both). A campaign with no
+    deployment, or with any deployment that did not succeed, is unchanged.
+    The caller holds the deployment locks (the order of record_progress).
+    """
+    if campaign is None or campaign.status not in {"ACTIVE", "PAUSED"}:
+        return False
+    statuses = list(session.scalars(select(FirmwareDeployment.status).where(
+        FirmwareDeployment.campaign_id == campaign.id)))
+    if not statuses or any(status != "SUCCEEDED" for status in statuses):
+        return False
+    locked = session.scalar(select(FirmwareCampaign).where(FirmwareCampaign.id == campaign.id)
+                            .with_for_update().execution_options(populate_existing=True))
+    if locked is None or locked.status not in {"ACTIVE", "PAUSED"}:
+        return False
+    locked.status = "COMPLETED"
+    locked.pause_reason = None
+    locked.updated_at = utc_now()
+    return True
+
+
+def control_campaign(session: Session, *, campaign_public_id: str, action: str,
+                     reason: str | None = None) -> tuple[FirmwareCampaign, int]:
+    """Pause, resume or cancel one campaign; returns it and the held downloads failed.
+
+    Locks follow the order everywhere else (connector, deployment, campaign):
+    the connectors of downloads that may be held for a re-offer (their
+    heartbeat and assignment take the same lock), then the campaign's
+    deployments, then the campaign. The deployments to cancel are read only
+    after the locks: a retry committed meanwhile is cancelled with the rest,
+    and a retry still running waits for this control.
+
+    Pause starts only from ACTIVE, resume only from PAUSED and cancel only
+    from ACTIVE or PAUSED; anything else (and a resume while the zone holds
+    another active or paused campaign) is a ValueError, never a state change.
+    """
+    reason = (reason or "").strip()[:200] or CAMPAIGN_CONTROL_REASONS.get(action, action)
+    campaign_row = session.scalar(select(FirmwareCampaign.id).where(
+        FirmwareCampaign.campaign_id == campaign_public_id))
+    if campaign_row is None:
+        raise LookupError("Firmware campaign not found.")
+    session.scalars(select(Connector.id).where(Connector.id.in_(
+        select(FirmwareDeployment.connector_id).where(
+            FirmwareDeployment.campaign_id == campaign_row,
+            FirmwareDeployment.status.in_(["OFFERED", "DOWNLOADING"]))))
+        .order_by(Connector.id).with_for_update()).all()
+    session.scalars(select(FirmwareDeployment.id).where(FirmwareDeployment.campaign_id == campaign_row)
+                    .order_by(FirmwareDeployment.id).with_for_update()).all()
+    campaign = session.scalar(select(FirmwareCampaign).where(FirmwareCampaign.id == campaign_row)
+                              .with_for_update().execution_options(populate_existing=True))
+    if action not in CAMPAIGN_CONTROL_STATES:
+        raise ValueError("Unknown firmware campaign control.")
+    if campaign.status not in CAMPAIGN_CONTROL_SOURCES[action]:
+        raise ValueError(f"A {campaign.status.lower()} firmware campaign cannot be {CAMPAIGN_CONTROL_VERBS[action]}.")
+    if action == "resume":
+        release = session.get(FirmwareRelease, campaign.release_id)
+        if release is None or release.state not in {"AVAILABLE", "HIL_ONLY"}:
+            raise ValueError("This campaign cannot resume because its signed release is unavailable.")
+        if session.scalar(select(FirmwareCampaign.id).where(
+                FirmwareCampaign.zone_id == campaign.zone_id, FirmwareCampaign.id != campaign.id,
+                FirmwareCampaign.status.in_(["ACTIVE", "PAUSED"])).limit(1)) is not None:
+            raise ValueError("This zone already has another active or paused firmware campaign.")
+    failed = 0
+    if action in {"pause", "cancel"}:
+        from zk_add.ota_interruption import fail_held_downloads
+
+        # A 2.6.x download held for a re-offer has no grant outstanding: it
+        # fails closed (and leaves no uncertain reservation) instead.
+        failed = fail_held_downloads(
+            session, campaign.id, reason=f"the campaign was {CAMPAIGN_CONTROL_STATES[action].lower()} ({reason})")
+        session.flush()
+    campaign.status = CAMPAIGN_CONTROL_STATES[action]
+    campaign.pause_reason = reason if action != "resume" else None
+    campaign.updated_at = utc_now()
+    if action == "cancel":
+        for deployment in session.scalars(select(FirmwareDeployment).where(
+                FirmwareDeployment.campaign_id == campaign.id,
+                FirmwareDeployment.status.in_(["PENDING", "OFFERED", "DOWNLOADING"]))):
+            deployment.status = "CANCELLED"
+    return campaign, failed
+
+
+_DEPLOYMENT_OUTCOME_REASON = re.compile(r"(?:FAILED|ROLLED_BACK) \([^()]*\)")
+
+
+def deployment_pause_reason(connector: Connector, *, state: str, error_code: str | None) -> str:
+    """The pause reason ADD writes when one ESP's deployment fails or rolls back."""
+    return f"{connector.connector_id}: {state} ({error_code or 'UNKNOWN'})"
+
+
+def pause_for_deployment_outcome(campaign: FirmwareCampaign, connector: Connector, *, state: str,
+                                 error_code: str | None) -> None:
+    """Pause the campaign for a FAILED or ROLLED_BACK deployment without undoing an earlier decision.
+
+    A cancelled campaign stays cancelled: the deployment, its event and the
+    alert carry the outcome. A campaign already paused keeps its reason (the
+    owner's hold, a revoke, another ESP's failure) unless that reason is
+    ADD's own earlier outcome for this same ESP, so the first reason stays
+    visible and the owner's retry cannot lift a pause it did not cause.
+    """
+    if campaign.status == "CANCELLED":
+        return
+    if campaign.status == "PAUSED" and campaign.pause_reason:
+        prefix = f"{connector.connector_id}: "
+        if not (campaign.pause_reason.startswith(prefix)
+                and _DEPLOYMENT_OUTCOME_REASON.fullmatch(campaign.pause_reason[len(prefix):])):
+            return
+    campaign.status = "PAUSED"
+    campaign.pause_reason = deployment_pause_reason(connector, state=state, error_code=error_code)
+    campaign.updated_at = utc_now()
 
 
 def record_progress(
@@ -1249,9 +1446,16 @@ def record_progress(
     image_sha256: str | None = None,
     error_code: str | None = None,
     error_message: str | None = None,
+    event_details: dict[str, Any] | None = None,
 ) -> FirmwareDeployment:
+    """Apply one checked transition; event_details (server-side evidence only) joins its event."""
     if state not in ACTIVE_DEPLOYMENT_STATES | TERMINAL_DEPLOYMENT_STATES:
         raise ValueError("Unknown firmware deployment state.")
+    # Connector, then deployment, then campaign: the order of the WebSocket
+    # heartbeat and of campaign control. This transition also updates the
+    # connector's ota_state, so taking that row last could deadlock with a
+    # pause or cancel. A lock this transaction already holds is not waited on.
+    session.execute(select(Connector.id).where(Connector.id == connector.id).with_for_update())
     deployment = session.scalar(select(FirmwareDeployment).where(
         FirmwareDeployment.deployment_id == deployment_public_id,
         FirmwareDeployment.connector_id == connector.id).with_for_update().execution_options(populate_existing=True))
@@ -1308,14 +1512,17 @@ def record_progress(
                                   # ZKT 2.7.7: the evidence a report names
                                   # survives the next transition (critique 12).
                                   **({"error_message": error_message[:500]} if error_message else {}),
+                                  **(event_details or {}),
                               }))
     if state in TERMINAL_DEPLOYMENT_STATES:
         deployment.completed_at = utc_now()
     campaign = session.get(FirmwareCampaign, deployment.campaign_id)
     if state in {"FAILED", "ROLLED_BACK"} and campaign is not None:
-        campaign.status = "PAUSED"
-        campaign.pause_reason = f"{connector.connector_id}: {state} ({error_code or 'UNKNOWN'})"
-        campaign.updated_at = utc_now()
+        pause_for_deployment_outcome(campaign, connector, state=state, error_code=error_code)
+    if state == "SUCCEEDED":
+        # The last success leaves nothing to offer: the zone is free again.
+        session.flush()
+        complete_if_succeeded(session, campaign)
     connector.ota_state = ("OTA_READY" if state == "SUCCEEDED" else
                            "ROLLBACK_REQUIRED" if state == "ROLLED_BACK" else
                            "UPDATING" if state in ACTIVE_DEPLOYMENT_STATES else connector.ota_state)
@@ -1617,6 +1824,7 @@ def _deployment_rows(
     campaign: FirmwareCampaign,
     *,
     include_events: bool,
+    include_diagnosis: bool = False,
 ) -> tuple[dict[str, int], list[dict[str, Any]]]:
     deployments = list(
         session.scalars(
@@ -1662,6 +1870,7 @@ def _deployment_rows(
                     if include_events and deployment.offered_at is not None
                     else None
                 ),
+                **(_rollback_rows(session, campaign, deployment) if include_diagnosis else {}),
                 "events": [
                     {
                         "state": event.state,
@@ -1675,15 +1884,26 @@ def _deployment_rows(
     return counts, rows
 
 
+def _rollback_rows(session: Session, campaign: FirmwareCampaign,
+                   deployment: FirmwareDeployment) -> dict[str, Any]:
+    """Re-read rollback evidence and the owner's retry hint for one detail view."""
+    if deployment.status != "ROLLED_BACK":
+        return {"rollback_diagnosis": None, "retry": None}
+    from zk_add.ota_interruption import refreshed_diagnosis, retry_view
+    return {"rollback_diagnosis": refreshed_diagnosis(session, deployment),
+            "retry": retry_view(session, campaign, deployment)}
+
+
 def _serialize_campaign(
     session: Session,
     campaign: FirmwareCampaign,
     *,
     include_deployments: bool,
     include_events: bool,
+    include_diagnosis: bool = False,
 ) -> dict[str, Any]:
     counts, deployments = _deployment_rows(
-        session, campaign, include_events=include_events
+        session, campaign, include_events=include_events, include_diagnosis=include_diagnosis
     )
     release = session.get(FirmwareRelease, campaign.release_id)
     zone_name = session.scalar(
@@ -1692,6 +1912,14 @@ def _serialize_campaign(
         .order_by(Connector.id.asc())
         .limit(1)
     )
+    # A live campaign whose next device is held (for example while it is
+    # offline) is waiting, not stuck: say why.
+    waiting = None
+    if campaign.status == "ACTIVE" and not any(row["status"] in ACTIVE_DEPLOYMENT_STATES for row in deployments):
+        queued = next((row for row in deployments if row["status"] == "PENDING"), None)
+        if queued is not None and queued["error_code"]:
+            waiting = {"connector_id": queued["connector_id"], "display_name": queued["display_name"],
+                       "code": queued["error_code"], "message": queued["error_message"]}
     return {
         "campaign_id": campaign.campaign_id,
         "release_id": release.release_id if release else None,
@@ -1707,8 +1935,11 @@ def _serialize_campaign(
         "actor": campaign.actor,
         "reason": campaign.reason,
         "deployments": deployments if include_deployments else [],
+        "waiting": waiting,
         "created_at": campaign.created_at,
         "updated_at": campaign.updated_at,
+        "archived_at": campaign.archived_at,
+        "archived_by": campaign.archived_by,
     }
 
 
@@ -1722,11 +1953,18 @@ def campaign_page(
     cursor: int | None = None,
     limit: int | None = None,
     include_deployments: bool = False,
+    include_archived: bool = False,
 ) -> dict[str, Any]:
-    """Return campaign summaries with exact national and filtered counts."""
+    """Return campaign summaries with exact national and filtered counts.
+
+    Archived campaigns (cancelled or completed, hidden by the owner) are left
+    out of the rows and the totals unless include_archived is set; their
+    deployments and evidence are unchanged and the detail view still reads them.
+    """
 
     sync_release_store(session)
-    clauses = []
+    visible = [] if include_archived else [FirmwareCampaign.archived_at.is_(None)]
+    clauses = [*visible]
     if query and query.strip():
         term = f"%{query.strip()}%"
         clauses.append(
@@ -1768,7 +2006,7 @@ def campaign_page(
 
     campaign_totals: dict[str, int] = {"all": 0}
     for campaign_state, count in session.execute(
-        select(FirmwareCampaign.status, func.count(FirmwareCampaign.id)).group_by(
+        select(FirmwareCampaign.status, func.count(FirmwareCampaign.id)).where(*visible).group_by(
             FirmwareCampaign.status
         )
     ):
@@ -1776,7 +2014,9 @@ def campaign_page(
         campaign_totals["all"] += int(count)
     deployment_totals: dict[str, int] = {"all": 0}
     for deployment_state, count in session.execute(
-        select(FirmwareDeployment.status, func.count(FirmwareDeployment.id)).group_by(
+        select(FirmwareDeployment.status, func.count(FirmwareDeployment.id))
+        .join(FirmwareCampaign, FirmwareDeployment.campaign_id == FirmwareCampaign.id)
+        .where(*visible).group_by(
             FirmwareDeployment.status
         )
     ):
@@ -1798,6 +2038,8 @@ def campaign_page(
         "totals": {
             "campaigns": campaign_totals,
             "deployments": deployment_totals,
+            "archived_campaigns": int(session.scalar(
+                select(func.count(FirmwareCampaign.id)).where(FirmwareCampaign.archived_at.is_not(None))) or 0),
         },
     }
 
@@ -1810,7 +2052,7 @@ def campaign_detail(session: Session, campaign_id: str) -> dict[str, Any] | None
     if campaign is None:
         return None
     return _serialize_campaign(
-        session, campaign, include_deployments=True, include_events=True
+        session, campaign, include_deployments=True, include_events=True, include_diagnosis=True
     )
 
 
@@ -1827,7 +2069,11 @@ def resolve_download(session: Session, token: str) -> tuple[FirmwareRelease, Pat
     if grant is None:
         raise ValueError("Firmware download grant is invalid or expired.")
     deployment = session.get(FirmwareDeployment, grant.deployment_id)
-    release = session.get(FirmwareRelease, deployment.release_id) if deployment else None
+    if deployment is None or deployment.status in TERMINAL_DEPLOYMENT_STATES:
+        # A failed, cancelled, rolled-back or superseded attempt is never
+        # written further, whatever grant it still holds.
+        raise ValueError("Firmware deployment is no longer active.")
+    release = session.get(FirmwareRelease, deployment.release_id)
     if release is None or release.state not in {"AVAILABLE", "HIL_ONLY"}:
         raise ValueError("Firmware release is unavailable.")
     if release.version in RECOVERY_RELEASE_IDS and deployment.status not in RECOVERY_OFFERABLE_STATES:

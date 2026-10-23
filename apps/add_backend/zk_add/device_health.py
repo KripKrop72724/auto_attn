@@ -20,6 +20,7 @@ from sqlalchemy.orm import Session
 
 from zk_add.hil_startup import PHASES as HIL_STARTUP_PHASES, STORAGE_COUNTERS, STORAGE_ERRORS
 from zk_add.models import Connector, DeviceAlert, DeviceTelemetry, ZKTDevice
+from zk_add.queue_evidence import OPERATOR_ONLY_REASONS, custody_only, unheld_evidence
 from zk_add.settings import settings
 from zk_add.time_utils import ensure_utc, parse_datetime, utc_now
 
@@ -42,7 +43,8 @@ STARTUP_PHASES = frozenset(HIL_STARTUP_PHASES - {"READY"}) | {"BRIDGE_VALIDATION
 WORKFLOW_OWNED_CODES = frozenset({
     "ADMIN_REVOKE_OVERDUE", "ATTENDANCE_EVENT_QUARANTINED", "ATTENDANCE_REPAIR_NEEDS_ATTENTION",
     "ATTENDANCE_REPAIR_STALLED", "ORDS_DELIVERY_FAILED", "DUPLICATE_USER_CNIC",
-    "ORACLE_RECEIPT_CONNECTOR_MISMATCH", "HISTORY_BACKFILL_BLOCKED",
+    "ORACLE_RECEIPT_CONNECTOR_MISMATCH", "HISTORY_BACKFILL_BLOCKED", "USER_CNIC_FORMAT_SUSPECT",
+    "CHECKIN_NOTIFY_DEGRADED",
 })
 DIAGNOSTICS_CODES = ("ESP_DURABILITY_FAULT", "ESP_DELIVERY_WORKER_FAULT")
 
@@ -84,9 +86,14 @@ POLICY = {
         55, True, "POSITIVE", "Clears when the Hikvision terminal is online and its last check succeeded.",
         RULE),
     "DEVICE_MESSAGE_REJECTED": Policy(
-        60, True, "REJECTION", "Clears when ADD accepts the next message of each rejected type.", RULE),
+        60, True, "REJECTION", "Clears when ADD accepts the next message of each rejected type. A refused "
+        "queue_evidence clears only once ADD holds each refused copy's bytes. Once ADD accepts a later "
+        "queue_evidence, copies it does not hold no longer hold HIL or factory work, but stay open as a "
+        "warning until an operator verifies the device and resolves them.", RULE),
     "ADD_MESSAGE_PROCESSING_FAILED": Policy(
-        65, False, "REJECTION", "Clears when ADD processes the next message of each failed type.", RULE),
+        65, False, "REJECTION", "Clears when ADD processes the next message of each failed type; a "
+        "queue_evidence clears only once ADD holds each copy it could not process, or an operator "
+        "resolves it.", RULE),
     "HIK_LIGHT_RECONCILE_BLOCKED": Policy(
         70, True, "POSITIVE", "Clears when the Hikvision history audit is scanning or complete.", WARNING),
     "OTA_DEVICE_ROLLED_BACK": Policy(
@@ -108,12 +115,16 @@ POLICY = {
         102, False, "POSITIVE", "Clears when the terminal clock is within two minutes of trusted time."),
     "HIK_CLOCK_DRIFT": Policy(
         102, False, "POSITIVE", "Clears when the terminal clock is within two minutes of trusted time."),
+    "ESP_CLOCK_SKEW": Policy(
+        102, False, "POSITIVE", "Clears when the ESP's heartbeat clock is within two minutes of ADD time."),
     "USER_SNAPSHOT_TRUNCATED": Policy(
         103, False, "LATCHED", "Clears when a complete, stable user snapshot is received."),
     "HISTORY_BACKFILL_BLOCKED": Policy(
         104, False, "POSITIVE", "Clears when history backfill is running or complete."),
     "ORDS_DELIVERY_FAILED": Policy(105, False, "LATCHED", "Clears when Oracle delivery succeeds."),
     "ORDS_EVENT_REJECTED": Policy(105, False, "LATCHED", "Clears through the Oracle rejection review."),
+    "CHECKIN_NOTIFY_DEGRADED": Policy(
+        105, False, "LATCHED", "Clears when employee check-in notifications are delivered again."),
     "ATTENDANCE_EVENT_QUARANTINED": Policy(
         106, False, "LATCHED", "Clears when the quarantined attendance events are released."),
     "ATTENDANCE_TIMESTAMP_QUARANTINED": Policy(
@@ -124,10 +135,34 @@ POLICY = {
         107, False, "LATCHED", "Clears when the attendance repair completes."),
     "ADD_SOURCE_COVERAGE_INVALIDATED": Policy(
         108, False, "LATCHED", "Clears through a source coverage review."),
+    "ADD_SOURCE_GENERATION_LINEAGE_DIVERGED": Policy(
+        108, False, "LATCHED", "Clears through a source coverage review."),
+    "ADD_SOURCE_COVERAGE_UNVERIFIED": Policy(
+        108, False, "LATCHED", "Clears through a source coverage review."),
+    "ADD_SOURCE_TAIL_STALE_GENERATION": Policy(
+        108, False, "POSITIVE", "Clears when ADD commits a tail in the current coverage generation."),
     "TERMINAL_SOURCE_EXCEPTION": Policy(108, False, "LATCHED", "Clears through a source exception review."),
+    "TERMINAL_NEWEST_RECORD_CORRECTED": Policy(
+        108, False, "LATCHED",
+        "Clears when an operator resolves it after HR verifies the punch corrected from an unwritten "
+        "newest terminal record."),
+    "TERMINAL_NEWEST_RECORD_CHANGED": Policy(
+        108, False, "LATCHED",
+        "Clears when an operator resolves it after HR verifies the punch ADD took from an unwritten "
+        "newest terminal record."),
+    "TERMINAL_NEWEST_RECORD_PUNCH_UNRECEIVED": Policy(
+        108, False, "LATCHED",
+        "Clears by itself once ADD accounts for every listed slot: a complete source reconcile reads it "
+        "while later records exist, or LIVE capture delivers its punch."),
+    "TERMINAL_NEWEST_RECORD_RELEASE_HELD": Policy(
+        108, False, "LATCHED",
+        "Clears by itself once every listed punch is released or confirmed by a complete source reconcile."),
     "USER_DELETION_JOB_INCOMPLETE": Policy(
         109, False, "LATCHED", "Clears when the user deletion job completes."),
     "DUPLICATE_USER_CNIC": Policy(109, False, "LATCHED", "Clears when the duplicate CNIC is resolved."),
+    "USER_CNIC_FORMAT_SUSPECT": Policy(
+        109, False, "LATCHED",
+        "Clears at the next user snapshot once no active user's name hides a CNIC typo."),
     "ORACLE_RECEIPT_CONNECTOR_MISMATCH": Policy(
         109, False, "LATCHED", "Clears when Oracle receipts match this connector."),
     "ADMIN_REVOKE_OVERDUE": Policy(109, False, "LATCHED", "Clears when the temporary admin is revoked."),
@@ -462,6 +497,112 @@ def classify_led_latch(led_state: str | None, evidence: dict | None, *, storage_
     return None
 
 
+# Signed 2.6.15 checks at boot (zone_lite.c:3196) that the other OTA slot
+# holds a qualified predecessor (2.4.12 to 2.6.14). Any 2.7.x download writes
+# that slot, so every later 2.6.15 boot latches LOCAL_FAILURE, never runs its
+# persistence probe and reports durability DEGRADED until a 2.7.x install
+# succeeds. This latch only names that cause (error code and message); the
+# tier stays DEGRADED. Zero I/O counters on such a boot are not a passed
+# probe: 2.6.15 keeps the first latch's source, so a later LOCAL_FAILURE on
+# the same boot is invisible, and its legacy-queue reads and writes fail
+# without touching the counters. The label also needs ADD's own record of
+# the 2.7.x download and a clean storage history.
+ROLLBACK_SLOT_RESIDUE = "OTA_ROLLBACK_SLOT_RESIDUE"
+RESIDUE_FIRMWARE_VERSION = "2.6.15"
+RESIDUE_APPLICATION_SHA256 = "832c0c3d8dac6e41d7cd0a9d4fbe4508e4f66982fa5ddeceaca4dc5adcbd80d6"
+RESIDUE_LED_SOURCE = "zone_lite.c:3196"
+RESIDUE_UPGRADE_ERROR = "STORAGE_DIRECT_ROLLBACK_IMAGE_UNQUALIFIED"
+RESIDUE_ERROR_FIELDS = ("error_code", "error_operation", "persistence_probe_error", "persistence_probe_operation",
+                        "legacy_error_code", "legacy_error_operation", "legacy_error_queue")
+# Earlier boots whose last reported storage counters show any I/O fault in
+# this window keep DEGRADED (MULTAN-02 had EIO write failures on 15 Oct).
+RESIDUE_HISTORY_DAYS = 14
+RESIDUE_HISTORY_CHUNK = 500
+
+
+def rollback_slot_residue_candidate(evidence: dict | None, firmware_version: str | None) -> bool:
+    """Every device-side gate of the rollback-slot residue latch; any I/O fault fails it."""
+    if not isinstance(evidence, dict) or not isinstance(evidence.get("storage"), dict):
+        return False
+    storage = evidence["storage"]
+    runtime = evidence.get("ota_runtime") if isinstance(evidence.get("ota_runtime"), dict) else {}
+    return (
+        plain_version(firmware_version) == RESIDUE_FIRMWARE_VERSION
+        and runtime.get("image_sha256") == RESIDUE_APPLICATION_SHA256
+        and evidence.get("journal_storage") is None
+        and storage.get("local_failure_source") == RESIDUE_LED_SOURCE
+        and storage.get("local_failure_last_source") in (None, RESIDUE_LED_SOURCE)
+        and storage.get("upgrade_error") == RESIDUE_UPGRADE_ERROR
+        and storage.get("upgrade_ready") is not True
+        and storage.get("durability") == "DEGRADED"
+        and storage.get("recovery_complete") is True
+        and type(storage.get("write_failures")) is int and storage["write_failures"] == 0
+        and type(storage.get("read_failures")) is int and storage["read_failures"] == 0
+        and all(storage.get(name) in (None, 0) for name in STORAGE_COUNTERS)
+        and not any(_reported(storage.get(name)) for name in RESIDUE_ERROR_FIELDS)
+        and storage.get("fault_class") in (None, "NONE")
+    )
+
+
+def storage_io_fault(storage: dict) -> dict | None:
+    """Reported storage I/O faults (counters, error fields, fault class); latch sources and upgrade state are not."""
+    faults = {name: storage[name] for name in STORAGE_COUNTERS
+              if type(storage.get(name)) is int and storage[name] > 0}
+    faults.update({name: storage[name] for name in RESIDUE_ERROR_FIELDS if _reported(storage.get(name))})
+    if storage.get("fault_class") not in (None, "NONE"):
+        faults["fault_class"] = storage["fault_class"]
+    return faults or None
+
+
+def rollback_slot_residue_history(session: Session, connector: Connector, *, now: datetime | None = None) -> dict:
+    """Storage I/O faults reported by this ESP's earlier boots in the last RESIDUE_HISTORY_DAYS.
+
+    Counters accumulate per boot, so each earlier boot's last heartbeat is
+    read. A boot whose firmware reported no storage counters is counted, not
+    treated as a fault. The current boot is checked by the latch's own gates.
+    """
+    from sqlalchemy import func
+
+    now = now or utc_now()
+    statement = select(func.max(DeviceTelemetry.id)).where(
+        DeviceTelemetry.connector_id == connector.id,
+        DeviceTelemetry.created_at >= now - timedelta(days=RESIDUE_HISTORY_DAYS),
+        DeviceTelemetry.boot_id.is_not(None))
+    if connector.boot_id:
+        statement = statement.where(DeviceTelemetry.boot_id != connector.boot_id)
+    last_ids = sorted(row for row in session.scalars(statement.group_by(DeviceTelemetry.boot_id)) if row)
+    faults, unreported = [], 0
+    for offset in range(0, len(last_ids), RESIDUE_HISTORY_CHUNK):
+        for row_id, boot_id, created_at, payload in session.execute(select(
+                DeviceTelemetry.id, DeviceTelemetry.boot_id, DeviceTelemetry.created_at, DeviceTelemetry.payload,
+        ).where(DeviceTelemetry.id.in_(last_ids[offset:offset + RESIDUE_HISTORY_CHUNK]))):
+            diagnostics = (payload or {}).get("diagnostics") if isinstance(payload, dict) else None
+            storage = diagnostics.get("storage") if isinstance(diagnostics, dict) else None
+            if not isinstance(storage, dict) or not any(name in storage for name in STORAGE_COUNTERS):
+                unreported += 1
+                continue
+            fault = storage_io_fault(storage)
+            if fault:
+                faults.append({"boot_id": boot_id, "at": ensure_utc(created_at).isoformat(), **fault})
+    return {"boot_id": connector.boot_id, "checked_at": now.isoformat(), "days": RESIDUE_HISTORY_DAYS,
+            "boots_checked": len(last_ids), "boots_without_storage_counters": unreported,
+            "faults": faults[:10], "clean": not faults}
+
+
+def rollback_slot_residue_latch(record: dict | None, history: dict | None) -> dict | None:
+    """The latch, only with ADD's own record of the 2.7.x download and a clean storage history."""
+    if not record or not history or not history.get("clean"):
+        return None
+    return {"kind": ROLLBACK_SLOT_RESIDUE, "source": RESIDUE_LED_SOURCE,
+            "firmware_version": RESIDUE_FIRMWARE_VERSION, "upgrade_error": RESIDUE_UPGRADE_ERROR,
+            "residue": record, "history": {key: history.get(key) for key in (
+                "days", "boots_checked", "boots_without_storage_counters")}}
+
+
+def _residue(details: dict) -> bool:
+    return (details.get("latch") or {}).get("kind") == ROLLBACK_SLOT_RESIDUE
+
+
 def _refreshing_heartbeat(session: Session, row: DeviceAlert) -> DeviceTelemetry | None:
     """The heartbeat that last refreshed a diagnostics alert; it records the boot."""
     seen = ensure_utc(row.last_seen_at)
@@ -518,9 +659,35 @@ def _rejection_entries(row: DeviceAlert) -> dict[str, dict]:
         "first_at": row.first_seen_at, "last_at": row.last_seen_at}}
 
 
+def _unheld_summary(entry: dict) -> str:
+    pending, untracked = unheld_evidence(entry)
+    conflicts = len([item for item in entry.get("pending") or [] if isinstance(item, dict)
+                     and item.get("reason") in OPERATOR_ONLY_REASONS])
+    conflict_note = " (1 is an identity conflict)" if conflicts == 1 else (
+        f" ({conflicts} are identity conflicts)" if conflicts else "")
+    parts = ([f"{pending} refused record{'s' if pending != 1 else ''} not yet held{conflict_note}"]
+             if pending else []) + (
+        [f"{untracked} unmatched refusal{'s' if untracked != 1 else ''}"] if untracked else [])
+    if parts and custody_only(entry):
+        parts.append("no HIL or factory hold since a later acceptance")
+    return "; " + ", ".join(parts) if parts else ""
+
+
 def _entry_current(entry: dict, now: datetime) -> bool:
+    if custody_only(entry):
+        return False  # ADD accepted that type after this entry's latest refusal
     age = _age(now, _when(entry.get("last_at")))
     return age is not None and age <= settings.message_rejection_current_seconds
+
+
+def _rejection_gating(row: DeviceAlert, policy: Policy) -> bool:
+    """A rejection left with only refused copies ADD does not hold after a
+    later acceptance no longer holds HIL or factory work: that acceptance
+    used to close it. It stays open, as a warning, for an operator."""
+    if not policy.gating or row.code not in {"DEVICE_MESSAGE_REJECTED", "ADD_MESSAGE_PROCESSING_FAILED"}:
+        return policy.gating
+    entries = _rejection_entries(row)
+    return not (entries and all(custody_only(entry) for entry in entries.values()))
 
 
 def _refreshed_by_last_heartbeat(row: DeviceAlert, connector: Connector) -> bool:
@@ -572,6 +739,10 @@ def _rule_tier(row: DeviceAlert, connector: Connector, currency: str, *, now: da
             # fault stays a gating warning; capable firmware keeps it DEGRADED
             # until one of its boots verifies or fails storage.
             return WARNING if diagnostics_reporting(connector) == "NOT_REPORTED_BY_FIRMWARE" else DEGRADED
+        if _residue(details):
+            # Persistence unverified - OTA rollback slot residue: a label, not
+            # verified storage, so the tier stays DEGRADED.
+            return DEGRADED
         return _latched_led_tier(details) or DEGRADED
     if row.code == "ESP_DELIVERY_WORKER_FAULT":
         return WARNING if currency == PREVIOUS_BOOT else DEGRADED
@@ -611,7 +782,11 @@ def _error_code(row: DeviceAlert) -> str:
     if row.code == "HIK_CAPTURE_UNHEALTHY":
         return str(details.get("reason") or row.code)[:120]
     if row.code == "OTA_DEVICE_ROLLED_BACK":
+        if details.get("classification") == "TARGET_BOOT_INTERRUPTED":
+            return "OTA_TARGET_BOOT_INTERRUPTED"
         return "OTA_PREVIOUS_FIRMWARE_OBSERVED"
+    if row.code in {"ESP_DURABILITY_FAULT", "ESP_LOCAL_FAILURE"} and _residue(details):
+        return ROLLBACK_SLOT_RESIDUE
     if row.code == "OTA_DEVICE_REPORTED_FAILURE" and details.get("error_code"):
         return f"OTA_{details['error_code']}"[:120]
     return row.code
@@ -622,13 +797,25 @@ def _evidence_summary(row: DeviceAlert) -> str | None:
     evidence = details.get("evidence")
     summary = evidence.get("summary") if isinstance(evidence, dict) else None
     latch = details.get("latch")
+    if _residue(details):
+        residue = latch.get("residue") or {}
+        history = latch.get("history") or {}
+        return (f"Persistence unverified - OTA rollback slot residue: {latch.get('source')} on "
+                f"{latch.get('firmware_version')} after {residue.get('target_version') or '2.7.x'} wrote "
+                f"{residue.get('bytes_written') or 'some'} bytes to the other slot; no storage I/O counters on "
+                f"this boot or in {history.get('days') or RESIDUE_HISTORY_DAYS} days of earlier boots, but the "
+                "persistence probe did not run and later latches on this boot are not reported"
+                + (f" ({summary})" if summary else "") + ".")[:300]
+    diagnosis = details.get("diagnosis")
+    if row.code == "OTA_DEVICE_ROLLED_BACK" and isinstance(diagnosis, dict) and diagnosis.get("summary"):
+        return str(diagnosis["summary"])[:300]
     if not summary and isinstance(latch, dict) and latch.get("kind"):
         summary = (f"{latch['kind']}: latched by {latch.get('source') or 'an unreported source'} on firmware "
                    f"{latch.get('firmware_version') or 'unknown'}.")
     if not summary and row.code in {"DEVICE_MESSAGE_REJECTED", "ADD_MESSAGE_PROCESSING_FAILED"}:
         summary = "; ".join(
             f"{name} x{int(entry.get('count') or 1)} ({entry.get('category') or 'UNKNOWN'}"
-            f"{': ' + str(entry['error_reason']) if entry.get('error_reason') else ''})"
+            f"{': ' + str(entry['error_reason']) if entry.get('error_reason') else ''}{_unheld_summary(entry)})"
             for name, entry in sorted(_rejection_entries(row).items()))
     if not summary and row.code == "HIK_CAPTURE_UNHEALTHY" and details.get("reason"):
         summary = f"{details['reason']} (poll error {details.get('poll_error')})."
@@ -716,7 +903,8 @@ def alert_reason(row: DeviceAlert, connector: Connector, *, now: datetime, link:
     tier = _rule_tier(row, connector, currency, now=now, link=link) if policy.tier == RULE else policy.tier
     details = row.details or {}
     reason = Reason(
-        code=row.code, error_code=_error_code(row), tier=tier, currency=currency, gating=policy.gating,
+        code=row.code, error_code=_error_code(row), tier=tier, currency=currency,
+        gating=_rejection_gating(row, policy),
         severity=row.severity, message=row.message,
         since=_when(details.get("boot_first_seen_at")) or ensure_utc(row.first_seen_at),
         last_seen_at=ensure_utc(row.last_seen_at), clear_condition=policy.clear_condition,

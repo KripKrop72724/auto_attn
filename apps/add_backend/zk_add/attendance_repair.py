@@ -54,6 +54,7 @@ from zk_add.models import (
 )
 from zk_add.ords_states import ORDS_ACTIVE_STATUSES, ORDS_TERMINAL_REVIEW_STATUSES
 from zk_add.reconciliation import (
+    COVERAGE_FINALISATION_HOLDS,
     TERMINAL_JOB_STATES as RECONCILIATION_TERMINAL_STATES,
     active_coverage,
     create_reconciliation_job,
@@ -2093,6 +2094,26 @@ def _attach_source_dependency(
             ReconciliationJob.status.not_in(RECONCILIATION_TERMINAL_STATES),
         )
     )
+    from zk_add import source_newest_slot as newest_slot
+
+    if active is not None and active.error_code in {newest_slot.PUNCH_PENDING_HOLD, newest_slot.OPEN_JOB_HOLD}:
+        # The job waits for a terminal newest-record punch ADD has not received
+        # (or for another job): it cannot certify the repair's source until an
+        # operator cancels it and reconciles again.
+        raise RepairError(
+            f"The device's source reconciliation {active.job_id} is held ({active.error_code}); "
+            "cancel it and run another complete source reconcile before preparing a repair.",
+            code="SOURCE_DEPENDENCY_UNAVAILABLE",
+        )
+    if active is not None and active.error_code in COVERAGE_FINALISATION_HOLDS:
+        # Sealing this job is held on committed source evidence (a paused job
+        # keeps that code); waiting on it cannot certify the repair's source.
+        # An operator retries or cancels it.
+        raise RepairError(
+            f"The device's source reconciliation {active.job_id} is held ({active.error_code}); "
+            "retry or cancel it before preparing a repair.",
+            code="SOURCE_DEPENDENCY_UNAVAILABLE",
+        )
     if active is None:
         try:
             active = create_reconciliation_job(
@@ -2110,6 +2131,16 @@ def _attach_source_dependency(
                 "The required full-device source reconciliation could not be queued.",
                 code="SOURCE_DEPENDENCY_UNAVAILABLE",
             ) from exc
+    from zk_add.reconciliation import hikvision_tail_job
+
+    if hikvision_tail_job(session, active):
+        # A recent tail never certifies source coverage, so waiting on it
+        # would wait forever; it is also the terminal's only capture path.
+        raise RepairError(
+            f"Recent-tail recovery {active.job_id} is following this terminal and never certifies "
+            "source coverage; prepare the repair after it ends.",
+            code="SOURCE_DEPENDENCY_UNAVAILABLE",
+        )
     job.source_reconciliation_job_id = active.id
     job.status = "PREPARING_SOURCE"
     job.phase = "WAITING_SOURCE_RECONCILIATION"

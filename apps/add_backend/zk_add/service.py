@@ -4,6 +4,7 @@ import hashlib
 import json
 import re
 import secrets
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
@@ -15,7 +16,11 @@ from zk_add.audit import append_audit
 from zk_add.device_health import (
     Health,
     bind_unbound_row,
+    ROLLBACK_SLOT_RESIDUE,
     classify_led_latch,
+    rollback_slot_residue_candidate,
+    rollback_slot_residue_history,
+    rollback_slot_residue_latch,
     diagnostics_evidence,
     diagnostics_reporting,
     DEVICE_REJECTION_CATEGORIES,
@@ -40,7 +45,12 @@ from zk_add.crypto import (
     normalize_cnic,
 )
 from zk_add.attendance_identity_evidence import TERMINAL_RECONCILE_SOURCES
-from zk_add.identity import build_machine_name, parse_machine_name
+from zk_add.identity import (
+    build_machine_name,
+    clean_display_name,
+    parse_machine_name,
+    suspect_cnic_name,
+)
 from zk_add.identity_conflicts import (
     valid_identity_resolutions,
     valid_resolution_for_user,
@@ -66,16 +76,19 @@ from zk_add.models import (
     OrdsOutbox,
     Site,
     TemporaryAdminLease,
-    TerminalRecordManifest,
     UserDeletionItem,
     UserDeletionJob,
     ZKTDevice,
 )
+from zk_add.attendance_identity_evidence import DUMP_RECONCILE_SOURCES
 from zk_add.schemas import (
     AttendanceEventIn,
     HeartbeatPayload,
     OracleReceiptBatchRequest,
     UserSnapshotRequest,
+)
+from zk_add.queue_evidence import (
+    LATER_ACCEPTANCE, custody_only, evidence_identity, find_held_copy, holds_refused_copy, unheld_evidence,
 )
 from zk_add.security import connector_token_hash
 from zk_add.settings import settings
@@ -303,8 +316,19 @@ def apply_ota_heartbeat_diagnostics(
         session, connector=connector, deployment=deployment, payload=payload,
     )
     if evidence is not None:
-        rollback_code = "PREVIOUS_FIRMWARE_OBSERVED"
-        rollback_message = (
+        # The ESP's own BOOTLOADER_ROLLBACK report may have been recorded
+        # while this heartbeat was read: label and alert only a transition
+        # this heartbeat makes.
+        locked = session.scalar(select(FirmwareDeployment).where(FirmwareDeployment.id == deployment.id)
+                                .with_for_update().execution_options(populate_existing=True))
+        if locked is None or locked.status not in {"BOOTED_PENDING", "RECONCILING"}:
+            return
+        diagnosis = _diagnose_target_return(session, connector, deployment, evidence)
+        from zk_add.ota_interruption import TARGET_BOOT_INTERRUPTED, interrupted_message
+
+        interrupted = diagnosis["classification"] == TARGET_BOOT_INTERRUPTED
+        rollback_code = TARGET_BOOT_INTERRUPTED if interrupted else "PREVIOUS_FIRMWARE_OBSERVED"
+        rollback_message = interrupted_message(diagnosis) if interrupted else (
             "The ESP has returned to its previous firmware after a verified "
             "target boot. Two fresh heartbeats confirm the return; the reset "
             "cause was not reported. The campaign remains paused for review."
@@ -317,13 +341,10 @@ def apply_ota_heartbeat_diagnostics(
             running_partition=ota.running_partition,
             image_sha256=ota.image_sha256,
             error_code=rollback_code, error_message=rollback_message,
+            event_details={"return_evidence": evidence, "diagnosis": diagnosis},
         )
-        connector.last_error_code = f"OTA_{rollback_code}"
-        connector.last_error_message = rollback_message
-        upsert_alert(
-            session, connector, code="OTA_DEVICE_ROLLED_BACK", severity="HIGH",
-            message=rollback_message, details=evidence,
-        )
+        _flag_target_return(session, connector, code=rollback_code, message=rollback_message,
+                            evidence=evidence, diagnosis=diagnosis)
         return
 
     # A heartbeat for another target, or a heartbeat with no OTA evidence,
@@ -366,20 +387,41 @@ def apply_ota_heartbeat_diagnostics(
             and _local_boot_is_waiting(payload, release)):
         connector.ota_state = "UPDATING"
         return
-    bounded_bytes = min(
-        release.image_size,
-        max(deployment.bytes_written, ota.bytes_written),
+    from zk_add.ota_interruption import download_interruption
+
+    interruption = download_interruption(
+        session, connector=connector, deployment=deployment, release=release,
+        payload=payload, error_code=error_code, runtime_state=runtime_state,
     )
+    if interruption is not None and interruption["decision"] in {"WAIT", "RETRY_SCHEDULED"}:
+        # 2.6.0-2.6.15 resume this deployment when it is offered again; the
+        # end-to-end signature and digest checks still gate boot selection.
+        connector.ota_state = "UPDATING"
+        return
     error_message = OTA_FAILURE_MESSAGES.get(
         error_code,
         "The ESP reported a fail-closed OTA error.",
     )
+    if interruption is not None:
+        error_code, error_message = interruption["error_code"], interruption["message"]
+    fail_ota_deployment(
+        session, connector=connector, deployment=deployment, error_code=error_code,
+        error_message=error_message, runtime_state=runtime_state,
+        bytes_written=min(release.image_size, max(deployment.bytes_written, ota.bytes_written)),
+    )
+
+
+def fail_ota_deployment(session: Session, *, connector: Connector, deployment, error_code: str,
+                        error_message: str, runtime_state: str, bytes_written: int | None = None) -> None:
+    """Fail an active deployment closed: FAILED, the campaign paused, the ESP's OTA blocked, an alert."""
+    from zk_add.ota import record_progress
+
     record_progress(
         session,
         connector=connector,
         deployment_public_id=deployment.deployment_id,
         state="FAILED",
-        bytes_written=bounded_bytes,
+        bytes_written=deployment.bytes_written if bytes_written is None else bytes_written,
         error_code=error_code,
         error_message=error_message,
     )
@@ -398,6 +440,120 @@ def apply_ota_heartbeat_diagnostics(
             "target_version": deployment.target_version,
         },
     )
+
+
+def _diagnose_target_return(session: Session, connector: Connector, deployment, evidence: dict) -> dict:
+    """Classification and rollback evidence; missing evidence never blocks the fail-closed return."""
+    from zk_add.ota_interruption import diagnose_return
+
+    try:
+        return diagnose_return(session, connector=connector, deployment=deployment, return_evidence=evidence)
+    except (ArithmeticError, KeyError, TypeError, ValueError):
+        return {"classification": "UNCLASSIFIED", "unclassified_reasons": ["EVIDENCE_UNAVAILABLE"]}
+
+
+def _flag_target_return(session: Session, connector: Connector, *, code: str, message: str,
+                        evidence: dict, diagnosis: dict) -> None:
+    connector.last_error_code = f"OTA_{code}"
+    connector.last_error_message = message
+    upsert_alert(
+        session, connector, code="OTA_DEVICE_ROLLED_BACK", severity="HIGH",
+        message=message, details={
+            **evidence, "classification": diagnosis["classification"], "diagnosis": diagnosis,
+        },
+    )
+
+
+def _device_return_in_scope(session: Session, deployment, *, running_version: str | None) -> bool:
+    from zk_add.ota import FirmwareRelease, _versions_match
+    from zk_add.ota_interruption import return_in_scope
+
+    return (deployment is not None and deployment.status == "BOOTED_PENDING"
+            and _versions_match(running_version, deployment.previous_version)
+            and not _versions_match(running_version, deployment.target_version)
+            and return_in_scope(deployment, session.get(FirmwareRelease, deployment.release_id)))
+
+
+def device_reported_return_candidate(
+    session: Session, *, connector: Connector, deployment_public_id: str,
+    running_version: str | None, error_code: str | None,
+) -> bool:
+    """A cheap, lock-free scope check; every other progress report keeps the unchanged path.
+
+    record_device_reported_return re-checks the same conditions under its locks.
+    """
+    from zk_add.ota import FirmwareDeployment
+
+    if connector.firmware_family != "zkt" or (error_code or "").strip().upper() != "BOOTLOADER_ROLLBACK":
+        return False
+    deployment = session.scalar(select(FirmwareDeployment).where(
+        FirmwareDeployment.deployment_id == deployment_public_id,
+        FirmwareDeployment.connector_id == connector.id))
+    return _device_return_in_scope(session, deployment, running_version=running_version)
+
+
+def record_device_reported_return(
+    session: Session, *, connector: Connector, deployment_public_id: str, bytes_written: int,
+    running_version: str | None, running_partition: str | None, image_sha256: str | None,
+    error_code: str | None, error_message: str | None,
+):
+    """A 2.6.0-2.6.15 ESP's own ROLLED_BACK BOOTLOADER_ROLLBACK report from an unconfirmed target boot.
+
+    The same evidence and classification as the heartbeat-inferred return, so
+    which of the two reaches ADD first no longer decides the label, the alert
+    or the owner's retry. None when the report is outside that scope: the
+    caller records it unchanged. Raises ReturnEvidencePending (a 409 the ESP
+    repeats every 60 s) while the return boot has sent no heartbeat yet, for
+    at most RETURN_REPORT_WAIT_SECONDS after the target's last report.
+
+    The connector is locked before the deployment, the order of the
+    WebSocket heartbeat that can observe the same return, so the two never
+    deadlock; the heartbeat then waits for this report's commit.
+    """
+    from zk_add.ota import FirmwareDeployment, record_progress
+    from zk_add.ota_interruption import (
+        TARGET_BOOT_INTERRUPTED,
+        ReturnEvidencePending,
+        device_return_evidence,
+        interrupted_message,
+        return_report_may_wait,
+    )
+
+    if connector.firmware_family != "zkt" or (error_code or "").strip().upper() != "BOOTLOADER_ROLLBACK":
+        return None
+    # Re-read under the lock: the return boot's first heartbeat may have
+    # committed a newer boot_id since this request authenticated.
+    session.scalar(select(Connector).where(Connector.id == connector.id).with_for_update()
+                   .execution_options(populate_existing=True))
+    deployment = session.scalar(select(FirmwareDeployment).where(
+        FirmwareDeployment.deployment_id == deployment_public_id,
+        FirmwareDeployment.connector_id == connector.id,
+    ).with_for_update().execution_options(populate_existing=True))
+    if not _device_return_in_scope(session, deployment, running_version=running_version):
+        return None
+    evidence = device_return_evidence(session, connector=connector, deployment=deployment)
+    if evidence is None:
+        if return_report_may_wait(session, deployment):
+            raise ReturnEvidencePending(
+                "RETURN_EVIDENCE_PENDING: ADD records this return once the return boot's first heartbeat "
+                "arrives; repeat the report.")
+        return None
+    diagnosis = _diagnose_target_return(session, connector, deployment, evidence)
+    interrupted = diagnosis["classification"] == TARGET_BOOT_INTERRUPTED
+    code = TARGET_BOOT_INTERRUPTED if interrupted else "BOOTLOADER_ROLLBACK"
+    message = interrupted_message(diagnosis) if interrupted else (
+        error_message or "The ESP reported that its bootloader returned to the previous firmware before the "
+        "new image was confirmed; the reset cause was not reported. The campaign remains paused for review.")
+    record_progress(
+        session, connector=connector, deployment_public_id=deployment.deployment_id,
+        state="ROLLED_BACK", bytes_written=bytes_written, running_version=running_version,
+        running_partition=running_partition, image_sha256=image_sha256,
+        error_code=code, error_message=message,
+        event_details={"return_evidence": evidence, "diagnosis": diagnosis,
+                       "device_error_code": "BOOTLOADER_ROLLBACK", "device_error_message": error_message},
+    )
+    _flag_target_return(session, connector, code=code, message=message, evidence=evidence, diagnosis=diagnosis)
+    return deployment
 
 
 def user_snapshot_state_hash(snapshot: UserSnapshotRequest) -> str:
@@ -760,6 +916,21 @@ def apply_firmware_diagnostics(session: Session, connector: Connector, payload: 
                       resolution={"kind": "CONDITION_CLEARED"}, touch_last_seen=False)
     latch = classify_led_latch(payload.led_state, evidence, storage_verified=storage_verified,
                                workers_verified=workers_verified, firmware_version=connector.firmware_version)
+    residue_history = None
+    if latch is None and rollback_slot_residue_candidate(evidence, connector.firmware_version):
+        from zk_add.ota_interruption import rollback_slot_residue_record
+
+        # Every device gate held on this boot; the latch also needs ADD's own
+        # record that a 2.7.x download wrote the other slot after the last
+        # 2.6.15 install, and no storage I/O fault on the ESP's earlier boots.
+        residue_record = rollback_slot_residue_record(session, connector)
+        if residue_record:
+            durability = open_alert_row(session, connector, "ESP_DURABILITY_FAULT")
+            cached = (durability.details or {}).get("residue_history") if durability is not None else None
+            # Earlier boots cannot change, so one check per boot suffices.
+            residue_history = (cached if isinstance(cached, dict) and cached.get("boot_id") == connector.boot_id
+                               else rollback_slot_residue_history(session, connector, now=now))
+        latch = rollback_slot_residue_latch(residue_record, residue_history)
     for code, failed, verified, message in (
         ("ESP_DURABILITY_FAULT", storage_failed, storage_verified,
          "Attendance preservation needs recovery; connectivity alone does not confirm durable storage."),
@@ -772,6 +943,8 @@ def apply_firmware_diagnostics(session: Session, connector: Connector, payload: 
             message = (f"Attendance preservation needs recovery: {record['summary']}."
                        if code == "ESP_DURABILITY_FAULT" else
                        f"Attendance delivery worker fault: {record['summary']}.")[:1000]
+            if code == "ESP_DURABILITY_FAULT" and (latch or {}).get("kind") == ROLLBACK_SLOT_RESIDUE:
+                message = f"Persistence unverified - OTA rollback slot residue: {record['summary']}."[:1000]
             previous = (existing.details or {}) if existing is not None else {}
             same_boot = previous.get("boot_id") == connector.boot_id and previous.get("boot_first_seen_at")
             upsert_alert(session, connector, code=code, severity="HIGH", message=message, details={
@@ -781,6 +954,8 @@ def apply_firmware_diagnostics(session: Session, connector: Connector, payload: 
                 "boot_first_seen_at": previous["boot_first_seen_at"] if same_boot else now.isoformat(),
                 "evidence": record,
                 **({"latch": latch} if latch and code == "ESP_DURABILITY_FAULT" else {}),
+                **({"residue_history": residue_history}
+                   if residue_history and code == "ESP_DURABILITY_FAULT" else {}),
             })
         elif verified:
             resolution = {"kind": "VERIFIED"}
@@ -1168,10 +1343,38 @@ def update_heartbeat(
             elif audit and audit.state in {"SCANNING", "COMPLETE"}:
                 resolve_alert(session, connector, code="HIK_LIGHT_RECONCILE_BLOCKED")
             clock = payload.terminal.clock_sample if payload.terminal else None
+            # The sample's sampled_epoch is the ESP's own clock. The envelope's
+            # sent_at uses that clock too, so ADD's time measures the ESP's
+            # error. When the ESP is off by more than two minutes, re-base the
+            # sample on ADD time. Before this, ADD discarded every sample from
+            # an ESP 77 minutes slow as stale, while the firmware's own clock
+            # log read the correct terminal as 77 minutes fast (LF-ZONE-BLD1-01).
+            from zk_add.hikvision_clock import ESP_OFFSET_WINDOW, esp_clock_offset_seconds, stable_esp_offset
+            measured = esp_clock_offset_seconds(now, device_sent_at)
+            offsets = list(((zkt.capability_profile or {}).get("esp_clock_offsets") or [])[-(ESP_OFFSET_WINDOW - 1):])
+            if measured is not None:
+                offsets.append(measured)
+                zkt.capability_profile = {**(zkt.capability_profile or {}), "esp_clock_offsets": offsets}
+            # A single late heartbeat neither raises the alert nor shifts the sample.
+            esp_offset = stable_esp_offset(offsets) if measured is not None else None
+            zkt_payload["esp_clock_offset_seconds"] = esp_offset
+            sampled_epoch = (clock.sampled_epoch + (esp_offset if esp_offset is not None and abs(esp_offset) > 120
+                                                    else 0)) if clock else None
+            if esp_offset is not None and abs(esp_offset) > 120:
+                upsert_alert(
+                    session, connector, code="ESP_CLOCK_SKEW", severity="WARNING",
+                    message=("The ESP clock differs from ADD time by more than two minutes; terminal clock "
+                             "checks are corrected for it. Do not change the terminal clock for this."),
+                    details={"esp_offset_seconds": esp_offset},
+                )
+            elif esp_offset is not None:
+                resolve_alert(session, connector, code="ESP_CLOCK_SKEW")
             # A missing/stale sample must not leave the previous clock looking live.
-            if clock and 0 <= now.timestamp() - clock.sampled_epoch <= 180:
+            # Freshness is judged on ADD's processing time, so a heartbeat that
+            # waited behind a burst fails it rather than shifting the sample.
+            if clock and 0 <= now.timestamp() - sampled_epoch <= 180:
                 zkt_payload["device_time"] = datetime.fromtimestamp(clock.device_epoch, timezone.utc).isoformat()
-                zkt_payload["device_time_sampled_at"] = datetime.fromtimestamp(clock.sampled_epoch, timezone.utc).isoformat()
+                zkt_payload["device_time_sampled_at"] = datetime.fromtimestamp(sampled_epoch, timezone.utc).isoformat()
             else:
                 zkt.sampled_device_time = None
                 zkt.device_time_sampled_at = None
@@ -1740,6 +1943,8 @@ def _replace_user_snapshot(
             )
     from zk_add.attendance_identity_evidence import record_identity_observation
     session.flush()
+    # After the flush so a user this snapshot removed or fixed is not counted.
+    refresh_cnic_format_alert_safely(session, connector, zkt)
     record_identity_observation(
         session,
         connector,
@@ -1756,12 +1961,48 @@ def _replace_user_snapshot(
             AttendanceEvent.ords_status.in_(("BLOCKED_IDENTITY", "WAITING_FOR_SNAPSHOT")),
         ).distinct()).all()
         if held_user_ids:
+            # In zones the owner enabled, recent legacy dump punches can use
+            # their authenticated batch proof, capped per snapshot and per
+            # hour. Older punches and holds, and punches ADD did not observe
+            # the roster around, need the owner's audited backlog release.
+            # The proof check runs once per held punch either way.
+            dump_release = dump_identity_auto_release(session, connector)
             for row in session.scalars(select(DeviceUser).where(
                 DeviceUser.zkt_device_id == zkt.id,
                 DeviceUser.user_id.in_(held_user_ids),
                 DeviceUser.lifecycle_state == "ACTIVE",
             )).all():
-                release_synced_cnic_attendance(session, zkt=zkt, user=row)
+                release_synced_cnic_attendance(
+                    session, zkt=zkt, user=row, dump_release=dump_release
+                )
+            if dump_release is not None and (
+                dump_release.released_ids or dump_release.rereleased_ids
+            ):
+                append_audit(
+                    session,
+                    actor=DUMP_AUTO_RELEASE_ACTOR,
+                    action=DUMP_AUTO_RELEASE_ACTION,
+                    target_type="connector",
+                    target_id=connector.connector_id,
+                    outcome="RELEASED",
+                    after={
+                        "snapshot_id": snapshot_record.snapshot_id,
+                        "zone_id": connector.zone_id,
+                        "proof": DUMP_RELEASE_PROOF,
+                        "released": len(dump_release.released_ids),
+                        "event_ids": dump_release.released_ids,
+                        # Released before, then re-held by delivery because
+                        # this newer snapshot arrived first. Separate cap.
+                        "rereleased": len(dump_release.rereleased_ids),
+                        "rereleased_event_ids": dump_release.rereleased_ids,
+                        "window_hours": settings.attendance_dump_identity_auto_release_hours,
+                        "batch_cap": settings.attendance_dump_identity_auto_release_batch,
+                        "hourly_cap": settings.attendance_dump_identity_auto_release_hourly_cap,
+                        "max_snapshot_gap_minutes": (
+                            settings.attendance_dump_identity_auto_release_max_snapshot_gap_minutes
+                        ),
+                    },
+                )
     zkt.updated_at = utc_now()
     return len(snapshot.users)
 
@@ -1853,6 +2094,24 @@ def reconcile_device_user_identity_conflicts(
         for row in rows
         if row.id in previously_conflicted and row.identity_conflict_code is None
     ]
+
+
+def refresh_cnic_format_alert_safely(session: Session, connector: Connector, zkt: ZKTDevice) -> None:
+    """A data-quality note must never fail the user snapshot that carries it."""
+    from zk_add.attendance_release_safety import refresh_cnic_format_alert
+
+    try:
+        if session.get_bind().dialect.name == "postgresql":
+            with session.begin_nested():
+                refresh_cnic_format_alert(session, connector, zkt)
+        else:
+            refresh_cnic_format_alert(session, connector, zkt)
+    except Exception:
+        import logging
+
+        logging.getLogger(__name__).exception(
+            "CNIC format alert refresh failed for connector %s", connector.id,
+        )
 
 
 def persist_identity_tombstone(
@@ -3219,9 +3478,31 @@ def enrich_undelivered_attendance(
 
 def synced_cnic_identity_proven(
     session: Session, connector: Connector, zkt: ZKTDevice,
-    user: DeviceUser, row: AttendanceEvent,
+    user: DeviceUser, row: AttendanceEvent, *, allow_reconcile_batch: bool = False,
 ) -> bool:
-    """Check the roster and capture proof used by both repair and delivery."""
+    """Check the roster and capture proof used by both repair and delivery.
+
+    allow_reconcile_batch also accepts a legacy dump row without a saved
+    terminal record (AUTHENTICATED_RECONCILE_BATCH). That proof always needs a
+    retained, fingerprint-bound interval whose CNIC is the user's current one.
+    """
+    return synced_cnic_proof_kind(
+        session, connector, zkt, user, row, allow_reconcile_batch=allow_reconcile_batch
+    ) is not None
+
+
+def synced_cnic_proof_kind(
+    session: Session, connector: Connector, zkt: ZKTDevice,
+    user: DeviceUser, row: AttendanceEvent, *, allow_reconcile_batch: bool = False,
+) -> str | None:
+    """The synced-CNIC proof that holds for this punch, or None.
+
+    "CAPTURED_CNIC" or "LIVE_ROSTER" for a punch captured with its identity;
+    otherwise the authenticated source of a terminal reconcile record, such
+    as "SAVED_TERMINAL_RECORD" or "AUTHENTICATED_RECONCILE_BATCH". Allowing
+    the batch proof never changes the verdict for a row another source
+    proves: source_evidence offers it only when no other source applies.
+    """
     if not (
         zkt.snapshot_complete and zkt.identity_snapshot_stable
         and zkt.identity_snapshot_observed_at and zkt.confirmed_serial == zkt.serial
@@ -3239,15 +3520,19 @@ def synced_cnic_identity_proven(
         and (not row.captured_cnic_lookup_hash
              or row.captured_cnic_lookup_hash == user.cnic_lookup_hash)
     ):
-        return False
+        return None
     try:
         cnic = decrypt_cnic(user.cnic_encrypted)
         if not cnic or cnic_lookup(cnic) != user.cnic_lookup_hash:
-            return False
+            return None
     except Exception:
-        return False
+        return None
     if row.captured_cnic_lookup_hash == user.cnic_lookup_hash:
-        return True
+        if row.source not in {"LIVE", "LIVE_POLL"} and punch_time_cnic_conflict(
+            session, zkt=zkt, user=user, row=row
+        ):
+            return None
+        return "CAPTURED_CNIC"
     if (
         row.source in {"LIVE", "LIVE_POLL"}
             and zkt.last_identity_change_at is not None
@@ -3258,7 +3543,7 @@ def synced_cnic_identity_proven(
             and ensure_utc(zkt.identity_snapshot_observed_at)
             >= ensure_utc(row.captured_at)
     ):
-        return True
+        return "LIVE_ROSTER"
     # A reconciled ID-only record needs its own authenticated source and proof
     # that the same CNIC covered the punch time. A later roster observation
     # alone cannot attribute a historical punch to this employee.
@@ -3266,11 +3551,19 @@ def synced_cnic_identity_proven(
         row.source not in TERMINAL_RECONCILE_SOURCES
         or not row.uid or row.uid != user.uid or row.connector_id != connector.id
     ):
-        return False
+        return None
     from zk_add.attendance_identity_evidence import identity_evidence
     from zk_add.models import AttendanceIdentityHistory
 
-    evidence = identity_evidence(session, row, connector)
+    evidence = identity_evidence(
+        session, row, connector, allow_reconcile_batch=allow_reconcile_batch
+    )
+    if (
+        evidence
+        and evidence.proof["source"]["kind"] == "AUTHENTICATED_RECONCILE_BATCH"
+        and evidence.proof["kind"] not in {"RETAINED_INTERVAL", "RETAINED_EQUIVALENT_INTERVALS"}
+    ):
+        return None
     if evidence and evidence.proof["kind"] == "LEGACY_CONTINUITY":
         # A revoked or conflicting interval cannot be bypassed by the older
         # aggregate roster proof. Use that fallback only when no per-user
@@ -3284,19 +3577,383 @@ def synced_cnic_identity_proven(
             AttendanceIdentityHistory.observed_until >= row.device_event_time,
         ).limit(1))
         if prior_interval is not None:
-            return False
-    return bool(
+            return None
+    if (
         evidence and evidence.proof["kind"] in {
             "RETAINED_INTERVAL", "RETAINED_EQUIVALENT_INTERVALS", "LEGACY_CONTINUITY"
         }
         and evidence.user_id == user.id
         and evidence.cnic_hash == user.cnic_lookup_hash
+    ):
+        return evidence.proof["source"]["kind"]
+    return None
+
+
+def punch_time_cnic_conflict(
+    session: Session, *, zkt: ZKTDevice, user: DeviceUser, row: AttendanceEvent,
+) -> bool:
+    """A retained interval shows another CNIC for this terminal user at punch time.
+
+    Firmware before 2.6 (2.4.12, 2.5.2) fills a dump or reconcile record's
+    CNIC from the user table when it reads the log, not when the employee
+    punched. If the user ID changed hands since, that captured CNIC is the
+    new holder's. Only positive evidence counts: an unrevoked interval with a
+    different, known CNIC covering the punch. A live capture carries the
+    punch-time CNIC and is not checked here. Mirrors migration 0056's
+    add_auto_synced_cnic_verified.
+    """
+    from zk_add.models import AttendanceIdentityHistory
+
+    return session.scalar(select(AttendanceIdentityHistory.id).where(
+        AttendanceIdentityHistory.zkt_device_id == zkt.id,
+        AttendanceIdentityHistory.terminal_serial == row.device_serial,
+        AttendanceIdentityHistory.user_id == row.user_id,
+        AttendanceIdentityHistory.revoked.is_(False),
+        AttendanceIdentityHistory.cnic_lookup_hash.is_not(None),
+        AttendanceIdentityHistory.cnic_lookup_hash != user.cnic_lookup_hash,
+        AttendanceIdentityHistory.observed_from <= row.device_event_time,
+        AttendanceIdentityHistory.observed_until >= row.device_event_time,
+    ).limit(1)) is not None
+
+
+DUMP_AUTO_RELEASE_ACTOR = "system:identity-dump-auto-release"
+DUMP_AUTO_RELEASE_ACTION = "ATTENDANCE_DUMP_IDENTITY_AUTO_RELEASED"
+DUMP_RELEASE_PROOF = "AUTHENTICATED_RECONCILE_BATCH"
+HELD_ORDS_STATUSES = frozenset({"BLOCKED_IDENTITY", "WAITING_FOR_SNAPSHOT"})
+
+
+def dump_identity_release_enabled() -> bool:
+    """The owner's switch for AUTHENTICATED_RECONCILE_BATCH everywhere."""
+    return bool(settings.attendance_dump_identity_release_enabled)
+
+
+def dump_auto_release_zone_enabled(zone_id: str | None) -> bool:
+    zones = {
+        value.strip()
+        for value in settings.attendance_dump_identity_auto_release_zones.split(",")
+        if value.strip()
+    }
+    return bool(zone_id) and ("*" in zones or zone_id in zones)
+
+
+def previously_synced_cnic_release(row: AttendanceEvent) -> bool:
+    """A held row that a synced-CNIC proof released before.
+
+    Delivery re-holds such a row when a newer roster snapshot arrives before
+    Oracle acknowledges it; it is not new backlog.
+    """
+    return (
+        row.identity_resolution_status == "RESOLVED_SYNCED_CNIC"
+        and row.identity_repair_reason == "VERIFIED_SYNCED_CNIC"
     )
+
+
+def _roster_snapshot_times(session: Session, row: AttendanceEvent):
+    """The terminal's complete, stable roster snapshots just before and after the punch."""
+    when = ensure_utc(row.device_event_time)
+    observed = (
+        DeviceUserSnapshot.zkt_device_id == row.zkt_device_id,
+        DeviceUserSnapshot.complete.is_(True),
+        DeviceUserSnapshot.stable.is_(True),
+    )
+    before = session.scalar(select(func.max(DeviceUserSnapshot.observed_at)).where(
+        *observed, DeviceUserSnapshot.observed_at <= when
+    ))
+    after = session.scalar(select(func.min(DeviceUserSnapshot.observed_at)).where(
+        *observed, DeviceUserSnapshot.observed_at >= when
+    ))
+    return (
+        ensure_utc(before) if before is not None else None,
+        ensure_utc(after) if after is not None else None,
+    )
+
+
+@dataclass
+class DumpIdentityRelease:
+    """Permission to release legacy dump rows on AUTHENTICATED_RECONCILE_BATCH.
+
+    Automatic release (held_since set) admits a new hold only when both the
+    punch and ADD's receipt of it fall inside the rollout window, and ADD
+    observed the terminal's roster shortly before and after the punch (at
+    most max_snapshot_gap apart). A dump that uploads punches from an outage,
+    or old punches for the first time, therefore waits for the owner.
+    remaining caps new holds; rereleases_remaining separately caps rows a
+    synced-CNIC proof released before and delivery re-held, so a re-hold
+    cannot use up the new-hold cap or loop without bound.
+
+    The owner's backlog release (held_since None) has no age or gap limit and
+    sets only_dump_proof: it releases nothing another proof would, and lists
+    such rows in other_proof_ids for the next roster snapshot. A row an
+    administrator approved for a manual or forced send keeps that custody and
+    is never admitted.
+    """
+
+    held_since: datetime | None
+    remaining: int
+    rereleases_remaining: int = 0
+    max_snapshot_gap: timedelta | None = None
+    only_dump_proof: bool = False
+    released_ids: list[int] = field(default_factory=list)
+    rereleased_ids: list[int] = field(default_factory=list)
+    other_proof_ids: list[int] = field(default_factory=list)
+
+    def admits(self, row: AttendanceEvent) -> bool:
+        """Checks that need no query; the proof runs only for admitted rows."""
+        if not dump_identity_release_enabled() or row.source not in DUMP_RECONCILE_SOURCES:
+            return False
+        if previously_synced_cnic_release(row):
+            return self.rereleases_remaining > 0
+        if self.remaining <= 0:
+            return False
+        if self.held_since is None:
+            return True
+        return bool(
+            row.received_at and ensure_utc(row.received_at) >= self.held_since
+            and row.device_event_time
+            and ensure_utc(row.device_event_time) >= self.held_since
+        )
+
+    def confirms(self, session: Session, row: AttendanceEvent) -> bool:
+        """After the dump proof passed: custody and, if automatic, observation."""
+        from zk_add.attendance_manual_guard import decision_for
+
+        if decision_for(session, row) is not None:
+            return False
+        if self.max_snapshot_gap is None or previously_synced_cnic_release(row):
+            return True
+        before, after = _roster_snapshot_times(session, row)
+        return bool(before and after and after - before <= self.max_snapshot_gap)
+
+    def record(self, row: AttendanceEvent, *, rerelease: bool) -> None:
+        if rerelease:
+            self.rereleases_remaining -= 1
+            self.rereleased_ids.append(row.id)
+        else:
+            self.remaining -= 1
+            self.released_ids.append(row.id)
+
+
+def _automatic_dump_release_on(connector: Connector) -> bool:
+    return bool(
+        settings.attendance_dump_identity_auto_release_hours > 0
+        and settings.attendance_dump_identity_auto_release_batch > 0
+        and settings.attendance_dump_identity_auto_release_hourly_cap > 0
+        and dump_identity_release_enabled()
+        and connector.firmware_family != "hikvision"
+        and dump_auto_release_zone_enabled(connector.zone_id)
+    )
+
+
+def _automatic_dump_release_policy(
+    now: datetime, *, remaining: int, rereleases_remaining: int,
+) -> DumpIdentityRelease:
+    return DumpIdentityRelease(
+        held_since=now - timedelta(hours=settings.attendance_dump_identity_auto_release_hours),
+        remaining=remaining,
+        rereleases_remaining=rereleases_remaining,
+        max_snapshot_gap=timedelta(
+            minutes=settings.attendance_dump_identity_auto_release_max_snapshot_gap_minutes
+        ),
+    )
+
+
+def dump_auto_released_last_hour(
+    session: Session, connector: Connector, now: datetime | None = None,
+) -> tuple[int, int]:
+    """New and repeated automatic dump releases for this connector in the last hour."""
+    from zk_add.models import AuditEvent
+
+    since = ensure_utc(now or utc_now()) - timedelta(hours=1)
+    released = rereleased = 0
+    for after in session.scalars(select(AuditEvent.after).where(
+        AuditEvent.action == DUMP_AUTO_RELEASE_ACTION,
+        AuditEvent.target_type == "connector",
+        AuditEvent.target_id == connector.connector_id,
+        AuditEvent.created_at >= since,
+    )).all():
+        released += int((after or {}).get("released") or 0)
+        rereleased += int((after or {}).get("rereleased") or 0)
+    return released, rereleased
+
+
+def dump_identity_auto_release(
+    session: Session, connector: Connector, now: datetime | None = None,
+) -> DumpIdentityRelease | None:
+    """The automatic policy for one connector snapshot, or None when off.
+
+    Off unless the proof is enabled, the connector's zone is listed in
+    ADD_ATTENDANCE_DUMP_IDENTITY_AUTO_RELEASE_ZONES, and the window and caps
+    are positive. Each snapshot may release at most the batch cap, and the
+    connector at most the hourly cap in any hour: 2.6.x sends a snapshot on
+    every reconnect, so a per-snapshot cap alone would not bound the rate.
+    """
+    if not _automatic_dump_release_on(connector):
+        return None
+    now = ensure_utc(now or utc_now())
+    cap = settings.attendance_dump_identity_auto_release_batch
+    hourly = settings.attendance_dump_identity_auto_release_hourly_cap
+    released, rereleased = dump_auto_released_last_hour(session, connector, now)
+    return _automatic_dump_release_policy(
+        now,
+        remaining=max(0, min(cap, hourly - released)),
+        rereleases_remaining=max(0, min(cap, hourly - rereleased)),
+    )
+
+
+def synced_cnic_release_proof(
+    session: Session, *, zkt: ZKTDevice, user: DeviceUser, row: AttendanceEvent,
+    dump_release: DumpIdentityRelease | None = None,
+) -> str | None:
+    """Read-only: the proof an automatic release would use now, or None.
+
+    Returns "SYNCED_CNIC" for the established proofs, or
+    "AUTHENTICATED_RECONCILE_BATCH" when only the dump-row proof applies and
+    dump_release admits and confirms the row. The punch is evaluated once.
+    Both must also pass the installed database guard, so a preview counts
+    exactly what a release would change. With dump_release.only_dump_proof,
+    a row an established proof releases is noted in other_proof_ids instead.
+    """
+    if row.ords_status not in HELD_ORDS_STATUSES:
+        return None
+    kind = synced_cnic_proof_kind(
+        session, zkt.connector, zkt, user, row,
+        allow_reconcile_batch=dump_release is not None and dump_release.admits(row),
+    )
+    if kind is None:
+        return None
+    if kind == DUMP_RELEASE_PROOF and not dump_release.confirms(session, row):
+        return None
+    from zk_add.attendance_auto_release_guard import database_synced_cnic_release_proven
+
+    if not database_synced_cnic_release_proven(session, row=row, zkt=zkt, user=user):
+        return None
+    if kind == DUMP_RELEASE_PROOF:
+        return DUMP_RELEASE_PROOF
+    if dump_release is not None and dump_release.only_dump_proof:
+        dump_release.other_proof_ids.append(row.id)
+        return None
+    return "SYNCED_CNIC"
+
+
+def _dump_awaits_next_snapshot(
+    session: Session, event: AttendanceEvent, connector: Connector, zkt: ZKTDevice,
+    user: DeviceUser,
+) -> bool:
+    """A punch after the latest roster snapshot whose identity is still open.
+
+    The batch proof needs an interval covering the punch. When the open
+    interval of exactly this user ID, UID, fingerprint, device user and
+    current CNIC ends just before the punch, the next snapshot that still
+    shows this identity extends it over the punch.
+    """
+    from zk_add.attendance_identity_evidence import authenticated_reconcile_batch
+    from zk_add.attendance_manual_guard import decision_for
+    from zk_add.models import AttendanceIdentityHistory
+
+    when = ensure_utc(event.device_event_time)
+    if not (
+        authenticated_reconcile_batch(session, event, connector) is not None
+        and user.uid == event.uid and user.cnic_lookup_hash
+        and user.terminal_identity_fingerprint == event.identity_terminal_fingerprint
+        and (not event.captured_cnic_lookup_hash
+             or event.captured_cnic_lookup_hash == user.cnic_lookup_hash)
+        and decision_for(session, event) is None
+    ):
+        return False
+    return session.scalar(select(AttendanceIdentityHistory.id).where(
+        AttendanceIdentityHistory.zkt_device_id == zkt.id,
+        AttendanceIdentityHistory.device_user_id == user.id,
+        AttendanceIdentityHistory.terminal_serial == event.device_serial,
+        AttendanceIdentityHistory.user_id == event.user_id,
+        AttendanceIdentityHistory.uid == event.uid,
+        AttendanceIdentityHistory.fingerprint == event.identity_terminal_fingerprint,
+        AttendanceIdentityHistory.cnic_lookup_hash == user.cnic_lookup_hash,
+        AttendanceIdentityHistory.revoked.is_(False),
+        AttendanceIdentityHistory.closed.is_(False),
+        AttendanceIdentityHistory.observed_from <= when,
+        AttendanceIdentityHistory.observed_until < when,
+    ).limit(1)) is not None
+
+
+def dump_release_outlook(session: Session, event: AttendanceEvent) -> dict:
+    """Read-only: whether only the dump-row proof can release this held punch, and how.
+
+    For fix/attendance-release-safety's identity evidence report; this branch
+    leaves that endpoint unchanged. awaiting_next_snapshot: the proof cannot
+    pass yet only because the punch is newer than the latest roster snapshot.
+    release_path is "AUTOMATIC_SNAPSHOT_RELEASE" when a roster snapshot
+    releases it on its own (subject to the caps), or "OWNER_BACKLOG_RELEASE"
+    when only the owner's zone release can. A manual send of such a punch
+    would bypass the stronger proof.
+    """
+    result = {
+        "proof": None,
+        "proof_passes": False,
+        "awaiting_next_snapshot": False,
+        "release_path": None,
+        "automatic_zone_enabled": False,
+        "window_hours": settings.attendance_dump_identity_auto_release_hours,
+    }
+    if (
+        event.source not in DUMP_RECONCILE_SOURCES
+        or event.ords_status not in HELD_ORDS_STATUSES
+        or not dump_identity_release_enabled()
+    ):
+        return result
+    connector = session.get(Connector, event.connector_id)
+    zkt = connector.zkt_device if connector else None
+    if zkt is None:
+        return result
+    result["automatic_zone_enabled"] = dump_auto_release_zone_enabled(connector.zone_id)
+    users = session.scalars(select(DeviceUser).where(
+        DeviceUser.zkt_device_id == zkt.id,
+        DeviceUser.user_id == event.user_id,
+        DeviceUser.lifecycle_state == "ACTIVE",
+    ).limit(2)).all()
+    if len(users) != 1:
+        return result
+    owner = DumpIdentityRelease(
+        held_since=None, remaining=1, rereleases_remaining=1, only_dump_proof=True
+    )
+    now = utc_now()
+    # Whether a snapshot would release it, regardless of this hour's budget.
+    automatic = (
+        _automatic_dump_release_policy(now, remaining=1, rereleases_remaining=1)
+        if _automatic_dump_release_on(connector) else None
+    )
+    if synced_cnic_release_proof(
+        session, zkt=zkt, user=users[0], row=event, dump_release=owner
+    ) == DUMP_RELEASE_PROOF:
+        result.update(proof=DUMP_RELEASE_PROOF, proof_passes=True)
+        by_snapshot = bool(
+            automatic is not None and automatic.admits(event)
+            and automatic.confirms(session, event)
+        )
+    elif not owner.other_proof_ids and _dump_awaits_next_snapshot(
+        session, event, connector, zkt, users[0]
+    ):
+        result.update(proof=DUMP_RELEASE_PROOF, awaiting_next_snapshot=True)
+        # The next snapshot closes the bracket; it can be no shorter than
+        # the time since the last one before the punch.
+        before, _after = _roster_snapshot_times(session, event)
+        by_snapshot = bool(
+            automatic is not None and automatic.admits(event)
+            and (previously_synced_cnic_release(event) or (
+                before is not None and now - before <= automatic.max_snapshot_gap
+            ))
+        )
+    else:
+        return result
+    result["release_path"] = (
+        "AUTOMATIC_SNAPSHOT_RELEASE" if by_snapshot else "OWNER_BACKLOG_RELEASE"
+    )
+    return result
 
 
 def release_synced_cnic_attendance(
     session: Session, *, zkt: ZKTDevice, user: DeviceUser,
     limit: int | None = None, after_id: int = 0,
+    dump_release: DumpIdentityRelease | None = None,
 ) -> int:
     """Release held ZKT punches when the device roster proves their CNIC.
 
@@ -3315,23 +3972,41 @@ def release_synced_cnic_attendance(
         ).order_by(AttendanceEvent.id).limit(limit).with_for_update(skip_locked=True)
     ).all()
     return sum(
-        release_synced_cnic_attendance_event(session, zkt=zkt, user=user, row=row)
+        release_synced_cnic_attendance_event(
+            session, zkt=zkt, user=user, row=row, dump_release=dump_release
+        )
         for row in rows
     )
 
 
 def release_synced_cnic_attendance_event(
     session: Session, *, zkt: ZKTDevice, user: DeviceUser, row: AttendanceEvent,
+    dump_release: DumpIdentityRelease | None = None,
 ) -> bool:
     """Use the same retained proof for newly ingested punches and backlog repair."""
-    if row.ords_status not in {"BLOCKED_IDENTITY", "WAITING_FOR_SNAPSHOT"}:
+    rerelease = previously_synced_cnic_release(row)
+    proof = synced_cnic_release_proof(
+        session, zkt=zkt, user=user, row=row, dump_release=dump_release
+    )
+    if proof is None:
         return False
-    if not synced_cnic_identity_proven(session, zkt.connector, zkt, user, row):
-        return False
-    from zk_add.attendance_auto_release_guard import database_synced_cnic_release_proven
+    from zk_add.source_newest_slot import alert_release_held, newest_only_event_ids
 
-    if not database_synced_cnic_release_proven(session, row=row, zkt=zkt, user=user):
+    if newest_only_event_ids(session, [row]):
+        # Read only from the terminal's unwritten newest slot: its identity
+        # bytes may belong to someone else until a later read confirms them.
+        if zkt.connector is not None:
+            alert_release_held(session, zkt.connector, row)
         return False
+    # Only after the proof, so a roster snapshot over many held punches pays
+    # this query only for those it would release.
+    outbox = _attendance_ords_outbox(session, row)
+    if outbox is not None and outbox.status == "IN_FLIGHT":
+        # Only a stale read sees a held punch with a claim in flight. Leave
+        # it to the delivery result; never return it to the send queue.
+        return False
+    if proof == DUMP_RELEASE_PROOF:
+        dump_release.record(row, rerelease=rerelease)
     row.device_user_id = user.id
     row.identity_snapshot_id = zkt.identity_snapshot_id
     row.identity_resolution_status = "RESOLVED_SYNCED_CNIC"
@@ -3346,6 +4021,11 @@ def release_synced_cnic_attendance_event(
     outbox, _ = ensure_attendance_ords_outbox(session, row, status="PENDING")
     outbox.next_attempt_at = None
     outbox.last_error = None
+    if proof == DUMP_RELEASE_PROOF:
+        # Recovered history: the per-connector background lane, so a large
+        # release never queues ahead of live punches. The Oracle capture type
+        # still comes from the event's own source.
+        outbox.delivery_type = "FULL_HISTORY"
     return True
 
 
@@ -3362,18 +4042,7 @@ def _ords_delivery_type_for_event(row: AttendanceEvent) -> str:
     return "FULL_HISTORY"
 
 
-def ensure_attendance_ords_outbox(
-    session: Session,
-    row: AttendanceEvent,
-    *,
-    status: str | None = None,
-) -> tuple[OrdsOutbox, bool]:
-    """Create the single durable ORDS row for an attendance event.
-
-    This helper is deliberately idempotent and is used by both normal
-    ingestion repairs and the historical sweep.  It never creates an ORDS
-    delivery row for a second time and never changes an acknowledged row.
-    """
+def _attendance_ords_outbox(session: Session, row: AttendanceEvent) -> OrdsOutbox | None:
     # The backlog sweep can release a held row and revisit its delivery state
     # in the same transaction. Sessions with autoflush disabled cannot see the
     # first pending INSERT through a SELECT, so reuse it before querying.
@@ -3389,6 +4058,22 @@ def ensure_attendance_ords_outbox(
         outbox = session.scalar(
             select(OrdsOutbox).where(OrdsOutbox.attendance_event_id == row.id)
         )
+    return outbox
+
+
+def ensure_attendance_ords_outbox(
+    session: Session,
+    row: AttendanceEvent,
+    *,
+    status: str | None = None,
+) -> tuple[OrdsOutbox, bool]:
+    """Create the single durable ORDS row for an attendance event.
+
+    This helper is deliberately idempotent and is used by both normal
+    ingestion repairs and the historical sweep.  It never creates an ORDS
+    delivery row for a second time and never changes an acknowledged row.
+    """
+    outbox = _attendance_ords_outbox(session, row)
     created = outbox is None
     if outbox is None:
         outbox = OrdsOutbox(
@@ -3513,27 +4198,23 @@ def repair_attendance_delivery_backlog(
         # evidence proves continuity.  This is also the HIK/ZKT boundary that
         # prevents a current user ID from silently claiming reused history.
         if row.identity_resolution_status == "BLOCKED_PROVENANCE":
+            # A held row was offered to the synced-CNIC release above. Past the
+            # approval check, the recovery contract accepts a current, exact
+            # UID/user match when the durable event itself carries a verified
+            # serial and the identity snapshot proves continuity. Keep this
+            # inside the row lock; ambiguous or stale history remains
+            # fail-closed.
             connector = session.get(Connector, row.connector_id)
-            if connector is not None and recover_verified_source_identity(
-                session, connector=connector, row=row
+            from zk_add.attendance_recovery import _apply_verified_identity
+            outbox = session.scalar(
+                select(OrdsOutbox).where(OrdsOutbox.attendance_event_id == row.id)
+            )
+            if connector is None or not _apply_verified_identity(
+                session, row, outbox, connector
             ):
-                repaired += 1
-            else:
-                # The recovery contract also accepts a current, exact UID/user
-                # match when the durable event itself carries a verified serial
-                # and the identity snapshot proves continuity.  Keep this
-                # fallback inside the row lock; ambiguous or stale history
-                # remains fail-closed.
-                from zk_add.attendance_recovery import _apply_verified_identity
-                outbox = session.scalar(
-                    select(OrdsOutbox).where(OrdsOutbox.attendance_event_id == row.id)
-                )
-                if connector is None or not _apply_verified_identity(
-                    session, row, outbox, connector
-                ):
-                    unresolved += 1
-                    continue
-                repaired += 1
+                unresolved += 1
+                continue
+            repaired += 1
 
         if row.cnic_lookup_hash and row.identity_resolution_status in VERIFIED_IDENTITY_RESOLUTION_STATUSES:
             row.ords_status = "PENDING"
@@ -3696,7 +4377,9 @@ def restore_resolved_alias_direct_approvals(
             or "terminal" not in decision.proof
             or decision.proof["terminal"] != row.device_serial
             or decision.proof.get("hardware_id") != connector.hardware_id
-            or decision.proof.get("cnic_source") not in {"SYNCED_USER", "SAVED_PUNCH"}
+            # A punch-time approval is restored too: approved_payload re-checks
+            # its retained record, new evidence and another holder of its CNIC.
+            or decision.proof.get("cnic_source") not in {"SYNCED_USER", "SAVED_PUNCH", direct.PUNCH_TIME_SOURCE}
             or decision.proof.get("current_user_key") != user.user_key
             or item.connector_id != row.connector_id
             or direct.approved_payload(session, row, connector, decision) is None
@@ -3773,88 +4456,6 @@ def block_undelivered_attendance(
             outbox.next_attempt_at = None
         changed += 1
     return changed
-
-
-def recover_verified_source_identity(session: Session, *, connector: Connector, row: AttendanceEvent) -> bool:
-    """Recover a provenance hold only when retained identity proves continuity."""
-    from zk_add.attendance_manual_guard import requires_approval
-    if requires_approval(row):
-        return False
-    zkt = connector.zkt_device
-    source_manifest = None
-    if zkt is not None:
-        source_manifest = session.scalar(select(TerminalRecordManifest.id).where(
-            TerminalRecordManifest.attendance_event_id == row.id,
-            TerminalRecordManifest.connector_id == connector.id,
-            TerminalRecordManifest.zkt_device_id == zkt.id,
-            TerminalRecordManifest.canonical_source.is_(True),
-        ).limit(1))
-    source_attested = bool(
-        source_manifest is not None
-        or (row.raw_event or {}).get("reconciliation_source") == "VERIFIED_TERMINAL_SOURCE"
-    )
-    if (zkt is None or not source_attested or row.ords_status != "BLOCKED_IDENTITY"
-            or row.identity_resolution_status != "BLOCKED_PROVENANCE"
-            or row.cnic_lookup_hash or row.identity_content_status == "VERIFIED"
-            or row.clock_quality != "OK"):
-        return False
-    user = session.scalar(select(DeviceUser).where(
-        DeviceUser.zkt_device_id == zkt.id,
-        DeviceUser.user_id == row.user_id,
-        DeviceUser.uid == row.uid,
-        DeviceUser.lifecycle_state == "ACTIVE",
-        DeviceUser.present.is_(True),
-        DeviceUser.identity_conflict_code.is_(None),
-    ))
-    if not user or not user.cnic_lookup_hash:
-        return False
-    if (
-        user.snapshot_revision is None
-        or zkt.identity_snapshot_revision is None
-        or user.snapshot_revision != zkt.identity_snapshot_revision
-    ):
-        return False
-    try:
-        cnic = decrypt_cnic(user.cnic_encrypted)
-        if not cnic or cnic_lookup(cnic) != user.cnic_lookup_hash:
-            return False
-    except Exception:
-        return False
-    if not historical_identity_is_supported(
-        serial=row.device_serial, bound_serial=zkt.serial,
-        confirmed_serial=zkt.confirmed_serial,
-        uid=row.uid, expected_uid=user.uid,
-        fingerprint=row.identity_terminal_fingerprint,
-        expected_fingerprint=user.terminal_identity_fingerprint,
-        event_time=row.device_event_time, continuity_started=zkt.last_identity_change_at,
-        snapshot_observed=zkt.identity_snapshot_observed_at,
-        snapshot_stable=bool(zkt.snapshot_complete and zkt.identity_snapshot_stable
-                             and zkt.identity_snapshot_id),
-        tolerance_seconds=settings.identity_snapshot_capture_tolerance_seconds,
-        allow_user_id_only=not row.uid and not row.identity_terminal_fingerprint,
-        expected_user_id=user.user_id,
-    ):
-        return False
-    row.device_user_id = user.id
-    row.identity_snapshot_id = zkt.identity_snapshot_id
-    row.identity_resolution_status = "RESOLVED_CURRENT_SNAPSHOT"
-    row.identity_resolved_at = row.identity_repaired_at = utc_now()
-    row.identity_repair_reason = "VERIFIED_SOURCE_REPLAY_CONTINUITY"
-    row.display_name = user.display_name
-    row.cnic_encrypted = user.cnic_encrypted
-    row.cnic_lookup_hash = user.cnic_lookup_hash
-    row.cnic_last4 = user.cnic_last4
-    row.ords_status = "PENDING"
-    outbox = session.scalar(select(OrdsOutbox).where(
-        OrdsOutbox.attendance_event_id == row.id
-    ))
-    if outbox is None:
-        session.add(OrdsOutbox(attendance_event_id=row.id, status="PENDING",
-                               delivery_type="FULL_HISTORY"))
-    elif outbox.status == "BLOCKED_IDENTITY":
-        outbox.status = "PENDING"
-        outbox.next_attempt_at = None
-    return True
 
 
 def repair_missing_terminal_provenance(
@@ -4990,6 +5591,12 @@ def create_device_user_command(
         session, zkt=zkt, user_id_override=user_id_override
     )
     name_limit = int(zkt.capability_profile.get("name_bytes", 24))
+    # The CNIC is stored once, as the name suffix; a CNIC-like suffix typed
+    # into the name would otherwise be cut into the 24-byte terminal name.
+    # A "-S" shift-worker marker inside that suffix is kept as the flag.
+    suspect = suspect_cnic_name(display_name)
+    shift_worker = bool(shift_worker or (suspect and suspect.shift_worker))
+    display_name = clean_display_name(display_name) or display_name
     machine_name = build_machine_name(
         display_name=display_name,
         cnic=normalized_cnic,
@@ -5130,6 +5737,17 @@ def update_device_user_command(
         raise ValueError(duplicate_cnic_message(claims))
     next_display = " ".join((display_name or user.display_name).strip().split())
     next_shift = user.shift_worker if shift_worker is None else shift_worker
+    if cnic is not None:
+        # Setting a verified CNIC (e.g. for "A.Saleem-A4230111028815") must not
+        # keep the unparsed CNIC text in the name: the 24-byte terminal name
+        # would become "A.Saleem-A-<CNIC>". The unparsed name never set the
+        # shift-worker flag, so a "-S" marker in it is kept as the flag rather
+        # than silently dropped with the suffix.
+        suspect = suspect_cnic_name(next_display) or (
+            None if user.cnic_lookup_hash else suspect_cnic_name(decrypt_text(user.machine_name_encrypted))
+        )
+        next_display = clean_display_name(next_display) or next_display
+        next_shift = bool(next_shift or (suspect and suspect.shift_worker))
     next_privilege = user.privilege if privilege is None else privilege
     if (connector.firmware_family == "hikvision" and next_privilege != user.privilege
             and not zkt.capability_profile.get("user_role_write")):
@@ -5870,6 +6488,108 @@ def close_alert_row(row: DeviceAlert, *, resolution: dict | None = None, touch_l
 
 REJECTION_CODES = ("DEVICE_MESSAGE_REJECTED", "ADD_MESSAGE_PROCESSING_FAILED")
 MAX_REJECTION_TYPES = 16
+# Refused queue_evidence copies ADD does not hold yet, per rejection entry.
+MAX_PENDING_EVIDENCE = 16
+MAX_EVIDENCE_RESOLUTIONS = 16
+_COPY_KEY = ("queue", "queue_generation", "record_id", "claimed_digest", "received_digest")
+
+
+def _evidence_resolution(refused: dict, held: dict, match: str, finding: str, now: datetime) -> dict:
+    return {
+        "queue": refused.get("queue"), "queue_generation": refused.get("queue_generation"),
+        "record_id": refused.get("record_id"), "reason": refused.get("reason"),
+        "refused_request_id": refused.get("request_id"), "refused_count": refused.get("count"),
+        # Byte counts, never bytes: what arrived beside what ADD holds shows a
+        # truncated copy apart from one corrupted in place.
+        "received_bytes": refused.get("received_bytes"),
+        "held_as": {"queue": held.get("queue"), "queue_generation": held.get("queue_generation"),
+                    "record_id": held.get("record_id"), "receipt_id": held.get("receipt_id"),
+                    "byte_count": held.get("byte_count")},
+        "match": match, "finding": finding, "at": now.isoformat(),
+    }
+
+
+def _track_refused_evidence(session: Session, connector: Connector, entry: dict, evidence: dict | None, *,
+                            reason: str, request_id: str, now: datetime) -> tuple[dict, dict | None]:
+    """Add one refused queue_evidence copy to the copies ADD must still hold.
+
+    Returns the entry's tracking fields and, when ADD already holds what this
+    copy carried, the resolution recorded instead of a pending copy. Each
+    distinct copy (identity and both digests) is tracked on its own, so a
+    later refusal of the same record never replaces what an earlier one
+    showed. A copy is pending until ADD holds it (resolve_message_rejection).
+    A refusal whose identity ADD could not read, or one beyond the bound, is
+    counted in untracked_refusals: nothing can show it was held later, so
+    only an operator who verified the device can resolve it. Refusals
+    recorded before identities were tracked stay legacy_refusals under the
+    rule they were written with.
+    """
+    if "pending" in entry:
+        pending = [dict(item) for item in entry.get("pending") or [] if isinstance(item, dict)]
+        untracked = int(entry.get("untracked_refusals") or 0)
+        legacy = int(entry.get("legacy_refusals") or 0)
+    else:
+        pending, untracked, legacy = [], 0, int(entry.get("count") or 0)
+    tracked = {"pending": pending, "untracked_refusals": untracked, "legacy_refusals": legacy}
+    identity = evidence_identity(evidence)
+    if identity is None:
+        return {**tracked, "untracked_refusals": untracked + 1}, None
+    copy = {"queue": identity[0], "queue_generation": identity[1], "record_id": identity[2],
+            "claimed_digest": evidence.get("claimed_digest"), "received_digest": evidence.get("received_digest"),
+            "received_bytes": evidence.get("received_bytes"), "received_crc32": evidence.get("received_crc32"),
+            "reason": reason, "request_id": request_id}
+    previous = next((item for item in pending
+                     if all(item.get(name) == copy[name] for name in _COPY_KEY)), None)
+    copy.update({"count": int((previous or {}).get("count") or 0) + 1,
+                 "first_at": (previous or {}).get("first_at") or now.isoformat(), "last_at": now.isoformat()})
+    found = find_held_copy(session, connector, copy)
+    if found is not None:
+        if previous is not None:
+            pending.remove(previous)
+        held, (match, finding) = found
+        return tracked, _evidence_resolution(copy, held, match, finding, now)
+    if previous is None and len(pending) >= MAX_PENDING_EVIDENCE:
+        return {**tracked, "untracked_refusals": untracked + 1}, None
+    if previous is not None:
+        pending.remove(previous)
+    pending.append(copy)
+    return tracked, None
+
+
+def _settle_refused_evidence(entry: object, accepted: dict | None,
+                             now: datetime) -> tuple[dict | None, list[dict], bool]:
+    """Which refused copies an accepted queue_evidence holds.
+
+    Returns the entry still outstanding (None once nothing is), what was
+    held, and whether the entry changed. holds_refused_copy() decides each
+    copy. Refusals recorded before identities were tracked keep the old rule:
+    any accepted queue_evidence clears them. The first acceptance after a
+    refusal also stamps LATER_ACCEPTANCE on what is left: that acceptance used
+    to close the rejection, so from then on the copies ADD does not hold stay
+    visible for an operator without holding HIL or factory work.
+    """
+    if not isinstance(entry, dict) or "pending" not in entry:
+        return None, [], True
+    pending = [item for item in entry.get("pending") or [] if isinstance(item, dict)]
+    held, kept = [], []
+    for item in pending:
+        result = holds_refused_copy(item, accepted)
+        if result is None:
+            kept.append(item)
+        else:
+            held.append(_evidence_resolution(item, accepted, *result, now))
+    legacy = int(entry.get("legacy_refusals") or 0)
+    if not kept and not int(entry.get("untracked_refusals") or 0):
+        return None, held, True
+    stamped = isinstance(entry.get(LATER_ACCEPTANCE), str)
+    outstanding = {**entry, "pending": kept, "legacy_refusals": 0,
+                   LATER_ACCEPTANCE: entry[LATER_ACCEPTANCE] if stamped else now.isoformat()}
+    return outstanding, held, bool(held) or legacy > 0 or not stamped
+
+
+def _evidence_resolutions(details: dict, added: list[dict]) -> list[dict]:
+    kept = [item for item in details.get("evidence_resolutions") or [] if isinstance(item, dict)]
+    return (kept + added)[-MAX_EVIDENCE_RESOLUTIONS:]
 
 
 def record_message_rejection(
@@ -5885,12 +6605,25 @@ def record_message_rejection(
     now: datetime | None = None,
     error_reason: str | None = None,
     error_site: str | None = None,
+    error_types: list[str] | None = None,
+    evidence: dict | None = None,
 ) -> DeviceAlert:
-    """Track a rejected message per type; field paths and codes only, never values.
+    """Track a rejected message per type, never a value from the message itself.
+
+    Each entry keeps field paths, pydantic error types and bounded reason
+    codes. A refused queue_evidence also keeps its custody identity and two
+    SHA-256 digests (queue_evidence.refused_copy), never its bytes or
+    provenance: the same kind of values ADD lists for every record it holds
+    (GET /devices/{id}/queue-evidence), readable by the same admins.
 
     A device-side rejection (the message itself is invalid) is
     DEVICE_MESSAGE_REJECTED. A failure inside ADD is
     ADD_MESSAGE_PROCESSING_FAILED, so the device is not blamed for it.
+
+    A refused queue_evidence copy that ADD already holds (a reconnect overlap)
+    leaves nothing open for its type: the refusal is still recorded, on an
+    alert closed at once as EVIDENCE_HELD unless other types keep it open.
+    The returned alert's state says which.
     """
     now = now or utc_now()
     device_side = category in DEVICE_REJECTION_CATEGORIES
@@ -5909,20 +6642,51 @@ def record_message_rejection(
             "last_at": ensure_utc(existing.last_seen_at).isoformat() if existing.last_seen_at else now.isoformat(),
             "request_id": previous.get("request_id")}
     entry = types.pop(message_type, None) or {"count": 0, "first_at": now.isoformat()}
-    types[message_type] = {
+    refreshed = {
         **entry, "category": category, "error_type": error_type, "error_paths": error_paths[:5],
         "count": int(entry.get("count") or 0) + 1, "last_at": now.isoformat(), "boot_id": boot_id,
         "firmware_version": connector.firmware_version, "request_id": request_id,
         # Why the latest one was refused, so an unknown rejection is diagnosable.
-        "error_reason": error_reason, "error_site": error_site,
+        "error_reason": error_reason, "error_site": error_site, "error_types": (error_types or [])[:5],
     }
+    # A new refusal makes the entry live again, whatever was accepted before it.
+    refreshed.pop(LATER_ACCEPTANCE, None)
+    resolved = []
+    held_at_once = False
+    if message_type == "queue_evidence":
+        tracked, resolution = _track_refused_evidence(
+            session, connector, entry, evidence, reason=error_reason or category, request_id=request_id, now=now)
+        refreshed.update(tracked)
+        resolved = [resolution] if resolution is not None else []
+        held_at_once = (resolution is not None and unheld_evidence(refreshed) == (0, 0)
+                        and not int(refreshed.get("legacy_refusals") or 0))
+    if not held_at_once:
+        types[message_type] = refreshed
     while len(types) > MAX_REJECTION_TYPES:
-        types.pop(min(types, key=lambda name: str(types[name].get("last_at") or "")))
-    return upsert_alert(
+        # An entry with refused copies ADD does not hold is never dropped to
+        # make room: only holding them, or an operator, may close it.
+        droppable = [name for name in types if unheld_evidence(types[name]) == (0, 0)]
+        if not droppable:
+            break
+        types.pop(min(droppable, key=lambda name: str(types[name].get("last_at") or "")))
+    details = {"message_type": message_type, "error_type": error_type, "request_id": request_id,
+               "error_category": category, "error_reason": error_reason, "types": types}
+    # upsert_alert replaces details, so what earlier acceptances showed is kept here.
+    resolutions = _evidence_resolutions(previous, resolved)
+    if resolutions:
+        details["evidence_resolutions"] = resolutions
+    if held_at_once and types and existing is not None:
+        # Other rejected types keep the alert open; it still describes them.
+        existing.details = {**previous, "types": types, "evidence_resolutions": resolutions}
+        return existing
+    row = upsert_alert(
         session, connector, code=code, severity="HIGH" if device_side else "WARNING", message=message,
-        details={"message_type": message_type, "error_type": error_type, "request_id": request_id,
-                 "error_category": category, "error_reason": error_reason, "types": types},
+        details=details,
     )
+    if held_at_once:
+        close_alert_row(row, resolution={"kind": "EVIDENCE_HELD", "message_type": message_type},
+                        touch_last_seen=False, now=now)
+    return row
 
 
 def resolve_message_rejection(
@@ -5931,11 +6695,20 @@ def resolve_message_rejection(
     *,
     message_type: str,
     rederive: bool = True,
+    evidence: dict | None = None,
 ) -> bool:
-    """An accepted message clears only the rejection entry for its own type."""
+    """An accepted message clears only the rejection entry for its own type.
+
+    A queue_evidence entry clears only once ADD holds every copy it refused
+    (``evidence`` is the record just accepted: identity, digest and receipt)
+    and no refusal is left unmatched. Until then the first acceptance after a
+    refusal leaves it custody only: open, but no longer holding HIL or
+    factory work, as when any acceptance closed it.
+    """
     now = utc_now()
     changed = False
     resolved_codes = set()
+    released_codes = set()
     for row in session.scalars(
         select(DeviceAlert).where(
             DeviceAlert.connector_id == connector.id,
@@ -5945,17 +6718,28 @@ def resolve_message_rejection(
     ).all():
         details = row.details or {}
         types = details.get("types") if isinstance(details.get("types"), dict) else {}
+        held = []
         if types:
             if message_type not in types:
                 continue
             remaining = {name: entry for name, entry in types.items() if name != message_type}
+            if message_type == "queue_evidence":
+                outstanding, held, entry_changed = _settle_refused_evidence(types[message_type], evidence, now)
+                if not entry_changed:
+                    continue  # this acceptance holds none of the refused copies
+                if outstanding is not None:
+                    remaining[message_type] = outstanding
         elif details.get("message_type") == message_type:
             remaining = {}
         else:
             continue
         changed = True
+        if held:
+            details = {**details, "evidence_resolutions": _evidence_resolutions(details, held)}
         if remaining:
             row.details = {**details, "types": remaining}
+            if all(custody_only(entry) for entry in remaining.values()):
+                released_codes.add(row.code)
         else:
             row.details = {**details, "types": {}}
             close_alert_row(row, resolution={"kind": "MESSAGE_ACCEPTED", "message_type": message_type},
@@ -5964,7 +6748,7 @@ def resolve_message_rejection(
     if settings.device_health_derived_enabled:
         if changed and rederive:
             apply_device_health(session, connector, source="MESSAGE_ACCEPTED", now=now)
-    elif resolved_codes and connector.last_error_code in resolved_codes:
+    elif (resolved_codes | released_codes) and connector.last_error_code in resolved_codes | released_codes:
         connector.last_error_code = None
         connector.last_error_message = None
         if message_type != "heartbeat":  # the legacy heartbeat writers set its own lifecycle

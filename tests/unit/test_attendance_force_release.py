@@ -31,6 +31,11 @@ from zk_add.worker import claim_ords_batch, apply_ords_confirmation, apply_ords_
 @pytest.fixture()
 def store(repair_store, monkeypatch):
     sessions, connector_id, user_key, event_uid = repair_store
+    from zk_add import source_newest_slot
+
+    # The fixture's one-row baseline read an already written record; a job's
+    # final ordinal is otherwise assumed to be the unwritten newest slot.
+    monkeypatch.setattr(source_newest_slot, "baseline_newest_ordinal", lambda job: None)
     monkeypatch.setattr(settings, "attendance_force_release_preview_enabled", True)
     monkeypatch.setattr(settings, "attendance_force_release_execution_enabled", True)
     monkeypatch.setattr(settings, "attendance_force_release_allowed_connectors", "")

@@ -74,6 +74,22 @@ from zk_add.time_utils import utc_now
 
 
 SERIAL = "ADZV211860253"
+
+
+@pytest.fixture(autouse=True)
+def final_ordinal_written(monkeypatch):
+    """These scenarios read terminals whose final record was already written.
+
+    No reconcile chunk reports the count it was read against, so ADD treats a
+    job's final ordinal as possibly the terminal's unwritten newest slot and
+    holds a punch there that no capture delivered. test_source_newest_slot
+    covers that rule; here the final record is an ordinary punch.
+    """
+    from zk_add import source_newest_slot
+
+    monkeypatch.setattr(source_newest_slot, "baseline_newest_ordinal", lambda job: None)
+
+
 def _raw_record(*, uid=7, minute=0, hour=13):
     from zk_add.zkt_decode import PAKISTAN_TIME, encode_time
     raw = bytearray(40)
@@ -2140,14 +2156,17 @@ def test_source_epoch_commit_ack_and_bootstrap_are_bound(reconciliation_db, monk
     assert replay.ack["duplicate"] and replay.ack["source_epoch"] == expected
     _, bootstrap = web.stream_bootstrap(pk)
     assert bootstrap["source_epoch"] == expected and bootstrap["source_committed_cursor"] == 2
-    prior_commits = len(commits)
     bad_payload = {**envelope.payload, "source_epoch": "22222222-2222-4333-8444-555555555555"}
-    with pytest.raises(ValueError, match="Source epoch"):
-        web.persist_envelope(pk, envelope.model_copy(update={"seq": 3, "payload": bad_payload}))
-    assert len(commits) == prior_commits
+    # A stale epoch is never applied or ACKed as a duplicate. It is answered
+    # with ADD's bound coverage so the reader resyncs instead of looping.
+    stale = web.persist_envelope(pk, envelope.model_copy(update={"seq": 3, "payload": bad_payload}))
+    assert stale.ack["type"] == "error" and stale.ack["code"] == "SOURCE_TAIL_EPOCH_STALE"
+    assert stale.coverage_before_ack["source_epoch"] == expected
+    assert stale.coverage_before_ack["source_committed_cursor"] == 2
     with Session(session.bind) as db:
-        assert db.get(Connector, pk).last_sequence == 2
-        assert db.get(ReconciliationCoverage, coverage.id).active
+        current = db.get(ReconciliationCoverage, coverage.id)
+        assert current.active and current.source_committed_cursor == 2
+        assert db.scalar(select(func.count(SourceTailChunk.id))) == 1
 
 
 def test_bound_anchor_cannot_change_epoch_generation(reconciliation_db):

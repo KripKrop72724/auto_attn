@@ -7,7 +7,7 @@
 
 typedef void (*setup_portal_station_visibility_cb_t)(bool connected);
 
-/* Prepare the normally-dormant AP netif before esp_wifi_init(). */
+/* Prepare the dormant AP netif and arm initial recovery before station events. */
 esp_err_t setup_portal_prepare(setup_portal_station_visibility_cb_t visibility_cb);
 
 /* Start the low-priority recovery/BOOT-button controller after esp_wifi_start(). */

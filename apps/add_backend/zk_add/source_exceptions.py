@@ -5,9 +5,11 @@ import base64
 from sqlalchemy import case, func, select
 from sqlalchemy.orm import Session
 
+from zk_add import source_newest_slot as newest_slot
 from zk_add.audit import append_audit
 from zk_add.crypto import decrypt_text
 from zk_add.models import (
+    AttendanceSourceCorrection,
     AuditEvent,
     Connector,
     ReconciliationCoverage,
@@ -60,8 +62,21 @@ def _serialize(
     connector: Connector | None,
     review: TerminalRecordReview | None,
     coverage: ReconciliationCoverage | None,
+    *,
+    newest_unsettled: bool = False,
+    out_of_order: bool = False,
+    correction_ids: list[str] | None = None,
 ) -> dict:
     committed_cursor = coverage.source_committed_cursor if coverage else 0
+    condition = None
+    if out_of_order:
+        condition = newest_slot.OUT_OF_ORDER_CONDITION
+    elif newest_unsettled:
+        condition = (
+            newest_slot.CORRECTED_CONDITION if correction_ids
+            else newest_slot.UNCONFIRMED_CONDITION if newest_slot.is_held(row)
+            else newest_slot.UNSETTLED_CONDITION
+        )
     return {
         "id": row.id,
         "connector_id": connector.connector_id if connector else None,
@@ -89,10 +104,21 @@ def _serialize(
         "review_reason": review.reason if review else None,
         "source_committed_cursor": committed_cursor,
         "cursor_advanced": committed_cursor > row.ordinal,
+        # An out-of-order newest-slot record is a reviewable exclusion, not an identity hold.
         "oracle_action": (
             "HELD_IDENTITY_EVIDENCE_REQUIRED"
-            if row.disposition == "IDENTITY_UNRESOLVED" else "EXCLUDED_FAIL_CLOSED"
+            if row.disposition == "IDENTITY_UNRESOLVED" and not out_of_order else "EXCLUDED_FAIL_CLOSED"
         ),
+        # Derived from the receipt that read the row; the stored codes above
+        # stay exactly as the reader sent them.
+        "source_condition": condition,
+        "operator_reason": {
+            newest_slot.CORRECTED_CONDITION: newest_slot.CORRECTED_REASON,
+            newest_slot.UNCONFIRMED_CONDITION: newest_slot.UNCONFIRMED_REASON,
+            newest_slot.UNSETTLED_CONDITION: newest_slot.OPERATOR_REASON,
+            newest_slot.OUT_OF_ORDER_CONDITION: newest_slot.OUT_OF_ORDER_REASON,
+        }.get(condition),
+        "source_correction_ids": list(correction_ids or []),
     }
 
 
@@ -105,6 +131,7 @@ def list_source_exceptions(
     error_code: str | None = None,
     review_state: str | None = None,
     ordinal: int | None = None,
+    corrected: bool | None = None,
     cursor: int | None = None,
     limit: int = 100,
 ) -> dict:
@@ -135,6 +162,15 @@ def list_source_exceptions(
         statement = statement.where(
             TerminalRecordManifest.id.in_(select(TerminalRecordReview.manifest_id))
         )
+    if corrected is not None:
+        live_corrections = select(AttendanceSourceCorrection.manifest_id).where(
+            AttendanceSourceCorrection.manifest_id.is_not(None),
+            AttendanceSourceCorrection.status == "CREATED",
+        )
+        statement = statement.where(
+            TerminalRecordManifest.id.in_(live_corrections) if corrected
+            else ~TerminalRecordManifest.id.in_(live_corrections)
+        )
     filtered_total = session.scalar(
         select(func.count()).select_from(statement.order_by(None).subquery())
     ) or 0
@@ -154,6 +190,9 @@ def list_source_exceptions(
         ).all()
     } if page else {}
     coverage = _coverage_by_terminal(session, list({row.zkt_device_id for row in page}))
+    unsettled = newest_slot.unsettled_newest_ids(session, page) if page else set()
+    out_of_order = newest_slot.out_of_order_ids(session, page) if page else set()
+    corrections = newest_slot.corrections_by_row(session, page)
 
     totals_statement = select(
         func.count(TerminalRecordManifest.id),
@@ -166,8 +205,15 @@ def list_source_exceptions(
         TerminalRecordManifest.disposition.in_(EXCEPTION_DISPOSITIONS),
     )
     total, invalid_time, malformed, identity_unresolved, affected_terminals = session.execute(totals_statement).one()
+    # Reviews stay with the bytes they reviewed; a settled row's review is
+    # no longer an open or reviewed exception.
     reviewed = session.scalar(
         select(func.count(func.distinct(TerminalRecordReview.manifest_id)))
+        .join(TerminalRecordManifest, TerminalRecordManifest.id == TerminalRecordReview.manifest_id)
+        .where(
+            TerminalRecordManifest.canonical_source == True,  # noqa: E712
+            TerminalRecordManifest.disposition.in_(EXCEPTION_DISPOSITIONS),
+        )
     ) or 0
     return {
         "totals": {
@@ -185,6 +231,9 @@ def list_source_exceptions(
                 connectors.get(row.connector_id),
                 reviews.get(row.id),
                 coverage.get((row.zkt_device_id, row.generation)),
+                newest_unsettled=row.id in unsettled,
+                out_of_order=row.id in out_of_order,
+                correction_ids=corrections.get(row.id),
             )
             for row in page
         ],
@@ -203,7 +252,13 @@ def source_exception_detail(session: Session, row: TerminalRecordManifest) -> di
     coverage = _coverage_by_terminal(session, [row.zkt_device_id]).get(
         (row.zkt_device_id, row.generation)
     )
-    result = _serialize(row, connector, reviews[-1] if reviews else None, coverage)
+    result = _serialize(row, connector, reviews[-1] if reviews else None, coverage,
+                        newest_unsettled=newest_slot.is_unsettled_newest(session, row),
+                        out_of_order=row.id in newest_slot.out_of_order_ids(session, [row]),
+                        correction_ids=newest_slot.corrections_by_row(session, [row]).get(row.id))
+    # Later reads of this slot, kept as receipts, and whether ADD holds the
+    # punch each decodes to.
+    result["slot_receipts"] = newest_slot.slot_receipts(session, row)
     result["reviews"] = [
         {
             "review_id": review.review_id,

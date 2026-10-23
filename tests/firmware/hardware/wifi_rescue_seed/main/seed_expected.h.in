@@ -1,0 +1,4 @@
+#pragma once
+#define SEED_EXPECTED_SSID "@expected_ssid_c@"
+#define SEED_EXPECTED_PASSWORD "@expected_password_c@"
+#define SEED_INITIAL_SSID "@initial_ssid@"

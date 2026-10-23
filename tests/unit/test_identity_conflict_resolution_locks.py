@@ -162,7 +162,12 @@ def test_postgres_resolution_recovery_and_revocation_share_safe_lock_order(force
             "PENDING" if first_writer == "restore" else "BLOCKED_IDENTITY"
         )
         assert decision.proof == original_proof and decision.payload_encrypted == original_payload
-        assert direct.approved_payload(session, row, connector, decision) is not None
+        # The saved approval is unchanged, but it was approved while the
+        # same-employee resolution was active. Its revocation reopens the
+        # duplicate-CNIC conflict, which the administrator never accepted, so
+        # the approval no longer delivers in either lock order (before the
+        # punch-time checks it still delivered when the restore won the race).
+        assert direct.approved_payload(session, row, connector, decision) is None
         assert session.get(AttendanceRecoveryItem, decision.item_id).result["direct_post_attempts"] == 1
         assert outbox.attempt_count == 3 and row.oracle_confirmed_at is None
         assert session.get(AttendanceEvent, unapproved_id).ords_status == "BLOCKED_IDENTITY"

@@ -2,13 +2,102 @@ import subprocess
 import textwrap
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[2]
 FIRMWARE = ROOT / "firmware" / "zone_lite"
 PORTAL = (FIRMWARE / "main" / "setup_portal.c").read_text(encoding="utf-8")
 PORTAL_HEADER = (FIRMWARE / "main" / "setup_portal.h").read_text(encoding="utf-8")
 ZONE = (FIRMWARE / "main" / "zone_lite.c").read_text(encoding="utf-8")
 ASSETS = (FIRMWARE / "main" / "setup_portal_assets.c").read_text(encoding="utf-8")
+
+
+def test_recovery_clock_is_armed_before_station_events_and_cleared_on_ip(
+    tmp_path: Path,
+) -> None:
+    # Compile the actual state-transition bodies with deterministic IDF/time
+    # substitutes. No disconnect event is generated for the initial empty SSID.
+    prepare = PORTAL[
+        PORTAL.index("esp_err_t setup_portal_prepare"):
+        PORTAL.index("esp_err_t setup_portal_start_controller")
+    ]
+    station_events = PORTAL[
+        PORTAL.index("bool setup_portal_handle_sta_disconnected"):
+        PORTAL.index("static bool ap_station_is_currently_associated")
+    ]
+    harness = tmp_path / "recovery_clock.c"
+    executable = tmp_path / "recovery_clock"
+    harness.write_text(textwrap.dedent(r"""
+        #include <assert.h>
+        #include <stdbool.h>
+        #include <stdint.h>
+        #include <string.h>
+        typedef int esp_err_t;
+        typedef int esp_netif_t;
+        typedef int ip4_addr_t;
+        typedef struct { int ip, gw, netmask; } esp_netif_ip_info_t;
+        typedef void (*setup_portal_station_visibility_cb_t)(bool);
+        #define ESP_OK 0
+        #define ESP_ERR_NO_MEM -1
+        #define ESP_NETIF_OP_SET 1
+        #define ESP_NETIF_CAPTIVEPORTAL_URI 2
+        #define VALIDATION_FAIL_BIT 1
+        #define VALIDATION_OK_BIT 2
+        #define PORTAL_IP "192.168.254.1"
+        #define ESP_RETURN_ON_ERROR(expr, ...) do { \
+            int result = (expr); if (result) return result; } while (0)
+        static setup_portal_station_visibility_cb_t s_visibility_cb;
+        static void *s_validation_events, *s_ap_client_events;
+        static esp_netif_t *s_ap_netif;
+        static bool s_station_owned, s_validation_connecting, s_active;
+        static bool s_pending_rollback_attempted;
+        static int64_t s_disconnected_since_ms, s_last_sta_retry_ms;
+        static int64_t s_connected_since_ms, fake_now = 500;
+        static int64_t now_ms(void) { return fake_now; }
+        static void *xEventGroupCreate(void) { return (void *)1; }
+        static void vEventGroupDelete(void *p) { (void)p; }
+        static void xEventGroupSetBits(void *p, int bits) { (void)p; (void)bits; }
+        static esp_netif_t *esp_netif_create_default_wifi_ap(void) {
+            static esp_netif_t netif; return &netif;
+        }
+        static void ip4addr_aton(const char *s, ip4_addr_t *out) {
+            (void)s; *out = 1;
+        }
+        static int esp_netif_dhcps_stop(esp_netif_t *p) { (void)p; return 0; }
+        static int esp_netif_set_ip_info(esp_netif_t *p, esp_netif_ip_info_t *ip) {
+            (void)p; (void)ip; return 0;
+        }
+        static int esp_netif_dhcps_option(esp_netif_t *p, int op, int opt,
+                                         void *data, int len) {
+            (void)p; (void)op; (void)opt; (void)data; (void)len; return 0;
+        }
+    """) + prepare + station_events + textwrap.dedent(r"""
+        int main(void) {
+            assert(setup_portal_prepare(0) == ESP_OK);
+            /* Empty SSID: no disconnect callback ever arrives. */
+            assert(s_disconnected_since_ms == 500);
+            assert(s_last_sta_retry_ms == 500);
+            fake_now = 120500;
+            assert(fake_now - s_disconnected_since_ms >= 120000);
+            /* Successful initial connection cancels recovery. */
+            assert(!setup_portal_handle_sta_got_ip());
+            assert(s_disconnected_since_ms == 0);
+            assert(s_last_sta_retry_ms == 0);
+            assert(s_connected_since_ms == fake_now);
+            /* Later failures retain their first failure time across retries. */
+            fake_now += 1000;
+            assert(!setup_portal_handle_sta_disconnected());
+            int64_t first_failure = s_disconnected_since_ms;
+            fake_now += 5000;
+            assert(!setup_portal_handle_sta_disconnected());
+            assert(s_disconnected_since_ms == first_failure);
+            assert(s_connected_since_ms == 0);
+            assert(!setup_portal_handle_sta_got_ip());
+            assert(s_disconnected_since_ms == 0);
+            return 0;
+        }
+    """), encoding="utf-8")
+    subprocess.run(["cc", "-std=c11", "-Wall", "-Wextra", "-Werror",
+                    str(harness), "-o", str(executable)], check=True)
+    subprocess.run([str(executable)], check=True)
 
 
 def test_setup_ap_credential_is_build_injected_and_portal_fails_closed_without_it() -> None:

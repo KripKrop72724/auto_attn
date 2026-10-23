@@ -38,6 +38,7 @@ from zk_add.device_health import (
     duplicate_serial_claimed,
     gate_effect,
     plain_version,
+    unheld_evidence,
 )
 from zk_add.device_health_actions import HealthActionError, _rederive
 from zk_add.models import AuditEvent, Connector, DeviceAlert, DeviceTelemetry
@@ -50,7 +51,9 @@ APPLIED = "DEVICE_HEALTH_CLEANUP_APPLIED"
 MAX_SCOPE, MAX_ALERTS, TELEMETRY_LOOKUPS = 50, 200, 50
 DATA_CODES = WORKFLOW_OWNED_CODES | {
     "ORDS_EVENT_REJECTED", "ATTENDANCE_TIMESTAMP_QUARANTINED", "ADD_SOURCE_COVERAGE_INVALIDATED",
-    "TERMINAL_SOURCE_EXCEPTION", "USER_DELETION_JOB_INCOMPLETE",
+    "ADD_SOURCE_GENERATION_LINEAGE_DIVERGED", "ADD_SOURCE_COVERAGE_UNVERIFIED", "ADD_SOURCE_TAIL_STALE_GENERATION",
+    "TERMINAL_SOURCE_EXCEPTION", "TERMINAL_NEWEST_RECORD_CORRECTED", "TERMINAL_NEWEST_RECORD_CHANGED",
+    "TERMINAL_NEWEST_RECORD_PUNCH_UNRECEIVED", "TERMINAL_NEWEST_RECORD_RELEASE_HELD", "USER_DELETION_JOB_INCOMPLETE",
 }
 RECOVERY_NOTE = ("The 2.6.24-2.6.27 storage recovery images start no delivery workers by design, "
                  "so this fault describes the recovery run, not the device.")
@@ -147,6 +150,13 @@ def _latest_deployment(session: Session, connector: Connector) -> str:
             f"{latest.status} in a {campaign.status if campaign else 'missing'} campaign.")
 
 
+def _refused_ords_row(entry: dict) -> bool:
+    """A refused ORDS-lane copy: 2.6.x retries that row through ORDS once its
+    user maps, so it may be in Oracle without ADD ever holding its evidence."""
+    return any(isinstance(item, dict) and item.get("queue") in {"ords", "ords_legacy"}
+               for item in entry.get("pending") or [])
+
+
 def _cleared(session: Session, connector: Connector, row: DeviceAlert, open_codes: set[str],
              now: datetime) -> tuple[str, bool, str] | None:
     """(class, preselected, rationale) when fresh evidence disproves the condition."""
@@ -180,6 +190,14 @@ def _cleared(session: Session, connector: Connector, row: DeviceAlert, open_code
     if code in {"DEVICE_MESSAGE_REJECTED", "ADD_MESSAGE_PROCESSING_FAILED"}:
         if alert_currency(row, connector, now=now) == CURRENT:
             return None
+        unheld = [entry for entry in _rejection_entries(row).values() if unheld_evidence(entry) != (0, 0)]
+        if unheld:
+            # Time passing proves nothing about custody: someone must check what
+            # the device did with each refused record, then resolve it with a reason.
+            return REVIEW, False, "Refused queue_evidence records are not yet held by ADD. Verify each on the " \
+                "device before resolving: it may still hold the row" + (
+                    ", or, for an ORDS row, have delivered it to Oracle without sending evidence again."
+                    if any(_refused_ords_row(entry) for entry in unheld) else ".")
         entries = _rejection_entries(row).values()
         old = all(not _entry_current(entry, now) and (
             (entry.get("boot_id") and entry.get("boot_id") != connector.boot_id)

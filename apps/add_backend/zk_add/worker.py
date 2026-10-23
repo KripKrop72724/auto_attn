@@ -37,6 +37,7 @@ from zk_add.ords_states import (
     ORDS_MEMBERSHIP_REVERIFY_STATUSES,
 )
 from zk_add.identity_states import VERIFIED_IDENTITY_RESOLUTION_STATUSES
+from zk_add.ords_outbox_coverage import ords_outbox_coverage
 from zk_add.realtime import browser_events, connector_hub
 from zk_add.provisioning import (
     TERMINAL_STATES as PROVISIONING_TERMINAL_STATES,
@@ -62,6 +63,7 @@ from zk_add.service import (
     upsert_alert,
 )
 from zk_add.attendance_recovery import advance_attendance_recovery_jobs
+from zk_add.checkin_notify import note_delivered_cnic
 from zk_add.device_health import apply_device_health
 from zk_add.settings import settings
 from zk_add.time_utils import ensure_utc, utc_now
@@ -175,7 +177,7 @@ def ords_failure_category(
     return f"HTTP_{status}"
 
 
-def ords_delivery_metrics(session: Session) -> dict:
+def ords_delivery_metrics(session: Session, *, outbox_coverage: dict | None = None) -> dict:
     rows = session.execute(
         select(OrdsOutbox.status, func.count(OrdsOutbox.id)).group_by(OrdsOutbox.status)
     ).all()
@@ -225,19 +227,7 @@ def ords_delivery_metrics(session: Session) -> dict:
         if status.upper() in ORDS_ACKNOWLEDGED_STATUSES
     )
     sweep = session.get(AttendanceDeliverySweep, 1)
-    missing_outbox = int(
-        session.scalar(
-            select(func.count(AttendanceEvent.id))
-            .outerjoin(OrdsOutbox, OrdsOutbox.attendance_event_id == AttendanceEvent.id)
-            .where(
-                OrdsOutbox.id.is_(None),
-                ~AttendanceEvent.ords_status.in_(
-                    tuple(ORDS_ACKNOWLEDGED_STATUSES)
-                ),
-            )
-        )
-        or 0
-    )
+    coverage = outbox_coverage if outbox_coverage is not None else ords_outbox_coverage(session)
     return {
         "backlog": active_outbox + blocked_identity,
         "pending": counts.get("pending", 0),
@@ -253,9 +243,24 @@ def ords_delivery_metrics(session: Session) -> dict:
         "membership_reverify": membership_reverify,
         "oldest_backlog_at": oldest_backlog_at,
         "last_attempt_at": last_attempt_at,
-        "missing_outbox": missing_outbox,
+        # Only deliverable punches, and held punches that already have a
+        # release decision, are missing an outbox row; other identity holds
+        # and review quarantines get no Oracle work item by design.
+        "missing_outbox": coverage["missing_outbox"],
+        "held_without_outbox": coverage["held_without_outbox"],
+        "review_without_outbox": coverage["review_without_outbox"],
+        "decided_held_without_outbox": coverage["decided_held_without_outbox"],
+        "without_outbox_total": coverage["without_outbox_total"],
+        "without_outbox_by_status": coverage["without_outbox_by_status"],
         "historical_sweep": {
             "state": sweep.state if sweep else "NOT_STARTED",
+            # Every counter is a running total since started_at, never a count
+            # of distinct punches. scanned and unresolved add each row visit,
+            # and a held row is revisited for as long as it is held. repaired
+            # adds repair steps (one synced-CNIC release adds two), and
+            # outbox_created leaves out the outbox such a release creates.
+            # docs/attendance-delivery-sweep.md defines each counter.
+            "counter_scope": "CUMULATIVE_SINCE_STARTED_AT",
             "last_event_id": sweep.last_event_id if sweep else None,
             "pages": sweep.pages if sweep else 0,
             "scanned": sweep.scanned_count if sweep else 0,
@@ -263,6 +268,7 @@ def ords_delivery_metrics(session: Session) -> dict:
             "outbox_created": sweep.outbox_created_count if sweep else 0,
             "unresolved": sweep.unresolved_count if sweep else 0,
             "quarantined": sweep.quarantined_count if sweep else 0,
+            "started_at": sweep.started_at if sweep else None,
             "updated_at": sweep.updated_at if sweep else None,
         },
     }
@@ -363,12 +369,14 @@ async def _safe_attendance_repair_loop(stop: asyncio.Event) -> None:
     from zk_add.attendance_safe_repair import tick
     from zk_add.attendance_force_release import tick as force_tick
     from zk_add.attendance_direct_ords import tick as direct_tick
+    from zk_add.attendance_identity_backlog import tick as backlog_tick
 
     while not stop.is_set():
         for work, code in (
             (tick, "SAFE_ATTENDANCE_REPAIR_WORKER_ERROR"),
             (force_tick, "MANUAL_FORCE_RELEASE_WORKER_ERROR"),
             (direct_tick, "DIRECT_ORDS_WORKER_ERROR"),
+            (backlog_tick, "IDENTITY_BACKLOG_RELEASE_WORKER_ERROR"),
         ):
             try:
                 await asyncio.to_thread(work)
@@ -387,6 +395,7 @@ async def _safe_attendance_repair_loop(stop: asyncio.Event) -> None:
 
 
 async def maintenance_loop(stop: asyncio.Event) -> None:
+    from zk_add.checkin_notify import notify_loop
     from zk_add.zkt_custody_runtime import run_custody_processor
 
     tasks = [
@@ -396,6 +405,7 @@ async def maintenance_loop(stop: asyncio.Event) -> None:
         asyncio.create_task(_ords_audit_loop(stop)),
         asyncio.create_task(_attendance_repair_loop(stop)),
         asyncio.create_task(_safe_attendance_repair_loop(stop)),
+        asyncio.create_task(notify_loop(stop, publish=browser_events.publish)),
     ]
     try:
         await stop.wait()
@@ -557,6 +567,15 @@ def prepare_maintenance_tick(
     except Exception:
         # Offline marking must not starve deletion, delivery or recovery work.
         logger.exception("Stale connector sweep failed")
+    try:
+        from zk_add.ota_interruption import expire_held_downloads
+
+        # A 2.6.x download held for a re-offer whose ESP went quiet fails
+        # closed here instead of keeping its zone busy.
+        with session_scope() as session:
+            expire_held_downloads(session, now=now)
+    except Exception:
+        logger.exception("Held firmware download sweep failed")
     with session_scope() as session:
         advance_user_deletion_jobs(session)
         repair_missing_terminal_provenance(session)
@@ -938,11 +957,34 @@ def claim_ords_batch(limit: int) -> list[tuple[int, dict, int, bool]]:
                 else None
             )
             from zk_add.attendance_manual_guard import delivery_authorized, decision_for
+            from zk_add.attendance_direct_ords import (
+                TAKEOVER,
+                TAKEOVER_UNCERTAIN,
+                automatic_takeover,
+                hold_uncertain_takeover,
+            )
             decision = decision_for(session, event) if event else None
-            if decision and decision.proof.get("policy") == "manual-direct-ords-v1":
+            # A stopped direct approval never blocks ADD's own later automatic
+            # release: ordinary delivery below owns that punch again, unless
+            # the approval may already have POSTed another CNIC.
+            takeover = automatic_takeover(session, event, decision) if decision else None
+            automatic_owner = takeover == TAKEOVER
+            if decision and decision.proof.get("policy") == "manual-direct-ords-v1" and not automatic_owner:
                 connector = session.get(Connector, event.connector_id)
                 from zk_add.attendance_force_release import delivery_payload
+                from zk_add.attendance_release_safety import time_refusal
 
+                if time_refusal(event):
+                    # An administrator approval never makes an impossible time true.
+                    row.status = event.ords_status = "QUARANTINED_INVALID_DEVICE_TIME"
+                    row.last_error = "The punch time is invalid; it is never sent to Oracle."
+                    row.next_attempt_at = None
+                    continue
+                if takeover == TAKEOVER_UNCERTAIN:
+                    # Oracle may hold the approval's CNIC; a 409 to the
+                    # automatic payload would certify another person.
+                    hold_uncertain_takeover(session, event, row, decision)
+                    continue
                 candidate_payload = delivery_payload(session, event, connector)
                 if candidate_payload is None:
                     row.status = event.ords_status = "BLOCKED_IDENTITY"
@@ -1015,7 +1057,7 @@ def claim_ords_batch(limit: int) -> list[tuple[int, dict, int, bool]]:
                 )
                 continue
             candidate_payload = oracle_payload(connector, zkt, event, cnic)
-            if decision_for(session, event):
+            if decision_for(session, event) and not automatic_owner:
                 from zk_add.attendance_force_release import delivery_payload
                 candidate_payload = delivery_payload(session, event, connector)
                 if candidate_payload is None:
@@ -1645,6 +1687,7 @@ def apply_ords_confirmation(
     *,
     claimed_id: int,
     path: str,
+    delivered_cnic: str | None = None,
 ) -> None:
     row = session.get(OrdsOutbox, claimed_id)
     if row is None:
@@ -1653,6 +1696,8 @@ def apply_ords_confirmation(
     event = session.get(AttendanceEvent, row.attendance_event_id) if row.attendance_event_id else None
     if event and not generic_confirmation_allowed(session, event):
         return
+    if event is not None:
+        note_delivered_cnic(session, event.id, delivered_cnic)
     confirmed_at = utc_now()
     row.status = "ACKED_CHECK"
     row.acknowledged_at = confirmed_at
@@ -1730,6 +1775,7 @@ def apply_ords_delivery_result(
     body: object,
     transport_error: str | None,
     response_parsed: bool,
+    delivered_cnic: str | None = None,
 ) -> None:
     row = session.get(OrdsOutbox, claimed_id)
     if row is None:
@@ -1752,6 +1798,10 @@ def apply_ords_delivery_result(
         row.next_attempt_at = None
         row.last_error = None
         if event:
+            # Only Oracle's acceptance of THIS request proves it stored this
+            # CNIC; 409 "already exists" may hold an earlier copy's CNIC.
+            if status in {200, 201}:
+                note_delivered_cnic(session, event.id, delivered_cnic)
             event.ords_status = "ACKED"
             event.oracle_confirmed_at = confirmed_at
             event.oracle_confirmation_path = "ADD_DELIVERY"
@@ -1823,12 +1873,19 @@ def apply_ords_batch_results(
     membership_failure: tuple[int | None, str | None, bool] | None,
     results: list[tuple[int, int, int | None, object, str | None, bool]],
 ) -> None:
+    # The CNIC each claim sent (or would have sent) to Oracle. A membership
+    # confirmation only proves the punch ID exists, so there it is evidence
+    # for "CNIC uncertain", never a different CNIC to notify.
+    delivered = {
+        claim[0]: claim[1].get("cnic") if isinstance(claim[1], dict) else None for claim in claims
+    }
     with session_scope() as session:
         for claimed_id in confirmed_claim_ids:
             apply_ords_confirmation(
                 session,
                 claimed_id=claimed_id,
                 path="ORDS_MEMBERSHIP_CHECK",
+                delivered_cnic=delivered.get(claimed_id),
             )
         if membership_failure is not None:
             failure_status, failure_error, failure_parsed = membership_failure
@@ -1848,6 +1905,7 @@ def apply_ords_batch_results(
                 body=body,
                 transport_error=error,
                 response_parsed=parsed,
+                delivered_cnic=delivered.get(row_id),
             )
 
 

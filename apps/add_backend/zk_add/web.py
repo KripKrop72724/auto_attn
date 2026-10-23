@@ -30,16 +30,23 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.concurrency import run_in_threadpool
 from sqlalchemy import and_, case, func, or_, select, text
-from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+from sqlalchemy.exc import IntegrityError, OperationalError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from zk_add import APP_VERSION
 from zk_add.hil_transport import TransportInterrupted, enforce_transport
 from zk_add import attendance_force_release as force_release
 from zk_add import attendance_direct_ords as direct_ords
-from zk_add.attendance_cnic_link import cnic_not_linked_expression
+from zk_add import checkin_notify
+from zk_add import source_newest_slot as newest_slot
+from zk_add.attendance_cnic_link import cnic_not_linked_expression, unknown_synced_cnic_expression
 from zk_add.attendance_force_schemas import ForceCheckRequest, ForceStartRequest, ForceControlRequest, UserRefreshRequest
-from zk_add.attendance_direct_ords_schemas import DirectOrdsRecheckRequest, DirectOrdsStartRequest
+from zk_add.attendance_direct_ords_schemas import (
+    DirectOrdsPreviewRequest,
+    DirectOrdsQuickReleaseRequest,
+    DirectOrdsRecheckRequest,
+    DirectOrdsStartRequest,
+)
 from zk_add.audit import append_audit
 from zk_add.hikvision_evidence import ObservationIn, preserve_observation
 from zk_add.schemas import HikvisionPolicyRequest, HikvisionWriteExceptionRequest
@@ -50,7 +57,9 @@ from zk_add.attendance_batches import (
     review_attendance_quarantine,
     settle_attendance_batch,
 )
-from zk_add.queue_evidence import QueueEvidenceRequest, evidence_ack, preserve_queue_evidence
+from zk_add.queue_evidence import (
+    QueueEvidenceRequest, evidence_ack, held_record, preserve_queue_evidence, refused_copy,
+)
 from zk_add.models import QueueEvidence
 from zk_add.crypto import decrypt_json
 from zk_add.crypto import cnic_lookup, decrypt_cnic, decrypt_text, mask_cnic, normalize_cnic
@@ -61,10 +70,11 @@ from zk_add.identity_conflicts import (
     valid_identity_resolutions,
 )
 from zk_add.identity_catalog import identity_catalog_messages
-from zk_add.db import SessionLocal, init_db, session_scope
+from zk_add.db import SessionLocal, database_busy, init_db, session_scope
 from zk_add.device_session import DeviceStreamSession
 from zk_add.models import (
     AdminSession,
+    AttendanceCheckinNotification,
     AttendanceEvent,
     AttendanceRecoveryJob,
     Connector,
@@ -120,6 +130,9 @@ from zk_add.schemas import (
     ReconciliationAssignmentReleaseRequest,
     ReconciliationAnchorRequest,
     ReconciliationChunkRequest,
+    ReconciliationArchiveRequest,
+    ReconciliationBulkCreateRequest,
+    ReconciliationClearHistoryRequest,
     ReconciliationControlRequest,
     ReconciliationCreateRequest,
     ReconciliationManifestRequest,
@@ -197,6 +210,7 @@ from zk_add.comm_keys import (
     serialize_operation as serialize_comm_key_operation,
 )
 from zk_add.worker import maintenance_loop, ords_delivery_metrics
+from zk_add.ords_outbox_coverage import ords_outbox_coverage
 from zk_add.attendance_repair import attendance_release_states, repair_worker_metrics
 from zk_add.attendance_recovery import (
     RecoveryError,
@@ -214,6 +228,8 @@ from zk_add.attendance_recovery import (
 )
 from zk_add.time_utils import ensure_utc, parse_datetime, utc_now
 from zk_add.reconciliation import (
+    SOURCE_TAIL_STALE_GENERATION,
+    coverage_authority_payload,
     source_epoch_uuid,
     apply_reconciliation_assignment_release,
     apply_reconciliation_anchor,
@@ -222,7 +238,11 @@ from zk_add.reconciliation import (
     apply_source_tail_chunk,
     apply_source_probe_result,
     active_coverage,
+    archive_reconciliation_job,
+    cancel_and_archive_reconciliation_job,
+    clear_reconciliation_history,
     control_reconciliation_job,
+    create_bulk_reconciliation_jobs,
     create_reconciliation_job,
     preflight_reconciliation,
     reconciliation_manifest_authority,
@@ -238,6 +258,11 @@ from zk_add.source_exceptions import (
     reveal_source_exception,
     review_source_exception,
     source_exception_detail,
+)
+from zk_add.source_tail_authority import (
+    active_coverage_push,
+    inactive_coverage_push,
+    refuse_tail_without_authority,
 )
 
 
@@ -573,15 +598,22 @@ def session_info(auth: tuple[Session, AdminContext] = Depends(require_admin)):
 def overview(auth: tuple[Session, AdminContext] = Depends(require_admin)):
     db, _context = auth
     result = fleet_counts(db)
-    result["ords_delivery"] = ords_delivery_metrics(db)
+    # Both summaries report the same anti-join; run it once per request.
+    coverage = ords_outbox_coverage(db)
+    result["ords_delivery"] = ords_delivery_metrics(db, outbox_coverage=coverage)
     result["attendance_repair"] = repair_worker_metrics(db)
-    result["attendance_recovery"] = recovery_summary(db)
+    result["attendance_recovery"] = recovery_summary(db, outbox_coverage=coverage)
+    result["checkin_notifications"] = checkin_notify.overview(db)
     return result
 
 
 from zk_add import attendance_safe_repair as safe_repair  # noqa: E402
 from zk_add.attendance_safe_repair_schemas import (  # noqa: E402
     SafeRepairCheckRequest, SafeRepairStartRequest, SafeRepairControlRequest,
+)
+from zk_add import attendance_identity_backlog as identity_backlog  # noqa: E402
+from zk_add.attendance_identity_backlog_schemas import (  # noqa: E402
+    IdentityBacklogReleaseRequest, IdentityBacklogStopRequest,
 )
 
 
@@ -612,6 +644,73 @@ def list_direct_ords_runs(
         .order_by(AttendanceRecoveryJob.id.desc()).limit(limit)
     ).all()
     return {"rows": [direct_ords.serialize(db, row) for row in rows]}
+
+
+# The ledger's "select all" covers this many punches; larger backlogs release in rounds.
+UNKNOWN_SYNCED_ID_LIMIT = 10_000
+
+
+@app.get("/api/v2/attendance-direct-ords/unknown-synced")
+def unknown_synced_summary(auth: tuple[Session, AdminContext] = Depends(require_admin)):
+    """Count and IDs of held "Unknown identity · CNIC on synced user" punches."""
+    db, _context = auth
+    condition = unknown_synced_cnic_expression()
+    devices = db.execute(
+        select(Connector.connector_id, Connector.display_name, Connector.zone_id, func.count(AttendanceEvent.id))
+        .join(Connector, Connector.id == AttendanceEvent.connector_id)
+        .where(condition)
+        .group_by(Connector.connector_id, Connector.display_name, Connector.zone_id)
+        .order_by(func.count(AttendanceEvent.id).desc())
+    ).all()
+    total = sum(row[3] for row in devices)
+    event_ids = direct_ords.unknown_synced_event_ids(db, limit=UNKNOWN_SYNCED_ID_LIMIT)
+    return {
+        "count": total,
+        "devices": [
+            {"connector_id": connector_id, "display_name": name, "zone_id": zone_id, "count": count}
+            for connector_id, name, zone_id, count in devices
+        ],
+        "event_ids": event_ids,
+        "truncated": total > len(event_ids),
+    }
+
+
+@app.post("/api/v2/attendance-direct-ords/quick-release", status_code=202)
+def quick_release_direct_ords(
+    body: DirectOrdsQuickReleaseRequest,
+    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+):
+    """One click, no reason or password: send selected unknown-identity punches now."""
+    db, context = auth
+    try:
+        job, not_matching = direct_ords.quick_release(
+            db, actor=context.username, event_ids=body.event_ids, idempotency_key=body.idempotency_key,
+        )
+        db.flush()
+    except RecoveryError as exc:
+        raise HTTPException(status_code=409, detail={"code": exc.code, "message": str(exc)}) from exc
+    except OperationalError as exc:
+        if not database_busy(exc):
+            raise
+        # Nothing was saved; the dashboard retries this batch with the same key.
+        raise HTTPException(status_code=503, detail={
+            "code": "ADD_BUSY", "message": "ADD is busy delivering earlier punches. Retrying shortly.",
+        }) from exc
+    return {
+        **direct_ords.serialize(db, job),
+        "not_matching": not_matching,
+        "skipped_by_reason": direct_ords.skipped_by_reason(db, job),
+    }
+
+
+@app.post("/api/v2/attendance-direct-ords/preview")
+def preview_direct_ords_run(
+    body: DirectOrdsPreviewRequest,
+    auth: tuple[Session, AdminContext] = Depends(require_admin),
+):
+    """Read-only: refused punch times, CNIC choices and imminent automatic releases."""
+    db, _context = auth
+    return direct_ords.preview(db, body.event_ids)
 
 
 @app.post("/api/v2/attendance-direct-ords", status_code=202)
@@ -669,6 +768,109 @@ def recheck_direct_ords_legacy(
         return direct_ords.serialize(db, job)
     except RecoveryError as exc:
         raise HTTPException(status_code=409, detail={"code": exc.code, "message": str(exc)}) from exc
+
+
+@app.get("/api/v2/attendance-identity-backlog/preview")
+def preview_identity_backlog(
+    zone_id: str = Query(min_length=1, max_length=100),
+    after_id: int = Query(default=0, ge=0),
+    limit: int = Query(default=200, ge=1, le=identity_backlog.PREVIEW_PAGE_MAX),
+    as_of: str | None = Query(default=None, max_length=64),
+    until_id: int | None = Query(default=None, ge=0),
+    window_hours: int | None = Query(default=None, ge=0, le=14 * 24),
+    auth: tuple[Session, AdminContext] = Depends(require_admin),
+):
+    """Read-only count of a zone's held dump punches the release proof would accept.
+
+    The first page freezes and signs the check; later pages pass its as_of,
+    until_id and window_hours back. One page runs at a time across ADD.
+    """
+    db, context = auth
+    try:
+        return identity_backlog.preview_page(
+            db, zone_id=zone_id, actor=context.username, after_id=after_id, limit=limit,
+            as_of=as_of, until_id=until_id, window_hours=window_hours,
+        )
+    except RecoveryError as exc:
+        raise HTTPException(status_code=409, detail={"code": exc.code, "message": str(exc)}) from exc
+
+
+@app.get("/api/v2/attendance-identity-backlog/releases")
+def list_identity_backlog_releases(
+    zone_id: str | None = Query(default=None, max_length=100),
+    limit: int = Query(default=10, ge=1, le=30),
+    auth: tuple[Session, AdminContext] = Depends(require_admin),
+):
+    db, _context = auth
+    rows = db.scalars(
+        select(AttendanceRecoveryJob)
+        .where(AttendanceRecoveryJob.action == identity_backlog.ACTION)
+        .order_by(AttendanceRecoveryJob.id.desc())
+        .limit(200 if zone_id else limit)
+    ).all()
+    if zone_id:
+        rows = [row for row in rows if row.scope["request"]["zone_id"] == zone_id][:limit]
+    return {
+        "rows": [identity_backlog.serialize(db, row) for row in rows],
+        "confirmation": identity_backlog.confirmation_phrase(zone_id) if zone_id else None,
+    }
+
+
+@app.post("/api/v2/attendance-identity-backlog/releases", status_code=202)
+def start_identity_backlog_release(
+    body: IdentityBacklogReleaseRequest,
+    request: Request,
+    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+):
+    """Owner step-up: release a zone's held dump punches that pass the same proof."""
+    db, context = auth
+    require_step_up(body.password.get_secret_value(), db, context)
+    try:
+        job = identity_backlog.create_release(
+            db, actor=context.username, zone_id=body.zone_id, reason=body.reason,
+            typed_confirmation=body.typed_confirmation, idempotency_key=body.idempotency_key,
+            scope=body.scope.model_dump(), expires_at=body.expires_at,
+            signature=body.signature,
+            groups=[group.model_dump() for group in body.groups],
+            approved_count=body.approved_count, previewed_held=body.previewed_held,
+            ip_address=client_ip(request),
+        )
+        db.flush()
+        return identity_backlog.serialize(db, job)
+    except RecoveryError as exc:
+        raise HTTPException(status_code=409, detail={"code": exc.code, "message": str(exc)}) from exc
+
+
+def _identity_backlog_job(db, job_id):
+    row = _recovery_job_or_404(db, job_id)
+    if row.action != identity_backlog.ACTION:
+        raise HTTPException(status_code=404, detail="Zone release not found.")
+    return row
+
+
+@app.get("/api/v2/attendance-identity-backlog/releases/{job_id}")
+def get_identity_backlog_release(
+    job_id: str, auth: tuple[Session, AdminContext] = Depends(require_admin),
+):
+    db, _context = auth
+    return identity_backlog.serialize(db, _identity_backlog_job(db, job_id))
+
+
+@app.post("/api/v2/attendance-identity-backlog/releases/{job_id}/stop")
+def stop_identity_backlog_release(
+    job_id: str,
+    body: IdentityBacklogStopRequest,
+    request: Request,
+    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+):
+    db, context = auth
+    require_step_up(body.password.get_secret_value(), db, context)
+    job = identity_backlog.stop(
+        db, _identity_backlog_job(db, job_id), actor=context.username,
+        ip_address=client_ip(request),
+    )
+    db.flush()
+    return identity_backlog.serialize(db, job)
 
 
 @app.post("/api/v2/attendance-force-releases", status_code=202)
@@ -1647,16 +1849,15 @@ async def start_full_history_reconciliation(
     body: ReconciliationCreateRequest,
     auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
 ):
+    # One click: the admin session and CSRF token authorize it; reason,
+    # confirmation and password are no longer asked for.
     db, context = auth
-    require_step_up(body.password, db, context)
     connector = connector_or_404(db, connector_id)
     try:
         job = create_reconciliation_job(
             db,
             connector=connector,
             actor=context.username,
-            reason=body.reason,
-            confirmation=body.confirmation,
             idempotency_key=body.idempotency_key,
             scope=body.scope,
         )
@@ -1669,6 +1870,59 @@ async def start_full_history_reconciliation(
     return serialize_job(db, job, include_events=True)
 
 
+@app.post("/api/v1/reconciliations/bulk")
+async def start_bulk_reconciliation(
+    body: ReconciliationBulkCreateRequest,
+    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+):
+    db, context = auth
+
+    def create_all() -> dict:
+        created = create_bulk_reconciliation_jobs(
+            db,
+            connector_ids=body.connector_ids,
+            actor=context.username,
+            idempotency_key=body.idempotency_key,
+            scope=body.scope,
+        )
+        db.commit()
+        return created
+
+    # Up to 100 preflights and inserts: keep them off the event loop.
+    result = await run_in_threadpool(create_all)
+    for row in result["results"]:
+        if row["outcome"] == "CREATED":
+            await browser_events.publish(
+                "reconciliation", {"job_id": row["job_id"], "status": row["status"]}
+            )
+    return result
+
+
+@app.post("/api/v1/reconciliations/clear-history")
+async def clear_reconciliation_history_route(
+    body: ReconciliationClearHistoryRequest | None = None,
+    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+):
+    db, context = auth
+    # Committed batches over the whole history: keep them off the event loop.
+    try:
+        result = await run_in_threadpool(
+            clear_reconciliation_history,
+            db,
+            actor=context.username,
+            request_id=body.idempotency_key if body else None,
+        )
+    except OperationalError as exc:
+        if not database_busy(exc):
+            raise
+        # Batches already committed stay done; pressing again finishes the rest.
+        raise HTTPException(status_code=503, detail={
+            "code": "ADD_BUSY", "message": "ADD's database is busy. Press Clear reconcile history again to finish."
+        }) from exc
+    await browser_events.publish("reconciliation", {"history_cleared": True})
+    return result
+
+
 @app.get("/api/v1/reconciliations")
 def list_reconciliations(
     connector_id: str | None = None,
@@ -1678,10 +1932,14 @@ def list_reconciliations(
     q: str | None = Query(default=None, max_length=120),
     cursor: int | None = Query(default=None, ge=1),
     limit: int = Query(default=100, ge=1, le=500),
+    include_archived: bool = False,
     auth: tuple[Session, AdminContext] = Depends(require_admin),
 ):
     db, _context = auth
-    clauses = []
+    # Archived jobs leave the dashboard and its totals; their evidence stays
+    # readable by job ID and by every check that uses it.
+    visible = [] if include_archived else [ReconciliationJob.archived_at.is_(None)]
+    clauses = [*visible]
     if connector_id:
         connector = connector_or_404(db, connector_id)
         clauses.append(ReconciliationJob.connector_id == connector.id)
@@ -1739,31 +1997,31 @@ def list_reconciliations(
     rows = fetched[:limit]
     next_cursor = rows[-1].id if len(fetched) > limit and rows else None
     totals = {
-        "all": int(db.scalar(select(func.count(ReconciliationJob.id))) or 0),
+        "all": int(db.scalar(select(func.count(ReconciliationJob.id)).where(*visible)) or 0),
         "active": int(
             db.scalar(
-                select(func.count(ReconciliationJob.id)).where(status_groups["ACTIVE"])
+                select(func.count(ReconciliationJob.id)).where(status_groups["ACTIVE"], *visible)
             )
             or 0
         ),
         "queued_waiting": int(
             db.scalar(
                 select(func.count(ReconciliationJob.id)).where(
-                    status_groups["QUEUED_WAITING"]
+                    status_groups["QUEUED_WAITING"], *visible
                 )
             )
             or 0
         ),
         "paused": int(
             db.scalar(
-                select(func.count(ReconciliationJob.id)).where(status_groups["PAUSED"])
+                select(func.count(ReconciliationJob.id)).where(status_groups["PAUSED"], *visible)
             )
             or 0
         ),
         "attention": int(
             db.scalar(
                 select(func.count(ReconciliationJob.id)).where(
-                    status_groups["ATTENTION"]
+                    status_groups["ATTENTION"], *visible
                 )
             )
             or 0
@@ -1771,7 +2029,7 @@ def list_reconciliations(
         "completed": int(
             db.scalar(
                 select(func.count(ReconciliationJob.id)).where(
-                    status_groups["COMPLETED"]
+                    status_groups["COMPLETED"], *visible
                 )
             )
             or 0
@@ -1779,7 +2037,7 @@ def list_reconciliations(
         "cancelled": int(
             db.scalar(
                 select(func.count(ReconciliationJob.id)).where(
-                    status_groups["CANCELLED"]
+                    status_groups["CANCELLED"], *visible
                 )
             )
             or 0
@@ -1826,6 +2084,7 @@ def source_exceptions(
     error_code: str | None = None,
     review_state: str | None = None,
     ordinal: int | None = Query(default=None, ge=0),
+    corrected: bool | None = None,
     cursor: int | None = Query(default=None, ge=1),
     limit: int = Query(default=100, ge=1, le=500),
     auth: tuple[Session, AdminContext] = Depends(require_admin),
@@ -1852,6 +2111,7 @@ def source_exceptions(
         error_code=error_code,
         review_state=review_state,
         ordinal=ordinal,
+        corrected=corrected,
         cursor=cursor,
         limit=limit,
     )
@@ -1875,6 +2135,8 @@ def source_exceptions(
                     "state",
                     "cohort_digest",
                     "correction_ids",
+                    "newest_held",
+                    "newest_punch_unreceived",
                 )
             },
         }
@@ -1902,6 +2164,39 @@ def attendance_quarantine(
         cursor=cursor,
         limit=limit,
     )
+
+
+@app.get("/api/v1/attendance-batch-replays")
+def attendance_batch_replays(
+    auth: tuple[Session, AdminContext] = Depends(require_admin),
+):
+    """Attendance batch replays this API process has settled since it started."""
+    from zk_add.attendance_batches import (
+        REPLAY_LOG_INTERVAL_SECONDS,
+        attendance_batch_replay_metrics,
+    )
+
+    db, _context = auth
+    metrics = attendance_batch_replay_metrics()
+    names = dict(
+        db.execute(
+            select(Connector.connector_id, Connector.display_name).where(
+                Connector.connector_id.in_(list(metrics))
+            )
+        ).all()
+    ) if metrics else {}
+    return {
+        "scope": "PROCESS_SINCE_START",
+        "log_interval_seconds": int(REPLAY_LOG_INTERVAL_SECONDS),
+        "rows": [
+            {
+                "connector_id": connector_id,
+                "display_name": names.get(connector_id),
+                "counts": counts,
+            }
+            for connector_id, counts in sorted(metrics.items())
+        ],
+    }
 
 
 @app.post("/api/v1/attendance-quarantine/{item_id}/review")
@@ -2043,6 +2338,7 @@ def zkt_source_evidence_list(
     before: int | None = Query(default=None, ge=1),
     limit: int = Query(default=20, ge=1, le=50),
     disposition: str | None = Query(default=None, max_length=50),
+    newest: bool = False,
     auth: tuple[Session, AdminContext] = Depends(require_admin),
 ):
     from zk_add.zkt_source_evidence import list_evidence
@@ -2051,7 +2347,8 @@ def zkt_source_evidence_list(
     try:
         response.headers["Cache-Control"] = "no-store, max-age=0"
         response.headers["Pragma"] = "no-cache"
-        return list_evidence(db, connector, before=before, limit=limit, disposition=disposition)
+        return list_evidence(db, connector, before=before, limit=limit, disposition=disposition,
+                             newest=newest)
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
@@ -2287,6 +2584,51 @@ def reveal_reconciliation_divergence(
     }
 
 
+# Registered before the generic {action} route below, which would match first.
+@app.post("/api/v1/reconciliations/{job_id}/archive")
+async def archive_reconciliation(
+    job_id: str,
+    body: ReconciliationArchiveRequest | None = None,
+    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+):
+    db, context = auth
+    job = reconciliation_or_404(db, job_id)
+    try:
+        job = archive_reconciliation_job(
+            db, job=job, actor=context.username,
+            request_id=body.idempotency_key if body else None,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    db.commit()
+    await browser_events.publish(
+        "reconciliation", {"job_id": job.job_id, "status": job.status, "archived": True}
+    )
+    return serialize_job(db, job)
+
+
+@app.post("/api/v1/reconciliations/{job_id}/cancel-and-archive")
+async def cancel_and_archive_reconciliation(
+    job_id: str,
+    body: ReconciliationArchiveRequest | None = None,
+    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+):
+    db, context = auth
+    job = reconciliation_or_404(db, job_id)
+    try:
+        job = cancel_and_archive_reconciliation_job(
+            db, job=job, actor=context.username,
+            idempotency_key=(body.idempotency_key if body else None) or str(uuid4()),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    db.commit()
+    await browser_events.publish(
+        "reconciliation", {"job_id": job.job_id, "status": job.status, "archived": True}
+    )
+    return serialize_job(db, job)
+
+
 @app.post("/api/v1/reconciliations/{job_id}/{action}")
 async def control_reconciliation(
     job_id: str,
@@ -2296,8 +2638,8 @@ async def control_reconciliation(
 ):
     if action not in {"pause", "resume", "cancel", "retry"}:
         raise HTTPException(status_code=404, detail="Unknown reconciliation action.")
+    # One click: no reason or password. A guarded retry still binds expected_state.
     db, context = auth
-    require_step_up(body.password, db, context)
     job = reconciliation_or_404(db, job_id)
     try:
         job = control_reconciliation_job(
@@ -2305,7 +2647,6 @@ async def control_reconciliation(
             job=job,
             action=action,
             actor=context.username,
-            reason=body.reason,
             idempotency_key=body.idempotency_key,
             expected_state=body.expected_state,
         )
@@ -3265,6 +3606,14 @@ def attendance_identity_evidence_report(
 
     source = source_evidence(db, event, connector) if connector else None
     evidence = identity_evidence(db, event, connector) if connector else None
+    auto_release_eligible = bool(
+        connector and zkt and user
+        and synced_cnic_identity_proven(db, connector, zkt, user, event)
+    )
+    safety = _identity_release_safety(
+        db, event, connector=connector, zkt=zkt, user=user, manifest=manifest,
+        source=source, auto_release_eligible=auto_release_eligible,
+    )
     return {
         "event_id": event.id,
         "ords_status": event.ords_status,
@@ -3353,10 +3702,176 @@ def attendance_identity_evidence_report(
         "active_user_cnic_matches_history": bool(
             user and evidence and user.cnic_lookup_hash == evidence.cnic_hash
         ),
-        "auto_release_eligible": bool(
-            connector and zkt and user
-            and synced_cnic_identity_proven(db, connector, zkt, user, event)
-        ),
+        "auto_release_eligible": auto_release_eligible,
+        **safety,
+    }
+
+
+IDENTITY_RELEASE_HINTS = {
+    "CLOCK_INVALID": "The terminal clock was invalid for this punch. It can never be sent to Oracle.",
+    "TIME_IMPOSSIBLE": "The punch time is impossible. It can never be sent to Oracle.",
+    "AUTO_RELEASE_AT_NEXT_SNAPSHOT": (
+        "ADD's own proof and the database guard pass: the next user snapshot "
+        "(normally within 15 minutes) releases this punch. Do not send it by hand."
+    ),
+    "AWAITING_NEXT_SNAPSHOT": (
+        "This punch arrived after the latest user snapshot. ADD checks it again at the next "
+        "snapshot (normally within 15 minutes) and may release it automatically."
+    ),
+    "DATABASE_GUARD_REJECTS": (
+        "ADD's proof passes but the installed database guard would keep this punch held."
+    ),
+    "NO_SAVED_TERMINAL_RECORD": (
+        "No saved terminal record yet: a full-history or tail read must link this punch "
+        "to the terminal's own attendance log before ADD can prove its source."
+    ),
+    "DATABASE_GUARD_UNAVAILABLE": (
+        "ADD's proof passes but the database guard could not be read. Treat the punch as "
+        "about to be released automatically."
+    ),
+    "PUNCH_TIME_CNIC_DIFFERS": (
+        "The terminal held a different CNIC for this user ID at punch time. A manual send "
+        "must choose which CNIC to use; the punch-time CNIC is the default."
+    ),
+    "PUNCH_TIME_CNIC_CONFLICT": (
+        "ADD's records show another CNIC or another person for this user ID at or near the "
+        "punch time, and nothing close enough to the punch says which (see "
+        "other_cnics_masked, evidence_signals, record_before_ended_at and "
+        "record_after_started_at). A manual send refuses this punch."
+    ),
+    "IDENTITY_CONFLICT_UNRESOLVED": (
+        "Two active terminal users have today's CNIC and the duplicate is not resolved. A "
+        "manual send refuses this punch until it is resolved in ADD Users."
+    ),
+    "PUNCH_TIME_CNIC_CHANGED_NEARBY": (
+        "No record covers the punch time: the old CNIC's record ended before it and today's "
+        "started after it (see record_before_ended_at and record_after_started_at). A manual "
+        "send asks for this punch on its own and offers only a record within 30 minutes of "
+        "the punch: the old CNIC from today's own terminal user record, today's CNIC from "
+        "its first record. Choose only after HR confirms who held the user ID."
+    ),
+    "PUNCH_TIME_CNIC_BRIDGED_GAP": (
+        "No record covers the punch time, but the records just before and after it are the "
+        "same terminal user with the same CNIC. A manual send treats that CNIC as the "
+        "punch-time CNIC."
+    ),
+    "RECORD_HOLDER_DELETED_BEFORE_PUNCH": (
+        "The terminal user on the record before the punch was deleted before the punch, so "
+        "that record says nothing about who punched."
+    ),
+    "PUNCH_BEFORE_FIRST_OBSERVATION": (
+        "The punch is older than ADD's first record of this terminal user ID (see "
+        "first_observed_at). A user ID reused before then cannot be detected; confirm with HR."
+    ),
+    "NAME_DIFFERS": (
+        "The name saved with the punch is not today's user's name. Confirm with HR who punched."
+    ),
+    "PUNCH_TIME_CNIC_AMBIGUOUS": (
+        "The records at punch time are revoked, belong to another terminal UID or terminal "
+        "user, or the punch was linked to another user. They do not prove today's CNIC."
+    ),
+    "NO_PUNCH_TIME_IDENTITY": (
+        "ADD has no identity record for this user ID at punch time. Today's CNIC may only be "
+        "used after HR confirms the user ID belonged to the same employee then."
+    ),
+}
+
+
+def _identity_release_safety(
+    db, event, *, connector, zkt, user, manifest, source, auto_release_eligible,
+) -> dict:
+    """Read-only facts an administrator needs before overriding a hold by hand."""
+    from zk_add.attendance_identity_evidence import TERMINAL_RECONCILE_SOURCES
+    from zk_add.attendance_release_safety import (
+        AMBIGUOUS,
+        CHANGED_NEAR_PUNCH,
+        CONFLICT,
+        DIFFERS,
+        GAP_BRIDGED_SAME_CNIC,
+        IDENTITY_CONFLICT_UNRESOLVED,
+        NAME_DIFFERS,
+        NONE,
+        PUNCH_BEFORE_FIRST_OBSERVATION,
+        RECORD_HOLDER_DELETED_BEFORE_PUNCH,
+        auto_release_preview,
+        database_guard_state,
+        other_cnics_masked,
+        safe_cnic,
+        single_event_identity,
+        time_refusal,
+    )
+
+    current_cnic = safe_cnic(user.cnic_encrypted) if user else None
+    current_hash = cnic_lookup(current_cnic) if current_cnic else None
+    punch = single_event_identity(db, event, user, current_hash)
+    guard = (
+        database_guard_state(db, event=event, zkt=zkt, user=user)
+        if connector and zkt and user else "NOT_CHECKED"
+    )
+    release = auto_release_preview(db, event, identity=punch, include_guard=False)
+    at_next_snapshot = bool(
+        release["held"] and auto_release_eligible
+        and guard in {"ACCEPTED", "NOT_APPLICABLE", "UNAVAILABLE"}
+    )
+    saved_record = manifest is not None
+    codes = []
+    refusal = time_refusal(event)
+    if refusal:
+        codes.append(refusal)
+    if at_next_snapshot:
+        codes.append("AUTO_RELEASE_AT_NEXT_SNAPSHOT")
+    elif release["awaiting_snapshot"]:
+        codes.append("AWAITING_NEXT_SNAPSHOT")
+    if auto_release_eligible and guard == "REJECTED":
+        codes.append("DATABASE_GUARD_REJECTS")
+    if auto_release_eligible and guard == "UNAVAILABLE":
+        codes.append("DATABASE_GUARD_UNAVAILABLE")
+    if not saved_record and source is None and event.source in TERMINAL_RECONCILE_SOURCES:
+        codes.append("NO_SAVED_TERMINAL_RECORD")
+    punch_code = {
+        DIFFERS: "PUNCH_TIME_CNIC_DIFFERS",
+        CONFLICT: "PUNCH_TIME_CNIC_CONFLICT",
+        CHANGED_NEAR_PUNCH: "PUNCH_TIME_CNIC_CHANGED_NEARBY",
+        AMBIGUOUS: "PUNCH_TIME_CNIC_AMBIGUOUS",
+        NONE: "NO_PUNCH_TIME_IDENTITY",
+    }.get(punch.state)
+    if punch_code:
+        codes.append(punch_code)
+    for signal, code in (
+        (IDENTITY_CONFLICT_UNRESOLVED, "IDENTITY_CONFLICT_UNRESOLVED"),
+        (GAP_BRIDGED_SAME_CNIC, "PUNCH_TIME_CNIC_BRIDGED_GAP"),
+        (RECORD_HOLDER_DELETED_BEFORE_PUNCH, "RECORD_HOLDER_DELETED_BEFORE_PUNCH"),
+        (PUNCH_BEFORE_FIRST_OBSERVATION, "PUNCH_BEFORE_FIRST_OBSERVATION"),
+        (NAME_DIFFERS, "NAME_DIFFERS"),
+    ):
+        if signal in punch.signals:
+            codes.append(code)
+    other_cnic = bool(punch.cnic_hash and punch.interval is not None)
+    return {
+        "time_refusal": refusal,
+        "database_guard": guard,
+        "auto_release_at_next_snapshot": at_next_snapshot,
+        "awaiting_next_snapshot": release["awaiting_snapshot"],
+        "saved_terminal_record": saved_record,
+        "punch_time_cnic": {
+            "state": punch.state,
+            # The single other CNIC at or near the punch (DIFFERS, or today's
+            # own record that ended just before it for CHANGED_NEAR_PUNCH), masked.
+            "cnic_masked": mask_cnic(punch.cnic) if other_cnic and punch.cnic else None,
+            "display_name": punch.display_name if other_cnic else None,
+            "basis": punch.basis if other_cnic else None,
+            "record_position": punch.position,
+            "first_observed_at": punch.first_observed_at,
+            "record_before_ended_at": punch.record_before_until,
+            "record_after_started_at": punch.record_after_from,
+            "history_ids": list(punch.history_ids),
+            "other_cnics_masked": other_cnics_masked(punch, current_hash),
+            "evidence_signals": sorted(punch.signals),
+            "uid_matches_current": punch.uid_matches_current,
+        },
+        "current_cnic_masked": mask_cnic(current_cnic),
+        "punch_time_cnic_matches_current": punch.state == "MATCHES_CURRENT",
+        "hints": [{"code": code, "message": IDENTITY_RELEASE_HINTS[code]} for code in codes],
     }
 
 
@@ -3370,7 +3885,9 @@ def attendance(
     clock_quality: str | None = None,
     forced: bool = False,
     ords_status: list[str] = Query(default=[]),
+    notify_status: list[str] = Query(default=[]),
     cnic_present: bool | None = None,
+    unknown_synced_cnic: bool = False,
     from_time: str | None = None,
     to_time: str | None = None,
     cursor: int | None = None,
@@ -3420,6 +3937,15 @@ def attendance(
                 AttendanceEvent.cnic_encrypted == "",
             )
         )
+    if unknown_synced_cnic:
+        statement = statement.where(unknown_synced_cnic_expression())
+    if notify_status:
+        if not set(notify_status) <= set(checkin_notify.PILL_FILTERS):
+            raise HTTPException(status_code=422, detail="Select valid phone notification statuses.")
+        statement = statement.outerjoin(
+            AttendanceCheckinNotification,
+            AttendanceCheckinNotification.attendance_event_id == AttendanceEvent.id,
+        ).where(checkin_notify.filter_condition(sorted(set(notify_status))))
     if ords_status:
         stored_statuses = set(ords_status) - {"CNIC_NOT_LINKED"}
         selected_states = [AttendanceEvent.ords_status.in_(stored_statuses)]
@@ -3451,6 +3977,7 @@ def attendance(
     release_states = attendance_release_states(db, page_rows)
     force_metadata = force_release.metadata_for_page(db, page_rows)
     direct_ords_identity = direct_ords.identity_hints_for_page(db, page_rows)
+    notifications = checkin_notify.pills_for_page(db, page_rows)
     return {
         "rows": [
             {
@@ -3462,14 +3989,64 @@ def attendance(
                 "force_release": force_metadata.get(row.id),
                 "direct_ords_identity": direct_ords_identity.get(row.id),
                 "cnic_not_linked": bool(results[index][1]),
+                "checkin_notification": notifications.get(row.id),
             }
             for index, row in enumerate(page_rows)
         ],
         "next_cursor": next_cursor,
+        # A compact summary for the first page; older pages do not repeat it.
+        "checkin_notifications": None if cursor else checkin_notify.overview(db),
         "status_options": db.scalars(
             select(AttendanceEvent.ords_status).distinct().order_by(AttendanceEvent.ords_status).limit(100)
         ).all() + ["CNIC_NOT_LINKED"],
     }
+
+
+@app.get("/api/v1/checkin-notifications")
+def checkin_notification_settings(auth: tuple[Session, AdminContext] = Depends(require_admin)):
+    """Mode, pilot allowlist, health and 24-hour counts of check-in notifications."""
+    db, _context = auth
+    return checkin_notify.describe_control(db)
+
+
+@app.put("/api/v1/checkin-notifications/settings")
+def update_checkin_notification_settings(
+    request: Request,
+    body: checkin_notify.CheckinNotifySettingsRequest,
+    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+):
+    """Switch OFF / PILOT / ALL at runtime; password step-up and audited."""
+    db, context = auth
+    require_step_up(body.password.get_secret_value(), db, context)
+    try:
+        result = checkin_notify.update_control(
+            db, body, actor=context.username, ip_address=client_ip(request)
+        )
+    except checkin_notify.CheckinNotifyError as error:
+        raise HTTPException(status_code=error.status, detail=error.detail) from error
+    db.commit()
+    return result
+
+
+@app.post("/api/v1/attendance/{event_id}/checkin-notification/retry")
+def retry_checkin_notification(
+    request: Request,
+    event_id: int,
+    body: checkin_notify.CheckinNotifyRetryRequest,
+    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+):
+    """Queue one failed notification again; password step-up and audited."""
+    db, context = auth
+    require_step_up(body.password.get_secret_value(), db, context)
+    try:
+        result = checkin_notify.retry_notification(
+            db, event_id=event_id, actor=context.username, reason=body.reason,
+            ip_address=client_ip(request),
+        )
+    except checkin_notify.CheckinNotifyError as error:
+        raise HTTPException(status_code=error.status, detail=error.detail) from error
+    db.commit()
+    return {"checkin_notification": result}
 
 
 @app.get("/api/v1/devices/{connector_id}/logs")
@@ -3954,7 +4531,9 @@ def persist_device_attendance(
     db, connector = auth
     settlement = settle_attendance_batch(db, connector=connector, payload=body)
     db.commit()
-    for event_uid in settlement.accepted_event_uids:
+    # A retry or replay repeats an earlier receipt and accepted nothing new.
+    accepted_now = () if settlement.duplicate_batch else settlement.accepted_event_uids
+    for event_uid in accepted_now:
         events.append(("attendance", {"connector_id": connector.connector_id, "event_uid": event_uid}))
     response = settlement.response()
 
@@ -4024,13 +4603,17 @@ def persist_device_reconciliation_chunk(
             "phase": job.phase,
             "committed_next_ordinal": job.committed_next_ordinal,
         }))
+    # A safety hold or a source-change probe commits no chunk; answer with
+    # the submitted chunk's identity, as the device stream does.
     response = {
-        "ok": job.status != "NEEDS_ATTENTION",
+        "ok": chunk is not None and job.status != "NEEDS_ATTENTION",
         "job_id": job.job_id,
-        "generation": chunk.generation,
-        "sequence": chunk.sequence,
+        "generation": chunk.generation if chunk is not None else body.generation,
+        "sequence": chunk.sequence if chunk is not None else body.sequence,
         "committed_next_ordinal": job.committed_next_ordinal,
-        "resulting_chain_digest": chunk.resulting_chain_digest,
+        "resulting_chain_digest": (
+            chunk.resulting_chain_digest if chunk is not None else body.resulting_chain_digest
+        ),
         "duplicate": duplicate,
     }
 
@@ -4278,15 +4861,28 @@ async def device_stream(websocket: WebSocket):
     finally:
         try:
             await session.stop()
+            # A session superseded by the same ESP's newer socket must not mark
+            # the connector disconnected: the newer session is live, and the
+            # flag would otherwise read OFFLINE until its next message.
+            still_current = connector_hub.current(connector_id) is websocket
             await connector_hub.disconnect(connector_id, websocket)
-            try:
-                await asyncio.to_thread(set_stream_connected, connector_pk, False)
-            except Exception as exc:
-                logger.warning(
-                    "ADD device stream could not record its disconnection connector_id=%s error_type=%s",
-                    connector_id, type(exc).__name__,
-                )
-            await browser_events.publish("device", {"connector_id": connector_id, "connected": False})
+            if still_current:
+                try:
+                    await asyncio.to_thread(set_stream_connected, connector_pk, False)
+                    # The ESP may have registered its newer socket while this
+                    # write ran, and that socket's own connected write may have
+                    # committed first. Restore the flag for the live session.
+                    replaced = connector_hub.current(connector_id) is not None
+                    if replaced:
+                        await asyncio.to_thread(set_stream_connected, connector_pk, True)
+                except Exception as exc:
+                    replaced = False
+                    logger.warning(
+                        "ADD device stream could not record its disconnection connector_id=%s error_type=%s",
+                        connector_id, type(exc).__name__,
+                    )
+                if not replaced:
+                    await browser_events.publish("device", {"connector_id": connector_id, "connected": False})
         finally:
             # Even a cleanup cut short by cancellation reports the session.
             session.log_end()
@@ -4340,6 +4936,7 @@ async def open_device_stream(session: DeviceStreamSession, connector_pk: int, co
             if not session.should_stop():
                 await session.close(1011, "Source coverage delivery failed")
             return False
+        session.coverage_push_outstanding = True
     try:
         await send_pending_commands(connector_id, only_to=session.websocket)
     except Exception as exc:
@@ -4527,13 +5124,17 @@ def record_envelope_rejection(connector_pk: int, envelope: Envelope, error: Exce
     from zk_add.rejection import rejection_category, rejection_reason, rejection_site
 
     category = rejection_category(error)
-    # Field locations only: rejected values can carry attendance or credentials.
-    error_paths = [".".join(str(part) for part in row.get("loc", ()))[:120]
-                   for row in error.errors(include_input=False, include_url=False)[:5]
-                   ] if isinstance(error, ValidationError) else []
+    # Field locations and pydantic error types only: rejected values can carry
+    # attendance or credentials, and neither of these ever includes one.
+    schema_errors = error.errors(include_input=False, include_url=False)[:5] \
+        if isinstance(error, ValidationError) else []
+    error_paths = [".".join(str(part) for part in row.get("loc", ()))[:120] for row in schema_errors]
+    error_types = [str(row.get("type"))[:80] for row in schema_errors]
     # A bounded code and the ADD code location, never the message or payload.
     error_reason = rejection_reason(error)
     error_site = rejection_site(error) if error_reason is not None else None
+    # Which custody record was refused, so its later acceptance can be proven.
+    evidence = refused_copy(envelope.payload) if envelope.type == "queue_evidence" else None
     with session_scope() as db:
         connector = db.scalar(select(Connector).where(Connector.id == connector_pk).with_for_update())
         if connector is None:
@@ -4541,13 +5142,18 @@ def record_envelope_rejection(connector_pk: int, envelope: Envelope, error: Exce
         alert = record_message_rejection(
             db, connector, message_type=envelope.type, category=category, error_type=error_type,
             error_paths=error_paths, request_id=envelope.message_id, boot_id=envelope.boot_id,
-            error_reason=error_reason, error_site=error_site)
+            error_reason=error_reason, error_site=error_site, error_types=error_types, evidence=evidence)
         if settings.device_health_derived_enabled:
             apply_device_health(db, connector, source="REJECTION")
-        else:
+        elif alert.state == "OPEN":
             connector.lifecycle_state = "DEGRADED"
             connector.last_error_code = alert.code
             connector.last_error_message = alert.message
+        elif connector.last_error_code == alert.code:
+            # A refused copy ADD already held closed its alert at once.
+            connector.lifecycle_state = "ONLINE"
+            connector.last_error_code = None
+            connector.last_error_message = None
         ingest_logs(
             db,
             connector=connector,
@@ -4561,9 +5167,10 @@ def record_envelope_rejection(connector_pk: int, envelope: Envelope, error: Exce
                     message=alert.message,
                     context={"message_type": envelope.type, "error_type": error_type,
                              "request_id": envelope.message_id, "error_category": category,
-                             "error_paths": error_paths,
+                             "error_paths": error_paths, "error_types": error_types,
                              **({"error_reason": error_reason, "error_site": error_site}
-                                if error_reason is not None else {})},
+                                if error_reason is not None else {}),
+                             **({"evidence": evidence} if evidence is not None else {})},
                     device_time=envelope.sent_at,
                 )
             ],
@@ -4577,6 +5184,11 @@ class EnvelopeOutcome:
     commands_for: str | None = None
     coverage: dict | None = None
     provisioning: dict | None = None
+    # Sent before the ACK (send_coverage_before_ack). coverage_before_ack is a
+    # tail answer's own push; ack_coverage is ADD's coverage as of a positive
+    # tail or manifest ACK, sent only to a stream session that still owes one.
+    coverage_before_ack: dict | None = None
+    ack_coverage: dict | None = None
 
 
 def persist_envelope(connector_pk: int, envelope: Envelope) -> EnvelopeOutcome | None:
@@ -4584,9 +5196,13 @@ def persist_envelope(connector_pk: int, envelope: Envelope) -> EnvelopeOutcome |
     provisioning_payload = None
     event_payload = None
     ack_payload = None
+    held_evidence = None
     authoritative_coverage_payload = None
+    coverage_before_ack_payload = None
+    ack_coverage_payload = None
     send_commands_after_ack = False
     connector_id_to_flush = None
+    stale_generation_tail = False
     with session_scope() as db:
         # Separate sockets may overlap during reconnect. Serialize sequence checks
         # and acceptance for the same connector before acknowledging either socket.
@@ -4689,13 +5305,17 @@ def persist_envelope(connector_pk: int, envelope: Envelope) -> EnvelopeOutcome |
             settlement = settle_attendance_batch(
                 db, connector=connector, payload=envelope.payload
             )
+            # A retry or replay repeats an earlier receipt (its ACK carries
+            # that receipt's counts); this message settled no new rows.
+            repeated = settlement.duplicate_batch
             event_payload = {
                 "connector_id": connector.connector_id,
                 "receipt_id": settlement.receipt_id,
                 "outcome": settlement.outcome,
-                "accepted": settlement.accepted_count,
-                "duplicates": settlement.duplicate_count,
-                "quarantined": settlement.quarantined_count,
+                "accepted": 0 if repeated else settlement.accepted_count,
+                "duplicates": 0 if repeated else settlement.duplicate_count,
+                "quarantined": 0 if repeated else settlement.quarantined_count,
+                "duplicate_batch": repeated,
             }
             ack_payload = settlement.ack(
                 message_id=envelope.message_id, sequence=envelope.seq
@@ -4719,6 +5339,7 @@ def persist_envelope(connector_pk: int, envelope: Envelope) -> EnvelopeOutcome |
             evidence = preserve_queue_evidence(
                 db, connector, QueueEvidenceRequest.model_validate(envelope.payload)
             )
+            held_evidence = held_record(evidence)
             ack_payload = evidence_ack(evidence, connector, envelope.message_id)
             event_payload = {"connector_id": connector.connector_id,
                              "receipt_id": evidence.receipt_id, "disposition": evidence.disposition}
@@ -4855,6 +5476,12 @@ def persist_envelope(connector_pk: int, envelope: Envelope) -> EnvelopeOutcome |
                 "status": job.status,
                 "capture_certificate": job.capture_certificate or None,
             }
+            if ack_payload["type"] == "reconcile_manifest_ack":
+                # The reader installs this certificate on the ACK, then applies
+                # whatever push it queued meanwhile (send_coverage_before_ack).
+                certified = active_coverage(db, connector.zkt_device)
+                if certified is not None:
+                    ack_coverage_payload = active_coverage_push(db, certified)
         elif envelope.type == "source_probe_result":
             probe = SourceProbeResultRequest.model_validate(envelope.payload)
             job = apply_source_probe_result(db, connector=connector, payload=probe)
@@ -4890,6 +5517,18 @@ def persist_envelope(connector_pk: int, envelope: Envelope) -> EnvelopeOutcome |
                     "source_committed_chain_digest": "0" * 64,
                     "active": False,
                 }
+        elif envelope.type == "source_tail_chunk" and (
+            tail_refusal := refuse_tail_without_authority(db, connector=connector, envelope=envelope)
+        ) is not None:
+            # The ESP is extending a certificate ADD no longer holds, or holds
+            # under another epoch. A plain rejection would leave its state
+            # unchanged and it would resend the same range every interval.
+            # The refusal committed no evidence, so it clears no rejection.
+            return EnvelopeOutcome(
+                ack=tail_refusal.ack,
+                event=tail_refusal.event,
+                coverage_before_ack=tail_refusal.coverage,
+            )
         elif envelope.type == "source_tail_chunk":
             tail = SourceTailChunkRequest.model_validate(envelope.payload)
             coverage, chunk, duplicate, error_code = apply_source_tail_chunk(
@@ -4897,6 +5536,14 @@ def persist_envelope(connector_pk: int, envelope: Envelope) -> EnvelopeOutcome |
                 connector=connector,
                 payload=tail,
             )
+            if error_code and not coverage.active:
+                # This tail just invalidated the certificate it extended. The
+                # ESP drops its certificate only on a coverage push.
+                coverage_before_ack_payload = inactive_coverage_push(
+                    connector, terminal_serial=tail.terminal_serial
+                )
+            elif error_code is None and coverage.active:
+                ack_coverage_payload = active_coverage_push(db, coverage)
             event_payload = {
                 "connector_id": connector.connector_id,
                 "coverage_id": coverage.coverage_id,
@@ -4927,17 +5574,36 @@ def persist_envelope(connector_pk: int, envelope: Envelope) -> EnvelopeOutcome |
                 "exception_count": chunk.exception_count if chunk is not None else 0,
                 "raw_preserved_count": chunk.raw_preserved_count if chunk is not None else 0,
             }
+            if error_code == SOURCE_TAIL_STALE_GENERATION:
+                # The device tails a retired generation. Its message is not a
+                # rejection (no DEGRADED, no last_error_code): it needs ADD's
+                # current coverage, exactly like the manifest authority path.
+                authoritative_coverage_payload = coverage_authority_payload(db, coverage)
+                stale_generation_tail = True
+            elif error_code == newest_slot.REPLAY_SUPERSEDED_CODE:
+                # A rewound reader replayed committed ordinals and differed only
+                # in newest-slot reads. Like a refused stale epoch, it resumes
+                # from ADD's unchanged committed cursor: the push goes before
+                # the error ACK so the reader applies it before its next tail.
+                # Its replay committed no tail evidence, so it clears nothing.
+                coverage_before_ack_payload = active_coverage_push(db, coverage)
+                stale_generation_tail = True
         else:
             event_payload = {"connector_id": connector.connector_id, "type": envelope.type}
         # The same transaction that accepted the message clears its type's
         # rejection; a replayed duplicate returned above proves nothing new.
-        resolve_message_rejection(db, connector, message_type=envelope.type)
+        # A stale-generation tail committed nothing, so it clears nothing.
+        # A refused queue_evidence clears only when this holds that record.
+        if not stale_generation_tail:
+            resolve_message_rejection(db, connector, message_type=envelope.type, evidence=held_evidence)
     return EnvelopeOutcome(
         ack=ack_payload or {"type": "ack", "message_id": envelope.message_id, "seq": envelope.seq},
         event=event_payload or {},
         commands_for=connector_id_to_flush if send_commands_after_ack else None,
         coverage=authoritative_coverage_payload,
         provisioning=provisioning_payload,
+        coverage_before_ack=coverage_before_ack_payload,
+        ack_coverage=ack_coverage_payload,
     )
 
 
@@ -4962,8 +5628,53 @@ async def accept_envelope(
         return None
     # The worker returns only after commit. No acknowledgement or browser success
     # can escape a failed transaction; reconnects replay the unacknowledged input.
+    await send_coverage_before_ack(envelope, outcome, websocket)
     await websocket.send_json(outcome.ack)
     return outcome
+
+
+async def send_coverage_before_ack(
+    envelope: Envelope,
+    outcome: EnvelopeOutcome,
+    websocket: WebSocket | DeviceStreamSession,
+) -> None:
+    """Put ADD's source coverage in the reader's queue before its ACK releases the waiting step.
+
+    Every Zone Lite generation keeps source_coverage pushes in a queue of one
+    (xQueueOverwrite) and applies the queued push only at the top of its main
+    loop, after the tail or manifest step that waits for this ACK returns. A
+    push sent while the reader waited (a connect bootstrap's, when the tail or
+    manifest was sent during the bootstrap) would otherwise be applied after
+    the ACK and step the reader back to the older cursor it carries ("Local
+    tail cursor was ahead of ADD"); its next tail then resends a committed
+    range. PESHAWAR-06 and SLICTOWER-3FL logged that step back before they
+    lost their coverage. The reader handles frames in order, so a push sent
+    first replaces the queued one before the ACK can release the step,
+    however the link delays either frame. Both pushes are ADD's committed
+    state after the commit the ACK reports: they certify nothing.
+    """
+    stream = isinstance(websocket, DeviceStreamSession)
+    if outcome.coverage_before_ack is not None:
+        push, owed = outcome.coverage_before_ack, True
+    elif outcome.ack_coverage is not None and stream and websocket.coverage_push_outstanding:
+        push, owed = outcome.ack_coverage, False
+    else:
+        return
+    try:
+        sent = await websocket.send_json(push)
+    except Exception as exc:
+        # The message is committed: its ACK must still go out and must never
+        # be answered as a rejection. The reader keeps its own cursor.
+        logger.error(
+            "ADD could not send source coverage before an ACK connector_id=%s "
+            "type=%s message_id=%s error_type=%s",
+            envelope.connector_id, envelope.type, envelope.message_id, type(exc).__name__,
+        )
+        return
+    if stream and sent is not False:
+        # A tail answer's own push is conservatively treated as still owed, so
+        # the next positive ACK repeats ADD's coverage once more.
+        websocket.coverage_push_outstanding = owed
 
 
 async def send_envelope_follow_ups(
@@ -4977,7 +5688,11 @@ async def send_envelope_follow_ups(
     if outcome.commands_for:
         await send_pending_commands(outcome.commands_for, only_to=only_to)
     if outcome.coverage is not None:
-        await websocket.send_json(outcome.coverage)
+        sent = await websocket.send_json(outcome.coverage)
+        if sent is not False and isinstance(websocket, DeviceStreamSession):
+            # It may sit in the reader's queue while a later tail or manifest
+            # waits for its ACK: see send_coverage_before_ack.
+            websocket.coverage_push_outstanding = True
     await publish_envelope_events(envelope, outcome)
 
 
@@ -5105,6 +5820,9 @@ def device_user_identity_integrity(
                 if member.id != user.id
             ]
     with_cnic = sum(bool(user.cnic_lookup_hash) for user in active)
+    from zk_add.attendance_release_safety import suspect_user_count
+
+    cnic_format_suspect = suspect_user_count(active)
     unresolved_groups = [
         group
         for group in duplicate_groups
@@ -5120,6 +5838,7 @@ def device_user_identity_integrity(
             "total_users": len(active),
             "with_cnic": with_cnic,
             "missing_cnic": len(active) - with_cnic,
+            "cnic_format_suspect_users": cnic_format_suspect,
             "duplicate_groups": len(duplicate_groups),
             "duplicate_users": sum(len(group) for group in duplicate_groups),
             "resolved_duplicate_groups": len(duplicate_groups) - len(unresolved_groups),
@@ -5140,8 +5859,12 @@ def serialize_user(
 ) -> dict:
     from zk_add.service import user_profile_is_writable
 
+    from zk_add.identity import suspect_cnic_name
+
     cnic = decrypt_cnic(row.cnic_encrypted)
     machine_name = decrypt_text(row.machine_name_encrypted) or ""
+    # Never parsed or used: an operator confirms the CNIC with HR first.
+    suspect = None if cnic else suspect_cnic_name(machine_name)
     if cnic and machine_name:
         machine_name = machine_name.replace(cnic, mask_cnic(cnic) or "[CNIC]")
     return {
@@ -5172,6 +5895,11 @@ def serialize_user(
         "machine_name_preview": machine_name or None,
         "current_command_state": "PENDING" if row.current_command_id else None,
         "read_only": bool(zkt and not user_profile_is_writable(zkt.connector, zkt)),
+        "cnic_format_suspect": suspect is not None,
+        "cnic_format_suspect_reason": suspect.reason if suspect else None,
+        "suggested_display_name": suspect.display_name if suspect and suspect.display_name else None,
+        # The unparsed name's "-S" marker; the edit dialog keeps it as the flag.
+        "suggested_shift_worker": bool(suspect and suspect.shift_worker),
     }
 
 
@@ -5323,19 +6051,20 @@ def serialize_lease(row: TemporaryAdminLease | None) -> dict | None:
 # Firmware OTA routes are intentionally additive. Legacy connectors never call
 # these endpoints and remain supported by the existing device protocol.
 from pathlib import Path as _Path  # noqa: E402
-from typing import Literal as _Literal  # noqa: E402
+from typing import Annotated as _Annotated, Literal as _Literal  # noqa: E402
 
 from fastapi.responses import StreamingResponse as _StreamingResponse  # noqa: E402
 from pydantic import BaseModel as _BaseModel, Field as _Field, SecretStr as _SecretStr, ConfigDict as _ConfigDict  # noqa: E402
+from pydantic import field_validator as _field_validator  # noqa: E402
 from sqlalchemy import select as _select  # noqa: E402
 
 from zk_add.audit import append_audit as _append_audit  # noqa: E402
 from zk_add.ota import (  # noqa: E402
     FirmwareCampaign as _FirmwareCampaign,
-    FirmwareDeployment as _FirmwareDeployment,
     FirmwareRelease as _FirmwareRelease,
     assignment_for_connector as _assignment_for_connector,
     campaign_detail as _campaign_detail,
+    control_campaign as _control_firmware_campaign_state,
     campaign_page as _campaign_page,
     create_campaign as _create_firmware_campaign,
     parse_single_range as _parse_single_range,
@@ -5548,11 +6277,18 @@ class _FirmwareProgressIn(_BaseModel):
 class _FirmwareCampaignIn(_BaseModel):
     release_id: str = _Field(min_length=1, max_length=100)
     zone_id: str = _Field(min_length=1, max_length=100)
-    reason: str = _Field(min_length=10, max_length=500)
-    typed_confirmation: str = _Field(min_length=1, max_length=80)
-    password: str = _Field(min_length=1, max_length=512)
+    # One click: no reason, typed version or password. Accepted (and ignored)
+    # so a dashboard tab opened before this change still works.
+    reason: str | None = _Field(default=None, max_length=500)
+    typed_confirmation: str | None = _Field(default=None, max_length=80)
+    password: str | None = _Field(default=None, max_length=512)
     scope_token: str = _Field(min_length=32, max_length=4096)
     idempotency_key: str = _Field(min_length=8, max_length=120)
+    # Required when the preflight reports ESP stability warnings (A3), with
+    # the preflight's stability_warnings_digest: the override covers exactly
+    # the warnings the owner reviewed.
+    override_stability_warnings: bool = False
+    stability_warnings_digest: str | None = _Field(default=None, pattern=r"^[0-9a-f]{64}$")
 
 
 class _FirmwarePreflightIn(_BaseModel):
@@ -5560,12 +6296,48 @@ class _FirmwarePreflightIn(_BaseModel):
     zone_id: str = _Field(min_length=1, max_length=100)
 
 
+class _FirmwareBulkCampaignIn(_BaseModel):
+    model_config = _ConfigDict(extra="forbid")
+    release_id: str = _Field(min_length=1, max_length=100)
+    zone_ids: list[_Annotated[str, _Field(min_length=1, max_length=100)]] = _Field(min_length=1, max_length=30)
+    idempotency_key: str = _Field(min_length=8, max_length=120)
+
+    @_field_validator("zone_ids")
+    @classmethod
+    def _distinct_zones(cls, value: list[str]) -> list[str]:
+        if len(set(value)) != len(value):
+            raise ValueError("Each zone may appear once.")
+        return value
+
+
+class _FirmwareRetryTargetIn(_BaseModel):
+    model_config = _ConfigDict(extra="forbid")
+    deployment_id: str = _Field(min_length=1, max_length=100)
+    # One click; accepted and ignored for an older open dashboard tab.
+    reason: str | None = _Field(default=None, max_length=200)
+    typed_confirmation: str | None = _Field(default=None, max_length=80)
+    password: str | None = _Field(default=None, max_length=512)
+    override_stability_warnings: bool = False
+    stability_warnings_digest: str | None = _Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    # The campaign's other PENDING deployments that resuming it also offers.
+    resume_pending_deployments: int = _Field(default=0, ge=0, le=10_000)
+
+
 class _FirmwareControlIn(_BaseModel):
+    # Release revocation keeps its audited reason and step-up password.
     # FirmwareCampaign.pause_reason is deliberately bounded to 200 characters.
     # Validate at the API boundary so an overlong audit reason is a clear 422,
     # not a database error after the operator has already stepped up.
     reason: str = _Field(min_length=10, max_length=200)
     password: str = _Field(min_length=1, max_length=512)
+
+
+class _FirmwareCampaignControlIn(_BaseModel):
+    # Pause, resume and cancel are one click. An optional reason (still
+    # bounded by the 200-character pause_reason column) and a password from
+    # an older open tab are accepted; the password is ignored.
+    reason: str | None = _Field(default=None, max_length=200)
+    password: str | None = _Field(default=None, max_length=512)
 
 
 async def _require_ota_connector(
@@ -5692,6 +6464,12 @@ async def firmware_progress(
 ):
     db, connector = auth
     try:
+        # Connector, then deployment, then campaign: the order of the
+        # WebSocket heartbeat and of campaign control, so a report racing an
+        # owner's pause or cancel (or this ESP's own heartbeat) waits instead
+        # of deadlocking. Every report already took this row lock when it
+        # committed its ota_state; it is only taken first now.
+        db.execute(_select(Connector.id).where(Connector.id == connector.id).with_for_update())
         from zk_add.legacy_bld5_bridge import accept_legacy_progress
 
         legacy = accept_legacy_progress(
@@ -5700,18 +6478,34 @@ async def firmware_progress(
         if legacy is not None:
             db.commit()
             return JSONResponse(legacy, status_code=202 if legacy.get("awaiting_signed_capability") else 200)
-        deployment = _record_firmware_progress(
-            db,
-            connector=connector,
-            deployment_public_id=deployment_id,
-            state=body.state,
-            bytes_written=body.bytes_written,
-            running_version=body.running_version,
-            running_partition=body.running_partition,
-            image_sha256=body.image_sha256,
-            error_code=body.error_code,
-            error_message=body.error_message,
-        )
+        deployment = None
+        from zk_add.service import device_reported_return_candidate, record_device_reported_return
+
+        if body.state == "ROLLED_BACK" and device_reported_return_candidate(
+                db, connector=connector, deployment_public_id=deployment_id,
+                running_version=body.running_version, error_code=body.error_code):
+            # A 2.6.x return report gets the heartbeat path's evidence and
+            # classification; its 7-day reset scan runs off the event loop.
+            # Every other report keeps the unchanged synchronous path.
+            deployment = await run_in_threadpool(
+                record_device_reported_return, db, connector=connector, deployment_public_id=deployment_id,
+                bytes_written=body.bytes_written, running_version=body.running_version,
+                running_partition=body.running_partition, image_sha256=body.image_sha256,
+                error_code=body.error_code, error_message=body.error_message,
+            )
+        if deployment is None:
+            deployment = _record_firmware_progress(
+                db,
+                connector=connector,
+                deployment_public_id=deployment_id,
+                state=body.state,
+                bytes_written=body.bytes_written,
+                running_version=body.running_version,
+                running_partition=body.running_partition,
+                image_sha256=body.image_sha256,
+                error_code=body.error_code,
+                error_message=body.error_message,
+            )
     except ValueError as error:
         raise HTTPException(status_code=409, detail=str(error)) from error
     receipt = _firmware_progress_receipt(db, deployment, requested_state=body.state)
@@ -5785,6 +6579,7 @@ def list_firmware_campaigns(
     release_id: str | None = Query(default=None, max_length=100),
     cursor: int | None = Query(default=None, ge=1),
     limit: int | None = Query(default=None, ge=1, le=200),
+    include_archived: bool = False,
     auth: tuple[Session, AdminContext] = Depends(require_admin),
 ):
     db, _ = auth
@@ -5797,6 +6592,7 @@ def list_firmware_campaigns(
         cursor=cursor,
         limit=limit,
         include_deployments=view == "full",
+        include_archived=include_archived,
     )
     return {
         **result,
@@ -5838,65 +6634,274 @@ async def start_firmware_campaign(
     body: _FirmwareCampaignIn,
     auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
 ):
-    db, context = auth
     if not (settings.firmware_ota_enabled or settings.firmware_hil_enabled):
         raise HTTPException(status_code=409, detail="Firmware OTA remains disabled until pilot acceptance.")
-    require_step_up(body.password, db, context)
-    try:
-        campaign = _create_firmware_campaign(
-            db, release_public_id=body.release_id, zone_id=body.zone_id, reason=body.reason,
-            typed_confirmation=body.typed_confirmation, actor=context.username,
-            scope_token=body.scope_token, idempotency_key=body.idempotency_key,
-        )
-    except (ValueError, RuntimeError) as error:
-        raise HTTPException(status_code=409, detail=str(error)) from error
-    from zk_add.zkt_hil_schedule import campaign_audit_scope
-    _append_audit(db, actor=context.username, action="FIRMWARE_CAMPAIGN_CREATED", target_type="zone",
-                  target_id=body.zone_id, outcome="ACTIVE", after={"campaign_id": campaign.campaign_id,
-                      "release_id": body.release_id, **campaign_audit_scope(db, campaign)})
-    db.commit()
+
+    def persist():
+        # One click (session + CSRF): no step-up or typed version. The scope
+        # locks and the 7-day stability scans stay off the event loop that
+        # serves the device WebSockets.
+        db, context = auth
+        try:
+            campaign = _create_firmware_campaign(
+                db, release_public_id=body.release_id, zone_id=body.zone_id, reason=body.reason,
+                actor=context.username,
+                scope_token=body.scope_token, idempotency_key=body.idempotency_key,
+                override_stability_warnings=body.override_stability_warnings,
+                stability_warnings_digest=body.stability_warnings_digest,
+            )
+        except (ValueError, RuntimeError) as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        from zk_add.zkt_hil_schedule import campaign_audit_scope
+        _append_audit(db, actor=context.username, action="FIRMWARE_CAMPAIGN_CREATED", target_type="zone",
+                      target_id=body.zone_id, outcome="ACTIVE", after={"campaign_id": campaign.campaign_id,
+                          "release_id": body.release_id, **campaign_audit_scope(db, campaign),
+                          **({"override_stability_warnings": True,
+                              "stability_warnings_digest": body.stability_warnings_digest}
+                             if body.override_stability_warnings else {})})
+        db.commit()
+        return {"campaign_id": campaign.campaign_id, "status": campaign.status,
+                "eligible": campaign.eligible_count, "legacy_skipped": campaign.legacy_skipped_count}
+
+    result = await run_in_threadpool(persist)
     await browser_events.publish(
         "firmware",
-        {"campaign_id": campaign.campaign_id, "status": campaign.status, "zone_id": body.zone_id},
+        {"campaign_id": result["campaign_id"], "status": result["status"], "zone_id": body.zone_id},
     )
-    return {"campaign_id": campaign.campaign_id, "status": campaign.status,
-            "eligible": campaign.eligible_count, "legacy_skipped": campaign.legacy_skipped_count}
+    return result
+
+
+def _firmware_ota_open() -> None:
+    if not (settings.firmware_ota_enabled or settings.firmware_hil_enabled):
+        raise HTTPException(status_code=409, detail="Firmware OTA remains disabled until pilot acceptance.")
+
+
+@app.post("/api/v1/firmware/campaigns/bulk")
+async def start_firmware_campaigns_for_zones(
+    body: _FirmwareBulkCampaignIn,
+    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+):
+    """One click: one campaign per zone (each in its own savepoint) from a fresh scope preview.
+
+    Each zone reports CREATED, BUSY (a campaign with a queued or updating
+    device already runs there) or BLOCKED (the server's reason). Every OTA
+    guard is unchanged: a created campaign whose device is offline simply
+    waits.
+    """
+    from zk_add.firmware_campaigns import create_for_zones
+
+    _firmware_ota_open()
+
+    def persist():
+        db, context = auth
+        try:
+            result = create_for_zones(db, release_public_id=body.release_id, zone_ids=body.zone_ids,
+                                      actor=context.username, idempotency_key=body.idempotency_key)
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        db.commit()
+        return result
+
+    result = await run_in_threadpool(persist)
+    for row in result["results"]:
+        if row["outcome"] == "CREATED":
+            await browser_events.publish(
+                "firmware", {"campaign_id": row["campaign_id"], "status": row["status"], "zone_id": row["zone_id"]})
+        for closed in row["closed"]:
+            await browser_events.publish("firmware", closed)
+    return result
+
+
+@app.post("/api/v1/firmware/campaigns/archive-cancelled")
+async def archive_closed_firmware_campaigns(
+    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+):
+    """One click: hide every cancelled or completed campaign; their evidence is unchanged."""
+    from zk_add.firmware_campaigns import archive_closed
+
+    def persist():
+        db, context = auth
+        archived = archive_closed(db, actor=context.username)
+        if archived:
+            _append_audit(db, actor=context.username, action="FIRMWARE_CAMPAIGNS_ARCHIVED",
+                          target_type="firmware_campaigns", target_id=None, outcome="ARCHIVED",
+                          after={"archived": len(archived), "campaign_ids": archived[:500]})
+        db.commit()
+        return len(archived)
+
+    archived = await run_in_threadpool(persist)
+    if archived:
+        await browser_events.publish("firmware", {"archived": archived})
+    return {"archived": archived}
+
+
+@app.post("/api/v1/firmware/campaigns/clear-history")
+async def clear_firmware_campaign_history(
+    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+):
+    """One click: finish, cancel, then delete or archive old firmware attempts.
+
+    A campaign with a device mid-install in the last 6 hours keeps running
+    (reported in kept_running). Only campaigns that never offered anything
+    and are evidence for no other check are deleted; the rest are archived.
+    """
+    from zk_add.firmware_campaigns import clear_history
+
+    def persist():
+        db, context = auth
+        try:
+            result = clear_history(db, actor=context.username)
+            db.commit()
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        except OperationalError as error:
+            if not database_busy(error):
+                raise
+            raise HTTPException(status_code=503, detail={
+                "code": "ADD_BUSY", "message": "ADD's database is busy. Press Clear firmware history again.",
+            }) from error
+        return result
+
+    result = await run_in_threadpool(persist)
+    await browser_events.publish("firmware", {"history_cleared": True})
+    return result
+
+
+@app.get("/api/v1/firmware/campaigns/{campaign_id}/retry-target")
+def preview_firmware_campaign_retry_target(
+    campaign_id: str,
+    deployment_id: str = Query(min_length=1, max_length=100),
+    auth: tuple[Session, AdminContext] = Depends(require_admin),
+):
+    """What the owner reviews before "Retry same target": refusal, stability warnings, ESP state.
+
+    Read-only; the 7-day stability scan runs only here and in the retry itself.
+    """
+    from zk_add.ota_interruption import retry_preflight
+
+    db, _context = auth
+    try:
+        return retry_preflight(db, campaign_public_id=campaign_id, deployment_public_id=deployment_id)
+    except LookupError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+
+
+# Registered before the generic {action} route, which would otherwise match.
+@app.post("/api/v1/firmware/campaigns/{campaign_id}/retry-target")
+async def retry_firmware_campaign_target(
+    campaign_id: str,
+    body: _FirmwareRetryTargetIn,
+    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+):
+    """Owner-only: one new attempt for a target boot ADD classified as interrupted."""
+    from zk_add.ota_interruption import retry_interrupted_target
+
+    if not (settings.firmware_ota_enabled or settings.firmware_hil_enabled):
+        raise HTTPException(status_code=409, detail="Firmware OTA remains disabled until pilot acceptance.")
+
+    def persist():
+        # One click (session + CSRF). Row locks and the 7-day stability scan
+        # stay off the event loop.
+        db, context = auth
+        try:
+            result = retry_interrupted_target(
+                db, campaign_public_id=campaign_id, deployment_public_id=body.deployment_id,
+                actor=context.username, reason=body.reason,
+                override_stability_warnings=body.override_stability_warnings,
+                stability_warnings_digest=body.stability_warnings_digest,
+                resume_pending_deployments=body.resume_pending_deployments,
+            )
+        except LookupError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        _append_audit(db, actor=context.username, action="FIRMWARE_CAMPAIGN_RETRY_TARGET",
+                      target_type="firmware_campaign", target_id=campaign_id, outcome=result["status"],
+                      after={"reason": body.reason or "One-click retry", "deployment_id": result["deployment_id"],
+                             "retry_of": result["retry_of"], "connector_id": result["connector_id"],
+                             "stability_warnings_overridden": result["stability_warnings_overridden"],
+                             "resumed_pending_deployments": result["resumed_pending_deployments"]})
+        db.commit()
+        return result
+
+    result = await run_in_threadpool(persist)
+    await browser_events.publish("firmware", {"campaign_id": campaign_id, "status": result["status"]})
+    return result
+
+
+# Registered before the generic {action} route, which would otherwise match.
+@app.post("/api/v1/firmware/campaigns/{campaign_id}/archive")
+async def archive_firmware_campaign(
+    campaign_id: str,
+    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+):
+    """One click: hide a cancelled or completed campaign. Idempotent; evidence is unchanged."""
+    from zk_add.firmware_campaigns import archive_campaign
+
+    def persist():
+        db, context = auth
+        try:
+            campaign, changed = archive_campaign(db, campaign_public_id=campaign_id, actor=context.username)
+        except LookupError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        if changed:
+            _append_audit(db, actor=context.username, action="FIRMWARE_CAMPAIGN_ARCHIVED",
+                          target_type="firmware_campaign", target_id=campaign_id, outcome=campaign.status,
+                          after={"zone_id": campaign.zone_id,
+                                 "archived_at": ensure_utc(campaign.archived_at).isoformat()})
+        result = {"campaign_id": campaign_id, "status": campaign.status,
+                  "archived_at": ensure_utc(campaign.archived_at), "archived_by": campaign.archived_by}
+        db.commit()
+        return result, changed
+
+    result, changed = await run_in_threadpool(persist)
+    if changed:
+        await browser_events.publish("firmware", {"campaign_id": campaign_id, "archived": True})
+    return result
 
 
 @app.post("/api/v1/firmware/campaigns/{campaign_id}/{action}")
 async def control_firmware_campaign(
     campaign_id: str,
     action: _Literal["pause", "resume", "cancel"],
-    body: _FirmwareControlIn,
+    body: _FirmwareCampaignControlIn | None = None,
     auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
 ):
-    db, context = auth
-    require_step_up(body.password, db, context)
-    campaign = db.scalar(_select(_FirmwareCampaign).where(_FirmwareCampaign.campaign_id == campaign_id))
-    if campaign is None:
-        raise HTTPException(status_code=404, detail="Firmware campaign not found.")
-    if action == "resume":
-        release = db.get(_FirmwareRelease, campaign.release_id)
-        if release is None or release.state not in {"AVAILABLE", "HIL_ONLY"}:
-            raise HTTPException(
-                status_code=409,
-                detail="This campaign cannot resume because its signed release is unavailable.",
-            )
-    campaign.status = {"pause": "PAUSED", "resume": "ACTIVE", "cancel": "CANCELLED"}[action]
-    campaign.pause_reason = body.reason if action != "resume" else None
-    if action == "cancel":
-        for deployment in db.scalars(_select(_FirmwareDeployment).where(
-            _FirmwareDeployment.campaign_id == campaign.id,
-            _FirmwareDeployment.status.in_(["PENDING", "OFFERED", "DOWNLOADING"]))):
-            deployment.status = "CANCELLED"
-    _append_audit(db, actor=context.username, action=f"FIRMWARE_CAMPAIGN_{action.upper()}",
-                  target_type="firmware_campaign", target_id=campaign_id,
-                  outcome=campaign.status, after={"reason": body.reason})
-    db.commit()
+    def persist():
+        # One click (session + CSRF). The control takes row locks; keep it
+        # off the event loop. Pause only from ACTIVE, resume only from
+        # PAUSED, cancel only from ACTIVE or PAUSED: anything else is a 409.
+        db, context = auth
+        reason = getattr(body, "reason", None)
+        try:
+            campaign, failed = _control_firmware_campaign_state(
+                db, campaign_public_id=campaign_id, action=action, reason=reason)
+        except LookupError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        _append_audit(db, actor=context.username, action=f"FIRMWARE_CAMPAIGN_{action.upper()}",
+                      target_type="firmware_campaign", target_id=campaign_id,
+                      outcome=campaign.status, after={"reason": campaign.pause_reason or reason or "One click",
+                                                      **({"held_downloads_failed": failed} if failed else {})})
+        try:
+            db.commit()
+        except IntegrityError as error:
+            # A resume raced another campaign into this zone (its partial unique index).
+            db.rollback()
+            raise HTTPException(status_code=409, detail="This zone already has another active or paused "
+                                                        "firmware campaign.") from error
+        return campaign.status
+
+    status = await run_in_threadpool(persist)
     await browser_events.publish(
-        "firmware", {"campaign_id": campaign_id, "status": campaign.status}
+        "firmware", {"campaign_id": campaign_id, "status": status}
     )
-    return {"campaign_id": campaign_id, "status": campaign.status}
+    return {"campaign_id": campaign_id, "status": status}
 
 
 @app.post("/api/v1/firmware/releases/{release_id}/revoke")
@@ -5905,29 +6910,38 @@ async def revoke_firmware_release(
     body: _FirmwareControlIn,
     auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
 ):
-    db, context = auth
-    require_step_up(body.password, db, context)
-    release = db.scalar(_select(_FirmwareRelease).where(_FirmwareRelease.release_id == release_id))
-    if release is None:
-        raise HTTPException(status_code=404, detail="Firmware release not found.")
-    release.state = "REVOKED"
-    release.revoked_at = _ota_utc_now()
-    release.revoked_by = context.username
-    for campaign in db.scalars(_select(_FirmwareCampaign).where(
-        _FirmwareCampaign.release_id == release.id,
-        _FirmwareCampaign.status.in_(["ACTIVE", "PAUSED"]))):
-        campaign.status = "PAUSED"
-        # The complete operator reason remains in the audit event below.
-        # Reserve the prefix within the column's 200-character bound too.
-        campaign.pause_reason = f"Release revoked: {body.reason}"[:200]
-    _append_audit(db, actor=context.username, action="FIRMWARE_RELEASE_REVOKED",
-                  target_type="firmware_release", target_id=release_id,
-                  outcome="REVOKED", after={"reason": body.reason})
-    db.commit()
+    def persist():
+        # Failing a held download takes row locks; keep them off the event loop.
+        db, context = auth
+        require_step_up(body.password, db, context)
+        release = db.scalar(_select(_FirmwareRelease).where(_FirmwareRelease.release_id == release_id))
+        if release is None:
+            raise HTTPException(status_code=404, detail="Firmware release not found.")
+        release.state = "REVOKED"
+        release.revoked_at = _ota_utc_now()
+        release.revoked_by = context.username
+        from zk_add.ota_interruption import fail_held_downloads
+
+        for campaign in db.scalars(_select(_FirmwareCampaign).where(
+            _FirmwareCampaign.release_id == release.id,
+            _FirmwareCampaign.status.in_(["ACTIVE", "PAUSED"]))).all():
+            # A 2.6.x download held for a re-offer fails closed: nothing re-offers it.
+            fail_held_downloads(db, campaign.id, reason=f"the release was revoked ({body.reason})")
+            campaign.status = "PAUSED"
+            # The complete operator reason remains in the audit event below.
+            # Reserve the prefix within the column's 200-character bound too.
+            campaign.pause_reason = f"Release revoked: {body.reason}"[:200]
+        _append_audit(db, actor=context.username, action="FIRMWARE_RELEASE_REVOKED",
+                      target_type="firmware_release", target_id=release_id,
+                      outcome="REVOKED", after={"reason": body.reason})
+        db.commit()
+        return release.state
+
+    state = await run_in_threadpool(persist)
     await browser_events.publish(
-        "firmware", {"release_id": release_id, "state": release.state}
+        "firmware", {"release_id": release_id, "state": state}
     )
-    return {"release_id": release_id, "state": release.state}
+    return {"release_id": release_id, "state": state}
 
 
 # Physical provisioning is isolated in an additive router so the existing

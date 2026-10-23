@@ -153,7 +153,9 @@ jobs:
               $campaign.status -ne 'CANCELLED' -or
               [int]$campaign.eligible -ne 1 -or
               [int]$campaign.legacy_skipped -ne 0 -or
-              [int]$campaign.counts.SUCCEEDED -ne 1
+              [int]$campaign.counts.SUCCEEDED -ne 1 -or
+              [int]$campaign.counts.ROLLED_BACK -ne 0 -or
+              [int]$campaign.counts.FAILED -ne 0
             ) {
               throw 'Exact closed production-canary campaign did not contain one successful deployment.'
             }
@@ -308,7 +310,7 @@ jobs:
                 -Method Get `
                 -Uri (
                   "$env:ADD_BASE_URL/api/v1/reconciliations" +
-                  "?connector_id=$($row.connector_id)&status_group=COMPLETED&limit=20"
+                  "?connector_id=$($row.connector_id)&status_group=COMPLETED&include_archived=true&limit=20"
                 ) `
                 -WebSession $session `
                 -TimeoutSec 30

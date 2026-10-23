@@ -4,6 +4,7 @@ A roster is an observation, not proof about all preceding time. Continuity start
 at the first retained observation and breaks on partial snapshots or replacement.
 """
 
+import re
 from dataclasses import dataclass
 from datetime import timedelta
 
@@ -166,6 +167,11 @@ def near_live_reconcile_capture(event: AttendanceEvent) -> bool:
 TERMINAL_RECONCILE_SOURCES = frozenset({
     "CURRENT_RECONCILE", "DUMP_RECONNECT", "DUMP_STARTUP", "RECONCILE_15M", "FULL_HISTORY",
 })
+# Legacy (pre source-coverage) firmware reads the whole attendance log after a
+# reconnect or restart and uploads it in its authenticated attendance batch,
+# usually before the next roster snapshot.
+DUMP_RECONCILE_SOURCES = frozenset({"DUMP_RECONNECT", "DUMP_STARTUP"})
+_HEX64 = re.compile(r"[0-9a-f]{64}")
 
 
 def manifest_identity_matches_event(manifest, event: AttendanceEvent) -> bool:
@@ -215,7 +221,63 @@ def owner_source_manifest(session: Session, event: AttendanceEvent):
     )
 
 
-def source_evidence(session: Session, event: AttendanceEvent, connector: Connector) -> dict | None:
+def authenticated_reconcile_batch(
+    session: Session, event: AttendanceEvent, connector: Connector
+) -> dict | None:
+    """Source proof for a legacy dump punch that has no saved terminal record.
+
+    The connector's authenticated batch carried the terminal's user ID, its
+    enrolled UID and the 64-character identity fingerprint, all read from the
+    terminal within ten minutes of ADD receiving them. This proves only what
+    the terminal reported. It always requires a retained, fingerprint-bound
+    CNIC interval for that exact user at punch time; whole-roster continuity
+    never qualifies. Any saved terminal record, from any connector, takes
+    precedence, so this applies only when none exists.
+    """
+    from zk_add.models import TerminalRecordManifest
+
+    zkt = connector.zkt_device
+    if not (
+        zkt is not None
+        and connector.firmware_family != "hikvision"
+        and event.source in DUMP_RECONCILE_SOURCES
+        and event.connector_id == connector.id
+        and event.zkt_device_id == zkt.id
+        and event.device_serial
+        and event.device_serial == zkt.confirmed_serial == zkt.serial
+        and event.clock_quality == "OK"
+        and event.uid
+        and _HEX64.fullmatch(event.event_uid or "")
+        and _HEX64.fullmatch(event.identity_terminal_fingerprint or "")
+        and plausible_reconcile_receipt(event)
+    ):
+        return None
+    if event.id is None or session.scalar(
+        select(TerminalRecordManifest.id)
+        .where(TerminalRecordManifest.attendance_event_id == event.id)
+        .limit(1)
+    ) is not None:
+        return None
+    return {
+        "kind": "AUTHENTICATED_RECONCILE_BATCH",
+        "serial": event.device_serial,
+        "requires_retained_identity": True,
+    }
+
+
+def source_evidence(
+    session: Session,
+    event: AttendanceEvent,
+    connector: Connector,
+    *,
+    allow_reconcile_batch: bool = False,
+) -> dict | None:
+    """The authenticated source of a punch, or None.
+
+    allow_reconcile_batch admits AUTHENTICATED_RECONCILE_BATCH. Only the
+    automatic synced-CNIC release (which applies its own rollout window), the
+    owner's backlog release and their pre-delivery recheck pass it.
+    """
     from zk_add.models import TerminalSourceEpoch
 
     if event.source in {"LIVE", "LIVE_POLL"}:
@@ -283,11 +345,17 @@ def source_evidence(session: Session, event: AttendanceEvent, connector: Connect
         return near_live
     if (event.raw_event or {}).get("reconciliation_source") == "VERIFIED_TERMINAL_SOURCE":
         return {"kind": "VERIFIED_TERMINAL_SOURCE", "serial": event.device_serial}
+    if allow_reconcile_batch:
+        return authenticated_reconcile_batch(session, event, connector)
     return None
 
 
 def identity_evidence(
-    session: Session, event: AttendanceEvent, connector: Connector
+    session: Session,
+    event: AttendanceEvent,
+    connector: Connector,
+    *,
+    allow_reconcile_batch: bool = False,
 ) -> IdentityEvidence | None:
     """No writes, guesses from names, tolerance before the first observation, or cross-terminal joins."""
     zkt = connector.zkt_device
@@ -303,22 +371,29 @@ def identity_evidence(
         "BLOCKED_SOURCE_CONFLICT",
     }:
         return None
-    source = source_evidence(session, event, connector)
+    source = source_evidence(
+        session, event, connector, allow_reconcile_batch=allow_reconcile_batch
+    )
     if source is None:
         return None
     when = ensure_utc(event.device_event_time)
     tolerance = timedelta(seconds=settings.identity_snapshot_capture_tolerance_seconds)
+    covers_punch = AttendanceIdentityHistory.observed_until >= when
+    if source["kind"] != "AUTHENTICATED_RECONCILE_BATCH":
+        # A punch seconds after the latest observation of an open interval.
+        # A dump row has no capture-time evidence of its own, so it waits
+        # until a later snapshot observes the same identity again.
+        covers_punch = covers_punch | (
+            AttendanceIdentityHistory.closed.is_(False)
+            & (AttendanceIdentityHistory.observed_until >= when - tolerance)
+        )
     history_query = select(AttendanceIdentityHistory).where(
         AttendanceIdentityHistory.zkt_device_id == zkt.id,
         AttendanceIdentityHistory.terminal_serial == event.device_serial,
         AttendanceIdentityHistory.user_id == event.user_id,
         AttendanceIdentityHistory.revoked.is_(False),
         AttendanceIdentityHistory.observed_from <= when,
-        (AttendanceIdentityHistory.observed_until >= when)
-        | (
-            AttendanceIdentityHistory.closed.is_(False)
-            & (AttendanceIdentityHistory.observed_until >= when - tolerance)
-        ),
+        covers_punch,
     )
     if event.uid:
         history_query = history_query.where(AttendanceIdentityHistory.uid == event.uid)
@@ -343,7 +418,7 @@ def identity_evidence(
         and event.identity_terminal_fingerprint
         and (
             near_live_reconcile_capture(event)
-            or source["kind"] == "SAVED_TERMINAL_RECORD"
+            or source["kind"] in {"SAVED_TERMINAL_RECORD", "AUTHENTICATED_RECONCILE_BATCH"}
         )
         and all(
             (

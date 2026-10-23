@@ -255,6 +255,18 @@ export interface FirmwareScopePreview {
   counts: { candidates: number; eligible: number; excluded: number; offline: number }
   eligible: Array<Pick<Device, 'connector_id' | 'display_name' | 'zone_id' | 'hardware_id' | 'connected' | 'firmware_version' | 'ota_state'>>
   excluded: Array<Pick<Device, 'connector_id' | 'display_name' | 'zone_id' | 'hardware_id' | 'connected' | 'firmware_version' | 'ota_state'> & { reason: string }>
+  // Owner-overridable ESP reset-rate and uptime warnings; never part of the signed scope.
+  stability_warnings?: FirmwareStabilityWarning[]
+  // An override must name this digest, so it covers exactly the warnings shown.
+  stability_warnings_digest?: string
+}
+
+export interface FirmwareStabilityWarning {
+  code: 'ESP_RESET_RATE_HIGH' | 'ESP_UPTIME_SHORT' | 'TARGET_BOOT_INTERRUPTED_REPEATEDLY' | string
+  connector_id: string
+  display_name?: string | null
+  message: string
+  [key: string]: unknown
 }
 
 export interface AlertQueueResponse {
@@ -598,12 +610,26 @@ export interface Overview {
     membership_reverify: number
     oldest_backlog_at: string | null
     last_attempt_at: string | null
+    missing_outbox?: number
+    held_without_outbox?: number
+    review_without_outbox?: number
+    decided_held_without_outbox?: number
+    without_outbox_total?: number
+    without_outbox_by_status?: Record<string, number>
   }
   attendance_recovery?: AttendanceRecoverySummary
 }
 
 export interface ReconciliationPreflight {
   active_user_history?: { eligible: boolean; user_count: number | null; reason: string | null }
+  recent_tail?: {
+    eligible: boolean
+    ready_now?: boolean
+    anchor_serial: number | null
+    begin_serial: number | null
+    earlier_breaks?: number[]
+    reason: string | null
+  }
   source_protocol?: string
   eligible: boolean
   ready_now: boolean
@@ -677,7 +703,29 @@ export interface SourceException {
   source_committed_cursor: number
   cursor_advanced: boolean
   oracle_action: 'EXCLUDED_FAIL_CLOSED' | 'HELD_IDENTITY_EVIDENCE_REQUIRED'
+  // Derived from the receipt that read the row; older backends omit it.
+  source_condition?:
+    | 'TERMINAL_NEWEST_RECORD_UNSETTLED'
+    | 'TERMINAL_NEWEST_RECORD_UNCONFIRMED'
+    | 'TERMINAL_NEWEST_RECORD_CORRECTED'
+    | 'TERMINAL_NEWEST_RECORD_OUT_OF_ORDER'
+    | null
+  operator_reason?: string | null
+  source_correction_ids?: string[]
+  // Detail only: later reads of this slot kept as receipts.
+  slot_receipts?: SourceSlotReceipt[]
   reviews?: SourceExceptionReview[]
+}
+
+export interface SourceSlotReceipt {
+  manifest_id: number
+  source_kind: string
+  job_id: string | null
+  raw_record_digest: string
+  disposition: string
+  decodes_as_punch: boolean
+  punch_received: boolean | null
+  observed_at: string
 }
 
 export interface SourceExceptionTotals {
@@ -715,7 +763,10 @@ export interface SourceExceptionAssurance {
   identity_unresolved_open?: number
   raw_preserved?: number
   raw_interpretation_open?: number
-  state: 'NONE' | 'REVIEW_REQUIRED' | 'IDENTITY_EVIDENCE_REQUIRED' | 'INTERPRETATION_REQUIRED' | 'REVIEWED_EXCLUSIONS' | 'CORRECTED_DERIVED_EVENTS' | 'SCOPE_MISMATCH'
+  newest_held?: number
+  newest_punch_unreceived?: number
+  state: 'NONE' | 'REVIEW_REQUIRED' | 'IDENTITY_EVIDENCE_REQUIRED' | 'INTERPRETATION_REQUIRED' | 'NEWEST_PUNCH_UNRECEIVED' | 'REVIEWED_EXCLUSIONS' | 'CORRECTED_DERIVED_EVENTS' | 'SCOPE_MISMATCH'
+
   cohort_digest: string | null
   correction_ids?: string[]
 }
@@ -734,6 +785,8 @@ export interface AttendanceRecoverySummary {
   delivery: {
     safe_retryable: number
     missing_outbox: number
+    held_without_outbox?: number
+    review_without_outbox?: number
     stale_in_flight: number
     active_in_flight?: number
     identity_held: number
@@ -903,8 +956,28 @@ export interface ReconciliationDivergenceReveal {
   new_raw_digest: string
 }
 
+export type HikvisionHistoryScope = 'ACTIVE_USERS' | 'ALL_RECORDS' | 'RECENT_TAIL'
+
 export interface ReconciliationJob {
-  scope?: 'ACTIVE_USERS' | 'ALL_RECORDS'
+  scope?: HikvisionHistoryScope
+  recent_tail?: {
+    anchor_serial: number
+    begin_serial: number
+    boundary_serial: number | null
+    earlier_breaks: number[]
+    last_serial: number | null
+    anchor_returned: boolean | null
+    pages: number
+    records: number
+    overlap_records: number
+    fact_conflicts: number
+    confirmed_conflicts: number
+    continuity_conflicts: number
+    caught_up: boolean
+    caught_up_at: string | null
+    last_page_at: string | null
+    coverage_certified: false
+  }
   active_user_scope?: {
     user_count: number
     completed_users: number
@@ -923,7 +996,7 @@ export interface ReconciliationJob {
   operator_state?: string
   operator_message?: string
   completion_outcome?: string | null
-  assurance_outcome?: 'ALL_CONFIRMED' | 'COMPLETED_WITH_IDENTITY_HOLDS' | 'COMPLETED_WITH_CORRECTIONS' | 'COMPLETED_WITH_REVIEW' | 'REVIEW_REQUIRED' | null
+  assurance_outcome?: 'ALL_CONFIRMED' | 'COMPLETED_WITH_IDENTITY_HOLDS' | 'COMPLETED_WITH_CORRECTIONS' | 'COMPLETED_WITH_REVIEW' | 'REVIEW_REQUIRED' | 'NOT_CERTIFIED' | null
   review_required?: boolean
   source_exception_assurance: SourceExceptionAssurance
   connector: null | {
@@ -1007,6 +1080,36 @@ export interface ReconciliationJob {
   oracle_certified_at: string | null
   completed_at: string | null
   updated_at: string
+  archived_at?: string | null
+  archived_by?: string | null
+}
+
+export type ReconciliationBulkOutcome = 'CREATED' | 'ALREADY_ACTIVE' | 'BLOCKED'
+
+export interface ReconciliationBulkResult {
+  connector_id: string
+  display_name: string | null
+  zone_id: string | null
+  outcome: ReconciliationBulkOutcome
+  job_id: string | null
+  status: string | null
+  message: string | null
+}
+
+export interface ReconciliationBulkResponse {
+  results: ReconciliationBulkResult[]
+  created: number
+}
+
+export interface ReconciliationClearHistoryResult {
+  cancelled: number
+  deleted: number
+  archived: number
+  kept_reasons: Record<string, number>
+  // Open jobs left running: Hikvision recent-tail capture, or an open attendance repair's source.
+  kept_running?: Record<string, number>
+  // Jobs a busy database row held past the lock timeout; the next press finishes them.
+  busy?: number
 }
 
 export interface ReconciliationScheduler {
@@ -1101,8 +1204,45 @@ export interface FirmwareCampaign {
   actor: string
   reason: string
   deployments: FirmwareDeployment[]
+  // A live campaign whose next device is held (for example while it is
+  // offline) is waiting, not stuck.
+  waiting?: { connector_id: string | null; display_name: string | null; code: string; message: string | null } | null
   created_at: string
   updated_at: string
+  archived_at?: string | null
+  archived_by?: string | null
+}
+
+// POST /api/v1/firmware/campaigns/bulk: one campaign per zone, in one click.
+export interface FirmwareBulkZoneResult {
+  zone_id: string
+  outcome: 'CREATED' | 'BUSY' | 'BLOCKED'
+  campaign_id: string | null
+  status: string | null
+  message: string | null
+  stability_warnings: FirmwareStabilityWarning[]
+  eligible: number
+  // Why the zone's first device would wait for now (e.g. NATIONWIDE_TWO_UPGRADE_RESERVATIONS).
+  fleet_hold: string | null
+  closed: Array<{ campaign_id: string; status: string }>
+}
+
+export interface FirmwareBulkResult {
+  release_id: string
+  results: FirmwareBulkZoneResult[]
+  created: number
+}
+
+// POST /api/v1/firmware/campaigns/clear-history
+export interface FirmwareHistoryCleared {
+  completed: number
+  cancelled: number
+  kept_running: Array<{ campaign_id: string; zone_id: string; connector: string | null; connector_id: string | null; state: string }>
+  // Campaigns a device's own transaction held past the lock timeout; counted in more.
+  busy?: number
+  deleted: number
+  archived: number
+  more: boolean
 }
 
 export interface FirmwareDeploymentEvent {
@@ -1142,6 +1282,79 @@ export interface FirmwareTransportDiagnostics {
   }
 }
 
+export interface FirmwareRollbackDiagnosis {
+  classification: 'TARGET_BOOT_INTERRUPTED' | 'UNCLASSIFIED' | string | null
+  unclassified_reasons?: string[]
+  summary?: string
+  target_version?: string
+  previous_version?: string
+  classified_at?: string | null
+  target_boot?: {
+    estimated_lifetime_seconds: { min: number | null; max: number | null }
+    last_progress_at: string | null
+    last_progress_state: string | null
+    last_progress_code: string | null
+    progress_reports: number
+    failure_reports: Array<{ state: string; error_code: string | null; at: string | null }>
+    logs_received: number
+    telemetry_received: number
+  }
+  previous_firmware_resets?: {
+    resets: number
+    boot_ids: number
+    online_hours: number
+    reset_rate_per_online_hour: number
+    days: number
+  }
+  // ADD's receipt of the terminal's time sync: an upper bound on when it answered.
+  terminal?: {
+    time_sync_after_new_boot_seconds: number | null
+    answered_within_30_seconds: boolean | null
+    bound?: 'upper' | null
+    source?: 'received_at' | 'inconsistent' | null
+  }
+  location_resets?: {
+    location: string | null
+    peers_checked: number
+    window_seconds: number
+    complete: boolean
+    resets: Array<{ connector_id: string; display_name: string; offset_seconds: number }>
+  }
+  reconcile_at_reset?: { running: boolean | null; last_target_activity: string | null }
+}
+
+// Campaign detail's hint only; the owner's dialog reads FirmwareRetryPreflight.
+export interface FirmwareRetryView {
+  available: boolean
+  refusal: string | null
+  interrupted_boots: number
+  limit: number
+  // Other PENDING deployments that resuming the campaign also offers.
+  pending_deployments?: number
+}
+
+// The ESP's current storage and queue state, shown with the retry.
+export interface FirmwareRetryEspState {
+  connected: boolean
+  firmware_version: string | null
+  boot_id: string | null
+  storage_reported: boolean
+  storage_durability: string | null
+  storage_io_faults: Record<string, unknown> | null
+  diagnostics_at: string | null
+  outbox_depth: number | null
+  last_heartbeat_at: string | null
+}
+
+export interface FirmwareRetryPreflight extends FirmwareRetryView {
+  campaign_id: string
+  deployment_id: string
+  target_version: string
+  stability_warnings: FirmwareStabilityWarning[]
+  stability_warnings_digest: string
+  esp_state: FirmwareRetryEspState | null
+}
+
 export interface FirmwareDeployment {
   deployment_id: string
   connector_id: string | null
@@ -1159,6 +1372,9 @@ export interface FirmwareDeployment {
   completed_at: string | null
   updated_at: string
   transport_diagnostics: FirmwareTransportDiagnostics | null
+  // Campaign detail only: re-read rollback evidence and the owner's retry hint.
+  rollback_diagnosis?: FirmwareRollbackDiagnosis | null
+  retry?: FirmwareRetryView | null
   events: FirmwareDeploymentEvent[]
 }
 
@@ -1173,6 +1389,7 @@ export interface FirmwareReleaseTotals {
 export interface FirmwareCampaignTotals {
   campaigns: Record<string, number>
   deployments: Record<string, number>
+  archived_campaigns?: number
 }
 
 export interface FirmwareListResponse<T, TTotals> {
@@ -1206,6 +1423,12 @@ export interface DeviceUser {
   machine_name_preview: string | null
   current_command_state: string | null
   read_only: boolean
+  /** The terminal name holds a CNIC ADD cannot parse (e.g. a letter before the digits). Never used. */
+  cnic_format_suspect?: boolean
+  cnic_format_suspect_reason?: 'LETTER_BEFORE_DIGITS' | 'SEPARATED_DIGITS' | 'UNSUPPORTED_SEPARATOR' | null
+  suggested_display_name?: string | null
+  /** The unparsed name carried the "-S" shift-worker marker; the edit dialog keeps it. */
+  suggested_shift_worker?: boolean
 }
 
 export interface AttendanceRepairCohortCandidate {
@@ -1565,6 +1788,7 @@ export interface IdentityIntegrity {
   total_users: number
   with_cnic: number
   missing_cnic: number
+  cnic_format_suspect_users?: number
   duplicate_groups: number
   duplicate_users: number
   resolved_duplicate_groups: number
@@ -1663,10 +1887,159 @@ export interface HistoricalIdentityReport {
   unassigned_groups?: HistoricalIdentityCandidate[]
 }
 
+export type PunchTimeCnicState = 'MATCHES_CURRENT' | 'DIFFERS' | 'CONFLICT' | 'CHANGED_NEAR_PUNCH' | 'AMBIGUOUS' | 'NONE'
+export type DirectOrdsCnicChoice = 'PUNCH_TIME' | 'CURRENT'
+/** One administrator CNIC decision, bound to the evidence the dialog showed. */
+export interface DirectOrdsCnicDecision {
+  event_id: number
+  choice: DirectOrdsCnicChoice
+  /** The preview's evidence_digest; ADD skips the choice if the evidence changed. */
+  evidence_digest: string
+  /** Required to send a punch-time CNIC another active terminal user holds today. */
+  held_by_other_confirmed: boolean
+}
+/** Evidence notes about who held the terminal user ID at punch time; they never carry a CNIC. */
+export type PunchTimeEvidenceSignal =
+  | 'REVOKED_RECORD' | 'OTHER_UID_RECORD' | 'CAPTURED_CNIC_DIFFERS' | 'CAPTURED_CNIC_MATCHES'
+  | 'PREVIOUS_HOLDER_DELETED' | 'PUNCH_LINKED_TO_OTHER_USER' | 'UID_DIFFERS' | 'IDENTITY_CONFLICT_UNRESOLVED'
+  | 'CNIC_CHANGED_NEAR_PUNCH' | 'RECORDS_TRUNCATED' | 'PUNCH_TIME_CNIC_HELD_BY_OTHER'
+  | 'PUNCH_BEFORE_FIRST_OBSERVATION' | 'GAP_BRIDGED_SAME_CNIC' | 'NAME_DIFFERS'
+  | 'RECORD_HOLDER_DELETED_BEFORE_PUNCH'
+/** Where a punch that no identity record covers sits in ADD's records of the user ID. */
+export type PunchTimeRecordPosition = 'NO_RECORDS' | 'BEFORE_FIRST_RECORD' | 'BETWEEN_RECORDS' | 'AFTER_LAST_RECORD'
+
+/** Read-only checks shown before an administrator approves a direct Oracle send. */
+export interface DirectOrdsPreviewRow {
+  event_id: number
+  zkt_device_id?: number | null
+  device_serial?: string | null
+  user_id: string
+  display_name: string | null
+  device_event_time: string
+  exclusion: string | null
+  exclusion_reason: string | null
+  cnic_source: 'SAVED_PUNCH' | 'SYNCED_USER' | 'PUNCH_TIME_HISTORY' | null
+  punch_time_cnic: PunchTimeCnicState | null
+  punch_time_cnic_masked: string | null
+  punch_time_display_name: string | null
+  /**
+   * How the other CNIC is known: a record covering the punch, records on both sides of a break,
+   * or today's own terminal user record that ended at most 30 minutes before an uncovered punch.
+   */
+  punch_time_cnic_basis?: 'COVERING_RECORD' | 'BRIDGED_GAP' | 'RECORD_BEFORE_PUNCH' | null
+  record_position?: PunchTimeRecordPosition | null
+  /** BEFORE_FIRST_RECORD: when ADD first recorded this terminal user ID. */
+  first_observed_at?: string | null
+  /** An uncovered punch: when the record before it ended and the record after it started. */
+  record_before_ended_at?: string | null
+  record_after_started_at?: string | null
+  /** NAME_DIFFERS: the name saved with the punch. */
+  punch_display_name?: string | null
+  /** Masked CNICs of anyone else ADD's records show at or near the punch time. */
+  other_cnics_masked?: string[]
+  evidence_signals?: PunchTimeEvidenceSignal[]
+  current_cnic_masked: string | null
+  uid_matches_current: boolean
+  identity_conflict_code?: string | null
+  punch_time_cnic_held_by_other?: boolean
+  cnic_choice_required: boolean
+  cnic_choices: DirectOrdsCnicChoice[]
+  default_cnic_choice: DirectOrdsCnicChoice | null
+  /** CHOOSE_CNIC: radio per group; CONFIRM_TODAY: an explicit tick per group. */
+  decision_kind?: 'CHOOSE_CNIC' | 'CONFIRM_TODAY' | null
+  /** Rows with identical evidence share one decision; mixed evidence is one row per group. */
+  decision_group?: string | null
+  auto_release_at_next_snapshot: boolean
+  awaiting_next_snapshot: boolean
+  database_guard: string
+  replaces_stopped_approval?: boolean
+  /** Echoed with a CNIC choice so ADD can refuse a choice made on older evidence. */
+  evidence_digest?: string | null
+}
+
+export interface DirectOrdsPreview {
+  rows: DirectOrdsPreviewRow[]
+  missing_event_ids: number[]
+  counts: { selected: number; refused: number; cnic_choice_required: number; auto_release_soon: number }
+}
+
+export type CheckinNotificationStatus = 'NOTIFIED' | 'PENDING' | 'RETRYING' | 'FAILED' | 'NOT_SENT'
+
+// The employee "attendance punched" phone notification for one punch. Punches
+// from before the feature have no stored row and arrive as NOT_SENT.
+export interface CheckinNotification {
+  status: CheckinNotificationStatus
+  reason: string | null
+  detail: string | null
+  sent_at: string | null
+  attempts: number
+  next_attempt_at: string | null
+  last_http_status: number | null
+  host: 'PRIMARY' | 'FALLBACK' | null
+  updated_at: string | null
+  can_retry: boolean
+  manual_retry: boolean
+}
+
+export interface CheckinNotificationOverview {
+  state: 'OK' | 'DEGRADED' | 'PAUSED' | 'OFF' | 'NOT_CONFIGURED'
+  configured: boolean
+  mode: 'OFF' | 'PILOT' | 'ALL'
+  punch_policy: 'ALL_PUNCHES' | 'FIRST_PER_DAY'
+  pilot_zone_count: number
+  pilot_cnic_count: number
+  last_success_at: string | null
+  last_failure_at: string | null
+  last_failure_category: string | null
+  consecutive_failures: number
+  preferred_host: 'PRIMARY' | 'FALLBACK'
+  primary_reprobe_at: string | null
+  paused_until: string | null
+  oldest_pending_at: string | null
+  oldest_pending_age_seconds: number
+  started_at: string | null
+  last_24h: {
+    notified: number
+    pending: number
+    retrying: number
+    failed: number
+    not_sent: number
+    not_sent_reasons: Record<string, number>
+    window_hours: number
+  }
+}
+
+export interface CheckinNotificationSettings extends CheckinNotificationOverview {
+  revision: number
+  pilot_zone_ids: string[]
+  pilot_cnics: Array<{ id: string; masked: string | null }>
+  updated_by: string | null
+  updated_at: string | null
+  endpoint_host: string | null
+  fallback_host: string | null
+  cnic_json_type: 'number' | 'string'
+  stale_window_hours: number
+  coalesce_seconds: number
+  retry_window_hours: number
+  modes: Array<'OFF' | 'PILOT' | 'ALL'>
+  punch_policies: Array<'ALL_PUNCHES' | 'FIRST_PER_DAY'>
+}
+
 export interface AttendanceEvent {
+  checkin_notification?: CheckinNotification | null
   cnic_not_linked?: boolean
   force_release?: { run_id: string; policy?: string | null; administrator: string; approved_at: string; reason: string; audit_id: number | null; snapshot_id: number | null; sync_command_id: number | null; needs_attention?: boolean; approved_identity?: { display_name: string | null; cnic_masked: string | null } | null } | null
-  direct_ords_identity?: { eligible: boolean; cnic_source: 'SAVED_PUNCH' | 'SYNCED_USER' | null; exclusion: 'UNKNOWN_USER' | 'CNIC_MISSING' | 'INVALID_EVENT_UID' | null } | null
+  direct_ords_identity?: {
+    eligible: boolean
+    cnic_source: 'SAVED_PUNCH' | 'SYNCED_USER' | null
+    exclusion:
+      | 'UNKNOWN_USER' | 'CNIC_MISSING' | 'INVALID_EVENT_UID' | 'CLOCK_INVALID' | 'TIME_IMPOSSIBLE' | 'CNIC_CONFLICT'
+      | 'IDENTITY_CONFLICT_UNRESOLVED' | 'PUNCH_TIME_RECORDS_TOO_MANY' | 'ALREADY_CONFIRMED' | null
+    /** Which CNIC the terminal held for this user ID at the punch time. */
+    punch_time_cnic?: PunchTimeCnicState | null
+    /** The send dialog must ask which CNIC to use; ADD never picks today's by user ID alone. */
+    cnic_choice_required?: boolean
+  } | null
   id: number
   event_uid: string
   device_serial: string | null

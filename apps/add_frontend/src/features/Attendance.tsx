@@ -17,9 +17,12 @@ import {
 import { Icon } from '../Icon'
 import { humanizeStatus } from '../status'
 import type { RealtimeState } from '../realtime'
-import type { AttendanceEvent, Device } from '../types'
+import type { AttendanceEvent, CheckinNotificationOverview, CheckinNotificationStatus, Device } from '../types'
 import { AttendanceReleaseHistory } from './AttendanceRelease'
+import { CheckinNotifyPill, CheckinNotifySummary, notifyStatusLabels } from './CheckinNotification'
 import { DirectOrdsSend } from './DirectOrdsSend'
+import { IdentityBacklogRelease } from './IdentityBacklogRelease'
+import { UnknownSyncedRelease } from './UnknownSyncedRelease'
 
 type AttendanceRange = 'latest' | 'today' | 'last24' | 'custom'
 type AttendanceViewMode = 'all-events' | 'needs-review' | 'release-history'
@@ -34,15 +37,26 @@ type AttendanceFilters = {
   to_time: string
   forced: string
   ords_statuses: string[]
+  notify_statuses: CheckinNotificationStatus[]
   cnic_presence: string
+  unknown_synced: string
 }
-type AttendanceResponse = { rows: AttendanceEvent[]; next_cursor: number | null; status_options?: string[] }
+type AttendanceResponse = {
+  rows: AttendanceEvent[]
+  next_cursor: number | null
+  status_options?: string[]
+  // Only the first page carries the phone notification summary.
+  checkin_notifications?: CheckinNotificationOverview | null
+}
 
 const emptyFilters: AttendanceFilters = {
   device_id: '', q: '', cnic: '', punch: '', clock_quality: '', source: '',
   from_time: '', to_time: '', forced: '',
-  ords_statuses: [], cnic_presence: '',
+  ords_statuses: [], notify_statuses: [], cnic_presence: '', unknown_synced: '',
 }
+
+const notifyFilterOptions: CheckinNotificationStatus[] = ['NOTIFIED', 'PENDING', 'RETRYING', 'FAILED', 'NOT_SENT']
+type Toast = { notice: (message: string) => void; error: (message: string) => void }
 
 const sourceLabels: Record<string, string> = {
   LIVE: 'Live capture',
@@ -101,14 +115,17 @@ function AllAttendanceEvents({
   realtimeState,
   realtimeLastSyncAt,
   onReviewEmployee,
+  toast,
 }: {
   devices: Device[]
   revision: number
   realtimeState: RealtimeState
   realtimeLastSyncAt: Date | null
   onReviewEmployee: (row: AttendanceEvent) => void
+  toast: Toast
 }) {
   const [rows, setRows] = useState<AttendanceEvent[]>([])
+  const [notifySummary, setNotifySummary] = useState<CheckinNotificationOverview | null>(null)
   const rowsRef = useRef(rows)
   rowsRef.current = rows
   const [pendingRows, setPendingRows] = useState<AttendanceEvent[]>([])
@@ -144,7 +161,7 @@ function AllAttendanceEvents({
   }, [filters.cnic, filters.from_time, filters.to_time])
 
   const requestPath = useCallback((cursor?: number) => {
-    const { ords_statuses, cnic_presence, ...singleFilters } = filters
+    const { ords_statuses, notify_statuses, cnic_presence, unknown_synced, ...singleFilters } = filters
     const params = new URLSearchParams(queryString({
       ...singleFilters,
       from_time: pktInputToUtc(filters.from_time),
@@ -153,7 +170,9 @@ function AllAttendanceEvents({
       limit: pageSize,
     }).slice(1))
     ords_statuses.forEach((status) => params.append('ords_status', status))
+    notify_statuses.forEach((status) => params.append('notify_status', status))
     if (cnic_presence) params.set('cnic_present', String(cnic_presence === 'present'))
+    if (unknown_synced) params.set('unknown_synced_cnic', 'true')
     return `/api/v1/attendance?${params.toString()}`
   }, [filters, pageSize])
 
@@ -177,6 +196,7 @@ function AllAttendanceEvents({
       setRows(response.rows)
       setNextCursor(response.next_cursor ?? null)
       if (response.status_options) setStatusOptions(response.status_options)
+      if (response.checkin_notifications) setNotifySummary(response.checkin_notifications)
       setLastUpdatedAt(new Date())
       setAnnouncement(`${response.rows.length} attendance events loaded.`)
     } catch (reason) {
@@ -205,6 +225,7 @@ function AllAttendanceEvents({
       const unseen = response.rows.filter((row) => !currentIds.has(row.event_uid))
       const newestById = new Map(response.rows.map((row) => [row.event_uid, row]))
       if (response.status_options) setStatusOptions(response.status_options)
+      if (response.checkin_notifications) setNotifySummary(response.checkin_notifications)
       const refreshedCurrent = current.map((row) => newestById.get(row.event_uid) || row)
       if (reveal || topVisible) {
         setRows(mergeByEventUid(unseen, refreshedCurrent))
@@ -345,13 +366,14 @@ function AllAttendanceEvents({
     const identity = displayIdentity(row)
     return !identity.display_name || !identity.cnic_masked || row.clock_quality !== 'OK'
   }).length
-  const filtered = Object.entries(filters).filter(([key, value]) => key !== 'ords_statuses' && Boolean(value)) as Array<[keyof AttendanceFilters, string]>
-  const activeFilterCount = filtered.length + filters.ords_statuses.length
+  const filtered = Object.entries(filters).filter(([key, value]) => key !== 'ords_statuses' && key !== 'notify_statuses' && Boolean(value)) as Array<[keyof AttendanceFilters, string]>
+  const activeFilterCount = filtered.length + filters.ords_statuses.length + filters.notify_statuses.length
   const filterLabels: Partial<Record<keyof AttendanceFilters, string>> = {
     device_id: 'Device', q: 'Search', cnic: 'Exact CNIC', punch: 'Punch',
     clock_quality: 'Clock', source: 'Capture', from_time: 'From', to_time: 'To',
     forced: 'Forced attendance',
     cnic_presence: 'CNIC',
+    unknown_synced: 'Unknown identity',
   }
   const connectionLabel = {
     connecting: 'Connecting', live: 'Realtime connected', reconnecting: 'Reconnecting', stale: 'Cached connection',
@@ -406,6 +428,7 @@ function AllAttendanceEvents({
                 <label>Manual release<select value={filters.forced} onChange={event => setFilters({ ...filters, forced: event.target.value })}><option value="">All attendance</option><option value="true">Forced attendance</option></select></label>
                 <label>CNIC availability<select value={filters.cnic_presence} onChange={event => setFilters({ ...filters, cnic_presence: event.target.value })}><option value="">Any CNIC</option><option value="present">CNIC present</option><option value="missing">CNIC missing</option></select></label>
                 <label>Exact CNIC<input inputMode="numeric" autoComplete="off" value={filters.cnic} onChange={(event) => setFilters({ ...filters, cnic: event.target.value.replace(/\D/g, '').slice(0, 13) })} placeholder="13 digits" /></label>
+                <fieldset className="attendance-status-filter"><legend>Phone notification</legend><div>{notifyFilterOptions.map((status) => <label key={status}><input type="checkbox" checked={filters.notify_statuses.includes(status)} onChange={(event) => setFilters({ ...filters, notify_statuses: event.target.checked ? [...filters.notify_statuses, status] : filters.notify_statuses.filter((item) => item !== status) })} />{notifyStatusLabels[status]}</label>)}</div></fieldset>
                 <fieldset className="attendance-status-filter"><legend>Oracle delivery status</legend><div>{statusOptions.map((status) => <label key={status}><input type="checkbox" checked={filters.ords_statuses.includes(status)} onChange={(event) => setFilters({ ...filters, ords_statuses: event.target.checked ? [...filters.ords_statuses, status] : filters.ords_statuses.filter((item) => item !== status) })} />{humanizeStatus(status)}</label>)}</div>{!statusOptions.length && <small>Status choices will appear after attendance loads.</small>}</fieldset>
                 <label>Punch<select value={filters.punch} onChange={(event) => setFilters({ ...filters, punch: event.target.value })}><option value="">All punches</option><option value="0">Check in</option><option value="1">Check out</option></select></label>
                 <label>Clock quality<select value={filters.clock_quality} onChange={(event) => setFilters({ ...filters, clock_quality: event.target.value })}><option value="">Any quality</option><option value="OK">OK</option><option value="DRIFTED">Drifted</option><option value="UNKNOWN">Unknown</option></select></label>
@@ -421,13 +444,16 @@ function AllAttendanceEvents({
         {activeFilterCount > 0 && (
           <div className="active-filter-bar" aria-label="Active attendance filters">
             <span>{activeFilterCount} active</span>
-            {filtered.map(([key, value]) => <button type="button" key={key} onClick={() => removeFilter(key)}>{filterLabels[key]}: {key === 'device_id' ? devices.find((device) => device.connector_id === value)?.display_name || value : key === 'source' ? captureLabel(value) : key === 'punch' ? punchLabel(value) : key === 'cnic_presence' ? value === 'missing' ? 'Missing' : 'Present' : value}<Icon name="x" /></button>)}
+            {filtered.map(([key, value]) => <button type="button" key={key} onClick={() => removeFilter(key)}>{filterLabels[key]}: {key === 'device_id' ? devices.find((device) => device.connector_id === value)?.display_name || value : key === 'source' ? captureLabel(value) : key === 'punch' ? punchLabel(value) : key === 'cnic_presence' ? value === 'missing' ? 'Missing' : 'Present' : key === 'unknown_synced' ? 'CNIC on synced user' : value}<Icon name="x" /></button>)}
             {filters.ords_statuses.map((status) => <button type="button" key={status} onClick={() => setFilters({ ...filters, ords_statuses: filters.ords_statuses.filter((item) => item !== status) })}>Oracle: {humanizeStatus(status)}<Icon name="x" /></button>)}
+            {filters.notify_statuses.map((status) => <button type="button" key={`notify-${status}`} onClick={() => setFilters({ ...filters, notify_statuses: filters.notify_statuses.filter((item) => item !== status) })}>Phone: {notifyStatusLabels[status]}<Icon name="x" /></button>)}
             <button className="text-button" type="button" onClick={resetFilters}>Clear all</button>
           </div>
         )}
 
+        {notifySummary && <CheckinNotifySummary summary={notifySummary} toast={toast} onChanged={() => void refreshFeed(true)} />}
         {(error || validationError) && <div className="message pattern-blocked operational-error" role="alert"><Icon name="alert" /><span>{validationError || error}</span><button className="button secondary" type="button" onClick={() => void replaceFeed()}>Retry</button></div>}
+        <UnknownSyncedRelease active={Boolean(filters.unknown_synced)} onToggle={() => { setSelected(new Map()); setFilters((current) => ({ ...current, unknown_synced: current.unknown_synced ? '' : 'true' })) }} selectedIds={[...selected.keys()]} clearSelection={() => setSelected(new Map())} refresh={refreshDirectProgress} />
         <DirectOrdsSend selected={[...selected.values()]} clearSelection={() => setSelected(new Map())} refresh={refreshDirectProgress} openRequest={singleSendRequest} selectControl={<label className="attendance-select-all"><input type="checkbox" checked={selectableRows.length > 0 && selectableRows.every((row) => selected.has(row.id))} disabled={!selectableRows.length || selected.size >= 500 && !selectableRows.every((row) => selected.has(row.id))} onChange={(event) => setSelected((current) => { const next = new Map(current); selectableRows.forEach((row) => { if (event.target.checked && next.size < 500) next.set(row.id, row); else if (!event.target.checked) next.delete(row.id) }); return next })} /> Select loaded punches</label>} />
         <div className="sr-only" aria-live="polite">{announcement}</div>
         <div ref={topSentinel} className="attendance-top-sentinel" aria-hidden="true" />
@@ -455,11 +481,17 @@ function AllAttendanceEvents({
                   <StatusBadge state={row.force_release?.needs_attention ? 'Needs attention' : row.force_release && ['PENDING', 'IN_FLIGHT', 'FAILED_RETRYABLE'].includes(row.ords_status) ? 'Waiting for Oracle' : row.ords_status} />
                   {(row.cnic_not_linked ?? (!identity.cnic_masked && !row.direct_ords_identity?.cnic_source)) && <StatusBadge state="CNIC_NOT_LINKED" />}
                   {row.force_release && <ForcedPill evidence={row.force_release} />}
+                  <CheckinNotifyPill row={row} toast={toast} onChanged={() => void refreshFeed(true)} />
                   {row.release_state && row.release_state !== 'NOT_APPLICABLE' && <StatusBadge state={row.release_state_label || row.release_state} />}
                   <small>{row.release_state === 'RELEASED' && row.effective_identity_downstream_confirmed_at ? `Oracle and downstream verified ${relativeTime(row.effective_identity_downstream_confirmed_at)}` : row.oracle_confirmed_at ? `${row.release_state && row.release_state !== 'NOT_APPLICABLE' ? 'Original disposition confirmed' : 'Confirmed'} ${relativeTime(row.oracle_confirmed_at)}` : row.release_lock_reason ? explainReleaseLock(row.release_lock_reason) : 'Confirmation pending'}</small>
                   {row.release_state === 'ELIGIBLE' && row.release_target_user_key && row.release_connector_id && <button className="text-button" type="button" onClick={() => onReviewEmployee(row)}>Review employee</button>}
                   {canSelect(row) && <button className="text-button" type="button" onClick={() => { setSelected(new Map([[row.id, row]])); setSingleSendRequest((value) => value + 1) }}>Send to ORDS</button>}
                   {row.direct_ords_identity?.exclusion === 'INVALID_EVENT_UID' && !row.oracle_confirmed_at && <small className="attention-copy">Older punch ID needs repair before Oracle can accept it.</small>}
+                  {(row.direct_ords_identity?.exclusion === 'CLOCK_INVALID' || row.direct_ords_identity?.exclusion === 'TIME_IMPOSSIBLE') && !row.oracle_confirmed_at && <small className="attention-copy">Invalid punch time; it is never sent to Oracle.</small>}
+                  {row.direct_ords_identity?.punch_time_cnic === 'DIFFERS' && !row.oracle_confirmed_at && <small className="attention-copy">CNIC changed since this punch; sending asks which CNIC to use.</small>}
+                  {row.direct_ords_identity?.exclusion === 'CNIC_CONFLICT' && !row.oracle_confirmed_at && <small className="attention-copy">Another CNIC or person held this user ID at or near punch time; it cannot be sent by hand.</small>}
+                  {row.direct_ords_identity?.exclusion === 'IDENTITY_CONFLICT_UNRESOLVED' && !row.oracle_confirmed_at && <small className="attention-copy">Duplicate CNIC not resolved; resolve it in ADD Users before sending.</small>}
+                  {row.direct_ords_identity?.punch_time_cnic === 'CHANGED_NEAR_PUNCH' && !row.oracle_confirmed_at && <small className="attention-copy">CNIC changed near this punch; sending asks which CNIC to use.</small>}
                 </div>
                 <details className="attendance-event-details"><summary aria-label={`View event details for ${identity.display_name || `user ${row.user_id}`}`} title="Event details"><Icon name="chevron" /><span>Details</span></summary><div><span><small>Terminal IDs</small><strong>UID {row.uid || '—'} · User {row.user_id}</strong></span><span><small>Captured / received</small><strong>{dateTime(row.captured_at)} / {dateTime(row.received_at)}</strong></span><span><small>Clock evidence</small><strong>{row.clock_drift_seconds == null ? humanizeStatus(row.clock_quality) : `${Math.round(row.clock_drift_seconds)}s drift · ${humanizeStatus(row.clock_quality)}`}</strong></span><span><small>Event UID</small><code>{row.event_uid}</code></span><span><small>Original Oracle disposition</small><strong>{humanizeStatus(row.ords_status)}</strong></span><span><small>Effective release state</small><strong>{row.release_state_label || 'Not released'}{row.latest_release_job_id ? ` · job ${row.latest_release_job_id}` : ''}</strong></span></div></details>
               </article>
@@ -611,8 +643,9 @@ export function AttendanceView({
         role="tabpanel"
         aria-labelledby={`attendance-${mode}-tab`}
       >
-        {mode === 'all-events' && <AllAttendanceEvents devices={devices} revision={revision} realtimeState={realtimeState} realtimeLastSyncAt={realtimeLastSyncAt} onReviewEmployee={reviewEmployee} />}
+        {mode === 'all-events' && <AllAttendanceEvents devices={devices} revision={revision} realtimeState={realtimeState} realtimeLastSyncAt={realtimeLastSyncAt} onReviewEmployee={reviewEmployee} toast={safeToast} />}
         {mode === 'needs-review' && <ManualForceRelease devices={devices} toast={safeToast} initialConnectorId={reviewConnectorId} />}
+        {mode === 'needs-review' && <IdentityBacklogRelease devices={devices} toast={safeToast} />}
         {mode === 'release-history' && <AttendanceReleaseHistory devices={devices} revision={revision} toast={safeToast} initialJobId={releaseJobId} />}
         {mode === 'release-history' && <SafeAttendanceRepair devices={devices} toast={safeToast} />}
       </div>

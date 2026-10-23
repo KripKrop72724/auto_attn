@@ -8,18 +8,98 @@ on:
         required: true
         type: string
       confirmation:
-        description: Type CREATE ADD FIRMWARE VAULT
+        description: Type CREATE ADD FIRMWARE VAULT or BUILD USB WIFI RESCUE HIL
         required: true
         type: string
+      wifi_profile:
+        description: USB rescue profile (direct uses the separately protected Lahore site credentials)
+        type: choice
+        default: setup-ap
+        options:
+          - setup-ap
+          - lahore-direct
 
 permissions:
   contents: read
+  checks: read
 
 concurrency:
   group: zone-lite-firmware-signing-vault
   cancel-in-progress: false
 
 jobs:
+  usb-wifi-rescue-build:
+    if: github.ref == 'refs/heads/main' && inputs.confirmation == 'BUILD USB WIFI RESCUE HIL' && inputs.device_mac == '14:c1:9f:46:ae:1c'
+    runs-on: ubuntu-latest
+    environment: firmware-signing
+    timeout-minutes: 30
+    env:
+      SLIC_RESCUE_WIFI_PASSWORD: ${{ secrets.LAHORE_USB_RESCUE_WIFI_PASSWORD }}
+      SLIC_RESCUE_DIRECT_WIFI_PASSWORD: ${{ secrets.LAHORE_USB_DIRECT_WIFI_PASSWORD }}
+      SLIC_RESCUE_WIFI_PROFILE: ${{ inputs.wifi_profile || 'setup-ap' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Require every current ADD gate for this exact main commit
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/check-runs?per_page=100" > /tmp/rescue-checks.json
+          python - <<'PY'
+          import json
+          checks = json.load(open('/tmp/rescue-checks.json'))['check_runs']
+          for name in ('repository-contract', 'windows-publication', 'firmware', 'backend', 'backend-static', 'frontend', 'oracle-projection', 'containers'):
+              matches = [r for r in checks if r['name'] == name and r['app']['slug'] == 'github-actions']
+              if not matches or max(matches, key=lambda r: r['id'])['conclusion'] != 'success':
+                  raise SystemExit('Exact main CI gate is not green: ' + name)
+          PY
+      - name: Build separate encrypted-NVS rescue and spare-only predecessor
+        run: python scripts/build_usb_wifi_rescue.py --output usb-rescue-unsigned
+      - uses: actions/upload-artifact@v4
+        with:
+          name: usb-wifi-rescue-unsigned-${{ github.sha }}
+          path: usb-rescue-unsigned/
+          retention-days: 1
+          if-no-files-found: error
+
+  usb-wifi-rescue-sign:
+    needs: usb-wifi-rescue-build
+    if: github.ref == 'refs/heads/main'
+    runs-on: [self-hosted, Windows, X64]
+    environment: firmware-signing
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: usb-wifi-rescue-unsigned-${{ github.sha }}
+          path: usb-rescue-unsigned
+      - name: Sign HIL bytes with the existing vault; never bootstrap new keys
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $vault = Join-Path $env:ProgramData 'StateLife\AttendanceDeviceDashboard\firmware-signing'
+          foreach ($entry in @(@('seed','usb-wifi-rescue-seed'), @('rescue','usb-wifi-rescue'))) {
+            ./deploy/add/bootstrap-firmware-signing.ps1 `
+              -VaultDirectory $vault `
+              -UnsignedDirectory (Join-Path $PWD ('usb-rescue-unsigned/' + $entry[0])) `
+              -OutputDirectory (Join-Path $PWD ('usb-rescue-signed/' + $entry[0])) `
+              -DeviceMac '14:c1:9f:46:ae:1c' `
+              -GitSha '${{ github.sha }}' `
+              -ImageRole $entry[1]
+          }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: usb-wifi-rescue-signed-hil-${{ github.sha }}
+          path: usb-rescue-signed/
+          retention-days: 1
+          if-no-files-found: error
+
   build:
     if: ${{ inputs.confirmation == 'CREATE ADD FIRMWARE VAULT' }}
     runs-on: ubuntu-latest

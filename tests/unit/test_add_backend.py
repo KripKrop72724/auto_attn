@@ -2007,6 +2007,7 @@ def test_duplicate_cnic_snapshot_is_quarantined_then_recovers_without_data_loss(
         "total_users": 2,
         "with_cnic": 2,
         "missing_cnic": 0,
+        "cnic_format_suspect_users": 0,
         "duplicate_groups": 1,
         "duplicate_users": 2,
         "resolved_duplicate_groups": 0,

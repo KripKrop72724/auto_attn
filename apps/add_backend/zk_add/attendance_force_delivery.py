@@ -15,6 +15,7 @@ from zk_add.attendance_force_release import delivery_payload, explain
 from zk_add.attendance_legacy_uid import matches_original, potentially_recoverable
 from zk_add.attendance_manual_guard import decision_for
 from zk_add.attendance_repair import _identity_digest, _ords_request, _protected_digest
+from zk_add.checkin_notify import note_delivered_cnic
 from zk_add.crypto import decrypt_json
 from zk_add.db import session_scope
 from zk_add.models import AttendanceEvent, AttendanceRecoveryItem, Connector, OrdsOutbox
@@ -41,13 +42,15 @@ def content_check_facts(proof, payload):
 
 
 def split_claims(claims):
+    from zk_add.attendance_direct_ords import superseded_by_automatic_release
+
     ordinary, forced = [], []
     with session_scope() as session:
         for claim in claims:
             row = session.get(OrdsOutbox, claim[0])
             event = session.get(AttendanceEvent, row.attendance_event_id) if row else None
             decision = decision_for(session, event) if event else None
-            if decision is None:
+            if decision is None or superseded_by_automatic_release(session, event, decision):
                 ordinary.append(claim)
                 continue
             connector = session.get(Connector, event.connector_id)
@@ -200,6 +203,8 @@ def persist_result(claim, classification, token=None, error_code=None, matched_e
             classification = "UNKNOWN"
         if classification in {"MATCH", "LEGACY_SOURCE_MATCH"}:
             now = utc_now()
+            # The approved payload's CNIC is the one Oracle holds for this punch.
+            note_delivered_cnic(session, event.id, claim["payload"].get("cnic"))
             row.status = event.ords_status = "ACKED_CHECK"
             row.acknowledged_at = event.oracle_confirmed_at = now
             event.oracle_confirmation_path = (

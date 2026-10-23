@@ -85,6 +85,10 @@ MESSAGES = {
     "ROLLOUT_RESTRICTED": "Force release is not enabled for this device yet.",
     "ORACLE_UNAVAILABLE": "Oracle verification is unavailable. The approved attendance is saved.",
     "ORACLE_CONFLICT": "Oracle contains different attendance or employee details. Review is required.",
+    "TERMINAL_NEWEST_RECORD_UNCONFIRMED": (
+        "This punch was read only from the terminal's newest slot, which may not have been written "
+        "yet. A complete source reconcile must confirm it before release."
+    ),
 }
 
 
@@ -681,6 +685,12 @@ def classify(session, event, connector, task, *, scan_cache=None):
         return "NEEDS_REVIEW", code, {}
     if outbox and outbox.status not in {"BLOCKED_IDENTITY", "WAITING_FOR_SNAPSHOT"}:
         return "NEEDS_REVIEW", "PERMANENT_REVIEW", {}
+    from zk_add import source_newest_slot as newest_slot
+
+    if _scan_cached(scan_cache, ("newest_only", event.id),
+                    lambda: bool(newest_slot.newest_only_event_ids(session, [event]))):
+        # Bytes read from an unwritten newest slot may carry another person's identity.
+        return "NEEDS_REVIEW", newest_slot.UNCONFIRMED_CONDITION, {}
     proof, error = identity_proof(session, event, connector, task, scan_cache=scan_cache)
     if error:
         return "NEEDS_REVIEW", error, {}
@@ -701,6 +711,10 @@ def _scan(session, job, task, connector):
         for row in session.scalars(select(OrdsOutbox).where(
                 OrdsOutbox.attendance_event_id.in_([event.id for event in events]))):
             scan_cache[("outbox", row.attendance_event_id)] = row
+        from zk_add.source_newest_slot import newest_only_event_ids
+
+        newest_only = newest_only_event_ids(session, events)
+        scan_cache.update({("newest_only", event.id): event.id in newest_only for event in events})
     for event in events:
         state, code, proof = classify(session, event, connector, task, scan_cache=scan_cache)
         session.add(

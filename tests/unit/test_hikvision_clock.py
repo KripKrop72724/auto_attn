@@ -88,6 +88,70 @@ def test_hikvision_recovery_clears_fault_only_after_proof_and_clock_expires(db):
     update(heartbeat(dict(device_epoch=now-10,sampled_epoch=now)),6)
     assert session.scalar(select(DeviceAlert).where(DeviceAlert.code=='HIK_CLOCK_DRIFT')).state=='RESOLVED'
 
+def test_slow_esp_clock_is_not_reported_as_a_fast_terminal(db):
+    # LF-ZONE-BLD1-01, 21 Oct 2026: the ESP clock ran 4,628 s slow and the
+    # terminal sample read "+4,627 s" against it; the terminal was correct.
+    from datetime import timedelta
+    from zk_add.time_utils import utc_now
+
+    session, connector = db
+    now = utc_now()
+    esp_now = int(now.timestamp()) - 4628
+    def update(p, seq, sent_at):
+        update_heartbeat(session, connector=connector, boot_id='esp-clock', sequence=seq, payload=p,
+                         device_sent_at=sent_at)
+        session.flush()
+    # One heartbeat alone proves nothing: it may have waited in a queue.
+    update(heartbeat(dict(device_epoch=esp_now + 4627, sampled_epoch=esp_now)), 1, now - timedelta(seconds=4628))
+    terminal = connector.zkt_device
+    assert terminal.device_time_sampled_at is None
+    assert session.scalar(select(DeviceAlert).where(DeviceAlert.code == 'ESP_CLOCK_SKEW')) is None
+    update(heartbeat(dict(device_epoch=esp_now + 4627, sampled_epoch=esp_now)), 2, now - timedelta(seconds=4628))
+    assert terminal.device_time_drift_seconds == -1
+    assert terminal.capability_profile['hikvision_health']['esp_clock_offset_seconds'] == 4628
+    assert session.scalar(select(DeviceAlert).where(DeviceAlert.code == 'HIK_CLOCK_DRIFT')) is None
+    skew = session.scalar(select(DeviceAlert).where(DeviceAlert.code == 'ESP_CLOCK_SKEW'))
+    assert skew.state == 'OPEN' and skew.details == {'esp_offset_seconds': 4628}
+    assert 'Do not change the terminal clock' in skew.message
+    # A genuinely fast terminal is still reported against corrected time.
+    update(heartbeat(dict(device_epoch=esp_now + 4628 + 600, sampled_epoch=esp_now)), 3, now - timedelta(seconds=4628))
+    assert terminal.device_time_drift_seconds == 600
+    assert session.scalar(select(DeviceAlert).where(DeviceAlert.code == 'HIK_CLOCK_DRIFT')).state == 'OPEN'
+    # Once the ESP clock is right again the skew alert resolves and nothing is re-based.
+    now_epoch = int(now.timestamp())
+    update(heartbeat(dict(device_epoch=now_epoch - 5, sampled_epoch=now_epoch)), 4, now)
+    update(heartbeat(dict(device_epoch=now_epoch - 5, sampled_epoch=now_epoch)), 5, now)
+    assert terminal.device_time_drift_seconds == -5
+    assert terminal.capability_profile['hikvision_health']['esp_clock_offset_seconds'] == 0
+    assert skew.state == 'RESOLVED'
+    assert session.scalar(select(DeviceAlert).where(DeviceAlert.code == 'HIK_CLOCK_DRIFT')).state == 'RESOLVED'
+
+
+def test_late_heartbeat_neither_raises_esp_skew_nor_fakes_terminal_drift(db):
+    # A correct ESP whose heartbeat waited 200 s behind a reconnect burst: the
+    # measured offset is ADD's delay, not an ESP clock error.
+    from datetime import timedelta
+    from zk_add.time_utils import utc_now
+
+    session, connector = db
+    now = utc_now()
+    epoch = int(now.timestamp())
+    def update(p, seq, sent_at):
+        update_heartbeat(session, connector=connector, boot_id='esp-late', sequence=seq, payload=p,
+                         device_sent_at=sent_at)
+        session.flush()
+    update(heartbeat(dict(device_epoch=epoch, sampled_epoch=epoch)), 1, now)
+    update(heartbeat(dict(device_epoch=epoch, sampled_epoch=epoch)), 2, now)
+    late = epoch - 200
+    update(heartbeat(dict(device_epoch=late, sampled_epoch=late)), 3, now - timedelta(seconds=200))
+    terminal = connector.zkt_device
+    assert terminal.capability_profile['hikvision_health']['esp_clock_offset_seconds'] == 0
+    assert session.scalar(select(DeviceAlert).where(DeviceAlert.code == 'ESP_CLOCK_SKEW')) is None
+    # The 200 s old sample is stale on ADD time, so it is dropped, not read as drift.
+    assert terminal.device_time_sampled_at is None and terminal.device_time_drift_seconds is None
+    assert session.scalar(select(DeviceAlert).where(DeviceAlert.code == 'HIK_CLOCK_DRIFT')) is None
+
+
 # A terminal fault is explained on a live ESP: storage failures degrade it, other
 # checks warn, and an unreachable terminal warns once it has been down for 5 min.
 @pytest.mark.parametrize('error,code,state', [(1,'HIK_CONFIGURATION','ONLINE_WITH_WARNINGS'),

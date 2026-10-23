@@ -422,7 +422,7 @@ def certify(session, connector, raws):
     return job, coverage
 
 
-def tail_chunk(session, coverage, raws, *, start: int, end: int) -> SourceTailChunkRequest:
+def tail_chunk(session, coverage, raws, *, start: int, end: int, latest: int | None = None) -> SourceTailChunkRequest:
     """The source_tail_chunk Zone Lite sends for new ordinals after a certified cutoff."""
     captured_at = utc_now().strftime("%Y-%m-%dT%H:%M:%SZ")
     records = [source_row(raw, ordinal, serial=K50, captured_at=captured_at)[0]
@@ -432,7 +432,8 @@ def tail_chunk(session, coverage, raws, *, start: int, end: int) -> SourceTailCh
     draft = SourceTailChunkRequest.model_validate({
         "source_epoch": source_epoch_uuid(session, coverage), "terminal_serial": K50,
         "terminal_generation": coverage.terminal_generation, "record_size": len(raws[0]),
-        "start_ordinal": start, "end_ordinal": end, "latest_terminal_count": end,
+        "start_ordinal": start, "end_ordinal": end,
+        "latest_terminal_count": end if latest is None else latest,
         "chunk_digest": "0" * 64, "previous_chain_digest": coverage.source_committed_chain_digest,
         "resulting_chain_digest": "0" * 64, "records": records,
     })
@@ -676,7 +677,9 @@ def test_tail_of_a_moved_terminal_commits_its_own_punches(db) -> None:
     three_fl_owned_the_terminal(db, raws)
     bld9 = _bld9(db)
     _job, coverage = certify(db, bld9, raws[:100])
-    tail = tail_chunk(db, coverage, raws, start=100, end=140)
+    # The terminal already holds a later record, so ordinal 139 is not its
+    # unwritten newest slot (see test_source_newest_slot).
+    tail = tail_chunk(db, coverage, raws, start=100, end=140, latest=141)
 
     coverage, chunk, duplicate, error_code = apply_source_tail_chunk(db, connector=bld9, payload=tail)
 

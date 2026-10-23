@@ -211,13 +211,17 @@ const scheduler = {
   history_backlog_limit: 20000,
 }
 
-function Harness({ terminal = device }: { terminal?: Device } = {}) {
+function Harness({
+  terminal = device,
+  devices,
+  revision = 0,
+}: { terminal?: Device; devices?: Device[]; revision?: number } = {}) {
   const toast = useToast()
   return (
     <>
       <ReconciliationView
-        devices={[terminal]}
-        revision={0}
+        devices={devices || [terminal]}
+        revision={revision}
         toast={toast}
       />
       {toast.toast && <div role="status">{toast.toast.text}</div>}
@@ -496,6 +500,195 @@ describe('Reviewed source-exception continuation', () => {
     expect(screen.queryByText(/assurance resumes automatically from its existing checkpoint/i)).toBeNull()
   })
 
+  it('explains an unwritten newest terminal record instead of a clock fault', async () => {
+    const unsettled: SourceException = {
+      ...sourceException,
+      source_kind: 'TAIL',
+      ordinal: 15379,
+      source_condition: 'TERMINAL_NEWEST_RECORD_UNSETTLED',
+      operator_reason:
+        'The terminal reported this ordinal as its newest record before it had written the record.',
+    }
+    const base = reconciliationFetch()
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = new URL(String(input), 'https://add.test').pathname
+      if (path === `/api/v1/source-exceptions/${sourceException.id}`) return json(unsettled)
+      const response = await base(input, init)
+      const body = await response.json()
+      if (path === '/api/v1/source-exceptions') body.rows = [unsettled]
+      return json(body)
+    }))
+    window.history.replaceState(
+      null,
+      '',
+      `/reconciliation?tab=source-exceptions&job_id=${job().job_id}&device_id=${device.connector_id}`,
+    )
+    render(<Harness />)
+
+    const row = await screen.findByRole('listitem')
+    expect(within(row).getByText(/Newest record read before the terminal wrote it/)).toBeTruthy()
+    fireEvent.click(within(row).getByRole('button', { name: 'Inspect' }))
+    expect(
+      await screen.findByRole('heading', { name: 'Terminal newest record not yet written' }),
+    ).toBeTruthy()
+    expect(screen.getByText(/reported this ordinal as its newest record/)).toBeTruthy()
+    expect(screen.queryByText('Excluded from attendance and Oracle')).toBeNull()
+  })
+
+  it('flags a source correction made from an unwritten newest record for HR', async () => {
+    const corrected: SourceException = {
+      ...sourceException,
+      source_kind: 'TAIL',
+      ordinal: 14360,
+      source_condition: 'TERMINAL_NEWEST_RECORD_CORRECTED',
+      operator_reason:
+        'A source time correction was created from this row before ADD recognised it as the terminal\'s unwritten newest record. HR must verify that punch.',
+      source_correction_ids: ['b9c8e8a0-6f4f-4a56-9a53-6a0c9f3d2e11'],
+    }
+    const base = reconciliationFetch()
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = new URL(String(input), 'https://add.test').pathname
+      if (path === `/api/v1/source-exceptions/${sourceException.id}`) return json(corrected)
+      const response = await base(input, init)
+      const body = await response.json()
+      if (path === '/api/v1/source-exceptions') body.rows = [corrected]
+      return json(body)
+    }))
+    window.history.replaceState(
+      null,
+      '',
+      `/reconciliation?tab=source-exceptions&job_id=${job().job_id}&device_id=${device.connector_id}`,
+    )
+    render(<Harness />)
+
+    const row = await screen.findByRole('listitem')
+    expect(within(row).getByText(/Corrected from an unwritten newest record; HR must verify/)).toBeTruthy()
+    expect(within(row).queryByText(/Newest record read before the terminal wrote it/)).toBeNull()
+    fireEvent.click(within(row).getByRole('button', { name: 'Inspect' }))
+    expect(
+      await screen.findByRole('heading', { name: 'Corrected from an unwritten newest record' }),
+    ).toBeTruthy()
+    expect(screen.getByText(/HR must verify that punch/)).toBeTruthy()
+    expect(screen.queryByText('Terminal newest record not yet written')).toBeNull()
+  })
+
+  it('shows a held newest-record punch and the later reads of its slot', async () => {
+    const held: SourceException = {
+      ...sourceException,
+      source_kind: 'TAIL',
+      ordinal: 15380,
+      disposition: 'IDENTITY_UNRESOLVED',
+      error_code: 'TERMINAL_NEWEST_RECORD_UNCONFIRMED',
+      observed_uid: '17',
+      observed_user_id: '44',
+      oracle_action: 'HELD_IDENTITY_EVIDENCE_REQUIRED',
+      source_condition: 'TERMINAL_NEWEST_RECORD_UNCONFIRMED',
+      operator_reason:
+        'The terminal returned these bytes from its newest slot. ADD holds them instead of sending a punch that may belong to someone else.',
+      slot_receipts: [
+        {
+          manifest_id: 9001,
+          source_kind: 'TAIL',
+          job_id: null,
+          raw_record_digest: 'e'.repeat(64),
+          disposition: 'EVENT',
+          decodes_as_punch: true,
+          punch_received: false,
+          observed_at: '2026-10-21T08:15:00Z',
+        },
+      ],
+    }
+    const base = reconciliationFetch()
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = new URL(String(input), 'https://add.test').pathname
+      if (path === `/api/v1/source-exceptions/${sourceException.id}`) return json(held)
+      const response = await base(input, init)
+      const body = await response.json()
+      if (path === '/api/v1/source-exceptions') body.rows = [{ ...held, slot_receipts: undefined }]
+      return json(body)
+    }))
+    window.history.replaceState(
+      null,
+      '',
+      `/reconciliation?tab=source-exceptions&job_id=${job().job_id}&device_id=${device.connector_id}`,
+    )
+    render(<Harness />)
+
+    const row = await screen.findByRole('listitem')
+    expect(within(row).getByText(/Newest-record punch held until LIVE capture or a reconcile confirms it/)).toBeTruthy()
+    fireEvent.click(within(row).getByRole('button', { name: 'Inspect' }))
+    expect(
+      await screen.findByRole('heading', { name: 'Held: newest-record punch not confirmed' }),
+    ).toBeTruthy()
+    expect(screen.getByText(/ADD holds them instead of sending a punch/)).toBeTruthy()
+    const reads = screen.getByRole('region', { name: 'Reads of this slot' })
+    expect(within(reads).getByText(/Decodes as a punch ADD has not received/)).toBeTruthy()
+    expect(screen.getByText(/It does not settle this slot or read its punch/)).toBeTruthy()
+    expect(screen.queryByText('Held for verified historical identity')).toBeNull()
+  })
+
+  it('shows confirmed newest-record bytes out of time order as a reviewable exclusion', async () => {
+    const outOfOrder: SourceException = {
+      ...sourceException,
+      source_kind: 'TAIL',
+      ordinal: 15381,
+      disposition: 'IDENTITY_UNRESOLVED',
+      error_code: 'TERMINAL_NEWEST_RECORD_UNCONFIRMED',
+      oracle_action: 'EXCLUDED_FAIL_CLOSED',
+      source_condition: 'TERMINAL_NEWEST_RECORD_OUT_OF_ORDER',
+      operator_reason:
+        'A complete reconcile read the same bytes again while later records existed, but their time does not lie between the punches before and after it.',
+    }
+    const base = reconciliationFetch()
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = new URL(String(input), 'https://add.test').pathname
+      if (path === `/api/v1/source-exceptions/${sourceException.id}`) return json(outOfOrder)
+      const response = await base(input, init)
+      const body = await response.json()
+      if (path === '/api/v1/source-exceptions') body.rows = [outOfOrder]
+      return json(body)
+    }))
+    window.history.replaceState(
+      null,
+      '',
+      `/reconciliation?tab=source-exceptions&job_id=${job().job_id}&device_id=${device.connector_id}`,
+    )
+    render(<Harness />)
+
+    const row = await screen.findByRole('listitem')
+    expect(within(row).getByText(/Newest-record bytes out of time order; excluded for review/)).toBeTruthy()
+    fireEvent.click(within(row).getByRole('button', { name: 'Inspect' }))
+    expect(
+      await screen.findByRole('heading', { name: 'Excluded: newest-record bytes out of time order' }),
+    ).toBeTruthy()
+    expect(screen.getByText(/does not lie between the punches before and after it/)).toBeTruthy()
+    expect(screen.queryByText('Held for verified historical identity')).toBeNull()
+  })
+
+  it('holds a job whose newest-record slot has a punch ADD has not received', async () => {
+    const pending = assurance({
+      state: 'NEWEST_PUNCH_UNRECEIVED', reviewed: 1, open: 1, newest_punch_unreceived: 1,
+    })
+    const base = reconciliationFetch()
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = new URL(String(input), 'https://add.test').pathname
+      const response = await base(input, init)
+      const body = await response.json()
+      if (path === '/api/v1/reconciliations') {
+        body.rows = [{ ...job(pending), status: 'NEEDS_ATTENTION', phase: 'FINAL_ASSURANCE',
+          wait_reason: 'SOURCE_NEWEST_PUNCH_UNRECEIVED', error_code: 'SOURCE_NEWEST_PUNCH_UNRECEIVED' }]
+      }
+      return json(body)
+    }))
+    render(<Harness />)
+
+    expect(await screen.findByText('Terminal punch not yet received')).toBeTruthy()
+    expect(screen.getByText(/1 terminal newest-record slot holds a punch ADD has not received/)).toBeTruthy()
+    expect(screen.queryByRole('button', { name: /^Retry$/ })).toBeNull()
+    expect(screen.getByRole('button', { name: 'Inspect held source records' })).toBeTruthy()
+  })
+
+
   it('redirects the retired employee-repair deep link to Attendance review', async () => {
     window.history.replaceState(
       null,
@@ -515,9 +708,29 @@ describe('Reviewed source-exception continuation', () => {
 })
 
 
+const requestBody = (fetchMock: ReturnType<typeof vi.fn>, suffix: string) => {
+  const call = fetchMock.mock.calls.find(([input, init]) =>
+    new URL(String(input), 'https://add.test').pathname.endsWith(suffix) && (init as RequestInit | undefined)?.method === 'POST')
+  return call ? JSON.parse(String((call[1] as RequestInit).body)) : undefined
+}
+
+const zktPreflight = {
+  eligible: true, ready_now: true, hard_blockers: [], waitable_blockers: [],
+  terminal: { serial: 'RKQ4245100152', connection_state: 'ONLINE', range_resume_verified: true },
+  coverage: null,
+}
+
+async function selectTerminal() {
+  fireEvent.click(screen.getByRole('button', { name: 'Select terminal' }))
+  fireEvent.click(within(screen.getByRole('listbox')).getAllByRole('option')[0])
+  const start = await screen.findByRole('button', { name: 'Reconcile now' }) as HTMLButtonElement
+  await waitFor(() => expect(start.disabled).toBe(false))
+  return start
+}
+
 describe('Hikvision reconciliation scope', () => {
   afterEach(() => { cleanup(); vi.unstubAllGlobals() })
-  it.each(['ACTIVE_USERS', 'ALL_RECORDS'] as const)('submits explicit %s scope with matching confirmation', async (scope) => {
+  it.each(['ALL_RECORDS', 'ACTIVE_USERS'] as const)('starts %s in one click with no reason, confirmation or password', async (scope) => {
     window.history.replaceState(null, '', '/reconciliation')
     const hik = { ...device, firmware_family: 'hikvision' as const }
     const fallback = reconciliationFetch()
@@ -533,23 +746,239 @@ describe('Hikvision reconciliation scope', () => {
     })
     vi.stubGlobal('fetch', fetchMock)
     render(<Harness terminal={hik} />)
-    fireEvent.click(screen.getByRole('button', { name: 'Select terminal' }))
-    fireEvent.click(within(screen.getByRole('listbox')).getByRole('option'))
-    const start = await screen.findByRole('button', { name: 'Reconcile attendance' })
-    await waitFor(() => expect((start as HTMLButtonElement).disabled).toBe(false))
+    const start = await selectTerminal()
+    const select = screen.getByLabelText('History scope') as HTMLSelectElement
+    expect(select.value).toBe('ALL_RECORDS')
+    if (scope !== 'ALL_RECORDS') fireEvent.change(select, { target: { value: scope } })
     fireEvent.click(start)
-    const select = screen.getByLabelText(/History scope/)
-    expect((select as HTMLSelectElement).value).toBe('ACTIVE_USERS')
-    if (scope === 'ALL_RECORDS') fireEvent.change(select, { target: { value: scope } })
-    const confirmation = `RECONCILE ${device.device_id} ${scope === 'ACTIVE_USERS' ? 'ACTIVE USERS' : 'FROM START'}`
-    fireEvent.change(screen.getByLabelText('Audited reason'), { target: { value: 'Recover the requested user history' } })
-    fireEvent.change(screen.getByLabelText(new RegExp(`Type ${confirmation}`)), { target: { value: confirmation } })
-    fireEvent.change(screen.getByLabelText('Administrator password'), { target: { value: 'test-only-password' } })
-    fireEvent.click(screen.getByRole('button', { name: 'Start durable reconcile' }))
-    await waitFor(() => {
-      const call = fetchMock.mock.calls.find(([input]) => String(input).endsWith('/reconciliations/full-history'))
-      expect(call).toBeTruthy()
-      expect(JSON.parse(String(call?.[1]?.body))).toMatchObject({ scope, confirmation })
+    await waitFor(() => expect(requestBody(fetchMock, '/reconciliations/full-history')).toBeTruthy())
+    const body = requestBody(fetchMock, '/reconciliations/full-history')
+    expect(body.scope).toBe(scope)
+    expect(Object.keys(body).sort()).toEqual(['idempotency_key', 'scope'])
+    expect(screen.queryByRole('dialog')).toBeNull()
+  })
+
+  it.each([true, false])('offers recent-tail recovery only when ADD holds a resume point (%s)', async (eligible) => {
+    window.history.replaceState(null, '', '/reconciliation')
+    const hik = { ...device, firmware_family: 'hikvision' as const }
+    const fallback = reconciliationFetch()
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = new URL(String(input), 'https://add.test').pathname
+      if (path === `/api/v1/devices/${device.connector_id}`) return json(hik)
+      if (path.endsWith('/reconciliations/preflight')) return json({
+        eligible: true, ready_now: true, hard_blockers: [], waitable_blockers: [],
+        terminal: null, coverage: null, source_protocol: 'hikvision-isapi-v1',
+        recent_tail: eligible
+          ? { eligible: true, ready_now: true, anchor_serial: 597801, begin_serial: 597782,
+              earlier_breaks: [512000], reason: null }
+          : { eligible: false, anchor_serial: null, begin_serial: null,
+              reason: 'ADD holds no checkpointed live-poll record for this terminal; use a full terminal audit instead.' },
+      })
+      if (path.endsWith('/reconciliations/full-history')) return json(job())
+      return fallback(input, init)
     })
+    vi.stubGlobal('fetch', fetchMock)
+    render(<Harness terminal={hik} />)
+    const start = await selectTerminal()
+    fireEvent.change(screen.getByLabelText('History scope'), { target: { value: 'RECENT_TAIL' } })
+    expect(await screen.findByText(eligible
+      ? /Resumes at terminal serial 597782.*break after serial 512000; only a full history read covers those/
+      : /holds no checkpointed live-poll record/)).toBeTruthy()
+    expect(start.disabled).toBe(!eligible)
+    if (!eligible) return
+    fireEvent.click(start)
+    await waitFor(() => expect(requestBody(fetchMock, '/reconciliations/full-history')).toMatchObject({ scope: 'RECENT_TAIL' }))
+  })
+})
+
+describe('One-click reconcile', () => {
+  beforeEach(() => window.history.replaceState(null, '', '/reconciliation'))
+  afterEach(() => { cleanup(); vi.unstubAllGlobals() })
+
+  const fetchWith = (
+    overrides: (path: string, init: RequestInit | undefined, url: URL) => Response | Promise<Response> | undefined,
+    status?: ReconciliationJob['status'],
+  ) => {
+    const fallback = reconciliationFetch(status)
+    return vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input), 'https://add.test')
+      const path = url.pathname
+      const custom = await overrides(path, init, url)
+      if (custom) return custom
+      if (path === `/api/v1/devices/${device.connector_id}`) return json(device)
+      if (path.endsWith('/reconciliations/preflight')) return json(zktPreflight)
+      if (path === '/api/v2/attendance-recovery/summary')
+        return json({ delivery: { safe_retryable: 0, identity_held: 0, permanent_review: 0 } })
+      return fallback(input, init)
+    })
+  }
+
+  it('starts a ZKT reconcile with one click and sends no password or reason', async () => {
+    const fetchMock = fetchWith((path) =>
+      path.endsWith('/reconciliations/full-history') ? json(job()) : undefined)
+    vi.stubGlobal('fetch', fetchMock)
+    render(<Harness />)
+    expect(screen.queryByText(/Jobs needing attention first/)).toBeNull()
+    expect(screen.getByText(/Newest first/)).toBeTruthy()
+    const start = await selectTerminal()
+    expect(screen.queryByLabelText('History scope')).toBeNull()
+    fireEvent.click(start)
+    expect(await screen.findByText(/Full terminal reconciliation queued/)).toBeTruthy()
+    expect(Object.keys(requestBody(fetchMock, '/reconciliations/full-history')).sort()).toEqual(['idempotency_key', 'scope'])
+    expect(screen.queryByLabelText('Administrator password')).toBeNull()
+    expect(screen.queryByLabelText('Audited reason')).toBeNull()
+  })
+
+  it('cancels with one click and archives a finished job without a reload jump', async () => {
+    let archived = false
+    const running = { ...job(assurance({ total: 0, open: 0, state: 'NONE' })), status: 'RUNNING' as const }
+    const finished = { ...job(assurance({ total: 0, open: 0, state: 'NONE' })), job_id: 'finished-job', status: 'COMPLETED' as const,
+      connector: { ...job().connector!, display_name: 'Finished terminal' } }
+    const fetchMock = fetchWith((path, init) => {
+      if (path === `/api/v1/reconciliations/${running.job_id}/cancel`) return json({ ...running, status: 'CANCELLED' })
+      if (path === '/api/v1/reconciliations/finished-job/archive') {
+        archived = true
+        return json({ ...finished, archived_at: '2026-10-23T10:00:00Z' })
+      }
+      if (path === '/api/v1/reconciliations' && (!init?.method || init.method === 'GET'))
+        return json({ enabled: true, scheduler, rows: archived ? [running] : [running, finished], next_cursor: null,
+          filtered_total: archived ? 1 : 2, totals: { all: 2, active: 1, queued_waiting: 0, paused: 0, attention: 0, completed: 1, cancelled: 0 } })
+      return undefined
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    render(<Harness />)
+    const finishedCard = (await screen.findByRole('heading', { name: 'Finished terminal' })).closest('article') as HTMLElement
+    const runningCard = screen.getByRole('heading', { name: 'ZONE-MULTAN-01' }).closest('article') as HTMLElement
+    expect(within(finishedCard).queryByRole('button', { name: 'Cancel' })).toBeNull()
+    expect(within(runningCard).getByRole('button', { name: 'Cancel & archive' })).toBeTruthy()
+
+    fireEvent.click(within(runningCard).getByRole('button', { name: 'Cancel' }))
+    await waitFor(() => expect(requestBody(fetchMock, `/${running.job_id}/cancel`)).toBeTruthy())
+    expect(Object.keys(requestBody(fetchMock, `/${running.job_id}/cancel`))).toEqual(['idempotency_key'])
+    expect(screen.queryByRole('dialog')).toBeNull()
+
+    fireEvent.click(within(finishedCard).getByRole('button', { name: 'Archive' }))
+    await waitFor(() => expect(screen.queryByRole('heading', { name: 'Finished terminal' })).toBeNull())
+    expect(screen.getByRole('heading', { name: 'ZONE-MULTAN-01' })).toBeTruthy()
+    expect(await screen.findByText('Reconciliation archived.')).toBeTruthy()
+  })
+
+  it('reconciles several terminals by zone with one click and summarises the outcome', async () => {
+    const second: Device = { ...device, connector_id: 'lahore-connector', device_id: '18', display_name: 'ZONE-LAHORE-01',
+      zone_id: 'ZONE-LAHORE', zone_name: 'Lahore' }
+    const fetchMock = fetchWith((path) => path === '/api/v1/reconciliations/bulk' ? json({
+      created: 1,
+      results: [
+        { connector_id: device.connector_id, display_name: device.display_name, zone_id: device.zone_id,
+          outcome: 'CREATED', job_id: 'new-job', status: 'QUEUED', message: null },
+        { connector_id: second.connector_id, display_name: second.display_name, zone_id: second.zone_id,
+          outcome: 'BLOCKED', job_id: null, status: null, message: 'Zone Lite 2.3.0 or newer is required.' },
+      ],
+    }) : undefined)
+    vi.stubGlobal('fetch', fetchMock)
+    render(<Harness devices={[device, second]} />)
+    fireEvent.click(screen.getByRole('button', { name: /Bulk reconcile/ }))
+    const panel = screen.getByRole('region', { name: 'Reconcile several terminals' })
+    expect(within(panel).getByText('Lahore')).toBeTruthy()
+    fireEvent.click(within(panel).getByLabelText(/Select all \(2\)/))
+    fireEvent.click(within(panel).getByRole('button', { name: 'Reconcile 2 selected' }))
+    expect(await within(panel).findByText('1 started')).toBeTruthy()
+    expect(within(panel).getByText(/Blocked — Zone Lite 2.3.0 or newer is required/)).toBeTruthy()
+    const body = requestBody(fetchMock, '/reconciliations/bulk')
+    expect(body.connector_ids.sort()).toEqual([device.connector_id, second.connector_id].sort())
+    expect(body.scope).toBe('ALL_RECORDS')
+    expect(body).not.toHaveProperty('password')
+  })
+
+  it('clears reconcile history with one click and reports the counts', async () => {
+    let cleared = false
+    const fetchMock = fetchWith((path, init) => {
+      if (path === '/api/v1/reconciliations/clear-history') {
+        cleared = true
+        return json({ cancelled: 1, deleted: 3, archived: 2, kept_reasons: { SOURCE_COVERAGE: 2 } })
+      }
+      if (path === '/api/v1/reconciliations' && cleared && (!init?.method || init.method === 'GET'))
+        return json({ enabled: true, scheduler, rows: [], next_cursor: null, filtered_total: 0,
+          totals: { all: 0, active: 0, queued_waiting: 0, paused: 0, attention: 0, completed: 0, cancelled: 0 } })
+      return undefined
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    render(<Harness />)
+    await screen.findByRole('heading', { name: 'ZONE-MULTAN-01' })
+    fireEvent.click(screen.getByRole('button', { name: /Clear reconcile history/ }))
+    expect(await screen.findByRole('status')).toBeTruthy()
+    expect(screen.getByRole('status').textContent).toMatch(/1 cancelled, 3 deleted, 2 archived/)
+    await waitFor(() => expect(screen.queryByRole('heading', { name: 'ZONE-MULTAN-01' })).toBeNull())
+  })
+
+  it('keeps the readiness panel and loaded older jobs in place when a revision arrives', async () => {
+    const page = (start: number, count: number) => Array.from({ length: count }, (_, index) => ({
+      ...job(assurance({ total: 0, open: 0, state: 'NONE' })), status: 'COMPLETED' as const,
+      job_id: `job-${start + index}`, connector: { ...job().connector!, display_name: `Terminal ${start + index}` },
+    }))
+    const listCalls: URLSearchParams[] = []
+    let preflightCalls = 0
+    const fetchMock = fetchWith((path, init, url) => {
+      if (path.endsWith('/reconciliations/preflight')) {
+        preflightCalls += 1
+        return json(zktPreflight)
+      }
+      if (path !== '/api/v1/reconciliations' || (init?.method && init.method !== 'GET')) return undefined
+      const params = url.searchParams
+      listCalls.push(params)
+      const totals = { all: 45, active: 0, queued_waiting: 0, paused: 0, attention: 0, completed: 45, cancelled: 0 }
+      if (params.get('cursor')) return json({ enabled: true, scheduler, rows: page(40, 5), next_cursor: null, filtered_total: 45, totals })
+      const limit = Number(params.get('limit'))
+      return json({ enabled: true, scheduler, rows: page(0, Math.min(limit, 45)), next_cursor: limit < 45 ? 900 : null,
+        filtered_total: 45, totals })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const view = render(<Harness revision={0} />)
+    await screen.findByRole('heading', { name: 'Terminal 0' })
+    expect(listCalls).toHaveLength(1)
+    fireEvent.click(screen.getByRole('button', { name: 'Load older jobs' }))
+    await screen.findByRole('heading', { name: 'Terminal 44' })
+    await selectTerminal()
+    expect(screen.getByText('ESP connection')).toBeTruthy()
+    const before = preflightCalls
+
+    view.rerender(<Harness revision={1} />)
+    // The panel never blanks while the refresh runs.
+    expect(screen.getByText('ESP connection')).toBeTruthy()
+    await waitFor(() => expect(preflightCalls).toBeGreaterThan(before))
+    await waitFor(() => expect(listCalls.at(-1)?.get('limit')).toBe('45'))
+    expect(listCalls.at(-1)?.get('cursor')).toBeNull()
+    expect(screen.getByText('ESP connection')).toBeTruthy()
+    expect(screen.getByRole('heading', { name: 'Terminal 44' })).toBeTruthy()
+    expect(screen.getAllByRole('heading', { name: /^Terminal \d+$/ })).toHaveLength(45)
+  })
+})
+
+describe('Hikvision recent-tail job card', () => {
+  afterEach(() => { cleanup(); vi.unstubAllGlobals() })
+
+  it('counts only records after the resume point as new', async () => {
+    const fallback = reconciliationFetch()
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const response = await fallback(input, init)
+      if (new URL(String(input), 'https://add.test').pathname !== '/api/v1/reconciliations') return response
+      const body = await response.json()
+      return json({
+        ...body,
+        rows: [{
+          ...body.rows[0],
+          mode: 'HIKVISION_SERIAL_HISTORY',
+          scope: 'RECENT_TAIL',
+          recent_tail: {
+            anchor_serial: 597801, begin_serial: 597782, boundary_serial: 597782, earlier_breaks: [],
+            last_serial: 597801, anchor_returned: true, pages: 2, records: 0, overlap_records: 20,
+            fact_conflicts: 0, confirmed_conflicts: 0, continuity_conflicts: 0, caught_up: true,
+            caught_up_at: '2026-10-22T15:00:00Z', last_page_at: '2026-10-22T15:00:00Z', coverage_certified: false,
+          },
+        }],
+      })
+    }))
+    render(<Harness />)
+    expect(await screen.findByText(/0 new records after serial 597801 · 20 held records re-read/)).toBeTruthy()
   })
 })

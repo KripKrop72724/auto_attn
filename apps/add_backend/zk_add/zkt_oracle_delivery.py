@@ -21,6 +21,7 @@ import httpx
 from sqlalchemy import select
 
 from zk_add.attendance_repair import _ords_request, _protected_digest
+from zk_add.checkin_notify import note_delivered_cnic
 from zk_add.crypto import decrypt_cnic, decrypt_json, encrypt_json
 from zk_add.db import session_scope
 from zk_add.models import (AttendanceEvent, Connector, OrdsOutbox, ZktOccurrenceAlias,
@@ -131,6 +132,7 @@ def register_intent(session, *, connector, event, outbox, alias, verification_sc
 
 
 def _current(session, intent, row):
+    from zk_add.attendance_direct_ords import superseded_by_automatic_release
     from zk_add.attendance_manual_guard import decision_for, delivery_authorized
     from zk_add.attendance_recovery import _terminal_provenance_verified
     from zk_add.attendance_safe_repair import delivery_proof_valid
@@ -148,7 +150,9 @@ def _current(session, intent, row):
             or event.event_uid != alias.occurrence_id or not connector.zkt_device
             or not _occurrence_bound(session, connector, alias)
             or not _terminal_provenance_verified(event, connector)
-            or not delivery_authorized(session, event) or decision_for(session, event) is not None
+            or not delivery_authorized(session, event)
+            or not (decision_for(session, event) is None or superseded_by_automatic_release(
+                session, event, decision_for(session, event)))
             or event.identity_resolution_status not in VERIFIED_IDENTITY_RESOLUTION_STATUSES
             or not delivery_proof_valid(session, event, connector)
             or event.clock_quality == "INVALID"
@@ -370,6 +374,7 @@ def persist_result(claim, classification, token=None):
                     response_digest=token.response_digest, verification_scope=MEMBERSHIP_SCOPE,
                     claim_attempt=claim["attempt"]))
             now = utc_now()
+            note_delivered_cnic(session, event.id, payload.get("cnic"))
             row.status = event.ords_status = "ACKED_CHECK"
             row.acknowledged_at = event.oracle_confirmed_at = now
             event.oracle_confirmation_path = "ADD_ZKT_UID_ONLY_V1"
@@ -390,6 +395,7 @@ def persist_result(claim, classification, token=None):
                     content_token=token, claim_attempt=claim["attempt"])
                 session.add(receipt)
             now = utc_now()
+            note_delivered_cnic(session, event.id, payload.get("cnic"))
             row.status = event.ords_status = "ACKED_CHECK"
             row.acknowledged_at = event.oracle_confirmed_at = now
             event.oracle_confirmation_path = "ADD_ZKT_PROJECTION_V2"

@@ -7,10 +7,26 @@ param(
     [string]$AdminUsername = 'StateHealthAdmin',
     [ValidateRange(1, 5)][int]$BatchSize = 1,
     [ValidateRange(15, 240)][int]$BatchTimeoutMinutes = 90,
-    [switch]$DeferOfflineZones
+    [switch]$DeferOfflineZones,
+    # The owner's override of ADD's ESP stability warnings, one reviewed
+    # 'ZONE_ID=<stability_warnings_digest>' pair per zone. A zone whose
+    # preflight shows warnings halts the rollout unless its current digest
+    # is listed here, so an override covers only warnings the owner saw.
+    [string[]]$ReviewedStabilityWarnings = @()
 )
 
 $ErrorActionPreference = 'Stop'
+
+$reviewedStability = @{}
+foreach ($entry in @($ReviewedStabilityWarnings | ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ })) {
+    if ($entry -notmatch '^(?<zone>[A-Za-z0-9._:-]{1,100})=(?<digest>[0-9a-f]{64})$') {
+        throw "Reviewed stability warnings must be ZONE_ID=<64 lowercase hex digest> pairs: '$entry'."
+    }
+    if ($reviewedStability.ContainsKey($Matches.zone)) {
+        throw "Zone $($Matches.zone) is listed twice in the reviewed stability warnings."
+    }
+    $reviewedStability[$Matches.zone] = $Matches.digest
+}
 
 function Invoke-AddApi {
     param(
@@ -316,7 +332,20 @@ try {
                         "offline=$($scope.counts.offline)."
                     )
                 }
-                $createdCampaign = Invoke-AddApi -Method POST -Path '/api/v1/firmware/campaigns' -Body @{
+                $stabilityWarnings = @($scope.stability_warnings | Where-Object { $null -ne $_ })
+                $stabilityDigest = [string]$scope.stability_warnings_digest
+                if ($stabilityWarnings.Count -gt 0) {
+                    $stabilityDetail = ($stabilityWarnings | ForEach-Object { [string]$_.message }) -join ' '
+                    if ($reviewedStability[$zoneId] -cne $stabilityDigest) {
+                        throw (
+                            "Zone $zoneId has ESP stability warnings: $stabilityDetail " +
+                            "Only after the owner reviews exactly these warnings, rerun with the reviewed pair " +
+                            "'$zoneId=$stabilityDigest'."
+                        )
+                    }
+                    Write-Warning "Owner-reviewed override of ESP stability warnings for zone ${zoneId}: $stabilityDetail"
+                }
+                $campaignBody = @{
                     release_id = $release.release_id
                     zone_id = $zoneId
                     reason = "Nationwide COMM Key recovery rollout $Version; batch $([int]($offset / $BatchSize) + 1)."
@@ -325,6 +354,11 @@ try {
                     scope_token = [string]$scope.scope_token
                     idempotency_key = "nationwide-$Version-$zoneId-$([guid]::NewGuid().ToString('N'))"
                 }
+                if ($stabilityWarnings.Count -gt 0) {
+                    $campaignBody.override_stability_warnings = $true
+                    $campaignBody.stability_warnings_digest = $stabilityDigest
+                }
+                $createdCampaign = Invoke-AddApi -Method POST -Path '/api/v1/firmware/campaigns' -Body $campaignBody
                 if ([int]$createdCampaign.eligible -lt 1) { throw "Zone $zoneId has no eligible deployment." }
                 $created += [pscustomobject]@{ campaign_id = $createdCampaign.campaign_id; zone_id = $zoneId; status = 'ACTIVE' }
             }
