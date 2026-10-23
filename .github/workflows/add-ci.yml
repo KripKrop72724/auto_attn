@@ -48,6 +48,18 @@ jobs:
       - name: Verify repair guards in PowerShell Core
         shell: pwsh
         run: ./tools/usb-wifi-rescue/test-guards.ps1
+      - name: Verify real repair child-process results in Windows PowerShell 5.1
+        shell: powershell
+        run: ./tools/usb-wifi-rescue/test-process.ps1
+      - name: Verify real repair child-process results in PowerShell Core
+        shell: pwsh
+        run: ./tools/usb-wifi-rescue/test-process.ps1
+      - name: Verify resume-only capture and power-cycle guards in Windows PowerShell 5.1
+        shell: powershell
+        run: ./tools/usb-wifi-rescue/test-capture.ps1
+      - name: Verify resume-only capture and power-cycle guards in PowerShell Core
+        shell: pwsh
+        run: ./tools/usb-wifi-rescue/test-capture.ps1
       - name: Verify pinned audit source after Windows checkout
         shell: powershell
         run: |
@@ -659,6 +671,8 @@ jobs:
       - name: Compile quarantined USB Wi-Fi rescue and synthetic predecessor
         env:
           SLIC_RESCUE_WIFI_PASSWORD: HIL-Recovery-Only
+          SLIC_RESCUE_DIRECT_WIFI_PASSWORD: HIL-Recovery-Only
+          SLIC_RESCUE_WIFI_PROFILE: lahore-direct
         run: python3 scripts/build_usb_wifi_rescue.py --output build-ci-usb-rescue
 
   firmware:

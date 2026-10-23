@@ -1,4 +1,4 @@
-/* Public synthetic settings only; no fleet credentials or attendance code. */
+/* Synthetic settings and configured network readback; no attendance code. */
 #include <stdio.h>
 #include <string.h>
 #include "sdkconfig.h"
@@ -11,6 +11,7 @@
 #include "freertos/task.h"
 #include "nvs.h"
 #include "nvs_flash.h"
+#include "seed_expected.h"
 
 void app_main(void)
 {
@@ -45,7 +46,7 @@ void app_main(void)
         ESP_ERROR_CHECK(nvs_set_u8(h, "provisioned", 1));
         ESP_ERROR_CHECK(nvs_set_str(h, "zone_id", "ZONE-LAHORE-01"));
         ESP_ERROR_CHECK(nvs_set_str(h, "zone_dev", "1"));
-        ESP_ERROR_CHECK(nvs_set_str(h, "wifi_ssid", ""));
+        ESP_ERROR_CHECK(nvs_set_str(h, "wifi_ssid", SEED_INITIAL_SSID));
         ESP_ERROR_CHECK(nvs_set_str(h, "wifi_pass", "old-password"));
         ESP_ERROR_CHECK(nvs_set_str(h, "connector_id", "PUBLIC-TEST-CONNECTOR"));
         ESP_ERROR_CHECK(nvs_set_u32(h, "zkt_key", 1979));
@@ -87,7 +88,8 @@ void app_main(void)
             key == 1979 && !strcmp(connector, "PUBLIC-TEST-CONNECTOR");
         printf("SLIC_RESCUE_SEED_BOOT ssid_state=%s password_matches_target=%d other_fixture_intact=%d\n",
             !ssid[0] ? "EMPTY" : !strcmp(ssid,"RE7") ? "RE7" : "OTHER",
-            !strcmp(pass,"HIL-Recovery-Only"), intact);
+            !strcmp(pass,SEED_EXPECTED_PASSWORD), intact);
+        printf("SLIC_RESCUE_SEED_NETWORK ssid_matches_target=%d\n", !strcmp(ssid,SEED_EXPECTED_SSID));
         fflush(stdout);
         vTaskDelay(pdMS_TO_TICKS(2000));
     }

@@ -11,6 +11,13 @@ on:
         description: Type CREATE ADD FIRMWARE VAULT or BUILD USB WIFI RESCUE HIL
         required: true
         type: string
+      wifi_profile:
+        description: USB rescue profile (direct uses the separately protected Lahore site credentials)
+        type: choice
+        default: setup-ap
+        options:
+          - setup-ap
+          - lahore-direct
 
 permissions:
   contents: read
@@ -28,6 +35,8 @@ jobs:
     timeout-minutes: 30
     env:
       SLIC_RESCUE_WIFI_PASSWORD: ${{ secrets.LAHORE_USB_RESCUE_WIFI_PASSWORD }}
+      SLIC_RESCUE_DIRECT_WIFI_PASSWORD: ${{ secrets.LAHORE_USB_DIRECT_WIFI_PASSWORD }}
+      SLIC_RESCUE_WIFI_PROFILE: ${{ inputs.wifi_profile || 'setup-ap' }}
     steps:
       - uses: actions/checkout@v4
         with:

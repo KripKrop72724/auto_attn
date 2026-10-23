@@ -170,7 +170,12 @@ void app_main(void)
         nvs_handle_t handle;
         err = nvs_open("zone_cfg", NVS_READWRITE, &handle);
         if (err == ESP_OK) {
-            err = rescue_wifi_keys(handle, "RE7", RESCUE_WIFI_PASSWORD, &changed);
+#if RESCUE_REPLACE_WIFI
+            printf("SLIC_WIFI_RESCUE_PROFILE direct_credentials\n");
+            err = rescue_wifi_keys_exact(handle, RESCUE_WIFI_SSID, RESCUE_WIFI_PASSWORD, &changed);
+#else
+            err = rescue_wifi_keys(handle, RESCUE_WIFI_SSID, RESCUE_WIFI_PASSWORD, &changed);
+#endif
             nvs_close(handle);
         }
     }

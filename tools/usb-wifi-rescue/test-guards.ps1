@@ -24,6 +24,11 @@ $script:devices += $script:devices[0]
 $refused = $false
 try { $null = Get-ExactUsbPort } catch { $refused = $true }
 if (-not $refused) { throw 'Ambiguous USB device accepted' }
+$ghost = [pscustomobject]@{Name='USB Serial Device (COM99)';DeviceID=$script:devices[0].DeviceID;Present=$false;ConfigManagerErrorCode=45}
+$script:devices = @($script:devices[0],$ghost)
+if ((Get-ExactUsbPort).Port -ne 'COM6') { throw 'Disconnected ghost COM port obscured the real device' }
+$script:devices = @($ghost)
+if ($null -ne (Get-ExactUsbPort -AllowMissing)) { throw 'Disconnected device was treated as present' }
 $report = @'
 ESP32-S3 in Secure Download Mode
 Flags: 0x000000c5 (0b11000101)
