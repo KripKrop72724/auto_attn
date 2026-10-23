@@ -51,6 +51,7 @@ def main():
     parser.add_argument('--tools', type=Path, required=True)
     parser.add_argument('--zig', required=True)
     parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--resume-only', action='store_true', help='Capture the repair already installed by v1.1; no host flash operations')
     args = parser.parse_args()
     if args.output.exists():
         raise ValueError('Refusing to replace an existing executable')
@@ -77,6 +78,10 @@ def main():
                 package.writestr(name, data)
             package.writestr('rescue.bin', signed)
         payload = (Path(__file__).parent / 'repair.ps1').read_text()
+        if args.resume_only:
+            if payload.count('[switch]$ResumeOnly)') != 1:
+                raise ValueError('Resume-only default cannot be safely embedded')
+            payload = payload.replace('[switch]$ResumeOnly)', '[switch]$ResumeOnly = $true)')
         payload = payload.replace('__TARGET_MAC__', 'ac:27:6e:a3:16:d4')
         payload = payload.replace('__ARCHIVE_SHA256__', hashlib.sha256(archive.read_bytes()).hexdigest())
         payload = payload.replace('__IMAGE_SHA256__', hashlib.sha256(signed).hexdigest())

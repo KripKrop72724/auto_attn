@@ -1,4 +1,4 @@
-param([string]$ReadyFile, [string]$ToolArchive, [switch]$GuiSmokeTest)
+param([string]$ReadyFile, [string]$ToolArchive, [switch]$GuiSmokeTest, [switch]$ResumeOnly)
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
@@ -18,6 +18,11 @@ $label.Size = New-Object Drawing.Size(710,55)
 $form.Controls.Add($label)
 $button = New-Object Windows.Forms.Button
 $button.Text = 'Start repair'
+if ($ResumeOnly) {
+    $form.Text = 'SLIC Attendance - Resume installed USB repair'
+    $label.Text = "The repair was installed by v1.1. Click Resume and verify.`r`nFollow the power-off and reconnect instructions."
+    $button.Text = 'Resume and verify'
+}
 $button.Location = New-Object Drawing.Point(15,80)
 $button.Size = New-Object Drawing.Size(180,35)
 $form.Controls.Add($button)
@@ -35,9 +40,13 @@ function Say([string]$Text) {
     if ($script:folder) { Add-Content -LiteralPath (Join-Path $script:folder 'progress.txt') -Value $line -Encoding UTF8 }
     [Windows.Forms.Application]::DoEvents()
 }
-function Get-ExactUsbPort {
+function Get-ExactUsbPort([switch]$AllowMissing) {
     $devicesFound = @()
     foreach ($device in @(Get-CimInstance Win32_PnPEntity -Filter "PNPClass='Ports'")) {
+        # Windows can retain disconnected COM entries. Do not let a stale
+        # device hide removal or make the reconnected target look ambiguous.
+        if ($device.PSObject.Properties['Present'] -and $device.Present -eq $false) { continue }
+        if ($device.PSObject.Properties['ConfigManagerErrorCode'] -and $null -ne $device.ConfigManagerErrorCode -and $device.ConfigManagerErrorCode -ne 0) { continue }
         if ($device.Name -notmatch '\((COM\d+)\)' -or $device.DeviceID -notmatch '^USB\\VID_303A&PID_1001') { continue }
         $portName = [regex]::Match($device.Name, '\((COM\d+)\)').Groups[1].Value
         $ancestor = $device.DeviceID
@@ -53,7 +62,8 @@ function Get-ExactUsbPort {
             $devicesFound += [pscustomobject]@{ Port=$portName; Identity=$device.DeviceID }
         }
     }
-    if ($devicesFound.Count -ne 1) { throw 'The expected ESP was not uniquely identified. Check its USB cable and close other serial programs, then run this tool again. No repair was started.' }
+    if ($devicesFound.Count -eq 0 -and $AllowMissing) { return $null }
+    if ($devicesFound.Count -ne 1) { throw 'The expected ESP was not uniquely identified. Check its USB cable and close other serial programs, then run this tool again.' }
     return $devicesFound[0]
 }
 function Run-Tool([string]$Stage, [string[]]$Arguments, [int]$TimeoutSeconds = 240) {
@@ -118,25 +128,62 @@ function Assert-SecurityProfile([string]$Report) {
         throw 'USB security differs from the tested device profile. No flash writes were made.'
     }
 }
-function Capture-Repair {
-    $label.Text = "Unplug and reconnect the ESP USB cable now.`r`nThen leave it connected and wait for the result."
-    Say 'The repair is installed. Unplug and reconnect the ESP USB cable now.'
+function Write-CaptureNote([string]$Text) {
+    Add-Content -LiteralPath (Join-Path $script:folder 'serial-detection.txt') -Value ((Get-Date -Format o) + ' ' + $Text) -Encoding UTF8
+}
+function Confirm-EspPowerOff {
+    $answer = [Windows.Forms.MessageBox]::Show(
+        "Unplug the ESP USB cable NOW. If the ESP has another power lead, remove that ESP power lead too.`r`n`r`nKeep the ESP unplugged, then click OK. Reconnect only when the next screen asks. Do not hold BOOT.",
+        'Step 1 of 2 - Unplug the ESP and keep it unplugged',
+        [Windows.Forms.MessageBoxButtons]::OKCancel,
+        [Windows.Forms.MessageBoxIcon]::Information)
+    return $answer -eq [Windows.Forms.DialogResult]::OK
+}
+function Wait-ForEspPowerOff {
+    $label.Text = "STEP 1: Unplug the ESP USB and any other ESP power.`r`nKeep it unplugged until this window asks you to reconnect."
+    while ($null -ne (Get-ExactUsbPort -AllowMissing)) {
+        Say 'ACTION REQUIRED: unplug the ESP. Keep it unplugged, then click OK in the instructions.'
+        if (-not (Confirm-EspPowerOff)) { throw 'Power-cycle step cancelled. The installed repair was left in place; run Resume and verify again when ready.' }
+        [Windows.Forms.Application]::DoEvents(); Start-Sleep -Milliseconds 500
+    }
+    Write-CaptureNote 'Expected ESP USB removal detected. Waiting five seconds before reconnect instruction.'
+}
+function New-CapturePort([string]$PortName) {
+    $port = New-Object System.IO.Ports.SerialPort $PortName,115200,([IO.Ports.Parity]::None),8,([IO.Ports.StopBits]::One)
+    $port.DtrEnable = $false; $port.RtsEnable = $false
+    $port.Handshake = [IO.Ports.Handshake]::None
+    $port.ReadTimeout = 200
+    return $port
+}
+function Capture-Repair([int]$WaitSeconds = 90, [int]$CaptureSeconds = 240, [int]$PowerOffPauseSeconds = 5) {
+    Wait-ForEspPowerOff
+    $pause = [Diagnostics.Stopwatch]::StartNew()
+    while ($pause.Elapsed.TotalSeconds -lt $PowerOffPauseSeconds) { [Windows.Forms.Application]::DoEvents(); Start-Sleep -Milliseconds 100 }
+    $label.Text = "STEP 2: Reconnect the ESP USB NOW, WITHOUT holding BOOT.`r`nThen leave it connected while data and setup Wi-Fi are checked."
+    Say 'Reconnect the ESP USB now, WITHOUT BOOT. Leave any second ESP power lead disconnected for this test.'
     Say 'Waiting for the ESP to check its data and restart the original firmware...'
-    $deadline = (Get-Date).AddSeconds(210)
+    $deadline = (Get-Date).AddSeconds($WaitSeconds)
     $raw = [IO.File]::Open((Join-Path $script:folder 'serial.bin'), [IO.FileMode]::Create, [IO.FileAccess]::Write, [IO.FileShare]::Read)
     $text = New-Object Text.StringBuilder
     $serial = $null
     $next = Get-Date
+    $firstOpen = $false
+    $lastError = ''; $nextErrorLog = Get-Date
     try {
         while ((Get-Date) -lt $deadline) {
             try {
                 if (-not $serial) {
-                    $device = Get-ExactUsbPort
-                    $serial = New-Object IO.Ports.SerialPort $device.Port,115200,([IO.Ports.Parity]::None),8,([IO.Ports.StopBits]::One)
-                    $serial.DtrEnable = $false; $serial.RtsEnable = $false
-                    $serial.Handshake = [IO.Ports.Handshake]::None
-                    $serial.ReadTimeout = 200
+                    $device = Get-ExactUsbPort -AllowMissing
+                    if ($null -eq $device) { throw 'Expected ESP USB is not connected yet. Reconnect its USB cable WITHOUT BOOT.' }
+                    $serial = New-CapturePort $device.Port
                     $serial.Open()
+                    Write-CaptureNote ("Opened $($device.Port); 115200 baud; DTR=False; RTS=False; identity=$($device.Identity)")
+                    if (-not $firstOpen) {
+                        $firstOpen = $true
+                        $deadline = (Get-Date).AddSeconds($CaptureSeconds)
+                        $label.Text = "ESP USB detected. Keep it connected.`r`nChecking the repair, saved data and setup Wi-Fi (up to 4 minutes)."
+                        Say 'ESP reconnected. Serial recorder is open. Keep USB connected.'
+                    }
                 }
                 $count = $serial.BytesToRead
                 if ($count -gt 0) {
@@ -146,6 +193,12 @@ function Capture-Repair {
                     [void]$text.Append([Text.Encoding]::UTF8.GetString($bytes,0,$count))
                 }
             } catch {
+                $detail = $_.Exception.GetType().FullName + ': ' + $_.Exception.Message
+                if ($detail -ne $lastError -or (Get-Date) -ge $nextErrorLog) {
+                    Write-CaptureNote $detail
+                    Say ('USB recorder: ' + $_.Exception.Message)
+                    $lastError = $detail; $nextErrorLog = (Get-Date).AddSeconds(5)
+                }
                 if ($serial) { $serial.Dispose(); $serial = $null }
             }
             if ((Get-Date) -ge $next) { Say 'Waiting for the repair result. Keep the ESP connected.'; $next = (Get-Date).AddSeconds(10) }
@@ -157,6 +210,7 @@ function Capture-Repair {
         $raw.Dispose()
         $completeText = [Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes((Join-Path $script:folder 'serial.bin')))
         [IO.File]::WriteAllText((Join-Path $script:folder 'serial.txt'), $completeText, (New-Object Text.UTF8Encoding($false)))
+        Write-CaptureNote ("Capture finished. Received $($completeText.Length) decoded characters; raw bytes saved in serial.bin.")
     }
     return $completeText
 }
@@ -186,8 +240,12 @@ $button.Add_Click({
         $image = Join-Path $script:extract 'rescue.bin'
         if ((Get-FileHash -LiteralPath $image -Algorithm SHA256).Hash.ToLowerInvariant() -ne $imageDigest) { throw 'Repair image verification failed. No repair was started.' }
         $device = Get-ExactUsbPort
-        Say "Correct ESP detected on $($device.Port). Checking USB security..."
+        Say "Correct ESP detected on $($device.Port)."
         $device | ConvertTo-Json | Set-Content (Join-Path $script:folder 'usb-identity.json') -Encoding UTF8
+        if ($ResumeOnly) {
+            Say 'Resume mode: using the repair already installed by v1.1. No USB flash writes, erases, security reset or re-provisioning will be performed by this EXE.'
+        } else {
+        Say 'Checking USB security...'
         $common = @('--chip','esp32s3','--port',$device.Port,'--no-stub','--after','no-reset')
         $security = Run-Tool 'security-check' ($common + @('get-security-info'))
         Assert-SecurityProfile $security
@@ -199,6 +257,7 @@ $button.Add_Click({
         [IO.File]::WriteAllBytes((Join-Path $script:extract 'empty-sector.bin'), [byte[]](@(255)*4096))
         foreach ($offset in @('0x17000','0x18000')) {
             $null = Run-Tool ('select-rescue-' + $offset) ($common + @('write-flash','--flash-size','16MB','--flash-mode','keep','--flash-freq','keep','--no-compress',$offset,'empty-sector.bin'))
+        }
         }
         $serialText = Capture-Repair
         $scan = (& netsh.exe wlan show networks mode=bssid 2>&1 | Out-String)
@@ -214,6 +273,7 @@ $button.Add_Click({
             $result = 'Wi-Fi settings repaired and attendance storage checked unchanged. Setup Wi-Fi was not confirmed by this computer. Send the saved ZIP to support.'
         } else {
             $result = 'Repair could not be verified. Do not erase or re-provision the ESP. Send the saved ZIP to support.'
+            if ($serialText.Length -eq 0) { $result += ' No serial bytes were received. See serial-detection.txt for USB/open errors and make sure all ESP power was removed before reconnecting WITHOUT BOOT.' }
         }
         $result | Set-Content (Join-Path $script:folder 'RESULT.txt') -Encoding UTF8
         Say $result
