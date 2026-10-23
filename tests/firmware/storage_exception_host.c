@@ -111,7 +111,8 @@ static void p02_runtime(sx_runtime_t *rt)
     rt->health_known = true;
     rt->health_blockers = SX_H_QS_RECOVERY | SX_H_QS_PERSISTENCE | SX_H_QS_LAST_ERROR | SX_H_QS_PROBE_ERROR |
         SX_H_LED_LOCAL_FAILURE;
-    rt->add_connected = rt->capability_accepted = rt->ota_precheck_ok = rt->passive_slot_ok = true;
+    rt->add_connected = rt->heartbeat_acked = true;
+    rt->capability_accepted = rt->ota_precheck_ok = rt->passive_slot_ok = true;
     rt->internal_largest = 63488;
 }
 
@@ -269,6 +270,9 @@ static int gate_terms(void)
     }
     /* ADD and the OTA path. */
     p02(); runtime.add_connected = false; EXPECT_REASON(sx_evaluate(&input), SX_ADD_DISCONNECTED);
+    /* D2: a device whose heartbeats ADD drops (and so whose floor, confirm
+     * reason and exception diagnostics the operator cannot see) refuses. */
+    p02(); runtime.heartbeat_acked = false; EXPECT_REASON(sx_evaluate(&input), SX_HEARTBEAT_UNACKED);
     p02(); runtime.capability_accepted = false; EXPECT_REASON(sx_evaluate(&input), SX_CAPABILITY);
     p02(); runtime.ota_precheck_ok = false; EXPECT_REASON(sx_evaluate(&input), SX_OTA_PRECHECK);
     p02(); runtime.passive_slot_ok = false; EXPECT_REASON(sx_evaluate(&input), SX_OTA_SLOT);
@@ -423,50 +427,62 @@ static int restarts(void)
     /* The confirming boot: its one restart; counted before it, so a second
      * look at the same boot never restarts again. */
     sx_record_t r = at(SX_STATE_CONFIRMED, 0, 0, 0, 0);
-    EXPECT(sx_next_step(&r, true, t0, &wait) == SX_NEXT_RESTART);
-    EXPECT(sx_next_step(&r, false, 0, &wait) == SX_NEXT_RESTART);
+    EXPECT(sx_next_step(&r, true, t0, 0, &wait) == SX_NEXT_RESTART);
+    EXPECT(sx_next_step(&r, false, 0, 0, &wait) == SX_NEXT_RESTART);
     r = at(SX_STATE_CONFIRMED, 0, 1, 0, t0);
-    EXPECT(sx_next_step(&r, true, t0 + 10, &wait) == SX_NEXT_UNREPAIRED);
+    EXPECT(sx_next_step(&r, true, t0 + 10, 10, &wait) == SX_NEXT_UNREPAIRED);
     /* The CONFIRMED record failed to write: CONFIRMING on the valid image. */
     r = at(SX_STATE_CONFIRMING, 0, 0, 0, 0);
-    EXPECT(sx_next_step(&r, true, t0, &wait) == SX_NEXT_RESTART);
+    EXPECT(sx_next_step(&r, true, t0, 0, &wait) == SX_NEXT_RESTART);
     /* A round boot that could not record its outcome. */
     r = at(SX_STATE_CONFIRMED, 0, 1, 1, t0);
-    EXPECT(sx_next_step(&r, true, t0 + 10, &wait) == SX_NEXT_UNREPAIRED);
+    EXPECT(sx_next_step(&r, true, t0 + 10, 10, &wait) == SX_NEXT_UNREPAIRED);
     /* Done: nothing more. */
     r = at(SX_STATE_ROUND_DONE, 0, 1, 1, t0);
-    EXPECT(sx_next_step(&r, true, t0 + 10, &wait) == SX_NEXT_NONE);
+    EXPECT(sx_next_step(&r, true, t0 + 10, 10, &wait) == SX_NEXT_NONE);
     /* Retryable: the second after 1 h, the third after 6 h more, no fourth. */
     r = at(SX_STATE_ROUND_SHORT, SX_ROUND_TIME, 1, 1, t0);
-    EXPECT(sx_next_step(&r, true, t0 + 3599, &wait) == SX_NEXT_WAIT && wait == 1);
-    EXPECT(sx_next_step(&r, true, t0 + 3600, &wait) == SX_NEXT_RESTART);
+    EXPECT(sx_next_step(&r, true, t0 + 3599, 0, &wait) == SX_NEXT_WAIT && wait == 1);
+    EXPECT(sx_next_step(&r, true, t0 + 3600, 0, &wait) == SX_NEXT_RESTART);
     r = at(SX_STATE_ROUND_SHORT, SX_ROUND_STORE_BLOCKED, 2, 2, t0);
-    EXPECT(sx_next_step(&r, true, t0 + 6 * 3600 - 1, &wait) == SX_NEXT_WAIT && wait == 1);
-    EXPECT(sx_next_step(&r, true, t0 + 6 * 3600, &wait) == SX_NEXT_RESTART);
+    EXPECT(sx_next_step(&r, true, t0 + 6 * 3600 - 1, 0, &wait) == SX_NEXT_WAIT && wait == 1);
+    EXPECT(sx_next_step(&r, true, t0 + 6 * 3600, 0, &wait) == SX_NEXT_RESTART);
     r = at(SX_STATE_ROUND_SHORT, SX_ROUND_STORE_BLOCKED, 3, 3, t0);
-    EXPECT(sx_next_step(&r, true, t0 + 99 * 3600, &wait) == SX_NEXT_UNREPAIRED);
-    /* No time, no retry yet (never a restart loop on an unknown clock). */
+    EXPECT(sx_next_step(&r, true, t0 + 99 * 3600, 0, &wait) == SX_NEXT_UNREPAIRED);
+    /* An unknown wall clock backs off on this boot's own clock instead of
+     * waiting forever (round 2 review, defect 4): the second restart after
+     * 1 h of uptime, the third after 6 h, and the cap still ends it. */
     r = at(SX_STATE_ROUND_SHORT, SX_ROUND_TIME, 1, 1, t0);
-    EXPECT(sx_next_step(&r, false, 0, &wait) == SX_NEXT_WAIT && wait == 0);
+    EXPECT(sx_next_step(&r, false, 0, 0, &wait) == SX_NEXT_WAIT && wait == 3600);
+    EXPECT(sx_next_step(&r, false, 0, 3599, &wait) == SX_NEXT_WAIT && wait == 1);
+    EXPECT(sx_next_step(&r, false, 0, 3600, &wait) == SX_NEXT_RESTART);
+    /* The restart was counted with the clock unknown (restart_epoch 0): the
+     * uptime backoff also applies when time is known now. */
     r = at(SX_STATE_ROUND_SHORT, SX_ROUND_TIME, 1, 1, 0);
-    EXPECT(sx_next_step(&r, true, t0, &wait) == SX_NEXT_WAIT);
+    EXPECT(sx_next_step(&r, true, t0, 0, &wait) == SX_NEXT_WAIT && wait == 3600);
+    EXPECT(sx_next_step(&r, true, t0, 3600, &wait) == SX_NEXT_RESTART);
+    r = at(SX_STATE_ROUND_SHORT, SX_ROUND_TIME, 2, 2, 0);
+    EXPECT(sx_next_step(&r, false, 0, 6 * 3600 - 1, &wait) == SX_NEXT_WAIT && wait == 1);
+    EXPECT(sx_next_step(&r, false, 0, 6 * 3600, &wait) == SX_NEXT_RESTART);
+    r = at(SX_STATE_ROUND_SHORT, SX_ROUND_TIME, 3, 3, 0);
+    EXPECT(sx_next_step(&r, false, 0, 99 * 3600, &wait) == SX_NEXT_UNREPAIRED);
     /* Never after an outcome no boot can change, or after a crash (M7). */
     for (int o = SX_ROUND_MISMATCH; o < SX_ROUND_COUNT; ++o) {
         r = at(SX_STATE_ROUND_SHORT, (uint8_t)o, 1, 1, t0);
-        EXPECT(sx_next_step(&r, true, t0 + 99 * 3600, &wait) == SX_NEXT_UNREPAIRED);
+        EXPECT(sx_next_step(&r, true, t0 + 99 * 3600, 0, &wait) == SX_NEXT_UNREPAIRED);
     }
     r = at(SX_STATE_ROUND_SHORT, SX_ROUND_TIME, 1, 1, t0);
     r.crashes = 1;
     sx_record_seal(&r);
-    EXPECT(sx_next_step(&r, true, t0 + 99 * 3600, &wait) == SX_NEXT_UNREPAIRED);
+    EXPECT(sx_next_step(&r, true, t0 + 99 * 3600, 0, &wait) == SX_NEXT_UNREPAIRED);
     /* Ended or other states: nothing (the caller resumes an UNREPAIRED report). */
     r = at(SX_STATE_UNREPAIRED, 0, 1, 1, t0);
-    EXPECT(sx_next_step(&r, true, t0, &wait) == SX_NEXT_NONE);
+    EXPECT(sx_next_step(&r, true, t0, 0, &wait) == SX_NEXT_NONE);
     r = at(SX_STATE_ABANDONED, 0, 0, 0, 0);
-    EXPECT(sx_next_step(&r, true, t0, &wait) == SX_NEXT_NONE);
+    EXPECT(sx_next_step(&r, true, t0, 0, &wait) == SX_NEXT_NONE);
     sx_record_t invalid = r;
     invalid.crc ^= 1;
-    EXPECT(sx_next_step(&invalid, true, t0, &wait) == SX_NEXT_NONE);
+    EXPECT(sx_next_step(&invalid, true, t0, 0, &wait) == SX_NEXT_NONE);
     return 0;
 }
 
@@ -509,7 +525,7 @@ static int boots_after(durable_t *d, uint32_t tag, uint32_t crc, sx_outcome_t ro
             d->journal[0] = '\0';
         }
         uint32_t wait = 0;
-        sx_next_t next = sx_next_step(&d->record, true, now, &wait);
+        sx_next_t next = sx_next_step(&d->record, true, now, 0, &wait);
         if (next == SX_NEXT_NONE) return (int)boot + 1;
         if (next == SX_NEXT_UNREPAIRED) {
             d->record.state = SX_STATE_UNREPAIRED;
@@ -600,7 +616,7 @@ static int cuts(void)
     EXPECT(sx_record_after_boot(&r, tag, false, true, SX_ROUND_TIME));
     EXPECT(r.crashes == 1 && r.state == SX_STATE_ROUND_SHORT && r.round_boots == 1 && sx_record_valid(&r));
     uint32_t wait = 0;
-    EXPECT(sx_next_step(&r, true, 1900000000U, &wait) == SX_NEXT_UNREPAIRED);
+    EXPECT(sx_next_step(&r, true, 1900000000U, 0, &wait) == SX_NEXT_UNREPAIRED);
     r.state = SX_STATE_ROUND_DONE;
     sx_record_seal(&r);
     EXPECT(sx_record_after_boot(&r, tag, false, true, SX_ROUND_FAILED));

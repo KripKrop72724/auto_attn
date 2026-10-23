@@ -1059,6 +1059,10 @@ static __attribute__((noinline)) bool sx_collect(sx_input_t *in, sx_store_t *sto
     rt->health_blockers = blockers & ~(uint32_t)SX_H_LOCK;
     s_sx.blockers = rt->health_blockers;
     rt->add_connected = add_connector_is_connected();
+    /* D2: ADD acknowledged a heartbeat within SX_HEARTBEAT_ACK_SECONDS. */
+    int64_t acked_ms = add_connector_heartbeat_acked_ms();
+    rt->heartbeat_acked = acked_ms > 0 &&
+        esp_timer_get_time() / 1000 - acked_ms <= (int64_t)SX_HEARTBEAT_ACK_SECONDS * 1000;
     rt->capability_accepted = s_capability_reported;
     rt->ota_precheck_ok = zj_ota_precheck_cached();
     rt->passive_slot_ok = sx_passive_slot_ok();
@@ -1325,7 +1329,21 @@ static __attribute__((noinline)) void sx_after_confirm_step(void)
     }
     uint32_t wait = 0;
     time_t now = time(NULL);
-    sx_next_t next = sx_next_step(&record, now >= 1700000000, now >= 1700000000 ? (uint32_t)now : 0, &wait);
+    sx_next_t next = sx_next_step(&record, now >= 1700000000, now >= 1700000000 ? (uint32_t)now : 0, uptime_s(), &wait);
+    if (next == SX_NEXT_UNREPAIRED &&
+        (record.state == SX_STATE_CONFIRMED || record.state == SX_STATE_CONFIRMING)) {
+        /* The round boot could not record its outcome (its NVS write failed):
+         * before ending the deployment, re-derive the outcome from this
+         * boot's own repair report and store that instead (round 2 review,
+         * defect 5: the round may in fact have REPAIRED the store). */
+        sx_inputs_t *b = sx_buffers();
+        if (b && storage_repair_exception_repair(&b->repair) &&
+            sx_record_after_boot(&record, storage_repair_image_tag(), storage_repair_running_pending(), false,
+                                 sx_round_outcome(&b->repair))) {
+            (void)storage_repair_exception_store(&record);
+            next = sx_next_step(&record, now >= 1700000000, now >= 1700000000 ? (uint32_t)now : 0, uptime_s(), &wait);
+        }
+    }
     if (next == SX_NEXT_RESTART) {
         sx_restart(&record);
         return;

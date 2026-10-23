@@ -162,6 +162,9 @@ uint32_t add_connector_boot_health_blockers(void);
  * structured context (a JSON object, or NULL). */
 bool add_connector_log_acknowledged(const char *level, const char *subsystem, const char *code, const char *message,
                                     const char *context_json, uint32_t timeout_ms);
+/* ZKT 2.7.7 (gate term D2): when ADD last acknowledged a heartbeat, in
+ * esp_timer milliseconds; 0 when none was acknowledged on this transport. */
+int64_t add_connector_heartbeat_acked_ms(void);
 /* ZKT 2.7.7: the ADD WebSocket client's task stack (bytes). */
 #define ADD_WEBSOCKET_TASK_STACK 6144
 /* Exact ZKT bridge/writer local proof; never Oracle or remote HIL acceptance. */

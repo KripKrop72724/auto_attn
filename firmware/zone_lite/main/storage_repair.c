@@ -579,9 +579,17 @@ static void redo_recover(srr_config_t *config, bool timed)
         }
     }
     heap_caps_free(work);
-    /* 2.7.7, the OTA floor (critique 1): anything this device ever wrote to
-     * the area or journaled about it. A foreign area counts too. */
-    s_floor_seen = have && (journal.flags || journal.rounds || journal.blocks);
+    /* 2.7.7, the OTA floor (critique 1; round 2 review, defect 2): anything
+     * that proves custody bytes may be in the area or that a round has
+     * written the store: a journal flag beyond CLAIMED, any round or block,
+     * or any slot not erased (a foreign one, and a torn write of our own,
+     * count too). CLAIMED alone, with every slot of a discovered area
+     * erased, proves no record was ever completed (a torn record leaves a
+     * non-erased slot) and does not ban the pre-2.7.6 recovery images; a
+     * boot that could not inspect the whole area keeps the floor. */
+    s_floor_seen = have && ((journal.flags & ~(uint32_t)SRP_RECLAIM_CLAIMED) || journal.rounds || journal.blocks);
+    bool area_inspected = s_area.state == SRX_AREA_READY || s_area.state == SRX_AREA_FOREIGN;
+    if (have && (journal.flags & SRP_RECLAIM_CLAIMED) && !area_inspected) s_floor_seen = true;
     for (uint32_t slot = 0; slot < s_area.slots && !s_floor_seen; ++slot) s_floor_seen = s_area.slot[slot] != SRX_SLOT_ERASED;
     /* Also without a journal (NVS lost it): records left open, or sources,
      * get one, so no later boot redoes an open record after this boot's
@@ -769,8 +777,16 @@ static void exception_after_boot(void)
     sx_outcome_t outcome = sx_round_outcome(after);
     heap_caps_free(after);
     esp_reset_reason_t reason = boot_report_reset_reason();
+    /* A brownout counts as the image's crash only when it ended a boot
+     * inside the repair or its round (2.7.6's D5 scope: an erase that pulls
+     * the supply down must not loop). A voltage dip during ordinary runtime
+     * at a flaky-power site says nothing about the exception's machinery and
+     * must not end the controlled-restart budget (round 1 review, defect 4).
+     * A panic, watchdog or lockup is the image's own wherever it happened. */
+    bool previous_in_repair = s_previous_known && !s_previous_returned;
     bool crashed = reason == ESP_RST_PANIC || reason == ESP_RST_INT_WDT || reason == ESP_RST_TASK_WDT ||
-        reason == ESP_RST_WDT || reason == ESP_RST_CPU_LOCKUP || reason == ESP_RST_BROWNOUT;
+        reason == ESP_RST_WDT || reason == ESP_RST_CPU_LOCKUP ||
+        (reason == ESP_RST_BROWNOUT && previous_in_repair);
     sx_record_t record = s_exception;
     uint8_t state = record.state;
     bool changed = sx_record_after_boot(&record, s_image_tag, s_running_pending, crashed, outcome);

@@ -264,6 +264,12 @@ static uint32_t s_reconcile_last_committed_ordinal;
 static bool s_onboarding_task_started;
 static bool s_command_inbox_restored;
 static char s_waiting_ack[80];
+/* ZKT 2.7.7 (D2): the last heartbeat sent and when ADD acknowledged one.
+ * ADD answers every accepted message with at least a default ack carrying
+ * its message_id; heartbeats do not wait for theirs, so the id is matched
+ * here instead. Both under s_lock. */
+static char s_heartbeat_sent_id[80];
+static int64_t s_heartbeat_acked_at_ms;
 static char s_running_command_id[48];
 static char s_queued_command_ids[ADD_TRACKED_COMMAND_CAPACITY][48];
 static size_t s_queued_command_count;
@@ -417,6 +423,7 @@ static void mark_transport_disconnected(void)
         wake_waiter = s_connected || s_waiting_ack[0] != '\0';
         s_connected = false;
         s_waiting_ack[0] = '\0';
+        s_heartbeat_sent_id[0] = '\0'; /* its ack cannot arrive on a new transport */
         s_ack_matched = false;
         if (s_disconnected_since_ms == 0) {
             s_disconnected_since_ms = monotonic_ms();
@@ -2480,6 +2487,10 @@ static void parse_inbound(const char *data, size_t len)
          strcmp(type->valuestring, "hikvision_observation_ack") == 0)) {
         cJSON *message_id = cJSON_GetObjectItemCaseSensitive(root, "message_id");
         if (cJSON_IsString(message_id) && xSemaphoreTake(s_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
+            /* D2: a heartbeat's ack is not waited for; it is matched here. */
+            if (strcmp(type->valuestring, "ack") == 0 && s_heartbeat_sent_id[0] &&
+                strcmp(s_heartbeat_sent_id, message_id->valuestring) == 0)
+                s_heartbeat_acked_at_ms = monotonic_ms();
             if (strcmp(s_waiting_ack, message_id->valuestring) == 0) {
                 s_ack_duplicate = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(root, "duplicate"));
                 memset(&s_reconcile_chunk_ack, 0, sizeof(s_reconcile_chunk_ack));
@@ -3272,7 +3283,14 @@ static void heartbeat_task(void *arg)
             char *json = cJSON_PrintUnformatted(payload);
             cJSON_Delete(payload);
             if (json) {
-                (void)add_connector_send_payload("heartbeat", json);
+                /* D2: the ack handler stamps the heartbeat ADD acknowledged
+                 * (the gate's add_connector_heartbeat_acked_ms). */
+                char message_id[80] = {0};
+                bool sent = send_payload("heartbeat", json, false, message_id);
+                if (sent && message_id[0] && xSemaphoreTake(s_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
+                    strlcpy(s_heartbeat_sent_id, message_id, sizeof(s_heartbeat_sent_id));
+                    xSemaphoreGive(s_lock);
+                }
                 free(json);
             }
         } else if (s_client) {
@@ -4980,6 +4998,16 @@ bool add_connector_is_connected(void)
         connected = false;
     }
     return connected;
+}
+
+int64_t add_connector_heartbeat_acked_ms(void)
+{
+    int64_t at = 0;
+    if (s_lock && xSemaphoreTake(s_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
+        at = s_heartbeat_acked_at_ms;
+        xSemaphoreGive(s_lock);
+    }
+    return at;
 }
 
 const char *add_connector_local_boot_health_error(void)

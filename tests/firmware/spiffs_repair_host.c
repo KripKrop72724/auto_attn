@@ -5671,6 +5671,7 @@ static sx_reason_t p02field_gate(const srr_report_t *report, srx_test_t test)
     runtime.probe_error = ENOENT;
     runtime.probe_operation = "persistence_open_write";
     runtime.spiffs_mounted = runtime.health_known = runtime.add_connected = true;
+    runtime.heartbeat_acked = true; /* D2: ADD acknowledged a heartbeat */
     runtime.capability_accepted = runtime.ota_precheck_ok = runtime.passive_slot_ok = true;
     runtime.health_blockers = SX_H_QS_RECOVERY | SX_H_QS_PERSISTENCE | SX_H_QS_PROBE_ERROR;
     runtime.internal_largest = 63488;

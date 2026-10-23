@@ -41,6 +41,9 @@
 #define SX_INTERNAL_FLOOR_BYTES 16384U
 /* An exception device out of ADD's reach this long polls OTA anyway. */
 #define SX_OTA_WITHOUT_ADD_SECONDS (10U * 60U)
+/* D2: ADD acknowledged a heartbeat this recently (the channel its floor and
+ * the operator's view read; three 15 s heartbeats). */
+#define SX_HEARTBEAT_ACK_SECONDS 45U
 
 typedef enum {
     SX_STATE_NONE = 0,
@@ -75,7 +78,7 @@ typedef enum {
     /* every other boot-health term */
     SX_HEALTH, SX_HEALTH_UNKNOWN,
     /* ADD and the OTA path */
-    SX_ADD_DISCONNECTED, SX_CAPABILITY, SX_OTA_PRECHECK, SX_OTA_SLOT, SX_HEAP,
+    SX_ADD_DISCONNECTED, SX_HEARTBEAT_UNACKED, SX_CAPABILITY, SX_OTA_PRECHECK, SX_OTA_SLOT, SX_HEAP,
     /* the confirmation itself */
     SX_STABILIZING, SX_EVIDENCE_UNACKED, SX_RECEIPT, SX_BUDGET, SX_NVS_RECORD, SX_MARK_VALID,
     SX_REASON_COUNT,
@@ -165,8 +168,10 @@ typedef struct {
      * fails, and whether the check could run (its lock) */
     bool health_known;
     uint32_t health_blockers;
-    /* ADD and the OTA path */
-    bool add_connected, capability_accepted, ota_precheck_ok, passive_slot_ok;
+    /* ADD and the OTA path. heartbeat_acked: ADD acknowledged a heartbeat
+     * within SX_HEARTBEAT_ACK_SECONDS (D2: the channel that carries the
+     * floor, the confirm reason and the exception diagnostics). */
+    bool add_connected, heartbeat_acked, capability_accepted, ota_precheck_ok, passive_slot_ok;
     uint32_t internal_largest;
 } sx_runtime_t;
 
@@ -326,10 +331,14 @@ typedef enum {
 } sx_next_t;
 /* What follows a boot of an exception-confirmed image: the first controlled
  * restart after CONFIRMED, retries only for retryable outcomes after the
- * backoff and with the time known, at most SX_MAX_RESTARTS, none after a
- * crash; otherwise UNREPAIRED. `*wait_s`: seconds until a WAIT may restart
- * (0 when the time is unknown). */
-sx_next_t sx_next_step(const sx_record_t *record, bool time_known, uint32_t now_epoch, uint32_t *wait_s);
+ * backoff, at most SX_MAX_RESTARTS, none after a crash; otherwise
+ * UNREPAIRED. When the wall clock is unknown now or was when the restart was
+ * counted (`restart_epoch` 0), the backoff runs on this boot's own clock
+ * (`uptime_s`), so a device whose network blocks NTP still ends in a bounded
+ * retry instead of waiting forever (round 2 review, defect 4).
+ * `*wait_s`: seconds until a WAIT may restart. */
+sx_next_t sx_next_step(const sx_record_t *record, bool time_known, uint32_t now_epoch, uint32_t uptime_s,
+                       uint32_t *wait_s);
 
 /* ---- the OTA floor (critique 1) --------------------------------------------- */
 /* A target image that reads 2.7.6's redo area: 2.7.6 or later. Anything else

@@ -33,7 +33,7 @@ const char *sx_reason_name(sx_reason_t reason)
         "STORAGE_UNKNOWN", "STORAGE_ERROR_CLASS", "PROBE_ERROR_CLASS", "LED_FATAL", "LED_CAUSE",
         "STORE_NOT_MOUNTED", "STORE_CHANGED",
         "HEALTH", "HEALTH_UNKNOWN",
-        "ADD_DISCONNECTED", "CAPABILITY", "OTA_PRECHECK", "OTA_SLOT", "HEAP",
+        "ADD_DISCONNECTED", "HEARTBEAT_UNACKED", "CAPABILITY", "OTA_PRECHECK", "OTA_SLOT", "HEAP",
         "STABILIZING", "EVIDENCE_UNACKED", "RECEIPT", "BUDGET", "NVS_RECORD", "MARK_VALID"};
     return (unsigned)reason < SX_REASON_COUNT ? names[reason] : "UNKNOWN";
 }
@@ -202,8 +202,13 @@ sx_reason_t sx_runtime_verdict(const sx_repair_t *r, const sx_inventory_t *v, co
     /* Every other boot-health term (3.7). */
     if (!rt->health_known) return SX_HEALTH_UNKNOWN;
     if (rt->health_blockers & ~(uint32_t)SX_HEALTH_EXCEPTED) return SX_HEALTH;
-    /* ADD and the OTA path (D1, D4, critique 6). */
+    /* ADD and the OTA path (D1, D2, D4, critique 6). */
     if (!rt->add_connected) return SX_ADD_DISCONNECTED;
+    /* D2 (round 2 review, defect 1): ADD acknowledged a heartbeat within
+     * SX_HEARTBEAT_ACK_SECONDS. The log and the receipt prove the log and
+     * HTTPS paths; the heartbeat is the channel that carries the floor, the
+     * confirm reason and the exception diagnostics the operator reads. */
+    if (!rt->heartbeat_acked) return SX_HEARTBEAT_UNACKED;
     if (!rt->capability_accepted) return SX_CAPABILITY;
     if (!rt->ota_precheck_ok) return SX_OTA_PRECHECK;
     if (!rt->passive_slot_ok) return SX_OTA_SLOT;
@@ -378,7 +383,8 @@ bool sx_record_after_boot(sx_record_t *r, uint32_t image_tag, bool running_pendi
     return changed;
 }
 
-sx_next_t sx_next_step(const sx_record_t *record, bool time_known, uint32_t now_epoch, uint32_t *wait_s)
+sx_next_t sx_next_step(const sx_record_t *record, bool time_known, uint32_t now_epoch, uint32_t uptime_s,
+                       uint32_t *wait_s)
 {
     if (wait_s) *wait_s = 0;
     if (!sx_record_valid(record)) return SX_NEXT_NONE;
@@ -395,8 +401,16 @@ sx_next_t sx_next_step(const sx_record_t *record, bool time_known, uint32_t now_
     if (state == SX_STATE_CONFIRMED) return SX_NEXT_UNREPAIRED;
     if (record->crashes || !sx_outcome_retryable((sx_outcome_t)record->reason) || record->restarts >= SX_MAX_RESTARTS)
         return SX_NEXT_UNREPAIRED;
-    if (!time_known || !record->restart_epoch) return SX_NEXT_WAIT;
     uint32_t backoff = record->restarts <= 1 ? SX_RETRY_SECONDS_2 : SX_RETRY_SECONDS_3;
+    if (!time_known || !record->restart_epoch) {
+        /* The wall clock is unknown now, or was when the restart was counted:
+         * the backoff runs on this boot's own clock. SX_MAX_RESTARTS still
+         * bounds the total, so a reset before the wait ends only repeats the
+         * wait; it can never loop (round 2 review, defect 4). */
+        if (uptime_s >= backoff) return SX_NEXT_RESTART;
+        if (wait_s) *wait_s = backoff - uptime_s;
+        return SX_NEXT_WAIT;
+    }
     uint32_t due = record->restart_epoch + backoff;
     if (now_epoch >= due) return SX_NEXT_RESTART;
     if (wait_s) *wait_s = due - now_epoch;
