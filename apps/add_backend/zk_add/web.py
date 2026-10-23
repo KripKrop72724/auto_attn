@@ -130,6 +130,9 @@ from zk_add.schemas import (
     ReconciliationAssignmentReleaseRequest,
     ReconciliationAnchorRequest,
     ReconciliationChunkRequest,
+    ReconciliationArchiveRequest,
+    ReconciliationBulkCreateRequest,
+    ReconciliationClearHistoryRequest,
     ReconciliationControlRequest,
     ReconciliationCreateRequest,
     ReconciliationManifestRequest,
@@ -235,7 +238,11 @@ from zk_add.reconciliation import (
     apply_source_tail_chunk,
     apply_source_probe_result,
     active_coverage,
+    archive_reconciliation_job,
+    cancel_and_archive_reconciliation_job,
+    clear_reconciliation_history,
     control_reconciliation_job,
+    create_bulk_reconciliation_jobs,
     create_reconciliation_job,
     preflight_reconciliation,
     reconciliation_manifest_authority,
@@ -1835,16 +1842,15 @@ async def start_full_history_reconciliation(
     body: ReconciliationCreateRequest,
     auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
 ):
+    # One click: the admin session and CSRF token authorize it; reason,
+    # confirmation and password are no longer asked for.
     db, context = auth
-    require_step_up(body.password, db, context)
     connector = connector_or_404(db, connector_id)
     try:
         job = create_reconciliation_job(
             db,
             connector=connector,
             actor=context.username,
-            reason=body.reason,
-            confirmation=body.confirmation,
             idempotency_key=body.idempotency_key,
             scope=body.scope,
         )
@@ -1857,6 +1863,51 @@ async def start_full_history_reconciliation(
     return serialize_job(db, job, include_events=True)
 
 
+@app.post("/api/v1/reconciliations/bulk")
+async def start_bulk_reconciliation(
+    body: ReconciliationBulkCreateRequest,
+    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+):
+    db, context = auth
+
+    def create_all() -> dict:
+        created = create_bulk_reconciliation_jobs(
+            db,
+            connector_ids=body.connector_ids,
+            actor=context.username,
+            idempotency_key=body.idempotency_key,
+            scope=body.scope,
+        )
+        db.commit()
+        return created
+
+    # Up to 100 preflights and inserts: keep them off the event loop.
+    result = await run_in_threadpool(create_all)
+    for row in result["results"]:
+        if row["outcome"] == "CREATED":
+            await browser_events.publish(
+                "reconciliation", {"job_id": row["job_id"], "status": row["status"]}
+            )
+    return result
+
+
+@app.post("/api/v1/reconciliations/clear-history")
+async def clear_reconciliation_history_route(
+    body: ReconciliationClearHistoryRequest | None = None,
+    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+):
+    db, context = auth
+    # Committed batches over the whole history: keep them off the event loop.
+    result = await run_in_threadpool(
+        clear_reconciliation_history,
+        db,
+        actor=context.username,
+        request_id=body.idempotency_key if body else None,
+    )
+    await browser_events.publish("reconciliation", {"history_cleared": True})
+    return result
+
+
 @app.get("/api/v1/reconciliations")
 def list_reconciliations(
     connector_id: str | None = None,
@@ -1866,10 +1917,14 @@ def list_reconciliations(
     q: str | None = Query(default=None, max_length=120),
     cursor: int | None = Query(default=None, ge=1),
     limit: int = Query(default=100, ge=1, le=500),
+    include_archived: bool = False,
     auth: tuple[Session, AdminContext] = Depends(require_admin),
 ):
     db, _context = auth
-    clauses = []
+    # Archived jobs leave the dashboard and its totals; their evidence stays
+    # readable by job ID and by every check that uses it.
+    visible = [] if include_archived else [ReconciliationJob.archived_at.is_(None)]
+    clauses = [*visible]
     if connector_id:
         connector = connector_or_404(db, connector_id)
         clauses.append(ReconciliationJob.connector_id == connector.id)
@@ -1927,31 +1982,31 @@ def list_reconciliations(
     rows = fetched[:limit]
     next_cursor = rows[-1].id if len(fetched) > limit and rows else None
     totals = {
-        "all": int(db.scalar(select(func.count(ReconciliationJob.id))) or 0),
+        "all": int(db.scalar(select(func.count(ReconciliationJob.id)).where(*visible)) or 0),
         "active": int(
             db.scalar(
-                select(func.count(ReconciliationJob.id)).where(status_groups["ACTIVE"])
+                select(func.count(ReconciliationJob.id)).where(status_groups["ACTIVE"], *visible)
             )
             or 0
         ),
         "queued_waiting": int(
             db.scalar(
                 select(func.count(ReconciliationJob.id)).where(
-                    status_groups["QUEUED_WAITING"]
+                    status_groups["QUEUED_WAITING"], *visible
                 )
             )
             or 0
         ),
         "paused": int(
             db.scalar(
-                select(func.count(ReconciliationJob.id)).where(status_groups["PAUSED"])
+                select(func.count(ReconciliationJob.id)).where(status_groups["PAUSED"], *visible)
             )
             or 0
         ),
         "attention": int(
             db.scalar(
                 select(func.count(ReconciliationJob.id)).where(
-                    status_groups["ATTENTION"]
+                    status_groups["ATTENTION"], *visible
                 )
             )
             or 0
@@ -1959,7 +2014,7 @@ def list_reconciliations(
         "completed": int(
             db.scalar(
                 select(func.count(ReconciliationJob.id)).where(
-                    status_groups["COMPLETED"]
+                    status_groups["COMPLETED"], *visible
                 )
             )
             or 0
@@ -1967,7 +2022,7 @@ def list_reconciliations(
         "cancelled": int(
             db.scalar(
                 select(func.count(ReconciliationJob.id)).where(
-                    status_groups["CANCELLED"]
+                    status_groups["CANCELLED"], *visible
                 )
             )
             or 0
@@ -2514,6 +2569,51 @@ def reveal_reconciliation_divergence(
     }
 
 
+# Registered before the generic {action} route below, which would match first.
+@app.post("/api/v1/reconciliations/{job_id}/archive")
+async def archive_reconciliation(
+    job_id: str,
+    body: ReconciliationArchiveRequest | None = None,
+    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+):
+    db, context = auth
+    job = reconciliation_or_404(db, job_id)
+    try:
+        job = archive_reconciliation_job(
+            db, job=job, actor=context.username,
+            request_id=body.idempotency_key if body else None,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    db.commit()
+    await browser_events.publish(
+        "reconciliation", {"job_id": job.job_id, "status": job.status, "archived": True}
+    )
+    return serialize_job(db, job)
+
+
+@app.post("/api/v1/reconciliations/{job_id}/cancel-and-archive")
+async def cancel_and_archive_reconciliation(
+    job_id: str,
+    body: ReconciliationArchiveRequest | None = None,
+    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+):
+    db, context = auth
+    job = reconciliation_or_404(db, job_id)
+    try:
+        job = cancel_and_archive_reconciliation_job(
+            db, job=job, actor=context.username,
+            idempotency_key=(body.idempotency_key if body else None) or str(uuid4()),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    db.commit()
+    await browser_events.publish(
+        "reconciliation", {"job_id": job.job_id, "status": job.status, "archived": True}
+    )
+    return serialize_job(db, job)
+
+
 @app.post("/api/v1/reconciliations/{job_id}/{action}")
 async def control_reconciliation(
     job_id: str,
@@ -2523,8 +2623,8 @@ async def control_reconciliation(
 ):
     if action not in {"pause", "resume", "cancel", "retry"}:
         raise HTTPException(status_code=404, detail="Unknown reconciliation action.")
+    # One click: no reason or password. A guarded retry still binds expected_state.
     db, context = auth
-    require_step_up(body.password, db, context)
     job = reconciliation_or_404(db, job_id)
     try:
         job = control_reconciliation_job(
@@ -2532,7 +2632,6 @@ async def control_reconciliation(
             job=job,
             action=action,
             actor=context.username,
-            reason=body.reason,
             idempotency_key=body.idempotency_key,
             expected_state=body.expected_state,
         )

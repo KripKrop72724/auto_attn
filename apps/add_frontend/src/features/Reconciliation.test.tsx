@@ -211,13 +211,17 @@ const scheduler = {
   history_backlog_limit: 20000,
 }
 
-function Harness({ terminal = device }: { terminal?: Device } = {}) {
+function Harness({
+  terminal = device,
+  devices,
+  revision = 0,
+}: { terminal?: Device; devices?: Device[]; revision?: number } = {}) {
   const toast = useToast()
   return (
     <>
       <ReconciliationView
-        devices={[terminal]}
-        revision={0}
+        devices={devices || [terminal]}
+        revision={revision}
         toast={toast}
       />
       {toast.toast && <div role="status">{toast.toast.text}</div>}
@@ -704,9 +708,29 @@ describe('Reviewed source-exception continuation', () => {
 })
 
 
+const requestBody = (fetchMock: ReturnType<typeof vi.fn>, suffix: string) => {
+  const call = fetchMock.mock.calls.find(([input, init]) =>
+    new URL(String(input), 'https://add.test').pathname.endsWith(suffix) && (init as RequestInit | undefined)?.method === 'POST')
+  return call ? JSON.parse(String((call[1] as RequestInit).body)) : undefined
+}
+
+const zktPreflight = {
+  eligible: true, ready_now: true, hard_blockers: [], waitable_blockers: [],
+  terminal: { serial: 'RKQ4245100152', connection_state: 'ONLINE', range_resume_verified: true },
+  coverage: null,
+}
+
+async function selectTerminal() {
+  fireEvent.click(screen.getByRole('button', { name: 'Select terminal' }))
+  fireEvent.click(within(screen.getByRole('listbox')).getAllByRole('option')[0])
+  const start = await screen.findByRole('button', { name: 'Reconcile now' }) as HTMLButtonElement
+  await waitFor(() => expect(start.disabled).toBe(false))
+  return start
+}
+
 describe('Hikvision reconciliation scope', () => {
   afterEach(() => { cleanup(); vi.unstubAllGlobals() })
-  it.each(['ACTIVE_USERS', 'ALL_RECORDS'] as const)('submits explicit %s scope with matching confirmation', async (scope) => {
+  it.each(['ALL_RECORDS', 'ACTIVE_USERS'] as const)('starts %s in one click with no reason, confirmation or password', async (scope) => {
     window.history.replaceState(null, '', '/reconciliation')
     const hik = { ...device, firmware_family: 'hikvision' as const }
     const fallback = reconciliationFetch()
@@ -722,24 +746,16 @@ describe('Hikvision reconciliation scope', () => {
     })
     vi.stubGlobal('fetch', fetchMock)
     render(<Harness terminal={hik} />)
-    fireEvent.click(screen.getByRole('button', { name: 'Select terminal' }))
-    fireEvent.click(within(screen.getByRole('listbox')).getByRole('option'))
-    const start = await screen.findByRole('button', { name: 'Reconcile attendance' })
-    await waitFor(() => expect((start as HTMLButtonElement).disabled).toBe(false))
+    const start = await selectTerminal()
+    const select = screen.getByLabelText('History scope') as HTMLSelectElement
+    expect(select.value).toBe('ALL_RECORDS')
+    if (scope !== 'ALL_RECORDS') fireEvent.change(select, { target: { value: scope } })
     fireEvent.click(start)
-    const select = screen.getByLabelText(/History scope/)
-    expect((select as HTMLSelectElement).value).toBe('ACTIVE_USERS')
-    if (scope === 'ALL_RECORDS') fireEvent.change(select, { target: { value: scope } })
-    const confirmation = `RECONCILE ${device.device_id} ${scope === 'ACTIVE_USERS' ? 'ACTIVE USERS' : 'FROM START'}`
-    fireEvent.change(screen.getByLabelText('Audited reason'), { target: { value: 'Recover the requested user history' } })
-    fireEvent.change(screen.getByLabelText(new RegExp(`Type ${confirmation}`)), { target: { value: confirmation } })
-    fireEvent.change(screen.getByLabelText('Administrator password'), { target: { value: 'test-only-password' } })
-    fireEvent.click(screen.getByRole('button', { name: 'Start durable reconcile' }))
-    await waitFor(() => {
-      const call = fetchMock.mock.calls.find(([input]) => String(input).endsWith('/reconciliations/full-history'))
-      expect(call).toBeTruthy()
-      expect(JSON.parse(String(call?.[1]?.body))).toMatchObject({ scope, confirmation })
-    })
+    await waitFor(() => expect(requestBody(fetchMock, '/reconciliations/full-history')).toBeTruthy())
+    const body = requestBody(fetchMock, '/reconciliations/full-history')
+    expect(body.scope).toBe(scope)
+    expect(Object.keys(body).sort()).toEqual(['idempotency_key', 'scope'])
+    expect(screen.queryByRole('dialog')).toBeNull()
   })
 
   it.each([true, false])('offers recent-tail recovery only when ADD holds a resume point (%s)', async (eligible) => {
@@ -763,27 +779,178 @@ describe('Hikvision reconciliation scope', () => {
     })
     vi.stubGlobal('fetch', fetchMock)
     render(<Harness terminal={hik} />)
-    fireEvent.click(screen.getByRole('button', { name: 'Select terminal' }))
-    fireEvent.click(within(screen.getByRole('listbox')).getByRole('option'))
-    const start = await screen.findByRole('button', { name: 'Reconcile attendance' })
-    await waitFor(() => expect((start as HTMLButtonElement).disabled).toBe(false))
-    fireEvent.click(start)
-    fireEvent.change(screen.getByLabelText(/History scope/), { target: { value: 'RECENT_TAIL' } })
+    const start = await selectTerminal()
+    fireEvent.change(screen.getByLabelText('History scope'), { target: { value: 'RECENT_TAIL' } })
     expect(await screen.findByText(eligible
-      ? /Resumes at terminal serial 597782.*break after serial 512000; only a full terminal audit covers those/
+      ? /Resumes at terminal serial 597782.*break after serial 512000; only a full history read covers those/
       : /holds no checkpointed live-poll record/)).toBeTruthy()
-    const confirmation = `RECONCILE ${device.device_id} RECENT TAIL`
-    fireEvent.change(screen.getByLabelText('Audited reason'), { target: { value: 'Recover punches while the poll anchor is blocked' } })
-    fireEvent.change(screen.getByLabelText(new RegExp(`Type ${confirmation}`)), { target: { value: confirmation } })
-    fireEvent.change(screen.getByLabelText('Administrator password'), { target: { value: 'test-only-password' } })
-    const submit = screen.getByRole('button', { name: 'Start durable reconcile' }) as HTMLButtonElement
-    expect(submit.disabled).toBe(!eligible)
+    expect(start.disabled).toBe(!eligible)
     if (!eligible) return
-    fireEvent.click(submit)
-    await waitFor(() => {
-      const call = fetchMock.mock.calls.find(([input]) => String(input).endsWith('/reconciliations/full-history'))
-      expect(JSON.parse(String(call?.[1]?.body))).toMatchObject({ scope: 'RECENT_TAIL', confirmation })
+    fireEvent.click(start)
+    await waitFor(() => expect(requestBody(fetchMock, '/reconciliations/full-history')).toMatchObject({ scope: 'RECENT_TAIL' }))
+  })
+})
+
+describe('One-click reconcile', () => {
+  beforeEach(() => window.history.replaceState(null, '', '/reconciliation'))
+  afterEach(() => { cleanup(); vi.unstubAllGlobals() })
+
+  const fetchWith = (
+    overrides: (path: string, init: RequestInit | undefined, url: URL) => Response | Promise<Response> | undefined,
+    status?: ReconciliationJob['status'],
+  ) => {
+    const fallback = reconciliationFetch(status)
+    return vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input), 'https://add.test')
+      const path = url.pathname
+      const custom = await overrides(path, init, url)
+      if (custom) return custom
+      if (path === `/api/v1/devices/${device.connector_id}`) return json(device)
+      if (path.endsWith('/reconciliations/preflight')) return json(zktPreflight)
+      if (path === '/api/v2/attendance-recovery/summary')
+        return json({ delivery: { safe_retryable: 0, identity_held: 0, permanent_review: 0 } })
+      return fallback(input, init)
     })
+  }
+
+  it('starts a ZKT reconcile with one click and sends no password or reason', async () => {
+    const fetchMock = fetchWith((path) =>
+      path.endsWith('/reconciliations/full-history') ? json(job()) : undefined)
+    vi.stubGlobal('fetch', fetchMock)
+    render(<Harness />)
+    expect(screen.queryByText(/Jobs needing attention first/)).toBeNull()
+    expect(screen.getByText(/Newest first/)).toBeTruthy()
+    const start = await selectTerminal()
+    expect(screen.queryByLabelText('History scope')).toBeNull()
+    fireEvent.click(start)
+    expect(await screen.findByText(/Full terminal reconciliation queued/)).toBeTruthy()
+    expect(Object.keys(requestBody(fetchMock, '/reconciliations/full-history')).sort()).toEqual(['idempotency_key', 'scope'])
+    expect(screen.queryByLabelText('Administrator password')).toBeNull()
+    expect(screen.queryByLabelText('Audited reason')).toBeNull()
+  })
+
+  it('cancels with one click and archives a finished job without a reload jump', async () => {
+    let archived = false
+    const running = { ...job(assurance({ total: 0, open: 0, state: 'NONE' })), status: 'RUNNING' as const }
+    const finished = { ...job(assurance({ total: 0, open: 0, state: 'NONE' })), job_id: 'finished-job', status: 'COMPLETED' as const,
+      connector: { ...job().connector!, display_name: 'Finished terminal' } }
+    const fetchMock = fetchWith((path, init) => {
+      if (path === `/api/v1/reconciliations/${running.job_id}/cancel`) return json({ ...running, status: 'CANCELLED' })
+      if (path === '/api/v1/reconciliations/finished-job/archive') {
+        archived = true
+        return json({ ...finished, archived_at: '2026-10-23T10:00:00Z' })
+      }
+      if (path === '/api/v1/reconciliations' && (!init?.method || init.method === 'GET'))
+        return json({ enabled: true, scheduler, rows: archived ? [running] : [running, finished], next_cursor: null,
+          filtered_total: archived ? 1 : 2, totals: { all: 2, active: 1, queued_waiting: 0, paused: 0, attention: 0, completed: 1, cancelled: 0 } })
+      return undefined
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    render(<Harness />)
+    const finishedCard = (await screen.findByRole('heading', { name: 'Finished terminal' })).closest('article') as HTMLElement
+    const runningCard = screen.getByRole('heading', { name: 'ZONE-MULTAN-01' }).closest('article') as HTMLElement
+    expect(within(finishedCard).queryByRole('button', { name: 'Cancel' })).toBeNull()
+    expect(within(runningCard).getByRole('button', { name: 'Cancel & archive' })).toBeTruthy()
+
+    fireEvent.click(within(runningCard).getByRole('button', { name: 'Cancel' }))
+    await waitFor(() => expect(requestBody(fetchMock, `/${running.job_id}/cancel`)).toBeTruthy())
+    expect(Object.keys(requestBody(fetchMock, `/${running.job_id}/cancel`))).toEqual(['idempotency_key'])
+    expect(screen.queryByRole('dialog')).toBeNull()
+
+    fireEvent.click(within(finishedCard).getByRole('button', { name: 'Archive' }))
+    await waitFor(() => expect(screen.queryByRole('heading', { name: 'Finished terminal' })).toBeNull())
+    expect(screen.getByRole('heading', { name: 'ZONE-MULTAN-01' })).toBeTruthy()
+    expect(await screen.findByText('Reconciliation archived.')).toBeTruthy()
+  })
+
+  it('reconciles several terminals by zone with one click and summarises the outcome', async () => {
+    const second: Device = { ...device, connector_id: 'lahore-connector', device_id: '18', display_name: 'ZONE-LAHORE-01',
+      zone_id: 'ZONE-LAHORE', zone_name: 'Lahore' }
+    const fetchMock = fetchWith((path) => path === '/api/v1/reconciliations/bulk' ? json({
+      created: 1,
+      results: [
+        { connector_id: device.connector_id, display_name: device.display_name, zone_id: device.zone_id,
+          outcome: 'CREATED', job_id: 'new-job', status: 'QUEUED', message: null },
+        { connector_id: second.connector_id, display_name: second.display_name, zone_id: second.zone_id,
+          outcome: 'BLOCKED', job_id: null, status: null, message: 'Zone Lite 2.3.0 or newer is required.' },
+      ],
+    }) : undefined)
+    vi.stubGlobal('fetch', fetchMock)
+    render(<Harness devices={[device, second]} />)
+    fireEvent.click(screen.getByRole('button', { name: /Bulk reconcile/ }))
+    const panel = screen.getByRole('region', { name: 'Reconcile several terminals' })
+    expect(within(panel).getByText('Lahore')).toBeTruthy()
+    fireEvent.click(within(panel).getByLabelText(/Select all \(2\)/))
+    fireEvent.click(within(panel).getByRole('button', { name: 'Reconcile 2 selected' }))
+    expect(await within(panel).findByText('1 started')).toBeTruthy()
+    expect(within(panel).getByText(/Blocked — Zone Lite 2.3.0 or newer is required/)).toBeTruthy()
+    const body = requestBody(fetchMock, '/reconciliations/bulk')
+    expect(body.connector_ids.sort()).toEqual([device.connector_id, second.connector_id].sort())
+    expect(body.scope).toBe('ALL_RECORDS')
+    expect(body).not.toHaveProperty('password')
+  })
+
+  it('clears reconcile history with one click and reports the counts', async () => {
+    let cleared = false
+    const fetchMock = fetchWith((path, init) => {
+      if (path === '/api/v1/reconciliations/clear-history') {
+        cleared = true
+        return json({ cancelled: 1, deleted: 3, archived: 2, kept_reasons: { SOURCE_COVERAGE: 2 } })
+      }
+      if (path === '/api/v1/reconciliations' && cleared && (!init?.method || init.method === 'GET'))
+        return json({ enabled: true, scheduler, rows: [], next_cursor: null, filtered_total: 0,
+          totals: { all: 0, active: 0, queued_waiting: 0, paused: 0, attention: 0, completed: 0, cancelled: 0 } })
+      return undefined
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    render(<Harness />)
+    await screen.findByRole('heading', { name: 'ZONE-MULTAN-01' })
+    fireEvent.click(screen.getByRole('button', { name: /Clear reconcile history/ }))
+    expect(await screen.findByRole('status')).toBeTruthy()
+    expect(screen.getByRole('status').textContent).toMatch(/1 cancelled, 3 deleted, 2 archived/)
+    await waitFor(() => expect(screen.queryByRole('heading', { name: 'ZONE-MULTAN-01' })).toBeNull())
+  })
+
+  it('keeps the readiness panel and loaded older jobs in place when a revision arrives', async () => {
+    const page = (start: number, count: number) => Array.from({ length: count }, (_, index) => ({
+      ...job(assurance({ total: 0, open: 0, state: 'NONE' })), status: 'COMPLETED' as const,
+      job_id: `job-${start + index}`, connector: { ...job().connector!, display_name: `Terminal ${start + index}` },
+    }))
+    const listCalls: URLSearchParams[] = []
+    let preflightCalls = 0
+    const fetchMock = fetchWith((path, init, url) => {
+      if (path.endsWith('/reconciliations/preflight')) {
+        preflightCalls += 1
+        return json(zktPreflight)
+      }
+      if (path !== '/api/v1/reconciliations' || (init?.method && init.method !== 'GET')) return undefined
+      const params = url.searchParams
+      listCalls.push(params)
+      const totals = { all: 45, active: 0, queued_waiting: 0, paused: 0, attention: 0, completed: 45, cancelled: 0 }
+      if (params.get('cursor')) return json({ enabled: true, scheduler, rows: page(40, 5), next_cursor: null, filtered_total: 45, totals })
+      const limit = Number(params.get('limit'))
+      return json({ enabled: true, scheduler, rows: page(0, Math.min(limit, 45)), next_cursor: limit < 45 ? 900 : null,
+        filtered_total: 45, totals })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const view = render(<Harness revision={0} />)
+    await screen.findByRole('heading', { name: 'Terminal 0' })
+    expect(listCalls).toHaveLength(1)
+    fireEvent.click(screen.getByRole('button', { name: 'Load older jobs' }))
+    await screen.findByRole('heading', { name: 'Terminal 44' })
+    await selectTerminal()
+    expect(screen.getByText('ESP connection')).toBeTruthy()
+    const before = preflightCalls
+
+    view.rerender(<Harness revision={1} />)
+    // The panel never blanks while the refresh runs.
+    expect(screen.getByText('ESP connection')).toBeTruthy()
+    await waitFor(() => expect(preflightCalls).toBeGreaterThan(before))
+    await waitFor(() => expect(listCalls.at(-1)?.get('limit')).toBe('45'))
+    expect(listCalls.at(-1)?.get('cursor')).toBeNull()
+    expect(screen.getByText('ESP connection')).toBeTruthy()
+    expect(screen.getByRole('heading', { name: 'Terminal 44' })).toBeTruthy()
+    expect(screen.getAllByRole('heading', { name: /^Terminal \d+$/ })).toHaveLength(45)
   })
 })
 

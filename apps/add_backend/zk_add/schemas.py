@@ -858,12 +858,41 @@ class AttendanceBatchRequest(BaseModel):
         return value
 
 
+ReconciliationScope = Literal["ALL_RECORDS", "ACTIVE_USERS", "RECENT_TAIL"]
+
+
 class ReconciliationCreateRequest(BaseModel):
-    scope: Literal["ALL_RECORDS", "ACTIVE_USERS", "RECENT_TAIL"] = "ALL_RECORDS"
-    reason: str = Field(min_length=10, max_length=500)
-    confirmation: str = Field(min_length=10, max_length=180)
-    password: str = Field(min_length=1, max_length=512)
+    """One-click start. reason, confirmation and password are accepted from an
+    older open tab and ignored."""
+
+    scope: ReconciliationScope = "ALL_RECORDS"
+    reason: str | None = Field(default=None, max_length=500)
+    confirmation: str | None = Field(default=None, max_length=180)
+    password: str | None = Field(default=None, max_length=512)
     idempotency_key: str = Field(min_length=8, max_length=120)
+
+
+class ReconciliationBulkCreateRequest(BaseModel):
+    connector_ids: list[Annotated[str, Field(min_length=1, max_length=100)]] = Field(
+        min_length=1, max_length=100
+    )
+    scope: ReconciliationScope = "ALL_RECORDS"
+    idempotency_key: str = Field(min_length=8, max_length=120)
+
+    @field_validator("connector_ids")
+    @classmethod
+    def require_distinct_connectors(cls, value: list[str]) -> list[str]:
+        if len(set(value)) != len(value):
+            raise ValueError("connector_ids must be distinct")
+        return value
+
+
+class ReconciliationArchiveRequest(BaseModel):
+    idempotency_key: str | None = Field(default=None, min_length=8, max_length=120)
+
+
+class ReconciliationClearHistoryRequest(BaseModel):
+    idempotency_key: str | None = Field(default=None, min_length=8, max_length=120)
 
 
 class ReconciliationRetryExpectedState(BaseModel):
@@ -898,8 +927,10 @@ class ReconciliationRetryExpectedState(BaseModel):
 
 
 class ReconciliationControlRequest(BaseModel):
-    reason: str = Field(min_length=10, max_length=500)
-    password: str = Field(min_length=1, max_length=512)
+    """One-click control. reason and password are accepted and ignored."""
+
+    reason: str | None = Field(default=None, max_length=500)
+    password: str | None = Field(default=None, max_length=512)
     idempotency_key: str = Field(min_length=8, max_length=120)
     expected_state: ReconciliationRetryExpectedState | None = None
 
