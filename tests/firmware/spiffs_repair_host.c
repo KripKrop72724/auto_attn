@@ -1042,7 +1042,7 @@ typedef struct {
     bool json, ids;
 } model_file_t;
 
-#define MAX_MODEL 16
+#define MAX_MODEL 24
 static model_file_t model[MAX_MODEL];
 static uint32_t model_count;
 static uint32_t row_seq;
@@ -5455,6 +5455,27 @@ static void build_p02field(void)
     model_file_t *live = new_model("/add_live.jsonl", true, false);
     model_file_t *outbox = new_model("/add_pending.jsonl", true, false);
     model_file_t *commands = new_model("/processed_commands.txt", false, true);
+    /* A real store's fuller directory (round 2 review, defect 6), in every
+     * variant but the P02 fit (P02's own directory had six files; the
+     * histogram assertions keep that model faithful): the device reports at
+     * most SX_INVENTORY_FILES files, so this store holds more than that,
+     * almost all of them larger than the smallest custody file.
+     * /add_corrupt.bak is one row of the legacy quarantine, a reclaim queue
+     * the repair tracks: by size alone it would lose its report slot and
+     * the gate would refuse CUSTODY_MISSING every boot. */
+    if (p02field_variant != P02F_HIDDEN) {
+        static const char *const clutter[] = {
+            "/add_identities.enc", "/led_journal.txt", "/history_2025.idx", "/history_2026.idx", "/zone_config.bak",
+            "/boot_report.bak", "/ords_cursor.pos", "/add_live.pos", "/add_pending.pos", "/lease_state.txt",
+            "/comm_key.rev", "/outbox_seq.txt"};
+        for (size_t i = 0; i < sizeof(clutter) / sizeof(clutter[0]); ++i) {
+            model_file_t *m = new_model(clutter[i], false, true);
+            model_append_ids(m, 4 + (uint32_t)(rnd() % 44));
+        }
+        model_file_t *quarantine = new_model("/add_corrupt.bak", true, false);
+        static const char quarantine_row[] = "{\"event_uid\":\"q\",\"seq\":1,\"reason\":\"CORRUPT\"}\n";
+        model_append(quarantine, quarantine_row, (uint32_t)sizeof(quarantine_row) - 1);
+    }
     bool e1 = p02field_variant == P02F_UNWINDOWED;
     char row[600], chunk[1600];
     uint32_t step = 0, quiet = 0, next_quiet = 25 + rnd() % 4;
@@ -5492,12 +5513,17 @@ static void build_p02field(void)
 /* The blocks a confirmed round may take, as the planner sees them on this
  * model (the harness's own reading of section 6.1): a valid strong magic, a
  * droppable page past the entry-0 rule, no header or index page, and every
- * kept page either a non-last data page of /pending.jsonl (custody) or
- * leaked (no header anywhere). `blocks` gets 1 per such block. */
+ * kept page either custody the round may window (a non-last data page of a
+ * reclaim queue or of the re-fetchable catalog, a blocked span a live index
+ * still reads among them) or leaked (no header anywhere). `blocks` gets 1
+ * per such block. */
+static const char *const p02field_windowable[] = {"/pending.jsonl", "/add_corrupt.bak", "/add_identities.enc"};
+#define P02F_WINDOWABLE (sizeof(p02field_windowable) / sizeof(p02field_windowable[0]))
 static uint32_t p02field_custody_blocks(uint8_t *blocks, uint16_t *gain)
 {
     uint32_t pages = flash_size / PAGE, count = 0;
-    uint8_t *referenced = calloc(pages, 1), *headered = calloc(0x8000, 1);
+    uint16_t *referenced = calloc(pages, sizeof(uint16_t)); /* owner id + 1; 0 unreferenced */
+    uint8_t *headered = calloc(0x8000, 1);
     for (uint32_t pix = 0; pix < pages; ++pix) {
         const uint8_t *page = flash + pix * PAGE;
         uint16_t obj = (uint16_t)(page[0] | (page[1] << 8)), span = (uint16_t)(page[2] | (page[3] << 8));
@@ -5506,15 +5532,24 @@ static uint32_t p02field_custody_blocks(uint8_t *blocks, uint16_t *gain)
         uint32_t table = span == 0 ? 49 : 8, entries = span == 0 ? 103 : 124;
         for (uint32_t i = 0; i < entries; ++i) {
             uint16_t ref = (uint16_t)(page[table + i * 2] | (page[table + i * 2 + 1] << 8));
-            if (ref < pages && ref % 16) referenced[ref] = 1;
+            if (ref < pages && ref % 16) referenced[ref] = (uint16_t)((obj & 0x7FFF) + 1);
         }
     }
     mount_plain();
-    uint16_t pending = object_of("/pending.jsonl");
-    spiffs_stat st;
-    CHECK(SPIFFS_stat(&fs, "/pending.jsonl", &st) == SPIFFS_OK, "p02field: stat pending");
+    uint16_t wobj[P02F_WINDOWABLE];
+    uint32_t wlast[P02F_WINDOWABLE];
+    for (size_t w = 0; w < P02F_WINDOWABLE; ++w) {
+        spiffs_stat st;
+        if (SPIFFS_stat(&fs, p02field_windowable[w], &st) != SPIFFS_OK) {
+            SPIFFS_clearerr(&fs);
+            wobj[w] = 0xFFFF;
+            wlast[w] = 0;
+            continue;
+        }
+        wobj[w] = object_of(p02field_windowable[w]);
+        wlast[w] = (st.size + SPAN - 1) / SPAN - 1;
+    }
     SPIFFS_unmount(&fs);
-    uint32_t last_span = (st.size + SPAN - 1) / SPAN - 1;
     for (uint32_t b = 0; b < flash_size / BLOCK; ++b) {
         blocks[b] = 0;
         if (gain) gain[b] = 0;
@@ -5536,9 +5571,28 @@ static uint32_t p02field_custody_blocks(uint8_t *blocks, uint16_t *gain)
                 continue;
             }
             later_kept = true;
-            if (lu == 0 || lu == 0xFFFF || (obj & 0x8000) || lu != obj) usable = false;
-            else if (!headered[lu & 0x7FFF]) continue; /* leaked */
-            else if (lu == pending && span < last_span) custody = true;
+            uint16_t owner = lu != 0 && lu != 0xFFFF ? lu :
+                referenced[pix] ? (uint16_t)(referenced[pix] - 1U) : 0xFFFF;
+            size_t w = P02F_WINDOWABLE;
+            for (size_t k = 0; k < P02F_WINDOWABLE && w == P02F_WINDOWABLE; ++k)
+                if ((owner & 0x7FFF) == (wobj[k] & 0x7FFF)) w = k;
+            if (lu == 0 && referenced[pix]) {
+                /* A deleted page a live index still reads (an interrupted GC
+                 * move the deferred run had no room to normalize): a blocked
+                 * span. Its owner's class decides, as the planner's
+                 * keep_class does: a windowable file's non-last span is
+                 * custody. */
+                if (!headered[owner & 0x7FFF]) continue; /* its owner leaked */
+                if (w < P02F_WINDOWABLE && span < wlast[w]) custody = true;
+                else usable = false;
+            }
+            else if (lu == 0 || lu == 0xFFFF || (obj & 0x8000) || lu != obj) usable = false;
+            else if (!headered[lu & 0x7FFF]) {
+                /* Leaked - unless a headered file's index still reads the
+                 * page (keep_class: hidden): then it is kept and excludes. */
+                if (referenced[pix] && headered[(uint16_t)(referenced[pix] - 1U) & 0x7FFF]) usable = false;
+            }
+            else if (w < P02F_WINDOWABLE && span < wlast[w]) custody = true;
             else usable = false;
         }
         if (drop0 && !later_kept) dropped++;
@@ -5607,12 +5661,32 @@ static srx_test_t p02field_area_test(void)
     return srx_area_test(&redo_io, &boot_area, scratch, NULL);
 }
 
-/* 2.7.4's inventory as the VFS would read the store: every file span by span
- * (sx_inventory_t, as storage_repair.c hands it to the gate). */
-static void p02field_inventory(sx_inventory_t *v)
+/* 2.7.4's inventory as the VFS would read the store: every file span by
+ * span, then the device's report policy over the cap (storage_inventory
+ * keep(): unreadable files first, then the repair's custody names, then the
+ * largest; SI_MAX_FILES slots), as storage_repair.c hands it to the gate.
+ * The field store holds more files than the report, so this exercises the
+ * cap the way P02's first 2.7.7 boot will (round 2 review, defect 6). */
+#define P02F_DIR_FILES 32U
+static uint32_t p02field_larger_files; /* listed files larger than /add_corrupt.bak */
+static bool p02field_priority(const sx_repair_t *r, const char *bare)
+{
+    for (uint32_t i = 0; r && i < r->file_count && i < SX_REPAIR_FILES; ++i)
+        if (r->file[i].custody && !r->file[i].removed && r->file[i].name[0] == '/' &&
+            !strcmp(r->file[i].name + 1, bare))
+            return true;
+    return false;
+}
+
+static void p02field_inventory(sx_inventory_t *v, const sx_repair_t *repair)
 {
     static uint8_t buffer[SPAN];
+    static sx_inventory_file_t all[P02F_DIR_FILES];
+    static bool priority[P02F_DIR_FILES];
+    uint32_t listed = 0;
     memset(v, 0, sizeof(*v));
+    memset(all, 0, sizeof(all));
+    memset(priority, 0, sizeof(priority));
     mount_plain();
     spiffs_DIR dir;
     struct spiffs_dirent entry;
@@ -5620,8 +5694,10 @@ static void p02field_inventory(sx_inventory_t *v)
     v->done = v->complete = true;
     while (SPIFFS_readdir(&dir, &entry)) {
         v->files++;
-        CHECK(v->count < SX_INVENTORY_FILES, "p02field: more than %u files", SX_INVENTORY_FILES);
-        sx_inventory_file_t *f = &v->file[v->count++];
+        CHECK(listed < P02F_DIR_FILES, "p02field: more than %u files", P02F_DIR_FILES);
+        sx_inventory_file_t *f = &all[listed];
+        priority[listed] = p02field_priority(repair, (const char *)entry.name + 1);
+        listed++;
         snprintf(f->name, sizeof(f->name), "%.32s", (const char *)entry.name + 1);
         f->bytes = entry.size;
         spiffs_file fd = SPIFFS_open(&fs, (const char *)entry.name, SPIFFS_O_RDONLY, 0);
@@ -5652,6 +5728,29 @@ static void p02field_inventory(sx_inventory_t *v)
     SPIFFS_closedir(&dir);
     SPIFFS_clearerr(&fs);
     SPIFFS_unmount(&fs);
+    /* Files larger than the one-row quarantine: by size alone they would
+     * fill every slot and evict it (the run asserts the policy keeps it). */
+    uint32_t quarantine_bytes = 0;
+    for (uint32_t i = 0; i < listed; ++i)
+        if (!strcmp(all[i].name, "add_corrupt.bak")) quarantine_bytes = all[i].bytes;
+    p02field_larger_files = 0;
+    for (uint32_t i = 0; i < listed; ++i)
+        p02field_larger_files += quarantine_bytes && all[i].bytes > quarantine_bytes;
+    /* The device's keep policy over the cap. */
+    while (v->count < SX_INVENTORY_FILES) {
+        uint32_t best = listed;
+        for (uint32_t i = 0; i < listed; ++i) {
+            if (!all[i].name[0]) continue;
+            if (best == listed) { best = i; continue; }
+            const sx_inventory_file_t *a = &all[i], *b = &all[best];
+            bool earlier = (a->first_error != 0) != (b->first_error != 0) ? a->first_error != 0 :
+                priority[i] != priority[best] ? priority[i] : a->bytes > b->bytes;
+            if (earlier) best = i;
+        }
+        if (best == listed) break;
+        v->file[v->count++] = all[best];
+        all[best].name[0] = '\0';
+    }
 }
 
 /* The gate's storage terms on the unconfirmed boot's own report, with ADD,
@@ -5665,7 +5764,7 @@ static sx_reason_t p02field_gate(const srr_report_t *report, srx_test_t test)
     repair.storage_allowed = !mount_blocked;
     repair.pending_verify = true;
     snprintf(repair.area_test, sizeof(repair.area_test), "%s", srx_test_name(test));
-    p02field_inventory(&inventory);
+    p02field_inventory(&inventory, &repair);
     memset(&runtime, 0, sizeof(runtime));
     runtime.qs_known = runtime.qs_observed = runtime.qs_available = runtime.led_known = true;
     runtime.probe_error = ENOENT;
@@ -7080,6 +7179,45 @@ static void run_reclaim_p02field(uint32_t kib, uint32_t variant)
     CHECK(test == SRX_TEST_PASSED, "p02field: the area test %s", srx_test_name(test));
     if (variant == P02F_HIDDEN) p02field_area_test_cuts();
     sx_reason_t gate = p02field_gate(u, test);
+    /* The report cap is really exercised (round 2 review, defect 6) in the
+     * cluttered variants: the directory holds more files than the device
+     * reports and enough files are larger than the one-row /add_corrupt.bak
+     * that by size alone it would lose its slot. With the repair reporting
+     * it as custody (13FL's shape: P02's own report names only
+     * /pending.jsonl), the keep policy holds its slot and the gate's custody
+     * check passes; without the priority the gate would refuse
+     * CUSTODY_MISSING every boot. The P02 fit keeps its six-file directory. */
+    if (variant == P02F_HIDDEN) {
+        static sx_inventory_t inv;
+        static sx_repair_t rep;
+        sx_from_srr(u, &rep);
+        p02field_inventory(&inv, &rep);
+        CHECK(inv.files == 5, "p02field %s: %u files, not P02's directory", names[variant], inv.files);
+    } else {
+        static sx_repair_t rep;
+        static sx_inventory_t inv;
+        sx_from_srr(u, &rep);
+        CHECK(rep.file_count < SX_REPAIR_FILES, "p02field %s: no report slot left", names[variant]);
+        sx_repair_file_t *q = &rep.file[rep.file_count++];
+        memset(q, 0, sizeof(*q));
+        snprintf(q->name, sizeof(q->name), "/add_corrupt.bak");
+        q->custody = true;
+        q->size = (uint32_t)model_of("/add_corrupt.bak")->size;
+        p02field_inventory(&inv, &rep);
+        CHECK(inv.files > SX_INVENTORY_FILES, "p02field %s: only %u files on the store", names[variant], inv.files);
+        CHECK(p02field_larger_files >= SX_INVENTORY_FILES,
+              "p02field %s: only %u files larger than the quarantine", names[variant], p02field_larger_files);
+        const sx_inventory_file_t *kept = NULL;
+        for (uint32_t i = 0; i < inv.count && !kept; ++i)
+            if (!strcmp(inv.file[i].name, "add_corrupt.bak")) kept = &inv.file[i];
+        CHECK(kept && !kept->first_error && kept->bytes == q->size,
+              "p02field %s: the quarantine lost its report slot to the cap", names[variant]);
+        CHECK(sx_inventory_verdict(&rep, &inv) == SX_OK, "p02field %s: the gate refuses %s with the slot kept",
+              names[variant], sx_reason_name(sx_inventory_verdict(&rep, &inv)));
+        p02field_inventory(&inv, NULL); /* the 2.7.6 policy: by size alone */
+        CHECK(sx_inventory_verdict(&rep, &inv) == SX_CUSTODY_MISSING,
+              "p02field %s: size alone would not have evicted the quarantine", names[variant]);
+    }
     /* The worst case at 1 MiB has fewer custody blocks than pages short:
      * every one drops a page, and that is still too few. */
     bool short_of_room = variant == P02F_SHORT || (variant == P02F_MIN_GAIN && kib < 8192);

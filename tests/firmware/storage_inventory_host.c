@@ -236,6 +236,21 @@ int main(int argc, char **argv)
     assert(find(&report, "blocked_identity.jsonl") && find(&report, "persistence-probe") &&
            find(&report, "pending_events.jsonl") && find(&report, "big.bin") && !find(&report, "acked_uids.txt"));
 
+    /* 2.7.7 (round 2 review, defect 6): a priority name (a repair-tracked
+     * custody file) keeps its slot ahead of merely larger readable files, so
+     * the confirm-first gate's CUSTODY_MISSING check never loses a small
+     * custody file to the cap. Unreadable files still come first, and a
+     * priority name that is not on the store matches nothing. */
+    static const char priority_names[][33] = {"acked_uids.txt", "add_corrupt.bak"};
+    const si_ports_t custody_ports = {.priority = priority_names, .priority_count = 2};
+    si_scan(directory, &custody_ports, &report);
+    assert(report.complete && report.files == 25 && report.count == SI_MAX_FILES && report.unreadable_files == 3);
+    const si_file_t *acked = find(&report, "acked_uids.txt");
+    assert(acked && acked->priority && acked->bytes == 600);
+    assert(report.file[0].first_error && report.file[1].first_error && report.file[2].first_error);
+    assert(!strcmp(report.file[3].name, "acked_uids.txt"));
+    assert(find(&report, "big.bin") && !find(&report, "segment-08.bin") && !find(&report, "add_corrupt.bak"));
+
     /* Damage across a chunk boundary is mapped page by page, as is a damaged
      * byte in a later chunk; whole chunks resume once a chunk reads back. */
     char spans[512];

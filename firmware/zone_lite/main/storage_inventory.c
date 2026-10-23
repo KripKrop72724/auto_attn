@@ -8,11 +8,22 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "zone_storage_paths.h"
+#if defined(ZONE_LITE_STORAGE_REPAIR) && ZONE_LITE_STORAGE_REPAIR
+#include "storage_repair.h"
+#endif
 
 /* Boot, terminal session and boot confirmation settle first; the scan then
  * yields to every storage user and stops at its budget. */
 #define SI_START_DELAY_MS (60 * 1000)
 #define SI_BUDGET_US (180LL * 1000LL * 1000LL)
+/* ZKT 2.7.7 (round 2 review, defect 5): on a boot that may use the
+ * confirm-first exception, the budget grows with the spans the boot repair
+ * holds (each costs a failed chunk and a failed span read, and a damaged
+ * page can cost a search of the whole store), bounded well inside the 900 s
+ * confirmation budget. 13FL's ~15,000 held spans would overrun the plain
+ * 180 s every boot and refuse the exception with INVENTORY_UNEXPLAINED. */
+#define SI_SPAN_BUDGET_US 20000LL
+#define SI_BUDGET_EXTRA_MAX_US (300LL * 1000LL * 1000LL)
 /* A yield per 32 pages that read back, as in 2.7.4, where a read was a page;
  * a read is now a chunk of data spans, and only a failed chunk is read again
  * by span. */
@@ -56,8 +67,29 @@ static void inventory_task(void *argument)
 {
     (void)argument;
     vTaskDelay(pdMS_TO_TICKS(SI_START_DELAY_MS));
-    s_deadline_us = esp_timer_get_time() + SI_BUDGET_US;
-    const si_ports_t ports = {.keep_going = keep_going};
+    si_ports_t ports = {.keep_going = keep_going};
+    int64_t budget = SI_BUDGET_US;
+#if defined(ZONE_LITE_STORAGE_REPAIR) && ZONE_LITE_STORAGE_REPAIR
+    /* ZKT 2.7.7: the boot repair's custody files are guaranteed a report
+     * slot (the gate's CUSTODY_MISSING reads the report), and on an
+     * exception-candidate boot the budget covers the held spans. */
+    static char priority[SX_REPAIR_FILES][33];
+    static sx_repair_t repair;
+    uint32_t held_spans = 0;
+    if (storage_repair_exception_repair(&repair)) {
+        for (uint32_t i = 0; i < repair.file_count && i < SX_REPAIR_FILES; ++i) {
+            held_spans += repair.file[i].blocked_spans;
+            if (!repair.file[i].custody || repair.file[i].removed || repair.file[i].name[0] != '/') continue;
+            snprintf(priority[ports.priority_count++], sizeof(priority[0]), "%s", repair.file[i].name + 1);
+        }
+        ports.priority = (const char (*)[33])priority;
+    }
+    if (storage_repair_hold_probe()) {
+        int64_t extra = (int64_t)held_spans * SI_SPAN_BUDGET_US;
+        budget += extra < SI_BUDGET_EXTRA_MAX_US ? extra : SI_BUDGET_EXTRA_MAX_US;
+    }
+#endif
+    s_deadline_us = esp_timer_get_time() + budget;
     si_scan(ZONE_STORAGE_BASE, &ports, &s_report);
     __atomic_store_n(&s_ready, true, __ATOMIC_RELEASE);
     log_report();

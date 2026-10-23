@@ -21,11 +21,23 @@ static bool keep_going(const si_ports_t *ports)
     return !ports || !ports->keep_going || ports->keep_going(ports->context);
 }
 
-/* Unreadable files first, then the largest: the ones a repair must handle. */
+/* Unreadable files first, then the caller's priority names, then the
+ * largest. An unreadable file must stay in the report (the gate refuses when
+ * one is missing from it), and a priority file (a repair-tracked custody
+ * file) must never lose its slot to a merely larger readable one. */
 static bool before(const si_file_t *a, const si_file_t *b)
 {
     if ((a->first_error != 0) != (b->first_error != 0)) return a->first_error != 0;
+    if (a->priority != b->priority) return a->priority;
     return a->bytes > b->bytes;
+}
+
+static bool is_priority(const si_ports_t *ports, const char *name)
+{
+    if (!ports || !ports->priority) return false;
+    for (uint32_t i = 0; i < ports->priority_count; ++i)
+        if (!strcmp(ports->priority[i], name)) return true;
+    return false;
 }
 
 static void keep(si_report_t *report, const si_file_t *file)
@@ -175,6 +187,7 @@ void si_scan(const char *directory, const si_ports_t *ports, si_report_t *report
         if ((size_t)snprintf(path, sizeof(path), "%s/%s", directory, names[index]) >= sizeof(path)) continue;
         si_file_t file = {0};
         snprintf(file.name, sizeof(file.name), "%s", names[index]);
+        file.priority = is_priority(ports, file.name);
         struct stat status;
         errno = 0;
         if (stat(path, &status) != 0) {
