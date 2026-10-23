@@ -1106,6 +1106,8 @@ export interface ReconciliationClearHistoryResult {
   deleted: number
   archived: number
   kept_reasons: Record<string, number>
+  // Open jobs left running: Hikvision recent-tail capture, or an open attendance repair's source.
+  kept_running?: Record<string, number>
 }
 
 export interface ReconciliationScheduler {

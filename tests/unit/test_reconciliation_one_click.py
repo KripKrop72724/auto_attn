@@ -295,7 +295,7 @@ def test_clear_history_cancels_deletes_bare_jobs_and_archives_evidence(db):
 
     result = clear_reconciliation_history(session, actor="ops", request_id="clear-history-0001", batch_size=2)
     assert result == {"cancelled": 1, "deleted": 4, "archived": 4, "kept_reasons": {
-        "SOURCE_COVERAGE": 2, "TERMINAL_RECORD_MANIFEST": 1, "RECOVERY_PARENT": 1}}
+        "SOURCE_COVERAGE": 2, "TERMINAL_RECORD_MANIFEST": 1, "RECOVERY_PARENT": 1}, "kept_running": {}}
     session.expire_all()
     remaining = {row.id: row for row in session.scalars(select(ReconciliationJob))}
     assert set(remaining) == {covered.id, manifested.id, kept_parent.id, kept_child.id, already.id}
@@ -310,8 +310,37 @@ def test_clear_history_cancels_deletes_bare_jobs_and_archives_evidence(db):
 
     assert clear_reconciliation_history(session, actor="ops", request_id="clear-history-0001") == result
     second = clear_reconciliation_history(session, actor="ops")
-    assert second == {"cancelled": 0, "deleted": 0, "archived": 0, "kept_reasons": {}}
+    assert second == {"cancelled": 0, "deleted": 0, "archived": 0, "kept_reasons": {}, "kept_running": {}}
     assert session.scalar(select(func.count(ReconciliationJob.id))) == 5
+
+
+def test_clear_history_keeps_live_tail_capture_and_an_open_repair_source_running(db, monkeypatch):
+    from zk_add import reconciliation
+    from zk_add.models import AttendanceRepairJob
+
+    session, connector = db
+    tail_terminal = _eligible(session, mac="e0:72:a1:d6:f3:40", device_id="40", serial="ONECLICK0040")
+    plain_terminal = _eligible(session, mac="e0:72:a1:d6:f3:41", device_id="41", serial="ONECLICK0041")
+    repair_source = create_reconciliation_job(session, connector=connector, actor="test", idempotency_key="keep-0001")
+    tail = create_reconciliation_job(session, connector=tail_terminal, actor="test", idempotency_key="keep-0002")
+    plain = create_reconciliation_job(session, connector=plain_terminal, actor="test", idempotency_key="keep-0003")
+    session.add(AttendanceRepairJob(
+        connector_id=connector.id, zkt_device_id=connector.zkt_device.id, actor="test",
+        idempotency_key="repair-keep-0001", request_digest="b" * 64, status="PREPARING_SOURCE",
+        source_reconciliation_job_id=repair_source.id))
+    session.commit()
+    # A Hikvision recent-tail job keeps following its terminal: live capture, not history.
+    monkeypatch.setattr(reconciliation, "hikvision_tail_job", lambda _session, job: job.id == tail.id)
+
+    result = clear_reconciliation_history(session, actor="ops", request_id="clear-keep-0001")
+    assert result["cancelled"] == 1
+    assert result["kept_running"] == {"HIKVISION_TAIL_CAPTURE": 1, "ATTENDANCE_REPAIR_SOURCE": 1}
+    session.expire_all()
+    # Cancelled with nothing load-bearing on it, so the history sweep deleted it.
+    assert session.get(ReconciliationJob, plain.id) is None
+    for job in (repair_source, tail):
+        kept = session.get(ReconciliationJob, job.id)
+        assert kept.status not in {"CANCELLED", "COMPLETED", "FAILED", "INVALIDATED"} and kept.archived_at is None
 
 
 def test_clear_history_route(db):

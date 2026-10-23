@@ -19,13 +19,6 @@ def request_required(spec: dict, path: str, method: str) -> set[str]:
     return set(request_schema(spec, path, method).get("required", []))
 
 
-def request_schema(spec: dict, path: str, method: str) -> dict:
-    """The request model, also when the body itself is optional (anyOf model | null)."""
-    schema = spec["paths"][path][method]["requestBody"]["content"]["application/json"]["schema"]
-    reference = schema.get("$ref") or next(row["$ref"] for row in schema["anyOf"] if "$ref" in row)
-    return spec["components"]["schemas"][reference.rsplit("/", 1)[-1]]
-
-
 def main() -> None:
     spec = app.openapi()
     paths = spec["paths"]

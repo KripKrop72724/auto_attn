@@ -900,6 +900,26 @@ def _kept_job_reasons(session: Session, job_ids: list[int]) -> dict[int, str]:
     return reasons
 
 
+def _open_job_keep_reason(session: Session, job: ReconciliationJob) -> str | None:
+    """Why clearing history leaves this open job running, if it must.
+
+    A Hikvision recent-tail job keeps following the terminal: it is a live
+    capture path, not history. An open attendance repair waits on its source
+    reconcile and would stall without it. Either can still be cancelled one
+    job at a time.
+    """
+    from zk_add.attendance_repair import JOB_TERMINAL_STATES as REPAIR_TERMINAL_STATES
+    from zk_add.models import AttendanceRepairJob
+
+    if hikvision_tail_job(session, job):
+        return "HIKVISION_TAIL_CAPTURE"
+    if session.scalar(select(AttendanceRepairJob.id).where(
+            AttendanceRepairJob.source_reconciliation_job_id == job.id,
+            AttendanceRepairJob.status.not_in(REPAIR_TERMINAL_STATES)).limit(1)) is not None:
+        return "ATTENDANCE_REPAIR_SOURCE"
+    return None
+
+
 def clear_reconciliation_history(
     session: Session,
     *,
@@ -910,6 +930,8 @@ def clear_reconciliation_history(
 ) -> dict:
     """Cancel every open job, then delete or archive every finished job.
 
+    Open Hikvision recent-tail jobs (live capture) and the source reconcile of
+    an open attendance repair keep running and are counted in kept_running.
     A finished job is deleted (with its events and chunks) only when nothing
     load-bearing references it; otherwise it is archived, so every proof that
     reads it keeps working. Work runs in committed batches so a long history
@@ -924,7 +946,7 @@ def clear_reconciliation_history(
         AuditEvent.action == HISTORY_CLEARED_ACTION, AuditEvent.request_id == request_id))
     if previous is not None:
         return dict(previous.after or {})
-    counts: dict = {"cancelled": 0, "deleted": 0, "archived": 0, "kept_reasons": {}}
+    counts: dict = {"cancelled": 0, "deleted": 0, "archived": 0, "kept_reasons": {}, "kept_running": {}}
     cancel_key = "clear-history-" + hashlib.sha256(request_id.encode()).hexdigest()[:48]
     last_id = 0
     while True:
@@ -937,6 +959,10 @@ def clear_reconciliation_history(
             break
         for job in open_jobs:
             last_id = job.id
+            keep = _open_job_keep_reason(session, job)
+            if keep:
+                counts["kept_running"][keep] = counts["kept_running"].get(keep, 0) + 1
+                continue
             try:
                 job = control_reconciliation_job(
                     session, job=job, action="cancel", actor=actor, idempotency_key=cancel_key,

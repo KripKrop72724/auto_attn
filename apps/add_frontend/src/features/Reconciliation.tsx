@@ -1988,7 +1988,8 @@ export function ReconciliationView({
       rowsRef.current = []
       setRows([])
       setJobCursor(null)
-      const message = `Reconcile history cleared: ${result.cancelled} cancelled, ${result.deleted} deleted, ${result.archived} archived as evidence.`
+      const running = Object.values(result.kept_running || {}).reduce((total, count) => total + count, 0)
+      const message = `Reconcile history cleared: ${result.cancelled} cancelled, ${result.deleted} deleted, ${result.archived} archived as evidence.${running ? ` ${running} kept running (Hikvision live tail capture or an open attendance repair); cancel them individually if needed.` : ''}`
       toast.notice(message)
       setLiveStatus(message)
       await refreshJobsAndReadiness()
