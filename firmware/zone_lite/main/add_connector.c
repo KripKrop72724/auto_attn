@@ -19,6 +19,11 @@
 #include "ota_manager.h"
 #include "storage_inventory.h"
 #include "storage_recovery.h"
+/* The boot-health terms (SX_H_*) name this file's own checks, on every role:
+ * the journal, bridge, recovery and direct images report them too. The header
+ * is pure C (no ESP-IDF or repair dependency); only repair builds link the
+ * decision module itself. */
+#include "storage_exception.h"
 #if defined(ZONE_LITE_STORAGE_REPAIR) && ZONE_LITE_STORAGE_REPAIR
 #include "storage_repair.h"
 #endif
