@@ -1,7 +1,7 @@
 """Interrupted OTA attempts, after MULTAN-02's 2.6.15 -> 2.7.5 attempts on 21 Oct 2026.
 
 Bounded resumption of a stalled 2.6.x download, the TARGET_BOOT_INTERRUPTED
-classification and its evidence, the owner's step-up retry, ESP stability
+classification and its evidence, the owner's one-click retry, ESP stability
 preflight warnings and the 2.6.15 rollback-slot residue health latch. Each
 test runs on SQLite and, when configured, PostgreSQL.
 """
@@ -524,7 +524,7 @@ def test_releases_with_their_own_return_evidence_are_never_classified(version):
     assert classify_return(deployment, SimpleNamespace(version="2.7.5"), evidence)[0] == TARGET_BOOT_INTERRUPTED
 
 
-# --- A1b: the owner's step-up retry ---------------------------------------------------------------
+# --- A1b: the owner's one-click retry --------------------------------------------------------------
 
 
 def admin_client(db):
@@ -541,8 +541,7 @@ def admin_client(db):
 
 
 def retry_body(deployment, **changes):
-    return {"deployment_id": deployment.deployment_id, "reason": "Site replaced the ESP power supply.",
-            "typed_confirmation": "2.7.5", "password": "correct-password", **changes}
+    return {"deployment_id": deployment.deployment_id, **changes}
 
 
 def retry_row(db, run, deployment):
@@ -550,7 +549,7 @@ def retry_row(db, run, deployment):
     return next(item for item in detail["deployments"] if item["deployment_id"] == deployment.deployment_id)
 
 
-def test_owner_retry_needs_step_up_typed_version_and_override_then_adds_one_attempt(db):
+def test_owner_retry_is_one_click_but_needs_the_reviewed_override_then_adds_one_attempt(db):
     _rel, device, run, deployment = booted_target(db)
     returned_heartbeat(db, device)
     detail = campaign_detail(db, run.campaign_id)
@@ -566,10 +565,11 @@ def test_owner_retry_needs_step_up_typed_version_and_override_then_adds_one_atte
     assert review["available"] is True and review["pending_deployments"] == 0
     assert {warning["code"] for warning in review["stability_warnings"]} == {"ESP_RESET_RATE_HIGH", "ESP_UPTIME_SHORT"}
     assert review["esp_state"]["connected"] is True and review["esp_state"]["boot_id"] == "boot-ret"
-    assert client.post(path, json=retry_body(deployment, password="wrong"), headers=headers).status_code == 403
     assert client.post(path, json=retry_body(deployment), headers={}).status_code == 403  # CSRF
-    wrong = client.post(path, json=retry_body(deployment, typed_confirmation="2.7.6"), headers=headers)
-    assert wrong.status_code == 409 and "Typed firmware version" in wrong.json()["detail"]
+    # No password or typed version: an older tab's values are accepted and ignored.
+    legacy = client.post(path, json=retry_body(deployment, password="wrong", typed_confirmation="2.7.6",
+                                               reason="Old tab"), headers=headers)
+    assert legacy.status_code == 409 and "override" in legacy.json()["detail"]
     unconfirmed = client.post(path, json=retry_body(deployment), headers=headers)
     assert unconfirmed.status_code == 409 and "override" in unconfirmed.json()["detail"]
     # The override names exactly the warnings the owner reviewed.
@@ -1838,13 +1838,19 @@ def test_an_owner_pause_survives_an_interrupted_return_and_refuses_the_retry(db,
     assert db.scalar(select(func.count(FirmwareDeployment.id)).where(FirmwareDeployment.campaign_id == run.id)) == 1
 
 
-def test_a_pause_after_the_rollback_pause_also_refuses_the_retry(db):
+def test_pausing_the_rollback_paused_campaign_again_is_refused_and_cancel_ends_the_retry(db):
     _rel, device, run, deployment = booted_target(db)
     returned_heartbeat(db, device)
     assert retry_row(db, run, deployment)["retry"]["available"] is True
-    control_campaign(db, campaign_public_id=run.campaign_id, action="pause", reason=OWNER_HOLD)
+    # Pause starts only from ACTIVE: a second pause cannot overwrite the rollback's reason.
+    with pytest.raises(ValueError, match="paused firmware campaign cannot be paused"):
+        control_campaign(db, campaign_public_id=run.campaign_id, action="pause", reason=OWNER_HOLD)
+    db.rollback()
+    assert retry_row(db, run, deployment)["retry"]["available"] is True
+    # The owner's one-click hold is a cancel, which ends the retry.
+    control_campaign(db, campaign_public_id=run.campaign_id, action="cancel", reason=OWNER_HOLD)
     db.commit()
-    assert f"paused for another reason ({OWNER_HOLD})" in retry_row(db, run, deployment)["retry"]["refusal"]
+    assert retry_row(db, run, deployment)["retry"]["refusal"] == "A cancelled campaign cannot retry; start a new campaign."
 
 
 @pytest.mark.parametrize("path", ["heartbeat", "device_report"])

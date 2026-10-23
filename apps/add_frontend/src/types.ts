@@ -1174,8 +1174,43 @@ export interface FirmwareCampaign {
   actor: string
   reason: string
   deployments: FirmwareDeployment[]
+  // A live campaign whose next device is held (for example by the nationwide
+  // ZKT upgrade slots) is waiting, not stuck.
+  waiting?: { connector_id: string | null; display_name: string | null; code: string; message: string | null } | null
   created_at: string
   updated_at: string
+  archived_at?: string | null
+  archived_by?: string | null
+}
+
+// POST /api/v1/firmware/campaigns/bulk: one campaign per zone, in one click.
+export interface FirmwareBulkZoneResult {
+  zone_id: string
+  outcome: 'CREATED' | 'BUSY' | 'BLOCKED'
+  campaign_id: string | null
+  status: string | null
+  message: string | null
+  stability_warnings: FirmwareStabilityWarning[]
+  eligible: number
+  // Why the zone's first device would wait for now (e.g. NATIONWIDE_TWO_UPGRADE_RESERVATIONS).
+  fleet_hold: string | null
+  closed: Array<{ campaign_id: string; status: string }>
+}
+
+export interface FirmwareBulkResult {
+  release_id: string
+  results: FirmwareBulkZoneResult[]
+  created: number
+}
+
+// POST /api/v1/firmware/campaigns/clear-history
+export interface FirmwareHistoryCleared {
+  completed: number
+  cancelled: number
+  kept_running: Array<{ campaign_id: string; zone_id: string; connector: string | null; connector_id: string | null; state: string }>
+  deleted: number
+  archived: number
+  more: boolean
 }
 
 export interface FirmwareDeploymentEvent {
@@ -1322,6 +1357,7 @@ export interface FirmwareReleaseTotals {
 export interface FirmwareCampaignTotals {
   campaigns: Record<string, number>
   deployments: Record<string, number>
+  archived_campaigns?: number
 }
 
 export interface FirmwareListResponse<T, TTotals> {

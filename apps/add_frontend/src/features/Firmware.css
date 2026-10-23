@@ -81,15 +81,6 @@
 .firmware-campaign-alert > svg { width: 16px; height: 16px; margin-top: 2px; color: var(--critical); }
 .firmware-campaign-alert > span { display: grid; gap: 2px; font-size: 13px; }
 .firmware-campaign-card > footer { align-items: center; justify-content: flex-end; gap: 8px; }
-.firmware-action-menu { position: relative; }
-.firmware-action-menu > button[aria-expanded="true"] { border-color: var(--accent-border); color: var(--accent); background: var(--accent-subtle); }
-.firmware-action-panel { width: 310px; padding: 6px; border: 1px solid var(--border); border-radius: var(--radius-lg); background: var(--surface); box-shadow: var(--shadow-lg); }
-.firmware-action-panel button { width: 100%; min-height: 52px; display: grid; grid-template-columns: 18px minmax(0, 1fr); align-items: center; gap: 12px; padding: 8px 10px; border: 0; border-radius: var(--radius-sm); color: var(--critical); background: transparent; text-align: left; }
-.firmware-action-panel button:hover { background: var(--critical-subtle); }
-.firmware-action-panel button svg { width: 16px; height: 16px; }
-.firmware-action-panel button span { display: grid; gap: 1px; }
-.firmware-action-panel button strong { color: inherit; font-size: 13px; font-weight: 500; }
-.firmware-action-panel button small { color: var(--text-tertiary); font-size: 12px; }
 
 .firmware-inline-error { min-height: 64px; display: grid; grid-template-columns: 20px minmax(0, 1fr) auto; align-items: center; gap: 12px; margin: 12px 16px; padding: 12px 14px; border: 1px solid var(--tone-border, var(--border)); border-radius: var(--radius-md); background: var(--tone-bg, var(--surface)); }
 .firmware-inline-error > svg { width: 18px; height: 18px; color: var(--tone-fg, var(--critical)); }
@@ -99,46 +90,6 @@
 .firmware-skeleton i { height: 60px; border-radius: var(--radius-md); background: linear-gradient(90deg, var(--surface-sunken) 25%, #f7f8fa 50%, var(--surface-sunken) 75%); background-size: 200% 100%; animation: firmware-shimmer 1.3s linear infinite; }
 @keyframes firmware-shimmer { to { background-position: -200% 0; } }
 
-.firmware-campaign-dialog { width: min(1000px, 94vw); }
-.firmware-campaign-wizard { min-height: 600px; display: grid; grid-template-columns: 170px minmax(0, 1fr); background: var(--canvas); }
-.firmware-campaign-wizard > ol { margin: 0; padding: 20px 12px; border-right: 1px solid var(--border); background: var(--surface); list-style: none; }
-.firmware-campaign-wizard > ol li { position: relative; min-height: 56px; display: grid; grid-template-columns: 26px minmax(0, 1fr); align-items: center; gap: 10px; color: var(--text-tertiary); font-size: 13px; }
-.firmware-campaign-wizard > ol li:not(:last-child)::after { content: ""; position: absolute; left: 12px; top: 42px; width: 2px; height: 26px; border-radius: 1px; background: var(--border); }
-.firmware-campaign-wizard > ol li > span { width: 26px; height: 26px; display: grid; place-items: center; border: 1px solid var(--border-strong); border-radius: 50%; background: var(--surface); font-size: 12px; font-weight: 600; }
-.firmware-campaign-wizard > ol li > span svg { width: 14px; height: 14px; }
-.firmware-campaign-wizard > ol li.active { color: var(--text); font-weight: 600; }
-.firmware-campaign-wizard > ol li.active > span { color: #fff; border-color: var(--accent); background: var(--accent); box-shadow: 0 0 0 4px var(--accent-muted); }
-.firmware-campaign-wizard > ol li.done { color: var(--text-secondary); }
-.firmware-campaign-wizard > ol li.done > span { color: var(--positive); border-color: var(--positive-border); background: var(--positive-subtle); }
-.firmware-campaign-wizard > ol li.done::after { background: var(--positive-border); }
-.firmware-campaign-wizard > form { display: grid; align-content: start; gap: 12px; padding: 20px; }
-.firmware-campaign-wizard > form > section { display: grid; gap: 12px; padding: 16px; border: 1px solid var(--border); border-radius: var(--radius-lg); background: var(--surface); }
-.firmware-campaign-wizard label { display: grid; gap: 6px; color: var(--text); font-size: 13px; font-weight: 500; }
-.firmware-campaign-wizard textarea { min-height: 80px; }
-.firmware-wizard-heading { display: flex; align-items: center; gap: 8px; margin: 0; color: var(--text); font-size: 14px; font-weight: 600; line-height: 1.4; }
-.firmware-wizard-heading > span { width: 20px; height: 20px; display: grid; place-items: center; flex: 0 0 auto; border-radius: 50%; background: var(--surface-sunken); color: var(--text-secondary); font-size: 11px; font-variant-numeric: tabular-nums; }
-.firmware-wizard-hint { margin: 0; color: var(--text-tertiary); font-size: 13px; line-height: 1.5; }
-.firmware-wizard-label { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px; }
-.firmware-wizard-label small { color: var(--text-tertiary); font-size: 12px; font-weight: 400; }
-.firmware-wizard-label code { padding: 1px 6px; border-radius: var(--radius-xs); color: var(--text); background: var(--surface-sunken); font-size: 12px; font-weight: 600; }
-.firmware-wizard-context { display: flex; align-items: center; gap: 10px; padding: 10px 12px; border: 1px solid var(--tone-border, var(--border)); border-radius: var(--radius-md); background: var(--tone-bg, var(--surface-subtle)); }
-.firmware-wizard-context > svg { width: 16px; height: 16px; color: var(--tone-fg, var(--accent)); }
-.firmware-wizard-context > span:not(.status-badge) { display: grid; gap: 2px; font-size: 13px; }
-.firmware-wizard-context small { color: var(--text-secondary); }
-.firmware-scope-result { overflow: hidden; border: 1px solid var(--border); border-radius: var(--radius-md); }
-.firmware-scope-result > header { min-height: 60px; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)) auto; align-items: center; gap: 10px; padding: 10px 14px; background: var(--surface-subtle); }
-.firmware-scope-result > header > span:not(.status-badge) { display: grid; gap: 1px; color: var(--text-tertiary); font-size: 12px; }
-.firmware-scope-result > header strong { font-size: 18px; font-variant-numeric: tabular-nums; }
-.firmware-scope-columns { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
-.firmware-scope-columns > section { padding: 12px 14px; }
-.firmware-scope-columns > section + section { border-left: 1px solid var(--border); }
-.firmware-scope-columns h4 { margin: 0 0 8px; font-size: 13px; }
-.firmware-scope-columns article { display: flex; gap: 8px; padding: 8px 0; border-top: 1px solid var(--border); }
-.firmware-scope-columns article > svg { width: 16px; height: 16px; flex: 0 0 auto; color: var(--accent); }
-.firmware-scope-columns article > span { display: grid; gap: 1px; font-size: 13px; }
-.firmware-scope-columns article small { color: var(--text-tertiary); font-size: 12px; }
-.firmware-scope-result > .text-button { margin: 0 14px 10px; }
-.firmware-campaign-wizard > form > footer { position: sticky; bottom: 0; z-index: 2; display: flex; justify-content: flex-end; gap: 8px; margin: 0 -20px -20px; padding: 12px 20px 16px; border-top: 1px solid var(--border); background: var(--canvas); }
 
 .firmware-campaign-detail { display: grid; gap: 16px; }
 .firmware-assurance-card { display: flex; gap: 12px; padding: 16px; border: 1px solid var(--tone-border, var(--border)); border-radius: var(--radius-lg); background: var(--tone-bg, var(--surface)); }
@@ -212,10 +163,6 @@
   .firmware-campaign-toolbar { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .firmware-campaign-toolbar > .search-field { grid-column: 1 / -1; }
   .firmware-campaign-toolbar > label:nth-of-type(4), .firmware-campaign-toolbar > .button { grid-row: auto; }
-  .firmware-campaign-wizard { grid-template-columns: minmax(0, 1fr); }
-  .firmware-campaign-wizard > ol { display: flex; gap: 8px; overflow-x: auto; padding: 12px 16px; border-right: 0; border-bottom: 1px solid var(--border); }
-  .firmware-campaign-wizard > ol li { min-width: 140px; min-height: 40px; }
-  .firmware-campaign-wizard > ol li::after { display: none; }
 }
 @media (max-width: 760px) {
   .firmware-channel-strip { grid-template-columns: minmax(0, 1fr); }
@@ -234,15 +181,7 @@
   .firmware-release-card, .firmware-campaign-card { padding: 16px; }
   .firmware-release-card > header, .firmware-campaign-card > header { align-items: flex-start; flex-direction: column; gap: 8px; }
   .firmware-campaign-card > footer { align-items: stretch; flex-direction: column; }
-  .firmware-campaign-card > footer .button, .firmware-action-menu { width: 100%; }
-  .firmware-action-menu > button { width: 100%; justify-content: center; }
-  .firmware-action-panel { width: auto; border-radius: 16px 16px 0 0; box-shadow: var(--shadow-xl); }
-  .firmware-campaign-dialog { width: 100%; }
-  .firmware-campaign-wizard > form { padding: 14px; }
-  .firmware-campaign-wizard > form > footer { margin: 0 -14px -14px; padding: 12px 14px max(12px, env(safe-area-inset-bottom)); }
-  .firmware-scope-result > header { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .firmware-scope-columns { grid-template-columns: minmax(0, 1fr); }
-  .firmware-scope-columns > section + section { border-top: 1px solid var(--border); border-left: 0; }
+  .firmware-campaign-card > footer .button { width: 100%; }
   .firmware-drawer-actions { bottom: 52px; align-items: stretch; flex-direction: column; }
   .firmware-provisioning-workspace .provisioning-actions { bottom: 72px; padding-bottom: max(12px, env(safe-area-inset-bottom)); }
 }
@@ -281,5 +220,38 @@
 .firmware-retry-target { display: flex; align-items: center; gap: 8px; margin: 10px 0 0; }
 .firmware-retry-target p { display: flex; align-items: center; gap: 6px; margin: 0; color: var(--text-secondary); font-size: 12px; }
 .firmware-stability-warnings ul { margin: 4px 0 6px; padding-left: 18px; }
-.firmware-override { display: flex; align-items: center; gap: 6px; font-weight: 500; }
 @media (max-width: 640px) { .firmware-rollback-evidence dl { grid-template-columns: minmax(0, 1fr); } }
+
+.firmware-campaign-badges { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 6px; }
+.firmware-campaign-waiting { display: flex; align-items: flex-start; gap: 10px; padding: 10px 14px; border: 1px solid var(--warning-border); border-radius: var(--radius-md); background: var(--warning-subtle); }
+.firmware-campaign-waiting > svg { width: 16px; height: 16px; margin-top: 2px; color: var(--warning); }
+.firmware-campaign-waiting > span { display: grid; gap: 2px; font-size: 13px; }
+.firmware-history-actions { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 8px; }
+.firmware-history-actions .check-row { margin: 0; color: var(--text-secondary); font-size: 13px; }
+.firmware-history-result { display: grid; grid-template-columns: 18px minmax(0, 1fr) auto; align-items: start; margin: 12px 16px; }
+.firmware-history-result p { margin: 2px 0 0; color: var(--text-secondary); font-size: 13px; overflow-wrap: anywhere; }
+.firmware-update-dialog { width: min(720px, 94vw); }
+.firmware-update { display: grid; gap: 14px; }
+.firmware-update > label { display: grid; gap: 6px; font-size: 13px; font-weight: 500; }
+.firmware-update-hint { display: flex; align-items: center; gap: 6px; margin: 0; color: var(--text-secondary); font-size: 13px; }
+.firmware-update-hint svg { width: 14px; height: 14px; color: var(--warning); }
+.firmware-zone-picker { display: grid; gap: 10px; margin: 0; padding: 12px 14px; border: 1px solid var(--border); border-radius: var(--radius-md); }
+.firmware-zone-picker legend { padding: 0 4px; font-size: 13px; font-weight: 600; }
+.firmware-zone-picker legend small { margin-left: 6px; color: var(--text-tertiary); font-weight: 400; }
+.firmware-zone-picker > .button { justify-self: start; }
+.firmware-zone-picker > div { max-height: 320px; display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 6px 12px; overflow-y: auto; }
+.firmware-zone-picker .check-row { min-height: 40px; padding: 4px 8px; border-radius: var(--radius-sm); }
+.firmware-zone-picker .check-row:hover { background: var(--surface-hover); }
+.firmware-zone-picker .check-row > span { min-width: 0; display: grid; gap: 1px; font-size: 13px; }
+.firmware-zone-picker .check-row small { color: var(--text-tertiary); font-size: 12px; overflow-wrap: anywhere; }
+.firmware-update-results { display: grid; gap: 6px; margin: 0; padding: 0; list-style: none; }
+.firmware-update-results li { display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: start; gap: 10px; padding: 8px 12px; border: 1px solid var(--tone-border, var(--border)); border-radius: var(--radius-md); background: var(--tone-bg, var(--surface)); }
+.firmware-update-results li > span:not(.status-badge) { min-width: 0; display: grid; gap: 2px; font-size: 13px; }
+.firmware-update-results small { color: var(--text-secondary); font-size: 12px; overflow-wrap: anywhere; }
+.firmware-update-results .message { margin: 6px 0 0; }
+@media (max-width: 760px) {
+  .firmware-update-dialog { width: 100%; }
+  .firmware-history-actions { justify-content: stretch; }
+  .firmware-history-actions .button { flex: 1 1 100%; }
+  .firmware-zone-picker > div { grid-template-columns: minmax(0, 1fr); }
+}

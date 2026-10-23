@@ -13,34 +13,20 @@ import type {
 
 type Toast = Pick<ReturnType<typeof useToast>, 'notice'>
 
-export function StabilityWarnings({
-  warnings,
-  override,
-  onOverride,
-}: {
-  warnings: FirmwareStabilityWarning[]
-  override: boolean
-  onOverride: (value: boolean) => void
-}) {
+// Information only: a one-click update or retry overrides exactly these
+// warnings (by the server's digest) and records them with the attempt.
+export function StabilityWarnings({ warnings }: { warnings: FirmwareStabilityWarning[] }) {
   if (!warnings.length) return null
   return (
     <div className="message pattern-waiting firmware-stability-warnings" role="status">
       <Icon name="alert" />
       <div>
-        <strong>ESP stability warnings</strong>
+        <strong>ESP stability warnings (recorded with the attempt)</strong>
         <ul>
           {warnings.map((warning) => (
             <li key={`${warning.connector_id}-${warning.code}`}>{warning.message}</li>
           ))}
         </ul>
-        <label className="firmware-override">
-          <input
-            type="checkbox"
-            checked={override}
-            onChange={(event) => onOverride(event.target.checked)}
-          />{' '}
-          Override the stability warnings for this attempt
-        </label>
       </div>
     </div>
   )
@@ -183,11 +169,6 @@ export function RetryTargetDialog({
 }) {
   const [preflight, setPreflight] = useState<FirmwareRetryPreflight | null>(null)
   const [preflightError, setPreflightError] = useState('')
-  const [reason, setReason] = useState('')
-  const [confirmation, setConfirmation] = useState('')
-  const [password, setPassword] = useState('')
-  const [override, setOverride] = useState(false)
-  const [pendingConfirmed, setPendingConfirmed] = useState(false)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
   useEffect(() => {
@@ -208,16 +189,11 @@ export function RetryTargetDialog({
   }, [campaign.campaign_id, deployment.deployment_id])
   const warnings = preflight?.stability_warnings || []
   const pending = preflight?.pending_deployments ?? 0
-  const valid =
-    Boolean(preflight?.available) &&
-    reason.trim().length >= 10 &&
-    confirmation === deployment.target_version &&
-    Boolean(password) &&
-    (!warnings.length || override) &&
-    (!pending || pendingConfirmed) &&
-    !busy
+  const valid = Boolean(preflight?.available) && !busy
+  // One click: the review's warnings (by digest) and pending count go with
+  // the request; the server refuses if either changed since the review.
   const retry = async () => {
-    if (!preflight) return
+    if (!preflight || !valid) return
     setBusy(true)
     setError('')
     try {
@@ -225,23 +201,19 @@ export function RetryTargetDialog({
         method: 'POST',
         body: JSON.stringify({
           deployment_id: deployment.deployment_id,
-          reason: reason.trim(),
-          typed_confirmation: confirmation,
-          password,
-          override_stability_warnings: override,
-          ...(override && warnings.length ? { stability_warnings_digest: preflight.stability_warnings_digest } : {}),
-          // Only the number the owner confirmed; the server refuses any other.
-          resume_pending_deployments: pendingConfirmed ? pending : 0,
+          override_stability_warnings: warnings.length > 0,
+          ...(warnings.length ? { stability_warnings_digest: preflight.stability_warnings_digest } : {}),
+          resume_pending_deployments: pending,
         }),
       })
-      setPassword('')
       toast.notice(
-        `One new ${deployment.target_version} attempt for ${deployment.display_name || deployment.connector_id} is queued; the campaign is active again.`,
+        `One new ${deployment.target_version} attempt for ${deployment.display_name || deployment.connector_id} is queued; the campaign is active again${
+          pending ? ` and also offers its ${pending} other pending deployment${pending === 1 ? '' : 's'}` : ''
+        }.`,
       )
       await onChanged()
       onClose()
     } catch (reason) {
-      setPassword('')
       setError(reason instanceof Error ? reason.message : 'The retry was refused.')
     } finally {
       setBusy(false)
@@ -286,46 +258,10 @@ export function RetryTargetDialog({
             <div>
               Retrying resumes the campaign, which also offers its {pending} other pending
               deployment{pending === 1 ? '' : 's'}, one at a time before this retry.
-              <label className="firmware-override">
-                <input
-                  type="checkbox"
-                  checked={pendingConfirmed}
-                  onChange={(event) => setPendingConfirmed(event.target.checked)}
-                />{' '}
-                Also offer the {pending} pending deployment{pending === 1 ? '' : 's'}
-              </label>
             </div>
           </div>
         )}
-        <StabilityWarnings warnings={warnings} override={override} onOverride={setOverride} />
-        <label>
-          Audited reason
-          <textarea
-            value={reason}
-            onChange={(event) => setReason(event.target.value)}
-            maxLength={200}
-            placeholder="10–200 characters"
-          />
-        </label>
-        <label>
-          <span>
-            Type exact version <code>{deployment.target_version}</code>
-          </span>
-          <input
-            value={confirmation}
-            onChange={(event) => setConfirmation(event.target.value)}
-            autoComplete="off"
-          />
-        </label>
-        <label>
-          Administrator password
-          <input
-            type="password"
-            autoComplete="current-password"
-            value={password}
-            onChange={(event) => setPassword(event.target.value)}
-          />
-        </label>
+        <StabilityWarnings warnings={warnings} />
         {error && (
           <div className="message pattern-blocked" role="alert">
             <Icon name="alert" />
