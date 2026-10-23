@@ -7,8 +7,8 @@ static void wipe(void *buffer, size_t size)
     while (size--) *p++ = 0;
 }
 
-esp_err_t rescue_wifi_keys(nvs_handle_t handle, const char *ssid,
-                          const char *password, bool *changed)
+static esp_err_t save_wifi_keys(nvs_handle_t handle, const char *ssid,
+                               const char *password, bool *changed, bool replace)
 {
     if (!ssid || !password || !changed) return ESP_ERR_INVALID_ARG;
     *changed = false;
@@ -20,7 +20,16 @@ esp_err_t rescue_wifi_keys(nvs_handle_t handle, const char *ssid,
     size_t size = sizeof(previous);
     esp_err_t err = nvs_get_str(handle, "wifi_ssid", previous, &size);
     if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND) return err;
-    if (previous[0]) return ESP_OK;
+    if (previous[0] && !replace) return ESP_OK;
+    if (replace && !strcmp(previous, ssid)) {
+        char previous_pass[64] = {0};
+        size = sizeof(previous_pass);
+        err = nvs_get_str(handle, "wifi_pass", previous_pass, &size);
+        bool equal = err == ESP_OK && !strcmp(previous_pass, password);
+        wipe(previous_pass, sizeof(previous_pass));
+        if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND) return err;
+        if (equal) return ESP_OK;
+    }
     err = nvs_set_str(handle, "wifi_pass", password);
     if (err == ESP_OK) err = nvs_set_str(handle, "wifi_ssid", ssid);
     if (err == ESP_OK) err = nvs_commit(handle);
@@ -35,4 +44,16 @@ esp_err_t rescue_wifi_keys(nvs_handle_t handle, const char *ssid,
     wipe(readback_pass, sizeof(readback_pass));
     if (err == ESP_OK) *changed = true;
     return err;
+}
+
+esp_err_t rescue_wifi_keys(nvs_handle_t handle, const char *ssid,
+                          const char *password, bool *changed)
+{
+    return save_wifi_keys(handle, ssid, password, changed, false);
+}
+
+esp_err_t rescue_wifi_keys_exact(nvs_handle_t handle, const char *ssid,
+                                const char *password, bool *changed)
+{
+    return save_wifi_keys(handle, ssid, password, changed, true);
 }

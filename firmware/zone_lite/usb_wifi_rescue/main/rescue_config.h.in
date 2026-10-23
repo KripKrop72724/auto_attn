@@ -1,3 +1,5 @@
 #pragma once
 #define RESCUE_WIFI_PASSWORD "@rescue_password_c@"
+#define RESCUE_WIFI_SSID "@rescue_ssid_c@"
+#define RESCUE_REPLACE_WIFI @replace_wifi@
 #define RESCUE_SPARE_PREDECESSOR_SHA256 "@test_sha@"

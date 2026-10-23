@@ -29,7 +29,7 @@ def test_wifi_only_repair_preserves_other_keys_and_recovers_each_failure(tmp_pat
         #include "wifi_keys.h"
         static char ssid[80], password[80], protected_key[80];
         static int step, failure, writes;
-        static bool missing, corrupt_readback;
+        static bool missing, corrupt_readback, replacing;
         static bool fail(void) { return ++step == failure; }
         int nvs_get_str(int h, const char *key, char *out, size_t *size) {
             assert(h == 123);
@@ -47,7 +47,7 @@ def test_wifi_only_repair_preserves_other_keys_and_recovers_each_failure(tmp_pat
             /* Any accidental write outside the pair aborts the test. */
             assert(!strcmp(key,"wifi_ssid") || !strcmp(key,"wifi_pass"));
             if (!strcmp(key,"wifi_pass")) {
-                assert(!ssid[0]); strcpy(password,value);
+                assert(!ssid[0] || replacing); strcpy(password,value);
             } else {
                 assert(!strcmp(password,"HIL-Recovery-Only")); strcpy(ssid,value); missing=false;
             }
@@ -57,7 +57,7 @@ def test_wifi_only_repair_preserves_other_keys_and_recovers_each_failure(tmp_pat
         static void reset(void) {
             strcpy(ssid,""); strcpy(password,"old-password");
             strcpy(protected_key,"fixture-connector-token");
-            step=failure=writes=0; missing=corrupt_readback=false;
+            step=failure=writes=0; missing=corrupt_readback=replacing=false;
         }
         int main(void) {
             bool changed;
@@ -85,6 +85,22 @@ def test_wifi_only_repair_preserves_other_keys_and_recovers_each_failure(tmp_pat
             assert(!writes);
             reset(); corrupt_readback=true;
             assert(rescue_wifi_keys(123,"RE7","HIL-Recovery-Only",&changed)==ESP_FAIL && !changed);
+            /* Direct mode is explicitly authorized to replace this pair only.
+             * Nonempty old SSID, changed password, every failed call and retry. */
+            for (int cut=0; cut<=6; ++cut) {
+                reset(); replacing=true; strcpy(ssid,"Old site"); failure=cut;
+                int result=rescue_wifi_keys_exact(123,"Admin Department (H&AI)","HIL-Recovery-Only",&changed);
+                assert(cut ? result!=ESP_OK : result==ESP_OK);
+                assert(!strcmp(protected_key,"fixture-connector-token"));
+                failure=0;
+                assert(rescue_wifi_keys_exact(123,"Admin Department (H&AI)","HIL-Recovery-Only",&changed)==ESP_OK);
+                assert(!strcmp(ssid,"Admin Department (H&AI)") && !strcmp(password,"HIL-Recovery-Only"));
+                writes=0;
+                assert(rescue_wifi_keys_exact(123,"Admin Department (H&AI)","HIL-Recovery-Only",&changed)==ESP_OK && !changed && !writes);
+                strcpy(password,"wrong-password"); writes=step=0;
+                assert(rescue_wifi_keys_exact(123,"Admin Department (H&AI)","HIL-Recovery-Only",&changed)==ESP_OK && changed);
+                assert(!strcmp(password,"HIL-Recovery-Only"));
+            }
             puts("PASS: two-key confinement, every failure, retry, readback and operator edits");
             return 0;
         }
