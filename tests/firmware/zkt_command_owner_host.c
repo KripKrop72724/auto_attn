@@ -84,7 +84,10 @@ static bool parse_command_object(cJSON *root, add_command_t *command)
     return true;
 }
 /* Any use of the former caller-owned NVS/budget path is a regression. */
-static void led_status_fault(int state) { (void)state; assert(false); }
+/* ZKT 2.7.7: every failure site in these regions reports its errno now; the
+ * plain stub stays for future extractions. Neither path is exercised here. */
+__attribute__((unused)) static void led_status_fault(int state) { (void)state; assert(false); }
+static void led_status_fault_errno(int state,int error) { (void)state;(void)error;assert(false); }
 bool qs_local_begin(qs_admission_t policy, size_t bytes)
 { (void)policy; (void)bytes; assert(false); return false; }
 void qs_local_end(bool ok, int error) { (void)ok; (void)error; assert(false); }

@@ -50,7 +50,8 @@ static void *allocate(size_t n){if(++calls==fail_at)return NULL;return malloc(n)
 #define malloc allocate
 static int xSemaphoreTake(void *m,int timeout){(void)m;(void)timeout;assert(!held);held=true;return 1;}
 static void xSemaphoreGive(void *m){(void)m;assert(held);held=false;}
-static void led_status_fault(int state){assert(state==1);}
+/* ZKT 2.7.7: every failure site in these regions now reports its errno. */
+static void led_status_fault_errno(int state,int error){(void)error;assert(state==1);}
 static bool qs_local_begin(int policy,size_t bytes){assert(held && policy==2 && bytes<=65536);admitted=!deny_budget;return admitted;}
 static void qs_local_end_file(bool ok,int error,const char *file){(void)ok;(void)error;assert(file&&file[0]);assert(admitted);admitted=false;}
 static void command_unmark_queued_locked(const char *id){assert(held && id[0]);}

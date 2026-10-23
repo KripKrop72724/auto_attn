@@ -26,7 +26,8 @@
 /* The failing step and errno, as read_blocked_locked records them. */
 static const char *g_blocked_read_stage="";
 static int g_blocked_read_error;
-static struct { struct { uint32_t offset; } checkpoint; } g_legacy_blocked={{.offset=11}};
+static struct { bool ready; struct { uint32_t offset; } checkpoint; uint32_t recovery_offset; }
+    g_legacy_blocked={.ready=true,.checkpoint={.offset=11},.recovery_offset=3};
 static unsigned queue_failure_logs;
 static char last_failure[192];
 static dq_result_t blocked_read_failed(const char *stage,dq_result_t result)
@@ -53,6 +54,12 @@ static bool legacy_attendance_owner_required(void) { return required; }
 static int xSemaphoreTake(int lock,unsigned delay) { assert(lock && delay==200 && !held);held=lock;return pdTRUE; }
 static void xSemaphoreGive(int lock) { assert(held==lock);held=0; }
 static void led_status_fault(int code) { assert(code==LED_STATUS_LOCAL_FAILURE); }
+/* ZKT 2.7.7: a blocked-queue read that failed at the checkpointed offset
+ * reports its errno and offset (S3's store-read classification). */
+#define LED_QUEUE_BLOCKED 1
+static void led_status_fault_read(int code,int error,int queue,uint32_t offset)
+{ (void)error;(void)offset;assert(code==LED_STATUS_LOCAL_FAILURE && queue==LED_QUEUE_BLOCKED); }
+static void led_status_fault_errno(int code,int error) { (void)error;assert(code==LED_STATUS_LOCAL_FAILURE); }
 static bool append_line(const char *path,const char *line)
 {
     assert(!strcmp(path,PENDING_PATH) && (required ? !held : held));
