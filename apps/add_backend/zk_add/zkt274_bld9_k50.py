@@ -76,7 +76,3 @@ def offer_location(release: Any, connector: Any) -> str | None:
                 release.image_sha256, _application_sha256(release))
     return LOCATION if OFFER_RELEASES.get(identity) == release.state else None
 
-
-def reserved_location(connector_id: str) -> str | None:
-    """Where this device's occupied upgrade slot is, like a nationwide target's."""
-    return LOCATION if connector_id == TARGET.connector_id else None

@@ -89,36 +89,32 @@ def offer(db, device):
     return assignment_for_connector(db, connector=device, public_base="https://test.invalid")
 
 
-def test_two_fleet_slots_and_physical_location_are_enforced_in_real_assignment(store):
+def test_any_number_of_targets_upgrade_at_once_even_at_one_location(store):
+    # Owner decision (23 Oct 2026): no nationwide or per-location concurrency limit.
     with store() as db:
         tower, swat, faisalabad, upstairs = [connector(db, i) for i in [0, 1, 2, 11]]
         assert offer(db, tower)
-        assert offer(db, upstairs) is None
-        assert deployment(db, upstairs).error_code == "NATIONWIDE_LOCATION_BUSY"
+        assert offer(db, upstairs)  # The same SLICTOWER location.
         assert offer(db, swat)
-        assert offer(db, faisalabad) is None
-        assert deployment(db, faisalabad).error_code == "NATIONWIDE_TWO_UPGRADE_RESERVATIONS"
-        assert db.scalar(select(func.count(FirmwareDownloadGrant.id))) == 2
-        assert offer(db, tower)  # Resume reuses its reservation.
+        assert offer(db, faisalabad)
+        assert all(deployment(db, device).error_code is None for device in (tower, upstairs, swat, faisalabad))
+        assert db.scalar(select(func.count(FirmwareDownloadGrant.id))) == 4
+        assert offer(db, tower)  # Resume reuses its offer.
         assert deployment(db, tower).attempt_count == 1
-        deployment(db, tower).status = "SUCCEEDED"
-        assert offer(db, upstairs)
-        assert deployment(db, upstairs).error_code is None
-        assert deployment(db, faisalabad).status == "PENDING"
 
 
 @pytest.mark.parametrize("state", ["OFFERED", "DOWNLOADING", "VERIFYING", "READY_TO_BOOT", "BOOTED_PENDING",
                                   "RECONCILING", "CANCELLED", "SUPERSEDED", "RELEASE_REVOKED"])
-def test_offline_paused_and_unconfirmed_cancelled_offers_still_reserve_a_location(store, state):
+def test_unsettled_offers_at_a_location_no_longer_hold_another_upgrade(store, state):
     with store() as db:
         tower, upstairs = connector(db, 0), connector(db, 11)
         row = deployment(db, tower)
         row.status, row.offered_at = state, datetime.now(timezone.utc)
         tower.connected = False
         db.get(FirmwareCampaign, row.campaign_id).status = "PAUSED"
-        assert offer(db, upstairs) is None
-        assert deployment(db, upstairs).error_code == "NATIONWIDE_LOCATION_BUSY"
-        assert db.scalar(select(func.count(FirmwareDownloadGrant.id))) == 0
+        assert offer(db, upstairs)
+        assert deployment(db, upstairs).error_code is None
+        assert db.scalar(select(func.count(FirmwareDownloadGrant.id))) == 1
 
 
 @pytest.mark.parametrize("fault", ["offline", "spare", "serial", "mac", "unknown"])
@@ -140,14 +136,13 @@ def test_new_offers_require_the_exact_online_active_target(store, fault):
         assert db.scalar(select(func.count(FirmwareDownloadGrant.id))) == 0
 
 
-def test_unknown_active_location_blocks_and_hikvision_is_separate(store):
+def test_an_unknown_upgrading_device_does_not_block_and_hikvision_is_separate(store):
     with store() as db:
         tower, swat = connector(db, 0), connector(db, 1)
         row = deployment(db, tower)
         row.status, row.offered_at = "DOWNLOADING", datetime.now(timezone.utc)
         tower.connector_id = "unknown-location"
-        assert offer(db, swat) is None
-        assert deployment(db, swat).error_code == "NATIONWIDE_ACTIVE_LOCATION_UNKNOWN"
+        assert pending_offer_hold(db, swat) is None
         tower.firmware_family = "hikvision"
         assert try_assignment_lock(db, tower) and pending_offer_hold(db, tower) is None
         assert offer(db, swat)
@@ -170,22 +165,21 @@ def test_previous_release_offers_keep_their_policy_before_journal_registration(s
         assert all(offer(db, connector(db, index)) for index in [0, 1, 2, 11])
 
 
-def test_postgres_simultaneous_requests_cannot_reserve_three_slots(store):
+def test_postgres_simultaneous_requests_are_serialized_without_a_slot_limit(store):
     if store.kw["bind"].dialect.name != "postgresql":
         return
     with store() as first, store() as second, store() as third:
         a, b, c = connector(first, 0), connector(second, 1), connector(third, 2)
         assert offer(first, a)
         started = time.monotonic()
+        # The assignment lock still serializes offers; a busy lock never waits.
         assert offer(second, b) is None and time.monotonic()-started < 1
-        assert offer(third, c) is None
         first.commit()
         assert offer(second, b)
-        assert offer(third, c) is None
         second.commit()
-        assert offer(third, c) is None
-        assert deployment(third, c).error_code == "NATIONWIDE_TWO_UPGRADE_RESERVATIONS"
-        assert third.scalar(select(func.count(FirmwareDownloadGrant.id))) == 2
+        assert offer(third, c)
+        third.commit()
+        assert third.scalar(select(func.count(FirmwareDownloadGrant.id))) == 3
 
 
 def test_postgres_failed_assignment_commit_releases_its_reservation(store):
@@ -244,14 +238,14 @@ def test_verified_later_installation_releases_old_reservation_without_rewriting_
         assert settled["deployment_id"] == later.deployment_id and settled["event_id"] == event.id
         assert offer(db, connector(db, 11))
         assert offer(db, connector(db, 1))
-        assert offer(db, connector(db, 2)) is None
+        assert offer(db, connector(db, 2))
         assert (old.status, old.updated_at, old.completed_at, campaign.status) == before
 
 
 @pytest.mark.parametrize("fault", ["active", "paused", "missing_event", "other_connector", "incomplete",
     "bad_digest", "bad_partition", "bad_version", "bad_target", "failed_event", "failed_deployment",
     "missing_completed", "old_offer", "old_event", "future_event", "missing_offer", "wrong_bytes", "error"])
-def test_unproven_later_installation_cannot_release_reservation(store, fault):
+def test_unproven_later_installation_stays_unsettled_without_holding_offers(store, fault):
     with store() as db:
         device, old, campaign, later, event = cancelled_then_installed(db)
         if fault in {"active", "paused"}:
@@ -287,18 +281,19 @@ def test_unproven_later_installation_cannot_release_reservation(store, fault):
             event.details = {**event.details, key:value}
         db.flush()
         assert reservation_snapshot(db)["reservations"][0]["later_installation"] is None
-        assert offer(db, connector(db, 11)) is None
-        assert deployment(db, connector(db, 11)).error_code == "NATIONWIDE_LOCATION_BUSY"
+        assert offer(db, connector(db, 11))
+        assert deployment(db, connector(db, 11)).error_code is None
 
 
-def test_same_connector_uncertainty_counts_once_and_unbounded_history_is_held(store, monkeypatch):
+def test_unsettled_history_of_any_size_never_holds_an_offer(store, monkeypatch):
     with store() as db:
         device, old, campaign, later, event = cancelled_then_installed(db)
         later.status, later.offered_at = "CANCELLED", old.offered_at
-        assert offer(db, connector(db, 1))  # One unknown ESP plus this offer, not three ESPs.
-        assert offer(db, connector(db, 2)) is None
+        assert offer(db, connector(db, 1))
+        assert offer(db, connector(db, 2))
         monkeypatch.setattr("zk_add.zkt_ota_admission.RESERVATION_SCAN_LIMIT", 1)
-        assert pending_offer_hold(db, connector(db, 2)) == "NATIONWIDE_RESERVATION_SCAN_LIMIT"
+        assert not reservation_snapshot(db)["scan_complete"]
+        assert pending_offer_hold(db, connector(db, 11)) is None
 
 
 def test_real_progress_commit_settles_cancelled_attempt_and_new_attempt_reserves_again(store):
@@ -313,17 +308,19 @@ def test_real_progress_commit_settles_cancelled_attempt_and_new_attempt_reserves
             bytes_written=1024, running_version=later.target_version, running_partition="ota_1", image_sha256="c"*64)
         db.commit()
         assert pending_offer_hold(db, connector(db, 11)) is None
-        # A new attempt on this device is a new reservation, regardless of the
-        # historical cancelled attempts already settled by that valid boot.
+        # A new attempt on this device is shown as a new reservation, and still
+        # never holds another device's offer.
         db.add(FirmwareDeployment(deployment_id="new-attempt", campaign_id=later.campaign_id,
             release_id=later.release_id, connector_id=device.id, target_version=later.target_version,
             status="OFFERED", offered_at=datetime.now(timezone.utc)))
         db.commit()
-        assert pending_offer_hold(db, connector(db, 11)) == "NATIONWIDE_LOCATION_BUSY"
+        assert any(row["deployment_id"] == "new-attempt" and row["later_installation"] is None
+                   for row in reservation_snapshot(db)["reservations"])
+        assert pending_offer_hold(db, connector(db, 11)) is None
 
 
 # ZONE-BLD9-01's K50 sits outside the 17. Only its exact signed 2.4.12 bridge
-# and 2.7.4 may queue it, at the BLD9 location, under every other limit.
+# and 2.7.4 may be offered to it.
 def k50_release(db, identity, state):
     release_id, version, git_sha, image, application = identity
     row = FirmwareRelease(release_id=release_id, version=version, git_sha=git_sha, image_sha256=image,
@@ -407,7 +404,7 @@ def test_k50_exception_is_its_exact_identity_and_zone(store, fault):
             assert pending_offer_hold(db, k50, row) == "NATIONWIDE_EXACT_TARGET_REQUIRED"
 
 
-def test_k50_shares_bld9_and_the_two_fleet_slots(store):
+def test_k50_upgrades_alongside_bld9_and_the_rest_of_the_fleet(store):
     from zk_add.zkt274_bld9_k50 import TARGET
     with store() as db:
         k50, bridge, release = k50_store(db)
@@ -417,24 +414,17 @@ def test_k50_shares_bld9_and_the_two_fleet_slots(store):
         k50.connected = False
         assert pending_offer_hold(db, k50, release) == "NATIONWIDE_TARGET_OFFLINE"
         k50.connected = True
-        # The nationwide BLD9 01 holding a slot keeps the K50 waiting, and back.
+        # BLD9 01 upgrading at the same location no longer keeps the K50 waiting.
         hold(db, bld9_01, legacy)
-        assert pending_offer_hold(db, k50, bridge) == "NATIONWIDE_LOCATION_BUSY"
-        db.scalar(select(FirmwareDeployment).where(FirmwareDeployment.connector_id == bld9_01.id)).status = "SUCCEEDED"
+        assert pending_offer_hold(db, k50, bridge) is None
         hold(db, k50, bridge)
-        assert reservation_snapshot(db)["reservations"][0]["connector_id"] == TARGET.connector_id
-        assert pending_offer_hold(db, bld9_02, legacy) == "NATIONWIDE_LOCATION_BUSY"
-        # Elsewhere a K50 slot is a known location, never LOCATION_UNKNOWN.
+        assert {row["connector_id"] for row in reservation_snapshot(db)["reservations"]} >= {TARGET.connector_id}
+        assert pending_offer_hold(db, bld9_02, legacy) is None
         tower, swat = connector(db, 0), connector(db, 1)
-        assert pending_offer_hold(db, tower, legacy) is None
-        row = deployment(db, tower)
-        row.status, row.offered_at = "DOWNLOADING", datetime.now(timezone.utc)
-        assert pending_offer_hold(db, swat, legacy) == "NATIONWIDE_TWO_UPGRADE_RESERVATIONS"
-        # And two other slots keep the K50 waiting too.
-        db.scalar(select(FirmwareDeployment).where(FirmwareDeployment.connector_id == k50.id)).status = "SUCCEEDED"
-        row = deployment(db, swat)
-        row.status, row.offered_at = "DOWNLOADING", datetime.now(timezone.utc)
-        assert pending_offer_hold(db, k50, release) == "NATIONWIDE_TWO_UPGRADE_RESERVATIONS"
+        for device in (tower, swat):
+            row = deployment(db, device)
+            row.status, row.offered_at = "DOWNLOADING", datetime.now(timezone.utc)
+        assert pending_offer_hold(db, k50, release) is None
 
 
 def test_other_devices_outside_the_17_still_wait_with_the_k50_exception(store):
@@ -462,8 +452,6 @@ def test_k50_bridge_offer_through_real_assignment(store):
         db.flush()
         legacy = db.scalar(select(FirmwareRelease).where(FirmwareRelease.version == "2.2.1"))
         hold(db, bld9_01, legacy)
-        assert offer(db, k50) is None
-        assert deployment(db, k50).error_code == "NATIONWIDE_LOCATION_BUSY"
-        db.scalar(select(FirmwareDeployment).where(FirmwareDeployment.connector_id == bld9_01.id)).status = "SUCCEEDED"
+        # BLD9 01 mid-upgrade at the same location does not hold the K50's offer.
         assert offer(db, k50)["version"] == "2.4.12"
         assert deployment(db, k50).status == "OFFERED" and deployment(db, k50).error_code is None

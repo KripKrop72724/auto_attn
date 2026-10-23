@@ -353,8 +353,8 @@ def _permitted_hil_targets(session: Session, release: FirmwareRelease) -> list[H
     if release.version in FLEET_PLATFORM_VERSIONS:
         # The 2.7 platform in the 2.6.15 fleet's legacy authority. Its exact
         # nationwide prefix starts each target independently, like the
-        # recovery image: the fleet reservation guard (at most two unsettled
-        # upgrades, one per location) and one-zone campaigns set the pace.
+        # recovery image, with no fleet-wide concurrency limit (removed by the
+        # owner on 23 Oct 2026); one-zone campaigns set the pace.
         # The shared ordered HIL configuration is untouched.
         if not settings.firmware_hil_enabled:
             raise ValueError("Ordered firmware HIL quarantine is disabled.")
