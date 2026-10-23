@@ -10,7 +10,8 @@ import json
 import re
 from uuid import uuid4
 
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import and_, delete, func, or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, aliased
 
 from zk_add import source_newest_slot as newest_slot
@@ -172,14 +173,18 @@ def _require_source_epoch(
         )
 
 
-def _request_digest(*, connector: Connector, reason: str, confirmation: str, scope: str = "ALL_RECORDS") -> str:
+def _request_mode(scope: str) -> str:
+    return scope if scope in {"ACTIVE_USERS", "RECENT_TAIL"} else "FULL_HISTORY_BASELINE"
+
+
+def _request_digest(*, connector: Connector, scope: str = "ALL_RECORDS",
+                    reason: str | None = None, confirmation: str | None = None) -> str:
+    """A start is one click: the digest binds only the connector and scope.
+
+    Reason and typed confirmation are accepted from older callers and ignored,
+    so a replay with the same idempotency key always returns the same job."""
     material = json.dumps(
-        {
-            "connector_id": connector.connector_id,
-            "confirmation": confirmation,
-            "mode": scope if scope in {"ACTIVE_USERS", "RECENT_TAIL"} else "FULL_HISTORY_BASELINE",
-            "reason": reason.strip(),
-        },
+        {"connector_id": connector.connector_id, "mode": _request_mode(scope)},
         separators=(",", ":"),
         sort_keys=True,
     )
@@ -435,28 +440,39 @@ def preflight_reconciliation(
     }
 
 
+ONE_CLICK_START_REASON = "One-click reconcile"
+HIKVISION_ONLY_SCOPE_MESSAGE = (
+    "Active-user history and recent-tail recovery are supported only for Hikvision terminals."
+)
+
+
+def _one_click_reason(reason: str | None, default: str) -> str:
+    return (reason or "").strip() or default
+
+
 def create_reconciliation_job(
     session: Session,
     *,
     connector: Connector,
     actor: str,
-    reason: str,
-    confirmation: str,
     idempotency_key: str,
     scope: str = "ALL_RECORDS",
+    reason: str | None = None,
+    confirmation: str | None = None,
 ) -> ReconciliationJob:
+    """Queue a job in one click. `confirmation` is accepted and ignored;
+    `reason` is optional and only recorded."""
     if scope not in {"ALL_RECORDS", "ACTIVE_USERS", "RECENT_TAIL"} or (
             scope != "ALL_RECORDS" and connector.firmware_family != "hikvision"):
-        raise ValueError("Active-user history and recent-tail recovery are supported only for Hikvision terminals.")
+        raise ValueError(HIKVISION_ONLY_SCOPE_MESSAGE)
     locked_connector = session.scalar(
         select(Connector).where(Connector.id == connector.id).with_for_update()
     )
     if locked_connector is None:
         raise ValueError("Connector no longer exists.")
     connector = locked_connector
-    digest = _request_digest(
-        connector=connector, reason=reason, confirmation=confirmation, scope=scope
-    )
+    reason = _one_click_reason(reason, ONE_CLICK_START_REASON)
+    digest = _request_digest(connector=connector, scope=scope)
     existing = session.scalar(
         select(ReconciliationJob).where(
             ReconciliationJob.connector_id == connector.id,
@@ -467,10 +483,6 @@ def create_reconciliation_job(
         if existing.request_digest != digest:
             raise ValueError("That idempotency key was used for a different request.")
         return existing
-    expected = f"RECONCILE {connector.device_id} " + {
-        "ACTIVE_USERS": "ACTIVE USERS", "RECENT_TAIL": "RECENT TAIL"}.get(scope, "FROM START")
-    if confirmation != expected:
-        raise ValueError(f"Type {expected} exactly to confirm this operation.")
     preflight = preflight_reconciliation(session, connector, scope=scope)
     if preflight["hard_blockers"]:
         raise ValueError(preflight["hard_blockers"][0]["message"])
@@ -496,7 +508,7 @@ def create_reconciliation_job(
         connector_id=connector.id,
         zkt_device_id=zkt.id,
         actor=actor,
-        reason=reason.strip(),
+        reason=reason,
         idempotency_key=idempotency_key,
         request_digest=digest,
         status="QUEUED",
@@ -523,7 +535,7 @@ def create_reconciliation_job(
         target_type="connector",
         target_id=connector.connector_id,
         outcome="QUEUED",
-        after={"job_id": job.job_id, "reason": reason.strip(), "scope": scope},
+        after={"job_id": job.job_id, "reason": reason, "scope": scope},
     )
     return job
 
@@ -534,10 +546,12 @@ def control_reconciliation_job(
     job: ReconciliationJob,
     action: str,
     actor: str,
-    reason: str,
     idempotency_key: str,
+    reason: str | None = None,
     expected_state: ReconciliationRetryExpectedState | None = None,
 ) -> ReconciliationJob:
+    """One-click control; a missing reason records a default text."""
+    reason = _one_click_reason(reason, f"One-click {action} by operator")
     if expected_state is not None and action != "retry":
         raise ValueError("Expected state is supported only for a guarded retry.")
     # A request without the newer connector-generation field keeps its
@@ -691,6 +705,305 @@ def control_reconciliation_job(
         after={"status": job.status, "reason": reason.strip()},
     )
     return job
+
+
+BULK_RECONCILIATION_LIMIT = 100
+HISTORY_CLEARED_ACTION = "RECONCILIATION_HISTORY_CLEARED"
+CLEAR_HISTORY_BATCH_SIZE = 100
+
+
+class ReconciliationNotTerminal(ValueError):
+    """Archive refused: the job is still open and must be cancelled first."""
+
+
+def _bulk_idempotency_key(idempotency_key: str, connector_id: str) -> str:
+    key = f"{idempotency_key}:{connector_id}"
+    return key if len(key) <= 120 else "bulk:" + hashlib.sha256(key.encode()).hexdigest()
+
+
+def create_bulk_reconciliation_jobs(
+    session: Session,
+    *,
+    connector_ids: list[str],
+    actor: str,
+    idempotency_key: str,
+    scope: str = "ALL_RECORDS",
+) -> dict:
+    """Start one job per terminal in one click.
+
+    Each terminal is created inside its own savepoint, so one blocked terminal
+    never rolls back the others. A replay with the same key returns the jobs
+    it created; a terminal that already has an open job is reported, not failed.
+    """
+    connectors = {
+        row.connector_id: row
+        for row in session.scalars(select(Connector).where(Connector.connector_id.in_(connector_ids)))
+    }
+    results: dict[str, dict] = {}
+    # One lock order for every bulk start, so two concurrent ones cannot deadlock.
+    for connector_id in sorted(connector_ids, key=lambda value: (
+            connectors[value].id if value in connectors else 0, value)):
+        connector = connectors.get(connector_id)
+        row = results[connector_id] = {
+            "connector_id": connector_id,
+            "display_name": connector.display_name if connector else None,
+            "zone_id": connector.zone_id if connector else None,
+            "outcome": "BLOCKED",
+            "job_id": None,
+            "status": None,
+            "message": None,
+        }
+        if connector is None:
+            row["message"] = "Terminal not found."
+            continue
+        key = _bulk_idempotency_key(idempotency_key, connector_id)
+        replay = session.scalar(select(ReconciliationJob.id).where(
+            ReconciliationJob.connector_id == connector.id, ReconciliationJob.idempotency_key == key))
+        active = None if replay else session.scalar(
+            select(ReconciliationJob).where(
+                ReconciliationJob.connector_id == connector.id,
+                ReconciliationJob.status.not_in(TERMINAL_JOB_STATES),
+            ).order_by(ReconciliationJob.id.desc()).limit(1)
+        )
+        if active is not None:
+            row.update(outcome="ALREADY_ACTIVE", job_id=active.job_id, status=active.status,
+                       message=f"A reconcile is already {humanize_status(active.status)} on this terminal.")
+            continue
+        try:
+            with session.begin_nested():
+                job = create_reconciliation_job(
+                    session, connector=connector, actor=actor, idempotency_key=key, scope=scope,
+                )
+        except ValueError as exc:
+            row["message"] = str(exc)
+            continue
+        except IntegrityError:
+            row["message"] = "Another reconcile started on this terminal at the same moment; refresh to see it."
+            continue
+        row.update(outcome="CREATED", job_id=job.job_id, status=job.status)
+    ordered = [results[connector_id] for connector_id in connector_ids]
+    return {"results": ordered, "created": sum(row["outcome"] == "CREATED" for row in ordered)}
+
+
+def humanize_status(status: str) -> str:
+    return status.lower().replace("_", " ")
+
+
+def _lock_job(session: Session, job: ReconciliationJob) -> ReconciliationJob:
+    locked = session.scalar(
+        select(ReconciliationJob).where(ReconciliationJob.id == job.id)
+        .with_for_update().execution_options(populate_existing=True)
+    )
+    if locked is None:
+        raise ValueError("Reconciliation job no longer exists.")
+    return locked
+
+
+def archive_reconciliation_job(
+    session: Session,
+    *,
+    job: ReconciliationJob,
+    actor: str,
+    request_id: str | None = None,
+) -> ReconciliationJob:
+    """Hide a finished job from the dashboards. Its evidence stays readable."""
+    job = _lock_job(session, job)
+    if job.archived_at is not None:
+        return job
+    if job.status not in TERMINAL_JOB_STATES:
+        raise ReconciliationNotTerminal(
+            f"Reconciliation is still {humanize_status(job.status)}; cancel it before archiving."
+        )
+    now = utc_now()
+    job.archived_at = now
+    job.archived_by = actor
+    append_audit(
+        session,
+        actor=actor,
+        action="RECONCILIATION_ARCHIVED",
+        target_type="reconciliation_job",
+        target_id=job.job_id,
+        outcome="ARCHIVED",
+        before={"status": job.status},
+        after={"status": job.status, "archived_at": now.isoformat()},
+        request_id=request_id,
+    )
+    return job
+
+
+def cancel_and_archive_reconciliation_job(
+    session: Session,
+    *,
+    job: ReconciliationJob,
+    actor: str,
+    idempotency_key: str,
+) -> ReconciliationJob:
+    """Cancel an open job (if it is still open) and archive it, in one transaction."""
+    job = _lock_job(session, job)
+    if job.status not in TERMINAL_JOB_STATES:
+        job = control_reconciliation_job(
+            session, job=job, action="cancel", actor=actor, idempotency_key=idempotency_key,
+            reason="One-click cancel and archive by operator",
+        )
+    return archive_reconciliation_job(session, job=job, actor=actor, request_id=idempotency_key)
+
+
+def _kept_job_reasons(session: Session, job_ids: list[int]) -> dict[int, str]:
+    """Why each terminal job must be kept (archived) instead of deleted.
+
+    A job is kept while any evidence other code reads hangs off it: its source
+    coverage, terminal record manifest (custody, tail, ordinal and attendance
+    proofs), divergences, an attendance repair's source, Hikvision source
+    state or pages (tail resume spans), or a recovery child that is kept.
+    """
+    from zk_add.hikvision_reconciliation import (
+        HikvisionReconciliationPage,
+        HikvisionReconciliationState,
+    )
+    from zk_add.models import AttendanceRepairJob
+
+    checks = (
+        ("SOURCE_COVERAGE", select(ReconciliationCoverage.job_id)
+         .where(ReconciliationCoverage.job_id.in_(job_ids))),
+        ("TERMINAL_RECORD_MANIFEST", select(TerminalRecordManifest.job_id)
+         .where(TerminalRecordManifest.job_id.in_(job_ids))),
+        ("TERMINAL_RECORD_MANIFEST", select(ReconciliationChunk.job_id)
+         .join(TerminalRecordManifest, TerminalRecordManifest.chunk_id == ReconciliationChunk.id)
+         .where(ReconciliationChunk.job_id.in_(job_ids))),
+        ("SOURCE_DIVERGENCE", select(ReconciliationDivergence.job_id)
+         .where(ReconciliationDivergence.job_id.in_(job_ids))),
+        ("ATTENDANCE_REPAIR_SOURCE", select(AttendanceRepairJob.source_reconciliation_job_id)
+         .where(AttendanceRepairJob.source_reconciliation_job_id.in_(job_ids))),
+        ("HIKVISION_SOURCE_STATE", select(HikvisionReconciliationState.job_id)
+         .where(HikvisionReconciliationState.job_id.in_(job_ids))),
+        ("HIKVISION_SOURCE_PAGES", select(HikvisionReconciliationPage.job_id)
+         .where(HikvisionReconciliationPage.job_id.in_(job_ids))),
+    )
+    reasons: dict[int, str] = {}
+    for reason, statement in checks:
+        for job_id in session.scalars(statement.distinct()):
+            reasons.setdefault(job_id, reason)
+    # A parent stays while a child that is not deleted with it still names it.
+    candidates = {job_id for job_id in job_ids if job_id not in reasons}
+    while candidates:
+        kept_parents = {
+            parent for child, parent in session.execute(
+                select(ReconciliationJob.id, ReconciliationJob.recovery_parent_job_id)
+                .where(ReconciliationJob.recovery_parent_job_id.in_(candidates))
+            ) if child not in candidates
+        }
+        if not kept_parents:
+            break
+        for parent in kept_parents:
+            reasons[parent] = "RECOVERY_PARENT"
+        candidates -= kept_parents
+    return reasons
+
+
+def clear_reconciliation_history(
+    session: Session,
+    *,
+    actor: str,
+    request_id: str | None = None,
+    batch_size: int = CLEAR_HISTORY_BATCH_SIZE,
+    commit=None,
+) -> dict:
+    """Cancel every open job, then delete or archive every finished job.
+
+    A finished job is deleted (with its events and chunks) only when nothing
+    load-bearing references it; otherwise it is archived, so every proof that
+    reads it keeps working. Work runs in committed batches so a long history
+    never holds locks for long, and a second call finds nothing left to do.
+    Audit rows are never touched.
+    """
+    from zk_add.models import AuditEvent
+
+    commit = commit or session.commit
+    request_id = request_id or str(uuid4())
+    previous = session.scalar(select(AuditEvent).where(
+        AuditEvent.action == HISTORY_CLEARED_ACTION, AuditEvent.request_id == request_id))
+    if previous is not None:
+        return dict(previous.after or {})
+    counts: dict = {"cancelled": 0, "deleted": 0, "archived": 0, "kept_reasons": {}}
+    cancel_key = "clear-history-" + hashlib.sha256(request_id.encode()).hexdigest()[:48]
+    last_id = 0
+    while True:
+        open_jobs = session.scalars(
+            select(ReconciliationJob).where(
+                ReconciliationJob.status.not_in(TERMINAL_JOB_STATES), ReconciliationJob.id > last_id,
+            ).order_by(ReconciliationJob.id.asc()).limit(batch_size)
+        ).all()
+        if not open_jobs:
+            break
+        for job in open_jobs:
+            last_id = job.id
+            try:
+                job = control_reconciliation_job(
+                    session, job=job, action="cancel", actor=actor, idempotency_key=cancel_key,
+                    reason="Cancelled by clear reconcile history",
+                )
+            except ValueError:
+                continue  # It finished by itself meanwhile; the sweep below handles it.
+            counts["cancelled"] += int(job.status == "CANCELLED")
+        commit()
+    cursor: int | None = None
+    while True:
+        statement = select(ReconciliationJob).where(
+            ReconciliationJob.status.in_(TERMINAL_JOB_STATES), ReconciliationJob.archived_at.is_(None),
+        )
+        if cursor is not None:
+            statement = statement.where(ReconciliationJob.id < cursor)
+        # Newest first: a recovery child is handled before the parent it names.
+        batch = session.scalars(
+            statement.order_by(ReconciliationJob.id.desc()).limit(batch_size).with_for_update()
+        ).all()
+        if not batch:
+            break
+        cursor = batch[-1].id
+        ids = [row.id for row in batch]
+        reasons = _kept_job_reasons(session, ids)
+        deletable = [job_id for job_id in ids if job_id not in reasons]
+        if deletable:
+            try:
+                with session.begin_nested():
+                    for model, column in ((ReconciliationEvent, ReconciliationEvent.job_id),
+                                          (ReconciliationChunk, ReconciliationChunk.job_id),
+                                          (ReconciliationJob, ReconciliationJob.id)):
+                        session.execute(
+                            delete(model).where(column.in_(deletable)),
+                            execution_options={"synchronize_session": False},
+                        )
+            except IntegrityError:
+                # Something began referencing these rows; keep them instead.
+                reasons.update({job_id: "REFERENCED" for job_id in deletable})
+            else:
+                counts["deleted"] += len(deletable)
+                gone = set(deletable)
+                for row in batch:
+                    if row.id in gone:
+                        session.expunge(row)
+        now = utc_now()
+        for row in batch:
+            reason = reasons.get(row.id)
+            if reason is None:
+                continue
+            row.archived_at = now
+            row.archived_by = actor
+            counts["archived"] += 1
+            counts["kept_reasons"][reason] = counts["kept_reasons"].get(reason, 0) + 1
+        commit()
+    append_audit(
+        session,
+        actor=actor,
+        action=HISTORY_CLEARED_ACTION,
+        target_type="reconciliation_history",
+        target_id=None,
+        outcome="CLEARED",
+        after=counts,
+        request_id=request_id,
+    )
+    commit()
+    return counts
 
 
 def apply_reconciliation_anchor(
@@ -4012,6 +4325,8 @@ def serialize_job(session: Session, job: ReconciliationJob, *, include_events: b
         "oracle_certified_at": job.oracle_certified_at,
         "completed_at": job.completed_at,
         "updated_at": job.updated_at,
+        "archived_at": job.archived_at,
+        "archived_by": job.archived_by,
     }
     if job.mode == "HIKVISION_SERIAL_HISTORY":
         from zk_add.hikvision_reconciliation import HikvisionReconciliationState

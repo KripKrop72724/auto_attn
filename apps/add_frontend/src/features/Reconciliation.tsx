@@ -19,7 +19,6 @@ import {
   relativeTime,
   statusPattern,
   useToast,
-  type ReconciliationDialogState,
 } from '../App'
 import { Icon } from '../Icon'
 import { AnchoredLayer } from '../AnchoredLayer'
@@ -29,6 +28,9 @@ import type {
   HikvisionHistoryScope,
   ReconciliationDivergenceDetail,
   ReconciliationDivergenceReveal,
+  ReconciliationBulkResponse,
+  ReconciliationBulkResult,
+  ReconciliationClearHistoryResult,
   ReconciliationJob,
   ReconciliationJobTotals,
   ReconciliationListResponse,
@@ -132,6 +134,243 @@ const reconciliationEtaLabel = (job: ReconciliationJob) => {
   if (job.eta.unavailable_reason?.includes('ORACLE')) return 'Oracle verifying'
   if (job.eta.unavailable_reason === 'WAITING_FOR_DEVICE') return 'Device wait'
   return 'Measuring'
+}
+
+// Realtime revisions arrive on every chunk and punch. Refetch at most once per
+// interval (trailing edge), so a running scan does not keep reloading the view.
+function useThrottledValue<T>(value: T, intervalMs: number): T {
+  const [throttled, setThrottled] = useState(value)
+  const lastRef = useRef(0)
+  useEffect(() => {
+    if (Object.is(value, throttled)) return
+    const timer = window.setTimeout(() => {
+      lastRef.current = Date.now()
+      setThrottled(value)
+    }, Math.max(0, lastRef.current + intervalMs - Date.now()))
+    return () => window.clearTimeout(timer)
+  }, [value, throttled, intervalMs])
+  return throttled
+}
+
+const REVISION_REFRESH_MS = 5000
+const JOB_PAGE = 40
+const BULK_REQUEST_LIMIT = 100
+
+// A refresh re-reads the loaded window, newest first by job id. Rows older than
+// the refreshed window stay as loaded, so "Load older" rows never vanish and
+// nothing is reordered; rows missing inside the window were archived or deleted.
+const mergeJobWindow = (
+  current: ReconciliationJob[],
+  fresh: ReconciliationJob[],
+  windowTruncated: boolean,
+) => {
+  if (!windowTruncated || !fresh.length) return { rows: fresh, keptTail: false }
+  const freshIds = new Set(fresh.map((row) => row.job_id))
+  const boundary = current.findIndex(
+    (row) => row.job_id === fresh[fresh.length - 1].job_id,
+  )
+  const tail =
+    boundary < 0
+      ? []
+      : current.slice(boundary + 1).filter((row) => !freshIds.has(row.job_id))
+  return { rows: [...fresh, ...tail], keptTail: tail.length > 0 }
+}
+
+const bulkOutcomeCopy: Record<ReconciliationBulkResult['outcome'], string> = {
+  CREATED: 'Started',
+  ALREADY_ACTIVE: 'Already running',
+  BLOCKED: 'Blocked',
+}
+
+function BulkReconcilePanel({
+  devices,
+  busy,
+  result,
+  onStart,
+  onClose,
+}: {
+  devices: Device[]
+  busy: boolean
+  result: ReconciliationBulkResponse | null
+  onStart: (connectorIds: string[]) => void
+  onClose: () => void
+}) {
+  const [selection, setSelection] = useState<Set<string>>(() => new Set())
+  const [query, setQuery] = useState('')
+  const zones = useMemo(() => {
+    const normalized = query.trim().toLowerCase()
+    const grouped = new Map<string, { name: string; devices: Device[] }>()
+    devices
+      .filter((device) =>
+        `${device.display_name} ${device.zone_name} ${device.zone_id} ${device.connector_id} ${device.device_id} ${device.zkt?.serial || ''}`
+          .toLowerCase()
+          .includes(normalized),
+      )
+      .forEach((device) => {
+        const key = device.zone_id || 'UNKNOWN'
+        const group = grouped.get(key) || {
+          name: device.zone_name || key,
+          devices: [],
+        }
+        group.devices.push(device)
+        grouped.set(key, group)
+      })
+    return [...grouped.entries()].sort(([left], [right]) =>
+      left.localeCompare(right),
+    )
+  }, [devices, query])
+  const shownIds = zones.flatMap(([, group]) =>
+    group.devices.map((device) => device.connector_id),
+  )
+  const allShownSelected =
+    shownIds.length > 0 && shownIds.every((id) => selection.has(id))
+  const toggle = (ids: string[], checked: boolean) =>
+    setSelection((current) => {
+      const next = new Set(current)
+      ids.forEach((id) => (checked ? next.add(id) : next.delete(id)))
+      return next
+    })
+  const counts = result
+    ? {
+        CREATED: result.results.filter((row) => row.outcome === 'CREATED'),
+        ALREADY_ACTIVE: result.results.filter(
+          (row) => row.outcome === 'ALREADY_ACTIVE',
+        ),
+        BLOCKED: result.results.filter((row) => row.outcome === 'BLOCKED'),
+      }
+    : null
+  return (
+    <section
+      className="panel reconciliation-bulk"
+      aria-labelledby="reconciliation-bulk-title"
+    >
+      <div className="panel-header">
+        <div>
+          <h2 id="reconciliation-bulk-title">Reconcile several terminals</h2>
+          <p>
+            Tick terminals or whole zones and start them with one click. Each
+            terminal gets its own full-history job; a blocked terminal is
+            reported and never stops the others.
+          </p>
+        </div>
+        <button
+          className="icon-button"
+          type="button"
+          aria-label="Close bulk reconcile"
+          onClick={onClose}
+        >
+          <Icon name="x" />
+        </button>
+      </div>
+      <div className="reconciliation-bulk-toolbar">
+        <label className="reconciliation-bulk-check">
+          <input
+            type="checkbox"
+            checked={allShownSelected}
+            disabled={!shownIds.length}
+            onChange={(event) => toggle(shownIds, event.target.checked)}
+          />
+          <span>Select all ({shownIds.length.toLocaleString()})</span>
+        </label>
+        <label className="search-field">
+          <span className="sr-only">Filter terminals for bulk reconcile</span>
+          <Icon name="search" />
+          <input
+            value={query}
+            onChange={(event) => setQuery(event.target.value)}
+            placeholder="Filter by name, zone, ID, or serial"
+          />
+        </label>
+        <button
+          className="button primary"
+          type="button"
+          disabled={!selection.size || busy}
+          onClick={() => onStart([...selection])}
+        >
+          <Icon name="refresh" />{' '}
+          {busy
+            ? 'Starting…'
+            : `Reconcile ${selection.size.toLocaleString()} selected`}
+        </button>
+      </div>
+      <div className="reconciliation-bulk-zones">
+        {zones.map(([zoneId, group]) => {
+          const ids = group.devices.map((device) => device.connector_id)
+          const zoneSelected = ids.every((id) => selection.has(id))
+          return (
+            <fieldset key={zoneId}>
+              <legend>
+                <label className="reconciliation-bulk-check">
+                  <input
+                    type="checkbox"
+                    checked={zoneSelected}
+                    onChange={(event) => toggle(ids, event.target.checked)}
+                  />
+                  <span>
+                    <strong>{group.name}</strong>
+                    <small>
+                      {zoneId} · {ids.length} terminal{ids.length === 1 ? '' : 's'}
+                    </small>
+                  </span>
+                </label>
+              </legend>
+              <div>
+                {group.devices.map((device) => (
+                  <label
+                    key={device.connector_id}
+                    className="reconciliation-bulk-check"
+                  >
+                    <input
+                      type="checkbox"
+                      checked={selection.has(device.connector_id)}
+                      onChange={(event) =>
+                        toggle([device.connector_id], event.target.checked)
+                      }
+                    />
+                    <span>
+                      <strong>{device.display_name}</strong>
+                      <small>
+                        {device.zkt?.serial || 'serial pending'} ·{' '}
+                        {humanize(device.state)}
+                      </small>
+                    </span>
+                  </label>
+                ))}
+              </div>
+            </fieldset>
+          )
+        })}
+        {!zones.length && (
+          <div className="empty-state compact">
+            <Icon name="search" />
+            <p>No terminals match this filter.</p>
+          </div>
+        )}
+      </div>
+      {counts && (
+        <div className="reconciliation-bulk-result" aria-label="Bulk reconcile result">
+          <p>
+            <strong>{counts.CREATED.length} started</strong> ·{' '}
+            {counts.ALREADY_ACTIVE.length} already running ·{' '}
+            {counts.BLOCKED.length} blocked
+          </p>
+          {[...counts.ALREADY_ACTIVE, ...counts.BLOCKED].length > 0 && (
+            <ul>
+              {[...counts.BLOCKED, ...counts.ALREADY_ACTIVE].map((row) => (
+                <li key={row.connector_id} className={`pattern-${row.outcome === 'BLOCKED' ? 'blocked' : 'waiting'}`}>
+                  <strong>{row.display_name || row.connector_id}</strong>
+                  <span>
+                    {bulkOutcomeCopy[row.outcome]}
+                    {row.message ? ` — ${row.message}` : ''}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
+    </section>
+  )
 }
 
 function WorkspaceTabs({
@@ -356,21 +595,6 @@ function TerminalPicker({
         </AnchoredLayer>
       )}
     </section>
-  )
-}
-
-function ReconciliationCancelMenu({ onCancel }: { onCancel: () => void }) {
-  const [open, setOpen] = useState(false)
-  const triggerRef = useRef<HTMLButtonElement>(null)
-  return (
-    <div className="reconciliation-action-menu">
-      <button ref={triggerRef} className="icon-button" type="button" aria-label="More reconciliation actions" title="More actions" aria-haspopup="menu" aria-expanded={open} onClick={() => setOpen((value) => !value)}><Icon name="more" /></button>
-      {open && <AnchoredLayer anchorRef={triggerRef} className="reconciliation-action-layer" mobileSheet preferredWidth={310} onDismiss={(reason) => { setOpen(false); if (reason === 'escape') triggerRef.current?.focus() }}>
-        <div className="reconciliation-action-panel" role="group" aria-label="Reconciliation actions">
-          <button type="button" className="danger-action" onClick={() => { setOpen(false); onCancel() }}><Icon name="x" /><span><strong>Cancel reconciliation</strong><small>Committed checkpoints and evidence remain preserved.</small></span></button>
-        </div>
-      </AnchoredLayer>}
-    </div>
   )
 }
 
@@ -1280,17 +1504,18 @@ export function ReconciliationView({
   )
   const [preflightLoading, setPreflightLoading] = useState(false)
   const [preflightError, setPreflightError] = useState('')
-  const [dialog, setDialog] = useState<ReconciliationDialogState>(null)
-  const [historyScope, setHistoryScope] = useState<HikvisionHistoryScope>('ACTIVE_USERS')
+  const [historyScope, setHistoryScope] = useState<HikvisionHistoryScope>('ALL_RECORDS')
   const [jobDrawer, setJobDrawer] = useState<ReconciliationJob | null>(null)
   const jobDrawerReturnFocusRef = useRef<HTMLButtonElement>(null)
   const [divergenceDrawerId, setDivergenceDrawerId] = useState<string | null>(
     null,
   )
-  const [reason, setReason] = useState('')
-  const [confirmation, setConfirmation] = useState('')
-  const [password, setPassword] = useState('')
-  const [busy, setBusy] = useState(false)
+  // One action at a time: 'start', 'bulk', 'clear', or `${job_id}:${action}`.
+  const [busyKey, setBusyKey] = useState<string | null>(null)
+  const [bulkOpen, setBulkOpen] = useState(false)
+  const [bulkResult, setBulkResult] =
+    useState<ReconciliationBulkResponse | null>(null)
+  const [liveStatus, setLiveStatus] = useState('')
   const [exceptionRows, setExceptionRows] = useState<SourceException[]>([])
   const [exceptionTotals, setExceptionTotals] =
     useState<SourceExceptionTotals>(emptyExceptionTotals)
@@ -1317,6 +1542,14 @@ export function ReconciliationView({
   })
   const jobAbortRef = useRef<AbortController | null>(null)
   const exceptionAbortRef = useRef<AbortController | null>(null)
+  const preflightAbortRef = useRef<AbortController | null>(null)
+  const rowsRef = useRef<ReconciliationJob[]>([])
+  const jobCursorRef = useRef<number | null>(null)
+  useEffect(() => {
+    rowsRef.current = rows
+    jobCursorRef.current = jobCursor
+  }, [rows, jobCursor])
+  const refreshRevision = useThrottledValue(revision, REVISION_REFRESH_MS)
   const selected =
     devices.find((device) => device.connector_id === selectedId) || null
   const zones = useMemo(
@@ -1407,34 +1640,52 @@ export function ReconciliationView({
       cursor,
       append = false,
       quiet = false,
-    }: { cursor?: number; append?: boolean; quiet?: boolean } = {}) => {
+      refresh = false,
+    }: {
+      cursor?: number
+      append?: boolean
+      quiet?: boolean
+      refresh?: boolean
+    } = {}) => {
       if (append) setJobLoadingMore(true)
       else if (!quiet) setJobLoading(true)
       setJobError('')
       jobAbortRef.current?.abort()
       const controller = new AbortController()
       jobAbortRef.current = controller
+      // A refresh re-reads the whole loaded window instead of page 1, so the
+      // rows the operator paged in stay put.
+      const limit = refresh
+        ? Math.min(500, Math.max(JOB_PAGE, rowsRef.current.length))
+        : JOB_PAGE
       try {
         const response = await api<ReconciliationListResponse>(
-          `/api/v1/reconciliations${queryString({ q: jobQuery.trim() || undefined, zone_id: jobZone || undefined, status_group: jobStatus || undefined, cursor, limit: 40 })}`,
+          `/api/v1/reconciliations${queryString({ q: jobQuery.trim() || undefined, zone_id: jobZone || undefined, status_group: jobStatus || undefined, cursor, limit })}`,
           { signal: controller.signal },
         )
-        setRows((current) =>
-          append
-            ? [
-                ...new Map(
-                  [...current, ...response.rows].map((row) => [
-                    row.job_id,
-                    row,
-                  ]),
-                ).values(),
-              ]
-            : response.rows,
-        )
+        let nextCursor = response.next_cursor
+        if (append) {
+          setRows((current) => [
+            ...new Map(
+              [...current, ...response.rows].map((row) => [row.job_id, row]),
+            ).values(),
+          ])
+        } else if (refresh) {
+          const merged = mergeJobWindow(
+            rowsRef.current,
+            response.rows,
+            response.next_cursor != null,
+          )
+          if (merged.keptTail) nextCursor = jobCursorRef.current
+          rowsRef.current = merged.rows
+          setRows(merged.rows)
+        } else {
+          setRows(response.rows)
+        }
         setEnabled(response.enabled)
         setScheduler(response.scheduler || emptyScheduler)
         setJobTotals(response.totals || emptyJobTotals)
-        setJobCursor(response.next_cursor)
+        setJobCursor(nextCursor)
         setJobFilteredTotal(response.filtered_total)
       } catch (reason) {
         if (!(reason instanceof DOMException && reason.name === 'AbortError'))
@@ -1506,15 +1757,18 @@ export function ReconciliationView({
     const timer = window.setTimeout(() => void loadJobs(), 250)
     return () => window.clearTimeout(timer)
   }, [loadJobs])
+  // Revisions refresh in place; the first load above is the mount's only load,
+  // so a refresh never races it and replaces rows the operator paged in.
+  const listRevisionRef = useRef(refreshRevision)
   useEffect(() => {
-    if (section === 'jobs') void loadJobs({ quiet: true })
-  }, [revision]) // eslint-disable-line react-hooks/exhaustive-deps
+    if (listRevisionRef.current === refreshRevision) return
+    listRevisionRef.current = refreshRevision
+    if (section === 'jobs') void loadJobs({ quiet: true, refresh: true })
+    else if (section === 'exceptions') void loadExceptions({ quiet: true })
+  }, [refreshRevision]) // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => {
     void loadExceptions()
   }, [loadExceptions])
-  useEffect(() => {
-    if (section === 'exceptions') void loadExceptions({ quiet: true })
-  }, [revision]) // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => {
     void api<{
       delivery: {
@@ -1531,133 +1785,242 @@ export function ReconciliationView({
         ),
       )
       .catch(() => setRecoveryCount(0))
-  }, [revision])
+  }, [refreshRevision])
   useEffect(
     () => () => {
       jobAbortRef.current?.abort()
       exceptionAbortRef.current?.abort()
+      preflightAbortRef.current?.abort()
     },
     [],
   )
+  const loadPreflight = useCallback(async (id: string, quiet: boolean) => {
+    preflightAbortRef.current?.abort()
+    if (!id) return
+    const controller = new AbortController()
+    preflightAbortRef.current = controller
+    if (!quiet) setPreflightLoading(true)
+    const [detail, check] = await Promise.allSettled([
+      api<Device>(`/api/v1/devices/${id}`, { signal: controller.signal }),
+      api<ReconciliationPreflight>(
+        `/api/v1/devices/${id}/reconciliations/preflight`,
+        { signal: controller.signal },
+      ),
+    ])
+    if (controller.signal.aborted) return
+    // A quiet refresh swaps new data in and keeps the old panel on failure.
+    if (detail.status === 'fulfilled') setDeviceDetail(detail.value)
+    if (check.status === 'fulfilled') {
+      setPreflight(check.value)
+      setPreflightError('')
+    } else if (!quiet)
+      setPreflightError(
+        check.reason instanceof Error
+          ? check.reason.message
+          : 'Preflight could not be loaded.',
+      )
+    setPreflightLoading(false)
+  }, [])
+  // Only a new terminal clears the readiness panel; revisions refresh it in place.
   useEffect(() => {
     setDeviceDetail(null)
     setPreflight(null)
     setPreflightError('')
-    if (!selectedId) return
-    const controller = new AbortController()
-    setPreflightLoading(true)
-    Promise.allSettled([
-      api<Device>(`/api/v1/devices/${selectedId}`, {
-        signal: controller.signal,
-      }),
-      api<ReconciliationPreflight>(
-        `/api/v1/devices/${selectedId}/reconciliations/preflight`,
-        { signal: controller.signal },
-      ),
-    ])
-      .then(([detail, check]) => {
-        if (controller.signal.aborted) return
-        if (detail.status === 'fulfilled') setDeviceDetail(detail.value)
-        if (check.status === 'fulfilled') setPreflight(check.value)
-        else
-          setPreflightError(
-            check.reason instanceof Error
-              ? check.reason.message
-              : 'Preflight could not be loaded.',
-          )
-      })
-      .finally(() => {
-        if (!controller.signal.aborted) setPreflightLoading(false)
-      })
-    return () => controller.abort()
-  }, [selectedId, revision])
+    setPreflightLoading(false)
+    void loadPreflight(selectedId, false)
+  }, [selectedId, loadPreflight])
+  const preflightRevisionRef = useRef(refreshRevision)
+  useEffect(() => {
+    if (preflightRevisionRef.current === refreshRevision) return
+    preflightRevisionRef.current = refreshRevision
+    if (selectedId) void loadPreflight(selectedId, true)
+  }, [refreshRevision]) // eslint-disable-line react-hooks/exhaustive-deps
 
-  const closeDialog = () => {
-    setDialog(null)
-    setReason('')
-    setConfirmation('')
-    setPassword('')
+  const failure = (error: unknown, fallback: string) =>
+    toast.error(error instanceof Error ? error.message : fallback)
+  const refreshJobsAndReadiness = async () => {
+    await Promise.all([
+      loadJobs({ quiet: true, refresh: true }),
+      selectedId ? loadPreflight(selectedId, true) : Promise.resolve(),
+    ])
   }
   const start = async () => {
     if (!selected) return
-    setBusy(true)
+    const scope =
+      selected.firmware_family === 'hikvision' ? historyScope : 'ALL_RECORDS'
+    setBusyKey('start')
     try {
-      await api(
+      await api<ReconciliationJob>(
         `/api/v1/devices/${selected.connector_id}/reconciliations/full-history`,
         {
           method: 'POST',
           body: JSON.stringify({
-            reason: reason.trim(),
-            confirmation,
-            password,
             idempotency_key: idempotency('full-history'),
-            scope: selected.firmware_family === 'hikvision' ? historyScope : 'ALL_RECORDS',
+            scope,
           }),
         },
       )
-      closeDialog()
-      toast.notice(
-        selected.firmware_family === 'hikvision' && historyScope === 'ACTIVE_USERS'
+      const message =
+        scope === 'ACTIVE_USERS'
           ? 'Active-user history queued. ADD freezes the current user list and preserves resumable checkpoints.'
-          : selected.firmware_family === 'hikvision' && historyScope === 'RECENT_TAIL'
+          : scope === 'RECENT_TAIL'
             ? 'Recent-tail recovery queued. ADD resumes from its last held serial and keeps following new punches.'
-            : 'Full terminal reconciliation queued. ADD now owns its checkpoint.',
-      )
-      await loadJobs({ quiet: true })
+            : 'Full terminal reconciliation queued. ADD now owns its checkpoint.'
+      toast.notice(message)
+      setLiveStatus(`Reconcile queued for ${selected.display_name}.`)
+      await refreshJobsAndReadiness()
     } catch (error) {
-      setPassword('')
-      toast.error(
-        error instanceof Error
-          ? error.message
-          : 'Could not start reconciliation.',
-      )
+      failure(error, 'Could not start reconciliation.')
     } finally {
-      setBusy(false)
+      setBusyKey(null)
     }
   }
   const control = async (
     job: ReconciliationJob,
     action: 'pause' | 'resume' | 'cancel' | 'retry',
   ) => {
-    setBusy(true)
+    setBusyKey(`${job.job_id}:${action}`)
     try {
-      await api(`/api/v1/reconciliations/${job.job_id}/${action}`, {
-        method: 'POST',
-        body: JSON.stringify({
-          reason: reason.trim(),
-          password,
-          idempotency_key: idempotency(`reconcile-${action}`),
-        }),
-      })
-      closeDialog()
-      toast.notice(`Reconciliation ${action} recorded in the audit trail.`)
-      await loadJobs({ quiet: true })
-    } catch (error) {
-      setPassword('')
-      toast.error(
-        error instanceof Error
-          ? error.message
-          : 'Reconciliation control failed.',
+      const updated = await api<ReconciliationJob>(
+        `/api/v1/reconciliations/${job.job_id}/${action}`,
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            idempotency_key: idempotency(`reconcile-${action}`),
+          }),
+        },
       )
+      setRows((current) =>
+        current.map((row) =>
+          row.job_id === updated.job_id ? { ...row, ...updated } : row,
+        ),
+      )
+      toast.notice(`Reconciliation ${action} recorded in the audit trail.`)
+      setLiveStatus(
+        `${humanize(action)} recorded for ${job.connector?.display_name || job.job_id}.`,
+      )
+      await refreshJobsAndReadiness()
+    } catch (error) {
+      failure(error, 'Reconciliation control failed.')
     } finally {
-      setBusy(false)
+      setBusyKey(null)
+    }
+  }
+  const archive = async (job: ReconciliationJob, cancelFirst: boolean) => {
+    const action = cancelFirst ? 'cancel-and-archive' : 'archive'
+    setBusyKey(`${job.job_id}:${action}`)
+    try {
+      await api<ReconciliationJob>(
+        `/api/v1/reconciliations/${job.job_id}/${action}`,
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            idempotency_key: idempotency(`reconcile-${action}`),
+          }),
+        },
+      )
+      // Remove the card in place; the quiet refresh then fills the window.
+      setRows((current) => {
+        const next = current.filter((row) => row.job_id !== job.job_id)
+        rowsRef.current = next
+        return next
+      })
+      setJobFilteredTotal((total) => Math.max(0, total - 1))
+      toast.notice(
+        cancelFirst
+          ? 'Reconciliation cancelled and archived.'
+          : 'Reconciliation archived.',
+      )
+      setLiveStatus(
+        `${job.connector?.display_name || job.job_id} ${cancelFirst ? 'cancelled and archived' : 'archived'}.`,
+      )
+      await refreshJobsAndReadiness()
+    } catch (error) {
+      failure(error, 'Reconciliation could not be archived.')
+    } finally {
+      setBusyKey(null)
+    }
+  }
+  const startBulk = async (connectorIds: string[]) => {
+    setBusyKey('bulk')
+    setBulkResult(null)
+    try {
+      const results: ReconciliationBulkResult[] = []
+      for (let index = 0; index < connectorIds.length; index += BULK_REQUEST_LIMIT) {
+        const response = await api<ReconciliationBulkResponse>(
+          '/api/v1/reconciliations/bulk',
+          {
+            method: 'POST',
+            body: JSON.stringify({
+              connector_ids: connectorIds.slice(index, index + BULK_REQUEST_LIMIT),
+              scope: 'ALL_RECORDS',
+              idempotency_key: idempotency('reconcile-bulk'),
+            }),
+          },
+        )
+        results.push(...response.results)
+      }
+      const created = results.filter((row) => row.outcome === 'CREATED').length
+      setBulkResult({ results, created })
+      toast.notice(
+        `${created} reconcile${created === 1 ? '' : 's'} started; ${results.length - created} not started.`,
+      )
+      setLiveStatus(`${created} of ${results.length} selected terminals started.`)
+      await refreshJobsAndReadiness()
+    } catch (error) {
+      failure(error, 'Bulk reconcile could not start.')
+    } finally {
+      setBusyKey(null)
+    }
+  }
+  const clearHistory = async () => {
+    setBusyKey('clear')
+    try {
+      const result = await api<ReconciliationClearHistoryResult>(
+        '/api/v1/reconciliations/clear-history',
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            idempotency_key: idempotency('reconcile-clear-history'),
+          }),
+        },
+      )
+      rowsRef.current = []
+      setRows([])
+      setJobCursor(null)
+      const message = `Reconcile history cleared: ${result.cancelled} cancelled, ${result.deleted} deleted, ${result.archived} archived as evidence.`
+      toast.notice(message)
+      setLiveStatus(message)
+      await refreshJobsAndReadiness()
+    } catch (error) {
+      failure(error, 'Reconcile history could not be cleared.')
+    } finally {
+      setBusyKey(null)
     }
   }
 
   const isHikvision = selected?.firmware_family === 'hikvision'
   const activeUsersOnly = isHikvision && historyScope === 'ACTIVE_USERS'
   const recentTail = isHikvision && historyScope === 'RECENT_TAIL'
-  const startConfirmation = `RECONCILE ${selected?.device_id} ${
-    activeUsersOnly ? 'ACTIVE USERS' : recentTail ? 'RECENT TAIL' : 'FROM START'}`
-  const canOpenStart = Boolean(selected && enabled && preflight?.eligible)
   const canStart = Boolean(
-    canOpenStart &&
+    selected &&
+      enabled &&
+      preflight?.eligible &&
       (!activeUsersOnly || preflight?.active_user_history?.eligible !== false) &&
-      (!recentTail || preflight?.recent_tail?.eligible === true) &&
-      reason.trim().length >= 10 &&
-      password &&
-      confirmation === startConfirmation,
+      (!recentTail || preflight?.recent_tail?.eligible === true),
   )
+  const startBlockedReason = !selected
+    ? 'Select a terminal first.'
+    : !enabled
+      ? 'Reconciliation is not enabled on this server.'
+      : !preflight
+        ? 'Checking readiness…'
+        : preflight.hard_blockers[0]?.message ||
+          (activeUsersOnly && preflight.active_user_history?.eligible === false
+            ? preflight.active_user_history.reason || 'Active-user history is not available.'
+            : recentTail && preflight.recent_tail?.eligible !== true
+              ? preflight.recent_tail?.reason || 'Recent-tail recovery is not available.'
+              : undefined)
   const activeJobCount =
     jobTotals.active +
     jobTotals.queued_waiting +
@@ -1692,7 +2055,7 @@ export function ReconciliationView({
               className="button secondary"
               onClick={() =>
                 void (section === 'jobs'
-                  ? loadJobs({ quiet: true })
+                  ? refreshJobsAndReadiness()
                   : section === 'exceptions'
                     ? loadExceptions({ quiet: true })
                     : api('/api/v2/attendance-recovery/summary').then(() => undefined))
@@ -1701,24 +2064,26 @@ export function ReconciliationView({
               <Icon name="refresh" /> Refresh
             </button>
             {section === 'jobs' && (
-              <button
-                className="button primary"
-                disabled={!canOpenStart}
-                title={
-                  !canOpenStart
-                    ? preflight?.hard_blockers[0]?.message ||
-                      'Select an eligible terminal first.'
-                    : undefined
-                }
-                onClick={() => setDialog({ mode: 'start' })}
-              >
-                <Icon name="plus" />{' '}
-                {preflight?.ready_now
-                  ? isHikvision ? 'Reconcile attendance' : 'Start complete reconcile'
-                  : preflight?.eligible
-                    ? 'Queue when safe'
-                    : 'New complete reconcile'}
-              </button>
+              <>
+                <button
+                  className="button secondary"
+                  type="button"
+                  aria-expanded={bulkOpen}
+                  onClick={() => setBulkOpen((open) => !open)}
+                >
+                  <Icon name="list" /> Bulk reconcile
+                </button>
+                <button
+                  className="button destructive-outline"
+                  type="button"
+                  disabled={busyKey === 'clear'}
+                  title="Cancels every open reconcile, deletes finished jobs that no proof depends on, and archives the rest."
+                  onClick={() => void clearHistory()}
+                >
+                  <Icon name="trash" />{' '}
+                  {busyKey === 'clear' ? 'Clearing…' : 'Clear reconcile history'}
+                </button>
+              </>
             )}
           </div>
         }
@@ -1779,6 +2144,18 @@ export function ReconciliationView({
               }
             />
           </section>
+          {bulkOpen && (
+            <BulkReconcilePanel
+              devices={devices}
+              busy={busyKey === 'bulk'}
+              result={bulkResult}
+              onStart={(ids) => void startBulk(ids)}
+              onClose={() => {
+                setBulkOpen(false)
+                setBulkResult(null)
+              }}
+            />
+          )}
           <TerminalPicker
             devices={devices}
             selectedId={selectedId}
@@ -1796,19 +2173,71 @@ export function ReconciliationView({
                     device {selected.device_id}
                   </p>
                 </div>
-                <StatusBadge
-                  state={
-                    preflightLoading
-                      ? 'CHECKING'
-                      : preflight?.ready_now
-                        ? 'READY'
-                        : preflight?.eligible
-                          ? 'WAITING FOR SAFE WINDOW'
-                          : 'BLOCKED'
-                  }
-                />
+                <div className="reconciliation-start-actions">
+                  <StatusBadge
+                    state={
+                      preflightLoading && !preflight
+                        ? 'CHECKING'
+                        : preflight?.ready_now
+                          ? 'READY'
+                          : preflight?.eligible
+                            ? 'WAITING FOR SAFE WINDOW'
+                            : 'BLOCKED'
+                    }
+                  />
+                  {isHikvision && (
+                    <label className="reconciliation-scope-select">
+                      <span className="sr-only">History scope</span>
+                      <select
+                        aria-label="History scope"
+                        value={historyScope}
+                        onChange={(event) =>
+                          setHistoryScope(
+                            event.target.value as HikvisionHistoryScope,
+                          )
+                        }
+                      >
+                        <option value="ALL_RECORDS">Full history</option>
+                        <option value="ACTIVE_USERS">Active users</option>
+                        <option value="RECENT_TAIL">Recent tail</option>
+                      </select>
+                    </label>
+                  )}
+                  <button
+                    className="button primary"
+                    type="button"
+                    disabled={!canStart || busyKey === 'start'}
+                    title={
+                      startBlockedReason ||
+                      (preflight?.ready_now
+                        ? 'Starts now.'
+                        : 'Queues now and starts when the terminal is safe to read.')
+                    }
+                    onClick={() => void start()}
+                  >
+                    <Icon name="refresh" />{' '}
+                    {busyKey === 'start' ? 'Starting…' : 'Reconcile now'}
+                  </button>
+                </div>
               </div>
-              {preflightLoading && (
+              {isHikvision && (
+                <p className="reconciliation-scope-note">
+                  {activeUsersOnly
+                    ? preflight?.active_user_history
+                      ? preflight.active_user_history.eligible
+                        ? `${preflight.active_user_history.user_count} active users in the verified snapshot. Searches only those employees’ retained history; former users are excluded.`
+                        : preflight.active_user_history.reason
+                      : 'Searches only current employees’ retained history; former users are excluded.'
+                    : recentTail
+                      ? preflight?.recent_tail
+                        ? preflight.recent_tail.eligible
+                          ? `Resumes at terminal serial ${preflight.recent_tail.begin_serial} (re-reads up to serial ${preflight.recent_tail.anchor_serial}, the last serial before the newest break in ADD's ESP-poll records) and keeps following new punches until cancelled. It never certifies coverage.${preflight.recent_tail.earlier_breaks?.length ? ` ADD's poll records also break after serial${preflight.recent_tail.earlier_breaks.length === 1 ? '' : 's'} ${preflight.recent_tail.earlier_breaks.join(', ')}; only a full history read covers those.` : ''}`
+                          : preflight.recent_tail.reason
+                        : 'Reads every record after the last held punch and keeps following new punches.'
+                      : 'Scans all retained terminal records, including former users and non-attendance events.'}
+                </p>
+              )}
+              {preflightLoading && !preflight && (
                 <div className="reconciliation-skeleton compact">
                   <i />
                   <i />
@@ -1984,8 +2413,8 @@ export function ReconciliationView({
               <div>
                 <h2>Reconciliation jobs</h2>
                 <p>
-                  Jobs needing attention first, with capture and Oracle
-                  assurance progress for each terminal.
+                  Newest first, with capture and Oracle assurance progress for
+                  each terminal. Archived jobs are hidden.
                 </p>
               </div>
               <span className="badge">
@@ -2071,7 +2500,10 @@ export function ReconciliationView({
                 <i />
               </div>
             )}
-            <div className="reconciliation-job-list" aria-live="polite">
+            <p className="reconciliation-live-status" aria-live="polite">
+              {liveStatus}
+            </p>
+            <div className="reconciliation-job-list">
               {rows.map((job) => {
                 const cutoff = job.terminal.cutoff_count || 0
                 const capturePercent = job.scope === 'RECENT_TAIL'
@@ -2312,19 +2744,37 @@ export function ReconciliationView({
                       {directAction && (
                         <button
                           className={`button ${sourceAssurance.state === 'REVIEW_REQUIRED' ? 'secondary' : 'primary'}`}
-                          onClick={() =>
-                            setDialog({
-                              mode: 'control',
-                              job,
-                              action: directAction,
-                            })
-                          }
+                          disabled={busyKey !== null}
+                          onClick={() => void control(job, directAction)}
                         >
                           {humanize(directAction)}
                         </button>
                       )}
-                      {controls.includes('cancel') && (
-                        <ReconciliationCancelMenu onCancel={() => setDialog({ mode: 'control', job, action: 'cancel' })} />
+                      {controls.includes('cancel') ? (
+                        <>
+                          <button
+                            className="button destructive-outline"
+                            disabled={busyKey !== null}
+                            onClick={() => void control(job, 'cancel')}
+                          >
+                            {busyKey === `${job.job_id}:cancel` ? 'Cancelling…' : 'Cancel'}
+                          </button>
+                          <button
+                            className="button secondary"
+                            disabled={busyKey !== null}
+                            onClick={() => void archive(job, true)}
+                          >
+                            {busyKey === `${job.job_id}:cancel-and-archive` ? 'Archiving…' : 'Cancel & archive'}
+                          </button>
+                        </>
+                      ) : (
+                        <button
+                          className="button secondary"
+                          disabled={busyKey !== null}
+                          onClick={() => void archive(job, false)}
+                        >
+                          {busyKey === `${job.job_id}:archive` ? 'Archiving…' : 'Archive'}
+                        </button>
                       )}
                     </footer>
                   </article>
@@ -2336,12 +2786,12 @@ export function ReconciliationView({
                   <h3>
                     {activeJobFilters
                       ? 'No reconciliation jobs match these filters'
-                      : 'No reconciliation has been requested yet'}
+                      : 'No open or recent reconciliation jobs'}
                   </h3>
                   <p>
                     {activeJobFilters
                       ? 'Clear one or more filters to broaden the durable ledger.'
-                      : 'Select an eligible terminal, review preflight, and create the first source-coverage job.'}
+                      : 'Select a terminal and press Reconcile now, or reconcile several at once.'}
                   </p>
                 </div>
               )}
@@ -2829,126 +3279,6 @@ export function ReconciliationView({
             )}
           </section>
         </div>
-      )}
-      {dialog && (
-        <Dialog
-          titleId="reconciliation-dialog-title"
-          title={
-            dialog.mode === 'start'
-              ? preflight?.ready_now
-                ? activeUsersOnly ? 'Reconcile active users — all retained history' : 'Full terminal audit — all records'
-                : 'Queue reconciliation when safe'
-              : `${humanize(dialog.action)} reconciliation`
-          }
-          description={
-            dialog.mode === 'start'
-              ? selected?.display_name
-              : dialog.job.connector?.display_name
-          }
-          onClose={closeDialog}
-        >
-          <div className="dialog-body">
-            <div
-              className={`info-copy pattern-${dialog.mode === 'start' ? 'notice' : dialog.action === 'cancel' ? 'blocked' : 'waiting'}`}
-            >
-              <Icon name="shield" />
-              <div>
-                <h3>
-                  {dialog.mode === 'start'
-                    ? `ADD runs up to ${scheduler.device_concurrency} isolated terminal scans in parallel.`
-                    : 'ADD preserves every committed checkpoint and evidence record.'}
-                </h3>
-                <p>
-                  Live punches retain priority. Cancellation stops future work
-                  without deleting captured source evidence or Oracle membership
-                  proof.
-                </p>
-              </div>
-            </div>
-            {dialog.mode === 'start' && isHikvision && (
-              <label>
-                History scope
-                <select value={historyScope} onChange={(event) => {
-                  setHistoryScope(event.target.value as HikvisionHistoryScope)
-                  setConfirmation('')
-                }}>
-                  <option value="ACTIVE_USERS">Active users — all retained history (recommended)</option>
-                  <option value="ALL_RECORDS">Full terminal audit — all records</option>
-                  <option value="RECENT_TAIL">Recent tail — resume after the last held punch and keep following</option>
-                </select>
-                {recentTail && preflight?.recent_tail && <p>{preflight.recent_tail.eligible
-                  ? `Resumes at terminal serial ${preflight.recent_tail.begin_serial} (re-reads up to serial ${preflight.recent_tail.anchor_serial}, the resume point: the last serial before the newest break in ADD's ESP-poll records). It steps back further if those records changed.${preflight.recent_tail.earlier_breaks?.length ? ` ADD's poll records also break after serial${preflight.recent_tail.earlier_breaks.length === 1 ? '' : 's'} ${preflight.recent_tail.earlier_breaks.join(', ')}; only a full terminal audit covers those.` : ''}${preflight.recent_tail.ready_now === false ? ' Waiting for the terminal and ESP.' : ''}`
-                  : preflight.recent_tail.reason}</p>}
-                {activeUsersOnly && preflight?.active_user_history && <p>{preflight.active_user_history.eligible
-                  ? `${preflight.active_user_history.user_count} active users in the verified snapshot.`
-                  : preflight.active_user_history.reason}</p>}
-                <small>{activeUsersOnly
-                  ? 'Freezes the current complete user snapshot. Searches only those employees’ retained history; former users are excluded. Refresh terminal users first if the snapshot is older than 15 minutes. No records are deleted.'
-                  : recentTail
-                    ? 'For a terminal whose own poll is blocked: reads every record after the resume point, then checks for new punches every 15 seconds until cancelled or the ESP poll is proven to work again. Re-read records that changed are held for review. It never certifies coverage, and while it runs no other reconciliation can start on this device.'
-                    : 'Scans all retained terminal records, including former users and non-attendance events.'}</small>
-              </label>
-            )}
-            <label>
-              Audited reason
-              <textarea
-                value={reason}
-                onChange={(event) => setReason(event.target.value)}
-                maxLength={500}
-                placeholder="At least 10 characters"
-              />
-            </label>
-            {dialog.mode === 'start' && selected && (
-              <label>
-                Type <code>{startConfirmation}</code>
-                <input
-                  value={confirmation}
-                  onChange={(event) => setConfirmation(event.target.value)}
-                  autoComplete="off"
-                />
-              </label>
-            )}
-            <label>
-              Administrator password
-              <input
-                type="password"
-                autoComplete="current-password"
-                value={password}
-                onChange={(event) => setPassword(event.target.value)}
-              />
-            </label>
-            <div className="dialog-actions">
-              <button className="button secondary" onClick={closeDialog}>
-                Keep current state
-              </button>
-              {dialog.mode === 'start' ? (
-                <button
-                  className="button primary"
-                  disabled={!canStart || busy}
-                  onClick={() => void start()}
-                >
-                  {busy
-                    ? 'Verifying…'
-                    : preflight?.ready_now
-                      ? 'Start durable reconcile'
-                      : 'Queue when safe'}
-                </button>
-              ) : (
-                <button
-                  className={
-                    dialog.action === 'cancel'
-                      ? 'button destructive'
-                      : 'button primary'
-                  }
-                  disabled={reason.trim().length < 10 || !password || busy}
-                  onClick={() => void control(dialog.job, dialog.action)}
-                >
-                  {busy ? 'Verifying…' : `Confirm ${dialog.action}`}
-                </button>
-              )}
-            </div>
-          </div>
-        </Dialog>
       )}
       {jobDrawer && (
         <JobDetailDrawer

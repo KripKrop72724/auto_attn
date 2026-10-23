@@ -9,6 +9,13 @@ def request_properties(spec: dict, path: str, method: str) -> set[str]:
     return set(spec["components"]["schemas"][reference].get("properties", {}))
 
 
+def request_schema(spec: dict, path: str, method: str) -> dict:
+    """The request model, also when the body itself is optional (anyOf model | null)."""
+    schema = spec["paths"][path][method]["requestBody"]["content"]["application/json"]["schema"]
+    reference = schema.get("$ref") or next(row["$ref"] for row in schema["anyOf"] if "$ref" in row)
+    return spec["components"]["schemas"][reference.rsplit("/", 1)[-1]]
+
+
 def main() -> None:
     spec = app.openapi()
     paths = spec["paths"]
@@ -84,6 +91,22 @@ def main() -> None:
     )
     attendance_parameters = {row["name"] for row in paths["/api/v1/attendance"]["get"]["parameters"]}
     assert "notify_status" in attendance_parameters
+    # Reconcile is one click: the dashboard sends no reason, confirmation or password.
+    start = request_schema(spec, "/api/v1/devices/{connector_id}/reconciliations/full-history", "post")
+    assert {"scope", "idempotency_key"}.issubset(start["properties"])
+    assert set(start.get("required", [])) == {"idempotency_key"}
+    control = request_schema(spec, "/api/v1/reconciliations/{job_id}/{action}", "post")
+    assert {"idempotency_key", "expected_state"}.issubset(control["properties"])
+    assert set(control.get("required", [])) == {"idempotency_key"}
+    bulk = request_schema(spec, "/api/v1/reconciliations/bulk", "post")
+    assert {"connector_ids", "scope", "idempotency_key"}.issubset(bulk["properties"])
+    assert set(bulk.get("required", [])) == {"connector_ids", "idempotency_key"}
+    for path in ("/api/v1/reconciliations/{job_id}/archive", "/api/v1/reconciliations/{job_id}/cancel-and-archive",
+                 "/api/v1/reconciliations/clear-history"):
+        optional = request_schema(spec, path, "post")
+        assert "idempotency_key" in optional["properties"] and not optional.get("required")
+    reconciliation_parameters = {row["name"] for row in paths["/api/v1/reconciliations"]["get"]["parameters"]}
+    assert {"include_archived", "cursor", "limit", "status_group", "zone_id", "q"}.issubset(reconciliation_parameters)
     print("Frontend OpenAPI safety contracts are synchronized.")
 
 

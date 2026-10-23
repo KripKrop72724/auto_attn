@@ -1080,6 +1080,32 @@ export interface ReconciliationJob {
   oracle_certified_at: string | null
   completed_at: string | null
   updated_at: string
+  archived_at?: string | null
+  archived_by?: string | null
+}
+
+export type ReconciliationBulkOutcome = 'CREATED' | 'ALREADY_ACTIVE' | 'BLOCKED'
+
+export interface ReconciliationBulkResult {
+  connector_id: string
+  display_name: string | null
+  zone_id: string | null
+  outcome: ReconciliationBulkOutcome
+  job_id: string | null
+  status: string | null
+  message: string | null
+}
+
+export interface ReconciliationBulkResponse {
+  results: ReconciliationBulkResult[]
+  created: number
+}
+
+export interface ReconciliationClearHistoryResult {
+  cancelled: number
+  deleted: number
+  archived: number
+  kept_reasons: Record<string, number>
 }
 
 export interface ReconciliationScheduler {
