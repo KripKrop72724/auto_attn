@@ -671,6 +671,8 @@ jobs:
       - name: Compile quarantined USB Wi-Fi rescue and synthetic predecessor
         env:
           SLIC_RESCUE_WIFI_PASSWORD: HIL-Recovery-Only
+          SLIC_RESCUE_DIRECT_WIFI_PASSWORD: HIL-Recovery-Only
+          SLIC_RESCUE_WIFI_PROFILE: lahore-direct
         run: python3 scripts/build_usb_wifi_rescue.py --output build-ci-usb-rescue
 
   firmware:

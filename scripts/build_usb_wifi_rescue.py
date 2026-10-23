@@ -33,11 +33,14 @@ def owned_build_directory():
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--wifi-profile', choices=['setup-ap', 'lahore-direct'],
+                        default=os.environ.get('SLIC_RESCUE_WIFI_PROFILE', 'setup-ap'))
     args = parser.parse_args()
     output = args.output.resolve()
     if output.exists():
         raise ValueError('Refusing to replace an existing output directory')
-    password = os.environ.get('SLIC_RESCUE_WIFI_PASSWORD', '')
+    direct = args.wifi_profile == 'lahore-direct'
+    password = os.environ.get('SLIC_RESCUE_DIRECT_WIFI_PASSWORD' if direct else 'SLIC_RESCUE_WIFI_PASSWORD', '')
     if not 8 <= len(password.encode()) <= 63 or not password.isascii() or not password.isprintable():
         raise ValueError('An explicit printable ASCII recovery password is required')
     output.mkdir(parents=True)
@@ -45,6 +48,7 @@ def main():
 
         def build(project, name, options, env):
             command = ['docker', 'run', '--rm', '-e', 'SLIC_RESCUE_WIFI_PASSWORD',
+                       '-e', 'SLIC_RESCUE_WIFI_SSID', '-e', 'SLIC_RESCUE_REPLACE_WIFI',
                        '-e', 'SLIC_RESCUE_SPARE_PREDECESSOR_SHA256',
                        '-v', f'{ROOT}:/project:ro', '-v', f'{scratch}:/scratch',
                        '-w', '/project/' + project, 'espressif/idf:v5.5.3',
@@ -61,6 +65,9 @@ def main():
                 raise RuntimeError(f'{name} build failed; redacted diagnostics retained')
 
         env = os.environ.copy()
+        env['SLIC_RESCUE_WIFI_PASSWORD'] = password
+        env['SLIC_RESCUE_WIFI_SSID'] = 'Admin Department (H&AI)' if direct else 'RE7'
+        env['SLIC_RESCUE_REPLACE_WIFI'] = '1' if direct else '0'
         build('tests/firmware/hardware/wifi_rescue_seed', 'seed',
               ['-D', 'SDKCONFIG_DEFAULTS=sdkconfig.defaults;sdkconfig.secure.defaults'], env)
         seed_sha = application_digest(scratch / 'seed/wifi_rescue_seed.bin', 'wifi_rescue_seed', '0.0.1')

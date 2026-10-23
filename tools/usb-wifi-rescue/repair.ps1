@@ -1,4 +1,4 @@
-param([string]$ReadyFile, [string]$ToolArchive, [switch]$GuiSmokeTest, [switch]$WatchSetup, [switch]$ResumeOnly)
+param([string]$ReadyFile, [string]$ToolArchive, [switch]$GuiSmokeTest, [switch]$WatchSetup, [switch]$DirectWifi, [switch]$ResumeOnly)
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
@@ -18,6 +18,11 @@ $label.Size = New-Object Drawing.Size(710,55)
 $form.Controls.Add($label)
 $button = New-Object Windows.Forms.Button
 $button.Text = 'Start repair'
+if ($DirectWifi) {
+    $form.Text = 'SLIC Lahore 2 - Set site Wi-Fi directly'
+    $label.Text = "Connect the Lahore ESP by USB, then click Set site Wi-Fi.`r`nThe bundled repair sets Admin Department (H&AI) directly. No setup page is needed."
+    $button.Text = 'Set site Wi-Fi'
+}
 if ($ResumeOnly) {
     $form.Text = 'SLIC Attendance - Resume installed USB repair'
     $label.Text = "The repair was installed by v1.1. Click Resume and verify.`r`nFollow the power-off and reconnect instructions."
@@ -300,6 +305,17 @@ $button.Add_Click({
             if ($success) { $result += ' The one-shot repair verified attendance storage and other settings unchanged before returning to the original firmware.' }
             if ($serialText -match 'Connecting to Wi-Fi SSID[ \t]*\r?\n') { $result += ' An empty Wi-Fi name was observed during this recording; router connectivity is not verified.' }
             if ($serialText -match 'Validated and atomically saved a new Wi-Fi network') { $result += ' A setup-page save was captured; support must check the following reboot for successful connection.' }
+        }
+        if ($DirectWifi) {
+            $result = 'Direct Wi-Fi repair was not verified. Send this ZIP to support; do not erase or re-provision the ESP.'
+            if ($success) {
+                $result = 'Site Wi-Fi credentials verified on the ESP. Attendance storage and other settings checked unchanged; original firmware restarted.'
+                if ($serialText -match 'Wi-Fi connected with IP (?!0\.0\.0\.0)(\d{1,3}\.){3}\d{1,3}') {
+                    $result += ' The original firmware confirmed a Wi-Fi IP address. Send this ZIP to support to check attendance synchronization and any red LED fault.'
+                } else {
+                    $result += ' Router connectivity was not confirmed. Send this ZIP to support.'
+                }
+            }
         }
         $result | Set-Content (Join-Path $script:folder 'RESULT.txt') -Encoding UTF8
         Say $result

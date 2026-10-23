@@ -41,6 +41,10 @@ def validate_qualification(bundle, report):
     hashes = report.get('evidence_sha256', {})
     if not hashes or any(not re.fullmatch('[0-9a-f]{64}', v) for v in hashes.values()):
         raise ValueError('Raw hardware evidence hashes are required')
+    if b'SLIC_WIFI_RESCUE_PROFILE direct_credentials' in signed:
+        if (report.get('wifi_profile') != 'lahore-direct'
+                or report.get('target_network_readback_verified') is not True):
+            raise ValueError('Direct-credentials profile requires matching physical readback evidence')
     return signed
 
 
@@ -53,11 +57,14 @@ def main():
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--resume-only', action='store_true', help='Capture the repair already installed by v1.1; no host flash operations')
     parser.add_argument('--watch-setup', action='store_true', help='Keep recording while the operator saves site Wi-Fi on a phone')
+    parser.add_argument('--direct-wifi', action='store_true', help='Apply the separately qualified direct site Wi-Fi profile')
     args = parser.parse_args()
     if args.output.exists():
         raise ValueError('Refusing to replace an existing executable')
     report = json.loads(args.qualification.read_text())
     signed = validate_qualification(args.bundle, report)
+    if args.direct_wifi != (b'SLIC_WIFI_RESCUE_PROFILE direct_credentials' in signed):
+        raise ValueError('Executable mode must match the qualified firmware Wi-Fi profile')
     metadata = json.loads((ROOT / 'tools/usb-security-check/tool-metadata.json').read_text())
     with zipfile.ZipFile(args.tools) as tools:
         if set(tools.namelist()) != {'esptool.exe', 'LICENSE', 'README.md'}:
@@ -79,6 +86,10 @@ def main():
                 package.writestr(name, data)
             package.writestr('rescue.bin', signed)
         payload = (Path(__file__).parent / 'repair.ps1').read_text()
+        if args.direct_wifi:
+            if payload.count('[switch]$DirectWifi,') != 1:
+                raise ValueError('Direct-Wi-Fi default cannot be safely embedded')
+            payload = payload.replace('[switch]$DirectWifi,', '[switch]$DirectWifi = $true,')
         if args.watch_setup:
             if payload.count('[switch]$WatchSetup,') != 1:
                 raise ValueError('Setup-recording default cannot be safely embedded')

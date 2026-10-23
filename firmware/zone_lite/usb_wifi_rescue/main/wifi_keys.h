@@ -8,3 +8,6 @@
  * No erase API is used, and no key outside this pair is written. */
 esp_err_t rescue_wifi_keys(nvs_handle_t handle, const char *ssid,
                           const char *password, bool *changed);
+/* Explicit operator-authorized replacement of this same two-key pair. */
+esp_err_t rescue_wifi_keys_exact(nvs_handle_t handle, const char *ssid,
+                                const char *password, bool *changed);
