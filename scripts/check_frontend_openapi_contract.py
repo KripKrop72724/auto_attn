@@ -3,10 +3,20 @@
 from zk_add.web import app
 
 
-def request_properties(spec: dict, path: str, method: str) -> set[str]:
+def request_schema(spec: dict, path: str, method: str) -> dict:
     schema = spec["paths"][path][method]["requestBody"]["content"]["application/json"]["schema"]
+    # An optional body is anyOf [model, null].
+    schema = next((item for item in schema.get("anyOf", [schema]) if "$ref" in item), schema)
     reference = schema["$ref"].rsplit("/", 1)[-1]
-    return set(spec["components"]["schemas"][reference].get("properties", {}))
+    return spec["components"]["schemas"][reference]
+
+
+def request_properties(spec: dict, path: str, method: str) -> set[str]:
+    return set(request_schema(spec, path, method).get("properties", {}))
+
+
+def request_required(spec: dict, path: str, method: str) -> set[str]:
+    return set(request_schema(spec, path, method).get("required", []))
 
 
 def main() -> None:
@@ -20,15 +30,36 @@ def main() -> None:
     assert {"release_id", "zone_id"}.issubset(
         request_properties(spec, "/api/v1/firmware/campaigns/preflight", "post")
     )
-    assert {"release_id", "zone_id", "reason", "typed_confirmation", "password", "scope_token", "idempotency_key"}.issubset(
-        request_properties(spec, "/api/v1/firmware/campaigns", "post")
+    # Firmware updates are one click: no reason, typed version or password is
+    # required (an older open tab may still send them and they are ignored).
+    one_click_fields = {"reason", "typed_confirmation", "password"}
+    assert {"release_id", "zone_id", "scope_token", "idempotency_key"}.issubset(
+        request_required(spec, "/api/v1/firmware/campaigns", "post")
     )
     assert {"override_stability_warnings", "stability_warnings_digest"}.issubset(
         request_properties(spec, "/api/v1/firmware/campaigns", "post")
     )
-    assert {"deployment_id", "reason", "typed_confirmation", "password", "override_stability_warnings",
-            "stability_warnings_digest", "resume_pending_deployments"}.issubset(
+    assert not one_click_fields & request_required(spec, "/api/v1/firmware/campaigns", "post")
+    assert {"release_id", "zone_ids", "idempotency_key"} == request_required(
+        spec, "/api/v1/firmware/campaigns/bulk", "post"
+    )
+    bulk_zones = request_schema(spec, "/api/v1/firmware/campaigns/bulk", "post")["properties"]["zone_ids"]
+    assert (bulk_zones.get("minItems"), bulk_zones.get("maxItems")) == (1, 30)
+    assert {"deployment_id", "override_stability_warnings", "stability_warnings_digest",
+            "resume_pending_deployments"}.issubset(
         request_properties(spec, "/api/v1/firmware/campaigns/{campaign_id}/retry-target", "post")
+    )
+    assert request_required(spec, "/api/v1/firmware/campaigns/{campaign_id}/retry-target", "post") == {
+        "deployment_id"}
+    assert not request_required(spec, "/api/v1/firmware/campaigns/{campaign_id}/{action}", "post")
+    for path in ("/api/v1/firmware/campaigns/{campaign_id}/archive", "/api/v1/firmware/campaigns/archive-cancelled",
+                 "/api/v1/firmware/campaigns/clear-history"):
+        assert "post" in paths[path] and "requestBody" not in paths[path]["post"]
+    campaign_list = {row["name"] for row in paths["/api/v1/firmware/campaigns"]["get"]["parameters"]}
+    assert {"view", "status", "cursor", "limit", "include_archived"}.issubset(campaign_list)
+    # Release revocation keeps its audited reason and step-up password.
+    assert {"reason", "password"}.issubset(
+        request_required(spec, "/api/v1/firmware/releases/{release_id}/revoke", "post")
     )
     retry_review = {row["name"] for row in paths["/api/v1/firmware/campaigns/{campaign_id}/retry-target"]["get"]
                     ["parameters"]}

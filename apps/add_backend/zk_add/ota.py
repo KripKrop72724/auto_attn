@@ -1032,19 +1032,29 @@ def sync_release_store(session: Session) -> None:
     session.flush()
 
 
+ONE_CLICK_REASON = "One-click firmware update"
+
+
 def create_campaign(
     session: Session,
     *,
     release_public_id: str,
     zone_id: str,
-    reason: str,
-    typed_confirmation: str,
     actor: str,
     scope_token: str,
     idempotency_key: str,
+    reason: str | None = None,
+    typed_confirmation: str | None = None,
     override_stability_warnings: bool = False,
     stability_warnings_digest: str | None = None,
 ) -> FirmwareCampaign:
+    """Create one zone's campaign from a fresh signed scope preview.
+
+    One click: no typed version or operator reason is required. The signed
+    scope token, nationwide schedule, zone serialization and stability
+    override digest remain the authority. typed_confirmation is ignored; the
+    stored value is the release version for the legacy NOT NULL column.
+    """
     replay = session.scalar(
         select(FirmwareCampaign).where(
             FirmwareCampaign.actor == actor,
@@ -1068,8 +1078,6 @@ def create_campaign(
         release_public_id=release_public_id,
         zone_id=zone_id,
     )
-    if typed_confirmation != release.version:
-        raise ValueError("Typed firmware version does not match the release.")
     nationwide = schedule(session, release)
     if nationwide and nationwide["reservation"]:
         raise ValueError("Nationwide HIL scope already has an unsettled reservation.")
@@ -1085,8 +1093,8 @@ def create_campaign(
     if flagged and stability_warnings_digest != warnings_digest(flagged):
         raise ValueError("The ESP stability warnings changed since the preview; preview the scope again.")
     campaign = FirmwareCampaign(campaign_id=secrets.token_hex(16), release_id=release.id, zone_id=zone_id,
-        actor=actor, idempotency_key=idempotency_key, reason=reason,
-        typed_confirmation=typed_confirmation, eligible_count=len(eligible),
+        actor=actor, idempotency_key=idempotency_key, reason=(reason or "").strip() or ONE_CLICK_REASON,
+        typed_confirmation=release.version, eligible_count=len(eligible),
         legacy_skipped_count=len(connectors) - len(eligible))
     session.add(campaign)
     session.flush()
@@ -1273,10 +1281,40 @@ def assignment_for_connector(session: Session, *, connector: Connector, public_b
 
 
 CAMPAIGN_CONTROL_STATES = {"pause": "PAUSED", "resume": "ACTIVE", "cancel": "CANCELLED"}
+# The only campaign states each control may start from.
+CAMPAIGN_CONTROL_SOURCES = {"pause": {"ACTIVE"}, "resume": {"PAUSED"}, "cancel": {"ACTIVE", "PAUSED"}}
+CAMPAIGN_CONTROL_VERBS = {"pause": "paused", "resume": "resumed", "cancel": "cancelled"}
+CAMPAIGN_CONTROL_REASONS = {"pause": "Paused with one click", "resume": "Resumed with one click",
+                            "cancel": "Cancelled with one click"}
+
+
+def complete_if_succeeded(session: Session, campaign: FirmwareCampaign | None) -> bool:
+    """Mark an ACTIVE or PAUSED campaign COMPLETED once every deployment SUCCEEDED.
+
+    Nothing is left to offer, so COMPLETED frees the zone for the next
+    campaign. COMPLETED stays valid HIL, bridge and acceptance evidence
+    everywhere ACTIVE is (those checks accept both). A campaign with no
+    deployment, or with any deployment that did not succeed, is unchanged.
+    The caller holds the deployment locks (the order of record_progress).
+    """
+    if campaign is None or campaign.status not in {"ACTIVE", "PAUSED"}:
+        return False
+    statuses = list(session.scalars(select(FirmwareDeployment.status).where(
+        FirmwareDeployment.campaign_id == campaign.id)))
+    if not statuses or any(status != "SUCCEEDED" for status in statuses):
+        return False
+    locked = session.scalar(select(FirmwareCampaign).where(FirmwareCampaign.id == campaign.id)
+                            .with_for_update().execution_options(populate_existing=True))
+    if locked is None or locked.status not in {"ACTIVE", "PAUSED"}:
+        return False
+    locked.status = "COMPLETED"
+    locked.pause_reason = None
+    locked.updated_at = utc_now()
+    return True
 
 
 def control_campaign(session: Session, *, campaign_public_id: str, action: str,
-                     reason: str) -> tuple[FirmwareCampaign, int]:
+                     reason: str | None = None) -> tuple[FirmwareCampaign, int]:
     """Pause, resume or cancel one campaign; returns it and the held downloads failed.
 
     Locks follow the order everywhere else (connector, deployment, campaign):
@@ -1285,7 +1323,12 @@ def control_campaign(session: Session, *, campaign_public_id: str, action: str,
     deployments, then the campaign. The deployments to cancel are read only
     after the locks: a retry committed meanwhile is cancelled with the rest,
     and a retry still running waits for this control.
+
+    Pause starts only from ACTIVE, resume only from PAUSED and cancel only
+    from ACTIVE or PAUSED; anything else (and a resume while the zone holds
+    another active or paused campaign) is a ValueError, never a state change.
     """
+    reason = (reason or "").strip()[:200] or CAMPAIGN_CONTROL_REASONS.get(action, action)
     campaign_row = session.scalar(select(FirmwareCampaign.id).where(
         FirmwareCampaign.campaign_id == campaign_public_id))
     if campaign_row is None:
@@ -1299,10 +1342,18 @@ def control_campaign(session: Session, *, campaign_public_id: str, action: str,
                     .order_by(FirmwareDeployment.id).with_for_update()).all()
     campaign = session.scalar(select(FirmwareCampaign).where(FirmwareCampaign.id == campaign_row)
                               .with_for_update().execution_options(populate_existing=True))
+    if action not in CAMPAIGN_CONTROL_STATES:
+        raise ValueError("Unknown firmware campaign control.")
+    if campaign.status not in CAMPAIGN_CONTROL_SOURCES[action]:
+        raise ValueError(f"A {campaign.status.lower()} firmware campaign cannot be {CAMPAIGN_CONTROL_VERBS[action]}.")
     if action == "resume":
         release = session.get(FirmwareRelease, campaign.release_id)
         if release is None or release.state not in {"AVAILABLE", "HIL_ONLY"}:
             raise ValueError("This campaign cannot resume because its signed release is unavailable.")
+        if session.scalar(select(FirmwareCampaign.id).where(
+                FirmwareCampaign.zone_id == campaign.zone_id, FirmwareCampaign.id != campaign.id,
+                FirmwareCampaign.status.in_(["ACTIVE", "PAUSED"])).limit(1)) is not None:
+            raise ValueError("This zone already has another active or paused firmware campaign.")
     failed = 0
     if action in {"pause", "cancel"}:
         from zk_add.ota_interruption import fail_held_downloads
@@ -1314,6 +1365,7 @@ def control_campaign(session: Session, *, campaign_public_id: str, action: str,
         session.flush()
     campaign.status = CAMPAIGN_CONTROL_STATES[action]
     campaign.pause_reason = reason if action != "resume" else None
+    campaign.updated_at = utc_now()
     if action == "cancel":
         for deployment in session.scalars(select(FirmwareDeployment).where(
                 FirmwareDeployment.campaign_id == campaign.id,
@@ -1434,6 +1486,10 @@ def record_progress(
     campaign = session.get(FirmwareCampaign, deployment.campaign_id)
     if state in {"FAILED", "ROLLED_BACK"} and campaign is not None:
         pause_for_deployment_outcome(campaign, connector, state=state, error_code=error_code)
+    if state == "SUCCEEDED":
+        # The last success leaves nothing to offer: the zone is free again.
+        session.flush()
+        complete_if_succeeded(session, campaign)
     connector.ota_state = ("OTA_READY" if state == "SUCCEEDED" else
                            "ROLLBACK_REQUIRED" if state == "ROLLED_BACK" else
                            "UPDATING" if state in ACTIVE_DEPLOYMENT_STATES else connector.ota_state)
@@ -1813,6 +1869,14 @@ def _serialize_campaign(
         .order_by(Connector.id.asc())
         .limit(1)
     )
+    # A live campaign whose next device is held (for example by the
+    # nationwide ZKT upgrade slots) is waiting, not stuck: say why.
+    waiting = None
+    if campaign.status == "ACTIVE" and not any(row["status"] in ACTIVE_DEPLOYMENT_STATES for row in deployments):
+        queued = next((row for row in deployments if row["status"] == "PENDING"), None)
+        if queued is not None and queued["error_code"]:
+            waiting = {"connector_id": queued["connector_id"], "display_name": queued["display_name"],
+                       "code": queued["error_code"], "message": queued["error_message"]}
     return {
         "campaign_id": campaign.campaign_id,
         "release_id": release.release_id if release else None,
@@ -1828,8 +1892,11 @@ def _serialize_campaign(
         "actor": campaign.actor,
         "reason": campaign.reason,
         "deployments": deployments if include_deployments else [],
+        "waiting": waiting,
         "created_at": campaign.created_at,
         "updated_at": campaign.updated_at,
+        "archived_at": campaign.archived_at,
+        "archived_by": campaign.archived_by,
     }
 
 
@@ -1843,11 +1910,18 @@ def campaign_page(
     cursor: int | None = None,
     limit: int | None = None,
     include_deployments: bool = False,
+    include_archived: bool = False,
 ) -> dict[str, Any]:
-    """Return campaign summaries with exact national and filtered counts."""
+    """Return campaign summaries with exact national and filtered counts.
+
+    Archived campaigns (cancelled or completed, hidden by the owner) are left
+    out of the rows and the totals unless include_archived is set; their
+    deployments and evidence are unchanged and the detail view still reads them.
+    """
 
     sync_release_store(session)
-    clauses = []
+    visible = [] if include_archived else [FirmwareCampaign.archived_at.is_(None)]
+    clauses = [*visible]
     if query and query.strip():
         term = f"%{query.strip()}%"
         clauses.append(
@@ -1889,7 +1963,7 @@ def campaign_page(
 
     campaign_totals: dict[str, int] = {"all": 0}
     for campaign_state, count in session.execute(
-        select(FirmwareCampaign.status, func.count(FirmwareCampaign.id)).group_by(
+        select(FirmwareCampaign.status, func.count(FirmwareCampaign.id)).where(*visible).group_by(
             FirmwareCampaign.status
         )
     ):
@@ -1897,7 +1971,9 @@ def campaign_page(
         campaign_totals["all"] += int(count)
     deployment_totals: dict[str, int] = {"all": 0}
     for deployment_state, count in session.execute(
-        select(FirmwareDeployment.status, func.count(FirmwareDeployment.id)).group_by(
+        select(FirmwareDeployment.status, func.count(FirmwareDeployment.id))
+        .join(FirmwareCampaign, FirmwareDeployment.campaign_id == FirmwareCampaign.id)
+        .where(*visible).group_by(
             FirmwareDeployment.status
         )
     ):
@@ -1919,6 +1995,8 @@ def campaign_page(
         "totals": {
             "campaigns": campaign_totals,
             "deployments": deployment_totals,
+            "archived_campaigns": int(session.scalar(
+                select(func.count(FirmwareCampaign.id)).where(FirmwareCampaign.archived_at.is_not(None))) or 0),
         },
     }
 

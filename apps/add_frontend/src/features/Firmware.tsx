@@ -7,12 +7,10 @@ import {
   useMemo,
   useRef,
   useState,
-  type FormEvent,
   type KeyboardEvent,
 } from 'react'
-import { z } from 'zod'
 import './Firmware.css'
-import { hilAllowedTargets, hilDevice, hilDeviceMismatch, hilScopeLabel } from './hilTargets'
+import { hilAllowedTargets, hilDevice, hilScopeLabel } from './hilTargets'
 import { RetryTargetDialog, RollbackEvidence, StabilityWarnings } from './FirmwareRetry'
 import { api, queryString } from '../api'
 import {
@@ -27,16 +25,17 @@ import {
   useToast,
 } from '../App'
 import { Icon } from '../Icon'
-import { AnchoredLayer } from '../AnchoredLayer'
 import type {
   Device,
+  FirmwareBulkResult,
+  FirmwareBulkZoneResult,
   FirmwareCampaign,
   FirmwareCampaignTotals,
   FirmwareDeployment,
+  FirmwareHistoryCleared,
   FirmwareListResponse,
   FirmwareRelease,
   FirmwareReleaseTotals,
-  FirmwareScopePreview,
   FirmwareSection,
 } from '../types'
 
@@ -71,60 +70,6 @@ const activeDeploymentStates = [
   'RECONCILING',
 ]
 const attentionDeploymentStates = ['FAILED', 'ROLLED_BACK', 'RELEASE_REVOKED']
-
-const firmwareScopeSchema = z.object({
-  scope_token: z.string().min(32),
-  expires_at: z.string().min(1),
-  release: z.object({
-    release_id: z.string(),
-    version: z.string(),
-    state: z.string(),
-  }),
-  zone_id: z.string(),
-  counts: z.object({
-    candidates: z.number().int().nonnegative(),
-    eligible: z.number().int().nonnegative(),
-    excluded: z.number().int().nonnegative(),
-    offline: z.number().int().nonnegative(),
-  }),
-  eligible: z.array(
-    z
-      .object({
-        connector_id: z.string(),
-        display_name: z.string(),
-        zone_id: z.string(),
-        hardware_id: z.string(),
-        connected: z.boolean(),
-      })
-      .passthrough(),
-  ),
-  excluded: z.array(
-    z
-      .object({
-        connector_id: z.string(),
-        display_name: z.string(),
-        zone_id: z.string(),
-        hardware_id: z.string(),
-        connected: z.boolean(),
-        reason: z.string(),
-      })
-      .passthrough(),
-  ),
-  stability_warnings: z
-    .array(
-      z
-        .object({ code: z.string(), connector_id: z.string(), message: z.string() })
-        .passthrough(),
-    )
-    .default([]),
-  stability_warnings_digest: z.string().optional(),
-})
-const firmwareCampaignCreatedSchema = z.object({
-  campaign_id: z.string().min(1),
-  status: z.string(),
-  eligible: z.number().int().nonnegative(),
-  legacy_skipped: z.number().int().nonnegative(),
-})
 
 const humanize = (value?: string | null) =>
   (value || 'Unknown')
@@ -196,107 +141,225 @@ function FirmwareTabs({
   )
 }
 
-function CampaignControlDialog({
-  campaign,
-  action,
+// The server accepts at most this many zones per one-click request; more are sent in turn.
+const BULK_ZONE_LIMIT = 30
+const liveCampaignStates = ['ACTIVE', 'PAUSED']
+const closedCampaignStates = ['CANCELLED', 'COMPLETED']
+
+const publishable = (release: FirmwareRelease, enabled: boolean, hilEnabled: boolean) =>
+  release.state === 'AVAILABLE' ? enabled : release.state === 'HIL_ONLY' && hilEnabled
+
+// Zones with a device this release may reach; the server still decides each zone.
+function releaseZones(release: FirmwareRelease | null, devices: Device[]) {
+  if (!release) return []
+  const family = release.firmware_family
+  const named = new Map<string, string>()
+  devices
+    .filter((device) => !device.is_spare && device.zone_id && (!family || !device.firmware_family || device.firmware_family === family))
+    .forEach((device) => {
+      if (!named.has(device.zone_id)) named.set(device.zone_id, device.zone_name || device.zone_id)
+    })
+  let ids = [...named.keys()]
+  if (release.state === 'HIL_ONLY') {
+    const allowed = release.hil_targets
+      ? hilAllowedTargets(release).map((target) => devices.find((device) => device.connector_id === target.connector_id)?.zone_id)
+      : [hilDevice(release, devices)?.zone_id]
+    ids = ids.filter((id) => allowed.includes(id))
+  }
+  return ids.sort((left, right) => left.localeCompare(right)).map((id) => ({ id, name: named.get(id) || id }))
+}
+
+const waitingLabel = (code: string) =>
+  code.startsWith('NATIONWIDE_') ? 'Waiting for a fleet slot' : `Waiting: ${humanize(code)}`
+
+function bulkOutcome(row: FirmwareBulkZoneResult) {
+  if (row.outcome === 'CREATED' && row.fleet_hold)
+    return {
+      badge: 'WAITING_FOR_FLEET_SLOT',
+      pattern: 'waiting',
+      text: `Created; waits for a nationwide upgrade slot (${humanize(row.fleet_hold).toLowerCase()}).`,
+    }
+  if (row.outcome === 'CREATED')
+    return {
+      badge: 'CREATED',
+      pattern: 'confirmed',
+      text:
+        row.message ||
+        `${row.eligible} device${row.eligible === 1 ? '' : 's'} queued${row.closed.length ? '; the finished campaign was closed' : ''}.`,
+    }
+  return { badge: row.outcome, pattern: row.outcome === 'BUSY' ? 'waiting' : 'blocked', text: row.message || '' }
+}
+
+function UpdateFirmwareDialog({
+  releases,
+  devices,
+  campaigns,
+  enabled,
+  hilEnabled,
   onClose,
-  onChanged,
+  onDone,
   toast,
 }: {
-  campaign: FirmwareCampaign
-  action: CampaignAction
+  releases: FirmwareRelease[]
+  devices: Device[]
+  campaigns: FirmwareCampaign[]
+  enabled: boolean
+  hilEnabled: boolean
   onClose: () => void
-  onChanged: () => Promise<void>
+  onDone: () => Promise<void>
   toast: Toast
 }) {
-  const [reason, setReason] = useState('')
-  const [password, setPassword] = useState('')
+  const options = useMemo(
+    () => releases.filter((release) => publishable(release, enabled, hilEnabled)),
+    [releases, enabled, hilEnabled],
+  )
+  const [releaseId, setReleaseId] = useState('')
+  const [selected, setSelected] = useState<string[]>([])
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
-  const control = async () => {
+  const [results, setResults] = useState<FirmwareBulkZoneResult[] | null>(null)
+  // The catalog is newest first: default to the newest publishable release.
+  const release = options.find((row) => row.release_id === releaseId) || options[0] || null
+  const zones = useMemo(() => releaseZones(release, devices), [release, devices])
+  const zoneName = (id: string) => zones.find((zone) => zone.id === id)?.name || id
+  const running = new Map(
+    campaigns.filter((row) => liveCampaignStates.includes(row.status)).map((row) => [row.zone_id, row]),
+  )
+  const allSelected = zones.length > 0 && zones.every((zone) => selected.includes(zone.id))
+  const chooseRelease = (value: string) => {
+    setReleaseId(value)
+    setSelected([])
+    setResults(null)
+    setError('')
+  }
+  const toggle = (id: string) =>
+    setSelected((current) => (current.includes(id) ? current.filter((value) => value !== id) : [...current, id]))
+  const update = async () => {
+    if (!release || !selected.length || busy) return
     setBusy(true)
     setError('')
+    setResults(null)
+    const collected: FirmwareBulkZoneResult[] = []
     try {
-      await api(
-        `/api/v1/firmware/campaigns/${campaign.campaign_id}/${action}`,
-        {
+      for (let start = 0; start < selected.length; start += BULK_ZONE_LIMIT) {
+        const response = await api<FirmwareBulkResult>('/api/v1/firmware/campaigns/bulk', {
           method: 'POST',
-          body: JSON.stringify({ reason: reason.trim(), password }),
-        },
-      )
-      setPassword('')
+          body: JSON.stringify({
+            release_id: release.release_id,
+            zone_ids: selected.slice(start, start + BULK_ZONE_LIMIT),
+            idempotency_key: idempotency('firmware-bulk'),
+          }),
+        })
+        collected.push(...response.results)
+        setResults([...collected])
+      }
+      const created = collected.filter((row) => row.outcome === 'CREATED').length
       toast.notice(
-        `Firmware campaign ${action === 'pause' ? 'paused' : action === 'resume' ? 'resumed' : 'cancelled'} with an audit entry.`,
+        `${firmwareName(release)}: ${created} of ${collected.length} zone${collected.length === 1 ? '' : 's'} started.`,
       )
-      await onChanged()
-      onClose()
     } catch (reason) {
-      setPassword('')
-      setError(
-        reason instanceof Error ? reason.message : 'Campaign control failed.',
-      )
+      setError(reason instanceof Error ? reason.message : 'The update could not be started.')
     } finally {
       setBusy(false)
+      if (collected.length) await onDone()
     }
   }
   return (
     <Dialog
-      titleId="firmware-campaign-control-title"
-      title={`${humanize(action)} firmware campaign`}
-      description={`${campaign.zone_name || campaign.zone_id} · Zone Lite ${campaign.version || 'unknown'}`}
+      titleId="firmware-update-title"
+      title="Update firmware"
+      description="Pick a release and the zones. One click starts a campaign in each zone."
       onClose={onClose}
+      className="firmware-update-dialog"
     >
-      <div className="dialog-body">
-        <div
-          className={`info-copy pattern-${action === 'cancel' ? 'blocked' : 'waiting'}`}
-        >
-          <Icon name={action === 'cancel' ? 'alert' : 'shield'} />
-          <div>
-            <h3>
-              {action === 'cancel'
-                ? 'Cancellation cannot be resumed.'
-                : 'The server verifies release and rollout safety before changing state.'}
-            </h3>
-            <p>
-              Devices already applying signed bytes continue through their
-              durable safety state. Audit evidence remains available.
-            </p>
+      <div className="dialog-body firmware-update">
+        {!options.length ? (
+          <div className="message pattern-blocked" role="alert">
+            <Icon name="alert" />
+            No enabled deployable release is available.
           </div>
-        </div>
-        <label>
-          Audited reason
-          <textarea
-            value={reason}
-            onChange={(event) => setReason(event.target.value)}
-            maxLength={200}
-            placeholder="10–200 characters"
-          />
-        </label>
-        <label>
-          Administrator password
-          <input
-            type="password"
-            autoComplete="current-password"
-            value={password}
-            onChange={(event) => setPassword(event.target.value)}
-          />
-        </label>
+        ) : (
+          <>
+            <label>
+              Release
+              <select value={release?.release_id || ''} onChange={(event) => chooseRelease(event.target.value)}>
+                {options.map((row) => (
+                  <option key={row.release_id} value={row.release_id}>
+                    {firmwareName(row)} · {row.state === 'HIL_ONLY' ? 'HIL only' : 'Production'}
+                  </option>
+                ))}
+              </select>
+            </label>
+            {release?.state === 'HIL_ONLY' && (
+              <p className="firmware-update-hint">
+                <Icon name="shield" /> {hilScopeLabel(release)}
+              </p>
+            )}
+            <fieldset className="firmware-zone-picker">
+              <legend>
+                Zones <small>{selected.length} of {zones.length} selected</small>
+              </legend>
+              {zones.length > 0 && (
+                <button
+                  type="button"
+                  className="button secondary"
+                  onClick={() => setSelected(allSelected ? [] : zones.map((zone) => zone.id))}
+                >
+                  {allSelected ? 'Clear selection' : 'Select all eligible'}
+                </button>
+              )}
+              <div>
+                {zones.map((zone) => (
+                  <label key={zone.id} className="check-row">
+                    <input type="checkbox" checked={selected.includes(zone.id)} onChange={() => toggle(zone.id)} />
+                    <span>
+                      <strong>{zone.name}</strong>
+                      <small>
+                        {zone.id}
+                        {running.has(zone.id) ? ` · ${humanize(running.get(zone.id)?.status)} campaign` : ''}
+                      </small>
+                    </span>
+                  </label>
+                ))}
+              </div>
+              {!zones.length && <p className="firmware-update-hint">No zone has a device this release may update.</p>}
+            </fieldset>
+          </>
+        )}
         {error && (
           <div className="message pattern-blocked" role="alert">
             <Icon name="alert" />
             {error}
           </div>
         )}
+        {results && (
+          <ul className="firmware-update-results" aria-label="Update results">
+            {results.map((row) => {
+              const outcome = bulkOutcome(row)
+              return (
+                <li key={row.zone_id} className={`pattern-${outcome.pattern}`}>
+                  <StatusBadge state={outcome.badge} />
+                  <span>
+                    <strong>{zoneName(row.zone_id)}</strong>
+                    <small>{outcome.text}</small>
+                    <StabilityWarnings warnings={row.stability_warnings} />
+                  </span>
+                </li>
+              )
+            })}
+          </ul>
+        )}
         <div className="dialog-actions">
           <button className="button secondary" onClick={onClose}>
-            Keep current state
+            {results ? 'Done' : 'Close'}
           </button>
           <button
-            className={`button ${action === 'cancel' ? 'destructive' : 'primary'}`}
-            disabled={busy || reason.trim().length < 10 || !password}
-            onClick={() => void control()}
+            className="button primary"
+            disabled={busy || !release || !selected.length}
+            onClick={() => void update()}
           >
-            {busy ? 'Verifying…' : `Confirm ${action}`}
+            <Icon name="power" />{' '}
+            {busy ? 'Updating…' : `Update ${selected.length} zone${selected.length === 1 ? '' : 's'}`}
           </button>
         </div>
       </div>
@@ -308,11 +371,15 @@ function CampaignDetailDrawer({
   seed,
   onClose,
   onControl,
+  onArchive,
+  acting,
   toast,
 }: {
   seed: FirmwareCampaign
   onClose: () => void
-  onControl: (campaign: FirmwareCampaign, action: CampaignAction) => void
+  onControl: (campaign: FirmwareCampaign, action: CampaignAction) => Promise<boolean>
+  onArchive: (campaign: FirmwareCampaign) => Promise<boolean>
+  acting: boolean
   toast: Toast
 }) {
   const [campaign, setCampaign] = useState<FirmwareCampaign | null>(null)
@@ -341,6 +408,10 @@ function CampaignDetailDrawer({
   useEffect(() => {
     void load()
   }, [load])
+  // One click; the drawer re-reads the campaign once the action succeeded.
+  const act = async (run: () => Promise<boolean>) => {
+    if (await run()) await load()
+  }
   const row = campaign || seed
   return (
     <Dialog
@@ -641,34 +712,47 @@ function CampaignDetailDrawer({
                 </div>
               )}
             </section>
-            {['ACTIVE', 'PAUSED'].includes(row.status) && (
+            {liveCampaignStates.includes(row.status) && (
               <footer className="firmware-drawer-actions">
                 {row.status === 'ACTIVE' ? (
                   <button
                     className="button secondary"
-                    onClick={() => onControl(row, 'pause')}
+                    disabled={acting}
+                    onClick={() => void act(() => onControl(row, 'pause'))}
                   >
                     <Icon name="pause" /> Pause rollout
                   </button>
                 ) : (
                   <button
                     className="button primary"
-                    disabled={row.release_state === 'REVOKED'}
+                    disabled={acting || row.release_state === 'REVOKED'}
                     title={
                       row.release_state === 'REVOKED'
                         ? 'A revoked release cannot resume.'
                         : undefined
                     }
-                    onClick={() => onControl(row, 'resume')}
+                    onClick={() => void act(() => onControl(row, 'resume'))}
                   >
                     <Icon name="refresh" /> Resume rollout
                   </button>
                 )}
                 <button
                   className="button destructive"
-                  onClick={() => onControl(row, 'cancel')}
+                  disabled={acting}
+                  onClick={() => void act(() => onControl(row, 'cancel'))}
                 >
                   <Icon name="x" /> Cancel campaign
+                </button>
+              </footer>
+            )}
+            {closedCampaignStates.includes(row.status) && !row.archived_at && (
+              <footer className="firmware-drawer-actions">
+                <button
+                  className="button secondary"
+                  disabled={acting}
+                  onClick={() => void act(() => onArchive(row))}
+                >
+                  <Icon name="download" /> Archive campaign
                 </button>
               </footer>
             )}
@@ -685,440 +769,6 @@ function CampaignDetailDrawer({
         />
       )}
     </Dialog>
-  )
-}
-
-function CampaignCreator({
-  releases,
-  devices,
-  enabled,
-  hilEnabled,
-  onClose,
-  onCreated,
-  toast,
-}: {
-  releases: FirmwareRelease[]
-  devices: Device[]
-  enabled: boolean
-  hilEnabled: boolean
-  onClose: () => void
-  onCreated: () => Promise<void>
-  toast: Toast
-}) {
-  const [releaseId, setReleaseId] = useState('')
-  const [zoneId, setZoneId] = useState('')
-  const [reason, setReason] = useState('')
-  const [confirmation, setConfirmation] = useState('')
-  const [password, setPassword] = useState('')
-  const [scope, setScope] = useState<FirmwareScopePreview | null>(null)
-  const [overrideStability, setOverrideStability] = useState(false)
-  const [previewBusy, setPreviewBusy] = useState(false)
-  const [busy, setBusy] = useState(false)
-  const [error, setError] = useState('')
-  const [clock, setClock] = useState(() => Date.now())
-  const selectedRelease =
-    releases.find((release) => release.release_id === releaseId) || null
-  const isHil = selectedRelease?.state === 'HIL_ONLY'
-  const zones = useMemo(
-    () =>
-      [
-        ...new Map(
-          devices.map((device) => [
-            device.zone_id,
-            device.zone_name || device.zone_id,
-          ]),
-        ).entries(),
-      ].sort(([left], [right]) => left.localeCompare(right)),
-    [devices],
-  )
-  const hilZoneIds = selectedRelease?.hil_targets
-    ? hilAllowedTargets(selectedRelease).map(
-        target => devices.find(device => device.connector_id === target.connector_id)?.zone_id,
-      )
-    : [hilDevice(selectedRelease, devices)?.zone_id]
-  const selectableZones = isHil ? zones.filter(([id]) => hilZoneIds.includes(id)) : zones
-  const hilTarget = hilDevice(selectedRelease, devices, zoneId)
-  const expiresIn = scope
-    ? Math.max(0, Math.ceil((Date.parse(scope.expires_at) - clock) / 1000))
-    : 0
-  const expired = Boolean(scope && expiresIn <= 0)
-  useEffect(() => {
-    if (!scope) return
-    const timer = window.setInterval(() => setClock(Date.now()), 1_000)
-    return () => window.clearInterval(timer)
-  }, [scope])
-  const resetScope = () => {
-    setScope(null)
-    setOverrideStability(false)
-    setConfirmation('')
-    setPassword('')
-  }
-  const stabilityWarnings = scope?.stability_warnings || []
-  const chooseRelease = (value: string) => {
-    setReleaseId(value)
-    resetScope()
-    const next = releases.find((release) => release.release_id === value)
-    const target = hilDevice(next, devices)
-    setZoneId(next?.state === 'HIL_ONLY' ? target?.zone_id || '' : '')
-  }
-  const preview = async () => {
-    if (!selectedRelease || !zoneId) return
-    setPreviewBusy(true)
-    setScope(null)
-    setOverrideStability(false)
-    setError('')
-    try {
-      setScope(
-        firmwareScopeSchema.parse(
-          await api('/api/v1/firmware/campaigns/preflight', {
-            method: 'POST',
-            body: JSON.stringify({
-              release_id: selectedRelease.release_id,
-              zone_id: zoneId,
-            }),
-          }),
-        ) as FirmwareScopePreview,
-      )
-      setClock(Date.now())
-    } catch (reason) {
-      setError(
-        reason instanceof Error
-          ? reason.message
-          : 'Firmware scope could not be previewed.',
-      )
-    } finally {
-      setPreviewBusy(false)
-    }
-  }
-  const valid = Boolean(
-    selectedRelease &&
-      zoneId &&
-      scope &&
-      !expired &&
-      scope.release.release_id === selectedRelease.release_id &&
-      scope.zone_id === zoneId &&
-      scope.counts.eligible > 0 &&
-      (!stabilityWarnings.length || overrideStability) &&
-      reason.trim().length >= 10 &&
-      confirmation === selectedRelease.version &&
-      password &&
-      !busy,
-  )
-  const start = async (event: FormEvent) => {
-    event.preventDefault()
-    if (!valid || !selectedRelease || !scope) return
-    setBusy(true)
-    setError('')
-    try {
-      const result = firmwareCampaignCreatedSchema.parse(
-        await api('/api/v1/firmware/campaigns', {
-          method: 'POST',
-          body: JSON.stringify({
-            release_id: selectedRelease.release_id,
-            zone_id: zoneId,
-            reason: reason.trim(),
-            typed_confirmation: confirmation,
-            password,
-            scope_token: scope.scope_token,
-            idempotency_key: idempotency('firmware-campaign'),
-            override_stability_warnings: overrideStability,
-            ...(overrideStability && scope.stability_warnings_digest
-              ? { stability_warnings_digest: scope.stability_warnings_digest }
-              : {}),
-          }),
-        }),
-      )
-      setPassword('')
-      setConfirmation('')
-      toast.notice(
-        `Firmware campaign created for ${result.eligible} eligible device${result.eligible === 1 ? '' : 's'}; ${result.legacy_skipped} safely excluded.`,
-      )
-      await onCreated()
-      onClose()
-    } catch (reason) {
-      setPassword('')
-      setConfirmation('')
-      setError(
-        reason instanceof Error
-          ? reason.message
-          : 'Firmware campaign could not be created.',
-      )
-    } finally {
-      setBusy(false)
-    }
-  }
-  const stage = !releaseId ? 1 : !zoneId ? 2 : !scope || expired ? 3 : 4
-  return (
-    <Dialog
-      titleId="firmware-campaign-create-title"
-      title="Create a constrained firmware campaign"
-      description="Select signed bytes, verify exact server scope, then complete administrator step-up."
-      onClose={onClose}
-      className="firmware-campaign-dialog"
-    >
-      <div className="firmware-campaign-wizard">
-        <ol aria-label="Campaign setup progress">
-          {['Release', 'Zone', 'Scope', 'Confirm'].map((label, index) => (
-            <li
-              key={label}
-              className={
-                index + 1 < stage ? 'done' : index + 1 === stage ? 'active' : ''
-              }
-              aria-current={index + 1 === stage ? 'step' : undefined}
-            >
-              <span>
-                {index + 1 < stage ? <Icon name="check" /> : index + 1}
-              </span>
-              <strong>{label}</strong>
-            </li>
-          ))}
-        </ol>
-        <form onSubmit={(event) => void start(event)}>
-          <section>
-            <h3 className="firmware-wizard-heading"><span aria-hidden="true">1</span>Signed release</h3>
-            <label>
-              Release channel
-              <select
-                value={releaseId}
-                onChange={(event) => chooseRelease(event.target.value)}
-              >
-                <option value="">Select signed bytes</option>
-                {releases
-                  .filter((release) => release.state !== 'REVOKED')
-                  .map((release) => (
-                    <option key={release.release_id} value={release.release_id}>
-                      {firmwareName(release)} ·{' '}
-                      {release.state === 'HIL_ONLY'
-                        ? 'HIL-only exact MAC'
-                        : 'Production'}
-                    </option>
-                  ))}
-              </select>
-            </label>
-            {selectedRelease && (
-              <div className="firmware-wizard-context">
-                <StatusBadge state={selectedRelease.state} />
-                <span>
-                  <strong>{selectedRelease.partition_layout}</strong>
-                  <small>
-                    Key {selectedRelease.signing_key_id} · published{' '}
-                    {dateTime(selectedRelease.published_at)}
-                  </small>
-                </span>
-              </div>
-            )}
-          </section>
-          <section>
-            <h3 className="firmware-wizard-heading"><span aria-hidden="true">2</span>Destination zone</h3>
-            <label>
-              Zone
-              <select
-                value={zoneId}
-                disabled={isHil && selectableZones.length <= 1}
-                onChange={(event) => {
-                  setZoneId(event.target.value)
-                  resetScope()
-                }}
-              >
-                <option value="">Select a zone</option>
-                {selectableZones.map(([id, name]) => (
-                  <option key={id} value={id}>
-                    {name} · {id}
-                  </option>
-                ))}
-              </select>
-            </label>
-            {isHil && (
-              <div
-                className={`firmware-wizard-context pattern-${hilTarget ? 'confirmed' : 'blocked'}`}
-              >
-                <Icon name={hilTarget ? 'shield' : 'alert'} />
-                <span>
-                  <strong>Exact-device HIL quarantine</strong>
-                  <small>
-                    {selectedRelease ? hilScopeLabel(selectedRelease) : 'No target'}
-                    {hilTarget
-                      ? ` · ${hilTarget.display_name}`
-                      : ` · ${hilDeviceMismatch(selectedRelease, devices, zoneId) || 'no registered match'}`}
-                  </small>
-                </span>
-              </div>
-            )}
-            {selectedRelease?.hil_schedule && (
-              <details>
-                <summary>Nationwide qualification status ({selectedRelease.hil_schedule.denominator} connectors)</summary>
-                <p>Deferred offline connectors remain incomplete. A bridge readiness verdict covers the bridge observation only.</p>
-                <table>
-                  <thead><tr><th>Connector</th><th>Status</th><th>Reason and prerequisites</th></tr></thead>
-                  <tbody>{selectedRelease.hil_schedule.rows.map(row => (
-                    <tr key={row.target.connector_id}>
-                      <td>{row.name}{row.exposed ? '' : ' · awaiting exposure'}</td>
-                      <td>{row.status.replaceAll('_', ' ')}</td>
-                      <td>{[row.reason, ...row.prerequisites, ...(row.current_hold ? [row.current_hold] : [])].map(value => value.replaceAll('_', ' ').toLowerCase()).join('; ')}</td>
-                    </tr>
-                  ))}</tbody>
-                </table>
-              </details>
-            )}
-          </section>
-          <section>
-            <h3 className="firmware-wizard-heading"><span aria-hidden="true">3</span>Device scope</h3>
-            {(!selectedRelease || !zoneId) && (
-              <p className="firmware-wizard-hint">
-                Choose a release and zone to preview exactly which devices will
-                receive it.
-              </p>
-            )}
-            {selectedRelease && zoneId && (!scope || expired) && (
-              <button
-                type="button"
-                className="button secondary"
-                disabled={previewBusy || (isHil ? !hilEnabled : !enabled)}
-                onClick={() => void preview()}
-              >
-                <Icon name="search" />{' '}
-                {previewBusy
-                  ? 'Calculating exact scope…'
-                  : expired
-                    ? 'Refresh expired scope'
-                    : 'Preview eligible and excluded devices'}
-              </button>
-            )}
-            {scope && !expired && (
-              <div className="firmware-scope-result" aria-live="polite">
-                <header>
-                  <span>
-                    <strong>{scope.counts.eligible}</strong> eligible
-                  </span>
-                  <span>
-                    <strong>{scope.counts.excluded}</strong> excluded
-                  </span>
-                  <span>
-                    <strong>{scope.counts.offline}</strong> offline
-                  </span>
-                  <StatusBadge state={`${expiresIn}s REMAINING`} />
-                </header>
-                <div className="firmware-scope-columns">
-                  <section>
-                    <h4>Eligible devices</h4>
-                    {scope.eligible.map((device) => (
-                      <article key={device.connector_id}>
-                        <Icon name="check" />
-                        <span>
-                          <strong>{device.display_name}</strong>
-                          <small>
-                            {device.hardware_id} ·{' '}
-                            {device.connected
-                              ? 'online'
-                              : 'offline, remains pending'}
-                          </small>
-                        </span>
-                      </article>
-                    ))}
-                  </section>
-                  <section>
-                    <h4>Safely excluded</h4>
-                    {scope.excluded.map((device) => (
-                      <article key={device.connector_id}>
-                        <Icon name="alert" />
-                        <span>
-                          <strong>{device.display_name}</strong>
-                          <small>
-                            {humanize(device.reason)} · {device.hardware_id}
-                          </small>
-                        </span>
-                      </article>
-                    ))}
-                  </section>
-                </div>
-                <StabilityWarnings
-                  warnings={stabilityWarnings}
-                  override={overrideStability}
-                  onOverride={setOverrideStability}
-                />
-                <button
-                  type="button"
-                  className="button text-button"
-                  onClick={() => void preview()}
-                >
-                  <Icon name="refresh" /> Recalculate scope
-                </button>
-              </div>
-            )}
-          </section>
-          <section>
-            <h3 className="firmware-wizard-heading"><span aria-hidden="true">4</span>Audit and confirm</h3>
-            <label>
-              Audited reason
-              <textarea
-                value={reason}
-                onChange={(event) => setReason(event.target.value)}
-                maxLength={500}
-                placeholder="Why is this rollout required? At least 10 characters."
-              />
-            </label>
-            <label>
-              <span className="firmware-wizard-label">
-                Type exact version{' '}
-                {selectedRelease ? (
-                  <code>{selectedRelease.version}</code>
-                ) : (
-                  <small>after choosing a release</small>
-                )}
-              </span>
-              <input
-                value={confirmation}
-                onChange={(event) => setConfirmation(event.target.value)}
-                autoComplete="off"
-              />
-            </label>
-            <label>
-              Administrator password
-              <input
-                type="password"
-                autoComplete="current-password"
-                value={password}
-                onChange={(event) => setPassword(event.target.value)}
-              />
-            </label>
-          </section>
-          {error && (
-            <div className="message pattern-blocked" role="alert">
-              <Icon name="alert" />
-              {error}
-            </div>
-          )}
-          <footer>
-            <button
-              type="button"
-              className="button secondary"
-              onClick={onClose}
-            >
-              Cancel
-            </button>
-            <button className="button primary" disabled={!valid}>
-              <Icon name="power" />{' '}
-              {busy ? 'Starting audited campaign…' : 'Start sequential rollout'}
-            </button>
-          </footer>
-        </form>
-      </div>
-    </Dialog>
-  )
-}
-
-function FirmwareCancelMenu({ onCancel }: { onCancel: () => void }) {
-  const [open, setOpen] = useState(false)
-  const triggerRef = useRef<HTMLButtonElement>(null)
-  return (
-    <div className="firmware-action-menu">
-      <button ref={triggerRef} className="button secondary" type="button" aria-label="More firmware campaign actions" aria-haspopup="menu" aria-expanded={open} onClick={() => setOpen((value) => !value)}><Icon name="menu" /> More</button>
-      {open && <AnchoredLayer anchorRef={triggerRef} className="firmware-action-layer" mobileSheet preferredWidth={310} onDismiss={(reason) => { setOpen(false); if (reason === 'escape') triggerRef.current?.focus() }}>
-        <div className="firmware-action-panel" role="group" aria-label="Firmware campaign actions">
-          <button type="button" className="danger-action" onClick={() => { setOpen(false); onCancel() }}><Icon name="x" /><span><strong>Cancel campaign</strong><small>Signed evidence and device state remain durable.</small></span></button>
-        </div>
-      </AnchoredLayer>}
-    </div>
   )
 }
 
@@ -1160,14 +810,14 @@ export function FirmwareView({
   const [campaignError, setCampaignError] = useState('')
   const [enabled, setEnabled] = useState(false)
   const [hilEnabled, setHilEnabled] = useState(false)
-  const [creatorOpen, setCreatorOpen] = useState(false)
+  const [updateOpen, setUpdateOpen] = useState(false)
   const [campaignDrawer, setCampaignDrawer] = useState<FirmwareCampaign | null>(
     null,
   )
-  const [campaignControl, setCampaignControl] = useState<{
-    campaign: FirmwareCampaign
-    action: CampaignAction
-  } | null>(null)
+  const [showArchived, setShowArchived] = useState(false)
+  // The campaign (or 'history') a one-click action is running for.
+  const [acting, setActing] = useState<string | null>(null)
+  const [historyResult, setHistoryResult] = useState<FirmwareHistoryCleared | null>(null)
   const [revokeRelease, setRevokeRelease] = useState<FirmwareRelease | null>(
     null,
   )
@@ -1266,7 +916,7 @@ export function FirmwareView({
       campaignAbortRef.current = controller
       try {
         const response = await api<CampaignResponse>(
-          `/api/v1/firmware/campaigns${queryString({ view: 'summary', q: campaignQuery.trim() || undefined, status: campaignStatus || undefined, zone_id: campaignZone || undefined, release_id: campaignRelease || undefined, cursor, limit: 24 })}`,
+          `/api/v1/firmware/campaigns${queryString({ view: 'summary', q: campaignQuery.trim() || undefined, status: campaignStatus || undefined, zone_id: campaignZone || undefined, release_id: campaignRelease || undefined, include_archived: showArchived || undefined, cursor, limit: 24 })}`,
           { signal: controller.signal },
         )
         setCampaignRows((current) =>
@@ -1300,7 +950,7 @@ export function FirmwareView({
         }
       }
     },
-    [campaignQuery, campaignStatus, campaignZone, campaignRelease],
+    [campaignQuery, campaignStatus, campaignZone, campaignRelease, showArchived],
   )
 
   useEffect(() => {
@@ -1363,6 +1013,75 @@ export function FirmwareView({
       )
     } finally {
       setRevokeBusy(false)
+    }
+  }
+  // One click each: the server checks the campaign's state (409 otherwise).
+  const controlCampaign = async (campaign: FirmwareCampaign, action: CampaignAction) => {
+    setActing(campaign.campaign_id)
+    try {
+      await api(`/api/v1/firmware/campaigns/${campaign.campaign_id}/${action}`, {
+        method: 'POST',
+        body: JSON.stringify({}),
+      })
+      toast.notice(
+        `${campaign.zone_name || campaign.zone_id}: campaign ${action === 'pause' ? 'paused' : action === 'resume' ? 'resumed' : 'cancelled'}.`,
+      )
+      await loadCampaigns({ quiet: true })
+      return true
+    } catch (reason) {
+      toast.error(reason instanceof Error ? reason.message : 'Campaign control failed.')
+      return false
+    } finally {
+      setActing(null)
+    }
+  }
+  const archiveCampaign = async (campaign: FirmwareCampaign) => {
+    setActing(campaign.campaign_id)
+    try {
+      await api(`/api/v1/firmware/campaigns/${campaign.campaign_id}/archive`, { method: 'POST' })
+      toast.notice(`${campaign.zone_name || campaign.zone_id}: campaign archived.`)
+      await loadCampaigns({ quiet: true })
+      return true
+    } catch (reason) {
+      toast.error(reason instanceof Error ? reason.message : 'The campaign could not be archived.')
+      return false
+    } finally {
+      setActing(null)
+    }
+  }
+  const archiveAllClosed = async () => {
+    setActing('history')
+    try {
+      const result = await api<{ archived: number }>('/api/v1/firmware/campaigns/archive-cancelled', {
+        method: 'POST',
+      })
+      toast.notice(
+        result.archived
+          ? `${result.archived} cancelled or completed campaign${result.archived === 1 ? '' : 's'} archived.`
+          : 'No cancelled or completed campaign to archive.',
+      )
+      await loadCampaigns({ quiet: true })
+    } catch (reason) {
+      toast.error(reason instanceof Error ? reason.message : 'Campaigns could not be archived.')
+    } finally {
+      setActing(null)
+    }
+  }
+  const clearHistory = async () => {
+    setActing('history')
+    try {
+      const result = await api<FirmwareHistoryCleared>('/api/v1/firmware/campaigns/clear-history', {
+        method: 'POST',
+      })
+      setHistoryResult(result)
+      toast.notice(
+        `Firmware history cleared: ${result.cancelled} cancelled, ${result.deleted} removed, ${result.archived} archived.`,
+      )
+      await Promise.all([loadCatalog(), loadCampaigns({ quiet: true })])
+    } catch (reason) {
+      toast.error(reason instanceof Error ? reason.message : 'Firmware history could not be cleared.')
+    } finally {
+      setActing(null)
     }
   }
   const copy = async (label: string, value: string) => {
@@ -1434,9 +1153,9 @@ export function FirmwareView({
                   ? 'No enabled deployable release channel is available.'
                   : undefined
               }
-              onClick={() => setCreatorOpen(true)}
+              onClick={() => setUpdateOpen(true)}
             >
-              <Icon name="plus" /> New campaign
+              <Icon name="power" /> Update firmware
             </button>
           </div>
         }
@@ -1624,7 +1343,11 @@ export function FirmwareView({
                     <strong>
                       {sumStates(campaign.counts, activeDeploymentStates)}
                     </strong>
-                    <small>deployments in progress</small>
+                    <small>
+                      {campaign.status === 'ACTIVE' && campaign.waiting
+                        ? waitingLabel(campaign.waiting.code).toLowerCase()
+                        : 'deployments in progress'}
+                    </small>
                   </span>
                   <StatusBadge state={campaign.status} />
                   <Icon name="chevron" />
@@ -1900,10 +1623,59 @@ export function FirmwareView({
                 per-device evidence.
               </p>
             </div>
-            <span className="badge">
-              {campaignFilteredTotal.toLocaleString()} matching
-            </span>
+            <div className="firmware-history-actions">
+              <label className="check-row">
+                <input
+                  type="checkbox"
+                  checked={showArchived}
+                  onChange={(event) => setShowArchived(event.target.checked)}
+                />{' '}
+                Show archived{campaignTotals.archived_campaigns ? ` (${campaignTotals.archived_campaigns.toLocaleString()})` : ''}
+              </label>
+              <button
+                className="button secondary"
+                disabled={acting !== null}
+                onClick={() => void archiveAllClosed()}
+              >
+                <Icon name="download" /> Archive all cancelled
+              </button>
+              <button
+                className="button destructive-outline"
+                disabled={acting !== null}
+                title="Cancels every campaign that is not mid-install, then removes never-offered attempts and archives the rest. Evidence the OTA checks read is kept."
+                onClick={() => void clearHistory()}
+              >
+                <Icon name="trash" /> {acting === 'history' ? 'Clearing…' : 'Clear firmware history'}
+              </button>
+              <span className="badge">
+                {campaignFilteredTotal.toLocaleString()} matching
+              </span>
+            </div>
           </div>
+          {historyResult && (
+            <div className="message pattern-confirmed firmware-history-result" role="status">
+              <Icon name="check" />
+              <div>
+                <strong>Firmware history cleared</strong>
+                <p>
+                  {historyResult.completed} completed · {historyResult.cancelled} cancelled ·{' '}
+                  {historyResult.deleted} removed · {historyResult.archived} archived
+                  {historyResult.more ? ' · more remain, clear again' : ''}
+                </p>
+                {historyResult.kept_running.length > 0 && (
+                  <p>
+                    Still installing, kept running:{' '}
+                    {historyResult.kept_running
+                      .map((row) => `${row.zone_id} · ${row.connector || row.connector_id || 'device'} (${humanize(row.state).toLowerCase()})`)
+                      .join('; ')}
+                  </p>
+                )}
+              </div>
+              <button className="button text-button" onClick={() => setHistoryResult(null)}>
+                Dismiss
+              </button>
+            </div>
+          )}
           <div className="firmware-campaign-toolbar">
             <label className="search-field">
               <span className="sr-only">Search firmware campaigns</span>
@@ -2025,7 +1797,10 @@ export function FirmwareView({
                       <h3>Zone Lite {campaign.version || 'unknown'}</h3>
                       <small>{campaign.campaign_id}</small>
                     </span>
-                    <StatusBadge state={campaign.status} />
+                    <span className="firmware-campaign-badges">
+                      <StatusBadge state={campaign.status} />
+                      {campaign.archived_at && <StatusBadge state="ARCHIVED" />}
+                    </span>
                   </header>
                   <div className="firmware-campaign-progress">
                     <div>
@@ -2063,7 +1838,18 @@ export function FirmwareView({
                       <dd>{relativeTime(campaign.updated_at)}</dd>
                     </div>
                   </dl>
-                  {campaign.pause_reason && (
+                  {campaign.status === 'ACTIVE' && campaign.waiting && (
+                    <div className="firmware-campaign-waiting">
+                      <Icon name="clock" />
+                      <span>
+                        <strong>{waitingLabel(campaign.waiting.code)}</strong>
+                        {[campaign.waiting.display_name || campaign.waiting.connector_id, campaign.waiting.message]
+                          .filter(Boolean)
+                          .join(' · ')}
+                      </span>
+                    </div>
+                  )}
+                  {campaign.pause_reason && liveCampaignStates.includes(campaign.status) && (
                     <div className="firmware-campaign-alert">
                       <Icon name="alert" />
                       <span>
@@ -2082,9 +1868,8 @@ export function FirmwareView({
                     {campaign.status === 'ACTIVE' && (
                       <button
                         className="button secondary"
-                        onClick={() =>
-                          setCampaignControl({ campaign, action: 'pause' })
-                        }
+                        disabled={acting !== null}
+                        onClick={() => void controlCampaign(campaign, 'pause')}
                       >
                         <Icon name="pause" /> Pause
                       </button>
@@ -2092,21 +1877,36 @@ export function FirmwareView({
                     {campaign.status === 'PAUSED' && (
                       <button
                         className="button primary"
-                        disabled={campaign.release_state === 'REVOKED'}
+                        disabled={acting !== null || campaign.release_state === 'REVOKED'}
                         title={
                           campaign.release_state === 'REVOKED'
                             ? 'A revoked release cannot resume.'
                             : undefined
                         }
-                        onClick={() =>
-                          setCampaignControl({ campaign, action: 'resume' })
-                        }
+                        onClick={() => void controlCampaign(campaign, 'resume')}
                       >
                         <Icon name="refresh" /> Resume
                       </button>
                     )}
-                    {['ACTIVE', 'PAUSED'].includes(campaign.status) && (
-                      <FirmwareCancelMenu onCancel={() => setCampaignControl({ campaign, action: 'cancel' })} />
+                    {liveCampaignStates.includes(campaign.status) && (
+                      <button
+                        className="button destructive-outline"
+                        disabled={acting !== null}
+                        aria-label={`Cancel campaign for ${campaign.zone_name || campaign.zone_id}`}
+                        onClick={() => void controlCampaign(campaign, 'cancel')}
+                      >
+                        <Icon name="x" /> Cancel
+                      </button>
+                    )}
+                    {closedCampaignStates.includes(campaign.status) && !campaign.archived_at && (
+                      <button
+                        className="button secondary"
+                        disabled={acting !== null}
+                        aria-label={`Archive campaign for ${campaign.zone_name || campaign.zone_id}`}
+                        onClick={() => void archiveCampaign(campaign)}
+                      >
+                        <Icon name="download" /> Archive
+                      </button>
                     )}
                   </footer>
                 </article>
@@ -2121,8 +1921,8 @@ export function FirmwareView({
                     : 'No firmware campaigns have been started.'}
                 </h3>
                 <p>
-                  Create a guarded exact-scope campaign from an enabled signed
-                  release.
+                  Use Update firmware to start one-click campaigns from an
+                  enabled signed release.
                 </p>
               </div>
             )}
@@ -2153,14 +1953,15 @@ export function FirmwareView({
           )}
         </section>
       )}
-      {creatorOpen && (
-        <CampaignCreator
+      {updateOpen && (
+        <UpdateFirmwareDialog
           releases={catalogReleases}
           devices={devices}
+          campaigns={campaignRows}
           enabled={enabled}
           hilEnabled={hilEnabled}
-          onClose={() => setCreatorOpen(false)}
-          onCreated={async () => {
+          onClose={() => setUpdateOpen(false)}
+          onDone={async () => {
             await Promise.all([loadCatalog(), loadCampaigns({ quiet: true })])
           }}
           toast={toast}
@@ -2170,21 +1971,9 @@ export function FirmwareView({
         <CampaignDetailDrawer
           seed={campaignDrawer}
           onClose={() => setCampaignDrawer(null)}
-          onControl={(campaign, action) => {
-            setCampaignDrawer(null)
-            setCampaignControl({ campaign, action })
-          }}
-          toast={toast}
-        />
-      )}
-      {campaignControl && (
-        <CampaignControlDialog
-          campaign={campaignControl.campaign}
-          action={campaignControl.action}
-          onClose={() => setCampaignControl(null)}
-          onChanged={async () => {
-            await loadCampaigns({ quiet: true })
-          }}
+          onControl={controlCampaign}
+          onArchive={archiveCampaign}
+          acting={acting !== null}
           toast={toast}
         />
       )}

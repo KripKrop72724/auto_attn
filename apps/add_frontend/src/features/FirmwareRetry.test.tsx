@@ -94,12 +94,6 @@ const campaign = {
   campaign_id: 'campaign-multan-02', zone_id: 'ZONE-MULTAN-02', status: 'PAUSED', deployments: [deployment],
 } as unknown as FirmwareCampaign
 
-const fill = () => {
-  fireEvent.change(screen.getByLabelText('Audited reason'), { target: { value: 'Site replaced the ESP supply.' } })
-  fireEvent.change(screen.getByLabelText(/Type exact version/), { target: { value: '2.7.5' } })
-  fireEvent.change(screen.getByLabelText('Administrator password'), { target: { value: 'local-step-up-value' } })
-}
-
 const dialog = (onClose = vi.fn(), notice = vi.fn(), onChanged = vi.fn(async () => undefined)) =>
   render(
     <RetryTargetDialog
@@ -128,7 +122,7 @@ describe('interrupted target boot', () => {
     expect(document.body.textContent).not.toMatch(/power suspected/i)
   })
 
-  it('retries the same target only with typed version, step-up and the stability override', async () => {
+  it('retries the same target with one click, overriding exactly the reviewed stability warnings', async () => {
     const fetchMock = server(preflight())
     vi.stubGlobal('fetch', fetchMock)
     const notice = vi.fn()
@@ -140,10 +134,11 @@ describe('interrupted target boot', () => {
     expect(review).toBe('/api/v1/firmware/campaigns/campaign-multan-02/retry-target?deployment_id=deployment-multan-02')
     expect(screen.getByText(/DEGRADED · no I\/O faults reported/)).toBeTruthy()
     expect(screen.getByText(/^0 queued at/)).toBeTruthy()
+    expect(screen.queryByLabelText('Administrator password')).toBeNull()
+    expect(screen.queryByLabelText('Audited reason')).toBeNull()
+    expect(screen.queryByLabelText(/Type exact version/)).toBeNull()
+    expect(screen.queryByLabelText(/Override the stability warnings/)).toBeNull()
     const retry = screen.getByRole('button', { name: 'Retry same target' }) as HTMLButtonElement
-    fill()
-    expect(retry.disabled).toBe(true)
-    fireEvent.click(screen.getByLabelText(/Override the stability warnings/))
     expect(retry.disabled).toBe(false)
     fireEvent.click(retry)
     await waitFor(() => expect(onClose).toHaveBeenCalled())
@@ -151,9 +146,6 @@ describe('interrupted target boot', () => {
     expect(path).toBe('/api/v1/firmware/campaigns/campaign-multan-02/retry-target')
     expect(JSON.parse(String(init.body))).toEqual({
       deployment_id: 'deployment-multan-02',
-      reason: 'Site replaced the ESP supply.',
-      typed_confirmation: '2.7.5',
-      password: 'local-step-up-value',
       override_stability_warnings: true,
       stability_warnings_digest: 'a'.repeat(64),
       resume_pending_deployments: 0,
@@ -162,16 +154,14 @@ describe('interrupted target boot', () => {
     expect(notice).toHaveBeenCalledWith(expect.stringMatching(/2\.7\.5 attempt for Multan 02 is queued/))
   })
 
-  it('needs the owner to confirm the pending deployments the retry also resumes', async () => {
+  it('sends the pending deployments the retry also resumes and says so', async () => {
     const fetchMock = server(preflight({ stability_warnings: [], pending_deployments: 2 }))
     vi.stubGlobal('fetch', fetchMock)
     const onClose = vi.fn()
-    dialog(onClose)
+    const notice = vi.fn()
+    dialog(onClose, notice)
     expect(await screen.findByText(/also offers its 2 other pending deployments/)).toBeTruthy()
-    fill()
     const retry = screen.getByRole('button', { name: 'Retry same target' }) as HTMLButtonElement
-    expect(retry.disabled).toBe(true)
-    fireEvent.click(screen.getByLabelText(/Also offer the 2 pending deployments/))
     expect(retry.disabled).toBe(false)
     fireEvent.click(retry)
     await waitFor(() => expect(onClose).toHaveBeenCalled())
@@ -179,6 +169,7 @@ describe('interrupted target boot', () => {
     expect(body.resume_pending_deployments).toBe(2)
     expect(body.override_stability_warnings).toBe(false)
     expect(body).not.toHaveProperty('stability_warnings_digest')
+    expect(notice).toHaveBeenCalledWith(expect.stringMatching(/also offers its 2 other pending deployments/))
   })
 
   it('shows the server refusal from the review and never offers the retry', async () => {
@@ -190,7 +181,6 @@ describe('interrupted target boot', () => {
     dialog()
     expect((await screen.findByRole('alert')).textContent).toContain('storage I/O faults')
     expect(screen.getByText('I/O faults: write_failures=3')).toBeTruthy()
-    fill()
     expect((screen.getByRole('button', { name: 'Retry same target' }) as HTMLButtonElement).disabled).toBe(true)
     expect(posts(fetchMock)).toHaveLength(0)
   })
@@ -209,10 +199,8 @@ describe('interrupted target boot', () => {
     const onClose = vi.fn()
     dialog(onClose)
     await screen.findByText(/Current ESP state/)
-    fill()
     fireEvent.click(screen.getByRole('button', { name: 'Retry same target' }))
     expect((await screen.findByRole('alert')).textContent).toContain('The ESP is offline.')
     expect(onClose).not.toHaveBeenCalled()
-    expect((screen.getByLabelText('Administrator password') as HTMLInputElement).value).toBe('')
   })
 })
