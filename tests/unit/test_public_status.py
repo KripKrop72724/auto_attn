@@ -349,3 +349,25 @@ def test_hikvision_epochs_from_a_wrong_esp_clock_are_ignored(db):
     assert public_status.last_hikvision_delivery(device, now) is None
     device.zkt_device.capability_profile = {"hikvision_health": {"last_stream_message_epoch": 10**12}}
     assert public_status.last_hikvision_delivery(device, now) is None
+
+
+def test_going_offline_is_never_dated_before_add_last_saw_it_online(db):
+    now = utc_now()
+    delivered = now - timedelta(minutes=10)  # live capture healthy, no punch since
+    device = _failing_hikvision(db, "LF-ZONE-BLD1-01", 1, delivered=delivered)
+    device.created_at = now - timedelta(days=60)
+    health = device.zkt_device.capability_profile["hikvision_health"]
+    device.zkt_device.connection_state = "ONLINE"
+    device.zkt_device.capability_profile = {"hikvision_health": {**health, "poll_error": 0}}
+    device.zkt_device.last_transition_at = now - timedelta(hours=2)  # Online since then
+    _seen(db, [device], now)
+    tracker = StatusTracker(STARTED)
+    online = tracker.refresh_in(db, now)["devices"][0]
+    assert (online["status"], online["since"]) == (ONLINE, public_status.iso_utc(now - timedelta(hours=2)))
+    device.zkt_device.connection_state = "OFFLINE"
+    device.zkt_device.capability_profile = {"hikvision_health": {**health, "poll_error": 6}}
+    for step in (10, 200):
+        _flap(db, device, now + timedelta(seconds=step))
+        row = tracker.refresh_in(db, now + timedelta(seconds=step))["devices"][0]
+    assert row["status"] == OFFLINE
+    assert row["since"] == public_status.iso_utc(now)

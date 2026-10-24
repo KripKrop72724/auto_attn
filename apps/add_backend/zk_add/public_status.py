@@ -187,10 +187,17 @@ class StatusTracker:
                 if pending is None or pending[0] != status:
                     pending = self._pending[connector.id] = (status, now, evidence)
                 if now - pending[1] >= grace[status]:
-                    # Offline since the last contact or terminal loss; Online
-                    # since ADD first saw attendance could flow again.
-                    since = pending[2] if status == OFFLINE else pending[1]
-                    row.status, row.since, row.updated_at = status, _bounded(since, row.since, now), now
+                    # Offline since the last contact, terminal loss or delivery,
+                    # but never before ADD last saw it Online (a Hikvision
+                    # terminal can be Online between punches); Online since ADD
+                    # first saw attendance could flow again.
+                    floor = ensure_utc(row.since)
+                    if status == OFFLINE:
+                        since = pending[2]
+                        floor = max(floor, self._online_seen.get(connector.id, floor))
+                    else:
+                        since = pending[1]
+                    row.status, row.since, row.updated_at = status, _bounded(since, floor, now), now
                     self._pending.pop(connector.id, None)
             rows.append((connector, row.status, ensure_utc(row.since)))
         current = {connector.id for connector in connectors}
