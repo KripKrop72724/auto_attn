@@ -51,6 +51,13 @@ class AddSettings(BaseSettings):
     offline_startup_grace_seconds: int = Field(default=90, ge=0, le=15 * 60)
     esp_offline_alert_after_seconds: int = Field(default=120, ge=45, le=60 * 60)
     esp_offline_alert_window_seconds: int = Field(default=600, ge=60, le=24 * 60 * 60)
+    # The public status page (zk_add/public_status.py). A device must stay
+    # offline, or back online, this long before the page changes, so an ESP
+    # reconnect or an ADD restart never resets its "since".
+    public_status_offline_grace_seconds: int = Field(default=120, ge=0, le=15 * 60)
+    public_status_online_grace_seconds: int = Field(default=60, ge=0, le=15 * 60)
+    public_status_refresh_seconds: float = Field(default=10.0, ge=1.0, le=300.0)
+    public_status_max_streams: int = Field(default=200, ge=1, le=5000)
     # Derived device health (zk_add/device_health.py). The owner enforces the
     # derived lifecycle on deploy; false is the kill switch that hands
     # lifecycle and last_error back to the legacy writers on the next heartbeat.
