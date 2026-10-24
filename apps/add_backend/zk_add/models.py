@@ -2327,5 +2327,19 @@ class CheckinNotifyControl(Base):
     updated_at: Mapped[datetime] = utc_column()
 
 
+class PublicDeviceStatus(Base):
+    """The Online/Offline state the public status page shows, and since when.
+
+    No foreign key, so creating the table never locks add_connectors.
+    """
+
+    __tablename__ = "add_public_device_status"
+
+    connector_id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=False)
+    status: Mapped[str] = mapped_column(String(10), nullable=False)
+    since: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = utc_column()
+
+
 from zk_add import attendance_manual_guard as _attendance_manual_guard  # noqa: E402,F401
 from zk_add import checkin_notify as _checkin_notify  # noqa: E402,F401

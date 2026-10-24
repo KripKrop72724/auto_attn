@@ -9,6 +9,7 @@ import logging
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from typing import Literal
 from uuid import uuid4
 
 import httpx
@@ -38,6 +39,7 @@ from zk_add.hil_transport import TransportInterrupted, enforce_transport
 from zk_add import attendance_force_release as force_release
 from zk_add import attendance_direct_ords as direct_ords
 from zk_add import checkin_notify
+from zk_add import public_status
 from zk_add import source_newest_slot as newest_slot
 from zk_add.attendance_cnic_link import cnic_not_linked_expression, unknown_synced_cnic_expression
 from zk_add.attendance_force_schemas import ForceCheckRequest, ForceStartRequest, ForceControlRequest, UserRefreshRequest
@@ -344,6 +346,7 @@ async def lifespan(_app: FastAPI):
     tasks = [
         asyncio.create_task(maintenance_loop(stop)),
         asyncio.create_task(monitor_event_loop_lag(stop)),
+        asyncio.create_task(public_status.public_status_loop(stop)),
     ]
     try:
         yield
@@ -4510,6 +4513,75 @@ async def browser_stream(
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+# The public status page and API (zk_add/public_status.py): no sign-in, any
+# origin, and only device names with Online/Offline and since when.
+PUBLIC_HEADERS = {"Cache-Control": "no-store", "Access-Control-Allow-Origin": "*"}
+PublicZone = Literal["life", "health"]
+
+
+def public_status_json(snapshot: dict, zone: str | None) -> str:
+    return json.dumps(public_status.for_zone(snapshot, zone), separators=(",", ":"))
+
+
+@app.get("/api/public/v1/status")
+async def public_device_status(zone: PublicZone | None = None):
+    snapshot = await public_status.hub.current()
+    return Response(public_status_json(snapshot, zone), media_type="application/json",
+                    headers=PUBLIC_HEADERS)
+
+
+@app.get("/events/public/v1/status")
+async def public_device_status_stream(request: Request, zone: PublicZone | None = None):
+    if public_status.hub.full():
+        raise HTTPException(status_code=503, detail="Too many live connections. Try again shortly.",
+                            headers={"Retry-After": "30"})
+
+    async def stream():
+        async for snapshot in public_status.hub.updates():
+            if await request.is_disconnected():
+                break
+            yield f"event: status\ndata: {public_status_json(snapshot, zone)}\n\n"
+
+    return StreamingResponse(stream(), media_type="text/event-stream",
+                             headers={**PUBLIC_HEADERS, "X-Accel-Buffering": "no"})
+
+
+@app.websocket("/api/public/v1/status/ws")
+async def public_device_status_socket(websocket: WebSocket, zone: PublicZone | None = None):
+    if public_status.hub.full():
+        await websocket.close(code=1013, reason="Too many live connections")
+        return
+    await websocket.accept()
+    # Read and drop anything the client sends, so the connection keeps
+    # answering pings and its close ends this handler at once.
+    reader = asyncio.create_task(_drain_websocket(websocket))
+    updates = public_status.hub.updates()
+    update = None
+    try:
+        while not reader.done():
+            update = asyncio.ensure_future(anext(updates))
+            await asyncio.wait({update, reader}, return_when=asyncio.FIRST_COMPLETED)
+            if update.done():
+                await websocket.send_text(public_status_json(update.result(), zone))
+    except (WebSocketDisconnect, RuntimeError):
+        pass
+    finally:
+        reader.cancel()
+        if update is not None and not update.done():
+            update.cancel()
+            # The generator must stop running before it can be closed.
+            await asyncio.gather(update, return_exceptions=True)
+        await updates.aclose()
+
+
+async def _drain_websocket(websocket: WebSocket) -> None:
+    try:
+        while True:
+            await websocket.receive_text()
+    except (WebSocketDisconnect, RuntimeError):
+        pass
 
 
 @app.post("/device/v1/attendance/batches")
