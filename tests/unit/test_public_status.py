@@ -93,8 +93,8 @@ def _health(tier, link_state="CONNECTED", reason="LINK_UP", since=None):
     ],
 )
 def test_online_means_attendance_can_reach_add(health, expected):
-    connector = SimpleNamespace(last_seen_at=utc_now())
-    assert observed_status(connector, health)[0] == expected
+    connector = SimpleNamespace(last_seen_at=utc_now(), firmware_family="zkt")
+    assert observed_status(connector, health, utc_now())[0] == expected
 
 
 def _device(db, code, number, *, spare=False):
@@ -273,3 +273,79 @@ def test_a_new_device_is_saved_only_after_the_restart_warmup(db):
     _seen(db, [device], start + timedelta(seconds=95))
     assert tracker.refresh_in(db, start + timedelta(seconds=95))["devices"][0]["status"] == ONLINE
     assert db.get(PublicDeviceStatus, device.id).status == ONLINE
+
+
+def _failing_hikvision(db, code, number, *, delivered):
+    """A Hikvision terminal failing its checks, whose state changes every few seconds."""
+    connector = _device(db, code, number)
+    connector.firmware_family = "hikvision"
+    zkt = connector.zkt_device
+    zkt.connection_state = "OFFLINE"
+    zkt.capability_profile = {"hikvision_health": {
+        "poll_error": 6, "poll_stage": "events", "capture_mode": "poll", "stream_open": False,
+        "last_stream_message_epoch": int(delivered.timestamp()) if delivered else 0,
+        "last_successful_poll_epoch": 0,
+    }}
+    db.commit()
+    return connector
+
+
+def _flap(db, connector, now):
+    connector.zkt_device.last_transition_at = now - timedelta(seconds=5)
+    _seen(db, [connector], now)
+
+
+def test_failing_hikvision_terminal_is_offline_since_its_last_delivery(db):
+    now = utc_now()
+    delivered = now - timedelta(hours=29)
+    device = _failing_hikvision(db, "LF-ZONE-BLD1-01", 1, delivered=delivered)
+    device.created_at = now - timedelta(days=60)
+    _flap(db, device, now)
+    seeded = StatusTracker(STARTED).refresh_in(db, now)["devices"][0]
+    assert (seeded["name"], seeded["status"]) == ("Building 1", OFFLINE)
+    assert seeded["since"] == public_status.iso_utc(delivered.replace(microsecond=0))
+
+
+def test_a_saved_offline_date_moves_back_to_when_the_outage_began(db):
+    now = utc_now()
+    delivered = now - timedelta(hours=29)
+    device = _failing_hikvision(db, "LF-ZONE-BLD1-01", 1, delivered=None)
+    device.created_at = now - timedelta(days=60)
+    _flap(db, device, now)
+    tracker = StatusTracker(STARTED)
+    # Saved before the fix: dated from the latest flap.
+    assert tracker.refresh_in(db, now)["devices"][0]["since"] == public_status.iso_utc(now - timedelta(seconds=5))
+    device.zkt_device.capability_profile = {"hikvision_health": {
+        **device.zkt_device.capability_profile["hikvision_health"],
+        "last_stream_message_epoch": int(delivered.timestamp())}}
+    later = now + timedelta(seconds=10)
+    _flap(db, device, later)
+    corrected = tracker.refresh_in(db, later)["devices"][0]
+    assert (corrected["status"], corrected["since"]) == (OFFLINE, public_status.iso_utc(delivered.replace(microsecond=0)))
+    assert ensure_utc(db.get(PublicDeviceStatus, device.id).since) == delivered.replace(microsecond=0)
+
+
+def test_offline_date_never_moves_back_past_a_time_add_saw_it_online(db):
+    now = utc_now()
+    device = _device(db, "ZONE-KARACHI-01", 1)
+    _seen(db, [device], now)
+    tracker = StatusTracker(STARTED)
+    tracker.refresh_in(db, now)  # Online, seen by this process at now
+    device.zkt_device.connection_state = "OFFLINE"
+    device.zkt_device.offline_since = now - timedelta(days=2)  # left over from an older outage
+    device.zkt_device.last_transition_at = now + timedelta(seconds=10)
+    for step in (20, 200, 330):
+        _seen(db, [device], now + timedelta(seconds=step))
+        row = tracker.refresh_in(db, now + timedelta(seconds=step))["devices"][0]
+    assert row["status"] == OFFLINE
+    assert row["since"] >= public_status.iso_utc(now)
+
+
+def test_hikvision_epochs_from_a_wrong_esp_clock_are_ignored(db):
+    now = utc_now()
+    device = _failing_hikvision(db, "ZONE-QUETTA-01", 1, delivered=now - timedelta(days=400))
+    device.created_at = now - timedelta(days=60)
+    db.commit()
+    assert public_status.last_hikvision_delivery(device, now) is None
+    device.zkt_device.capability_profile = {"hikvision_health": {"last_stream_message_epoch": 10**12}}
+    assert public_status.last_hikvision_delivery(device, now) is None

@@ -11,6 +11,12 @@ time that state began, and nothing else:
 * Online otherwise. DEGRADED and ONLINE_WITH_WARNINGS devices are Online: their
   attendance still arrives.
 
+An Offline device is dated from when its attendance stopped: its last contact,
+when its terminal was lost, or for a failing Hikvision terminal (whose state
+changes every few seconds) its last delivery. While it stays offline, better
+evidence of when the outage began moves "since" earlier, but never before ADD
+last saw the device online.
+
 A change must hold for public_status_{offline,online}_grace_seconds before the
 page shows it, so an ESP reconnect, a planned terminal restart or an ADD
 restart never makes a device flicker or resets its "since". Pending changes
@@ -36,7 +42,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
 from zk_add.db import session_scope
-from zk_add.device_health import evaluate_health_batch
+from zk_add.device_health import _epoch, evaluate_health_batch
 from zk_add.models import Connector, PublicDeviceStatus
 from zk_add.settings import settings
 from zk_add.time_utils import ensure_utc, iso_utc, utc_now
@@ -93,13 +99,35 @@ def _natural(text: str) -> list:
     return [int(part) if part.isdigit() else part.lower() for part in re.split(r"(\d+)", text)]
 
 
-def observed_status(connector: Connector, health) -> tuple[str, datetime | None]:
+def last_hikvision_delivery(connector: Connector, now: datetime) -> datetime | None:
+    """A Hikvision terminal's last stream message or successful check.
+
+    The epochs come from the ESP clock, so a time before the connector existed
+    or after now is ignored.
+    """
+    zkt = connector.zkt_device
+    profile = (zkt.capability_profile or {}) if zkt is not None else {}
+    health = profile.get("hikvision_health") or {}
+    earliest = ensure_utc(connector.created_at) if connector.created_at else None
+    times = [_epoch(health.get(name))
+             for name in ("last_stream_message_epoch", "last_successful_poll_epoch")]
+    times = [time for time in times
+             if time is not None and time <= now and (earliest is None or time >= earliest)]
+    return max(times) if times else None
+
+
+def observed_status(connector: Connector, health, now: datetime) -> tuple[str, datetime | None]:
     """Online or Offline now, and when the evidence says that condition began."""
     link = health.terminal_link
     if health.tier == "OFFLINE":
         return OFFLINE, connector.last_seen_at
     if link["state"] in TERMINAL_DOWN or link["reason"] == "NO_TERMINAL":
-        return OFFLINE, link["since"]
+        since = ensure_utc(link["since"]) if link["since"] else None
+        if (connector.firmware_family or "zkt") == "hikvision":
+            delivered = last_hikvision_delivery(connector, now)
+            if delivered is not None and (since is None or delivered < since):
+                since = delivered
+        return OFFLINE, since
     return ONLINE, link["since"] if link["state"] == "CONNECTED" else None
 
 
@@ -117,6 +145,8 @@ class StatusTracker:
         self.started_at = started_at or utc_now()
         # connector pk -> (status, first observed at, evidence since)
         self._pending: dict[int, tuple[str, datetime, datetime | None]] = {}
+        # connector pk -> when this process last saw it Online
+        self._online_seen: dict[int, datetime] = {}
         self._lock = threading.Lock()
 
     def refresh(self, now: datetime | None = None) -> dict:
@@ -137,7 +167,9 @@ class StatusTracker:
         warming = now < self.started_at + timedelta(seconds=settings.offline_startup_grace_seconds)
         rows = []
         for connector in connectors:
-            status, evidence = observed_status(connector, healths[connector.id])
+            status, evidence = observed_status(connector, healths[connector.id], now)
+            if status == ONLINE:
+                self._online_seen[connector.id] = now
             row = stored.get(connector.id)
             if row is None:
                 row = PublicDeviceStatus(connector_id=connector.id, status=status,
@@ -146,6 +178,10 @@ class StatusTracker:
                     session.add(row)
             elif row.status == status:
                 self._pending.pop(connector.id, None)
+                began = ensure_utc(evidence) if status == OFFLINE and evidence else None
+                seen = self._online_seen.get(connector.id)
+                if began is not None and began < ensure_utc(row.since) and (seen is None or began >= seen):
+                    row.since, row.updated_at = began, now
             else:
                 pending = self._pending.get(connector.id)
                 if pending is None or pending[0] != status:
@@ -158,8 +194,9 @@ class StatusTracker:
                     self._pending.pop(connector.id, None)
             rows.append((connector, row.status, ensure_utc(row.since)))
         current = {connector.id for connector in connectors}
-        for connector_id in set(self._pending) - current:
-            del self._pending[connector_id]
+        for tracked in (self._pending, self._online_seen):
+            for connector_id in set(tracked) - current:
+                del tracked[connector_id]
         return build_snapshot(rows, now)
 
 

@@ -12,6 +12,12 @@ other systems such as APEX dashboards can use it.
   ESP is up but cannot read its terminal: unreachable for more than 5 minutes, failing its checks,
   or no terminal bound.
 
+An Offline device's "since" is when its attendance stopped. That is its last contact, or when its
+terminal was lost. For a Hikvision terminal failing its checks, it is the terminal's last delivery
+(last stream message or successful check), because that state changes every few seconds. While a
+device stays offline, better evidence can move "since" earlier, but never before ADD last saw the
+device online.
+
 A change shows only after it holds for 2 minutes (to Offline) or 1 minute (back to Online). This
 way an ESP reconnect, a planned terminal restart or an ADD restart does not make a device flicker or
 reset its "since". The settings are `ADD_PUBLIC_STATUS_OFFLINE_GRACE_SECONDS` and
