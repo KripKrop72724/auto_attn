@@ -31,6 +31,16 @@ describe('firmware preservation evidence', () => {
     expect(screen.getByText('899 · Last check not ready')).toBeTruthy()
     expect(screen.getByText('2.6.17 · ota_1')).toBeTruthy()
   })
+  it('says why the confirm-first storage exception refused, with every failing term (2.7.8)', () => {
+    render(<FirmwareHealth bootId="current" observedAt={new Date().toISOString()}
+      diagnostics={{ ...healthy, ota_runtime: { running_version: '2.7.8', state: 'BOOTED_PENDING',
+        storage_exception: { state: 'REFUSED', reason: 'INVENTORY_UNEXPLAINED', detail: 'SPAN_ERRNO',
+          detail_file: 'pending.jsonl', failing_terms: ['INVENTORY_UNEXPLAINED', 'CUSTODY_BLOCKS'] } } }} />)
+    const row = within(screen.getByText('Storage exception').parentElement!)
+    expect(row.getByText(/refused · Unreadable storage does not match the pages the repair holds · a damaged page failed with an unexpected error \(pending.jsonl\)/)).toBeTruthy()
+    expect(within(screen.getByText('Storage exception failing terms').parentElement!)
+      .getByText('INVENTORY_UNEXPLAINED, CUSTODY_BLOCKS')).toBeTruthy()
+  })
   it.each(['missing', 'stale', 'wrong-boot'])('does not substitute an older capability for %s current boot evidence', reason => {
     const diagnostics = { ...healthy, ota_runtime: reason === 'missing' ? undefined : {
       running_version: '2.6.17', image_sha256: 'f'.repeat(64), state: 'READY_TO_BOOT',

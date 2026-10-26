@@ -35,6 +35,25 @@ const journalPhases: Record<string, string> = {
   QUIESCING: 'Finishing storage work before restart', AUTHORITY_HOLD: 'Delivery ownership needs recovery',
   BRIDGE_VALIDATION: 'Verifying the bridge reader before boot confirmation',
 }
+// ZKT 2.7.8: why the confirm-first storage exception refused an unconfirmed
+// image, in the operator's words.
+const exceptionReasons: Record<string, string> = {
+  INVENTORY_UNEXPLAINED: 'Unreadable storage does not match the pages the repair holds',
+  CUSTODY_LOST: 'The boot repair reports lost records', CUSTODY_BLOCKS: 'Too many storage blocks to reformat in one round',
+  CUSTODY_UNHELD: 'The repair could not hold every record file', CUSTODY_SHORT: 'Reformatting would not free enough room',
+  AREA_TEST: 'The reformat area did not pass its write test', LED_CAUSE: 'A local failure other than a full store',
+}
+const exceptionDetails: Record<string, string> = {
+  INCOMPLETE: 'the storage scan did not finish', SCAN_ERROR: 'the storage directory could not be read',
+  FILE_COUNT: 'more unreadable files than the report holds', NOT_HELD: 'a file is unreadable that the repair does not hold',
+  OTHER_UNREADABLE: 'bytes were lost other than on a damaged page (open, size or early end)',
+  SPAN_ERRNO: 'a damaged page failed with an unexpected error', FIRST_ERRNO: 'the first read error was not a damaged-page error',
+  SPAN_COUNT: 'a different number of damaged pages', FIRST_OFFSET: 'the first damaged page differs',
+  LAST_OFFSET: 'the last damaged page differs', DIGEST: 'a different set of damaged pages',
+  BYTES: 'unreadable bytes outside the held pages', UNMATCHED: 'unreadable files the report does not list',
+  HELD_READABLE: 'a file the repair holds now reads whole or is missing',
+}
+const code = (value?: string | null) => value ? value.replaceAll('_', ' ').toLowerCase() : ''
 
 export function FirmwareHealth({ diagnostics, observedAt, bootId, imageDigest }: {
   diagnostics?: FirmwareDiagnostics | null
@@ -51,6 +70,7 @@ export function FirmwareHealth({ diagnostics, observedAt, bootId, imageDigest }:
   const sameBoot = Boolean(diagnostics?.boot_id && bootId && diagnostics.boot_id === bootId)
   const fresh = sameBoot && Number.isFinite(observed) && now - observed >= -1000 && now - observed <= 45_000
   const ota = diagnostics?.ota_runtime
+  const exception = ota?.storage_exception
   const currentBootReported = fresh && Boolean(ota?.running_version &&
     ['factory', 'ota_0', 'ota_1'].includes(ota.running_partition || '') &&
     /^[0-9a-f]{64}$/.test(ota.image_sha256 || ''))
@@ -113,6 +133,11 @@ export function FirmwareHealth({ diagnostics, observedAt, bootId, imageDigest }:
         {!!ota?.last_error && <div><dt>Reported OTA error</dt><dd>{ota.last_error === 'BOOT_ROLLBACK_PREDECESSOR_UNQUALIFIED'
           ? 'Previous image is not qualified to read the preserved data; connector rollback is held.'
           : ota.last_error.replaceAll('_', ' ')}</dd></div>}
+        {exception?.state && <div><dt>Storage exception</dt><dd>{code(exception.state)}{exception.reason
+          ? ` · ${exceptionReasons[exception.reason] || code(exception.reason)}` : ''}{exception.detail
+          ? ` · ${exceptionDetails[exception.detail] || code(exception.detail)}` : ''}{exception.detail_file
+          ? ` (${exception.detail_file})` : ''}</dd></div>}
+        {!!exception?.failing_terms?.length && <div><dt>Storage exception failing terms</dt><dd>{exception.failing_terms.join(', ')}</dd></div>}
         <div><dt>Local boot checks</dt><dd>{ota?.boot_health_checks
           ? `${ota.boot_health_checks} · ${ota.boot_health_last_ready ? 'Last check ready' : 'Last check not ready'}` : 'No checks reported'}</dd></div>
         <div><dt>Oracle delivery owner</dt><dd>{fresh && diagnostics.delivery_authority === 'ADD' ? 'ADD'
