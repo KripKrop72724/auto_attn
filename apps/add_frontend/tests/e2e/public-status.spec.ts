@@ -2,15 +2,22 @@ import AxeBuilder from '@axe-core/playwright'
 import { expect, test } from '@playwright/test'
 
 const hoursAgo = (hours: number) => new Date(Date.now() - hours * 3_600_000).toISOString()
-const device = (code: string, name: string, zone: 'life' | 'health', status: 'online' | 'offline', since: string) =>
-  ({ code, name, location: name.split(' · ')[0], unit: name.split(' · ')[1] ?? null, zone, status, since })
+const reasons = {
+  no_internet: ['No internet', 'The device may be switched off, or the internet at this place is not working.'],
+  machine_not_responding: ['Machine not responding', 'The attendance machine may be switched off or its cable unplugged.'],
+  machine_records_changed: ['Machine records changed', "The attendance machine's saved records have changed, for example after a reset, so it needs to be checked."],
+} as const
+const device = (code: string, name: string, zone: 'life' | 'health', status: 'online' | 'offline', since: string,
+  reason: keyof typeof reasons | null = null) =>
+  ({ code, name, location: name.split(' · ')[0], unit: name.split(' · ')[1] ?? null, zone, status, since,
+     reason_code: reason, reason: reason && reasons[reason][0], reason_detail: reason && reasons[reason][1] })
 
 const devices = [
-  device('LF-ZONE-BLD1-01', 'Building 1', 'life', 'offline', hoursAgo(29)),
+  device('LF-ZONE-BLD1-01', 'Building 1', 'life', 'offline', hoursAgo(29), 'machine_records_changed'),
   device('LF-ZONE-BLD5-01', 'Building 5', 'life', 'online', hoursAgo(4.5)),
-  device('LF-ZONE-BLD9-01', 'Building 9 · Device 1', 'life', 'offline', hoursAgo(22)),
-  device('LF-ZONE-BLD9-02', 'Building 9 · Device 2', 'life', 'offline', hoursAgo(22)),
-  device('LF-ZONE-BLD9-03', 'Building 9 · Device 3', 'life', 'offline', hoursAgo(73)),
+  device('LF-ZONE-BLD9-01', 'Building 9 · Device 1', 'life', 'offline', hoursAgo(22), 'no_internet'),
+  device('LF-ZONE-BLD9-02', 'Building 9 · Device 2', 'life', 'offline', hoursAgo(22), 'no_internet'),
+  device('LF-ZONE-BLD9-03', 'Building 9 · Device 3', 'life', 'offline', hoursAgo(73), 'machine_not_responding'),
   device('LF-ZONE-G&PBLD8-01', 'Group & Pension Building 8', 'life', 'online', hoursAgo(4.5)),
   device('ZONE-BLD9-01', 'Building 9', 'health', 'online', hoursAgo(4.5)),
   device('ZONE-FAISALABAD-01', 'Faisalabad · Device 1', 'health', 'online', hoursAgo(4.5)),
@@ -19,7 +26,7 @@ const devices = [
   device('ZONE-LAHORE-01', 'Lahore · Device 1', 'health', 'online', hoursAgo(4.5)),
   device('ZONE-LAHORE-02', 'Lahore · Device 2', 'health', 'online', hoursAgo(1.8)),
   device('ZONE-MULTAN-01', 'Multan · Device 1', 'health', 'online', hoursAgo(4)),
-  device('ZONE-MULTAN-02', 'Multan · Device 2', 'health', 'offline', hoursAgo(25)),
+  device('ZONE-MULTAN-02', 'Multan · Device 2', 'health', 'offline', hoursAgo(25), 'no_internet'),
   device('ZONE-PESHAWAR-02', 'Peshawar · Device 2', 'health', 'online', hoursAgo(4.5)),
   device('ZONE-PESHAWAR-06', 'Peshawar · Device 6', 'health', 'online', hoursAgo(4.5)),
   device('ZONE-QUETTA-01', 'Quetta', 'health', 'online', hoursAgo(4.5)),
@@ -56,6 +63,8 @@ test('public status page needs no sign-in, fits every screen and is accessible',
   const life = page.getByRole('region', { name: 'Life' })
   await expect(life.getByText('2 of 6 online')).toBeVisible()
   await expect(life.getByText('4 offline')).toBeVisible()
+  await expect(life.getByRole('listitem').filter({ hasText: 'Building 9 · Device 3' }))
+    .toContainText('Machine not responding. The attendance machine may be switched off or its cable unplugged.')
   await expect(page.getByRole('region', { name: 'Health' }).getByText('13 of 14 online')).toBeVisible()
   await expect(page.getByRole('button', { name: /sign in/i })).toHaveCount(0)
   expect(dashboardCalls).toEqual([])

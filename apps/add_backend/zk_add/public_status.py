@@ -11,6 +11,10 @@ time that state began, and nothing else:
 * Online otherwise. DEGRADED and ONLINE_WITH_WARNINGS devices are Online: their
   attendance still arrives.
 
+An Offline device also says why, in plain words for people who know nothing
+of the system (offline_reason and REASONS). The reason is the latest one seen
+while the device looked offline, so a terminal whose state flickers keeps it.
+
 An Offline device is dated from when its attendance stopped: its last contact,
 when its terminal was lost, or for a failing Hikvision terminal (whose state
 changes every few seconds) its last delivery. While it stays offline, better
@@ -54,6 +58,30 @@ ZONES = (("life", "Life"), ("health", "Health"))
 TERMINAL_DOWN = frozenset({"DISCONNECTED", "ERROR"})
 LOCATIONS = {"SLICTOWER": "SLIC Tower"}
 HEARTBEAT_SECONDS = 30
+
+# Why a device is Offline: (heading, one plain sentence). The keys are the
+# API's reason_code; the words are for people who know nothing of the system.
+REASONS = {
+    "no_internet": ("No internet",
+                    "The device may be switched off, or the internet at this place is not working."),
+    "machine_not_responding": ("Machine not responding",
+                               "The attendance machine may be switched off or its cable unplugged."),
+    "machine_records_changed": ("Machine records changed",
+                                "The attendance machine's saved records have changed, for example "
+                                "after a reset, so it needs to be checked."),
+    "machine_settings_wrong": ("Wrong machine settings",
+                               "The attendance machine's password or settings do not match, so its "
+                               "attendance cannot be read."),
+    "machine_problem": ("Machine problem",
+                        "The attendance machine is not giving its attendance properly, so it needs "
+                        "to be checked."),
+    "not_set_up": ("Not set up yet", "No attendance machine has been linked to this device yet."),
+}
+TERMINAL_ERROR_REASONS = {
+    "HIK_SOURCE_CHANGED": "machine_records_changed",
+    "HIK_AUTH": "machine_settings_wrong",
+    "HIK_CONFIGURATION": "machine_settings_wrong",
+}
 
 
 @dataclass(frozen=True)
@@ -131,6 +159,18 @@ def observed_status(connector: Connector, health, now: datetime) -> tuple[str, d
     return ONLINE, link["since"] if link["state"] == "CONNECTED" else None
 
 
+def offline_reason(health) -> str:
+    """Why an Offline device's attendance is not arriving: a key of REASONS."""
+    link = health.terminal_link
+    if health.tier == "OFFLINE":
+        return "no_internet"
+    if link["reason"] == "NO_TERMINAL":
+        return "not_set_up"
+    if link["state"] == "ERROR":
+        return TERMINAL_ERROR_REASONS.get(link["reason"], "machine_problem")
+    return "machine_not_responding"
+
+
 def _bounded(value: datetime | None, floor: datetime | None, now: datetime) -> datetime:
     value = ensure_utc(value) if value else now
     if floor is not None and value < ensure_utc(floor):
@@ -147,6 +187,8 @@ class StatusTracker:
         self._pending: dict[int, tuple[str, datetime, datetime | None]] = {}
         # connector pk -> when this process last saw it Online
         self._online_seen: dict[int, datetime] = {}
+        # connector pk -> the latest offline_reason seen
+        self._reason: dict[int, str] = {}
         self._lock = threading.Lock()
 
     def refresh(self, now: datetime | None = None) -> dict:
@@ -167,9 +209,12 @@ class StatusTracker:
         warming = now < self.started_at + timedelta(seconds=settings.offline_startup_grace_seconds)
         rows = []
         for connector in connectors:
-            status, evidence = observed_status(connector, healths[connector.id], now)
+            health = healths[connector.id]
+            status, evidence = observed_status(connector, health, now)
             if status == ONLINE:
                 self._online_seen[connector.id] = now
+            else:
+                self._reason[connector.id] = offline_reason(health)
             row = stored.get(connector.id)
             if row is None:
                 row = PublicDeviceStatus(connector_id=connector.id, status=status,
@@ -199,26 +244,28 @@ class StatusTracker:
                         since = pending[1]
                     row.status, row.since, row.updated_at = status, _bounded(since, floor, now), now
                     self._pending.pop(connector.id, None)
-            rows.append((connector, row.status, ensure_utc(row.since)))
+            reason = self._reason.get(connector.id) if row.status == OFFLINE else None
+            rows.append((connector, row.status, ensure_utc(row.since), reason))
         current = {connector.id for connector in connectors}
-        for tracked in (self._pending, self._online_seen):
+        for tracked in (self._pending, self._online_seen, self._reason):
             for connector_id in set(tracked) - current:
                 del tracked[connector_id]
         return build_snapshot(rows, now)
 
 
 def build_snapshot(rows, now: datetime) -> dict:
-    named = [(device_name(connector.display_name or connector.zone_id), connector, status, since)
-             for connector, status, since in rows]
+    named = [(device_name(connector.display_name or connector.zone_id), connector, status, since, reason)
+             for connector, status, since, reason in rows]
     numbered: dict[tuple[str, str], int] = {}
     for name, *_ in named:
         if name.number is not None:
             numbered[(name.zone, name.location)] = numbered.get((name.zone, name.location), 0) + 1
     zone_rank = {key: rank for rank, (key, _title) in enumerate(ZONES)}
     devices = []
-    for name, connector, status, since in sorted(named, key=lambda item: (
+    for name, connector, status, since, reason in sorted(named, key=lambda item: (
             zone_rank[item[0].zone], _natural(item[0].location), _natural(item[0].unit or ""),
             item[1].display_name or "")):
+        heading, detail = REASONS.get(reason, (None, None))
         shown = name.unit and (name.number is None or numbered[(name.zone, name.location)] > 1)
         devices.append({
             "name": f"{name.location} · {name.unit}" if shown else name.location,
@@ -228,6 +275,9 @@ def build_snapshot(rows, now: datetime) -> dict:
             "code": connector.display_name,
             "status": status,
             "since": iso_utc(since),
+            "reason_code": reason if heading else None,
+            "reason": heading,
+            "reason_detail": detail,
         })
     return _summarize(devices, iso_utc(now))
 

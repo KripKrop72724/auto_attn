@@ -23,9 +23,9 @@ const snapshot = (overrides: Partial<PublicStatusSnapshot> = {}): PublicStatusSn
     { zone: 'health', name: 'Health', total: 1, online: 1, offline: 0 },
   ],
   devices: [
-    { name: 'Building 9 · Device 1', location: 'Building 9', unit: 'Device 1', zone: 'life', code: 'LF-ZONE-BLD9-01', status: 'online', since: '2026-10-24T07:03:00Z' },
-    { name: 'Building 9 · Device 3', location: 'Building 9', unit: 'Device 3', zone: 'life', code: 'LF-ZONE-BLD9-03', status: 'offline', since: '2026-10-21T10:17:00Z' },
-    { name: 'Swat', location: 'Swat', unit: null, zone: 'health', code: 'ZONE-SWAT-01', status: 'online', since: '2026-10-24T07:03:00Z' },
+    { name: 'Building 9 · Device 1', location: 'Building 9', unit: 'Device 1', zone: 'life', code: 'LF-ZONE-BLD9-01', status: 'online', since: '2026-10-24T07:03:00Z', reason_code: null, reason: null, reason_detail: null },
+    { name: 'Building 9 · Device 3', location: 'Building 9', unit: 'Device 3', zone: 'life', code: 'LF-ZONE-BLD9-03', status: 'offline', since: '2026-10-21T10:17:00Z', reason_code: 'machine_not_responding', reason: 'Machine not responding', reason_detail: 'The attendance machine may be switched off or its cable unplugged.' },
+    { name: 'Swat', location: 'Swat', unit: null, zone: 'health', code: 'ZONE-SWAT-01', status: 'online', since: '2026-10-24T07:03:00Z', reason_code: null, reason: null, reason_detail: null },
   ],
   ...overrides,
 })
@@ -47,9 +47,11 @@ describe('public status page', () => {
     const offline = within(life).getByText('Building 9 · Device 3').closest('li')!
     within(offline).getByText('Offline')
     expect(offline.getAttribute('title')).toBe('LF-ZONE-BLD9-03')
+    expect(offline.textContent).toContain('Machine not responding. The attendance machine may be switched off or its cable unplugged.')
     const health = screen.getByRole('region', { name: 'Health' })
     within(health).getByText('All online')
     within(health).getByText('Online')
+    expect(screen.getAllByText(/Machine not responding/)).toHaveLength(1) // online devices give no reason
     expect(screen.queryByText(/degraded|warning/i)).toBeNull()
     expect(document.title).toBe('Attendance Device Status · State Life')
   })

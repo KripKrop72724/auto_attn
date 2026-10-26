@@ -1,7 +1,7 @@
 # Public device status page and API
 
 `https://attendancedevices.slichealth.com/status` shows management whether each attendance device
-is **Online** or **Offline**, and since when. It needs no sign-in, and neither does its API, so
+is **Online** or **Offline**, since when, and for an Offline device why, in plain words. It needs no sign-in, and neither does its API, so
 other systems such as APEX dashboards can use it.
 
 ## What Online and Offline mean
@@ -17,6 +17,24 @@ terminal was lost. For a Hikvision terminal failing its checks, it is the termin
 (last stream message or successful check), because that state changes every few seconds. While a
 device stays offline, better evidence can move "since" earlier, but never before ADD last saw the
 device online.
+
+## Why a device is Offline
+
+Each Offline device shows a short reason written for people who know nothing about the system.
+The page shows the heading and the sentence; the API also gives a fixed `reason_code`.
+
+| `reason_code` | Heading | Sentence | When |
+| --- | --- | --- | --- |
+| `no_internet` | No internet | The device may be switched off, or the internet at this place is not working. | The ESP is not connected to ADD. |
+| `machine_not_responding` | Machine not responding | The attendance machine may be switched off or its cable unplugged. | The ESP is up but its terminal has been unreachable for more than 5 minutes. |
+| `machine_records_changed` | Machine records changed | The attendance machine's saved records have changed, for example after a reset, so it needs to be checked. | A Hikvision terminal's records no longer match (`HIK_SOURCE_CHANGED`). |
+| `machine_settings_wrong` | Wrong machine settings | The attendance machine's password or settings do not match, so its attendance cannot be read. | `HIK_AUTH` or `HIK_CONFIGURATION`. |
+| `machine_problem` | Machine problem | The attendance machine is not giving its attendance properly, so it needs to be checked. | Any other terminal check failure. |
+| `not_set_up` | Not set up yet | No attendance machine has been linked to this device yet. | No terminal is bound. |
+
+The reason is the latest one seen while the device looked offline, so a terminal whose state
+flickers keeps its reason. Right after an ADD restart, a device that is coming back online may
+show no reason for up to a minute.
 
 A change shows only after it holds for 2 minutes (to Offline) or 1 minute (back to Online). This
 way an ESP reconnect, a planned terminal restart or an ADD restart does not make a device flicker or
@@ -62,7 +80,10 @@ the WebSocket closes with code 1013.
       "zone": "life",
       "code": "LF-ZONE-BLD9-03",
       "status": "offline",
-      "since": "2026-10-21T10:17:52Z"
+      "since": "2026-10-21T10:17:52Z",
+      "reason_code": "machine_not_responding",
+      "reason": "Machine not responding",
+      "reason_detail": "The attendance machine may be switched off or its cable unplugged."
     }
   ]
 }
@@ -71,6 +92,8 @@ the WebSocket closes with code 1013.
 - `status` is `online` or `offline`. `since` is when that status began, in UTC.
 - `code` is the device's name in ADD. `name` is the plain-words name the page shows; `location` and
   `unit` are its two parts (`unit` is null when only the place is shown).
+- `reason_code`, `reason` and `reason_detail` say why an Offline device is offline (see the table
+  above). They are null for an Online device.
 - Devices are sorted by zone (Life first) and then by name.
 
 The snapshot holds names and statuses only: no addresses, serial numbers, firmware, users or

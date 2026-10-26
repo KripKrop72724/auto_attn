@@ -1,5 +1,6 @@
-// The public /status page: Online or Offline per device, and since when. The
-// backend (zk_add/public_status.py) decides the status and the friendly names.
+// The public /status page: Online or Offline per device, since when, and why
+// an Offline device is offline. The backend (zk_add/public_status.py) decides
+// the status, the friendly names and the plain-words reasons.
 
 export type PublicZoneKey = 'life' | 'health'
 
@@ -11,6 +12,10 @@ export interface PublicDevice {
   code: string
   status: 'online' | 'offline'
   since: string
+  // Offline devices only; null when Online.
+  reason_code: string | null
+  reason: string | null
+  reason_detail: string | null
 }
 
 export interface PublicZone {
