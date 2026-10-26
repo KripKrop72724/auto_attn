@@ -26,7 +26,7 @@ Nothing here reboots, re-installs or starts an attempt on its own:
 
 Every other running version (2.4.12, 2.5.2, 2.6.16+ and every 2.7.x) and every
 target with its own return evidence (the journal bridges, 2.7.0, the 2.6.24+
-recovery images, 2.7.6 and 2.7.7) keep the existing fail-closed path unchanged.
+recovery images, 2.7.6, 2.7.7 and 2.7.8) keep the existing fail-closed path unchanged.
 
 Lock order, everywhere: connector, then deployment, then campaign (the
 WebSocket heartbeat locks its connector first, record_progress and the HTTPS
@@ -123,10 +123,10 @@ IMAGE_VERIFY_RETRY_LIMIT = 2
 RETRY_NOT_RETRYABLE = ("Only a target boot that ADD classified TARGET_BOOT_INTERRUPTED, or a downloaded image that "
                        "did not verify on the ESP (PARTITION_HASH_FAILED), can be retried.")
 # Journal bridges, the 2.7.0 writer, the one-shot recovery images, the 2.7.6
-# last-resort reformat and 2.7.7's confirm-first exception carry their own
+# last-resort reformat and 2.7.7's and 2.7.8's confirm-first exception carry their own
 # return evidence, rollback expectations and HIL acceptance flows.
 _OWN_RETURN_EVIDENCE = frozenset({"2.6.16", "2.6.17", "2.6.18", "2.6.19", "2.6.20", "2.6.21", "2.6.22",
-                                  "2.6.23", "2.7.0", "2.7.6", "2.7.7", *RECOVERY_RELEASE_IDS})
+                                  "2.6.23", "2.7.0", "2.7.6", "2.7.7", "2.7.8", *RECOVERY_RELEASE_IDS})
 _RECONCILE_ACTIVITIES = frozenset({"FULL_RECONCILE", "HISTORICAL_RECONCILE", "LIGHT_RECONCILE"})
 
 

@@ -9,8 +9,9 @@ DIRECT_VERSION = "2.6.1"
 # the panic trace 3FL's 2.7.2 cache error lacked; 2.7.4 reports the storage
 # damage that kept 2.7.3 from confirming on 13FL; 2.7.5 repairs it at boot;
 # 2.7.6 reformats a store the repair cannot give room, block by block in place;
-# 2.7.7 lets a wedged store's image confirm first so that reformat can run.
-FLEET_PLATFORM_VERSIONS = ("2.7.1", "2.7.2", "2.7.3", "2.7.4", "2.7.5", "2.7.6", "2.7.7")
+# 2.7.7 lets a wedged store's image confirm first so that reformat can run;
+# 2.7.8 accepts the held spans ESP-IDF reads as ENOENT and says why it refuses.
+FLEET_PLATFORM_VERSIONS = ("2.7.1", "2.7.2", "2.7.3", "2.7.4", "2.7.5", "2.7.6", "2.7.7", "2.7.8")
 FLEET_PLATFORM_VERSION = FLEET_PLATFORM_VERSIONS[-1]
 DIRECT_VERSIONS = (DIRECT_VERSION, "2.6.2", "2.6.3", "2.6.4", "2.6.5", "2.6.6", "2.6.7", "2.6.8", "2.6.9", "2.6.10", "2.6.11", "2.6.12", "2.6.13", "2.6.14", "2.6.15", *FLEET_PLATFORM_VERSIONS)
 DIRECT_BASELINES = ("2.4.12", "2.5.2")
@@ -114,10 +115,20 @@ REFORMAT_BASELINE_IMAGES = {
     "2.7.6": "9d7050768f1cb716e9bc11f9b7b4d20b423b3eccbe1531809130457998e96f0c",
 }
 REFORMAT_MARKER = REPAIR_MARKER + ",2.7.6"
+# 2.7.8 also accepts 2.7.7, so every 2.7.7 HIL device upgrades in place. The
+# marker is now 160 characters, all ADD's heartbeat field keeps.
+EXCEPTION_BASELINES = (*REFORMAT_BASELINES, "2.7.7")
+EXCEPTION_BASELINE_IMAGES = {
+    **REFORMAT_BASELINE_IMAGES,
+    "2.7.7": "6d9ee63dd7e5917c83a3ada14685405c0081073d593a7901487eb2a3fd2c3bc1",
+}
+EXCEPTION_MARKER = REFORMAT_MARKER + ",2.7.7"
 
 
 def platform_baselines(version: str) -> tuple[tuple[str, ...], dict[str, str]]:
     """The rollback predecessors a 2.7 platform image accepts."""
+    if version == "2.7.8":
+        return EXCEPTION_BASELINES, EXCEPTION_BASELINE_IMAGES
     if version == "2.7.7":
         return REFORMAT_BASELINES, REFORMAT_BASELINE_IMAGES
     if version == "2.7.6":
