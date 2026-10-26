@@ -93,6 +93,11 @@ static bool storage_inventory_append(cJSON *storage){
 static bool storage_repair_append(cJSON *storage){
  cJSON *repair=cJSON_AddObjectToObject(storage,"repair");
  return repair&&cJSON_AddStringToObject(repair,"result","CLEAN");}
+/* zkt_ota_guard.c (ZKT 2.7.7): the bridge-era journal evidence; one
+ * allocating field keeps its failure path inside this fault sweep. */
+static bool zj_ota_append_legacy_evidence(cJSON *storage){
+ cJSON *evidence=cJSON_AddObjectToObject(storage,"journal_evidence");
+ return evidence&&cJSON_AddStringToObject(evidence,"state","NONE");}
 void led_status_local_failure_report(led_local_failure_t *report){
  memset(report,0,sizeof(*report));report->incidents=2;report->recoveries=1;}
 static bool storage_upgrade_ready(void){return true;}
