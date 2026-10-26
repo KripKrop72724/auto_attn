@@ -43,7 +43,7 @@ void qs_local_end_file(bool ok, int error, const char *file) { assert(file && fi
 static void led_status_fault(int code) { assert(code == LED_STATUS_LOCAL_FAILURE); ++faults; }
 /* ZKT 2.7.7: incidents with their captured errno (classified by the LED). */
 #define led_status_fault_errno(code, error) ((void)(error), led_status_fault(code))
-#define led_status_fault_read(code, error, queue, offset) ((void)(error), (void)(queue), (void)(offset), led_status_fault(code))
+#define led_status_fault_read(code, error, from_read, queue, offset) ((void)(error), (void)(from_read), (void)(queue), (void)(offset), led_status_fault(code))
 typedef int led_queue_t;
 enum { LED_QUEUE_PENDING, LED_QUEUE_BLOCKED, LED_QUEUE_CORRUPT_ORDS };
 static esp_err_t nvs_open(const char *name, int mode, nvs_handle_t *handle)

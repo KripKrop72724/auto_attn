@@ -85,6 +85,8 @@ int esp_partition_get_sha256(const esp_partition_t *p,uint8_t *out){
         "430e2daf29dd99ff006a476ff584e4201493d661cee67e4b4f9ba15545b17a40":
         !strcmp(previous_app.version,"2.7.6")?
         "9d7050768f1cb716e9bc11f9b7b4d20b423b3eccbe1531809130457998e96f0c":
+        !strcmp(previous_app.version,"2.7.7")?
+        "6d9ee63dd7e5917c83a3ada14685405c0081073d593a7901487eb2a3fd2c3bc1":
         "4b4aa0697551f527b48b58e95229cd21e362f6ba25398a2d46263bdbf289146b";
     for(unsigned i=0;i<32;++i){unsigned value=0;assert(sscanf(hex+2*i,"%2x",&value)==1);out[i]=(uint8_t)value;}
     if(failure==7)out[0]^=1;
@@ -138,12 +140,14 @@ int main(void)
     strcpy(previous_app.version,"2.6.14");assert(storage_upgrade_init());
     /* The 2.7 platform rolls back to the fleet's exact signed 2.6.15. */
     strcpy(previous_app.version,"2.6.15");assert(storage_upgrade_init());
-    assert(!strcmp(UG_DIRECT_VERSION,"2.7.7"));
-    assert(!strcmp(strstr(storage_upgrade_contract(),",2.6.15,"),",2.6.15,2.7.2,2.7.3,2.7.4,2.7.5,2.7.6"));
-    /* 2.7.7 also rolls back to 2.7.2 (3FL), 2.7.3, 2.7.4, 2.7.5 and 2.7.6
-     * (their HIL devices), and to no other 2.7 image: 2.7.1 with 2.7.2's
-     * digest is still refused, so are 2.7.5 and 2.7.6 on other bytes, and so
-     * is a 2.7.7 in the other slot. */
+    assert(!strcmp(UG_DIRECT_VERSION,"2.7.8"));
+    assert(!strcmp(strstr(storage_upgrade_contract(),",2.6.15,"),",2.6.15,2.7.2,2.7.3,2.7.4,2.7.5,2.7.6,2.7.7"));
+    /* The marker is the 160 characters ADD's heartbeat field keeps. */
+    assert(strlen(storage_upgrade_contract())==160);
+    /* 2.7.8 also rolls back to 2.7.2 (3FL), 2.7.3, 2.7.4, 2.7.5, 2.7.6 and
+     * 2.7.7 (their HIL devices), and to no other 2.7 image: 2.7.1 with
+     * 2.7.2's digest is still refused, so are 2.7.5 to 2.7.7 on other bytes,
+     * and so is a 2.7.8 in the other slot. */
     strcpy(previous_app.version,"2.7.2");assert(storage_upgrade_init());
     strcpy(previous_app.version,"2.7.3");assert(storage_upgrade_init());
     strcpy(previous_app.version,"2.7.4");assert(storage_upgrade_init());
@@ -151,8 +155,10 @@ int main(void)
     failure=7;assert(!storage_upgrade_init());failure=0;
     strcpy(previous_app.version,"2.7.6");assert(storage_upgrade_init());
     failure=7;assert(!storage_upgrade_init());failure=0;
+    strcpy(previous_app.version,"2.7.7");assert(storage_upgrade_init());
+    failure=7;assert(!storage_upgrade_init());failure=0;
     strcpy(previous_app.version,"2.7.1");assert(!storage_upgrade_init());
-    strcpy(previous_app.version,"2.7.7");assert(!storage_upgrade_init());
+    strcpy(previous_app.version,"2.7.8");assert(!storage_upgrade_init());
     strcpy(previous_app.version,"2.6.15");
     failure=7;assert(!storage_upgrade_init());failure=0;
     failure=6;assert(!storage_upgrade_init());failure=7;assert(!storage_upgrade_init());failure=0;

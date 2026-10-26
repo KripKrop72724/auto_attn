@@ -24,6 +24,10 @@ typedef struct {
     lq_port_t port;
     bool ready, recovering, empty_cached, checkpoint_corrupt;
     uint32_t recovery_offset, recovery_crc;
+    /* ZKT 2.7.8: the last DQ_IO of lq_open_step or lq_peek came from a seek
+     * or read of the opened file (its errno is the read's), not from the
+     * open, the close or the checkpoint store. */
+    bool io_read;
 } legacy_queue_t;
 typedef struct {
     uint32_t generation, offset, end, crc;

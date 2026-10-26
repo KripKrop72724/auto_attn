@@ -130,7 +130,10 @@ typedef struct {
     char name[SX_NAME_BYTES];   /* the directory entry's name, no '/' */
     uint32_t bytes, unreadable_bytes, first_error_offset;
     int first_error;
-    uint32_t unreadable_spans, last_error_offset, span_digest, span_errors_other;
+    uint32_t unreadable_spans, last_error_offset, span_digest;
+    /* ZKT 2.7.8: span reads that failed with ENOENT, and with an errno that
+     * is neither EIO nor ENOENT (storage_inventory.h). */
+    uint32_t span_errors_enoent, span_errors_other;
     bool other_unreadable;
 } sx_inventory_file_t;
 
@@ -157,9 +160,10 @@ typedef struct {
     /* the LED's LOCAL_FAILURE incidents this boot, by cause (led_status.h) */
     bool led_known, led_fatal;
     uint32_t local_failures, room_failures, held_read_failures, held_read_queues;
-    /* per reclaim queue, the largest start offset of a read that failed
-     * with EIO: a read that starts past the last held span cannot have
-     * failed on one */
+    /* per reclaim queue, the largest start offset of a held read (EIO, or
+     * from 2.7.8 ENOENT from a read or seek of the open file, never its
+     * open: led_status.h): a read that starts past the last held span cannot
+     * have failed on one */
     uint32_t held_read_last[SX_QUEUE_COUNT];
     /* the VFS: mounted, and SPIFFS's used and total bytes now */
     bool spiffs_mounted;
@@ -218,11 +222,50 @@ typedef struct {
     const sx_runtime_t *runtime;
 } sx_input_t;
 
-/* The gate: SX_OK when every term holds now, else the first failing term. */
+/* The gate: SX_OK when every term holds now, else the first failing term.
+ * ZKT 2.7.8: an area test that did not run (area_test "NOT_RUN": the boot
+ * runs it only when every other repair term holds) is reported as the repair
+ * term that kept it from running, and as AREA_TEST only when none did; the
+ * gate still never passes without a test that PASSED. */
 sx_reason_t sx_evaluate(const sx_input_t *input);
 /* The parts of it, for the harness and the host tests. */
 sx_reason_t sx_repair_verdict(const sx_repair_t *repair);
 sx_reason_t sx_inventory_verdict(const sx_repair_t *repair, const sx_inventory_t *inventory);
+
+/* ---- ZKT 2.7.8: why the gate refused (diagnostics only) ------------------- */
+/* Which condition made the inventory INVENTORY_UNEXPLAINED. */
+typedef enum {
+    SX_DETAIL_NONE = 0,
+    SX_DETAIL_INCOMPLETE,       /* the scan stopped before every entry (budget, a file that shrank) */
+    SX_DETAIL_SCAN_ERROR,       /* the directory could not be read */
+    SX_DETAIL_FILE_COUNT,       /* more unreadable files than the report holds */
+    SX_DETAIL_NOT_HELD,         /* an unreadable file the repair holds no span of */
+    SX_DETAIL_OTHER_UNREADABLE, /* bytes lost other than by a span read: open, stat, early end */
+    SX_DETAIL_SPAN_ERRNO,       /* a span read failed with an errno that is neither EIO nor ENOENT */
+    SX_DETAIL_FIRST_ERRNO,      /* the first failed read's errno is not one the spans counted */
+    SX_DETAIL_SPAN_COUNT,       /* unreadable spans != held spans */
+    SX_DETAIL_FIRST_OFFSET,     /* the first unreadable span is not the first held one */
+    SX_DETAIL_LAST_OFFSET,      /* the last unreadable span is not the last held one */
+    SX_DETAIL_DIGEST,           /* the same count and ends, another set */
+    SX_DETAIL_BYTES,            /* unreadable bytes outside the held spans' bounds */
+    SX_DETAIL_UNMATCHED,        /* unreadable files the report does not list */
+    SX_DETAIL_HELD_READABLE,    /* a file the repair holds spans of reads whole, or is not listed */
+    SX_DETAIL_COUNT,
+} sx_detail_t;
+const char *sx_detail_name(sx_detail_t detail);
+typedef struct {
+    sx_detail_t detail;         /* the first unexplained condition */
+    char file[SX_NAME_BYTES];   /* its file (no '/'), "" when it is the scan's */
+} sx_why_t;
+/* sx_inventory_verdict, with the condition behind INVENTORY_UNEXPLAINED. */
+sx_reason_t sx_inventory_explain(const sx_repair_t *repair, const sx_inventory_t *inventory, sx_why_t *why);
+/* sx_evaluate's reason, with every failing term (bit 1 << reason; terms that
+ * an earlier failure makes meaningless are still evaluated where they can
+ * be) and the inventory's condition. */
+sx_reason_t sx_evaluate_terms(const sx_input_t *input, uint64_t *mask, sx_why_t *why);
+/* A repair verdict of a boot whose repair deferred for room (the boots the
+ * exception is for): past the guard, result and stage terms. */
+bool sx_repair_deferred_for_room(sx_reason_t verdict);
 sx_reason_t sx_runtime_verdict(const sx_repair_t *repair, const sx_inventory_t *inventory, const sx_runtime_t *runtime);
 /* The probe's and qs's errors that only say "no room" (H2): the operation
  * with its errno. */

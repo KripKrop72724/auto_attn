@@ -24,7 +24,8 @@ static struct {
 static struct {
     const char *name;
     long start, end;
-} bad[8];
+    int error; /* the read's errno; 0 is EIO (2.7.8: ENOENT is SPIFFS_ERR_DELETED) */
+} bad[16];
 static unsigned bad_count;
 static const char *unopenable, *shrunk, *resized, *changed;
 static long long resized_bytes, changed_by;
@@ -69,7 +70,7 @@ ssize_t si_test_read(int fd, void *buffer, size_t length)
     for (unsigned b = 0; b < bad_count; ++b) {
         if (strstr(open_files[i].path, bad[b].name) && open_files[i].offset < bad[b].end &&
             open_files[i].offset + (off_t)length > bad[b].start) {
-            errno = EIO;
+            errno = bad[b].error ? bad[b].error : EIO;
             return -1;
         }
     }
@@ -187,7 +188,7 @@ int main(int argc, char **argv)
     /* A damaged region is mapped page by page and the read continues past it;
      * a file that cannot be opened is wholly unreadable; a file that ends
      * before its size is missing the rest. */
-    bad[bad_count++] = (typeof(bad[0])){"blocked_identity.jsonl", 1000, 1300};
+    bad[bad_count++] = (typeof(bad[0])){"blocked_identity.jsonl", 1000, 1300, 0};
     unopenable = "persistence-probe";
     shrunk = "pending_events.jsonl";
     si_scan(directory, NULL, &report);
@@ -256,8 +257,8 @@ int main(int argc, char **argv)
     char spans[512];
     subdirectory(spans, sizeof(spans), directory, "spans");
     write_file(spans, "journal.bin", 6 * CHUNK_BYTES);
-    bad[bad_count++] = (typeof(bad[0])){"journal.bin", CHUNK_BYTES - 10, CHUNK_BYTES + 10};
-    bad[bad_count++] = (typeof(bad[0])){"journal.bin", 4 * CHUNK_BYTES + 300, 4 * CHUNK_BYTES + 301};
+    bad[bad_count++] = (typeof(bad[0])){"journal.bin", CHUNK_BYTES - 10, CHUNK_BYTES + 10, 0};
+    bad[bad_count++] = (typeof(bad[0])){"journal.bin", 4 * CHUNK_BYTES + 300, 4 * CHUNK_BYTES + 301, 0};
     reads = 0;
     si_scan(spans, NULL, &report);
     const si_file_t *journal = find(&report, "journal.bin");
@@ -285,7 +286,7 @@ int main(int argc, char **argv)
     static const char *const queues[] = {"q0.jsonl", "q1.jsonl", "q2.jsonl", "q3.jsonl"};
     for (int i = 0; i < 4; ++i) {
         write_file(survey, queues[i], 64 * CHUNK_BYTES);
-        bad[bad_count++] = (typeof(bad[0])){queues[i], CHUNK_BYTES, 64 * CHUNK_BYTES};
+        bad[bad_count++] = (typeof(bad[0])){queues[i], CHUNK_BYTES, 64 * CHUNK_BYTES, 0};
     }
     /* Enough for "." and "..", then per file its turn, a chunk, a failed chunk
      * and its pages, and a few reads more: not for mapping a whole file. */
@@ -357,6 +358,34 @@ int main(int argc, char **argv)
     assert(header && !header->bytes && header->first_error == EOVERFLOW && !header->unreadable_bytes);
 #endif
     resized = NULL;
+    assert_all_closed();
+
+    /* ZKT 2.7.8: span reads by errno. ESP-IDF reads ENOENT for a span whose
+     * index entry points at a deleted page (Peshawar-02's 2.7.7 boot); the
+     * report counts ENOENT and every errno that is neither EIO nor ENOENT,
+     * and names the first such errno and its offset, in the first pass and
+     * in the rest of a damaged file alike. */
+    char errnos[512];
+    subdirectory(errnos, sizeof(errnos), directory, "errnos");
+    write_file(errnos, "mixed.jsonl", 8 * CHUNK_BYTES);
+    write_file(errnos, "deleted.jsonl", 2 * CHUNK_BYTES);
+    bad[bad_count++] = (typeof(bad[0])){"mixed.jsonl", 2 * SI_SPAN_BYTES, 2 * SI_SPAN_BYTES + 1, 0};
+    bad[bad_count++] = (typeof(bad[0])){"mixed.jsonl", 5 * SI_SPAN_BYTES, 7 * SI_SPAN_BYTES, ENOENT};
+    bad[bad_count++] = (typeof(bad[0])){"mixed.jsonl", 3 * CHUNK_BYTES, 3 * CHUNK_BYTES + 1, ENOENT};
+    bad[bad_count++] = (typeof(bad[0])){"mixed.jsonl", 5 * CHUNK_BYTES, 5 * CHUNK_BYTES + 1, EBADMSG};
+    bad[bad_count++] = (typeof(bad[0])){"mixed.jsonl", 6 * CHUNK_BYTES, 6 * CHUNK_BYTES + 1, EINVAL};
+    bad[bad_count++] = (typeof(bad[0])){"deleted.jsonl", SI_SPAN_BYTES, 3 * SI_SPAN_BYTES, ENOENT};
+    si_scan(errnos, NULL, &report);
+    assert(report.complete && report.files == 2 && report.unreadable_files == 2);
+    const si_file_t *mixed = find(&report, "mixed.jsonl");
+    assert(mixed && mixed->first_error == EIO && mixed->first_error_offset == 2 * SI_SPAN_BYTES);
+    assert(mixed->unreadable_spans == 6 && mixed->span_errors_enoent == 3 && mixed->span_errors_other == 2);
+    assert(mixed->span_other_error == EBADMSG && mixed->span_other_offset == 5 * CHUNK_BYTES);
+    assert(mixed->last_error_offset == 6 * CHUNK_BYTES && !mixed->other_unreadable);
+    const si_file_t *deleted = find(&report, "deleted.jsonl");
+    assert(deleted && deleted->first_error == ENOENT && deleted->first_error_offset == SI_SPAN_BYTES);
+    assert(deleted->unreadable_spans == 2 && deleted->span_errors_enoent == 2 && !deleted->span_errors_other);
+    assert(!deleted->span_other_error && !deleted->span_other_offset && !deleted->other_unreadable);
     assert_all_closed();
 
     /* A directory that cannot be read is reported, not mistaken for an empty store. */

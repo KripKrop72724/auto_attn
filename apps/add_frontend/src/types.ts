@@ -376,6 +376,16 @@ export interface FirmwareDiagnostics {
     last_error?: string
     boot_health_checks?: number
     boot_health_last_ready?: boolean
+    // ZKT 2.7.7 and later: the confirm-first storage exception. 2.7.8 adds
+    // every failing term (named by ADD) and the inventory's condition.
+    storage_exception?: {
+      state?: string | null
+      reason?: string | null
+      since_seconds?: number | null
+      detail?: string | null
+      detail_file?: string | null
+      failing_terms?: string[]
+    } | null
   } | null
   delivery_authority?: 'LEGACY_DUAL' | 'ADD' | 'UNKNOWN' | null
   journal_runtime?: {

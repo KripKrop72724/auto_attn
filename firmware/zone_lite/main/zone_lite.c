@@ -7611,13 +7611,15 @@ static bool add_enqueue_json_receipts(
 
 /* ZKT 2.7.7: `read_error` is the errno of a failed read of /pending.jsonl
  * that started at byte `read_offset` (the LED's held-read cause; 0 for any
- * other deferral). */
-static void ords_drain_deferred(const char *stage, int error_code, int read_error, uint32_t read_offset)
+ * other deferral). 2.7.8: `from_read`, it came from a seek or read of the
+ * opened file (legacy_queue_t.io_read), not its open. */
+static void ords_drain_deferred(const char *stage, int error_code, int read_error, bool from_read,
+                                uint32_t read_offset)
 {
     int64_t now_ms = uptime_ms();
     g_ords_drain_retry_not_before_ms = now_ms + ZONE_LITE_ORDS_STORAGE_RETRY_DELAY_MS;
     led_status_set_backlog(true);
-    led_status_fault_read(LED_STATUS_LOCAL_FAILURE, read_error, LED_QUEUE_PENDING, read_offset);
+    led_status_fault_read(LED_STATUS_LOCAL_FAILURE, read_error, from_read, LED_QUEUE_PENDING, read_offset);
     ESP_LOGW(
         TAG,
         "ORDS delivery deferred at %s because a storage resource was unavailable errno=%d; preserved records remain recoverable",
@@ -7643,7 +7645,7 @@ static void ords_drain_deferred(const char *stage, int error_code, int read_erro
 
 static void ords_drain_preserved_deferred(const char *stage, int error_code)
 {
-    ords_drain_deferred(stage, error_code, 0, 0);
+    ords_drain_deferred(stage, error_code, 0, false, 0);
 }
 
 static char (*g_legacy_drain_buffer)[MAX_EVENT_JSON];
@@ -7864,6 +7866,7 @@ static void oracle_drain_pending(bool live_first)
     /* ZKT 2.7.7: a failed read's errno and where it started (the LED's
      * held-read cause). */
     int read_errno = 0;
+    bool read_from_read = false;
     uint32_t read_offset = 0;
     if (read == DQ_OK && !g_legacy_pending.ready) {
         lq_port_t port = {legacy_pending_load, legacy_pending_commit, NULL};
@@ -7871,6 +7874,7 @@ static void oracle_drain_pending(bool live_first)
         read = lq_open_step(&g_legacy_pending, PENDING_PATH, port);
         if (read != DQ_OK && read != DQ_PENDING) {
             read_errno = errno;
+            read_from_read = read == DQ_IO && g_legacy_pending.io_read;
             read_offset = g_legacy_pending.recovery_offset;
         }
     }
@@ -7882,6 +7886,7 @@ static void oracle_drain_pending(bool live_first)
         read = lq_peek(&scan, events[count], MAX_EVENT_JSON, &tokens[count]);
         if (read != DQ_OK && read != DQ_EMPTY && read != DQ_PENDING) {
             read_errno = errno;
+            read_from_read = read == DQ_IO && scan.io_read;
             read_offset = scan.checkpoint.offset;
         }
         if (read != DQ_OK) break;
@@ -7916,7 +7921,7 @@ static void oracle_drain_pending(bool live_first)
                 if (qs_snapshot(QS_ORDS, &depth) && depth == 0) led_status_set_backlog(false);
             }
         }
-        else if (read != DQ_PENDING) ords_drain_deferred("legacy-read", EIO, read_errno, read_offset);
+        else if (read != DQ_PENDING) ords_drain_deferred("legacy-read", EIO, read_errno, read_from_read, read_offset);
         xSemaphoreGive(g_ords_outbox_gate);
         return;
     }
@@ -8055,7 +8060,8 @@ static void blocked_evidence_slice(void)
             if (segmented || strcmp(g_blocked_read_stage, opened ? "peek" : "open"))
                 led_status_fault(LED_STATUS_LOCAL_FAILURE);
             else
-                led_status_fault_read(LED_STATUS_LOCAL_FAILURE, g_blocked_read_error, LED_QUEUE_BLOCKED,
+                led_status_fault_read(LED_STATUS_LOCAL_FAILURE, g_blocked_read_error, g_legacy_blocked.io_read,
+                                      LED_QUEUE_BLOCKED,
                                       opened ? g_legacy_blocked.checkpoint.offset : g_legacy_blocked.recovery_offset);
             if (segmented) report_queue_read_failure("segmented_blocked", "peek", read, errno, -1L, NULL);
             else report_queue_read_failure("identity_blocked", g_blocked_read_stage, read, g_blocked_read_error,
@@ -8174,6 +8180,15 @@ dq_result_t zkt_quarantine_owner_settle(unsigned lane, const lq_token_t *token, 
     return result;
 }
 #endif
+/* ZKT 2.7.8: the quarantine reads go through the journal owner's task. */
+static bool quarantine_via_owner(void)
+{
+#if defined(ZONE_LITE_QUEUE_OWNER) && ZONE_LITE_QUEUE_OWNER
+    return zj_runtime_checkpoint_required();
+#else
+    return false;
+#endif
+}
 static dq_result_t read_quarantine_delivery(unsigned lane, void *bytes, size_t capacity,
                                             size_t *length, lq_token_t *token)
 {
@@ -8212,7 +8227,11 @@ static void legacy_quarantine_slice(void)
             /* ZKT 2.7.7: the queue and where its read started (lanes are
              * corrupt_ords.jsonl, add_corrupt.jsonl, add_corrupt.bak). */
             const legacy_queue_t *queue = &g_legacy_quarantine[lane];
-            led_status_fault_read(LED_STATUS_LOCAL_FAILURE, error, (led_queue_t)(LED_QUEUE_CORRUPT_ORDS + lane),
+            /* 2.7.8: an ENOENT is a held read only from this task's own read
+             * or seek of the opened file (the owner path reports its own). */
+            bool from_read = read == DQ_IO && queue->io_read && !quarantine_via_owner();
+            led_status_fault_read(LED_STATUS_LOCAL_FAILURE, error, from_read,
+                                  (led_queue_t)(LED_QUEUE_CORRUPT_ORDS + lane),
                                   queue->ready ? queue->checkpoint.offset : queue->recovery_offset);
             report_queue_read_failure(names[lane], "read", read, error, -1L, NULL);
         }

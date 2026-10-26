@@ -51,11 +51,14 @@ typedef enum {
 /* A read of a reclaim queue that started at byte `offset` and failed with
  * `error`: EIO counts as a read of a span the boot repair may hold on flash
  * (the exception checks the queue and the offset against the held spans);
- * any other errno is an ordinary incident. */
-void led_status_fault_read_at(led_status_t status, int error, led_queue_t queue, uint32_t offset, const char *file,
-                              int line);
-#define led_status_fault_read(status, error, queue, offset)                                                            \
-    led_status_fault_read_at((status), (error), (queue), (offset), __FILE__, __LINE__)
+ * so does ENOENT (ZKT 2.7.8: ESP-IDF's errno for a span whose index entry
+ * points at a deleted page), but only when `from_read` says it came from a
+ * read or seek of the open file, never from its open (a missing file). Any
+ * other errno is an ordinary incident. */
+void led_status_fault_read_at(led_status_t status, int error, bool from_read, led_queue_t queue, uint32_t offset,
+                              const char *file, int line);
+#define led_status_fault_read(status, error, from_read, queue, offset)                                                 \
+    led_status_fault_read_at((status), (error), (from_read), (queue), (offset), __FILE__, __LINE__)
 void led_status_clear_fault(led_status_t status);
 /* LOCAL_FAILURE incidents raised this boot (wrapping) and whether the latch
  * is on. A latch that cannot be read is reported as on. */

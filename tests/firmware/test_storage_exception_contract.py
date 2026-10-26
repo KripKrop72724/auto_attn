@@ -155,7 +155,8 @@ def test_local_failures_are_classified_by_the_errno_their_site_captured() -> Non
     append = block(APP, "static bool append_line_policy(", "\n}\n")
     assert "errno = ok ? 0 : error;" in append
     # Reads of the reclaim queues name the queue and where they started.
-    assert "led_status_fault_read(LED_STATUS_LOCAL_FAILURE, read_error, LED_QUEUE_PENDING, read_offset)" in APP
+    assert ("led_status_fault_read(LED_STATUS_LOCAL_FAILURE, read_error, from_read, LED_QUEUE_PENDING, read_offset)"
+            in APP)
     assert "LED_QUEUE_BLOCKED" in APP and "(led_queue_t)(LED_QUEUE_CORRUPT_ORDS + lane)" in APP
     for site in ("compact_outbox_locked(outbox, true)) led_status_fault_errno",
                  "led_status_fault_errno(LED_STATUS_LOCAL_FAILURE, settle_error)",
@@ -163,3 +164,61 @@ def test_local_failures_are_classified_by_the_errno_their_site_captured() -> Non
         assert site in CONNECTOR
     # Every other incident stays ordinary: the gate refuses on it.
     assert APP.count("led_status_fault(LED_STATUS_LOCAL_FAILURE)") >= 10
+
+
+# ---- ZKT 2.7.8 -----------------------------------------------------------------
+LED = (MAIN / "led_status.c").read_text()
+QUEUE = (MAIN / "legacy_queue.c").read_text()
+INVENTORY = (MAIN / "storage_inventory.c").read_text()
+SCHEMAS = (ROOT / "apps/add_backend/zk_add/schemas.py").read_text()
+
+
+def test_enoent_is_a_held_read_only_from_a_read_or_seek_of_an_open_queue() -> None:
+    # The LED's rule: EIO as in 2.7.7, ENOENT only with the read provenance.
+    fault_read = block(LED, "void led_status_fault_read_at(", "\n}\n")
+    assert "(error == EIO || (error == ENOENT && from_read))" in fault_read
+    # The queue says where its DQ_IO came from: a seek or read of the opened
+    # file, never the open, the close or the checkpoint store.
+    for function in ("dq_result_t lq_open_step(", "dq_result_t lq_peek(", "dq_result_t lq_reclaim("):
+        assert "io_read=false;" in block(QUEUE, function, "\n}\n"), function
+    peek = block(QUEUE, "dq_result_t lq_peek(", "\n}\n")
+    assert peek.index("if (!file) return") < peek.index("q->io_read=true;")
+    # Each held-read site passes that provenance; the quarantine's owner path
+    # (another task's errno) never does.
+    assert "read_from_read = read == DQ_IO && g_legacy_pending.io_read;" in APP
+    assert "read_from_read = read == DQ_IO && scan.io_read;" in APP
+    assert 'ords_drain_deferred("legacy-read", EIO, read_errno, read_from_read, read_offset)' in APP
+    assert "g_blocked_read_error, g_legacy_blocked.io_read," in APP
+    assert "bool from_read = read == DQ_IO && queue->io_read && !quarantine_via_owner();" in APP
+    assert len(re.findall(r"led_status_fault_read\(", code(APP))) == 3
+
+
+def test_the_decision_is_sx_evaluate_and_the_terms_are_diagnostics() -> None:
+    judge = block(EXCEPTION, "static __attribute__((noinline)) sx_reason_t sx_judge(", "\n}\n")
+    assert "sx_reason_t verdict = sx_evaluate(in);" in judge
+    assert "(void)sx_evaluate_terms(in, &s_sx.terms, &s_sx.why);" in judge and "return verdict;" in judge
+    assert "sx_evaluate(&in)" not in code(EXCEPTION)
+    # The heartbeat carries the terms and the inventory's condition; ADD
+    # accepts every field the firmware sends.
+    telemetry = block(EXCEPTION, "static void sx_append_telemetry(cJSON *ota)", "\n}\n")
+    sent = set(re.findall(r'cJSON_Add\w+ToObject\(sx, "([a-z_]+)"', telemetry))
+    assert {"terms", "detail", "detail_file"} <= sent
+    model = SCHEMAS[SCHEMAS.index("class OtaStorageException(BaseModel):"):SCHEMAS.index("class OtaHeartbeatPayload(")]
+    assert sent <= set(re.findall(r"^    ([a-z_]+): ", model, re.M)), sent
+
+
+def test_the_inventory_rows_add_accepts() -> None:
+    append = block(INVENTORY, "static bool append_file(cJSON *rows, const si_file_t *source)", "\n}\n")
+    sent = set(re.findall(r'cJSON_Add\w+ToObject\(row, "([a-z_]+)"', append))
+    assert {"span_errors_enoent", "span_errors_other", "span_other_error", "span_other_offset"} <= sent
+    model = SCHEMAS[SCHEMAS.index("class StorageInventoryFile(BaseModel):"):SCHEMAS.index("class StorageInventory(")]
+    assert sent <= set(re.findall(r"^    ([a-z_]+): ", model, re.M)), sent
+
+
+def test_a_skipped_area_test_says_why() -> None:
+    after_run = block(REPAIR, "static void exception_after_run(void)", "\n}\n")
+    skipped = after_run[after_run.index("if (verdict != SX_OK && verdict != SX_RECORDS_UNACKED) {"):
+                        after_run.index("srp_reclaim_t journal;")]
+    assert "sx_repair_deferred_for_room(verdict)" in skipped and "s_area_skip = verdict;" in skipped
+    assert '"STORAGE_REPAIR_EXCEPTION_AREA_TEST"' in skipped and "return;" in skipped
+    assert 'cJSON_AddStringToObject(reclaim, "area_skip", sx_reason_name(s_area_skip))' in REPAIR

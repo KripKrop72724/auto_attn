@@ -74,7 +74,16 @@ static void unreadable_span(si_file_t *file, uint32_t offset, int error, uint32_
     file->unreadable_spans++;
     file->last_error_offset = offset;
     file->span_digest = span_digest_add(file->span_digest, offset / SI_SPAN_BYTES);
-    if ((error ? error : EIO) != EIO) file->span_errors_other++;
+    error = error ? error : EIO;
+    if (error == ENOENT) {
+        file->span_errors_enoent++;
+    } else if (error != EIO) {
+        if (!file->span_errors_other) {
+            file->span_other_error = error;
+            file->span_other_offset = offset;
+        }
+        file->span_errors_other++;
+    }
 }
 
 /* Reads a file from position to its size with open/read/lseek, a chunk of
@@ -237,6 +246,11 @@ void si_scan(const char *directory, const si_ports_t *ports, si_report_t *report
             entry->unreadable_spans += rest.unreadable_spans;
             if (rest.unreadable_spans) entry->last_error_offset = rest.last_error_offset;
             entry->span_digest += rest.span_digest;
+            entry->span_errors_enoent += rest.span_errors_enoent;
+            if (rest.span_errors_other && !entry->span_errors_other) {
+                entry->span_other_error = rest.span_other_error;
+                entry->span_other_offset = rest.span_other_offset;
+            }
             entry->span_errors_other += rest.span_errors_other;
             entry->other_unreadable |= rest.other_unreadable;
         }

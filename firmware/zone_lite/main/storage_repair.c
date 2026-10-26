@@ -110,6 +110,10 @@ static sx_record_t s_exception;      /* the record as this boot left it */
 static bool s_exception_present, s_exception_active, s_running_pending, s_previous_failed;
 static uint32_t s_image_tag;
 static srx_test_t s_area_test;
+/* ZKT 2.7.8: why the area test did not run on an unconfirmed boot (the
+ * repair verdict it would have had with the test passed; SX_OK when it ran or
+ * the boot could not use the exception at all). */
+static sx_reason_t s_area_skip;
 static bool s_probe_hold, s_floor_seen, s_ota_floor;
 
 /* Every program and erase of the VFS's SPIFFS (esp_spiffs.c takes these
@@ -706,6 +710,7 @@ bool storage_repair_exception_inventory(sx_inventory_t *out)
             t->unreadable_spans = f->unreadable_spans;
             t->last_error_offset = f->last_error_offset;
             t->span_digest = f->span_digest;
+            t->span_errors_enoent = f->span_errors_enoent;
             t->span_errors_other = f->span_errors_other;
             t->other_unreadable = f->other_unreadable;
         }
@@ -745,7 +750,19 @@ static void exception_after_run(void)
     snprintf(probe->area_test, sizeof(probe->area_test), "PASSED");
     sx_reason_t verdict = sx_repair_verdict(probe);
     heap_caps_free(probe);
-    if (verdict != SX_OK && verdict != SX_RECORDS_UNACKED) return;
+    if (verdict != SX_OK && verdict != SX_RECORDS_UNACKED) {
+        /* ZKT 2.7.8: say why (13FL's 2.7.7 refused AREA_TEST and hid the
+         * real terms). Only for a boot whose repair deferred for room, the
+         * one the exception is for; any other boot says nothing new. */
+        if (sx_repair_deferred_for_room(verdict)) {
+            s_area_skip = verdict;
+            char message[96];
+            snprintf(message, sizeof(message), "the redo area's program/erase test not run: %s",
+                     sx_reason_name(verdict));
+            queue_line("WARN", "STORAGE_REPAIR_EXCEPTION_AREA_TEST", message);
+        }
+        return;
+    }
     srp_reclaim_t journal;
     if (port_nvs_load(NULL, SRR_NVS_NAMESPACE, "reclaim", &journal, sizeof(journal)) != 1 || !srp_reclaim_valid(&journal))
         memset(&journal, 0, sizeof(journal));
@@ -1250,6 +1267,10 @@ bool storage_repair_append(cJSON *storage)
     if (ok && x->waiting) ok = cJSON_AddNumberToObject(reclaim, "waiting", x->waiting) != NULL;
     if (ok && s_area_test != SRX_TEST_NOT_RUN)
         ok = cJSON_AddStringToObject(reclaim, "area_test", srx_test_name(s_area_test)) != NULL;
+    /* 2.7.8: the area test did not run, and the repair verdict that kept it. */
+    if (ok && s_area_test == SRX_TEST_NOT_RUN && s_area_skip != SX_OK)
+        ok = cJSON_AddStringToObject(reclaim, "area_test", srx_test_name(s_area_test)) &&
+            cJSON_AddStringToObject(reclaim, "area_skip", sx_reason_name(s_area_skip));
     if (ok) ok = cJSON_AddBoolToObject(reclaim, "ota_floor", s_ota_floor) != NULL;
     if (ok) ok = cJSON_AddBoolToObject(repair, "manifest_active", r->manifest_active) != NULL;
     if (ok && r->names_surveyed) ok = cJSON_AddBoolToObject(repair, "journal_names", r->journal_names) != NULL;

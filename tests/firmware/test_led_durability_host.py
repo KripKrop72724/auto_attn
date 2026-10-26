@@ -65,7 +65,8 @@ int main(void) {
     assert(!led_status_clear_local_failure(seen));
     /* ZKT 2.7.7: incidents by the errno their site captured. Only ENOSPC is a
      * room refusal; only EIO on a reclaim queue a held read, with the largest
-     * start offset per queue. */
+     * start offset per queue. 2.7.8: ENOENT too, but only from a read or seek
+     * of the opened file, never from its open. */
     led_local_causes_t causes;
     led_status_local_causes(&causes);
     assert(causes.known && !causes.fatal && causes.incidents==3 && !causes.room && !causes.held_reads);
@@ -73,17 +74,26 @@ int main(void) {
     led_status_fault_errno(LED_STATUS_LOCAL_FAILURE, ENOENT);
     led_status_fault_errno(LED_STATUS_LOCAL_FAILURE, 0);
     led_status_fault_errno(LED_STATUS_ORDS_FAILURE, ENOSPC);
-    led_status_fault_read(LED_STATUS_LOCAL_FAILURE, EIO, LED_QUEUE_PENDING, 493968);
-    led_status_fault_read(LED_STATUS_LOCAL_FAILURE, EIO, LED_QUEUE_PENDING, 1000);
-    led_status_fault_read(LED_STATUS_LOCAL_FAILURE, ENOENT, LED_QUEUE_BLOCKED, 7);
-    led_status_fault_read(LED_STATUS_LOCAL_FAILURE, EIO, LED_QUEUE_COUNT, 7);
+    led_status_fault_read(LED_STATUS_LOCAL_FAILURE, EIO, false, LED_QUEUE_PENDING, 493968);
+    led_status_fault_read(LED_STATUS_LOCAL_FAILURE, EIO, true, LED_QUEUE_PENDING, 1000);
+    led_status_fault_read(LED_STATUS_LOCAL_FAILURE, ENOENT, false, LED_QUEUE_BLOCKED, 7);
+    led_status_fault_read(LED_STATUS_LOCAL_FAILURE, EIO, true, LED_QUEUE_COUNT, 7);
     led_status_local_causes(&causes);
     assert(causes.incidents==10 && causes.room==1 && causes.held_reads==2);
     assert(causes.held_queues==(1U<<LED_QUEUE_PENDING) && causes.held_last[LED_QUEUE_PENDING]==493968);
     assert(!causes.held_last[LED_QUEUE_BLOCKED]);
+    /* An ENOENT from a read of the opened queue is held; one from its open,
+     * EBADMSG and an unknown queue are not. */
+    led_status_fault_read(LED_STATUS_LOCAL_FAILURE, ENOENT, true, LED_QUEUE_PENDING, 494219);
+    led_status_fault_read(LED_STATUS_LOCAL_FAILURE, ENOENT, false, LED_QUEUE_PENDING, 600000);
+    led_status_fault_read(LED_STATUS_LOCAL_FAILURE, EBADMSG, true, LED_QUEUE_PENDING, 700000);
+    led_status_fault_read(LED_STATUS_LOCAL_FAILURE, ENOENT, true, LED_QUEUE_COUNT, 7);
+    led_status_local_causes(&causes);
+    assert(causes.incidents==14 && causes.room==1 && causes.held_reads==3);
+    assert(causes.held_queues==(1U<<LED_QUEUE_PENDING) && causes.held_last[LED_QUEUE_PENDING]==494219);
     led_status_fault(LED_STATUS_FATAL);
     led_status_local_causes(&causes);
-    assert(causes.fatal && causes.incidents==10);
+    assert(causes.fatal && causes.incidents==14);
     return 0;
 }
 '''

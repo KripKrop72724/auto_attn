@@ -49,10 +49,18 @@ static void log_report(void)
     for (size_t index = 0; index < s_report.count && index < SI_LOGGED_FILES; ++index) {
         const si_file_t *file = &s_report.file[index];
         if (!file->first_error) break;
-        snprintf(message, sizeof(message),
-                 "%s: %lu of %lu bytes unreadable, first at offset %lu (errno %d)", file->name,
-                 (unsigned long)file->unreadable_bytes, (unsigned long)file->bytes,
-                 (unsigned long)file->first_error_offset, file->first_error);
+        int used = snprintf(message, sizeof(message),
+                            "%s: %lu of %lu bytes unreadable, first at offset %lu (errno %d)", file->name,
+                            (unsigned long)file->unreadable_bytes, (unsigned long)file->bytes,
+                            (unsigned long)file->first_error_offset, file->first_error);
+        /* ZKT 2.7.8: the span reads by errno (EIO, ENOENT, any other). */
+        if (used > 0 && (size_t)used < sizeof(message) && file->unreadable_spans)
+            used += snprintf(message + used, sizeof(message) - (size_t)used, "; %lu spans, %lu ENOENT, %lu other",
+                             (unsigned long)file->unreadable_spans, (unsigned long)file->span_errors_enoent,
+                             (unsigned long)file->span_errors_other);
+        if (used > 0 && (size_t)used < sizeof(message) && file->span_errors_other)
+            (void)snprintf(message + used, sizeof(message) - (size_t)used, " (first errno %d at %lu)",
+                           file->span_other_error, (unsigned long)file->span_other_offset);
         (void)add_connector_log("WARN", "storage", "STORAGE_FILE_UNREADABLE", message);
     }
     snprintf(message, sizeof(message), "%lu files, %llu bytes, %lu unreadable files, %llu unreadable bytes%s",
@@ -126,7 +134,14 @@ static bool append_file(cJSON *rows, const si_file_t *source)
                 cJSON_AddNumberToObject(row, "unreadable_spans", file.unreadable_spans) &&
                 cJSON_AddNumberToObject(row, "last_error_offset", file.last_error_offset) &&
                 cJSON_AddNumberToObject(row, "span_digest", file.span_digest) &&
-                cJSON_AddBoolToObject(row, "other_unreadable", file.other_unreadable)));
+                cJSON_AddBoolToObject(row, "other_unreadable", file.other_unreadable) &&
+                /* 2.7.8: the span reads by errno; the first errno that is
+                 * neither EIO nor ENOENT only when there is one. */
+                cJSON_AddNumberToObject(row, "span_errors_enoent", file.span_errors_enoent) &&
+                cJSON_AddNumberToObject(row, "span_errors_other", file.span_errors_other) &&
+                (!file.span_errors_other ||
+                 (cJSON_AddNumberToObject(row, "span_other_error", file.span_other_error) &&
+                  cJSON_AddNumberToObject(row, "span_other_offset", file.span_other_offset)))));
     if (ok && cJSON_AddItemToArray(rows, row)) return true;
     cJSON_Delete(row);
     return false;

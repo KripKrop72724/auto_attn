@@ -24,7 +24,8 @@ from zk_add.ota import (
     progress_receipt,
     record_progress,
 )
-from zk_add.schemas import HeartbeatPayload, OtaHeartbeatPayload, StorageRepairDiagnostics
+from zk_add.schemas import (SX_REASON_NAMES, HeartbeatPayload, OtaHeartbeatPayload, StorageInventory,
+                             StorageRepairDiagnostics)
 
 DIGEST = "c" * 64
 
@@ -292,6 +293,71 @@ def test_the_repair_report_keeps_the_2_7_7_fields():
     odd = StorageRepairDiagnostics.model_validate({"reclaim": {"area": "READY", "excluded_file": "x" * 40,
                                                                "custody_gain": 5}})
     assert odd.reclaim is not None and odd.reclaim.excluded_file is None and odd.reclaim.custody_gain == 5
+
+
+def test_the_terms_are_named_in_the_firmwares_order():
+    # ZKT 2.7.8: bit i of storage_exception.terms is the firmware's reason i.
+    import re
+    from pathlib import Path
+
+    source = (Path(__file__).resolve().parents[2] / "firmware/zone_lite/main/storage_exception.c").read_text()
+    table = source[source.index("const char *sx_reason_name(sx_reason_t reason)"):]
+    table = table[table.index("names[SX_REASON_COUNT] = {"):table.index("};")]
+    assert tuple(re.findall(r'"([A-Z_]+)"', table)) == SX_REASON_NAMES
+
+
+def test_the_heartbeat_names_every_failing_term_and_the_inventory_condition():
+    # 13FL's 2.7.8 boot: the first failing term, every term failing with it,
+    # and why the inventory did not match the held spans.
+    def bit(name):
+        return 1 << SX_REASON_NAMES.index(name)
+
+    terms = bit("CUSTODY_LOST") | bit("AREA_TEST") | bit("CUSTODY_BLOCKS") | bit("INVENTORY_UNEXPLAINED")
+    ota = OtaHeartbeatPayload.model_validate({"storage_exception": {
+        "state": "REFUSED", "reason": "CUSTODY_LOST", "since_seconds": 30, "terms": terms,
+        "detail": "SPAN_ERRNO", "detail_file": "blocked_identity.jsonl", "failing_terms": ["FORGED"]}})
+    sx = ota.storage_exception
+    assert sx.reason == "CUSTODY_LOST" and sx.terms == terms
+    assert sx.failing_terms == ["AREA_TEST", "CUSTODY_LOST", "INVENTORY_UNEXPLAINED", "CUSTODY_BLOCKS"]
+    assert sx.detail == "SPAN_ERRNO" and sx.detail_file == "blocked_identity.jsonl"
+    # A later firmware's term beyond the table is named by its bit, never dropped.
+    later = OtaHeartbeatPayload.model_validate({"storage_exception": {"state": "REFUSED", "terms": 1 << 50}})
+    assert later.storage_exception.failing_terms == ["TERM_50"]
+    # Each unreadable 2.7.8 value drops alone; the object and the heartbeat stay.
+    odd = HeartbeatPayload.model_validate({"firmware_version": "2.7.8", "ota": {"storage_exception": {
+        "state": "REFUSED", "reason": "INVENTORY_UNEXPLAINED", "terms": -1, "detail": "not a code",
+        "detail_file": "\u00e9" * 3}}})
+    sx = odd.ota.storage_exception
+    assert sx is not None and sx.reason == "INVENTORY_UNEXPLAINED"
+    assert sx.terms is None and sx.detail is None and sx.detail_file is None and sx.failing_terms == []
+    # 2.7.7 sent none of them.
+    older = OtaHeartbeatPayload.model_validate({"storage_exception": {"state": "REFUSED", "reason": "AREA_TEST"}})
+    assert older.storage_exception.terms is None and older.storage_exception.failing_terms == []
+
+
+def test_the_inventory_and_reclaim_keep_the_2_7_8_fields():
+    inventory = StorageInventory.model_validate({
+        "complete": True, "files": 6, "bytes": 3526978, "unreadable_files": 1, "unreadable_bytes": 12801,
+        "entries": [{"name": "pending.jsonl", "bytes": 2526978, "unreadable_bytes": 12801, "first_error": 5,
+                     "first_error_offset": 493968, "unreadable_spans": 51, "last_error_offset": 506518,
+                     "span_digest": 3631770592, "other_unreadable": False, "span_errors_enoent": 11,
+                     "span_errors_other": 1, "span_other_error": 74, "span_other_offset": 500000}]})
+    row = inventory.entries[0]
+    assert row.span_errors_enoent == 11 and row.span_errors_other == 1
+    assert row.span_other_error == 74 and row.span_other_offset == 500000
+    # An unreadable 2.7.8 value drops alone; the row and the inventory stay.
+    odd = StorageInventory.model_validate({
+        "complete": True, "files": 1, "bytes": 10, "unreadable_files": 1, "unreadable_bytes": 10,
+        "entries": [{"name": "pending.jsonl", "bytes": 10, "span_errors_enoent": "many", "span_errors_other": 2.5,
+                     "span_other_error": -5, "span_other_offset": 1 << 40}]})
+    row = odd.entries[0]
+    assert (row.span_errors_enoent, row.span_errors_other, row.span_other_error, row.span_other_offset) == (
+        None, None, None, None)
+    reclaim = StorageRepairDiagnostics.model_validate({"reclaim": {
+        "area": "READY", "area_test": "NOT_RUN", "area_skip": "CUSTODY_LOST"}}).reclaim
+    assert reclaim.area_test == "NOT_RUN" and reclaim.area_skip == "CUSTODY_LOST"
+    reclaim = StorageRepairDiagnostics.model_validate({"reclaim": {"area": "READY", "area_skip": "lower"}}).reclaim
+    assert reclaim is not None and reclaim.area_skip is None
 
 
 def test_the_floor_latch_migration_is_the_single_head_after_mains_public_status():

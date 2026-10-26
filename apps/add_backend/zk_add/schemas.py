@@ -53,6 +53,44 @@ class Envelope(BaseModel):
 
 
 UPPER_CODE = r"^[A-Z_]{1,40}$"
+PRINTABLE_TEXT = r"^[\x20-\x7e]+$"
+
+# The confirm-first gate's terms, in firmware order (storage_exception.c
+# sx_reason_name): bit i of a heartbeat's storage_exception.terms is
+# SX_REASON_NAMES[i]. tests/unit/test_ota_storage_exception.py keeps the two
+# lists equal.
+SX_REASON_NAMES = (
+    "OK", "NOT_PENDING", "ROLE", "NOT_OTA_IMAGE", "ALREADY_USED",
+    "REPAIR_MISSING", "REPAIR_RESULT", "REPAIR_STAGE", "REPAIR_GUARD", "SHORT_REASON", "AREA_NOT_READY",
+    "AREA_TEST", "RECLAIM_FAULT", "ROUND_RAN", "MANIFEST", "ARRIVED_WITH_ROOM", "CHECK_DELETED",
+    "CUSTODY_UNHELD", "CUSTODY_LOST", "RECORDS_UNACKED", "INVENTORY_PENDING", "INVENTORY_UNEXPLAINED",
+    "CUSTODY_MISSING",
+    "ROOM_UNKNOWN", "CUSTODY_SHORT", "CUSTODY_BLOCKS",
+    "STORAGE_UNKNOWN", "STORAGE_ERROR_CLASS", "PROBE_ERROR_CLASS", "LED_FATAL", "LED_CAUSE",
+    "STORE_NOT_MOUNTED", "STORE_CHANGED",
+    "HEALTH", "HEALTH_UNKNOWN",
+    "ADD_DISCONNECTED", "HEARTBEAT_UNACKED", "CAPABILITY", "OTA_PRECHECK", "OTA_SLOT", "HEAP",
+    "STABILIZING", "EVIDENCE_UNACKED", "RECEIPT", "BUDGET", "NVS_RECORD", "MARK_VALID",
+)
+
+
+def _whole_number(value: Any, maximum: int) -> int | None:
+    """A JSON whole number in [0, maximum], else None (a later firmware's
+    unreadable value is dropped, never the heartbeat that carries it)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if isinstance(value, float) and (not math.isfinite(value) or not value.is_integer()):
+        return None
+    number = int(value)
+    return number if 0 <= number <= maximum else None
+
+
+def _code(value: Any) -> str | None:
+    return value if isinstance(value, str) and re.fullmatch(UPPER_CODE, value) else None
+
+
+def _printable(value: Any, maximum: int = 32) -> str | None:
+    return value if isinstance(value, str) and len(value) <= maximum and re.fullmatch(PRINTABLE_TEXT, value) else None
 
 
 class OtaStorageException(BaseModel):
@@ -69,6 +107,38 @@ class OtaStorageException(BaseModel):
     restarts: int | None = Field(default=None, ge=0, le=255)
     round_boots: int | None = Field(default=None, ge=0, le=255)
     crashes: int | None = Field(default=None, ge=0, le=255)
+    # ZKT 2.7.8 and later, on an unconfirmed boot: every term failing at the
+    # gate's last evaluation (bit i is SX_REASON_NAMES[i]; ADD names them in
+    # failing_terms), and for INVENTORY_UNEXPLAINED which condition failed
+    # (detail) in which file. Each is dropped alone when unreadable.
+    terms: int | None = Field(default=None, ge=0, le=2**53 - 1)
+    detail: str | None = Field(default=None, pattern=UPPER_CODE)
+    detail_file: str | None = Field(default=None, max_length=32, pattern=PRINTABLE_TEXT)
+    failing_terms: list[str] = Field(default_factory=list, max_length=64)
+
+    @field_validator("terms", mode="before")
+    @classmethod
+    def readable_terms(cls, value: Any) -> int | None:
+        return _whole_number(value, 2**53 - 1)
+
+    @field_validator("detail", mode="before")
+    @classmethod
+    def readable_detail(cls, value: Any) -> str | None:
+        return _code(value)
+
+    @field_validator("detail_file", mode="before")
+    @classmethod
+    def readable_detail_file(cls, value: Any) -> str | None:
+        return _printable(value)
+
+    @model_validator(mode="after")
+    def name_failing_terms(self) -> "OtaStorageException":
+        # Always ADD's own reading of `terms`, never a list the device sent.
+        terms = self.terms or 0
+        self.failing_terms = [
+            SX_REASON_NAMES[bit] if bit < len(SX_REASON_NAMES) else f"TERM_{bit}"
+            for bit in range(1, terms.bit_length()) if terms >> bit & 1]
+        return self
 
 
 class OtaHeartbeatPayload(BaseModel):
@@ -177,9 +247,6 @@ class JournalStorageDiagnostics(BaseModel):
     last_nvs_error: int | None = None
 
 
-PRINTABLE_TEXT = r"^[\x20-\x7e]+$"
-
-
 class StorageInventoryFile(BaseModel):
     # One file of the store and the bytes the filesystem could not read back,
     # with the first failing offset and errno; the read-error fields are only
@@ -196,6 +263,24 @@ class StorageInventoryFile(BaseModel):
     last_error_offset: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
     span_digest: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
     other_unreadable: bool | None = None
+    # ZKT 2.7.8 and later: the span reads by errno. ENOENT is ESP-IDF's errno
+    # for a span whose index entry points at a deleted page; "other" counts
+    # every errno that is neither EIO nor ENOENT, the first of them with its
+    # offset. Each is dropped alone when unreadable.
+    span_errors_enoent: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    span_errors_other: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    span_other_error: int | None = Field(default=None, ge=0, le=0xFFFF)
+    span_other_offset: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+
+    @field_validator("span_errors_enoent", "span_errors_other", "span_other_offset", mode="before")
+    @classmethod
+    def readable_span_count(cls, value: Any) -> int | None:
+        return _whole_number(value, 0xFFFFFFFF)
+
+    @field_validator("span_other_error", mode="before")
+    @classmethod
+    def readable_span_errno(cls, value: Any) -> int | None:
+        return _whole_number(value, 0xFFFF)
 
 
 class StorageInventory(BaseModel):
@@ -301,7 +386,16 @@ class StorageRepairReclaim(BaseModel):
     free_blocks_at_mount: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
     waiting: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
     area_test: str | None = Field(default=None, pattern=UPPER_CODE)
+    # ZKT 2.7.8 and later: the area test did not run (area_test NOT_RUN) on an
+    # unconfirmed boot whose repair deferred for room, and the repair term
+    # that kept it from running (13FL's 2.7.7 reported only AREA_TEST).
+    area_skip: str | None = Field(default=None, pattern=UPPER_CODE)
     ota_floor: bool | None = None
+
+    @field_validator("area_skip", mode="before")
+    @classmethod
+    def readable_area_skip(cls, value: Any) -> str | None:
+        return _code(value)
 
     @field_validator("excluded_file", mode="before")
     @classmethod

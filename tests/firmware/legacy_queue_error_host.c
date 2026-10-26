@@ -34,6 +34,8 @@ int main(void)
     fail_read = false;
     assert(lq_settle(&queue, &token) == DQ_IO && errno == ENOSPC && !commits);
     assert(lq_peek(&queue, bytes, sizeof(bytes), &token) == DQ_IO && errno == ENOSPC);
+    /* ZKT 2.7.8: a failed close is not a failed read. */
+    assert(!queue.io_read);
     fail_close = false;
     assert(lq_peek(&queue, bytes, sizeof(bytes), &token) == DQ_OK);
     lq_token_t wrong = token; wrong.crc ^= 1;
@@ -42,9 +44,20 @@ int main(void)
     memset(&queue, 0, sizeof(queue));
     fail_read = fail_close = true;
     assert(lq_open_step(&queue, "records", port) == DQ_IO && errno == ENXIO && !queue.recovery_offset);
+    /* ZKT 2.7.8: the errno is a read's (the LED may count ENOENT from one as
+     * a held read); a close's or an open's is not. */
+    assert(queue.io_read);
     fail_read = false;
     assert(lq_open_step(&queue, "records", port) == DQ_IO && errno == ENOSPC && !queue.recovery_offset);
+    assert(!queue.io_read);
     fail_close = false;
-    assert(lq_open_step(&queue, "records", port) == DQ_OK && queue.checkpoint.offset == 6);
+    assert(lq_open_step(&queue, "records", port) == DQ_OK && queue.checkpoint.offset == 6 && !queue.io_read);
     assert(lq_peek(&queue, bytes, sizeof(bytes), &token) == DQ_OK && !strcmp(bytes, "last\n"));
+    /* A file gone under a checkpoint past 0: the open fails with ENOENT, and
+     * that is never a read. */
+    assert(remove("records") == 0);
+    assert(lq_peek(&queue, bytes, sizeof(bytes), &token) == DQ_IO && errno == ENOENT && !queue.io_read);
+    memset(&queue, 0, sizeof(queue));
+    assert(lq_open_step(&queue, "records", port) == DQ_IO && errno == ENOENT && !queue.io_read);
+    assert(lq_reclaim(&queue) == DQ_IO && !queue.io_read);
 }
