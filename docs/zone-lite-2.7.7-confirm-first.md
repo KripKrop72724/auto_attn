@@ -1312,3 +1312,12 @@ proved by a test that fails on `aa7b87f` and passes after.
 | 5 (low) | Runbook 5 promised one-click retries for both Swat-01 and Quetta-01; in one campaign only the deployment whose failure paused it can be retried | **A.** Runbook 5 says so: the second device gets a new campaign (or each its own campaign). No ADD change |
 | 6 (low) | The guard held the queue-store lock across `stat`, `fopen` and full reads of every `zktj*` file, also when the verdict already refused | **A.** Only the directory walk holds the lock; names are kept (at most 16), then sized and read after it is released, and read only when `zle_contents_matter` (pure, host tested: whenever it says no, the verdict refuses whatever the files hold); the walk and read times are logged. The host test fails on aa7b87f's always-read behaviour |
 
+
+### 16.3 Found while re-verifying
+
+CI's allocation step (`run_allocation_checks.py`, firmware-production) had
+failed on this branch since 685ae36 and 19e663a, unnoticed by both reviews:
+its extractions of `ota_manager.c` and `add_connector.c` now contain
+`report_progress` and `zj_ota_append_legacy_evidence`, which the harnesses
+did not stub. Both are stubbed, and `report_progress` is swept for cJSON
+allocation failures (nothing sent, no receipt) - a88f12e.
