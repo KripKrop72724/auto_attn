@@ -8,8 +8,9 @@ DIRECT_VERSION = "2.6.1"
 # replaces 2.7.1, whose terminal framing failed on the 3FL G3; 2.7.3 records
 # the panic trace 3FL's 2.7.2 cache error lacked; 2.7.4 reports the storage
 # damage that kept 2.7.3 from confirming on 13FL; 2.7.5 repairs it at boot;
-# 2.7.6 reformats a store the repair cannot give room, block by block in place.
-FLEET_PLATFORM_VERSIONS = ("2.7.1", "2.7.2", "2.7.3", "2.7.4", "2.7.5", "2.7.6")
+# 2.7.6 reformats a store the repair cannot give room, block by block in place;
+# 2.7.7 lets a wedged store's image confirm first so that reformat can run.
+FLEET_PLATFORM_VERSIONS = ("2.7.1", "2.7.2", "2.7.3", "2.7.4", "2.7.5", "2.7.6", "2.7.7")
 FLEET_PLATFORM_VERSION = FLEET_PLATFORM_VERSIONS[-1]
 DIRECT_VERSIONS = (DIRECT_VERSION, "2.6.2", "2.6.3", "2.6.4", "2.6.5", "2.6.6", "2.6.7", "2.6.8", "2.6.9", "2.6.10", "2.6.11", "2.6.12", "2.6.13", "2.6.14", "2.6.15", *FLEET_PLATFORM_VERSIONS)
 DIRECT_BASELINES = ("2.4.12", "2.5.2")
@@ -106,10 +107,19 @@ REPAIR_BASELINE_IMAGES = {
     "2.7.5": "430e2daf29dd99ff006a476ff584e4201493d661cee67e4b4f9ba15545b17a40",
 }
 REPAIR_MARKER = INVENTORY_MARKER + ",2.7.5"
+# 2.7.7 also accepts 2.7.6, so every 2.7.6 HIL device upgrades in place.
+REFORMAT_BASELINES = (*REPAIR_BASELINES, "2.7.6")
+REFORMAT_BASELINE_IMAGES = {
+    **REPAIR_BASELINE_IMAGES,
+    "2.7.6": "9d7050768f1cb716e9bc11f9b7b4d20b423b3eccbe1531809130457998e96f0c",
+}
+REFORMAT_MARKER = REPAIR_MARKER + ",2.7.6"
 
 
 def platform_baselines(version: str) -> tuple[tuple[str, ...], dict[str, str]]:
     """The rollback predecessors a 2.7 platform image accepts."""
+    if version == "2.7.7":
+        return REFORMAT_BASELINES, REFORMAT_BASELINE_IMAGES
     if version == "2.7.6":
         return REPAIR_BASELINES, REPAIR_BASELINE_IMAGES
     if version == "2.7.5":

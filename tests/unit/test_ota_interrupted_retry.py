@@ -514,7 +514,7 @@ def test_other_returns_keep_previous_firmware_observed(db, lifetime, last_code, 
     assert run.status == "PAUSED"
 
 
-@pytest.mark.parametrize("version", ["2.6.17", "2.6.24", "2.7.0", "2.7.6"])
+@pytest.mark.parametrize("version", ["2.6.17", "2.6.24", "2.7.0", "2.7.6", "2.7.7"])
 def test_releases_with_their_own_return_evidence_are_never_classified(version):
     deployment = SimpleNamespace(status="BOOTED_PENDING", previous_version="2.6.15")
     evidence = {"target_boot": {"last_progress_code": None, "failure_reports": [],
