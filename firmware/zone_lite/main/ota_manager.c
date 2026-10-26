@@ -1334,14 +1334,33 @@ static __attribute__((noinline)) sx_step_t sx_confirm_step(const boot_confirm_t 
     return SX_STEP_CONFIRMED;
 }
 
-/* Before the ordinary path marks the image valid: a CONFIRMING record this
- * boot wrote must not make the next boot an exception boot. */
+/* Before the ordinary path marks the image valid: no record of this image
+ * (one this boot wrote, or another deployment's that never reached
+ * mark_app_valid; review of 26 October, D1) may make the next boot an
+ * exception boot. */
 static bool sx_ordinary_confirmation(void)
 {
-    if (!s_sx.confirming_written) return true;
+    sx_record_t record;
+    bool stale = storage_repair_exception_record(&record) &&
+        sx_record_clear_on_ordinary(&record, storage_repair_image_tag());
+    if (!s_sx.confirming_written && !stale) return true;
     if (!sx_store_record(SX_STATE_NONE)) return false;
     s_sx.confirming_written = false;
     return true;
+}
+
+/* An unconfirmed boot, before its gate: another deployment's record of this
+ * image is ABANDONED (D1). The device refuses an assignment of the version
+ * it runs, so the image this boot falls back to is never that record's. */
+static void sx_retire_other_record(void)
+{
+    sx_record_t record;
+    if (!storage_repair_exception_record(&record) ||
+        !sx_record_retire_other(&record, storage_repair_image_tag(), sx_deployment_crc(s_journal.deployment_id)))
+        return;
+    if (!storage_repair_exception_store(&record))
+        (void)add_connector_log("ERROR", "storage", "STORAGE_REPAIR_EXCEPTION_RECORD",
+                                "another deployment's record of this image could not be retired");
 }
 
 /* The budget ran out: a CONFIRMING record is abandoned before the rollback
@@ -1559,6 +1578,9 @@ static bool confirm_or_report_rollback(void)
     int64_t last_step = esp_timer_get_time() / 1000000;
     int64_t last_health_report = 0;
     bool add_acknowledged = false;
+#if OTA_STORAGE_EXCEPTION
+    sx_retire_other_record();
+#endif
     for (;;) {
         int64_t now = esp_timer_get_time() / 1000000;
         if (!add_acknowledged) {

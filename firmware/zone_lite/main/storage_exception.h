@@ -280,6 +280,18 @@ bool sx_exception_active(const sx_record_t *record, uint32_t image_tag, bool run
 /* The record ended this deployment's exception (ABANDONED, UNREPAIRED,
  * UNHEALTHY), so no second exception for it. */
 bool sx_record_ended(const sx_record_t *record, uint32_t deployment_crc);
+/* Review of 26 October, D1: a record of this image left by another
+ * deployment (CONFIRMING written, then a panic or cut before
+ * mark_app_valid: the bootloader rolls back and only the budget path writes
+ * ABANDONED) must not make a later valid boot of the same image an
+ * exception boot. Two places retire it:
+ * - an unconfirmed boot of deployment `deployment_crc`, before its gate:
+ *   another deployment's record of this image becomes ABANDONED (still
+ *   ended for that deployment); true when it changed (the caller stores it);
+ * - every ordinary confirmation: any record of this image other than NONE
+ *   is cleared before esp_ota_mark_app_valid_cancel_rollback. */
+bool sx_record_retire_other(sx_record_t *record, uint32_t image_tag, uint32_t deployment_crc);
+bool sx_record_clear_on_ordinary(const sx_record_t *record, uint32_t image_tag);
 
 /* ---- every boot of a 2.7.7 image with an OTA journal (critiques 13, 14; M4) -- */
 typedef enum {

@@ -626,6 +626,66 @@ static int cuts(void)
     return 0;
 }
 
+/* Review of 26 October, D1: deployment A of 2.7.7 wrote CONFIRMING, then a
+ * panic before mark_app_valid rolled it back (no ABANDONED). Deployment B of
+ * the same image must not inherit A's record, whether B confirms ordinarily
+ * or the image later runs valid some other way. */
+static int stale_record(void)
+{
+    const uint32_t tag = 0x2770U, a = sx_deployment_crc("deployment-A"), b = sx_deployment_crc("deployment-B");
+    sx_record_t stale = {.state = SX_STATE_CONFIRMING, .image_tag = tag, .deployment_crc = a};
+    sx_record_seal(&stale);
+    /* The reviewer's reproduction: nothing ends A's record for B, and a
+     * valid boot of the image reads it as an exception boot. */
+    EXPECT(!sx_record_ended(&stale, b));
+    EXPECT(!sx_exception_active(&stale, tag, true) && sx_exception_active(&stale, tag, false));
+    /* B's unconfirmed boot, before its gate: A's record is ABANDONED (still
+     * ended for A), so no later valid boot of the image is an exception boot. */
+    sx_record_t r = stale;
+    EXPECT(sx_record_retire_other(&r, tag, b));
+    EXPECT(sx_record_valid(&r) && r.state == SX_STATE_ABANDONED && r.deployment_crc == a);
+    EXPECT(sx_record_ended(&r, a) && !sx_record_ended(&r, b));
+    EXPECT(!sx_exception_active(&r, tag, false) && !sx_record_confirmed(&r, tag));
+    EXPECT(!sx_record_retire_other(&r, tag, b));
+    /* Every confirmed state of another deployment is retired; B's own record,
+     * another image's, an unconfirmed state or a torn record is not. */
+    for (int state = SX_STATE_NONE; state < SX_STATE_COUNT; ++state) {
+        r = stale;
+        r.state = (uint8_t)state;
+        sx_record_seal(&r);
+        bool confirmed = sx_record_confirmed(&r, tag);
+        EXPECT(sx_record_retire_other(&r, tag, b) == confirmed);
+        EXPECT(!sx_exception_active(&r, tag, false));
+    }
+    r = stale;
+    EXPECT(!sx_record_retire_other(&r, tag, a) && !sx_record_retire_other(&r, tag + 1, b));
+    EXPECT(r.state == SX_STATE_CONFIRMING);
+    r.crc ^= 1U;
+    EXPECT(!sx_record_retire_other(&r, tag, b));
+    /* An ordinary confirmation clears any record of this image, not only the
+     * CONFIRMING its own boot wrote: after it the image is not an exception
+     * image, the round's restarts never start, and B cannot end FAILED
+     * STORAGE_REPAIR_EXCEPTION_UNREPAIRED. */
+    EXPECT(sx_record_clear_on_ordinary(&stale, tag) && !sx_record_clear_on_ordinary(&stale, tag + 1));
+    sx_record_t cleared = {.state = SX_STATE_NONE, .image_tag = tag, .deployment_crc = b};
+    sx_record_seal(&cleared);
+    EXPECT(!sx_record_clear_on_ordinary(&cleared, tag));
+    EXPECT(!sx_exception_active(&cleared, tag, false));
+    EXPECT(!sx_record_after_boot(&cleared, tag, false, false, SX_ROUND_DEFERRED));
+    uint32_t wait = 0;
+    EXPECT(sx_next_step(&cleared, true, 1900000000U, 7200, &wait) == SX_NEXT_NONE);
+    for (int state = SX_STATE_EVALUATING; state < SX_STATE_COUNT; ++state) {
+        r = stale;
+        r.state = (uint8_t)state;
+        sx_record_seal(&r);
+        EXPECT(sx_record_clear_on_ordinary(&r, tag));
+    }
+    sx_record_t erased;
+    memset(&erased, 0xFF, sizeof(erased));
+    EXPECT(!sx_record_clear_on_ordinary(&erased, tag) && !sx_record_clear_on_ordinary(NULL, tag));
+    return 0;
+}
+
 static int floor_versions(void)
 {
     EXPECT(sx_version_redo_aware("2.7.6") && sx_version_redo_aware("2.7.7") && sx_version_redo_aware("2.7.10"));
@@ -646,7 +706,8 @@ static int floor_versions(void)
 
 int main(void)
 {
-    if (gate_terms() || window() || record() || outcomes() || restarts() || cuts() || floor_versions()) return 1;
+    if (gate_terms() || window() || record() || outcomes() || restarts() || cuts() || stale_record() || floor_versions())
+        return 1;
     printf("storage exception host tests passed (%u checks)\n", checks);
     return 0;
 }

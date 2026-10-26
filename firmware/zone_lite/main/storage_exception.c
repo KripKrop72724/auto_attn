@@ -310,6 +310,19 @@ bool sx_record_ended(const sx_record_t *record, uint32_t deployment_crc)
          record->state == SX_STATE_UNHEALTHY);
 }
 
+bool sx_record_retire_other(sx_record_t *record, uint32_t image_tag, uint32_t deployment_crc)
+{
+    if (!sx_record_confirmed(record, image_tag) || record->deployment_crc == deployment_crc) return false;
+    record->state = SX_STATE_ABANDONED;
+    sx_record_seal(record);
+    return true;
+}
+
+bool sx_record_clear_on_ordinary(const sx_record_t *record, uint32_t image_tag)
+{
+    return sx_record_valid(record) && record->image_tag == image_tag && record->state != SX_STATE_NONE;
+}
+
 /* ---- every boot ------------------------------------------------------------ */
 sx_boot_t sx_boot_action(const char *journal_state, bool running_pending, const sx_record_t *record,
                          uint32_t image_tag, uint32_t deployment_crc)
