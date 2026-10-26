@@ -7,6 +7,11 @@
 #include "esp_spiffs.h"
 #include "storage_exception.h"
 #include "storage_repair.h"
+#include "zkt_legacy_evidence.h"
+#include "cJSON.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/stat.h>
 #endif
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -17,6 +22,157 @@
 
 static uint64_t pending_ticket;
 
+#if defined(ZONE_LITE_STORAGE_REPAIR) && ZONE_LITE_STORAGE_REPAIR
+/* ZKT 2.7.7: bridge-era leftovers (zkt_legacy_evidence.h). The OTA task
+ * builds the inventory; the heartbeat reads the last one. */
+static portMUX_TYPE s_legacy_lock = portMUX_INITIALIZER_UNLOCKED;
+static zle_inventory_t s_legacy;
+static zle_verdict_t s_legacy_verdict;
+static bool s_legacy_known;
+
+static void legacy_nvs(zle_inventory_t *inventory)
+{
+    nvs_handle_t handle;
+    esp_err_t result = nvs_open("zkt_journal", NVS_READONLY, &handle);
+    if (result == ESP_ERR_NVS_NOT_FOUND) return;
+    inventory->namespace_present = true;
+    if (result != ESP_OK) { inventory->root = ZLE_ROOT_UNREADABLE; return; }
+    /* The root holds the journal key: read, classify, erase. */
+    uint8_t root[ZLE_ROOT_BYTES + 1];
+    size_t length = sizeof(root);
+    result = nvs_get_blob(handle, "root", root, &length);
+    if (result == ESP_ERR_NVS_NOT_FOUND) inventory->root = ZLE_ROOT_ABSENT;
+    else if (result == ESP_ERR_NVS_INVALID_LENGTH) inventory->root = ZLE_ROOT_INVALID;
+    else if (result != ESP_OK) inventory->root = ZLE_ROOT_UNREADABLE;
+    else inventory->root = zle_root_classify(root, length);
+    volatile uint8_t *wipe = root;
+    for (size_t i = 0; i < sizeof(root); ++i) wipe[i] = 0;
+    nvs_iterator_t it = NULL;
+    result = nvs_entry_find_in_handle(handle, NVS_TYPE_ANY, &it);
+    unsigned walked = 0;
+    while (result == ESP_OK && walked++ < 64U) {
+        nvs_entry_info_t info;
+        if (nvs_entry_info(it, &info) != ESP_OK) { result = ESP_FAIL; break; }
+        zle_note_key(inventory, info.key);
+        result = nvs_entry_next(&it);
+    }
+    nvs_release_iterator(it);
+    inventory->namespace_listed = result == ESP_ERR_NVS_NOT_FOUND;
+    nvs_close(handle);
+}
+
+/* Every zktj* name of the store, each read in full (at most ZLE_FILES_MAX,
+ * each at most one segment). Under the queue store's read lock, as the
+ * pre-2.7.7 directory walk. Returns the pre-2.7.7 errors for a store that
+ * cannot be listed. */
+static const char *legacy_files(zle_inventory_t *inventory)
+{
+    if (!qs_local_read_begin()) return "JOURNAL_OTA_STORAGE_UNAVAILABLE";
+    const char *error = NULL;
+    uint8_t *buffer = malloc(1024);
+    DIR *directory = buffer ? opendir(ZJ_DEVICE_DIRECTORY) : NULL;
+    if (!directory) error = "JOURNAL_OTA_STORAGE_UNAVAILABLE";
+    else {
+        unsigned count = 0;
+        for (;;) {
+            errno = 0;
+            struct dirent *entry = readdir(directory);
+            if (!entry) {
+                if (errno) error = "JOURNAL_OTA_STORAGE_UNAVAILABLE";
+                break;
+            }
+            if (++count > 1024U) { error = "JOURNAL_OTA_DIRECTORY_LIMIT"; break; }
+            if (strncmp(entry->d_name, ZJ_DEVICE_BASENAME, sizeof(ZJ_DEVICE_BASENAME) - 1)) continue;
+            char path[sizeof(ZJ_DEVICE_DIRECTORY) + 40];
+            struct stat st;
+            uint64_t size = 0, read_bytes = 0;
+            bool read_ok = false;
+            if (snprintf(path, sizeof(path), "%s/%s", ZJ_DEVICE_DIRECTORY, entry->d_name) < (int)sizeof(path) &&
+                !stat(path, &st) && st.st_size >= 0) {
+                size = (uint64_t)st.st_size;
+                if (inventory->files < ZLE_FILES_MAX && size <= ZLE_FILE_BYTES_MAX) {
+                    FILE *file = fopen(path, "rb");
+                    read_ok = file != NULL;
+                    while (read_ok) {
+                        size_t got = fread(buffer, 1, 1024, file);
+                        read_bytes += got;
+                        if (got < 1024) { read_ok = !ferror(file); break; }
+                        if (read_bytes > ZLE_FILE_BYTES_MAX) break;
+                    }
+                    if (file && fclose(file)) read_ok = false;
+                }
+            }
+            zle_note_file(inventory, entry->d_name, size, read_ok, read_bytes);
+        }
+        if (closedir(directory)) error = "JOURNAL_OTA_STORAGE_UNAVAILABLE";
+    }
+    free(buffer);
+    qs_local_end(true, 0); /* Read failure must not become attendance-write loss. */
+    inventory->store_listed = error == NULL;
+    return error;
+}
+
+static const char *legacy_evidence(void)
+{
+    zle_inventory_t inventory = {0};
+    /* zkt_journal_runtime.c's mode(): only the bridge and writer versions
+     * start the journal; every other image's runtime is DISABLED. */
+    const esp_app_desc_t *app = esp_app_get_description();
+    inventory.runtime_disabled = app && !strcmp(app->project_name, "zone_lite") &&
+        strcmp(app->version, ZJ_BRIDGE_VERSION) && strcmp(app->version, ZJ_WRITER_VERSION);
+    inventory.owner_started = zj_owner_started();
+    legacy_nvs(&inventory);
+    const char *error = NULL;
+    /* ZKT 2.7.7 (M5): with the VFS unmounted this boot (the boot repair kept
+     * it off, or it would not mount) the queue store never started: the boot
+     * repair's survey listed every object header, hidden ones too, and any
+     * journal name there still refuses (its files cannot be read now). */
+    if (!esp_spiffs_mounted(NULL)) {
+        bool journal_names = false;
+        if (!storage_repair_survey(&journal_names)) error = "JOURNAL_OTA_STORAGE_UNAVAILABLE";
+        else if (journal_names) error = "JOURNAL_LEGACY_EVIDENCE_PRESENT";
+        else inventory.store_listed = true;
+    } else {
+        error = legacy_files(&inventory);
+    }
+    zle_verdict_t verdict = zle_decide(&inventory);
+    if (!error) error = verdict.error;
+    else if (verdict.state != ZLE_REFUSED || !verdict.error) verdict = (zle_verdict_t){ZLE_REFUSED, error, "STORE_UNREADABLE"};
+    taskENTER_CRITICAL(&s_legacy_lock);
+    s_legacy = inventory;
+    s_legacy_verdict = verdict;
+    s_legacy_known = true;
+    taskEXIT_CRITICAL(&s_legacy_lock);
+    return error;
+}
+
+bool zj_ota_append_legacy_evidence(cJSON *storage)
+{
+    if (!storage) return false;
+    zle_inventory_t inventory;
+    zle_verdict_t verdict;
+    taskENTER_CRITICAL(&s_legacy_lock);
+    bool known = s_legacy_known;
+    inventory = s_legacy;
+    verdict = s_legacy_verdict;
+    taskEXIT_CRITICAL(&s_legacy_lock);
+    if (!known) return true;
+    cJSON *out = cJSON_CreateObject();
+    bool ok = out && cJSON_AddStringToObject(out, "state", zle_state_name(verdict.state)) &&
+        cJSON_AddStringToObject(out, "reason", verdict.reason ? verdict.reason : "UNKNOWN") &&
+        cJSON_AddBoolToObject(out, "namespace", inventory.namespace_present) &&
+        cJSON_AddStringToObject(out, "authority", inventory.namespace_present ? zle_root_name(inventory.root) : "ABSENT") &&
+        cJSON_AddNumberToObject(out, "keys", inventory.keys) &&
+        cJSON_AddBoolToObject(out, "reader_proof", inventory.reader_proof) &&
+        cJSON_AddNumberToObject(out, "files", inventory.files) &&
+        cJSON_AddNumberToObject(out, "bytes", inventory.bytes) &&
+        cJSON_AddNumberToObject(out, "unreadable", inventory.unreadable) &&
+        cJSON_AddBoolToObject(out, "runtime_disabled", inventory.runtime_disabled);
+    if (ok && cJSON_AddItemToObject(storage, "journal_evidence", out)) return true;
+    cJSON_Delete(out);
+    return false;
+}
+#else
 static const char *legacy_evidence(void)
 {
     /* Legacy versions cannot start the journal owner. Even an empty/orphaned
@@ -28,18 +184,6 @@ static const char *legacy_evidence(void)
         return "JOURNAL_LEGACY_EVIDENCE_PRESENT";
     }
     if (result != ESP_ERR_NVS_NOT_FOUND) return "JOURNAL_READER_PROOF_UNAVAILABLE";
-#if defined(ZONE_LITE_STORAGE_REPAIR) && ZONE_LITE_STORAGE_REPAIR
-    /* ZKT 2.7.7 (M5): with the VFS unmounted this boot (the boot repair kept
-     * it off, or it would not mount) the queue store never started, so this
-     * comes before its lock: the boot repair's own survey listed every
-     * object header, hidden ones too. This image never creates a journal
-     * file, so that survey stays true for the boot. No survey, no OTA. */
-    if (!esp_spiffs_mounted(NULL)) {
-        bool journal_names = false;
-        if (!storage_repair_survey(&journal_names)) return "JOURNAL_OTA_STORAGE_UNAVAILABLE";
-        return journal_names ? "JOURNAL_LEGACY_EVIDENCE_PRESENT" : NULL;
-    }
-#endif
     if (!qs_local_read_begin()) return "JOURNAL_OTA_STORAGE_UNAVAILABLE";
     const char *error = NULL;
     DIR *directory = opendir(ZJ_DEVICE_DIRECTORY);
@@ -64,6 +208,7 @@ static const char *legacy_evidence(void)
     qs_local_end(true, 0); /* Read failure must not become attendance-write loss. */
     return error;
 }
+#endif
 
 const char *zj_ota_before_download(uint32_t address, uint32_t size, const char *version)
 {

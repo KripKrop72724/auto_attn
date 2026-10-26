@@ -26,6 +26,7 @@
 #include "storage_exception.h"
 #if defined(ZONE_LITE_STORAGE_REPAIR) && ZONE_LITE_STORAGE_REPAIR
 #include "storage_repair.h"
+#include "zkt_ota_guard.h"
 #endif
 
 #include <ctype.h>
@@ -3108,7 +3109,7 @@ static void append_firmware_diagnostics(cJSON *payload, const add_zkt_telemetry_
          !cJSON_AddStringToObject(storage, "local_failure_last_source", local_failure.last_source)) ||
         !storage_inventory_append(storage)) goto failed;
 #if defined(ZONE_LITE_STORAGE_REPAIR) && ZONE_LITE_STORAGE_REPAIR
-    if (!storage_repair_append(storage)) goto failed;
+    if (!storage_repair_append(storage) || !zj_ota_append_legacy_evidence(storage)) goto failed;
 #endif
     if (!append_worker_diagnostic(workers, "add_delivery", s_outbox_task_handle != NULL,
             s_outbox_tick_ms, s_outbox_buffer_ready ? s_add_worker_operation : ADD_WORKER_RESOURCE)) goto failed;

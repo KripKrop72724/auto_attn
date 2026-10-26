@@ -96,7 +96,8 @@ def test_ota_and_its_guard_never_write_the_store() -> None:
     # unmounted the boot repair's survey answers, after the floor and before
     # the queue store's lock (critique 1, M5).
     evidence = block(GUARD, "static const char *legacy_evidence(void)", "\n}\n")
-    assert evidence.index("esp_spiffs_mounted(NULL)") < evidence.index("qs_local_read_begin()")
+    assert evidence.index("esp_spiffs_mounted(NULL)") < evidence.index("legacy_files(&inventory)")
+    assert "qs_local_read_begin()" in block(GUARD, "static const char *legacy_files(", "\n}\n")
     before = block(GUARD, "const char *zj_ota_before_download(", "if (strcmp(version, ZJ_WRITER_VERSION))")
     assert before.index('"STORAGE_REDO_FLOOR"') < before.index("return legacy_evidence();")
 

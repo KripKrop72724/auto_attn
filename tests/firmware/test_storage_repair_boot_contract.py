@@ -108,7 +108,8 @@ def test_command_inbox_waits_for_storage_and_reports_go_through_the_outbox_task(
     assert step.index("if (!atomic_load(&s_records_pending)) return;") < step.index("heap_caps_malloc(")
     # The evidence buffers live in PSRAM, not on the outbox task's stack.
     assert "char generation[80], record[120], raw[512];" not in glue.replace("    char generation[80], record[120], raw[512];\n} sr_send_t;", "")
-    assert "if (!storage_repair_append(storage)) goto failed;" in connector
+    # ZKT 2.7.7: with the OTA guard's bridge-era journal inventory.
+    assert "if (!storage_repair_append(storage) || !zj_ota_append_legacy_evidence(storage)) goto failed;" in connector
 
 
 def test_rollback_tag_names_the_image_the_bootloader_returns_to() -> None:

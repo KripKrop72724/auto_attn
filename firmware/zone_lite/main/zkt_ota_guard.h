@@ -11,3 +11,9 @@ const char *zj_ota_before_download(uint32_t address, uint32_t size, const char *
 /* ZKT 2.7.7, storage-repair builds: the OTA precheck for this image's own
  * version (the floor and the legacy-evidence check), read once per boot. */
 bool zj_ota_precheck_cached(void);
+
+/* ZKT 2.7.7, storage-repair builds: the last bridge-era journal inventory the
+ * guard took (zkt_legacy_evidence.h) as storage.journal_evidence; nothing
+ * before the guard first ran. False only when the object cannot be built. */
+struct cJSON;
+bool zj_ota_append_legacy_evidence(struct cJSON *storage);

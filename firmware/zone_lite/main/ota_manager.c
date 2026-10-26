@@ -1693,7 +1693,13 @@ static void ota_task(void *argument)
         }
         bool reachable = add_connector_is_connected();
         if (reachable) add_seen_us = esp_timer_get_time();
+#if !OTA_STORAGE_EXCEPTION
+        (void)add_seen_us;
+#endif
 #if OTA_STORAGE_EXCEPTION
+        /* ZKT 2.7.7: the guard's bridge-era inventory once per boot (cached;
+         * a busy store is asked again a minute later), for the heartbeat. */
+        (void)zj_ota_precheck_cached();
         sx_after_confirm_step();
         /* An exception image out of ADD's WebSocket this long still polls OTA
          * (signed HTTPS needs no WebSocket): a failed reconnect must not cut
