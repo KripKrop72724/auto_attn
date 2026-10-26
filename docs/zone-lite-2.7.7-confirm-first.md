@@ -1230,7 +1230,10 @@ still checked first. The verdict and an inventory go into every heartbeat as
 `storage.journal_evidence` (`state` NONE/ACCEPTED/REFUSED, `reason`,
 `namespace`, `authority`, `keys`, `reader_proof`, `files`, `bytes`,
 `unreadable`, `runtime_disabled`), computed once per boot by the OTA task;
-ADD keeps it leniently (an unreadable object is dropped).
+ADD keeps it leniently (an unreadable object is dropped). Only the directory
+walk holds the queue store's lock (as before 2.7.7); the files are sized and
+read after it is released, and read at all only when they can change the
+verdict (16.2 item 6).
 
 3FL itself cannot take 2.7.7 over the air (its running 2.7.2 refuses); the
 runbook's section 4 is the USB procedure.
@@ -1274,6 +1277,38 @@ the owner's one-click **Retry same target** accepts a `FAILED`
 downloads from byte 0 - a new deployment id never resumes), refused after
 two such failures of one release on one ESP until its power and flash are
 checked; a heartbeat still carrying the previous attempt's error (2.7.3
-keeps it in RAM) does not fail an `OFFERED` retry, because that error needs a
-complete download the retry has not reported. The retry-target wording no
+keeps it in RAM) does not fail the retry: not while it is `OFFERED`, and not
+once it is `DOWNLOADING` unless the ESP built the heartbeat after the
+retry's latest download grant (16.2 item 4). The retry-target wording no
 longer mentions a password step-up (removed in #419).
+
+## 16. Review of the 26 October head (aa7b87f): resolutions
+
+Two critiques of `aa7b87f` against `origin/main` `4942ae3`: a custody lens
+(one low defect, two notes) and a device and build lens (six defects). The
+custody lens re-ran the P02 field model and cut sweeps over the confirmed
+round and the rest of the boot (2,120 + 1,256 + 414 cuts, byte-exact, no
+gap record) and found no custody defect; the device lens rebuilt production
+(0 warnings, DIRAM 184,557 B free, IPC 1792, WebSocket 6144 on ZKT only)
+and found no blocking firmware defect. Every point was accepted; each fix is
+proved by a test that fails on `aa7b87f` and passes after.
+
+### 16.1 The custody lens
+
+| # | Finding | Resolution |
+|---|---|---|
+| D1 (low) | A stale `CONFIRMING` record of deployment A (a panic or cut before `mark_app_valid`; only the budget path writes `ABANDONED`) made a later, ordinarily confirmed deployment B of the same image an exception boot: floor latched, `confirm_reason` `STORAGE_REPAIR_EXCEPTION`, restarts, `FAILED` `UNREPAIRED` | **A.** Both fixes the review offered: the ordinary confirmation clears any record of this image (`sx_record_clear_on_ordinary`) before `mark_app_valid`, and an unconfirmed boot retires another deployment's record of this image to `ABANDONED` before its gate (`sx_record_retire_other`). The device refuses an assignment of the version it runs, so the image such a boot falls back to is never the record's. Host test `stale_record` (the reviewer's reproduction, then each state) fails on aa7b87f |
+| N1 | Full `zktj*` reads under the queue-store lock could make a live append wait past its 1 s | **A**, with device-lens D6 below |
+| N2 | The P02 histogram-fit assertion fails for review build salts 11 and 23 (99 index blocks) | **A.** The fit applies to CI's build (salt 0); a review salt prints the histogram and keeps every custody check. `REVIEW_BUILD_SALT=11` failed on aa7b87f and passes |
+
+### 16.2 The device and build lens
+
+| # | Finding | Resolution |
+|---|---|---|
+| 1 (medium) | The 3FL runbook said a 2.7.7 that fails Secure Boot falls back to 2.7.2; IDF's bootloader tries the slots below the selected one down to **factory** first, and the runbook skipped verification in Secure Download Mode | **A.** Runbook 4: Secure Download Mode is stop-and-escalate (owner's written acceptance only); otherwise `write_flash`'s `Hash of data verified.` and `verify_flash` must pass before otadata is touched; the fallback order is stated; the factory image is read and recorded first |
+| 2 (low/medium) | The otadata write always used `0x17000`, which may hold the entry in use | **A.** The runbook's script finds the valid entry in use (CRC, not `INVALID`/`ABORTED`, highest `ota_seq`), writes `seq + 1` to the other sector, and the re-dumped sector is checked; tested on synthetic dumps including 3FL's `ABORTED` 2.7.1 entry |
+| 3 (low) | The partition-table dump read `0x8000` | **A.** `0x10000` (`CONFIG_PARTITION_TABLE_OFFSET`), and the table is checked |
+| 4 (low) | A heartbeat built before the retry's grant, processed after its first 64 KiB report, failed a `DOWNLOADING` retry with the previous attempt's `PARTITION_HASH_FAILED` | **A.** `unverified_image_current`: for `DOWNLOADING` the error counts only from a heartbeat the ESP built after the deployment's latest download grant (`_built_after`'s uptime rule); `OFFERED` keeps the old rule. `test_a_stale_unverified_error_built_before_the_retry_grant_does_not_fail_a_downloading_retry` fails on aa7b87f |
+| 5 (low) | Runbook 5 promised one-click retries for both Swat-01 and Quetta-01; in one campaign only the deployment whose failure paused it can be retried | **A.** Runbook 5 says so: the second device gets a new campaign (or each its own campaign). No ADD change |
+| 6 (low) | The guard held the queue-store lock across `stat`, `fopen` and full reads of every `zktj*` file, also when the verdict already refused | **A.** Only the directory walk holds the lock; names are kept (at most 16), then sized and read after it is released, and read only when `zle_contents_matter` (pure, host tested: whenever it says no, the verdict refuses whatever the files hold); the walk and read times are logged. The host test fails on aa7b87f's always-read behaviour |
+

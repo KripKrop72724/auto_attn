@@ -206,44 +206,86 @@ eFuses. 2.7.2 stays in its slot for rollback.
 **At the ESP (native USB; keep the site supply connected too):**
 
 1. Read-only first: `esptool.py --chip esp32s3 -p PORT get_security_info`.
-   Expect Secure Boot on and no flash encryption, like the fleet. If it
-   reports Secure Download Mode, ROM flash reads and MD5 checks are
-   unavailable: skip the dumps below (nothing they would protect is written).
-   Otherwise, optionally, read-only dumps for the record:
-   `read_flash 0x8000 0x1000 pt.bin`, `read_flash 0x17000 0x2000 otadata.bin`,
-   `read_flash 0x11000 0x6000 nvs.bin`.
+   Expect Secure Boot on and no flash encryption, like the fleet. **If it
+   reports Secure Download Mode, stop and escalate:** esptool can then
+   neither read flash nor verify a write: the otadata sector in use is
+   unknown (writing that one, a power cut mid-write leaves only the older
+   entry), and with 2.7.7 on `ota_0` a write that does not verify boots the
+   factory image (step 4). Go on only with the owner's written acceptance of
+   both, naming the factory image from the fleet record.
+   Otherwise take these read-only dumps (required):
+   `read_flash 0x10000 0x1000 pt.bin` (the partition table:
+   `CONFIG_PARTITION_TABLE_OFFSET` is `0x10000`), `read_flash 0x17000 0x2000
+   otadata.bin`, `read_flash 0x11000 0x6000 nvs.bin` and
+   `read_flash 0x20000 0x100 factory.bin`. Check the table
+   (`gen_esp32part.py pt.bin`: factory `0x20000`, `ota_0` `0x2A0000`, `ota_1`
+   `0x520000`, storage `0x7A0000`; stop if not) and record the factory image:
+
+   ```
+   python3 -c "import sys; d=open(sys.argv[1],'rb').read(); print(d[0x20:0x24].hex(), d[0x30:0x50].split(b'\0')[0], d[0x50:0x70].split(b'\0')[0])" factory.bin
+   ```
+
+   (`3254cdab`, then its version and project; the fleet's factory slots hold
+   signed images, 2.5.2 or a rescue image.)
 2. Write the application to the **inactive** slot only:
-   `esptool.py --chip esp32s3 -p PORT --after no_reset write_flash <0x2A0000|0x520000> zone-lite-2.7.7.bin`
-   (`--no-stub` if the tool asks; in Secure Download Mode esptool cannot
-   verify by MD5 - the bootloader's Secure Boot check does on boot). If this
-   write fails, stop: selection is unchanged and 2.7.2 still boots.
-3. Select it. Build the 4 KiB first otadata sector: one 32-byte entry, then
-   `0xFF`. The entry: `ota_seq` (LE u32), 20 bytes `0xFF`, `ota_state` 2
-   (`ESP_OTA_IMG_VALID`, LE u32), `crc` = CRC-32 of the 4 `ota_seq` bytes
-   seeded `0xFFFFFFFF` (as IDF's `otatool.py`). The slot is
-   `(ota_seq - 1) % 2`: use `ota_seq` `0x00100001` for `ota_0`, `0x00100002`
-   for `ota_1` - far above any sequence 3FL has used, so this entry wins over
-   the other sector's:
+   `esptool.py --chip esp32s3 -p PORT --after no_reset write_flash <0x2A0000|0x520000> zone-lite-2.7.7.bin`.
+   Its output must end with `Hash of data verified.`; then
+   `esptool.py --chip esp32s3 -p PORT --after no_reset verify_flash <same address> zone-lite-2.7.7.bin`
+   must report `verify OK (digest matched)`. If the write or either check
+   fails, stop: selection is unchanged and 2.7.2 still boots (the same write
+   may be repeated).
+3. Select it, in the otadata sector that is **not** in use. IDF keeps two
+   4 KiB sectors (`0x17000`, `0x18000`) and alternates them; the bootloader
+   uses the valid entry (CRC good, state neither `INVALID` 3 nor `ABORTED` 4)
+   with the higher `ota_seq`, and the slot is `(ota_seq - 1) % 2`. Writing
+   the other sector leaves the entry in use intact if the power fails
+   mid-write (2.7.2 still boots). From the dump:
 
    ```
-   python3 -c "import struct,zlib,sys; s=int(sys.argv[1],0); e=struct.pack('<I',s)+b'\xff'*20+struct.pack('<II',2,zlib.crc32(struct.pack('<I',s),0xFFFFFFFF)); open('otadata0.bin','wb').write(e+b'\xff'*(4096-len(e)))" 0x00100001
-   esptool.py --chip esp32s3 -p PORT write_flash 0x17000 otadata0.bin
+   python3 - otadata.bin <<'EOF'
+   import struct, sys, zlib
+   data = open(sys.argv[1], 'rb').read()
+   assert len(data) == 0x2000
+   crc = lambda seq: zlib.crc32(struct.pack('<I', seq), 0xFFFFFFFF)
+   def entry(i):
+       seq, state, check = struct.unpack_from('<I20xII', data, i * 0x1000)
+       return seq if seq != 0xFFFFFFFF and check == crc(seq) and state not in (3, 4) else None
+   valid = [(seq, i) for i, seq in enumerate((entry(0), entry(1))) if seq is not None]
+   assert valid, 'no valid otadata entry: stop'
+   seq, sector = max(valid)
+   print('in use: sector', hex(0x17000 + 0x1000 * sector), 'ota_seq', seq, 'selects ota_%d' % ((seq - 1) % 2))
+   new = seq + 1
+   e = struct.pack('<I', new) + b'\xff' * 20 + struct.pack('<II', 2, crc(new))
+   open('otadata_new.bin', 'wb').write(e + b'\xff' * (4096 - len(e)))
+   print('write otadata_new.bin at', hex(0x17000 + 0x1000 * (1 - sector)), 'ota_seq', new, 'selects ota_%d' % ((new - 1) % 2))
+   EOF
    ```
 
-   State `VALID`, not `NEW`: with no OTA journal 2.7.7 would never confirm a
-   `NEW` image and the next reset would return to 2.7.2. Do not use
+   Stop if the slot "in use" is not 3FL's running slot (`ota.running_partition`)
+   or the new entry does not select the slot written in step 2. Then
+   `esptool.py --chip esp32s3 -p PORT --after no_reset write_flash <printed address> otadata_new.bin`,
+   dump `0x17000 0x2000` again and re-run the script on it: the sector just
+   written must now be "in use" and select the 2.7.7 slot.
+
+   State `VALID` (2), not `NEW`: with no OTA journal 2.7.7 would never confirm
+   a `NEW` image and the next reset would return to 2.7.2. Do not use
    `otatool.py switch_ota_partition` here: it keeps the target sector's old
    `ota_state`, which on 3FL may be an `ABORTED` entry from the 2.7.1 attempt.
-4. Reset (`esptool.py ... --after hard_reset` or the board's reset). If the
-   image failed Secure Boot verification the bootloader falls back to the
-   other slot (2.7.2): read the console and stop. A `VALID` entry has no
-   automatic rollback: if 2.7.7 boots but resets repeatedly or does not
-   reach ADD within 10 minutes, capture the USB console and apply the USB
-   rollback below only if the console shows no `STORAGE_REPAIR_RECLAIM ...
-   blocks reformatted in place` or `STORAGE_REPAIR_RECLAIM_REDONE` line
-   (a confirmed image may run 2.7.6's round at boot; 3FL's store is
-   `HEALTHY` beforehand, so none is expected). If a round ran, stop and
-   escalate: 2.7.2 cannot read the redo area.
+4. Reset (`esptool.py ... --after hard_reset` or the board's reset). A
+   verified write does not fail Secure Boot short of a flash fault, but if
+   the selected image cannot be loaded the ESP-IDF bootloader does **not**
+   go to the other slot first: it tries the slots below the selected one,
+   down to factory, then those above it. With 2.7.7 on `ota_0` that is the
+   **factory** image recorded in step 1, then `ota_1`; with 2.7.7 on `ota_1`,
+   `ota_0` (2.7.2) first. If the console shows any image other than 2.7.7,
+   write the rollback entry below at once and escalate with the console log.
+   A `VALID` entry has no automatic rollback: if 2.7.7 boots but resets
+   repeatedly or does not reach ADD within 10 minutes, capture the USB
+   console and apply the USB rollback below only if the console shows no
+   `STORAGE_REPAIR_RECLAIM ... blocks reformatted in place` or
+   `STORAGE_REPAIR_RECLAIM_REDONE` line (a confirmed image may run 2.7.6's
+   round at boot; 3FL's store is `HEALTHY` beforehand, so none is expected).
+   If a round ran, stop and escalate: 2.7.2 cannot read the redo area.
 
 **After (on ADD):**
 
@@ -258,16 +300,23 @@ eFuses. 2.7.2 stays in its slot for rollback.
    `ONLINE`.
 
 **Rollback by USB** (only while `reclaim.ota_floor` is false - never once the
-redo area holds records, which 2.7.2 cannot read): the same otadata write
-with the next sequence for 2.7.2's slot (`0x00100002` after `0x00100001`, or
-`0x00100003` after `0x00100002`).
+redo area holds records, which 2.7.2 cannot read): dump `0x17000 0x2000`
+again and run the step 3 script on it; it now finds 2.7.7's entry in use and
+writes the next `ota_seq`, which selects 2.7.2's slot, into the other sector.
+Check, write, dump and re-run exactly as in step 3.
 
 ## 5. Swat 01 and Quetta 01: PARTITION_HASH_FAILED
 
 On 26 October both (2.7.3) downloaded all of 2.7.6 and the written slot did
 not verify. With 2.7.7's ADD deployed, each `FAILED` `PARTITION_HASH_FAILED`
-deployment offers **Retry same target**: one click makes a fresh deployment,
-which the ESP downloads from byte 0 (a new deployment never resumes). A
+deployment can be retried with **Retry same target**: one click makes a
+fresh deployment, which the ESP downloads from byte 0 (a new deployment
+never resumes). The retry needs the campaign paused *by that deployment's*
+failure: if both devices failed in one campaign, only the first failure's
+deployment offers it (the second is refused because the pause reason names
+the first), and once that retry resumes the campaign the second cannot be
+retried with one click - give the second device a new campaign after the
+first is resolved (or put each device in its own campaign from the start). A
 second failure of the same release on the same ESP stops retries until its
 power and flash are checked. Quetta-01 also had 104 panics in 113 boots
 (the last a `StoreProhibited` in the `ota_manager` task on 2.7.3): read its
