@@ -70,5 +70,12 @@ void zle_note_key(zle_inventory_t *inventory, const char *key);
  * (read_ok false on any read error). */
 void zle_note_file(zle_inventory_t *inventory, const char *name, uint64_t size, bool read_ok, uint64_t read_bytes);
 zle_verdict_t zle_decide(const zle_inventory_t *inventory);
+/* Whether the files' sizes and contents can still change the verdict, with
+ * the NVS facts and the running image known and `names` zktj* names listed:
+ * false when it refuses whatever the files hold (a running journal, an ADD
+ * or malformed root, an unknown key, files without a legacy root, too many
+ * names). The guard reads the files only when true (review of 26 October,
+ * D6: no full reads for a verdict already decided). */
+bool zle_contents_matter(const zle_inventory_t *inventory, uint32_t names);
 const char *zle_root_name(zle_root_t root);
 const char *zle_state_name(zle_state_t state);

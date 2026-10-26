@@ -206,6 +206,40 @@ int main(void)
     if (expect_refused(none, "JOURNAL_OTA_STORAGE_UNAVAILABLE", "STORE_UNREADABLE")) return 1;
     EXPECT(zle_decide(NULL).state == ZLE_REFUSED);
 
+    /* Review of 26 October, D6: the guard reads the files only when their
+     * contents can change the verdict; when they cannot, the verdict refuses
+     * whatever they hold (so skipping the reads never accepts). */
+    zle_inventory_t facts = threefl();
+    facts.files = facts.bytes = 0;
+    EXPECT(zle_contents_matter(&facts, 1) && zle_contents_matter(&facts, ZLE_FILES_MAX));
+    EXPECT(zle_contents_matter(&facts, 0) && !zle_contents_matter(&facts, ZLE_FILES_MAX + 1));
+    EXPECT(!zle_contents_matter(NULL, 1));
+    for (unsigned variant = 0; variant < 7; ++variant) {
+        in = facts;
+        unsigned files = 1;
+        switch (variant) {
+        case 0: in.runtime_disabled = false; break;
+        case 1: in.owner_started = true; break;
+        case 2: in.root = ZLE_ROOT_ADD; break;
+        case 3: in.root = ZLE_ROOT_INVALID; break;
+        case 4: zle_note_key(&in, "source_v1"); break;
+        case 5: in.root = ZLE_ROOT_ABSENT; break;
+        default: files = ZLE_FILES_MAX + 1; break;
+        }
+        EXPECT(!zle_contents_matter(&in, files));
+        for (unsigned i = 0; i < files; ++i) zle_note_file(&in, "zktj0000000000000001.j", 240, true, 240);
+        EXPECT(zle_decide(&in).state == ZLE_REFUSED);
+    }
+    /* Contents that matter are still read: a damaged segment refuses. */
+    in = facts;
+    EXPECT(zle_contents_matter(&in, 1));
+    zle_note_file(&in, "zktj0000000000000001.j", 4096, false, 1024);
+    if (expect_refused(in, "JOURNAL_LEGACY_EVIDENCE_PRESENT", "FILE_UNREADABLE")) return 1;
+    /* The check reads the facts, not the files noted so far. */
+    in = facts;
+    zle_note_file(&in, "zktj0000000000000001.j", 4096, false, 1024);
+    EXPECT(zle_contents_matter(&in, 1));
+
     /* Names. */
     EXPECT(!strcmp(zle_root_name(ZLE_ROOT_LEGACY), "LEGACY") && !strcmp(zle_root_name(ZLE_ROOT_ADD), "ADD"));
     EXPECT(!strcmp(zle_state_name(ZLE_ACCEPTED), "ACCEPTED") && !strcmp(zle_state_name(ZLE_REFUSED), "REFUSED"));

@@ -9,6 +9,7 @@
 #include "storage_repair.h"
 #include "zkt_legacy_evidence.h"
 #include "cJSON.h"
+#include "esp_log.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/stat.h>
@@ -25,6 +26,7 @@ static uint64_t pending_ticket;
 #if defined(ZONE_LITE_STORAGE_REPAIR) && ZONE_LITE_STORAGE_REPAIR
 /* ZKT 2.7.7: bridge-era leftovers (zkt_legacy_evidence.h). The OTA task
  * builds the inventory; the heartbeat reads the last one. */
+static const char *TAG = "zkt_ota_guard";
 static portMUX_TYPE s_legacy_lock = portMUX_INITIALIZER_UNLOCKED;
 static zle_inventory_t s_legacy;
 static zle_verdict_t s_legacy_verdict;
@@ -61,16 +63,29 @@ static void legacy_nvs(zle_inventory_t *inventory)
     nvs_close(handle);
 }
 
+#define LEGACY_NAME_BYTES 40U
+
 /* Every zktj* name of the store, each read in full (at most ZLE_FILES_MAX,
- * each at most one segment). Under the queue store's read lock, as the
- * pre-2.7.7 directory walk. Returns the pre-2.7.7 errors for a store that
- * cannot be listed. */
+ * each at most one segment). Only the directory walk holds the queue store's
+ * read lock, as before 2.7.7: live appends wait at most 1 s for it (review of
+ * 26 October, D6/N1). Sizes and contents are read after it is released -
+ * nothing writes a journal file while this image's journal runtime is
+ * disabled - and only when they can change the verdict (an ADD root, an
+ * unknown key or a running journal already refuses). Returns the pre-2.7.7
+ * errors for a store that cannot be listed. */
 static const char *legacy_files(zle_inventory_t *inventory)
 {
-    if (!qs_local_read_begin()) return "JOURNAL_OTA_STORAGE_UNAVAILABLE";
+    char (*names)[LEGACY_NAME_BYTES] = calloc(ZLE_FILES_MAX, LEGACY_NAME_BYTES);
+    uint8_t *buffer = names ? malloc(1024) : NULL;
+    if (!buffer || !qs_local_read_begin()) {
+        free(buffer);
+        free(names);
+        return "JOURNAL_OTA_STORAGE_UNAVAILABLE";
+    }
+    int64_t started = esp_timer_get_time();
     const char *error = NULL;
-    uint8_t *buffer = malloc(1024);
-    DIR *directory = buffer ? opendir(ZJ_DEVICE_DIRECTORY) : NULL;
+    uint32_t kept = 0, seen = 0;
+    DIR *directory = opendir(ZJ_DEVICE_DIRECTORY);
     if (!directory) error = "JOURNAL_OTA_STORAGE_UNAVAILABLE";
     else {
         unsigned count = 0;
@@ -83,32 +98,50 @@ static const char *legacy_files(zle_inventory_t *inventory)
             }
             if (++count > 1024U) { error = "JOURNAL_OTA_DIRECTORY_LIMIT"; break; }
             if (strncmp(entry->d_name, ZJ_DEVICE_BASENAME, sizeof(ZJ_DEVICE_BASENAME) - 1)) continue;
-            char path[sizeof(ZJ_DEVICE_DIRECTORY) + 40];
-            struct stat st;
-            uint64_t size = 0, read_bytes = 0;
-            bool read_ok = false;
-            if (snprintf(path, sizeof(path), "%s/%s", ZJ_DEVICE_DIRECTORY, entry->d_name) < (int)sizeof(path) &&
-                !stat(path, &st) && st.st_size >= 0) {
-                size = (uint64_t)st.st_size;
-                if (inventory->files < ZLE_FILES_MAX && size <= ZLE_FILE_BYTES_MAX) {
-                    FILE *file = fopen(path, "rb");
-                    read_ok = file != NULL;
-                    while (read_ok) {
-                        size_t got = fread(buffer, 1, 1024, file);
-                        read_bytes += got;
-                        if (got < 1024) { read_ok = !ferror(file); break; }
-                        if (read_bytes > ZLE_FILE_BYTES_MAX) break;
-                    }
-                    if (file && fclose(file)) read_ok = false;
-                }
-            }
-            zle_note_file(inventory, entry->d_name, size, read_ok, read_bytes);
+            ++seen;
+            /* Past the limit, or a name too long to open: counted, never read
+             * (FILE_LIMIT or FILE_UNREADABLE refuses). */
+            if (kept < ZLE_FILES_MAX && strlen(entry->d_name) < LEGACY_NAME_BYTES)
+                strlcpy(names[kept++], entry->d_name, LEGACY_NAME_BYTES);
+            else zle_note_file(inventory, entry->d_name, 0, false, 0);
         }
         if (closedir(directory)) error = "JOURNAL_OTA_STORAGE_UNAVAILABLE";
     }
-    free(buffer);
     qs_local_end(true, 0); /* Read failure must not become attendance-write loss. */
+    int64_t walked = esp_timer_get_time();
+    bool read = !error && zle_contents_matter(inventory, seen);
+    for (uint32_t i = 0; !error && i < kept; ++i) {
+        char path[sizeof(ZJ_DEVICE_DIRECTORY) + LEGACY_NAME_BYTES];
+        struct stat st;
+        uint64_t size = 0, read_bytes = 0;
+        bool read_ok = false;
+        snprintf(path, sizeof(path), "%s/%s", ZJ_DEVICE_DIRECTORY, names[i]);
+        if (!stat(path, &st) && st.st_size >= 0) {
+            size = (uint64_t)st.st_size;
+            if (!read) {
+                /* The verdict refuses whatever the file holds: sized, not read. */
+                read_ok = true;
+                read_bytes = size;
+            } else if (size <= ZLE_FILE_BYTES_MAX) {
+                FILE *file = fopen(path, "rb");
+                read_ok = file != NULL;
+                while (read_ok) {
+                    size_t got = fread(buffer, 1, 1024, file);
+                    read_bytes += got;
+                    if (got < 1024) { read_ok = !ferror(file); break; }
+                    if (read_bytes > ZLE_FILE_BYTES_MAX) break;
+                }
+                if (file && fclose(file)) read_ok = false;
+            }
+        }
+        zle_note_file(inventory, names[i], size, read_ok, read_bytes);
+    }
+    free(buffer);
+    free(names);
     inventory->store_listed = error == NULL;
+    ESP_LOGI(TAG, "journal evidence: %lu zktj name(s), walk %lld ms under the queue lock, %s %lld ms",
+             (unsigned long)seen, (long long)((walked - started) / 1000), read ? "read" : "sized",
+             (long long)((esp_timer_get_time() - walked) / 1000));
     return error;
 }
 

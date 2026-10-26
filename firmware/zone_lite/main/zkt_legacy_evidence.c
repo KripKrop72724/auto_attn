@@ -96,6 +96,16 @@ zle_verdict_t zle_decide(const zle_inventory_t *in)
     return verdict(ZLE_ACCEPTED, NULL, "BRIDGE_LEFTOVERS");
 }
 
+bool zle_contents_matter(const zle_inventory_t *in, uint32_t names)
+{
+    if (!in) return false;
+    zle_inventory_t names_only = *in;
+    names_only.store_listed = true;
+    names_only.files = names;
+    names_only.bytes = names_only.not_segment = names_only.unreadable = names_only.oversized = 0;
+    return zle_decide(&names_only).state != ZLE_REFUSED;
+}
+
 const char *zle_root_name(zle_root_t root)
 {
     switch (root) {
