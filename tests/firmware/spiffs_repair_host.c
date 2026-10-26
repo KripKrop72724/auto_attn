@@ -5669,6 +5669,27 @@ static srx_test_t p02field_area_test(void)
  * cap the way P02's first 2.7.7 boot will (design 14.2 item 6). */
 #define P02F_DIR_FILES 32U
 static uint32_t p02field_larger_files; /* listed files larger than /add_corrupt.bak */
+/* ZKT 2.7.8: the errno ESP-IDF's VFS sets for a SPIFFS error
+ * (components/spiffs/esp_spiffs.c spiffs_res_to_errno, v5.5.3): a span whose
+ * index entry points at a deleted page reads SPIFFS_ERR_DELETED, so ENOENT.
+ * 2.7.7's harness read every failure as EIO and so never met Peshawar-02's
+ * refusal. */
+static int idf_errno(s32_t res)
+{
+    switch (res) {
+    case SPIFFS_OK: return 0;
+    case SPIFFS_ERR_NOT_MOUNTED: case SPIFFS_ERR_NOT_A_FS: return ENODEV;
+    case SPIFFS_ERR_FULL: return ENOSPC;
+    case SPIFFS_ERR_BAD_DESCRIPTOR: return EBADF;
+    case SPIFFS_ERR_MOUNTED: case SPIFFS_ERR_FILE_EXISTS: return EEXIST;
+    case SPIFFS_ERR_NOT_FOUND: case SPIFFS_ERR_NOT_A_FILE: case SPIFFS_ERR_DELETED: case SPIFFS_ERR_FILE_DELETED:
+        return ENOENT;
+    case SPIFFS_ERR_NAME_TOO_LONG: return ENAMETOOLONG;
+    case SPIFFS_ERR_RO_NOT_IMPL: case SPIFFS_ERR_RO_ABORTED_OPERATION: return EROFS;
+    default: return EIO;
+    }
+}
+static uint32_t p02field_span_errors[3]; /* the last inventory's span reads: EIO, ENOENT, other */
 static bool p02field_priority(const sx_repair_t *r, const char *bare)
 {
     for (uint32_t i = 0; r && i < r->file_count && i < SX_REPAIR_FILES; ++i)
@@ -5687,6 +5708,7 @@ static void p02field_inventory(sx_inventory_t *v, const sx_repair_t *repair)
     memset(v, 0, sizeof(*v));
     memset(all, 0, sizeof(all));
     memset(priority, 0, sizeof(priority));
+    memset(p02field_span_errors, 0, sizeof(p02field_span_errors));
     mount_plain();
     spiffs_DIR dir;
     struct spiffs_dirent entry;
@@ -5702,7 +5724,8 @@ static void p02field_inventory(sx_inventory_t *v, const sx_repair_t *repair)
         f->bytes = entry.size;
         spiffs_file fd = SPIFFS_open(&fs, (const char *)entry.name, SPIFFS_O_RDONLY, 0);
         if (fd < 0) {
-            f->first_error = ENOENT;
+            f->first_error = idf_errno(SPIFFS_errno(&fs));
+            f->first_error = f->first_error ? f->first_error : EIO;
             f->unreadable_bytes = entry.size;
             f->other_unreadable = true;
             SPIFFS_clearerr(&fs);
@@ -5712,15 +5735,20 @@ static void p02field_inventory(sx_inventory_t *v, const sx_repair_t *repair)
             uint32_t want = entry.size - at < SPAN ? entry.size - at : SPAN;
             SPIFFS_lseek(&fs, fd, (s32_t)at, SPIFFS_SEEK_SET);
             if (SPIFFS_read(&fs, fd, buffer, (s32_t)want) == (s32_t)want) continue;
+            int error = idf_errno(SPIFFS_errno(&fs));
+            error = error ? error : EIO;
             SPIFFS_clearerr(&fs);
             if (!f->first_error) {
-                f->first_error = EIO;
+                f->first_error = error;
                 f->first_error_offset = at;
             }
             f->unreadable_bytes += want;
             f->unreadable_spans++;
             f->last_error_offset = at;
             f->span_digest = span_digest_add(f->span_digest, at / SPAN);
+            if (error == ENOENT) f->span_errors_enoent++;
+            else if (error != EIO) f->span_errors_other++;
+            p02field_span_errors[error == EIO ? 0 : error == ENOENT ? 1 : 2]++;
         }
         SPIFFS_close(&fs, fd);
         v->unreadable_files += f->first_error != 0;
@@ -7185,6 +7213,16 @@ static void run_reclaim_p02field(uint32_t kib, uint32_t variant)
     CHECK(test == SRX_TEST_PASSED, "p02field: the area test %s", srx_test_name(test));
     if (variant == P02F_HIDDEN) p02field_area_test_cuts();
     sx_reason_t gate = p02field_gate(u, test);
+    uint32_t span_eio = p02field_span_errors[0], span_enoent = p02field_span_errors[1],
+             span_other = p02field_span_errors[2];
+    printf("p02field %s: the VFS reads %u held spans EIO, %u ENOENT, %u other\n", names[variant], span_eio,
+           span_enoent, span_other);
+    /* 2.7.8: read as ESP-IDF's VFS reads them, P02's held spans (each index
+     * entry pointing at a deleted page) fail with ENOENT, some or all of
+     * them; 2.7.7 refused that INVENTORY_UNEXPLAINED in the field. Nothing
+     * reads with another errno. */
+    CHECK(!span_other && (kib < 8192 || span_enoent), "p02field %s: %u EIO, %u ENOENT, %u other span reads",
+          names[variant], span_eio, span_enoent, span_other);
     /* The report cap is really exercised (design 14.2 item 6) in the
      * cluttered variants: the directory holds more files than the device
      * reports and enough files are larger than the one-row /add_corrupt.bak
@@ -7348,6 +7386,8 @@ static void run_p02field_refusals(uint32_t kib)
     CHECK(p02field_gate(&r277, SRX_TEST_PASSED) == SX_OK, "p02field refusals: the gate on the ordinary boot");
     CHECK(p02field_gate(&r277, SRX_TEST_FAILED) == SX_AREA_TEST, "p02field refusals: a failed area test");
     CHECK(p02field_gate(&r277, SRX_TEST_NO_SLOT) == SX_AREA_TEST, "p02field refusals: no slot for the area test");
+    /* 2.7.8: a test that did not run with every other term holding. */
+    CHECK(p02field_gate(&r277, SRX_TEST_NOT_RUN) == SX_AREA_TEST, "p02field refusals: an area test that did not run");
     snapshot_t unconfirmed = snapshot_take();
     /* Too little memory to hold the queue: the gate refuses on the run's own
      * report, and the store is again 2.7.6's. */
@@ -7359,6 +7399,11 @@ static void run_p02field_refusals(uint32_t kib)
     sx_reason_t gate = p02field_gate(&r, SRX_TEST_PASSED);
     CHECK(r.files_unheld_custody > 0 && gate == SX_CUSTODY_UNHELD && !r.reclaim.blocks,
           "p02field refusals: %u custody files unheld, the gate says %s", r.files_unheld_custody, sx_reason_name(gate));
+    /* 2.7.8 (13FL): the boot skips the area test on such a report; the gate
+     * names the term that kept it from running, not AREA_TEST. */
+    gate = p02field_gate(&r, SRX_TEST_NOT_RUN);
+    CHECK(gate == SX_CUSTODY_UNHELD, "p02field refusals: with the area test not run the gate says %s",
+          sx_reason_name(gate));
     /* The exception's round boot whose run cannot hold every custody file. */
     snapshot_put(&unconfirmed);
     srr_config_t round = config_2770(false);

@@ -29,12 +29,20 @@ typedef struct {
     uint32_t first_error_offset;
     int first_error; /* errno of the first failed open or read; 0 when fully readable */
     /* ZKT 2.7.7: the data spans that would not read back one at a time (each
-     * a failed span read, errno in span_errors_other when not EIO): how many,
-     * the last one's offset and an order-free digest of their indices
-     * (span_digest.h), so the confirm-first exception can compare them with
-     * the spans the boot repair holds on flash. other_unreadable: bytes lost
-     * any other way (an open or stat failure, a file ending before its size). */
-    uint32_t unreadable_spans, last_error_offset, span_digest, span_errors_other;
+     * a failed span read): how many, the last one's offset and an order-free
+     * digest of their indices (span_digest.h), so the confirm-first exception
+     * can compare them with the spans the boot repair holds on flash.
+     * other_unreadable: bytes lost any other way (an open or stat failure, a
+     * file ending before its size). */
+    uint32_t unreadable_spans, last_error_offset, span_digest;
+    /* ZKT 2.7.8: the span reads by errno. ESP-IDF's VFS maps SPIFFS_ERR_DELETED
+     * and SPIFFS_ERR_NOT_FOUND to ENOENT and every other SPIFFS error to EIO;
+     * a span whose index entry points at a deleted page (an interrupted GC
+     * move, Peshawar-02) reads ENOENT. span_errors_enoent counts those;
+     * span_errors_other counts every errno that is neither EIO nor ENOENT,
+     * the first of them in span_other_error at span_other_offset. */
+    uint32_t span_errors_enoent, span_errors_other, span_other_offset;
+    int span_other_error;
     bool other_unreadable;
     /* ZKT 2.7.7: one of the caller's priority names (the boot repair's
      * custody files), guaranteed a report slot ahead of merely larger files

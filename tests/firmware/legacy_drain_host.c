@@ -84,9 +84,10 @@ static int restore_stat(const char *path,struct stat *st)
 #undef stat
 static void ords_drain_preserved_deferred(const char *stage,int error)
 { assert(!storage_lock);(void)stage;(void)error;faults++; }
-/* ZKT 2.7.7: a deferral of a failed read names its errno and offset. */
-static void ords_drain_deferred(const char *stage,int error,int read_error,uint32_t read_offset)
-{ (void)read_error;(void)read_offset;ords_drain_preserved_deferred(stage,error); }
+/* ZKT 2.7.7: a deferral of a failed read names its errno and offset; 2.7.8:
+ * and whether it came from a read or seek of the opened file. */
+static void ords_drain_deferred(const char *stage,int error,int read_error,bool from_read,uint32_t read_offset)
+{ (void)read_error;(void)from_read;(void)read_offset;ords_drain_preserved_deferred(stage,error); }
 static int legacy_pending_load(void *context,lq_checkpoint_t *cp)
 { (void)context;*cp=durable;return exists?1:0; }
 static bool legacy_pending_commit(void *context,const lq_checkpoint_t *cp)

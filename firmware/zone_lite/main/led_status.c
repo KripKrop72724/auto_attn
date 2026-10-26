@@ -365,10 +365,10 @@ void led_status_fault_errno_at(led_status_t status, int error, const char *file,
     fault(status, file, line, error == ENOSPC ? LED_CAUSE_ROOM : LED_CAUSE_OTHER, LED_QUEUE_COUNT, 0);
 }
 
-void led_status_fault_read_at(led_status_t status, int error, led_queue_t queue, uint32_t offset, const char *file,
-                              int line)
+void led_status_fault_read_at(led_status_t status, int error, bool from_read, led_queue_t queue, uint32_t offset,
+                              const char *file, int line)
 {
-    bool held = error == EIO && (unsigned)queue < LED_QUEUE_COUNT;
+    bool held = (error == EIO || (error == ENOENT && from_read)) && (unsigned)queue < LED_QUEUE_COUNT;
     fault(status, file, line, held ? LED_CAUSE_HELD_READ : LED_CAUSE_OTHER, queue, offset);
 }
 

@@ -1086,7 +1086,23 @@ static struct {
     uint32_t logged_s;
     sx_reason_t logged_reason;
     char reconciling_status[48];
+    /* ZKT 2.7.8: every term failing at the last evaluation (bit 1 << reason)
+     * and the inventory's condition behind INVENTORY_UNEXPLAINED; diagnostics
+     * only, the decision is sx_evaluate's. */
+    uint64_t terms;
+    sx_why_t why;
 } s_sx = {.passive = -1};
+
+/* " DETAIL" when the reason is INVENTORY_UNEXPLAINED and its condition is
+ * known, else "". Static text (the OTA task's stack is the TLS handshake's). */
+static const char *sx_detail_suffix(sx_reason_t reason)
+{
+    static char text[24];
+    text[0] = '\0';
+    if (reason == SX_INVENTORY_UNEXPLAINED && s_sx.why.detail != SX_DETAIL_NONE)
+        snprintf(text, sizeof(text), " %s", sx_detail_name(s_sx.why.detail));
+    return text;
+}
 
 static uint32_t uptime_s(void) { return (uint32_t)(esp_timer_get_time() / 1000000); }
 
@@ -1190,8 +1206,12 @@ static void sx_note(sx_reason_t reason)
     s_sx.reason = reason;
     if (reason == s_sx.logged_reason || (s_sx.logged_s && now - s_sx.logged_s < SX_LOG_SECONDS)) return;
     char message[160];
-    snprintf(message, sizeof(message), "%s: %s; boot-health terms failing 0x%08lx", sx_state_name(state),
-             sx_reason_name(reason), (unsigned long)s_sx.blockers);
+    const char *detail = sx_detail_suffix(reason);
+    snprintf(message, sizeof(message), "%s: %s%s%s%s; terms failing 0x%06lx%08lx; boot-health terms failing 0x%08lx",
+             sx_state_name(state), sx_reason_name(reason), detail,
+             detail[0] && s_sx.why.file[0] ? " " : "", detail[0] ? s_sx.why.file : "",
+             (unsigned long)(s_sx.terms >> 32), (unsigned long)(s_sx.terms & 0xffffffffU),
+             (unsigned long)s_sx.blockers);
     (void)add_connector_log(state == SX_STATE_REFUSED ? "WARN" : "INFO", "storage",
                             state == SX_STATE_REFUSED ? "STORAGE_REPAIR_EXCEPTION_REFUSED" :
                                                         "STORAGE_REPAIR_EXCEPTION_ELIGIBLE", message);
@@ -1250,16 +1270,25 @@ typedef enum { SX_STEP_WAIT = 0, SX_STEP_CONFIRMED, SX_STEP_FAILED } sx_step_t;
  * (once), the evidence ADD stores, the receipted BOOTED_PENDING ADD allows,
  * the gate again with the store unchanged and the budget left, then valid,
  * the record CONFIRMED, the journal RECONCILING. */
+/* The gate's verdict now (sx_evaluate decides), and every failing term with
+ * the inventory's condition for the reports (2.7.8). */
+static __attribute__((noinline)) sx_reason_t sx_judge(const sx_input_t *in)
+{
+    sx_reason_t verdict = sx_evaluate(in);
+    (void)sx_evaluate_terms(in, &s_sx.terms, &s_sx.why);
+    return verdict;
+}
+
 static __attribute__((noinline)) sx_step_t sx_confirm_step(const boot_confirm_t *progress, uint32_t stepped_s)
 {
     sx_input_t in;
     sx_store_t store;
     if (!sx_collect(&in, &store)) return SX_STEP_WAIT;
-    sx_reason_t verdict = sx_evaluate(&in);
+    sx_reason_t verdict = sx_judge(&in);
     if (verdict == SX_CAPABILITY && in.runtime->add_connected) {
         s_capability_reported = report_capability();
         s_sx.inputs->runtime.capability_accepted = s_capability_reported;
-        verdict = sx_evaluate(&in);
+        verdict = sx_judge(&in);
     }
     sx_reason_t step = sx_window_step(&s_sx.window, verdict, uptime_s(), &store);
     sx_note(step);
@@ -1303,7 +1332,7 @@ static __attribute__((noinline)) sx_step_t sx_confirm_step(const boot_confirm_t 
     /* The last look: the gate holds now, nothing wrote the store since the
      * window opened, and the budget is not spent (M6). */
     uint32_t spent = uptime_s() - stepped_s;
-    sx_reason_t last = !sx_collect(&in, &store) ? SX_STORAGE_UNKNOWN : sx_evaluate(&in);
+    sx_reason_t last = !sx_collect(&in, &store) ? SX_STORAGE_UNKNOWN : sx_judge(&in);
     if (last == SX_OK && !sx_window_same(&s_sx.window, &store)) last = SX_STORE_CHANGED;
     if (last == SX_OK && (progress->active_seconds + spent >= BOOT_CONFIRM_ACTIVE_SECONDS ||
                           progress->elapsed_seconds + spent >= BOOT_CONFIRM_MAX_SECONDS))
@@ -1368,8 +1397,8 @@ static void sx_retire_other_record(void)
 static void sx_rollback_note(char *message, size_t bytes)
 {
     if (s_sx.confirming_written) (void)sx_store_record(SX_STATE_ABANDONED);
-    if (s_sx.evaluated) snprintf(message, bytes, "storage exception %s: %s", sx_state_name(s_sx.state),
-                                 sx_reason_name(s_sx.reason));
+    if (s_sx.evaluated) snprintf(message, bytes, "storage exception %s: %s%s", sx_state_name(s_sx.state),
+                                 sx_reason_name(s_sx.reason), sx_detail_suffix(s_sx.reason));
 }
 
 /* The controlled restart (M3): counted in the record before the safepoint
@@ -1530,6 +1559,22 @@ static void sx_append_telemetry(cJSON *ota)
         (!have || (cJSON_AddNumberToObject(sx, "restarts", record.restarts) &&
                    cJSON_AddNumberToObject(sx, "round_boots", record.round_boots) &&
                    cJSON_AddNumberToObject(sx, "crashes", record.crashes)));
+    /* 2.7.8: every term failing at the last evaluation (bit 1 << reason, in
+     * sx_reason_name order) and the inventory's condition behind
+     * INVENTORY_UNEXPLAINED with its file. */
+    if (ok && s_sx.evaluated && !active && s_sx.terms)
+        ok = cJSON_AddNumberToObject(sx, "terms", (double)s_sx.terms) != NULL;
+    if (ok && s_sx.evaluated && !active && s_sx.why.detail != SX_DETAIL_NONE &&
+        (s_sx.terms & (1ULL << SX_INVENTORY_UNEXPLAINED))) {
+        /* The OTA task may be rewriting it: a copy, printable and terminated. */
+        char file[sizeof(s_sx.why.file)];
+        memcpy(file, s_sx.why.file, sizeof(file));
+        file[sizeof(file) - 1] = '\0';
+        for (char *c = file; *c; ++c)
+            if ((unsigned char)*c < 0x20 || (unsigned char)*c > 0x7e) *c = '?';
+        ok = cJSON_AddStringToObject(sx, "detail", sx_detail_name(s_sx.why.detail)) &&
+            (!file[0] || cJSON_AddStringToObject(sx, "detail_file", file));
+    }
     if (ok && active) ok = cJSON_AddStringToObject(ota, "confirm_reason", "STORAGE_REPAIR_EXCEPTION") != NULL;
     if (ok && s_sx.evaluated && !active && s_sx.blockers) {
         cJSON *list = cJSON_AddArrayToObject(ota, "boot_health_blockers");
@@ -1645,8 +1690,9 @@ static bool confirm_or_report_rollback(void)
             /* ZKT 2.7.7: the operator sees the gate's state on the deployment. */
             char status[96] = "";
             if (s_sx.evaluated)
-                snprintf(status, sizeof(status), "storage exception %s: %s for %lu s", sx_state_name(s_sx.state),
-                         sx_reason_name(s_sx.reason), (unsigned long)(uptime_s() - s_sx.since_s));
+                snprintf(status, sizeof(status), "storage exception %s: %s%s for %lu s", sx_state_name(s_sx.state),
+                         sx_reason_name(s_sx.reason), sx_detail_suffix(s_sx.reason),
+                         (unsigned long)(uptime_s() - s_sx.since_s));
             cJSON *receipt = NULL;
             (void)report_progress("BOOTED_PENDING", "WAITING_FOR_RUNTIME_HEALTH", status, &receipt);
             cJSON_Delete(receipt);

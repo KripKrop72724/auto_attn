@@ -130,155 +130,177 @@ static void p02(void)
                          .repair = &repair, .inventory = &inventory, .runtime = &runtime};
 }
 
+/* ZKT 2.7.8: sx_evaluate_terms gives sx_evaluate's reason, and its mask
+ * holds that reason (the decision never depends on the diagnostics). */
+static int mismatches;
+static sx_reason_t both(const sx_input_t *in)
+{
+    sx_reason_t first = sx_evaluate(in);
+    uint64_t mask = 0;
+    sx_why_t why;
+    sx_reason_t again = sx_evaluate_terms(in, &mask, &why);
+    if (again != first || (first == SX_OK) != (mask == 0) || (first != SX_OK && !(mask & (1ULL << first)))) {
+        fprintf(stderr, "terms disagree: %s vs %s, mask 0x%llx\n", sx_reason_name(first), sx_reason_name(again),
+                (unsigned long long)mask);
+        ++mismatches;
+    }
+    if (first == SX_INVENTORY_UNEXPLAINED && why.detail == SX_DETAIL_NONE) {
+        fprintf(stderr, "INVENTORY_UNEXPLAINED without a detail\n");
+        ++mismatches;
+    }
+    return first;
+}
+
 static int gate_terms(void)
 {
     p02();
-    EXPECT_REASON(sx_evaluate(&input), SX_OK);
+    EXPECT_REASON(both(&input), SX_OK);
     /* Which boots. */
-    p02(); input.production_role = false; EXPECT_REASON(sx_evaluate(&input), SX_ROLE);
-    p02(); input.running_pending = false; EXPECT_REASON(sx_evaluate(&input), SX_NOT_PENDING);
-    p02(); input.ota_deployment = false; EXPECT_REASON(sx_evaluate(&input), SX_NOT_OTA_IMAGE);
-    p02(); input.record_terminal = true; EXPECT_REASON(sx_evaluate(&input), SX_ALREADY_USED);
+    p02(); input.production_role = false; EXPECT_REASON(both(&input), SX_ROLE);
+    p02(); input.running_pending = false; EXPECT_REASON(both(&input), SX_NOT_PENDING);
+    p02(); input.ota_deployment = false; EXPECT_REASON(both(&input), SX_NOT_OTA_IMAGE);
+    p02(); input.record_terminal = true; EXPECT_REASON(both(&input), SX_ALREADY_USED);
     /* The boot repair. */
-    p02(); repair.ran = false; EXPECT_REASON(sx_evaluate(&input), SX_REPAIR_MISSING);
-    p02(); repair.pending_verify = false; EXPECT_REASON(sx_evaluate(&input), SX_NOT_PENDING);
-    p02(); repair.previous_failed = true; EXPECT_REASON(sx_evaluate(&input), SX_REPAIR_GUARD);
-    p02(); strcpy(repair.mode, "REPORT_ONLY"); EXPECT_REASON(sx_evaluate(&input), SX_REPAIR_GUARD);
-    p02(); repair.mount_failed = true; EXPECT_REASON(sx_evaluate(&input), SX_REPAIR_RESULT);
-    p02(); strcpy(repair.result, "FAILED"); EXPECT_REASON(sx_evaluate(&input), SX_REPAIR_RESULT);
-    p02(); strcpy(repair.result, "REPAIRED"); EXPECT_REASON(sx_evaluate(&input), SX_REPAIR_RESULT);
-    p02(); repair.storage_allowed = false; EXPECT_REASON(sx_evaluate(&input), SX_STORE_NOT_MOUNTED);
-    p02(); strcpy(repair.error_stage, "time"); EXPECT_REASON(sx_evaluate(&input), SX_REPAIR_STAGE);
-    p02(); strcpy(repair.trigger, "gc_unsafe"); EXPECT_REASON(sx_evaluate(&input), SX_REPAIR_STAGE);
-    p02(); repair.error_code = -10010; EXPECT_REASON(sx_evaluate(&input), SX_REPAIR_STAGE);
+    p02(); repair.ran = false; EXPECT_REASON(both(&input), SX_REPAIR_MISSING);
+    p02(); repair.pending_verify = false; EXPECT_REASON(both(&input), SX_NOT_PENDING);
+    p02(); repair.previous_failed = true; EXPECT_REASON(both(&input), SX_REPAIR_GUARD);
+    p02(); strcpy(repair.mode, "REPORT_ONLY"); EXPECT_REASON(both(&input), SX_REPAIR_GUARD);
+    p02(); repair.mount_failed = true; EXPECT_REASON(both(&input), SX_REPAIR_RESULT);
+    p02(); strcpy(repair.result, "FAILED"); EXPECT_REASON(both(&input), SX_REPAIR_RESULT);
+    p02(); strcpy(repair.result, "REPAIRED"); EXPECT_REASON(both(&input), SX_REPAIR_RESULT);
+    p02(); repair.storage_allowed = false; EXPECT_REASON(both(&input), SX_STORE_NOT_MOUNTED);
+    p02(); strcpy(repair.error_stage, "time"); EXPECT_REASON(both(&input), SX_REPAIR_STAGE);
+    p02(); strcpy(repair.trigger, "gc_unsafe"); EXPECT_REASON(both(&input), SX_REPAIR_STAGE);
+    p02(); repair.error_code = -10010; EXPECT_REASON(both(&input), SX_REPAIR_STAGE);
     p02(); strcpy(repair.error_stage, "gc_unsafe"); strcpy(repair.trigger, "gc_unsafe");
-    EXPECT_REASON(sx_evaluate(&input), SX_OK);
-    p02(); strcpy(repair.area, "FOREIGN"); EXPECT_REASON(sx_evaluate(&input), SX_AREA_NOT_READY);
-    p02(); strcpy(repair.area_test, "FAILED"); EXPECT_REASON(sx_evaluate(&input), SX_AREA_TEST);
-    p02(); repair.area_test[0] = '\0'; EXPECT_REASON(sx_evaluate(&input), SX_AREA_TEST);
-    p02(); strcpy(repair.short_reason, "slots"); EXPECT_REASON(sx_evaluate(&input), SX_SHORT_REASON);
-    p02(); repair.rounds = 1; EXPECT_REASON(sx_evaluate(&input), SX_ROUND_RAN);
-    p02(); repair.blocks = 1; EXPECT_REASON(sx_evaluate(&input), SX_ROUND_RAN);
-    p02(); repair.failed = 1; EXPECT_REASON(sx_evaluate(&input), SX_RECLAIM_FAULT);
-    p02(); repair.held_mismatch = 1; EXPECT_REASON(sx_evaluate(&input), SX_RECLAIM_FAULT);
-    p02(); repair.records_open = 1; EXPECT_REASON(sx_evaluate(&input), SX_RECLAIM_FAULT);
-    p02(); repair.reported = 1; EXPECT_REASON(sx_evaluate(&input), SX_RECLAIM_FAULT);
-    p02(); repair.sources = 1; EXPECT_REASON(sx_evaluate(&input), SX_RECLAIM_FAULT);
-    p02(); repair.store_blocked = true; EXPECT_REASON(sx_evaluate(&input), SX_RECLAIM_FAULT);
-    p02(); repair.waiting = 1; EXPECT_REASON(sx_evaluate(&input), SX_RECLAIM_FAULT);
-    p02(); repair.manifest_active = true; EXPECT_REASON(sx_evaluate(&input), SX_MANIFEST);
-    p02(); repair.mount_measured = false; EXPECT_REASON(sx_evaluate(&input), SX_ARRIVED_WITH_ROOM);
+    EXPECT_REASON(both(&input), SX_OK);
+    p02(); strcpy(repair.area, "FOREIGN"); EXPECT_REASON(both(&input), SX_AREA_NOT_READY);
+    p02(); strcpy(repair.area_test, "FAILED"); EXPECT_REASON(both(&input), SX_AREA_TEST);
+    p02(); repair.area_test[0] = '\0'; EXPECT_REASON(both(&input), SX_AREA_TEST);
+    p02(); strcpy(repair.short_reason, "slots"); EXPECT_REASON(both(&input), SX_SHORT_REASON);
+    p02(); repair.rounds = 1; EXPECT_REASON(both(&input), SX_ROUND_RAN);
+    p02(); repair.blocks = 1; EXPECT_REASON(both(&input), SX_ROUND_RAN);
+    p02(); repair.failed = 1; EXPECT_REASON(both(&input), SX_RECLAIM_FAULT);
+    p02(); repair.held_mismatch = 1; EXPECT_REASON(both(&input), SX_RECLAIM_FAULT);
+    p02(); repair.records_open = 1; EXPECT_REASON(both(&input), SX_RECLAIM_FAULT);
+    p02(); repair.reported = 1; EXPECT_REASON(both(&input), SX_RECLAIM_FAULT);
+    p02(); repair.sources = 1; EXPECT_REASON(both(&input), SX_RECLAIM_FAULT);
+    p02(); repair.store_blocked = true; EXPECT_REASON(both(&input), SX_RECLAIM_FAULT);
+    p02(); repair.waiting = 1; EXPECT_REASON(both(&input), SX_RECLAIM_FAULT);
+    p02(); repair.manifest_active = true; EXPECT_REASON(both(&input), SX_MANIFEST);
+    p02(); repair.mount_measured = false; EXPECT_REASON(both(&input), SX_ARRIVED_WITH_ROOM);
     /* A store that arrived with the room the work needs was filled by this
      * image's own run: a broken image must not confirm (critique 10). */
-    p02(); repair.erased_at_mount = 34; EXPECT_REASON(sx_evaluate(&input), SX_ARRIVED_WITH_ROOM);
-    p02(); repair.erased_at_mount = 33; EXPECT_REASON(sx_evaluate(&input), SX_OK);
-    p02(); repair.check_deleted_live = 1; EXPECT_REASON(sx_evaluate(&input), SX_CHECK_DELETED);
-    p02(); repair.check_delete_bad_file = 1; EXPECT_REASON(sx_evaluate(&input), SX_CHECK_DELETED);
+    p02(); repair.erased_at_mount = 34; EXPECT_REASON(both(&input), SX_ARRIVED_WITH_ROOM);
+    p02(); repair.erased_at_mount = 33; EXPECT_REASON(both(&input), SX_OK);
+    p02(); repair.check_deleted_live = 1; EXPECT_REASON(both(&input), SX_CHECK_DELETED);
+    p02(); repair.check_delete_bad_file = 1; EXPECT_REASON(both(&input), SX_CHECK_DELETED);
     /* Custody. */
-    p02(); repair.files_unheld_custody = 1; EXPECT_REASON(sx_evaluate(&input), SX_CUSTODY_UNHELD);
-    p02(); repair.file[0].unheld = true; EXPECT_REASON(sx_evaluate(&input), SX_CUSTODY_UNHELD);
-    p02(); repair.gaps = 1; EXPECT_REASON(sx_evaluate(&input), SX_CUSTODY_LOST);
-    p02(); repair.unreadable_bytes = 1; EXPECT_REASON(sx_evaluate(&input), SX_CUSTODY_LOST);
-    p02(); repair.records_dropped = 1; EXPECT_REASON(sx_evaluate(&input), SX_CUSTODY_LOST);
-    p02(); repair.interrupted_losses = 1; EXPECT_REASON(sx_evaluate(&input), SX_CUSTODY_LOST);
-    p02(); repair.commands_damaged = true; EXPECT_REASON(sx_evaluate(&input), SX_CUSTODY_LOST);
-    p02(); repair.records_pending = 1; EXPECT_REASON(sx_evaluate(&input), SX_RECORDS_UNACKED);
+    p02(); repair.files_unheld_custody = 1; EXPECT_REASON(both(&input), SX_CUSTODY_UNHELD);
+    p02(); repair.file[0].unheld = true; EXPECT_REASON(both(&input), SX_CUSTODY_UNHELD);
+    p02(); repair.gaps = 1; EXPECT_REASON(both(&input), SX_CUSTODY_LOST);
+    p02(); repair.unreadable_bytes = 1; EXPECT_REASON(both(&input), SX_CUSTODY_LOST);
+    p02(); repair.records_dropped = 1; EXPECT_REASON(both(&input), SX_CUSTODY_LOST);
+    p02(); repair.interrupted_losses = 1; EXPECT_REASON(both(&input), SX_CUSTODY_LOST);
+    p02(); repair.commands_damaged = true; EXPECT_REASON(both(&input), SX_CUSTODY_LOST);
+    p02(); repair.records_pending = 1; EXPECT_REASON(both(&input), SX_RECORDS_UNACKED);
     /* Room. Every counted custody block drops a page: 67 blocks, 34 short. */
-    p02(); repair.want = 0; EXPECT_REASON(sx_evaluate(&input), SX_ROOM_UNKNOWN);
-    p02(); repair.custody_gain = 33; EXPECT_REASON(sx_evaluate(&input), SX_CUSTODY_SHORT);
-    p02(); repair.custody_gain = 34; EXPECT_REASON(sx_evaluate(&input), SX_OK);
-    p02(); repair.custody_blocks = 0; EXPECT_REASON(sx_evaluate(&input), SX_CUSTODY_BLOCKS);
-    p02(); repair.custody_blocks = 257; EXPECT_REASON(sx_evaluate(&input), SX_CUSTODY_BLOCKS);
+    p02(); repair.want = 0; EXPECT_REASON(both(&input), SX_ROOM_UNKNOWN);
+    p02(); repair.custody_gain = 33; EXPECT_REASON(both(&input), SX_CUSTODY_SHORT);
+    p02(); repair.custody_gain = 34; EXPECT_REASON(both(&input), SX_OK);
+    p02(); repair.custody_blocks = 0; EXPECT_REASON(both(&input), SX_CUSTODY_BLOCKS);
+    p02(); repair.custody_blocks = 257; EXPECT_REASON(both(&input), SX_CUSTODY_BLOCKS);
     /* The inventory against the held spans (C4, critique 8). */
-    p02(); inventory.done = false; EXPECT_REASON(sx_evaluate(&input), SX_INVENTORY_PENDING);
+    p02(); inventory.done = false; EXPECT_REASON(both(&input), SX_INVENTORY_PENDING);
     EXPECT(sx_reason_unknown(SX_INVENTORY_PENDING));
-    p02(); inventory.complete = false; EXPECT_REASON(sx_evaluate(&input), SX_INVENTORY_UNEXPLAINED);
-    p02(); inventory.error = EIO; EXPECT_REASON(sx_evaluate(&input), SX_INVENTORY_UNEXPLAINED);
-    p02(); inventory.unreadable_files = 17; EXPECT_REASON(sx_evaluate(&input), SX_INVENTORY_UNEXPLAINED);
-    p02(); inventory.unreadable_files = 2; EXPECT_REASON(sx_evaluate(&input), SX_INVENTORY_UNEXPLAINED);
-    p02(); inventory.file[0].first_error = ENOENT; EXPECT_REASON(sx_evaluate(&input), SX_INVENTORY_UNEXPLAINED);
-    p02(); inventory.file[0].other_unreadable = true; EXPECT_REASON(sx_evaluate(&input), SX_INVENTORY_UNEXPLAINED);
-    p02(); inventory.file[0].span_errors_other = 1; EXPECT_REASON(sx_evaluate(&input), SX_INVENTORY_UNEXPLAINED);
+    p02(); inventory.complete = false; EXPECT_REASON(both(&input), SX_INVENTORY_UNEXPLAINED);
+    p02(); inventory.error = EIO; EXPECT_REASON(both(&input), SX_INVENTORY_UNEXPLAINED);
+    p02(); inventory.unreadable_files = 17; EXPECT_REASON(both(&input), SX_INVENTORY_UNEXPLAINED);
+    p02(); inventory.unreadable_files = 2; EXPECT_REASON(both(&input), SX_INVENTORY_UNEXPLAINED);
+    p02(); inventory.file[0].first_error = ENOENT; EXPECT_REASON(both(&input), SX_INVENTORY_UNEXPLAINED);
+    p02(); inventory.file[0].other_unreadable = true; EXPECT_REASON(both(&input), SX_INVENTORY_UNEXPLAINED);
+    p02(); inventory.file[0].span_errors_other = 1; EXPECT_REASON(both(&input), SX_INVENTORY_UNEXPLAINED);
     /* One unheld unreadable span among the held ones: the count, the first,
      * the last or the digest differs. */
     p02(); inventory.file[0].unreadable_spans = 52; inventory.file[0].unreadable_bytes += 251;
-    EXPECT_REASON(sx_evaluate(&input), SX_INVENTORY_UNEXPLAINED);
-    p02(); inventory.file[0].first_error_offset -= 251; EXPECT_REASON(sx_evaluate(&input), SX_INVENTORY_UNEXPLAINED);
-    p02(); inventory.file[0].last_error_offset += 251; EXPECT_REASON(sx_evaluate(&input), SX_INVENTORY_UNEXPLAINED);
+    EXPECT_REASON(both(&input), SX_INVENTORY_UNEXPLAINED);
+    p02(); inventory.file[0].first_error_offset -= 251; EXPECT_REASON(both(&input), SX_INVENTORY_UNEXPLAINED);
+    p02(); inventory.file[0].last_error_offset += 251; EXPECT_REASON(both(&input), SX_INVENTORY_UNEXPLAINED);
     /* The same count, first and last, one span moved inside: the digest. */
     p02(); inventory.file[0].span_digest = span_digest_add(p02_digest() - span_digest_add(0, 1990), 2100);
-    EXPECT_REASON(sx_evaluate(&input), SX_INVENTORY_UNEXPLAINED);
-    p02(); inventory.file[0].unreadable_bytes = 50 * 251; EXPECT_REASON(sx_evaluate(&input), SX_INVENTORY_UNEXPLAINED);
+    EXPECT_REASON(both(&input), SX_INVENTORY_UNEXPLAINED);
+    p02(); inventory.file[0].unreadable_bytes = 50 * 251; EXPECT_REASON(both(&input), SX_INVENTORY_UNEXPLAINED);
     /* Another file unreadable, which the repair does not hold. */
     p02(); inventory.unreadable_files = 2; inventory.file[1].first_error = EIO; inventory.file[1].unreadable_spans = 1;
-    inventory.file[1].unreadable_bytes = 251; EXPECT_REASON(sx_evaluate(&input), SX_INVENTORY_UNEXPLAINED);
+    inventory.file[1].unreadable_bytes = 251; EXPECT_REASON(both(&input), SX_INVENTORY_UNEXPLAINED);
     /* A held file that now reads whole: the sets differ. */
     p02(); memset(&inventory.file[0].unreadable_bytes, 0, sizeof(inventory.file[0]) - offsetof(sx_inventory_file_t, unreadable_bytes));
     inventory.file[0].bytes = 2526978; inventory.unreadable_files = 0;
-    EXPECT_REASON(sx_evaluate(&input), SX_INVENTORY_UNEXPLAINED);
+    EXPECT_REASON(both(&input), SX_INVENTORY_UNEXPLAINED);
     /* A custody file the repair reported is gone or shorter (critique 7). */
     p02(); strcpy(inventory.file[0].name, "pending.old"); inventory.unreadable_files = 1;
-    EXPECT_REASON(sx_evaluate(&input), SX_INVENTORY_UNEXPLAINED);
+    EXPECT_REASON(both(&input), SX_INVENTORY_UNEXPLAINED);
     p02(); repair.file_count = 2; strcpy(repair.file[1].name, "/acked_uids.txt"); repair.file[1].custody = true;
-    repair.file[1].size = 200001; EXPECT_REASON(sx_evaluate(&input), SX_CUSTODY_MISSING);
-    repair.file[1].size = 200000; EXPECT_REASON(sx_evaluate(&input), SX_OK);
-    repair.file[1].removed = true; repair.file[1].size = 900000; EXPECT_REASON(sx_evaluate(&input), SX_OK);
+    repair.file[1].size = 200001; EXPECT_REASON(both(&input), SX_CUSTODY_MISSING);
+    repair.file[1].size = 200000; EXPECT_REASON(both(&input), SX_OK);
+    repair.file[1].removed = true; repair.file[1].size = 900000; EXPECT_REASON(both(&input), SX_OK);
     p02(); repair.file_count = 2; strcpy(repair.file[1].name, "/add_cancelled.txt"); repair.file[1].custody = true;
-    EXPECT_REASON(sx_evaluate(&input), SX_CUSTODY_MISSING);
+    EXPECT_REASON(both(&input), SX_CUSTODY_MISSING);
     /* Runtime storage evidence: only "no room" (S2, H2). */
-    p02(); runtime.spiffs_mounted = false; EXPECT_REASON(sx_evaluate(&input), SX_STORE_NOT_MOUNTED);
-    p02(); runtime.qs_known = false; EXPECT_REASON(sx_evaluate(&input), SX_STORAGE_UNKNOWN);
+    p02(); runtime.spiffs_mounted = false; EXPECT_REASON(both(&input), SX_STORE_NOT_MOUNTED);
+    p02(); runtime.qs_known = false; EXPECT_REASON(both(&input), SX_STORAGE_UNKNOWN);
     EXPECT(sx_reason_unknown(SX_STORAGE_UNKNOWN));
-    p02(); runtime.qs_available = false; EXPECT_REASON(sx_evaluate(&input), SX_STORAGE_ERROR_CLASS);
-    p02(); runtime.probe_operation = "persistence_open_read"; EXPECT_REASON(sx_evaluate(&input), SX_PROBE_ERROR_CLASS);
-    p02(); runtime.probe_error = EIO; EXPECT_REASON(sx_evaluate(&input), SX_PROBE_ERROR_CLASS);
+    p02(); runtime.qs_available = false; EXPECT_REASON(both(&input), SX_STORAGE_ERROR_CLASS);
+    p02(); runtime.probe_operation = "persistence_open_read"; EXPECT_REASON(both(&input), SX_PROBE_ERROR_CLASS);
+    p02(); runtime.probe_error = EIO; EXPECT_REASON(both(&input), SX_PROBE_ERROR_CLASS);
     p02(); runtime.probe_error = ENOSPC; runtime.probe_operation = "persistence_capacity";
-    EXPECT_REASON(sx_evaluate(&input), SX_OK);
+    EXPECT_REASON(both(&input), SX_OK);
     p02(); runtime.probe_error = ENOENT; runtime.probe_operation = "persistence_capacity";
-    EXPECT_REASON(sx_evaluate(&input), SX_PROBE_ERROR_CLASS);
+    EXPECT_REASON(both(&input), SX_PROBE_ERROR_CLASS);
     p02(); runtime.probe_operation = "persistence_nvs_commit"; runtime.probe_error = ENOSPC;
-    EXPECT_REASON(sx_evaluate(&input), SX_PROBE_ERROR_CLASS);
-    p02(); runtime.last_error = ENOENT; EXPECT_REASON(sx_evaluate(&input), SX_STORAGE_ERROR_CLASS);
-    p02(); runtime.last_error = EIO; EXPECT_REASON(sx_evaluate(&input), SX_STORAGE_ERROR_CLASS);
-    p02(); runtime.last_error = EBADMSG; EXPECT_REASON(sx_evaluate(&input), SX_STORAGE_ERROR_CLASS);
-    p02(); runtime.last_operation = "segment_read"; EXPECT_REASON(sx_evaluate(&input), SX_STORAGE_ERROR_CLASS);
-    p02(); runtime.last_operation = "capacity_admission"; EXPECT_REASON(sx_evaluate(&input), SX_OK);
-    p02(); runtime.last_error = 0; runtime.probe_error = 0; EXPECT_REASON(sx_evaluate(&input), SX_OK);
+    EXPECT_REASON(both(&input), SX_PROBE_ERROR_CLASS);
+    p02(); runtime.last_error = ENOENT; EXPECT_REASON(both(&input), SX_STORAGE_ERROR_CLASS);
+    p02(); runtime.last_error = EIO; EXPECT_REASON(both(&input), SX_STORAGE_ERROR_CLASS);
+    p02(); runtime.last_error = EBADMSG; EXPECT_REASON(both(&input), SX_STORAGE_ERROR_CLASS);
+    p02(); runtime.last_operation = "segment_read"; EXPECT_REASON(both(&input), SX_STORAGE_ERROR_CLASS);
+    p02(); runtime.last_operation = "capacity_admission"; EXPECT_REASON(both(&input), SX_OK);
+    p02(); runtime.last_error = 0; runtime.probe_error = 0; EXPECT_REASON(both(&input), SX_OK);
     /* The LED (S3, H1): every incident classified, by errno at the site. */
-    p02(); runtime.led_known = false; EXPECT_REASON(sx_evaluate(&input), SX_STORAGE_UNKNOWN);
-    p02(); runtime.led_fatal = true; EXPECT_REASON(sx_evaluate(&input), SX_LED_FATAL);
-    p02(); runtime.local_failures = 3; EXPECT_REASON(sx_evaluate(&input), SX_LED_CAUSE);
+    p02(); runtime.led_known = false; EXPECT_REASON(both(&input), SX_STORAGE_UNKNOWN);
+    p02(); runtime.led_fatal = true; EXPECT_REASON(both(&input), SX_LED_FATAL);
+    p02(); runtime.local_failures = 3; EXPECT_REASON(both(&input), SX_LED_CAUSE);
     p02(); runtime.local_failures = 3; runtime.held_read_failures = 1; runtime.held_read_queues = 1U << 0;
-    EXPECT_REASON(sx_evaluate(&input), SX_OK);
+    EXPECT_REASON(both(&input), SX_OK);
     /* A read failure of a queue the repair does not report blocked. */
     p02(); runtime.local_failures = 3; runtime.held_read_failures = 1; runtime.held_read_queues = 1U << 1;
-    EXPECT_REASON(sx_evaluate(&input), SX_LED_CAUSE);
+    EXPECT_REASON(both(&input), SX_LED_CAUSE);
     p02(); runtime.local_failures = 3; runtime.held_read_failures = 1; runtime.held_read_queues = 1U << 7;
-    EXPECT_REASON(sx_evaluate(&input), SX_LED_CAUSE);
+    EXPECT_REASON(both(&input), SX_LED_CAUSE);
     /* A held read must start at or before the last held span (H1): the
      * last span's first byte to its last byte, not past it. */
     p02(); runtime.local_failures = 3; runtime.held_read_failures = 1; runtime.held_read_queues = 1U << 0;
-    runtime.held_read_last[0] = (1968 + 50) * 251 + 250; EXPECT_REASON(sx_evaluate(&input), SX_OK);
-    runtime.held_read_last[0]++; EXPECT_REASON(sx_evaluate(&input), SX_LED_CAUSE);
+    runtime.held_read_last[0] = (1968 + 50) * 251 + 250; EXPECT_REASON(both(&input), SX_OK);
+    runtime.held_read_last[0]++; EXPECT_REASON(both(&input), SX_LED_CAUSE);
     /* Every other boot-health term (3.7). */
-    p02(); runtime.health_known = false; EXPECT_REASON(sx_evaluate(&input), SX_HEALTH_UNKNOWN);
+    p02(); runtime.health_known = false; EXPECT_REASON(both(&input), SX_HEALTH_UNKNOWN);
     for (uint32_t bit = 1; bit <= SX_H_TERMINAL_COUNTS; bit <<= 1) {
         p02();
         runtime.health_blockers |= bit;
-        EXPECT_REASON(sx_evaluate(&input), (bit & SX_HEALTH_EXCEPTED) ? SX_OK : SX_HEALTH);
+        EXPECT_REASON(both(&input), (bit & SX_HEALTH_EXCEPTED) ? SX_OK : SX_HEALTH);
         EXPECT(strcmp(sx_health_name(bit), "UNKNOWN"));
     }
     /* ADD and the OTA path. */
-    p02(); runtime.add_connected = false; EXPECT_REASON(sx_evaluate(&input), SX_ADD_DISCONNECTED);
+    p02(); runtime.add_connected = false; EXPECT_REASON(both(&input), SX_ADD_DISCONNECTED);
     /* D2: a device whose heartbeats ADD drops (and so whose floor, confirm
      * reason and exception diagnostics the operator cannot see) refuses. */
-    p02(); runtime.heartbeat_acked = false; EXPECT_REASON(sx_evaluate(&input), SX_HEARTBEAT_UNACKED);
-    p02(); runtime.capability_accepted = false; EXPECT_REASON(sx_evaluate(&input), SX_CAPABILITY);
-    p02(); runtime.ota_precheck_ok = false; EXPECT_REASON(sx_evaluate(&input), SX_OTA_PRECHECK);
-    p02(); runtime.passive_slot_ok = false; EXPECT_REASON(sx_evaluate(&input), SX_OTA_SLOT);
-    p02(); runtime.internal_largest = SX_INTERNAL_FLOOR_BYTES - 1; EXPECT_REASON(sx_evaluate(&input), SX_HEAP);
+    p02(); runtime.heartbeat_acked = false; EXPECT_REASON(both(&input), SX_HEARTBEAT_UNACKED);
+    p02(); runtime.capability_accepted = false; EXPECT_REASON(both(&input), SX_CAPABILITY);
+    p02(); runtime.ota_precheck_ok = false; EXPECT_REASON(both(&input), SX_OTA_PRECHECK);
+    p02(); runtime.passive_slot_ok = false; EXPECT_REASON(both(&input), SX_OTA_SLOT);
+    p02(); runtime.internal_largest = SX_INTERNAL_FLOOR_BYTES - 1; EXPECT_REASON(both(&input), SX_HEAP);
     for (int r = 0; r < SX_REASON_COUNT; ++r) EXPECT(strcmp(sx_reason_name((sx_reason_t)r), "UNKNOWN"));
     for (int s = 0; s < SX_STATE_COUNT; ++s) EXPECT(strcmp(sx_state_name((sx_state_t)s), "UNKNOWN"));
+    EXPECT(!mismatches);
     return 0;
 }
 
@@ -704,9 +726,151 @@ static int floor_versions(void)
     return 0;
 }
 
+#define BIT(reason) (1ULL << (reason))
+
+/* ZKT 2.7.8: Peshawar-02's first 2.7.7 boot (26 October 2026) refused
+ * INVENTORY_UNEXPLAINED with every reported field matching the held set: at
+ * least one span read failed with ENOENT (ESP-IDF's errno for SPIFFS_ERR_DELETED,
+ * a span whose index entry points at a deleted page). Span reads that fail
+ * with EIO or ENOENT are the held set; any other errno, a failed open or an
+ * early end still refuse, and every set check stays. */
+static int span_errnos(void)
+{
+    sx_why_t why;
+    uint64_t mask;
+    /* EIO first, some spans ENOENT: P02 as it booted. */
+    p02(); inventory.file[0].span_errors_enoent = 11; EXPECT_REASON(both(&input), SX_OK);
+    /* Every span ENOENT, the first read too. */
+    p02(); inventory.file[0].first_error = ENOENT; inventory.file[0].span_errors_enoent = 51;
+    EXPECT_REASON(both(&input), SX_OK);
+    /* The first span ENOENT, the rest EIO. */
+    p02(); inventory.file[0].first_error = ENOENT; inventory.file[0].span_errors_enoent = 1;
+    EXPECT_REASON(both(&input), SX_OK);
+    /* Any other errno on a span refuses, whatever the set. */
+    p02(); inventory.file[0].span_errors_enoent = 10; inventory.file[0].span_errors_other = 1;
+    EXPECT_REASON(sx_inventory_explain(&repair, &inventory, &why), SX_INVENTORY_UNEXPLAINED);
+    EXPECT(why.detail == SX_DETAIL_SPAN_ERRNO && !strcmp(why.file, "pending.jsonl"));
+    EXPECT(!strcmp(sx_detail_name(why.detail), "SPAN_ERRNO"));
+    EXPECT_REASON(both(&input), SX_INVENTORY_UNEXPLAINED);
+    /* A first errno that is neither, or that no span counted. */
+    p02(); inventory.file[0].first_error = EBADMSG;
+    EXPECT_REASON(sx_inventory_explain(&repair, &inventory, &why), SX_INVENTORY_UNEXPLAINED);
+    EXPECT(why.detail == SX_DETAIL_FIRST_ERRNO);
+    p02(); inventory.file[0].first_error = ENOENT;
+    EXPECT_REASON(sx_inventory_explain(&repair, &inventory, &why), SX_INVENTORY_UNEXPLAINED);
+    EXPECT(why.detail == SX_DETAIL_FIRST_ERRNO);
+    p02(); inventory.file[0].span_errors_enoent = 51; /* EIO first, yet every span ENOENT */
+    EXPECT_REASON(sx_inventory_explain(&repair, &inventory, &why), SX_INVENTORY_UNEXPLAINED);
+    EXPECT(why.detail == SX_DETAIL_FIRST_ERRNO);
+    p02(); inventory.file[0].first_error = ENOENT; inventory.file[0].span_errors_enoent = 52;
+    EXPECT_REASON(sx_inventory_explain(&repair, &inventory, &why), SX_INVENTORY_UNEXPLAINED);
+    EXPECT(why.detail == SX_DETAIL_SPAN_ERRNO);
+    /* ENOENT on the open (a missing or renamed file): bytes lost other than
+     * by a span read. */
+    p02(); inventory.file[0].first_error = ENOENT; inventory.file[0].other_unreadable = true;
+    inventory.file[0].span_errors_enoent = 0;
+    EXPECT_REASON(sx_inventory_explain(&repair, &inventory, &why), SX_INVENTORY_UNEXPLAINED);
+    EXPECT(why.detail == SX_DETAIL_OTHER_UNREADABLE);
+    /* ENOENT spans leave every set check in force. */
+    p02(); inventory.file[0].span_errors_enoent = 11; inventory.file[0].unreadable_spans = 52;
+    inventory.file[0].unreadable_bytes += 251;
+    EXPECT_REASON(sx_inventory_explain(&repair, &inventory, &why), SX_INVENTORY_UNEXPLAINED);
+    EXPECT(why.detail == SX_DETAIL_SPAN_COUNT);
+    p02(); inventory.file[0].span_errors_enoent = 11; inventory.file[0].first_error_offset -= 251;
+    EXPECT_REASON(sx_inventory_explain(&repair, &inventory, &why), SX_INVENTORY_UNEXPLAINED);
+    EXPECT(why.detail == SX_DETAIL_FIRST_OFFSET);
+    p02(); inventory.file[0].span_errors_enoent = 11; inventory.file[0].last_error_offset += 251;
+    EXPECT_REASON(sx_inventory_explain(&repair, &inventory, &why), SX_INVENTORY_UNEXPLAINED);
+    EXPECT(why.detail == SX_DETAIL_LAST_OFFSET);
+    p02(); inventory.file[0].span_errors_enoent = 11;
+    inventory.file[0].span_digest = span_digest_add(p02_digest() - span_digest_add(0, 1990), 2100);
+    EXPECT_REASON(sx_inventory_explain(&repair, &inventory, &why), SX_INVENTORY_UNEXPLAINED);
+    EXPECT(why.detail == SX_DETAIL_DIGEST);
+    p02(); inventory.file[0].span_errors_enoent = 11; inventory.file[0].unreadable_bytes = 50 * 251;
+    EXPECT_REASON(sx_inventory_explain(&repair, &inventory, &why), SX_INVENTORY_UNEXPLAINED);
+    EXPECT(why.detail == SX_DETAIL_BYTES);
+    /* The other conditions, each named. */
+    p02(); inventory.complete = false;
+    EXPECT_REASON(sx_inventory_explain(&repair, &inventory, &why), SX_INVENTORY_UNEXPLAINED);
+    EXPECT(why.detail == SX_DETAIL_INCOMPLETE && !why.file[0]);
+    p02(); inventory.error = EIO;
+    EXPECT_REASON(sx_inventory_explain(&repair, &inventory, &why), SX_INVENTORY_UNEXPLAINED);
+    EXPECT(why.detail == SX_DETAIL_SCAN_ERROR);
+    p02(); inventory.unreadable_files = 17;
+    EXPECT_REASON(sx_inventory_explain(&repair, &inventory, &why), SX_INVENTORY_UNEXPLAINED);
+    EXPECT(why.detail == SX_DETAIL_FILE_COUNT);
+    p02(); inventory.unreadable_files = 2;
+    EXPECT_REASON(sx_inventory_explain(&repair, &inventory, &why), SX_INVENTORY_UNEXPLAINED);
+    EXPECT(why.detail == SX_DETAIL_UNMATCHED);
+    p02(); inventory.unreadable_files = 2; inventory.file[1].first_error = EIO; inventory.file[1].unreadable_spans = 1;
+    inventory.file[1].unreadable_bytes = 251;
+    EXPECT_REASON(sx_inventory_explain(&repair, &inventory, &why), SX_INVENTORY_UNEXPLAINED);
+    EXPECT(why.detail == SX_DETAIL_NOT_HELD && !strcmp(why.file, "acked_uids.txt"));
+    p02(); memset(&inventory.file[0].unreadable_bytes, 0,
+                  sizeof(inventory.file[0]) - offsetof(sx_inventory_file_t, unreadable_bytes));
+    inventory.unreadable_files = 0;
+    EXPECT_REASON(sx_inventory_explain(&repair, &inventory, &why), SX_INVENTORY_UNEXPLAINED);
+    EXPECT(why.detail == SX_DETAIL_HELD_READABLE && !strcmp(why.file, "pending.jsonl"));
+    /* A damaged name is reported as text. */
+    p02(); inventory.unreadable_files = 2; inventory.file[1].first_error = EIO; inventory.file[1].name[0] = (char)0xC3;
+    EXPECT_REASON(sx_inventory_explain(&repair, &inventory, &why), SX_INVENTORY_UNEXPLAINED);
+    EXPECT(why.file[0] == '?');
+    p02(); EXPECT_REASON(sx_inventory_explain(&repair, &inventory, &why), SX_OK);
+    EXPECT(why.detail == SX_DETAIL_NONE);
+    for (int d = 0; d < SX_DETAIL_COUNT; ++d) EXPECT(strcmp(sx_detail_name((sx_detail_t)d), "UNKNOWN"));
+    /* Every failing term in the mask. */
+    p02(); inventory.file[0].span_errors_other = 1; runtime.add_connected = false; repair.custody_blocks = 300;
+    EXPECT_REASON(sx_evaluate_terms(&input, &mask, &why), SX_CUSTODY_BLOCKS);
+    EXPECT(mask == (BIT(SX_CUSTODY_BLOCKS) | BIT(SX_INVENTORY_UNEXPLAINED) | BIT(SX_ADD_DISCONNECTED)));
+    EXPECT(why.detail == SX_DETAIL_SPAN_ERRNO);
+    p02(); EXPECT_REASON(sx_evaluate_terms(&input, &mask, &why), SX_OK);
+    EXPECT(!mask && why.detail == SX_DETAIL_NONE);
+    EXPECT(!mismatches);
+    return 0;
+}
+
+/* ZKT 2.7.8: SLICTOWER-13FL's 2.7.7 refused AREA_TEST, but the boot runs the
+ * area test only when every other repair term holds: the real terms were
+ * CUSTODY_LOST (one gap, 71 bytes), CUSTODY_BLOCKS (774 custody blocks over
+ * the cap of 256) and unexplained spans. A test that did not run now reports
+ * the term that kept it; the gate still never passes without one. */
+static int area_test_masking(void)
+{
+    uint64_t mask;
+    sx_why_t why;
+    p02(); strcpy(repair.area_test, "NOT_RUN"); repair.gaps = 1; repair.unreadable_bytes = 71;
+    repair.custody_blocks = 774; repair.custody_gain = 774 * 4;
+    inventory.file[0].span_errors_enoent = 3; inventory.file[0].span_errors_other = 1;
+    EXPECT_REASON(both(&input), SX_CUSTODY_LOST);
+    EXPECT_REASON(sx_repair_verdict(&repair), SX_CUSTODY_LOST);
+    EXPECT_REASON(sx_evaluate_terms(&input, &mask, &why), SX_CUSTODY_LOST);
+    EXPECT(mask == (BIT(SX_AREA_TEST) | BIT(SX_CUSTODY_LOST) | BIT(SX_CUSTODY_BLOCKS) | BIT(SX_INVENTORY_UNEXPLAINED)));
+    EXPECT(why.detail == SX_DETAIL_SPAN_ERRNO);
+    /* With the custody lost and the blocks over the cap fixed, the last
+     * repair term; with none left, AREA_TEST itself. */
+    repair.gaps = 0; repair.unreadable_bytes = 0; EXPECT_REASON(both(&input), SX_CUSTODY_BLOCKS);
+    repair.custody_blocks = 67; EXPECT_REASON(both(&input), SX_AREA_TEST);
+    EXPECT_REASON(sx_repair_verdict(&repair), SX_AREA_TEST);
+    /* A test that ran and failed is the reason, as in 2.7.7. */
+    p02(); strcpy(repair.area_test, "FAILED"); repair.gaps = 1; EXPECT_REASON(both(&input), SX_AREA_TEST);
+    p02(); strcpy(repair.area_test, "NO_SLOT"); repair.custody_blocks = 774; EXPECT_REASON(both(&input), SX_AREA_TEST);
+    /* The earlier repair terms are unchanged. */
+    p02(); strcpy(repair.area_test, "NOT_RUN"); strcpy(repair.area, "FOREIGN");
+    EXPECT_REASON(both(&input), SX_AREA_NOT_READY);
+    /* Which repair verdicts are a boot the exception is for (the area-test
+     * skip is logged only for those). */
+    EXPECT(!sx_repair_deferred_for_room(SX_REPAIR_MISSING) && !sx_repair_deferred_for_room(SX_NOT_PENDING) &&
+           !sx_repair_deferred_for_room(SX_REPAIR_GUARD) && !sx_repair_deferred_for_room(SX_REPAIR_RESULT) &&
+           !sx_repair_deferred_for_room(SX_STORE_NOT_MOUNTED) && !sx_repair_deferred_for_room(SX_REPAIR_STAGE));
+    EXPECT(sx_repair_deferred_for_room(SX_CUSTODY_LOST) && sx_repair_deferred_for_room(SX_CUSTODY_BLOCKS) &&
+           sx_repair_deferred_for_room(SX_AREA_NOT_READY));
+    EXPECT(!mismatches);
+    return 0;
+}
+
 int main(void)
 {
-    if (gate_terms() || window() || record() || outcomes() || restarts() || cuts() || stale_record() || floor_versions())
+    if (gate_terms() || span_errnos() || area_test_masking() || window() || record() || outcomes() || restarts() || cuts() || stale_record() || floor_versions())
         return 1;
     printf("storage exception host tests passed (%u checks)\n", checks);
     return 0;

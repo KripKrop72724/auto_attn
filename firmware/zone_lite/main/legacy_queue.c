@@ -43,6 +43,7 @@ static bool persist(legacy_queue_t *q, lq_checkpoint_t next)
 dq_result_t lq_open_step(legacy_queue_t *q, const char *path, lq_port_t port)
 {
     if (!q || !path || strlen(path)>=sizeof(q->path) || !port.load || !port.commit) return DQ_IO;
+    q->io_read=false;
     if (!q->recovering || strcmp(q->path,path) || q->port.context!=port.context ||
         q->port.load!=port.load || q->port.commit!=port.commit) {
         memset(q,0,sizeof(*q)); strcpy(q->path,path); q->port=port;
@@ -73,9 +74,10 @@ dq_result_t lq_open_step(legacy_queue_t *q, const char *path, lq_port_t port)
             if (position==cp->offset && cp->version==1 && bytes[n-1]!='\n') boundary=false;
         }
         if (ferror(file)) { ok=false; if(!error)error=errno?errno:EIO; }
+        bool read_failed=!ok;
         if (fclose(file)!=0) { ok=false; if(!error)error=errno?errno:EIO; }
         // Failed I/O retries exactly this slice, including a failed close.
-        if (!ok) { errno=error; return DQ_IO; }
+        if (!ok) { q->io_read=read_failed; errno=error; return DQ_IO; }
         if (!boundary) { q->recovering=false; q->checkpoint_corrupt=true; return DQ_CORRUPT; }
         q->recovery_offset=position; q->recovery_crc=crc;
         if (position<cp->offset) return DQ_PENDING;
@@ -95,11 +97,12 @@ dq_result_t lq_open(legacy_queue_t *q, const char *path, lq_port_t port)
 }
 dq_result_t lq_peek(legacy_queue_t *q, char *data, size_t capacity, lq_token_t *token)
 {
+    if (q) q->io_read=false;
     if (!q || !q->ready || !data || capacity<2 || capacity>DQ_MAX_RECORD_BYTES+1 || !token) return DQ_IO;
     FILE *file=fopen(q->path,"rb");
     if (!file) return errno==ENOENT && !q->checkpoint.offset ? DQ_EMPTY : DQ_IO;
     if (fseek(file,(long)q->checkpoint.offset,SEEK_SET)!=0) {
-        int error=errno?errno:EIO; fclose(file); errno=error; return DQ_IO;
+        int error=errno?errno:EIO; fclose(file); q->io_read=true; errno=error; return DQ_IO;
     }
     errno=0;
     size_t n=0; int ch=EOF;
@@ -109,8 +112,9 @@ dq_result_t lq_peek(legacy_queue_t *q, char *data, size_t capacity, lq_token_t *
     }
     bool ok=!ferror(file);
     int error=ok?0:(errno?errno:EIO);
+    bool read_failed=!ok;
     if (fclose(file)!=0) { ok=false; if(!error)error=errno?errno:EIO; }
-    if (!ok) { errno=error; return DQ_IO; }
+    if (!ok) { q->io_read=read_failed; errno=error; return DQ_IO; }
     if (!n && ch==EOF) return DQ_EMPTY;
     if (n>UINT32_MAX-q->checkpoint.offset) return DQ_CORRUPT;
     data[n]=0;
@@ -185,6 +189,7 @@ dq_result_t lq_settle_evidence(legacy_queue_t *q, const lq_token_t *token)
 
 dq_result_t lq_reclaim(legacy_queue_t *q)
 {
+    if (q) q->io_read=false;
     if (!q || !q->ready) return DQ_IO;
     struct stat st;
     if (stat(q->path,&st)!=0) return errno==ENOENT && !q->checkpoint.offset ? DQ_EMPTY : DQ_IO;
