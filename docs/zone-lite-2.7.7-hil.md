@@ -1,5 +1,10 @@
 # Zone Lite 2.7.7: ZKT platform HIL
 
+> **Superseded for the exception by [2.7.8](zone-lite-2.7.8-hil.md)** (26
+> October 2026): 2.7.7 refused Peshawar 02 `INVENTORY_UNEXPLAINED` because
+> its held spans read `ENOENT`, not `EIO`, and reported 13FL's real terms as
+> `AREA_TEST`. This runbook still applies with 2.7.8 for 2.7.7.
+
 2.7.7 is 2.7.6 plus one narrow way for a new image to confirm although its
 storage health fails: the confirm-first storage exception (owner decision on
 2.7.6's open decision 3, 21 October 2026: **(a) confirm first**). An image
