@@ -43,7 +43,7 @@ def _setup(session: Session, *, release_state: str = "HIL_ONLY", campaign_status
     session.flush()
     campaign = FirmwareCampaign(
         campaign_id="campaign-p02", release_id=release.id, zone_id=connector.zone_id, status=campaign_status,
-        actor="StateHealthAdmin", idempotency_key="campaign-p02-key", reason="2.7.7 for P02 alone",
+        actor="StateHealthAdmin", idempotency_key="campaign-p02-request", reason="2.7.7 for P02 alone",
         typed_confirmation="2.7.7", eligible_count=1, legacy_skipped_count=0)
     session.add(campaign)
     session.flush()
