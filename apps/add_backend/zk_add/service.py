@@ -367,12 +367,15 @@ def apply_ota_heartbeat_diagnostics(
         connector.ota_state = "UPDATING"
         return
 
-    # ZKT 2.7.7: PARTITION_HASH_FAILED needs a complete download, which an
-    # OFFERED deployment has not reported yet: it is the previous attempt's
-    # error, kept in RAM until a reboot, and must not fail the owner's retry.
-    if deployment.status == "OFFERED" and reported_error == "PARTITION_HASH_FAILED":
-        connector.ota_state = "UPDATING"
-        return
+    # ZKT 2.7.7: PARTITION_HASH_FAILED needs a complete download of this
+    # deployment. A heartbeat built before its latest download grant carries
+    # the previous attempt's error (kept in RAM until a reboot) and must not
+    # fail the owner's retry, even once the retry has reported progress.
+    if reported_error == "PARTITION_HASH_FAILED" and deployment.status in {"OFFERED", "DOWNLOADING"}:
+        from zk_add.ota_interruption import unverified_image_current
+        if not unverified_image_current(session, connector, deployment, payload.uptime_seconds):
+            connector.ota_state = "UPDATING"
+            return
 
     if not reported_error:
         if runtime_state in {

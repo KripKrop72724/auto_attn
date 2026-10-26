@@ -265,6 +265,37 @@ def _built_after(session: Session, connector: Connector, sample: DeviceTelemetry
     return sample.uptime_seconds >= (at - started).total_seconds() - ATTEMPT_UPTIME_SLACK_SECONDS
 
 
+def unverified_image_current(session: Session, connector: Connector, deployment: FirmwareDeployment,
+                             uptime_seconds: int | None, *, now: datetime | None = None) -> bool:
+    """Whether a heartbeat reporting PARTITION_HASH_FAILED can belong to `deployment`'s own download.
+
+    ZKT 2.7.7: 2.7.3 and earlier keep the previous attempt's error in RAM, so
+    after the owner's retry a heartbeat built before the retry's download grant
+    may arrive after the retry's first progress report (a WebSocket read
+    pause, a reconnect burst). That error needs a complete download, which
+    needs a grant: only a heartbeat built after the deployment's latest grant
+    (judged as _built_after does, by the ESP's uptime) can carry this
+    deployment's failure. An OFFERED deployment has reported no download at
+    all, so it never can; without an uptime a DOWNLOADING one is judged as
+    before the review (current).
+    """
+    if deployment.status == "OFFERED":
+        return False
+    if uptime_seconds is None or uptime_seconds < 0:
+        return True
+    granted = session.scalar(select(func.max(FirmwareDownloadGrant.created_at)).where(
+        FirmwareDownloadGrant.deployment_id == deployment.id))
+    if granted is None:
+        return False
+    now = now or utc_now()
+    starts = [now - timedelta(seconds=uptime_seconds)]
+    started = _boot_start(session, connector, connector.boot_id)
+    if started is not None:
+        starts.append(started)
+    built = min(starts) + timedelta(seconds=uptime_seconds)
+    return built >= ensure_utc(granted) - timedelta(seconds=ATTEMPT_UPTIME_SLACK_SECONDS)
+
+
 def download_interruption(session: Session, *, connector: Connector, deployment: FirmwareDeployment,
                           release: FirmwareRelease, payload: Any, error_code: str, runtime_state: str,
                           now: datetime | None = None) -> dict | None:

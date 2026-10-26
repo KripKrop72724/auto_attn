@@ -65,7 +65,7 @@ from zk_add import service
 from zk_add.service import apply_ota_heartbeat_diagnostics, record_device_reported_return, update_heartbeat
 from zk_add.settings import settings
 from zk_add.storage_contract import FLEET_BASELINE_IMAGES, platform_baselines
-from zk_add.time_utils import parse_datetime, utc_now
+from zk_add.time_utils import ensure_utc, parse_datetime, utc_now
 from zk_add.web import _require_ota_connector, app, get_db
 from zk_add.zkt270_scope import TARGETS
 from zk_add.zkt_bridge_contract import signed_hil_targets
@@ -2220,6 +2220,44 @@ def test_an_unverified_image_fails_with_the_corrected_message_and_the_owner_retr
     run_row = db.get(FirmwareCampaign, run.id)
     refusal = retry_refusal(db, run_row, retry)
     assert refusal is not None and "did not verify on this ESP" in refusal
+
+
+def test_a_stale_unverified_error_built_before_the_retry_grant_does_not_fail_a_downloading_retry(db):
+    # Review of 26 October, D4: the retry's first 64 KiB report has moved it
+    # to DOWNLOADING when a heartbeat the ESP built before fetching the retry
+    # (still carrying the previous attempt's error) is processed.
+    _rel, device, run, deployment = unverified(db)
+    client, headers = admin_client(db)
+    path = f"/api/v1/firmware/campaigns/{run.campaign_id}/retry-target"
+    review = client.get(path, params={"deployment_id": deployment.deployment_id}).json()
+    response = client.post(path, json=retry_body(deployment, override_stability_warnings=True,
+                                                 stability_warnings_digest=review["stability_warnings_digest"],
+                                                 resume_pending_deployments=0), headers=headers)
+    assert response.status_code == 200, response.text
+    db.expire_all()
+    retry = db.scalar(select(FirmwareDeployment).where(
+        FirmwareDeployment.deployment_id == response.json()["deployment_id"]))
+    device = db.get(Connector, device.id)
+    assert offer(db, device)["deployment_id"] == retry.deployment_id
+    db.expire_all()
+    retry = db.get(FirmwareDeployment, retry.id)
+    retry.status = "DOWNLOADING"
+    retry.bytes_written = 65536
+    db.commit()
+    granted = db.scalar(select(func.max(FirmwareDownloadGrant.created_at)).where(
+        FirmwareDownloadGrant.deployment_id == retry.id))
+    device = db.get(Connector, device.id)
+    stale = int((ensure_utc(granted) - ensure_utc(boot_started(db, device))).total_seconds()) - 30
+    beat(db, device, stuck(error="PARTITION_HASH_FAILED", written=IMAGE_SIZE - 4096, uptime=stale))
+    db.expire_all()
+    retry = db.get(FirmwareDeployment, retry.id)
+    assert (retry.status, retry.error_code) == ("DOWNLOADING", None)
+    # The retry's own failure, built after its grant, still fails it.
+    device = db.get(Connector, device.id)
+    beat(db, device, stuck(error="PARTITION_HASH_FAILED", written=IMAGE_SIZE - 4096))
+    db.expire_all()
+    retry = db.get(FirmwareDeployment, retry.id)
+    assert (retry.status, retry.error_code) == ("FAILED", "PARTITION_HASH_FAILED")
 
 
 def test_an_unverified_image_of_a_release_with_its_own_return_evidence_can_be_retried(db):
