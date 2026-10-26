@@ -292,3 +292,19 @@ def test_the_repair_report_keeps_the_2_7_7_fields():
     odd = StorageRepairDiagnostics.model_validate({"reclaim": {"area": "READY", "excluded_file": "x" * 40,
                                                                "custody_gain": 5}})
     assert odd.reclaim is not None and odd.reclaim.excluded_file is None and odd.reclaim.custody_gain == 5
+
+
+def test_the_floor_latch_migration_is_the_single_head_after_mains_public_status():
+    # 2.7.7's column follows main's #421 migration; two heads would stop the
+    # API container's "alembic upgrade head".
+    from pathlib import Path
+
+    from alembic.config import Config
+    from alembic.script import ScriptDirectory
+
+    root = Path(__file__).resolve().parents[2] / "apps/add_backend"
+    config = Config(str(root / "alembic.ini"))
+    config.set_main_option("script_location", str(root / "migrations"))
+    script = ScriptDirectory.from_config(config)
+    assert script.get_heads() == ["20261026_0059_ota_floor_latch"]
+    assert script.get_revision("20261026_0059_ota_floor_latch").down_revision == "20261024_0058_public_status"

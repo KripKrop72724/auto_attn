@@ -14,8 +14,8 @@ default, so the table is not rewritten.
 from alembic import op
 import sqlalchemy as sa
 
-revision = "20261023_0058_ota_floor_latch"
-down_revision = "20261023_0057_archive_history"
+revision = "20261026_0059_ota_floor_latch"
+down_revision = "20261024_0058_public_status"
 branch_labels = None
 depends_on = None
 

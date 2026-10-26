@@ -1094,7 +1094,7 @@ duplicates a readable unsettled byte.
    redo-area work and rolled back to 2.5.2 overwrote its diagnostics with
    heartbeats carrying no `ota_floor`, and ADD would offer 2.6.25/2.6.27
    again. ADD now latches the floor durably on the connector
-   (`ota_floor_latched_at`, migration 20261023_0058): set by any heartbeat
+   (`ota_floor_latched_at`, migration 20261026_0059, after main's 20261024_0058): set by any heartbeat
    whose diagnostics show the floor and by the confirmation's own
    `RECONCILING` or ended-`FAILED` progress reports, never cleared by a
    later heartbeat. A `BOOTED_PENDING` exception report alone does not
