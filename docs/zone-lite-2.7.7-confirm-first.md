@@ -1182,3 +1182,98 @@ duplicates a readable unsettled byte.
    the scan's full name walk** - the walk's names live only inside the scan
    task; the report is the one structure the gate, the heartbeat and the
    operator all read, so the guarantee belongs there.
+
+## 15. Added scope (26 October 2026)
+
+Two field findings from the owner's bulk 2.7.6 campaign of 26 October joined
+2.7.7 with the owner's approval. Neither touches the exception, the planner
+or custody: both are refusal and diagnosis paths.
+
+### 15.1 ZONE-SLICTOWER-3FL: bridge-era journal leftovers
+
+3FL (2.7.2) refuses every OTA with `JOURNAL_LEGACY_EVIDENCE_PRESENT`: its
+guard (`zkt_ota_guard.c` `legacy_evidence()`, identical on `main`) refuses
+any `zkt_journal` NVS namespace and any `zktj*` file, and the 2.6.18 to
+2.6.21 bridges 3FL ran left both. Nothing on ADD clears it, and a 2.7.6 or
+2.7.7 installed by USB would be stuck the same way at the next release.
+
+What the leftovers can hold: a bridge opens the journal with legacy delivery
+authority; only `zj_state_enable_add` moves the root's authority byte to ADD
+(the writer, after proving its rollback image), and `zj_state_reserve` - the
+only way to allocate a journal sequence - refuses anything but ADD authority.
+So a legacy root keeps limit 1 and no segment can hold a journal record:
+every punch those images captured went through the legacy queues, which the
+storage repair keeps as custody.
+
+2.7.7's guard (storage-repair images only; journal roles and the recovery
+image keep the old refusal) accepts exactly that leftover, in
+`zkt_legacy_evidence.c` (pure, host tested):
+
+- this image's journal runtime is disabled (its version is neither the
+  bridge's nor the writer's: `zkt_journal_runtime.c`'s `mode()`), and no
+  journal owner started;
+- the namespace, if present, holds only `root` and `reader_v1`; any other key
+  (`retirement`, a writer's `source_v1`, anything unknown) refuses;
+- the root, if present, is well formed (magic, CRC, layout, key, epoch,
+  serial) with authority byte 0 and limit 1; ADD authority, a malformed root
+  or legacy authority with a reserved sequence refuses;
+- every `zktj*` name is a segment name the storage repair classifies
+  `SRP_CLASS_EVIDENCE` (`/zktj<16 hex>.j`), so neither the repair nor OTA
+  ever removes it; at most 16, each at most one segment (64 KiB + 240 B) and
+  read in full without error; segments without a legacy root refuse;
+- with the VFS unmounted any journal name the boot survey saw still refuses
+  (its files cannot be read); NVS and store errors keep their old codes.
+
+The guard reads only: no NVS write, no file written or removed (contract
+test). The root's key bytes are erased after classification. The OTA floor is
+still checked first. The verdict and an inventory go into every heartbeat as
+`storage.journal_evidence` (`state` NONE/ACCEPTED/REFUSED, `reason`,
+`namespace`, `authority`, `keys`, `reader_proof`, `files`, `bytes`,
+`unreadable`, `runtime_disabled`), computed once per boot by the OTA task;
+ADD keeps it leniently (an unreadable object is dropped).
+
+3FL itself cannot take 2.7.7 over the air (its running 2.7.2 refuses); the
+runbook's section 4 is the USB procedure.
+
+Rejected: **deleting or rewriting the leftovers** - they are the only record
+of what the bridges did; the narrow acceptance needs neither. **Accepting any
+namespace when the runtime is disabled** - an ADD-authority root, a
+retirement checkpoint or a source boundary means a writer ran, and those
+still refuse.
+
+### 15.2 PARTITION_HASH_FAILED (Swat-01 and Quetta-01)
+
+Both (2.7.3) downloaded all 1,511,424 bytes of 2.7.6 and failed in
+`perform_update` when `esp_partition_get_sha256(target)` failed before
+`esp_https_ota_finish`: the written slot did not verify. The cause (RAM
+corruption before the write, or flash programming) is unproven - that call
+folds every failure into `ESP_ERR_IMAGE_INVALID`, and 2.7.3 sent no report
+and kept the journal at the last checkpoint, so a re-offer of the same
+deployment would resume over the same bytes.
+
+2.7.7, on that failure only, after `esp_https_ota_abort`:
+
+- re-runs IDF's steps to name the failing one: `HEADER`
+  (`esp_image_get_metadata`, with its `esp_err_t`), `READ` (a plain
+  `esp_partition_read` of the hashed range, no mmap), `DIGEST` (the bytes on
+  flash do not match their own appended digest: corrupt bytes reached the
+  slot) or `UNREPRODUCED` (they do: IDF's check failed elsewhere); and
+  whether the read-back and the appended digest equal the release's;
+- erases the written range of the update slot (never the running slot) and
+  resets the checkpoint to byte 0, so any retry downloads the whole image;
+- sends the finding as the log `OTA_IMAGE_UNVERIFIED` and with a `FAILED`
+  `PARTITION_HASH_FAILED` report.
+
+This is the "cheap" verification against the release digest: on success the
+existing check already compares IDF's digest with the release's; the extra
+read costs one pass over the slot and runs only on this failure path.
+
+ADD: the message reads "The downloaded image did not verify on the device";
+the owner's one-click **Retry same target** accepts a `FAILED`
+`PARTITION_HASH_FAILED` deployment (a fresh deployment, which every ESP
+downloads from byte 0 - a new deployment id never resumes), refused after
+two such failures of one release on one ESP until its power and flash are
+checked; a heartbeat still carrying the previous attempt's error (2.7.3
+keeps it in RAM) does not fail an `OFFERED` retry, because that error needs a
+complete download the retry has not reported. The retry-target wording no
+longer mentions a password step-up (removed in #419).

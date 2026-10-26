@@ -11,7 +11,11 @@ changed for 120 s. It then restarts once at a capture safepoint, and 2.7.6's
 confirmed round, unchanged, reformats custody blocks in place on the next
 boot. Every other storage failure rolls back exactly as 2.7.6. 2.7.7 also
 raises the ADD WebSocket task's stack to 6 KiB and IDF's IPC tasks' to
-1,792 B. The design, the gate, its review and every rejected point are in
+1,792 B, accepts the bridge-era journal leftovers that stop
+ZONE-SLICTOWER-3FL's OTA (section 4), and on `PARTITION_HASH_FAILED` names
+the failing step, erases the written slot and restarts the download from
+byte 0, which ADD lets the owner retry with one click (section 5; design
+section 15). The design, the gate, its review and every rejected point are in
 [zone-lite-2.7.7-confirm-first.md](zone-lite-2.7.7-confirm-first.md) (section
 13 for the review). The [2.7.6 runbook](zone-lite-2.7.6-hil.md) still applies
 to the repair's report and the round, and the
@@ -171,6 +175,99 @@ the heartbeat's report.
 On a healthy store 2.7.7 reports what 2.7.6 did plus `reclaim.ota_floor`
 (false on a device whose redo area was never written) and confirms the
 ordinary way; `ota.storage_exception` is absent.
+
+## 4. SLICTOWER 3FL, from 2.7.2, by USB
+
+3FL's 2.7.2 refuses every OTA with `JOURNAL_LEGACY_EVIDENCE_PRESENT` (the
+2.6.18-2.6.21 bridges left a `zkt_journal` namespace and possibly `zktj*`
+segments); only its *running* image's guard decides, so 2.7.7 cannot arrive
+over the air. Once 2.7.7 runs, its guard accepts exactly the bridge-era
+leftover (design 15.1) and later releases arrive by OTA again. The USB
+install writes **only** the signed 2.7.7 application to the inactive slot and
+**one** 4 KiB boot-selection sector. Never erase flash, never write NVS
+(0x11000), the storage partition, the partition table, the bootloader or
+eFuses. 2.7.2 stays in its slot for rollback.
+
+**Before (on ADD, the day of the visit):**
+
+1. Outside punch hours (after the evening shift or a holiday), with the
+   terminal idle.
+2. 3FL connected, `storage.durability` `HEALTHY`, every queue empty: the
+   heartbeat's `queues` all 0 records (live, bulk, ORDS pending, blocked
+   identity, quarantines), no `pending` reconciliation chunk, the terminal's
+   records reconciled. If anything is queued, wait for it to drain.
+3. Note the running slot (`ota.running_partition`, `ota_1` on 12 October)
+   and its digest (2.7.2: `e908496e...`). The inactive slot is the other one:
+   `ota_0` at `0x2A0000` or `ota_1` at `0x520000` (2.5 MiB each).
+4. Cancel 3FL's failed 2.7.6 campaign. Download the published signed
+   `zone-lite-2.7.7` image from ADD and check its SHA-256 against the
+   release's `image_sha256` and its size against `image_size`.
+
+**At the ESP (native USB; keep the site supply connected too):**
+
+1. Read-only first: `esptool.py --chip esp32s3 -p PORT get_security_info`.
+   Expect Secure Boot on and no flash encryption, like the fleet. If it
+   reports Secure Download Mode, ROM flash reads and MD5 checks are
+   unavailable: skip the dumps below (nothing they would protect is written).
+   Otherwise, optionally, read-only dumps for the record:
+   `read_flash 0x8000 0x1000 pt.bin`, `read_flash 0x17000 0x2000 otadata.bin`,
+   `read_flash 0x11000 0x6000 nvs.bin`.
+2. Write the application to the **inactive** slot only:
+   `esptool.py --chip esp32s3 -p PORT --after no_reset write_flash <0x2A0000|0x520000> zone-lite-2.7.7.bin`
+   (`--no-stub` if the tool asks; in Secure Download Mode esptool cannot
+   verify by MD5 - the bootloader's Secure Boot check does on boot). If this
+   write fails, stop: selection is unchanged and 2.7.2 still boots.
+3. Select it. Build the 4 KiB first otadata sector: one 32-byte entry, then
+   `0xFF`. The entry: `ota_seq` (LE u32), 20 bytes `0xFF`, `ota_state` 2
+   (`ESP_OTA_IMG_VALID`, LE u32), `crc` = CRC-32 of the 4 `ota_seq` bytes
+   seeded `0xFFFFFFFF` (as IDF's `otatool.py`). The slot is
+   `(ota_seq - 1) % 2`: use `ota_seq` `0x00100001` for `ota_0`, `0x00100002`
+   for `ota_1` - far above any sequence 3FL has used, so this entry wins over
+   the other sector's:
+
+   ```
+   python3 -c "import struct,zlib,sys; s=int(sys.argv[1],0); e=struct.pack('<I',s)+b'\xff'*20+struct.pack('<II',2,zlib.crc32(struct.pack('<I',s),0xFFFFFFFF)); open('otadata0.bin','wb').write(e+b'\xff'*(4096-len(e)))" 0x00100001
+   esptool.py --chip esp32s3 -p PORT write_flash 0x17000 otadata0.bin
+   ```
+
+   State `VALID`, not `NEW`: with no OTA journal 2.7.7 would never confirm a
+   `NEW` image and the next reset would return to 2.7.2. Do not use
+   `otatool.py switch_ota_partition` here: it keeps the target sector's old
+   `ota_state`, which on 3FL may be an `ABORTED` entry from the 2.7.1 attempt.
+4. Reset (`esptool.py ... --after hard_reset` or the board's reset). If the
+   image failed Secure Boot verification the bootloader falls back to the
+   other slot (2.7.2): read the console and stop.
+
+**After (on ADD):**
+
+1. 3FL reports `zone-lite-2.7.7` on the written slot with the release's
+   application digest; the boot repair `CLEAN`; `reclaim.ota_floor` false.
+2. `storage.journal_evidence`: `state` `ACCEPTED` (`reason`
+   `BRIDGE_LEFTOVERS`, `authority` `LEGACY`, `files`/`bytes`, `unreadable` 0)
+   or `NONE`. `REFUSED` names why (`ADD_AUTHORITY`, `NAMESPACE_KEYS`,
+   `FILE_UNREADABLE`, ...): 3FL then keeps refusing OTA exactly as before -
+   stop and report; nothing was deleted.
+3. Queues drain, the terminal reconnects, punches flow; ADD shows 3FL
+   `ONLINE`.
+
+**Rollback by USB** (only while `reclaim.ota_floor` is false - never once the
+redo area holds records, which 2.7.2 cannot read): the same otadata write
+with the next sequence for 2.7.2's slot (`0x00100002` after `0x00100001`, or
+`0x00100003` after `0x00100002`).
+
+## 5. Swat 01 and Quetta 01: PARTITION_HASH_FAILED
+
+On 26 October both (2.7.3) downloaded all of 2.7.6 and the written slot did
+not verify. With 2.7.7's ADD deployed, each `FAILED` `PARTITION_HASH_FAILED`
+deployment offers **Retry same target**: one click makes a fresh deployment,
+which the ESP downloads from byte 0 (a new deployment never resumes). A
+second failure of the same release on the same ESP stops retries until its
+power and flash are checked. Quetta-01 also had 104 panics in 113 boots
+(the last a `StoreProhibited` in the `ota_manager` task on 2.7.3): read its
+boot reports before retrying it, and prefer Swat-01 first. Once a device runs
+2.7.7, the same failure says which step failed (`OTA_IMAGE_UNVERIFIED`:
+`HEADER`, `READ`, `DIGEST` or `UNREPRODUCED`, whether the bytes on flash equal
+the release) in the log and on the `FAILED` report, and its slot is erased.
 
 ## Rollback expectations
 
