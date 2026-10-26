@@ -395,6 +395,24 @@ class StorageRepairDiagnostics(BaseModel):
             return None
 
 
+class JournalEvidenceDiagnostics(BaseModel):
+    # ZKT 2.7.7 and later: the OTA guard's inventory of bridge-era journal
+    # leftovers (an NVS namespace zkt_journal and /zktj* segments from the
+    # 2.6.18-2.6.21 bridges). ACCEPTED: legacy authority only, intact segments
+    # kept as evidence, so OTA proceeds; REFUSED with the reason; NONE: no
+    # leftovers. Codes are text and an unreadable object is dropped.
+    state: str | None = Field(default=None, pattern=UPPER_CODE)
+    reason: str | None = Field(default=None, pattern=UPPER_CODE)
+    namespace: bool | None = None
+    authority: str | None = Field(default=None, pattern=UPPER_CODE)
+    keys: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    reader_proof: bool | None = None
+    files: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    bytes: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    unreadable: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    runtime_disabled: bool | None = None
+
+
 class StorageDiagnostics(BaseModel):
     local_failure_source: str | None = Field(default=None, max_length=80)
     # ZKT 2.7.1 and later: the latest incident of a latched LOCAL_FAILURE, and
@@ -430,6 +448,8 @@ class StorageDiagnostics(BaseModel):
     inventory: StorageInventory | None = None
     # ZKT 2.7.5 and later: the boot storage repair; dropped when unreadable.
     repair: StorageRepairDiagnostics | None = None
+    # ZKT 2.7.7 and later: bridge-era journal leftovers and the OTA guard's verdict.
+    journal_evidence: JournalEvidenceDiagnostics | None = None
     fault_class: Literal["NONE", "LOCK_CONTENTION", "CAPACITY", "MISSING_FILE", "CORRUPTION",
                          "ALLOCATION", "PERSISTENCE", "RECOVERY"] | None = None
     rejected_optional_writes: int | None = Field(default=None, ge=0)
@@ -463,6 +483,14 @@ class StorageDiagnostics(BaseModel):
     def readable_repair(cls, value: Any) -> StorageRepairDiagnostics | None:
         try:
             return StorageRepairDiagnostics.model_validate(value) if value is not None else None
+        except ValidationError:
+            return None
+
+    @field_validator("journal_evidence", mode="before")
+    @classmethod
+    def readable_journal_evidence(cls, value: Any) -> JournalEvidenceDiagnostics | None:
+        try:
+            return JournalEvidenceDiagnostics.model_validate(value) if value is not None else None
         except ValidationError:
             return None
 
