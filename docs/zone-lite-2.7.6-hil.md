@@ -1,5 +1,18 @@
 # Zone Lite 2.7.6: ZKT platform HIL
 
+> **Superseded by [2.7.7](zone-lite-2.7.7-hil.md).** On 21 October 2026
+> Peshawar 02's first 2.7.6 boot (from 2.5.2, unconfirmed) ended `DEFERRED`
+> (`full`, 34 pages short) with custody intact (`files_unheld_custody` 0,
+> `gaps` 0) but found no block an unconfirmed image may take: 0 candidates,
+> 67 custody blocks, 88 with an index page, 1,817 excluded. The round needs a
+> confirmed image for custody blocks (section 8 of the design), so no round
+> ran and the image rolled back to 2.5.2 at the 900 s budget. The owner chose
+> decision 3 (a), confirm first, which 2.7.7 implements. On 26 October
+> Swat 01 and Quetta 01 (2.7.3) failed `PARTITION_HASH_FAILED` after complete
+> downloads, and SLICTOWER 3FL (2.7.2) refused it with
+> `JOURNAL_LEGACY_EVIDENCE_PRESENT`; 2.7.7 handles both. Keep 2.7.6 published
+> while devices run it: 2.7.7 accepts it as a rollback predecessor.
+
 2.7.6 is 2.7.5 plus the last resort for wedged stores: when the boot storage
 repair is about to hand over a store without room, it reformats blocks in
 place, one 4 KiB block at a time, keeping every page anything may still read

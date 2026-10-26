@@ -36,9 +36,14 @@ custody blocks alone, `REPAIRED`, every file byte-exact, through power cuts.
 ## Before any campaign
 
 1. **Owner and review.** The owner's word on design section 11 and a green
-   `main` with this branch merged. Publish like 2.7.6 (`HIL_ONLY`). Keep
-   2.7.6 published: the release plumbing commit adds it as a qualified
-   predecessor. **Never revoke 2.7.7 while a device runs it under the
+   `main` with this branch merged. Publish like 2.7.6 (`HIL_ONLY`, to an
+   exact prefix of the nationwide scope `deploy/add/hil-targets-zkt-270.json`;
+   P02 is its sixth entry). Keep 2.7.6 published: 2.7.7 accepts it as a
+   qualified rollback predecessor (application
+   `9d7050768f1cb716e9bc11f9b7b4d20b423b3eccbe1531809130457998e96f0c`, ADD's
+   published `zone-lite-2.7.6`) beside 2.4.12, 2.5.2, 2.6.6 to 2.6.15 and
+   2.7.2 to 2.7.5; the compiled marker ends `,2.7.4,2.7.5,2.7.6` (154 of the
+   160 characters ADD keeps). **Never revoke 2.7.7 while a device runs it under the
    exception**: such a device cannot roll back, and ADD offers a fix only
    from a published predecessor (2.7.8's contract lists 2.7.7 under the retry
    rule while 2.7.7 is `HIL_ONLY`).
@@ -131,10 +136,19 @@ back as 2.7.6.
    `ROUND_DONE`, `ota.confirm_reason` `STORAGE_REPAIR_EXCEPTION`.
 3. The probe passes, `qs` verifies persistence, the inventory finds nothing
    unreadable, and `pending.jsonl` (about 2.5 MB) drains to ORDS.
-4. The deployment stays `RECONCILING` until source coverage is certified:
-   retry `f69322c1` from its checkpoint; if it is held again, cancel it and
-   request a new full-history reconciliation. Then `SUCCEEDED`, then the 2.7.1
-   acceptance evidence.
+4. **P02's stuck reconciliation job.** The deployment stays `RECONCILING`
+   until source coverage is certified, and P02 has none: job `f69322c1` has
+   been `NEEDS_ATTENTION` `SOURCE_RANGE_LAYOUT_INVALID` at ordinal 57,300 of
+   68,788 since 25 September, and ADD never retries a held job by itself
+   (design 7.2). While the deployment is `RECONCILING` it blocks further OTA
+   to P02 and new campaigns in P02's zone only. Once P02 is `ONLINE`, the
+   round boot `REPAIRED`, `qs` `persistence_verified` true and
+   `pending.jsonl` drained (step 3), the operator retries `f69322c1` from
+   its checkpoint (ADD's job action "retry": `NEEDS_ATTENTION` -> `QUEUED`).
+   Not before: a retry while the store is still wedged would be held again.
+   If it is held again, cancel it and request a new full-history
+   reconciliation for P02. When a job certifies coverage the deployment
+   reports `SUCCEEDED`; then the 2.7.1 acceptance evidence (`HIL_ACCEPTED`).
 5. `FAILED` `STORAGE_REPAIR_EXCEPTION_UNREPAIRED` (the round could not repair
    the store within three bounded restarts) or `..._UNHEALTHY` (repaired, but
    the storage terms still failed for 30 min): the device stays on 2.7.7,

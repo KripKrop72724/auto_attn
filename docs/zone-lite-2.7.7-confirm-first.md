@@ -1,8 +1,8 @@
 # Zone Lite 2.7.7: confirm first under a narrow storage exception
 
-Status: implemented on `release/zkt-2.7.7` (version not bumped yet), with the
-first review round's two critiques folded in: section 13 lists every point,
-what changed and what was rejected and why. Where sections 1 to 11 and section
+Status: implemented on `release/zkt-2.7.7` and versioned 2.7.7 (section
+17), with the first review round's two critiques folded in: section 13 lists
+every point, what changed and what was rejected and why. Where sections 1 to 11 and section
 13 disagree, section 13 is what the code does. Nothing has run on a device.
 Branch `release/zkt-2.7.7` from `origin/main` 2dbd314 (2.7.6 merged, #401).
 The HIL runbook is [zone-lite-2.7.7-hil.md](zone-lite-2.7.7-hil.md).
@@ -1321,3 +1321,20 @@ its extractions of `ota_manager.c` and `add_connector.c` now contain
 `report_progress` and `zj_ota_append_legacy_evidence`, which the harnesses
 did not stub. Both are stubbed, and `report_progress` is swept for cJSON
 allocation failures (nothing sent, no receipt) - a88f12e.
+
+## 17. Release
+
+The release commit `bc98512` versions the branch as `ab079f1` did for 2.7.6: project
+VERSION 2.7.7 and `UG_DIRECT_VERSION` "2.7.7"; 2.7.6's application SHA-256
+`9d7050768f1cb716e9bc11f9b7b4d20b423b3eccbe1531809130457998e96f0c` (the
+`application_sha256` of ADD's published `zone-lite-2.7.6`) as a qualified
+rollback predecessor in the device guard, ADD's storage contract
+(`REFORMAT_*`, `platform_baselines("2.7.7")`) and the signing script; the
+compiled marker ends `,2.7.2,2.7.3,2.7.4,2.7.5,2.7.6` (154 of the 160
+characters ADD keeps); ADD offers 2.7.7 to the HIL-only 2.7.2 to 2.7.6 while
+each is published; the CI direct-legacy step, the HIL candidate workflow,
+publication and signing take 2.7.7 with the nationwide HIL scope. 2.7.7 also
+joins 2.7.6 among the targets with their own return evidence
+(`ota_interruption.py`), so a 2.6.x ESP's interrupted 2.7.7 boot keeps the
+fail-closed path. The 2.7.6 runbook is marked superseded. Signing happens
+when HIL publishes the candidate; nothing has run on a device.
