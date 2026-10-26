@@ -226,6 +226,20 @@ typedef struct {
  * own torn write. `sector`: 4096 bytes. */
 void srx_discover(const srx_io_t *io, bool claimed, uint8_t *sector, srx_area_t *area);
 bool srx_slot_free(const srx_area_t *area, uint32_t slot);
+
+/* ZKT 2.7.7 (the confirm-first exception, review critique 3): before an
+ * unconfirmed image may confirm under the exception, this device proves that
+ * the redo area takes a program and an erase: a free slot (an erased one
+ * first) is erased unless it reads all 0xFF, programmed with a test pattern
+ * that never decodes as a record, read back, erased and read back erased.
+ * The caller has saved CLAIMED in the reclaim journal first, so a reset at
+ * any of these writes leaves a sector the next discovery reads as this
+ * device's own torn write (a free slot), never FOREIGN. Nothing of the store
+ * is touched. `scratch`: 4096 bytes. */
+typedef enum { SRX_TEST_NOT_RUN = 0, SRX_TEST_PASSED, SRX_TEST_FAILED, SRX_TEST_NO_SLOT } srx_test_t;
+#define SRX_TEST_MAGIC 0x31545253U    /* "SRT1": never a record's */
+srx_test_t srx_area_test(const srx_io_t *io, const srx_area_t *area, uint8_t *scratch, uint32_t *slot_out);
+const char *srx_test_name(srx_test_t test);
 /* A block that is the block of a record not yet free (open, source). */
 bool srx_block_busy(const srx_area_t *area, uint32_t block);
 

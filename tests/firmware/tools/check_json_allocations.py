@@ -214,6 +214,15 @@ static bool post_json(const char *path,cJSON *root,int *http_status,const char *
     if(strstr(path,"progress"))assert(strstr(body,"bytes_written") && strstr(body,"error_code"));
     ++sends;free(body);return true;
 }
+/* ZKT 2.7.7: report_progress posts its own body and may return the receipt. */
+#define OTA_HTTP_RESPONSE_BYTES 64
+typedef struct { char *data; size_t length; size_t capacity; } ota_response_t;
+static bool signed_request(const char *method,const char *path,const char *body,ota_response_t *response,int *status)
+{
+    assert(!strcmp(method,"POST") && strstr(path,"progress") && body);
+    assert(strstr(body,"running_version") && strstr(body,"image_sha256") && strstr(body,"error_message"));
+    ++sends;snprintf(response->data,response->capacity,"{\"confirm\":true}");*status=200;return true;
+}
 ''' + ota[start:end] + ota[ota.index("void ota_manager_append_telemetry("):] + r'''
 int main(void)
 {
@@ -234,6 +243,17 @@ int main(void)
         missing_description=true;assert(!(mode?report_capability():report_state("SUCCEEDED","test")));missing_description=false;
         assert(!sends);
     }
+    /* report_progress: every cJSON allocation failure sends nothing and
+     * returns no receipt; the success returns the parsed receipt. */
+    fail_at=calls=sends=0;
+    {cJSON *receipt=NULL;assert(report_progress("FAILED","PARTITION_HASH_FAILED","slot did not verify",&receipt));
+     assert(sends==1 && receipt && cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(receipt,"confirm")));cJSON_Delete(receipt);}
+    {size_t progress_total=calls;
+     for(size_t i=1;i<=progress_total;++i){
+         cJSON *receipt=NULL;calls=sends=0;fail_at=i;
+         bool ok=report_progress("FAILED","PARTITION_HASH_FAILED","slot did not verify",&receipt);
+         assert(ok?sends==1:(!sends && !receipt));cJSON_Delete(receipt);
+     }}
     fail_at=0;cJSON *heartbeat=cJSON_CreateObject();calls=0;
     ota_manager_append_telemetry(heartbeat);size_t total=calls;
     cJSON *evidence=cJSON_GetObjectItemCaseSensitive(heartbeat,"ota");assert(evidence);

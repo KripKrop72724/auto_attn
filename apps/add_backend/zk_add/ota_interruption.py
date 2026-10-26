@@ -21,12 +21,12 @@ Nothing here reboots, re-installs or starts an attempt on its own:
 * A 2.6.0-2.6.15 ESP that left a target image ADD saw boot, with no failure
   report and within five minutes, is labelled TARGET_BOOT_INTERRUPTED with
   evidence, whether ADD saw the return in two heartbeats or the ESP reported
-  ROLLED_BACK BOOTLOADER_ROLLBACK first. Only the owner's step-up "Retry same
+  ROLLED_BACK BOOTLOADER_ROLLBACK first. Only the owner's one-click "Retry same
   target" makes a new attempt.
 
 Every other running version (2.4.12, 2.5.2, 2.6.16+ and every 2.7.x) and every
 target with its own return evidence (the journal bridges, 2.7.0, the 2.6.24+
-recovery images and 2.7.6) keep the existing fail-closed path unchanged.
+recovery images, 2.7.6 and 2.7.7) keep the existing fail-closed path unchanged.
 
 Lock order, everywhere: connector, then deployment, then campaign (the
 WebSocket heartbeat locks its connector first, record_progress and the HTTPS
@@ -112,11 +112,21 @@ RETRY_REQUESTED = "RETRY_REQUESTED"
 # refused here (and a new campaign needs the owner's override): after two,
 # capture the ESP's UART at the site first.
 TARGET_BOOT_RETRY_LIMIT = 2
-# Journal bridges, the 2.7.0 writer, the one-shot recovery images and the
-# 2.7.6 last-resort reformat carry their own return evidence, rollback
-# expectations and HIL acceptance flows.
+# ZKT 2.7.7: a complete download whose written slot did not verify on the ESP
+# (26 October 2026, Swat-01 and Quetta-01 on 2.7.3 with 2.7.6). The owner may
+# retry it as a fresh deployment, which every ESP downloads from byte 0 (a new
+# deployment never resumes; 2.7.7 also erases the slot and resets its own
+# checkpoint). After this many on one ESP and release, check its power and
+# flash first.
+UNVERIFIED_IMAGE = "PARTITION_HASH_FAILED"
+IMAGE_VERIFY_RETRY_LIMIT = 2
+RETRY_NOT_RETRYABLE = ("Only a target boot that ADD classified TARGET_BOOT_INTERRUPTED, or a downloaded image that "
+                       "did not verify on the ESP (PARTITION_HASH_FAILED), can be retried.")
+# Journal bridges, the 2.7.0 writer, the one-shot recovery images, the 2.7.6
+# last-resort reformat and 2.7.7's confirm-first exception carry their own
+# return evidence, rollback expectations and HIL acceptance flows.
 _OWN_RETURN_EVIDENCE = frozenset({"2.6.16", "2.6.17", "2.6.18", "2.6.19", "2.6.20", "2.6.21", "2.6.22",
-                                  "2.6.23", "2.7.0", "2.7.6", *RECOVERY_RELEASE_IDS})
+                                  "2.6.23", "2.7.0", "2.7.6", "2.7.7", *RECOVERY_RELEASE_IDS})
 _RECONCILE_ACTIVITIES = frozenset({"FULL_RECONCILE", "HISTORICAL_RECONCILE", "LIGHT_RECONCILE"})
 
 
@@ -253,6 +263,37 @@ def _built_after(session: Session, connector: Connector, sample: DeviceTelemetry
     if started is None:
         return False
     return sample.uptime_seconds >= (at - started).total_seconds() - ATTEMPT_UPTIME_SLACK_SECONDS
+
+
+def unverified_image_current(session: Session, connector: Connector, deployment: FirmwareDeployment,
+                             uptime_seconds: int | None, *, now: datetime | None = None) -> bool:
+    """Whether a heartbeat reporting PARTITION_HASH_FAILED can belong to `deployment`'s own download.
+
+    ZKT 2.7.7: 2.7.3 and earlier keep the previous attempt's error in RAM, so
+    after the owner's retry a heartbeat built before the retry's download grant
+    may arrive after the retry's first progress report (a WebSocket read
+    pause, a reconnect burst). That error needs a complete download, which
+    needs a grant: only a heartbeat built after the deployment's latest grant
+    (judged as _built_after does, by the ESP's uptime) can carry this
+    deployment's failure. An OFFERED deployment has reported no download at
+    all, so it never can; without an uptime a DOWNLOADING one is judged as
+    before the review (current).
+    """
+    if deployment.status == "OFFERED":
+        return False
+    if uptime_seconds is None or uptime_seconds < 0:
+        return True
+    granted = session.scalar(select(func.max(FirmwareDownloadGrant.created_at)).where(
+        FirmwareDownloadGrant.deployment_id == deployment.id))
+    if granted is None:
+        return False
+    now = now or utc_now()
+    starts = [now - timedelta(seconds=uptime_seconds)]
+    started = _boot_start(session, connector, connector.boot_id)
+    if started is not None:
+        starts.append(started)
+    built = min(starts) + timedelta(seconds=uptime_seconds)
+    return built >= ensure_utc(granted) - timedelta(seconds=ATTEMPT_UPTIME_SLACK_SECONDS)
 
 
 def download_interruption(session: Session, *, connector: Connector, deployment: FirmwareDeployment,
@@ -809,7 +850,7 @@ def interrupted_message(diagnosis: dict) -> str:
         f"it to {diagnosis['previous_version']}. The new image sent no failure report: ADD cannot tell a crash "
         "from a power or reset event, so read the rollback evidence. The campaign is paused. Before any new "
         "attempt check the ESP's power, its reset history and its current storage and queue state (shown with "
-        "the retry); the owner may then retry the same target with password step-up."
+        "the retry); the owner may then retry the same target with one click."
     )
 
 
@@ -850,6 +891,32 @@ def refreshed_diagnosis(session: Session, deployment: FirmwareDeployment, *, now
             "classified_at": _iso(event.created_at), "summary": evidence_summary(evidence)}
 
 
+def retry_kind(deployment: FirmwareDeployment) -> str | None:
+    """What the owner's one-click retry would retry, or None when it does not apply."""
+    if deployment.status == "ROLLED_BACK" and deployment.error_code == TARGET_BOOT_INTERRUPTED:
+        return TARGET_BOOT_INTERRUPTED
+    if deployment.status == "FAILED" and deployment.error_code == UNVERIFIED_IMAGE:
+        return UNVERIFIED_IMAGE
+    return None
+
+
+def _unverified_images(session: Session, *, connector_id: int, release_id: int) -> int:
+    return int(session.scalar(select(func.count(FirmwareDeployment.id)).where(
+        FirmwareDeployment.connector_id == connector_id,
+        FirmwareDeployment.release_id == release_id,
+        FirmwareDeployment.status == "FAILED",
+        FirmwareDeployment.error_code == UNVERIFIED_IMAGE)) or 0)
+
+
+def _retry_count(session: Session, deployment: FirmwareDeployment, kind: str | None) -> tuple[int, int]:
+    """The attempts of this kind so far on this ESP and release, and the limit."""
+    if kind == UNVERIFIED_IMAGE:
+        return (_unverified_images(session, connector_id=deployment.connector_id, release_id=deployment.release_id),
+                IMAGE_VERIFY_RETRY_LIMIT)
+    return (_interrupted_boots(session, connector_id=deployment.connector_id, release_id=deployment.release_id),
+            TARGET_BOOT_RETRY_LIMIT)
+
+
 def _interrupted_boots(session: Session, *, connector_id: int, release_id: int) -> int:
     return int(session.scalar(select(func.count(FirmwareDeployment.id)).where(
         FirmwareDeployment.connector_id == connector_id,
@@ -888,7 +955,7 @@ def _rollback_pause_reason(connector: Connector | None, deployment: FirmwareDepl
 
     if connector is None:
         return None
-    return deployment_pause_reason(connector, state="ROLLED_BACK", error_code=deployment.error_code)
+    return deployment_pause_reason(connector, state=deployment.status, error_code=deployment.error_code)
 
 
 STORAGE_IO_FAULT_HISTORY = "ESP_STORAGE_IO_FAULT_HISTORY"
@@ -954,17 +1021,19 @@ def retry_refusal(session: Session, campaign: FirmwareCampaign, deployment: Firm
     """Why the owner's retry is refused now, or None. The action re-checks everything."""
     from zk_add.zkt_hil_schedule import applies as nationwide_schedule_applies
 
-    if deployment.status != "ROLLED_BACK" or deployment.error_code != TARGET_BOOT_INTERRUPTED:
-        return "Only a target boot that ADD classified TARGET_BOOT_INTERRUPTED can be retried."
+    kind = retry_kind(deployment)
+    if kind is None:
+        return RETRY_NOT_RETRYABLE
     if campaign.status != "PAUSED":
         return ("A cancelled campaign cannot retry; start a new campaign." if campaign.status == "CANCELLED"
                 else "The campaign must be paused to retry a target.")
     release = session.get(FirmwareRelease, deployment.release_id)
     if release is None or release.state not in OFFERABLE_RELEASE_STATES:
         return "The signed release is no longer available."
-    if has_own_return_evidence(release) or nationwide_schedule_applies(release):
+    if nationwide_schedule_applies(release) or (kind == TARGET_BOOT_INTERRUPTED and has_own_return_evidence(release)):
         return "This release has its own return evidence and HIL schedule; start a new campaign."
-    if not in_scope_version(deployment.previous_version):
+    # The image never booted after a failed verification: no return to classify.
+    if kind == TARGET_BOOT_INTERRUPTED and not in_scope_version(deployment.previous_version):
         return (f"A return to {deployment.previous_version} after an interrupted first boot can lose queued "
                 "punches with no gap record (owner decision 6). Check the ESP's queue and the terminal's records "
                 "against ADD, then start a new campaign.")
@@ -978,9 +1047,12 @@ def retry_refusal(session: Session, campaign: FirmwareCampaign, deployment: Firm
         FirmwareDeployment.status.in_(ACTIVE_DEPLOYMENT_STATES)).limit(1))
     if busy is not None:
         return "Another deployment in this campaign is still active."
-    if _interrupted_boots(session, connector_id=deployment.connector_id,
-                          release_id=deployment.release_id) >= TARGET_BOOT_RETRY_LIMIT:
-        return (f"{TARGET_BOOT_RETRY_LIMIT} boots of {release.version} on this ESP were interrupted. Capture the "
+    count, limit = _retry_count(session, deployment, kind)
+    if count >= limit:
+        if kind == UNVERIFIED_IMAGE:
+            return (f"{limit} downloads of {release.version} did not verify on this ESP. Check its power and flash "
+                    "(each FAILED report names the failing step) before another attempt.")
+        return (f"{limit} boots of {release.version} on this ESP were interrupted. Capture the "
                 "ESP's UART at the site before another attempt.")
     connector = session.get(Connector, deployment.connector_id)
     if campaign.pause_reason != _rollback_pause_reason(connector, deployment):
@@ -1008,13 +1080,13 @@ def retry_view(session: Session, campaign: FirmwareCampaign, deployment: Firmwar
 
     No 7-day stability scan here: the owner's dialog reads retry_preflight.
     """
-    if deployment.status != "ROLLED_BACK" or deployment.error_code != TARGET_BOOT_INTERRUPTED:
+    kind = retry_kind(deployment)
+    if kind is None:
         return None
     refusal = retry_refusal(session, campaign, deployment)
-    return {"available": refusal is None, "refusal": refusal,
-            "interrupted_boots": _interrupted_boots(session, connector_id=deployment.connector_id,
-                                                    release_id=deployment.release_id),
-            "limit": TARGET_BOOT_RETRY_LIMIT,
+    count, limit = _retry_count(session, deployment, kind)
+    return {"available": refusal is None, "refusal": refusal, "kind": kind,
+            "interrupted_boots": count, "limit": limit,
             "pending_deployments": _pending_others(session, campaign) if refusal is None else 0}
 
 
@@ -1042,16 +1114,16 @@ def retry_preflight(session: Session, *, campaign_public_id: str, deployment_pub
                     now: datetime | None = None) -> dict:
     """What the owner reviews before the retry: refusal, stability warnings, pending offers, ESP state."""
     campaign, deployment = _load_retry_target(session, campaign_public_id, deployment_public_id, lock=False)
-    if deployment.status != "ROLLED_BACK" or deployment.error_code != TARGET_BOOT_INTERRUPTED:
-        raise ValueError("Only a target boot that ADD classified TARGET_BOOT_INTERRUPTED can be retried.")
+    kind = retry_kind(deployment)
+    if kind is None:
+        raise ValueError(RETRY_NOT_RETRYABLE)
     refusal = retry_refusal(session, campaign, deployment)
     connector = session.get(Connector, deployment.connector_id)
     warnings = retry_warnings(session, connector, now=now) if refusal is None and connector is not None else []
+    count, limit = _retry_count(session, deployment, kind)
     return {"campaign_id": campaign.campaign_id, "deployment_id": deployment.deployment_id,
             "target_version": deployment.target_version, "available": refusal is None, "refusal": refusal,
-            "interrupted_boots": _interrupted_boots(session, connector_id=deployment.connector_id,
-                                                    release_id=deployment.release_id),
-            "limit": TARGET_BOOT_RETRY_LIMIT, "stability_warnings": warnings,
+            "kind": kind, "interrupted_boots": count, "limit": limit, "stability_warnings": warnings,
             "stability_warnings_digest": warnings_digest(warnings),
             "pending_deployments": _pending_others(session, campaign) if refusal is None else 0,
             "esp_state": esp_state(session, connector)}
@@ -1063,6 +1135,9 @@ def retry_interrupted_target(session: Session, *, campaign_public_id: str, deplo
                              resume_pending_deployments: int = 0, now: datetime | None = None) -> dict:
     """The owner's one-click retry: one new PENDING attempt in the same paused campaign.
 
+    For an interrupted target boot, or (ZKT 2.7.7) a downloaded image that did
+    not verify on the ESP: the new deployment is downloaded from byte 0.
+
     No typed version, reason or password: typed_confirmation is ignored. The
     new attempt is offered only through every ordinary admission check.
     Resuming the campaign also offers its other PENDING deployments, so the
@@ -1070,7 +1145,7 @@ def retry_interrupted_target(session: Session, *, campaign_public_id: str, deplo
     stability warnings the review showed.
     """
     now = now or utc_now()
-    reason = (reason or "").strip() or "One-click retry of an interrupted target boot"
+    reason = (reason or "").strip() or "One-click retry of the same target"
     campaign, deployment = _load_retry_target(session, campaign_public_id, deployment_public_id, lock=True)
     release = session.get(FirmwareRelease, deployment.release_id)
     if release is None:
@@ -1095,10 +1170,11 @@ def retry_interrupted_target(session: Session, *, campaign_public_id: str, deplo
     session.add(retry)
     session.flush()
     overridden = [{"code": warning["code"], "message": warning["message"]} for warning in warnings]
+    kind = retry_kind(deployment)
+    count, _limit = _retry_count(session, deployment, kind)
     session.add(FirmwareEvent(deployment_id=retry.id, state=RETRY_REQUESTED, details={
-        "retry_of": deployment.deployment_id, "classification": TARGET_BOOT_INTERRUPTED, "actor": actor,
-        "reason": reason, "interrupted_boots": _interrupted_boots(
-            session, connector_id=deployment.connector_id, release_id=deployment.release_id),
+        "retry_of": deployment.deployment_id, "classification": kind, "actor": actor,
+        "reason": reason, "interrupted_boots": count,
         "stability_warnings_overridden": overridden, "resumed_pending_deployments": pending,
         "esp_state": esp_state(session, connector)}))
     campaign.status = "ACTIVE"

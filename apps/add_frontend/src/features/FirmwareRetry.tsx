@@ -231,12 +231,20 @@ export function RetryTargetDialog({
           <Icon name="shield" />
           <div>
             <h3>One new attempt, through every admission check.</h3>
-            <p>
-              The ESP reset before it confirmed the new image. Retry only after checking its power,
-              its reset history and its current storage and queue state below;{' '}
-              {preflight?.limit ?? deployment.retry?.limit ?? 2} interrupted boots of one release stop
-              retries until a UART capture is taken.
-            </p>
+            {(preflight?.kind ?? deployment.retry?.kind) === 'PARTITION_HASH_FAILED' ? (
+              <p>
+                The downloaded image did not verify on the ESP. The new attempt downloads it again from
+                the start; {preflight?.limit ?? deployment.retry?.limit ?? 2} failed verifications of one
+                release stop retries until the power and flash of the ESP are checked.
+              </p>
+            ) : (
+              <p>
+                The ESP reset before it confirmed the new image. Retry only after checking its power,
+                its reset history and its current storage and queue state below;{' '}
+                {preflight?.limit ?? deployment.retry?.limit ?? 2} interrupted boots of one release stop
+                retries until a UART capture is taken.
+              </p>
+            )}
           </div>
         </div>
         {!preflight && !preflightError && (

@@ -23,7 +23,8 @@ MAIN = ROOT / "firmware/zone_lite/main"
 HOST = ROOT / "tests/firmware"
 SPIFFS_SOURCES = ["spiffs_nucleus.c", "spiffs_gc.c", "spiffs_hydrogen.c", "spiffs_cache.c", "spiffs_check.c"]
 SHIMMED = ["legacy_queue.c", "file_transaction.c", "reliability.c", "command_inbox_merge.c"]
-PLAIN = ["durable_queue.c", "zkt_clock.c", "storage_repair_plan.c", "storage_repair_mirror.c", "storage_repair_redo.c"]
+PLAIN = ["durable_queue.c", "zkt_clock.c", "storage_repair_plan.c", "storage_repair_mirror.c", "storage_repair_redo.c",
+         "storage_exception.c"]
 FLAGS = ["-std=c11", "-D_POSIX_C_SOURCE=200809L", "-g", "-O1", "-fsanitize=address,undefined",
          "-fno-omit-frame-pointer"]
 # The CI run: 1 MiB stores, every scenario with several seeds, the special,
@@ -62,7 +63,15 @@ CI_RUNS = [["--seeds=3", "--organic=0"], ["cuts", "--seeds=12", "--first-seed=3"
            # finds, a source bit that will not take, sources across file
            # generations (the cuts and rollback entries add a worn first
            # window).
-           ["reclaim-round2", "--kib=8192"]]
+           ["reclaim-round2", "--kib=8192"],
+           # 2.7.7, the confirm-first exception: P02's store as its first
+           # 2.7.6 boot found it (21 October: 0 usable blocks, 67 custody, 1,817
+           # excluded), the gate on that boot's own report, the confirmed
+           # round (the same image tag), the worst case, too few custody pages,
+           # the attempts guard carried over, the refusals (2.7.6's store byte
+           # for byte, the round boot without the hold) and cuts in the
+           # confirmed round.
+           ["reclaim-p02field", "--kib=8192"]]
 
 
 def spiffs_source_dir() -> Path | None:

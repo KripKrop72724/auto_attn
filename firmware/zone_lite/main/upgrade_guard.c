@@ -38,6 +38,9 @@ bool ug_direct_predecessor_matches(const char *version, const uint8_t digest[32]
     /* 2.7.5: the boot storage repair HIL image, so its devices upgrade in place. */
     static const char platform_275[] =
         "430e2daf29dd99ff006a476ff584e4201493d661cee67e4b4f9ba15545b17a40";
+    /* 2.7.6: the last-resort reformat HIL image, so its devices upgrade in place. */
+    static const char platform_276[] =
+        "9d7050768f1cb716e9bc11f9b7b4d20b423b3eccbe1531809130457998e96f0c";
     const char *expected = !strcmp(version, "2.4.12") ? baseline_2412 :
         !strcmp(version, "2.5.2") ? baseline_252 :
         !strcmp(version, "2.6.6") ? hil_266 :
@@ -52,7 +55,8 @@ bool ug_direct_predecessor_matches(const char *version, const uint8_t digest[32]
         !strcmp(version, "2.7.2") ? platform_272 :
         !strcmp(version, "2.7.3") ? platform_273 :
         !strcmp(version, "2.7.4") ? platform_274 :
-        !strcmp(version, "2.7.5") ? platform_275 : NULL;
+        !strcmp(version, "2.7.5") ? platform_275 :
+        !strcmp(version, "2.7.6") ? platform_276 : NULL;
     if (!expected) return false;
     static const char hex[] = "0123456789abcdef";
     for (unsigned i = 0; i < 32; ++i) {

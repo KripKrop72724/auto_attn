@@ -32,6 +32,30 @@ void led_status_init(void);
 void led_status_set(led_status_t status);
 void led_status_fault_at(led_status_t status, const char *file, int line);
 #define led_status_fault(status) led_status_fault_at((status), __FILE__, __LINE__)
+/* ZKT 2.7.7: a fault with the errno its site captured (0 when it has none).
+ * For LOCAL_FAILURE, ENOSPC counts as a store write refused for room; every
+ * other errno is an ordinary incident. The confirm-first storage exception
+ * accepts a latched LOCAL_FAILURE only when every incident of the boot was
+ * a room refusal or a held read (below). */
+void led_status_fault_errno_at(led_status_t status, int error, const char *file, int line);
+#define led_status_fault_errno(status, error) led_status_fault_errno_at((status), (error), __FILE__, __LINE__)
+/* The reclaim queues, in storage_exception.h's sx_queue_names order. */
+typedef enum {
+    LED_QUEUE_PENDING = 0,      /* /pending.jsonl */
+    LED_QUEUE_BLOCKED,          /* /blocked_identity.jsonl */
+    LED_QUEUE_CORRUPT_ORDS,     /* /corrupt_ords.jsonl */
+    LED_QUEUE_ADD_CORRUPT,      /* /add_corrupt.jsonl */
+    LED_QUEUE_ADD_CORRUPT_BAK,  /* /add_corrupt.bak */
+    LED_QUEUE_COUNT,
+} led_queue_t;
+/* A read of a reclaim queue that started at byte `offset` and failed with
+ * `error`: EIO counts as a read of a span the boot repair may hold on flash
+ * (the exception checks the queue and the offset against the held spans);
+ * any other errno is an ordinary incident. */
+void led_status_fault_read_at(led_status_t status, int error, led_queue_t queue, uint32_t offset, const char *file,
+                              int line);
+#define led_status_fault_read(status, error, queue, offset)                                                            \
+    led_status_fault_read_at((status), (error), (queue), (offset), __FILE__, __LINE__)
 void led_status_clear_fault(led_status_t status);
 /* LOCAL_FAILURE incidents raised this boot (wrapping) and whether the latch
  * is on. A latch that cannot be read is reported as on. */
@@ -46,6 +70,14 @@ typedef struct {
     char first_source[80], last_source[80];
 } led_local_failure_t;
 void led_status_local_failure_report(led_local_failure_t *report);
+/* ZKT 2.7.7: this boot's LOCAL_FAILURE incidents by cause; `known` false
+ * when the state lock was busy. */
+typedef struct {
+    bool known, fatal;
+    uint32_t incidents, room, held_reads, held_queues; /* held_queues: bit per led_queue_t */
+    uint32_t held_last[LED_QUEUE_COUNT];               /* the largest start offset of a held read, per queue */
+} led_local_causes_t;
+void led_status_local_causes(led_local_causes_t *causes);
 void led_status_event(led_status_event_t event);
 void led_status_set_backlog(bool has_backlog);
 const char *led_status_current_name(void);

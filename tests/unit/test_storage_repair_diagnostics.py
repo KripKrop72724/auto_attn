@@ -128,3 +128,31 @@ def test_an_unreadable_reclaim_object_is_dropped_and_the_report_kept():
         assert report is not None and report.reclaim is None and report.result == "REPAIRED_WITH_GAPS"
     later = dict(RECLAIM, area="SOME_LATER_STATE", a_later_field=1)
     assert StorageRepairReclaim.model_validate(later).area == "SOME_LATER_STATE"
+
+
+# ZKT 2.7.7: the OTA guard's inventory of bridge-era journal leftovers (3FL).
+JOURNAL_EVIDENCE = {
+    "state": "ACCEPTED", "reason": "BRIDGE_LEFTOVERS", "namespace": True, "authority": "LEGACY", "keys": 2,
+    "reader_proof": True, "files": 1, "bytes": 240, "unreadable": 0, "runtime_disabled": True,
+}
+
+
+def test_journal_evidence_is_kept_with_the_heartbeat(db):
+    connector = connector_fixture(db)
+    update_heartbeat(db, connector=connector, boot_id="journal-evidence-boot", sequence=1,
+                     payload=heartbeat({"durability": "HEALTHY", "persistence_verified": True,
+                                        "recovery_complete": True, "journal_evidence": JOURNAL_EVIDENCE}))
+    db.flush()
+    stored = connector.firmware_diagnostics["storage"]["journal_evidence"]
+    assert stored == JOURNAL_EVIDENCE
+
+
+def test_unreadable_journal_evidence_is_dropped_and_the_heartbeat_accepted():
+    for field, value in [("state", "lower"), ("files", -1), ("authority", "Mixed Case"), ("bytes", 2**33)]:
+        broken = {**JOURNAL_EVIDENCE, field: value}
+        storage = StorageDiagnostics(durability="HEALTHY", journal_evidence=broken)
+        assert storage.journal_evidence is None and storage.durability == "HEALTHY"
+    refused = {**JOURNAL_EVIDENCE, "state": "REFUSED", "reason": "ADD_AUTHORITY", "authority": "ADD"}
+    assert StorageDiagnostics(journal_evidence=refused).journal_evidence.reason == "ADD_AUTHORITY"
+    assert StorageDiagnostics().journal_evidence is None
+    assert heartbeat({"journal_evidence": "not an object"}).diagnostics.storage.journal_evidence is None

@@ -1,4 +1,5 @@
 #include "storage_inventory.h"
+#include "span_digest.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -20,11 +21,23 @@ static bool keep_going(const si_ports_t *ports)
     return !ports || !ports->keep_going || ports->keep_going(ports->context);
 }
 
-/* Unreadable files first, then the largest: the ones a repair must handle. */
+/* Unreadable files first, then the caller's priority names, then the
+ * largest. An unreadable file must stay in the report (the gate refuses when
+ * one is missing from it), and a priority file (a repair-tracked custody
+ * file) must never lose its slot to a merely larger readable one. */
 static bool before(const si_file_t *a, const si_file_t *b)
 {
     if ((a->first_error != 0) != (b->first_error != 0)) return a->first_error != 0;
+    if (a->priority != b->priority) return a->priority;
     return a->bytes > b->bytes;
+}
+
+static bool is_priority(const si_ports_t *ports, const char *name)
+{
+    if (!ports || !ports->priority) return false;
+    for (uint32_t i = 0; i < ports->priority_count; ++i)
+        if (!strcmp(ports->priority[i], name)) return true;
+    return false;
 }
 
 static void keep(si_report_t *report, const si_file_t *file)
@@ -47,6 +60,23 @@ static void unreadable(si_file_t *file, uint32_t offset, int error, uint32_t len
     file->unreadable_bytes += length;
 }
 
+/* Bytes lost other than by a failed span read. */
+static void lost(si_file_t *file, uint32_t offset, int error, uint32_t length)
+{
+    unreadable(file, offset, error, length);
+    file->other_unreadable = true;
+}
+
+/* One data span that would not read back (offset on its page boundary). */
+static void unreadable_span(si_file_t *file, uint32_t offset, int error, uint32_t length)
+{
+    unreadable(file, offset, error, length);
+    file->unreadable_spans++;
+    file->last_error_offset = offset;
+    file->span_digest = span_digest_add(file->span_digest, offset / SI_SPAN_BYTES);
+    if ((error ? error : EIO) != EIO) file->span_errors_other++;
+}
+
 /* Reads a file from position to its size with open/read/lseek, a chunk of
  * SPIFFS data spans per read() and so about one filesystem call per 4 KiB.
  * (newlib's stdio refills an unbuffered stream one byte per read() on the
@@ -63,7 +93,7 @@ static bool scan_file(const char *path, uint32_t position, uint32_t size, unsign
     errno = 0;
     int fd = open(path, O_RDONLY);
     if (fd < 0) {
-        unreadable(file, position, errno, size - position);
+        lost(file, position, errno, size - position);
         return true;
     }
     uint32_t paged = 0; /* bytes of a failed chunk still to read one span at a time */
@@ -89,7 +119,7 @@ static bool scan_file(const char *path, uint32_t position, uint32_t size, unsign
         }
         if (got >= 0) {
             /* The file ended before its reported size: what remains is missing. */
-            unreadable(file, position + (uint32_t)got, ENODATA, size - position - (uint32_t)got);
+            lost(file, position + (uint32_t)got, ENODATA, size - position - (uint32_t)got);
             break;
         }
         if (!paged) {
@@ -97,7 +127,7 @@ static bool scan_file(const char *path, uint32_t position, uint32_t size, unsign
             continue;
         }
         /* Only a span read gets here: a failed chunk is read again by span. */
-        unreadable(file, position, error, want);
+        unreadable_span(file, position, error, want);
         position += want;
         paged -= want;
     }
@@ -157,15 +187,16 @@ void si_scan(const char *directory, const si_ports_t *ports, si_report_t *report
         if ((size_t)snprintf(path, sizeof(path), "%s/%s", directory, names[index]) >= sizeof(path)) continue;
         si_file_t file = {0};
         snprintf(file.name, sizeof(file.name), "%s", names[index]);
+        file.priority = is_priority(ports, file.name);
         struct stat status;
         errno = 0;
         if (stat(path, &status) != 0) {
-            unreadable(&file, 0, errno, 0);
+            lost(&file, 0, errno, 0);
         } else if (S_ISDIR(status.st_mode)) {
             continue;
         } else if (status.st_size < 0) {
             /* A size the device's 32-bit off_t cannot hold: damaged metadata. */
-            unreadable(&file, 0, EOVERFLOW, 0);
+            lost(&file, 0, EOVERFLOW, 0);
         } else {
             /* Compared unsigned: (off_t)UINT32_MAX is -1 where off_t is 32-bit. */
             file.bytes = (uintmax_t)status.st_size > UINT32_MAX ? UINT32_MAX : (uint32_t)status.st_size;
@@ -200,7 +231,14 @@ void si_scan(const char *directory, const si_ports_t *ports, si_report_t *report
         report->unreadable_bytes += rest.unreadable_bytes;
         for (size_t kept = 0; kept < report->count; ++kept) {
             si_file_t *entry = &report->file[kept];
-            if (!strcmp(entry->name, names[index])) entry->unreadable_bytes += rest.unreadable_bytes;
+            if (strcmp(entry->name, names[index])) continue;
+            entry->unreadable_bytes += rest.unreadable_bytes;
+            /* The rest begins past every span the first pass met. */
+            entry->unreadable_spans += rest.unreadable_spans;
+            if (rest.unreadable_spans) entry->last_error_offset = rest.last_error_offset;
+            entry->span_digest += rest.span_digest;
+            entry->span_errors_other += rest.span_errors_other;
+            entry->other_unreadable |= rest.other_unreadable;
         }
     }
     if (stopped) report->complete = false;

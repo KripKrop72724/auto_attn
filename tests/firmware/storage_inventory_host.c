@@ -11,6 +11,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "span_digest.h"
 #include "storage_inventory.h"
 
 #define CHUNK_BYTES SI_CHUNK_BYTES
@@ -197,11 +198,18 @@ int main(int argc, char **argv)
     assert(blocked && blocked->bytes == 4000 && blocked->first_error == EIO);
     /* Bytes 1000-1299 lie in data spans 3-5: a page's exact boundary. */
     assert(blocked->first_error_offset == 3 * SI_SPAN_BYTES && blocked->unreadable_bytes == 3 * SI_SPAN_BYTES);
+    /* 2.7.7: the spans themselves, as the confirm-first exception compares
+     * them with the spans the boot repair holds: 3, 4 and 5, all EIO. */
+    assert(blocked->unreadable_spans == 3 && blocked->last_error_offset == 5 * SI_SPAN_BYTES);
+    assert(blocked->span_digest == span_digest_add(span_digest_add(span_digest_add(0, 5), 3), 4));
+    assert(!blocked->span_errors_other && !blocked->other_unreadable);
     const si_file_t *probe = find(&report, "persistence-probe");
     assert(probe && probe->first_error == ENOENT && probe->first_error_offset == 0 && probe->unreadable_bytes == 32);
+    assert(probe->other_unreadable && !probe->unreadable_spans && !probe->span_digest);
     const si_file_t *pending = find(&report, "pending_events.jsonl");
     assert(pending && pending->first_error == ENODATA && pending->first_error_offset == 512);
     assert(pending->unreadable_bytes == 2000 - 512);
+    assert(pending->other_unreadable && !pending->unreadable_spans);
     assert(report.unreadable_bytes == 3 * SI_SPAN_BYTES + 32 + 1488);
     /* Unreadable files first, then the largest. */
     assert(!strcmp(report.file[0].name, "blocked_identity.jsonl") && !strcmp(report.file[1].name, "pending_events.jsonl"));
@@ -228,6 +236,21 @@ int main(int argc, char **argv)
     assert(find(&report, "blocked_identity.jsonl") && find(&report, "persistence-probe") &&
            find(&report, "pending_events.jsonl") && find(&report, "big.bin") && !find(&report, "acked_uids.txt"));
 
+    /* 2.7.7 (design 14.2 item 6): a priority name (a repair-tracked
+     * custody file) keeps its slot ahead of merely larger readable files, so
+     * the confirm-first gate's CUSTODY_MISSING check never loses a small
+     * custody file to the cap. Unreadable files still come first, and a
+     * priority name that is not on the store matches nothing. */
+    static const char priority_names[][33] = {"acked_uids.txt", "add_corrupt.bak"};
+    const si_ports_t custody_ports = {.priority = priority_names, .priority_count = 2};
+    si_scan(directory, &custody_ports, &report);
+    assert(report.complete && report.files == 25 && report.count == SI_MAX_FILES && report.unreadable_files == 3);
+    const si_file_t *acked = find(&report, "acked_uids.txt");
+    assert(acked && acked->priority && acked->bytes == 600);
+    assert(report.file[0].first_error && report.file[1].first_error && report.file[2].first_error);
+    assert(!strcmp(report.file[3].name, "acked_uids.txt"));
+    assert(find(&report, "big.bin") && !find(&report, "segment-08.bin") && !find(&report, "add_corrupt.bak"));
+
     /* Damage across a chunk boundary is mapped page by page, as is a damaged
      * byte in a later chunk; whole chunks resume once a chunk reads back. */
     char spans[512];
@@ -243,6 +266,14 @@ int main(int argc, char **argv)
     assert(journal && journal->bytes == 6 * CHUNK_BYTES && journal->first_error == EIO);
     assert(journal->first_error_offset == CHUNK_BYTES - SI_SPAN_BYTES);
     assert(journal->unreadable_bytes == 3 * SI_SPAN_BYTES);
+    /* The spans across the chunk boundary (first pass) and the later one
+     * (the rest, mapped in the second pass) are one set. */
+    uint32_t later = (4 * CHUNK_BYTES + 300) / SI_SPAN_BYTES;
+    assert(journal->unreadable_spans == 3 && journal->last_error_offset == later * SI_SPAN_BYTES);
+    assert(journal->span_digest == span_digest_add(span_digest_add(span_digest_add(0, later),
+                                                                   CHUNK_BYTES / SI_SPAN_BYTES),
+                                                   CHUNK_BYTES / SI_SPAN_BYTES - 1));
+    assert(!journal->other_unreadable && !journal->span_errors_other);
     assert(reads < 6 * SI_CHUNK_SPANS);
     assert_all_closed();
 

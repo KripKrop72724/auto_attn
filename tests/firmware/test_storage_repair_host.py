@@ -81,6 +81,19 @@ def test_repair_against_esp_idf_spiffs_with_power_cuts(tmp_path: Path) -> None:
     assert "source bit, attempts and journal refused: block 135 closed, the record never redone" in output
     assert "source generations, a reported entry over a filled span: the live bytes kept" in output
     assert "p02 confirmed, a worn first window:" in output and "a worn first window, old image:" in output
+    # 2.7.7: the confirm-first exception on P02's field store: the gate on the
+    # unconfirmed boot's own report, the confirmed round (same image tag), a
+    # refusal with too few custody pages, the guard carried over, the redo
+    # area's program/erase test through cuts, and cuts in the confirmed round.
+    assert "p02field 1024 KiB hidden header: the gate ELIGIBLE; the confirmed boot reformatted" in output
+    assert "p02field 1024 KiB custody short:" in output and "the gate refuses CUSTODY_SHORT" in output
+    assert "the attempts guard's state carries over to the round boot (same image tag)" in output
+    assert "the redo area test cut at each of its" in output
+    assert "p02field confirmed:" in output and "custody byte-exact, no gap" in output
+    # A refusal rolls back as 2.7.6: the unconfirmed 2.7.7 boot leaves 2.7.6's
+    # store byte for byte, and the round boot takes nothing without the hold.
+    assert "the unconfirmed 2.7.7 boot leaves 2.7.6's store byte for byte" in output
+    assert "takes no block (short hold, retryable)" in output
 
 
 def test_ci_runs_the_repair_harness_in_the_esp_idf_image() -> None:

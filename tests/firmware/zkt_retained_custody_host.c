@@ -5,6 +5,7 @@
 #include "reliability.h"
 #include "cJSON.h"
 #include <assert.h>
+#include <errno.h>
 #include <setjmp.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -49,6 +50,9 @@ static int xSemaphoreTake(SemaphoreHandle_t lock,unsigned wait)
 { assert(lock && wait && !held);held=lock;return pdTRUE; }
 static void xSemaphoreGive(SemaphoreHandle_t lock) { assert(held==lock);held=0; }
 static void led_status_fault(int fault) { assert(fault==LED_STATUS_LOCAL_FAILURE && !held); }
+/* ZKT 2.7.7: the worker reports the settle's captured errno (S3's store-write
+ * classification). The host's settle stubs fail without setting errno. */
+static void led_status_fault_errno(int fault,int error) { (void)error;assert(fault==LED_STATUS_LOCAL_FAILURE && !held); }
 bool qs_snapshot(qs_lane_t lane,uint32_t *depth) { assert(lane<QS_COUNT && !held);*depth=1;return true; }
 bool qs_generation(char output[33]) { assert(!held);memset(output,'a',32);output[32]=0;return generation_ok; }
 int ds_pick(const delivery_scheduler_t *s,unsigned ready,uint64_t now,bool background)

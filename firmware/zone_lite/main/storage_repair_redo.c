@@ -411,6 +411,52 @@ bool srx_slot_free(const srx_area_t *area, uint32_t slot)
     return s == SRX_SLOT_ERASED || s == SRX_SLOT_TORN || s == SRX_SLOT_DONE || s == SRX_SLOT_RETIRED;
 }
 
+const char *srx_test_name(srx_test_t test)
+{
+    switch (test) {
+    case SRX_TEST_NOT_RUN: return "NOT_RUN";
+    case SRX_TEST_PASSED: return "PASSED";
+    case SRX_TEST_FAILED: return "FAILED";
+    case SRX_TEST_NO_SLOT: return "NO_SLOT";
+    }
+    return "UNKNOWN";
+}
+
+srx_test_t srx_area_test(const srx_io_t *io, const srx_area_t *area, uint8_t *scratch, uint32_t *slot_out)
+{
+    if (slot_out) *slot_out = UINT32_MAX;
+    if (!io || !area || !scratch || area->state != SRX_AREA_READY || !io->area_size) return SRX_TEST_NOT_RUN;
+    /* An erased slot first (no extra erase), then a torn, retired or done one
+     * (its block long completed: nothing reads its copy). */
+    static const uint8_t preference[] = {SRX_SLOT_ERASED, SRX_SLOT_TORN, SRX_SLOT_RETIRED, SRX_SLOT_DONE};
+    uint32_t slot = area->slots;
+    for (size_t p = 0; p < sizeof(preference) && slot == area->slots; ++p)
+        for (uint32_t s = area->slots; s-- > 0;)
+            if (area->slot[s] == preference[p] && srx_slot_free(area, s)) {
+                slot = s;
+                break;
+            }
+    if (slot == area->slots) return SRX_TEST_NO_SLOT;
+    if (slot_out) *slot_out = slot;
+    uint32_t base = slot * SRX_BLOCK;
+    if (!io->area_read(io->context, base, scratch, SRX_BLOCK)) return SRX_TEST_FAILED;
+    if (!srx_erased(scratch, SRX_BLOCK) && !io->area_erase(io->context, base, SRX_BLOCK)) return SRX_TEST_FAILED;
+    for (uint32_t i = 0; i < SRX_BLOCK; ++i) scratch[i] = (uint8_t)((i * 37U + 11U) ^ (i >> 8));
+    put32(scratch, SRX_TEST_MAGIC);
+    bool ok = io->area_write(io->context, base, scratch, SRX_BLOCK);
+    /* Read back over the pattern regenerated: a short or wrong program fails. */
+    uint8_t expect[64];
+    for (uint32_t at = 0; ok && at < SRX_BLOCK; at += sizeof(expect)) {
+        for (uint32_t i = 0; i < sizeof(expect); ++i) expect[i] = (uint8_t)(((at + i) * 37U + 11U) ^ ((at + i) >> 8));
+        if (!at) put32(expect, SRX_TEST_MAGIC);
+        ok = io->area_read(io->context, base + at, scratch, sizeof(expect)) && !memcmp(scratch, expect, sizeof(expect));
+    }
+    /* Erased again whatever the program did, and read back erased. */
+    bool erased = io->area_erase(io->context, base, SRX_BLOCK) && io->area_read(io->context, base, scratch, SRX_BLOCK) &&
+        srx_erased(scratch, SRX_BLOCK);
+    return ok && erased ? SRX_TEST_PASSED : SRX_TEST_FAILED;
+}
+
 bool srx_block_busy(const srx_area_t *area, uint32_t block)
 {
     for (uint32_t s = 0; s < area->slots; ++s)

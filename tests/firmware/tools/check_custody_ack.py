@@ -30,6 +30,11 @@ harness = r'''
 /* ATTENDANCE_TYPE */
 static unsigned acknowledgements;
 static int s_lock, s_ack_sem;
+/* ZKT 2.7.7 (D2): the heartbeat's own ack is matched inside parse_inbound. */
+static char s_heartbeat_sent_id[80];
+static int64_t s_heartbeat_acked_at_ms;
+static bool s_ack_duplicate;
+static int64_t monotonic_ms(void) { return 4242; }
 static bool s_ack_matched, s_waiting_evidence, s_waiting_hikvision, s_waiting_zkt_custody;
 static char s_waiting_ack[80], s_hikvision_expected[65], s_reconcile_last_job_id[40];
 static uint32_t s_reconcile_last_generation, s_reconcile_last_committed_ordinal;

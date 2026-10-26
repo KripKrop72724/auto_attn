@@ -24,6 +24,8 @@
 #include "queue_store.h"
 #include "spiffs_api.h" /* esp_spiffs_t: SPIFFS_LOCK takes its mutex */
 #include "spiffs_nucleus.h"
+#include "storage_exception_srr.h"
+#include "storage_inventory.h"
 #include "storage_repair_core.h"
 #include "storage_repair_mirror.h"
 #include "storage_repair_redo.h"
@@ -101,6 +103,32 @@ static esp_timer_handle_t s_deadline_timer;
 static volatile unsigned s_phase, s_pass;
 
 static void count_records(void);
+
+/* ---- 2.7.7: the confirm-first storage exception ------------------------- */
+static atomic_uint s_store_writes;
+static sx_record_t s_exception;      /* the record as this boot left it */
+static bool s_exception_present, s_exception_active, s_running_pending, s_previous_failed;
+static uint32_t s_image_tag;
+static srx_test_t s_area_test;
+static bool s_probe_hold, s_floor_seen, s_ota_floor;
+
+/* Every program and erase of the VFS's SPIFFS (esp_spiffs.c takes these
+ * through its HAL pointers; the link wraps them, CMakeLists.txt). The private
+ * mount of the repair has its own HAL and is not counted. */
+s32_t __real_spiffs_api_write(spiffs *fs, uint32_t addr, uint32_t size, uint8_t *src);
+s32_t __real_spiffs_api_erase(spiffs *fs, uint32_t addr, uint32_t size);
+s32_t __wrap_spiffs_api_write(spiffs *fs, uint32_t addr, uint32_t size, uint8_t *src);
+s32_t __wrap_spiffs_api_erase(spiffs *fs, uint32_t addr, uint32_t size);
+s32_t __wrap_spiffs_api_write(spiffs *fs, uint32_t addr, uint32_t size, uint8_t *src)
+{
+    atomic_fetch_add(&s_store_writes, 1);
+    return __real_spiffs_api_write(fs, addr, size, src);
+}
+s32_t __wrap_spiffs_api_erase(spiffs *fs, uint32_t addr, uint32_t size)
+{
+    atomic_fetch_add(&s_store_writes, 1);
+    return __real_spiffs_api_erase(fs, addr, size);
+}
 
 /* ---- flash, through one internal bounce buffer ------------------------ */
 /* esp_flash allocates a temporary internal buffer of up to 16 KiB for every
@@ -551,6 +579,18 @@ static void redo_recover(srr_config_t *config, bool timed)
         }
     }
     heap_caps_free(work);
+    /* 2.7.7, the OTA floor (critique 1; design 14.2 item 2): anything
+     * that proves custody bytes may be in the area or that a round has
+     * written the store: a journal flag beyond CLAIMED, any round or block,
+     * or any slot not erased (a foreign one, and a torn write of our own,
+     * count too). CLAIMED alone, with every slot of a discovered area
+     * erased, proves no record was ever completed (a torn record leaves a
+     * non-erased slot) and does not ban the pre-2.7.6 recovery images; a
+     * boot that could not inspect the whole area keeps the floor. */
+    s_floor_seen = have && ((journal.flags & ~(uint32_t)SRP_RECLAIM_CLAIMED) || journal.rounds || journal.blocks);
+    bool area_inspected = s_area.state == SRX_AREA_READY || s_area.state == SRX_AREA_FOREIGN;
+    if (have && (journal.flags & SRP_RECLAIM_CLAIMED) && !area_inspected) s_floor_seen = true;
+    for (uint32_t slot = 0; slot < s_area.slots && !s_floor_seen; ++slot) s_floor_seen = s_area.slot[slot] != SRX_SLOT_ERASED;
     /* Also without a journal (NVS lost it): records left open, or sources,
      * get one, so no later boot redoes an open record after this boot's
      * mount (round 2 review, R2-2). */
@@ -582,6 +622,184 @@ static void note_area(void)
     s_report.reclaim.failed = s_area.failed;
 }
 
+/* ---- 2.7.7: the exception's record and inputs ---------------------------- */
+static bool exception_load(sx_record_t *out)
+{
+    memset(out, 0, sizeof(*out));
+    return port_nvs_load(NULL, SRR_NVS_NAMESPACE, SX_RECORD_KEY, out, sizeof(*out)) == 1 && sx_record_valid(out);
+}
+
+bool storage_repair_exception_store(sx_record_t *record)
+{
+    if (!record) return false;
+    sx_record_seal(record);
+    sx_record_t back;
+    bool ok = port_nvs_store(NULL, SRR_NVS_NAMESPACE, SX_RECORD_KEY, record, sizeof(*record)) && exception_load(&back) &&
+        !memcmp(&back, record, sizeof(back));
+    if (ok) {
+        s_exception = *record;
+        s_exception_present = true;
+    }
+    return ok;
+}
+
+bool storage_repair_exception_record(sx_record_t *out)
+{
+    if (!out || !s_exception_present) return false;
+    *out = s_exception;
+    return true;
+}
+
+bool storage_repair_exception_active(void) { return s_exception_active; }
+void storage_repair_exception_mark_confirmed(void)
+{
+    s_exception_active = true;
+    s_ota_floor = true;
+}
+uint32_t storage_repair_image_tag(void) { return s_image_tag; }
+bool storage_repair_running_pending(void) { return s_running_pending; }
+uint32_t storage_repair_store_writes(void) { return atomic_load(&s_store_writes); }
+bool storage_repair_hold_probe(void) { return s_probe_hold; }
+bool storage_repair_ota_floor(void) { return s_ota_floor; }
+
+bool storage_repair_survey(bool *journal_names)
+{
+    if (journal_names) *journal_names = s_report.journal_names;
+    return s_ran && !s_mount_failed && s_report.names_surveyed;
+}
+
+bool storage_repair_exception_repair(sx_repair_t *out)
+{
+    if (!out) return false;
+    sx_from_srr(s_ran ? &s_report : NULL, out);
+    out->ran = s_ran && out->ran;
+    out->mount_failed = s_mount_failed;
+    out->storage_allowed = !s_mount_blocked;
+    out->pending_verify = s_running_pending;
+    out->previous_failed = s_previous_failed;
+    snprintf(out->area_test, sizeof(out->area_test), "%s", srx_test_name(s_area_test));
+    out->records_pending = atomic_load(&s_records_pending);
+    return out->ran;
+}
+
+bool storage_repair_exception_inventory(sx_inventory_t *out)
+{
+    if (!out) return false;
+    memset(out, 0, sizeof(*out));
+    si_report_t *scan = heap_caps_malloc(sizeof(*scan), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    bool done = scan && storage_inventory_snapshot(scan);
+    if (done) {
+        out->done = true;
+        out->complete = scan->complete;
+        out->error = scan->error;
+        out->files = scan->files;
+        out->unreadable_files = scan->unreadable_files;
+        out->count = scan->count < SX_INVENTORY_FILES ? (uint32_t)scan->count : SX_INVENTORY_FILES;
+        for (uint32_t i = 0; i < out->count; ++i) {
+            const si_file_t *f = &scan->file[i];
+            sx_inventory_file_t *t = &out->file[i];
+            snprintf(t->name, sizeof(t->name), "%s", f->name);
+            t->bytes = f->bytes;
+            t->unreadable_bytes = f->unreadable_bytes;
+            t->first_error_offset = f->first_error_offset;
+            t->first_error = f->first_error;
+            t->unreadable_spans = f->unreadable_spans;
+            t->last_error_offset = f->last_error_offset;
+            t->span_digest = f->span_digest;
+            t->span_errors_other = f->span_errors_other;
+            t->other_unreadable = f->other_unreadable;
+        }
+    }
+    heap_caps_free(scan);
+    return done;
+}
+
+/* Before the run: the record, and whether this boot is an exception image's
+ * round boot (critique 11: custody blocks only with every custody file held). */
+static void exception_before(srr_config_t *config)
+{
+    s_image_tag = config->image_tag;
+    s_running_pending = config->pending_verify;
+    s_previous_failed = config->previous_failed;
+    s_exception_present = exception_load(&s_exception);
+    s_exception_active = s_exception_present && sx_exception_active(&s_exception, s_image_tag, s_running_pending);
+    config->custody_needs_hold = s_exception_active;
+}
+
+/* After the run, while the redo area is still registered. On an exception
+ * image: spans that wait for byte sources keep the VFS off (2.7.6 decision 5
+ * (c), critique 2). On an unconfirmed boot that could use the exception: the
+ * area's program/erase test, CLAIMED journaled first so a torn test is this
+ * device's own write (critique 3), and the persistence probe held. */
+static void exception_after_run(void)
+{
+    if (s_exception_active && s_report.reclaim.waiting && !s_mount_blocked) {
+        s_mount_blocked = true;
+        queue_line("ERROR", "STORAGE_REPAIR_EXCEPTION_WAITING",
+                   "spans wait for byte sources after the exception's round; the store stays unmounted this boot");
+    }
+    if (!s_running_pending || s_exception_active) return;
+    sx_repair_t *probe = heap_caps_calloc(1, sizeof(*probe), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!probe) return;
+    (void)storage_repair_exception_repair(probe);
+    snprintf(probe->area_test, sizeof(probe->area_test), "PASSED");
+    sx_reason_t verdict = sx_repair_verdict(probe);
+    heap_caps_free(probe);
+    if (verdict != SX_OK && verdict != SX_RECORDS_UNACKED) return;
+    srp_reclaim_t journal;
+    if (port_nvs_load(NULL, SRR_NVS_NAMESPACE, "reclaim", &journal, sizeof(journal)) != 1 || !srp_reclaim_valid(&journal))
+        memset(&journal, 0, sizeof(journal));
+    if (!(journal.flags & SRP_RECLAIM_CLAIMED)) {
+        journal.flags |= SRP_RECLAIM_CLAIMED;
+        srp_reclaim_seal(&journal);
+        if (!port_nvs_store(NULL, SRR_NVS_NAMESPACE, "reclaim", &journal, sizeof(journal))) return;
+        s_floor_seen = true;
+    }
+    uint8_t *scratch = heap_caps_malloc(SRX_BLOCK, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    s_area_test = scratch ? srx_area_test(&REDO_IO, &s_area, scratch, NULL) : SRX_TEST_NOT_RUN;
+    heap_caps_free(scratch);
+    s_probe_hold = s_area_test == SRX_TEST_PASSED;
+    char message[120];
+    snprintf(message, sizeof(message), "the redo area's program/erase test: %s; the storage exception may apply",
+             srx_test_name(s_area_test));
+    queue_line(s_area_test == SRX_TEST_PASSED ? "WARN" : "ERROR", "STORAGE_REPAIR_EXCEPTION_AREA_TEST", message);
+}
+
+/* After everything: an exception image's round boot records its outcome and
+ * a crash of the boot before (M7); the OTA floor. */
+static void exception_after_boot(void)
+{
+    s_ota_floor = s_floor_seen || s_exception_active || s_mount_blocked;
+    if (!s_exception_active) return;
+    sx_repair_t *after = heap_caps_calloc(1, sizeof(*after), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!after) return;
+    (void)storage_repair_exception_repair(after);
+    sx_outcome_t outcome = sx_round_outcome(after);
+    heap_caps_free(after);
+    esp_reset_reason_t reason = boot_report_reset_reason();
+    /* A brownout counts as the image's crash only when it ended a boot
+     * inside the repair or its round (2.7.6's D5 scope: an erase that pulls
+     * the supply down must not loop). A voltage dip during ordinary runtime
+     * at a flaky-power site says nothing about the exception's machinery and
+     * must not end the controlled-restart budget (design 14.1 item 4).
+     * A panic, watchdog or lockup is the image's own wherever it happened. */
+    bool previous_in_repair = s_previous_known && !s_previous_returned;
+    bool crashed = reason == ESP_RST_PANIC || reason == ESP_RST_INT_WDT || reason == ESP_RST_TASK_WDT ||
+        reason == ESP_RST_WDT || reason == ESP_RST_CPU_LOCKUP ||
+        (reason == ESP_RST_BROWNOUT && previous_in_repair);
+    sx_record_t record = s_exception;
+    uint8_t state = record.state;
+    bool changed = sx_record_after_boot(&record, s_image_tag, s_running_pending, crashed, outcome);
+    if (changed && !storage_repair_exception_store(&record))
+        queue_line("ERROR", "STORAGE_REPAIR_EXCEPTION_RECORD", "the exception's record could not be updated");
+    if (state == SX_STATE_ROUND_DONE && !crashed) return;
+    char message[160];
+    snprintf(message, sizeof(message), "round boot %u: %s; %s, %u restart(s), %u crash(es)", (unsigned)record.round_boots,
+             sx_outcome_name(outcome), sx_state_name((sx_state_t)record.state), (unsigned)record.restarts,
+             (unsigned)record.crashes);
+    queue_line(outcome == SX_ROUND_OK ? "WARN" : "ERROR", "STORAGE_REPAIR_EXCEPTION_ROUND", message);
+}
+
 /* ---- the run --------------------------------------------------------- */
 void storage_repair_boot(void)
 {
@@ -598,6 +816,7 @@ void storage_repair_boot(void)
         return;
     }
     srr_config_t config = boot_config();
+    exception_before(&config);
     /* Internal: the bounce buffer every transfer of the store and of the redo
      * area goes through. */
     s_bounce = heap_caps_malloc(SR_BOUNCE_BYTES, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
@@ -625,6 +844,7 @@ void storage_repair_boot(void)
         note_area();
         /* Records an earlier run left still go to ADD. */
         count_records();
+        exception_after_boot();
         /* This boot's repair is over: a crash later in it is not the
          * repair's (round 1 review, low 2). */
         boot_report_repair_returned();
@@ -707,6 +927,7 @@ void storage_repair_boot(void)
         s_report.result = SRR_RESULT_FAILED;
     }
     note_area();
+    exception_after_run();
     (void)esp_timer_stop(s_deadline_timer);
     (void)esp_timer_delete(s_deadline_timer);
     s_deadline_timer = NULL;
@@ -727,6 +948,7 @@ void storage_repair_boot(void)
     s_internal_after = (uint32_t)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
     nvs_entries(&s_nvs_free_after, &s_nvs_available_after);
     count_records();
+    exception_after_boot();
     boot_report_repair_returned();
 }
 
@@ -1005,6 +1227,32 @@ bool storage_repair_append(cJSON *storage)
             cJSON_AddNumberToObject(reclaim, "index_blocks", x->index_blocks) &&
             cJSON_AddNumberToObject(reclaim, "excluded_blocks", x->excluded_blocks) &&
             cJSON_AddNumberToObject(reclaim, "low_magic_blocks", x->low_magic_blocks);
+    /* 2.7.7: the planner's room, the excluded blocks by reason and the store
+     * as the first survey found it (diagnostics); the area test and the OTA
+     * floor of the confirm-first exception. */
+    if (ok && x->wanted)
+        ok = cJSON_AddNumberToObject(reclaim, "want", x->want) && cJSON_AddNumberToObject(reclaim, "target", x->target) &&
+            cJSON_AddNumberToObject(reclaim, "custody_gain", x->custody_gain) &&
+            cJSON_AddNumberToObject(reclaim, "unconfirmed_gain", x->unconfirmed_gain) &&
+            cJSON_AddNumberToObject(reclaim, "held_out", x->held_out) &&
+            cJSON_AddNumberToObject(reclaim, "excluded_hidden", x->excluded_hidden) &&
+            cJSON_AddNumberToObject(reclaim, "excluded_unwindowed", x->excluded_unwindowed) &&
+            cJSON_AddNumberToObject(reclaim, "excluded_last_page", x->excluded_last_page) &&
+            cJSON_AddNumberToObject(reclaim, "excluded_index_flag", x->excluded_index_flag) &&
+            cJSON_AddNumberToObject(reclaim, "excluded_busy", x->excluded_busy) &&
+            cJSON_AddNumberToObject(reclaim, "excluded_mixed", x->excluded_mixed) &&
+            (!x->excluded_file[0] || !printable(x->excluded_file) || strlen(x->excluded_file) > 32 ||
+             (cJSON_AddStringToObject(reclaim, "excluded_file", x->excluded_file) &&
+              cJSON_AddNumberToObject(reclaim, "excluded_file_blocks", x->excluded_file_blocks)));
+    if (ok && x->mount_measured)
+        ok = cJSON_AddNumberToObject(reclaim, "erased_at_mount", x->erased_at_mount) &&
+            cJSON_AddNumberToObject(reclaim, "free_blocks_at_mount", x->free_blocks_at_mount);
+    if (ok && x->waiting) ok = cJSON_AddNumberToObject(reclaim, "waiting", x->waiting) != NULL;
+    if (ok && s_area_test != SRX_TEST_NOT_RUN)
+        ok = cJSON_AddStringToObject(reclaim, "area_test", srx_test_name(s_area_test)) != NULL;
+    if (ok) ok = cJSON_AddBoolToObject(reclaim, "ota_floor", s_ota_floor) != NULL;
+    if (ok) ok = cJSON_AddBoolToObject(repair, "manifest_active", r->manifest_active) != NULL;
+    if (ok && r->names_surveyed) ok = cJSON_AddBoolToObject(repair, "journal_names", r->journal_names) != NULL;
     if (ok && x->area == SRX_AREA_FOREIGN)
         ok = cJSON_AddNumberToObject(reclaim, "area_foreign_sectors", x->area_foreign) &&
             cJSON_AddNumberToObject(reclaim, "area_first_foreign", x->area_first_foreign) &&
@@ -1021,7 +1269,9 @@ bool storage_repair_append(cJSON *storage)
             cJSON_AddNumberToObject(row, "unreadable_bytes", f->unreadable_bytes) &&
             cJSON_AddNumberToObject(row, "spans_rewritten", f->spans_rewritten) &&
             (!f->blocked_spans || (cJSON_AddNumberToObject(row, "blocked_spans", f->blocked_spans) &&
-                                   cJSON_AddNumberToObject(row, "blocked_offset", f->blocked_offset))) &&
+                                   cJSON_AddNumberToObject(row, "blocked_offset", f->blocked_offset) &&
+                                   cJSON_AddNumberToObject(row, "blocked_last", r->blocked_last[i]) &&
+                                   cJSON_AddNumberToObject(row, "blocked_digest", r->blocked_digest[i]))) &&
             add_actions(row, f->actions);
         if (!row_ok || !cJSON_AddItemToArray(files, row)) {
             cJSON_Delete(row);

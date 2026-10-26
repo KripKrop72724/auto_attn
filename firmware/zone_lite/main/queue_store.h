@@ -56,6 +56,15 @@ bool qs_snapshot(qs_lane_t lane, uint32_t *depth);
  * not replace custody, boot-health or queue-retirement checks. */
 bool qs_snapshot_ram(qs_lane_t lane, uint32_t *depth);
 qs_health_t qs_health(void);
+/* As qs_health, false (and *out zeroed) when its lock was busy: unknown, not
+ * unhealthy (ZKT 2.7.7, the confirm-first exception). */
+bool qs_health_known(qs_health_t *out);
+/* ZKT 2.7.7: on an unconfirmed boot whose store arrived without room (the
+ * boot repair deferred for room), the persistence probe writes nothing: it
+ * fails at its capacity check with ENOSPC instead of creating and removing a
+ * file on a store whose next allocation may run SPIFFS's garbage collection
+ * (critique 9). Boot health fails exactly as the probe itself would. */
+void qs_hold_probe(bool hold);
 
 /* Holds the shared filesystem admission lock across bounded local writes only.
  * Every successful begin must have exactly one end; never wait on a network

@@ -136,6 +136,10 @@ typedef struct {
      * or HELD): a queue's unreadable bytes wait for a boot that reads them,
      * never filled or recorded as lost. */
     bool sources_unread;
+    /* 2.7.7 (the confirm-first exception's round boots): custody blocks are
+     * taken only by a run that held every custody file, so the held-CRC
+     * oracle and the restore comparison cover the first custody round. */
+    bool custody_needs_hold;
 } srr_config_t;
 
 enum {
@@ -180,6 +184,29 @@ typedef struct {
      * source nor journaled as one; the store was not written again and the
      * VFS must not mount it this boot. */
     bool store_blocked;
+    /* 2.7.7, diagnostics (no rule reads them in the engine): the pages the
+     * last round considered short (`want`) of the erased pages it aimed for
+     * (`target`); the pages the confirmed rules would drop from the custody
+     * blocks and from the blocks any image may take; custody blocks a round
+     * would not take because a custody file was not held (custody_needs_hold). */
+    uint32_t want, target, custody_gain, unconfirmed_gain, held_out;
+    /* Excluded blocks by the one reason every excluding page of the block
+     * shares (a hidden or unmapped header's object, a live file never put in
+     * a window, a reclaimable file's last data page, a page whose header says
+     * index under a live lookup entry), the blocks of an open or source
+     * record, and blocks with more than one reason; the object that excludes
+     * the most blocks (its header's name, hidden ones too) and how many. */
+    uint32_t excluded_hidden, excluded_unwindowed, excluded_last_page, excluded_index_flag, excluded_busy;
+    uint32_t excluded_mixed, excluded_file_blocks;
+    char excluded_file[SRP_NAME_BYTES];
+    /* The store as the boot's first survey found it, before anything wrote:
+     * erased pages and SPIFFS's free blocks (a store that arrived without
+     * room, not one this image's own run filled). */
+    uint32_t erased_at_mount, free_blocks_at_mount;
+    bool mount_measured;
+    /* Source pages and queues whose unreadable spans wait for byte sources
+     * (2.7.6 decision 5's precondition) when the boot's last run ended. */
+    uint32_t waiting;
 } srr_reclaim_report_t;
 
 typedef struct {
@@ -211,6 +238,16 @@ typedef struct {
     srr_report_file_t file[SRR_REPORT_FILES];
     uint32_t runs;                 /* 2.7.6: runs this boot (a round is followed by another run) */
     srr_reclaim_report_t reclaim;
+    /* 2.7.7: a manifest was still active when the boot's last run ended; the
+     * survey listed every object header (`names_surveyed`) and one of them
+     * (visible or hidden) is a journal file's (`journal_names`, ZJ_DEVICE_BASENAME). */
+    bool manifest_active, names_surveyed, journal_names;
+    /* 2.7.7, per entry of `file` (kept apart so that every struct stays a
+     * prefix of the next release's, as the released 2.7.5 engine in the host
+     * harness needs): the last blocked span's offset and an order-free digest
+     * of the blocked span indices (span_digest.h), so that the inventory's
+     * unreadable spans can be compared with them set for set. */
+    uint32_t blocked_last[SRR_REPORT_FILES], blocked_digest[SRR_REPORT_FILES];
 } srr_report_t;
 
 /* Runs the repair on a mounted SPIFFS with no open files. The mount must use

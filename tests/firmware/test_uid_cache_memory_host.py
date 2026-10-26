@@ -31,6 +31,7 @@ def test_bounded_psram_cache_lifetime_and_replay_on_partial_failure(tmp_path, fa
 #include "uid_cache.h"
 #include "queue_store.h"
 #include <assert.h>
+#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 #define SEEN_UID_CAPACITY 65536U
@@ -62,6 +63,9 @@ static bool append_line_policy(const char *path,const char *json,qs_admission_t 
  assert(preserved<2);memcpy(preserved_uids[preserved++],json,65);return true;
 }
 static void led_status_fault(int code){assert(code==LED_STATUS_LOCAL_FAILURE || code==LED_STATUS_BLOCKED_IDENTITY);}
+/* ZKT 2.7.7: the incident's captured errno (classified by the LED). */
+#define led_status_fault_errno(code, error) ((void)(error), led_status_fault(code))
+static int g_enqueue_storage_errno;
 static void led_status_set_backlog(bool value){assert(value);}
 static int xSemaphoreCreateMutex(void){++mutex_creations;++calls;return FAIL==calls?0:1;}
 static int xSemaphoreTake(int mutex,int timeout){assert(mutex==1 && timeout==200 && !held);++takes;if(busy)return 0;held=1;return 1;}

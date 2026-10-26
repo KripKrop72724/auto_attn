@@ -1327,6 +1327,10 @@ export interface FirmwareRollbackDiagnosis {
 export interface FirmwareRetryView {
   available: boolean
   refusal: string | null
+  // TARGET_BOOT_INTERRUPTED, or (ZKT 2.7.7) PARTITION_HASH_FAILED: the
+  // downloaded image did not verify on the ESP. interrupted_boots counts
+  // attempts of that kind on this ESP and release.
+  kind?: string
   interrupted_boots: number
   limit: number
   // Other PENDING deployments that resuming the campaign also offers.

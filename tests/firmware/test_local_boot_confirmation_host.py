@@ -64,6 +64,14 @@ static int esp_ota_mark_app_invalid_rollback_and_reboot(void){++rollbacks;return
 static bool save_journal(void){if(++saves==fail_save){s_journal=durable;return false;}durable=s_journal;return true;}
 static bool clear_journal(void){memset(&s_journal,0,sizeof(s_journal));return save_journal();}
 static bool acknowledge_pending_success(void){return false;}
+/* ZKT 2.7.7: the running partition's state follows the mark-valid call. */
+typedef enum {ESP_OTA_IMG_NEW,ESP_OTA_IMG_PENDING_VERIFY,ESP_OTA_IMG_VALID,ESP_OTA_IMG_INVALID,ESP_OTA_IMG_ABORTED,
+    ESP_OTA_IMG_UNDEFINED} esp_ota_img_states_t;
+typedef struct {int unused;} esp_partition_t;
+static const esp_partition_t running_partition;
+static const esp_partition_t *esp_ota_get_running_partition(void){return &running_partition;}
+static int esp_ota_get_state_partition(const esp_partition_t *partition,esp_ota_img_states_t *state)
+{(void)partition;*state=actual_valid?ESP_OTA_IMG_VALID:ESP_OTA_IMG_PENDING_VERIFY;return ESP_OK;}
 static bool report_state(const char *state,const char *error)
 {
     ++reports;
@@ -150,6 +158,14 @@ int main(void)
     legacy_ready=false;
     assert(!confirm_or_report_rollback() && rollbacks==1 && !strcmp(failed_error,"BOOT_CONFIRM_CAP"));
     assert(s_boot_confirm.elapsed_seconds>=BOOT_CONFIRM_MAX_SECONDS && !s_boot_confirm.active_seconds);
+    /* ZKT 2.7.7 (critiques 13, M4): READY_TO_BOOT on an image that is already
+     * valid (a reset after it marked itself valid, before the journal said
+     * RECONCILING) reconciles at once: never the loop, never marked again,
+     * never rolled back, however unhealthy it looks. */
+    reset();strcpy(app.version,"2.6.15");strcpy(s_journal.target_version,"2.6.15");durable=s_journal;
+    actual_valid=true;legacy_ready=false;local_failure=true;network=environment=true;remote_state=1;
+    assert(confirm_or_report_rollback() && !marked && !rollbacks && remote_state==2);
+    assert(!strcmp(durable.state,"RECONCILING") && !s_boot_confirm.elapsed_seconds);
     puts("Local boot proof, legacy behavior, lost replies and checkpoint boundaries passed");
 }
 '''

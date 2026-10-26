@@ -29,3 +29,11 @@ CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
 
 # uxTaskGetSystemState feeds per-task stack high-water marks to ADD.
 CONFIG_FREERTOS_USE_TRACE_FACILITY=y
+
+# ZKT 2.7.7: IDF's cross-core call tasks (ipc0, ipc1) run the flash
+# operations' stall and interrupt allocation. 2.7.3 to 2.7.5 devices reported
+# as little as 436 B left of 1,280 B; an interrupt saves its frame and spills
+# register windows on the interrupted task's stack, and an overflow panics
+# the device. 512 B more each (1 KiB of internal RAM from startup, before the
+# delivery worker stacks are reserved). Applies to every ZKT role.
+CONFIG_ESP_IPC_TASK_STACK_SIZE=1792

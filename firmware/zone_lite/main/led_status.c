@@ -1,5 +1,6 @@
 #include "led_status.h"
 
+#include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -47,6 +48,9 @@ typedef struct {
     char local_failure_last_source[80]; /* most recent incident */
     uint32_t local_failures;            /* incidents this boot; wraps */
     uint32_t local_failure_recoveries;  /* latches cleared after verification */
+    /* ZKT 2.7.7: incidents by cause (wrapping like local_failures). */
+    uint32_t room_failures, held_reads, held_queues;
+    uint32_t held_last[LED_QUEUE_COUNT];
     bool has_backlog;
     bool live_flash;
     int64_t live_flash_until_ms;
@@ -314,7 +318,10 @@ void led_status_set(led_status_t status)
     }
 }
 
-void led_status_fault_at(led_status_t status, const char *file, int line)
+typedef enum { LED_CAUSE_OTHER = 0, LED_CAUSE_ROOM, LED_CAUSE_HELD_READ } led_cause_t;
+
+static void fault(led_status_t status, const char *file, int line, led_cause_t cause, led_queue_t queue,
+                  uint32_t offset)
 {
     if (!s_started || s_led_lock == NULL || !is_fault_status(status)) {
         return;
@@ -331,6 +338,12 @@ void led_status_fault_at(led_status_t status, const char *file, int line)
             }
             s_state.local_failure = true;
             ++s_state.local_failures;
+            if (cause == LED_CAUSE_ROOM) ++s_state.room_failures;
+            if (cause == LED_CAUSE_HELD_READ && (unsigned)queue < LED_QUEUE_COUNT) {
+                ++s_state.held_reads;
+                s_state.held_queues |= 1U << queue;
+                if (offset > s_state.held_last[queue]) s_state.held_last[queue] = offset;
+            }
         }
         s_state.latched_fault = status;
         s_state.has_latched_fault = true;
@@ -340,6 +353,23 @@ void led_status_fault_at(led_status_t status, const char *file, int line)
         }
         xSemaphoreGive(s_led_lock);
     }
+}
+
+void led_status_fault_at(led_status_t status, const char *file, int line)
+{
+    fault(status, file, line, LED_CAUSE_OTHER, LED_QUEUE_COUNT, 0);
+}
+
+void led_status_fault_errno_at(led_status_t status, int error, const char *file, int line)
+{
+    fault(status, file, line, error == ENOSPC ? LED_CAUSE_ROOM : LED_CAUSE_OTHER, LED_QUEUE_COUNT, 0);
+}
+
+void led_status_fault_read_at(led_status_t status, int error, led_queue_t queue, uint32_t offset, const char *file,
+                              int line)
+{
+    bool held = error == EIO && (unsigned)queue < LED_QUEUE_COUNT;
+    fault(status, file, line, held ? LED_CAUSE_HELD_READ : LED_CAUSE_OTHER, queue, offset);
 }
 
 void led_status_clear_fault(led_status_t status)
@@ -399,6 +429,23 @@ void led_status_local_failure_report(led_local_failure_t *report)
         report->recoveries = s_state.local_failure_recoveries;
         snprintf(report->first_source, sizeof(report->first_source), "%s", s_state.local_failure_source);
         snprintf(report->last_source, sizeof(report->last_source), "%s", s_state.local_failure_last_source);
+        xSemaphoreGive(s_led_lock);
+    }
+}
+
+void led_status_local_causes(led_local_causes_t *causes)
+{
+    if (!causes) return;
+    memset(causes, 0, sizeof(*causes));
+    if (s_led_lock && xSemaphoreTake(s_led_lock, pdMS_TO_TICKS(50)) == pdTRUE) {
+        causes->known = true;
+        causes->fatal = s_state.base == LED_STATUS_FATAL ||
+            (s_state.has_latched_fault && s_state.latched_fault == LED_STATUS_FATAL);
+        causes->incidents = s_state.local_failures;
+        causes->room = s_state.room_failures;
+        causes->held_reads = s_state.held_reads;
+        causes->held_queues = s_state.held_queues;
+        memcpy(causes->held_last, s_state.held_last, sizeof(causes->held_last));
         xSemaphoreGive(s_led_lock);
     }
 }

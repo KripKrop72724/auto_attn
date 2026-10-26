@@ -58,6 +58,12 @@ class Connector(Base):
     zkt_custody_enabled: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
     firmware_diagnostics: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     firmware_diagnostics_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # ZKT 2.7.7 (design 14.1 item 3): the redo-area OTA floor, latched
+    # when any heartbeat or progress report shows the device's redo area or
+    # reclaim journal holds anything, or a confirmed storage exception. The
+    # latest heartbeat alone evaporates when the device rolls back to an
+    # image that reports no floor; this never does.
+    ota_floor_latched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     ota_capable: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
     ota_secure_boot: Mapped[bool] = mapped_column(Boolean, default=False)
     ota_rollback_enabled: Mapped[bool] = mapped_column(Boolean, default=False)

@@ -70,7 +70,8 @@ def test_running_image_digest_is_cached_before_delivery_workers_start() -> None:
 def test_ota_http_response_buffers_do_not_consume_task_stack() -> None:
     text = (FIRMWARE / "main" / "ota_manager.c").read_text(encoding="utf-8")
     assert "char response_data[OTA_HTTP_RESPONSE_BYTES]" not in text
-    assert text.count("calloc(1, OTA_HTTP_RESPONSE_BYTES)") == 2
+    # ZKT 2.7.7: the storage exception's receipted progress report is the third.
+    assert text.count("calloc(1, OTA_HTTP_RESPONSE_BYTES)") == 3
     assert text.count("free(response_data)") >= 4
     assert "#define OTA_HTTP_TRANSPORT_BUFFER_BYTES 4096" in text
     assert ".buffer_size = OTA_HTTP_TRANSPORT_BUFFER_BYTES" in text
@@ -103,11 +104,12 @@ def test_direct_ota_tls_buffers_can_use_psram_after_worker_startup() -> None:
 
 def test_ota_capability_is_retried_until_add_acknowledges_it() -> None:
     text = (FIRMWARE / "main" / "ota_manager.c").read_text(encoding="utf-8")
-    assert "bool capability_reported = false;" in text
-    assert "if (!capability_reported)" in text
-    assert "capability_reported = report_capability();" in text
-    assert "capability_reported && !s_busy" in text
-    assert "capability_reported = report_capability();" in text
+    # ZKT 2.7.7: one flag per boot, shared with the storage exception's gate
+    # (the capability ADD accepted on this boot is one of its terms).
+    assert "static bool s_capability_reported;" in text
+    assert "if (!s_capability_reported)" in text
+    assert "s_capability_reported = report_capability();" in text
+    assert "s_capability_reported && !s_busy" in text
 
 
 def test_ota_success_is_durable_and_same_version_is_never_downloaded_again() -> None:
@@ -152,3 +154,32 @@ def test_release_signer_uses_a_docker_mountable_ephemeral_workspace() -> None:
     assert "$env:RUNNER_TEMP" in signer
     assert "$env:GITHUB_WORKSPACE" in signer
     assert "Join-Path $env:TEMP" not in signer
+
+
+def test_a_written_image_that_does_not_verify_is_diagnosed_erased_and_restarted_from_zero() -> None:
+    # ZKT 2.7.7: Swat-01 and Quetta-01 (26 October 2026) failed
+    # PARTITION_HASH_FAILED after a complete download of 2.7.6.
+    ota = (FIRMWARE / "main" / "ota_manager.c").read_text(encoding="utf-8")
+    start = ota.index("static __attribute__((noinline)) void written_image_unverified(")
+    helper = ota[start:ota.index("\n}\n", start)]
+    update = ota[ota.index("static bool perform_update(void)"):ota.index("static void wait_for_capture_safepoint(void)\n{")]
+    failure = update[update.index("esp_err_t hash_error = esp_partition_get_sha256(target, digest);"):]
+    failure = failure[:failure.index("hex_bytes(digest")]
+    assert failure.index("esp_https_ota_abort(handle);") < failure.index("written_image_unverified(target, hash_error);")
+    # Each step named: header/segments, a plain read, the appended digest.
+    order = [helper.index(marker) for marker in (
+        "esp_image_get_metadata(&position, &m->meta)",
+        "esp_partition_read(target, at, m->block, chunk)",
+        'step = strcmp(m->computed, m->appended) ? "DIGEST" : "UNREPRODUCED";',
+        "esp_partition_erase_range(target, 0, written)",
+        "s_journal.bytes_written = 0;",
+        "bool restarted = save_journal();",
+        'add_connector_log("ERROR", "ota", "OTA_IMAGE_UNVERIFIED", finding)',
+        'report_progress("FAILED", "PARTITION_HASH_FAILED", finding, &receipt)',
+    )]
+    assert order == sorted(order)
+    # Only the update slot, never more than the slot; nothing else is erased.
+    assert helper.count("esp_partition_erase_range(") == 1
+    assert "if (written > target->size) written = target->size;" in helper
+    assert "esp_ota_get_running_partition" not in helper and "esp_ota_set_boot_partition" not in helper
+    assert "The downloaded image did not verify on the device" in helper

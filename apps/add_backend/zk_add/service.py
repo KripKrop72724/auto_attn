@@ -210,8 +210,14 @@ OTA_FAILURE_MESSAGES = {
     "DOWNLOAD_BEGIN_FAILED": "The ESP could not begin the secure OTA download.",
     "IMAGE_DESCRIPTOR_MISMATCH": "The downloaded image descriptor does not match the assigned release.",
     "DOWNLOAD_OR_SIGNATURE_FAILED": "The ESP could not complete and authenticate the OTA download.",
-    "PARTITION_HASH_FAILED": "The ESP could not read back the written OTA partition digest.",
+    # ZKT 2.7.7: esp_partition_get_sha256 failed on the written slot (its
+    # header, its own appended digest, or reading it). The owner may retry the
+    # same target; the fresh deployment downloads from byte 0.
+    "PARTITION_HASH_FAILED": ("The downloaded image did not verify on the device. Retry the same target to "
+                              "download it again from the start."),
     "IMAGE_HASH_MISMATCH": "The written OTA partition digest does not match the signed release.",
+    # ZKT 2.7.7: the device's OTA floor refused an image that cannot read its redo area.
+    "STORAGE_REDO_FLOOR": "The ESP keeps custody in its storage redo area; only 2.7.6 or later may be installed.",
 }
 LOCAL_BOOT_WAIT_REASONS = frozenset({
     "BOOT_LOCAL_STORAGE_UPGRADE", "BOOT_LOCAL_JOURNAL_RECOVERY",
@@ -360,6 +366,16 @@ def apply_ota_heartbeat_diagnostics(
     if runtime_state == "UPDATING":
         connector.ota_state = "UPDATING"
         return
+
+    # ZKT 2.7.7: PARTITION_HASH_FAILED needs a complete download of this
+    # deployment. A heartbeat built before its latest download grant carries
+    # the previous attempt's error (kept in RAM until a reboot) and must not
+    # fail the owner's retry, even once the retry has reported progress.
+    if reported_error == "PARTITION_HASH_FAILED" and deployment.status in {"OFFERED", "DOWNLOADING"}:
+        from zk_add.ota_interruption import unverified_image_current
+        if not unverified_image_current(session, connector, deployment, payload.uptime_seconds):
+            connector.ota_state = "UPDATING"
+            return
 
     if not reported_error:
         if runtime_state in {
@@ -856,6 +872,13 @@ def apply_firmware_diagnostics(session: Session, connector: Connector, payload: 
             evidence["worker_contract"] = "NOT_APPLICABLE_STORAGE_RECOVERY"
     connector.firmware_diagnostics = evidence
     connector.firmware_diagnostics_at = now if diagnostics else None
+    # ZKT 2.7.7 (design 14.1 item 3): the redo-area OTA floor is latched
+    # the moment any heartbeat shows it; a device that rolls back to an image
+    # whose heartbeats carry no evidence keeps it.
+    if connector.ota_floor_latched_at is None:
+        from zk_add.ota import redo_floor_evidence
+        if redo_floor_evidence(evidence):
+            connector.ota_floor_latched_at = now
     storage = diagnostics.storage if diagnostics else None
     journal_status = journal_storage_status(evidence or {}, payload.uptime_seconds)
     starting = diagnostics_starting(evidence or {}, payload.uptime_seconds)
