@@ -1919,9 +1919,11 @@ def _deployment_rows(
 def _rollback_rows(session: Session, campaign: FirmwareCampaign,
                    deployment: FirmwareDeployment) -> dict[str, Any]:
     """Re-read rollback evidence and the owner's retry hint for one detail view."""
-    if deployment.status != "ROLLED_BACK":
-        return {"rollback_diagnosis": None, "retry": None}
     from zk_add.ota_interruption import refreshed_diagnosis, retry_view
+    if deployment.status != "ROLLED_BACK":
+        # ZKT 2.7.7: a downloaded image that did not verify may be retried too.
+        return {"rollback_diagnosis": None, "retry": retry_view(session, campaign, deployment)
+                if deployment.status == "FAILED" else None}
     return {"rollback_diagnosis": refreshed_diagnosis(session, deployment),
             "retry": retry_view(session, campaign, deployment)}
 

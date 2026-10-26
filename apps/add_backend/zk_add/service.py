@@ -210,7 +210,11 @@ OTA_FAILURE_MESSAGES = {
     "DOWNLOAD_BEGIN_FAILED": "The ESP could not begin the secure OTA download.",
     "IMAGE_DESCRIPTOR_MISMATCH": "The downloaded image descriptor does not match the assigned release.",
     "DOWNLOAD_OR_SIGNATURE_FAILED": "The ESP could not complete and authenticate the OTA download.",
-    "PARTITION_HASH_FAILED": "The ESP could not read back the written OTA partition digest.",
+    # ZKT 2.7.7: esp_partition_get_sha256 failed on the written slot (its
+    # header, its own appended digest, or reading it). The owner may retry the
+    # same target; the fresh deployment downloads from byte 0.
+    "PARTITION_HASH_FAILED": ("The downloaded image did not verify on the device. Retry the same target to "
+                              "download it again from the start."),
     "IMAGE_HASH_MISMATCH": "The written OTA partition digest does not match the signed release.",
     # ZKT 2.7.7: the device's OTA floor refused an image that cannot read its redo area.
     "STORAGE_REDO_FLOOR": "The ESP keeps custody in its storage redo area; only 2.7.6 or later may be installed.",
@@ -360,6 +364,13 @@ def apply_ota_heartbeat_diagnostics(
     # stops, the runtime returns to the durable journal state (for example,
     # DOWNLOADING), so only UPDATING is safe to treat as active work here.
     if runtime_state == "UPDATING":
+        connector.ota_state = "UPDATING"
+        return
+
+    # ZKT 2.7.7: PARTITION_HASH_FAILED needs a complete download, which an
+    # OFFERED deployment has not reported yet: it is the previous attempt's
+    # error, kept in RAM until a reboot, and must not fail the owner's retry.
+    if deployment.status == "OFFERED" and reported_error == "PARTITION_HASH_FAILED":
         connector.ota_state = "UPDATING"
         return
 

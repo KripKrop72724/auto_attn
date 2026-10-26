@@ -2149,3 +2149,94 @@ def test_the_migration_never_drops_an_invalid_index(db, caplog):
             connection.execute(text(f"DROP INDEX IF EXISTS {name}"))
             connection.execute(text("DELETE FROM add_device_telemetry"))
             connection.execute(text(module.OPERATOR_COMMAND.replace(" CONCURRENTLY", "")))
+
+
+# --- ZKT 2.7.7: a downloaded image that did not verify on the ESP -------------------------------------
+# 26 Oct 2026: Swat-01 and Quetta-01 (2.7.3) downloaded all of 2.7.6 and failed PARTITION_HASH_FAILED.
+
+
+def unverified(db, *, firmware="2.6.15", target="2.7.5"):
+    rel = release(db, target)
+    device = esp(db, MULTAN_02, "ZONE-MULTAN-02", firmware=firmware)
+    run, deployment = campaign(db, rel, device, previous=firmware, bytes_written=IMAGE_SIZE - 4096)
+    now = utc_now()
+    grant(db, deployment, now - timedelta(minutes=7))
+    telemetry(db, device, boot=device.boot_id, at=now - timedelta(seconds=20), uptime=2380, firmware=firmware,
+              target=target)
+    beat(db, device, stuck(firmware=firmware, error="PARTITION_HASH_FAILED", target=target,
+                           written=IMAGE_SIZE - 4096))
+    return rel, device, run, deployment
+
+
+def test_an_unverified_image_fails_with_the_corrected_message_and_the_owner_retries_it(db):
+    rel, device, run, deployment = unverified(db)
+    assert (deployment.status, deployment.error_code) == ("FAILED", "PARTITION_HASH_FAILED")
+    assert deployment.error_message.startswith("The downloaded image did not verify on the device.")
+    assert run.status == "PAUSED" and run.pause_reason.endswith("FAILED (PARTITION_HASH_FAILED)")
+    row = retry_row(db, run, deployment)
+    assert row["rollback_diagnosis"] is None
+    assert row["retry"]["available"] is True, row["retry"]
+    assert row["retry"]["kind"] == "PARTITION_HASH_FAILED"
+    assert (row["retry"]["interrupted_boots"], row["retry"]["limit"]) == (1, 2)
+    client, headers = admin_client(db)
+    path = f"/api/v1/firmware/campaigns/{run.campaign_id}/retry-target"
+    review = client.get(path, params={"deployment_id": deployment.deployment_id})
+    assert review.status_code == 200, review.text
+    review = review.json()
+    assert review["available"] is True and review["kind"] == "PARTITION_HASH_FAILED"
+    response = client.post(path, json=retry_body(deployment, override_stability_warnings=True,
+                                                 stability_warnings_digest=review["stability_warnings_digest"],
+                                                 resume_pending_deployments=0), headers=headers)
+    assert response.status_code == 200, response.text
+    db.expire_all()
+    retry = db.scalar(select(FirmwareDeployment).where(
+        FirmwareDeployment.deployment_id == response.json()["deployment_id"]))
+    # A fresh deployment: no ESP resumes a deployment it has not seen, so it downloads from byte 0.
+    assert retry.status == "PENDING" and retry.bytes_written == 0 and retry.deployment_id != deployment.deployment_id
+    [requested] = events(db, retry, "RETRY_REQUESTED")
+    assert requested.details["classification"] == "PARTITION_HASH_FAILED"
+    device = db.get(Connector, device.id)
+    assignment = offer(db, device)
+    assert assignment is not None and assignment["deployment_id"] == retry.deployment_id
+    db.expire_all()
+    retry = db.get(FirmwareDeployment, retry.id)
+    assert retry.status == "OFFERED"
+    # 2.7.3 and earlier keep the previous attempt's error in RAM: a heartbeat
+    # before the retry reports progress does not fail it.
+    device = db.get(Connector, device.id)
+    beat(db, device, stuck(error="PARTITION_HASH_FAILED", written=IMAGE_SIZE - 4096))
+    db.expire_all()
+    retry = db.get(FirmwareDeployment, retry.id)
+    assert retry.status == "OFFERED" and retry.error_code is None
+    # Once the retry downloads, the same error fails it and a third attempt waits for a flash check.
+    retry.status = "DOWNLOADING"
+    retry.bytes_written = IMAGE_SIZE - 4096
+    db.commit()
+    device = db.get(Connector, device.id)
+    beat(db, device, stuck(error="PARTITION_HASH_FAILED", written=IMAGE_SIZE - 4096))
+    db.expire_all()
+    retry = db.get(FirmwareDeployment, retry.id)
+    assert (retry.status, retry.error_code) == ("FAILED", "PARTITION_HASH_FAILED")
+    run_row = db.get(FirmwareCampaign, run.id)
+    refusal = retry_refusal(db, run_row, retry)
+    assert refusal is not None and "did not verify on this ESP" in refusal
+
+
+def test_an_unverified_image_of_a_release_with_its_own_return_evidence_can_be_retried(db):
+    # 2.7.6 carries its own return evidence; a slot that did not verify never booted it.
+    rel, device, run, deployment = unverified(db, firmware="2.6.15", target="2.7.6")
+    assert (deployment.status, deployment.error_code) == ("FAILED", "PARTITION_HASH_FAILED")
+    assert retry_refusal(db, run, deployment) is None
+    # Every other failure stays non-retryable here.
+    deployment.error_code = "IMAGE_HASH_MISMATCH"
+    assert "PARTITION_HASH_FAILED" in retry_refusal(db, run, deployment)
+    deployment.error_code = "PARTITION_HASH_FAILED"
+    deployment.status = "ROLLED_BACK"
+    assert retry_refusal(db, run, deployment) is not None
+
+
+def test_the_interrupted_return_message_has_no_step_up():
+    from zk_add.ota_interruption import interrupted_message
+    message = interrupted_message({"target_boot": {"estimated_lifetime_seconds": {"min": 40, "max": 47}},
+                                   "target_version": "2.7.5", "previous_version": "2.6.15"})
+    assert "step-up" not in message and "password" not in message and "one click" in message

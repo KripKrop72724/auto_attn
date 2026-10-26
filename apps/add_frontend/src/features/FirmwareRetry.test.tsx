@@ -204,3 +204,28 @@ describe('interrupted target boot', () => {
     expect(onClose).not.toHaveBeenCalled()
   })
 })
+
+describe('downloaded image that did not verify (ZKT 2.7.7)', () => {
+  it('explains a fresh download instead of an interrupted boot', async () => {
+    vi.stubGlobal('fetch', server(preflight({ kind: 'PARTITION_HASH_FAILED', stability_warnings: [] })))
+    render(
+      <RetryTargetDialog
+        campaign={campaign}
+        deployment={{
+          ...deployment,
+          status: 'FAILED',
+          error_code: 'PARTITION_HASH_FAILED',
+          rollback_diagnosis: null,
+          retry: { ...deployment.retry!, kind: 'PARTITION_HASH_FAILED' },
+        }}
+        onClose={vi.fn()}
+        onChanged={vi.fn(async () => undefined)}
+        toast={{ notice: vi.fn() }}
+      />,
+    )
+    expect(screen.getByText(/did not verify on the ESP/)).toBeTruthy()
+    expect(screen.getByText(/downloads it again from\s+the start/)).toBeTruthy()
+    expect(document.body.textContent).not.toMatch(/reset before it confirmed/)
+    await waitFor(() => expect(screen.queryByText(/Checking the ESP/)).toBeNull())
+  })
+})
