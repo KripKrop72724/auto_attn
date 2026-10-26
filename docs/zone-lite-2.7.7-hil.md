@@ -236,7 +236,14 @@ eFuses. 2.7.2 stays in its slot for rollback.
    `ota_state`, which on 3FL may be an `ABORTED` entry from the 2.7.1 attempt.
 4. Reset (`esptool.py ... --after hard_reset` or the board's reset). If the
    image failed Secure Boot verification the bootloader falls back to the
-   other slot (2.7.2): read the console and stop.
+   other slot (2.7.2): read the console and stop. A `VALID` entry has no
+   automatic rollback: if 2.7.7 boots but resets repeatedly or does not
+   reach ADD within 10 minutes, capture the USB console and apply the USB
+   rollback below only if the console shows no `STORAGE_REPAIR_RECLAIM ...
+   blocks reformatted in place` or `STORAGE_REPAIR_RECLAIM_REDONE` line
+   (a confirmed image may run 2.7.6's round at boot; 3FL's store is
+   `HEALTHY` beforehand, so none is expected). If a round ran, stop and
+   escalate: 2.7.2 cannot read the redo area.
 
 **After (on ADD):**
 
