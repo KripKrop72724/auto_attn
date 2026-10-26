@@ -119,6 +119,11 @@ function DeviceRow({ device, now }: { device: PublicDevice; now: Date }) {
           Since {formatSince(device.since, now)}
           <span className="ps-device-duration"> · {formatDuration(device.since, now)}</span>
         </span>
+        {!online && device.reason && (
+          <span className="ps-device-reason">
+            <strong>{device.reason}.</strong> {device.reason_detail}
+          </span>
+        )}
       </span>
       <span className="ps-pill">{online ? 'Online' : 'Offline'}</span>
     </li>
@@ -190,7 +195,7 @@ export default function PublicStatus() {
         )}
       </main>
       <footer className="ps-footer">
-        A device is online when its attendance is reaching the system. Times are Pakistan time.
+        A device is online when its attendance is reaching the system. For an offline device, the most likely reason is shown. Times are Pakistan time.
       </footer>
     </div>
   )

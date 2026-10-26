@@ -259,6 +259,15 @@
 
 .ps-device-duration { color: var(--text-tertiary); }
 
+.ps-device-reason {
+  margin-top: 4px;
+  color: var(--text-secondary);
+  font-size: 13px;
+  line-height: 1.4;
+}
+
+.ps-device-reason strong { color: var(--critical); font-weight: 600; }
+
 .ps-pill {
   padding: 3px 10px;
   border: 1px solid var(--positive-border);

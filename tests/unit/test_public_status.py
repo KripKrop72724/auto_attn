@@ -20,6 +20,7 @@ from zk_add.public_status import (
     build_snapshot,
     device_name,
     observed_status,
+    offline_reason,
 )
 from zk_add.time_utils import ensure_utc, utc_now
 from zk_add.web import app
@@ -49,7 +50,7 @@ def test_device_names_read_as_places(code, zone, location, unit):
 
 def test_device_number_is_shown_only_where_a_place_has_several():
     now = utc_now()
-    rows = [(SimpleNamespace(display_name=code, zone_id=code), ONLINE, now) for code in (
+    rows = [(SimpleNamespace(display_name=code, zone_id=code), ONLINE, now, None) for code in (
         "LF-ZONE-BLD9-03", "LF-ZONE-BLD9-01", "LF-ZONE-BLD1-01", "LF-ZONE-G&PBLD8-01",
         "ZONE-BLD9-01", "ZONE-SWAT-01", "ZONE-PESHAWAR-06", "ZONE-PESHAWAR-02",
         "ZONE-SLICTOWER-13FL", "ZONE-SLICTOWER-3FL")]
@@ -95,6 +96,32 @@ def _health(tier, link_state="CONNECTED", reason="LINK_UP", since=None):
 def test_online_means_attendance_can_reach_add(health, expected):
     connector = SimpleNamespace(last_seen_at=utc_now(), firmware_family="zkt")
     assert observed_status(connector, health, utc_now())[0] == expected
+
+
+@pytest.mark.parametrize(
+    ("health", "reason", "heading"),
+    [
+        (_health("OFFLINE", "UNKNOWN", "ESP_DISCONNECTED"), "no_internet", "No internet"),
+        (_health("OFFLINE", "UNKNOWN", "NO_TERMINAL"), "no_internet", "No internet"),
+        (_health("ONLINE_WITH_WARNINGS", "DISCONNECTED", "HIK_NETWORK"), "machine_not_responding",
+         "Machine not responding"),
+        (_health("ONLINE", "DISCONNECTED", "OFFLINE"), "machine_not_responding", "Machine not responding"),
+        (_health("DEGRADED", "ERROR", "HIK_SOURCE_CHANGED"), "machine_records_changed",
+         "Machine records changed"),
+        (_health("DEGRADED", "ERROR", "HIK_AUTH"), "machine_settings_wrong", "Wrong machine settings"),
+        (_health("DEGRADED", "ERROR", "HIK_INVALID_RESPONSE"), "machine_problem", "Machine problem"),
+        (_health("ONLINE", "UNKNOWN", "NO_TERMINAL"), "not_set_up", "Not set up yet"),
+    ],
+)
+def test_offline_devices_say_why_in_plain_words(health, reason, heading):
+    assert offline_reason(health) == reason
+    now = utc_now()
+    device = build_snapshot([(SimpleNamespace(display_name="ZONE-SWAT-01", zone_id="ZONE-SWAT-01"),
+                              OFFLINE, now, reason)], now)["devices"][0]
+    assert (device["reason_code"], device["reason"]) == (reason, heading)
+    # No system words for people who do not know the system.
+    words = set(device["reason_detail"].lower().replace(",", " ").replace(".", " ").split())
+    assert not words & {"esp", "add", "terminal", "hikvision", "zkt", "server", "connector"}
 
 
 def _device(db, code, number, *, spare=False):
@@ -154,6 +181,7 @@ def test_grace_periods_keep_since_through_short_outages(db):
     offline = tracker.refresh_in(db, start + timedelta(seconds=221))["devices"][0]
     assert offline["status"] == OFFLINE
     assert offline["since"] == public_status.iso_utc(last_contact)
+    assert (offline["reason_code"], offline["reason"]) == ("no_internet", "No internet")
     row = db.get(PublicDeviceStatus, device.id)
     assert (row.status, ensure_utc(row.since)) == (OFFLINE, last_contact)
 
@@ -165,6 +193,7 @@ def test_grace_periods_keep_since_through_short_outages(db):
     _seen(db, [device], back + timedelta(seconds=60))
     online = tracker.refresh_in(db, back + timedelta(seconds=60))["devices"][0]
     assert (online["status"], online["since"]) == (ONLINE, public_status.iso_utc(back))
+    assert (online["reason_code"], online["reason"], online["reason_detail"]) == (None, None, None)
 
 
 def test_terminal_unreachable_is_offline_since_it_was_lost(db):
@@ -179,6 +208,7 @@ def test_terminal_unreachable_is_offline_since_it_was_lost(db):
     seeded = StatusTracker(STARTED).refresh_in(db, now)["devices"][0]
     assert (seeded["name"], seeded["zone"], seeded["status"]) == ("Building 9", "life", OFFLINE)
     assert seeded["since"] == public_status.iso_utc(lost)
+    assert seeded["reason"] == "Machine not responding"
 
 
 @contextmanager
@@ -204,7 +234,8 @@ def test_public_api_needs_no_sign_in_and_shows_only_names_and_status(db, monkeyp
         body = response.json()
         assert set(body) == {"updated_at", "total", "online", "offline", "zones", "devices"}
         assert [set(device) for device in body["devices"]] == [
-            {"name", "location", "unit", "zone", "code", "status", "since"}] * 2
+            {"name", "location", "unit", "zone", "code", "status", "since",
+             "reason_code", "reason", "reason_detail"}] * 2
         assert [device["name"] for device in body["devices"]] == ["Building 5", "Quetta"]
 
         life = client.get("/api/public/v1/status?zone=life").json()
@@ -302,7 +333,7 @@ def test_failing_hikvision_terminal_is_offline_since_its_last_delivery(db):
     device.created_at = now - timedelta(days=60)
     _flap(db, device, now)
     seeded = StatusTracker(STARTED).refresh_in(db, now)["devices"][0]
-    assert (seeded["name"], seeded["status"]) == ("Building 1", OFFLINE)
+    assert (seeded["name"], seeded["status"], seeded["reason"]) == ("Building 1", OFFLINE, "Machine records changed")
     assert seeded["since"] == public_status.iso_utc(delivered.replace(microsecond=0))
 
 
