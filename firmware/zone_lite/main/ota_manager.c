@@ -13,6 +13,7 @@
 #include "esp_crt_bundle.h"
 #include "esp_http_client.h"
 #include "esp_https_ota.h"
+#include "esp_image_format.h"
 #include "esp_log.h"
 #include "esp_ota_ops.h"
 #include "esp_partition.h"
@@ -415,10 +416,9 @@ static bool report_state(const char *state, const char *error)
     return ok;
 }
 
-#if OTA_STORAGE_EXCEPTION
 /* ZKT 2.7.7: a progress report with an operator-visible message whose
- * receipt the caller checks (the exception's BOOTED_PENDING, RECONCILING and
- * terminal FAILED reports; never for the bridge or writer roles). */
+ * receipt the caller may check (the exception's BOOTED_PENDING, RECONCILING
+ * and terminal FAILED reports, and a written image that did not verify). */
 static bool report_progress(const char *state, const char *error, const char *message, cJSON **receipt_out)
 {
     if (receipt_out) *receipt_out = NULL;
@@ -446,7 +446,6 @@ static bool report_progress(const char *state, const char *error, const char *me
     free(body);
     return ok;
 }
-#endif
 
 static bool report_capability(void)
 {
@@ -527,6 +526,96 @@ static bool fetch_assignment(void)
     cJSON_Delete(root);
     free(response_data);
     return valid;
+}
+
+/* ZKT 2.7.7: the written OTA slot did not verify. On 26 October 2026
+ * ZONE-SWAT-01 and ZONE-QUETTA-01 (2.7.3) downloaded all 1,511,424 bytes of
+ * 2.7.6 and esp_partition_get_sha256() failed: the cause (RAM corruption
+ * before the write, or flash programming) was not provable, because that
+ * call folds every failure into ESP_ERR_IMAGE_INVALID and the device kept
+ * resuming the same deployment over the same bytes. Its steps are re-run
+ * here to name the one that fails: the image header and segments
+ * (esp_image_get_metadata), a plain read of the hashed range, and the
+ * appended digest against that read and against the release's. Then the
+ * written range is erased and the checkpoint goes back to byte 0, so a retry
+ * downloads the whole image again; the finding goes to ADD as a log and with
+ * the FAILED report. Never the running slot (target is the update slot) and
+ * never before esp_https_ota_abort released it. */
+typedef struct {
+    esp_image_metadata_t meta;
+    mbedtls_sha256_context sha;
+    unsigned char block[4096];
+    unsigned char digest[32];
+    char computed[65], appended[65];
+    char finding[240];
+} ota_verify_scratch_t;
+
+/* Out of line, its texts on the heap: perform_update's frame stays as it was
+ * under the FAILED report's TLS handshake (ota_manager's 12 KiB stack). */
+static __attribute__((noinline)) void written_image_unverified(const esp_partition_t *target, esp_err_t hash_error)
+{
+    strlcpy(s_last_error, "PARTITION_HASH_FAILED", sizeof(s_last_error));
+    ota_verify_scratch_t *m = calloc(1, sizeof(*m));
+    const char *step = "SCRATCH", *readback = "UNREAD", *appended = "UNREAD";
+    esp_err_t step_error = ESP_ERR_NO_MEM;
+    if (m) {
+        const esp_partition_pos_t position = {.offset = target->address, .size = target->size};
+        step_error = esp_image_get_metadata(&position, &m->meta);
+        if (step_error != ESP_OK) step = "HEADER";
+        else if (!m->meta.image.hash_appended || m->meta.image_len <= sizeof(m->digest) ||
+                 m->meta.image_len > target->size) {
+            step = "HEADER";
+            step_error = ESP_ERR_IMAGE_INVALID;
+        } else {
+            /* A plain read, no mmap: the bytes the slot holds. */
+            uint32_t hashed = m->meta.image_len - sizeof(m->digest);
+            mbedtls_sha256_init(&m->sha);
+            int sha = mbedtls_sha256_starts(&m->sha, 0);
+            for (uint32_t at = 0; !sha && step_error == ESP_OK && at < hashed; at += sizeof(m->block)) {
+                uint32_t chunk = hashed - at < sizeof(m->block) ? hashed - at : sizeof(m->block);
+                step_error = esp_partition_read(target, at, m->block, chunk);
+                if (step_error == ESP_OK) sha = mbedtls_sha256_update(&m->sha, m->block, chunk);
+                if (!(at % (64U * 1024U))) vTaskDelay(1);
+            }
+            if (!sha && step_error == ESP_OK) sha = mbedtls_sha256_finish(&m->sha, m->digest);
+            mbedtls_sha256_free(&m->sha);
+            if (step_error != ESP_OK) step = "READ";
+            else if (sha) { step = "READ"; step_error = ESP_FAIL; }
+            else {
+                hex_bytes(m->digest, sizeof(m->digest), m->computed);
+                hex_bytes(m->meta.image_digest, sizeof(m->meta.image_digest), m->appended);
+                /* Flash content that does not match its own appended digest:
+                 * corrupt bytes reached the slot. Content that matches: the
+                 * IDF check failed elsewhere (mapping) and did not reproduce. */
+                step = strcmp(m->computed, m->appended) ? "DIGEST" : "UNREPRODUCED";
+                readback = strcmp(m->computed, s_journal.image_sha256) ? "MISMATCH" : "MATCH";
+                appended = strcmp(m->appended, s_journal.image_sha256) ? "MISMATCH" : "MATCH";
+            }
+        }
+    }
+    uint32_t written = s_journal.image_size + target->erase_size - 1;
+    written -= written % target->erase_size;
+    if (written > target->size) written = target->size;
+    esp_err_t erased = esp_partition_erase_range(target, 0, written);
+    s_journal.bytes_written = 0;
+    bool restarted = save_journal();
+    const char *finding = "The downloaded image did not verify on the device (no memory to name the step).";
+    if (m) {
+        snprintf(m->finding, sizeof(m->finding),
+                 "The downloaded image did not verify on the device: step %s (%s), hash %s; read-back %s and "
+                 "appended digest %s the release; slot erase %s; next download from byte %s.",
+                 step, esp_err_to_name(step_error), esp_err_to_name(hash_error), readback, appended,
+                 erased == ESP_OK ? "done" : esp_err_to_name(erased), restarted ? "0" : "unknown");
+        finding = m->finding;
+    }
+    ESP_LOGE(TAG, "%s (slot erase %s)", finding, esp_err_to_name(erased));
+    (void)add_connector_log("ERROR", "ota", "OTA_IMAGE_UNVERIFIED", finding);
+    cJSON *receipt = NULL;
+    (void)report_progress("FAILED", "PARTITION_HASH_FAILED", finding, &receipt);
+    cJSON_Delete(receipt);
+    free(m);
+    /* save_journal failing restores the committed journal: keep the error. */
+    strlcpy(s_last_error, "PARTITION_HASH_FAILED", sizeof(s_last_error));
 }
 
 /* The existing attested bridge is selected locally. A network download must
@@ -822,9 +911,10 @@ static bool perform_update(void)
     // a different signed image leaves an unsafe reset window between them.
     unsigned char digest[32];
     char digest_hex[65];
-    if (esp_partition_get_sha256(target, digest) != ESP_OK) {
+    esp_err_t hash_error = esp_partition_get_sha256(target, digest);
+    if (hash_error != ESP_OK) {
         esp_https_ota_abort(handle);
-        strlcpy(s_last_error, "PARTITION_HASH_FAILED", sizeof(s_last_error));
+        written_image_unverified(target, hash_error);
         return false;
     }
     hex_bytes(digest, sizeof(digest), digest_hex);

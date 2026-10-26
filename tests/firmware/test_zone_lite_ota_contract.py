@@ -154,3 +154,32 @@ def test_release_signer_uses_a_docker_mountable_ephemeral_workspace() -> None:
     assert "$env:RUNNER_TEMP" in signer
     assert "$env:GITHUB_WORKSPACE" in signer
     assert "Join-Path $env:TEMP" not in signer
+
+
+def test_a_written_image_that_does_not_verify_is_diagnosed_erased_and_restarted_from_zero() -> None:
+    # ZKT 2.7.7: Swat-01 and Quetta-01 (26 October 2026) failed
+    # PARTITION_HASH_FAILED after a complete download of 2.7.6.
+    ota = (FIRMWARE / "main" / "ota_manager.c").read_text(encoding="utf-8")
+    start = ota.index("static __attribute__((noinline)) void written_image_unverified(")
+    helper = ota[start:ota.index("\n}\n", start)]
+    update = ota[ota.index("static bool perform_update(void)"):ota.index("static void wait_for_capture_safepoint(void)\n{")]
+    failure = update[update.index("esp_err_t hash_error = esp_partition_get_sha256(target, digest);"):]
+    failure = failure[:failure.index("hex_bytes(digest")]
+    assert failure.index("esp_https_ota_abort(handle);") < failure.index("written_image_unverified(target, hash_error);")
+    # Each step named: header/segments, a plain read, the appended digest.
+    order = [helper.index(marker) for marker in (
+        "esp_image_get_metadata(&position, &m->meta)",
+        "esp_partition_read(target, at, m->block, chunk)",
+        'step = strcmp(m->computed, m->appended) ? "DIGEST" : "UNREPRODUCED";',
+        "esp_partition_erase_range(target, 0, written)",
+        "s_journal.bytes_written = 0;",
+        "bool restarted = save_journal();",
+        'add_connector_log("ERROR", "ota", "OTA_IMAGE_UNVERIFIED", finding)',
+        'report_progress("FAILED", "PARTITION_HASH_FAILED", finding, &receipt)',
+    )]
+    assert order == sorted(order)
+    # Only the update slot, never more than the slot; nothing else is erased.
+    assert helper.count("esp_partition_erase_range(") == 1
+    assert "if (written > target->size) written = target->size;" in helper
+    assert "esp_ota_get_running_partition" not in helper and "esp_ota_set_boot_partition" not in helper
+    assert "The downloaded image did not verify on the device" in helper

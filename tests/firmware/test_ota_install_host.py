@@ -56,6 +56,10 @@ static int esp_https_ota_finish(esp_https_ota_handle_t h)
 {assert(h && handle_live && boot_checkpoint && hashes==1 && !selected);++finishes;handle_live=false;if(stage==5)return -1;selected=true;return 0;}
 static int esp_partition_get_sha256(const esp_partition_t *p,unsigned char digest[32])
 {assert(p==&target && handle_live && !selected && !finishes && !boot_checkpoint);++hashes;memset(digest,stage==7?0x22:0x11,32);return stage==6?-1:0;}
+static unsigned unverified;
+static void written_image_unverified(const esp_partition_t *t,esp_err_t e)
+{assert(t==&target && e==-1 && !handle_live && !selected && !finishes && !boot_checkpoint);++unverified;
+ s_journal.bytes_written=0;strlcpy(s_last_error,"PARTITION_HASH_FAILED",sizeof(s_last_error));}
 static void hex_bytes(const unsigned char *bytes,size_t n,char *out){memset(out,bytes[0]==0x11?'a':'b',2*n);out[2*n]=0;}
 static bool save_journal(void)
 {if(++saves==fail_save)return false;if(!strcmp(s_journal.state,"READY_TO_BOOT")){assert(s_journal.bytes_written==s_journal.image_size && hashes==1);boot_checkpoint=true;}else assert(!(s_journal.bytes_written%4096));return true;}
@@ -66,7 +70,7 @@ static void esp_restart(void){assert(selected && boot_checkpoint);++reboots;}
 /* PRODUCTION */
 static void reset(void)
 {
-    saves=performs=aborts=finishes=reboots=hashes=begins=0;
+    saves=performs=aborts=finishes=reboots=hashes=begins=unverified=0;
     handle_live=selected=boot_checkpoint=resumed=false;
     memset(&s_journal,0,sizeof(s_journal));strcpy(s_journal.target_version,"2.6.0");
     strcpy(s_journal.state,"DOWNLOADING");strcpy(s_journal.download_url,"https://test.invalid/image");
@@ -88,6 +92,10 @@ int main(void)
         assert(!selected);
         if(stage!=5)assert(!finishes);
         if(stage==6 || stage==7)assert(hashes==1 && aborts==1 && !boot_checkpoint);
+        /* ZKT 2.7.7: a slot that does not verify is diagnosed, erased and
+         * the checkpoint reset to byte 0, after the handle is released. */
+        if(stage==6)assert(unverified==1 && !s_journal.bytes_written && !strcmp(s_last_error,"PARTITION_HASH_FAILED"));
+        if(stage==7)assert(!unverified && !strcmp(s_last_error,"IMAGE_HASH_MISMATCH"));
         if(stage==8 || stage==10)assert(!strcmp(s_last_error,"IMAGE_LENGTH_MISMATCH") && !hashes && !boot_checkpoint);
     }
     stage=0;
