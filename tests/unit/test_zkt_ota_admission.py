@@ -455,3 +455,67 @@ def test_k50_bridge_offer_through_real_assignment(store):
         # BLD9 01 mid-upgrade at the same location does not hold the K50's offer.
         assert offer(db, k50)["version"] == "2.4.12"
         assert deployment(db, k50).status == "OFFERED" and deployment(db, k50).error_code is None
+
+
+def addition(db, *, model="G3", connector_id="d4b8e5ee-8539-4719-b92f-a9458f6600d3"):
+    from zk_add.hil_scope import HilTarget
+    device = add_device(db, HilTarget(connector_id=connector_id, mac="14:c1:9f:46:ae:1c",
+                                      terminal_serial="PGB1261300043"), "LF-ZONE-BLD1-01")
+    device.zkt_device.model = model
+    return device
+
+
+def test_a_qualified_later_zkt_takes_production_images_only(store):
+    with store() as db:
+        device = addition(db)
+        legacy = db.scalar(select(FirmwareRelease).where(FirmwareRelease.version == "2.2.1"))
+        assert pending_offer_hold(db, device, legacy) is None
+        # The 17 remain the exact scope of every HIL_ONLY image.
+        legacy.state = "HIL_ONLY"
+        assert pending_offer_hold(db, device, legacy) == "NATIONWIDE_EXACT_TARGET_REQUIRED"
+        assert pending_offer_hold(db, device, None) == "NATIONWIDE_EXACT_TARGET_REQUIRED"
+        legacy.state = "AVAILABLE"
+        device.connected = False
+        assert pending_offer_hold(db, device, legacy) == "NATIONWIDE_TARGET_OFFLINE"
+
+
+@pytest.mark.parametrize("fault", ["k50_model", "no_model", "unbound", "serial", "spare", "inactive",
+                                   "k50_connector", "changed_target"])
+def test_later_zkt_needs_a_confirmed_qualified_terminal(store, fault):
+    from zk_add.zkt274_bld9_k50 import TARGET as K50
+    with store() as db:
+        legacy = db.scalar(select(FirmwareRelease).where(FirmwareRelease.version == "2.2.1"))
+        if fault == "changed_target":
+            # One of the 17 whose terminal changed is not a new addition.
+            device = connector(db, 0)
+            device.zkt_device.model = "G3"
+            device.zkt_device.serial = device.zkt_device.confirmed_serial = "REPLACED"
+        elif fault == "k50_connector":
+            device = addition(db, connector_id=K50.connector_id)
+        else:
+            device = addition(db, model={"k50_model": "K50", "no_model": None}.get(fault, "G3"))
+        if fault == "unbound":
+            device.zkt_device.terminal_binding_state = "PENDING_DEVICE_ACK"
+        elif fault == "serial":
+            device.zkt_device.serial = "REPLACED"
+        elif fault == "spare":
+            device.is_spare = True
+        elif fault == "inactive":
+            device.active = False
+        assert pending_offer_hold(db, device, legacy) == "NATIONWIDE_EXACT_TARGET_REQUIRED"
+
+
+def test_a_qualified_later_zkt_is_offered_through_real_assignment(store):
+    with store() as db:
+        device = addition(db)
+        legacy = db.scalar(select(FirmwareRelease).where(FirmwareRelease.version == "2.2.1"))
+        campaign = FirmwareCampaign(campaign_id="later-zkt", release_id=legacy.id, zone_id=device.zone_id,
+            actor="synthetic", idempotency_key="later-zkt", reason="Synthetic later ZKT",
+            typed_confirmation=legacy.version)
+        db.add(campaign)
+        db.flush()
+        db.add(FirmwareDeployment(deployment_id="later-zkt", campaign_id=campaign.id, release_id=legacy.id,
+            connector_id=device.id, previous_version=device.firmware_version, target_version=legacy.version))
+        db.flush()
+        assert offer(db, device)["version"] == "2.2.1"
+        assert deployment(db, device).status == "OFFERED" and deployment(db, device).error_code is None

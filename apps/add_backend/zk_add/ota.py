@@ -35,6 +35,7 @@ from sqlalchemy.orm import Mapped, Session, mapped_column
 from zk_add.db import Base
 from zk_add.hil_scope import HilTarget, parse_hil_targets, target_matches
 from zk_add.hil_2615_cities import CITY_FACTORY_PREDECESSORS, CITY_TARGETS, SIGNED_BRIDGE_IDENTITIES
+from zk_add.zkt_life_factory_bridges import LIFE_FACTORY_PREDECESSORS, LIFE_TARGETS
 from zk_add.storage_recovery import (
     OFFERABLE_STATES as RECOVERY_OFFERABLE_STATES,
     RELEASE_IDS as RECOVERY_RELEASE_IDS,
@@ -92,6 +93,8 @@ HIL_2615_BLD5_TARGETS = (*HIL_269_EXACT_TARGETS, HIL_2615_BLD5_TARGET)
 # Preserve the six published identities and append the eight newly reviewed
 # devices. Peshawar's two original identities join this independent city trial.
 HIL_2615_CITY_TARGETS = (*HIL_2615_BLD5_TARGETS, *CITY_TARGETS.values())
+FACTORY_BRIDGE_TARGETS = {**CITY_TARGETS, **LIFE_TARGETS}
+FACTORY_BRIDGE_PREDECESSORS = {**CITY_FACTORY_PREDECESSORS, **LIFE_FACTORY_PREDECESSORS}
 # The live 3FL connector boots the signed 2.4.12 application from factory.
 # A direct 2.6.x boot would lack a qualified predecessor in the other OTA
 # slot. Bridge only this exact device through the already published 2.5.2
@@ -456,13 +459,13 @@ def _ordered_hil_target(session: Session, release: FirmwareRelease) -> HilTarget
 
 
 def _factory_3fl_bridge_target(release: FirmwareRelease, zone_id: str) -> HilTarget | None:
-    city_predecessor = CITY_FACTORY_PREDECESSORS.get(zone_id)
+    city_predecessor = FACTORY_BRIDGE_PREDECESSORS.get(zone_id)
     if city_predecessor and release.release_id == f"zone-lite-{city_predecessor[2]}":
         identity = (release.release_id, release.version, release.git_sha,
                     release.image_sha256, _application_sha256(release))
         if release.state != "AVAILABLE" or identity != SIGNED_BRIDGE_IDENTITIES[city_predecessor[2]]:
             raise ValueError("The city factory bridge requires the exact published signed image.")
-        return CITY_TARGETS[zone_id]
+        return FACTORY_BRIDGE_TARGETS[zone_id]
     if zone_id == bld9_k50.ZONE and release.release_id == bld9_k50.BRIDGE_IDENTITY[0]:
         identity = (release.release_id, release.version, release.git_sha,
                     release.image_sha256, _application_sha256(release))
@@ -486,7 +489,7 @@ def _factory_3fl_bridge_exclusion(connector: Connector, target: HilTarget) -> st
     if not connector.connected:
         return "BRIDGE_TARGET_OFFLINE"
     predecessor = (bld9_k50.FACTORY_PREDECESSOR if connector.zone_id == bld9_k50.ZONE
-                   else CITY_FACTORY_PREDECESSORS.get(connector.zone_id))
+                   else FACTORY_BRIDGE_PREDECESSORS.get(connector.zone_id))
     version, digest = predecessor[:2] if predecessor else ("2.4.12", DIRECT_BASELINE_IMAGES["2.4.12"])
     if (not _versions_match(connector.firmware_version, version)
             or connector.ota_running_partition != "factory"
