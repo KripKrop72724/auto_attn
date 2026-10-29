@@ -100,3 +100,31 @@ and its block count; its heartbeat would now say `CUSTODY_LOST` with
 `INVENTORY_UNEXPLAINED` if a span still fails another way), and
 `reclaim.area_skip` `CUSTODY_LOST`. That is the evidence the decision
 needs; it changes nothing on the store.
+
+## Production promotion
+
+2.7.8 was proven on the field fleet, not on the bench gate. By 29 Oct 2026,
+eight ESPs had run it from 26–27 Oct with no rollback:
+
+- Peshawar 02, Faisalabad 01, Karachi, Lahore 01, Multan 01, Peshawar 06 and
+  BLD5 01 were all online, OTA_READY and on HEALTHY storage.
+- Peshawar 02 was storage-repaired by it.
+- The only failures were three interrupted downloads on Faisalabad 02's slow
+  link. The running image was untouched each time.
+
+`firmware-fleet-promote.yml` (Actions → "Zone Lite fleet-proven ZKT promotion",
+inputs: the release commit and version) promotes it only after re-checking
+that evidence on the ADD host. It checks:
+
+- The exact HIL_ONLY release identity.
+- No rollback.
+- No failure after a transfer.
+- At least `minimum_field_devices` ESPs running the exact application digest,
+  online with HEALTHY storage, `minimum_soak_hours` after success.
+
+It then runs `promote-firmware.ps1` on the exact published bytes and confirms
+that ADD re-reads them as AVAILABLE.
+
+AVAILABLE does not widen who can be offered the image. ADD's exact-identity
+nationwide guard (`zkt_ota_admission.pending_offer_hold`) still limits ZKT
+offers to the 17 signed fleet targets, and the K50 bridge keeps its own rule.

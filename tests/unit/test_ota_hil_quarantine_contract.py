@@ -147,6 +147,45 @@ def test_production_canary_promotion_fails_closed_on_exact_runtime_evidence() ->
         assert required in workflow
 
 
+def test_fleet_promotion_requires_exact_healthy_field_evidence() -> None:
+    workflow = (
+        ROOT / ".github" / "workflows" / "firmware-fleet-promote.yml"
+    ).read_text(encoding="utf-8")
+    for required in (
+        'git merge-base --is-ancestor "$sha" origin/main',
+        '[[ "$INPUT_VERSION" =~ ^2\\.7\\.[0-9]+$ ]]',
+        'test "$INPUT_MINIMUM_FIELD_DEVICES" -ge 3',
+        'test "$INPUT_MINIMUM_SOAK_HOURS" -ge 24',
+        "runs-on: [self-hosted, Windows, X64]",
+        "environment: firmware-production",
+        "ADD_BASE_URL: http://127.0.0.1:8096",
+        "-WebSession $session",
+        "/api/v1/auth/logout",
+        "$release.state -ne 'HIL_ONLY'",
+        "$release.git_sha -ne $env:EXPECTED_SHA",
+        "$release.firmware_family -ne 'zkt'",
+        "@($release.hil_targets).Count -lt 1",
+        "include_archived=true&limit=200",
+        "$null -ne $campaigns.next_cursor",
+        "$_.status -eq 'ROLLED_BACK'",
+        "@('DOWNLOAD_BEGIN_FAILED', 'DOWNLOAD_INCOMPLETE')",
+        "$soakHours -ge [double]$env:MINIMUM_SOAK_HOURS",
+        "[string]$row.ota_image_sha256 -eq $applicationDigest",
+        "$durability -eq 'HEALTHY'",
+        "$row.ota_state -eq 'OTA_READY'",
+        "A successful ESP no longer runs this release healthily",
+        "$proven.Count -lt [int]$env:MINIMUM_FIELD_DEVICES",
+        "deploy/add/promote-firmware.ps1",
+        "Test-Path -LiteralPath 'promoted-release/.hil-only.json'",
+        "$_.state -eq 'AVAILABLE'",
+    ):
+        assert required in workflow, required
+    # Inputs reach the shell only through the environment, never as script text.
+    provenance = workflow.split("verify-and-promote:", 1)[0]
+    run_block = provenance.split("run: |", 1)[1]
+    assert "${{" not in run_block
+
+
 def test_release_manifest_contract_matches_add_verifier() -> None:
     signer = (ROOT / "deploy/add/sign-firmware-release.ps1").read_text(encoding="utf-8")
     ota = (ROOT / "apps/add_backend/zk_add/ota.py").read_text(encoding="utf-8")

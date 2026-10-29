@@ -138,6 +138,7 @@ def main() -> int:
         ".github/workflows/firmware-hil-candidate.yml",
         ".github/workflows/firmware-extend-2-6-0-hil.yml",
         ".github/workflows/firmware-extend-journal-hil.yml",
+        ".github/workflows/firmware-fleet-promote.yml",
         ".github/workflows/firmware-hil.yml",
         ".github/workflows/firmware-key-bootstrap.yml",
         ".github/workflows/firmware-nationwide-rollout.yml",
