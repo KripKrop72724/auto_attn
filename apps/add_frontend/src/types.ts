@@ -1174,6 +1174,10 @@ export interface FirmwareRelease {
   published_at: string
   revoked_at?: string | null
   revoked_by?: string | null
+  /** Active devices of this family that report this version. */
+  devices_running?: number
+  /** Still needed: not revoked, and running, in a live campaign, newest production or a newer HIL candidate. */
+  current?: boolean
   hil_target_mac: string | null
   hil_targets?: HilTarget[] | null
   hil_next_target?: HilTarget | null
@@ -1397,7 +1401,10 @@ export interface FirmwareReleaseTotals {
   available: number
   hil_only: number
   revoked: number
-  [state: string]: number
+  /** Releases still needed, and the superseded ones the default view hides. */
+  current?: number
+  hidden?: number
+  [state: string]: number | undefined
 }
 
 export interface FirmwareCampaignTotals {

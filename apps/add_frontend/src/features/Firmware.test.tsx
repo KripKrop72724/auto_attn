@@ -1,6 +1,6 @@
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import type { Device, FirmwareCampaign } from '../types'
+import type { Device, FirmwareCampaign, FirmwareRelease } from '../types'
 import { FirmwareView } from './Firmware'
 
 const response = (body: unknown, status = 200) =>
@@ -142,5 +142,93 @@ describe('one-click firmware campaign operations', () => {
     expect(lists().every((path) => !path.includes('include_archived'))).toBe(true)
     fireEvent.click(screen.getByRole('checkbox', { name: /Show archived/ }))
     await waitFor(() => expect(lists().some((path) => path.includes('include_archived=true'))).toBe(true))
+  })
+})
+
+const signedRelease = (changes: Partial<FirmwareRelease>): FirmwareRelease => ({
+  release_id: 'zone-lite-2.7.8',
+  version: '2.7.8',
+  firmware_family: 'zkt',
+  git_sha: 'a'.repeat(40),
+  image_sha256: 'b'.repeat(64),
+  application_sha256: 'c'.repeat(64),
+  image_size: 1_572_864,
+  state: 'AVAILABLE',
+  partition_layout: 'zone-lite-ota-v1',
+  signing_key_id: 'production-key',
+  published_at: '2026-10-28T08:00:00Z',
+  revoked_at: null,
+  revoked_by: null,
+  hil_target_mac: null,
+  ...changes,
+})
+
+const newest = signedRelease({ devices_running: 3, current: true })
+const superseded = signedRelease({
+  release_id: 'zone-lite-2.6.0', version: '2.6.0', image_sha256: 'd'.repeat(64), devices_running: 0, current: false,
+})
+// An older ADD omits the new fields: such a release must stay listed.
+const unannotated = signedRelease({ release_id: 'zone-lite-2.5.2', version: '2.5.2', image_sha256: 'e'.repeat(64) })
+
+const releaseServer = () =>
+  vi.fn(async (input: RequestInfo | URL) => {
+    const path = String(input)
+    if (path.startsWith('/api/v1/firmware/releases')) {
+      const rows = new URLSearchParams(path.split('?')[1]).get('scope') === 'current'
+        ? [newest]
+        : [newest, superseded, unannotated]
+      return response({ enabled: true, hil_enabled: false, rows, next_cursor: null, filtered_total: rows.length,
+        totals: { all: 3, available: 3, hil_only: 0, revoked: 0, current: 1, hidden: 2 } })
+    }
+    if (path.startsWith('/api/v1/firmware/campaigns')) {
+      return response({ enabled: true, hil_enabled: false, rows: [], next_cursor: null, filtered_total: 0,
+        totals: { campaigns: { all: 0 }, deployments: { all: 0 } } })
+    }
+    return response({ detail: `Unexpected ${path}` }, 404)
+  })
+
+const releasesView = () =>
+  render(
+    <FirmwareView devices={[] as Device[]} revision={0} toast={toast} section="releases" onSection={vi.fn()} />,
+  )
+
+describe('signed release inventory hides superseded releases without revoking them', () => {
+  it('lists current releases with their device counts and shows older ones only on request', async () => {
+    const fetchMock = releaseServer()
+    vi.stubGlobal('fetch', fetchMock)
+    releasesView()
+    expect(await screen.findByText('2 older releases hidden')).toBeTruthy()
+    expect(screen.getByText('3 devices')).toBeTruthy()
+    expect(screen.queryByRole('heading', { name: 'ZKT Zone Lite 2.6.0' })).toBeNull()
+    const inventory = () => (fetchMock.mock.calls as unknown as Array<[string]>)
+      .map(([path]) => path)
+      .filter((path) => path.startsWith('/api/v1/firmware/releases?') && !path.includes('limit=200'))
+    expect(inventory().length).toBeGreaterThan(0)
+    expect(inventory().every((path) => path.includes('scope=current'))).toBe(true)
+
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Show older releases' }))
+    expect(await screen.findByRole('heading', { name: 'ZKT Zone Lite 2.6.0' })).toBeTruthy()
+    expect(inventory().at(-1)).not.toContain('scope=')
+    expect(screen.queryByText('2 older releases hidden')).toBeNull()
+    expect(screen.getByText('0 devices')).toBeTruthy()
+    // Hiding is a view: nothing is revoked or otherwise changed.
+    expect(posts(fetchMock)).toEqual([])
+  })
+
+  it('offers only current releases in the update dialog unless older ones are shown', async () => {
+    vi.stubGlobal('fetch', releaseServer())
+    releasesView()
+    const update = (await screen.findByRole('button', { name: 'Update firmware' })) as HTMLButtonElement
+    await waitFor(() => expect(update.disabled).toBe(false))
+    const offered = () =>
+      Array.from((screen.getByLabelText('Release') as HTMLSelectElement).options).map((option) => option.value)
+
+    fireEvent.click(update)
+    expect(offered()).toEqual(['zone-lite-2.7.8', 'zone-lite-2.5.2'])
+    fireEvent.click(screen.getByRole('button', { name: 'Close dialog' }))
+
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Show older releases' }))
+    fireEvent.click(update)
+    expect(offered()).toEqual(['zone-lite-2.7.8', 'zone-lite-2.6.0', 'zone-lite-2.5.2'])
   })
 })

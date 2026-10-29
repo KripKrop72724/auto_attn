@@ -149,6 +149,13 @@ const closedCampaignStates = ['CANCELLED', 'COMPLETED']
 const publishable = (release: FirmwareRelease, enabled: boolean, hilEnabled: boolean) =>
   release.state === 'AVAILABLE' ? enabled : release.state === 'HIL_ONLY' && hilEnabled
 
+// Superseded releases are hidden, never revoked: a device's OTA path still
+// verifies its running image against them. An older ADD omits the field, so
+// absence keeps the release listed.
+const isCurrent = (release: FirmwareRelease) => release.current !== false
+
+const plural = (count: number, word: string) => `${count.toLocaleString()} ${word}${count === 1 ? '' : 's'}`
+
 // Zones with a device this release may reach; the server still decides each zone.
 function releaseZones(release: FirmwareRelease | null, devices: Device[]) {
   if (!release) return []
@@ -201,6 +208,7 @@ function UpdateFirmwareDialog({
   campaigns,
   enabled,
   hilEnabled,
+  showOlder,
   onClose,
   onDone,
   toast,
@@ -210,13 +218,18 @@ function UpdateFirmwareDialog({
   campaigns: FirmwareCampaign[]
   enabled: boolean
   hilEnabled: boolean
+  /** "Show older releases" on Signed releases also lists superseded ones here. */
+  showOlder: boolean
   onClose: () => void
   onDone: () => Promise<void>
   toast: Toast
 }) {
   const options = useMemo(
-    () => releases.filter((release) => publishable(release, enabled, hilEnabled)),
-    [releases, enabled, hilEnabled],
+    () =>
+      releases.filter(
+        (release) => publishable(release, enabled, hilEnabled) && (showOlder || isCurrent(release)),
+      ),
+    [releases, enabled, hilEnabled, showOlder],
   )
   const [releaseId, setReleaseId] = useState('')
   const [selected, setSelected] = useState<string[]>([])
@@ -798,6 +811,8 @@ export function FirmwareView({
   const [releaseCursor, setReleaseCursor] = useState<number | null>(null)
   const [releaseQuery, setReleaseQuery] = useState('')
   const [releaseState, setReleaseState] = useState('')
+  // Off by default: only releases still in use or next in line are listed.
+  const [showOlderReleases, setShowOlderReleases] = useState(false)
   const [releaseLoading, setReleaseLoading] = useState(true)
   const [releaseLoadingMore, setReleaseLoadingMore] = useState(false)
   const [releaseError, setReleaseError] = useState('')
@@ -871,7 +886,7 @@ export function FirmwareView({
       releaseAbortRef.current = controller
       try {
         const response = await api<ReleaseResponse>(
-          `/api/v1/firmware/releases${queryString({ q: releaseQuery.trim() || undefined, state: releaseState || undefined, cursor, limit: 24 })}`,
+          `/api/v1/firmware/releases${queryString({ q: releaseQuery.trim() || undefined, state: releaseState || undefined, scope: showOlderReleases ? undefined : 'current', cursor, limit: 24 })}`,
           { signal: controller.signal },
         )
         setReleaseRows((current) =>
@@ -905,7 +920,7 @@ export function FirmwareView({
         }
       }
     },
-    [releaseQuery, releaseState],
+    [releaseQuery, releaseState, showOlderReleases],
   )
   const loadCampaigns = useCallback(
     async ({
@@ -1122,6 +1137,7 @@ export function FirmwareView({
   )
   const releaseFilterCount =
     Number(Boolean(releaseQuery.trim())) + Number(Boolean(releaseState))
+  const hiddenReleases = releaseTotals.hidden ?? 0
   const campaignFilterCount =
     Number(Boolean(campaignQuery.trim())) +
     Number(Boolean(campaignStatus)) +
@@ -1378,13 +1394,27 @@ export function FirmwareView({
             <div>
               <h2>Signed release inventory</h2>
               <p>
-                Production, HIL-only, and revoked releases with their signing
-                evidence.
+                {showOlderReleases
+                  ? 'Production, HIL-only, and revoked releases with their signing evidence.'
+                  : 'Releases devices run, live campaigns use, the newest production release, and newer HIL candidates. Older releases are hidden, not revoked.'}
               </p>
             </div>
-            <span className="badge">
-              {releaseFilteredTotal.toLocaleString()} matching
-            </span>
+            <div className="firmware-history-actions">
+              {!showOlderReleases && hiddenReleases > 0 && (
+                <small>{plural(hiddenReleases, 'older release')} hidden</small>
+              )}
+              <label className="check-row">
+                <input
+                  type="checkbox"
+                  checked={showOlderReleases}
+                  onChange={(event) => setShowOlderReleases(event.target.checked)}
+                />{' '}
+                Show older releases
+              </label>
+              <span className="badge">
+                {releaseFilteredTotal.toLocaleString()} matching
+              </span>
+            </div>
           </div>
           <div className="firmware-toolbar">
             <label className="search-field">
@@ -1465,7 +1495,17 @@ export function FirmwareView({
                     <h3>{firmwareName(release)}</h3>
                     <small>{release.release_id}</small>
                   </span>
-                  <StatusBadge state={release.state} />
+                  <span className="firmware-campaign-badges">
+                    {typeof release.devices_running === 'number' && (
+                      <span
+                        className="badge"
+                        title="Active devices that report this firmware version"
+                      >
+                        {plural(release.devices_running, 'device')}
+                      </span>
+                    )}
+                    <StatusBadge state={release.state} />
+                  </span>
                 </header>
                 <div className="firmware-release-primary">
                   <span>
@@ -1580,7 +1620,9 @@ export function FirmwareView({
                 <h3>
                   {releaseFilterCount
                     ? 'No signed releases match these filters.'
-                    : 'No signed firmware releases are published.'}
+                    : !showOlderReleases && hiddenReleases > 0
+                      ? 'No current signed releases. Older releases are hidden.'
+                      : 'No signed firmware releases are published.'}
                 </h3>
                 <p>
                   Signing, key custody, binary upload, and promotion remain
@@ -1603,8 +1645,8 @@ export function FirmwareView({
                 }
               >
                 {releaseLoadingMore
-                  ? 'Loading older releases…'
-                  : 'Load older releases'}
+                  ? 'Loading more releases…'
+                  : 'Load more releases'}
               </button>
               <small>
                 {releaseRows.length.toLocaleString()} of{' '}
@@ -1965,6 +2007,7 @@ export function FirmwareView({
           campaigns={campaignRows}
           enabled={enabled}
           hilEnabled={hilEnabled}
+          showOlder={showOlderReleases}
           onClose={() => setUpdateOpen(false)}
           onDone={async () => {
             await Promise.all([loadCatalog(), loadCampaigns({ quiet: true })])

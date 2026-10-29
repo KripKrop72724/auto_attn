@@ -228,6 +228,7 @@
 .firmware-campaign-waiting > span { display: grid; gap: 2px; font-size: 13px; }
 .firmware-history-actions { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 8px; }
 .firmware-history-actions .check-row { margin: 0; color: var(--text-secondary); font-size: 13px; }
+.firmware-history-actions > small { color: var(--text-tertiary); font-size: 12px; }
 .firmware-history-result { display: grid; grid-template-columns: 18px minmax(0, 1fr) auto; align-items: start; margin: 12px 16px; }
 .firmware-history-result p { margin: 2px 0 0; color: var(--text-secondary); font-size: 13px; overflow-wrap: anywhere; }
 .firmware-update-dialog { width: min(720px, 94vw); }
