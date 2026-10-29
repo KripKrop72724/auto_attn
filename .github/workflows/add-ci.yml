@@ -39,6 +39,7 @@ jobs:
           ./tests/firmware/test_backup_restore.ps1
           ./tests/firmware/test_deployed_firmware_contract.ps1
           ./tests/firmware/test_usb_wifi_rescue_signing.ps1
+          ./tests/firmware/test_bootstrap_production_signing.ps1
       - name: Verify USB rescue signing refusals in PowerShell Core
         shell: pwsh
         run: ./tests/firmware/test_usb_wifi_rescue_signing.ps1
@@ -154,6 +155,9 @@ jobs:
       - name: Exercise deployed backend firmware admission
         shell: pwsh
         run: ./tests/firmware/test_deployed_firmware_contract.ps1
+      - name: Exercise production bootstrap predecessor and storage refusals
+        shell: pwsh
+        run: ./tests/firmware/test_bootstrap_production_signing.ps1
       - name: Parse production PowerShell scripts
         shell: pwsh
         run: |
@@ -540,6 +544,19 @@ jobs:
           -w /project/firmware/zone_lite
           espressif/idf:v5.5.3
           bash -lc 'rm -rf build-ci && idf.py -B build-ci -D SDKCONFIG=/tmp/zone-lite-ci-sdkconfig build'
+      - name: Build the new-device empty storage image exactly as the bootstrap does
+        # The bootstrap writes this image to a new board's storage partition.
+        # These are the bytes bench-verified on new boards on 29 Oct 2026; a
+        # different digest means SPIFFS options or spiffsgen changed and the
+        # image must be verified on hardware again.
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/project" \
+            -w /project/firmware/zone_lite \
+            espressif/idf:v5.5.3 \
+            python tools/build_empty_storage_image.py --build-dir build-ci --output build-ci/storage-empty.bin
+          echo "f39db7c1c7626ee6156dbab5da7912968040a489d1d927c1fb288d1f42c5ec70  firmware/zone_lite/build-ci/storage-empty.bin" | sha256sum --check
       - name: Build dedicated Hikvision ESP32-S3 firmware
         run: >-
           docker run --rm

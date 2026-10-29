@@ -22,6 +22,10 @@ on:
         description: Factory bootstrap application - latest (newest AVAILABLE ZKT release in the store, flashed to factory and ota_0), an exact AVAILABLE version, or none (this commit's build)
         type: string
         default: latest
+      rollback_predecessor:
+        description: Older exact AVAILABLE ZKT version flashed to ota_1 - 2.7.x starts storage only beside a qualified predecessor (2.5.2 is one); none only with production_release none
+        type: string
+        default: '2.5.2'
 
 permissions:
   contents: read
@@ -115,17 +119,20 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - name: Build exact unsigned Secure Boot candidate
+      - name: Build exact unsigned Secure Boot candidate and its empty storage image
         shell: bash
         run: |
           set -euo pipefail
           test -n "$ZONE_LITE_SETUP_PASSWORD"
+          # Zone Lite never formats storage, so a new board needs an empty
+          # SPIFFS image sized from this partition table with the SPIFFS
+          # options this build compiled (the tool refuses any drift).
           docker run --rm \
             -e ZONE_LITE_SETUP_PASSWORD \
             -v "$GITHUB_WORKSPACE:/project" \
             -w /project/firmware/zone_lite \
             espressif/idf:v5.5.3 \
-            bash -lc 'rm -rf build-bootstrap && idf.py -B build-bootstrap -D SDKCONFIG=/tmp/zone-lite-bootstrap-sdkconfig build'
+            bash -lc 'rm -rf build-bootstrap && idf.py -B build-bootstrap -D SDKCONFIG=/tmp/zone-lite-bootstrap-sdkconfig build && python tools/build_empty_storage_image.py --build-dir build-bootstrap --output build-bootstrap/storage-empty.bin'
           python - <<'PY'
           import os
           from pathlib import Path
@@ -146,6 +153,7 @@ jobs:
             firmware/zone_lite/build-bootstrap/ota_data_initial.bin
             firmware/zone_lite/build-bootstrap/zone_lite.bin
             firmware/zone_lite/build-bootstrap/flasher_args.json
+            firmware/zone_lite/build-bootstrap/storage-empty.bin
 
   generate-and-sign:
     needs: build
@@ -166,13 +174,23 @@ jobs:
       - name: Generate or reuse ADD-hosted key vault and sign bootstrap image
         env:
           PRODUCTION_RELEASE: ${{ inputs.production_release || 'latest' }}
+          ROLLBACK_PREDECESSOR: ${{ inputs.rollback_predecessor || '2.5.2' }}
           ADD_FIRMWARE_STORE_HOST_PATH: ${{ vars.ADD_FIRMWARE_STORE_HOST_PATH }}
         run: |
           $ErrorActionPreference = 'Stop'
           if ($env:PRODUCTION_RELEASE -notmatch '^(latest|none|[0-9]+\.[0-9]+\.[0-9]+)$') {
             throw 'production_release must be latest, none or an exact version'
           }
+          if ($env:ROLLBACK_PREDECESSOR -notmatch '^(none|[0-9]+\.[0-9]+\.[0-9]+)$') {
+            throw 'rollback_predecessor must be none or an exact version'
+          }
+          if ($env:ROLLBACK_PREDECESSOR -eq 'none' -and $env:PRODUCTION_RELEASE -ne 'none') {
+            throw 'rollback_predecessor none is allowed only with production_release none: 2.7.x refuses storage without a qualified predecessor in ota_1'
+          }
           $productionArguments = @{}
+          if ($env:PRODUCTION_RELEASE -eq 'none' -and $env:ROLLBACK_PREDECESSOR -ne 'none') {
+            Write-Host "production_release none flashes this commit's build to factory only; rollback_predecessor $env:ROLLBACK_PREDECESSOR is not used"
+          }
           if ($env:PRODUCTION_RELEASE -ne 'none') {
             if (-not $env:ADD_FIRMWARE_STORE_HOST_PATH) { throw 'ADD_FIRMWARE_STORE_HOST_PATH is not configured' }
             $available = @(Get-ChildItem -LiteralPath $env:ADD_FIRMWARE_STORE_HOST_PATH -Directory | Where-Object {
@@ -192,13 +210,21 @@ jobs:
             if (-not $chosen) { throw "No AVAILABLE ZKT release '$env:PRODUCTION_RELEASE' in the firmware store" }
             Write-Host "Factory bootstrap boots the exact AVAILABLE release $($chosen.Name) from ota_0"
             $productionArguments.ProductionReleaseDirectory = $chosen.FullName
+            # The ota_1 rollback image comes from the same AVAILABLE-only list.
+            $predecessor = $available | Where-Object { $_.Name -eq $env:ROLLBACK_PREDECESSOR }
+            if (-not $predecessor) { throw "No AVAILABLE ZKT release '$env:ROLLBACK_PREDECESSOR' in the firmware store for the ota_1 rollback predecessor" }
+            if ([version]$predecessor.Name -ge [version]$chosen.Name) {
+              throw "Rollback predecessor $($predecessor.Name) must be older than production release $($chosen.Name)"
+            }
+            Write-Host "Factory bootstrap keeps the exact AVAILABLE release $($predecessor.Name) in ota_1 as the rollback predecessor"
+            $productionArguments.RollbackPredecessorDirectory = $predecessor.FullName
           }
           $artifact = Join-Path $PWD 'unsigned'
           $unsigned = Join-Path $PWD 'unsigned-package'
           New-Item -ItemType Directory -Path $unsigned -Force | Out-Null
           Copy-Item -LiteralPath (Join-Path $artifact 'bootloader\bootloader.bin') -Destination (Join-Path $unsigned 'bootloader.bin')
           Copy-Item -LiteralPath (Join-Path $artifact 'partition_table\partition-table.bin') -Destination (Join-Path $unsigned 'partition-table.bin')
-          foreach ($name in @('ota_data_initial.bin', 'zone_lite.bin', 'flasher_args.json')) {
+          foreach ($name in @('ota_data_initial.bin', 'zone_lite.bin', 'flasher_args.json', 'storage-empty.bin')) {
             Copy-Item -LiteralPath (Join-Path $artifact $name) -Destination (Join-Path $unsigned $name)
           }
           $output = Join-Path $PWD 'signed-bootstrap'

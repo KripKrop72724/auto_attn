@@ -9,42 +9,88 @@ param(
     # A published AVAILABLE release directory in the ADD firmware store. Its
     # exact signed application replaces this build's, so a new ESP boots the
     # production bytes ADD already verifies (flashed to factory and ota_0).
-    [string]$ProductionReleaseDirectory = ''
+    [string]$ProductionReleaseDirectory = '',
+    # An older published AVAILABLE release, flashed to ota_1. 2.7.x direct
+    # upgrade builds start storage only when the other OTA slot holds a
+    # qualified predecessor (exact application digest) as their rollback image.
+    [string]$RollbackPredecessorDirectory = ''
 )
 
 $ErrorActionPreference = 'Stop'
 $GitSha = $GitSha.ToLowerInvariant()
-$productionRelease = $null
-if ($ProductionReleaseDirectory) {
-    if ($ImageRole -ne 'factory') { throw 'Only a factory bootstrap can carry a production release' }
-    $releaseDirectory = (Resolve-Path -LiteralPath $ProductionReleaseDirectory).Path
+# The empty SPIFFS image of the 8 MiB storage partition. Zone Lite never
+# formats storage, so a blank partition would never mount.
+$storagePartitionSize = 0x800000
+
+function Get-AvailableReleaseImage {
+    param(
+        [Parameter(Mandatory = $true)][string]$Directory,
+        [Parameter(Mandatory = $true)][string]$Purpose
+    )
+    $releaseDirectory = (Resolve-Path -LiteralPath $Directory).Path
     foreach ($marker in @('.hil-only.json', '.diagnostic-only.json')) {
         if (Test-Path -LiteralPath (Join-Path $releaseDirectory $marker)) {
-            throw "Production release $releaseDirectory is not AVAILABLE ($marker)"
+            throw "$Purpose $releaseDirectory is not AVAILABLE ($marker)"
         }
     }
     $releaseManifest = Get-Content -LiteralPath (Join-Path $releaseDirectory 'manifest.json') -Raw | ConvertFrom-Json
     if (-not (Test-Path -LiteralPath (Join-Path $releaseDirectory 'manifest.sig') -PathType Leaf)) {
-        throw 'Production release is missing its signed manifest'
+        throw "$Purpose is missing its signed manifest"
     }
     $releaseFamily = if ($releaseManifest.firmware_family) { [string]$releaseManifest.firmware_family } else { 'zkt' }
     if ($releaseFamily -ne $FirmwareFamily -or [string]$releaseManifest.partition_layout -ne 'zone-lite-ota-v1' -or
         [string]$releaseManifest.release_channel -eq 'EXPERIMENTAL_HIL_ONLY') {
-        throw 'Production release family, layout or channel is not a factory production image'
+        throw "$Purpose family, layout or channel is not a factory production image"
     }
-    $productionImage = Join-Path $releaseDirectory ([string]$releaseManifest.image_name)
-    $productionHash = (Get-FileHash -LiteralPath $productionImage -Algorithm SHA256).Hash.ToLowerInvariant()
-    if ($productionHash -ne [string]$releaseManifest.image_sha256 -or
-        (Get-Item -LiteralPath $productionImage).Length -ne [int64]$releaseManifest.image_size) {
-        throw 'Production release image does not match its signed manifest'
+    if ([string]$releaseManifest.version -notmatch '^[0-9]+\.[0-9]+\.[0-9]+$') {
+        throw "$Purpose version is not an exact release version"
     }
-    $productionRelease = [ordered]@{
-        release_id = [string]$releaseManifest.release_id
-        version = [string]$releaseManifest.version
-        git_sha = [string]$releaseManifest.git_sha
-        image_sha256 = $productionHash
-        application_sha256 = [string]$releaseManifest.application_sha256
-        boot_slot = 'ota_0'
+    $image = Join-Path $releaseDirectory ([string]$releaseManifest.image_name)
+    $hash = (Get-FileHash -LiteralPath $image -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($hash -ne [string]$releaseManifest.image_sha256 -or
+        (Get-Item -LiteralPath $image).Length -ne [int64]$releaseManifest.image_size) {
+        throw "$Purpose image does not match its signed manifest"
+    }
+    return @{
+        Image = $image
+        Version = [version][string]$releaseManifest.version
+        Record = [ordered]@{
+            release_id = [string]$releaseManifest.release_id
+            version = [string]$releaseManifest.version
+            git_sha = [string]$releaseManifest.git_sha
+            image_sha256 = $hash
+            application_sha256 = [string]$releaseManifest.application_sha256
+        }
+    }
+}
+
+$productionRelease = $null
+$rollbackPredecessor = $null
+if ($RollbackPredecessorDirectory -and -not $ProductionReleaseDirectory) {
+    throw 'A rollback predecessor is carried only together with a production release'
+}
+if ($ProductionReleaseDirectory) {
+    if ($ImageRole -ne 'factory') { throw 'Only a factory bootstrap can carry a production release' }
+    if (-not $RollbackPredecessorDirectory) {
+        throw 'A production release bootstrap must carry a rollback predecessor for ota_1; 2.7.x refuses storage without one'
+    }
+    $production = Get-AvailableReleaseImage -Directory $ProductionReleaseDirectory -Purpose 'Production release'
+    $predecessor = Get-AvailableReleaseImage -Directory $RollbackPredecessorDirectory -Purpose 'Rollback predecessor'
+    if ($predecessor.Version -ge $production.Version) {
+        throw "Rollback predecessor $($predecessor.Version) must be older than production release $($production.Version)"
+    }
+    $productionImage = $production.Image
+    $productionRelease = $production.Record
+    $productionRelease.boot_slot = 'ota_0'
+    $rollbackPredecessorImage = $predecessor.Image
+    $rollbackPredecessor = $predecessor.Record
+    $rollbackPredecessor.slot = 'ota_1'
+    $storageSource = Join-Path $UnsignedDirectory 'storage-empty.bin'
+    if (-not (Test-Path -LiteralPath $storageSource -PathType Leaf)) {
+        throw 'Unsigned firmware package is missing storage-empty.bin, the empty SPIFFS image a production bootstrap writes to storage'
+    }
+    if ((Get-Item -LiteralPath $storageSource).Length -ne $storagePartitionSize) {
+        throw 'Empty storage image does not cover the 8 MiB storage partition'
     }
 }
 Add-Type -AssemblyName System.Security
@@ -283,6 +329,8 @@ try {
     Copy-Item -LiteralPath (Join-Path $work 'bootloader-signed.bin') -Destination (Join-Path $output 'bootloader-signed.bin')
     if ($productionRelease) {
         Copy-Item -LiteralPath $productionImage -Destination (Join-Path $output 'zone-lite-signed.bin')
+        Copy-Item -LiteralPath $rollbackPredecessorImage -Destination (Join-Path $output 'rollback-predecessor.bin')
+        Copy-Item -LiteralPath (Join-Path $unsigned 'storage-empty.bin') -Destination (Join-Path $output 'storage-empty.bin')
     }
     else {
         Copy-Item -LiteralPath (Join-Path $work 'zone-lite-signed.bin') -Destination (Join-Path $output 'zone-lite-signed.bin')
@@ -307,7 +355,15 @@ try {
         if ($packageFields.application_sha256 -ne $productionRelease.image_sha256) {
             throw 'Bootstrap application is not the exact production release image'
         }
+        $predecessorHash = (Get-FileHash (Join-Path $output 'rollback-predecessor.bin') -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($predecessorHash -ne $rollbackPredecessor.image_sha256) {
+            throw 'Bootstrap ota_1 image is not the exact rollback predecessor image'
+        }
+        $storageImage = Get-Item -LiteralPath (Join-Path $output 'storage-empty.bin')
         $packageFields.production_release = $productionRelease
+        $packageFields.rollback_predecessor = $rollbackPredecessor
+        $packageFields.storage_image_sha256 = (Get-FileHash $storageImage.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+        $packageFields.storage_image_size = $storageImage.Length
     }
     if ($ImageRole -ne 'factory') {
         $packageFields.image_role = $ImageRole

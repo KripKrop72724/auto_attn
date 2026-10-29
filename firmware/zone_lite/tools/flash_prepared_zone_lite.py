@@ -36,15 +36,30 @@ FLASH_LAYOUT = (
 # had arrived by OTA: 2.6.10 and later refuse to upgrade an image running from
 # factory, and ADD verifies a predecessor only in an OTA slot. The same bytes
 # in factory remain the bootloader's last resort.
+#
+# Two more ranges make the first boot accepted (both found on new boards on
+# 29 Oct 2026, where the release alone booted to LOCAL_FAILURE):
+# - ota_1 holds an older published release. 2.7.x direct-upgrade builds start
+#   storage only when the other OTA slot holds a qualified predecessor (an
+#   exact application digest) as their rollback image.
+# - storage holds an empty, formatted SPIFFS. The firmware never formats a
+#   partition that will not mount, so erased flash would stay unusable.
 OTA_0_OFFSET = 0x2A0000
+OTA_1_OFFSET = 0x520000
+APP_SLOT_SIZE = 0x280000
+STORAGE_OFFSET = 0x7A0000
+STORAGE_SIZE = 0x800000
 OTADATA_OFFSET = 0x17000
 OTADATA_SIZE = 0x2000
 PRODUCTION_PARTITIONS = {
     "otadata": (1, 0x00, OTADATA_OFFSET, OTADATA_SIZE),
-    "factory": (0, 0x00, 0x20000, 0x280000),
-    "ota_0": (0, 0x10, OTA_0_OFFSET, 0x280000),
-    "ota_1": (0, 0x11, 0x520000, 0x280000),
+    "factory": (0, 0x00, 0x20000, APP_SLOT_SIZE),
+    "ota_0": (0, 0x10, OTA_0_OFFSET, APP_SLOT_SIZE),
+    "ota_1": (0, 0x11, OTA_1_OFFSET, APP_SLOT_SIZE),
+    "storage": (1, 0x82, STORAGE_OFFSET, STORAGE_SIZE),
 }
+ROLLBACK_PREDECESSOR_IMAGE = "rollback-predecessor.bin"
+STORAGE_IMAGE = "storage-empty.bin"
 PRODUCTION_LAYOUT = (
     ("bootloader-signed.bin", 0x0),
     ("partition-table.bin", 0x10000),
@@ -52,8 +67,12 @@ PRODUCTION_LAYOUT = (
     ("otadata-ota0.bin", OTADATA_OFFSET),
     ("zone-lite-signed.bin", 0x20000),
     ("zone-lite-signed.bin", OTA_0_OFFSET),
+    (ROLLBACK_PREDECESSOR_IMAGE, OTA_1_OFFSET),
+    (STORAGE_IMAGE, STORAGE_OFFSET),
 )
 ESP_OTA_IMG_VALID = 2
+SHA256_HEX = re.compile(r"[0-9a-f]{64}")
+VERSION = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+")
 
 FlashProgress = Callable[[str, int, int], None]
 
@@ -119,14 +138,44 @@ def partition_entries(table: bytes) -> dict[str, tuple[int, int, int, int]]:
     return entries
 
 
+def version_tuple(version: str) -> tuple[int, ...]:
+    return tuple(int(part) for part in version.split("."))
+
+
 def production_release(bootstrap: dict) -> dict | None:
+    """The signed production claim, or None for a package of this build.
+
+    A production claim must also name the rollback predecessor for ota_1 and
+    the empty storage image: without them 2.7.x boots to LOCAL_FAILURE.
+    """
     release = bootstrap.get("production_release")
     if release is None:
         return None
     if (not isinstance(release, dict) or release.get("boot_slot") != "ota_0"
-            or not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", str(release.get("version", "")))
+            or not VERSION.fullmatch(str(release.get("version", "")))
             or release.get("image_sha256") != bootstrap.get("application_sha256")):
         raise RuntimeError("Signed bootstrap production release is invalid")
+    predecessor = bootstrap.get("rollback_predecessor")
+    if not isinstance(predecessor, dict):
+        raise RuntimeError(
+            "Signed bootstrap production release has no rollback predecessor for ota_1; "
+            "2.7.x refuses storage without one"
+        )
+    if (predecessor.get("slot") != "ota_1"
+            or not VERSION.fullmatch(str(predecessor.get("version", "")))
+            or not SHA256_HEX.fullmatch(str(predecessor.get("image_sha256", "")))
+            or predecessor.get("image_sha256") == release.get("image_sha256")):
+        raise RuntimeError("Signed bootstrap rollback predecessor is invalid")
+    if version_tuple(predecessor["version"]) >= version_tuple(release["version"]):
+        raise RuntimeError(
+            "Signed bootstrap rollback predecessor must be older than the production release"
+        )
+    if (not SHA256_HEX.fullmatch(str(bootstrap.get("storage_image_sha256", "")))
+            or bootstrap.get("storage_image_size") != STORAGE_SIZE):
+        raise RuntimeError(
+            "Signed bootstrap production release has no empty storage image for the "
+            "8 MiB storage partition"
+        )
     return release
 
 
@@ -158,6 +207,20 @@ def validate_inputs(
         partitions = partition_entries((signed_package / "partition-table.bin").read_bytes())
         if any(partitions.get(name) != expected for name, expected in PRODUCTION_PARTITIONS.items()):
             raise RuntimeError("Partition table does not match the production OTA layout")
+        for name, expected_sha256 in (
+            (ROLLBACK_PREDECESSOR_IMAGE, bootstrap["rollback_predecessor"]["image_sha256"]),
+            (STORAGE_IMAGE, bootstrap["storage_image_sha256"]),
+        ):
+            image = signed_package / name
+            if not image.is_file():
+                raise RuntimeError(f"Signed bootstrap production package is missing {name}")
+            if sha256(image) != expected_sha256:
+                raise RuntimeError(f"Signed bootstrap {name} hash does not match its manifest")
+        if any((signed_package / name).stat().st_size > APP_SLOT_SIZE
+               for name in ("zone-lite-signed.bin", ROLLBACK_PREDECESSOR_IMAGE)):
+            raise RuntimeError("A production application image does not fit its OTA slot")
+        if (signed_package / STORAGE_IMAGE).stat().st_size != STORAGE_SIZE:
+            raise RuntimeError("Empty storage image does not cover the whole storage partition")
 
     provisioning = json.loads(provisioning_manifest.read_text(encoding="utf-8"))
     aad = provisioning.get("aad", {})
@@ -210,9 +273,20 @@ def flash_and_verify(
         flash_sources_and_verify(
             esptool=esptool,
             port=port,
-            sources={**sources, "otadata-ota0.bin": otadata},
+            sources={
+                **sources,
+                "otadata-ota0.bin": otadata,
+                ROLLBACK_PREDECESSOR_IMAGE: signed_package / ROLLBACK_PREDECESSOR_IMAGE,
+                STORAGE_IMAGE: signed_package / STORAGE_IMAGE,
+            },
             layout=PRODUCTION_LAYOUT,
             progress=progress,
+            # The first-use device is not in Secure Download Mode yet, so the
+            # stub can hash each range on chip. A ROM read_flash readback of
+            # the 8 MiB storage image alone takes about 15 minutes over USB,
+            # and on 29 Oct 2026 the readback of the second application range
+            # failed its CRC on every new board although the bytes were right.
+            verify_with_stub=True,
         )
 
 
@@ -223,6 +297,7 @@ def flash_sources_and_verify(
     sources: dict[str, Path],
     layout: tuple[tuple[str, int], ...],
     progress: FlashProgress | None = None,
+    verify_with_stub: bool = False,
 ) -> None:
     image_bytes = sum(sources[name].stat().st_size for name, _offset in layout)
     total_bytes = image_bytes * 2
@@ -280,6 +355,16 @@ def flash_sources_and_verify(
     if progress:
         progress("FLASHING", completed_bytes, total_bytes)
 
+    if verify_with_stub:
+        for name, offset in layout:
+            source = sources[name]
+            verify_flash_range(esptool=esptool, port=port, name=name, offset=offset,
+                               source=source)
+            completed_bytes += source.stat().st_size
+            if progress:
+                progress("READBACK_VERIFYING", completed_bytes, total_bytes)
+        return
+
     with tempfile.TemporaryDirectory(prefix="zone-lite-flash-readback-") as directory:
         temporary = Path(directory)
         for name, offset in layout:
@@ -308,6 +393,30 @@ def flash_sources_and_verify(
             completed_bytes += source.stat().st_size
             if progress:
                 progress("READBACK_VERIFYING", completed_bytes, total_bytes)
+
+
+def verify_flash_range(*, esptool: str, port: str, name: str, offset: int, source: Path) -> None:
+    """Compare one flashed range with its source by the stub's on-chip MD5."""
+    command = [
+        esptool,
+        "--chip",
+        "esp32s3",
+        "--port",
+        port,
+        "--before",
+        "default_reset",
+        "--after",
+        "no_reset",
+        "verify_flash",
+        hex(offset),
+        str(source),
+    ]
+    try:
+        output = run(command)
+    except subprocess.CalledProcessError as error:
+        raise RuntimeError(f"Flash verification failed for {name} at {hex(offset)}") from error
+    if "digest matched" not in output.lower():
+        raise RuntimeError(f"Flash verification failed for {name} at {hex(offset)}")
 
 
 def flash_managed_and_verify(
@@ -382,7 +491,7 @@ def main() -> None:
         provision_nvs=args.provision_nvs,
     )
     print(
-        f"Prepared and readback-verified Zone Lite device {mac}; "
+        f"Prepared and flash-verified Zone Lite device {mac}; "
         "first boot is intentionally pending"
     )
 
