@@ -83,6 +83,27 @@ Physical bootstrap permanently enables Secure Boot V2 and cannot be treated like
 
 Never remotely enable Secure Boot, replace the partition table, or bootstrap an unknown device. A mismatched MAC confirmation must stop the provisioning operation.
 
+### New ZKT devices start on the production release
+
+The `Zone Lite signing key bootstrap` workflow's `production_release` input defaults to `latest`. It packages the newest AVAILABLE ZKT release from the ADD firmware store, byte for byte, instead of this commit's build. Releases with a `.hil-only.json` or `.diagnostic-only.json` marker are never used. You can also name an exact AVAILABLE version, or pass `none` to keep the old built image.
+
+`bootstrap-manifest.json` then carries `production_release` (`boot_slot` `ota_0`), and `flash_prepared_zone_lite.py` changes what it writes:
+
+- It requires the partition table to have otadata at `0x17000`, factory at `0x20000`, ota_0 at `0x2A0000` and ota_1 at `0x520000`.
+- It writes the exact image to both factory and ota_0.
+- It writes an otadata sector whose one valid entry (`ota_seq` 1, state VALID, ESP-IDF otatool CRC) selects ota_0, then reads back every range.
+
+The device boots the published bytes from an OTA slot, as if they had arrived by OTA. 2.6.10 and later refuse to upgrade from an image running in factory, and ADD verifies a predecessor only in an OTA slot. With this layout the next production release reaches the device by an ordinary campaign, with no bridge and no per-device code.
+
+Bench-verify the first such bootstrap on a sacrificial ESP32-S3 before using it in the field. Check that:
+
+1. The device boots 2.7.8 from `ota_0` with Secure Boot enabled.
+2. Storage mounts on the never-used partition.
+3. Punches are queued and delivered.
+4. A reboot keeps `ota_0`.
+
+Until then, pass `production_release=none`.
+
 ## HIL evidence contract
 
 The site-owned rig command must exit successfully and write `ota-hil-evidence.json` with this shape:
