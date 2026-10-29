@@ -6631,10 +6631,13 @@ def list_firmware_releases(
     state: str | None = Query(default=None, max_length=30),
     cursor: int | None = Query(default=None, ge=1),
     limit: int | None = Query(default=None, ge=1, le=200),
+    # "current" hides superseded releases from the view; it never changes a
+    # release's state. "all" stays the default for existing scripts.
+    scope: _Literal["current", "all"] = "all",
     auth: tuple[Session, AdminContext] = Depends(require_admin),
 ):
     db, _ = auth
-    result = _release_page(db, query=q, state=state, cursor=cursor, limit=limit)
+    result = _release_page(db, query=q, state=state, cursor=cursor, limit=limit, scope=scope)
     return {
         **result,
         "enabled": settings.firmware_ota_enabled,

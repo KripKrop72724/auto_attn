@@ -410,6 +410,8 @@ def test_firmware_catalog_pages_are_stable_filterable_and_summary_first(monkeypa
             "available": 1,
             "hil_only": 0,
             "revoked": 1,
+            "current": 1,
+            "hidden": 1,
         }
         assert first["next_cursor"] is not None
         second = release_page(session, query="2.2", cursor=first["next_cursor"], limit=1)

@@ -57,6 +57,12 @@ def main() -> None:
         assert "post" in paths[path] and "requestBody" not in paths[path]["post"]
     campaign_list = {row["name"] for row in paths["/api/v1/firmware/campaigns"]["get"]["parameters"]}
     assert {"view", "status", "cursor", "limit", "include_archived"}.issubset(campaign_list)
+    # The release page hides superseded releases on request only; scripts that
+    # read the list without a scope still get every release.
+    release_list = {row["name"]: row for row in paths["/api/v1/firmware/releases"]["get"]["parameters"]}
+    assert {"q", "state", "cursor", "limit", "scope"}.issubset(release_list)
+    assert not release_list["scope"].get("required")
+    assert release_list["scope"]["schema"].get("default") == "all"
     # Release revocation keeps its audited reason and step-up password.
     assert {"reason", "password"}.issubset(
         request_required(spec, "/api/v1/firmware/releases/{release_id}/revoke", "post")

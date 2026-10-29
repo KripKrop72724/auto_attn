@@ -1713,6 +1713,72 @@ def _serialize_release(row: FirmwareRelease, session: Session) -> dict[str, Any]
     }
 
 
+def _release_currency(session: Session) -> tuple[dict[int, int], set[int]]:
+    """Count the devices on each release and find the releases still in use.
+
+    A release is current unless it is revoked, and only while a device runs
+    it, a live campaign targets it, it is its family's newest production
+    release, or it is a HIL candidate newer than that production release.
+    Everything else is superseded: hidden from the default view only. Its
+    state never changes, so an OTA path that verifies a device's running
+    image against its predecessor release keeps working.
+    """
+
+    # One grouped read of the fleet; device versions look like "zone-lite-2.7.8"
+    # and are compared exactly as _versions_match compares them.
+    running: dict[tuple[str, tuple[int, int, int]], int] = {}
+    for family, firmware_version, count in session.execute(
+        select(Connector.firmware_family, Connector.firmware_version, func.count(Connector.id))
+        .where(Connector.active == True)  # noqa: E712
+        .group_by(Connector.firmware_family, Connector.firmware_version)
+    ):
+        version = semantic_version(firmware_version)
+        if version is not None:
+            key = (family or "zkt", version)
+            running[key] = running.get(key, 0) + int(count)
+    campaigned = set(session.scalars(
+        select(FirmwareCampaign.release_id)
+        .where(FirmwareCampaign.status.in_(["ACTIVE", "PAUSED"]))
+        .distinct()
+    ))
+    releases: list[tuple[int, str, str | None, tuple[int, int, int] | None]] = []
+    newest_available: dict[str, tuple[int, int, int]] = {}
+    newest_live: dict[str, tuple[tuple[int, int, int], int]] = {}
+    for row_id, version_text, state, manifest in session.execute(
+        select(FirmwareRelease.id, FirmwareRelease.version, FirmwareRelease.state, FirmwareRelease.manifest)
+    ):
+        try:
+            family = release_family(manifest or {})
+        except ValueError:
+            family = None
+        version = semantic_version(version_text)
+        releases.append((row_id, state, family, version))
+        if family is None or version is None or state == "REVOKED":
+            continue
+        if state == "AVAILABLE" and version > newest_available.get(family, (-1, -1, -1)):
+            newest_available[family] = version
+        if family not in newest_live or version > newest_live[family][0]:
+            newest_live[family] = (version, row_id)
+
+    devices: dict[int, int] = {}
+    current: set[int] = set()
+    for row_id, state, family, version in releases:
+        devices[row_id] = running.get((family, version), 0) if family and version else 0
+        if state == "REVOKED":
+            continue
+        newest_production = newest_available.get(family) if family else None
+        hil_candidate = (
+            state == "HIL_ONLY"
+            and family is not None
+            and newest_live.get(family, (None, None))[1] == row_id
+            and (newest_production is None or version > newest_production)
+        )
+        if (devices[row_id] > 0 or row_id in campaigned or hil_candidate
+                or (state == "AVAILABLE" and version is not None and version == newest_production)):
+            current.add(row_id)
+    return devices, current
+
+
 def release_page(
     session: Session,
     *,
@@ -1720,10 +1786,18 @@ def release_page(
     state: str | None = None,
     cursor: int | None = None,
     limit: int | None = None,
+    scope: str = "all",
 ) -> dict[str, Any]:
-    """Return a stable newest-first release page without changing the legacy row shape."""
+    """Return a stable newest-first release page without changing the legacy row shape.
 
+    ``scope="current"`` leaves superseded releases out of the page, its
+    pagination and ``filtered_total``; the default ``"all"`` is unchanged.
+    """
+
+    if scope not in {"all", "current"}:
+        raise ValueError("Release scope must be 'current' or 'all'.")
     sync_release_store(session)
+    devices_running, current_ids = _release_currency(session)
     clauses = []
     if query and query.strip():
         term = f"%{query.strip()}%"
@@ -1738,6 +1812,8 @@ def release_page(
         )
     if state:
         clauses.append(FirmwareRelease.state == state.upper())
+    if scope == "current":
+        clauses.append(FirmwareRelease.id.in_(sorted(current_ids)))
 
     filtered_total = session.scalar(
         select(func.count(FirmwareRelease.id)).where(*clauses)
@@ -1763,8 +1839,17 @@ def release_page(
         normalized = str(release_state).lower()
         totals[normalized] = int(count)
         totals["all"] += int(count)
+    totals["current"] = len(current_ids)
+    totals["hidden"] = totals["all"] - len(current_ids)
     return {
-        "rows": [_serialize_release(row, session) for row in page],
+        "rows": [
+            {
+                **_serialize_release(row, session),
+                "devices_running": devices_running.get(row.id, 0),
+                "current": row.id in current_ids,
+            }
+            for row in page
+        ],
         "next_cursor": next_cursor,
         "filtered_total": int(filtered_total),
         "totals": totals,
