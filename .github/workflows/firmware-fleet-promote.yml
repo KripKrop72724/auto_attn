@@ -1,0 +1,277 @@
+name: Zone Lite fleet-proven ZKT promotion
+
+# ZKT 2.7.x images are published HIL_ONLY to the signed nationwide scope and
+# proven on the field fleet itself, not on a single canary or the bench gate.
+# This promotes the exact published bytes to AVAILABLE once enough of that
+# fleet has run them, healthy, for the soak period. ADD's exact-identity
+# nationwide guard still decides which ESPs may be offered an AVAILABLE image.
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit_sha:
+        description: Exact green main commit that built the published HIL_ONLY release
+        required: true
+        type: string
+      version:
+        description: ZKT 2.7.x SemVer version, without a v prefix
+        required: true
+        type: string
+      minimum_field_devices:
+        description: Fail closed unless at least this many fleet ESPs run the exact release, healthy
+        required: true
+        default: 5
+        type: number
+      minimum_soak_hours:
+        description: Each counted ESP's successful deployment must be at least this old
+        required: true
+        default: 48
+        type: number
+
+permissions:
+  contents: read
+
+concurrency:
+  group: zone-lite-firmware-release
+  cancel-in-progress: false
+
+jobs:
+  provenance:
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.provenance.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - id: provenance
+        name: Require an exact main SHA and the fleet-proof thresholds
+        shell: bash
+        env:
+          INPUT_COMMIT_SHA: ${{ inputs.commit_sha }}
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_MINIMUM_FIELD_DEVICES: ${{ inputs.minimum_field_devices }}
+          INPUT_MINIMUM_SOAK_HOURS: ${{ inputs.minimum_soak_hours }}
+        run: |
+          set -euo pipefail
+          [[ "$INPUT_VERSION" =~ ^2\.7\.[0-9]+$ ]]
+          [[ "$INPUT_COMMIT_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$INPUT_MINIMUM_FIELD_DEVICES" =~ ^[0-9]+$ ]]
+          [[ "$INPUT_MINIMUM_SOAK_HOURS" =~ ^[0-9]+$ ]]
+          test "$INPUT_MINIMUM_FIELD_DEVICES" -ge 3
+          test "$INPUT_MINIMUM_SOAK_HOURS" -ge 24
+          git fetch origin main
+          sha="$(git rev-parse "${INPUT_COMMIT_SHA}^{commit}")"
+          git merge-base --is-ancestor "$sha" origin/main
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+  verify-and-promote:
+    needs: provenance
+    runs-on: [self-hosted, Windows, X64]
+    environment: firmware-production
+    timeout-minutes: 15
+    env:
+      ADD_BASE_URL: http://127.0.0.1:8096
+      ADD_ADMIN_USERNAME: StateHealthAdmin
+      ADD_ADMIN_PASSWORD: ${{ secrets.ADD_CANARY_ADMIN_PASSWORD }}
+      ADD_FIRMWARE_STORE_HOST_PATH: ${{ vars.ADD_FIRMWARE_STORE_HOST_PATH }}
+      EXPECTED_SHA: ${{ needs.provenance.outputs.sha }}
+      EXPECTED_VERSION: ${{ inputs.version }}
+      MINIMUM_FIELD_DEVICES: ${{ inputs.minimum_field_devices }}
+      MINIMUM_SOAK_HOURS: ${{ inputs.minimum_soak_hours }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Verify the field fleet, promote the exact bytes, confirm ADD serves them as AVAILABLE
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not $env:ADD_ADMIN_PASSWORD) {
+            throw 'ADD_CANARY_ADMIN_PASSWORD is not configured in firmware-production.'
+          }
+          if (-not $env:ADD_FIRMWARE_STORE_HOST_PATH) {
+            throw 'ADD_FIRMWARE_STORE_HOST_PATH is not configured'
+          }
+          $releaseId = "zone-lite-$env:EXPECTED_VERSION"
+          $loginBody = @{
+            username = $env:ADD_ADMIN_USERNAME
+            password = $env:ADD_ADMIN_PASSWORD
+          } | ConvertTo-Json -Compress
+          $loginResponse = Invoke-WebRequest `
+            -UseBasicParsing `
+            -Method Post `
+            -Uri "$env:ADD_BASE_URL/api/v1/auth/login" `
+            -ContentType 'application/json' `
+            -Body $loginBody `
+            -TimeoutSec 30
+          $login = $loginResponse.Content | ConvertFrom-Json
+          if (-not $login.ok -or $login.username -ne $env:ADD_ADMIN_USERNAME -or
+              [string]::IsNullOrWhiteSpace([string]$login.csrf_token)) {
+            throw 'Fleet promotion could not establish an authenticated ADD session.'
+          }
+          $setCookie = @($loginResponse.Headers['Set-Cookie']) -join ','
+          $cookieMatch = [regex]::Match(
+            $setCookie,
+            '(?:^|[,\s])add_admin=([^;,\s]+)'
+          )
+          if (-not $cookieMatch.Success) {
+            throw 'Fleet promotion did not receive the ADD administrator cookie.'
+          }
+          $session = New-Object Microsoft.PowerShell.Commands.WebRequestSession
+          $adminCookie = New-Object System.Net.Cookie
+          $adminCookie.Name = 'add_admin'
+          $adminCookie.Value = $cookieMatch.Groups[1].Value
+          $adminCookie.Path = '/'
+          $adminCookie.Secure = $false
+          $session.Cookies.Add([Uri]$env:ADD_BASE_URL, $adminCookie)
+          $failed = $false
+          try {
+            $releases = Invoke-RestMethod `
+              -Method Get `
+              -Uri "$env:ADD_BASE_URL/api/v1/firmware/releases?q=$releaseId&limit=20" `
+              -WebSession $session `
+              -TimeoutSec 60
+            $matching = @($releases.rows | Where-Object { $_.release_id -eq $releaseId })
+            if ($matching.Count -ne 1) {
+              throw 'Exact release was not found in ADD.'
+            }
+            $release = $matching[0]
+            $applicationDigest = [string]$release.application_sha256
+            if (
+              $release.version -ne $env:EXPECTED_VERSION -or
+              $release.git_sha -ne $env:EXPECTED_SHA -or
+              $release.state -ne 'HIL_ONLY' -or
+              $release.firmware_family -ne 'zkt' -or
+              $null -ne $release.revoked_at -or
+              @($release.hil_targets).Count -lt 1 -or
+              $applicationDigest -notmatch '^[0-9a-f]{64}$'
+            ) {
+              throw 'Exact published HIL_ONLY ZKT release identity was not found.'
+            }
+
+            $campaigns = Invoke-RestMethod `
+              -Method Get `
+              -Uri "$env:ADD_BASE_URL/api/v1/firmware/campaigns?release_id=$releaseId&include_archived=true&limit=200" `
+              -WebSession $session `
+              -TimeoutSec 60
+            if ($null -ne $campaigns.next_cursor) {
+              throw 'Release campaigns exceeded one verification page; promotion refuses an incomplete inspection.'
+            }
+            $deployments = @($campaigns.rows | ForEach-Object { @($_.deployments) })
+            $rolledBack = @($deployments | Where-Object { $_.status -eq 'ROLLED_BACK' })
+            if ($rolledBack.Count -ne 0) {
+              throw "$($rolledBack.Count) deployment(s) of this release rolled back."
+            }
+            # Only a transfer that never reached the device's OTA slot is
+            # tolerated: the running image was untouched and no boot occurred.
+            $transportFailures = @('DOWNLOAD_BEGIN_FAILED', 'DOWNLOAD_INCOMPLETE')
+            $unsafeFailures = @($deployments | Where-Object {
+              $_.status -eq 'FAILED' -and $transportFailures -notcontains [string]$_.error_code
+            })
+            if ($unsafeFailures.Count -ne 0) {
+              throw "$($unsafeFailures.Count) deployment(s) of this release failed after the transfer."
+            }
+
+            $devices = Invoke-RestMethod `
+              -Method Get `
+              -Uri "$env:ADD_BASE_URL/api/v1/devices" `
+              -WebSession $session `
+              -TimeoutSec 60
+            $now = [DateTimeOffset]::UtcNow
+            $proven = @{}
+            $regressed = @()
+            foreach ($deployment in @($deployments | Where-Object { $_.status -eq 'SUCCEEDED' })) {
+              $rows = @($devices.rows | Where-Object { $_.connector_id -eq $deployment.connector_id })
+              if ($rows.Count -ne 1) { continue }
+              $row = $rows[0]
+              $running = ([string]$row.firmware_version).Trim()
+              if ($running.StartsWith('zone-lite-')) { $running = $running.Substring(10) }
+              $storage = $null
+              if ($null -ne $row.firmware_diagnostics) { $storage = $row.firmware_diagnostics.storage }
+              $durability = if ($null -ne $storage) { [string]$storage.durability } else { '' }
+              if ($running -ne $env:EXPECTED_VERSION) {
+                $regressed += "$($row.zone_id) now runs $running"
+                continue
+              }
+              if ($durability -eq 'DEGRADED') {
+                $regressed += "$($row.zone_id) reports DEGRADED storage on this release"
+                continue
+              }
+              if ([string]::IsNullOrWhiteSpace([string]$deployment.completed_at)) { continue }
+              $soakHours = ($now - [DateTimeOffset]::Parse([string]$deployment.completed_at)).TotalHours
+              if (
+                $soakHours -ge [double]$env:MINIMUM_SOAK_HOURS -and
+                $row.firmware_family -eq 'zkt' -and
+                [bool]$row.connected -and
+                $row.ota_state -eq 'OTA_READY' -and
+                [string]$row.ota_image_sha256 -eq $applicationDigest -and
+                $durability -eq 'HEALTHY'
+              ) {
+                $proven[[string]$row.connector_id] = [string]$row.zone_id
+              }
+            }
+            if ($regressed.Count -ne 0) {
+              throw "A successful ESP no longer runs this release healthily: $($regressed -join '; ')."
+            }
+            if ($proven.Count -lt [int]$env:MINIMUM_FIELD_DEVICES) {
+              throw "Only $($proven.Count) fleet ESP(s) run the exact release, healthy, after $env:MINIMUM_SOAK_HOURS h; $env:MINIMUM_FIELD_DEVICES required."
+            }
+            Write-Host (
+              "Fleet proof: $($proven.Count) ESP(s) run the exact $env:EXPECTED_VERSION application digest, " +
+              "online with HEALTHY storage, at least $env:MINIMUM_SOAK_HOURS h after success: " +
+              (($proven.Values | Sort-Object) -join ', ') + '. ' +
+              "Tolerated transfer failures: $(@($deployments | Where-Object { $_.status -eq 'FAILED' }).Count)."
+            )
+
+            ./deploy/add/promote-firmware.ps1 `
+              -StoreDirectory $env:ADD_FIRMWARE_STORE_HOST_PATH `
+              -Version $env:EXPECTED_VERSION `
+              -GitSha $env:EXPECTED_SHA `
+              -OutputDirectory promoted-release
+            if (Test-Path -LiteralPath 'promoted-release/.hil-only.json') {
+              throw 'Promoted production package is still HIL-targeted.'
+            }
+
+            $after = Invoke-RestMethod `
+              -Method Get `
+              -Uri "$env:ADD_BASE_URL/api/v1/firmware/releases?q=$releaseId&limit=20" `
+              -WebSession $session `
+              -TimeoutSec 60
+            $promoted = @($after.rows | Where-Object {
+              $_.release_id -eq $releaseId -and
+              $_.state -eq 'AVAILABLE' -and
+              $_.git_sha -eq $env:EXPECTED_SHA -and
+              $_.image_sha256 -eq $release.image_sha256 -and
+              [string]$_.application_sha256 -eq $applicationDigest
+            })
+            if ($promoted.Count -ne 1) {
+              throw 'ADD did not re-read the promoted release as AVAILABLE with the same identity.'
+            }
+            Write-Host "ADD serves Zone Lite $env:EXPECTED_VERSION as AVAILABLE."
+          } catch {
+            $failed = $true
+            throw
+          } finally {
+            try {
+              $logoutHeaders = @{
+                'X-CSRF-Token' = [string]$login.csrf_token
+              }
+              Invoke-RestMethod `
+                -Method Post `
+                -Uri "$env:ADD_BASE_URL/api/v1/auth/logout" `
+                -Headers $logoutHeaders `
+                -WebSession $session `
+                -ContentType 'application/json' `
+                -Body '{}' `
+                -TimeoutSec 15 | Out-Null
+            } catch {
+              if (-not $failed) {
+                throw 'Fleet promotion succeeded, but the temporary ADD session could not be revoked.'
+              }
+              Write-Warning 'Temporary ADD session revocation also failed after a promotion failure.'
+            }
+          }
