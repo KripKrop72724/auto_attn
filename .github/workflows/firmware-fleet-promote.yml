@@ -27,6 +27,11 @@ on:
         required: true
         default: 48
         type: number
+      reviewed_deployments:
+        description: Comma-separated deployment IDs of rollbacks or post-transfer failures the owner reviewed and accepts; any other one blocks promotion
+        required: false
+        default: ''
+        type: string
 
 permissions:
   contents: read
@@ -53,6 +58,7 @@ jobs:
           INPUT_VERSION: ${{ inputs.version }}
           INPUT_MINIMUM_FIELD_DEVICES: ${{ inputs.minimum_field_devices }}
           INPUT_MINIMUM_SOAK_HOURS: ${{ inputs.minimum_soak_hours }}
+          INPUT_REVIEWED_DEPLOYMENTS: ${{ inputs.reviewed_deployments }}
         run: |
           set -euo pipefail
           [[ "$INPUT_VERSION" =~ ^2\.7\.[0-9]+$ ]]
@@ -61,6 +67,7 @@ jobs:
           [[ "$INPUT_MINIMUM_SOAK_HOURS" =~ ^[0-9]+$ ]]
           test "$INPUT_MINIMUM_FIELD_DEVICES" -ge 3
           test "$INPUT_MINIMUM_SOAK_HOURS" -ge 24
+          [[ -z "$INPUT_REVIEWED_DEPLOYMENTS" || "$INPUT_REVIEWED_DEPLOYMENTS" =~ ^[0-9a-f]{32}(,[0-9a-f]{32})*$ ]]
           git fetch origin main
           sha="$(git rev-parse "${INPUT_COMMIT_SHA}^{commit}")"
           git merge-base --is-ancestor "$sha" origin/main
@@ -80,6 +87,7 @@ jobs:
       EXPECTED_VERSION: ${{ inputs.version }}
       MINIMUM_FIELD_DEVICES: ${{ inputs.minimum_field_devices }}
       MINIMUM_SOAK_HOURS: ${{ inputs.minimum_soak_hours }}
+      REVIEWED_DEPLOYMENTS: ${{ inputs.reviewed_deployments }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -162,18 +170,27 @@ jobs:
               throw 'Release campaigns exceeded one verification page; promotion refuses an incomplete inspection.'
             }
             $deployments = @($campaigns.rows | ForEach-Object { @($_.deployments) })
-            $rolledBack = @($deployments | Where-Object { $_.status -eq 'ROLLED_BACK' })
-            if ($rolledBack.Count -ne 0) {
-              throw "$($rolledBack.Count) deployment(s) of this release rolled back."
-            }
             # Only a transfer that never reached the device's OTA slot is
-            # tolerated: the running image was untouched and no boot occurred.
+            # tolerated on its own: the running image was untouched and no
+            # boot occurred. Every rollback or later failure needs the owner's
+            # review, named by its exact deployment ID.
             $transportFailures = @('DOWNLOAD_BEGIN_FAILED', 'DOWNLOAD_INCOMPLETE')
-            $unsafeFailures = @($deployments | Where-Object {
-              $_.status -eq 'FAILED' -and $transportFailures -notcontains [string]$_.error_code
+            $outcomes = @($deployments | Where-Object {
+              $_.status -eq 'ROLLED_BACK' -or
+              ($_.status -eq 'FAILED' -and $transportFailures -notcontains [string]$_.error_code)
             })
-            if ($unsafeFailures.Count -ne 0) {
-              throw "$($unsafeFailures.Count) deployment(s) of this release failed after the transfer."
+            $reviewed = @(([string]$env:REVIEWED_DEPLOYMENTS).Split(',') | Where-Object { $_ })
+            $unreviewed = @($outcomes | Where-Object { $reviewed -notcontains [string]$_.deployment_id })
+            if ($unreviewed.Count -ne 0) {
+              $listed = ($unreviewed | ForEach-Object { "$($_.zone_id) $($_.deployment_id) $($_.status) $($_.error_code)" }) -join '; '
+              throw "$($unreviewed.Count) deployment(s) of this release rolled back or failed after the transfer without owner review: $listed."
+            }
+            $stale = @($reviewed | Where-Object { @($outcomes.deployment_id) -notcontains $_ })
+            if ($stale.Count -ne 0) {
+              throw "Reviewed deployment(s) are not a rollback or failure of this release: $($stale -join ', ')."
+            }
+            foreach ($outcome in $outcomes) {
+              Write-Host "Owner-reviewed: $($outcome.zone_id) $($outcome.deployment_id) $($outcome.status) $($outcome.error_code)"
             }
 
             $devices = Invoke-RestMethod `
