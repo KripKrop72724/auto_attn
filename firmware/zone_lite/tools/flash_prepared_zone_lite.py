@@ -15,9 +15,11 @@ import json
 from pathlib import Path
 import re
 import shutil
+import struct
 import subprocess
 import tempfile
 from typing import Callable
+import zlib
 
 from provision_zone_lite import ensure_nvs_hmac_key, normalize_mac, read_mac
 
@@ -29,6 +31,29 @@ FLASH_LAYOUT = (
     ("ota_data_initial.bin", 0x17000),
     ("zone-lite-signed.bin", 0x20000),
 )
+
+# A production package boots the exact published release from ota_0, as if it
+# had arrived by OTA: 2.6.10 and later refuse to upgrade an image running from
+# factory, and ADD verifies a predecessor only in an OTA slot. The same bytes
+# in factory remain the bootloader's last resort.
+OTA_0_OFFSET = 0x2A0000
+OTADATA_OFFSET = 0x17000
+OTADATA_SIZE = 0x2000
+PRODUCTION_PARTITIONS = {
+    "otadata": (1, 0x00, OTADATA_OFFSET, OTADATA_SIZE),
+    "factory": (0, 0x00, 0x20000, 0x280000),
+    "ota_0": (0, 0x10, OTA_0_OFFSET, 0x280000),
+    "ota_1": (0, 0x11, 0x520000, 0x280000),
+}
+PRODUCTION_LAYOUT = (
+    ("bootloader-signed.bin", 0x0),
+    ("partition-table.bin", 0x10000),
+    ("provision.bin", 0x11000),
+    ("otadata-ota0.bin", OTADATA_OFFSET),
+    ("zone-lite-signed.bin", 0x20000),
+    ("zone-lite-signed.bin", OTA_0_OFFSET),
+)
+ESP_OTA_IMG_VALID = 2
 
 FlashProgress = Callable[[str, int, int], None]
 
@@ -70,6 +95,41 @@ def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def otadata_selecting_ota_0() -> bytes:
+    """Both otadata sectors, with one valid entry that selects ota_0.
+
+    The bootloader boots the valid entry with the highest ota_seq, slot
+    (ota_seq - 1) % 2; its CRC is ESP-IDF otatool's.
+    """
+    seq = 1
+    crc = zlib.crc32(struct.pack("<I", seq), 0xFFFFFFFF)
+    entry = struct.pack("<I", seq) + b"\xff" * 20 + struct.pack("<II", ESP_OTA_IMG_VALID, crc)
+    return entry + b"\xff" * (OTADATA_SIZE - len(entry))
+
+
+def partition_entries(table: bytes) -> dict[str, tuple[int, int, int, int]]:
+    entries = {}
+    for start in range(0, len(table) - 31, 32):
+        row = table[start:start + 32]
+        if row[:2] != b"\xaa\x50":
+            break
+        kind, subtype, offset, size = struct.unpack_from("<BBII", row, 2)
+        label = row[12:28].split(b"\0", 1)[0].decode("ascii", "replace")
+        entries[label] = (kind, subtype, offset, size)
+    return entries
+
+
+def production_release(bootstrap: dict) -> dict | None:
+    release = bootstrap.get("production_release")
+    if release is None:
+        return None
+    if (not isinstance(release, dict) or release.get("boot_slot") != "ota_0"
+            or not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", str(release.get("version", "")))
+            or release.get("image_sha256") != bootstrap.get("application_sha256")):
+        raise RuntimeError("Signed bootstrap production release is invalid")
+    return release
+
+
 def validate_inputs(
     *,
     signed_package: Path,
@@ -94,6 +154,10 @@ def validate_inputs(
         "application_sha256"
     ):
         raise RuntimeError("Signed application hash does not match its manifest")
+    if production_release(bootstrap) is not None:
+        partitions = partition_entries((signed_package / "partition-table.bin").read_bytes())
+        if any(partitions.get(name) != expected for name, expected in PRODUCTION_PARTITIONS.items()):
+            raise RuntimeError("Partition table does not match the production OTA layout")
 
     provisioning = json.loads(provisioning_manifest.read_text(encoding="utf-8"))
     aad = provisioning.get("aad", {})
@@ -130,13 +194,26 @@ def flash_and_verify(
         "ota_data_initial.bin": signed_package / "ota_data_initial.bin",
         "zone-lite-signed.bin": signed_package / "zone-lite-signed.bin",
     }
-    flash_sources_and_verify(
-        esptool=esptool,
-        port=port,
-        sources=sources,
-        layout=FLASH_LAYOUT,
-        progress=progress,
-    )
+    bootstrap = json.loads((signed_package / "bootstrap-manifest.json").read_text(encoding="utf-8"))
+    if production_release(bootstrap) is None:
+        flash_sources_and_verify(
+            esptool=esptool,
+            port=port,
+            sources=sources,
+            layout=FLASH_LAYOUT,
+            progress=progress,
+        )
+        return
+    with tempfile.TemporaryDirectory(prefix="zone-lite-otadata-") as directory:
+        otadata = Path(directory) / "otadata-ota0.bin"
+        otadata.write_bytes(otadata_selecting_ota_0())
+        flash_sources_and_verify(
+            esptool=esptool,
+            port=port,
+            sources={**sources, "otadata-ota0.bin": otadata},
+            layout=PRODUCTION_LAYOUT,
+            progress=progress,
+        )
 
 
 def flash_sources_and_verify(

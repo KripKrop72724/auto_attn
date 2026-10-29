@@ -5,11 +5,48 @@ param(
     [Parameter(Mandatory = $true)][ValidatePattern('^[0-9a-fA-F]{2}(:[0-9a-fA-F]{2}){5}$')][string]$DeviceMac,
     [Parameter(Mandatory = $true)][ValidatePattern('^[0-9a-fA-F]{40}$')][string]$GitSha,
     [ValidateSet('zkt', 'hikvision')][string]$FirmwareFamily = 'zkt',
-    [ValidateSet('factory', 'usb-wifi-rescue', 'usb-wifi-rescue-seed')][string]$ImageRole = 'factory'
+    [ValidateSet('factory', 'usb-wifi-rescue', 'usb-wifi-rescue-seed')][string]$ImageRole = 'factory',
+    # A published AVAILABLE release directory in the ADD firmware store. Its
+    # exact signed application replaces this build's, so a new ESP boots the
+    # production bytes ADD already verifies (flashed to factory and ota_0).
+    [string]$ProductionReleaseDirectory = ''
 )
 
 $ErrorActionPreference = 'Stop'
 $GitSha = $GitSha.ToLowerInvariant()
+$productionRelease = $null
+if ($ProductionReleaseDirectory) {
+    if ($ImageRole -ne 'factory') { throw 'Only a factory bootstrap can carry a production release' }
+    $releaseDirectory = (Resolve-Path -LiteralPath $ProductionReleaseDirectory).Path
+    foreach ($marker in @('.hil-only.json', '.diagnostic-only.json')) {
+        if (Test-Path -LiteralPath (Join-Path $releaseDirectory $marker)) {
+            throw "Production release $releaseDirectory is not AVAILABLE ($marker)"
+        }
+    }
+    $releaseManifest = Get-Content -LiteralPath (Join-Path $releaseDirectory 'manifest.json') -Raw | ConvertFrom-Json
+    if (-not (Test-Path -LiteralPath (Join-Path $releaseDirectory 'manifest.sig') -PathType Leaf)) {
+        throw 'Production release is missing its signed manifest'
+    }
+    $releaseFamily = if ($releaseManifest.firmware_family) { [string]$releaseManifest.firmware_family } else { 'zkt' }
+    if ($releaseFamily -ne $FirmwareFamily -or [string]$releaseManifest.partition_layout -ne 'zone-lite-ota-v1' -or
+        [string]$releaseManifest.release_channel -eq 'EXPERIMENTAL_HIL_ONLY') {
+        throw 'Production release family, layout or channel is not a factory production image'
+    }
+    $productionImage = Join-Path $releaseDirectory ([string]$releaseManifest.image_name)
+    $productionHash = (Get-FileHash -LiteralPath $productionImage -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($productionHash -ne [string]$releaseManifest.image_sha256 -or
+        (Get-Item -LiteralPath $productionImage).Length -ne [int64]$releaseManifest.image_size) {
+        throw 'Production release image does not match its signed manifest'
+    }
+    $productionRelease = [ordered]@{
+        release_id = [string]$releaseManifest.release_id
+        version = [string]$releaseManifest.version
+        git_sha = [string]$releaseManifest.git_sha
+        image_sha256 = $productionHash
+        application_sha256 = [string]$releaseManifest.application_sha256
+        boot_slot = 'ota_0'
+    }
+}
 Add-Type -AssemblyName System.Security
 
 function Invoke-DockerText {
@@ -244,7 +281,12 @@ try {
     }
 
     Copy-Item -LiteralPath (Join-Path $work 'bootloader-signed.bin') -Destination (Join-Path $output 'bootloader-signed.bin')
-    Copy-Item -LiteralPath (Join-Path $work 'zone-lite-signed.bin') -Destination (Join-Path $output 'zone-lite-signed.bin')
+    if ($productionRelease) {
+        Copy-Item -LiteralPath $productionImage -Destination (Join-Path $output 'zone-lite-signed.bin')
+    }
+    else {
+        Copy-Item -LiteralPath (Join-Path $work 'zone-lite-signed.bin') -Destination (Join-Path $output 'zone-lite-signed.bin')
+    }
     foreach ($name in @('partition-table.bin', 'ota_data_initial.bin', 'flasher_args.json')) {
         Copy-Item -LiteralPath (Join-Path $unsigned $name) -Destination (Join-Path $output $name)
     }
@@ -261,13 +303,19 @@ try {
         bootloader_sha256 = (Get-FileHash (Join-Path $output 'bootloader-signed.bin') -Algorithm SHA256).Hash.ToLowerInvariant()
         application_sha256 = (Get-FileHash (Join-Path $output 'zone-lite-signed.bin') -Algorithm SHA256).Hash.ToLowerInvariant()
     }
+    if ($productionRelease) {
+        if ($packageFields.application_sha256 -ne $productionRelease.image_sha256) {
+            throw 'Bootstrap application is not the exact production release image'
+        }
+        $packageFields.production_release = $productionRelease
+    }
     if ($ImageRole -ne 'factory') {
         $packageFields.image_role = $ImageRole
         $packageFields.hil_only = $true
         $packageFields.factory_release_eligible = $false
         [IO.File]::WriteAllText((Join-Path $output '.hil-only.json'), '{"state":"HIL_ONLY","purpose":"USB_WIFI_RESCUE"}', (New-Object Text.UTF8Encoding($false)))
     }
-    $package = $packageFields | ConvertTo-Json
+    $package = $packageFields | ConvertTo-Json -Depth 4
     [IO.File]::WriteAllText((Join-Path $output 'bootstrap-manifest.json'), $package, (New-Object Text.UTF8Encoding($false)))
     if ($env:ADD_FACTORY_VERSION) {
         & python scripts/build_factory_manifest.py `

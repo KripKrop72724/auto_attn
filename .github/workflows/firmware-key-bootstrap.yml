@@ -18,6 +18,10 @@ on:
         options:
           - setup-ap
           - lahore-direct
+      production_release:
+        description: Factory bootstrap application - latest (newest AVAILABLE ZKT release in the store, flashed to factory and ota_0), an exact AVAILABLE version, or none (this commit's build)
+        type: string
+        default: latest
 
 permissions:
   contents: read
@@ -160,8 +164,35 @@ jobs:
           name: zone-lite-bootstrap-unsigned-${{ github.sha }}
           path: unsigned
       - name: Generate or reuse ADD-hosted key vault and sign bootstrap image
+        env:
+          PRODUCTION_RELEASE: ${{ inputs.production_release || 'latest' }}
+          ADD_FIRMWARE_STORE_HOST_PATH: ${{ vars.ADD_FIRMWARE_STORE_HOST_PATH }}
         run: |
           $ErrorActionPreference = 'Stop'
+          if ($env:PRODUCTION_RELEASE -notmatch '^(latest|none|[0-9]+\.[0-9]+\.[0-9]+)$') {
+            throw 'production_release must be latest, none or an exact version'
+          }
+          $productionArguments = @{}
+          if ($env:PRODUCTION_RELEASE -ne 'none') {
+            if (-not $env:ADD_FIRMWARE_STORE_HOST_PATH) { throw 'ADD_FIRMWARE_STORE_HOST_PATH is not configured' }
+            $available = @(Get-ChildItem -LiteralPath $env:ADD_FIRMWARE_STORE_HOST_PATH -Directory | Where-Object {
+              $_.Name -match '^[0-9]+\.[0-9]+\.[0-9]+$' -and
+              (Test-Path -LiteralPath (Join-Path $_.FullName 'manifest.json') -PathType Leaf) -and
+              -not (Test-Path -LiteralPath (Join-Path $_.FullName '.hil-only.json')) -and
+              -not (Test-Path -LiteralPath (Join-Path $_.FullName '.diagnostic-only.json'))
+            } | Where-Object {
+              $family = [string](Get-Content -LiteralPath (Join-Path $_.FullName 'manifest.json') -Raw | ConvertFrom-Json).firmware_family
+              -not $family -or $family -eq 'zkt'
+            })
+            $chosen = if ($env:PRODUCTION_RELEASE -eq 'latest') {
+              $available | Sort-Object { [version]$_.Name } | Select-Object -Last 1
+            } else {
+              $available | Where-Object { $_.Name -eq $env:PRODUCTION_RELEASE }
+            }
+            if (-not $chosen) { throw "No AVAILABLE ZKT release '$env:PRODUCTION_RELEASE' in the firmware store" }
+            Write-Host "Factory bootstrap boots the exact AVAILABLE release $($chosen.Name) from ota_0"
+            $productionArguments.ProductionReleaseDirectory = $chosen.FullName
+          }
           $artifact = Join-Path $PWD 'unsigned'
           $unsigned = Join-Path $PWD 'unsigned-package'
           New-Item -ItemType Directory -Path $unsigned -Force | Out-Null
@@ -177,7 +208,8 @@ jobs:
             -UnsignedDirectory $unsigned `
             -OutputDirectory $output `
             -DeviceMac '${{ inputs.device_mac }}' `
-            -GitSha '${{ github.sha }}'
+            -GitSha '${{ github.sha }}' `
+            @productionArguments
       - uses: actions/upload-artifact@v4
         with:
           name: zone-lite-signed-bootstrap-${{ github.sha }}
