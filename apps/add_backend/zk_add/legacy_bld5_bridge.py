@@ -14,25 +14,26 @@ from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from zk_add.hil_scope import target_matches
-from zk_add.hil_2615_cities import CITY_FACTORY_PREDECESSORS, CITY_TARGETS, SIGNED_BRIDGE_IDENTITIES
+from zk_add.hil_2615_cities import SIGNED_BRIDGE_IDENTITIES
 from zk_add import zkt274_bld9_k50 as bld9_k50
 from zk_add.models import Connector, DeviceTelemetry
 from zk_add.ota import (
-    FirmwareCampaign, FirmwareDeployment, FirmwareEvent, FirmwareRelease,
-    HIL_2615_BLD5_TARGET, _application_sha256, _factory_3fl_bridge_target, _versions_match, record_progress,
+    FACTORY_BRIDGE_PREDECESSORS, FACTORY_BRIDGE_TARGETS, FirmwareCampaign, FirmwareDeployment, FirmwareEvent,
+    FirmwareRelease, HIL_2615_BLD5_TARGET, _application_sha256, _factory_3fl_bridge_target, _versions_match,
+    record_progress,
 )
 from zk_add.time_utils import ensure_utc, utc_now
 
 
 BRIDGE_IDENTITY = SIGNED_BRIDGE_IDENTITIES["2.4.12"]
 BRIDGE_TARGETS = {"LF-ZONE-BLD5-01": HIL_2615_BLD5_TARGET, **{
-    zone: CITY_TARGETS[zone] for zone, predecessor in CITY_FACTORY_PREDECESSORS.items()
+    zone: FACTORY_BRIDGE_TARGETS[zone] for zone, predecessor in FACTORY_BRIDGE_PREDECESSORS.items()
     if predecessor[2] == "2.4.12"
 }, bld9_k50.ZONE: bld9_k50.TARGET}
 # (version, application digest) each factory-gated bridge zone ran before 2.4.12.
 FACTORY_PREDECESSORS = {
     zone: predecessor[:2] for zone, predecessor in
-    {**CITY_FACTORY_PREDECESSORS, bld9_k50.ZONE: bld9_k50.FACTORY_PREDECESSOR}.items()
+    {**FACTORY_BRIDGE_PREDECESSORS, bld9_k50.ZONE: bld9_k50.FACTORY_PREDECESSOR}.items()
     if zone in BRIDGE_TARGETS
 }
 REPORT, CAPABILITY, VERIFIED = (

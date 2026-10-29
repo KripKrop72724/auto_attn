@@ -9,12 +9,15 @@ from sqlalchemy import and_, or_, select, text
 from zk_add.hil_scope import target_matches
 from zk_add.models import Connector
 from zk_add.time_utils import ensure_utc, utc_now
-from zk_add.zkt270_scope import BY_ID
+from zk_add.zkt270_scope import BY_ID, TARGETS
 
 JOURNAL_VERSIONS = ("2.6.16", "2.6.17", "2.6.18", "2.6.19", "2.6.20", "2.6.21", "2.6.22", "2.6.23", "2.7.0")
 # Fixed two-key namespace; independent of Python's randomized hash function.
 LOCK_NAMESPACE, LOCK_KEY = 0x5A4B54, 270
 RESERVATION_SCAN_LIMIT = 128
+# Terminal models the 17 were qualified on. A ZKT added later may take a
+# production image only on one of these; the K50 and SenseFace are not.
+QUALIFIED_MODELS = frozenset(target.model for target in TARGETS)
 UNCERTAIN_STATES = ("CANCELLED", "SUPERSEDED", "RELEASE_REVOKED")
 
 
@@ -93,6 +96,28 @@ def try_assignment_lock(session, connector):
                                {"namespace": LOCK_NAMESPACE, "key": LOCK_KEY}))
 
 
+def admitted_addition(connector, release) -> bool:
+    """A ZKT ESP onboarded after the 17 may take a production (AVAILABLE) image.
+
+    Owner decision (29 Oct 2026). The 17 stay the exact scope of every
+    HIL_ONLY image; a later ESP reaches only AVAILABLE ones, and only with an
+    administrator-confirmed terminal binding on a qualified model. A connector
+    of the 17 whose identity changed is not an addition. ADD's predecessor and
+    storage checks still decide whether its running image may take the release.
+    """
+    from zk_add.zkt274_bld9_k50 import TARGET as K50
+
+    terminal = connector.zkt_device
+    return bool(
+        release is not None and release.state == "AVAILABLE"
+        and connector.connector_id not in BY_ID and connector.connector_id != K50.connector_id
+        and connector.active and not connector.is_spare
+        and terminal is not None and terminal.terminal_binding_state == "CONFIRMED"
+        and terminal.confirmed_serial and terminal.serial == terminal.confirmed_serial
+        and terminal.model in QUALIFIED_MODELS
+    )
+
+
 def pending_offer_hold(session, connector, release=None):
     """Offer only to an exact, online fleet target; never limit how many upgrade at once.
 
@@ -111,9 +136,10 @@ def pending_offer_hold(session, connector, release=None):
     if journal_release is None:
         return None
     target = BY_ID.get(connector.connector_id)
-    # Outside the 17, only the one reviewed K50 with its exact signed 2.4.12
-    # bridge or 2.7.4 may be offered.
-    if not (target is not None and target_matches(target.identity, connector)) and offer_location(release, connector) is None:
+    # Outside the 17: the one reviewed K50 with its exact signed 2.4.12 bridge
+    # or 2.7.4, and later qualified additions for production images only.
+    if (not (target is not None and target_matches(target.identity, connector))
+            and offer_location(release, connector) is None and not admitted_addition(connector, release)):
         return "NATIONWIDE_EXACT_TARGET_REQUIRED"
     if not connector.connected:
         return "NATIONWIDE_TARGET_OFFLINE"
