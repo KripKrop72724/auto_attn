@@ -153,4 +153,10 @@ def test_first_use_flasher_is_fail_closed_and_verifies_all_ranges():
     assert "--confirm-secure-boot-for" in source
     assert "ensure_nvs_hmac_key(" in source
     assert "Flash readback verification failed" in source
+    # A production (first-use 2.7.x) package also writes the ota_1 rollback
+    # predecessor and the empty storage image, verified on chip by the stub.
+    assert "(ROLLBACK_PREDECESSOR_IMAGE, OTA_1_OFFSET)" in source
+    assert "(STORAGE_IMAGE, STORAGE_OFFSET)" in source
+    assert '"verify_flash"' in source
+    assert "Flash verification failed for" in source
     assert '"first boot is intentionally pending"' in source

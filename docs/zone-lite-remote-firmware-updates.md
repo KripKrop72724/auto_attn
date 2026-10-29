@@ -87,22 +87,39 @@ Never remotely enable Secure Boot, replace the partition table, or bootstrap an 
 
 The `Zone Lite signing key bootstrap` workflow's `production_release` input defaults to `latest`. It packages the newest AVAILABLE ZKT release from the ADD firmware store, byte for byte, instead of this commit's build. Releases with a `.hil-only.json` or `.diagnostic-only.json` marker are never used. You can also name an exact AVAILABLE version, or pass `none` to keep the old built image.
 
-`bootstrap-manifest.json` then carries `production_release` (`boot_slot` `ota_0`), and `flash_prepared_zone_lite.py` changes what it writes:
+A production release alone does not boot cleanly on a never-used board. A 2.7.x release also needs two things that a blank flash chip lacks:
 
-- It requires the partition table to have otadata at `0x17000`, factory at `0x20000`, ota_0 at `0x2A0000` and ota_1 at `0x520000`.
-- It writes the exact image to both factory and ota_0.
-- It writes an otadata sector whose one valid entry (`ota_seq` 1, state VALID, ESP-IDF otatool CRC) selects ota_0, then reads back every range.
+- **A rollback predecessor in ota_1.** 2.7.x direct-upgrade builds start storage only when the other OTA slot holds a qualified predecessor. `storage_upgrade_init()` checks the exact application digests that `ug_direct_predecessor_matches()` lists (2.4.12, 2.5.2, 2.6.x, 2.7.2 and later). Without one, storage stops with `STORAGE_DIRECT_ROLLBACK_IMAGE_UNQUALIFIED`, the LED shows LOCAL_FAILURE (orange), and the device never confirms a later OTA.
+- **An empty SPIFFS in the storage partition.** Zone Lite never formats storage (`format_if_mount_failed` is false), so a mount failure can never erase punches. Erased flash fails to mount with `-10025`, which puts the device in fail-safe mode with the same orange LED.
+
+The workflow's `rollback_predecessor` input defaults to `2.5.2`. It is resolved from the same AVAILABLE-only ZKT list as `production_release`, and it must be older. `none` is accepted only together with `production_release=none`; a built image is flashed to factory only, so it is ignored there.
+
+The build job also runs `tools/build_empty_storage_image.py`. It sizes the image from the build's storage partition and calls ESP-IDF v5.5.3's `spiffsgen.py` with `--page-size 256 --block-size 4096 --obj-name-len 32 --meta-len 4 --use-magic --use-magic-len`. The tool refuses a build whose generated sdkconfig uses other SPIFFS options. CI builds the same image and checks that it is byte-for-byte the bench-verified image.
+
+`bootstrap-manifest.json` then carries three entries:
+
+- `production_release`, with `boot_slot` `ota_0`.
+- `rollback_predecessor`: release ID, version, Git SHA, image and application digests, and `slot` `ota_1`.
+- `storage_image_sha256` and `storage_image_size`.
+
+The signer copies the predecessor's exact signed image as `rollback-predecessor.bin` and the build's `storage-empty.bin`. It validates the predecessor like the production release (markers, signed manifest, family, layout, channel, image hash and size).
+
+`flash_prepared_zone_lite.py` refuses a production package that is missing either file, or whose file hashes differ from the signed manifest. It then changes what it writes:
+
+- It requires the partition table to have otadata at `0x17000`, factory at `0x20000`, ota_0 at `0x2A0000`, ota_1 at `0x520000`, and an 8 MiB SPIFFS storage partition at `0x7A0000`.
+- It writes the exact production image to both factory and ota_0, and the predecessor to ota_1.
+- It writes an otadata sector whose one valid entry (`ota_seq` 1, state VALID, ESP-IDF otatool CRC) selects ota_0.
+- It writes the empty SPIFFS image to storage.
+- It verifies every range with esptool's stub `verify_flash`, an on-chip MD5. A blank device is not in Secure Download Mode yet, so the stub can load. The `--no-stub` readback this replaces failed its CRC on the second application range of all three new boards on 29 Oct 2026, although the bytes were correct. It would also take about 15 minutes for the 8 MiB storage image. Packages without a production release keep the readback.
 
 The device boots the published bytes from an OTA slot, as if they had arrived by OTA. 2.6.10 and later refuse to upgrade from an image running in factory, and ADD verifies a predecessor only in an OTA slot. With this layout the next production release reaches the device by an ordinary campaign, with no bridge and no per-device code.
 
-Bench-verify the first such bootstrap on a sacrificial ESP32-S3 before using it in the field. Check that:
+This path was verified on hardware on 29 Oct 2026, on two new ESP32-S3 boards:
 
-1. The device boots 2.7.8 from `ota_0` with Secure Boot enabled.
-2. Storage mounts on the never-used partition.
-3. Punches are queued and delivered.
-4. A reboot keeps `ota_0`.
+- Gujrat 01: `ac:27:6e:a4:ce:a8`
+- Gujrat 02: `ac:27:6e:a4:4a:d8`
 
-Until then, pass `production_release=none`.
+Both were bootstrapped with 2.7.8 in factory and ota_0. 2.5.2 was then written to ota_1 and the empty SPIFFS image to storage, byte for byte what this path now writes. Both showed the blue LED with storage ready, and the setup AP came up after about two minutes.
 
 ## HIL evidence contract
 
