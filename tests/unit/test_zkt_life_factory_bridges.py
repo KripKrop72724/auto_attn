@@ -17,6 +17,8 @@ NEW_BLD1 = "LF-ZONE-BLD1-01"
 
 def test_life_bridges_are_exact_identities_outside_the_2615_city_cohort():
     assert set(LIFE_TARGETS) == set(LIFE_FACTORY_PREDECESSORS)
+    # Zone IDs exactly as ADD registers them; Group & Pension's carries an ampersand.
+    assert set(LIFE_TARGETS) == {"LF-ZONE-BLD9-01", "LF-ZONE-BLD9-02", "LF-ZONE-G&PBLD8-01", NEW_BLD1}
     for zone, target in LIFE_TARGETS.items():
         version, digest, bridge = LIFE_FACTORY_PREDECESSORS[zone]
         assert (version, bridge) == ("2.5.2", "2.4.12")

@@ -20,7 +20,7 @@ LIFE_TARGETS = {
         mac="ac:27:6e:a3:0a:08", terminal_serial="PGB1261300034"),
     "LF-ZONE-BLD9-02": HilTarget(connector_id="a886e2d9-204d-425c-bc8f-ded85fc89874",
         mac="ac:27:6e:a5:4c:d8", terminal_serial="PGB1254700036"),
-    "LF-ZONE-G_PBLD8-01": HilTarget(connector_id="a1ff7b24-4dcb-4dde-ad41-1a8401c7b006",
+    "LF-ZONE-G&PBLD8-01": HilTarget(connector_id="a1ff7b24-4dcb-4dde-ad41-1a8401c7b006",
         mac="e0:72:a1:d6:f3:28", terminal_serial="PGB1254700027"),
     "LF-ZONE-BLD1-01": HilTarget(connector_id="d4b8e5ee-8539-4719-b92f-a9458f6600d3",
         mac="14:c1:9f:46:ae:1c", terminal_serial="PGB1261300043"),
@@ -31,6 +31,6 @@ LIFE_TARGETS = {
 LIFE_FACTORY_PREDECESSORS = {
     "LF-ZONE-BLD9-01": ("2.5.2", "191b63c5f18485a9aa7f705f77679f932e79f326e1bf87e3c4bb237d249fb786", "2.4.12"),
     "LF-ZONE-BLD9-02": ("2.5.2", "00dcc3514b997570fcdf7495f7b8a85302bcff6c2670120d13245f93c0424e8b", "2.4.12"),
-    "LF-ZONE-G_PBLD8-01": ("2.5.2", "e068ee75073e3198f7894f04a249169eef96feb996d9b7db7e5a8c7a04829e91", "2.4.12"),
+    "LF-ZONE-G&PBLD8-01": ("2.5.2", "e068ee75073e3198f7894f04a249169eef96feb996d9b7db7e5a8c7a04829e91", "2.4.12"),
     "LF-ZONE-BLD1-01": ("2.5.2", "0cbd3350d316fe4c9c21d334d593c499b2eee6b671e84aec9e28b4591e78feb3", "2.4.12"),
 }
