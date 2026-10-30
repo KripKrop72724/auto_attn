@@ -22,7 +22,7 @@ ROOT = Path(__file__).resolve().parents[3]
 MAIN = ROOT / "firmware/zone_lite/main"
 SOURCE = Path(os.environ["IDF_PATH"]) / "components/mbedtls/mbedtls"
 # SHA-256 of the 2033-byte DMC keystream in fandbsoft/zkteco4730-java (MIT).
-KEYSTREAM_SHA256 = "77b8046423dd368826cb5c7506731e2b42b732ea25f19927cd8b0a2a0af1af84"
+DMC_STREAM_SHA256 = "77b8046423dd368826cb5c7506731e2b42b732ea25f19927cd8b0a2a0af1af84"
 
 TABLE = []
 for index in range(256):
@@ -109,7 +109,7 @@ with tempfile.TemporaryDirectory(prefix="zkt-secure-pull-") as temporary:
         harness.stdin.flush()
 
     keystream = bytes.fromhex(read("keystream"))
-    assert len(keystream) == 2033 and hashlib.sha256(keystream).hexdigest() == KEYSTREAM_SHA256
+    assert len(keystream) == 2033 and hashlib.sha256(keystream).hexdigest() == DMC_STREAM_SHA256
     assert int(read("crc"), 16) == crc(bytes(range(256)))
     for client, server in ((1761811200, 3735928559), (1, 1), (4294967295, 0), (0, 4294967295)):
         assert bytes.fromhex(read("derive")) == derive(client, server)
