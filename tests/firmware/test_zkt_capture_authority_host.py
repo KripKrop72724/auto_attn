@@ -13,7 +13,7 @@ MAIN = ROOT / "firmware/zone_lite/main"
 def test_live_capture_has_no_dual_delivery_or_disabled_writer_fallback(tmp_path, capture, hikvision):
     source = (MAIN / "zone_lite.c").read_text()
     preservation = source[source.index("typedef enum { ZK_LIVE_HELD"):
-                          source.index("static bool zk_recv_data_stream(")]
+                          source.index("static uint8_t *zk_secure_buffer(")]
     processing = source[source.index("static size_t process_live_packet("):
                         source.index("static bool zk_register_attlog_events(")]
     start = source.index("                /* Keep this packet's route")

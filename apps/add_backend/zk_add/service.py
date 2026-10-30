@@ -942,8 +942,8 @@ def apply_firmware_diagnostics(session: Session, connector: Connector, payload: 
         from zk_add.ota_interruption import rollback_slot_residue_record
 
         # Every device gate held on this boot; the latch also needs ADD's own
-        # record that a 2.7.x download wrote the other slot after the last
-        # 2.6.15 install, and no storage I/O fault on the ESP's earlier boots.
+        # record that a 2.7.x or 2.8.0 download wrote the other slot after the
+        # last 2.6.15 install, and no storage I/O fault on the ESP's earlier boots.
         residue_record = rollback_slot_residue_record(session, connector)
         if residue_record:
             durability = open_alert_row(session, connector, "ESP_DURABILITY_FAULT")

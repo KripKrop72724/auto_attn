@@ -18,6 +18,7 @@
 #include "zkt_source_boundary_client.h"
 #endif
 #include "zkt_credential_record.h"
+#include "zkt_secure.h"
 #include "worker_retry.h"
 #include <errno.h>
 #include <ctype.h>
@@ -43,6 +44,7 @@
 #include "esp_http_client.h"
 #include "esp_log.h"
 #include "esp_mac.h"
+#include "esp_random.h"
 #include "esp_netif.h"
 #include "esp_netif_sntp.h"
 #include "esp_spiffs.h"
@@ -157,6 +159,7 @@
 #endif
 
 #define CMD_OPTIONS_RRQ 11
+#define CMD_OPTIONS_WRQ 12
 #define CMD_USERTEMP_RRQ 9
 #define CMD_USER_WRQ 8
 #define CMD_DELETE_USER 18
@@ -421,6 +424,13 @@ typedef struct {
     uint16_t session_id;
     uint16_t reply_id;
     uint8_t live_record_size;
+    /* Secure-pull terminals (CONNECT answers 6001) encrypt every frame after
+     * the handshake; a zeroed context is a legacy session. */
+    bool secure;
+    /* From 10065 on the reply may already be sealed, as the vendor SDK
+     * accepts; requests stay plain until the confirm is acknowledged. */
+    bool secure_rx;
+    uint8_t secure_key[ZKT_SECURE_KEY_BYTES];
 } zk_context_t;
 
 typedef struct {
@@ -1096,7 +1106,7 @@ static void configure_zkt_socket(int sock)
 #endif
 }
 
-static bool zk_send_ack_only(int sock, uint16_t session_id, int64_t deadline);
+static bool zk_send_ack_only(int sock, const zk_context_t *ctx, uint16_t session_id, int64_t deadline);
 static bool zkt_legacy_capture_allowed(void);
 
 /* Legacy authority keeps the terminal framing that 2.6.15 accepted. On the
@@ -1187,8 +1197,52 @@ static zk_live_path_t zk_preserve_live_packet(const uint8_t *packet, size_t leng
 #endif
 }
 
-static bool zk_recv_data_stream(int sock, uint16_t session_id, uint8_t *out, size_t out_len, size_t *actual_len)
+/* Secure frame buffers are transient; plain malloc of 4 KiB or less would
+ * take scarce internal RAM, so they come from PSRAM when it is there. */
+static uint8_t *zk_secure_buffer(size_t length)
 {
+    uint8_t *buffer = heap_caps_malloc(length, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    return buffer ? buffer : malloc(length);
+}
+
+/* Reads a secure session's frame after its TCP header. A secure frame is
+ * decrypted and its ZK header and payload moved to the start of the malloc'd
+ * buffer, so callers see the bytes a legacy terminal sends; a plain frame is
+ * still accepted, as the vendor SDK does. Returns NULL or why it failed. */
+static const char *zk_secure_read_body(int sock, const zk_context_t *ctx, const zk_tcp_header_t *top,
+                                       size_t limit, int64_t deadline, uint8_t **packet, size_t *length)
+{
+    bool sealed = top->marker_1 == ZKT_SECURE_TCP_MARKER_1 && top->marker_2 == ZKT_SECURE_TCP_MARKER_2;
+    bool plain = top->marker_1 == MACHINE_PREPARE_DATA_1 && top->marker_2 == MACHINE_PREPARE_DATA_2;
+    if (!sealed && !plain) return "invalid frame header";
+    if (plain ? top->length < sizeof(zk_header_t) || top->length > limit
+              : top->length < 16 || top->length % 16 || top->length > limit + ZKT_SECURE_SEAL_SLACK) {
+        return "invalid frame header";
+    }
+    uint8_t *body = zk_secure_buffer(top->length);
+    if (!body) return "frame allocation failed";
+    if (!recv_exact_until(sock, body, top->length, deadline)) {
+        free(body);
+        return "frame body not received";
+    }
+    size_t inner = top->length;
+    if (sealed) {
+        size_t offset = 0;
+        if (zkt_secure_open(ctx->secure_key, body, top->length, &offset, &inner) != ZKT_SECURE_OK ||
+            inner < sizeof(zk_header_t) || inner > limit) {
+            free(body);
+            return "secure frame rejected";
+        }
+        memmove(body, body + offset, inner);
+    }
+    *packet = body;
+    *length = inner;
+    return NULL;
+}
+
+static bool zk_recv_data_stream(int sock, const zk_context_t *ctx, uint8_t *out, size_t out_len, size_t *actual_len)
+{
+    uint16_t session_id = ctx->session_id;
     int64_t deadline = zk_io_deadline();
     size_t written = 0;
     bool saw_ack = false;
@@ -1198,19 +1252,27 @@ static bool zk_recv_data_stream(int sock, uint16_t session_id, uint8_t *out, siz
         if (!recv_exact_until(sock, (uint8_t *)&top, sizeof(top), deadline)) {
             return zk_stream_reject("frame header not received");
         }
-        if (top.marker_1 != MACHINE_PREPARE_DATA_1 || top.marker_2 != MACHINE_PREPARE_DATA_2 ||
-            top.length < sizeof(zk_header_t) || top.length > ZKT_BUFFER_CHUNK_BYTES + sizeof(zk_header_t)) {
-            return zk_stream_reject("invalid frame header");
-        }
-        uint8_t *packet = malloc(top.length);
-        if (packet == NULL) {
-            /* This session is abandoned on failure. Do not spend another
-             * unbounded body-drain interval after allocation has failed. */
-            return zk_stream_reject("frame allocation failed");
-        }
-        if (!recv_exact_until(sock, packet, top.length, deadline)) {
-            free(packet);
-            return zk_stream_reject("frame body not received");
+        uint8_t *packet = NULL;
+        size_t packet_len = top.length;
+        if (ctx->secure) {
+            const char *rejected = zk_secure_read_body(sock, ctx, &top,
+                ZKT_BUFFER_CHUNK_BYTES + sizeof(zk_header_t), deadline, &packet, &packet_len);
+            if (rejected) return zk_stream_reject(rejected);
+        } else {
+            if (top.marker_1 != MACHINE_PREPARE_DATA_1 || top.marker_2 != MACHINE_PREPARE_DATA_2 ||
+                top.length < sizeof(zk_header_t) || top.length > ZKT_BUFFER_CHUNK_BYTES + sizeof(zk_header_t)) {
+                return zk_stream_reject("invalid frame header");
+            }
+            packet = malloc(top.length);
+            if (packet == NULL) {
+                /* This session is abandoned on failure. Do not spend another
+                 * unbounded body-drain interval after allocation has failed. */
+                return zk_stream_reject("frame allocation failed");
+            }
+            if (!recv_exact_until(sock, packet, top.length, deadline)) {
+                free(packet);
+                return zk_stream_reject("frame body not received");
+            }
         }
         zk_header_t *header = (zk_header_t *)packet;
         if (header->session_id != session_id) {
@@ -1220,7 +1282,7 @@ static bool zk_recv_data_stream(int sock, uint16_t session_id, uint8_t *out, siz
             }
             zk_note_framing(ZK_FRAME_SESSION, header->command, session_id, header->session_id);
         }
-        size_t data_len = top.length - sizeof(zk_header_t);
+        size_t data_len = packet_len - sizeof(zk_header_t);
         uint8_t *data = packet + sizeof(zk_header_t);
         if (header->command == CMD_DATA) {
             size_t copy_len = data_len;
@@ -1243,8 +1305,8 @@ static bool zk_recv_data_stream(int sock, uint16_t session_id, uint8_t *out, siz
             free(packet);
             break;
         } else if (CMD_REG_EVENT == header->command) {
-            bool acknowledged = zk_preserve_live_packet(packet, top.length) &&
-                zk_send_ack_only(sock, header->session_id, deadline);
+            bool acknowledged = zk_preserve_live_packet(packet, packet_len) &&
+                zk_send_ack_only(sock, ctx, header->session_id, deadline);
             free(packet);
             if (!acknowledged) return zk_stream_reject("interleaved event not preserved");
             continue;
@@ -1270,14 +1332,21 @@ static bool zk_send_command(
     zk_response_t *response)
 {
     uint8_t tx[sizeof(zk_tcp_header_t) + 512];
+    /* Only the secure-pull key exchange carries more than 512 bytes. */
+    bool handshake = command == ZKT_SECURE_CMD_DMC_EXCHANGE || command == ZKT_SECURE_CMD_KEY_EXCHANGE;
+    size_t payload_limit = handshake ? ZKT_SECURE_MESSAGE_MAX
+                                     : sizeof(tx) - sizeof(zk_tcp_header_t) - sizeof(zk_header_t);
     if (!ctx || !rx || !response || rx_cap < sizeof(zk_header_t) ||
-        payload_len > sizeof(tx) - sizeof(zk_tcp_header_t) - sizeof(zk_header_t) ||
+        payload_len > payload_limit ||
         (payload_len && !payload)) return false;
     int64_t deadline = zk_io_deadline();
     size_t packet_len = sizeof(zk_header_t) + payload_len;
-    if (packet_len > sizeof(tx) - sizeof(zk_tcp_header_t)) {
-        ESP_LOGE(TAG, "ZKT command payload too large: %u", (unsigned)payload_len);
-        return false;
+    uint8_t *frame = tx;
+    size_t frame_cap = sizeof(tx);
+    if (ctx->secure || handshake) {
+        frame_cap = sizeof(zk_tcp_header_t) + zkt_secure_sealed_length(packet_len);
+        frame = zk_secure_buffer(frame_cap);
+        if (!frame) return false;
     }
 
     uint16_t current_reply = ctx->reply_id;
@@ -1292,7 +1361,7 @@ static bool zk_send_command(
         .session_id = ctx->session_id,
         .reply_id = current_reply,
     };
-    uint8_t *packet = tx + sizeof(zk_tcp_header_t);
+    uint8_t *packet = frame + sizeof(zk_tcp_header_t);
     memcpy(packet, &header, sizeof(header));
     if (payload_len > 0) {
         memcpy(packet + sizeof(header), payload, payload_len);
@@ -1300,14 +1369,21 @@ static bool zk_send_command(
     ((zk_header_t *)packet)->checksum = zk_checksum(packet, packet_len);
     ((zk_header_t *)packet)->reply_id = next_reply;
 
-    zk_tcp_header_t tcp_header = {
-        .marker_1 = MACHINE_PREPARE_DATA_1,
-        .marker_2 = MACHINE_PREPARE_DATA_2,
-        .length = (uint32_t)packet_len,
-    };
-    memcpy(tx, &tcp_header, sizeof(tcp_header));
-
-    if (!zk_io_write_until(sock, tx, sizeof(zk_tcp_header_t) + packet_len, deadline, esp_timer_get_time)) {
+    size_t frame_len = sizeof(zk_tcp_header_t) + packet_len;
+    bool framed = true;
+    if (ctx->secure) {
+        framed = zkt_secure_seal(ctx->secure_key, packet, packet_len, frame, frame_cap, &frame_len) == ZKT_SECURE_OK;
+    } else {
+        zk_tcp_header_t tcp_header = {
+            .marker_1 = MACHINE_PREPARE_DATA_1,
+            .marker_2 = MACHINE_PREPARE_DATA_2,
+            .length = (uint32_t)packet_len,
+        };
+        memcpy(frame, &tcp_header, sizeof(tcp_header));
+    }
+    bool written = framed && zk_io_write_until(sock, frame, frame_len, deadline, esp_timer_get_time);
+    if (frame != tx) free(frame);
+    if (!written) {
         return false;
     }
 
@@ -1316,22 +1392,36 @@ static bool zk_send_command(
         if (!recv_exact_until(sock, (uint8_t *)&reply_top, sizeof(reply_top), deadline)) {
             return false;
         }
-        if (reply_top.marker_1 != MACHINE_PREPARE_DATA_1 ||
-            reply_top.marker_2 != MACHINE_PREPARE_DATA_2 || reply_top.length < sizeof(zk_header_t)) {
-            return false;
-        }
-        if (reply_top.length > rx_cap) {
-            ESP_LOGW(TAG, "ZKT reply too large for buffer: %lu", (unsigned long)reply_top.length);
-            // The advertised length is untrusted: never drain an arbitrary
-            // multi-gigabyte body. Legacy authority drains a frame within the
-            // stream's frame limit, as 2.6.15 did, so the session stays framed.
-            if (zk_legacy_framing() && reply_top.length <= ZKT_BUFFER_CHUNK_BYTES + sizeof(zk_header_t)) {
-                (void)zk_drain_until(sock, reply_top.length, deadline);
+        if (ctx->secure || ctx->secure_rx) {
+            uint8_t *packet_in = NULL;
+            size_t packet_in_len = 0;
+            const char *rejected = zk_secure_read_body(sock, ctx, &reply_top, rx_cap, deadline,
+                                                       &packet_in, &packet_in_len);
+            if (rejected) {
+                ESP_LOGW(TAG, "ZKT secure reply to command %u rejected: %s", command, rejected);
+                return false;
             }
-            return false;
-        }
-        if (!recv_exact_until(sock, rx, reply_top.length, deadline)) {
-            return false;
+            memcpy(rx, packet_in, packet_in_len);
+            free(packet_in);
+            reply_top.length = (uint32_t)packet_in_len;
+        } else {
+            if (reply_top.marker_1 != MACHINE_PREPARE_DATA_1 ||
+                reply_top.marker_2 != MACHINE_PREPARE_DATA_2 || reply_top.length < sizeof(zk_header_t)) {
+                return false;
+            }
+            if (reply_top.length > rx_cap) {
+                ESP_LOGW(TAG, "ZKT reply too large for buffer: %lu", (unsigned long)reply_top.length);
+                // The advertised length is untrusted: never drain an arbitrary
+                // multi-gigabyte body. Legacy authority drains a frame within the
+                // stream's frame limit, as 2.6.15 did, so the session stays framed.
+                if (zk_legacy_framing() && reply_top.length <= ZKT_BUFFER_CHUNK_BYTES + sizeof(zk_header_t)) {
+                    (void)zk_drain_until(sock, reply_top.length, deadline);
+                }
+                return false;
+            }
+            if (!recv_exact_until(sock, rx, reply_top.length, deadline)) {
+                return false;
+            }
         }
 
         zk_header_t *reply = (zk_header_t *)rx;
@@ -1342,7 +1432,7 @@ static bool zk_send_command(
         if (CMD_REG_EVENT == reply->command) {
             if (!ctx->session_id || (reply->session_id != ctx->session_id && !zk_legacy_framing())) return false;
             if (!zk_preserve_live_packet(rx, reply_top.length) ||
-                !zk_send_ack_only(sock, reply->session_id, deadline)) return false;
+                !zk_send_ack_only(sock, ctx, reply->session_id, deadline)) return false;
             continue;
         }
         ctx->reply_id = reply->reply_id;
@@ -1357,9 +1447,9 @@ static bool zk_send_command(
     return false;
 }
 
-static bool zk_send_ack_only(int sock, uint16_t session_id, int64_t deadline)
+static bool zk_send_ack_only(int sock, const zk_context_t *ctx, uint16_t session_id, int64_t deadline)
 {
-    uint8_t tx[sizeof(zk_tcp_header_t) + sizeof(zk_header_t)];
+    uint8_t tx[ZKT_SECURE_TCP_HEADER_BYTES + sizeof(zk_header_t) + ZKT_SECURE_SEAL_SLACK];
     uint16_t reply_id = USHRT_MAX_ZK - 1;
     uint16_t next_reply = (uint16_t)(reply_id + 1);
     if (next_reply >= USHRT_MAX_ZK) {
@@ -1377,19 +1467,214 @@ static bool zk_send_ack_only(int sock, uint16_t session_id, int64_t deadline)
     ((zk_header_t *)packet)->checksum = zk_checksum(packet, sizeof(zk_header_t));
     ((zk_header_t *)packet)->reply_id = next_reply;
 
+    if (ctx && ctx->secure) {
+        size_t sealed_len = 0;
+        return zkt_secure_seal(ctx->secure_key, packet, sizeof(zk_header_t), tx, sizeof(tx), &sealed_len) ==
+                   ZKT_SECURE_OK &&
+               zk_io_write_until(sock, tx, sealed_len, deadline, esp_timer_get_time);
+    }
     zk_tcp_header_t tcp_header = {
         .marker_1 = MACHINE_PREPARE_DATA_1,
         .marker_2 = MACHINE_PREPARE_DATA_2,
         .length = sizeof(zk_header_t),
     };
     memcpy(tx, &tcp_header, sizeof(tcp_header));
-    return zk_io_write_until(sock, tx, sizeof(tx), deadline, esp_timer_get_time);
+    return zk_io_write_until(sock, tx, sizeof(zk_tcp_header_t) + sizeof(zk_header_t), deadline, esp_timer_get_time);
 }
 
 static bool zk_status_ok(uint16_t code)
 {
     return code == CMD_ACK_OK || code == CMD_ACK_DATA || code == CMD_PREPARE_DATA ||
            code == CMD_DATA;
+}
+
+/* The ESP's RSA identity for secure-pull handshakes: generated once per boot
+ * on the first 6001, then reused (and serialized: RSA decrypt updates its
+ * blinding state). */
+static zkt_secure_identity_t s_zk_secure_identity;
+static SemaphoreHandle_t s_zk_secure_lock;
+static portMUX_TYPE s_zk_secure_lock_guard = portMUX_INITIALIZER_UNLOCKED;
+
+static int zk_secure_random(void *context, unsigned char *output, size_t length)
+{
+    /* Key generation runs for seconds; yield so the idle tasks still run. */
+    int64_t *last_yield_us = context;
+    esp_fill_random(output, length);
+    if (last_yield_us && esp_timer_get_time() - *last_yield_us > 20000) {
+        vTaskDelay(1);
+        *last_yield_us = esp_timer_get_time();
+    }
+    return 0;
+}
+
+static bool zk_secure_lock_take(void)
+{
+    if (!s_zk_secure_lock) {
+        SemaphoreHandle_t created = xSemaphoreCreateMutex();
+        if (!created) return false;
+        bool installed = false;
+        taskENTER_CRITICAL(&s_zk_secure_lock_guard);
+        if (!s_zk_secure_lock) {
+            s_zk_secure_lock = created;
+            installed = true;
+        }
+        taskEXIT_CRITICAL(&s_zk_secure_lock_guard);
+        if (!installed) vSemaphoreDelete(created);
+    }
+    return xSemaphoreTake(s_zk_secure_lock, pdMS_TO_TICKS(120000)) == pdTRUE;
+}
+
+static bool zk_secure_identity_ready_locked(void)
+{
+    if (s_zk_secure_identity.rsa) return true;
+    int64_t started_us = esp_timer_get_time();
+    int64_t last_yield_us = started_us;
+    zkt_secure_status_t status = zkt_secure_identity_generate(&s_zk_secure_identity, 2048,
+                                                              zk_secure_random, &last_yield_us);
+    char message[96];
+    snprintf(message, sizeof(message), "Secure-pull RSA key %s in %lld ms",
+             status == ZKT_SECURE_OK ? "generated" : zkt_secure_status_name(status),
+             (long long)((esp_timer_get_time() - started_us) / 1000));
+    ESP_LOGI(TAG, "%s", message);
+    add_connector_log(status == ZKT_SECURE_OK ? "INFO" : "ERROR", "zkt",
+                      status == ZKT_SECURE_OK ? "ZKT_SECURE_KEY_READY" : "ZKT_SECURE_KEY_FAILED", message);
+    return status == ZKT_SECURE_OK;
+}
+
+/* Each failing stage and code reaches ADD once per boot; reconnects repeat. */
+static void zk_secure_report(const char *stage, uint16_t code, zkt_secure_status_t status)
+{
+    static struct { const char *stage; uint16_t code; } reported[8];
+    static size_t reported_count;
+    char message[128];
+    snprintf(message, sizeof(message), "Secure-pull handshake failed at %s (code=%u, %s)", stage, code,
+             zkt_secure_status_name(status));
+    ESP_LOGW(TAG, "%s", message);
+    for (size_t i = 0; i < reported_count; i++) {
+        if (reported[i].stage == stage && reported[i].code == code) return;
+    }
+    if (reported_count < sizeof(reported) / sizeof(reported[0])) {
+        reported[reported_count].stage = stage;
+        reported[reported_count++].code = code;
+    }
+    add_connector_log("WARN", "zkt", "ZKT_SECURE_HANDSHAKE_FAILED", message);
+}
+
+/* CONNECT answered 6001: run the secure-pull handshake (10063 public keys,
+ * 10064 secrets, 10065 confirm), switch the session to AES frames, then
+ * authenticate with CMD_AUTH or, when the terminal refuses it, CMD_AUTH_EXT.
+ * *auth_code is the final authentication response, 0 when none arrived. */
+static bool zk_secure_begin(int sock, zk_context_t *ctx, uint32_t comm_key, uint16_t *auth_code)
+{
+    static bool announced;
+    /* A 4096-bit terminal key makes a ~1.1 KB 10063 reply. */
+    enum { RX_BYTES = 2048 };
+    zk_response_t response = {0};
+    uint8_t *rx = zk_secure_buffer(RX_BYTES);
+    uint8_t *message = zk_secure_buffer(ZKT_SECURE_MESSAGE_MAX);
+    size_t message_len = 0;
+    uint32_t client_secret = esp_random() | 1U;
+    uint32_t server_secret = 0;
+    zkt_secure_status_t status = ZKT_SECURE_OK;
+    const char *stage = "key";
+    *auth_code = 0;
+    if (!rx || !message || !zk_secure_lock_take()) {
+        free(rx);
+        free(message);
+        zk_secure_report("memory", 0, ZKT_SECURE_ERR_MEMORY);
+        return false;
+    }
+    bool ok = zk_secure_identity_ready_locked();
+    if (ok) {
+        stage = "public key exchange";
+        response.code = 0;
+        status = zkt_secure_dmc_exchange_payload(&s_zk_secure_identity, message, ZKT_SECURE_MESSAGE_MAX,
+                                                 &message_len);
+        ok = status == ZKT_SECURE_OK &&
+             zk_send_command(sock, ctx, ZKT_SECURE_CMD_DMC_EXCHANGE, message, message_len, rx, RX_BYTES,
+                             &response) &&
+             response.code == CMD_ACK_OK;
+    }
+    if (ok) {
+        stage = "session key exchange";
+        response.code = 0;
+        status = zkt_secure_key_exchange_payload(response.data, response.data_len, client_secret,
+                                                 zk_secure_random, NULL, message, ZKT_SECURE_MESSAGE_MAX,
+                                                 &message_len);
+        ok = status == ZKT_SECURE_OK &&
+             zk_send_command(sock, ctx, ZKT_SECURE_CMD_KEY_EXCHANGE, message, message_len, rx, RX_BYTES,
+                             &response) &&
+             response.code == CMD_ACK_OK;
+    }
+    if (ok) {
+        stage = "server secret";
+        status = zkt_secure_server_secret(&s_zk_secure_identity, response.data, response.data_len,
+                                          zk_secure_random, NULL, &server_secret);
+        ok = status == ZKT_SECURE_OK;
+    }
+    xSemaphoreGive(s_zk_secure_lock);
+    free(message);
+    if (ok) {
+        static const uint8_t confirm[4] = {0};
+        stage = "confirm";
+        response.code = 0;
+        zkt_secure_derive_aes_key(client_secret, server_secret, ctx->secure_key);
+        ctx->secure_rx = true;
+        ok = zk_send_command(sock, ctx, ZKT_SECURE_CMD_CONFIRM_SESSION, confirm, sizeof(confirm), rx, RX_BYTES,
+                             &response) &&
+             response.code == CMD_ACK_OK;
+    }
+    if (!ok) {
+        ctx->secure_rx = false;
+        zk_secure_report(stage, response.code, status);
+        free(rx);
+        return false;
+    }
+    ctx->secure = true;
+    vTaskDelay(pdMS_TO_TICKS(50));
+
+    /* Secure firmware usually refuses CMD_AUTH (2001) and accepts the
+     * extended comm key; 2032 locks authentication, so stop there. */
+    uint8_t commkey[4];
+    zkt_secure_commkey_native(comm_key, ctx->session_id, (uint8_t)(esp_random() & 0xFFU), commkey);
+    response.code = 0;
+    if (!zk_send_command(sock, ctx, CMD_AUTH, commkey, sizeof(commkey), rx, RX_BYTES, &response)) {
+        zk_secure_report("CMD_AUTH", 0, ZKT_SECURE_OK);
+        free(rx);
+        return false;
+    }
+    *auth_code = response.code;
+    if (response.code != CMD_ACK_OK && response.code != ZKT_SECURE_ACK_AUTH_LOCK) {
+        uint8_t extended[ZKT_SECURE_AUTH_EXT_BYTES];
+        status = zkt_secure_auth_ext_payload(comm_key, extended);
+        if (status != ZKT_SECURE_OK ||
+            !zk_send_command(sock, ctx, ZKT_SECURE_CMD_AUTH_EXT, extended, sizeof(extended), rx, RX_BYTES,
+                             &response)) {
+            *auth_code = 0;
+            zk_secure_report("CMD_AUTH_EXT", 0, status);
+            free(rx);
+            return false;
+        }
+        *auth_code = response.code;
+    }
+    if (*auth_code != CMD_ACK_OK) {
+        zk_secure_report("authentication", *auth_code, ZKT_SECURE_OK);
+        free(rx);
+        return false;
+    }
+    static const char sdk_build[] = "SDKBuild=1";
+    if (!zk_send_command(sock, ctx, CMD_OPTIONS_WRQ, (const uint8_t *)sdk_build, sizeof(sdk_build), rx,
+                         RX_BYTES, &response) ||
+        response.code != CMD_ACK_OK) {
+        ESP_LOGW(TAG, "ZKT secure terminal did not accept the SDKBuild marker (code=%u)", response.code);
+    }
+    free(rx);
+    if (!announced) {
+        announced = true;
+        add_connector_log("INFO", "zkt", "ZKT_SECURE_SESSION",
+                          "Terminal uses the secure-pull protocol (CONNECT 6001); AES session established.");
+    }
+    return true;
 }
 
 static bool zk_connect_and_auth_with_key_diagnosed(
@@ -1402,6 +1687,8 @@ static bool zk_connect_and_auth_with_key_diagnosed(
     zk_response_t response = {0};
     ctx->session_id = 0;
     ctx->reply_id = USHRT_MAX_ZK - 1;
+    ctx->secure = false;
+    ctx->secure_rx = false;
 
     if (!zk_send_command(sock, ctx, CMD_CONNECT, NULL, 0, rx, sizeof(rx), &response)) {
         ESP_LOGW(TAG, "ZKT CMD_CONNECT did not return a valid TCP response");
@@ -1421,7 +1708,22 @@ static bool zk_connect_and_auth_with_key_diagnosed(
         response.session_id,
         response.reply_id,
         (unsigned)response.data_len);
-    if (response.code == CMD_ACK_UNAUTH) {
+    if (response.code == ZKT_SECURE_CMD_CHALLENGE) {
+        if (diagnostics) diagnostics->auth_challenge_received = true;
+        uint16_t auth_code = 0;
+        bool secured = zk_secure_begin(sock, ctx, comm_key, &auth_code);
+        if (diagnostics) {
+            diagnostics->auth_response_received = auth_code != 0;
+            diagnostics->auth_response_code = auth_code;
+        }
+        if (!secured) {
+            if (diagnostics) {
+                diagnostics->stage = auth_code ? ZK_COMM_PROBE_AUTH_REJECTED : ZK_COMM_PROBE_AUTH_NO_RESPONSE;
+            }
+            return false;
+        }
+        response.code = CMD_ACK_OK;
+    } else if (response.code == CMD_ACK_UNAUTH) {
         if (diagnostics) diagnostics->auth_challenge_received = true;
         uint8_t commkey[4];
         make_commkey(comm_key, ctx->session_id, commkey);
@@ -1728,7 +2030,7 @@ static bool zk_read_buffer(
             &chunk_response);
         if (ok && chunk_response.code == CMD_PREPARE_DATA) {
             size_t actual = 0;
-            ok = zk_recv_data_stream(sock, ctx->session_id, chunk_rx, want, &actual);
+            ok = zk_recv_data_stream(sock, ctx, chunk_rx, want, &actual);
             chunk_response.data = chunk_rx;
             chunk_response.data_len = actual;
             chunk_response.code = ok ? CMD_DATA : chunk_response.code;
@@ -1868,7 +2170,7 @@ static bool zk_read_bounded_range(
     bool ok = sent;
     if (ok && response.code == CMD_PREPARE_DATA) {
         size_t actual = 0;
-        ok = zk_recv_data_stream(sock, ctx->session_id, rx, length, &actual);
+        ok = zk_recv_data_stream(sock, ctx, rx, length, &actual);
         response.data = rx;
         response.data_len = actual;
         response.code = ok ? CMD_DATA : response.code;
@@ -6149,12 +6451,17 @@ static bool zk_sync_terminal_time(int sock, zk_context_t *ctx)
     }
     struct tm readback = {0};
     time_t readback_utc = 0;
-    if (!zk_get_time_parts(sock, ctx, &readback) ||
-        !zkt_clock_pst_to_utc(&readback, &readback_utc) ||
-        llabs((long long)(readback_utc - time(NULL))) > 5) {
-        add_connector_log("ERROR", "zkt", "ZKT_TIME_SYNC_READBACK_FAILED",
-            "ZKT clock update did not verify within five seconds of Pakistan Standard Time.");
-        return false;
+    /* Secure-pull terminals apply SET_TIME 1-3 s after acknowledging it. */
+    for (int reread = 0;; reread++) {
+        if (zk_get_time_parts(sock, ctx, &readback) &&
+            zkt_clock_pst_to_utc(&readback, &readback_utc) &&
+            llabs((long long)(readback_utc - time(NULL))) <= 5) break;
+        if (!ctx->secure || reread >= 4) {
+            add_connector_log("ERROR", "zkt", "ZKT_TIME_SYNC_READBACK_FAILED",
+                "ZKT clock update did not verify within five seconds of Pakistan Standard Time.");
+            return false;
+        }
+        vTaskDelay(pdMS_TO_TICKS(1000));
     }
     g_last_terminal_time_sync_ms = (uint32_t)uptime_ms();
     g_terminal_time_sync_succeeded = true;
@@ -9499,15 +9806,28 @@ static int64_t gateway_run_session(uint32_t host_order_ip)
         if (rc > 0 && FD_ISSET(sock, &read_fds)) {
             int64_t deadline = zk_io_deadline();
             zk_tcp_header_t top;
-            if (!recv_exact_until(sock, (uint8_t *)&top, sizeof(top), deadline) ||
-                top.marker_1 != MACHINE_PREPARE_DATA_1 || top.marker_2 != MACHINE_PREPARE_DATA_2 ||
-                top.length < sizeof(zk_header_t) || top.length > 4096) {
-                ESP_LOGW(TAG, "ZKT live socket returned an invalid packet");
-                break;
-            }
-            uint8_t *packet = malloc(top.length);
-            if (!packet || !recv_exact_until(sock, packet, top.length, deadline)) {
-                free(packet); ESP_LOGW(TAG, "Could not read complete ZKT live packet"); break;
+            uint8_t *packet = NULL;
+            if (ctx.secure) {
+                size_t packet_len = 0;
+                const char *rejected = recv_exact_until(sock, (uint8_t *)&top, sizeof(top), deadline)
+                    ? zk_secure_read_body(sock, &ctx, &top, 4096, deadline, &packet, &packet_len)
+                    : "frame header not received";
+                if (rejected) {
+                    ESP_LOGW(TAG, "ZKT live socket returned an invalid secure packet: %s", rejected);
+                    break;
+                }
+                top.length = (uint32_t)packet_len;
+            } else {
+                if (!recv_exact_until(sock, (uint8_t *)&top, sizeof(top), deadline) ||
+                    top.marker_1 != MACHINE_PREPARE_DATA_1 || top.marker_2 != MACHINE_PREPARE_DATA_2 ||
+                    top.length < sizeof(zk_header_t) || top.length > 4096) {
+                    ESP_LOGW(TAG, "ZKT live socket returned an invalid packet");
+                    break;
+                }
+                packet = malloc(top.length);
+                if (!packet || !recv_exact_until(sock, packet, top.length, deadline)) {
+                    free(packet); ESP_LOGW(TAG, "Could not read complete ZKT live packet"); break;
+                }
             }
             zk_header_t *header = (zk_header_t *)packet;
             if (header->session_id != ctx.session_id) {
@@ -9517,7 +9837,7 @@ static int64_t gateway_run_session(uint32_t host_order_ip)
             if (header->command == CMD_REG_EVENT && top.length > sizeof(zk_header_t)) {
                 zk_live_path_t captured_path = zk_preserve_live_packet(packet, top.length);
                 if (captured_path == ZK_LIVE_HELD ||
-                    !zk_send_ack_only(sock, ctx.session_id, deadline)) { free(packet); break; }
+                    !zk_send_ack_only(sock, &ctx, ctx.session_id, deadline)) { free(packet); break; }
                 // The session starts from a two-read stable user snapshot and
                 // refreshes it periodically or on explicit ADD commands.  Do
                 // not perform another multi-minute full-table refresh while

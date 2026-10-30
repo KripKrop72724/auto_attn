@@ -24,9 +24,9 @@ Nothing here reboots, re-installs or starts an attempt on its own:
   ROLLED_BACK BOOTLOADER_ROLLBACK first. Only the owner's one-click "Retry same
   target" makes a new attempt.
 
-Every other running version (2.4.12, 2.5.2, 2.6.16+ and every 2.7.x) and every
-target with its own return evidence (the journal bridges, 2.7.0, the 2.6.24+
-recovery images, 2.7.6, 2.7.7 and 2.7.8) keep the existing fail-closed path unchanged.
+Every other running version (2.4.12, 2.5.2, 2.6.16+, every 2.7.x and 2.8.0) and
+every target with its own return evidence (the journal bridges, 2.7.0, the 2.6.24+
+recovery images, 2.7.6, 2.7.7, 2.7.8 and 2.8.0) keep the existing fail-closed path unchanged.
 
 Lock order, everywhere: connector, then deployment, then campaign (the
 WebSocket heartbeat locks its connector first, record_progress and the HTTPS
@@ -123,10 +123,10 @@ IMAGE_VERIFY_RETRY_LIMIT = 2
 RETRY_NOT_RETRYABLE = ("Only a target boot that ADD classified TARGET_BOOT_INTERRUPTED, or a downloaded image that "
                        "did not verify on the ESP (PARTITION_HASH_FAILED), can be retried.")
 # Journal bridges, the 2.7.0 writer, the one-shot recovery images, the 2.7.6
-# last-resort reformat and 2.7.7's and 2.7.8's confirm-first exception carry their own
-# return evidence, rollback expectations and HIL acceptance flows.
+# last-resort reformat and the confirm-first exception of 2.7.7, 2.7.8 and 2.8.0
+# carry their own return evidence, rollback expectations and HIL acceptance flows.
 _OWN_RETURN_EVIDENCE = frozenset({"2.6.16", "2.6.17", "2.6.18", "2.6.19", "2.6.20", "2.6.21", "2.6.22",
-                                  "2.6.23", "2.7.0", "2.7.6", "2.7.7", "2.7.8", *RECOVERY_RELEASE_IDS})
+                                  "2.6.23", "2.7.0", "2.7.6", "2.7.7", "2.7.8", "2.8.0", *RECOVERY_RELEASE_IDS})
 _RECONCILE_ACTIVITIES = frozenset({"FULL_RECONCILE", "HISTORICAL_RECONCILE", "LIGHT_RECONCILE"})
 
 
@@ -722,7 +722,7 @@ def classify_return(deployment: FirmwareDeployment, release: FirmwareRelease | N
         reasons.append("TARGET_HAS_OWN_RETURN_EVIDENCE")
     if not in_scope_version(deployment.previous_version):
         # 2.4.12 and 2.5.2 write through plain SPIFFS after a torn first boot
-        # (owner decision 6); 2.6.16+ and 2.7.x report their own returns.
+        # (owner decision 6); 2.6.16+, 2.7.x and 2.8.0 report their own returns.
         reasons.append("PREVIOUS_FIRMWARE_OUT_OF_SCOPE")
     if deployment.status != "BOOTED_PENDING" or target.get("reported_reconciling"):
         reasons.append("TARGET_REPORTED_CONFIRMATION")
@@ -1187,11 +1187,12 @@ def retry_interrupted_target(session: Session, *, campaign_public_id: str, deplo
 
 
 def rollback_slot_residue_record(session: Session, connector: Connector) -> dict | None:
-    """ADD's own record that a 2.7.x download wrote the other slot after the last 2.6.15 install.
+    """ADD's own record that a 2.7.x or 2.8.0 download wrote the other slot after the last 2.6.15
+    install.
 
     The latest successful deployment on this ESP must be the 2.6.15 install,
-    and a later 2.7.x deployment must have reported written bytes. A connector
-    row is one ESP: onboarding keys it by the ESP's hardware ID and never
+    and a later 2.7.x or 2.8.0 deployment must have reported written bytes. A
+    connector row is one ESP: onboarding keys it by the ESP's hardware ID and never
     rebinds it, so a replacement ESP is a new connector with no such record.
     """
     accepted = session.scalar(select(FirmwareDeployment).where(
@@ -1205,7 +1206,8 @@ def rollback_slot_residue_record(session: Session, connector: Connector) -> dict
             FirmwareDeployment.created_at > accepted.completed_at, FirmwareDeployment.bytes_written > 0,
     ).order_by(FirmwareDeployment.id.desc()).limit(20)):
         version = semantic_version(row.target_version)
-        if version is not None and version[:2] == (2, 7):
+        # 2.6.15 refuses 2.8.0 in its other slot as it refuses every 2.7.x.
+        if version is not None and (version[:2] == (2, 7) or version == (2, 8, 0)):
             return {"hardware_id": connector.hardware_id,
                     "accepted_deployment_id": accepted.deployment_id,
                     "accepted_at": _iso(accepted.completed_at),

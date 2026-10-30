@@ -40,7 +40,7 @@ void cJSON_Delete(cJSON *);
     runtime = runtime[:runtime.index("int main(void)")]
     zone = (MAIN / "zone_lite.c").read_text()
     preservation = zone[zone.index("typedef enum { ZK_LIVE_HELD"):
-                        zone.index("static bool zk_recv_data_stream(")]
+                        zone.index("static uint8_t *zk_secure_buffer(")]
     start = zone.index("                zk_live_path_t captured_path = zk_preserve_live_packet(packet, top.length);")
     live_acceptance = zone[start:zone.index("                // The session starts", start)]
     add = (MAIN / "add_connector.c").read_text()
@@ -76,14 +76,15 @@ bool zj_capture_runtime_packet(const uint8_t *packet,size_t length,const zj_capt
     assert(fwrite(packet,1,length,durable)==length && !fflush(durable) && !fsync(fileno(durable)));
     ++accepted;return true;
 }
-static bool zk_send_ack_only(int sock,uint16_t session,int64_t deadline)
-{assert(sock==1 && session==12 && deadline>0 && accepted==acks+1);++acks;return true;}
+typedef struct {uint16_t session_id;} zk_context_t;
+static bool zk_send_ack_only(int sock,const zk_context_t *ctx,uint16_t session,int64_t deadline)
+{assert(sock==1 && ctx->session_id==12 && session==12 && deadline>0 && accepted==acks+1);++acks;return true;}
 '''
     simulate = r'''
 static bool live_packet(unsigned ordinal)
 {
     uint8_t *packet=malloc(16);assert(packet);memset(packet,(int)ordinal,16);
-    struct {size_t length;} top={16};struct {uint16_t session_id;} ctx={12};
+    struct {size_t length;} top={16};zk_context_t ctx={12};
     int sock=1;int64_t deadline=1000000;
     for(;;){
 /* ACTUAL_LIVE_ACCEPTANCE */
