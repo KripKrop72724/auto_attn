@@ -9,9 +9,11 @@ ROOT = Path(__file__).resolve().parents[2]
 def test_prepared_transport_rejects_wrong_session_truncation_and_oversized_frames(tmp_path):
     source = (ROOT / "firmware/zone_lite/main/zone_lite.c").read_text()
     reads = source[source.index("static int64_t zk_io_deadline("):source.index("static bool send_all(")]
-    stream = source[source.index("static bool zk_recv_data_stream("):source.index("static bool zk_send_command(")]
+    stream = source[source.index("static const char *zk_secure_read_body("):
+                    source.index("static bool zk_send_command(")]
     command = source[source.index("static bool zk_send_command("):
-                     source.index("static bool zk_send_ack_only(int sock, uint16_t session_id, int64_t deadline)\n{")]
+                     source.index("static bool zk_send_ack_only(int sock, const zk_context_t *ctx, "
+                                  "uint16_t session_id, int64_t deadline)\n{")]
     bounded_range = source[source.index("static bool zk_read_bounded_range("):
                            source.index("static bool zk_close_bounded_buffer(")]
     harness = r'''
@@ -22,6 +24,7 @@ def test_prepared_transport_rejects_wrong_session_truncation_and_oversized_frame
 #include <string.h>
 #include "zkt_socket_io.h"
 #include "zkt_record.h"
+#include "zkt_secure.h"
 #define ZKT_IO_TIMEOUT_SEC 90
 #define MACHINE_PREPARE_DATA_1 0x5050
 #define MACHINE_PREPARE_DATA_2 0x7d82
@@ -38,7 +41,7 @@ def test_prepared_transport_rejects_wrong_session_truncation_and_oversized_frame
 #define ESP_LOGI(...) ((void)0)
 typedef struct {uint16_t command,checksum,session_id,reply_id;} zk_header_t;
 typedef struct {uint16_t marker_1,marker_2;uint32_t length;} zk_tcp_header_t;
-typedef struct {uint16_t session_id,reply_id;} zk_context_t;
+typedef struct {uint16_t session_id,reply_id;bool secure;uint8_t secure_key[ZKT_SECURE_KEY_BYTES];} zk_context_t;
 typedef struct {uint16_t code,session_id,reply_id;uint8_t *data;size_t data_len;} zk_response_t;
 typedef struct {bool prepared;uint32_t size;uint8_t *direct_data;} zk_bounded_buffer_t;
 static void write_le32(uint8_t *p,uint32_t value)
@@ -82,8 +85,18 @@ static unsigned read_failures;
 static void zk_report_read_failure(const char *read,uint16_t command,uint32_t offset,uint32_t want,
                                    uint16_t code,const char *reason)
 {(void)read;(void)command;(void)offset;(void)want;(void)code;read_failure=reason;++read_failures;}
-static bool zk_send_ack_only(int sock,uint16_t session,int64_t deadline)
-{(void)sock;assert((session==12 || legacy_framing) && preserved);if(now>=deadline)return false;preserved=false;++acknowledgements;return true;}
+static bool zk_send_ack_only(int sock,const zk_context_t *ctx,uint16_t session,int64_t deadline)
+{(void)sock;assert(!ctx->secure && (session==12 || legacy_framing) && preserved);if(now>=deadline)return false;preserved=false;++acknowledgements;return true;}
+/* A legacy session never seals or opens a frame. */
+static uint8_t *zk_secure_buffer(size_t length){(void)length;abort();}
+size_t zkt_secure_sealed_length(size_t zk_length){(void)zk_length;abort();}
+zkt_secure_status_t zkt_secure_seal(const uint8_t key[ZKT_SECURE_KEY_BYTES],const uint8_t *zk,size_t zk_length,
+                                    uint8_t *frame,size_t capacity,size_t *frame_length)
+{(void)key;(void)zk;(void)zk_length;(void)frame;(void)capacity;(void)frame_length;abort();}
+zkt_secure_status_t zkt_secure_open(const uint8_t key[ZKT_SECURE_KEY_BYTES],uint8_t *ciphertext,size_t length,
+                                    size_t *zk_offset,size_t *zk_length)
+{(void)key;(void)ciphertext;(void)length;(void)zk_offset;(void)zk_length;abort();}
+static zk_context_t session12={.session_id=12,.reply_id=1};
 bool zk_io_read_until(int sock,void *data,size_t count,int64_t deadline,zk_io_clock_t clock)
 {
  size_t offset=0;
@@ -119,23 +132,23 @@ int main(void){
  char out[16];size_t actual=0;
  for(fragment=1;fragment<=1024;fragment*=2){
   total=position=0;frame(CMD_DATA,12,"ab",2);frame(CMD_DATA,12,"cd",2);frame(CMD_ACK_OK,12,NULL,0);
-  assert(zk_recv_data_stream(1,12,(uint8_t*)out,4,&actual));assert(actual==4&&!memcmp(out,"abcd",4));
+  assert(zk_recv_data_stream(1,&session12,(uint8_t*)out,4,&actual));assert(actual==4&&!memcmp(out,"abcd",4));
  }
  total=position=0;frame(CMD_DATA,99,"abcd",4);frame(CMD_ACK_OK,12,NULL,0);
- assert(!zk_recv_data_stream(1,12,(uint8_t*)out,4,&actual));
+ assert(!zk_recv_data_stream(1,&session12,(uint8_t*)out,4,&actual));
  assert(!strcmp(s_zk_stream_failure,"frame session mismatch"));
  total=position=0;frame(CMD_DATA,12,"abcde",5);frame(CMD_ACK_OK,12,NULL,0);
- assert(!zk_recv_data_stream(1,12,(uint8_t*)out,4,&actual));
+ assert(!zk_recv_data_stream(1,&session12,(uint8_t*)out,4,&actual));
  assert(!strcmp(s_zk_stream_failure,"oversized frame"));
  total=position=0;frame(CMD_DATA,12,"abc",3);frame(CMD_ACK_OK,12,NULL,0);
- assert(!zk_recv_data_stream(1,12,(uint8_t*)out,4,&actual));
+ assert(!zk_recv_data_stream(1,&session12,(uint8_t*)out,4,&actual));
  total=position=0;frame(CMD_DATA,12,"abcd",4);total--;
- assert(!zk_recv_data_stream(1,12,(uint8_t*)out,4,&actual));
+ assert(!zk_recv_data_stream(1,&session12,(uint8_t*)out,4,&actual));
  total=position=0;frame(CMD_DATA,12,"abcd",4);((zk_tcp_header_t*)input)->length=UINT32_MAX;
- assert(!zk_recv_data_stream(1,12,(uint8_t*)out,4,&actual));
+ assert(!zk_recv_data_stream(1,&session12,(uint8_t*)out,4,&actual));
  assert(!acknowledgements);
  total=position=0;frame(CMD_DATA,12,"abcd",4);((zk_tcp_header_t*)input)->length=UINT32_MAX;
- zk_context_t ctx={12,1};zk_response_t response;
+ zk_context_t ctx={.session_id=12,.reply_id=1};zk_response_t response;
  assert(!zk_send_command(1,&ctx,1,NULL,0,(uint8_t*)out,sizeof(out),&response));
  assert(position==sizeof(zk_tcp_header_t)); /* No drain of untrusted body. */
  assert(!zk_send_command(1,&ctx,1,(const uint8_t*)"x",SIZE_MAX,(uint8_t*)out,sizeof(out),&response));
@@ -147,15 +160,15 @@ int main(void){
  for(fragment=1;fragment<=1024;fragment*=2){
   total=position=0;frame(CMD_DATA,12,(char*)records,80);
   frame(CMD_DATA,12,(char*)records+120,40);frame(CMD_ACK_OK,12,NULL,0);
-  assert(zk_recv_data_stream(1,12,range_out,120,&actual));
+  assert(zk_recv_data_stream(1,&session12,range_out,120,&actual));
   assert(actual==120&&!memcmp(range_out,records,80)&&!memcmp(range_out+80,records+120,40));
   total=position=0;frame(CMD_DATA,12,(char*)records,80);
   frame(CMD_DATA,12,(char*)records+80,40); /* Stale, but individually valid. */
   frame(CMD_DATA,12,(char*)records+120,40);frame(CMD_ACK_OK,12,NULL,0);
-  assert(!zk_recv_data_stream(1,12,range_out,120,&actual));
+  assert(!zk_recv_data_stream(1,&session12,range_out,120,&actual));
   total=position=0;frame(CMD_DATA,12,(char*)records,80);
   frame(CMD_DATA,99,(char*)records+80,40);frame(CMD_ACK_OK,12,NULL,0);
-  assert(!zk_recv_data_stream(1,12,range_out,120,&actual));
+  assert(!zk_recv_data_stream(1,&session12,range_out,120,&actual));
   zk_bounded_buffer_t prepared={.prepared=true,.size=4000};
   total=position=0;frame(CMD_DATA,12,(char*)records,160);
   assert(!zk_read_bounded_range(1,&ctx,&prepared,284,range_out,120));
@@ -165,11 +178,11 @@ int main(void){
   assert(!memcmp(range_out,records,120));
  }
  total=position=0;frame(CMD_REG_EVENT,12,"x",1);frame(CMD_DATA,12,"abcd",4);frame(CMD_ACK_OK,12,NULL,0);
- assert(zk_recv_data_stream(1,12,(uint8_t*)out,4,&actual));
+ assert(zk_recv_data_stream(1,&session12,(uint8_t*)out,4,&actual));
  assert(captures==1 && acknowledgements==1);
  preserve_ok=false;
  total=position=0;frame(CMD_REG_EVENT,12,"x",1);frame(CMD_DATA,12,"abcd",4);
- assert(!zk_recv_data_stream(1,12,(uint8_t*)out,4,&actual));
+ assert(!zk_recv_data_stream(1,&session12,(uint8_t*)out,4,&actual));
  assert(captures==2 && acknowledgements==1);
  total=position=0;frame(CMD_REG_EVENT,12,"x",1);frame(CMD_ACK_OK,12,NULL,0);
  assert(!zk_send_command(1,&ctx,1,NULL,0,(uint8_t*)out,sizeof(out),&response));
@@ -181,7 +194,7 @@ int main(void){
  /* A byte trickle does not reset the full operation's 90-second budget. */
  now=0;fragment_delay=20000000;fragment=1;
  total=position=0;frame(CMD_DATA,12,"abcd",4);frame(CMD_ACK_OK,12,NULL,0);
- assert(!zk_recv_data_stream(1,12,(uint8_t*)out,4,&actual) && position==4);
+ assert(!zk_recv_data_stream(1,&session12,(uint8_t*)out,4,&actual) && position==4);
  now=0;total=position=0;frame(CMD_ACK_OK,12,NULL,0);
  assert(!zk_send_command(1,&ctx,1,NULL,0,(uint8_t*)out,sizeof(out),&response) && position==4);
  fragment_delay=0;fragment=1024;preservation_delay=60000000;
@@ -207,17 +220,17 @@ int main(void){
  legacy_framing=true;now=0;fragment_delay=0;preservation_delay=0;preserve_ok=true;
  for(fragment=1;fragment<=1024;fragment*=2){
   total=position=0;frame(CMD_DATA,0,"ab",2);frame(CMD_DATA,0,"cd",2);frame(CMD_ACK_OK,0,NULL,0);
-  assert(zk_recv_data_stream(1,12,(uint8_t*)out,4,&actual)&&actual==4&&!memcmp(out,"abcd",4));
+  assert(zk_recv_data_stream(1,&session12,(uint8_t*)out,4,&actual)&&actual==4&&!memcmp(out,"abcd",4));
  }
  assert(framing_notes[ZK_FRAME_SESSION]==33);
  total=position=0;frame(CMD_DATA,12,"abcde",5);frame(CMD_ACK_OK,12,NULL,0);
- assert(zk_recv_data_stream(1,12,(uint8_t*)out,4,&actual)&&actual==4&&!memcmp(out,"abcd",4));
+ assert(zk_recv_data_stream(1,&session12,(uint8_t*)out,4,&actual)&&actual==4&&!memcmp(out,"abcd",4));
  assert(framing_notes[ZK_FRAME_OVERSIZE]==1);
  total=position=0;frame(CMD_DATA,12,"ab",2);frame(CMD_DATA,12,"cdef",4);frame(CMD_ACK_OK,12,NULL,0);
- assert(zk_recv_data_stream(1,12,(uint8_t*)out,4,&actual)&&actual==4&&!memcmp(out,"abcd",4));
+ assert(zk_recv_data_stream(1,&session12,(uint8_t*)out,4,&actual)&&actual==4&&!memcmp(out,"abcd",4));
  assert(framing_notes[ZK_FRAME_OVERSIZE]==2);
  total=position=0;frame(CMD_DATA,12,"abc",3);frame(CMD_ACK_OK,12,NULL,0);
- assert(!zk_recv_data_stream(1,12,(uint8_t*)out,4,&actual));
+ assert(!zk_recv_data_stream(1,&session12,(uint8_t*)out,4,&actual));
  assert(!strcmp(s_zk_stream_failure,"short transfer"));
  total=position=0;frame(CMD_ACK_OK,7,NULL,0);
  assert(zk_send_command(1,&ctx,1,NULL,0,(uint8_t*)out,sizeof(out),&response));
