@@ -85,6 +85,21 @@ The comm-key probe reports a failed secure authentication as
   `firmware-key-bootstrap.yml` (`production_release` 2.8.0, 2.7.8 or 2.5.2
   in ota_1).
 
+## Offers without a confirmed terminal
+
+Owner decision (30 October 2026): a production (AVAILABLE) image never
+waits on terminal verification. An ESP behind a secure-pull terminal cannot
+log in on 2.7.x, so it never reports a serial or model and its binding can
+never be confirmed. `zkt_ota_admission.unconfirmed_terminal_offer` admits
+any exact ESP whose terminal is not confirmed (never identified, not yet
+confirmed, or confirmed from a label and never observed) for AVAILABLE
+images: one of the 17 on its own connector and MAC, or a ZKT ESP added
+later. HIL_ONLY images keep the 17 with their confirmed terminals, a
+terminal an administrator confirmed still needs a qualified model, and the
+K50 keeps its reviewed path. Gilgit (`ac:27:6e:a4:61:68`,
+`LF-ZONE-GILGIT-01`), on 2.7.8 behind a SenseFace, is offered 2.8.0 as soon
+as 2.8.0 is AVAILABLE.
+
 ## Verification
 
 - The C module, built against ESP-IDF 5.5.3's mbedTLS 3.6.5, completed the
