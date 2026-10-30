@@ -530,25 +530,30 @@ def secure_pull_release(db, state="AVAILABLE", version="2.8.0"):
 
 def gilgit(db, *, terminal=False):
     """Gilgit (30 Oct 2026): 2.7.8 behind a SenseFace it cannot log in to."""
-    device = Connector(connector_id="5f1d2c3b-0000-4000-8000-61686168e001", hardware_id="ac:27:6e:a4:61:68",
-        zone_id="LF-ZONE-GILGIT-01", zone_name="LF-ZONE-GILGIT-01", device_id="1", display_name="Gilgit 01",
+    device = Connector(connector_id="5f1d2c3b-0000-4000-8000-3d303d30e001", hardware_id="ac:27:6e:a4:3d:30",
+        zone_id="ZONE-GILGIT-01", zone_name="ZONE-GILGIT-01", device_id="1", display_name="Gilgit 01",
         firmware_family="zkt", firmware_version="zone-lite-2.7.8", connected=True, active=True, is_spare=False,
         ota_capable=True, ota_secure_boot=True, ota_rollback_enabled=True,
         ota_partition_layout="zone-lite-ota-v1", ota_running_partition="ota_0")
     if terminal:
-        # Onboarded with the serial on the terminal's label: confirmed, never observed.
-        device.zkt_device = ZKTDevice(expected_serial="UFS2253100068", confirmed_serial="UFS2253100068",
-                                      terminal_binding_state="CONFIRMED")
+        # Onboarded with the serial on the terminal's label, pinned as onboard_connector
+        # pins it (serial too); the ESP never reports a model or platform.
+        device.zkt_device = ZKTDevice(serial="UFS2253100068", expected_serial="UFS2253100068",
+                                      confirmed_serial="UFS2253100068", terminal_binding_state="CONFIRMED",
+                                      serial_confirmed_by="AUTO_ONBOARD_EXPECTED_SERIAL")
     db.add(device)
     db.flush()
     return device
 
 
-@pytest.mark.parametrize("terminal", ["none", "label_only", "unbound", "replaced", "k50_unconfirmed"])
+@pytest.mark.parametrize("terminal", ["none", "label_pinned", "label_never_reported", "unbound", "replaced",
+                                      "k50_unconfirmed"])
 def test_an_esp_whose_terminal_is_not_confirmed_takes_production_images_only(store, terminal):
     with store() as db:
         device = gilgit(db, terminal=terminal != "none")
-        if terminal == "unbound":
+        if terminal == "label_never_reported":
+            device.zkt_device.serial = None
+        elif terminal == "unbound":
             device.zkt_device.terminal_binding_state = "PENDING_DEVICE_ACK"
         elif terminal == "replaced":
             device.zkt_device.serial = "REPLACED"
@@ -566,7 +571,8 @@ def test_an_esp_whose_terminal_is_not_confirmed_takes_production_images_only(sto
         assert pending_offer_hold(db, device, release) == "NATIONWIDE_TARGET_OFFLINE"
 
 
-@pytest.mark.parametrize("fault", ["spare", "inactive", "k50_connector", "other_mac_of_the_17", "confirmed_unqualified"])
+@pytest.mark.parametrize("fault", ["spare", "inactive", "k50_connector", "other_mac_of_the_17", "confirmed_unqualified",
+                                   "label_pinned_seen_unqualified", "admin_confirmed_no_model"])
 def test_an_unconfirmed_terminal_never_widens_the_esp_identity(store, fault):
     from zk_add.zkt274_bld9_k50 import TARGET as K50
     with store() as db:
@@ -581,9 +587,16 @@ def test_an_unconfirmed_terminal_never_widens_the_esp_identity(store, fault):
             device.active = False
         elif fault == "k50_connector":
             device.connector_id = K50.connector_id
+        elif fault == "label_pinned_seen_unqualified":
+            # Once the ESP reports the terminal, a qualified model decides again.
+            device.zkt_device.platform = "K50_PLATFORM"
+            device.zkt_device.model = "K50"
+        elif fault == "admin_confirmed_no_model":
+            device.zkt_device.serial_confirmed_by = "admin"
         else:
             # A terminal an administrator confirmed still needs a qualified model.
-            device.zkt_device.serial, device.zkt_device.model = "UFS2253100068", "K50"
+            device.zkt_device.serial_confirmed_by = "admin"
+            device.zkt_device.model = "K50"
         assert pending_offer_hold(db, device, release) == "NATIONWIDE_EXACT_TARGET_REQUIRED"
 
 

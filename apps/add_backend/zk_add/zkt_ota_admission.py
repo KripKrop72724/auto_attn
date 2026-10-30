@@ -119,10 +119,13 @@ def admitted_addition(connector, release) -> bool:
 
 
 def terminal_unconfirmed(terminal) -> bool:
-    """No administrator-confirmed terminal ADD has also seen: never identified,
-    not yet confirmed, or confirmed from a label and never observed."""
+    """No terminal both confirmed and seen: never identified, not yet confirmed,
+    confirmed to a serial the ESP does not report, or pinned at onboarding from
+    the label (serial too) while the ESP never reported its model or platform."""
     return (terminal is None or terminal.terminal_binding_state != "CONFIRMED"
-            or not terminal.confirmed_serial or terminal.serial != terminal.confirmed_serial)
+            or not terminal.confirmed_serial or terminal.serial != terminal.confirmed_serial
+            or (terminal.serial_confirmed_by == "AUTO_ONBOARD_EXPECTED_SERIAL"
+                and not terminal.model and not terminal.platform))
 
 
 def unconfirmed_terminal_offer(connector, release) -> bool:

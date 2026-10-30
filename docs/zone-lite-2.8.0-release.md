@@ -92,13 +92,13 @@ waits on terminal verification. An ESP behind a secure-pull terminal cannot
 log in on 2.7.x, so it never reports a serial or model and its binding can
 never be confirmed. `zkt_ota_admission.unconfirmed_terminal_offer` admits
 any exact ESP whose terminal is not confirmed (never identified, not yet
-confirmed, or confirmed from a label and never observed) for AVAILABLE
-images: one of the 17 on its own connector and MAC, or a ZKT ESP added
+confirmed, confirmed to a serial the ESP does not report, or pinned at
+onboarding from its label while the ESP never reported a model or platform)
+for AVAILABLE images: one of the 17 on its own connector and MAC, or a ZKT ESP added
 later. HIL_ONLY images keep the 17 with their confirmed terminals, a
 terminal an administrator confirmed still needs a qualified model, and the
-K50 keeps its reviewed path. Gilgit (`ac:27:6e:a4:61:68`,
-`LF-ZONE-GILGIT-01`), on 2.7.8 behind a SenseFace, is offered 2.8.0 as soon
-as 2.8.0 is AVAILABLE.
+K50 keeps its reviewed path. Gilgit's ESP, on 2.7.8 behind a SenseFace that
+answers 6001, is offered 2.8.0 as soon as 2.8.0 is AVAILABLE.
 
 ## Verification
 
@@ -118,10 +118,18 @@ as 2.8.0 is AVAILABLE.
 
 ## Rollout
 
-1. Merge; wait for the ADD deploy to finish.
-2. Dispatch the HIL candidate build for 2.8.0 at the merge commit.
-3. Campaign a legacy-terminal device first if possible (it must behave as
-   2.7.8), then the SenseFace site's new board.
-4. Promote with `firmware-fleet-promote.yml` once devices succeed.
+1. Merge; wait for the ADD deploy to finish (the wider heartbeat field must
+   be live before any device runs 2.8.0).
+2. Dispatch the HIL candidate build for 2.8.0 at the merge commit with the 17
+   targets of `deploy/add/hil-targets-zkt-270.json`; it is published
+   HIL_ONLY to those 17.
+3. Campaign at least three of the 17 (legacy terminals: they must behave as
+   on 2.7.8).
+4. After the soak (`firmware-fleet-promote.yml`: at least 3 healthy devices,
+   at least 24 h), promote 2.8.0 to AVAILABLE.
+5. Then ADD offers 2.8.0 to ESPs outside the 17 and to those whose terminal
+   is not confirmed (Gilgit's SenseFace site), and new SenseFace boards can
+   be bootstrapped with `production_release` 2.8.0. HIL_ONLY 2.8.0 reaches
+   only the 17.
 
 Rollback: an unconfirmed 2.8.0 rolls back to 2.7.8 as every 2.7.x does.
