@@ -498,15 +498,15 @@ def classify_led_latch(led_state: str | None, evidence: dict | None, *, storage_
 
 
 # Signed 2.6.15 checks at boot (zone_lite.c:3196) that the other OTA slot
-# holds a qualified predecessor (2.4.12 to 2.6.14). Any 2.7.x download writes
-# that slot, so every later 2.6.15 boot latches LOCAL_FAILURE, never runs its
-# persistence probe and reports durability DEGRADED until a 2.7.x install
-# succeeds. This latch only names that cause (error code and message); the
+# holds a qualified predecessor (2.4.12 to 2.6.14). Any 2.7.x or 2.8.0 download
+# writes that slot, so every later 2.6.15 boot latches LOCAL_FAILURE, never runs
+# its persistence probe and reports durability DEGRADED until a 2.7.x or 2.8.0
+# install succeeds. This latch only names that cause (error code and message); the
 # tier stays DEGRADED. Zero I/O counters on such a boot are not a passed
 # probe: 2.6.15 keeps the first latch's source, so a later LOCAL_FAILURE on
 # the same boot is invisible, and its legacy-queue reads and writes fail
 # without touching the counters. The label also needs ADD's own record of
-# the 2.7.x download and a clean storage history.
+# the 2.7.x or 2.8.0 download and a clean storage history.
 ROLLBACK_SLOT_RESIDUE = "OTA_ROLLBACK_SLOT_RESIDUE"
 RESIDUE_FIRMWARE_VERSION = "2.6.15"
 RESIDUE_APPLICATION_SHA256 = "832c0c3d8dac6e41d7cd0a9d4fbe4508e4f66982fa5ddeceaca4dc5adcbd80d6"
@@ -590,7 +590,8 @@ def rollback_slot_residue_history(session: Session, connector: Connector, *, now
 
 
 def rollback_slot_residue_latch(record: dict | None, history: dict | None) -> dict | None:
-    """The latch, only with ADD's own record of the 2.7.x download and a clean storage history."""
+    """The latch, only with ADD's own record of the 2.7.x or 2.8.0 download and a clean
+    storage history."""
     if not record or not history or not history.get("clean"):
         return None
     return {"kind": ROLLBACK_SLOT_RESIDUE, "source": RESIDUE_LED_SOURCE,

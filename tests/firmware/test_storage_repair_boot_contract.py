@@ -161,6 +161,7 @@ def test_controlled_reboot_window_never_meets_the_every_boot_repair() -> None:
     assert platform and '"2.7.5"' in platform.group(1) and '"2.7.6"' in platform.group(1)
     assert '"2.7.7"' in platform.group(1)
     assert '"2.7.8"' in platform.group(1)
+    assert '"2.8.0"' in platform.group(1)
     assert '"2.7.0"' not in platform.group(1)
 
 

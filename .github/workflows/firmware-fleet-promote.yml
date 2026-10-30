@@ -1,9 +1,9 @@
 name: Zone Lite fleet-proven ZKT promotion
 
-# ZKT 2.7.x images are published HIL_ONLY to the signed nationwide scope and
-# proven on the field fleet itself, not on a single canary or the bench gate.
-# This promotes the exact published bytes to AVAILABLE once enough of that
-# fleet has run them, healthy, for the soak period. ADD's exact-identity
+# ZKT 2.7.x and 2.8.0 images are published HIL_ONLY to the signed nationwide
+# scope and proven on the field fleet itself, not on a single canary or the
+# bench gate. This promotes the exact published bytes to AVAILABLE once enough
+# of that fleet has run them, healthy, for the soak period. ADD's exact-identity
 # nationwide guard still decides which ESPs may be offered an AVAILABLE image.
 
 on:
@@ -14,7 +14,7 @@ on:
         required: true
         type: string
       version:
-        description: ZKT 2.7.x SemVer version, without a v prefix
+        description: ZKT 2.7.x or 2.8.0 SemVer version, without a v prefix
         required: true
         type: string
       minimum_field_devices:
@@ -61,7 +61,8 @@ jobs:
           INPUT_REVIEWED_DEPLOYMENTS: ${{ inputs.reviewed_deployments }}
         run: |
           set -euo pipefail
-          [[ "$INPUT_VERSION" =~ ^2\.7\.[0-9]+$ ]]
+          # Any 2.7.x, or exactly 2.8.0 (2.7.8 with secure-pull terminals).
+          [[ "$INPUT_VERSION" == '2.8.0' ]] || [[ "$INPUT_VERSION" =~ ^2\.7\.[0-9]+$ ]]
           [[ "$INPUT_COMMIT_SHA" =~ ^[0-9a-f]{40}$ ]]
           [[ "$INPUT_MINIMUM_FIELD_DEVICES" =~ ^[0-9]+$ ]]
           [[ "$INPUT_MINIMUM_SOAK_HOURS" =~ ^[0-9]+$ ]]

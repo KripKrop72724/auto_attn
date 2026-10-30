@@ -514,7 +514,7 @@ def test_other_returns_keep_previous_firmware_observed(db, lifetime, last_code, 
     assert run.status == "PAUSED"
 
 
-@pytest.mark.parametrize("version", ["2.6.17", "2.6.24", "2.7.0", "2.7.6", "2.7.7", "2.7.8"])
+@pytest.mark.parametrize("version", ["2.6.17", "2.6.24", "2.7.0", "2.7.6", "2.7.7", "2.7.8", "2.8.0"])
 def test_releases_with_their_own_return_evidence_are_never_classified(version):
     deployment = SimpleNamespace(status="BOOTED_PENDING", previous_version="2.6.15")
     evidence = {"target_boot": {"last_progress_code": None, "failure_reports": [],
@@ -708,8 +708,8 @@ def residue_storage(**fields):
             "used_bytes": 116, "total_bytes": 1000, **fields}
 
 
-def residue_record(db, device, *, written=360_448, accepted="2.6.15"):
-    base = release(db, "2.7.5")
+def residue_record(db, device, *, written=360_448, accepted="2.6.15", target="2.7.5"):
+    base = release(db, target)
     accepted_release = db.scalar(select(FirmwareRelease).where(FirmwareRelease.version == accepted))
     now = utc_now()
     campaign(db, accepted_release, device, status="COMPLETED", deployment_status="SUCCEEDED",
@@ -756,6 +756,17 @@ def test_rollback_slot_residue_is_labelled_but_stays_degraded(db):
     assert "latch" not in alert(db, device, "ESP_DURABILITY_FAULT").details
     assert "latch" not in alert(db, device, "ESP_LOCAL_FAILURE").details
     assert evaluate_health(db, device).derived_lifecycle == "DEGRADED"
+
+
+@pytest.mark.parametrize("target", ["2.7.8", "2.8.0"])
+def test_rollback_slot_residue_counts_every_later_platform_download(db, target):
+    """2.6.15 refuses 2.8.0 in its other slot as it refuses every 2.7.x."""
+    device = esp(db, MULTAN_02, "ZONE-MULTAN-02")
+    residue_record(db, device, target=target)
+    residue_heartbeat(db, device, 1)
+    latch = alert(db, device, "ESP_DURABILITY_FAULT").details["latch"]
+    assert latch["kind"] == "OTA_ROLLBACK_SLOT_RESIDUE" and latch["residue"]["target_version"] == target
+    assert evaluate_health(db, device).last_error_code == "OTA_ROLLBACK_SLOT_RESIDUE"
 
 
 @pytest.mark.parametrize("change", [

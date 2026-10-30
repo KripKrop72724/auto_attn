@@ -10,8 +10,8 @@ param(
     # exact signed application replaces this build's, so a new ESP boots the
     # production bytes ADD already verifies (flashed to factory and ota_0).
     [string]$ProductionReleaseDirectory = '',
-    # An older published AVAILABLE release, flashed to ota_1. 2.7.x direct
-    # upgrade builds start storage only when the other OTA slot holds a
+    # An older published AVAILABLE release, flashed to ota_1. 2.7.x and 2.8.0
+    # direct upgrade builds start storage only when the other OTA slot holds a
     # qualified predecessor (exact application digest) as their rollback image.
     [string]$RollbackPredecessorDirectory = ''
 )
@@ -72,7 +72,7 @@ if ($RollbackPredecessorDirectory -and -not $ProductionReleaseDirectory) {
 if ($ProductionReleaseDirectory) {
     if ($ImageRole -ne 'factory') { throw 'Only a factory bootstrap can carry a production release' }
     if (-not $RollbackPredecessorDirectory) {
-        throw 'A production release bootstrap must carry a rollback predecessor for ota_1; 2.7.x refuses storage without one'
+        throw 'A production release bootstrap must carry a rollback predecessor for ota_1; 2.7.x and 2.8.0 refuse storage without one'
     }
     $production = Get-AvailableReleaseImage -Directory $ProductionReleaseDirectory -Purpose 'Production release'
     $predecessor = Get-AvailableReleaseImage -Directory $RollbackPredecessorDirectory -Purpose 'Rollback predecessor'

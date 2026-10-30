@@ -23,7 +23,7 @@ on:
         type: string
         default: latest
       rollback_predecessor:
-        description: Older exact AVAILABLE ZKT version flashed to ota_1 - 2.7.x starts storage only beside a qualified predecessor (2.5.2 is one); none only with production_release none
+        description: Older exact AVAILABLE ZKT version flashed to ota_1 - 2.7.x and 2.8.0 start storage only beside a qualified predecessor (2.5.2 is one; 2.7.8 also for 2.8.0); none only with production_release none
         type: string
         default: '2.5.2'
 
@@ -185,7 +185,7 @@ jobs:
             throw 'rollback_predecessor must be none or an exact version'
           }
           if ($env:ROLLBACK_PREDECESSOR -eq 'none' -and $env:PRODUCTION_RELEASE -ne 'none') {
-            throw 'rollback_predecessor none is allowed only with production_release none: 2.7.x refuses storage without a qualified predecessor in ota_1'
+            throw 'rollback_predecessor none is allowed only with production_release none: 2.7.x and 2.8.0 refuse storage without a qualified predecessor in ota_1'
           }
           $productionArguments = @{}
           if ($env:PRODUCTION_RELEASE -eq 'none' -and $env:ROLLBACK_PREDECESSOR -ne 'none') {

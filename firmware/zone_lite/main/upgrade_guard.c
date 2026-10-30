@@ -45,6 +45,10 @@ bool ug_direct_predecessor_matches(const char *version, const uint8_t digest[32]
      * so its devices upgrade in place. */
     static const char platform_277[] =
         "6d9ee63dd7e5917c83a3ada14685405c0081073d593a7901487eb2a3fd2c3bc1";
+    /* 2.7.8: the production image (AVAILABLE 29 Oct 2026), so the whole
+     * fleet upgrades in place. */
+    static const char platform_278[] =
+        "b8d0ca7e20d28d4114cff56fc69676e681a37bf9f7e831a243a65f9a1a972a3e";
     const char *expected = !strcmp(version, "2.4.12") ? baseline_2412 :
         !strcmp(version, "2.5.2") ? baseline_252 :
         !strcmp(version, "2.6.6") ? hil_266 :
@@ -61,7 +65,8 @@ bool ug_direct_predecessor_matches(const char *version, const uint8_t digest[32]
         !strcmp(version, "2.7.4") ? platform_274 :
         !strcmp(version, "2.7.5") ? platform_275 :
         !strcmp(version, "2.7.6") ? platform_276 :
-        !strcmp(version, "2.7.7") ? platform_277 : NULL;
+        !strcmp(version, "2.7.7") ? platform_277 :
+        !strcmp(version, "2.7.8") ? platform_278 : NULL;
     if (!expected) return false;
     static const char hex[] = "0123456789abcdef";
     for (unsigned i = 0; i < 32; ++i) {
