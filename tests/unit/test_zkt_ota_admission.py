@@ -117,7 +117,7 @@ def test_unsettled_offers_at_a_location_no_longer_hold_another_upgrade(store, st
         assert db.scalar(select(func.count(FirmwareDownloadGrant.id))) == 1
 
 
-@pytest.mark.parametrize("fault", ["offline", "spare", "serial", "mac", "unknown"])
+@pytest.mark.parametrize("fault", ["offline", "spare", "mac", "unknown"])
 def test_new_offers_require_the_exact_online_active_target(store, fault):
     with store() as db:
         device = connector(db, 0)
@@ -479,8 +479,8 @@ def test_a_qualified_later_zkt_takes_production_images_only(store):
         assert pending_offer_hold(db, device, legacy) == "NATIONWIDE_TARGET_OFFLINE"
 
 
-@pytest.mark.parametrize("fault", ["k50_model", "no_model", "unbound", "serial", "spare", "inactive",
-                                   "k50_connector", "changed_target"])
+@pytest.mark.parametrize("fault", ["k50_model", "no_model", "spare", "inactive", "k50_connector",
+                                   "changed_target"])
 def test_later_zkt_needs_a_confirmed_qualified_terminal(store, fault):
     from zk_add.zkt274_bld9_k50 import TARGET as K50
     with store() as db:
@@ -494,11 +494,7 @@ def test_later_zkt_needs_a_confirmed_qualified_terminal(store, fault):
             device = addition(db, connector_id=K50.connector_id)
         else:
             device = addition(db, model={"k50_model": "K50", "no_model": None}.get(fault, "G3"))
-        if fault == "unbound":
-            device.zkt_device.terminal_binding_state = "PENDING_DEVICE_ACK"
-        elif fault == "serial":
-            device.zkt_device.serial = "REPLACED"
-        elif fault == "spare":
+        if fault == "spare":
             device.is_spare = True
         elif fault == "inactive":
             device.active = False
@@ -519,3 +515,84 @@ def test_a_qualified_later_zkt_is_offered_through_real_assignment(store):
         db.flush()
         assert offer(db, device)["version"] == "2.2.1"
         assert deployment(db, device).status == "OFFERED" and deployment(db, device).error_code is None
+
+
+def secure_pull_release(db, state="AVAILABLE", version="2.8.0"):
+    release = FirmwareRelease(release_id="synthetic-" + version, version=version, git_sha="e"*40,
+        image_sha256=(version.replace(".", "") * 64)[:64], image_size=1024, signing_key_id="synthetic",
+        partition_layout="zone-lite-ota-v1", minimum_bootstrap_version="2.2.0",
+        storage_name=f"{version}/synthetic.bin", manifest={"application_sha256": "c"*64},
+        manifest_signature="synthetic", state=state)
+    db.add(release)
+    db.flush()
+    return release
+
+
+def gilgit(db, *, terminal=False):
+    """Gilgit (30 Oct 2026): 2.7.8 behind a SenseFace it cannot log in to."""
+    device = Connector(connector_id="5f1d2c3b-0000-4000-8000-61686168e001", hardware_id="ac:27:6e:a4:61:68",
+        zone_id="LF-ZONE-GILGIT-01", zone_name="LF-ZONE-GILGIT-01", device_id="1", display_name="Gilgit 01",
+        firmware_family="zkt", firmware_version="zone-lite-2.7.8", connected=True, active=True, is_spare=False,
+        ota_capable=True, ota_secure_boot=True, ota_rollback_enabled=True,
+        ota_partition_layout="zone-lite-ota-v1", ota_running_partition="ota_0")
+    if terminal:
+        # Onboarded with the serial on the terminal's label: confirmed, never observed.
+        device.zkt_device = ZKTDevice(expected_serial="UFS2253100068", confirmed_serial="UFS2253100068",
+                                      terminal_binding_state="CONFIRMED")
+    db.add(device)
+    db.flush()
+    return device
+
+
+@pytest.mark.parametrize("terminal", ["none", "label_only", "unbound", "replaced", "k50_unconfirmed"])
+def test_an_esp_whose_terminal_is_not_confirmed_takes_production_images_only(store, terminal):
+    with store() as db:
+        device = gilgit(db, terminal=terminal != "none")
+        if terminal == "unbound":
+            device.zkt_device.terminal_binding_state = "PENDING_DEVICE_ACK"
+        elif terminal == "replaced":
+            device.zkt_device.serial = "REPLACED"
+        elif terminal == "k50_unconfirmed":
+            device.zkt_device.serial, device.zkt_device.model = "SOMEOTHER", "K50"
+        release = secure_pull_release(db)
+        assert pending_offer_hold(db, device, release) is None
+        assert pending_offer_hold(db, device, secure_pull_release(db, version="2.7.8")) is None
+        # HIL_ONLY images keep the 17 with their confirmed terminals.
+        release.state = "HIL_ONLY"
+        assert pending_offer_hold(db, device, release) == "NATIONWIDE_EXACT_TARGET_REQUIRED"
+        assert pending_offer_hold(db, device, None) == "NATIONWIDE_EXACT_TARGET_REQUIRED"
+        release.state = "AVAILABLE"
+        device.connected = False
+        assert pending_offer_hold(db, device, release) == "NATIONWIDE_TARGET_OFFLINE"
+
+
+@pytest.mark.parametrize("fault", ["spare", "inactive", "k50_connector", "other_mac_of_the_17", "confirmed_unqualified"])
+def test_an_unconfirmed_terminal_never_widens_the_esp_identity(store, fault):
+    from zk_add.zkt274_bld9_k50 import TARGET as K50
+    with store() as db:
+        release = secure_pull_release(db)
+        device = connector(db, 0) if fault == "other_mac_of_the_17" else gilgit(db, terminal=True)
+        if fault == "other_mac_of_the_17":
+            device.zkt_device.confirmed_serial = "REPLACED"
+            device.hardware_id = "00:11:22:33:44:55"
+        elif fault == "spare":
+            device.is_spare = True
+        elif fault == "inactive":
+            device.active = False
+        elif fault == "k50_connector":
+            device.connector_id = K50.connector_id
+        else:
+            # A terminal an administrator confirmed still needs a qualified model.
+            device.zkt_device.serial, device.zkt_device.model = "UFS2253100068", "K50"
+        assert pending_offer_hold(db, device, release) == "NATIONWIDE_EXACT_TARGET_REQUIRED"
+
+
+def test_one_of_the_17_whose_terminal_is_not_confirmed_is_offered_production_images(store):
+    with store() as db:
+        device = connector(db, 0)
+        device.zkt_device.confirmed_serial = "REPLACED"
+        legacy = db.scalar(select(FirmwareRelease).where(FirmwareRelease.version == "2.2.1"))
+        assert offer(db, device)["version"] == "2.2.1"
+        assert deployment(db, device).status == "OFFERED" and deployment(db, device).error_code is None
+        legacy.state = "HIL_ONLY"
+        assert pending_offer_hold(db, device, legacy) == "NATIONWIDE_EXACT_TARGET_REQUIRED"

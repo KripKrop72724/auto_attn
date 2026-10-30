@@ -118,6 +118,38 @@ def admitted_addition(connector, release) -> bool:
     )
 
 
+def terminal_unconfirmed(terminal) -> bool:
+    """No administrator-confirmed terminal ADD has also seen: never identified,
+    not yet confirmed, or confirmed from a label and never observed."""
+    return (terminal is None or terminal.terminal_binding_state != "CONFIRMED"
+            or not terminal.confirmed_serial or terminal.serial != terminal.confirmed_serial)
+
+
+def unconfirmed_terminal_offer(connector, release) -> bool:
+    """A production image never waits on terminal verification.
+
+    Owner decision (30 Oct 2026): an ESP whose terminal is not confirmed may
+    take any AVAILABLE image, so firmware reaches ESPs that cannot log in to
+    their terminal yet (a SenseFace behind 2.7.x answers CONNECT with 6001;
+    2.8.0 is the image that logs in). The ESP itself stays exact: one of the 17
+    on its own connector and MAC, or a ZKT ESP added later. HIL_ONLY images
+    keep the 17 with their confirmed terminals, a terminal confirmed by an
+    administrator still needs a qualified model (``admitted_addition``), and
+    the K50 keeps its reviewed path. ADD's predecessor and storage checks still
+    decide whether the running image may take the release.
+    """
+    from zk_add.zkt274_bld9_k50 import TARGET as K50
+
+    target = BY_ID.get(connector.connector_id)
+    return bool(
+        release is not None and release.state == "AVAILABLE"
+        and connector.connector_id != K50.connector_id
+        and connector.active and not connector.is_spare
+        and (target is None or (connector.hardware_id or "").lower() == target.identity.mac)
+        and terminal_unconfirmed(connector.zkt_device)
+    )
+
+
 def pending_offer_hold(session, connector, release=None):
     """Offer only to an exact, online fleet target; never limit how many upgrade at once.
 
@@ -136,10 +168,12 @@ def pending_offer_hold(session, connector, release=None):
     if journal_release is None:
         return None
     target = BY_ID.get(connector.connector_id)
-    # Outside the 17: the one reviewed K50 with its exact signed 2.4.12 bridge
-    # or 2.7.4, and later qualified additions for production images only.
+    # Outside the exact 17: the one reviewed K50 with its exact signed 2.4.12
+    # bridge or 2.7.4, later qualified additions for production images, and
+    # any exact ESP whose terminal is not confirmed for production images.
     if (not (target is not None and target_matches(target.identity, connector))
-            and offer_location(release, connector) is None and not admitted_addition(connector, release)):
+            and offer_location(release, connector) is None and not admitted_addition(connector, release)
+            and not unconfirmed_terminal_offer(connector, release)):
         return "NATIONWIDE_EXACT_TARGET_REQUIRED"
     if not connector.connected:
         return "NATIONWIDE_TARGET_OFFLINE"
