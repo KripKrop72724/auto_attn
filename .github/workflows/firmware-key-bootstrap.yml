@@ -25,7 +25,7 @@ jobs:
     runs-on: ubuntu-latest
     environment: firmware-signing
     env:
-      ZONE_LITE_SETUP_PASSWORD: ${{ secrets.BLD1_HIK_SETUP_PASSWORD }}
+      ZONE_LITE_SETUP_PASSWORD: ${{ secrets.ZONE_LITE_SETUP_PASSWORD }}
     timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
