@@ -427,6 +427,9 @@ typedef struct {
     /* Secure-pull terminals (CONNECT answers 6001) encrypt every frame after
      * the handshake; a zeroed context is a legacy session. */
     bool secure;
+    /* From 10065 on the reply may already be sealed, as the vendor SDK
+     * accepts; requests stay plain until the confirm is acknowledged. */
+    bool secure_rx;
     uint8_t secure_key[ZKT_SECURE_KEY_BYTES];
 } zk_context_t;
 
@@ -1389,7 +1392,7 @@ static bool zk_send_command(
         if (!recv_exact_until(sock, (uint8_t *)&reply_top, sizeof(reply_top), deadline)) {
             return false;
         }
-        if (ctx->secure) {
+        if (ctx->secure || ctx->secure_rx) {
             uint8_t *packet_in = NULL;
             size_t packet_in_len = 0;
             const char *rejected = zk_secure_read_body(sock, ctx, &reply_top, rx_cap, deadline,
@@ -1584,6 +1587,7 @@ static bool zk_secure_begin(int sock, zk_context_t *ctx, uint32_t comm_key, uint
     bool ok = zk_secure_identity_ready_locked();
     if (ok) {
         stage = "public key exchange";
+        response.code = 0;
         status = zkt_secure_dmc_exchange_payload(&s_zk_secure_identity, message, ZKT_SECURE_MESSAGE_MAX,
                                                  &message_len);
         ok = status == ZKT_SECURE_OK &&
@@ -1593,6 +1597,7 @@ static bool zk_secure_begin(int sock, zk_context_t *ctx, uint32_t comm_key, uint
     }
     if (ok) {
         stage = "session key exchange";
+        response.code = 0;
         status = zkt_secure_key_exchange_payload(response.data, response.data_len, client_secret,
                                                  zk_secure_random, NULL, message, ZKT_SECURE_MESSAGE_MAX,
                                                  &message_len);
@@ -1612,16 +1617,19 @@ static bool zk_secure_begin(int sock, zk_context_t *ctx, uint32_t comm_key, uint
     if (ok) {
         static const uint8_t confirm[4] = {0};
         stage = "confirm";
+        response.code = 0;
+        zkt_secure_derive_aes_key(client_secret, server_secret, ctx->secure_key);
+        ctx->secure_rx = true;
         ok = zk_send_command(sock, ctx, ZKT_SECURE_CMD_CONFIRM_SESSION, confirm, sizeof(confirm), rx, RX_BYTES,
                              &response) &&
              response.code == CMD_ACK_OK;
     }
     if (!ok) {
+        ctx->secure_rx = false;
         zk_secure_report(stage, response.code, status);
         free(rx);
         return false;
     }
-    zkt_secure_derive_aes_key(client_secret, server_secret, ctx->secure_key);
     ctx->secure = true;
     vTaskDelay(pdMS_TO_TICKS(50));
 
@@ -1629,6 +1637,7 @@ static bool zk_secure_begin(int sock, zk_context_t *ctx, uint32_t comm_key, uint
      * extended comm key; 2032 locks authentication, so stop there. */
     uint8_t commkey[4];
     zkt_secure_commkey_native(comm_key, ctx->session_id, (uint8_t)(esp_random() & 0xFFU), commkey);
+    response.code = 0;
     if (!zk_send_command(sock, ctx, CMD_AUTH, commkey, sizeof(commkey), rx, RX_BYTES, &response)) {
         zk_secure_report("CMD_AUTH", 0, ZKT_SECURE_OK);
         free(rx);
@@ -1679,6 +1688,7 @@ static bool zk_connect_and_auth_with_key_diagnosed(
     ctx->session_id = 0;
     ctx->reply_id = USHRT_MAX_ZK - 1;
     ctx->secure = false;
+    ctx->secure_rx = false;
 
     if (!zk_send_command(sock, ctx, CMD_CONNECT, NULL, 0, rx, sizeof(rx), &response)) {
         ESP_LOGW(TAG, "ZKT CMD_CONNECT did not return a valid TCP response");

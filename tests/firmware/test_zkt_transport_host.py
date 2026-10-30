@@ -41,7 +41,7 @@ def test_prepared_transport_rejects_wrong_session_truncation_and_oversized_frame
 #define ESP_LOGI(...) ((void)0)
 typedef struct {uint16_t command,checksum,session_id,reply_id;} zk_header_t;
 typedef struct {uint16_t marker_1,marker_2;uint32_t length;} zk_tcp_header_t;
-typedef struct {uint16_t session_id,reply_id;bool secure;uint8_t secure_key[ZKT_SECURE_KEY_BYTES];} zk_context_t;
+typedef struct {uint16_t session_id,reply_id;bool secure,secure_rx;uint8_t secure_key[ZKT_SECURE_KEY_BYTES];} zk_context_t;
 typedef struct {uint16_t code,session_id,reply_id;uint8_t *data;size_t data_len;} zk_response_t;
 typedef struct {bool prepared;uint32_t size;uint8_t *direct_data;} zk_bounded_buffer_t;
 static void write_le32(uint8_t *p,uint32_t value)
