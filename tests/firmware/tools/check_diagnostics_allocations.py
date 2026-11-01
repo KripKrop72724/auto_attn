@@ -103,6 +103,10 @@ void led_status_local_failure_report(led_local_failure_t *report){
 static bool storage_upgrade_ready(void){return true;}
 static const char *storage_upgrade_error(void){return "";}
 static const char *storage_upgrade_contract(void){return "contract";}
+/* storage_upgrade.c (ZKT 2.8.1): non-empty, so both rollback-slot fields
+ * allocate inside this fault sweep. */
+static const char *storage_upgrade_rollback_slot(void){return "PREDECESSOR";}
+static const char *storage_upgrade_rollback_slot_state(void){return "VALID";}
 static int esp_spiffs_info(const void *label,size_t *total,size_t *used){(void)label;*total=8000000;*used=2000000;return 0;}
 static struct {unsigned total;} s_outbox_retry={2};
 static unsigned s_ords_start_attempts=2;
@@ -180,6 +184,8 @@ int main(void){
  assert(cJSON_GetObjectItemCaseSensitive(storage,"legacy_retire_faults")->valueint==3);
  assert(cJSON_GetObjectItemCaseSensitive(storage,"legacy_read_recoveries")->valueint==7);
  assert(!strcmp(string(storage,"legacy_error_queue"),"ords_pending"));
+ assert(!strcmp(string(storage,"rollback_slot"),"PREDECESSOR"));
+ assert(!strcmp(string(storage,"rollback_slot_state"),"VALID"));
  cJSON *queues=cJSON_GetObjectItemCaseSensitive(diagnostics,"queues");assert(cJSON_GetArraySize(queues)==11);
  assert(cJSON_GetObjectItemCaseSensitive(cJSON_GetArrayItem(queues,0),"bytes")->valueint==123);
  assert(!cJSON_HasObjectItem(cJSON_GetArrayItem(queues,1),"bytes"));

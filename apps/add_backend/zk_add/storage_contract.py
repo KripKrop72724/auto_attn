@@ -11,8 +11,9 @@ DIRECT_VERSION = "2.6.1"
 # 2.7.6 reformats a store the repair cannot give room, block by block in place;
 # 2.7.7 lets a wedged store's image confirm first so that reformat can run;
 # 2.7.8 accepts the held spans ESP-IDF reads as ENOENT and says why it refuses.
-# 2.8.0 also talks to secure-pull terminals (CONNECT 6001: SenseFace, SpeedFace).
-FLEET_PLATFORM_VERSIONS = ("2.7.1", "2.7.2", "2.7.3", "2.7.4", "2.7.5", "2.7.6", "2.7.7", "2.7.8", "2.8.0")
+# 2.8.0 also talks to secure-pull terminals (CONNECT 6001: SenseFace, SpeedFace);
+# 2.8.1 also starts storage when a confirmed image's other slot cannot boot.
+FLEET_PLATFORM_VERSIONS = ("2.7.1", "2.7.2", "2.7.3", "2.7.4", "2.7.5", "2.7.6", "2.7.7", "2.7.8", "2.8.0", "2.8.1")
 FLEET_PLATFORM_VERSION = FLEET_PLATFORM_VERSIONS[-1]
 DIRECT_VERSIONS = (DIRECT_VERSION, "2.6.2", "2.6.3", "2.6.4", "2.6.5", "2.6.6", "2.6.7", "2.6.8", "2.6.9", "2.6.10", "2.6.11", "2.6.12", "2.6.13", "2.6.14", "2.6.15", *FLEET_PLATFORM_VERSIONS)
 DIRECT_BASELINES = ("2.4.12", "2.5.2")
@@ -132,10 +133,20 @@ SECURE_PULL_BASELINE_IMAGES = {
     "2.7.8": "b8d0ca7e20d28d4114cff56fc69676e681a37bf9f7e831a243a65f9a1a972a3e",
 }
 SECURE_PULL_MARKER = EXCEPTION_MARKER + ",2.7.8"
+# 2.8.1 also accepts 2.8.0, the secure-pull HIL image, so its devices upgrade
+# in place. The marker is 172 characters.
+SLOT_RULE_BASELINES = (*SECURE_PULL_BASELINES, "2.8.0")
+SLOT_RULE_BASELINE_IMAGES = {
+    **SECURE_PULL_BASELINE_IMAGES,
+    "2.8.0": "21ac81b292b463cf7fa1bf0d6ce364a49493951836ad962a19dcae049f40ed76",
+}
+SLOT_RULE_MARKER = SECURE_PULL_MARKER + ",2.8.0"
 
 
 def platform_baselines(version: str) -> tuple[tuple[str, ...], dict[str, str]]:
     """The rollback predecessors a 2.7 platform image accepts."""
+    if version == "2.8.1":
+        return SLOT_RULE_BASELINES, SLOT_RULE_BASELINE_IMAGES
     if version == "2.8.0":
         return SECURE_PULL_BASELINES, SECURE_PULL_BASELINE_IMAGES
     if version == "2.7.8":

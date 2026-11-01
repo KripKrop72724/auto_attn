@@ -942,16 +942,21 @@ def apply_firmware_diagnostics(session: Session, connector: Connector, payload: 
         from zk_add.ota_interruption import rollback_slot_residue_record
 
         # Every device gate held on this boot; the latch also needs ADD's own
-        # record that a 2.7.x or 2.8.0 download wrote the other slot after the
-        # last 2.6.15 install, and no storage I/O fault on the ESP's earlier boots.
+        # record that a later download wrote the other slot after the running
+        # image's install (2.6.15, 2.7.8 or 2.8.0), and no storage I/O fault on
+        # the ESP's earlier boots.
         residue_record = rollback_slot_residue_record(session, connector)
         if residue_record:
-            durability = open_alert_row(session, connector, "ESP_DURABILITY_FAULT")
-            cached = (durability.details or {}).get("residue_history") if durability is not None else None
-            # Earlier boots cannot change, so one check per boot suffices.
-            residue_history = (cached if isinstance(cached, dict) and cached.get("boot_id") == connector.boot_id
-                               else rollback_slot_residue_history(session, connector, now=now))
-        latch = rollback_slot_residue_latch(residue_record, residue_history)
+            # Earlier boots cannot change, so one check per boot suffices. 2.7.8
+            # and 2.8.0 report durability UNKNOWN, so their LED row keeps it.
+            kept = [(row.details or {}).get("residue_history") for row in (
+                open_alert_row(session, connector, "ESP_DURABILITY_FAULT"),
+                open_alert_row(session, connector, "ESP_LOCAL_FAILURE")) if row is not None]
+            residue_history = next((item for item in kept if isinstance(item, dict)
+                                    and item.get("boot_id") == connector.boot_id), None
+                                   ) or rollback_slot_residue_history(session, connector, now=now)
+        latch = rollback_slot_residue_latch(residue_record, residue_history,
+                                            firmware_version=connector.firmware_version)
     for code, failed, verified, message in (
         ("ESP_DURABILITY_FAULT", storage_failed, storage_verified,
          "Attendance preservation needs recovery; connectivity alone does not confirm durable storage."),
@@ -1020,9 +1025,12 @@ def apply_firmware_diagnostics(session: Session, connector: Connector, payload: 
             connector.last_error_code = code
             connector.last_error_message = message
     led_row = open_alert_row(session, connector, "ESP_LOCAL_FAILURE") if evidence is not None else None
-    if led_row is not None and (latch or "latch" in (led_row.details or {})):
+    # The raised durability row keeps the residue history; without one the LED row does.
+    led_history = residue_history if residue_history and not storage_failed else None
+    if led_row is not None and (latch or led_history or "latch" in (led_row.details or {})):
         details = {key: value for key, value in (led_row.details or {}).items() if key != "latch"}
-        led_row.details = {**details, "latch": latch} if latch else details
+        led_row.details = {**details, **({"latch": latch} if latch else {}),
+                           **({"residue_history": led_history} if led_history else {})}
 
 
 def resolve_on_evidence(session: Session, connector: Connector, *, code: str,
@@ -1523,6 +1531,8 @@ def update_heartbeat(
                 # Diagnostics re-classify the latch below; a sample without
                 # them keeps this boot's classification, like the durability row.
                 **({"latch": previous["latch"]} if same_boot and previous.get("latch") else {}),
+                **({"residue_history": previous["residue_history"]}
+                   if same_boot and previous.get("residue_history") else {}),
             },
         )
     elif reported_led_state and reported_led_state not in {"STATE_LOCK_BUSY", "UNAVAILABLE"}:

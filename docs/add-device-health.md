@@ -121,6 +121,13 @@ minutes earlier.
   I/O fault on an earlier boot in the window (MULTAN-02 had EIO write
   failures on 15 October) shows the generic durability fault until that boot
   is 14 days old.
+  From 2.8.1's ADD the same label also covers the direct 2.7.8 image
+  (`b8d0ca7e...`, LED source `zone_lite.c:3573`) and 2.8.0 (`21ac81b2...`,
+  `zone_lite.c:3875`) after a later download that image refuses (2.8.0 or
+  2.8.1 for 2.7.8, 2.8.1 for 2.8.0). Those images report durability UNKNOWN
+  rather than DEGRADED without an I/O error, so the label goes on
+  `ESP_LOCAL_FAILURE` only, and the remedy reads "offer 2.8.1". 2.6.15's
+  rule is unchanged.
 - **Interrupted target boot.** For a 2.6.0-2.6.15 ESP, a return to the
   previous firmware is labelled `TARGET_BOOT_INTERRUPTED` (error code
   `OTA_TARGET_BOOT_INTERRUPTED`) when the new image never reported

@@ -49,6 +49,10 @@ bool ug_direct_predecessor_matches(const char *version, const uint8_t digest[32]
      * fleet upgrades in place. */
     static const char platform_278[] =
         "b8d0ca7e20d28d4114cff56fc69676e681a37bf9f7e831a243a65f9a1a972a3e";
+    /* 2.8.0: the secure-pull image (HIL_ONLY 30 Oct 2026), so its devices
+     * upgrade in place. */
+    static const char platform_280[] =
+        "21ac81b292b463cf7fa1bf0d6ce364a49493951836ad962a19dcae049f40ed76";
     const char *expected = !strcmp(version, "2.4.12") ? baseline_2412 :
         !strcmp(version, "2.5.2") ? baseline_252 :
         !strcmp(version, "2.6.6") ? hil_266 :
@@ -66,7 +70,8 @@ bool ug_direct_predecessor_matches(const char *version, const uint8_t digest[32]
         !strcmp(version, "2.7.5") ? platform_275 :
         !strcmp(version, "2.7.6") ? platform_276 :
         !strcmp(version, "2.7.7") ? platform_277 :
-        !strcmp(version, "2.7.8") ? platform_278 : NULL;
+        !strcmp(version, "2.7.8") ? platform_278 :
+        !strcmp(version, "2.8.0") ? platform_280 : NULL;
     if (!expected) return false;
     static const char hex[] = "0123456789abcdef";
     for (unsigned i = 0; i < 32; ++i) {
@@ -76,6 +81,51 @@ bool ug_direct_predecessor_matches(const char *version, const uint8_t digest[32]
             return false;
     }
     return true;
+}
+
+ug_slot_verdict_t ug_direct_slot_verdict(ug_ota_state_t running, ug_ota_state_t other, bool qualified)
+{
+    if (qualified) return UG_SLOT_PREDECESSOR;
+    /* An unconfirmed image can still roll back to the other slot. */
+    if (running != UG_OTA_VALID) return UG_SLOT_UNQUALIFIED;
+    /* Entries ESP-IDF 5.5.3's bootloader never selects: it aborts every
+     * PENDING_VERIFY entry before selection and skips INVALID and ABORTED;
+     * esp_ota_begin erases the inactive entry before the first write. */
+    switch (other) {
+    case UG_OTA_NO_ENTRY: return UG_SLOT_NONE_NO_ENTRY;
+    case UG_OTA_INVALID: return UG_SLOT_NONE_INVALID;
+    case UG_OTA_ABORTED: return UG_SLOT_NONE_ABORTED;
+    case UG_OTA_PENDING_VERIFY: return UG_SLOT_NONE_PENDING_VERIFY;
+    default: return UG_SLOT_UNQUALIFIED; /* NEW, VALID, UNDEFINED, unknown: selectable */
+    }
+}
+
+const char *ug_slot_verdict_name(ug_slot_verdict_t verdict)
+{
+    switch (verdict) {
+    case UG_SLOT_PREDECESSOR: return "PREDECESSOR";
+    case UG_SLOT_NONE_NO_ENTRY: return "NONE_NO_ENTRY";
+    case UG_SLOT_NONE_INVALID: return "NONE_INVALID";
+    case UG_SLOT_NONE_ABORTED: return "NONE_ABORTED";
+    case UG_SLOT_NONE_PENDING_VERIFY: return "NONE_PENDING_VERIFY";
+    case UG_SLOT_UNQUALIFIED: break;
+    }
+    return "UNQUALIFIED";
+}
+
+const char *ug_ota_state_name(ug_ota_state_t state)
+{
+    switch (state) {
+    case UG_OTA_NO_ENTRY: return "NO_ENTRY";
+    case UG_OTA_NEW: return "NEW";
+    case UG_OTA_PENDING_VERIFY: return "PENDING_VERIFY";
+    case UG_OTA_VALID: return "VALID";
+    case UG_OTA_INVALID: return "INVALID";
+    case UG_OTA_ABORTED: return "ABORTED";
+    case UG_OTA_UNDEFINED: return "UNDEFINED";
+    case UG_OTA_UNKNOWN: break;
+    }
+    return "UNKNOWN";
 }
 
 bool ug_capability_valid(const ug_capability_t *c)
