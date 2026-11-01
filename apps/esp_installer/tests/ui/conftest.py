@@ -7,11 +7,20 @@ Run in esp-installer-dev:local (QT_QPA_PLATFORM=offscreen), from apps/esp_instal
 from __future__ import annotations
 
 import os
+import sys
 from typing import Callable, List
 
 import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+if sys.platform == "win32" and os.environ["QT_QPA_PLATFORM"] == "offscreen":
+    # On Windows the offscreen platform reads fonts only from QT_QPA_FONTDIR, by
+    # default a "fonts" folder PySide6 does not ship. Without it every letter is
+    # an empty box and text is far wider than in the real app, which uses the
+    # Windows fonts directly.
+    os.environ.setdefault(
+        "QT_QPA_FONTDIR", os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts")
+    )
 
 from PySide6.QtCore import QEvent  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402

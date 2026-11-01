@@ -170,8 +170,8 @@ def _install_config(services: Services, args: argparse.Namespace) -> InstallConf
     zone_id = args.zone_id.strip().upper()
     return InstallConfig(family=family, zone_id=zone_id, zone_name=args.zone_name or zone_id,
                          device_id=args.device_id, wifi_ssid=wifi_ssid,
-                         wifi_password=wifi_password, bundle_id=args.bundle_id or "", zkt=zkt,
-                         hik=hik)
+                         wifi_password=wifi_password,
+                         bundle_id=args.bundle_id or "", zkt=zkt, hik=hik)
 
 
 def cmd_install(services: Services, args: argparse.Namespace) -> int:

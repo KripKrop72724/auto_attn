@@ -105,7 +105,9 @@ def to_config(values: FormValues, bundle_id: str, hik_source_epoch: str = "") ->
         )
     else:
         zkt = api.ZktSettings(
-            port=values.zkt_port, comm_key=values.zkt_comm_key, preferred_ip=values.zkt_preferred_ip
+            port=values.zkt_port,
+            comm_key=values.zkt_comm_key,
+            preferred_ip=values.zkt_preferred_ip,
         )
     return api.InstallConfig(
         family=values.family,

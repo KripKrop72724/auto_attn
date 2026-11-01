@@ -115,7 +115,7 @@ def test_log_file_is_redacted(tmp_path):
     logger = logging.getLogger("sl_installer.test")
     logger.info("sign-in with password=%s", "test-admin-pass")
     try:
-        raise RuntimeError("token=abc123def456")
+        raise RuntimeError("token=abc123def456")  # gitleaks:allow -- fake token for this test
     except RuntimeError:
         logger.exception("failed")
     for handler in logging.getLogger("sl_installer").handlers:

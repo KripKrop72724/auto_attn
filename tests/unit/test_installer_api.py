@@ -227,7 +227,7 @@ class Harness:
     store: Path
     signing_key: object
     provisioner: FakeProvisioner
-    app_key: X25519PrivateKey
+    app_key: X25519PrivateKey  # gitleaks:allow -- type annotation, not key material
     csrf: str = ""
     monkeypatch: object = None
     extra: dict = field(default_factory=dict)
