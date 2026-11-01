@@ -299,10 +299,10 @@ def test_public_websocket_close_keeps_the_cancel_scope_s_own_cancellation(monkey
             scopes.append(scope)
             await web.public_device_status_socket(socket, None)
             await anyio.sleep_forever()
-        return socket.sent, scope.cancelled_caught
+        # Checked inside the loop: its shutdown would close a leaked generator.
+        return socket.sent, scope.cancelled_caught, set(hub._subscribers)
 
-    assert asyncio.run(run()) == (["{}"], True)
-    assert hub._subscribers == set()
+    assert asyncio.run(run()) == (["{}"], True, set())
 
 
 def test_hub_pushes_changes_and_heartbeats(monkeypatch):
