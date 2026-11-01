@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 from contextlib import contextmanager
 from datetime import timedelta
 from types import SimpleNamespace
@@ -256,6 +257,7 @@ def test_public_websocket_sends_the_snapshot(db, monkeypatch):
         assert public_status.hub._subscribers == set()
 
 
+@pytest.mark.skipif(sys.version_info < (3, 12), reason="the race needs Python 3.12's task cancellation")
 def test_public_websocket_close_keeps_the_cancel_scope_s_own_cancellation(monkeypatch):
     """Starlette's TestClient cancels the app's anyio cancel scope as it closes a
     socket. Arriving after the handler cancels its pending update but before
@@ -269,8 +271,9 @@ def test_public_websocket_close_keeps_the_cancel_scope_s_own_cancellation(monkey
 
     class Update(asyncio.Task):
         def cancel(self, msg=None):
-            # Queue the scope's cancel ahead of this task's own wake-up.
-            asyncio.get_running_loop().call_soon(scopes[0].cancel)
+            if not scopes[0].cancel_called:
+                # Queue the scope's cancel ahead of this task's own wake-up.
+                asyncio.get_running_loop().call_soon(scopes[0].cancel)
             return super().cancel(msg)
 
     patched = SimpleNamespace(**vars(asyncio))
@@ -298,7 +301,8 @@ def test_public_websocket_close_keeps_the_cancel_scope_s_own_cancellation(monkey
         with anyio.fail_after(5), anyio.CancelScope() as scope:  # fail, never hang
             scopes.append(scope)
             await web.public_device_status_socket(socket, None)
-            await anyio.sleep_forever()
+            raise AssertionError("the handler returned instead of raising the scope's cancel, "
+                                 "or no longer starts its update with asyncio.ensure_future")
         # Checked inside the loop: its shutdown would close a leaked generator.
         return socket.sent, scope.cancelled_caught, set(hub._subscribers)
 
