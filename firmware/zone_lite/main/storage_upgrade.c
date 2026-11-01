@@ -36,7 +36,7 @@ const char *storage_upgrade_contract(void)
     /* One-shot custody transfer that always returns to the exact signed 2.5.2. */
     return "ZONE_STORAGE_CONTRACT_V2:RECOVERY:READ=2:LANES=3F:BASE=2.5.2";
 #elif ZONE_LITE_DIRECT_LEGACY_UPGRADE
-    return "ZONE_STORAGE_CONTRACT_V2:LEGACY:READ=2:LANES=3F:BASE=2.4.12,2.5.2,2.6.6,2.6.7,2.6.8,2.6.9,2.6.10,2.6.12,2.6.13,2.6.14,2.6.15,2.7.2,2.7.3,2.7.4,2.7.5,2.7.6,2.7.7,2.7.8";
+    return "ZONE_STORAGE_CONTRACT_V2:LEGACY:READ=2:LANES=3F:BASE=2.4.12,2.5.2,2.6.6,2.6.7,2.6.8,2.6.9,2.6.10,2.6.12,2.6.13,2.6.14,2.6.15,2.7.2,2.7.3,2.7.4,2.7.5,2.7.6,2.7.7,2.7.8,2.8.0";
 #elif ZONE_LITE_SEGMENTED_WRITES
     return "ZONE_STORAGE_CONTRACT_V1:SEGMENTED:READ=2:LANES=3F:COMPAT=2.5.4";
 #else
@@ -45,11 +45,36 @@ const char *storage_upgrade_contract(void)
 }
 static bool ready, segmented;
 static const char *error_code = "STORAGE_UPGRADE_NOT_CHECKED";
+static const char *slot_verdict = "";
+static const char *slot_other = "";
 static bool failed(const char *code) { error_code = code; ready = segmented = false; return false; }
+
+const char *storage_upgrade_rollback_slot(void) { return slot_verdict; }
+const char *storage_upgrade_rollback_slot_state(void) { return slot_other; }
+
+#if ZONE_LITE_DIRECT_LEGACY_UPGRADE
+static ug_ota_state_t slot_state(const esp_partition_t *partition)
+{
+    esp_ota_img_states_t state;
+    esp_err_t result = esp_ota_get_state_partition(partition, &state);
+    if (result == ESP_ERR_NOT_FOUND) return UG_OTA_NO_ENTRY;
+    if (result != ESP_OK) return UG_OTA_UNKNOWN;
+    switch (state) {
+    case ESP_OTA_IMG_NEW: return UG_OTA_NEW;
+    case ESP_OTA_IMG_PENDING_VERIFY: return UG_OTA_PENDING_VERIFY;
+    case ESP_OTA_IMG_VALID: return UG_OTA_VALID;
+    case ESP_OTA_IMG_INVALID: return UG_OTA_INVALID;
+    case ESP_OTA_IMG_ABORTED: return UG_OTA_ABORTED;
+    case ESP_OTA_IMG_UNDEFINED: return UG_OTA_UNDEFINED;
+    default: return UG_OTA_UNKNOWN;
+    }
+}
+#endif
 
 bool storage_upgrade_init(void)
 {
     ready = segmented = false;
+    slot_verdict = slot_other = "";
     const esp_app_desc_t *running = esp_app_get_description();
 #if defined(ZONE_LITE_HIKVISION) && ZONE_LITE_HIKVISION
     /* Hikvision starts with its own source lane; it never upgrades ZKT's
@@ -87,11 +112,18 @@ bool storage_upgrade_init(void)
         bool ota_slots = current && previous && current->address != previous->address &&
             (current->subtype == ESP_PARTITION_SUBTYPE_APP_OTA_0 || current->subtype == ESP_PARTITION_SUBTYPE_APP_OTA_1) &&
             (previous->subtype == ESP_PARTITION_SUBTYPE_APP_OTA_0 || previous->subtype == ESP_PARTITION_SUBTYPE_APP_OTA_1);
-        if (!ota_slots || esp_ota_get_partition_description(previous, &description) != ESP_OK ||
-            strcmp(description.project_name, "zone_lite") ||
-            esp_partition_get_sha256(previous, digest) != ESP_OK ||
-            !ug_direct_predecessor_matches(description.version, digest))
-            return failed("STORAGE_DIRECT_ROLLBACK_IMAGE_UNQUALIFIED");
+        if (!ota_slots) return failed("STORAGE_DIRECT_ROLLBACK_IMAGE_UNQUALIFIED");
+        bool qualified = esp_ota_get_partition_description(previous, &description) == ESP_OK &&
+            !strcmp(description.project_name, "zone_lite") &&
+            esp_partition_get_sha256(previous, digest) == ESP_OK &&
+            ug_direct_predecessor_matches(description.version, digest);
+        /* 2.8.1: also ready when this image is VALID and the other slot can
+         * never be booted (after a rollback or an interrupted download). */
+        ug_ota_state_t other = slot_state(previous);
+        ug_slot_verdict_t verdict = ug_direct_slot_verdict(slot_state(current), other, qualified);
+        slot_verdict = ug_slot_verdict_name(verdict);
+        slot_other = ug_ota_state_name(other);
+        if (verdict == UG_SLOT_UNQUALIFIED) return failed("STORAGE_DIRECT_ROLLBACK_IMAGE_UNQUALIFIED");
         ready = true; error_code = ""; return true;
     }
 #endif

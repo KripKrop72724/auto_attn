@@ -64,7 +64,7 @@ from zk_add.security import ADMIN_COOKIE, create_admin_session, hash_admin_passw
 from zk_add import service
 from zk_add.service import apply_ota_heartbeat_diagnostics, record_device_reported_return, update_heartbeat
 from zk_add.settings import settings
-from zk_add.storage_contract import FLEET_BASELINE_IMAGES, platform_baselines
+from zk_add.storage_contract import EXCEPTION_MARKER, FLEET_BASELINE_IMAGES, SECURE_PULL_MARKER, platform_baselines
 from zk_add.time_utils import ensure_utc, parse_datetime, utc_now
 from zk_add.web import _require_ota_connector, app, get_db
 from zk_add.zkt270_scope import TARGETS
@@ -160,7 +160,8 @@ def release(db, version="2.7.5") -> FirmwareRelease:
     signed = platform_manifest(version)
     row = FirmwareRelease(
         release_id=signed["release_id"], version=version, git_sha="a" * 40,
-        image_sha256=("b" if version == "2.7.5" else "d") * 64, image_size=IMAGE_SIZE,
+        image_sha256="b" * 64 if version == "2.7.5" else hashlib.sha256(version.encode()).hexdigest(),
+        image_size=IMAGE_SIZE,
         signing_key_id="production-key", partition_layout=ota.OTA_LAYOUT, minimum_bootstrap_version="2.4.12",
         storage_name=f"hil/{version}.bin", manifest_signature="sig", state="HIL_ONLY",
         manifest={**signed, "_publication_mode": "HIL_ONLY", "_hil_target_mac": None,
@@ -514,7 +515,7 @@ def test_other_returns_keep_previous_firmware_observed(db, lifetime, last_code, 
     assert run.status == "PAUSED"
 
 
-@pytest.mark.parametrize("version", ["2.6.17", "2.6.24", "2.7.0", "2.7.6", "2.7.7", "2.7.8", "2.8.0"])
+@pytest.mark.parametrize("version", ["2.6.17", "2.6.24", "2.7.0", "2.7.6", "2.7.7", "2.7.8", "2.8.0", "2.8.1"])
 def test_releases_with_their_own_return_evidence_are_never_classified(version):
     deployment = SimpleNamespace(status="BOOTED_PENDING", previous_version="2.6.15")
     evidence = {"target_boot": {"last_progress_code": None, "failure_reports": [],
@@ -710,7 +711,8 @@ def residue_storage(**fields):
 
 def residue_record(db, device, *, written=360_448, accepted="2.6.15", target="2.7.5"):
     base = release(db, target)
-    accepted_release = db.scalar(select(FirmwareRelease).where(FirmwareRelease.version == accepted))
+    accepted_release = (db.scalar(select(FirmwareRelease).where(FirmwareRelease.version == accepted))
+                        or release(db, accepted))
     now = utc_now()
     campaign(db, accepted_release, device, status="COMPLETED", deployment_status="SUCCEEDED",
              bytes_written=1024, previous="2.5.2", created_at=now - timedelta(days=9),
@@ -720,14 +722,15 @@ def residue_record(db, device, *, written=360_448, accepted="2.6.15", target="2.
     db.commit()
 
 
-def residue_heartbeat(db, device, sequence, *, storage=None, firmware="2.6.15", image=FLEET_2615):
+def residue_heartbeat(db, device, sequence, *, storage=None, firmware="2.6.15", image=FLEET_2615, uptime=600):
+    uptime += sequence * 15
     update_heartbeat(db, connector=device, boot_id="boot-res", sequence=sequence, payload=HeartbeatPayload(
-        firmware_version=f"zone-lite-{firmware}", uptime_seconds=600 + sequence * 15, led_state="LOCAL_FAILURE",
+        firmware_version=f"zone-lite-{firmware}", uptime_seconds=uptime, led_state="LOCAL_FAILURE",
         zkt={"online": True, "connection_state": "ONLINE", "serial": MULTAN_02.identity.terminal_serial},
         ota={"running_version": firmware, "running_partition": "ota_1", "image_sha256": image},
         diagnostics={"storage": storage or residue_storage(), "workers": [
-            {"name": "add_delivery", "state": "RUNNING", "last_activity_uptime_ms": (600 + sequence * 15) * 1000},
-            {"name": "ords_delivery", "state": "RUNNING", "last_activity_uptime_ms": (600 + sequence * 15) * 1000}]}))
+            {"name": "add_delivery", "state": "RUNNING", "last_activity_uptime_ms": uptime * 1000},
+            {"name": "ords_delivery", "state": "RUNNING", "last_activity_uptime_ms": uptime * 1000}]}))
     db.flush()
 
 
@@ -758,9 +761,9 @@ def test_rollback_slot_residue_is_labelled_but_stays_degraded(db):
     assert evaluate_health(db, device).derived_lifecycle == "DEGRADED"
 
 
-@pytest.mark.parametrize("target", ["2.7.8", "2.8.0"])
+@pytest.mark.parametrize("target", ["2.7.8", "2.8.0", "2.8.1"])
 def test_rollback_slot_residue_counts_every_later_platform_download(db, target):
-    """2.6.15 refuses 2.8.0 in its other slot as it refuses every 2.7.x."""
+    """2.6.15 refuses 2.8.0 and 2.8.1 in its other slot as it refuses every 2.7.x."""
     device = esp(db, MULTAN_02, "ZONE-MULTAN-02")
     residue_record(db, device, target=target)
     residue_heartbeat(db, device, 1)
@@ -811,6 +814,187 @@ def test_rollback_slot_residue_needs_adds_record(db, record):
     residue_heartbeat(db, device, 1)
     assert "latch" not in alert(db, device, "ESP_DURABILITY_FAULT").details
     assert evaluate_health(db, device).derived_lifecycle == "DEGRADED"
+
+
+# 2.7.8 (533ac55) and 2.8.0 (b390bfa) refuse an unlisted other slot as 2.6.15
+# does, at the LOCAL_FAILURE latch after storage_upgrade_init. A stopped
+# download of a later image, or a rollback from one, leaves the confirmed
+# image unable to verify storage; it reports durability UNKNOWN, so only
+# ESP_LOCAL_FAILURE carries the label, which names 2.8.1 as the remedy.
+STUCK_IMAGES = {"2.7.8": ("b8d0ca7e20d28d4114cff56fc69676e681a37bf9f7e831a243a65f9a1a972a3e", "zone_lite.c:3573"),
+                "2.8.0": ("21ac81b292b463cf7fa1bf0d6ce364a49493951836ad962a19dcae049f40ed76", "zone_lite.c:3875")}
+
+
+def stuck_storage(firmware, **fields):
+    """A 2.7.8 or 2.8.0 boot whose other slot holds no listed predecessor, with no I/O fault."""
+    source = STUCK_IMAGES[firmware][1]
+    return residue_storage(**{
+        "durability": "UNKNOWN", "local_failure_source": source, "local_failure_last_source": source,
+        "local_failures": 1, "local_failure_recoveries": 0, "persistence_probe_total_failures": 0,
+        "upgrade_contract": SECURE_PULL_MARKER if firmware == "2.8.0" else EXCEPTION_MARKER, **fields})
+
+
+def stuck_esp(db, firmware, target):
+    """MULTAN-02 on its exact 2.7.8 or 2.8.0 install after ADD's download of target wrote the other slot."""
+    device = esp(db, MULTAN_02, "ZONE-MULTAN-02", firmware=firmware)
+    device.ota_image_sha256 = STUCK_IMAGES[firmware][0]
+    residue_record(db, device, accepted=firmware, target=target)
+    return device
+
+
+def stuck_heartbeat(db, device, sequence, firmware, *, uptime=600, image=None, **fields):
+    residue_heartbeat(db, device, sequence, storage=stuck_storage(firmware, **fields), firmware=firmware,
+                      image=image or STUCK_IMAGES[firmware][0], uptime=uptime)
+
+
+def test_residue_images_are_the_exact_published_predecessors():
+    from zk_add.device_health import RESIDUE_IMAGES
+    assert {version: image.application_sha256 for version, image in RESIDUE_IMAGES.items()} == {
+        version: platform_baselines("2.8.1")[1][version] for version in ("2.6.15", "2.7.8", "2.8.0")}
+    assert {version: (image.source, image.durability, image.remedy_version)
+            for version, image in RESIDUE_IMAGES.items()} == {
+        "2.6.15": ("zone_lite.c:3196", "DEGRADED", None), "2.7.8": ("zone_lite.c:3573", "UNKNOWN", "2.8.1"),
+        "2.8.0": ("zone_lite.c:3875", "UNKNOWN", "2.8.1")}
+
+
+@pytest.mark.parametrize("firmware,target", [("2.7.8", "2.8.0"), ("2.7.8", "2.8.1"), ("2.8.0", "2.8.1")])
+def test_rollback_slot_residue_labels_a_stuck_2_7_8_or_2_8_0_and_names_2_8_1(db, firmware, target):
+    device = stuck_esp(db, firmware, target)
+    stuck_heartbeat(db, device, 1, firmware)
+    # Durability UNKNOWN is not a fault, so the LED row alone carries the label.
+    assert alert(db, device, "ESP_DURABILITY_FAULT") is None
+    latch = alert(db, device, "ESP_LOCAL_FAILURE").details["latch"]
+    assert (latch["kind"], latch["source"], latch["firmware_version"], latch["remedy_version"]) == (
+        "OTA_ROLLBACK_SLOT_RESIDUE", STUCK_IMAGES[firmware][1], firmware, "2.8.1")
+    assert latch["residue"]["target_version"] == target and latch["residue"]["bytes_written"] == 360_448
+    health = evaluate_health(db, device)
+    assert (health.derived_lifecycle, health.last_error_code) == ("DEGRADED", "OTA_ROLLBACK_SLOT_RESIDUE")
+    reason = next(item for item in health.reasons if item.code == "ESP_LOCAL_FAILURE")
+    assert reason.tier == "DEGRADED" and reason.error_code == "OTA_ROLLBACK_SLOT_RESIDUE"
+    assert reason.evidence_summary.startswith(
+        f"Persistence unverified - OTA rollback slot residue: {STUCK_IMAGES[firmware][1]} on {firmware} after "
+        f"{target} wrote 360448 bytes to the other slot; offer 2.8.1. No storage I/O counters")
+    # A sample without diagnostics keeps this boot's label and its history.
+    update_heartbeat(db, connector=device, boot_id="boot-res", sequence=2, payload=HeartbeatPayload(
+        firmware_version=f"zone-lite-{firmware}", uptime_seconds=640, led_state="LOCAL_FAILURE",
+        zkt={"online": True, "connection_state": "ONLINE", "serial": MULTAN_02.identity.terminal_serial},
+        ota={"running_version": firmware, "running_partition": "ota_1", "image_sha256": STUCK_IMAGES[firmware][0]}))
+    db.flush()
+    led = alert(db, device, "ESP_LOCAL_FAILURE")
+    assert led.details["latch"]["kind"] == "OTA_ROLLBACK_SLOT_RESIDUE"
+    assert led.details["residue_history"]["boot_id"] == "boot-res" and led.details["residue_history"]["clean"]
+    # Any later storage I/O failure on the same boot removes it.
+    stuck_heartbeat(db, device, 3, firmware, durability="DEGRADED", write_failures=1, error_code=5,
+                    error_operation="local_write_commit")
+    assert "latch" not in alert(db, device, "ESP_LOCAL_FAILURE").details
+    assert "latch" not in alert(db, device, "ESP_DURABILITY_FAULT").details
+    health = evaluate_health(db, device)
+    assert (health.derived_lifecycle, health.last_error_code) == ("DEGRADED", "ESP_DURABILITY_FAULT")
+
+
+@pytest.mark.parametrize("firmware", ["2.7.8", "2.8.0"])
+@pytest.mark.parametrize("change", [
+    {"durability": "DEGRADED"},
+    {"durability": "DEGRADED", "error_code": 5, "error_operation": "local_write_commit"},
+    {"read_failures": 1},
+    {"persistence_probe_error": 28},
+    {"legacy_read_faults": 1},
+    {"recovery_complete": False},
+    {"upgrade_ready": True, "upgrade_error": ""},
+    {"local_failure_source": "zone_lite.c:3196", "local_failure_last_source": "zone_lite.c:3196"},
+    {"local_failure_last_source": "zone_lite.c:3891"},
+    {"fault_class": "CORRUPTION"},
+    {"image": "f" * 64},
+])
+def test_rollback_slot_residue_gates_keep_a_stuck_image_generic(db, firmware, change):
+    device = stuck_esp(db, firmware, "2.8.1")
+    fields = dict(change)
+    stuck_heartbeat(db, device, 1, firmware, image=fields.pop("image", None), **fields)
+    assert "latch" not in alert(db, device, "ESP_LOCAL_FAILURE").details
+    health = evaluate_health(db, device)
+    assert health.derived_lifecycle == "DEGRADED" and health.last_error_code != "OTA_ROLLBACK_SLOT_RESIDUE"
+
+
+@pytest.mark.parametrize("firmware,source", [("2.7.8", "zone_lite.c:3875"), ("2.8.0", "zone_lite.c:3573"),
+                                             ("2.8.1", "zone_lite.c:3573"), ("2.8.1", "zone_lite.c:3875")])
+def test_rollback_slot_residue_needs_the_running_images_own_latch(db, firmware, source):
+    """The other image's latch line is not this image's storage_upgrade_init, and
+    2.8.1 itself starts storage when its confirmed image's other slot cannot boot."""
+    device = stuck_esp(db, "2.8.0" if firmware == "2.8.1" else firmware, "2.8.1")
+    image = STUCK_IMAGES.get(firmware, ("e" * 64,))[0]
+    residue_heartbeat(db, device, 1, firmware=firmware, image=image, storage=residue_storage(
+        durability="UNKNOWN", local_failure_source=source, local_failure_last_source=source))
+    assert "latch" not in alert(db, device, "ESP_LOCAL_FAILURE").details
+
+
+@pytest.mark.parametrize("record", ["accepted_other_image", "listed_target", "no_bytes"])
+def test_rollback_slot_residue_of_a_stuck_image_needs_adds_record(db, record):
+    """ADD's latest successful install must be the running image, and the later
+    download one of an image it does not list (2.8.0 lists 2.7.8)."""
+    device = esp(db, MULTAN_02, "ZONE-MULTAN-02", firmware="2.8.0")
+    device.ota_image_sha256 = STUCK_IMAGES["2.8.0"][0]
+    if record == "accepted_other_image":
+        residue_record(db, device, accepted="2.7.8", target="2.8.1")
+    elif record == "listed_target":
+        residue_record(db, device, accepted="2.8.0", target="2.7.8")
+    else:
+        residue_record(db, device, accepted="2.8.0", target="2.8.1", written=0)
+    stuck_heartbeat(db, device, 1, "2.8.0")
+    assert "latch" not in alert(db, device, "ESP_LOCAL_FAILURE").details
+    assert evaluate_health(db, device).last_error_code == "ESP_LOCAL_FAILURE"
+
+
+def test_stuck_image_residue_history_is_read_once_per_boot_from_its_led_row(db, monkeypatch):
+    device = stuck_esp(db, "2.7.8", "2.8.0")
+    earlier_boot(db, device, days=6, storage=stuck_storage("2.7.8", read_failures=2, error_code=5,
+                                                           error_operation="local_read"))
+    calls = []
+    original = service.rollback_slot_residue_history
+
+    def counted(*args, **kwargs):
+        calls.append(1)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(service, "rollback_slot_residue_history", counted)
+    stuck_heartbeat(db, device, 1, "2.7.8")
+    stuck_heartbeat(db, device, 2, "2.7.8")
+    assert len(calls) == 1
+    # The earlier boot's read faults keep the generic LED fault.
+    led = alert(db, device, "ESP_LOCAL_FAILURE")
+    assert "latch" not in led.details
+    assert led.details["residue_history"]["clean"] is False
+    assert led.details["residue_history"]["faults"][0]["boot_id"] == "earlier-6"
+    assert evaluate_health(db, device).last_error_code == "ESP_LOCAL_FAILURE"
+
+
+@pytest.mark.parametrize("firmware,target,predecessor_state", [("2.7.8", "2.8.0", "AVAILABLE"),
+                                                                ("2.8.0", "2.8.1", "HIL_ONLY")])
+def test_2_8_1_is_offered_to_a_stuck_2_7_8_or_2_8_0(db, firmware, target, predecessor_state):
+    """The remedy the label names: a heartbeat with upgrade_ready false and
+    STORAGE_DIRECT_ROLLBACK_IMAGE_UNQUALIFIED does not hold the HIL_ONLY 2.8.1,
+    which ADD offers through the exact predecessor check."""
+    db.add(FirmwareRelease(
+        release_id=f"zone-lite-{firmware}", version=firmware, git_sha="4" * 40,
+        image_sha256=hashlib.sha256(f"published-{firmware}".encode()).hexdigest(), image_size=IMAGE_SIZE,
+        signing_key_id="production-key", partition_layout=ota.OTA_LAYOUT, minimum_bootstrap_version="2.4.12",
+        storage_name=f"published/{firmware}.bin", manifest_signature="sig", state=predecessor_state,
+        manifest={"application_sha256": STUCK_IMAGES[firmware][0]}))
+    db.flush()
+    device = stuck_esp(db, firmware, target)
+    stuck_heartbeat(db, device, 1, firmware, uptime=3600)
+    storage = device.firmware_diagnostics["storage"]
+    assert (storage["upgrade_ready"], storage["upgrade_error"]) == (False, "STORAGE_DIRECT_ROLLBACK_IMAGE_UNQUALIFIED")
+    assert evaluate_health(db, device).last_error_code == "OTA_ROLLBACK_SLOT_RESIDUE"
+    rel = db.scalar(select(FirmwareRelease).where(FirmwareRelease.version == "2.8.1")) or release(db, "2.8.1")
+    assert rel.state == "HIL_ONLY"
+    scope = preview_campaign_scope(db, release_public_id=rel.release_id, zone_id=device.zone_id)
+    assert [row["connector_id"] for row in scope["eligible"]] == [device.connector_id]
+    create_campaign(db, release_public_id=rel.release_id, zone_id=device.zone_id, actor="StateHealthAdmin",
+                    scope_token=scope["scope_token"], idempotency_key=f"stuck-{firmware}",
+                    override_stability_warnings=bool(scope["stability_warnings"]),
+                    stability_warnings_digest=scope["stability_warnings_digest"])
+    db.commit()
+    assert offer(db, device)["version"] == "2.8.1"
 
 
 # --- Review fixes: a held download is bounded and fails closed --------------------------------------

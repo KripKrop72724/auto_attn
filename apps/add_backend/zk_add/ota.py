@@ -686,15 +686,17 @@ def _storage_predecessor_exclusion(session: Session, release: FirmwareRelease, c
             release.version in FLEET_PLATFORM_VERSIONS and qualified_version in {
                 "2.6.6", "2.6.7", "2.6.8", "2.6.9", "2.6.10", "2.6.12", "2.6.13", "2.6.14", "2.6.15"}) or (
             # Neither were 2.7.2 to 2.7.7, the HIL-only 2.7 platform images.
-            release.version in {"2.7.3", "2.7.4", "2.7.5", "2.7.6", "2.7.7", "2.7.8", "2.8.0"} and qualified_version == "2.7.2") or (
-            release.version in {"2.7.4", "2.7.5", "2.7.6", "2.7.7", "2.7.8", "2.8.0"} and qualified_version == "2.7.3") or (
-            release.version in {"2.7.5", "2.7.6", "2.7.7", "2.7.8", "2.8.0"} and qualified_version == "2.7.4") or (
-            release.version in {"2.7.6", "2.7.7", "2.7.8", "2.8.0"} and qualified_version == "2.7.5") or (
-            release.version in {"2.7.7", "2.7.8", "2.8.0"} and qualified_version == "2.7.6") or (
-            release.version in {"2.7.8", "2.8.0"} and qualified_version == "2.7.7") or (
+            release.version in {"2.7.3", "2.7.4", "2.7.5", "2.7.6", "2.7.7", "2.7.8", "2.8.0", "2.8.1"} and qualified_version == "2.7.2") or (
+            release.version in {"2.7.4", "2.7.5", "2.7.6", "2.7.7", "2.7.8", "2.8.0", "2.8.1"} and qualified_version == "2.7.3") or (
+            release.version in {"2.7.5", "2.7.6", "2.7.7", "2.7.8", "2.8.0", "2.8.1"} and qualified_version == "2.7.4") or (
+            release.version in {"2.7.6", "2.7.7", "2.7.8", "2.8.0", "2.8.1"} and qualified_version == "2.7.5") or (
+            release.version in {"2.7.7", "2.7.8", "2.8.0", "2.8.1"} and qualified_version == "2.7.6") or (
+            release.version in {"2.7.8", "2.8.0", "2.8.1"} and qualified_version == "2.7.7") or (
             # 2.7.8 was promoted (AVAILABLE, 29 Oct 2026); like every earlier
-            # 2.7 predecessor, 2.8.0 takes it published in either state.
-            release.version == "2.8.0" and qualified_version == "2.7.8")
+            # 2.7 predecessor, 2.8.0 and 2.8.1 take it published in either state.
+            release.version in {"2.8.0", "2.8.1"} and qualified_version == "2.7.8") or (
+            # 2.8.0 is HIL_ONLY (30 Oct 2026) and may never be promoted.
+            release.version == "2.8.1" and qualified_version == "2.8.0")
         allowed_state = {"AVAILABLE", "HIL_ONLY"} if hil_retry else {"AVAILABLE"}
         predecessor = session.scalar(select(FirmwareRelease).where(
             FirmwareRelease.release_id == f"zone-lite-{qualified_version}",

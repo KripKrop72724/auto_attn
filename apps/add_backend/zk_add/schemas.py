@@ -514,10 +514,15 @@ class StorageDiagnostics(BaseModel):
     local_failure_last_source: str | None = Field(default=None, max_length=80)
     local_failures: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
     local_failure_recoveries: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
-    # 2.8.0's compiled predecessor marker is 166 characters (2.7.8's was 160).
+    # 2.8.1's compiled predecessor marker is 172 characters (2.8.0's 166, 2.7.8's 160).
     upgrade_contract: str | None = Field(default=None, max_length=256)
     upgrade_error: str | None = Field(default=None, max_length=80)
     upgrade_ready: bool | None = None
+    # ZKT 2.8.1 and later, direct role: how the boot judged the other OTA slot
+    # (PREDECESSOR, NONE_NO_ENTRY, NONE_INVALID, NONE_ABORTED,
+    # NONE_PENDING_VERIFY or UNQUALIFIED) and that slot's otadata state.
+    rollback_slot: str | None = Field(default=None, max_length=32)
+    rollback_slot_state: str | None = Field(default=None, max_length=32)
     total_bytes: int | None = Field(default=None, ge=0)
     used_bytes: int | None = Field(default=None, ge=0)
     admission_reserve_bytes: int | None = Field(default=None, ge=0)

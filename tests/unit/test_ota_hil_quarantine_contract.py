@@ -153,6 +153,8 @@ def test_fleet_promotion_requires_exact_healthy_field_evidence() -> None:
     ).read_text(encoding="utf-8")
     for required in (
         'git merge-base --is-ancestor "$sha" origin/main',
+        # Any 2.7.x, or exactly 2.8.0 or 2.8.1.
+        '[[ "$INPUT_VERSION" == \'2.8.0\' || "$INPUT_VERSION" == \'2.8.1\' ]] || '
         '[[ "$INPUT_VERSION" =~ ^2\\.7\\.[0-9]+$ ]]',
         'test "$INPUT_MINIMUM_FIELD_DEVICES" -ge 3',
         'test "$INPUT_MINIMUM_SOAK_HOURS" -ge 24',
@@ -184,6 +186,7 @@ def test_fleet_promotion_requires_exact_healthy_field_evidence() -> None:
         "$_.state -eq 'AVAILABLE'",
     ):
         assert required in workflow, required
+    assert "^2\\.8" not in workflow
     # Inputs reach the shell only through the environment, never as script text.
     provenance = workflow.split("verify-and-promote:", 1)[0]
     run_block = provenance.split("run: |", 1)[1]

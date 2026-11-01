@@ -23,7 +23,7 @@ on:
         type: string
         default: latest
       rollback_predecessor:
-        description: Older exact AVAILABLE ZKT version flashed to ota_1 - 2.7.x and 2.8.0 start storage only beside a qualified predecessor (2.5.2 is one; 2.7.8 also for 2.8.0); none only with production_release none
+        description: Older exact AVAILABLE ZKT version flashed to ota_1 - 2.7.x and 2.8.0 start storage only beside a qualified predecessor (2.5.2 is one; 2.7.8 also for 2.8.0 and 2.8.1; 2.8.0 also for 2.8.1); none only with production_release none
         type: string
         default: '2.5.2'
 

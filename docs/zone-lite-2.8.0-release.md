@@ -118,6 +118,9 @@ answers 6001, is offered 2.8.0 as soon as 2.8.0 is AVAILABLE.
 
 ## Rollout
 
+Superseded by [2.8.1](zone-lite-2.8.1-release.md): campaign 2.8.1 from 2.7.8
+directly, not 2.8.0 (see Rollback below).
+
 1. Merge; wait for the ADD deploy to finish (the wider heartbeat field must
    be live before any device runs 2.8.0).
 2. Dispatch the HIL candidate build for 2.8.0 at the merge commit with the 17
@@ -132,4 +135,7 @@ answers 6001, is offered 2.8.0 as soon as 2.8.0 is AVAILABLE.
    be bootstrapped with `production_release` 2.8.0. HIL_ONLY 2.8.0 reaches
    only the 17.
 
-Rollback: an unconfirmed 2.8.0 rolls back to 2.7.8 as every 2.7.x does.
+Rollback: an unconfirmed 2.8.0 rolls back to 2.7.8, but 2.7.8's storage
+gate does not list 2.8.0. With 2.8.0 left in its other slot, 2.7.8 then
+boots with `STORAGE_DIRECT_ROLLBACK_IMAGE_UNQUALIFIED` (orange LED, DEGRADED
+in ADD) until 2.8.1 installs ([2.8.1 release](zone-lite-2.8.1-release.md)).
