@@ -318,6 +318,33 @@ foreach ($earlierMarker in @($exceptionMarker, $reformatMarker, $repairMarker, $
     try { Get-FirmwareStorageContract -ImagePath $contractImage -Version '2.8.0' | Out-Null } catch { $rejected = $true }
     if (-not $rejected) { throw '2.8.0 accepted an earlier platform storage contract' }
 }
+# 2.8.1 (2.8.0 with the rollback-slot gate fix) also rolls back to 2.8.0, the
+# secure-pull HIL image, so its devices upgrade in place, and keeps 2.7.8; its
+# marker is 172 characters.
+$slotGateMarker = $securePullMarker + ',2.8.0'
+if ($slotGateMarker.Length -ne 172) { throw '2.8.1 marker length changed' }
+[IO.File]::WriteAllText($contractImage, $slotGateMarker + [char]0)
+$slotGateContract = Get-FirmwareStorageContract -ImagePath $contractImage -Version '2.8.1'
+if ($slotGateContract.allowed_bootstrap_versions.Count -ne 19 -or $slotGateContract.allowed_bootstrap_images.Count -ne 19 -or
+    ($slotGateContract.allowed_bootstrap_versions[0..17] -join ',') -cne ($securePullContract.allowed_bootstrap_versions -join ',') -or
+    $slotGateContract.allowed_bootstrap_versions[18] -ne '2.8.0' -or
+    $slotGateContract.allowed_bootstrap_images['2.8.0'] -ne '21ac81b292b463cf7fa1bf0d6ce364a49493951836ad962a19dcae049f40ed76' -or
+    $slotGateContract.allowed_bootstrap_images['2.7.8'] -ne 'b8d0ca7e20d28d4114cff56fc69676e681a37bf9f7e831a243a65f9a1a972a3e' -or
+    @($securePullContract.allowed_bootstrap_versions | Where-Object { $slotGateContract.allowed_bootstrap_images[$_] -cne $securePullContract.allowed_bootstrap_images[$_] }).Count -ne 0 -or
+    $securePullContract.allowed_bootstrap_images.Count -ne 18) {
+    throw '2.8.1 rollback targets changed'
+}
+foreach ($platformVersion in @('2.7.1', '2.7.2', '2.7.3', '2.7.4', '2.7.5', '2.7.6', '2.7.7', '2.7.8', '2.8.0')) {
+    $rejected = $false
+    try { Get-FirmwareStorageContract -ImagePath $contractImage -Version $platformVersion | Out-Null } catch { $rejected = $true }
+    if (-not $rejected) { throw "$platformVersion accepted the 2.8.1 storage contract" }
+}
+foreach ($earlierMarker in @($securePullMarker, $exceptionMarker, $reformatMarker, $repairMarker, $inventoryMarker, $traceMarker, $platformMarker, $fleetMarker)) {
+    [IO.File]::WriteAllText($contractImage, $earlierMarker + [char]0)
+    $rejected = $false
+    try { Get-FirmwareStorageContract -ImagePath $contractImage -Version '2.8.1' | Out-Null } catch { $rejected = $true }
+    if (-not $rejected) { throw '2.8.1 accepted an earlier platform storage contract' }
+}
 [IO.File]::WriteAllText($contractImage, $fleetMarker + [char]0)
 $rejected = $false
 try { Get-FirmwareStorageContract -ImagePath $contractImage -Version '2.7.3' | Out-Null } catch { $rejected = $true }
@@ -766,10 +793,11 @@ if (-not $rejected) { throw 'Partial 2.6.15 HIL scope accepted' }
 & $publish -SourceDirectory $source -StoreDirectory $store -Version 2.6.15 -PublicationMode HIL_ONLY -HilTargetsJson $exact2615
 $zkt2615Marker = Get-Content -LiteralPath (Join-Path $store '2.6.15/.hil-only.json') -Raw | ConvertFrom-Json
 if ($zkt2615Marker.targets.Count -ne 5 -or $zkt2615Marker.application_sha256 -cne ('e'*64)) { throw '2.6.15 HIL marker is incomplete' }
-# The 2.7 platform and 2.8.0 publish only HIL_ONLY, to an exact prefix of the
-# signed nationwide scope. 2.7.1 is published last, as before this loop existed.
+# The 2.7 platform, 2.8.0 and 2.8.1 publish only HIL_ONLY, to an exact prefix
+# of the signed nationwide scope. 2.7.1 is published last, as before this loop
+# existed.
 $nationwide = Get-Content -LiteralPath (Join-Path $repo 'deploy/add/hil-targets-zkt-270.json') -Raw
-foreach ($platformVersion in @('2.8.0', '2.7.8', '2.7.7', '2.7.6', '2.7.5', '2.7.4', '2.7.3', '2.7.2', '2.7.1')) {
+foreach ($platformVersion in @('2.8.1', '2.8.0', '2.7.8', '2.7.7', '2.7.6', '2.7.5', '2.7.4', '2.7.3', '2.7.2', '2.7.1')) {
     $platformImage = Join-Path $source "zone-lite-$platformVersion.bin"
     [IO.File]::WriteAllText($platformImage, "ZKT $platformVersion fixture, not deployable firmware")
     $manifest.version=$platformVersion

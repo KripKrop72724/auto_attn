@@ -127,6 +127,14 @@ try {
             RollbackPredecessorDirectory = (New-SyntheticRelease -Version $version)
         } "Rollback predecessor $([regex]::Escape($version)) must be older than production release 2\.8\.0"
     }
+    # 2.8.1 may keep 2.8.0 in ota_1.
+    $slotGate = New-SyntheticRelease -Version '2.8.1'
+    foreach ($version in @('2.8.1', '2.10.0')) {
+        Assert-Refused "Predecessor $version beside production 2.8.1" @{
+            ProductionReleaseDirectory = $slotGate
+            RollbackPredecessorDirectory = (New-SyntheticRelease -Version $version)
+        } "Rollback predecessor $([regex]::Escape($version)) must be older than production release 2\.8\.1"
+    }
     Assert-Refused 'Production release whose image differs from its manifest' @{
         ProductionReleaseDirectory = (New-SyntheticRelease -Version '2.7.8' -Tampered)
         RollbackPredecessorDirectory = $predecessor
@@ -147,7 +155,8 @@ try {
     # application then fails the later identity check, before key access.
     Set-StorageImage 0x800000
     foreach ($claim in @(@{ ProductionReleaseDirectory = $production; RollbackPredecessorDirectory = $predecessor },
-                         @{ ProductionReleaseDirectory = $securePull; RollbackPredecessorDirectory = $production })) {
+                         @{ ProductionReleaseDirectory = $securePull; RollbackPredecessorDirectory = $production },
+                         @{ ProductionReleaseDirectory = $slotGate; RollbackPredecessorDirectory = $securePull })) {
         $message = Invoke-Signer $claim
         if ($message -match 'rollback predecessor|Production release|storage|not AVAILABLE|signed manifest') {
             throw "A complete production claim was refused by its own validation: '$message'"
