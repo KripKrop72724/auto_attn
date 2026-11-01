@@ -98,8 +98,9 @@ begin
   DataRoot := ExpandConstant('{#DataDir}');
   if DirExists(DataRoot) then
   begin
-    Question := 'Do you also want to delete the install records and logs saved on this computer?' +
-      #13#10#13#10 + 'Choose No to keep them. Head office may ask for them later.';
+    // A line must not start with "#": the preprocessor would read it as a directive.
+    Question := 'Do you also want to delete the install records and logs saved on this computer?' + #13#10#13#10 +
+      'Choose No to keep them. Head office may ask for them later.';
     // Silent uninstalls (/SUPPRESSMSGBOXES) take the default answer: No.
     if SuppressibleMsgBox(Question, mbConfirmation, MB_YESNO or MB_DEFBUTTON2, IDNO) = IDYES then
       DelTree(DataRoot, True, True, True);
