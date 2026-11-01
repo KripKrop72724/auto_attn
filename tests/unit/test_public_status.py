@@ -2,15 +2,18 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 from contextlib import contextmanager
 from datetime import timedelta
 from types import SimpleNamespace
 
+import anyio
 import pytest
+from fastapi import WebSocketDisconnect
 from fastapi.testclient import TestClient
 
 from test_add_backend import connector_fixture, db as db  # noqa: F401
-from zk_add import public_status
+from zk_add import public_status, web
 from zk_add.models import PublicDeviceStatus
 from zk_add.public_status import (
     OFFLINE,
@@ -252,6 +255,58 @@ def test_public_websocket_sends_the_snapshot(db, monkeypatch):
             body = socket.receive_json()
         assert [device["name"] for device in body["devices"]] == ["Multan"]
         assert public_status.hub._subscribers == set()
+
+
+@pytest.mark.skipif(sys.version_info < (3, 12), reason="the race needs Python 3.12's task cancellation")
+def test_public_websocket_close_keeps_the_cancel_scope_s_own_cancellation(monkeypatch):
+    """Starlette's TestClient cancels the app's anyio cancel scope as it closes a
+    socket. Arriving after the handler cancels its pending update but before
+    that task runs, the cancel must leave as the scope's own, which the scope
+    swallows; the update task's would escape (an intermittent CancelledError)."""
+    hub = StatusHub()
+    hub.snapshot = {"updated_at": "a", "devices": []}
+    monkeypatch.setattr(public_status, "hub", hub)
+    monkeypatch.setattr(web, "public_status_json", lambda snapshot, zone: "{}")
+    scopes = []
+
+    class Update(asyncio.Task):
+        def cancel(self, msg=None):
+            if not scopes[0].cancel_called:
+                # Queue the scope's cancel ahead of this task's own wake-up.
+                asyncio.get_running_loop().call_soon(scopes[0].cancel)
+            return super().cancel(msg)
+
+    patched = SimpleNamespace(**vars(asyncio))
+    patched.ensure_future = Update
+    monkeypatch.setattr(web, "asyncio", patched)
+
+    class Socket:
+        def __init__(self):
+            self.sent = []
+            self.gone = asyncio.Event()
+
+        async def accept(self):
+            pass
+
+        async def send_text(self, text):
+            self.sent.append(text)
+            self.gone.set()  # the client leaves after the first snapshot
+
+        async def receive_text(self):
+            await self.gone.wait()
+            raise WebSocketDisconnect(1000)
+
+    async def run():
+        socket = Socket()
+        with anyio.fail_after(5), anyio.CancelScope() as scope:  # fail, never hang
+            scopes.append(scope)
+            await web.public_device_status_socket(socket, None)
+            raise AssertionError("the handler returned instead of raising the scope's cancel, "
+                                 "or no longer starts its update with asyncio.ensure_future")
+        # Checked inside the loop: its shutdown would close a leaked generator.
+        return socket.sent, scope.cancelled_caught, set(hub._subscribers)
+
+    assert asyncio.run(run()) == (["{}"], True, set())
 
 
 def test_hub_pushes_changes_and_heartbeats(monkeypatch):

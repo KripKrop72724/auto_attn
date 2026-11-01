@@ -4571,8 +4571,11 @@ async def public_device_status_socket(websocket: WebSocket, zone: PublicZone | N
         reader.cancel()
         if update is not None and not update.done():
             update.cancel()
-            # The generator must stop running before it can be closed.
-            await asyncio.gather(update, return_exceptions=True)
+            # The generator must stop running before it can be closed. Not
+            # gather: cancelled meanwhile, it raises the update task's own
+            # CancelledError, which the canceller (an anyio cancel scope, as
+            # in Starlette's TestClient) does not recognise and lets escape.
+            await asyncio.wait({update})
         await updates.aclose()
 
 
