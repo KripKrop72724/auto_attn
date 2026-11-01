@@ -425,6 +425,10 @@ export interface FirmwareDiagnostics {
     upgrade_contract?: string | null
     upgrade_error?: string | null
     upgrade_ready?: boolean | null
+    // ZKT 2.8.1 and later, direct role: how the boot judged the other OTA
+    // slot (PREDECESSOR, NONE_* or UNQUALIFIED) and that slot's otadata state.
+    rollback_slot?: string | null
+    rollback_slot_state?: string | null
     total_bytes?: number | null
     used_bytes?: number | null
     admission_reserve_bytes?: number | null

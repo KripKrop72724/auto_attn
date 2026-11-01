@@ -187,6 +187,23 @@ def test_current_scope_shows_the_2_8_0_candidate_above_production_2_7_8(db):
     assert versions(release_page(db, scope="current")) == ["2.8.0", "2.7.8"]
 
 
+def test_current_scope_shows_the_2_8_1_candidate_above_hil_only_2_8_0_and_production_2_7_8(db):
+    """2.8.1 publishes HIL_ONLY above the HIL_ONLY 2.8.0 and the production
+    2.7.8; 2.8.0 stays current only while a device runs it, its state unchanged."""
+    release(db, "2.7.8")
+    superseded = release(db, "2.8.0", "HIL_ONLY")
+    candidate = release(db, "2.8.1", "HIL_ONLY")
+    db.commit()
+    assert versions(release_page(db, scope="current")) == ["2.8.1", "2.7.8"]
+    device(db, "zone-lite-2.8.0")
+    db.commit()
+    assert versions(release_page(db, scope="current")) == ["2.8.1", "2.8.0", "2.7.8"]
+    candidate.state = "AVAILABLE"
+    db.commit()
+    assert versions(release_page(db, scope="current")) == ["2.8.1", "2.8.0"]
+    assert superseded.state == "HIL_ONLY"
+
+
 def test_current_scope_keeps_a_release_with_a_live_campaign(db):
     active = release(db, "2.6.9", "HIL_ONLY")
     paused = release(db, "2.6.10", "HIL_ONLY")

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from typing import NamedTuple
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -498,20 +499,43 @@ def classify_led_latch(led_state: str | None, evidence: dict | None, *, storage_
 
 
 # Signed 2.6.15 checks at boot (zone_lite.c:3196) that the other OTA slot
-# holds a qualified predecessor (2.4.12 to 2.6.14). Any 2.7.x or 2.8.0 download
+# holds a qualified predecessor (2.4.12 to 2.6.14). Any 2.7.x or 2.8.x download
 # writes that slot, so every later 2.6.15 boot latches LOCAL_FAILURE, never runs
-# its persistence probe and reports durability DEGRADED until a 2.7.x or 2.8.0
+# its persistence probe and reports durability DEGRADED until a 2.7.x or 2.8.x
 # install succeeds. This latch only names that cause (error code and message); the
 # tier stays DEGRADED. Zero I/O counters on such a boot are not a passed
 # probe: 2.6.15 keeps the first latch's source, so a later LOCAL_FAILURE on
 # the same boot is invisible, and its legacy-queue reads and writes fail
 # without touching the counters. The label also needs ADD's own record of
-# the 2.7.x or 2.8.0 download and a clean storage history.
+# the later download and a clean storage history.
 ROLLBACK_SLOT_RESIDUE = "OTA_ROLLBACK_SLOT_RESIDUE"
 RESIDUE_FIRMWARE_VERSION = "2.6.15"
 RESIDUE_APPLICATION_SHA256 = "832c0c3d8dac6e41d7cd0a9d4fbe4508e4f66982fa5ddeceaca4dc5adcbd80d6"
 RESIDUE_LED_SOURCE = "zone_lite.c:3196"
 RESIDUE_UPGRADE_ERROR = "STORAGE_DIRECT_ROLLBACK_IMAGE_UNQUALIFIED"
+
+
+class ResidueImage(NamedTuple):
+    application_sha256: str
+    source: str  # the LOCAL_FAILURE latch after storage_upgrade_init
+    durability: str  # what the boot reports with no I/O fault
+    remedy_version: str | None  # the image ADD offers to clear it
+
+
+# The direct images 2.7.8 (zone_lite.c:3573 at 533ac55) and 2.8.0
+# (zone_lite.c:3875 at b390bfa) run the same check (2.4.12 to 2.7.7, and 2.7.8),
+# so a stopped download of a later image, or a rollback from one, leaves the
+# confirmed image unable to verify storage again. They report durability
+# UNKNOWN (DEGRADED only with an error), so the latch is on ESP_LOCAL_FAILURE
+# alone. 2.8.1 lists both and also starts storage when a confirmed image's
+# other slot cannot boot: the remedy is to offer it.
+RESIDUE_IMAGES = {
+    RESIDUE_FIRMWARE_VERSION: ResidueImage(RESIDUE_APPLICATION_SHA256, RESIDUE_LED_SOURCE, "DEGRADED", None),
+    "2.7.8": ResidueImage("b8d0ca7e20d28d4114cff56fc69676e681a37bf9f7e831a243a65f9a1a972a3e",
+                          "zone_lite.c:3573", "UNKNOWN", "2.8.1"),
+    "2.8.0": ResidueImage("21ac81b292b463cf7fa1bf0d6ce364a49493951836ad962a19dcae049f40ed76",
+                          "zone_lite.c:3875", "UNKNOWN", "2.8.1"),
+}
 RESIDUE_ERROR_FIELDS = ("error_code", "error_operation", "persistence_probe_error", "persistence_probe_operation",
                         "legacy_error_code", "legacy_error_operation", "legacy_error_queue")
 # Earlier boots whose last reported storage counters show any I/O fault in
@@ -526,15 +550,16 @@ def rollback_slot_residue_candidate(evidence: dict | None, firmware_version: str
         return False
     storage = evidence["storage"]
     runtime = evidence.get("ota_runtime") if isinstance(evidence.get("ota_runtime"), dict) else {}
+    image = RESIDUE_IMAGES.get(plain_version(firmware_version))
     return (
-        plain_version(firmware_version) == RESIDUE_FIRMWARE_VERSION
-        and runtime.get("image_sha256") == RESIDUE_APPLICATION_SHA256
+        image is not None
+        and runtime.get("image_sha256") == image.application_sha256
         and evidence.get("journal_storage") is None
-        and storage.get("local_failure_source") == RESIDUE_LED_SOURCE
-        and storage.get("local_failure_last_source") in (None, RESIDUE_LED_SOURCE)
+        and storage.get("local_failure_source") == image.source
+        and storage.get("local_failure_last_source") in (None, image.source)
         and storage.get("upgrade_error") == RESIDUE_UPGRADE_ERROR
         and storage.get("upgrade_ready") is not True
-        and storage.get("durability") == "DEGRADED"
+        and storage.get("durability") == image.durability
         and storage.get("recovery_complete") is True
         and type(storage.get("write_failures")) is int and storage["write_failures"] == 0
         and type(storage.get("read_failures")) is int and storage["read_failures"] == 0
@@ -589,13 +614,16 @@ def rollback_slot_residue_history(session: Session, connector: Connector, *, now
             "faults": faults[:10], "clean": not faults}
 
 
-def rollback_slot_residue_latch(record: dict | None, history: dict | None) -> dict | None:
-    """The latch, only with ADD's own record of the 2.7.x or 2.8.0 download and a clean
-    storage history."""
-    if not record or not history or not history.get("clean"):
+def rollback_slot_residue_latch(record: dict | None, history: dict | None, *,
+                                firmware_version: str | None) -> dict | None:
+    """The latch, only with ADD's own record of the later download and a clean storage history."""
+    version = plain_version(firmware_version)
+    image = RESIDUE_IMAGES.get(version)
+    if not record or not history or not history.get("clean") or image is None:
         return None
-    return {"kind": ROLLBACK_SLOT_RESIDUE, "source": RESIDUE_LED_SOURCE,
-            "firmware_version": RESIDUE_FIRMWARE_VERSION, "upgrade_error": RESIDUE_UPGRADE_ERROR,
+    return {"kind": ROLLBACK_SLOT_RESIDUE, "source": image.source,
+            "firmware_version": version, "upgrade_error": RESIDUE_UPGRADE_ERROR,
+            **({"remedy_version": image.remedy_version} if image.remedy_version else {}),
             "residue": record, "history": {key: history.get(key) for key in (
                 "days", "boots_checked", "boots_without_storage_counters")}}
 
@@ -801,10 +829,16 @@ def _evidence_summary(row: DeviceAlert) -> str | None:
     if _residue(details):
         residue = latch.get("residue") or {}
         history = latch.get("history") or {}
-        return (f"Persistence unverified - OTA rollback slot residue: {latch.get('source')} on "
-                f"{latch.get('firmware_version')} after {residue.get('target_version') or '2.7.x'} wrote "
-                f"{residue.get('bytes_written') or 'some'} bytes to the other slot; no storage I/O counters on "
-                f"this boot or in {history.get('days') or RESIDUE_HISTORY_DAYS} days of earlier boots, but the "
+        days = history.get("days") or RESIDUE_HISTORY_DAYS
+        cause = (f"Persistence unverified - OTA rollback slot residue: {latch.get('source')} on "
+                 f"{latch.get('firmware_version')} after {residue.get('target_version') or '2.7.x'} wrote "
+                 f"{residue.get('bytes_written') or 'some'} bytes to the other slot")
+        if latch.get("remedy_version"):
+            # 2.7.8 and 2.8.0 also report the latest latch's source.
+            return (f"{cause}; offer {latch['remedy_version']}. No storage I/O counters on this boot or in "
+                    f"{days} days of earlier boots, but the persistence probe did not run"
+                    + (f" ({summary})" if summary else "") + ".")[:300]
+        return (f"{cause}; no storage I/O counters on this boot or in {days} days of earlier boots, but the "
                 "persistence probe did not run and later latches on this boot are not reported"
                 + (f" ({summary})" if summary else "") + ".")[:300]
     diagnosis = details.get("diagnosis")
