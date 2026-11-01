@@ -1,3 +1,9 @@
 *.sh text eol=lf
 # This verifier's exact checkout bytes are pinned by the read-only launcher.
 scripts/audit_factory_bundle.py text eol=lf
+# Keys, the installer's pinned or hashed resources and the test fixtures whose
+# bytes are hashed keep their exact bytes on every checkout. Windows runners
+# check out with core.autocrlf=true and would write these text files with CRLF.
+*.pem -text
+apps/esp_installer/src/sl_installer/resources/** -text
+apps/esp_installer/tests/core/fixtures/** -text

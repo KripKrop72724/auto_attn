@@ -98,6 +98,14 @@ services:
         source: ${ADD_COMPANION_RELEASE_STORE_HOST_PATH:-./.companion-releases}
         target: /companion-releases
         read_only: true
+      # Signed State Life Device Installer bundles (docs/esp-installer-server.md).
+      # An empty store is valid; deploy.ps1 creates the production directory.
+      - type: bind
+        source: ${ADD_INSTALLER_BUNDLE_STORE_HOST_PATH:-./.installer-bundles}
+        target: /installer-bundles
+        read_only: true
+        bind:
+          create_host_path: true
       - type: volume
         source: add-provisioning-artifacts
         target: /provisioning-artifacts

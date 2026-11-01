@@ -1,0 +1,142 @@
+name: ESP installer release
+
+# Pull requests build a TEST installer: no secrets, and the app shows a
+# "TEST BUILD" banner. A dispatch on main with the confirmation builds the
+# field release, with the field defaults from the firmware-signing environment.
+on:
+  pull_request:
+    paths:
+      - apps/esp_installer/**
+      - .github/workflows/esp-installer-release.yml
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: Type BUILD INSTALLER RELEASE to build the field release from main
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: esp-installer-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test-build:
+    if: github.event_name == 'pull_request'
+    runs-on: windows-2022
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install the locked packages
+        run: |
+          # esptool is published only as source: install the locked setuptools
+          # first and build esptool with it, so every download is hash-checked.
+          python -m pip install --disable-pip-version-check --require-hashes --no-deps -r apps/esp_installer/requirements-build.lock
+          if ($LASTEXITCODE -ne 0) { throw 'The locked build tools did not install' }
+          python -m pip install --disable-pip-version-check --require-hashes --no-build-isolation -r apps/esp_installer/requirements.lock -r apps/esp_installer/requirements-build.lock
+          if ($LASTEXITCODE -ne 0) { throw 'The locked packages did not install' }
+          python -m pip check
+          if ($LASTEXITCODE -ne 0) { throw 'The locked packages do not fit together' }
+      - name: Run the app tests without a screen
+        working-directory: apps/esp_installer
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          python -m pytest -q
+          if ($LASTEXITCODE -ne 0) { throw 'The app tests failed' }
+      - name: Build the TEST app and Setup
+        run: |
+          python apps/esp_installer/packaging/build.py
+          if ($LASTEXITCODE -ne 0) { throw 'The build failed' }
+      - name: Install, check and uninstall the Setup
+        run: |
+          $setup = Get-ChildItem apps/esp_installer/dist -Filter 'StateLife-Device-Installer-Setup-*.exe' | Select-Object -First 1
+          if (-not $setup) { throw 'No Setup was built' }
+          ./apps/esp_installer/packaging/smoke_test.ps1 -Setup $setup.FullName -OutputDir smoke
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: esp-installer-test-${{ github.sha }}
+          path: |
+            apps/esp_installer/dist/StateLife-Device-Installer-Setup-*.exe
+            apps/esp_installer/dist/SHA256SUMS.txt
+            smoke/
+          if-no-files-found: warn
+          retention-days: 7
+
+  release:
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.confirmation == 'BUILD INSTALLER RELEASE'
+    runs-on: windows-2022
+    environment: firmware-signing
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install the locked packages
+        run: |
+          # esptool is published only as source: install the locked setuptools
+          # first and build esptool with it, so every download is hash-checked.
+          python -m pip install --disable-pip-version-check --require-hashes --no-deps -r apps/esp_installer/requirements-build.lock
+          if ($LASTEXITCODE -ne 0) { throw 'The locked build tools did not install' }
+          python -m pip install --disable-pip-version-check --require-hashes --no-build-isolation -r apps/esp_installer/requirements.lock -r apps/esp_installer/requirements-build.lock
+          if ($LASTEXITCODE -ne 0) { throw 'The locked packages did not install' }
+          python -m pip check
+          if ($LASTEXITCODE -ne 0) { throw 'The locked packages do not fit together' }
+      - name: Run the app tests without a screen
+        working-directory: apps/esp_installer
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          python -m pytest -q
+          if ($LASTEXITCODE -ne 0) { throw 'The app tests failed' }
+      - name: Build the release app and Setup
+        # The only step that sees the secrets. build.py never prints them and
+        # also masks the values inside the JSON secret.
+        env:
+          ESP_INSTALLER_FIELD_DEFAULTS_JSON: ${{ secrets.ESP_INSTALLER_FIELD_DEFAULTS_JSON }}
+          ZONE_LITE_SETUP_PASSWORD: ${{ secrets.ZONE_LITE_SETUP_PASSWORD }}
+        run: |
+          python apps/esp_installer/packaging/build.py --release
+          if ($LASTEXITCODE -ne 0) { throw 'The release build failed' }
+      - name: Install, check and uninstall the Setup
+        id: smoke
+        run: |
+          $setup = Get-ChildItem apps/esp_installer/dist -Filter 'StateLife-Device-Installer-Setup-*.exe' | Select-Object -First 1
+          if (-not $setup) { throw 'No Setup was built' }
+          if ($setup.Name -like '*-TEST.exe') { throw 'The release step produced a TEST build' }
+          ./apps/esp_installer/packaging/smoke_test.ps1 -Setup $setup.FullName -OutputDir smoke
+          # Windows PowerShell's Out-File would add a byte-order mark.
+          [IO.File]::AppendAllText($env:GITHUB_OUTPUT, "artifact=$($setup.BaseName)`n")
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.smoke.outputs.artifact }}
+          path: |
+            apps/esp_installer/dist/StateLife-Device-Installer-Setup-*.exe
+            apps/esp_installer/dist/SHA256SUMS.txt
+            smoke/screenshots/
+          if-no-files-found: error
+          retention-days: 30
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: esp-installer-smoke-logs-${{ github.sha }}
+          path: smoke/
+          if-no-files-found: ignore
+          retention-days: 7

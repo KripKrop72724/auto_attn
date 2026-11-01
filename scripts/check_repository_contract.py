@@ -115,6 +115,7 @@ def main() -> int:
         "add_backend",
         "add_frontend",
         "add_provisioner",
+        "esp_installer",
         "provisioning_companion",
     }
     unexpected_apps = sorted(app_products - expected_apps)
@@ -134,6 +135,7 @@ def main() -> int:
         ".github/workflows/add-ci.yml",
         ".github/workflows/add-deploy.yml",
         ".github/workflows/add-repair-diagnostics.yml",
+        ".github/workflows/esp-installer-release.yml",
         ".github/workflows/firmware-canary-promote.yml",
         ".github/workflows/firmware-hil-candidate.yml",
         ".github/workflows/firmware-extend-2-6-0-hil.yml",

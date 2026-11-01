@@ -1,0 +1,67 @@
+STATE LIFE DEVICE INSTALLER - LICENCE
+
+Please read this before you install the app. By installing or using it, you
+agree to these terms.
+
+1. Who this licence is between
+   This licence is between State Life Insurance Corporation of Pakistan
+   ("State Life", "we") and you, the person installing or using the State
+   Life Device Installer ("the app").
+
+2. What you may use the app for
+   You may use the app only to prepare, check and fix State Life attendance
+   devices: the boards that connect State Life attendance machines to State
+   Life's systems. You may use it only if State Life gave you the app and a
+   sign-in for this work.
+
+3. What you must not do
+   - Do not use the app on boards or machines that do not belong to State
+     Life.
+   - Do not give the app, your sign-in or your password to anyone outside
+     State Life.
+   - Do not use the app to get into systems or information you are not
+     allowed to use.
+
+4. Some changes are permanent
+   Setting up a board locks a security key into it. This cannot be undone,
+   and the board can then only be used with State Life's systems. Follow
+   the steps on the screen and do not unplug a board while the app is
+   working on it.
+
+5. Information the app sends and keeps
+   - To do its job, the app sends State Life's head office server (the
+     Attendance Device Dashboard, "ADD") your sign-in, board IDs, the
+     settings you choose and the results of each install and check. The
+     server keeps a record of this work.
+   - The app keeps install records and logs on this computer. They never
+     contain passwords or security keys.
+   - Apart from this, the app only checks that the internet works, using
+     the same Microsoft test address that Windows itself uses. It sends no
+     information about you or your boards anywhere else.
+
+6. Other people's software inside the app
+   The app includes free and open-source software from other people, such
+   as Python, Qt and esptool. Each part comes with its own licence. The
+   file THIRD-PARTY-NOTICES.txt in the app folder lists them and says where
+   to get their source code. Nothing in this licence limits the rights
+   those licences give you.
+
+7. No warranty
+   The app is given to you "as is". We try hard to make it work well, but
+   we do not promise that it is free of mistakes or that it will always
+   work.
+
+8. Limits on responsibility
+   As far as the law allows, State Life is not responsible for any loss or
+   damage that comes from using the app, or from being unable to use it.
+   This includes lost data, lost attendance records and damaged boards.
+
+9. Ending this licence
+   This licence ends if you break these terms, or when State Life asks you
+   to stop using the app. When it ends, uninstall the app.
+
+10. Law
+   The laws of Pakistan apply to this licence. The courts of Pakistan
+   decide any disagreement about it.
+
+Copyright (C) State Life Insurance Corporation of Pakistan.

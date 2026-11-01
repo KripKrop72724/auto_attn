@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools>=75", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "state-life-device-installer"
+dynamic = ["version"]
+description = "Windows app that prepares and checks Zone Lite boards for State Life attendance machines."
+readme = "README.md"
+requires-python = ">=3.9"
+# Release builds install requirements.lock and requirements-build.lock, which
+# pin every package with hashes (regenerate them with packaging/update_locks.py).
+dependencies = [
+  "PySide6-Essentials==6.9.2",
+  # esptool 5.1.0 itself needs Python 3.10+. A Python 3.9 bench setup can still
+  # import the app; it runs the tools with another Python that has esptool 5.1.0,
+  # named in SL_INSTALLER_TOOL_PYTHON or the bench's --tool-python (config.py).
+  "esptool==5.1.0; python_version >= '3.10'",
+  # espefuse 5.1.0 imports bitstring.BitStream, which bitstring 5 removed;
+  # esptool's own requirement (bitstring>=3.1.6) still allows 5.
+  "bitstring>=4.3,<5",
+  "pyserial==3.5",
+  "cryptography>=43",
+  "httpx==0.28.1",
+  "truststore>=0.10; python_version >= '3.10'",
+  "certifi",
+]
+
+[project.optional-dependencies]
+build = ["pyinstaller>=6.22,<7"]
+dev = ["pytest>=8", "pytest-qt>=4.4"]
+
+[project.gui-scripts]
+state-life-device-installer = "sl_installer.__main__:main"
+
+[tool.setuptools.dynamic]
+version = { attr = "sl_installer.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+sl_installer = ["resources/*", "resources/**/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests", "packaging/tests"]
+pythonpath = ["src"]
+qt_api = "pyside6"
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
