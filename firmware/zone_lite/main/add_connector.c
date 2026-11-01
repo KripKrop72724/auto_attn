@@ -3101,6 +3101,9 @@ static void append_firmware_diagnostics(cJSON *payload, const add_zkt_telemetry_
         !cJSON_AddStringToObject(storage, "upgrade_contract", storage_upgrade_contract()) ||
         !cJSON_AddStringToObject(storage, "upgrade_error", storage_upgrade_error()) ||
         !cJSON_AddBoolToObject(storage, "upgrade_ready", storage_upgrade_ready()) ||
+        (storage_upgrade_rollback_slot()[0] &&
+         (!cJSON_AddStringToObject(storage, "rollback_slot", storage_upgrade_rollback_slot()) ||
+          !cJSON_AddStringToObject(storage, "rollback_slot_state", storage_upgrade_rollback_slot_state()))) ||
         !cJSON_AddNumberToObject(storage, "local_failures", local_failure.incidents) ||
         !cJSON_AddNumberToObject(storage, "local_failure_recoveries", local_failure.recoveries) ||
         (local_failure.active && local_failure.first_source[0] &&
