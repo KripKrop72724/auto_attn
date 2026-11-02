@@ -430,6 +430,12 @@ def test_preflight_treats_an_anchor_mismatch_terminal_as_answering(db, monkeypat
     assert result["recent_tail"] == {"eligible": True, "ready_now": True, "anchor_serial": ANCHOR,
                                      "begin_serial": ANCHOR - 19, "earlier_breaks": [], "reason": None}
     assert preflight(session, connector, TAIL_SCOPE)["ready_now"]
+    # A terminal whose events page the ESP rejects (Jhelum's DS-K1T321MFWX)
+    # also answers; ADD validates the tail pages itself.
+    terminal.capability_profile = {"hikvision_health": {
+        "poll_error": 7, "poll_stage": "events", "poll_http_status": 200}}
+    assert terminal_answering(terminal)
+    assert preflight(session, connector, TAIL_SCOPE)["ready_now"]
     # An unreachable terminal (network timeout) still waits.
     terminal.capability_profile = {"hikvision_health": {
         "poll_error": 2, "poll_stage": "identity", "poll_http_status": 0}}
