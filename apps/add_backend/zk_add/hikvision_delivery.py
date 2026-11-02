@@ -268,7 +268,9 @@ def configure_policy(
         raise ValueError("HIKVISION_TERMINAL_BINDING_REQUIRED")
     if not source_epoch or len(source_epoch) > 64 or not profile_id or len(profile_id) > 80:
         raise ValueError("HIKVISION_PROFILE_REQUIRED")
-    if profile_commands_enabled and profile_id != "ds-k1t342efwx-v3.3.5-220310-poll5-pilot-v1":
+    from zk_add.hikvision_profiles import STABLE_FACT_PROFILES
+    if profile_commands_enabled and profile_id != "ds-k1t342efwx-v3.3.5-220310-poll5-pilot-v1" \
+            and profile_id not in STABLE_FACT_PROFILES:
         raise ValueError("HIKVISION_PROFILE_COMMANDS_NOT_QUALIFIED")
     if not success_codes or len(success_codes) > 32 or len(excluded_codes) > 256:
         raise ValueError("INVALID_EVENT_MAPPING")

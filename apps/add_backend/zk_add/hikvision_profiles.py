@@ -32,6 +32,16 @@ class HikvisionProfileScan(Base):
 # they cannot stop the snapshot, and its state fingerprint covers only these.
 STABLE_PROFILE_KEYS = ("employeeNo", "name", "userType", "localUIRight")
 VOLATILE_FLAG = "hikvision_profile_volatile_fields"
+# Profiles whose user commands (firmware profile_command_version 5) verify these
+# stable facts instead of the whole record; their snapshots always fingerprint
+# them, even when write-enabled.
+STABLE_FACT_PROFILES = frozenset({"ds-k1t321mfwx-v4.61.0-20260828-unverified-v1"})
+
+
+def stable_fingerprint(profile: dict) -> str:
+    """The digest the ESP computes over the same facts (sorted, compact, UTF-8)."""
+    return hashlib.sha256(json.dumps(_stable(profile), sort_keys=True, separators=(",", ":"),
+                                     ensure_ascii=False).encode()).hexdigest()
 
 
 def _stable(profile: dict) -> dict:
@@ -122,10 +132,12 @@ def accept_profile_page(session: Session, connector: Connector, payload: dict) -
             first = {key: json.loads(raw) for key, raw in data["first"].items()}
             second = {key: json.loads(raw) for key, raw in data["second"].items()}
             capability = dict(terminal.capability_profile or {})
+            stable_profile = ((capability.get("hikvision_health") or {}).get("capability_profile")
+                              in STABLE_FACT_PROFILES)
             volatile = capability.get(VOLATILE_FLAG)
             if first != second:
-                # A write-qualified profile must read back exactly.
-                if capability.get("user_write") is True:
+                # A write-qualified exact profile must read back exactly.
+                if capability.get("user_write") is True and not stable_profile:
                     raise ValueError("HIKVISION_PROFILE_SCAN_CHANGED")
                 fields = _changed_fields(first, second)
                 if sorted(set(volatile or []) | set(fields)) != volatile:
@@ -143,9 +155,8 @@ def accept_profile_page(session: Session, connector: Connector, payload: dict) -
                     profile.get("localUIRight") is False else 14,
                     terminal_identity_fingerprint=hashlib.sha256(
                         f"{page.terminal_serial}\n{employee}".encode()).hexdigest(),
-                    terminal_state_fingerprint=hashlib.sha256((
-                        json.dumps(_stable(profile), sort_keys=True, separators=(",", ":"))
-                        if volatile else raw).encode()).hexdigest(),
+                    terminal_state_fingerprint=stable_fingerprint(profile) if volatile or stable_profile
+                    else hashlib.sha256(raw.encode()).hexdigest(),
                 ))
             _replace_user_snapshot(session, connector=connector, snapshot=UserSnapshotRequest(
                 snapshot_id=page.snapshot_id, complete=True, stable=True,
