@@ -779,18 +779,32 @@ def auto_certify_zkt(session: Session, connector: Connector, zkt: ZKTDevice) -> 
             and zkt.terminal_binding_state == "CONFIRMED"
             and zkt.snapshot_complete and zkt.identity_snapshot_stable
         )
+        # Stable-fact profile (Jhelum DS-K1T321MFWX): renames and deletions of
+        # regular users only, verified by the ESP on stable facts (version 5).
+        from zk_add.hikvision_profiles import STABLE_FACT_PROFILES
+        stable_writes = (
+            not writable
+            and approval.get("enabled") is True
+            and approval.get("terminal_serial") == zkt.serial == zkt.confirmed_serial
+            and approval.get("profile_id") == health.get("capability_profile")
+            and health.get("capability_profile") in STABLE_FACT_PROFILES
+            and health.get("profile_command_version") == 5
+            and zkt.terminal_binding_state == "CONFIRMED"
+            and zkt.snapshot_complete and zkt.identity_snapshot_stable
+        )
         # Limited profile pilot capability is not full attendance/OTA certification.
-        writable = writable or temporary_exception
+        writable = writable or temporary_exception or stable_writes
         zkt.certification_state = "PROFILE_EXCEPTION" if temporary_exception else "PROFILE_PILOT" if writable else "READ_ONLY"
         zkt.writes_disabled_reason = None if writable else "HIKVISION_WRITE_QUALIFICATION_PENDING"
         zkt.capability_profile = {
             **profile,
-            "user_write": bool(writable), "create_user": bool(writable), "delete_user": bool(writable),
-            "user_role_write": bool(writable and not temporary_exception),
+            "user_write": bool(writable), "create_user": bool(writable and not stable_writes),
+            "delete_user": bool(writable),
+            "user_role_write": bool(writable and not temporary_exception and not stable_writes),
             "write_exception_expires_at": None if permanent_exception else "2026-10-15T16:00:00Z" if temporary_exception else "",
             "write_exception_permanent": permanent_exception,
             "write_exception_pending_firmware": permanent_requested and not permanent_exception,
-            "delete_all_credentials": bool(writable and (health.get("profile_command_version") == 2 or temporary_exception)),
+            "delete_all_credentials": bool(writable and not stable_writes and (health.get("profile_command_version") == 2 or temporary_exception)),
             "name_bytes": 128,
             "admin_lease": False, "protocol_restart": False, "telnet_recovery": False,
         }

@@ -17,12 +17,23 @@ static void digest(const char *value, char out[65])
     mbedtls_sha256((const unsigned char *)value, strlen(value), bytes, 0);
     for (unsigned i = 0; i < 32; i++) snprintf(out + 2 * i, 3, "%02x", bytes[i]);
 }
-static bool state_matches(const cJSON *profile, const char *expected)
+#define PILOT_PROFILE "ds-k1t342efwx-v3.3.5-220310-poll5-pilot-v1"
+/* Jhelum: renames and deletions of regular users only, on stable facts. */
+#define STABLE_PROFILE "ds-k1t321mfwx-v4.61.0-20260828-unverified-v1"
+static bool stable_mode;
+static bool state_hash(const cJSON *profile, char hash[65])
 {
-    char *raw = cJSON_PrintUnformatted(profile), hash[65];
+    cJSON *facts = stable_mode ? hik_profile_stable_facts(profile) : NULL;
+    char *raw = cJSON_PrintUnformatted(stable_mode ? facts : profile);
+    cJSON_Delete(facts);
     if (!raw) return false;
     digest(raw, hash); free(raw);
-    return !strcmp(hash, expected);
+    return true;
+}
+static bool state_matches(const cJSON *profile, const char *expected)
+{
+    char hash[65];
+    return state_hash(profile, hash) && !strcmp(hash, expected);
 }
 static bool credential_free(const cJSON *profile)
 {
@@ -54,10 +65,15 @@ hik_result_t hik_profile_command(const add_command_t *command, cJSON **receipt)
 {
     *receipt = NULL;
     const zone_config_t *cfg = zone_config_get();
-    if (strcmp(cfg->hik_profile, "ds-k1t342efwx-v3.3.5-220310-poll5-pilot-v1")) return HIK_CONFIGURATION;
+    stable_mode = !strcmp(cfg->hik_profile, STABLE_PROFILE);
+    if (strcmp(cfg->hik_profile, PILOT_PROFILE) && !stable_mode) return HIK_CONFIGURATION;
+    hik_api_use_stable_profiles(stable_mode);
     bool create = !strcmp(command->command_type, "CREATE_USER");
     bool update = !strcmp(command->command_type, "UPDATE_USER");
     bool remove = !strcmp(command->command_type, "DELETE_USER");
+    /* The stable profile is not qualified for creation or administrator changes. */
+    if (stable_mode && (create || (update && (!command->has_privilege || command->privilege != 0 ||
+            command->expected_privilege != 0)))) return HIK_CONFIGURATION;
     if ((!create && !update && !remove) || !command->user_id[0] ||
         strlen(command->user_id) > 32 || strspn(command->user_id, "0123456789") != strlen(command->user_id) ||
         strcmp(command->uid, command->user_id) || strcmp(command->expected_serial, cfg->hik_expected_serial) ||
@@ -133,7 +149,7 @@ hik_result_t hik_profile_command(const add_command_t *command, cJSON **receipt)
         cJSON *right = cJSON_CreateBool(command->privilege == 14);
         bool right_changed = expected_after && right && cJSON_ReplaceItemInObjectCaseSensitive(expected_after, "localUIRight", right);
         if (!right_changed) cJSON_Delete(right);
-        bool same = changed && right_changed && cJSON_Compare(expected_after, after, true);
+        bool same = changed && right_changed && hik_profile_equal(expected_after, after);
         cJSON_Delete(expected_after);
         if (!same) { result = HIK_BINDING; goto done; }
     }
@@ -146,9 +162,8 @@ hik_result_t hik_profile_command(const add_command_t *command, cJSON **receipt)
         result = HIK_NETWORK; goto done;
     }
     if (after) {
-        char *raw = cJSON_PrintUnformatted(after), hash[65];
-        if (!raw) { result = HIK_NETWORK; goto done; }
-        digest(raw, hash); free(raw);
+        char hash[65];
+        if (!state_hash(after, hash)) { result = HIK_NETWORK; goto done; }
         if (!cJSON_AddStringToObject(*receipt, "verified_terminal_state_fingerprint", hash)) result = HIK_NETWORK;
     }
 done:

@@ -9,7 +9,8 @@ static zone_config_t config = {.hik_expected_serial="TEST-SERIAL", .hik_profile=
 const zone_config_t *zone_config_get(void){return &config;}
 static cJSON *person;
 static unsigned writes, sequence;
-static bool timeout_write, ignore_write, delete_pending, corrupt_write;
+static bool timeout_write, ignore_write, delete_pending, corrupt_write, volatile_reads, corrupt_name;
+static unsigned door_opens;
 uint32_t esp_random(void){return ++sequence;}
 hik_result_t hik_http_verify_identity(void){return HIK_OK;}
 /* Hash stand-in exercises precondition handling, not the pinned crypto library. */
@@ -40,6 +41,8 @@ hik_result_t hik_http_request(esp_http_client_method_t method,const char *path,
   cJSON_AddNumberToObject(page,"numOfMatches",person?1:0);
   cJSON_AddNumberToObject(page,"totalMatches",person?1:0);
   cJSON *rows=cJSON_AddArrayToObject(page,"UserInfo");
+  /* Jhelum DS-K1T321MFWX: a counter in the user record changes every read. */
+  if(person&&volatile_reads)field(person,"openDoorTime",cJSON_CreateNumber(++door_opens));
   if(person)cJSON_AddItemToArray(rows,cJSON_Duplicate(person,true));
  }else{
   writes++;
@@ -60,6 +63,7 @@ hik_result_t hik_http_request(esp_http_client_method_t method,const char *path,
      field(person,v->string,cJSON_Duplicate(v,true));
     }
     if(corrupt_write)field(person,"doorRight",cJSON_CreateString("2"));
+    if(corrupt_name)field(person,"name",cJSON_CreateString("Truncat"));
    }else if(strstr(path,"/Delete")){
     assert(method==HTTP_METHOD_PUT);
     cJSON *list=cJSON_GetObjectItem(cJSON_GetObjectItem(req,"UserInfoDetail"),"EmployeeNoList");
@@ -88,7 +92,45 @@ static add_command_t existing_command(const char *type){
  hash("TEST-SERIAL\n000123",c.expected_terminal_identity_fingerprint);
  char *raw=cJSON_PrintUnformatted(person);hash(raw,c.expected_terminal_state_fingerprint);free(raw);return c;
 }
+static add_command_t stable_command(const char *type){
+ add_command_t c=existing_command(type);
+ cJSON *facts=hik_profile_stable_facts(person);char *raw=cJSON_PrintUnformatted(facts);
+ hash(raw,c.expected_terminal_state_fingerprint);free(raw);cJSON_Delete(facts);return c;
+}
+static void test_stable_profile(void){
+ /* Jhelum: renames and deletions of regular users compare stable facts only. */
+ strcpy(config.hik_profile,"ds-k1t321mfwx-v4.61.0-20260828-unverified-v1");
+ volatile_reads=true;cJSON *receipt=NULL;
+ person=cJSON_Parse("{\"employeeNo\":\"000123\",\"name\":\"Ali-1234512345671\",\"userType\":\"normal\","
+  "\"localUIRight\":false,\"numOfFace\":1,\"numOfFP\":0,\"numOfCard\":0,\"openDoorTime\":0}");
+ /* The fingerprint input is the JSON ADD hashes (sorted keys, compact). */
+ cJSON *facts=hik_profile_stable_facts(person);char *raw=cJSON_PrintUnformatted(facts);
+ assert(!strcmp(raw,"{\"employeeNo\":\"000123\",\"localUIRight\":false,\"name\":\"Ali-1234512345671\",\"userType\":\"normal\"}"));
+ free(raw);cJSON_Delete(facts);
+ add_command_t c=stable_command("UPDATE_USER");strcpy(c.name,"Ali Khan-1234512345671");
+ assert(hik_profile_command(&c,&receipt)==HIK_OK && receipt);
+ assert(!strcmp(cJSON_GetObjectItem(person,"name")->valuestring,"Ali Khan-1234512345671"));
+ cJSON *after=hik_profile_stable_facts(person);raw=cJSON_PrintUnformatted(after);char expect[65];hash(raw,expect);
+ assert(!strcmp(cJSON_GetObjectItem(receipt,"verified_terminal_state_fingerprint")->valuestring,expect));
+ free(raw);cJSON_Delete(after);cJSON_Delete(receipt);
+ /* Not qualified here: creation and administrator changes write nothing. */
+ unsigned prior=writes;c=stable_command("UPDATE_USER");c.privilege=14;
+ assert(hik_profile_command(&c,&receipt)==HIK_CONFIGURATION && writes==prior);
+ add_command_t create=create_command();strcpy(create.user_id,"000123");
+ assert(hik_profile_command(&create,&receipt)==HIK_CONFIGURATION && writes==prior);
+ /* A stale fingerprint (renamed on the terminal) still blocks the write. */
+ c=stable_command("DELETE_USER");field(person,"name",cJSON_CreateString("Renamed-1234512345671"));
+ assert(hik_profile_command(&c,&receipt)==HIK_BINDING && writes==prior && person);
+ /* A rename the terminal did not apply exactly is not verified. */
+ c=stable_command("UPDATE_USER");strcpy(c.name,"Ali Raza-1234512345671");corrupt_name=true;
+ assert(hik_profile_command(&c,&receipt)!=HIK_OK && !receipt);corrupt_name=false;
+ c=stable_command("DELETE_USER");
+ assert(hik_profile_command(&c,&receipt)==HIK_OK && !person);cJSON_Delete(receipt);
+ strcpy(config.hik_profile,"ds-k1t342efwx-v3.3.5-220310-poll5-pilot-v1");volatile_reads=false;
+}
 int main(void){
+ test_stable_profile();
+ hik_api_use_stable_profiles(false);
  cJSON *receipt=NULL;add_command_t c=create_command();
  ignore_write=true;assert(hik_profile_command(&c,&receipt)!=HIK_OK && !receipt && !person);
  ignore_write=false;timeout_write=true;

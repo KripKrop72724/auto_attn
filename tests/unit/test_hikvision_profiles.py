@@ -158,6 +158,60 @@ def test_profile_pilot_requires_add_approval_firmware_and_complete_snapshot(db, 
     assert terminal.certification_state == 'READ_ONLY'
 
 
+@pytest.mark.parametrize('command_version', [2, 5])
+def test_stable_fact_profile_allows_only_rename_and_delete_with_version_five(db, command_version):
+    # Jhelum's DS-K1T321MFWX: firmware 3.1.4 verifies renames and deletions of
+    # regular users on stable facts; no creation, roles or credential wipes.
+    from zk_add.hikvision_delivery import configure_policy
+    from zk_add.service import auto_certify_zkt, require_writable_user_profile
+
+    session, connector = db
+    terminal = connector.zkt_device
+    profile = 'ds-k1t321mfwx-v4.61.0-20260828-unverified-v1'
+    terminal.online = True
+    terminal.terminal_binding_state = 'CONFIRMED'
+    terminal.snapshot_complete = terminal.identity_snapshot_stable = True
+    terminal.capability_profile = {'hikvision_health': {
+        'capability_profile': profile, 'profile_command_version': command_version,
+    }}
+    configure_policy(session, connector, terminal_serial='terminal', source_epoch='epoch',
+                     profile_id=profile, success_codes=[[5, 75]], excluded_codes=[], enabled=True,
+                     profile_commands_enabled=True, actor='test', reason='Jhelum stable-fact profile writes',
+                     idempotency_key='stable-profile-approval')
+    auto_certify_zkt(session, connector, terminal)
+    capability = terminal.capability_profile
+    if command_version != 5:
+        assert terminal.certification_state == 'READ_ONLY' and not capability['user_write']
+        return
+    assert terminal.certification_state == 'PROFILE_PILOT'
+    assert require_writable_user_profile(connector, 'user_write') is terminal
+    assert require_writable_user_profile(connector, 'delete_user') is terminal
+    assert not capability['create_user'] and not capability['user_role_write']
+    assert not capability['delete_all_credentials']
+    with pytest.raises(ValueError, match='read-only'):
+        require_writable_user_profile(connector, 'create_user')
+
+
+def test_writable_stable_profile_snapshots_stay_tolerant_with_stable_fingerprints(db):
+    from zk_add.hikvision_profiles import stable_fingerprint
+
+    session, connector = db
+    terminal = connector.zkt_device
+    terminal.capability_profile = {'user_write': True, 'hikvision_health': {
+        'capability_profile': 'ds-k1t321mfwx-v4.61.0-20260828-unverified-v1'}}
+    session.commit()
+    accept_profile_page(session, connector, volatile_page(1, 1))
+    assert accept_profile_page(session, connector, volatile_page(2, 2))["published"]
+    session.commit()
+    user = session.scalar(select(DeviceUser))
+    assert user.terminal_state_fingerprint == stable_fingerprint(
+        {"employeeNo": "00111", "name": "Test-1234512345671", "userType": "normal", "localUIRight": False})
+    # The same digest the ESP computes over its compact sorted JSON.
+    import hashlib
+    assert user.terminal_state_fingerprint == hashlib.sha256(
+        b'{"employeeNo":"00111","localUIRight":false,"name":"Test-1234512345671","userType":"normal"}').hexdigest()
+
+
 def test_unknown_hikvision_profile_cannot_receive_write_approval(db):
     from zk_add.hikvision_delivery import configure_policy
 

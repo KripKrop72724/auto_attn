@@ -433,6 +433,35 @@ static hik_result_t submit(esp_http_client_method_t method, const char *path, co
     cJSON_Delete(response); cJSON_Delete(body);
     return result;
 }
+/* Stable-fact profiles (Jhelum's DS-K1T321MFWX) report user fields that change
+ * between two reads of an unchanged user. For them a user is the same user
+ * when these facts match; ADD fingerprints the same facts. */
+static bool stable_profiles;
+void hik_api_use_stable_profiles(bool enabled) { stable_profiles = enabled; }
+static const char *const stable_keys[] = {"employeeNo", "localUIRight", "name", "userType"};
+cJSON *hik_profile_stable_facts(const cJSON *profile)
+{
+    /* Sorted keys, missing facts as null: the JSON ADD hashes with
+     * json.dumps(sort_keys=True, separators=(",", ":"), ensure_ascii=False). */
+    cJSON *facts = cJSON_CreateObject();
+    for (unsigned i = 0; facts && i < 4; i++) {
+        const cJSON *value = cJSON_GetObjectItemCaseSensitive(profile, stable_keys[i]);
+        cJSON *copy = value ? cJSON_Duplicate(value, true) : cJSON_CreateNull();
+        if (!copy || !cJSON_AddItemToObject(facts, stable_keys[i], copy)) {
+            cJSON_Delete(copy); cJSON_Delete(facts); facts = NULL;
+        }
+    }
+    return facts;
+}
+bool hik_profile_equal(const cJSON *a, const cJSON *b)
+{
+    if (!a || !b) return false;
+    if (!stable_profiles) return cJSON_Compare(a, b, true);
+    cJSON *left = hik_profile_stable_facts(a), *right = hik_profile_stable_facts(b);
+    bool same = left && right && cJSON_Compare(left, right, true);
+    cJSON_Delete(left); cJSON_Delete(right);
+    return same;
+}
 bool hik_user_matches_created_profile(const cJSON *actual, const cJSON *desired)
 {
     const cJSON *field;
@@ -494,7 +523,7 @@ hik_result_t hik_user_edit(const cJSON *expected, const char *name, bool change_
     cJSON *before = NULL;
     if (result == HIK_OK) result = hik_user_read(employee, &before);
     if (result != HIK_OK) return result;
-    if (!before || !cJSON_Compare(before, expected, true)) { cJSON_Delete(before); return HIK_BINDING; }
+    if (!before || !hik_profile_equal(before, expected)) { cJSON_Delete(before); return HIK_BINDING; }
     cJSON *update = cJSON_CreateObject();
     bool valid = update && cJSON_AddStringToObject(update, "employeeNo", employee) && cJSON_AddStringToObject(update, "name", name);
     if (change_admin) valid = valid && cJSON_AddBoolToObject(update, "localUIRight", admin);
@@ -510,7 +539,7 @@ hik_result_t hik_user_edit(const cJSON *expected, const char *name, bool change_
         changed = right && cJSON_ReplaceItemInObjectCaseSensitive(before, "localUIRight", right);
         if (!changed) cJSON_Delete(right);
     }
-    *verified = changed && read == HIK_OK && after && cJSON_Compare(before, after, true);
+    *verified = changed && read == HIK_OK && after && hik_profile_equal(before, after);
     cJSON_Delete(after); cJSON_Delete(before);
     return *verified ? HIK_OK : result == HIK_OK ? HIK_CUSTODY : result;
 }
@@ -524,7 +553,7 @@ hik_result_t hik_user_delete(const cJSON *expected, bool *verified)
     if (result == HIK_OK) result = hik_user_read(employee, &before);
     if (result != HIK_OK) return result;
     if (!before) { *verified = true; return HIK_OK; }
-    if (!cJSON_Compare(before, expected, true)) { cJSON_Delete(before); return HIK_BINDING; }
+    if (!hik_profile_equal(before, expected)) { cJSON_Delete(before); return HIK_BINDING; }
     cJSON_Delete(before);
     cJSON *value = cJSON_CreateObject();
     cJSON *list = value ? cJSON_AddArrayToObject(value, "EmployeeNoList") : NULL;

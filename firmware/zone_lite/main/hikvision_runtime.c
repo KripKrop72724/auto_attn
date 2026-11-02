@@ -827,7 +827,9 @@ void hikvision_append_telemetry(cJSON *payload)
         cJSON_AddNumberToObject(light, "last_completed_epoch", atomic_load(&light_completed));
         cJSON_AddNumberToObject(light, "error", atomic_load(&light_error));
     }
-    cJSON_AddNumberToObject(terminal, "profile_command_version", 2);
+    /* 5: stable-fact renames and deletions for the DS-K1T321MFWX profile. */
+    cJSON_AddNumberToObject(terminal, "profile_command_version",
+        strcmp(cfg->hik_profile, "ds-k1t321mfwx-v4.61.0-20260828-unverified-v1") ? 2 : 5);
     cJSON_AddNumberToObject(terminal, "last_successful_poll_epoch", atomic_load(&last_poll));
     cJSON_AddNumberToObject(terminal, "poll_error", atomic_load(&poll_error));
     cJSON_AddStringToObject(terminal, "poll_stage", poll_stages[atomic_load(&poll_stage)]);
