@@ -91,13 +91,21 @@ int main(void){
  immutable(anchor,strlen(anchor),r.anchor_stable);writes=0;
  assert(range_row(&r,anchor,strlen(anchor),3199)&&!writes&&!r.page.anchor_conflict);
  assert(!range_row(&r,fresh,strlen(fresh),3199)&&r.page.anchor_conflict&&!writes);
- /* A backlog is cut into a window of at most 400 events that is never empty;
-  * a small one is read whole. */
+ /* A backlog is cut into a window of exactly 400 events; a smaller multi-page
+  * tail ends at its newest serial so new punches stay outside the window; a
+  * single page is read whole. */
  uint32_t end=0,inside=0;
  assert(poll_window_end(5000,&end)==HIK_OK&&end<3000000000U&&count_calls<40);
  hik_history_count(5000,end,&inside);assert(inside==400);
- hik_history_count(5000,end+1,&inside);assert(inside==401);
- assert(poll_window_end(7000,&end)==HIK_OK&&end==3000000000U);
+ hik_history_count(5000,end-1,&inside);assert(inside==399);
+ assert(poll_window_end(7000,&end)==HIK_OK&&end==7997);
+ hik_history_count(7000,end,&inside);assert(inside==333);
+ assert(poll_window_end(7950,&end)==HIK_OK&&end==3000000000U);
+ /* A first install starts at the newest 20 serials, whatever the time order. */
+ uint32_t tail=0;
+ assert(poll_tail_begin(&tail)==HIK_OK);
+ hik_history_count(tail,3000000000U,&inside);assert(inside==20);
+ hik_history_count(tail-1,3000000000U,&inside);assert(inside==21);
  /* A failed durable append keeps the checkpoint where it was. */
  r=(range_context_t){.anchor_serial=10};custody_ok=false;
  assert(!range_row(&r,c,strlen(c),12)&&!r.max_serial);custody_ok=true;

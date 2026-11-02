@@ -335,22 +335,42 @@ static bool range_row(void *context, const char *body, size_t length, uint32_t s
  * completely before the checkpoint moves, so no poll needs an unbounded scan. */
 #define POLL_WINDOW_ROWS 400
 #define POLL_RANGE_MAX_PAGES (POLL_WINDOW_ROWS / 20 + 2)
-/* Largest end with count(from, end) <= POLL_WINDOW_ROWS. When it is smaller
- * than 3e9, count(from, end + 1) exceeds the limit, so the window is never
- * empty and every serial up to end is read before the checkpoint moves. */
+/* The read window [from, end]. Up to one page is read whole. Otherwise end is
+ * the smallest serial whose window already holds min(waiting, POLL_WINDOW_ROWS)
+ * events: punches that arrive meanwhile take higher serials, stay outside it
+ * and cannot change its total mid-read; they are read by the next poll. One
+ * serial adds at most one event, so the window holds exactly that many. */
 static hik_result_t poll_window_end(uint32_t from, uint32_t *end)
 {
     uint32_t waiting = 0;
     *end = 3000000000U;
     hik_result_t result = hik_history_count(from, *end, &waiting);
-    if (result != HIK_OK || waiting <= POLL_WINDOW_ROWS) return result;
-    uint32_t lo = from, hi = *end;
+    if (result != HIK_OK || waiting <= 20) return result;
+    uint32_t target = waiting < POLL_WINDOW_ROWS ? waiting : POLL_WINDOW_ROWS;
+    uint32_t lo = from, hi = *end; /* count(from, lo) < target <= count(from, hi) */
     while (result == HIK_OK && hi - lo > 1) {
         uint32_t mid = lo + (hi - lo) / 2, in_window = 0;
         result = hik_history_count(from, mid, &in_window);
-        if (result == HIK_OK) { if (in_window <= POLL_WINDOW_ROWS) lo = mid; else hi = mid; }
+        if (result == HIK_OK) { if (in_window >= target) hi = mid; else lo = mid; }
     }
-    *end = lo;
+    *end = hi;
+    return result;
+}
+/* First install: the newest 20 serials. Position-based bounds assume serial
+ * order, which a time-sorted terminal does not give. */
+static hik_result_t poll_tail_begin(uint32_t *begin)
+{
+    uint32_t total = 0;
+    *begin = 1;
+    hik_result_t result = hik_history_count(1, 3000000000U, &total);
+    if (result != HIK_OK || total <= 20) return result;
+    uint32_t lo = 1, hi = 3000000000U; /* count(lo, end) > 20 >= count(hi, end) */
+    while (result == HIK_OK && hi - lo > 1) {
+        uint32_t mid = lo + (hi - lo) / 2, newer = 0;
+        result = hik_history_count(mid, 3000000000U, &newer);
+        if (result == HIK_OK) { if (newer > 20) lo = mid; else hi = mid; }
+    }
+    *begin = hi;
     return result;
 }
 static void poll_task(void *arg)
@@ -390,12 +410,10 @@ static void poll_task(void *arg)
          * then read every later serial in whatever order the terminal sorts it. */
         uint32_t begin = present && cursor.serial ? cursor.serial : 1;
         if (result == HIK_OK && !present) {
-            uint32_t first, last, count;
-            stage = 2;
-            result = hik_history_bounds(&first, &last, &count);
             /* First install starts at the recent tail. Earlier retained history
              * remains explicitly outstanding for the independent full job. */
-            if (result == HIK_OK) begin = count ? (last - first >= 19 ? last - 19 : first) : 1;
+            stage = 2;
+            result = poll_tail_begin(&begin);
         }
         if (result == HIK_OK && begin <= 3000000000U) {
             range_context_t range = {

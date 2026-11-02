@@ -269,7 +269,7 @@ hik_result_t hik_history_range(uint32_t begin, uint32_t end, unsigned max_pages,
      * serial seen twice means another was skipped: with a stable total and no
      * repeats, every row in the range was read exactly once. */
     uint32_t *seen = malloc(sizeof(uint32_t) * 20 * max_pages);
-    if (!seen) return HIK_NETWORK;
+    if (!seen) return HIK_CUSTODY;
     char search_id[33]; new_search_id(search_id);
     uint32_t position = 0, expected_total = 0, seen_count = 0;
     hik_result_t outcome = HIK_OVERSIZED;
