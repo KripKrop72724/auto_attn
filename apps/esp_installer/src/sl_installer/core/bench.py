@@ -33,12 +33,13 @@ from ..config import TOOL_PYTHON_ENV, AppConfig, load_config
 from . import texts
 from .api import (STEP_LABELS, Advice, BoardInfo, CancelToken, ConsoleEvent, Family,
                   HikSettings, InstallConfig, InstallerError, InstallMode, PresenceReport,
-                  PresenceState, ReplugPhase, SecurityState, Services, StepProgress, ZktSettings,
-                  steps_for)
+                  PresenceState, ReplugPhase, SecurityState, Services, StepProgress, UsbKind,
+                  ZktSettings, steps_for)
 from .esptool_runner import TOOL_VERSION, SubprocessRunner, tool_version_problems
 from .factory import make_services
 from .naming import hotspot_name, public_name_preview
 from .single_instance import LOCK_FILE_NAME, InstanceLock
+from .usb import usb_id
 
 _MODES = {
     SecurityState.BLANK: InstallMode.NEW_BOARD,
@@ -70,6 +71,14 @@ def _one_board(services: Services) -> PresenceReport:
     report = services.usb.snapshot()
     if report.state is not PresenceState.ONE_BOARD or report.board is None:
         _print_advice(services.diagnosis.diagnose(None, report, None, ()))
+        if report.state is PresenceState.OTHER_USB_MODE:
+            # The advice names the window's Next and Help; here the next run reads the board.
+            for candidate in report.candidates:
+                if candidate.kind is UsbKind.OTHER:
+                    what = f" ({candidate.description})" if candidate.description else ""
+                    print(f"\n{candidate.port}{what}: Espressif USB {usb_id(candidate)}, not "
+                          "the board's own USB-Serial/JTAG 303A:1001.")
+            print("Put the board into setup mode, then run this command again.")
         raise SystemExit(2)
     return report
 

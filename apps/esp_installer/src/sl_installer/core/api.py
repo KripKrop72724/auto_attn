@@ -81,7 +81,7 @@ class CancelToken:
 class UsbKind(str, enum.Enum):
     NATIVE = "native"   # ESP32-S3 USB-Serial/JTAG, VID 0x303A PID 0x1001 (socket marked USB)
     BRIDGE = "bridge"   # CP210x / CH34x / FTDI USB-UART chip (socket marked COM or UART)
-    OTHER = "other"
+    OTHER = "other"     # VID 0x303A, another PID (e.g. 0x4001): the chip runs other software
 
 
 @dataclass(frozen=True)
@@ -98,6 +98,7 @@ class PresenceState(str, enum.Enum):
     NO_BOARD = "no_board"
     ONE_BOARD = "one_board"
     WRONG_SOCKET = "wrong_socket"          # only a BRIDGE port is present
+    OTHER_USB_MODE = "other_usb_mode"      # no NATIVE port but an OTHER one: not in setup mode
     SEVERAL_BOARDS = "several_boards"
     RESTART_LOOP = "restart_loop"          # the board keeps appearing and vanishing
 

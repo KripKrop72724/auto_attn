@@ -261,6 +261,15 @@ HELP_TOPICS: Dict[str, HelpTopic] = {
                 "socket "
                 "on the computer.",
             ),
+            # The words of the screen's own advice (texts.SETUP_MODE_NEEDED), short.
+            HelpItem(
+                "boot_button",
+                "Put the board into setup mode",
+                "Do this when the screen asks for it. Hold down the BOOT button. While you hold "
+                "BOOT, press and release the RST button. Then let go of BOOT. If the screen "
+                "still asks, unplug the board. Hold down BOOT while you plug it back in, then "
+                "let go.",
+            ),
         ),
     ),
     "checking": HelpTopic(
@@ -454,6 +463,7 @@ def presence_advice(report: api.PresenceReport) -> Optional[Advice]:
                 "Plug it into the socket marked USB on the board.",
                 "Plug the other end straight into this computer, not into a hub.",
                 "Try another socket on the computer.",
+                texts.SETUP_MODE_TIP,
                 "If nothing changes after 3 tries, the board may be faulty. "
                 "Put it aside and use another.",
             ),
@@ -472,6 +482,9 @@ def presence_advice(report: api.PresenceReport) -> Optional[Advice]:
             Severity.WARNING,
             "usb_socket",
         )
+    if state is PresenceState.OTHER_USB_MODE:
+        # The engine's own words, so the steps (BOOT, RST, Next, Help) match either way.
+        return texts.SETUP_MODE_NEEDED
     if state is PresenceState.SEVERAL_BOARDS:
         return Advice(
             "SEVERAL_BOARDS",
