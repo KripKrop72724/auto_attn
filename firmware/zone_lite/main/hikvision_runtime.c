@@ -298,6 +298,8 @@ typedef struct {
     page_context_t page;
     uint32_t anchor_serial, max_serial;
     unsigned char max_digest[32];
+    bool recheck_anchor;
+    unsigned char anchor_stable[32];
 } range_context_t;
 static bool anchor_row(void *context, const char *body, size_t length, uint32_t serial)
 {
@@ -308,7 +310,18 @@ static bool anchor_row(void *context, const char *body, size_t length, uint32_t 
 static bool range_row(void *context, const char *body, size_t length, uint32_t serial)
 {
     range_context_t *range = context;
-    /* The anchor and anything at or below it were read before. */
+    /* The anchor and anything at or below it were read before. The anchor row
+     * may reappear in this second search; it must still carry the same facts. */
+    if (range->anchor_serial && serial == range->anchor_serial && range->recheck_anchor &&
+        range->page.digest_record) {
+        unsigned char stable[32];
+        if (!range->page.digest_record(body, length, stable) ||
+            memcmp(stable, range->anchor_stable, sizeof(stable))) {
+            memcpy(range->page.observed_anchor, stable, sizeof(stable));
+            range->page.anchor_conflict = true;
+            return false;
+        }
+    }
     if (range->anchor_serial && serial <= range->anchor_serial) return true;
     unsigned before = range->page.count;
     if (!poll_record(&range->page, body, length)) return false;
@@ -318,7 +331,28 @@ static bool range_row(void *context, const char *body, size_t length, uint32_t s
     }
     return true;
 }
-#define POLL_RANGE_MAX_PAGES 50
+/* A backlog is read in serial windows of at most this many records, each read
+ * completely before the checkpoint moves, so no poll needs an unbounded scan. */
+#define POLL_WINDOW_ROWS 400
+#define POLL_RANGE_MAX_PAGES (POLL_WINDOW_ROWS / 20 + 2)
+/* Largest end with count(from, end) <= POLL_WINDOW_ROWS. When it is smaller
+ * than 3e9, count(from, end + 1) exceeds the limit, so the window is never
+ * empty and every serial up to end is read before the checkpoint moves. */
+static hik_result_t poll_window_end(uint32_t from, uint32_t *end)
+{
+    uint32_t waiting = 0;
+    *end = 3000000000U;
+    hik_result_t result = hik_history_count(from, *end, &waiting);
+    if (result != HIK_OK || waiting <= POLL_WINDOW_ROWS) return result;
+    uint32_t lo = from, hi = *end;
+    while (result == HIK_OK && hi - lo > 1) {
+        uint32_t mid = lo + (hi - lo) / 2, in_window = 0;
+        result = hik_history_count(from, mid, &in_window);
+        if (result == HIK_OK) { if (in_window <= POLL_WINDOW_ROWS) lo = mid; else hi = mid; }
+    }
+    *end = lo;
+    return result;
+}
 static void poll_task(void *arg)
 {
     (void)arg;
@@ -374,13 +408,27 @@ static void poll_task(void *arg)
             };
             stage = 3;
             if (range.page.expected_anchor) {
-                /* +-1 so inclusive and exclusive serial bounds both return it. */
+                /* +-1 so inclusive and exclusive serial bounds both return it.
+                 * (A cursor at serial 1 on an exclusive-begin terminal cannot be
+                 * proved; it only arises from a terminal holding one event.) */
                 result = hik_history_range(cursor.serial > 1 ? cursor.serial - 1 : 1,
                     cursor.serial < 3000000000U ? cursor.serial + 1 : cursor.serial, 1, anchor_row, &range);
                 if (range.page.anchor_conflict || (result == HIK_OK && !range.page.anchor_seen))
                     result = HIK_BINDING;
                 range.page.expected_anchor = NULL;
             }
+            bool upgraded = range.page.legacy_upgraded;
+            unsigned char upgraded_anchor[32];
+            memcpy(upgraded_anchor, range.page.digest, sizeof(upgraded_anchor));
+            if (result == HIK_OK && range.page.anchor_seen) {
+                range.recheck_anchor = true;
+                memcpy(range.anchor_stable, upgraded ? upgraded_anchor : cursor.anchor, 32);
+            }
+            uint32_t from = range.anchor_serial ? range.anchor_serial : begin, end = 3000000000U;
+            if (result == HIK_OK) result = poll_window_end(from, &end);
+            if (result == HIK_OK)
+                result = hik_history_range(from, end, POLL_RANGE_MAX_PAGES, range_row, &range);
+            if (range.page.anchor_conflict) result = HIK_BINDING;
             if (range.page.anchor_conflict && started - last_anchor_report_us >= 60000000) {
                 char expected[65], observed[65], message[224];
                 for (unsigned i = 0; i < 32; i++) {
@@ -393,11 +441,6 @@ static void poll_task(void *arg)
                 (void)add_connector_log("WARN", "hikvision", "HIK_ANCHOR_MISMATCH", message);
                 last_anchor_report_us = started;
             }
-            bool upgraded = range.page.legacy_upgraded;
-            unsigned char upgraded_anchor[32];
-            memcpy(upgraded_anchor, range.page.digest, sizeof(upgraded_anchor));
-            if (result == HIK_OK)
-                result = hik_history_range(begin, 3000000000U, POLL_RANGE_MAX_PAGES, range_row, &range);
             if (result == HIK_OK && (range.page.count || !present || upgraded)) {
                 poll_checkpoint_t next = cursor;
                 next.version = 2;

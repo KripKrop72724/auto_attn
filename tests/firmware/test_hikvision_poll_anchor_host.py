@@ -16,6 +16,12 @@ def test_inclusive_poll_anchor_gates_durable_records(tmp_path):
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
+typedef enum {HIK_OK,HIK_CONFIGURATION,HIK_NETWORK,HIK_AUTH,HIK_HTTP_STATUS,HIK_OVERSIZED,HIK_BINDING,HIK_PARSE,HIK_CUSTODY} hik_result_t;
+/* A terminal holding 1000 events at serials 5000, 5003, ... 7997. */
+static unsigned count_calls;
+static hik_result_t hik_history_count(uint32_t begin,uint32_t end,uint32_t *total){
+ ++count_calls;*total=0;for(uint32_t s=5000;s<8000;s+=3)if(s>=begin&&s<=end)++*total;return HIK_OK;
+}
 static unsigned writes;
 static bool custody_ok = true;
 /* Deterministic digest stand-in: test ordering/custody, not SHA's implementation. */
@@ -80,6 +86,18 @@ int main(void){
  /* A wrong anchor admits nothing, wherever it sorts. */
  r=(range_context_t){.page={.expected_anchor=expected},.anchor_serial=3199};writes=0;
  assert(!anchor_row(&r,fresh,strlen(fresh),3199)&&r.page.anchor_conflict&&!writes);
+ /* The anchor row met again in the main read must carry the proved facts. */
+ r=(range_context_t){.anchor_serial=3199,.recheck_anchor=true,.page={.digest_record=immutable}};
+ immutable(anchor,strlen(anchor),r.anchor_stable);writes=0;
+ assert(range_row(&r,anchor,strlen(anchor),3199)&&!writes&&!r.page.anchor_conflict);
+ assert(!range_row(&r,fresh,strlen(fresh),3199)&&r.page.anchor_conflict&&!writes);
+ /* A backlog is cut into a window of at most 400 events that is never empty;
+  * a small one is read whole. */
+ uint32_t end=0,inside=0;
+ assert(poll_window_end(5000,&end)==HIK_OK&&end<3000000000U&&count_calls<40);
+ hik_history_count(5000,end,&inside);assert(inside==400);
+ hik_history_count(5000,end+1,&inside);assert(inside==401);
+ assert(poll_window_end(7000,&end)==HIK_OK&&end==3000000000U);
  /* A failed durable append keeps the checkpoint where it was. */
  r=(range_context_t){.anchor_serial=10};custody_ok=false;
  assert(!range_row(&r,c,strlen(c),12)&&!r.max_serial);custody_ok=true;

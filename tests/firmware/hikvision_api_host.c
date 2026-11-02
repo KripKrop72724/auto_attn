@@ -39,6 +39,9 @@ hik_result_t hik_http_request(esp_http_client_method_t method, const char *path,
         for (unsigned i = 0; i < sizeof(order) / sizeof(order[0]); i++)
             if ((mode == 41 ? order[i] > begin : order[i] >= begin) && order[i] <= end) matched[total++] = order[i];
         if (mode == 42 && position) total--;           /* the terminal changed mid-read */
+        /* Equal timestamps reordered between requests: page 2 repeats a row
+         * from page 1 and the row it displaced is never returned. */
+        if (mode == 45 && position) matched[position] = matched[3];
         unsigned count = position < total ? (total - position < size ? total - position : size) : 0;
         cJSON *page = cJSON_AddObjectToObject(out, "AcsEvent");
         cJSON_AddStringToObject(page, "searchID", cJSON_GetObjectItem(cond, "searchID")->valuestring);
@@ -203,6 +206,18 @@ static void test_unordered_ranges(void)
     mode = 44;
     assert(hik_history_range(3199, 3000000000U, 50, range_saved, NULL) == HIK_PARSE);
     assert(strstr(hik_history_last_reject(), "range=serial_scope"));
+    mode = 45;
+    assert(hik_history_range(3199, 3000000000U, 50, range_saved, NULL) == HIK_PARSE);
+    assert(strstr(hik_history_last_reject(), "range=duplicate_serial"));
+    /* Counts come from totalMatches of a one-row search. */
+    mode = 40; uint32_t waiting = 99;
+    assert(hik_history_count(3199, 3000000000U, &waiting) == HIK_OK && waiting == 24);
+    assert(hik_history_count(3199, 3300, &waiting) == HIK_OK && waiting == 9);
+    assert(hik_history_count(4000, 3000000000U, &waiting) == HIK_OK && !waiting);
+    /* A stale reason never survives a later successful read. */
+    range_rows = 0;
+    assert(hik_history_range(3199, 3000000000U, 50, range_saved, NULL) == HIK_OK);
+    assert(!strlen(hik_history_last_reject()));
     /* Too many pages, custody failure, and an empty range. */
     mode = 40;
     assert(hik_history_range(1, 3000000000U, 1, range_saved, NULL) == HIK_OVERSIZED);
