@@ -292,7 +292,7 @@ class InstallConfig:
 class InstallMode(str, enum.Enum):
     NEW_BOARD = "new_board"            # BLANK board
     RESUME = "resume"                  # KEY_BURNED_NOT_STARTED board
-    CHANGE_SETTINGS = "change_settings"  # SECURED_STATE_LIFE board: settings (and empty storage) only
+    CHANGE_SETTINGS = "change_settings"  # SECURED_STATE_LIFE board: NVS, storage, redo area only
 
 
 class StepId(str, enum.Enum):

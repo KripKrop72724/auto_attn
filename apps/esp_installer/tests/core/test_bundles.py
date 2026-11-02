@@ -1,8 +1,10 @@
 """The bundle gate (design sections 4.6 and 6) and the bundle cache."""
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
+import struct
 from pathlib import Path
 
 import pytest
@@ -288,3 +290,55 @@ def test_manifest_written_to_cache_round_trips(store, zkt_bundle):
     local, _ = fetch(store, zkt_bundle)
     saved = json.loads((Path(local.directory) / "manifest.json").read_text(encoding="utf-8"))
     assert manifest_sha256(saved) == manifest_sha256(zkt_bundle.manifest)
+
+
+def test_redo_area_image_is_made_locally_and_checked(tmp_path, manifest_key):
+    store = BundleStore(tmp_path / "c", support.verifier(manifest_key))  # no download source
+    path = store.redo_area_image()
+    assert path.name == "redo-area-blank.bin" and path.parent.name == "shared"
+    assert path.stat().st_size == 0x60000
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == bundles.REDO_AREA_BLANK_SHA256
+    path.write_bytes(b"\xff" * 0x5F000)  # short
+    assert store.redo_area_image().stat().st_size == 0x60000
+    assert not path.with_name(path.name + ".part").exists()
+    bundles.clean_cache(tmp_path / "c", keep=())
+    assert path.is_file()
+
+
+def test_redo_area_image_on_a_full_disk(tmp_path, manifest_key, monkeypatch):
+    store = BundleStore(tmp_path / "c", support.verifier(manifest_key))
+
+    def full(self, data):
+        raise OSError(errno.ENOSPC, "No space left on device")
+    monkeypatch.setattr(Path, "write_bytes", full)
+    with pytest.raises(InstallerError) as caught:
+        store.redo_area_image()
+    assert caught.value.advice is texts.DISK_FULL
+
+
+def _storage_twice() -> bytes:
+    """The production table with a second storage row, past 0xFA0000, before the real one:
+    the layout check sees only the last row of a label, so it passes."""
+    table = support.partition_table()
+    hidden = struct.pack("<2sBBII16sI", b"\xaa\x50", 1, 0x82, 0xFA0000, 0x10000, b"storage", 0)
+    return (table[:6 * 32] + hidden + table[6 * 32:])[:len(table)]
+
+
+@pytest.mark.parametrize("table", [
+    support.partition_table(coredump=(1, 0x03, 0xFA0000, 0x10000)), _storage_twice()],
+    ids=["extra-partition", "repeated-label"])
+def test_partition_table_reaching_the_redo_area_is_refused(tmp_path, store, manifest_key,
+                                                           table):
+    error = refused(store, _bundle(tmp_path, manifest_key, _set_file("partition-table.bin", table)))
+    assert "0xFA0000" in error.cause
+
+
+def test_a_bundle_may_not_carry_the_redo_area(tmp_path, store, manifest_key):
+    def add_redo(manifest, files):
+        files["redo.bin"] = b"\xff" * 0x60000
+        manifest["images"].append({"role": "redo-area", "name": "redo.bin", "offset": 0xFA0000,
+                                   "size": 0x60000,
+                                   "sha256": hashlib.sha256(files["redo.bin"]).hexdigest()})
+    error = refused(store, support.build_bundle(tmp_path, Family.ZKT, manifest_key,
+                                                change=add_redo))
+    assert "manifest roles" in error.cause

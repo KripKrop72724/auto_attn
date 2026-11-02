@@ -16,6 +16,8 @@ An installer bundle is one signed, MAC-independent set of flash images per firmw
 | `ota_1` | `rollback-predecessor.bin` | `0x520000` | The qualified predecessor (default 2.5.2) | Not written |
 | `storage` | `storage-empty.bin` | `0x7A0000` | Empty SPIFFS, SHA-256 `f39db7c1…5ec70` | Same |
 
+The app adds two ranges no bundle carries: `nvs` (ADD's per-board settings) and the blank redo area (`redo-area`: 0x60000 × 0xFF at `0xFA0000`, made by the app). A manifest listing either role is refused, and so is a partition table with any partition past `0xFA0000`.
+
 The partition table is at `0x10000` (`CONFIG_PARTITION_TABLE_OFFSET`, where the flash tool writes it), not `0x8000`. Each application entry also carries `app_project`, `app_version` and `app_digest`. `app_digest` is the SHA-256 the image carries after its segments: what the board's `esp_partition_get_sha256()` returns and what ADD release manifests call `application_sha256`. It is not the file hash.
 
 Bundle IDs:

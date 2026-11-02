@@ -389,7 +389,7 @@ def test_new_zkt_board_end_to_end_on_the_real_engine(rig):
     assert board.flash[0x0] == bundle.files["bootloader-signed.bin"]
     assert board.flash[0x11000] == r.server.nvs
     writes = esptool_args(r, "write-flash")
-    assert [args[-2] for args in writes] == ["0x7a0000", "0x0"]  # everything else, then 0x0
+    assert [args[-2] for args in writes] == ["0xfa0000", "0x0"]  # everything else, then 0x0
     commands = [command_of(seen.call.args) for seen in r.runner.seen]
     burn = commands.index("burn-key")
     assert commands[burn - 2 : burn + 4] == [
@@ -609,11 +609,12 @@ def test_secured_board_settings_change_on_the_real_engine(rig):
     first_start = r.page(pages.FIRST_START)
     assert first_start.result.advice.code == "FIRST_START_OK", first_start.result.advice
 
-    # Secure Download Mode: one blind ROM write of the settings and empty storage, no key.
+    # Secure Download Mode: one blind ROM write of the settings, empty storage and the blank
+    # redo area, in that order, no key.
     assert r.board.burned_key is None
     assert esptool_args(r, "burn-key") == [] and esptool_args(r, "erase-region") == []
     (write,) = esptool_args(r, "write-flash")
-    assert "--no-stub" in write and write[-4::2] == ("0x11000", "0x7a0000")
+    assert "--no-stub" in write and write[-6::2] == ("0x11000", "0x7a0000", "0xfa0000")
     assert r.board.flash[0x11000] == r.server.nvs
     assert not any(held for _gui, held in r.tool_calls[calls_before_fix:])
     (request,) = r.server.requests

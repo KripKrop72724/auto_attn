@@ -4,13 +4,21 @@ The order is the safety argument, so it lives in one pure function per mode and
 is unit-tested call by call:
 
 NEW_BOARD   identity check, erase 0x0-0xFFFF, write every range except the
-            bootloader, verify on the chip, check the key block is blank, burn
-            the HMAC key into BLOCK_KEY0 (HMAC_UP), check purpose and protection,
-            write the bootloader last, verify it.
+            bootloader (the blank redo area last), verify on the chip, check the
+            key block is blank, burn the HMAC key into BLOCK_KEY0 (HMAC_UP), check
+            purpose and protection, write the bootloader last, verify it.
 RESUME      the same without the burn; the key must already be HMAC_UP and
             protected.
-CHANGE_SETTINGS  identity check, then one write of settings (0x11000) and empty
-            storage (0x7A0000) with the flags Secure Download Mode accepts.
+CHANGE_SETTINGS  identity check, then one write of settings (0x11000), empty
+            storage (0x7A0000) and the blank redo area (0xFA0000), in that order,
+            with the flags Secure Download Mode accepts.
+
+The redo area (0xFA0000-0xFFFFFF, past the last partition) holds ZKT 2.7.6+'s
+last-resort reformat records. Their journal is in NVS (key "reclaim") and they
+describe blocks of the store; every mode replaces both, so every mode also
+writes the area back to all 0xFF, as on a board that never ran a round, after the
+settings and the storage it belonged to. Hikvision firmware never reads the
+area: clearing it there too keeps one plan for both families.
 
 Rules every call follows: esptool always gets ``--after no-reset`` (nothing may
 boot a Zone Lite image before its key is burned; the only first boot is the
@@ -52,6 +60,10 @@ OTA_1_OFFSET = 0x520000
 APP_SLOT_SIZE = 0x280000
 STORAGE_OFFSET = 0x7A0000
 STORAGE_SIZE = 0x800000
+# firmware/zone_lite/main/storage_repair.c SR_REDO_OFFSET and SR_REDO_BYTES: 96 sectors
+# from the end of storage to the end of the 16 MiB chip, in no partition.
+REDO_AREA_OFFSET = 0xFA0000
+REDO_AREA_SIZE = 0x60000
 ESP_OTA_IMG_VALID = 2
 
 ROLE_OFFSETS: Dict[str, int] = {
@@ -63,7 +75,14 @@ ROLE_OFFSETS: Dict[str, int] = {
     "ota_0": OTA_0_OFFSET,
     "ota_1": OTA_1_OFFSET,
     "storage": STORAGE_OFFSET,
+    "redo-area": REDO_AREA_OFFSET,
 }
+# Ranges the app adds to every mode's main write, never in a bundle: the settings from
+# ADD ("nvs") and the blank redo area, made here (blank_redo_area), never downloaded.
+APP_ROLES = ("nvs", "redo-area")
+# A settings change's one write, in this order: the redo area goes after the settings
+# and the storage it belonged to, so a cut write never leaves an old store without it.
+CHANGE_SETTINGS_ROLES = ("nvs", "storage", "redo-area")
 # Image roles each family's bundle carries (the settings come from ADD as "nvs").
 # ZKT boots the release from ota_0 with a qualified predecessor in ota_1; HIK
 # boots factory with blank otadata. Both need the empty storage image.
@@ -109,6 +128,11 @@ def blank_otadata() -> bytes:
     return b"\xff" * OTADATA_SIZE
 
 
+def blank_redo_area() -> bytes:
+    """The redo area as a board that never ran a round has it: erased."""
+    return b"\xff" * REDO_AREA_SIZE
+
+
 def partition_entries(table: bytes) -> Dict[str, Tuple[int, int, int, int]]:
     entries = {}
     for start in range(0, len(table) - 31, 32):
@@ -119,6 +143,22 @@ def partition_entries(table: bytes) -> Dict[str, Tuple[int, int, int, int]]:
         label = row[12:28].split(b"\0", 1)[0].decode("ascii", "replace")
         entries[label] = (kind, subtype, offset, size)
     return entries
+
+
+def partitions_end(table: bytes) -> int:
+    """Where the last partition of ``table`` ends.
+
+    Reads the rows partition_entries reads (up to the first that is not an entry),
+    but every one of them: a repeated label there keeps only its last row.
+    """
+    end = 0
+    for start in range(0, len(table) - 31, 32):
+        row = table[start:start + 32]
+        if row[:2] != b"\xaa\x50":
+            break
+        _kind, _subtype, offset, size = struct.unpack_from("<BBII", row, 2)
+        end = max(end, offset + size)
+    return end
 
 
 class Purpose(str, enum.Enum):
@@ -272,10 +312,13 @@ def _check_ranges(ranges: Sequence[FlashRange]) -> None:
             raise PlanError(f"{item.role} overlaps the range before it")
         if item.end > FLASH_TOTAL:
             raise PlanError(f"{item.role} runs past the end of the 16 MB chip")
+        if item.end > REDO_AREA_OFFSET and item.role != "redo-area":
+            raise PlanError(f"{item.role} reaches the redo area")
         end = item.end
     limits = {"bootloader": START_AREA_SIZE, "partition-table": PARTITION_TABLE_MAX,
               "factory": APP_SLOT_SIZE, "ota_0": APP_SLOT_SIZE, "ota_1": APP_SLOT_SIZE}
-    exact = {"nvs": NVS_SIZE, "otadata": OTADATA_SIZE, "storage": STORAGE_SIZE}
+    exact = {"nvs": NVS_SIZE, "otadata": OTADATA_SIZE, "storage": STORAGE_SIZE,
+             "redo-area": REDO_AREA_SIZE}
     for item in ordered:
         if item.role in limits and item.size > limits[item.role]:
             raise PlanError(f"{item.role} is too large for its slot")
@@ -286,7 +329,7 @@ def _check_ranges(ranges: Sequence[FlashRange]) -> None:
 def _split(family: Family, ranges: Sequence[FlashRange]
            ) -> Tuple[FlashRange, Tuple[FlashRange, ...]]:
     roles = sorted(item.role for item in ranges)
-    wanted = sorted(BUNDLE_ROLES[family] + ("nvs",))
+    wanted = sorted(BUNDLE_ROLES[family] + APP_ROLES)
     if roles != wanted:
         raise PlanError(f"expected images {wanted}, got {roles}")
     _check_ranges(ranges)
@@ -341,8 +384,9 @@ def resume_plan(port: str, family: Family, ranges: Sequence[FlashRange],
 
 def change_settings_plan(port: str, ranges: Sequence[FlashRange]) -> FlashPlan:
     roles = sorted(item.role for item in ranges)
-    if roles != ["nvs", "storage"]:
-        raise PlanError(f"settings change writes settings and storage only, got {roles}")
+    if roles != sorted(CHANGE_SETTINGS_ROLES):
+        raise PlanError("settings change writes settings, storage and the redo area only, "
+                        f"got {roles}")
     _check_ranges(ranges)
     ordered = tuple(sorted(ranges, key=lambda item: item.offset))
     timeout, idle = _write_timeout(ordered)
@@ -390,6 +434,22 @@ def safety_problems(plan: FlashPlan) -> Tuple[str, ...]:
             problems.append("firmware must be written before the key burn")
         if planned.call.tool == ESPEFUSE and "--after" in args:
             problems.append("espefuse has no --after option")
+        for item in planned.ranges:
+            if item.end > FLASH_TOTAL:
+                problems.append(f"{planned.call.label}: {item.role} runs past the 16 MB chip")
+            if item.end > REDO_AREA_OFFSET and (item.role, item.offset, item.size) != (
+                    "redo-area", REDO_AREA_OFFSET, REDO_AREA_SIZE):
+                problems.append(f"{planned.call.label}: only the redo area may be written "
+                                "past 0xFA0000")
+    # Every mode replaces the settings and the store, so its one main write clears their
+    # redo records too, once and after them (NEW_BOARD and RESUME still write the
+    # bootloader later, on its own).
+    main = [planned for planned in plan.calls
+            if planned.purpose in (Purpose.WRITE_FIRMWARE, Purpose.WRITE_SETTINGS)]
+    if (len(main) != 1 or not main[0].ranges
+            or [item.role for item in main[0].ranges].count("redo-area") != 1
+            or main[0].ranges[-1].role != "redo-area"):
+        problems.append("the redo area must be cleared once, as the last range of the main write")
     if plan.mode in (InstallMode.NEW_BOARD, InstallMode.RESUME):
         erase = [i for i, planned in enumerate(plan.calls)
                  if planned.purpose is Purpose.ERASE_START_AREA]
@@ -405,15 +465,20 @@ def safety_problems(plan: FlashPlan) -> Tuple[str, ...]:
         last = plan.calls[-1]
         if last.purpose is not Purpose.VERIFY_STARTUP:
             problems.append("the plan must end by verifying the bootloader")
+        verifies = [planned for planned in plan.calls
+                    if planned.purpose is Purpose.VERIFY_FIRMWARE]
+        if len(verifies) != 1 or not main or verifies[0].ranges != main[0].ranges:
+            problems.append("every copied range must be checked on the chip")
     else:
         for planned in plan.calls:
             if planned.call.tool == ESPEFUSE:
                 problems.append("a settings change must not touch the key")
             if planned.ranges and "--no-stub" not in planned.call.args:
                 problems.append("Secure Download Mode writes need --no-stub")
-            if planned.ranges and any(item.role not in ("nvs", "storage")
-                                      for item in planned.ranges):
-                problems.append("a settings change writes settings and storage only")
+            roles = tuple(item.role for item in planned.ranges)
+            if planned.ranges and roles != CHANGE_SETTINGS_ROLES:
+                problems.append("a settings change writes settings, storage and the redo area "
+                                "only, in that order")
     return tuple(problems)
 
 

@@ -76,6 +76,7 @@ def test_new_zkt_board_end_to_end(rig, zkt_bundle):
     assert flash[FACTORY] == flash[0x2A0000] == files["zone-lite-signed.bin"]
     assert flash[0x520000] == files["rollback-predecessor.bin"]
     assert flash[0x7A0000] == files["storage-empty.bin"]
+    assert flash[0xFA0000] == b"\xff" * 0x60000  # the redo area, cleared
     assert rig.fake.erased == [(0x0, 0x10000)]
     assert rig.fake.burned_key == rig.server.hmac_key
     assert summary.mode is InstallMode.NEW_BOARD and summary.mac == MAC
@@ -148,6 +149,7 @@ def test_hikvision_board_gets_profile_and_source_epoch(tmp_path, store, hik_bund
     assert sent.source_epoch == "lf-zone-jhelum-01-20261101"
     assert 0x2A0000 not in rig.fake.flash and 0x520000 not in rig.fake.flash
     assert rig.fake.flash[0x17000] == b"\xff" * 0x2000
+    assert rig.fake.flash[0xFA0000] == b"\xff" * 0x60000  # never read by 3.1.1, cleared alike
 
 
 def test_hikvision_keeps_the_epoch_head_office_has(tmp_path, store, hik_bundle):
@@ -171,6 +173,7 @@ def test_resume_rewrites_everything_and_never_burns(tmp_path, store, zkt_bundle)
     assert all("burn-key" not in call.args for call in rig.runner.calls)
     assert rig.purposes()[:3] == ["check board identity", "read key state", "clear start area"]
     assert rig.fake.flash[0x0] == zkt_bundle.files["bootloader-signed.bin"]
+    assert rig.fake.flash[0xFA0000] == b"\xff" * 0x60000
     assert rig.fake.burned_key is None
     assert rig.server.requests[0].mode is InstallMode.RESUME
 
@@ -183,7 +186,7 @@ def test_resume_refuses_a_board_whose_key_is_not_locked(tmp_path, store, zkt_bun
     assert "clear start area" not in rig.purposes()
 
 
-def test_change_settings_writes_settings_and_storage_only(tmp_path, store):
+def test_change_settings_writes_settings_storage_and_the_redo_area_only(tmp_path, store):
     rig = Rig(tmp_path, store, None, FakeBoard(efuse_state="sdm", sdm=True))
     board = blank_board(security=SecurityState.SECURED_STATE_LIFE, secure_download_mode=True,
                         hardware=HardwareVerdict.NOT_CHECKED, flash_size_mb=None, psram_mb=None)
@@ -192,9 +195,12 @@ def test_change_settings_writes_settings_and_storage_only(tmp_path, store):
     write = rig.runner.calls[1]
     assert write.args[8:16] == ("--no-stub", "write-flash", "--flash-size", "16MB",
                                 "--flash-mode", "keep", "--flash-freq", "keep")
-    assert sorted(rig.fake.flash) == [0x11000, 0x7A0000]
+    assert sorted(rig.fake.flash) == [0x11000, 0x7A0000, 0xFA0000]
     assert rig.fake.flash[0x11000] == rig.server.nvs
     assert rig.fake.flash[0x7A0000] == support.storage_image()
+    assert rig.fake.flash[0xFA0000] == b"\xff" * 0x60000
+    # One write: settings, storage, then the redo area last.
+    assert write.args[-6::2] == ("0x11000", "0x7a0000", "0xfa0000")
     assert summary.bundle.label == "Settings only"
     assert rig.kinds()[-2:] == ["SETTINGS_WRITTEN", "COMPLETED"]
 
@@ -204,7 +210,7 @@ def test_change_settings_needs_no_board_software(tmp_path, store):
     board = blank_board(security=SecurityState.SECURED_STATE_LIFE, secure_download_mode=True,
                         hardware=HardwareVerdict.NOT_CHECKED, flash_size_mb=None, psram_mb=None)
     rig.run(InstallMode.CHANGE_SETTINGS, board, support.zkt_config(bundle_id=""))
-    assert sorted(rig.fake.flash) == [0x11000, 0x7A0000]
+    assert sorted(rig.fake.flash) == [0x11000, 0x7A0000, 0xFA0000]
     assert rig.server.requests[0].config.bundle_id == ""
     started = next(detail for _r, _m, kind, detail in rig.server.events if kind == "STARTED")
     assert started["bundle_id"] is None  # no unrelated board software in the audit
@@ -551,6 +557,8 @@ def test_an_esptool_answer_without_the_board_id_stops_a_new_board(rig):
      texts.MODE_NOT_ALLOWED),
     (InstallMode.NEW_BOARD, blank_board(security=SecurityState.SECURED_OTHER),
      texts.MODE_NOT_ALLOWED),
+    # Every mode writes the redo area at the end of a 16 MB chip.
+    (InstallMode.NEW_BOARD, blank_board(flash_size_mb=32), texts.MODE_NOT_ALLOWED),
 ])
 def test_mode_must_fit_the_board(rig, mode, board, advice):
     with pytest.raises(InstallerError) as caught:
@@ -657,7 +665,7 @@ def test_change_settings_on_a_secured_board_outside_download_security(tmp_path, 
     rig = Rig(tmp_path, store, None, FakeBoard(efuse_state="secured-not-sdm"))
     board = blank_board(security=SecurityState.SECURED_STATE_LIFE)
     rig.run(InstallMode.CHANGE_SETTINGS, board)
-    assert sorted(rig.fake.flash) == [0x11000, 0x7A0000]
+    assert sorted(rig.fake.flash) == [0x11000, 0x7A0000, 0xFA0000]
     assert "--no-stub" in rig.runner.calls[1].args
 
 
@@ -682,3 +690,37 @@ def test_boot_and_faulty_board_reports(rig):
     request_id, mac, kind, detail = rig.server.events[-1]
     assert (mac, kind, detail["loop_period_s"]) == (MAC, "BOARD_FAULTY", 10.3)
     assert request_id.startswith("sli-")
+
+
+def test_change_settings_refuses_a_flash_chip_that_is_not_16_mb(tmp_path, store):
+    rig = Rig(tmp_path, store, None, FakeBoard(efuse_state="secured-not-sdm", flash_mb=8))
+    board = blank_board(security=SecurityState.SECURED_STATE_LIFE, flash_size_mb=8)
+    with pytest.raises(InstallerError) as caught:
+        rig.run(InstallMode.CHANGE_SETTINGS, board)
+    assert caught.value.advice is texts.MODE_NOT_ALLOWED
+    assert caught.value.cause == "change_settings on a 8 MB flash chip"
+    assert rig.runner.calls == [] and rig.server.requests == [] and rig.fake.flash == {}
+
+
+def test_a_changed_redo_area_image_is_made_again(tmp_path, store):
+    blank = store.redo_area_image()
+    blank.write_bytes(b"\x00" + blank.read_bytes()[1:])  # tampered or damaged on disk
+    rig = Rig(tmp_path, store, None, FakeBoard(efuse_state="sdm", sdm=True))
+    board = blank_board(security=SecurityState.SECURED_STATE_LIFE, secure_download_mode=True,
+                        hardware=HardwareVerdict.NOT_CHECKED, flash_size_mb=None, psram_mb=None)
+    rig.run(InstallMode.CHANGE_SETTINGS, board)
+    assert rig.fake.flash[0xFA0000] == b"\xff" * 0x60000
+
+
+def test_a_blank_redo_area_that_does_not_match_its_hash_stops_the_run(tmp_path, store,
+                                                                    monkeypatch):
+    from sl_installer.core import bundles
+    monkeypatch.setattr(bundles, "blank_redo_area", lambda: b"\x00" * 0x60000)
+    rig = Rig(tmp_path, store, None, FakeBoard(efuse_state="sdm", sdm=True))
+    board = blank_board(security=SecurityState.SECURED_STATE_LIFE, secure_download_mode=True,
+                        hardware=HardwareVerdict.NOT_CHECKED, flash_size_mb=None, psram_mb=None)
+    with pytest.raises(InstallerError) as caught:
+        rig.run(InstallMode.CHANGE_SETTINGS, board)
+    assert caught.value.advice is texts.TOOL_MISSING
+    assert caught.value.cause == "blank redo area does not match its pinned hash"
+    assert rig.runner.calls == [] and rig.server.requests == [] and rig.fake.flash == {}

@@ -39,9 +39,9 @@ from .clock import Clock, iso_utc
 from .envelope import EnvelopeError, OneTimeKey, OpenedPackage, open_package
 from .esptool_runner import (ESPEFUSE, PROGRESS_LINE, ToolCall, ToolResult, ToolRunner,
                              advice_for, failure_cause)
-from .flashplan import (NVS_OFFSET, NVS_SIZE, STORAGE_OFFSET, STORAGE_SIZE, FlashPlan,
-                        FlashRange, PlanError, PlannedCall, Purpose, build_plan, espefuse_args,
-                        with_port)
+from .flashplan import (NVS_OFFSET, NVS_SIZE, REDO_AREA_OFFSET, REDO_AREA_SIZE, STORAGE_OFFSET,
+                        STORAGE_SIZE, FlashPlan, FlashRange, PlanError, PlannedCall, Purpose,
+                        build_plan, espefuse_args, with_port)
 from .keepawake import keep_awake
 from .logging_setup import get_logger, register_secret
 
@@ -289,6 +289,11 @@ class Installer:
                 board.hardware is not HardwareVerdict.OK or board.secure_download_mode):
             raise InstallerError(texts.MODE_NOT_ALLOWED,
                                  cause=f"{mode.value} needs checked hardware outside SDM")
+        if board.flash_size_mb is not None and board.flash_size_mb != 16:
+            # Every mode writes up to the last byte of a 16 MB chip (the redo area ends there):
+            # a smaller chip would wrap those addresses onto the board software.
+            raise InstallerError(texts.MODE_NOT_ALLOWED,
+                                 cause=f"{mode.value} on a {board.flash_size_mb} MB flash chip")
 
     def _final_error(self, run: _Run, error: InstallerError) -> InstallerError:
         # Once the key is locked the screen offers only Finish the setup, so an error
@@ -341,6 +346,9 @@ class Installer:
                 raise InstallerError(texts.BUNDLE_WRONG_FAMILY, cause="bundle family")
         self._check_cancel(run)
 
+        # Made before head office is asked, so a full disk stops the run first.
+        redo = FlashRange("redo-area", REDO_AREA_OFFSET, str(self._store.redo_area_image()),
+                          REDO_AREA_SIZE)
         self._emit(run, step, 0.8, "Getting this board's settings from head office")
         opened = self._package(run)
         nvs_path = run.work / "settings.bin"
@@ -351,13 +359,14 @@ class Installer:
         nvs = FlashRange("nvs", NVS_OFFSET, str(nvs_path), NVS_SIZE)
         if bundle is None:
             storage = self._store.storage_image()
-            ranges = [nvs, FlashRange("storage", STORAGE_OFFSET, str(storage), STORAGE_SIZE)]
+            ranges = [nvs, FlashRange("storage", STORAGE_OFFSET, str(storage), STORAGE_SIZE),
+                      redo]
             info = BundleInfo(run.config.bundle_id, run.config.family, "Settings only", "",
-                              False, "", "Settings and empty storage only.")
+                              False, "", "Settings, empty storage and a blank redo area only.")
         else:
             # Checked again right before writing (design: verification on every use).
             fresh = self._store.verify_local(bundle.info.bundle_id)
-            ranges = flash_ranges(fresh) + [nvs]
+            ranges = flash_ranges(fresh) + [nvs, redo]
             info = fresh.info
         plan = build_plan(run.mode, run.board.port, run.config.family, ranges, run.work)
         self._emit(run, step, 1.0, "Ready")

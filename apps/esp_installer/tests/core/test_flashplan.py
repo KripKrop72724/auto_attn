@@ -1,6 +1,8 @@
 """The exact esptool/espefuse calls of each mode (design section 4)."""
 from __future__ import annotations
 
+import hashlib
+import re
 import struct
 import zlib
 from dataclasses import replace
@@ -8,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from sl_installer.core import flashplan
+from sl_installer.core import bundles, flashplan
 from sl_installer.core.api import Family, InstallMode, StepId, steps_for
 from sl_installer.core.flashplan import FlashRange, PlanError, Purpose
 
@@ -20,10 +22,11 @@ EFUSE = ("--chip", "esp32s3", "--port", PORT, "--before", "default-reset")
 
 def zkt_ranges(tmp: Path):
     sizes = {"bootloader": 0x6000, "partition-table": 0xC00, "nvs": 0x6000, "otadata": 0x2000,
-             "factory": 0x190000, "ota_0": 0x190000, "ota_1": 0x150000, "storage": 0x800000}
+             "factory": 0x190000, "ota_0": 0x190000, "ota_1": 0x150000, "storage": 0x800000,
+             "redo-area": 0x60000}
     names = {"bootloader": "boot.bin", "partition-table": "pt.bin", "nvs": "nvs.bin",
              "otadata": "otadata.bin", "factory": "app.bin", "ota_0": "app.bin",
-             "ota_1": "prev.bin", "storage": "storage.bin"}
+             "ota_1": "prev.bin", "storage": "storage.bin", "redo-area": "redo.bin"}
     return [FlashRange(role, flashplan.ROLE_OFFSETS[role], str(tmp / names[role]), size)
             for role, size in sizes.items()]
 
@@ -41,7 +44,7 @@ def test_new_board_zkt_exact_calls(tmp_path):
     rest = ("0x10000", path(tmp_path, "pt.bin"), "0x11000", path(tmp_path, "nvs.bin"),
             "0x17000", path(tmp_path, "otadata.bin"), "0x20000", path(tmp_path, "app.bin"),
             "0x2a0000", path(tmp_path, "app.bin"), "0x520000", path(tmp_path, "prev.bin"),
-            "0x7a0000", path(tmp_path, "storage.bin"))
+            "0x7a0000", path(tmp_path, "storage.bin"), "0xfa0000", path(tmp_path, "redo.bin"))
     expected = [
         (StepId.CLEAR_START_AREA, "esptool", COMMON + ("--no-stub", "get-security-info")),
         (StepId.CLEAR_START_AREA, "esptool", COMMON + ("erase-region", "0x0", "0x10000")),
@@ -73,7 +76,7 @@ def test_new_board_hikvision_writes_factory_only_layout(tmp_path):
     plan = flashplan.new_board_plan(PORT, Family.HIKVISION, hik_ranges(tmp_path), tmp_path)
     write = plan.for_step(StepId.COPY_FIRMWARE)[0]
     assert [r.role for r in write.ranges] == ["partition-table", "nvs", "otadata", "factory",
-                                              "storage"]
+                                              "storage", "redo-area"]
     assert "0x2a0000" not in write.call.args and "0x520000" not in write.call.args
 
 
@@ -90,7 +93,8 @@ def test_resume_never_burns_and_checks_the_key_first(tmp_path):
 
 
 def test_change_settings_uses_only_secure_download_mode_flags(tmp_path):
-    ranges = [FlashRange("storage", 0x7A0000, path(tmp_path, "storage.bin"), 0x800000),
+    ranges = [FlashRange("redo-area", 0xFA0000, path(tmp_path, "redo.bin"), 0x60000),
+              FlashRange("storage", 0x7A0000, path(tmp_path, "storage.bin"), 0x800000),
               FlashRange("nvs", 0x11000, path(tmp_path, "nvs.bin"), 0x6000)]
     plan = flashplan.change_settings_plan(PORT, ranges)
     assert [(p.step, p.call.tool, p.call.args) for p in plan.calls] == [
@@ -98,7 +102,7 @@ def test_change_settings_uses_only_secure_download_mode_flags(tmp_path):
         (StepId.WRITE_SETTINGS, "esptool", COMMON + (
             "--no-stub", "write-flash", "--flash-size", "16MB", "--flash-mode", "keep",
             "--flash-freq", "keep", "--no-compress", "0x11000", path(tmp_path, "nvs.bin"),
-            "0x7a0000", path(tmp_path, "storage.bin"))),
+            "0x7a0000", path(tmp_path, "storage.bin"), "0xfa0000", path(tmp_path, "redo.bin"))),
     ]
     assert plan.steps() == steps_for(InstallMode.CHANGE_SETTINGS)[1:]
     # The ROM erases a whole range silently before writing it: allow for that.
@@ -125,7 +129,8 @@ def test_stub_write_of_the_storage_range_may_stay_silent_for_minutes(tmp_path, m
 def test_no_call_can_boot_the_board(tmp_path, mode):
     plan = flashplan.build_plan(mode, PORT, Family.ZKT, zkt_ranges(tmp_path) if mode is not
                                 InstallMode.CHANGE_SETTINGS else
-                                [r for r in zkt_ranges(tmp_path) if r.role in ("nvs", "storage")],
+                                [r for r in zkt_ranges(tmp_path)
+                                 if r.role in ("nvs", "storage", "redo-area")],
                                 tmp_path)
     for planned in plan.calls:
         args = planned.call.args
@@ -185,8 +190,29 @@ def test_plan_refuses_wrong_layouts(tmp_path):
         flashplan.new_board_plan(PORT, Family.ZKT, short_storage, tmp_path)
     with pytest.raises(PlanError, match="expected images"):
         flashplan.new_board_plan(PORT, Family.HIKVISION, ranges, tmp_path)
-    with pytest.raises(PlanError, match="settings and storage only"):
+    with pytest.raises(PlanError, match="settings, storage and the redo area only"):
         flashplan.change_settings_plan(PORT, ranges)
+    no_redo = [r for r in ranges if r.role != "redo-area"]
+    with pytest.raises(PlanError, match="expected images"):
+        flashplan.new_board_plan(PORT, Family.ZKT, no_redo, tmp_path)
+    with pytest.raises(PlanError, match="settings, storage and the redo area only"):
+        flashplan.change_settings_plan(PORT, [r for r in no_redo if r.role in ("nvs", "storage")])
+    short_redo = [replace(r, size=0x5F000) if r.role == "redo-area" else r for r in ranges]
+    with pytest.raises(PlanError, match="exactly"):
+        flashplan.new_board_plan(PORT, Family.ZKT, short_redo, tmp_path)
+    moved_redo = [replace(r, offset=0xFA1000) if r.role == "redo-area" else r for r in ranges]
+    with pytest.raises(PlanError, match="production offset"):
+        flashplan.new_board_plan(PORT, Family.ZKT, moved_redo, tmp_path)
+    long_redo = [replace(r, size=0x61000) if r.role == "redo-area" else r for r in ranges]
+    with pytest.raises(PlanError, match="past the end of the 16 MB chip"):
+        flashplan.new_board_plan(PORT, Family.ZKT, long_redo, tmp_path)
+    # Only the blank redo area itself may reach 0xFA0000.
+    long_storage = [replace(r, size=0x801000) if r.role == "storage" else r for r in ranges]
+    with pytest.raises(PlanError, match="storage reaches the redo area"):
+        flashplan.new_board_plan(PORT, Family.ZKT, long_storage, tmp_path)
+    with pytest.raises(PlanError, match="storage reaches the redo area"):
+        flashplan.change_settings_plan(PORT, [r for r in long_storage
+                                              if r.role in flashplan.CHANGE_SETTINGS_ROLES])
 
 
 def test_otadata_selects_ota_0_like_flash_prepared():
@@ -214,3 +240,115 @@ def test_with_port_only_changes_the_port(tmp_path):
     assert [a for a in moved.call.args if a != "COM9"] == \
         [a for a in plan.calls[2].call.args if a != PORT]
     assert moved.ranges == plan.calls[2].ranges
+
+
+def test_redo_area_is_the_firmwares_and_blank():
+    # firmware/zone_lite/main/storage_repair.c: the 2.7.6+ redo area.
+    from .support import REPO
+    source = (REPO / "firmware" / "zone_lite" / "main" / "storage_repair.c").read_text(
+        encoding="utf-8")
+    assert int(re.search(r"#define SR_REDO_OFFSET (0x[0-9A-F]+)U", source).group(1), 16) == \
+        flashplan.REDO_AREA_OFFSET == flashplan.STORAGE_OFFSET + flashplan.STORAGE_SIZE
+    assert int(re.search(r"#define SR_REDO_BYTES (0x[0-9A-F]+)U", source).group(1), 16) == \
+        flashplan.REDO_AREA_SIZE == flashplan.FLASH_TOTAL - flashplan.REDO_AREA_OFFSET
+    blank = flashplan.blank_redo_area()
+    assert len(blank) == 0x60000 and set(blank) == {0xFF}
+    assert hashlib.sha256(blank).hexdigest() == bundles.REDO_AREA_BLANK_SHA256
+
+
+@pytest.mark.parametrize("mode,family", [(InstallMode.NEW_BOARD, Family.ZKT),
+                                         (InstallMode.NEW_BOARD, Family.HIKVISION),
+                                         (InstallMode.RESUME, Family.ZKT),
+                                         (InstallMode.CHANGE_SETTINGS, Family.ZKT)])
+def test_every_mode_clears_the_redo_area_last(tmp_path, mode, family):
+    ranges = zkt_ranges(tmp_path) if family is Family.ZKT else hik_ranges(tmp_path)
+    if mode is InstallMode.CHANGE_SETTINGS:
+        ranges = [r for r in ranges if r.role in ("nvs", "storage", "redo-area")]
+    plan = flashplan.build_plan(mode, PORT, family, ranges, tmp_path)
+    (write,) = [p for p in plan.calls if p.purpose in (Purpose.WRITE_FIRMWARE,
+                                                       Purpose.WRITE_SETTINGS)]
+    assert write.ranges[-1] == FlashRange("redo-area", 0xFA0000, path(tmp_path, "redo.bin"),
+                                          0x60000)
+    assert write.call.args[-2:] == ("0xfa0000", path(tmp_path, "redo.bin"))
+    assert [r.role for r in write.ranges].count("redo-area") == 1
+    if mode is InstallMode.CHANGE_SETTINGS:
+        assert [r.role for r in write.ranges] == ["nvs", "storage", "redo-area"]
+        # The ROM's silent erase of the 8 MiB storage stays inside the idle limit.
+        assert write.call.idle_timeout_s >= 400
+        assert write.call.timeout_s >= 180 + (0x6000 + 0x800000 + 0x60000) / 25_000
+    else:
+        (check,) = plan.for_step(StepId.CHECK_COPY)
+        assert check.ranges == write.ranges
+    assert flashplan.safety_problems(plan) == ()
+
+
+def test_safety_check_insists_on_the_redo_area(tmp_path):
+    plan = flashplan.change_settings_plan(PORT, [r for r in zkt_ranges(tmp_path)
+                                                 if r.role in ("nvs", "storage", "redo-area")])
+    write = plan.calls[1]
+    dropped = replace(plan, calls=(plan.calls[0], replace(write, ranges=write.ranges[:2])))
+    assert "the redo area must be cleared once, as the last range of the main write" in \
+        flashplan.safety_problems(dropped)
+    assert "a settings change writes settings, storage and the redo area only, in that order" \
+        in flashplan.safety_problems(dropped)
+    first = replace(plan, calls=(plan.calls[0], replace(
+        write, ranges=(write.ranges[2],) + write.ranges[:2])))
+    assert "the redo area must be cleared once, as the last range of the main write" in \
+        flashplan.safety_problems(first)
+    past = replace(plan, calls=(plan.calls[0], replace(write, ranges=write.ranges[:2] + (
+        FlashRange("storage", 0xFA0000, path(tmp_path, "x.bin"), 0x60000),))))
+    assert any("only the redo area may be written past 0xFA0000" in problem
+               for problem in flashplan.safety_problems(past))
+    # The area last, but the settings and the storage swapped.
+    swapped = replace(plan, calls=(plan.calls[0], replace(
+        write, ranges=(write.ranges[1], write.ranges[0], write.ranges[2]))))
+    problems = flashplan.safety_problems(swapped)
+    assert "a settings change writes settings, storage and the redo area only, in that order" \
+        in problems
+    assert "the redo area must be cleared once, as the last range of the main write" \
+        not in problems
+    twice = replace(plan, calls=(plan.calls[0], replace(
+        write, ranges=write.ranges + (write.ranges[2],))))
+    assert "the redo area must be cleared once, as the last range of the main write" in \
+        flashplan.safety_problems(twice)
+    # Past 0xFA0000 only the exact blank area: not a shorter one, nor one past the chip.
+    for size, problem in ((0x5F000, "only the redo area may be written past 0xFA0000"),
+                          (0x61000, "redo-area runs past the 16 MB chip")):
+        odd = replace(plan, calls=(plan.calls[0], replace(
+            write, ranges=write.ranges[:2] + (replace(write.ranges[2], size=size),))))
+        assert any(problem in found for found in flashplan.safety_problems(odd)), size
+    new = flashplan.new_board_plan(PORT, Family.ZKT, zkt_ranges(tmp_path), tmp_path)
+    calls = list(new.calls)
+    check = next(i for i, p in enumerate(calls) if p.purpose is Purpose.VERIFY_FIRMWARE)
+    calls[check] = replace(calls[check], ranges=calls[check].ranges[:-1])
+    assert "every copied range must be checked on the chip" in \
+        flashplan.safety_problems(replace(new, calls=tuple(calls)))
+    unchecked = replace(new, calls=tuple(p for p in new.calls
+                                         if p.purpose is not Purpose.VERIFY_FIRMWARE))
+    assert "every copied range must be checked on the chip" in \
+        flashplan.safety_problems(unchecked)
+
+
+def _entry(label: str, kind: int, subtype: int, offset: int, size: int) -> bytes:
+    return struct.pack("<2sBBII16sI", b"\xaa\x50", kind, subtype, offset, size,
+                       label.encode(), 0)
+
+
+def test_partitions_end_reads_every_row():
+    from .support import partition_table
+    table = partition_table()
+    assert flashplan.partitions_end(table) == 0xFA0000
+    assert flashplan.partitions_end(partition_table(coredump=(1, 0x03, 0xFA0000, 0x10000))) \
+        == 0xFB0000
+    # A second "storage" row before the production one: partition_entries keeps only the
+    # last, so the layout check cannot see it.
+    hidden = _entry("storage", 1, 0x82, 0xFA0000, 0x10000)
+    doubled = (table[:6 * 32] + hidden + table[6 * 32:])[:len(table)]
+    assert flashplan.partition_entries(doubled)["storage"] == \
+        flashplan.PRODUCTION_PARTITIONS["storage"]
+    assert flashplan.partitions_end(doubled) == 0xFB0000
+    # Rows after the first that is not an entry (ESP-IDF's MD5 row) are no partitions.
+    md5 = b"\xeb\xeb" + b"\xff" * 14 + bytes(16)
+    after = (table[:7 * 32] + md5 + hidden + table[7 * 32:])[:len(table)]
+    assert flashplan.partitions_end(after) == 0xFA0000
+    assert flashplan.partitions_end(b"") == 0

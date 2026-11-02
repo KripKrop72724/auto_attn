@@ -9,7 +9,8 @@ every use:
 * the manifest's structure: schema, layout name, family, version, release state,
   exactly the roles of the family at their production offsets and sizes;
 * each file's size and SHA-256;
-* the partition table holds the production partitions;
+* the partition table holds the production partitions, and no partition reaches
+  past 0xFA0000, where the firmware's redo area starts;
 * the images: ESP32-S3 headers, valid appended digests, app descriptors naming the
   family's project and version, Secure Boot V2 signature blocks that verify, a
   bootloader that trusts the pinned key and an app signed by one of its keys;
@@ -18,7 +19,8 @@ every use:
 * storage: exactly the empty SPIFFS image (sha256 f39db7c1...).
 
 The app carries that 8 MiB storage image gzip-compressed and uses it instead of
-downloading when the manifest hash matches.
+downloading when the manifest hash matches. The blank redo area (all 0xFF, sha256
+c97fce78...) is never in a bundle: the app makes it from a constant.
 """
 from __future__ import annotations
 
@@ -44,8 +46,10 @@ from . import texts
 from .api import (BundleInfo, BytesProgressFn, CancelToken, Family, InstallerError,
                   LocalBundle)
 from .flashplan import (APP_SLOT_SIZE, BUNDLE_ROLES, OTADATA_SIZE, PARTITION_TABLE_MAX,
-                        PRODUCTION_PARTITIONS, ROLE_OFFSETS, START_AREA_SIZE, STORAGE_SIZE,
-                        FlashRange, blank_otadata, otadata_selecting_ota_0, partition_entries)
+                        PRODUCTION_PARTITIONS, REDO_AREA_OFFSET, REDO_AREA_SIZE, ROLE_OFFSETS,
+                        START_AREA_SIZE, STORAGE_SIZE, FlashRange, blank_otadata,
+                        blank_redo_area, otadata_selecting_ota_0, partition_entries,
+                        partitions_end)
 from .logging_setup import get_logger
 from .validation import version_tuple
 
@@ -55,6 +59,9 @@ SCHEMA = "zone-lite-installer-bundle-v1"
 PARTITION_LAYOUT = "zone-lite-ota-v1"
 STORAGE_EMPTY_SHA256 = "f39db7c1c7626ee6156dbab5da7912968040a489d1d927c1fb288d1f42c5ec70"
 STORAGE_IMAGE_NAME = "storage-empty.bin"
+# 0x60000 bytes of 0xFF (flashplan.blank_redo_area).
+REDO_AREA_BLANK_SHA256 = "c97fce784428a2e10cd6d4ef97ccc756f2e4c1b146a9b9dc5415d4e3e245b70a"
+REDO_AREA_IMAGE_NAME = "redo-area-blank.bin"
 INSTALLABLE_STATES: Dict[Family, Tuple[str, ...]] = {
     Family.ZKT: ("AVAILABLE",),
     Family.HIKVISION: ("FIELD_BASELINE", "AVAILABLE"),
@@ -398,6 +405,9 @@ class Verifier:
         table = partition_entries(read["partition-table"])
         if any(table.get(name) != expected for name, expected in PRODUCTION_PARTITIONS.items()):
             raise _not_trusted("partition table is not the production layout")
+        if partitions_end(read["partition-table"]) > REDO_AREA_OFFSET:
+            # The firmware then has no redo area, and every mode clears 0xFA0000-0xFFFFFF.
+            raise _not_trusted("a partition reaches past 0xFA0000 (the redo area)")
         otadata = read["otadata"]
         if checked.family is Family.ZKT and otadata != otadata_selecting_ota_0():
             raise _not_trusted("ZKT otadata must select ota_0")
@@ -526,6 +536,33 @@ class BundleStore:
             raise _disk_error(error) from error
         raise InstallerError(texts.TOOL_MISSING, cause="embedded storage image unusable")
 
+    def redo_area_image(self) -> Path:
+        """The blank redo area (all 0xFF), made here from a constant, never downloaded.
+
+        Checked by size and pinned hash on every call, like the storage image, and
+        made again whenever the copy on disk differs.
+        """
+        target = self.root / "shared" / REDO_AREA_IMAGE_NAME
+        entry = ImageEntry("redo-area", REDO_AREA_IMAGE_NAME, REDO_AREA_OFFSET, REDO_AREA_SIZE,
+                           REDO_AREA_BLANK_SHA256)
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if self._cached(target, entry):
+                return target
+            data = blank_redo_area()
+            if (len(data) != REDO_AREA_SIZE
+                    or hashlib.sha256(data).hexdigest() != REDO_AREA_BLANK_SHA256):
+                raise InstallerError(texts.TOOL_MISSING,
+                                     cause="blank redo area does not match its pinned hash")
+            partial = target.with_name(target.name + ".part")
+            partial.write_bytes(data)
+            os.replace(partial, target)
+            if self._cached(target, entry):
+                return target
+        except OSError as error:
+            raise _disk_error(error) from error
+        raise InstallerError(texts.TOOL_MISSING, cause="blank redo area image unusable")
+
     @staticmethod
     def _cached(path: Path, entry: ImageEntry) -> bool:
         try:
@@ -591,7 +628,7 @@ def flash_ranges(bundle: LocalBundle) -> List[FlashRange]:
 
 
 def clean_cache(root: Path, keep: Iterable[str]) -> None:
-    """Remove cached bundles not in ``keep`` (the shared storage image stays)."""
+    """Remove cached bundles not in ``keep`` (the shared storage and redo area images stay)."""
     keep = set(keep)
     if not root.is_dir():
         return

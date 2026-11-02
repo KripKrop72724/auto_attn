@@ -197,7 +197,7 @@ def cmd_install(services: Services, args: argparse.Namespace) -> int:
             if device.settings_change_reason:
                 print(f"  (head office: {device.settings_change_reason})")
             return 2
-        firmware = "stays the same (settings and empty storage only)"
+        firmware = "stays the same (settings, empty storage and a blank redo area only)"
     else:
         bundles = {b.bundle_id: b for b in services.server.bundles(config.family)}
         if config.bundle_id not in bundles:

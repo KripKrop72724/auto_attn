@@ -72,7 +72,7 @@ apps/esp_installer/
    - the only first boot is the person's physical unplug and replug.
 2. **New-board write order:**
    1. Erase 0x0–0xFFFF, so no older bootloader can start anything.
-   2. Write every range except the bootloader.
+   2. Write every range except the bootloader; the last is the blank redo area (rule 10).
    3. Verify on the chip (stub `verify-flash`).
    4. Burn the HMAC key into BLOCK_KEY0 with purpose HMAC_UP.
    5. Check that KEY_PURPOSE_0 is HMAC_UP and that the block is read- and write-protected.
@@ -86,8 +86,8 @@ apps/esp_installer/
    - reads and verifies are impossible;
    - the MAC comes from the USB serial number.
 
-   To change settings, write NVS at 0x11000 (0x6000) and the empty storage image at 0x7A0000 (0x800000). The boot log then confirms the result.
-5. **Hardware gate before anything irreversible:** an ESP32-S3 with exactly 16 MB flash and 8 MB embedded PSRAM.
+   To change settings, write NVS at 0x11000 (0x6000), the empty storage image at 0x7A0000 (0x800000) and the blank redo area at 0xFA0000 (0x60000), in that order, in one call. The boot log confirms the settings and storage; only a ZKT board's heartbeat in ADD shows the redo area (`reclaim.area` `READY`, `ota_floor` false).
+5. **Hardware gate before anything irreversible:** an ESP32-S3 with exactly 16 MB flash and 8 MB embedded PSRAM. A settings change outside Secure Download Mode also refuses a flash size other than 16 MB.
 6. **Bundle gate:** before writing, check all of these against the pinned State Life key (`resources/firmware-signing-key-1.pem`):
    - the manifest signature (RSA-PSS SHA-256, salt 32, over canonical JSON);
    - every image's size and SHA-256;
@@ -102,6 +102,7 @@ apps/esp_installer/
    - A board whose ID neither gives is never written to: between two calls any board could be plugged into the same socket, under the same port name. Checking the board says so first (`BOARD_ID_NOT_READABLE`: another USB socket, or another computer) and offers no new board, resume or settings change; an install that loses the ID stops with the same advice (once the key is locked, inside the advice to finish the setup). Reading such a board (inspection, its console, the replug) still works, except in Secure Download Mode: with no MAC in the banner either, its check stops at `BOARD_ID_UNKNOWN`.
    - Inspection refuses a USB board ID that is not the chip's own (`BOARD_ID_UNKNOWN`).
    - After each esptool erase, write or verify, a MAC in the banner must be the board's. A new or unfinished board must show it: a Secure Download Mode banner, which has none, means another board, because only a first start turns that mode on. A settings change on a finished board accepts that banner. espefuse prints no MAC; its summaries are checked by their eFuse MAC.
+10. **The redo area is cleared in every mode, after the settings and the storage.** ZKT 2.7.6+ keeps its last-resort reformat records at 0xFA0000–0xFFFFFF, past the last partition (`firmware/zone_lite/main/storage_repair.c`, `SR_REDO_OFFSET`/`SR_REDO_BYTES`). Their journal (`CLAIMED`) is in NVS and they describe the store, and every mode replaces both. Leftovers would mean an area that stays `FOREIGN` for good, false `REFORMAT_INTERRUPTED` gaps sent to ADD, retained records and a latched OTA floor. So the app writes 0x60000 bytes of 0xFF (sha256 c97fce78…) after NVS and storage, verified on the chip in NEW_BOARD and RESUME, and the same on Hikvision boards, whose 3.1.1 never reads the area. A bundle whose partition table reaches past 0xFA0000 is refused.
 
 Partition layout (`zone-lite-ota-v1`):
 
@@ -115,10 +116,12 @@ Partition layout (`zone-lite-ota-v1`):
 | ota_0 | 0x2A0000 | — |
 | ota_1 | 0x520000 | — |
 | storage | 0x7A0000 | 0x800000 |
+| redo area (no partition) | 0xFA0000 | 0x60000 |
 
 What the bundles write:
 - **ZKT:** factory and ota_0 get the production release; ota_1 gets the predecessor (2.5.2); otadata selects ota_0; storage is empty SPIFFS (sha256 f39db7c1…).
 - **HIK:** factory gets 3.1.1; otadata is blank, so it boots factory; storage is empty SPIFFS.
+- **Added by the app in every mode, never in a bundle:** NVS from ADD and the blank redo area.
 
 ## 5. Server API (ADD) — `/api/v1/installer/*`
 
@@ -298,6 +301,7 @@ Faulty board signature: USB appears for about 10 s, then vanishes, in a loop, wi
 
 - **Core:** pytest with a fake esptool (scripted outputs), fake serial, and an `httpx.MockTransport` ADD. Covers:
   - the exact command order and flags of each plan;
+  - the redo area, pinned to `SR_REDO_OFFSET` and `SR_REDO_BYTES` in `storage_repair.c` and cleared after the settings and the storage in every mode;
   - no hard reset ever;
   - classification from espefuse JSON samples;
   - console parsing of firmware log lines;
@@ -307,4 +311,4 @@ Faulty board signature: USB appears for about 10 s, then vanishes, in a loop, wi
 - **Backend:** pytest for installer_api and provisioner v2.
 - **PowerShell:** tests for bundle publishing in windows-publication.
 - **Windows CI:** install, self-test, screenshots, uninstall.
-- **Bench:** a real blank board, on the Mac first, then a Windows 11 PC with the built installer.
+- **Bench:** a real blank board, on the Mac first, then a Windows 11 PC with the built installer. The console never shows the redo area, so after a new board and after a settings change in Secure Download Mode the bench checks a ZKT board's heartbeat in ADD: `storage.repair.reclaim.area` `READY`, no `area_foreign_sectors`, `reclaim.ota_floor` false.
