@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import threading
 
 import pytest
@@ -28,6 +29,16 @@ def test_every_page_renders(harness, size):
         assert page.title_label.text(), page_id
         # Nothing may be wider than the window: no sideways scrolling.
         assert page.scroll.horizontalScrollBar().maximum() == 0, page_id
+
+
+def test_board_found_reads_well_without_a_usb_board_id(harness):
+    connect = harness("happy_zkt").page(pages.CONNECT)
+    board = api.UsbCandidate("COM7", api.UsbKind.NATIVE, 0x303A, 0x1001, None)
+    connect.show_found(board)
+    assert connect.found.body.text() == ("This computer does not show the board ID. "
+                                         "Click Next to read it from the board.")
+    connect.show_found(dataclasses.replace(board, mac="ac:27:6e:a4:3d:30"))
+    assert connect.found.body.text() == "Board ID AC:27:6E:A4:3D:30. Click Next."
 
 
 def test_window_title_and_test_ribbon(harness):
@@ -177,3 +188,19 @@ def test_fields_have_accessible_names(harness):
     for field in form._all_fields():
         assert field.focus_target.accessibleName(), field.label.text()
     assert form.wifi_password.eye.accessibleName() in ("Show the password", "Hide the password")
+
+
+@pytest.mark.parametrize("page_id", [pages.DETAILS, pages.FIX_SETTINGS])
+def test_connection_offers_only_normal_http(harness, page_id):
+    # HTTPS needs the machine's own certificate, which the app cannot add (review CR2).
+    h = harness("happy_hik")
+    form = h.page(page_id).form
+    transport = form.hik_transport
+    assert [transport.itemData(index) for index in range(transport.count())] == ["http_digest"]
+    assert transport.currentText() == "Normal (HTTP)"
+    # A default or a saved answer of "https" never comes out of the form.
+    form.reset(api.Family.HIKVISION, api.FieldDefaults(hik_transport="https"))
+    assert form.values().hik_transport == "http_digest"
+    form.fill(dataclasses.replace(form.values(), hik_transport="https"))
+    assert transport.currentData() == "http_digest"
+    assert form.values().hik_transport == "http_digest" and form.values().hik_port == 80

@@ -88,9 +88,13 @@ class ConnectPage(BasePage):
     def show_found(self, board: UsbCandidate) -> None:
         self.waiting.hide()
         self.problem.hide()
-        self.found.set_notice(
-            "Board found", f"Board ID {naming.board_id(board.mac)}. Click Next.", Severity.SUCCESS
-        )
+        if board.mac:
+            found = f"Board ID {naming.board_id(board.mac)}. Click Next."
+        else:
+            # Some computers give no board ID over USB; the next screen reads it from the board.
+            found = ("This computer does not show the board ID. "
+                     "Click Next to read it from the board.")
+        self.found.set_notice("Board found", found, Severity.SUCCESS)
         self.found.show()
         self.set_primary_enabled(True)
         self.primary_button.setFocus()

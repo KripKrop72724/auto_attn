@@ -95,7 +95,13 @@ apps/esp_installer/
    - the app descriptor family and version;
    - for ZKT, the ota_1 image is a qualified predecessor.
 7. **Family rule:** refuse to set up a board as the other family (ZKT vs Hikvision) when ADD already knows it. ADD would 500-loop, and the firmware aborts on a family mismatch.
-8. **Secrets stay out of logs:** passwords, comm keys, HMAC keys, NVS plaintext, tokens and cookies are never logged or saved. The HMAC key file for espefuse lives in a private temp directory and is overwritten, then deleted, immediately after the burn.
+8. **Secrets stay out of logs:** passwords, comm keys, HMAC keys, NVS plaintext, tokens and cookies are never logged or saved. The HMAC key file for espefuse lives in a private temp directory and is overwritten, then deleted, immediately after the burn. If a crash or power cut leaves a work folder behind, the window wipes it the next time it opens: it holds the single-instance lock, and every install runs in a holder of that lock (the window or the bench's `install`), so none can be running. Callers without the lock (`--self-test`, the bench's `watch` and `diagnose`) wipe only folders older than 6 hours.
+9. **The same board for every call.** The board ID is the MAC: the banner's, or the USB serial number in Secure Download Mode, whose banner has none.
+   - Before every install call the app finds the port again by the USB board ID and uses only a port that has this board's ID. A swapped board is then caught before anything reaches it, and a port that moved is followed.
+   - A USB serial number counts only when the whole string is a MAC. A Windows computer that ignores serial numbers reports a location ID such as `5&2B33E3B5&0&12` instead, which can hold 12 hex digits; it never counts, and the cfgmgr32 fallback is asked.
+   - A board whose ID neither gives is never written to: between two calls any board could be plugged into the same socket, under the same port name. Checking the board says so first (`BOARD_ID_NOT_READABLE`: another USB socket, or another computer) and offers no new board, resume or settings change; an install that loses the ID stops with the same advice (once the key is locked, inside the advice to finish the setup). Reading such a board (inspection, its console, the replug) still works, except in Secure Download Mode: with no MAC in the banner either, its check stops at `BOARD_ID_UNKNOWN`.
+   - Inspection refuses a USB board ID that is not the chip's own (`BOARD_ID_UNKNOWN`).
+   - After each esptool erase, write or verify, a MAC in the banner must be the board's. A new or unfinished board must show it: a Secure Download Mode banner, which has none, means another board, because only a first start turns that mode on. A settings change on a finished board accepts that banner. espefuse prints no MAC; its summaries are checked by their eFuse MAC.
 
 Partition layout (`zone-lite-ota-v1`):
 
@@ -132,7 +138,7 @@ All routes need the admin session cookie. Mutations also need `X-CSRF-Token`. Pa
 `bundle_id` is required for `new_board` and `resume`, and not needed for `change_settings`, which writes no firmware.
 
 **Which boards may get new settings.** Boards set up before this app may use an older security root. Settings built from the fleet root would leave such a board unable to start. So:
-- `change_settings` is allowed only when ADD has no connector for the MAC, the connector has never been online, or the audit log holds a successful `INSTALLER_PACKAGE_ISSUED` (mode `new_board` or `resume`) for that MAC;
+- `change_settings` is allowed only when ADD has no connector for the MAC, the connector has never been online, or the audit log holds a successful `INSTALLER_PACKAGE_ISSUED` with mode `new_board` for that MAC (a `resume` burns no key, so its row proves nothing about the board's key);
 - `resume` is allowed only for a board ADD does not know or that has never been online;
 - otherwise the answer is 409 `SETTINGS_CHANGE_NOT_SUPPORTED`: "This board was set up before this app. Only head office can change its settings."
 
@@ -212,6 +218,7 @@ Screens:
 
 1. **Sign in.** Username and password with a show/hide eye.
    - After 3 wrong tries in 10 minutes, the app pauses sign-in for 10 minutes and explains why. ADD locks the account for 15 minutes after 5 tries, which would also lock the dashboard.
+   - The pause is timed on the monotonic clock, so putting the computer's clock right cannot stretch it. The end saved for a restart is dropped if it lies more than 15 minutes ahead (ADD's own lock, the longest pause).
    - The password is kept in memory only, for step-up calls and silent re-login on 401.
 2. **Home.** "Set up a new board", "Check or fix a board", and "How to connect a board".
 3. **Machine type.** Two big cards: ZKTeco and Hikvision.
@@ -221,7 +228,7 @@ Screens:
    - **Device ID:** next free number in that zone.
    - **Firmware:** dropdown with the recommended bundle preselected.
    - **Advanced (collapsed):** Wi-Fi name and password (visible with the eye), ZKT port, comm key, preferred IP, device ID.
-   - **HIK only:** machine address (required, LAN IPv4), password (required), model (sets the profile) and the machine's serial number (required: the firmware will not talk to a terminal without it). Advanced holds username (admin), port (80) and connection (HTTP digest / HTTPS). The source epoch is automatic: `<zone_id lower>-<yyyymmdd>`, or the epoch ADD already has for the MAC.
+   - **HIK only:** machine address (required, LAN IPv4), password (required), model (sets the profile) and the machine's serial number (required: the firmware will not talk to a terminal without it). Advanced holds username (admin), port (80) and connection (HTTP digest only). HTTPS is not offered and is refused in the field defaults and the bench: without the machine's own certificate (`hik_ca_pem`), which the app cannot add, the board checks a LAN terminal against the public certificate authorities and never connects. The source epoch is automatic: `<zone_id lower>-<yyyymmdd>`, or the epoch ADD already has for the MAC.
 5. **Connect the board.** A live USB watcher with a picture of the cable and the socket marked USB.
    - **No board for 15 s:** cable, port and socket tips.
    - **Bridge chip only:** "use the socket marked USB".
@@ -233,20 +240,21 @@ Screens:
    - unfinished setup → Resume, unless ADD has seen the board online (then ADD's reason and "Use another board");
    - already set up → Fix-settings flow;
    - wrong board or secured by someone else → stop.
+   - **USB gives no board ID** (rule 9): "This computer cannot read the board ID", with Try again. Try again, like every retry of the check, reads the board where USB lists it now, so a cable moved to another socket is followed.
    - **Auto download mode fails:** show manual steps: hold BOOT, tap RST, release BOOT, Try again.
 7. **Confirm.** A summary of the board, place and firmware, plus "This prepares the board for State Life for good" and an "I understand" checkbox.
 8. **Installing.** The steps from `steps_for(mode)` with progress, and a "Keep the cable plugged in" banner. Cancel works only before the key step.
 9. **First start.**
    1. Animated "Unplug the cable"; wait for the port to go.
    2. "Wait 3 seconds", then "Plug it back in".
-   3. Watch the console for up to 120 s.
-   4. Report the result: zone, device ID and version seen, or the fault advice.
+   3. Watch the console for up to 120 s. The console's USB copy drops what the board prints before the app opens the port, so the start line (`Zone Lite starting zone=… device_id=…`, under 2 s after power-on) can be gone when a slow computer lists the port again after the replug. Any later line of the program also shows the start: storage, Wi-Fi, the setup hotspot, head office or the attendance machine. ZKT 2.7.8 and 2.8.x, the 2.5.2 predecessor in ota_1, and HIK 3.1.1 print these only after loading and checking the board's settings. The storage wait and the crash rules count from the first such line. Without the start line its time is unknown, so then any crash seen in the watch counts.
+   4. Report the result: zone, device ID and version seen, or the fault advice. Without the start line no device is claimed, and no zone unless the settings line (`Loaded per-device provisioning for zone=…`) came; with neither, the screen says "It started and is working", and the record and ADD get none. "The board is silent" (may be faulty) only when no line at all arrived; other lines without a start give "The app did not see the board start".
 10. **Done.** "The board is ready". Shows what was set and what to do at the site:
     - hotspot `SLIC ATTENDANCE-XXXX`, where XXXX is the last 2 bytes of MAC+1;
     - the hotspot password;
     - `http://192.168.254.1` and the portal steps;
     - "Save a record" (text file), "Set up another board".
-11. **Check a board.** Board ID, security state, the ADD record (online/offline in plain words), live console lines in plain words, a "What is the light doing?" guide, and "Fix settings".
+11. **Check a board.** Board ID, security state, the ADD record (online/offline in plain words), live console lines in plain words, a "What is the light doing?" guide, and "Fix settings". When USB gives no board ID, Fix settings is not offered and the screen says why (rule 9); Check again reads the board where it is now.
 12. **Fix settings.** Offered only when ADD answered and `settings_change_allowed` is true; otherwise the screen shows `settings_change_reason` (or "head office could not be reached") and stops. ADD supplies only the ZONE ID, ZONE NAME and device number: the person must re-enter the comm key, machine address and port (or the Hikvision address, password, model and serial), because the board's copy cannot be read and a default would silently replace it. If `ever_online`, a strong warning ("unsent punches on the board will be lost") and the person must type the ZONE ID to confirm. Then mode `CHANGE_SETTINGS` (no bundle), then First start.
 13. **Light guide.** Pick the blink pattern, then the colour. The meanings come from `firmware/zone_lite/main/led_status.c`.
 
@@ -258,7 +266,7 @@ Faulty board signature: USB appears for about 10 s, then vanishes, in a loop, wi
 |---|---|
 | `add_client.py` | httpx client: login/logout, session, CSRF, silent re-login, client-side login throttle, typed errors. TLS uses `truststore` when available, otherwise certifi. Server `https://autoattn.slichealth.com`, overridable only with `--server` for tests. |
 | `connectivity.py` | Internet check: `http://www.msftconnecttest.com/connecttest.txt` → "Microsoft Connect Test". Server check: `GET /health/live`. Runs every 15 s. |
-| `usb.py` | pyserial enumeration; VID/PID classes (303A:1001 native; 10C4, 1A86, 0403 bridges); MAC from the USB serial, with a Windows cfgmgr32 parent-device fallback; presence timeline and restart-loop detection. |
+| `usb.py` | pyserial enumeration; VID/PID classes (303A:1001 native; 10C4, 1A86, 0403 bridges); MAC from the USB serial when it is a whole MAC, with a Windows cfgmgr32 parent-device fallback; presence timeline and restart-loop detection. A lone board without an ID is found only for reading (console, replug). |
 | `esptool_runner.py` | Runs bundled esptool/espefuse as child processes (`<exe> --tool esptool …` when frozen, `python -m esptool` in dev). Parses progress, applies timeouts and cancellation, captures logs with redaction, maps known failures to codes. |
 | `board.py` | `get-security-info` (works in SDM); for non-SDM boards also `chip-id`, `flash-id`, and `espefuse summary --format json`; classifies `SecurityState` and `HardwareVerdict`. Reads espefuse 5 JSON fields `value`/`readable`/`writeable` (there is no `raw_value`). |
 | `bundles.py` | Catalogue, download with progress into `%LOCALAPPDATA%\StateLife\DeviceInstaller\bundles`, full verification on every use. |
@@ -277,7 +285,8 @@ Faulty board signature: USB appears for about 10 s, then vanishes, in a loop, wi
 - **Inno Setup 6** (`ISCC.exe` on windows-2022):
   - per-user install (`PrivilegesRequired=lowest`, `{localappdata}\Programs\State Life Device Installer`), x64, MinVersion 10.0.17763;
   - EULA page; branded wizard images; Start menu and optional desktop shortcut; launch after install;
-  - an uninstaller that removes the app and the bundle cache, and asks before deleting saved records and logs.
+  - an uninstaller that removes the app and the bundle cache, and asks before deleting saved records and logs;
+  - `AppMutex=StateLifeDeviceInstaller`, the named mutex the open window holds: Setup and the uninstaller ask for the app to be closed and wait, so no file is deleted under a running setup. `CloseApplications=yes` stays, never forced: a forced close could stop esptool or espefuse halfway.
 - **Workflow** `.github/workflows/esp-installer-release.yml` (windows-2022):
   - tests, build and installer, then smoke tests: silent install, `--self-test`, `--screenshots`, silent uninstall, then a check that the files are gone;
   - artifacts: Setup exe, SHA256SUMS and screenshots;

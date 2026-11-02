@@ -3,9 +3,11 @@ from __future__ import annotations
 
 import os
 import stat
+import time
 from dataclasses import replace
 from datetime import date
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -13,10 +15,12 @@ from sl_installer.core import texts
 from sl_installer.core.api import (BoardInfo, Capabilities, CancelToken, DeviceRecord, Family,
                                    HardwareVerdict, HikSettings, InstallerError, InstallMode,
                                    SecurityState, StepId)
-from sl_installer.core.installer import Installer, cleanup_stale_work
+from sl_installer.core.installer import PORT_WAIT_S, Installer, cleanup_stale_work
+from sl_installer.core.usb import UsbWatcher
 
 from . import support
-from .support import MAC, PORT, FakeBoard, FakeClock, FakeRunner, FakeServer, FakeUsb, Failure
+from .support import (MAC, OTHER_MAC, PORT, FakeBoard, FakeClock, FakeRunner, FakeServer,
+                      FakeUsb, Failure)
 
 FACTORY = 0x20000
 
@@ -28,11 +32,12 @@ def blank_board(**changes) -> BoardInfo:
 
 
 class Rig:
-    def __init__(self, tmp_path: Path, store, bundle, fake: FakeBoard, **server_args) -> None:
+    def __init__(self, tmp_path: Path, store, bundle, fake: FakeBoard, usb=None,
+                 **server_args) -> None:
         self.fake = fake
         self.runner = FakeRunner(fake)
         self.server = FakeServer(store, bundle, **server_args)
-        self.usb = FakeUsb()
+        self.usb = usb or FakeUsb()
         self.clock = FakeClock()
         self.work = tmp_path / "work"
         self.steps = []
@@ -380,6 +385,163 @@ def test_second_board_without_an_id_is_refused(rig):
     assert caught.value.advice is texts.SEVERAL_BOARDS
 
 
+# ------------------------------------------------ one board, by its USB board ID
+
+def watcher_usb(serial):
+    """The real UsbWatcher on one listed port whose USB serial number is ``serial[0]``.
+
+    The computer ignores serial numbers when it is None, and the device-tree fallback
+    finds nothing either, so the same socket gives every board the same port name.
+    """
+    port = SimpleNamespace(device="COM7", vid=0x303A, pid=0x1001,
+                           description="USB Serial Device (COM7)")
+
+    def ports():
+        port.serial_number = serial[0]
+        return [port]
+    return UsbWatcher(ports, FakeClock(), tree_macs=dict), "COM7"
+
+
+def usb_for(finder):
+    """(port finder, its port, a way to make the board's USB board ID unreadable)."""
+    if finder == "watcher":
+        serial = [MAC.upper()]
+        usb, port = watcher_usb(serial)
+        return usb, port, lambda: serial.__setitem__(0, None)
+    usb = FakeUsb()
+    return usb, PORT, lambda: setattr(usb, "mac", None)
+
+
+def leftover_board():
+    """Put aside after a setup that stopped before the burn: software in, start area empty."""
+    board = FakeBoard(OTHER_MAC)
+    board.flash.update({0x20000: b"zone lite", 0x2A0000: b"zone lite"})
+    return board
+
+
+def finished_board():
+    """Another State Life board, in Secure Download Mode: erase and write still work."""
+    board = FakeBoard(OTHER_MAC, efuse_state="sdm", sdm=True)
+    board.flash[0x0] = b"its own start-up program"
+    return board
+
+
+def no_id_advice(key_locked):
+    """The stop without a USB board ID; once the key is locked, as the advice to finish."""
+    if not key_locked:
+        return texts.BOARD_ID_NOT_READABLE
+    advice = texts.resume_needed(texts.BOARD_ID_NOT_READABLE)
+    assert advice.what_to_do[0] == "Do not throw the board away."
+    assert advice.what_to_do[-1] == "Click Finish the setup."
+    return advice
+
+
+# Board A is unplugged right after one call and board B goes in before the next; this
+# computer gives B no USB board ID (review BS1). Nothing may then reach B.
+SWAPS = [
+    pytest.param("check board identity", 1, False, finished_board, id="before-the-erase"),
+    pytest.param("read key state", 1, False, lambda: FakeBoard(OTHER_MAC), id="before-the-burn"),
+    pytest.param("read key state", 2, True, leftover_board, id="before-the-start-up-program"),
+]
+
+
+@pytest.mark.parametrize("finder", ["fake", "watcher"])
+@pytest.mark.parametrize("label, nth, burned, other", SWAPS)
+def test_a_board_swapped_in_without_a_usb_board_id_gets_no_call(
+        tmp_path, store, zkt_bundle, finder, label, nth, burned, other):
+    usb, port, lose_id = usb_for(finder)
+    rig = Rig(tmp_path, store, zkt_bundle, FakeBoard(), usb=usb)
+    b = other()
+    b_flash, ends, original = dict(b.flash), [], rig.runner.run
+    rig.swapped_at = None
+
+    def run(call, *, cancel=None, on_line=None):
+        result = original(call, cancel=cancel, on_line=on_line)
+        ends.append(call.label)
+        if ends.count(label) == nth and call.label == label:
+            rig.runner.board = b  # A unplugged, B plugged in
+            lose_id()
+            rig.swapped_at = len(rig.runner.calls)
+        return result
+    rig.runner.run = run
+    with pytest.raises(InstallerError) as caught:
+        rig.run(board=blank_board(port=port))
+    error = caught.value
+    assert error.advice == no_id_advice(burned) and error.irreversible_done is burned
+    assert rig.swapped_at is not None and rig.runner.calls[rig.swapped_at:] == []  # no call
+    assert b.flash == b_flash and b.erased == [] and b.burned_key is None
+    assert (rig.fake.burned_key == rig.server.hmac_key) is burned and 0x0 not in rig.fake.flash
+    assert rig.kinds()[-1] == "FAILED"
+
+
+@pytest.mark.parametrize("finder", ["fake", "watcher"])
+@pytest.mark.parametrize("mode", list(InstallMode))
+def test_a_board_without_a_usb_board_id_is_never_written(tmp_path, store, zkt_bundle, finder,
+                                                         mode):
+    usb, port, lose_id = usb_for(finder)
+    lose_id()
+    fake = {InstallMode.NEW_BOARD: FakeBoard(),
+            InstallMode.RESUME: FakeBoard(efuse_state="key-burned"),
+            InstallMode.CHANGE_SETTINGS: FakeBoard(efuse_state="sdm", sdm=True)}[mode]
+    security = {InstallMode.NEW_BOARD: SecurityState.BLANK,
+                InstallMode.RESUME: SecurityState.KEY_BURNED_NOT_STARTED,
+                InstallMode.CHANGE_SETTINGS: SecurityState.SECURED_STATE_LIFE}[mode]
+    board = blank_board(port=port, security=security)
+    if mode is InstallMode.CHANGE_SETTINGS:
+        board = replace(board, secure_download_mode=True, hardware=HardwareVerdict.NOT_CHECKED)
+    rig = Rig(tmp_path, store, zkt_bundle, fake, usb=usb)
+    started = rig.clock.now
+    with pytest.raises(InstallerError) as caught:
+        rig.run(mode, board)
+    locked = mode is InstallMode.RESUME  # its key is locked
+    assert caught.value.advice == no_id_advice(locked)
+    assert caught.value.irreversible_done is locked
+    assert rig.runner.calls == [] and fake.flash == {} and fake.erased == []
+    assert rig.clock.now - started >= PORT_WAIT_S  # it waited for the ID to show first
+
+
+@pytest.mark.parametrize("mode", [InstallMode.NEW_BOARD, InstallMode.RESUME])
+def test_a_banner_in_secure_download_mode_means_another_board(tmp_path, store, zkt_bundle,
+                                                              mode):
+    # Only a first start switches Secure Download Mode on, so a new or unfinished board is
+    # never in it: even with its USB board ID, that answer came from another board.
+    fake = FakeBoard() if mode is InstallMode.NEW_BOARD else FakeBoard(efuse_state="key-burned")
+    rig = Rig(tmp_path, store, zkt_bundle, fake)
+    rig.runner.before = lambda call: setattr(fake, "sdm", fake.sdm or
+                                             call.label == "clear start area")
+    security = (SecurityState.BLANK if mode is InstallMode.NEW_BOARD
+                else SecurityState.KEY_BURNED_NOT_STARTED)
+    with pytest.raises(InstallerError) as caught:
+        rig.run(mode, blank_board(security=security))
+    advice = caught.value.advice
+    if mode is InstallMode.NEW_BOARD:
+        assert advice is texts.BOARD_SWAPPED
+    else:
+        # The key is locked: the screen offers only Finish the setup, and says so.
+        assert advice.code == "RESUME_NEEDED" and "board you started with" in advice.what_happened
+        assert advice.what_to_do == ("Do not throw the board away.",
+                                     "Plug in the board you started with.",
+                                     "Click Finish the setup.")
+    assert rig.purposes()[-1] == "clear start area"  # nothing after it
+    assert caught.value.irreversible_done is (mode is InstallMode.RESUME)
+
+
+def test_an_esptool_answer_without_the_board_id_stops_a_new_board(rig):
+    original = rig.fake.handle
+
+    def no_board_id(call):
+        code, output = original(call)
+        if call.label == "copy firmware":
+            output = "\n".join(line for line in output.splitlines()
+                               if not line.startswith("MAC:"))
+        return code, output
+    rig.fake.handle = no_board_id
+    with pytest.raises(InstallerError) as caught:
+        rig.run()
+    assert caught.value.advice is texts.BOARD_SWAPPED and rig.purposes()[-1] == "copy firmware"
+    assert rig.fake.burned_key is None
+
+
 @pytest.mark.parametrize("mode, board, advice", [
     (InstallMode.NEW_BOARD, blank_board(security=SecurityState.SECURED_STATE_LIFE),
      texts.ALREADY_SET_UP),
@@ -451,6 +613,30 @@ def test_stale_work_folders_are_wiped(tmp_path):
     os.utime(old, (0, 0))
     cleanup_stale_work(tmp_path)
     assert not old.exists() and fresh.exists()
+
+
+def test_a_holder_of_the_instance_lock_wipes_every_work_folder(tmp_path):
+    # Left by a power cut during the burn a minute ago: no install can be running now.
+    fresh = tmp_path / "sl-install-fresh"
+    fresh.mkdir()
+    (fresh / "board-key.bin").write_bytes(b"secret" * 6)
+    inspecting = tmp_path / "sl-inspect-fresh"  # not an install's folder
+    inspecting.mkdir()
+    cleanup_stale_work(tmp_path, max_age_s=0)
+    assert not fresh.exists() and inspecting.exists()
+
+
+def test_a_work_folder_dated_ahead_goes_only_with_the_instance_lock(tmp_path):
+    # The computer clock was 5 hours fast at the power cut; Windows has put it right since.
+    ahead = tmp_path / "sl-install-ahead"
+    ahead.mkdir()
+    (ahead / "board-key.bin").write_bytes(b"secret" * 6)
+    later = time.time() + 5 * 3600
+    os.utime(ahead, (later, later))
+    cleanup_stale_work(tmp_path)  # without the lock it may be a running install's
+    assert (ahead / "board-key.bin").exists()
+    cleanup_stale_work(tmp_path, max_age_s=0)
+    assert not ahead.exists()
 
 
 def test_write_without_its_confirmation_is_not_trusted(rig):

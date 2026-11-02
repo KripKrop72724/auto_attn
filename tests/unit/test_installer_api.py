@@ -843,6 +843,28 @@ def test_a_hikvision_package_gets_the_family_defaults(installer):
     assert_no_secrets(json.dumps([row.after for row in installer.audits()]))
 
 
+def test_a_hikvision_certificate_may_fill_one_nvs_string(installer):
+    # 3967 bytes is the most ESP-IDF 5.5.3's NVS generator stores in one string;
+    # one byte more is refused here as the field, not as a failed build (SV2).
+    write_bundle(installer.store, installer.signing_key, HIK_BUNDLE, family="hikvision",
+                 version="3.1.1")
+    installer.login()
+    footer = "\n-----END CERTIFICATE-----\n"
+    certificate = "-----BEGIN CERTIFICATE-----\n".ljust(3967 - len(footer), "A") + footer
+    assert len(certificate.encode("utf-8")) == 3967
+    response = installer.post("/packages", package_body(
+        installer, bundle_id=HIK_BUNDLE, configuration=hik_configuration(hik_ca_pem=certificate)))
+    assert response.status_code == 201, response.text
+    sent = json.loads(installer.provisioner.builds[-1].content)["configuration"]
+    assert sent["hik_ca_pem"] == certificate
+    response = installer.post("/packages", package_body(
+        installer, request_id="installer-test-0002", bundle_id=HIK_BUNDLE,
+        configuration=hik_configuration(hik_ca_pem=certificate + "A")))
+    body = assert_installer_error(response, 422, "INVALID_FIELD", "hik_ca_pem")
+    assert body["message"] == "The machine certificate is too long (up to 3967 characters)."
+    assert len(installer.provisioner.builds) == 1
+
+
 INVALID_CONFIGURATIONS = [
     ("zone_id", zkt_configuration(zone_id="BAD ZONE!")),
     ("zone_id", zkt_configuration(zone_id="Z" * 65)),
@@ -881,7 +903,9 @@ INVALID_CONFIGURATIONS = [
     ("hik_expected_serial", hik_configuration(hik_expected_serial="S" * 120)),
     ("hik_profile", hik_configuration(hik_profile="")),
     ("hik_source_epoch", hik_configuration(hik_source_epoch="E" * 65)),
-    ("hik_ca_pem", hik_configuration(hik_ca_pem="C" * 4096)),
+    # One NVS string holds at most 3967 bytes; the limit counts UTF-8 bytes.
+    ("hik_ca_pem", hik_configuration(hik_ca_pem="C" * 3968)),
+    ("hik_ca_pem", hik_configuration(hik_ca_pem="é" * 1984)),
     ("hik_port", hik_configuration(hik_port=0)),
     ("hik_transport", hik_configuration(hik_transport="telnet")),
     ("zkt_comm_key", hik_configuration(zkt_comm_key=COMM_KEY)),
@@ -1226,6 +1250,30 @@ def test_events_hide_the_firmware_s_own_secret_names_too(installer):
     assert "test-only-" not in stored and "135792468" not in stored
 
 
+def test_events_judge_each_key_before_it_is_cut_to_80_characters(installer):
+    installer.login()
+    # ADD stores only the first 80 characters of a key. A secret word after the
+    # cut, or split by it, must still hide the value, at any depth (review SV3).
+    long_keys = {
+        "k" * 90 + "password": "test-only-l1",
+        "x" * 76 + "_password": "test-only-l2",  # the cut keeps only "x…x_pas"
+        "y" * 85 + "_token": "test-only-l3",  # an installer word
+        "z" * 81 + "fleet_root": "test-only-l4",  # one of ADD's usual names
+    }
+    response = installer.post("/events", {
+        "request_id": "installer-test-0001", "mac": MAC, "kind": "install_failed",
+        "detail": {**long_keys, "step": "write_settings",
+                   "nested": {**long_keys, "attempts": [dict(long_keys)]}},
+    })
+    assert response.status_code == 204, response.text
+    (audit,) = installer.audits("INSTALLER_INSTALL_FAILED")
+    hidden = {key[:80]: "[REDACTED]" for key in long_keys}
+    assert len(hidden) == len(long_keys)
+    assert audit.after == {**hidden, "step": "write_settings",
+                           "nested": {**hidden, "attempts": [hidden]}}
+    assert "test-only-" not in json.dumps(audit.after)
+
+
 @pytest.mark.parametrize(("expected", "overrides"), [
     ("kind", {"kind": "PACKAGE_ISSUED"}),
     ("kind", {"kind": "package_issued"}),
@@ -1335,24 +1383,50 @@ def test_a_board_that_never_ran_may_get_new_settings_or_be_resumed(installer):
         "change_settings", "resume", "change_settings", "resume"]
 
 
-@pytest.mark.parametrize("prepared_with", ["new_board", "resume"])
-def test_a_board_this_app_prepared_may_change_settings_once_online(installer, prepared_with):
+@pytest.mark.parametrize("prepared_with", [("new_board",), ("new_board", "resume")],
+                         ids=["new_board", "new_board-then-resume"])
+def test_a_board_this_app_set_up_may_change_settings_once_online(installer, prepared_with):
     write_bundle(installer.store, installer.signing_key, ZKT_BUNDLE)
     installer.login()
-    # This app burned or finished the key, so it is the fleet root's for the MAC.
-    assert installer.post("/packages", package_body(installer, mode=prepared_with)).status_code == 201
+    # This app burned the key, so it is the fleet root's for the MAC. Finishing
+    # that same setup with a resume changes nothing.
+    for number, mode in enumerate(prepared_with, start=1):
+        response = installer.post("/packages", package_body(
+            installer, mode=mode, request_id=f"installer-test-000{number}"))
+        assert response.status_code == 201, response.text
     add_connector(installer, MAC, zone_id="ZONE-TEST-01", online=True)
     record = installer.get("/devices/AC-27-6E-A4-3D-30").json()
     assert (record["settings_change_allowed"], record["settings_change_reason"]) == (True, None)
     changed = installer.post("/packages", package_body(
-        installer, mode="change_settings", request_id="installer-test-0002", bundle_id=None))
+        installer, mode="change_settings", request_id="installer-test-0008", bundle_id=None))
     assert changed.status_code == 201, changed.text
     # A board that has started is never resumed: only an unfinished setup is.
     resumed = installer.post("/packages", package_body(
-        installer, mode="resume", request_id="installer-test-0003"))
+        installer, mode="resume", request_id="installer-test-0009"))
     assert_installer_error(resumed, 409, "SETTINGS_CHANGE_NOT_SUPPORTED")
     assert [row.after["mode"] for row in installer.audits("INSTALLER_PACKAGE_ISSUED")] == [
-        prepared_with, "change_settings"]
+        *prepared_with, "change_settings"]
+
+
+def test_a_resume_alone_never_proves_the_board_s_key(installer):
+    # A resume burns no key. The board may have been locked before this app,
+    # with an older root, and then set up again by head office with that root,
+    # which ADD does not record (review SV1). Its unsent punches must not be
+    # erased by fleet-root settings.
+    write_bundle(installer.store, installer.signing_key, ZKT_BUNDLE)
+    installer.login()
+    assert installer.post("/packages", package_body(installer, mode="resume")).status_code == 201
+    add_connector(installer, MAC, zone_id="ZONE-TEST-01", online=True)
+    record = installer.get(f"/devices/{MAC}").json()
+    assert (record["settings_change_allowed"], record["settings_change_reason"]) == (
+        False, SETTINGS_REFUSED)
+    changed = installer.post("/packages", package_body(
+        installer, mode="change_settings", request_id="installer-test-0002", bundle_id=None))
+    body = assert_installer_error(changed, 409, "SETTINGS_CHANGE_NOT_SUPPORTED")
+    assert body["message"] == SETTINGS_REFUSED
+    assert len(installer.provisioner.builds) == 1
+    assert [row.after["mode"] for row in installer.audits("INSTALLER_PACKAGE_ISSUED")] == [
+        "resume"]
 
 
 def test_only_this_app_s_key_packages_for_the_mac_prove_its_root(installer):

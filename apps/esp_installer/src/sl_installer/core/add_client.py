@@ -79,7 +79,13 @@ def tls_context() -> ssl.SSLContext:
 
 
 class LoginThrottle:
-    """Pauses sign-in after 3 wrong passwords in 10 minutes, for 10 minutes."""
+    """Pauses sign-in after 3 wrong passwords in 10 minutes, for 10 minutes.
+
+    A pause is timed on the monotonic clock, so a computer clock put right meanwhile
+    cannot stretch it. Its end on the wall clock is saved for the next start, and a
+    saved end further ahead than the longest pause (ADD's own 15-minute lock) is
+    dropped: only a clock put right since, or a damaged file, explains one.
+    """
 
     def __init__(self, clock: Optional[Clock] = None, state_file: Optional[Path] = None,
                  max_failures: int = MAX_FAILURES, window_s: float = FAILURE_WINDOW_S,
@@ -89,8 +95,10 @@ class LoginThrottle:
         self._max = max_failures
         self._window = window_s
         self._pause = pause_s
+        self._longest = max(pause_s, SERVER_LOCK_S)
         self._failures: List[float] = []
-        self._paused_until = 0.0
+        self._paused_until = 0.0  # wall clock: what the file keeps
+        self._resume_at: Optional[float] = None  # monotonic clock: what this run waits for
         self._lock = threading.Lock()
         self._load()
 
@@ -99,10 +107,24 @@ class LoginThrottle:
             return
         try:
             data = json.loads(self._file.read_text(encoding="utf-8"))
-            self._failures = [float(x) for x in data.get("failures", [])][-10:]
-            self._paused_until = float(data.get("paused_until", 0.0))
+            failures = [float(x) for x in data.get("failures", [])][-10:]
+            paused_until = float(data.get("paused_until", 0.0))
         except (OSError, ValueError, TypeError, AttributeError):
-            self._failures, self._paused_until = [], 0.0
+            return
+        self._failures = failures
+        left = paused_until - self._clock.wall()
+        if 0.0 < left <= self._longest:
+            self._pause_for(left)
+
+    def _pause_for(self, seconds: float) -> None:
+        seconds = min(seconds, self._longest)
+        self._resume_at = self._clock.monotonic() + seconds
+        self._paused_until = self._clock.wall() + seconds
+
+    def _left(self) -> float:
+        if self._resume_at is None:
+            return 0.0
+        return max(0.0, self._resume_at - self._clock.monotonic())
 
     def _save(self) -> None:
         if self._file is None:
@@ -117,7 +139,7 @@ class LoginThrottle:
 
     def seconds_left(self) -> float:
         with self._lock:
-            return max(0.0, self._paused_until - self._clock.wall())
+            return self._left()
 
     def check(self) -> None:
         left = self.seconds_left()
@@ -132,19 +154,19 @@ class LoginThrottle:
             self._failures = [t for t in self._failures if now - t < self._window] + [now]
             started = len(self._failures) >= self._max
             if started:
-                self._paused_until = now + self._pause
+                self._pause_for(self._pause)
                 self._failures = []
             self._save()
             return started
 
     def succeeded(self) -> None:
         with self._lock:
-            self._failures, self._paused_until = [], 0.0
+            self._failures, self._paused_until, self._resume_at = [], 0.0, None
             self._save()
 
     def server_locked(self) -> None:
         with self._lock:
-            self._paused_until = max(self._paused_until, self._clock.wall() + SERVER_LOCK_S)
+            self._pause_for(max(self._left(), SERVER_LOCK_S))
             self._failures = []
             self._save()
 

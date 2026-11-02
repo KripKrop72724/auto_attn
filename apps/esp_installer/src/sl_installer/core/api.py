@@ -385,7 +385,7 @@ class ConsoleEvent:
 class BootOutcome(str, enum.Enum):
     OK = "ok"
     WRONG_SETTINGS = "wrong_settings"        # started with another zone/device than expected
-    NO_OUTPUT = "no_output"                  # plugged in but silent
+    NO_OUTPUT = "no_output"                  # silent, or no line of the running program
     FAULTY_RESTART_LOOP = "faulty_restart_loop"
     SECURITY_KEY_PROBLEM = "security_key_problem"
     STORAGE_PROBLEM = "storage_problem"

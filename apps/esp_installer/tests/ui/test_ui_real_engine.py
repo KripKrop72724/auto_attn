@@ -44,6 +44,7 @@ from sl_installer.core.factory import make_services
 from sl_installer.core.installer import Installer
 from sl_installer.core.records import Records
 from sl_installer.core.usb import UsbWatcher
+from sl_installer.ui import controller as controller_module
 from sl_installer.ui import pages
 from sl_installer.ui.window import MainWindow
 
@@ -100,11 +101,18 @@ class Ports:
 
 
 class Console:
-    """What the board prints each time its port is opened."""
+    """What the board prints each time its port is opened.
+
+    By default every open replays ``lines``. With ``drop_unread`` it behaves like
+    USB-Serial/JTAG, which drops what nobody reads: an open replays nothing, and what
+    ``prints`` sends reaches only a port that is open at that moment (else ``dropped``).
+    """
 
     def __init__(self, ports: Ports, lines: List[str]) -> None:
         self.ports = ports
         self.lines = lines
+        self.drop_unread = False
+        self.dropped: List[str] = []
         self.opened: List[str] = []
         self.streams: List["_Stream"] = []
 
@@ -112,9 +120,18 @@ class Console:
         if not self.ports.plugged:
             raise FileNotFoundError(2, "No such file or directory")
         self.opened.append(port)
-        stream = _Stream(self.ports, ("\n".join(self.lines) + "\n").encode())
+        replay = b"" if self.drop_unread else ("\n".join(self.lines) + "\n").encode()
+        stream = _Stream(self.ports, replay)
         self.streams.append(stream)
         return stream
+
+    def prints(self, lines: List[str]) -> None:
+        """The board prints ``lines`` now."""
+        reading = [stream for stream in self.streams if not stream.closed]
+        for stream in reading:
+            stream.feed(("\n".join(lines) + "\n").encode())
+        if not reading:
+            self.dropped += lines
 
     @property
     def held(self) -> bool:
@@ -127,12 +144,18 @@ class _Stream:
         self.ports = ports
         self.data = data
         self.closed = False
+        self.lock = threading.Lock()  # the app reads on its worker thread, the test feeds
 
     def read(self, size: int) -> bytes:
         if not self.ports.plugged:
             raise OSError("device disconnected")
-        chunk, self.data = self.data[:size], self.data[size:]
+        with self.lock:
+            chunk, self.data = self.data[:size], self.data[size:]
         return chunk
+
+    def feed(self, data: bytes) -> None:
+        with self.lock:
+            self.data += data
 
     def close(self) -> None:
         self.closed = True
@@ -254,6 +277,24 @@ class Rig:
         self.ports.plugged = False
         self.wait(lambda: first_start.phase is ReplugPhase.WAITING_REPLUG)
         self.ports.plugged = True
+        self.wait(lambda: first_start.result.isVisible())
+
+    def replug_missing_the_start(self, missed: List[str], lines: List[str]) -> None:
+        """As replug, but the board prints ``missed`` before the app has its port open.
+
+        The console drops them, as USB-Serial/JTAG does: the board prints from power-on,
+        before the computer lists its port again. ``lines`` come once the app reads.
+        """
+        first_start = self.page(pages.FIRST_START)
+        self.wait_page(pages.FIRST_START)
+        self.wait(lambda: first_start.phase is ReplugPhase.WAITING_UNPLUG)
+        self.console.drop_unread = True
+        self.ports.plugged = False
+        self.wait(lambda: first_start.phase is ReplugPhase.WAITING_REPLUG)
+        self.console.prints(missed)
+        self.ports.plugged = True
+        self.wait(lambda: self.console.held)
+        self.console.prints(lines)
         self.wait(lambda: first_start.result.isVisible())
 
     def close(self) -> None:
@@ -431,6 +472,71 @@ def test_new_hikvision_board_end_to_end_on_the_real_engine(rig):
     assert r.board.burned_key == r.server.hmac_key
 
 
+def set_up_new_zkt_board(r: Rig) -> None:
+    """From Home to the first start of a new ZKTeco board."""
+    r.sign_in()
+    r.page(pages.HOME).action.emit("setup")
+    r.wait_page(pages.MACHINE)
+    r.page(pages.MACHINE).zkt_card.click()
+    r.wait_page(pages.DETAILS)
+    form = r.page(pages.DETAILS).form
+    r.wait(lambda: form.selected_bundle_id() == r.bundle.bundle_id)
+    form.zone_id.setText(ZONE)
+    r.click_primary(pages.DETAILS)
+    r.board_found()
+    checking = r.page(pages.CHECKING)
+    r.wait(lambda: checking.result.isVisible())
+    r.click_primary(pages.CHECKING)
+    r.confirm_and_install()
+
+
+def test_start_line_printed_before_the_port_opened_still_ends_on_done(rig):
+    # USB-Serial/JTAG drops the start line when the computer lists the port too late.
+    r = rig(support.FakeBoard())
+    set_up_new_zkt_board(r)
+    lines = boot_lines(ZONE)
+    start = next(index for index, line in enumerate(lines) if "Zone Lite starting" in line)
+    r.replug_missing_the_start(lines[: start + 1], lines[start + 1 :])
+    assert lines[start] in r.console.dropped
+
+    first_start = r.page(pages.FIRST_START)
+    advice = first_start.result.advice
+    assert advice.code == "FIRST_START_OK", advice
+    assert advice.what_happened == "It started and is working."  # no zone or device claimed
+    assert first_start.primary_button.text() == "Next"
+    r.click_primary(pages.FIRST_START)
+    r.wait_page(pages.DONE)
+    done = r.page(pages.DONE)
+    assert done.credentials.values["hotspot"].text() == "SLIC ATTENDANCE-3D31"
+    assert done.credentials.values["password"].text() == "test-hotspot-pass"
+    done.secondary_button.click()  # Save a record
+    r.wait(lambda: done.saved.isVisible())
+    record = Path(r.controller.session.record_path).read_text(encoding="utf-8")
+    assert "The board started correctly" in record and "Seen:" not in record
+    r.wait(lambda: [event[2] for event in r.server.events][-1:] == ["BOOT_OK"])
+    detail = r.server.events[-1][3]
+    assert (detail["zone_id_seen"], detail["device_id_seen"]) == (None, None)
+
+
+def test_lines_without_a_start_are_not_a_silent_board(rig, monkeypatch):
+    # Lines came, but none from the running program: not "silent", never "put it aside".
+    monkeypatch.setattr(controller_module, "FIRST_BOOT_TIMEOUT_S", 3.0)
+    r = rig(support.FakeBoard())
+    set_up_new_zkt_board(r)
+    lines = boot_lines(ZONE)
+    r.replug(lines[: next(i for i, line in enumerate(lines) if "zone_config" in line)])
+    first_start = r.page(pages.FIRST_START)
+    advice = first_start.result.advice
+    assert advice.code == "START_NOT_SEEN", advice
+    # Its steps name only the buttons this screen shows.
+    assert first_start.primary_button.text() == "Try again"
+    assert first_start.secondary_button.text() == "Check the board"
+    assert advice.what_to_do[-2:] == (
+        "Click Try again.",
+        "If it happens again, click Check the board.",
+    )
+
+
 def test_failure_after_the_key_is_finished_without_a_second_burn(rig):
     r = rig(support.FakeBoard())
     # The start-up program copy breaks once, after the key is locked (cable pulled).
@@ -512,6 +618,88 @@ def test_secured_board_settings_change_on_the_real_engine(rig):
     assert not any(held for _gui, held in r.tool_calls[calls_before_fix:])
     (request,) = r.server.requests
     assert request.config.zkt.comm_key == 12345
+
+
+def test_a_board_this_computer_gives_no_board_id_for_is_only_read(rig):
+    # The installer writes only to the port with the board's USB board ID (review BS1), so
+    # the check says so before anything starts, and Try again follows the cable.
+    r = rig(support.FakeBoard())
+    r.ports.info.serial_number = None  # this socket gives no board ID
+    r.sign_in()
+    r.page(pages.HOME).action.emit("setup")
+    r.wait_page(pages.MACHINE)
+    r.page(pages.MACHINE).zkt_card.click()
+    r.wait_page(pages.DETAILS)
+    form = r.page(pages.DETAILS).form
+    r.wait(lambda: form.selected_bundle_id() == r.bundle.bundle_id)
+    form.zone_id.setText(ZONE)
+    r.click_primary(pages.DETAILS)
+    r.board_found()
+    checking = r.page(pages.CHECKING)
+    r.wait(lambda: checking.result.isVisible())
+    assert checking.result.advice.code == "BOARD_ID_NOT_READABLE", checking.result.advice
+    assert checking.primary_button.text() == "Try again"
+    assert r.controller.session.mode is None
+    read_only = {"get-security-info", "flash-id", "summary"}
+    assert {command_of(seen.call.args) for seen in r.runner.seen} <= read_only
+
+    # The person plugs the cable into another socket, which gives the board ID.
+    r.ports.info.device, r.ports.info.serial_number = "/dev/ttyACM1", support.MAC.upper()
+    r.click_primary(pages.CHECKING)
+    r.wait(lambda: checking.result.isVisible() and checking.result.advice.code == "NEW_BOARD")
+    args = r.runner.seen[-1].call.args
+    assert args[args.index("--port") + 1] == "/dev/ttyACM1"
+    assert r.controller.session.candidate.mac == support.MAC
+    assert {command_of(seen.call.args) for seen in r.runner.seen} <= read_only
+
+
+def test_try_again_follows_the_board_to_a_socket_that_gives_no_board_id(rig):
+    r = rig(support.FakeBoard())
+    r.board.failures["get-security-info"] = support.Failure(2, support.PORT_GONE)
+    r.sign_in()
+    r.page(pages.HOME).action.emit("setup")
+    r.wait_page(pages.MACHINE)
+    r.page(pages.MACHINE).zkt_card.click()
+    r.wait_page(pages.DETAILS)
+    form = r.page(pages.DETAILS).form
+    r.wait(lambda: form.selected_bundle_id() == r.bundle.bundle_id)
+    form.zone_id.setText(ZONE)
+    r.click_primary(pages.DETAILS)
+    r.board_found()
+    checking = r.page(pages.CHECKING)
+    r.wait(lambda: checking.result.isVisible())
+    assert checking.primary_button.text() == "Try again"  # the cable was pulled out
+    # It goes into another socket, under another name, and that socket gives no board ID.
+    r.ports.info.device, r.ports.info.serial_number = "/dev/ttyACM1", None
+    r.click_primary(pages.CHECKING)
+    r.wait(
+        lambda: (
+            checking.result.isVisible() and checking.result.advice.code == "BOARD_ID_NOT_READABLE"
+        )
+    )
+    args = r.runner.seen[-1].call.args
+    assert args[args.index("--port") + 1] == "/dev/ttyACM1"
+
+
+def test_check_a_board_offers_no_fix_without_a_usb_board_id(rig):
+    r = rig(support.FakeBoard(efuse_state="secured-not-sdm"))
+    r.ports.info.serial_number = None
+    r.sign_in()
+    r.page(pages.HOME).action.emit("check")
+    r.board_found()
+    r.wait_page(pages.CHECK_BOARD)
+    check = r.page(pages.CHECK_BOARD)
+    r.wait(lambda: check.fix_blocked.isVisible())
+    assert check.fix_blocked.advice.code == "BOARD_ID_NOT_READABLE"
+    assert not check.primary_button.isVisible()  # no Fix settings
+    r.controller._check_board_fix()  # not even when asked directly
+    assert r.controller.current == pages.CHECK_BOARD
+
+    # Check again, after moving the cable to a socket that gives the board ID.
+    r.ports.info.device, r.ports.info.serial_number = "/dev/ttyACM1", support.MAC.upper()
+    check.again_link.click()
+    r.wait(lambda: check.primary_button.isVisible() and check.primary_button.isEnabled())
+    assert check.primary_button.text() == "Fix settings" and not check.fix_blocked.isVisible()
 
 
 @pytest.fixture

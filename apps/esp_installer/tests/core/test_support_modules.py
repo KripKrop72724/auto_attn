@@ -219,7 +219,31 @@ def test_other_field_rules():
     assert validation.check_hik(replace(hik, expected_serial="")).code == \
         "INVALID_FIELD:hik_expected_serial"
     assert validation.check_hik(replace(hik, transport="telnet")) is not None
-    assert validation.check_hik(replace(hik, ca_pem="x" * 4001)) is not None
+    # One NVS string holds at most 3967 bytes; the package builder fails on more.
+    assert validation.check_hik(replace(hik, ca_pem="x" * 3967)) is None
+    assert validation.check_hik(replace(hik, ca_pem="x" * 3968)).code == \
+        "INVALID_FIELD:hik_ca_pem"
+    assert validation.check_hik(replace(hik, ca_pem="é" * 1984)) is not None  # 3968 bytes
+
+
+def test_hikvision_https_needs_the_machine_certificate():
+    from dataclasses import replace
+
+    # Without one the board checks the machine against the public certificate
+    # authorities and never reaches it (review CR2); the app cannot add one.
+    hik = HikSettings(host="192.168.1.2", password="pw", expected_serial="S1", port=443,
+                      transport="https")
+    assert validation.check_hik(hik).code == "INVALID_FIELD:hik_transport"
+    assert validation.check_hik(replace(hik, ca_pem=" \n")).code == "INVALID_FIELD:hik_transport"
+    assert validation.check_hik(replace(hik, ca_pem="test-ca")) is None
+    assert validation.check_hik_transport("http_digest") is None
+    assert validation.check_hik_transport("https") is not None
+    # The engine checks this before it asks head office for the board's settings.
+    config = support.zkt_config(family=Family.HIKVISION, zkt=None, hik=hik)
+    assert [a.code for a in validation.problems(config)] == ["INVALID_FIELD:hik_transport"]
+    steps = texts.invalid_field("hik_transport").what_to_do
+    assert "Under Advanced settings, set Connection to Normal (HTTP)." in steps
+    assert not any("HTTPS" in step for step in steps)
 
 
 def test_problems_lists_every_field_in_screen_order():

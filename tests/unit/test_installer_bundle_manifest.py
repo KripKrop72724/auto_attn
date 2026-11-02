@@ -837,3 +837,71 @@ def test_signer_asks_the_app_and_deployed_add_before_the_vault():
     ]
     positions = [signer.index(step) for step in steps]
     assert positions == sorted(positions)
+
+
+# ------------------------------------------------ dispatch inputs (review BS1)
+
+DEVICE_MAC = "14:c1:9f:46:ae:1c"
+
+
+def dispatch_inputs(confirmation: str, device_mac: str = "", ref: str = "refs/heads/main",
+                    **inputs: str) -> subprocess.CompletedProcess:
+    """Run the workflow's own dispatch-inputs script with bash."""
+    yaml = pytest.importorskip("yaml")
+    workflow = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+    (step,) = workflow["jobs"]["dispatch-inputs"]["steps"]
+    # The step's inputs, with the workflow's defaults.
+    environment = {
+        "CONFIRMATION": confirmation, "DEVICE_MAC": device_mac, "BUNDLE_FAMILY": "zkt",
+        "HIKVISION_SOURCE_REF": HIK_SOURCE, "PRODUCTION_RELEASE": "latest",
+        "ROLLBACK_PREDECESSOR": "2.5.2", **inputs,
+    }
+    assert set(environment) == set(step["env"])
+    return subprocess.run(
+        ["bash", "-c", step["run"]], capture_output=True, text=True, timeout=60,
+        env={"PATH": os.environ.get("PATH", ""), "GITHUB_REF": ref, **environment},
+    )
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash is required")
+@pytest.mark.parametrize(("confirmation", "device_mac", "refusal"), [
+    ("PUBLISH INSTALLER BUNDLE", "", None),
+    ("PUBLISH INSTALLER BUNDLE", DEVICE_MAC, "An installer bundle serves every board"),
+    # GitHub's == ignores letter case, so the bundle jobs would run for these.
+    ("publish installer bundle", DEVICE_MAC, "Type the confirmation exactly"),
+    ("Publish Installer Bundle", "", "Type the confirmation exactly"),
+    ("create add firmware vault", DEVICE_MAC, "Type the confirmation exactly"),
+    # The per-device modes, typed exactly, still need one exact MAC.
+    ("CREATE ADD FIRMWARE VAULT", DEVICE_MAC, None),
+    ("CREATE ADD FIRMWARE VAULT", "", "CREATE ADD FIRMWARE VAULT needs device_mac"),
+    ("BUILD USB WIFI RESCUE HIL", DEVICE_MAC, None),
+    ("BUILD USB WIFI RESCUE HIL", "14:c1:9f:46:ae", "BUILD USB WIFI RESCUE HIL needs device_mac"),
+])
+def test_dispatch_inputs_take_the_confirmation_only_as_typed_exactly(confirmation, device_mac,
+                                                                     refusal):
+    result = dispatch_inputs(confirmation, device_mac)
+    if refusal is None:
+        assert (result.returncode, result.stdout, result.stderr) == (0, "", "")
+    else:
+        assert result.returncode == 1
+        (line,) = result.stdout.splitlines()
+        assert line.startswith("::error::") and refusal in line
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash is required")
+@pytest.mark.parametrize(("ref", "inputs", "refusal"), [
+    ("refs/heads/main", {"BUNDLE_FAMILY": "hikvision"}, None),
+    ("refs/heads/feature", {}, "Installer bundles are published only from main"),
+    ("refs/heads/main", {"BUNDLE_FAMILY": "hikvision", "HIKVISION_SOURCE_REF": "dc7d9c3"},
+     "hikvision_source_ref must be a full lowercase 40-hex commit SHA"),
+    ("refs/heads/main", {"PRODUCTION_RELEASE": "none"}, "A ZKT installer bundle needs"),
+    ("refs/heads/main", {"ROLLBACK_PREDECESSOR": "none"}, "A ZKT installer bundle needs"),
+])
+def test_dispatch_inputs_still_check_every_bundle_input(ref, inputs, refusal):
+    result = dispatch_inputs("PUBLISH INSTALLER BUNDLE", ref=ref, **inputs)
+    if refusal is None:
+        assert (result.returncode, result.stdout, result.stderr) == (0, "", "")
+    else:
+        assert result.returncode == 1
+        (line,) = result.stdout.splitlines()
+        assert line.startswith("::error::") and refusal in line

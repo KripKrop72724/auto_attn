@@ -146,6 +146,16 @@ def test_a_hikvision_package_forwards_the_terminal_settings(provisioner):
         0, "0.0.0.0", 4370)
 
 
+def test_a_hikvision_certificate_may_fill_one_nvs_string(provisioner):
+    # 3967 bytes is the most nvs_partition_gen (ESP-IDF 5.5.3) stores in one
+    # string. One byte more is refused as the field (the table below).
+    certificate = "c" * 3967
+    response = post(provisioner, request_body(hik(
+        hik_transport="https", hik_port=443, hik_ca_pem=certificate)))
+    assert response.status_code == 201, response.text
+    assert provisioner.builds[0].request["hik_ca_pem"] == certificate
+
+
 def _without(values: dict, key: str) -> dict:
     return {name: value for name, value in values.items() if name != key}
 
@@ -175,7 +185,9 @@ def _without(values: dict, key: str) -> dict:
     (request_body(hik(hik_password="")), "hik_password"),
     (request_body(hik(hik_expected_serial="s" * 120)), "hik_expected_serial"),
     (request_body(hik(hik_source_epoch="")), "hik_source_epoch"),
-    (request_body(hik(hik_ca_pem="c" * 4096)), "hik_ca_pem"),
+    # nvs_partition_gen stores one string of at most 3967 bytes plus its NUL.
+    (request_body(hik(hik_ca_pem="c" * 3968)), "hik_ca_pem"),
+    (request_body(hik(hik_ca_pem="é" * 1984)), "hik_ca_pem"),
     (request_body(hik(hik_transport="telnet")), "hik_transport"),
     (request_body(hik(hik_port="80")), "hik_port"),
     (request_body(hik(zkt_comm_key=COMM_KEY)), "zkt_comm_key"),

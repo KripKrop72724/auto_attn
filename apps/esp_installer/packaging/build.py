@@ -191,7 +191,8 @@ def _field_problems(values: Dict[str, object], setup_password: str) -> List[str]
         problems.append("zkt_port / zkt_comm_key / zkt_preferred_ip")
     if not 1 <= int(values["hik_port"]) <= 65535:
         problems.append("hik_port")
-    if values["hik_transport"] not in validation.HIK_TRANSPORTS:
+    # The defaults carry no machine certificate, so "https" is refused like "telnet".
+    if validation.check_hik_transport(str(values["hik_transport"])):
         problems.append("hik_transport")
     username = str(values["hik_username"])
     if not username or len(username.encode("utf-8")) > validation.HIK_LIMITS["hik_username"]:

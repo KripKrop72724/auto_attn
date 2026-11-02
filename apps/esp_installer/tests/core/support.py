@@ -614,7 +614,12 @@ class FakeUsb:
 
 @dataclass
 class SerialScript:
-    """A board's console over time: when it is plugged in and what it prints."""
+    """A board's console over time: when it is plugged in and what it prints.
+
+    By default lines printed before the port is opened wait in ``pending``. With
+    ``drop_unread`` the console behaves like USB-Serial/JTAG, which drops what nobody
+    reads: lines printed while no port is open never arrive (they go to ``dropped``).
+    """
 
     clock: FakeClock
     usb: FakeUsb
@@ -623,6 +628,9 @@ class SerialScript:
     pending: bytes = b""
     opened: List[str] = field(default_factory=list)
     busy_until: float = -1.0
+    drop_unread: bool = False
+    dropped: List[str] = field(default_factory=list)
+    reading: Optional[int] = None  # generation of the open port; None when no port is open
 
     def at(self, moment: float, action: str, value: object = None) -> "SerialScript":
         self.timeline.append((moment, action, value))
@@ -640,7 +648,10 @@ class SerialScript:
                 self.usb.present = True
             elif action == "print":
                 text = value if isinstance(value, str) else "\n".join(value)  # type: ignore
-                self.pending += (text + "\n").encode()
+                if self.drop_unread and self.reading != self.generation:
+                    self.dropped += text.split("\n")
+                else:
+                    self.pending += (text + "\n").encode()
 
     def opener(self, port: str):
         if self.clock.now < self.busy_until:
@@ -648,6 +659,7 @@ class SerialScript:
         if not self.usb.present:
             raise FileNotFoundError(2, "No such file or directory")
         self.opened.append(port)
+        self.reading = self.generation
         return FakeSerial(self, self.generation)
 
 
@@ -667,6 +679,8 @@ class FakeSerial:
 
     def close(self) -> None:
         self.closed = True
+        if self.script.reading == self.generation:
+            self.script.reading = None
 
 
 def zkt_config(**changes) -> InstallConfig:

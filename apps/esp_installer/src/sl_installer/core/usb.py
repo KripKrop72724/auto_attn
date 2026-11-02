@@ -9,7 +9,13 @@ pyserial 3.5 on Windows reads the serial number from the parent of the COM
 interface with CM_Get_Parent/CM_Get_Device_IDW, but it raises from comports() if
 the walk fails, and for some hubs returns nothing. ``device_tree_macs`` reads the
 same device tree from the composite parent down (cfgmgr32 through ctypes) and is
-used when pyserial gives no MAC.
+used when pyserial gives no MAC. When Windows ignores serial numbers it hands out
+a location-based instance ID instead (``5&2B33E3B5&0&12``), and twelve hex digits
+can hide in one, so only a serial number that is a whole MAC counts.
+
+A board whose ID neither source gives has ``mac`` None. ``find`` still returns it
+when it is the only board, for reading its console or waiting for a replug; the
+installer never writes to such a port (installer._resolve_port).
 
 A faulty board shows as a port that appears for about 10 s, vanishes and comes
 back, again and again, with nothing on its console (the bootloader's 9 s RTC
@@ -46,10 +52,23 @@ TIMELINE_WINDOW = 90.0
 
 PortLister = Callable[[], Sequence[object]]
 
+# The USB-Serial/JTAG serial number is the chip's MAC, "AC:27:6E:A4:3D:30".
+_SERIAL_MAC = re.compile(r"[0-9A-Fa-f]{2}(?:[:-]?[0-9A-Fa-f]{2}){5}")
+
 
 def default_lister() -> Sequence[object]:
     from serial.tools import list_ports
     return list(list_ports.comports())
+
+
+def serial_mac(value: object) -> Optional[str]:
+    """The MAC in a USB serial number that is nothing but a MAC, else None.
+
+    naming.normalize_mac keeps any twelve hex digits, which suits typed input but
+    would turn an instance ID like 5&2B33E3B5&0&12 into a made-up board ID.
+    """
+    text = str(value or "").strip()
+    return normalize_mac(text) if _SERIAL_MAC.fullmatch(text) else None
 
 
 def classify_port(info: object, macs: Optional[Dict[str, str]] = None) -> Optional[UsbCandidate]:
@@ -61,7 +80,7 @@ def classify_port(info: object, macs: Optional[Dict[str, str]] = None) -> Option
     if not port or vid is None:
         return None
     if vid == NATIVE_VID and pid == NATIVE_PID:
-        mac = normalize_mac(getattr(info, "serial_number", None))
+        mac = serial_mac(getattr(info, "serial_number", None))
         if mac is None and macs:
             mac = macs.get(port.upper()) or macs.get(port)
         return UsbCandidate(port, UsbKind.NATIVE, vid, pid, mac, description)
@@ -99,7 +118,7 @@ def device_tree_macs(tree: DeviceTree) -> Dict[str, str]:
     found: Dict[str, str] = {}
     for instance in tree.usb_instance_ids():
         match = _PARENT_ID.match(instance)
-        mac = normalize_mac(match.group(1)) if match else None
+        mac = serial_mac(match.group(1)) if match else None
         if mac is None:
             continue
         devinst = tree.locate(instance)
@@ -342,7 +361,11 @@ class UsbWatcher:
                 break
 
     def find(self, mac: str) -> Tuple[Optional[UsbCandidate], int]:
-        """The native port with this MAC, and how many native ports there are."""
+        """The native port with this MAC, and how many native ports there are.
+
+        A lone native port without a board ID is returned for any MAC, with ``mac``
+        None: enough to read a console or see a replug, never to write to a board.
+        """
         natives = [c for c in self.candidates() if c.kind is UsbKind.NATIVE]
         wanted = normalize_mac(mac)
         for candidate in natives:

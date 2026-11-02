@@ -266,6 +266,81 @@ def test_server_lock_is_explained_and_respected(add, tmp_path):
     assert caught.value.advice.code == "LOGIN_PAUSED"
 
 
+class SkewedClock(FakeClock):
+    """The computer's clock, which can be put right while time runs on."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.skew = 0.0
+
+    def wall(self) -> float:
+        return super().wall() + self.skew
+
+
+def test_a_clock_put_right_does_not_stretch_the_pause(add, tmp_path):
+    clock = SkewedClock()
+    clock.skew = 3 * 86400.0  # the clock is 3 days fast
+    state = tmp_path / "pause.json"
+    c = client(add, tmp_path, clock=clock, throttle_file=state)
+    for _ in range(3):
+        with pytest.raises(InstallerError):
+            c.login("StateHealthAdmin", "wrong-password-1")
+    assert c.throttle.seconds_left() == pytest.approx(600)
+    clock.skew = 0.0  # Windows time sync puts it right
+    clock.advance(60)
+    # This run times the pause on the monotonic clock: 9 minutes, not 3 days.
+    assert c.throttle.seconds_left() == pytest.approx(540)
+    with pytest.raises(InstallerError) as caught:
+        c.login("StateHealthAdmin", PASSWORD)
+    assert "9 minutes" in caught.value.advice.what_happened
+    # The next start finds an end 3 days ahead, more than any pause, and drops it.
+    again = client(add, tmp_path, clock=clock, throttle_file=state)
+    assert again.throttle.seconds_left() == 0
+    assert again.login("StateHealthAdmin", PASSWORD) == "StateHealthAdmin"
+    clock.advance(540)
+    assert c.login("StateHealthAdmin", PASSWORD) == "StateHealthAdmin"
+
+
+def test_a_saved_pause_never_ends_more_than_the_server_lock_ahead(tmp_path):
+    clock = SkewedClock()
+    state = tmp_path / "pause.json"
+    for _ in range(3):
+        LoginThrottle(clock, state).failed()
+    clock.skew = -200.0  # put back 200 s: the saved end is now 800 s ahead
+    kept = LoginThrottle(clock, state)
+    assert kept.seconds_left() == pytest.approx(800)
+    clock.skew = -10_000.0  # and moving the clock again changes nothing in this run
+    assert kept.seconds_left() == pytest.approx(800)
+    # The saved end is now 10 600 s ahead, more than ADD's own 15-minute lock: dropped.
+    assert LoginThrottle(clock, state).seconds_left() == 0
+
+
+def test_a_new_pause_after_the_clock_was_put_right_is_bounded(tmp_path):
+    clock = SkewedClock()
+    clock.skew = 3 * 86400.0
+    state = tmp_path / "pause.json"
+    throttle = LoginThrottle(clock, state)
+    for _ in range(3):
+        throttle.failed()
+    clock.skew = 0.0
+    clock.advance(600)
+    assert throttle.seconds_left() == 0
+    throttle.server_locked()  # ADD answers 429: 15 minutes from now, not from 3 days ahead
+    assert throttle.seconds_left() == pytest.approx(900)
+    saved = json.loads(state.read_text(encoding="utf-8"))["paused_until"]
+    assert saved == pytest.approx(clock.wall() + 900)
+    assert LoginThrottle(clock, state).seconds_left() == pytest.approx(900)
+
+
+@pytest.mark.parametrize("content", [
+    '{"paused_until": Infinity}', '{"paused_until": NaN}', '{"paused_until": "soon"}',
+    '{"failures": "x"}', "[1, 2]", "not json"])
+def test_a_damaged_pause_file_pauses_nothing(tmp_path, content):
+    state = tmp_path / "pause.json"
+    state.write_text(content, encoding="utf-8")
+    assert LoginThrottle(FakeClock(), state).seconds_left() == 0
+
+
 @pytest.mark.parametrize("response, code", [
     (httpx.Response(409, json={"code": "FAMILY_MISMATCH", "message": "Other family."}),
      "FAMILY_MISMATCH"),

@@ -48,7 +48,13 @@ UninstallDisplayIcon={app}\{#AppExe}
 UninstallDisplayName={#AppName}
 WizardImageFile={#BrandDir}\wizard-100.bmp,{#BrandDir}\wizard-125.bmp,{#BrandDir}\wizard-150.bmp,{#BrandDir}\wizard-175.bmp,{#BrandDir}\wizard-200.bmp,{#BrandDir}\wizard-225.bmp,{#BrandDir}\wizard-250.bmp
 WizardSmallImageFile={#BrandDir}\wizard-small-100.bmp,{#BrandDir}\wizard-small-125.bmp,{#BrandDir}\wizard-small-150.bmp,{#BrandDir}\wizard-small-175.bmp,{#BrandDir}\wizard-small-200.bmp,{#BrandDir}\wizard-small-225.bmp,{#BrandDir}\wizard-small-250.bmp
-; Close a running copy of the app before its files are replaced or removed.
+; The app's window holds this mutex (APP_MUTEX in sl_installer/__main__.py), so
+; Setup and the uninstaller both stop and ask for the app to be closed first: a
+; setup that is running never loses its files. The window cannot be closed while a
+; board is at a step that must not stop, so the person waits for it.
+AppMutex=StateLifeDeviceInstaller
+; Setup also asks Windows to close other programs that use the app's files. Never
+; force it: a forced close would stop a board halfway through a write.
 CloseApplications=yes
 RestartApplications=no
 Compression=lzma2/max

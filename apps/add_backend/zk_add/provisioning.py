@@ -476,20 +476,29 @@ def pairing_code_hash(code: str) -> str:
     return hashlib.sha256(f"{secret}:{code}".encode()).hexdigest()
 
 
-def sanitize_event_details(value: Any, *, depth: int = 0) -> Any:
+def sanitize_event_details(
+    value: Any, *, depth: int = 0, extra_secret_parts: tuple[str, ...] = ()
+) -> Any:
     if depth > 4:
         return "[TRUNCATED]"
     if isinstance(value, dict):
         clean: dict[str, Any] = {}
         for raw_key, raw_value in value.items():
             key = str(raw_key)[:80]
-            if key.lower() in SECRET_KEYS or any(part in key.lower() for part in SECRET_KEYS):
+            # Judge the whole key: the cut to 80 characters can drop a secret word.
+            whole = str(raw_key).lower()
+            if any(part in whole for part in (*SECRET_KEYS, *extra_secret_parts)):
                 clean[key] = "[REDACTED]"
             else:
-                clean[key] = sanitize_event_details(raw_value, depth=depth + 1)
+                clean[key] = sanitize_event_details(
+                    raw_value, depth=depth + 1, extra_secret_parts=extra_secret_parts
+                )
         return clean
     if isinstance(value, list):
-        return [sanitize_event_details(item, depth=depth + 1) for item in value[:50]]
+        return [
+            sanitize_event_details(item, depth=depth + 1, extra_secret_parts=extra_secret_parts)
+            for item in value[:50]
+        ]
     if isinstance(value, str):
         return value[:500]
     if value is None or isinstance(value, (bool, int, float)):

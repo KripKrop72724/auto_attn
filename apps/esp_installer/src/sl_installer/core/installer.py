@@ -3,9 +3,11 @@
 PREPARE_FILES checks head office, refuses a family switch ADD would reject,
 downloads and verifies the bundle, asks ADD for this board's encrypted settings
 with a one-time key and opens them. The flash plan (flashplan.py) then runs one
-call at a time. Before each call the board is found again by its board ID, so a
-re-enumerated port is followed and a swapped board is caught; after each call its
-output is checked (board ID, lock state, write and verify counts).
+call at a time. Before each call the board is found again by its USB board ID, so
+a re-enumerated port is followed and a swapped board is caught before anything
+reaches it. A port whose board ID Windows does not give is never used: any board
+could have been plugged into it since the last call. After each call its output is
+checked (board ID, lock state, write and verify counts).
 
 The security key file exists only for the burn call, in a private temporary
 directory, and is overwritten and deleted straight after it. Cancel works until
@@ -59,6 +61,8 @@ _ALLOWED = {
 
 
 class PortFinder(Protocol):
+    """usb.UsbWatcher. ``find`` may return a lone board with no ID; _resolve_port refuses it."""
+
     def find(self, mac: str) -> Tuple[Optional[UsbCandidate], int]: ...
 
 
@@ -98,18 +102,23 @@ def wipe(path: Path) -> None:
 STALE_WORK_AGE_S = 6 * 3600
 
 
-def cleanup_stale_work(root: Path, now: Optional[float] = None) -> None:
+def cleanup_stale_work(root: Path, now: Optional[float] = None,
+                       max_age_s: float = STALE_WORK_AGE_S) -> None:
     """Wipe settings and key files a crashed run left behind.
 
-    Only folders older than any install could take are touched, so a second window
-    of the app can never remove a running install's files.
+    By default only folders older than any install could take are touched, so a
+    caller without the instance lock can never remove a running install's files.
+    Only a caller that holds the lock (single_instance.py), and so knows that no
+    install is running, passes ``max_age_s=0`` to wipe them all, a folder dated ahead
+    too: a computer clock put right since the crash leaves one.
     """
     if not root.is_dir():
         return
     moment = time.time() if now is None else now
     for child in root.glob("sl-install-*"):
         try:
-            if not child.is_dir() or moment - child.stat().st_mtime < STALE_WORK_AGE_S:
+            if not child.is_dir() or (max_age_s > 0
+                                      and moment - child.stat().st_mtime < max_age_s):
                 continue
         except OSError:
             continue
@@ -282,6 +291,8 @@ class Installer:
                                  cause=f"{mode.value} needs checked hardware outside SDM")
 
     def _final_error(self, run: _Run, error: InstallerError) -> InstallerError:
+        # Once the key is locked the screen offers only Finish the setup, so an error
+        # raised without irreversible_done (BOARD_SWAPPED too) gets the resume wording.
         if run.key_burned and not error.irreversible_done:
             advice = error.advice
             if advice.can_retry or advice.code == texts.CANCELLED.code:
@@ -415,15 +426,26 @@ class Installer:
                          verify=verify)
 
     def _resolve_port(self, run: _Run) -> str:
+        """The port whose USB board ID is this board's, found again before every call.
+
+        A lone board without an ID is never taken for it: between two calls any board
+        could have been plugged in, and erase, write and burn calls would reach it
+        before their output could show the swap.
+        """
         deadline = self._clock.monotonic() + PORT_WAIT_S
         while True:
             candidate, natives = self._usb.find(run.board.mac)
-            if candidate is not None:
+            if candidate is not None and candidate.mac == run.board.mac:
                 return candidate.port
             if natives > 1:
                 raise InstallerError(texts.SEVERAL_BOARDS, step=run.step,
                                      cause="board not found among several")
             if self._clock.monotonic() >= deadline:
+                if candidate is not None and candidate.mac is None:
+                    # Like BOARD_DISCONNECTED: once the key is locked, _final_error marks it
+                    # irreversible and words it as the advice to finish the setup.
+                    raise InstallerError(texts.BOARD_ID_NOT_READABLE, step=run.step,
+                                         cause=f"no USB board ID on {candidate.port}")
                 raise InstallerError(texts.BOARD_DISCONNECTED, step=run.step,
                                      cause="board not on USB")
             cancel = None if run.burn_started else run.cancel
@@ -506,11 +528,20 @@ class Installer:
                                          cause="settings write not confirmed")
 
     def _check_mac_in_banner(self, run: _Run, result: ToolResult) -> None:
+        """An esptool erase, write or verify ran on this board, by its banner."""
         banner = parse_banner(result.output)
-        if banner.mac and banner.mac != run.board.mac:
+        if run.mode is InstallMode.CHANGE_SETTINGS:
+            # A finished board is usually in Secure Download Mode, whose banner has no MAC.
+            other = banner.mac is not None and banner.mac != run.board.mac
+        else:
+            # esptool prints the MAC on every connect outside Secure Download Mode, and
+            # only a first start switches that on, so a new or unfinished board always
+            # shows its own (espefuse calls print none and are not checked here).
+            other = banner.secure_download_mode or banner.mac != run.board.mac
+        if other:
+            seen = "in Secure Download Mode" if banner.secure_download_mode else banner.mac
             raise InstallerError(texts.BOARD_SWAPPED, step=run.step,
-                                 irreversible_done=run.key_burned,
-                                 cause=f"board {banner.mac} instead of {run.board.mac}")
+                                 cause=f"board {seen} instead of {run.board.mac}")
 
     def _check_identity(self, run: _Run, result: ToolResult) -> None:
         banner = parse_banner(result.output)
@@ -518,7 +549,9 @@ class Installer:
         if info is None:
             raise InstallerError(texts.SECURITY_UNKNOWN, step=run.step, cause="no security report")
         sdm = banner.secure_download_mode or info.secure_download_mode
-        self._check_mac_in_banner(run, result)
+        if banner.mac and banner.mac != run.board.mac:
+            raise InstallerError(texts.BOARD_SWAPPED, step=run.step,
+                                 cause=f"board {banner.mac} instead of {run.board.mac}")
         if run.mode is InstallMode.CHANGE_SETTINGS:
             if sdm:
                 ok = classify_sdm(info) is SecurityState.SECURED_STATE_LIFE
@@ -534,7 +567,6 @@ class Installer:
                                  irreversible_done=run.key_burned, cause="board is secured")
         if banner.mac != run.board.mac:
             raise InstallerError(texts.BOARD_SWAPPED, step=run.step,
-                                 irreversible_done=run.key_burned,
                                  cause="board ID missing from the identity check")
 
     def _check_key_state(self, run: _Run, planned: PlannedCall) -> None:
@@ -544,7 +576,6 @@ class Installer:
         reported = efuse_mac(summary)
         if reported != run.board.mac:
             raise InstallerError(texts.BOARD_SWAPPED, step=run.step,
-                                 irreversible_done=run.key_burned,
                                  cause=f"key summary is for {reported}")
         state, _note = classify_efuses(summary)
         if planned.purpose is Purpose.KEY_STATE_BEFORE_BURN and state is not SecurityState.BLANK:

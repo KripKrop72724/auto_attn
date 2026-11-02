@@ -108,6 +108,17 @@ BOARD_ID_UNKNOWN = _a(
     "Click Try again.",
     illustration="replug")
 
+# Some computers and hubs give no board ID over USB. The app writes only to the port
+# that has the board's ID (installer._resolve_port), so it stops instead. No step names
+# a button: the screens offer Try again, Check again or Finish the setup.
+BOARD_ID_NOT_READABLE = _a(
+    "BOARD_ID_NOT_READABLE", "This computer cannot read the board ID",
+    "This computer cannot read the board ID from USB, so the app cannot check that it is "
+    "still the same board.",
+    "Plug the cable straight into another USB socket on this computer, not into a hub.",
+    "If that does not help, use another computer.",
+    severity=Severity.WARNING, illustration="cable")
+
 
 def restart_loop_faulty(period_s: Optional[float]) -> Advice:
     every = f"about every {period_s:.0f} seconds" if period_s else "again and again"
@@ -335,9 +346,15 @@ def resume_needed(cause: Optional[Advice] = None) -> Advice:
                 "and offers Finish the setup.")
     else:
         last = "Click Finish the setup."
+    if cause.code == BOARD_SWAPPED.code:
+        # The locked board is the one the app started with, not the one plugged in now.
+        happened = ("A different board is connected now. The security key of the board you "
+                    "started with is locked, so that board now belongs to State Life. The "
+                    "rest of its setup did not finish.")
+    else:
+        happened = f"{cause.title}. {RESUME_NEEDED.what_happened}"
     return _a(
-        "RESUME_NEEDED", RESUME_NEEDED.title,
-        f"{cause.title}. {RESUME_NEEDED.what_happened}",
+        "RESUME_NEEDED", RESUME_NEEDED.title, happened,
         "Do not throw the board away.", *steps, last,
         illustration=cause.illustration or RESUME_NEEDED.illustration)
 
@@ -556,7 +573,7 @@ _FIELD_RULES = {
                         "local address such as 192.168.1.20.",
     "hik_host": "Type the machine's local IP address, such as 192.168.1.20.",
     "hik_port": "Use a number from 1 to 65535. The usual port is 80.",
-    "hik_transport": "Choose HTTP digest or HTTPS.",
+    "hik_transport": "Under Advanced settings, set Connection to Normal (HTTP).",
     "hik_username": "Type the machine's web username, usually admin.",
     "hik_password": "Type the machine's web password.",
     "hik_expected_serial": "Type the serial number exactly as the machine shows it.",
@@ -618,6 +635,15 @@ NO_OUTPUT = _a(
     "Click Try again.",
     "If it stays silent, the board may be faulty. Put it aside and use another one.",
     illustration="replug")
+
+# Lines came, but none that the board's program prints once it runs (console.judge).
+START_NOT_SEEN = _a(
+    "START_NOT_SEEN", "The app did not see the board start",
+    "The board sent some messages, but none of them showed that it started working.",
+    "Unplug the board, wait 3 seconds, and plug it back in. Do not press any button.",
+    "Click Try again.",
+    "If it happens again, click Check the board.",
+    severity=Severity.WARNING, illustration="replug")
 
 DOWNLOAD_MODE_STUCK = _a(
     "DOWNLOAD_MODE_STUCK", "The board is waiting in setup mode",
@@ -704,12 +730,16 @@ def boot_ok(zone_id: Optional[str], device_id: Optional[str], version: Optional[
         parts.append(f"zone {zone_id}")
     if device_id:
         parts.append(f"device {device_id}")
-    if version:
-        parts.append(f"version {version}")
-    started = ", ".join(parts) if parts else "its new settings"
+    if parts:
+        if version:
+            parts.append(f"version {version}")
+        happened = f"The board started with {', '.join(parts)}."
+    else:
+        # The start line, which names them, was missed; a later line showed it working.
+        happened = "The board started and is working." + (
+            f" Its software is version {version}." if version else "")
     return _a(
-        "BOOT_OK", "The board started correctly",
-        f"The board started with {started}.",
+        "BOOT_OK", "The board started correctly", happened,
         severity=Severity.SUCCESS)
 
 
@@ -790,7 +820,8 @@ COMM_KEY_WRONG = _a(
     "The board found the attendance machine, but the machine did not accept the comm key "
     "(the machine's connection password).",
     "On the attendance machine, look up its comm key in the communication settings.",
-    "Click Fix settings and type it under Advanced settings, Machine comm key.",
+    # Fix settings asks for the comm key at the top, not under Advanced settings.
+    "Click Fix settings and type it under The attendance machine, Machine comm key.",
     severity=Severity.WARNING)
 
 NEEDS_ZKT_280 = _a(
@@ -942,7 +973,7 @@ LED_GUIDE: Tuple[LedState, ...] = (
              "The board found the attendance machine, but the machine did not accept its "
              "comm key. Or a planned restart of the machine did not work.",
              ("Check the comm key in the attendance machine's menu.",
-              "Click Fix settings and type it under Advanced settings, Machine comm key."),
+              "Click Fix settings and type it under The attendance machine, Machine comm key."),
              Severity.ERROR),
     LedState("ORDS_FAILURE", "orange", (255, 80, 0), "slow blink",
              "The board cannot send attendance to the HR system. The punches are kept safe "
@@ -988,7 +1019,8 @@ def led_states(rhythm: Optional[str] = None, colour: Optional[str] = None
 STATIC: Dict[str, Advice] = {
     advice.code: advice for advice in (
         NO_BOARD, NO_BOARD_TIPS, WRONG_SOCKET, SEVERAL_BOARDS, BOARD_DISCONNECTED, PORT_BUSY,
-        BOARD_ID_UNKNOWN, AUTO_DOWNLOAD_FAILED, CABLE_PROBLEM, CONNECTION_LOST, TOOL_TIMEOUT,
+        BOARD_ID_UNKNOWN, BOARD_ID_NOT_READABLE, AUTO_DOWNLOAD_FAILED, CABLE_PROBLEM,
+        CONNECTION_LOST, TOOL_TIMEOUT,
         TOOL_FAILED, TOOL_MISSING, WRONG_CHIP, WRONG_FLASH_SIZE, WRONG_PSRAM, SECURED_OTHER,
         UNSECURED_USED, SECURITY_UNKNOWN, FIRST_START_UNFINISHED, ALREADY_SET_UP,
         UNFINISHED_SETUP, BOARD_SWAPPED, MODE_NOT_ALLOWED, CANCELLED, COPY_CHECK_FAILED,
@@ -998,7 +1030,7 @@ STATIC: Dict[str, Advice] = {
         PROVISIONER_UNAVAILABLE, SETTINGS_CHANGE_NOT_SUPPORTED, RATE_LIMITED, SERVER_DISABLED,
         APP_TOO_OLD, SERVER_ERROR,
         NOT_FOUND, LOGIN_FAILED, ACCOUNT_LOCKED, SESSION_EXPIRED, STEP_UP_FAILED, NO_INTERNET,
-        SERVER_UNREACHABLE, SECURE_CONNECTION_FAILED, NOT_REPLUGGED, NO_OUTPUT,
+        SERVER_UNREACHABLE, SECURE_CONNECTION_FAILED, NOT_REPLUGGED, NO_OUTPUT, START_NOT_SEEN,
         DOWNLOAD_MODE_STUCK, SECURITY_KEY_LOST, SETTINGS_UNREADABLE, FAMILY_MISMATCH_LOOP,
         STORAGE_PROBLEM, STORAGE_CHECKING, PSRAM_FAILED, CRASH_LOOP, POWER_PROBLEM,
         TEST_FIRMWARE, WRONG_START_COPY, HEAD_OFFICE_UNREACHABLE, TIME_SERVICE_BLOCKED,

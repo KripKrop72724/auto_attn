@@ -63,15 +63,27 @@ jobs:
           ROLLBACK_PREDECESSOR: ${{ inputs.rollback_predecessor || '2.5.2' }}
         run: |
           set -euo pipefail
-          if [ "$CONFIRMATION" != 'PUBLISH INSTALLER BUNDLE' ]; then
-            # Both per-device modes sign for one exact board, as when
-            # device_mac was a required input.
-            if [[ ! "$DEVICE_MAC" =~ ^[0-9a-fA-F]{2}(:[0-9a-fA-F]{2}){5}$ ]]; then
-              echo "::error::$CONFIRMATION needs device_mac, the exact ESP32-S3 MAC (aa:bb:cc:dd:ee:ff)"
+          # GitHub's == ignores letter case, so the job conditions also accept
+          # 'publish installer bundle'. Route on the exact text first: a quoted
+          # case pattern matches letter for letter. Any other spelling fails
+          # this job, and every other job needs it.
+          case "$CONFIRMATION" in
+            'CREATE ADD FIRMWARE VAULT'|'BUILD USB WIFI RESCUE HIL')
+              # Both per-device modes sign for one exact board, as when
+              # device_mac was a required input.
+              if [[ ! "$DEVICE_MAC" =~ ^[0-9a-fA-F]{2}(:[0-9a-fA-F]{2}){5}$ ]]; then
+                echo "::error::$CONFIRMATION needs device_mac, the exact ESP32-S3 MAC (aa:bb:cc:dd:ee:ff)"
+                exit 1
+              fi
+              exit 0
+              ;;
+            'PUBLISH INSTALLER BUNDLE')
+              ;;
+            *)
+              echo '::error::Type the confirmation exactly, in capitals: CREATE ADD FIRMWARE VAULT, BUILD USB WIFI RESCUE HIL or PUBLISH INSTALLER BUNDLE'
               exit 1
-            fi
-            exit 0
-          fi
+              ;;
+          esac
           if [ "$GITHUB_REF" != 'refs/heads/main' ]; then
             echo '::error::Installer bundles are published only from main'
             exit 1

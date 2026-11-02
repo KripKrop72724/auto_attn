@@ -26,6 +26,12 @@ VENDORED = {
     "pyside6-essentials": ["LGPL-3.0.txt", "GPL-3.0.txt"],
     "shiboken6": ["LGPL-3.0.txt", "GPL-3.0.txt"],
 }
+# The flasher stub esptool 5.1.0 loads into the board: stub version 1 is its default,
+# and the app never sets ESPTOOL_STUB_VERSION. esptool ships only its binaries (with
+# esptool/targets/stub_flasher/1/README.md naming this release), not its source.
+STUB_RELEASE = "v1.8.0"
+STUB_SOURCE = ("https://github.com/espressif/esptool-legacy-flasher-stub/releases/tag/"
+               + STUB_RELEASE)
 
 
 def locked_names(lock: Path) -> List[str]:
@@ -127,11 +133,22 @@ def _summary(app_version: str, versions: Dict[str, str]) -> str:
       Licence: GNU General Public License version 2 or later
       (GPL-2.0-or-later). The app uses esptool, unmodified, as a separate
       program: it starts its own executable with "--tool esptool" or
-      "--tool espefuse", which runs only esptool's code. The complete source
-      code is in "licenses\\esptool-{esptool}.tar.gz" in the app folder and at
-      https://github.com/espressif/esptool/tree/v{esptool}. The flasher stubs
-      inside esptool are under the Apache-2.0 or MIT licence; their licence
-      files are in "_internal\\esptool\\targets\\stub_flasher".
+      "--tool espefuse". In that process a small part of the app hands the
+      arguments over to esptool, which does the rest. esptool's source code
+      is in "licenses\\esptool-{esptool}.tar.gz" in the app folder and at
+      https://github.com/espressif/esptool/tree/v{esptool}.
+
+    esptool flasher stub (esptool-legacy-flasher-stub {STUB_RELEASE})
+      Licence: GNU General Public License version 2 or later
+      (GPL-2.0-or-later). To write a board, esptool loads this small program
+      into the board's memory. The app uses only this stub, the files in
+      "_internal\\esptool\\targets\\stub_flasher\\1". Its source code is
+      published at
+      {STUB_SOURCE}
+      and State Life head office can supply a copy on request. The stubs in
+      "_internal\\esptool\\targets\\stub_flasher\\2", which the app does not
+      use, are under the Apache-2.0 or MIT licence; their licence files are
+      in that folder.
 
     PyInstaller {pyinstaller} (the start-up program inside the app's .exe)
       Licence: GPL-2.0-or-later with the PyInstaller bootloader exception,

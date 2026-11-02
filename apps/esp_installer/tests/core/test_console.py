@@ -6,7 +6,8 @@ import sys
 import pytest
 
 from sl_installer.core import console, texts
-from sl_installer.core.api import (BootOutcome, CancelToken, ConsoleKind, ReplugPhase)
+from sl_installer.core.api import (BootOutcome, CancelToken, ConsoleKind, Family, HikSettings,
+                                   ReplugPhase)
 from sl_installer.core.console import BootWatcher, ConsoleParser, LineReader, judge
 
 from . import support
@@ -200,20 +201,20 @@ GOOD_BOOT = [
 ]
 
 
-def watcher_with(script_steps, *, mac=MAC):
+def watcher_with(script_steps, *, mac=MAC, drop_unread=False):
     clock = FakeClock()
     usb = FakeUsb(mac=mac)
-    script = SerialScript(clock, usb)
+    script = SerialScript(clock, usb, drop_unread=drop_unread)
     for moment, action, value in script_steps:
         script.at(clock.now + moment, action, value)
     clock.hooks.append(script.tick)
     return BootWatcher(usb, clock, opener=script.opener), script, clock
 
 
-def first_boot(watcher, timeout=120.0, cancel=None):
+def first_boot(watcher, timeout=120.0, cancel=None, config=None):
     phases, events = [], []
-    report = watcher.wait_first_boot(MAC, support.zkt_config(), phases.append, events.append,
-                                     cancel or CancelToken(), timeout_s=timeout)
+    report = watcher.wait_first_boot(MAC, config or support.zkt_config(), phases.append,
+                                     events.append, cancel or CancelToken(), timeout_s=timeout)
     return report, phases, events
 
 
@@ -467,3 +468,137 @@ def test_first_boot_keeps_the_pc_awake(monkeypatch):
     assert first_boot(watcher)[0].outcome is BootOutcome.OK
     assert calls[0] == keepawake.AWAKE and calls[-1] == keepawake.RELEASED
     assert calls.count(keepawake.AWAKE) == 1 and "tick" in calls[1:-1]
+
+
+# ------------------------------------------ start line printed before the port opened
+
+# The board prints from power-on, but the computer lists its port again only once it has
+# enumerated it, about 2 s later. USB-Serial/JTAG drops what nobody reads (SerialScript's
+# drop_unread), so the start line, under 2 s after power-on, is gone by then.
+def start_missed(before_open, after_open, *, then=()):
+    """A replug where the board prints ``before_open`` before its port is listed again."""
+    return watcher_with([(1.0, "unplug", None), (4.0, "print", before_open),
+                         (6.0, "plug", None), (6.5, "print", after_open), *then],
+                        drop_unread=True)
+
+
+# HIK 3.1.1 starts its factory copy; its project name differs, its log tags do not.
+HIK_BOOT = [line.replace("0x2a0000", "0x20000")
+            .replace("Project name:     zone_lite", "Project name:     zone_lite_hikvision")
+            .replace("App version:      2.9.1", "App version:      3.1.1") for line in GOOD_BOOT]
+HIK_POLL = ("I (21000) hikvision: Poll retrying; reason=http_error; stage=identity; http=500; "
+            "failures=1; terminal=192.168.1.20; duration_ms=40; cursor=0; queued=0; "
+            "storage=verified; source_worker=running")
+
+
+def hik_config():
+    return support.zkt_config(family=Family.HIKVISION, zkt=None,
+                              bundle_id="hikvision-3.1.1-dc7d9c3-77620195",
+                              hik=HikSettings(host="192.168.1.20", password="test-hik-pass",
+                                              expected_serial="TEST-SERIAL-0001"))
+
+
+def test_start_line_lost_before_the_port_opened_is_still_a_good_start():
+    watcher, script, _clock = start_missed(GOOD_BOOT[:11], GOOD_BOOT[11:])
+    report, _phases, events = first_boot(watcher)
+    assert GOOD_BOOT[10] in script.dropped  # "Zone Lite starting zone=... device_id=..."
+    assert ConsoleKind.APP_STARTED not in {event.kind for event in events}
+    assert report.outcome is BootOutcome.OK and report.advice.code == "BOOT_OK"
+    # Only the start line names the zone and device, so nothing is claimed without it.
+    assert (report.zone_id_seen, report.device_id_seen, report.app_version_seen) == (
+        None, None, None)
+    assert report.advice.what_happened == "The board started and is working."
+
+
+def test_hikvision_start_lost_and_storage_too_is_good_after_the_storage_wait():
+    # The port opened later still: the first line the app reads is a poll of the machine.
+    before = HIK_BOOT + ["I (6000) zone_lite: Wi-Fi connected with IP 192.168.1.44"]
+    watcher, script, clock = start_missed(before, [HIK_POLL])
+    begun = clock.now
+    report = first_boot(watcher, config=hik_config())[0]
+    assert any("Zone Lite starting" in line for line in script.dropped)
+    assert report.outcome is BootOutcome.OK and report.zone_id_seen is None
+    assert report.advice.what_happened == "The board started and is working."
+    # With no storage line, the board is watched as long as after a start line it saw.
+    waited = clock.now - (begun + 6.5)
+    assert console.STORAGE_WAIT_S <= waited < 60
+
+
+def test_crash_after_a_lost_start_line_is_never_a_good_start():
+    # The board ran (its Wi-Fi line came), crashed and started again, this time in view:
+    # the crash counts from the first line that showed it running.
+    crash = ["abort() was called at PC 0x4037ce4b on core 0", "Rebooting..."]
+    watcher, _script, _clock = start_missed(GOOD_BOOT[:12], GOOD_BOOT[12:], then=[
+        (9.0, "print", crash), (10.0, "print", PANIC_RESTART[4:] + GOOD_BOOT[5:12])])
+    report = first_boot(watcher, timeout=40)[0]
+    assert report.outcome is BootOutcome.FAULTY_RESTART_LOOP
+    assert report.advice is texts.CRASH_LOOP
+
+
+def test_without_the_start_line_a_crash_before_the_first_program_line_counts():
+    # When the start line is lost, its time is unknown: a crash seen before the first line
+    # of the program may still have come after the program started.
+    parser = ConsoleParser(MAC)
+    lines = ["abort() was called at PC 0x4037ce4b on core 0", "Rebooting...",
+             *GOOD_BOOT[:10], *GOOD_BOOT[11:]]
+    watch = console._Watch(started=0.0, events=[parser.parse(line, 1.0 + index / 10)
+                                                for index, line in enumerate(lines)])
+    assert ConsoleKind.APP_STARTED not in {event.kind for event in watch.events}
+    assert judge(watch, support.zkt_config(), 30.0, 120.0, final=False) is None
+    report = judge(watch, support.zkt_config(), 121.0, 120.0, final=True)
+    assert report.outcome is BootOutcome.FAULTY_RESTART_LOOP and report.advice is texts.CRASH_LOOP
+
+
+def test_hikvision_storage_failure_after_a_lost_start_line():
+    lines = HIK_BOOT[:11] + ["E (2000) zone_lite: Could not mount SPIFFS storage: ESP_FAIL"]
+    watcher, _script, _clock = start_missed(lines[:11], lines[11:])
+    report = first_boot(watcher, config=hik_config())[0]
+    assert report.outcome is BootOutcome.STORAGE_PROBLEM
+
+
+def test_without_the_start_line_only_the_settings_line_names_the_zone():
+    parser = ConsoleParser(MAC)
+
+    def watch(*lines):
+        return console._Watch(started=0.0, events=[parser.parse(line, 1.0) for line in lines])
+
+    report = judge(watch(GOOD_BOOT[9], GOOD_BOOT[11]), support.zkt_config(), 2.0, 120.0,
+                   final=False)
+    assert report.outcome is BootOutcome.OK
+    assert (report.zone_id_seen, report.device_id_seen) == ("LF-ZONE-GUJRAT-01", None)
+    assert report.advice.what_happened == "The board started with zone LF-ZONE-GUJRAT-01."
+    other = GOOD_BOOT[9].replace("GUJRAT-01", "GUJRAT-02")
+    report = judge(watch(other, GOOD_BOOT[11]), support.zkt_config(), 2.0, 120.0, final=False)
+    assert report.outcome is BootOutcome.WRONG_SETTINGS
+    assert "LF-ZONE-GUJRAT-02" in report.advice.what_happened
+
+
+@pytest.mark.parametrize("line, running", [
+    (GOOD_BOOT[8], False),   # the version line comes before the program starts
+    (GOOD_BOOT[9], False),   # after the settings line the program can still stop
+    ("I (380) app_init: Project name:     zone_lite", False),
+    (GOOD_BOOT[11], True),
+    ("E (1990) SPIFFS: mount failed, -10025", True),
+    ("W (123000) wifi_setup: Wi-Fi setup access point enabled (recovery mode)", True),
+    ("E (5000) wifi_setup: Wi-Fi setup portal is disabled because the protected build secret "
+     "was not supplied", True),
+    ("I (9000) wifi_setup: Validated and atomically saved a new Wi-Fi network", True),
+    ("W (9000) add_connector: Trusted time unavailable; delaying ADD onboarding", True),
+    ("W (11003) zone_lite: No authenticated ZKT device found on port 4370 (failure 2, "
+     "backoff=10000 ms)", True),
+    (HIK_POLL, True),
+])
+def test_lines_that_show_the_program_running(line, running):
+    assert console._after_start(ConsoleParser(MAC).parse(line)) is running
+
+
+@pytest.mark.parametrize("lines", [
+    GOOD_BOOT[:9],  # it never got past the start of its program
+    # Start-up lines the app has no rule for, printed before the program starts.
+    ["I (1170) cpu_start: Multicore app", "I (1190) cpu_start: Pro cpu start user code"],
+])
+def test_board_that_sent_lines_but_no_start_is_not_called_silent(lines):
+    watcher, _s, _c = watcher_with([(1, "unplug", None), (2, "plug", None), (2.2, "print", lines)])
+    report = first_boot(watcher, timeout=30)[0]
+    assert report.outcome is BootOutcome.NO_OUTPUT and report.advice is texts.START_NOT_SEEN
+    assert "faulty" not in " ".join(report.advice.what_to_do)

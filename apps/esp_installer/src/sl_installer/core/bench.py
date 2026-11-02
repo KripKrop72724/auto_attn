@@ -15,6 +15,10 @@ Every command line the engine builds is esptool 5.1.0's, so ``inspect`` and
 when they do not. esptool 5.1.0 needs Python 3.10+: on a Python 3.9 bench (the Mac's
 own python3 has esptool 4.7), add ``--tool-python /path/to/python3.12`` (or set
 SL_INSTALLER_TOOL_PYTHON) to run the tools with a Python that has esptool 5.1.0.
+
+``inspect`` and ``install`` hold the app's instance lock (single_instance.py) for
+the same data folder: they stop while the app's window is open there, and the
+window does not open while they run.
 """
 from __future__ import annotations
 
@@ -34,6 +38,7 @@ from .api import (STEP_LABELS, Advice, BoardInfo, CancelToken, ConsoleEvent, Fam
 from .esptool_runner import TOOL_VERSION, SubprocessRunner, tool_version_problems
 from .factory import make_services
 from .naming import hotspot_name, public_name_preview
+from .single_instance import LOCK_FILE_NAME, InstanceLock
 
 _MODES = {
     SecurityState.BLANK: InstallMode.NEW_BOARD,
@@ -275,7 +280,7 @@ def parser() -> argparse.ArgumentParser:
     install.add_argument("--hik-serial")
     install.add_argument("--hik-username")
     install.add_argument("--hik-port", type=int)
-    install.add_argument("--hik-transport", choices=("http_digest", "https"))
+    install.add_argument("--hik-transport", choices=("http_digest",))  # HTTPS needs a CA
     install.add_argument("--hik-model", default="ds-k1t342efwx")
     install.add_argument("--boot-seconds", type=float, default=150.0)
     return main
@@ -302,16 +307,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print(f"Nothing was sent to the board. Run the tools with a Python that has esptool "
                   f"{TOOL_VERSION}: add --tool-python PYTHON or set {TOOL_PYTHON_ENV}.")
             return 5
-    services = make_services(cfg)
-    handlers = {"inspect": cmd_inspect, "watch": cmd_watch, "diagnose": cmd_diagnose,
-                "install": cmd_install}
+    # The app's own lock: its window may be using the board, and when it opens it wipes
+    # every work folder, a running install's security key file too.
+    lock = InstanceLock(cfg.state_dir / LOCK_FILE_NAME)
+    if args.command in _TOOL_COMMANDS and not lock.acquire():
+        print("Stopped: the app is open on this computer. Close its window and run this "
+              "again. Nothing was sent to the board.")
+        return 6
     try:
-        return handlers[args.command](services, args)
-    except InstallerError as error:
-        _print_advice([error.advice])
-        if error.cause:
-            print(f"  (detail: {error.cause})")
-        return 3
+        services = make_services(cfg)
+        handlers = {"inspect": cmd_inspect, "watch": cmd_watch, "diagnose": cmd_diagnose,
+                    "install": cmd_install}
+        try:
+            return handlers[args.command](services, args)
+        except InstallerError as error:
+            _print_advice([error.advice])
+            if error.cause:
+                print(f"  (detail: {error.cause})")
+            return 3
+    finally:
+        lock.release()
 
 
 if __name__ == "__main__":

@@ -3,6 +3,9 @@
 The app console is a copy on the native USB-Serial/JTAG port (UART0 on the other
 socket is the main one). The USB copy drops text nobody reads and the port
 disappears on every chip reset, so the port is reopened as fast as it comes back.
+Even so, a start's first lines can be gone before the PC lists the port again: the
+start line comes under 2 s after power-on. The verdict (judge) therefore also takes
+any later line of the running program as the start.
 
 Opening must not move DTR/RTS: on USB-Serial/JTAG, RTS high with DTR low resets
 the chip. Windows (usbser.sys) applies both lines in one request, so they are
@@ -499,6 +502,30 @@ def _panic(event: ConsoleEvent) -> Optional[str]:
     return event.data.get("reason", "") if event.kind is ConsoleKind.PANIC else None
 
 
+# Lines the firmware prints only after its start line, so only once the main program has
+# loaded this board's encrypted settings and found them complete. In app_main of ZKT 2.7.8,
+# HIK 3.1.1 and 2.8.x the settings come first, then the start line, then storage, Wi-Fi
+# (with the setup hotspot's controller), head office and the attendance machine. With
+# missing or unreadable settings, or settings for the other machine type, app_main stops
+# before the start line (or aborts) and prints none of these.
+_AFTER_START = frozenset({
+    ConsoleKind.STORAGE_READY, ConsoleKind.STORAGE_FAILED, ConsoleKind.WIFI_CONNECTING,
+    ConsoleKind.WIFI_RETRY, ConsoleKind.WIFI_CONNECTED, ConsoleKind.SETUP_AP_OPEN,
+    ConsoleKind.ADD_CONNECTED, ConsoleKind.ADD_FAILED, ConsoleKind.TERMINAL_FOUND,
+    ConsoleKind.TERMINAL_AUTH_FAILED, ConsoleKind.TERMINAL_SECURE_PULL,
+    ConsoleKind.TERMINAL_UNREACHABLE,
+})
+
+
+def _after_start(event: ConsoleEvent) -> bool:
+    """True for a line that shows the main program running with its settings."""
+    if event.kind is ConsoleKind.OTHER:
+        # The setup hotspot's other lines, and Hikvision poll lines with no kind of their own.
+        return (event.data.get("signal") in ("portal_disabled", "wifi_saved")
+                or ("stage" in event.data and "http" in event.data))
+    return event.kind in _AFTER_START
+
+
 def crashes(events: Sequence[ConsoleEvent]) -> List[ConsoleEvent]:
     """Lines that show the board crashed: Guru Meditation, abort, a failed error check."""
     return [event for event in events
@@ -534,18 +561,18 @@ def judge(watch: _Watch, expect: InstallConfig, now: float, timeout_s: float, *,
           final: bool) -> Optional[BootReport]:
     """The first start's outcome, or None while it is still too early to say."""
     events = watch.events
+    started = _first(events, ConsoleKind.APP_STARTED)
+    loaded = _first(events, ConsoleKind.PROVISIONING_LOADED)
+    version = _first(events, ConsoleKind.APP_VERSION)
+    # Only the start line names the device, and only it and the settings line the zone.
+    zone_seen = (started.data.get("zone_id") if started else
+                 loaded.data.get("zone_id") if loaded else None)
+    device_seen = started.data.get("device_id") if started else None
+    version_seen = version.data.get("version") if version else None
 
     def report(outcome: BootOutcome, advice: Optional[Advice]) -> BootReport:
-        started = _first(events, ConsoleKind.APP_STARTED)
-        version = _first(events, ConsoleKind.APP_VERSION)
-        loaded = _first(events, ConsoleKind.PROVISIONING_LOADED)
-        return BootReport(
-            outcome,
-            zone_id_seen=(started.data.get("zone_id") if started else
-                          loaded.data.get("zone_id") if loaded else None),
-            device_id_seen=started.data.get("device_id") if started else None,
-            app_version_seen=version.data.get("version") if version else None,
-            events=tuple(events), advice=advice)
+        return BootReport(outcome, zone_id_seen=zone_seen, device_id_seen=device_seen,
+                          app_version_seen=version_seen, events=tuple(events), advice=advice)
 
     kinds = {event.kind for event in events}
     if ConsoleKind.NVS_KEY_DANGER in kinds:
@@ -558,7 +585,6 @@ def judge(watch: _Watch, expect: InstallConfig, now: float, timeout_s: float, *,
         return report(BootOutcome.FAULTY_RESTART_LOOP, texts.PSRAM_FAILED)
 
     expected = f"zone {expect.zone_id}, device {expect.device_id}"
-    loaded = _first(events, ConsoleKind.PROVISIONING_LOADED)
     if loaded and not _same(loaded.data.get("zone_id"), expect.zone_id):
         return report(BootOutcome.WRONG_SETTINGS, texts.wrong_settings(
             f"zone {loaded.data.get('zone_id')}", expected))
@@ -571,10 +597,15 @@ def judge(watch: _Watch, expect: InstallConfig, now: float, timeout_s: float, *,
     if crash_loop(events, watch.resets):
         return report(BootOutcome.FAULTY_RESTART_LOOP, texts.CRASH_LOOP)
 
-    started = _first(events, ConsoleKind.APP_STARTED)
-    if started:
-        if not (_same(started.data.get("zone_id"), expect.zone_id)
-                and _same(started.data.get("device_id"), expect.device_id)):
+    # The start line can be printed before the app has the port open after the replug,
+    # and then it is lost (module notes). A later line of the program shows the start as
+    # well; only the zone and device then stay unconfirmed. The rules below count from
+    # the first line that shows the start, so a crash after it is never missed.
+    running = next((event for event in events
+                    if event.kind is ConsoleKind.APP_STARTED or _after_start(event)), None)
+    if running:
+        if started and not (_same(started.data.get("zone_id"), expect.zone_id)
+                            and _same(started.data.get("device_id"), expect.device_id)):
             return report(BootOutcome.WRONG_SETTINGS, texts.wrong_settings(
                 f"zone {started.data.get('zone_id')}, device {started.data.get('device_id')}",
                 expected))
@@ -582,15 +613,15 @@ def judge(watch: _Watch, expect: InstallConfig, now: float, timeout_s: float, *,
             return report(BootOutcome.STORAGE_PROBLEM, texts.STORAGE_PROBLEM)
         # A board that went down after it started is never a good start: watch on, and
         # say what happened when the time is up. A watchdog warning alone is no crash.
-        went_down = any(event.at >= started.at for event in events
+        # Without the start line its time is unknown, so then any crash seen counts.
+        since = running.at if started else float("-inf")
+        went_down = any(event.at >= since for event in events
                         if _panic(event) not in (None, "task_watchdog"))
         if not went_down:
-            version = _first(events, ConsoleKind.APP_VERSION)
-            ok = texts.boot_ok(started.data.get("zone_id"), started.data.get("device_id"),
-                               version.data.get("version") if version else None)
+            ok = texts.boot_ok(zone_seen, device_seen, version_seen)
             if ConsoleKind.STORAGE_READY in kinds:
                 return report(BootOutcome.OK, ok)
-            if final or now - watch.started - started.at >= STORAGE_WAIT_S:
+            if final or now - watch.started - running.at >= STORAGE_WAIT_S:
                 return report(BootOutcome.OK, ok)
             return None
     else:
@@ -616,7 +647,12 @@ def judge(watch: _Watch, expect: InstallConfig, now: float, timeout_s: float, *,
         return report(BootOutcome.NO_OUTPUT, texts.DOWNLOAD_MODE_STUCK)
     if watch.port_busy and all(event.data.get("signal") == "port_busy" for event in events):
         return report(BootOutcome.NO_OUTPUT, texts.PORT_BUSY)
-    return report(BootOutcome.NO_OUTPUT, texts.NO_OUTPUT)
+    board_lines = watch.other_lines + sum(1 for event in events
+                                          if event.data.get("signal") != "port_busy")
+    if not board_lines:
+        return report(BootOutcome.NO_OUTPUT, texts.NO_OUTPUT)
+    # Lines came, but none from the running program: it stopped early or never got there.
+    return report(BootOutcome.NO_OUTPUT, texts.START_NOT_SEEN)
 
 
 def boot_hints(events: Sequence[ConsoleEvent], placeholders: Sequence[str] = ("RE7",)

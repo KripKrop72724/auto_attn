@@ -79,6 +79,7 @@ The build follows the Jhelum recipe: `idf.py -D ZONE_LITE_FAMILY=hikvision` with
 ## What gets checked
 
 1. **Dispatch inputs** (`dispatch-inputs`).
+   - The confirmation is typed exactly, in capitals, before anything else is checked. GitHub's job conditions ignore letter case, so this is the check that refuses `publish installer bundle` or `Publish Installer Bundle`. Any other letter case fails the whole run. Text that differs in more than letter case runs no job at all.
    - The ref is `main`.
    - `device_mac` is empty.
    - `hikvision_source_ref` is a full lowercase 40-hex SHA.
@@ -157,6 +158,7 @@ Revoking a ZKT release in ADD changes only ADD's database. `PUBLISH INSTALLER BU
 
 | Message | What to do |
 | --- | --- |
+| `Type the confirmation exactly, in capitals: …` | Run again with the confirmation exactly `PUBLISH INSTALLER BUNDLE`, in capital letters. |
 | `An installer bundle cannot create or replace signing keys` | The vault is missing on this runner. This is an incident; never bootstrap a new vault for bundles. |
 | `Installer bundles are published only from main` | Dispatch on `main`. |
 | `Exact main CI gate is not green: <job>` | Wait for, or fix, CI on that exact commit. |

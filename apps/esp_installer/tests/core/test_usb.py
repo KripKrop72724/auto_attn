@@ -10,7 +10,7 @@ from sl_installer.core.api import CancelToken, PresenceState, UsbKind
 from sl_installer.core.usb import (DeviceTree, PresenceTimeline, UsbWatcher, classify_port,
                                    device_tree_macs)
 
-from .support import MAC, FakeClock
+from .support import MAC, OTHER_MAC, FakeClock
 
 
 @dataclass
@@ -30,6 +30,7 @@ def test_classify_native_bridge_other():
     candidate = classify_port(native())
     assert candidate.kind is UsbKind.NATIVE and candidate.mac == MAC
     assert classify_port(native(serial="ac276ea43d30")).mac == MAC
+    assert classify_port(native(serial="AC-27-6E-A4-3D-30")).mac == MAC
     assert classify_port(Port("COM3", 0x10C4, 0xEA60)).kind is UsbKind.BRIDGE
     assert classify_port(Port("COM4", 0x1A86, 0x55D4)).kind is UsbKind.BRIDGE
     assert classify_port(Port("COM6", 0x0403, 0x6001)).kind is UsbKind.BRIDGE
@@ -68,6 +69,26 @@ def test_device_tree_fallback_reads_mac_from_the_composite_parent():
          "USB\\ROOT_HUB30\\4&1234&0&0"],
         {"USB\\VID_303A&PID_1001\\AC:27:6E:A4:3D:30": ["COM5"]})
     assert device_tree_macs(tree) == {"COM5": MAC}
+
+
+# What pyserial 3.5 gives on Windows when the computer ignores USB serial numbers: the
+# location-based instance ID of the board's parent. The first has twelve hex digits.
+@pytest.mark.parametrize("serial", ["5&2B33E3B5&0&12", "6&2E4C5DB8&0&3", "SN-AC276EA43D30",
+                                    "AC:27:6E:A4:3D:30:00", "AC:27:6E:A4:3D"])
+def test_a_serial_number_that_is_not_a_whole_mac_is_no_board_id(serial):
+    assert classify_port(native(serial=serial)).mac is None
+    # So the device-tree fallback is asked, and without it the board has no ID at all.
+    assert classify_port(native(serial=serial), {"COM5": MAC}).mac == MAC
+    report = UsbWatcher(lambda: [native(serial=serial)], FakeClock(), tree_macs=dict).snapshot()
+    assert report.state is PresenceState.ONE_BOARD and report.board.mac is None
+
+
+def test_device_tree_fallback_takes_only_a_whole_mac():
+    tree = FakeTree(["USB\\VID_303A&PID_1001\\SN-AC276EA43D30",
+                     "USB\\VID_303A&PID_1001\\AC276EA4CEA8"],
+                    {"USB\\VID_303A&PID_1001\\SN-AC276EA43D30": ["COM5"],
+                     "USB\\VID_303A&PID_1001\\AC276EA4CEA8": ["COM9"]})
+    assert device_tree_macs(tree) == {"COM9": OTHER_MAC}
 
 
 def test_fallback_is_used_only_when_pyserial_has_no_serial():
@@ -216,5 +237,9 @@ def test_find_by_mac():
     candidate, count = watcher.find(MAC)
     assert candidate.port == "COM5" and count == 2
     assert watcher.find("aa:bb:cc:dd:ee:ff") == (None, 2)
+    # A lone board without an ID is found for reading its console or seeing a replug, but
+    # with no ID: the installer writes only to a port that has the board's own.
     lone = UsbWatcher(lambda: [native(serial=None)], FakeClock(), tree_macs=dict)
-    assert lone.find(MAC)[0].port == "COM5"
+    candidate, count = lone.find(MAC)
+    assert candidate.port == "COM5" and candidate.mac is None and count == 1
+    assert lone.find(OTHER_MAC)[0].mac is None

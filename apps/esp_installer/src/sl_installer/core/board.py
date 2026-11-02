@@ -12,6 +12,10 @@ block is readable, writeable and all zeros.
 
 Every call uses ``--after no-reset``. Inspection leaves the board in download
 mode, so it only starts again after the person unplugs and replugs it.
+
+The board ID is the banner MAC, or the USB serial number in SDM, whose banner has
+none. When both are there they must agree: a USB board ID that is not the chip's
+is refused here, because every install call finds the board by it.
 """
 from __future__ import annotations
 
@@ -276,7 +280,10 @@ class BoardInspector:
             "secure_download_mode": sdm,
         })
         if banner.mac and usb_mac and banner.mac != usb_mac:
-            log.warning("USB serial %s differs from chip MAC %s", usb_mac, banner.mac)
+            # The installer finds the board by its USB board ID before every call, so a
+            # wrong one would lose the board or follow another one.
+            raise InstallerError(texts.BOARD_ID_UNKNOWN,
+                                 cause=f"USB serial {usb_mac} differs from chip MAC {banner.mac}")
         mac = banner.mac or usb_mac
         if not mac:
             raise InstallerError(texts.BOARD_ID_UNKNOWN, cause="no MAC from chip or USB")

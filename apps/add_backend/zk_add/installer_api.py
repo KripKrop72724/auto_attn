@@ -103,9 +103,10 @@ MANIFEST_MAX_BYTES = 1024 * 1024
 SIGNATURE_MAX_BYTES = 8 * 1024
 EVENT_DETAIL_MAX_BYTES = 8 * 1024
 RESERVED_EVENT_KINDS = frozenset({"PACKAGE_ISSUED"})
-# A new_board or resume package issued for a MAC means this app prepared that
-# board, so its key is the fleet root's (settings_change_refusal).
-KEY_PACKAGE_MODES = frozenset({"new_board", "resume"})
+# Only a new_board package issued for a MAC means this app set that board up, so
+# its key is the fleet root's (settings_change_refusal). A resume burns no key:
+# the board may have been locked by the flow before this app, with an older root.
+KEY_PACKAGE_MODES = frozenset({"new_board"})
 SETTINGS_CHANGE_REFUSED = (
     "This board was set up before this app. Only head office can change its settings."
 )
@@ -182,7 +183,7 @@ FIELD_MESSAGES = {
     "hik_expected_serial": "The attendance machine serial number must be 1 to 119 characters.",
     "hik_profile": "Choose the attendance machine model.",
     "hik_source_epoch": "The record series name must be 1 to 64 characters.",
-    "hik_ca_pem": "The machine certificate is too long (up to 4095 characters).",
+    "hik_ca_pem": "The machine certificate is too long (up to 3967 characters).",
 }
 # Fixed details raised by the shared admin dependencies (zk_add.security).
 STRING_DETAILS = {
@@ -895,7 +896,9 @@ class InstallerConfiguration(BaseModel):
     @field_validator("hik_ca_pem")
     @classmethod
     def validate_hik_ca(cls, value: str) -> str:
-        return _text_limit(value, 4095)
+        # The NVS generator (ESP-IDF 5.5.3) fits one string and its NUL on one
+        # page: at most 3967 bytes. A longer CA could never be built.
+        return _text_limit(value, 3967)
 
     def provisioner_payload(self) -> dict[str, Any]:
         keys = (
@@ -1027,19 +1030,10 @@ class InstallerEventRequest(BaseModel):
         return value
 
 
-def _scrub_event_detail(value: Any, *, depth: int = 0) -> Any:
-    """sanitize_event_details, then the installer's extra secret-looking keys."""
-    clean = sanitize_event_details(value) if depth == 0 else value
-    if isinstance(clean, dict):
-        return {
-            key: "[REDACTED]"
-            if any(part in key.lower() for part in EVENT_SECRET_PARTS)
-            else _scrub_event_detail(item, depth=depth + 1)
-            for key, item in clean.items()
-        }
-    if isinstance(clean, list):
-        return [_scrub_event_detail(item, depth=depth + 1) for item in clean]
-    return clean
+def _scrub_event_detail(value: Any) -> Any:
+    """sanitize_event_details, which also hides the installer's extra secret-looking
+    keys. It judges each key whole, before cutting it to 80 characters (review SV3)."""
+    return sanitize_event_details(value, extra_secret_parts=EVENT_SECRET_PARTS)
 
 
 # ------------------------------------------------------------- device view
@@ -1109,8 +1103,10 @@ def _ever_online(connector: Connector) -> bool:
 
 
 def _prepared_by_installer(db: Session, mac: str) -> bool:
-    """This app issued the board a new_board or resume package, so the key it
-    burned, or finished with, is the one the fleet root gives that MAC."""
+    """This app issued the board a new_board package, so the key it burned is the
+    one the fleet root gives that MAC. A resume package proves nothing: it burns
+    no key, and the board may have been locked before this app with an older
+    root (head office's later setup with that root leaves no record in ADD)."""
     issued = db.scalars(
         select(AuditEvent.after).where(
             AuditEvent.action == "INSTALLER_PACKAGE_ISSUED",
@@ -1134,8 +1130,9 @@ def settings_change_refusal(
     erased with the storage, and only head office could recover it (review
     B1/F1). Nobody can read a locked key, so ADD goes by its own records. A
     board ADD does not know, or has never seen online, has no punches to lose.
-    One that has been online gets new settings only when this app prepared it,
-    and is never resumed: a board whose setup stopped has never started.
+    One that has been online gets new settings only when this app set it up as
+    a new board, and is never resumed: a board whose setup stopped has never
+    started.
     """
     if connector is None or not _ever_online(connector):
         return None

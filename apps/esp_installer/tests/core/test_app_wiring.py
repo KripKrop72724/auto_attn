@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from sl_installer import __main__ as entry
 from sl_installer import config as app_config
 from sl_installer.config import AppConfig, load_config, load_field_defaults
 from sl_installer.core import bench, selftest
@@ -14,6 +15,7 @@ from sl_installer.core.api import (FieldDefaults, HardwareVerdict, PresenceRepor
                                    SecurityState, Services)
 from sl_installer.core.esptool_runner import ToolResult, ToolRunner
 from sl_installer.core.factory import make_services
+from sl_installer.core.single_instance import LOCK_FILE_NAME, InstanceLock
 
 from . import support
 
@@ -111,6 +113,108 @@ def test_factory_builds_every_service(tmp_path):
     assert hasattr(services.usb, "snapshot") and hasattr(services.usb, "watch")
     import logging
     logging.getLogger("sl_installer").propagate = True
+
+
+def test_services_without_the_instance_lock_keep_a_running_install_s_files(tmp_path):
+    import logging
+
+    running = tmp_path / "work" / "sl-install-running"
+    running.mkdir(parents=True)
+    (running / "board-key.bin").write_bytes(b"secret" * 6)
+    try:
+        make_services(load_config(data_dir=tmp_path))  # as the self-test builds them
+    finally:
+        logging.getLogger("sl_installer").propagate = True
+    assert (running / "board-key.bin").exists()
+
+
+def test_the_window_wipes_every_work_folder_and_holds_the_app_mutex(monkeypatch, tmp_path):
+    import sl_installer.core.factory
+    import sl_installer.ui.app
+
+    monkeypatch.setenv(app_config.DATA_DIR_ENV, str(tmp_path))
+    crashed = tmp_path / "work" / "sl-install-crashed"  # a power cut during the burn
+    crashed.mkdir(parents=True)
+    (crashed / "board-key.bin").write_bytes(b"secret" * 6)
+    mutex = []
+    monkeypatch.setattr(sl_installer.core.factory, "make_services", lambda cfg: "services")
+    monkeypatch.setattr(entry, "_hold_app_mutex", lambda: mutex.append("held") or 1234)
+    monkeypatch.setattr(entry, "_release_app_mutex", lambda handle: mutex.append(handle))
+
+    def run_gui(services):
+        assert not InstanceLock(tmp_path / "state" / LOCK_FILE_NAME).acquire()
+        assert not crashed.exists() and mutex == ["held"]
+        return 0
+
+    monkeypatch.setattr(sl_installer.ui.app, "run_gui", run_gui)
+    assert entry.main([]) == 0
+    assert mutex == ["held", 1234]  # closed again when the window closed
+
+
+def test_only_the_window_holds_the_app_mutex(monkeypatch, tmp_path):
+    from sl_installer.core import esptool_runner
+
+    held = []
+    monkeypatch.setattr(entry, "_hold_app_mutex", lambda: held.append(1))
+    monkeypatch.setattr(esptool_runner, "dispatch_tool", lambda args: 0)
+    monkeypatch.setattr(entry, "_self_test", lambda server: 0)
+    monkeypatch.setattr(entry, "_screenshots", lambda directory: 0)
+    assert entry.main(["--tool", "esptool", "version"]) == 0
+    assert entry.main(["--self-test"]) == 0
+    assert entry.main(["--screenshots", str(tmp_path)]) == 0
+    assert held == []
+
+
+def test_the_app_mutex_is_made_and_closed_through_kernel32(monkeypatch):
+    import ctypes
+
+    pytest.importorskip("ctypes.wintypes")
+    if sys.platform != "win32":
+        assert entry._hold_app_mutex() is None  # Windows only
+    calls = []
+
+    class Function:
+        def __init__(self, result):
+            self.result = result
+
+        def __call__(self, *args):
+            calls.append(args)
+            return self.result
+
+    class Kernel32:
+        CreateMutexW = Function(4321)
+        CloseHandle = Function(1)
+
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(ctypes, "WinDLL", lambda name, use_last_error: Kernel32(),
+                        raising=False)
+    handle = entry._hold_app_mutex()
+    entry._release_app_mutex(handle)
+    assert handle == 4321 and calls == [(None, False, entry.APP_MUTEX), (4321,)]
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="a Windows named mutex")
+def test_setup_sees_the_app_mutex_only_while_the_window_holds_it():
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenMutexW.restype = wintypes.HANDLE
+    kernel32.OpenMutexW.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.LPCWSTR)
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+
+    def setup_sees_it() -> bool:  # what Inno Setup does for AppMutex
+        found = kernel32.OpenMutexW(0x00100000, False, entry.APP_MUTEX)  # SYNCHRONIZE
+        if found:
+            kernel32.CloseHandle(found)
+        return bool(found)
+
+    handle = entry._hold_app_mutex()
+    try:
+        assert handle and setup_sees_it()
+    finally:
+        entry._release_app_mutex(handle)
+    assert not setup_sees_it()
 
 
 def test_bench_parser_and_confirmation(monkeypatch, capsys):

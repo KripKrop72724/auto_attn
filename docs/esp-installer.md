@@ -34,10 +34,13 @@ You do not need an administrator password. The app installs only for you.
    **Install**.
 6. Click **Finish**. The app opens.
 
-**A new version:** run the new Setup file in the same way. You do not need to
-remove the old version first.
+**A new version:** close the app first, then run the new Setup file in the
+same way. You do not need to remove the old version first. If the app is still
+open, Setup says so and waits: close the app, then click **OK**. If a board is
+being set up, let the app finish it first.
 
-**Removing the app:** open **Settings**, then **Apps**, then **Installed apps**.
+**Removing the app:** close the app first. Then open **Settings**, then
+**Apps**, then **Installed apps**.
 Find **State Life Device Installer** and click **Uninstall**. The app asks if
 you also want to delete the saved install records and logs. Choose **No**,
 unless head office tells you otherwise.
@@ -88,13 +91,16 @@ to sleep while it sets up a board and while it watches the board start.
 | No board is found | Use a different USB cable: some cables only charge. Try another USB socket on the computer. |
 | "Use the socket marked USB" | The cable is in the other socket on the board. Move it to the socket marked **USB**. |
 | "Connect only one board" | Unplug every other board. |
+| "This computer cannot read the board ID" | This computer, or the USB socket or hub, does not tell the app which board it is, so the app will not write to the board there. Plug the cable straight into another USB socket on the computer, not into a hub. Then click **Try again** (on **Check or fix a board**: **Check again**). If that does not help, use another computer. |
 | "The board keeps restarting" | Usually the cable or the USB socket does not give enough power. Use a short cable straight into the computer, not a hub, or another USB socket. Then click **Check again** (or **Try again** after the first start). |
 | "This board is faulty" | Put a FAULTY label on it, keep it aside and tell head office. |
 | The app cannot start the board's setup mode | Hold the **BOOT** button. Press and release **RST**. Release **BOOT**. Click **Try again**. |
 | Setup stopped before the end | Do what the screen says, then click **Finish the setup**. If the app was closed: choose **Set up a new board**, type the same details and connect the same board. The check then offers **Finish the setup**. |
 | The board started with other settings | Click **Fix settings**. The app checks the board again and offers **Change its settings**. |
+| "The app did not see the board start" | Unplug the board, wait 3 seconds and plug it back in without pressing any button. Click **Try again**. If it happens again, click **Check the board**. |
 | "This app cannot change this board's settings" | The board was locked in an older way. Leave it as it is and call head office with the board ID. |
 | "The app is already open" | Only one window of the app can run. Use the window that is open; look for its icon on the taskbar. |
+| Setup or the uninstaller says the app is running | Close the app. If it is setting up a board, wait until it has finished. Then click **OK**. |
 | "Please wait a moment" | Head office is busy. Wait as many minutes as the screen says, then click **Try again**. |
 | Anything else | Click **Help**, then **Save a help file**. Send the file to head office. It contains no passwords. |
 
@@ -170,7 +176,7 @@ them into the app. To change one, update the secret, then build a new release.
 | `zkt_preferred_ip` | text | `0.0.0.0` (find the machine), or the machine's LAN address |
 | `device_id` | text | first device ID offered in a zone |
 | `hik_port` | number, 1-65535 | Hikvision port |
-| `hik_transport` | text | `http_digest` or `https` |
+| `hik_transport` | text | `http_digest`. `https` is refused: it needs the attendance machine's own certificate, which the app cannot add |
 | `hik_username` | text | Hikvision user name |
 
 The JSON looks like this; replace each `<...>` with the real value (numbers
@@ -252,7 +258,10 @@ bench runs `esptool version` and `espefuse --help` (neither opens a port) and
 stops unless both say 5.1.0. The bench itself still needs `httpx`, `pyserial`
 and `cryptography` in the Python that runs it. `install` needs `--bundle-id`
 for a new or unfinished board; changing the settings of a finished board
-writes no board software, so it needs none.
+writes no board software, so it needs none. `inspect` and `install` take the
+app's own lock for the same data folder: while the app's window is open they
+stop (exit code 6) before touching the board, and the window does not open
+while they run.
 
 ### Runtime behaviour worth knowing
 
@@ -261,6 +270,18 @@ writes no board software, so it needs none.
   open; a second start shows "The app is already open" and stops before it
   opens the log. The lock goes away by itself when the app exits or crashes.
   Tool runs (`--tool`), `--self-test` and `--screenshots` are not limited.
+- Every setup runs in a holder of that lock (the window, or the bench's
+  `install`). So once the window holds it, no setup can be running, and it
+  wipes every work folder (`work\sl-install-*`) that a crash or power cut left
+  behind, however new: the board's settings and, after a cut during the key
+  step, its security key file. Without the lock (`--self-test`, the bench's
+  `watch` and `diagnose`) only folders older than 6 hours are wiped.
+- Before every call of a setup the app finds the board again by its USB board
+  ID, and it writes only to a port that has the board's ID. Some computers and
+  hubs give none (Windows then reports a location ID such as
+  `5&2B33E3B5&0&12`, which never counts as a board ID): the check says "This
+  computer cannot read the board ID" and offers no setup, finish or settings
+  change there.
 - While a board is being set up, and while its first start is watched, the app
   asks Windows to keep the computer and the screen awake
   (`SetThreadExecutionState`, `core/keepawake.py`): a laptop that sleeps
@@ -284,7 +305,7 @@ docker run --rm -v "$PWD":/w -w /w/apps/esp_installer -e PYTHONPATH=src \
 | `... --tool esptool ARGS` / `--tool espefuse ARGS` | runs the bundled tool and exits with its code. The engine starts the frozen app like this where a source checkout runs `python -m esptool`. Output is UTF-8. |
 | `... --self-test` | runs `sl_installer.core.selftest.run()`, opens and closes the window on fake services, then builds the real services and a window on them without starting it (nothing is contacted); prints `PROBLEM:` lines and exits 0 or 1 |
 | `... --screenshots DIR` | saves every screen as PNG files in `DIR` |
-| `... --server URL` | uses another ADD server (tests only) |
+| `... --server URL` | uses another ADD server (tests only). It must use `https`, unless it runs on this computer (`127.0.0.1`, `localhost` or `::1`), and the address may not hold a user name or password |
 | `python -m sl_installer ...` | the same, from source |
 
 ### Build
@@ -356,7 +377,11 @@ all of its Windows dependencies are locked.
 - `AppId` `{49E622E9-C86D-45A8-B698-80A6E828B344}` must never change: Windows
   uses it to find the app for updates and removal.
 - An update deletes the old `_internal` folder first, so files of two versions
-  never mix.
+  never mix, as long as the app is closed. Setup and the uninstaller make sure
+  of that: the open window holds the named mutex `StateLifeDeviceInstaller`
+  (`AppMutex` in `installer.iss`, `APP_MUTEX` in `__main__.py`), so they ask for
+  the app to be closed and wait. The window does not close while a board is at a
+  step that must not stop, and Setup never forces it closed.
 - The app keeps its data in `%LOCALAPPDATA%\StateLife\DeviceInstaller`
   (`sl_installer/config.py`): `bundles`, `logs`, `records`, `state`, `work`.
 - Uninstall removes the app, its shortcuts, the downloaded firmware
@@ -377,5 +402,12 @@ all of its Windows dependencies are locked.
 `EULA.txt` is the app's licence. `THIRD-PARTY-NOTICES.txt` is generated at
 build time from the runtime lock and each package's licence files. It covers
 Python (PSF), Qt and PySide6 (LGPL-3.0: unmodified, dynamically linked DLLs,
-with where to get their source), esptool (GPL-2.0-or-later: run as a separate
-program; its source ships in `licenses\`) and the PyInstaller bootloader.
+with where to get their source), esptool (GPL-2.0-or-later: unmodified, in a
+separate process where a small part of the app hands over to it; its source
+ships in `licenses\`), the flasher stub that esptool loads into the board and the
+PyInstaller bootloader. The app uses only the stub in `stub_flasher\1`
+(esptool-legacy-flasher-stub v1.8.0, GPL-2.0-or-later). esptool ships only the
+stub's binary, so the notice says where the stub's source is published
+(<https://github.com/espressif/esptool-legacy-flasher-stub/releases/tag/v1.8.0>)
+and that State Life head office can supply a copy on request. The stubs in
+`stub_flasher\2`, which the app does not use, are Apache-2.0 or MIT.

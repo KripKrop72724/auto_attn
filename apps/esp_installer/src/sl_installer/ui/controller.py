@@ -157,6 +157,7 @@ class _CheckOutcome:
     record: Optional[api.DeviceRecord]
     lookup_error: Optional[BaseException]
     advice: Tuple[Advice, ...]
+    candidate: Optional[api.UsbCandidate] = None  # the port the board was read on
 
 
 class Controller(QObject):
@@ -741,10 +742,33 @@ class Controller(QObject):
 
     # =============================================================== checking
 
+    def _board_on_usb_now(self, candidate: api.UsbCandidate) -> api.UsbCandidate:
+        """The same board as USB lists it now (on the worker): the port with its board ID,
+        or the only board when the old or the new port gives no ID.
+
+        Plugged into another socket it has a new port name, so Try again reads it there
+        instead of failing on the old one. Reading is all a check does.
+        """
+        try:
+            natives = [
+                item
+                for item in self.services.usb.snapshot().candidates
+                if item.kind is api.UsbKind.NATIVE
+            ]
+        except Exception:  # the old port may still be right
+            log.info("could not list the boards again", exc_info=True)
+            return candidate
+        same = [item for item in natives if candidate.mac and item.mac == candidate.mac]
+        if same:
+            return same[0]
+        if len(natives) == 1 and (candidate.mac is None or natives[0].mac is None):
+            return natives[0]
+        return candidate
+
     def _inspect_and_look_up(
         self, operation: Operation, on_board: Callable[[api.BoardInfo], None]
     ) -> _CheckOutcome:
-        candidate = self.session.candidate
+        candidate = self._board_on_usb_now(self.session.candidate)
         presence = self.session.presence
         board = self.services.boards.inspect(candidate, operation.token)
         on_board(board)
@@ -759,7 +783,7 @@ class Controller(QObject):
                 advice = tuple(self.services.diagnosis.diagnose(board, presence, record, ()))
             except Exception:  # advice is a bonus here; the result still stands
                 log.exception("diagnosis failed")
-        return _CheckOutcome(board, record, lookup_error, advice)
+        return _CheckOutcome(board, record, lookup_error, advice, candidate)
 
     def _enter_checking(self) -> None:
         page = self.page(CHECKING)
@@ -786,6 +810,7 @@ class Controller(QObject):
         session, page = self.session, self.page(CHECKING)
         board, record = outcome.board, outcome.record
         session.board, session.record = board, record
+        session.candidate = outcome.candidate or session.candidate
         page.show_facts(board, record)
         if outcome.lookup_error is not None:
             advice = advice_of(outcome.lookup_error)
@@ -806,6 +831,13 @@ class Controller(QObject):
                 primary=("Try again", "retry") if retry else None,
                 secondary=None if retry else ("Use another board", "another"),
             )
+            return
+        blocked = wording.install_blocked(session.candidate)
+        if blocked is not None:
+            # Each way on from here writes to the board, which the engine does only on the
+            # port that has the board's USB board ID (board-safety review BS1).
+            session.mode = None
+            page.show_result(blocked, primary=("Try again", "retry"))
             return
         security = board.security
         known_family = record.family if record is not None and record.known else None
@@ -1215,6 +1247,9 @@ class Controller(QObject):
             if report.zone_id_seen:
                 device = f", device number {report.device_id_seen}" if report.device_id_seen else ""
                 seen.append(f"It started for {report.zone_id_seen}{device}.")
+            else:
+                # The start line, with the zone, came before the app could read the board.
+                seen.append("It started and is working.")
             if report.app_version_seen:
                 seen.append(f"Its software is version {report.app_version_seen}.")
             page.show_result(
@@ -1374,6 +1409,7 @@ class Controller(QObject):
             return
         session, page = self.session, self.page(CHECK_BOARD)
         session.board, session.record = outcome.board, outcome.record
+        session.candidate = outcome.candidate or session.candidate
         page.show_board(outcome.board)
         if outcome.lookup_error is not None:
             page.show_record_problem(advice_of(outcome.lookup_error))
@@ -1391,6 +1427,11 @@ class Controller(QObject):
         board = session.board
         if board is None or board.security is not SecurityState.SECURED_STATE_LIFE:
             page.set_fix_available(False)
+            return
+        unreadable = wording.install_blocked(session.candidate)
+        if unreadable is not None:
+            # The page's own Check again reads the board again, after a socket change too.
+            page.show_fix_blocked(unreadable)
             return
         blocked = wording.settings_change_blocked(session.record, lookup_failed)
         if blocked is None:
@@ -1497,6 +1538,7 @@ class Controller(QObject):
             and session.board.security is SecurityState.SECURED_STATE_LIFE
             and not self.running("lookup")
             and wording.settings_change_blocked(session.record) is None
+            and wording.install_blocked(session.candidate) is None
         ):
             self.start_fixing()
 

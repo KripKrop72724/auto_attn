@@ -12,7 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
-from ..core import api
+from ..core import api, texts
 from ..core.api import (
     Advice,
     BootOutcome,
@@ -602,6 +602,18 @@ def resume_blocked(record: Optional[api.DeviceRecord]) -> Optional[Advice]:
     """
     if record is not None and record.known and record.ever_online:
         return _settings_not_allowed(record.settings_change_reason)
+    return None
+
+
+def install_blocked(candidate: Optional[api.UsbCandidate]) -> Optional[Advice]:
+    """Why no setup, finish or settings change may start on this board, or None when it can.
+
+    The engine writes only to the port that has the board's USB board ID (core/installer.py),
+    so a board this computer gives no ID for would stop at its first step. The screens say
+    so before anything starts, in the engine's own words.
+    """
+    if candidate is not None and candidate.mac is None:
+        return texts.BOARD_ID_NOT_READABLE
     return None
 
 

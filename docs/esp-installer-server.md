@@ -55,7 +55,7 @@ Notes:
 ```
 
 The configuration rules match `ProvisioningConfiguration` and the provisioner's
-`validate_request`:
+`validate_request`, except that the Hikvision CA limit is lower than `ProvisioningConfiguration`'s:
 
 - **ZONE ID and device ID:** `^[A-Za-z0-9][A-Za-z0-9._-]*$`, up to 64 and 31 characters.
   `LF-ZONE-G&PBLD8-01` is therefore refused.
@@ -67,8 +67,10 @@ The configuration rules match `ProvisioningConfiguration` and the provisioner's
   (`hik_port` and `hik_transport` are ignored).
 - **Hikvision boards:** the comm key is absent or 0. `hik_host` must be an RFC1918 IPv4 address.
   Username, password, serial, profile and epoch are required (up to 63, 127, 119, 79 and 64 bytes).
-  The CA is optional (up to 4095 bytes). The transport defaults to `https`. The port defaults to
-  443 for `https` and 80 for `http_digest`.
+  The CA is optional, up to 3967 bytes: the most ESP-IDF 5.5.3's NVS generator stores in one
+  string, and the provisioner's `nvs_rows` limit. A longer CA is refused as 422 `INVALID_FIELD`
+  for `hik_ca_pem`. The transport defaults to `https`. The port defaults to 443 for `https` and 80
+  for `http_digest`.
 - **Numbers:** must be JSON numbers, not strings. Unknown keys are ignored.
 - **`bundle_id`:** required for `new_board` and `resume`, which write firmware. A
   `change_settings` package writes no firmware, so it needs no published bundle. It may leave
@@ -96,9 +98,11 @@ so ADD decides from its own records:
 
 - **`change_settings`** is allowed when ADD has no connector for the MAC, or the connector has
   never been online (`ever_online` false), or the audit log holds an `INSTALLER_PACKAGE_ISSUED`
-  row for the MAC with mode `new_board` or `resume`. That row means this app prepared the board,
-  so its key came from the fleet root. A `change_settings` row, or a reported event, proves
-  nothing.
+  row for the MAC with mode `new_board`. That row means this app set the board up, so its key
+  came from the fleet root. A `resume` row proves nothing: a resume burns no key, and the board
+  may have been locked before this app with an older root. Nor does a `change_settings` row or a
+  reported event. A board this app set up and then finished with a resume still has its
+  `new_board` row.
 - **`resume`** is allowed only when ADD has no connector for the MAC, or it has never been online.
   A board whose setup stopped has never started.
 - **Otherwise** the answer is 409 `SETTINGS_CHANGE_NOT_SUPPORTED`, with the message "This board was
@@ -212,8 +216,8 @@ withdraw a bundle, move its directory out of the store.
   `token`, `cookie`, `csrf`, `pass`, `pwd`, `psk`, `key`, `hmac`, `nvs`, `ords`, `private`,
   `plaintext` or `ciphertext`, in any case, plus ADD's usual secret names. It covers the
   firmware's own `wifi_pass`, `hik_pass`, `tel_pass` and `zkt_key`. A harmless key with such a part
-  (for example `key_burned`) is redacted too, so report such facts under another name. The
-  outcome is `REPORTED`.
+  (for example `key_burned`) is redacted too, so report such facts under another name. ADD keeps
+  only the first 80 characters of a key, but it judges the whole key. The outcome is `REPORTED`.
 
 ## Provisioner
 
@@ -247,6 +251,8 @@ rolled back: no nonce, site or connector change is kept.
 - **Locked keys:** ADD cannot read a board's key. It trusts a board it does not know, or has never
   seen online, to take settings from the fleet root. If such a board in fact holds an older key,
   it will not start after the change, and head office must set it up again with its own root.
+  ADD keeps no record of that setup, which is why a `resume` row never allows a later
+  `change_settings`.
 - **Rate limits:** they live in memory and reset when add-api restarts.
 - **Store files:** the store's files are not ACL-restricted, like the other stores under Public
   Documents. Changing a file only makes its bundle unavailable, because every file must match the

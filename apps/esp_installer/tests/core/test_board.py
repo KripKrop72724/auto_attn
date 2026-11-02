@@ -119,6 +119,15 @@ def test_inspect_sdm_board_without_usb_serial_cannot_be_identified():
     assert caught.value.advice is texts.BOARD_ID_UNKNOWN
 
 
+def test_usb_board_id_that_is_not_the_chips_is_refused():
+    # Every install call finds the board by its USB board ID, so it must be the chip's own.
+    with pytest.raises(InstallerError) as caught:
+        inspect(FakeBoard(), native(mac=support.OTHER_MAC))
+    assert caught.value.advice is texts.BOARD_ID_UNKNOWN
+    info, _ = inspect(FakeBoard(), native(mac=None))  # no USB board ID: the chip's is used
+    assert info.mac == MAC and info.evidence["usb_mac"] is None
+
+
 def test_inspect_key_burned_board():
     info, _ = inspect(FakeBoard(efuse_state="key-burned"))
     assert info.security is SecurityState.KEY_BURNED_NOT_STARTED

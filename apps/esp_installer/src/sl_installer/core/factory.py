@@ -30,6 +30,9 @@ def field_defaults(cfg: AppConfig) -> FieldDefaults:
 def make_services(cfg: AppConfig) -> Services:
     cfg.ensure_dirs()
     setup_logging(cfg.logs_dir)
+    # Only work folders older than any install: the self-test (and the bench's watch and
+    # diagnose) build these services without the instance lock. The window, which holds
+    # it, wipes the rest (__main__._run_gui).
     cleanup_stale_work(cfg.work_dir)
     log.info("State Life Device Installer %s, server %s", cfg.app_version, cfg.server_url)
     defaults = field_defaults(cfg)

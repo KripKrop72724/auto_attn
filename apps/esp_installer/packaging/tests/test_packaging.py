@@ -75,6 +75,8 @@ def test_one_secret_alone_is_refused(secrets, monkeypatch):
     ({"zkt_preferred_ip": "8.8.8.8"}, "zkt_preferred_ip"),
     ({"device_id": "bad id"}, "device_id"),
     ({"hik_transport": "telnet"}, "hik_transport"),
+    # HTTPS needs the machine's own certificate, which the defaults cannot carry.
+    ({"hik_transport": "https"}, "hik_transport"),
     ({"hik_port": 0}, "hik_port"),
 ])
 def test_bad_defaults_are_refused_without_showing_values(secrets, change, message):
@@ -124,6 +126,15 @@ def test_the_app_reads_the_written_file_as_a_release(secrets, tmp_path, monkeypa
     assert defaults.is_test_build is False
     assert defaults.wifi_password == "test-wifi-pass" and defaults.zkt_comm_key == 4242
     assert defaults.setup_ap_password == SETUP_PASSWORD
+
+
+def test_the_app_refuses_https_in_the_defaults_file(tmp_path):
+    from sl_installer.config import load_field_defaults
+
+    target = tmp_path / "field_defaults.json"
+    target.write_text(json.dumps(dict(GOOD_DEFAULTS, hik_transport="https")), encoding="utf-8")
+    with pytest.raises(ValueError, match="hik_transport"):
+        load_field_defaults(target)
 
 
 def test_a_test_build_removes_any_old_file(secrets, tmp_path, monkeypatch):
@@ -314,6 +325,76 @@ def test_a_second_window_says_the_app_is_open_and_stops(monkeypatch, tmp_path):
         first_window.release()
 
 
+@pytest.mark.parametrize("url", [
+    "http://localhost.attacker.example", "http://127.0.0.1.attacker.example",
+    "http://127.0.0.1.attacker.example:80", "http://localhost@attacker.example",
+    "http://127.0.0.1@evil.example", "http://127.0.0.1@evil.example/",
+    "https://admin@add.example", "http://evil.example", "ftp://127.0.0.1",
+    "https://add.example:99999", "https://",
+])
+def test_a_server_must_use_https_unless_it_is_this_computer(url, tmp_path, capsys):
+    from sl_installer.config import load_config
+
+    # The host that counts is the one httpx would reach, not how the text starts.
+    with pytest.raises(ValueError):
+        load_config(url, tmp_path)
+    with pytest.raises(SystemExit) as stop:
+        entry.main(["--server", url, "--self-test"])
+    assert stop.value.code == 2 and "--server" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("url, kept", [
+    (None, "https://autoattn.slichealth.com"),
+    ("https://staging.example.test/", "https://staging.example.test"),
+    ("https://add.test", "https://add.test"),
+    ("https://127.0.0.1:9", "https://127.0.0.1:9"),
+    ("http://127.0.0.1:8096", "http://127.0.0.1:8096"),
+    ("http://LOCALHOST:8096/", "http://LOCALHOST:8096"),
+    ("http://[::1]:8096", "http://[::1]:8096"),
+])
+def test_good_server_addresses_are_kept(url, kept, tmp_path):
+    from sl_installer.config import load_config
+
+    assert load_config(url, tmp_path).server_url == kept
+
+
+# ------------------------------------------------------------------ notices
+
+def test_notices_give_the_flasher_stubs_true_licence():
+    import notices
+
+    text = notices._summary("1.2.3", {"qt": "6.9.2", "pyside6-essentials": "6.9.2",
+                                      "esptool": "5.1.0", "pyinstaller": "6.22.0"})
+    words = " ".join(text.split())
+    assert "a small part of the app hands the arguments over to esptool" in words
+    assert 'esptool\'s source code is in "licenses\\esptool-5.1.0.tar.gz"' in words
+    stub = words[words.index("esptool flasher stub (esptool-legacy-flasher-stub v1.8.0)"):]
+    assert '"_internal\\esptool\\targets\\stub_flasher\\1"' in stub
+    assert notices.STUB_SOURCE in stub and "head office can supply a copy on request" in stub
+    assert stub.index("GPL-2.0-or-later") < stub.index("stub_flasher\\2") \
+        < stub.index("Apache-2.0 or MIT")
+    assert "runs only esptool's code" not in words and "complete source" not in words
+    assert max(len(line) for line in text.splitlines()) <= len(notices.RULE)
+
+
+def test_the_notice_matches_the_stub_esptool_loads():
+    from importlib import metadata
+
+    try:
+        esptool = metadata.distribution("esptool")
+    except metadata.PackageNotFoundError:
+        pytest.skip("esptool is not installed here")
+    import notices
+
+    readme = Path(esptool.locate_file("esptool/targets/stub_flasher/1/README.md"))
+    words = " ".join(readme.read_text(encoding="utf-8").split())
+    assert "General Public License Version 2 or later" in words
+    assert notices.STUB_SOURCE in words
+    # Stub 1 is esptool's default, and the app never sets ESPTOOL_STUB_VERSION.
+    source = Path(esptool.locate_file("esptool/__init__.py")).read_text(encoding="utf-8")
+    assert 'os.environ.get("ESPTOOL_STUB_VERSION", "1")' in source
+
+
 def test_modes_cannot_be_combined_and_version_prints(capsys):
     with pytest.raises(SystemExit) as stop:
         entry.main(["--self-test", "--screenshots", "shots"])
@@ -327,3 +408,14 @@ def test_modes_cannot_be_combined_and_version_prints(capsys):
     from sl_installer import __version__
 
     assert capsys.readouterr().out.strip() == __version__
+
+
+def test_setup_waits_for_the_mutex_the_window_holds():
+    """Setup and the uninstaller find the open app by its mutex, and never force it closed."""
+    settings = {}
+    for line in (PACKAGING / "installer.iss").read_text(encoding="utf-8").splitlines():
+        name, equals, value = line.partition("=")
+        if equals and name in ("AppMutex", "CloseApplications"):
+            settings.setdefault(name, []).append(value.strip())
+    assert settings["AppMutex"] == [entry.APP_MUTEX]
+    assert settings["CloseApplications"] == ["yes"]  # "force" could stop a board mid-write

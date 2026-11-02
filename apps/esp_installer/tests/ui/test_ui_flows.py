@@ -115,10 +115,8 @@ def test_happy_hik_end_to_end(harness):
     form.hik_model.setCurrentIndex(form.hik_model.findData("ds-k1t321mfwx"))
     form.hik_serial.setText("TEST-SERIAL-0001")
     assert form.model_notice.isVisible()  # untested model: a gentle warning
-    form.hik_transport.setCurrentIndex(form.hik_transport.findData("https"))
-    assert form.hik_port.text() == "443"
-    form.hik_transport.setCurrentIndex(form.hik_transport.findData("http_digest"))
-    assert form.hik_port.text() == "80"
+    # No HTTPS: it needs the machine's own certificate, which the app cannot add.
+    assert form.hik_transport.findData("https") == -1 and form.hik_port.text() == "80"
     h.click_primary(pages.DETAILS)
     h.wait_page(pages.CONNECT)
     h.wait(lambda: h.page(pages.CONNECT).primary_button.isEnabled())

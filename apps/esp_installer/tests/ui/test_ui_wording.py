@@ -9,8 +9,18 @@ from pathlib import Path
 
 import pytest
 
-from sl_installer.core.api import ConsoleEvent, ConsoleKind, PresenceReport, PresenceState
+from sl_installer.core import texts
+from sl_installer.core.api import (
+    ConsoleEvent,
+    ConsoleKind,
+    Family,
+    FieldDefaults,
+    PresenceReport,
+    PresenceState,
+)
 from sl_installer.ui import naming, pictures, wording
+from sl_installer.ui.pages.settings_form import SettingsForm
+from sl_installer.ui.widgets import FieldBlock
 
 APP_ROOT = Path(__file__).resolve().parents[2]
 REPO_ROOT = Path(__file__).resolve().parents[4]
@@ -136,3 +146,41 @@ def test_help_topics_use_existing_pictures():
         for item in topic.items:
             assert item.picture is None or pictures.picture_path(item.picture) is not None
             assert item.text.endswith(".")
+
+
+# "Click Fix settings and type it under The attendance machine, Machine comm key.": a step
+# that sends the person to a field names the part of the form it is in (review CR3).
+FIELD_DIRECTION = re.compile(
+    r"\b[Uu]nder ([A-Z][\w' ]*?), (?:set )?([A-Z][\w' -]*?)(?: to [^.]*)?\."
+)
+
+
+def form_places(fix_mode):
+    """(part of the form, field) for every field the form shows, for each machine type."""
+    places = set()
+    for family in Family:
+        form = SettingsForm(fix_mode=fix_mode)
+        form.reset(family, FieldDefaults())
+        parts = (
+            (form.advanced.header.text(), form.advanced, form.advanced.content),
+            (form.machine_card.title_label.text(), form.machine_card, form.machine_card),
+        )
+        for field in form.findChildren(FieldBlock):
+            for title, part, body in parts:
+                if part.isVisibleTo(form) and body.isAncestorOf(field) and field.isVisibleTo(body):
+                    places.add((title, field.label.text()))
+        form.deleteLater()
+    return places
+
+
+def test_steps_name_the_part_of_the_form_where_the_field_is():
+    advices = list(texts.STATIC.values()) + [texts.light_hint(s) for s in texts.LED_GUIDE]
+    steps = [step for advice in advices for step in advice.what_to_do]
+    steps += list(texts._FIELD_RULES.values())  # shown after "Click Change the details."
+    fix, details = form_places(fix_mode=True), form_places(fix_mode=False)
+    directions = [(step, m.groups()) for step in steps for m in FIELD_DIRECTION.finditer(step)]
+    assert len(directions) >= 3, directions  # the pattern still finds what it checks
+    for step, place in directions:
+        # Fix settings opens the fix form; "Change the details" goes back to either form.
+        allowed = fix if "Fix settings" in step else fix | details
+        assert place in allowed, (step, sorted(allowed))

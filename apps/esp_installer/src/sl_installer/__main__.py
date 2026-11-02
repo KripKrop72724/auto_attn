@@ -14,6 +14,9 @@ imported only by the mode that needs it, so a tool run never loads Qt.
 
 Only one window runs at a time: a second start says the app is already open and
 stops (core/single_instance.py). Tool runs and the self-test are not limited.
+While the window is open on Windows the app also holds the named mutex
+``APP_MUTEX``: Setup and the uninstaller (packaging/installer.iss, AppMutex) then
+ask for the app to be closed instead of deleting files under a running setup.
 """
 from __future__ import annotations
 
@@ -28,6 +31,8 @@ from typing import List, Optional, Sequence
 
 # How long the self-test lets the window run before closing it.
 SMOKE_SECONDS = 2.0
+# packaging/installer.iss names the same mutex in AppMutex.
+APP_MUTEX = "StateLifeDeviceInstaller"
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -172,6 +177,7 @@ def _screenshots(directory: Path) -> int:
 def _run_gui(server: Optional[str]) -> int:
     from sl_installer.config import load_config
     from sl_installer.core.factory import make_services
+    from sl_installer.core.installer import cleanup_stale_work
     from sl_installer.core.single_instance import LOCK_FILE_NAME, InstanceLock
     from sl_installer.ui.app import run_gui
 
@@ -180,10 +186,48 @@ def _run_gui(server: Optional[str]) -> int:
     lock = InstanceLock(cfg.state_dir / LOCK_FILE_NAME)
     if not lock.acquire():
         return _already_open()
+    mutex: Optional[int] = None
     try:
-        return run_gui(make_services(cfg))
+        services = make_services(cfg)
+        # Every install runs in a holder of this lock, so none is running now: wipe the
+        # settings and key files of any setup a crash or power cut stopped, however new.
+        cleanup_stale_work(cfg.work_dir, max_age_s=0)
+        mutex = _hold_app_mutex()
+        return run_gui(services)
     finally:
+        _release_app_mutex(mutex)
         lock.release()
+
+
+def _hold_app_mutex() -> Optional[int]:
+    """Create APP_MUTEX for as long as the window is open; Windows only, else None."""
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateMutexW.restype = wintypes.HANDLE
+        kernel32.CreateMutexW.argtypes = (wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR)
+        handle = kernel32.CreateMutexW(None, False, APP_MUTEX)
+    except Exception as error:  # Setup then only has its own way of closing the app
+        import logging
+
+        logging.getLogger("sl_installer").warning("could not create the app mutex: %s", error)
+        return None
+    return handle or None
+
+
+def _release_app_mutex(handle: Optional[int]) -> None:
+    if not handle:
+        return
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle(handle)
 
 
 def _already_open() -> int:

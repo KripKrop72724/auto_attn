@@ -43,8 +43,11 @@ from ..widgets import (
     text,
 )
 
-TRANSPORTS = (("http_digest", "Normal (HTTP)"), ("https", "Secure (HTTPS)"))
-_TRANSPORT_PORTS = {"http_digest": 80, "https": 443}
+# No "Secure (HTTPS)": it needs the machine's certificate, which the app cannot add,
+# so the board would never reach the machine (validation.check_hik_transport). A
+# saved or default "https" shows as the first choice, so it never reaches a package.
+TRANSPORTS = (("http_digest", "Normal (HTTP)"),)
+_TRANSPORT_PORTS = {"http_digest": 80}
 
 CHOOSE_MODEL = "Choose the model"
 _COMM_KEY_HINT = "Shown in the machine's menu, under Comm."

@@ -29,9 +29,10 @@ HIK_LIMITS = {
     "hik_host": 63, "hik_username": 63, "hik_password": 127,
     "hik_expected_serial": 119, "hik_profile": 79, "hik_source_epoch": 64,
 }
-# ESP-IDF 5.5.3 nvs_partition_gen refuses strings over 4000 bytes, below the 4095
-# the other validators allow.
-HIK_CA_MAX = 4000
+# One NVS string, with its closing NUL, must fit on one page (124 entries of 32 bytes),
+# so the package builder (ESP-IDF 5.5.3 nvs_partition_gen) fails on a certificate over
+# 3967 bytes.
+HIK_CA_MAX = 3967
 HIK_TRANSPORTS = ("http_digest", "https")
 UNKNOWN_MODEL_PROFILE = "hikvision-other-unverified-v1"
 
@@ -97,13 +98,29 @@ def check_zkt(settings: ZktSettings) -> Optional[Advice]:
     return None
 
 
+def check_hik_transport(transport: str, ca_pem: str = "") -> Optional[Advice]:
+    """HTTPS only with the machine's own certificate (``ca_pem``).
+
+    Without one, the board checks the machine against the public certificate
+    authorities, which a machine on the site's network never passes (HIK 3.1.1
+    hikvision_http.c), so no punch is ever read. The app has no way to add a
+    certificate, so neither its form nor the bench offers HTTPS and the field
+    defaults may not choose it. ADD still accepts HTTPS with a certificate from
+    other clients.
+    """
+    if transport not in HIK_TRANSPORTS or (transport == "https" and not ca_pem.strip()):
+        return texts.invalid_field("hik_transport")
+    return None
+
+
 def check_hik(settings: HikSettings) -> Optional[Advice]:
     if not is_lan_ipv4(settings.host):
         return texts.invalid_field("hik_host")
     if type(settings.port) is not int or not 1 <= settings.port <= 65535:
         return texts.invalid_field("hik_port")
-    if settings.transport not in HIK_TRANSPORTS:
-        return texts.invalid_field("hik_transport")
+    transport = check_hik_transport(settings.transport, settings.ca_pem)
+    if transport:
+        return transport
     for field, value in (("hik_username", settings.username),
                          ("hik_password", settings.password),
                          ("hik_expected_serial", settings.expected_serial)):

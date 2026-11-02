@@ -1,11 +1,12 @@
-"""Only one window of the app at a time (single_instance.py)."""
+"""Only one window of the app at a time (single_instance.py), and no bench run beside it."""
 from __future__ import annotations
 
 import subprocess
 import sys
 import textwrap
 
-from sl_installer.core.single_instance import InstanceLock
+from sl_installer.core import bench
+from sl_installer.core.single_instance import LOCK_FILE_NAME, InstanceLock
 
 from .support import SRC
 
@@ -51,3 +52,40 @@ def test_acquire_twice_and_release_twice_are_harmless(tmp_path):
     lock.release()
     lock.release()
     assert InstanceLock(tmp_path / "app.lock").acquire()
+
+
+# An open window of the app: another process that holds the lock until stdin closes.
+OPEN_WINDOW = textwrap.dedent("""\
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, sys.argv[2])
+    from sl_installer.core.single_instance import InstanceLock
+    lock = InstanceLock(Path(sys.argv[1]))
+    print("open" if lock.acquire() else "refused", flush=True)
+    sys.stdin.read()
+""")
+
+
+def test_the_bench_touches_no_board_while_the_app_is_open(monkeypatch, tmp_path, capsys):
+    path = tmp_path / "state" / LOCK_FILE_NAME
+    built, held = [], []
+    monkeypatch.setattr(bench, "tool_check", lambda cfg: [])
+    monkeypatch.setattr(bench, "make_services", lambda cfg: built.append(cfg) or "services")
+    # While the bench reads a board, the app's window cannot open either.
+    monkeypatch.setattr(bench, "cmd_inspect",
+                        lambda services, args: held.append(not InstanceLock(path).acquire()))
+    monkeypatch.setattr(bench, "cmd_watch", lambda services, args: 0)
+    window = subprocess.Popen([sys.executable, "-c", OPEN_WINDOW, str(path), str(SRC)],
+                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+                              encoding="utf-8")
+    try:
+        assert window.stdout.readline().strip() == "open"
+        assert bench.main(["--data-dir", str(tmp_path), "inspect"]) == 6
+        assert "the app is open" in capsys.readouterr().out and built == []
+        assert bench.main(["--data-dir", str(tmp_path), "watch"]) == 0  # reads no board
+    finally:
+        window.stdin.close()
+        window.wait(timeout=60)
+    bench.main(["--data-dir", str(tmp_path), "inspect"])  # the window has closed
+    assert held == [True] and len(built) == 2
+    assert InstanceLock(path).acquire()  # and the bench let go of the lock again
