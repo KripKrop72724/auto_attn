@@ -291,6 +291,34 @@ static bool poll_record(void *context, const char *body, size_t length)
     page->count++;
     return true;
 }
+/* Unordered range reads (3.1.2). The anchor row is found by serial anywhere in
+ * a tiny search around it and checked before any new record enters custody.
+ * The checkpoint then moves to the highest serial admitted. */
+typedef struct {
+    page_context_t page;
+    uint32_t anchor_serial, max_serial;
+    unsigned char max_digest[32];
+} range_context_t;
+static bool anchor_row(void *context, const char *body, size_t length, uint32_t serial)
+{
+    range_context_t *range = context;
+    if (serial != range->anchor_serial || range->page.anchor_seen) return true;
+    return poll_record(&range->page, body, length);
+}
+static bool range_row(void *context, const char *body, size_t length, uint32_t serial)
+{
+    range_context_t *range = context;
+    /* The anchor and anything at or below it were read before. */
+    if (range->anchor_serial && serial <= range->anchor_serial) return true;
+    unsigned before = range->page.count;
+    if (!poll_record(&range->page, body, length)) return false;
+    if (range->page.count != before && serial > range->max_serial) {
+        range->max_serial = serial;
+        memcpy(range->max_digest, range->page.digest, sizeof(range->max_digest));
+    }
+    return true;
+}
+#define POLL_RANGE_MAX_PAGES 50
 static void poll_task(void *arg)
 {
     (void)arg;
@@ -324,10 +352,8 @@ static void poll_task(void *arg)
             sample_terminal_clock();
             clock_checked_us = started;
         }
-        /* Include the committed anchor in the same ordered source page as new
-         * records. Validate it before any new evidence enters the queue. This
-         * keeps reset/reuse protection without a second slow history search on
-         * every empty poll, which can starve profiles and reconciliation. */
+        /* Check the committed anchor before any new evidence enters the queue,
+         * then read every later serial in whatever order the terminal sorts it. */
         uint32_t begin = present && cursor.serial ? cursor.serial : 1;
         if (result == HIK_OK && !present) {
             uint32_t first, last, count;
@@ -338,21 +364,28 @@ static void poll_task(void *arg)
             if (result == HIK_OK) begin = count ? (last - first >= 19 ? last - 19 : first) : 1;
         }
         if (result == HIK_OK && begin <= 3000000000U) {
-            hik_search_t search; hik_search_init(&search, begin, 3000000000U);
-            page_context_t page = {
-                .expected_anchor = present && cursor.serial ? cursor.anchor : NULL,
-                .digest_record = hik_anchor_digest, .legacy_anchor = cursor.version == 1,
-                .approved_anchor = checkpoint_approved_anchor(&cursor),
+            range_context_t range = {
+                .page = {
+                    .expected_anchor = present && cursor.serial ? cursor.anchor : NULL,
+                    .digest_record = hik_anchor_digest, .legacy_anchor = cursor.version == 1,
+                    .approved_anchor = checkpoint_approved_anchor(&cursor),
+                },
+                .anchor_serial = present ? cursor.serial : 0,
             };
             stage = 3;
-            result = hik_history_page(&search, poll_record, &page);
-            if (page.anchor_conflict || (result == HIK_OK && page.expected_anchor && !page.anchor_seen))
-                result = HIK_BINDING;
-            if (page.anchor_conflict && started - last_anchor_report_us >= 60000000) {
+            if (range.page.expected_anchor) {
+                /* +-1 so inclusive and exclusive serial bounds both return it. */
+                result = hik_history_range(cursor.serial > 1 ? cursor.serial - 1 : 1,
+                    cursor.serial < 3000000000U ? cursor.serial + 1 : cursor.serial, 1, anchor_row, &range);
+                if (range.page.anchor_conflict || (result == HIK_OK && !range.page.anchor_seen))
+                    result = HIK_BINDING;
+                range.page.expected_anchor = NULL;
+            }
+            if (range.page.anchor_conflict && started - last_anchor_report_us >= 60000000) {
                 char expected[65], observed[65], message[224];
                 for (unsigned i = 0; i < 32; i++) {
                     snprintf(expected + i * 2, 3, "%02x", cursor.anchor[i]);
-                    snprintf(observed + i * 2, 3, "%02x", page.observed_anchor[i]);
+                    snprintf(observed + i * 2, 3, "%02x", range.page.observed_anchor[i]);
                 }
                 snprintf(message, sizeof(message), "HIK_ANCHOR_MISMATCH cursor=%lu expected_sha256=%s observed_sha256=%s; original checkpoint retained",
                     (unsigned long)cursor.serial, expected, observed);
@@ -360,14 +393,19 @@ static void poll_task(void *arg)
                 (void)add_connector_log("WARN", "hikvision", "HIK_ANCHOR_MISMATCH", message);
                 last_anchor_report_us = started;
             }
-            if (result == HIK_OK && (page.count || !present || page.legacy_upgraded)) {
+            bool upgraded = range.page.legacy_upgraded;
+            unsigned char upgraded_anchor[32];
+            memcpy(upgraded_anchor, range.page.digest, sizeof(upgraded_anchor));
+            if (result == HIK_OK)
+                result = hik_history_range(begin, 3000000000U, POLL_RANGE_MAX_PAGES, range_row, &range);
+            if (result == HIK_OK && (range.page.count || !present || upgraded)) {
                 poll_checkpoint_t next = cursor;
                 next.version = 2;
-                if (page.count) {
-                    next.serial = search.previous_serial;
-                    memcpy(next.anchor, page.digest, sizeof(next.anchor));
+                if (range.page.count) {
+                    next.serial = range.max_serial;
+                    memcpy(next.anchor, range.max_digest, sizeof(next.anchor));
                 }
-                else if(page.legacy_upgraded)memcpy(next.anchor,page.digest,32);
+                else if (upgraded) memcpy(next.anchor, upgraded_anchor, 32);
                 stage = 4;
                 if ((present && cursor.version==1 && !checkpoint_backup(&cursor)) || !checkpoint_save(&next)) result = HIK_CUSTODY;
                 else { cursor = next; present = true; }
@@ -404,8 +442,8 @@ static void poll_task(void *arg)
                 (unsigned long)((esp_timer_get_time() - started) / 1000), (unsigned long)cursor.serial,
                 (unsigned long)depth, storage.persistence_verified && !storage.last_error ? "verified" : "unverified",
                 workers_ready ? "running" : "waiting",
-                result == HIK_PARSE && stage == 3 ? "; rejected " : "",
-                result == HIK_PARSE && stage == 3 ? hik_history_last_reject() : "");
+                (result == HIK_PARSE || result == HIK_OVERSIZED) && stage == 3 ? "; rejected " : "",
+                (result == HIK_PARSE || result == HIK_OVERSIZED) && stage == 3 ? hik_history_last_reject() : "");
             ESP_LOGI(TAG, "%s", message);
             if (add_connector_log(result == HIK_OK ? "INFO" : "WARN", "hikvision", "HIK_POLL_STATUS", message)) {
                 previous_result = result; previous_led = status; last_report_us = started;

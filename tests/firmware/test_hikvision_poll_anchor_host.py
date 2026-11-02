@@ -14,6 +14,7 @@ def test_inclusive_poll_anchor_gates_durable_records(tmp_path):
 #include <assert.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <string.h>
 static unsigned writes;
 static bool custody_ok = true;
@@ -62,6 +63,26 @@ int main(void){
  assert(!poll_record(&p,fresh,strlen(fresh))&&!writes); /* changed facts remain blocked */
  p=(page_context_t){.expected_anchor=fixed,.digest_record=immutable};
  assert(poll_record(&p,presentation,strlen(presentation))&&!p.legacy_upgraded&&!writes);
+ /* 3.1.2 unordered ranges: the anchor is found by serial, not position, and
+  * the checkpoint follows the highest admitted serial, not the last row. */
+ writes=0;
+ range_context_t r={.page={.expected_anchor=expected},.anchor_serial=3199};
+ assert(anchor_row(&r,fresh,strlen(fresh),3198)&&!r.page.anchor_seen&&!writes); /* neighbour */
+ assert(anchor_row(&r,anchor,strlen(anchor),3199)&&r.page.anchor_seen&&!writes);
+ assert(anchor_row(&r,fresh,strlen(fresh),3199)&&!writes); /* already proved */
+ r.page.expected_anchor=NULL;
+ const char *a="boot record 3852",*b="boot record 3290",*c="punch 3900";
+ unsigned char top[32];mbedtls_sha256((const unsigned char *)c,strlen(c),top,0);
+ assert(range_row(&r,anchor,strlen(anchor),3199)&&!writes); /* the anchor again */
+ assert(range_row(&r,a,strlen(a),3852)&&range_row(&r,b,strlen(b),3290));
+ assert(range_row(&r,c,strlen(c),3900)&&range_row(&r,"punch 3300",10,3300));
+ assert(writes==4&&r.page.count==4&&r.max_serial==3900&&!memcmp(r.max_digest,top,32));
+ /* A wrong anchor admits nothing, wherever it sorts. */
+ r=(range_context_t){.page={.expected_anchor=expected},.anchor_serial=3199};writes=0;
+ assert(!anchor_row(&r,fresh,strlen(fresh),3199)&&r.page.anchor_conflict&&!writes);
+ /* A failed durable append keeps the checkpoint where it was. */
+ r=(range_context_t){.anchor_serial=10};custody_ok=false;
+ assert(!range_row(&r,c,strlen(c),12)&&!r.max_serial);custody_ok=true;
  return 0;
 }
 '''
