@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 240" width="320" height="240">
+  <title>A Hikvision face attendance machine.</title>
+  <rect x="108" y="8" width="104" height="224" rx="18" fill="#1d2939"/>
+  <circle cx="148" cy="22" r="4" fill="#475467"/>
+  <circle cx="172" cy="22" r="4" fill="#475467"/>
+  <rect x="118" y="34" width="84" height="156" rx="8" fill="#eef8fd"/>
+  <circle cx="160" cy="98" r="20" fill="none" stroke="#0094da" stroke-width="5"/>
+  <path d="M128 160 Q160 116 192 160" fill="none" stroke="#0094da" stroke-width="5" stroke-linecap="round"/>
+  <path d="M128 76 V62 H142" fill="none" stroke="#0071a7" stroke-width="4" stroke-linecap="round"/>
+  <path d="M192 76 V62 H178" fill="none" stroke="#0071a7" stroke-width="4" stroke-linecap="round"/>
+  <path d="M128 126 V140 H142" fill="none" stroke="#0071a7" stroke-width="4" stroke-linecap="round"/>
+  <path d="M192 126 V140 H178" fill="none" stroke="#0071a7" stroke-width="4" stroke-linecap="round"/>
+  <rect x="136" y="200" width="48" height="20" rx="6" fill="#475467"/>
+</svg>

@@ -5,7 +5,9 @@ import asyncio
 import hashlib
 import hmac
 import json
+import logging
 import os
+import re
 import secrets
 import tempfile
 from contextlib import asynccontextmanager, suppress
@@ -22,11 +24,40 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from build_provisioning_package import main as _cli_main  # noqa: F401
 from build_provisioning_package import validate_request
+from provision_zone_lite import nvs_rows
+from provisioning_envelope import REQUEST_ID_PATTERN
 
 ARTIFACT_ROOT = Path(os.environ.get("ADD_PROVISIONING_ARTIFACT_PATH", "/artifacts"))
 FACTORY_ROOT = Path(os.environ.get("ADD_PROVISIONING_FACTORY_STORE_PATH", "/factory-firmware"))
 IDF_PATH = Path(os.environ.get("IDF_PATH", "/opt/esp/idf"))
 ARTIFACT_SECONDS = int(os.environ.get("ADD_PROVISIONING_ARTIFACT_SECONDS", "900"))
+NVS_PACKAGE_PATH = "/internal/v2/nvs-packages"
+HIKVISION_FIELDS = (
+    "hik_host", "hik_port", "hik_transport", "hik_username", "hik_password",
+    "hik_expected_serial", "hik_profile", "hik_source_epoch", "hik_ca_pem",
+)
+# Validation errors of validate_request and nvs_rows, by the request field they
+# name. Only the field ever leaves this process; the messages can hold values.
+FIELD_ERRORS = {
+    "Unknown firmware family": "firmware_family",
+    "Invalid provisioning request ID": "request_id",
+    "Could not normalize the ESP Wi-Fi MAC address": "target_mac",
+    "Invalid Wi-Fi password": "wifi_password",
+    "Invalid ZKT port": "zkt_port",
+    "Invalid ZKT communication key": "zkt_comm_key",
+    "Invalid ZKT preferred IP": "zkt_preferred_ip",
+    "ZKT preferred IP must be RFC1918 unicast": "zkt_preferred_ip",
+    "Hikvision host must be a LAN address": "hik_host",
+    "Hikvision installation currently requires an IPv4 LAN address": "hik_host",
+    "Explicit Hikvision transport is required": "hik_transport",
+    "Invalid Hikvision port": "hik_port",
+}
+FIELD_ERROR_PATTERN = re.compile(
+    r"Invalid (?:or missing |Hikvision )?provisioning field: ([a-z0-9_]{1,40})"
+)
+# Builder names that differ from the v2 configuration names.
+V2_FIELD_NAMES = {"zone_device_id": "device_id", "recipient_public_key_b64": "recipient_public_key"}
+logger = logging.getLogger("add_provisioner")
 
 
 class PackageRequest(BaseModel):
@@ -41,6 +72,17 @@ class PackageRequest(BaseModel):
     bundle_manifest_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     configuration: dict
     managed_defaults: dict
+
+
+class NvsPackageRequest(BaseModel):
+    """The installer's per-board settings; only the NVS and HMAC key are built."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    request_id: str = Field(min_length=8, max_length=96)
+    target_mac: str = Field(min_length=12, max_length=32)
+    recipient_public_key: str = Field(min_length=1, max_length=128)
+    configuration: dict
 
 
 def _authorize(value: str | None) -> None:
@@ -87,7 +129,13 @@ app = FastAPI(
 
 
 @app.exception_handler(RequestValidationError)
-async def sanitized_validation_error(_request, error: RequestValidationError):
+async def sanitized_validation_error(request, error: RequestValidationError):
+    if request.url.path == NVS_PACKAGE_PATH:
+        names = [
+            part for item in error.errors() for part in item.get("loc", ())[1:]
+            if isinstance(part, str)
+        ]
+        return _invalid_field_response(names[0] if names else None)
     return JSONResponse(
         status_code=422,
         content={
@@ -310,4 +358,107 @@ def create_package(
                 "ciphertext_sha256"
             ],
         },
+    }
+
+
+def _invalid_field_response(field: str | None) -> JSONResponse:
+    content = {"code": "INVALID_FIELD"}
+    if field:
+        content["field"] = V2_FIELD_NAMES.get(field, field)
+    return JSONResponse(status_code=422, content=content)
+
+
+def _invalid_field(error: Exception) -> str | None:
+    """The request field a validation error names, never the value it holds."""
+    message = str(error) if isinstance(error, ValueError) else ""
+    match = FIELD_ERROR_PATTERN.fullmatch(message)
+    field = match.group(1) if match else FIELD_ERRORS.get(message)
+    if field is None and message.endswith("does not appear to be an IPv4 or IPv6 address"):
+        # ipaddress names the rejected value; only nvs_rows parses hik_host.
+        field = "hik_host"
+    return field
+
+
+def _build_failed(body: NvsPackageRequest, error: Exception) -> JSONResponse:
+    request_id = body.request_id if REQUEST_ID_PATTERN.fullmatch(body.request_id) else "-"
+    logger.warning(
+        "NVS package build failed request_id=%s error=%s", request_id, type(error).__name__
+    )
+    return JSONResponse(status_code=500, content={"code": "BUILD_FAILED"})
+
+
+def _build_nvs_request(body: NvsPackageRequest) -> dict:
+    config = body.configuration
+    family = config.get("firmware_family")
+    hikvision = family == "hikvision"
+    values = {
+        "request_id": body.request_id,
+        "target_mac": body.target_mac,
+        "recipient_public_key_b64": body.recipient_public_key,
+        "firmware_family": family,
+        "wifi_ssid": config.get("wifi_ssid"),
+        "wifi_password": config.get("wifi_password"),
+        "zkt_port": config.get("zkt_port", 4370),
+        "zkt_comm_key": config.get("zkt_comm_key", 0 if hikvision else None),
+        "zkt_preferred_ip": config.get("zkt_preferred_ip", "0.0.0.0" if hikvision else None),
+        "zkt_expected_serial": "",
+        "zone_device_id": config.get("device_id"),
+        "zone_id": config.get("zone_id"),
+        "zone_name": config.get("zone_name"),
+        "zkt_recovery_enabled": False,
+    }
+    # validate_request converts these with int(); only whole numbers may reach it.
+    for key in ("zkt_port", "zkt_comm_key"):
+        if type(values[key]) is not int:
+            raise ValueError(f"Invalid provisioning field: {key}")
+    if hikvision:
+        if values["zkt_comm_key"] != 0:
+            raise ValueError("Invalid provisioning field: zkt_comm_key")
+        for key in HIKVISION_FIELDS:
+            if key in config:
+                values[key] = config[key]
+    request = validate_request(values)
+    # The builder runs with its output discarded, so apply nvs_rows' field gate
+    # (the Hikvision limits) here first. Placeholders stand in for the secrets.
+    nvs_rows({**request, "ords_base_url": "-", "ords_username": "-", "ords_password": "-"}, "-")
+    return request
+
+
+@app.post(NVS_PACKAGE_PATH, status_code=201)
+def create_nvs_package(
+    body: NvsPackageRequest,
+    authorization: str | None = Header(default=None),
+):
+    """Build one board's encrypted NVS and HMAC eFuse key for the installer.
+
+    No factory bundle is read and no artifact file is written: both envelopes,
+    encrypted to the app's one-time X25519 key, return in the response. Both
+    keys always come from the fleet root (ADD_FLEET_ROOT_SECRET), so ADD asks
+    for no resume or settings-only package for a board that may hold another
+    root's key (installer_api.settings_change_refusal).
+    """
+    _authorize(authorization)
+    try:
+        request = _build_nvs_request(body)
+    except (TypeError, ValueError) as exc:
+        field = _invalid_field(exc)
+        if field is None:
+            return _build_failed(body, exc)
+        return _invalid_field_response(field)
+    try:
+        with tempfile.TemporaryDirectory(prefix="add-nvs-package-", dir="/tmp") as temporary:
+            package_dir = Path(temporary) / "package"
+            package_dir.mkdir(mode=0o700)
+            _run_builder(request, package_dir)
+            provisioning_manifest = json.loads(
+                (package_dir / "manifest.json").read_text(encoding="utf-8")
+            )
+            provisioning = (package_dir / "provision.bin.enc").read_bytes()
+            hmac_key = (package_dir / "hmac-key.bin.enc").read_bytes()
+    except Exception as exc:
+        return _build_failed(body, exc)
+    return {
+        "provisioning_manifest": provisioning_manifest,
+        "provisioning_ciphertext_b64": base64.b64encode(provisioning).decode(),
+        "hmac_ciphertext_b64": base64.b64encode(hmac_key).decode(),
     }

@@ -1237,18 +1237,31 @@ async def onboard(
             request_timestamp=parse_datetime(timestamp or ""),
         )
     )
-    connector, token, created = onboard_connector(
-        db,
-        hardware_id=header_mac,
-        zone_id=body.zone_id,
-        zone_name=body.zone_name,
-        device_id=body.device_id,
-        firmware_version=body.firmware_version,
-        firmware_family=body.firmware_family,
-        expected_serial=body.expected_serial,
-        actor=f"esp:{header_mac}",
-        ip_address=client_ip(request),
-    )
+    try:
+        connector, token, created = onboard_connector(
+            db,
+            hardware_id=header_mac,
+            zone_id=body.zone_id,
+            zone_name=body.zone_name,
+            device_id=body.device_id,
+            firmware_version=body.firmware_version,
+            firmware_family=body.firmware_family,
+            expected_serial=body.expected_serial,
+            actor=f"esp:{header_mac}",
+            ip_address=client_ip(request),
+        )
+    except ValueError as exc:
+        # A MAC ADD knows under the other family is refused (rolled back) as
+        # before; the ESP now gets a conflict it can log instead of a 500.
+        if str(exc) != "FIRMWARE_FAMILY_MISMATCH":
+            raise
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "FIRMWARE_FAMILY_MISMATCH: ADD registers this ESP for the other "
+                "firmware family, so it cannot onboard with this firmware."
+            ),
+        ) from exc
     from zk_add.provisioning_api import correlate_onboarding
 
     provisioning_session = correlate_onboarding(db, connector)
@@ -7026,6 +7039,12 @@ async def revoke_firmware_release(
 # device, attendance and OTA paths remain unchanged when the feature is dark.
 from zk_add.provisioning_api import router as provisioning_router  # noqa: E402
 from zk_add.attendance_repair_api import router as attendance_repair_router  # noqa: E402
+# The State Life Device Installer API (docs/esp-installer-server.md) is another
+# additive router. Its error shape applies only under /api/v1/installer/.
+from zk_add.installer_api import install_error_handlers  # noqa: E402
+from zk_add.installer_api import router as installer_router  # noqa: E402
 
 app.router.routes.extend(provisioning_router.routes)
 app.router.routes.extend(attendance_repair_router.routes)
+app.router.routes.extend(installer_router.routes)
+install_error_handlers(app)

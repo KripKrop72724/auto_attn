@@ -1,0 +1,45 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 240" width="320" height="240">
+  <title>The board is ready.</title>
+  <circle cx="160" cy="120" r="108" fill="#ecfdf3"/>
+  <g transform="translate(112 34) scale(0.98)">
+  <rect x="0" y="0" width="96" height="166" rx="8" fill="#12324f"/>
+  <rect x="3" y="3" width="90" height="160" rx="6" fill="none" stroke="#164c70" stroke-width="2"/>
+  <rect x="6" y="16" width="6" height="6" rx="1" fill="#d79a23"/>
+  <rect x="84" y="16" width="6" height="6" rx="1" fill="#d79a23"/>
+  <rect x="6" y="28" width="6" height="6" rx="1" fill="#d79a23"/>
+  <rect x="84" y="28" width="6" height="6" rx="1" fill="#d79a23"/>
+  <rect x="6" y="40" width="6" height="6" rx="1" fill="#d79a23"/>
+  <rect x="84" y="40" width="6" height="6" rx="1" fill="#d79a23"/>
+  <rect x="6" y="52" width="6" height="6" rx="1" fill="#d79a23"/>
+  <rect x="84" y="52" width="6" height="6" rx="1" fill="#d79a23"/>
+  <rect x="6" y="64" width="6" height="6" rx="1" fill="#d79a23"/>
+  <rect x="84" y="64" width="6" height="6" rx="1" fill="#d79a23"/>
+  <rect x="6" y="76" width="6" height="6" rx="1" fill="#d79a23"/>
+  <rect x="84" y="76" width="6" height="6" rx="1" fill="#d79a23"/>
+  <rect x="6" y="88" width="6" height="6" rx="1" fill="#d79a23"/>
+  <rect x="84" y="88" width="6" height="6" rx="1" fill="#d79a23"/>
+  <rect x="6" y="100" width="6" height="6" rx="1" fill="#d79a23"/>
+  <rect x="84" y="100" width="6" height="6" rx="1" fill="#d79a23"/>
+  <rect x="6" y="112" width="6" height="6" rx="1" fill="#d79a23"/>
+  <rect x="84" y="112" width="6" height="6" rx="1" fill="#d79a23"/>
+  <rect x="6" y="124" width="6" height="6" rx="1" fill="#d79a23"/>
+  <rect x="84" y="124" width="6" height="6" rx="1" fill="#d79a23"/>
+  <rect x="6" y="136" width="6" height="6" rx="1" fill="#d79a23"/>
+  <rect x="84" y="136" width="6" height="6" rx="1" fill="#d79a23"/>
+  <rect x="18" y="8" width="60" height="70" rx="3" fill="#164c70"/>
+  <path d="M24 22 V14 H32 V22 H40 V14 H48 V22 H56 V14 H64 V22 H72" fill="none" stroke="#8ca0ad" stroke-width="2"/>
+  <rect x="22" y="30" width="52" height="44" rx="2" fill="#d0d5dd" stroke="#98a2b3" stroke-width="1.5"/>
+  <rect x="43" y="88" width="10" height="10" rx="2" fill="#f9fafb"/>
+  <rect x="14" y="104" width="18" height="18" rx="3" fill="#e4e7ec"/>
+  <circle cx="23" cy="113" r="5" fill="#1d2939"/>
+  <rect x="64" y="104" width="18" height="18" rx="3" fill="#e4e7ec"/>
+  <circle cx="73" cy="113" r="5" fill="#1d2939"/>
+  <text x="33" y="150" font-family="Segoe UI, DejaVu Sans, Arial, sans-serif" font-size="9" font-weight="700" fill="#ffffff" text-anchor="middle">USB</text>
+  <rect x="21" y="156" width="24" height="13" rx="5" fill="#a9b2bf" stroke="#667085" stroke-width="1.5"/>
+  <text x="63" y="150" font-family="Segoe UI, DejaVu Sans, Arial, sans-serif" font-size="9" font-weight="700" fill="#ffffff" text-anchor="middle">COM</text>
+  <rect x="51" y="156" width="24" height="13" rx="5" fill="#a9b2bf" stroke="#667085" stroke-width="1.5"/>
+  </g>
+  <circle cx="204" cy="172" r="38" fill="#ffffff"/>
+  <circle cx="204" cy="172" r="32" fill="#067647"/>
+  <path d="M197 172 l5 5 l9 -10" stroke="#ffffff" stroke-width="3.5" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

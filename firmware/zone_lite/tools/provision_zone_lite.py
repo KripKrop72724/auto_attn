@@ -240,7 +240,9 @@ def nvs_rows(config: dict, bootstrap_secret: str) -> list[list[object]]:
             ("hik_serial", "data", "string", text("hik_expected_serial", 119)),
             ("hik_profile", "data", "string", text("hik_profile", 79)),
             ("hik_epoch", "data", "string", text("hik_source_epoch", 64)),
-            ("hik_ca", "data", "string", text("hik_ca_pem", 4095, optional=True)),
+            # nvs_partition_gen (ESP-IDF 5.5.3) fits one string and its NUL on
+            # one page: 3967 bytes at most, though the firmware buffer is 4096.
+            ("hik_ca", "data", "string", text("hik_ca_pem", 3967, optional=True)),
         ])
     return [[key, kind, encoding, value] for key, kind, encoding, value in values]
 

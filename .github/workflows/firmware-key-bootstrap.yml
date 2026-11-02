@@ -4,11 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       device_mac:
-        description: Exact physical ESP32-S3 MAC address
-        required: true
+        description: Exact physical ESP32-S3 MAC address (required by CREATE ADD FIRMWARE VAULT and BUILD USB WIFI RESCUE HIL; empty for PUBLISH INSTALLER BUNDLE)
+        required: false
         type: string
       confirmation:
-        description: Type CREATE ADD FIRMWARE VAULT or BUILD USB WIFI RESCUE HIL
+        description: Type CREATE ADD FIRMWARE VAULT, BUILD USB WIFI RESCUE HIL or PUBLISH INSTALLER BUNDLE
         required: true
         type: string
       wifi_profile:
@@ -19,13 +19,24 @@ on:
           - setup-ap
           - lahore-direct
       production_release:
-        description: Factory bootstrap application - latest (newest AVAILABLE ZKT release in the store, flashed to factory and ota_0), an exact AVAILABLE version, or none (this commit's build)
+        description: Factory bootstrap application - latest (newest ZKT release AVAILABLE in the store and in deployed ADD, flashed to factory and ota_0), an exact AVAILABLE version, or none (this commit's build; never for a ZKT installer bundle)
         type: string
         default: latest
       rollback_predecessor:
-        description: Older exact AVAILABLE ZKT version flashed to ota_1 - 2.7.x and 2.8.0 start storage only beside a qualified predecessor (2.5.2 is one; 2.7.8 also for 2.8.0 and 2.8.1; 2.8.0 also for 2.8.1); none only with production_release none
+        description: Older exact AVAILABLE ZKT version flashed to ota_1 - 2.7.x and 2.8.0 start storage only beside a qualified predecessor (2.5.2 is one; 2.7.8 also for 2.8.0 and 2.8.1; 2.8.0 also for 2.8.1); an installer bundle's must also be one the installer app accepts; none only with production_release none
         type: string
         default: '2.5.2'
+      family:
+        description: PUBLISH INSTALLER BUNDLE only - firmware family of the MAC-independent bundle
+        type: choice
+        default: zkt
+        options:
+          - zkt
+          - hikvision
+      hikvision_source_ref:
+        description: PUBLISH INSTALLER BUNDLE with family hikvision only - exact 40-hex source commit in main's history (default dc7d9c3, the HIK 3.1.1 source of the Jhelum and BLD1 boards)
+        type: string
+        default: dc7d9c3b0de1aa5e1f1b7f279f16e317bf7afe65
 
 permissions:
   contents: read
@@ -36,7 +47,65 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  dispatch-inputs:
+    if: inputs.confirmation == 'CREATE ADD FIRMWARE VAULT' || inputs.confirmation == 'BUILD USB WIFI RESCUE HIL' || inputs.confirmation == 'PUBLISH INSTALLER BUNDLE'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require the inputs this confirmation needs
+        shell: bash
+        env:
+          CONFIRMATION: ${{ inputs.confirmation }}
+          DEVICE_MAC: ${{ inputs.device_mac }}
+          BUNDLE_FAMILY: ${{ inputs.family || 'zkt' }}
+          HIKVISION_SOURCE_REF: ${{ inputs.hikvision_source_ref || 'dc7d9c3b0de1aa5e1f1b7f279f16e317bf7afe65' }}
+          PRODUCTION_RELEASE: ${{ inputs.production_release || 'latest' }}
+          ROLLBACK_PREDECESSOR: ${{ inputs.rollback_predecessor || '2.5.2' }}
+        run: |
+          set -euo pipefail
+          # GitHub's == ignores letter case, so the job conditions also accept
+          # 'publish installer bundle'. Route on the exact text first: a quoted
+          # case pattern matches letter for letter. Any other spelling fails
+          # this job, and every other job needs it.
+          case "$CONFIRMATION" in
+            'CREATE ADD FIRMWARE VAULT'|'BUILD USB WIFI RESCUE HIL')
+              # Both per-device modes sign for one exact board, as when
+              # device_mac was a required input.
+              if [[ ! "$DEVICE_MAC" =~ ^[0-9a-fA-F]{2}(:[0-9a-fA-F]{2}){5}$ ]]; then
+                echo "::error::$CONFIRMATION needs device_mac, the exact ESP32-S3 MAC (aa:bb:cc:dd:ee:ff)"
+                exit 1
+              fi
+              exit 0
+              ;;
+            'PUBLISH INSTALLER BUNDLE')
+              ;;
+            *)
+              echo '::error::Type the confirmation exactly, in capitals: CREATE ADD FIRMWARE VAULT, BUILD USB WIFI RESCUE HIL or PUBLISH INSTALLER BUNDLE'
+              exit 1
+              ;;
+          esac
+          if [ "$GITHUB_REF" != 'refs/heads/main' ]; then
+            echo '::error::Installer bundles are published only from main'
+            exit 1
+          fi
+          if [ -n "$DEVICE_MAC" ]; then
+            echo '::error::An installer bundle serves every board; leave device_mac empty'
+            exit 1
+          fi
+          if [ "$BUNDLE_FAMILY" = 'hikvision' ] && [[ ! "$HIKVISION_SOURCE_REF" =~ ^[0-9a-f]{40}$ ]]; then
+            echo '::error::hikvision_source_ref must be a full lowercase 40-hex commit SHA'
+            exit 1
+          fi
+          # A ZKT bundle boots a published release beside a qualified
+          # predecessor, never this commit's build.
+          if [ "$BUNDLE_FAMILY" = 'zkt' ] && { [[ ! "$PRODUCTION_RELEASE" =~ ^(latest|[0-9]+\.[0-9]+\.[0-9]+)$ ]] ||
+              [[ ! "$ROLLBACK_PREDECESSOR" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; }; then
+            echo '::error::A ZKT installer bundle needs production_release latest or an exact version, and an exact rollback_predecessor'
+            exit 1
+          fi
+
   usb-wifi-rescue-build:
+    needs: dispatch-inputs
     if: github.ref == 'refs/heads/main' && inputs.confirmation == 'BUILD USB WIFI RESCUE HIL' && inputs.device_mac == '14:c1:9f:46:ae:1c'
     runs-on: ubuntu-latest
     environment: firmware-signing
@@ -109,6 +178,7 @@ jobs:
           if-no-files-found: error
 
   build:
+    needs: dispatch-inputs
     if: ${{ inputs.confirmation == 'CREATE ADD FIRMWARE VAULT' }}
     runs-on: ubuntu-latest
     environment: firmware-signing
@@ -178,6 +248,19 @@ jobs:
           ADD_FIRMWARE_STORE_HOST_PATH: ${{ vars.ADD_FIRMWARE_STORE_HOST_PATH }}
         run: |
           $ErrorActionPreference = 'Stop'
+          function Invoke-BundleTool {
+            param([string[]]$Arguments)
+            $preference = $ErrorActionPreference
+            try {
+              # Windows PowerShell 5.1 turns native stderr into ErrorRecords;
+              # keep the tool's own refusal as the reason.
+              $ErrorActionPreference = 'Continue'
+              $lines = @(& python scripts/build_installer_bundle_manifest.py @Arguments 2>&1 | ForEach-Object { "$_" } | Where-Object { $_ })
+              $exitCode = $LASTEXITCODE
+            } finally { $ErrorActionPreference = $preference }
+            if ($exitCode -ne 0) { throw "build_installer_bundle_manifest.py $($Arguments[0]) refused: $($lines | Select-Object -Last 1)" }
+            return $lines
+          }
           if ($env:PRODUCTION_RELEASE -notmatch '^(latest|none|[0-9]+\.[0-9]+\.[0-9]+)$') {
             throw 'production_release must be latest, none or an exact version'
           }
@@ -202,17 +285,22 @@ jobs:
               $family = [string](Get-Content -LiteralPath (Join-Path $_.FullName 'manifest.json') -Raw | ConvertFrom-Json).firmware_family
               -not $family -or $family -eq 'zkt'
             })
+            # ADD revokes a release only in its database: the store is
+            # read-only and never marked. Keep the releases deployed ADD still
+            # offers as AVAILABLE and unrevoked, with these exact bytes.
+            $offered = @(Invoke-BundleTool (@('add-available') + @($available | ForEach-Object { $_.FullName })))
+            $available = @($available | Where-Object { $offered -ccontains $_.Name })
             $chosen = if ($env:PRODUCTION_RELEASE -eq 'latest') {
               $available | Sort-Object { [version]$_.Name } | Select-Object -Last 1
             } else {
               $available | Where-Object { $_.Name -eq $env:PRODUCTION_RELEASE }
             }
-            if (-not $chosen) { throw "No AVAILABLE ZKT release '$env:PRODUCTION_RELEASE' in the firmware store" }
+            if (-not $chosen) { throw "No AVAILABLE ZKT release '$env:PRODUCTION_RELEASE' in the firmware store and deployed ADD" }
             Write-Host "Factory bootstrap boots the exact AVAILABLE release $($chosen.Name) from ota_0"
             $productionArguments.ProductionReleaseDirectory = $chosen.FullName
             # The ota_1 rollback image comes from the same AVAILABLE-only list.
             $predecessor = $available | Where-Object { $_.Name -eq $env:ROLLBACK_PREDECESSOR }
-            if (-not $predecessor) { throw "No AVAILABLE ZKT release '$env:ROLLBACK_PREDECESSOR' in the firmware store for the ota_1 rollback predecessor" }
+            if (-not $predecessor) { throw "No AVAILABLE ZKT release '$env:ROLLBACK_PREDECESSOR' in the firmware store and deployed ADD for the ota_1 rollback predecessor" }
             if ([version]$predecessor.Name -ge [version]$chosen.Name) {
               throw "Rollback predecessor $($predecessor.Name) must be older than production release $($chosen.Name)"
             }
@@ -242,3 +330,215 @@ jobs:
           retention-days: 1
           if-no-files-found: error
           path: signed-bootstrap/
+
+  # One signed, MAC-independent bundle per family and version for the State
+  # Life Device Installer (docs/esp-installer-bundles.md).
+  installer-bundle-build:
+    needs: dispatch-inputs
+    if: github.ref == 'refs/heads/main' && inputs.confirmation == 'PUBLISH INSTALLER BUNDLE'
+    runs-on: ubuntu-latest
+    environment: firmware-signing
+    env:
+      ZONE_LITE_SETUP_PASSWORD: ${{ secrets.ZONE_LITE_SETUP_PASSWORD }}
+      BUNDLE_FAMILY: ${{ inputs.family || 'zkt' }}
+      HIKVISION_SOURCE_REF: ${{ inputs.hikvision_source_ref || 'dc7d9c3b0de1aa5e1f1b7f279f16e317bf7afe65' }}
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Require every current ADD gate for this exact main commit
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/check-runs?per_page=100" > /tmp/installer-checks.json
+          python - <<'PY'
+          import json
+          checks = json.load(open('/tmp/installer-checks.json'))['check_runs']
+          for name in ('repository-contract', 'windows-publication', 'firmware', 'backend', 'backend-static', 'frontend', 'oracle-projection', 'containers'):
+              matches = [r for r in checks if r['name'] == name and r['app']['slug'] == 'github-actions']
+              if not matches or max(matches, key=lambda r: r['id'])['conclusion'] != 'success':
+                  raise SystemExit('Exact main CI gate is not green: ' + name)
+          PY
+      - name: Check out the exact Hikvision source
+        if: env.BUNDLE_FAMILY == 'hikvision'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.HIKVISION_SOURCE_REF }}
+          path: hikvision-source
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Build the exact unsigned images and their empty storage image
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$ZONE_LITE_SETUP_PASSWORD"
+          # Zone Lite never formats storage, so both families get main's empty
+          # SPIFFS tool run against their own build: it sizes the image from
+          # that partition table and refuses any SPIFFS option drift.
+          if [ "$BUNDLE_FAMILY" = 'hikvision' ]; then
+            # Only reviewed source: the exact commit, reachable from this main
+            # commit, built exactly as the Jhelum and BLD1 boards were.
+            test "$(git -C hikvision-source rev-parse HEAD)" = "$HIKVISION_SOURCE_REF"
+            git -C hikvision-source merge-base --is-ancestor "$HIKVISION_SOURCE_REF" "$GITHUB_SHA"
+            build=hikvision-source/firmware/zone_lite/build-bootstrap
+            application=zone_lite_hikvision.bin
+            docker run --rm \
+              -e ZONE_LITE_SETUP_PASSWORD \
+              -v "$GITHUB_WORKSPACE:/project" \
+              -w /project/hikvision-source/firmware/zone_lite \
+              espressif/idf:v5.5.3 \
+              bash -lc 'rm -rf build-bootstrap && idf.py -B build-bootstrap -D ZONE_LITE_FAMILY=hikvision -D SDKCONFIG=/tmp/zone-lite-bootstrap-sdkconfig build && python /project/firmware/zone_lite/tools/build_empty_storage_image.py --build-dir build-bootstrap --output build-bootstrap/storage-empty.bin'
+          else
+            build=firmware/zone_lite/build-bootstrap
+            application=zone_lite.bin
+            docker run --rm \
+              -e ZONE_LITE_SETUP_PASSWORD \
+              -v "$GITHUB_WORKSPACE:/project" \
+              -w /project/firmware/zone_lite \
+              espressif/idf:v5.5.3 \
+              bash -lc 'rm -rf build-bootstrap && idf.py -B build-bootstrap -D SDKCONFIG=/tmp/zone-lite-bootstrap-sdkconfig build && python tools/build_empty_storage_image.py --build-dir build-bootstrap --output build-bootstrap/storage-empty.bin'
+          fi
+          APPLICATION="$build/$application" python - <<'PY'
+          import os
+          from pathlib import Path
+
+          image = Path(os.environ["APPLICATION"]).read_bytes()
+          configured = os.environ["ZONE_LITE_SETUP_PASSWORD"].encode()
+          if configured not in image or b"SLIC-CI-ONLY" in image:
+              raise SystemExit("Protected setup-password build provenance is invalid")
+          PY
+          python scripts/check_firmware_identity.py "$build/$application" --family "$BUNDLE_FAMILY"
+          echo "f39db7c1c7626ee6156dbab5da7912968040a489d1d927c1fb288d1f42c5ec70  $build/storage-empty.bin" | sha256sum --check
+          # The flat package the signer reads; it signs the application as
+          # zone_lite.bin for either family.
+          mkdir installer-unsigned
+          cp "$build/bootloader/bootloader.bin" "$build/partition_table/partition-table.bin" \
+            "$build/ota_data_initial.bin" "$build/flasher_args.json" "$build/storage-empty.bin" installer-unsigned/
+          cp "$build/$application" installer-unsigned/zone_lite.bin
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zone-lite-installer-unsigned-${{ github.sha }}
+          retention-days: 1
+          if-no-files-found: error
+          path: installer-unsigned/
+
+  installer-bundle-publish:
+    needs: installer-bundle-build
+    if: github.ref == 'refs/heads/main'
+    runs-on: [self-hosted, Windows, X64]
+    environment: firmware-signing
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: zone-lite-installer-unsigned-${{ github.sha }}
+          path: installer-unsigned
+      - name: Sign with the existing vault and publish the installer bundle
+        env:
+          BUNDLE_FAMILY: ${{ inputs.family || 'zkt' }}
+          HIKVISION_SOURCE_REF: ${{ inputs.hikvision_source_ref || 'dc7d9c3b0de1aa5e1f1b7f279f16e317bf7afe65' }}
+          PRODUCTION_RELEASE: ${{ inputs.production_release || 'latest' }}
+          ROLLBACK_PREDECESSOR: ${{ inputs.rollback_predecessor || '2.5.2' }}
+          ADD_FIRMWARE_STORE_HOST_PATH: ${{ vars.ADD_FIRMWARE_STORE_HOST_PATH }}
+          ADD_INSTALLER_BUNDLE_STORE_HOST_PATH: ${{ vars.ADD_INSTALLER_BUNDLE_STORE_HOST_PATH }}
+          # SHA-256 of vault key 1's DER SubjectPublicKeyInfo: the active signer
+          # and the key every State Life Device Installer pins. Unlike the PEM
+          # file's hash, it does not change with line endings or wrapping.
+          INSTALLER_SIGNER_SPKI_SHA256: 0523b6a90880e60c1526533128931c770024659d89f798a756c92fa7edae7bf0
+        run: |
+          $ErrorActionPreference = 'Stop'
+          function Invoke-BundleTool {
+            param([string[]]$Arguments)
+            $preference = $ErrorActionPreference
+            try {
+              # Windows PowerShell 5.1 turns native stderr into ErrorRecords;
+              # keep the tool's own refusal as the reason.
+              $ErrorActionPreference = 'Continue'
+              $lines = @(& python scripts/build_installer_bundle_manifest.py @Arguments 2>&1 | ForEach-Object { "$_" } | Where-Object { $_ })
+              $exitCode = $LASTEXITCODE
+            } finally { $ErrorActionPreference = $preference }
+            if ($exitCode -ne 0) { throw "build_installer_bundle_manifest.py $($Arguments[0]) refused: $($lines | Select-Object -Last 1)" }
+            return $lines
+          }
+          $vault = Join-Path $env:ProgramData 'StateLife\AttendanceDeviceDashboard\firmware-signing'
+          if (-not (Test-Path -LiteralPath (Join-Path $vault 'vault-manifest.json') -PathType Leaf)) {
+            throw 'An installer bundle cannot create or replace signing keys'
+          }
+          # Before any key is decrypted: no installed app accepts another key.
+          $signerSpki = @(Invoke-BundleTool @('spki', '--public-key', (Join-Path $vault 'key-1-public.pem')))
+          if ($signerSpki.Count -ne 1 -or $signerSpki[0] -cne $env:INSTALLER_SIGNER_SPKI_SHA256) {
+            throw 'Installer bundle signing key is not the key every installer pins'
+          }
+          $bundle = Join-Path $PWD 'installer-bundle'
+          $signing = @{
+            VaultDirectory = $vault
+            UnsignedDirectory = (Join-Path $PWD 'installer-unsigned')
+            OutputDirectory = $bundle
+            InstallerBundle = $true
+            FirmwareFamily = $env:BUNDLE_FAMILY
+          }
+          if ($env:BUNDLE_FAMILY -eq 'hikvision') {
+            # The exact source built every Hikvision image and names the bundle.
+            $signing.GitSha = $env:HIKVISION_SOURCE_REF
+          } else {
+            if ($env:PRODUCTION_RELEASE -notmatch '^(latest|[0-9]+\.[0-9]+\.[0-9]+)$') {
+              throw 'A ZKT installer bundle needs production_release latest or an exact AVAILABLE version'
+            }
+            if ($env:ROLLBACK_PREDECESSOR -notmatch '^[0-9]+\.[0-9]+\.[0-9]+$') {
+              throw 'A ZKT installer bundle needs an exact AVAILABLE rollback_predecessor for ota_1'
+            }
+            # The same AVAILABLE-only ZKT selection as generate-and-sign.
+            if (-not $env:ADD_FIRMWARE_STORE_HOST_PATH) { throw 'ADD_FIRMWARE_STORE_HOST_PATH is not configured' }
+            $available = @(Get-ChildItem -LiteralPath $env:ADD_FIRMWARE_STORE_HOST_PATH -Directory | Where-Object {
+              $_.Name -match '^[0-9]+\.[0-9]+\.[0-9]+$' -and
+              (Test-Path -LiteralPath (Join-Path $_.FullName 'manifest.json') -PathType Leaf) -and
+              -not (Test-Path -LiteralPath (Join-Path $_.FullName '.hil-only.json')) -and
+              -not (Test-Path -LiteralPath (Join-Path $_.FullName '.diagnostic-only.json'))
+            } | Where-Object {
+              $family = [string](Get-Content -LiteralPath (Join-Path $_.FullName 'manifest.json') -Raw | ConvertFrom-Json).firmware_family
+              -not $family -or $family -eq 'zkt'
+            })
+            # A bundle serves every new board until it is retired, so a release
+            # ADD revoked (in its database only; the store is never marked) is
+            # never chosen: keep what deployed ADD still offers with these bytes.
+            $offered = @(Invoke-BundleTool (@('add-available') + @($available | ForEach-Object { $_.FullName })))
+            $available = @($available | Where-Object { $offered -ccontains $_.Name })
+            $chosen = if ($env:PRODUCTION_RELEASE -eq 'latest') {
+              $available | Sort-Object { [version]$_.Name } | Select-Object -Last 1
+            } else {
+              $available | Where-Object { $_.Name -eq $env:PRODUCTION_RELEASE }
+            }
+            if (-not $chosen) { throw "No AVAILABLE ZKT release '$env:PRODUCTION_RELEASE' in the firmware store and deployed ADD" }
+            Write-Host "Installer bundle boots the exact AVAILABLE release $($chosen.Name) from ota_0"
+            $predecessor = $available | Where-Object { $_.Name -eq $env:ROLLBACK_PREDECESSOR }
+            if (-not $predecessor) { throw "No AVAILABLE ZKT release '$env:ROLLBACK_PREDECESSOR' in the firmware store and deployed ADD for the ota_1 rollback predecessor" }
+            if ([version]$predecessor.Name -ge [version]$chosen.Name) {
+              throw "Rollback predecessor $($predecessor.Name) must be older than production release $($chosen.Name)"
+            }
+            Write-Host "Installer bundle keeps the exact AVAILABLE release $($predecessor.Name) in ota_1 as the rollback predecessor"
+            # This commit built the bootloader and partition table.
+            $signing.GitSha = $env:GITHUB_SHA
+            $signing.ProductionReleaseDirectory = $chosen.FullName
+            $signing.RollbackPredecessorDirectory = $predecessor.FullName
+          }
+          ./deploy/add/bootstrap-firmware-signing.ps1 @signing
+          $bundleId = ./deploy/add/publish-installer-bundle.ps1 `
+            -SourceDirectory $bundle `
+            -PublicKeyPath (Join-Path $vault 'key-1-public.pem') `
+            -ExpectedPublicKeySpkiSha256 $env:INSTALLER_SIGNER_SPKI_SHA256
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "Published installer bundle ``$bundleId``"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zone-lite-installer-bundle-${{ github.sha }}
+          retention-days: 1
+          if-no-files-found: error
+          path: installer-bundle/

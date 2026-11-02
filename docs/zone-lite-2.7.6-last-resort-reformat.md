@@ -1030,6 +1030,9 @@ direct-legacy step, the HIL candidate workflow, publication and signing take
 - The `CLAIMED` flag lives in NVS: a device whose NVS is erased sees its own
   torn slots as foreign, and its area stays `FOREIGN` (never written again)
   until the owner decides; its valid records are still read and honoured.
+  The State Life Device Installer replaces NVS, the store and this area
+  together in every mode (docs/esp-installer-design.md section 4 rule 10), so
+  a board it writes starts `READY` with no records.
 - A redo given up after four attempts (supply that cannot sustain an erase)
   turns into sources; the spans stay unreadable to the application until a
   run has room for them.

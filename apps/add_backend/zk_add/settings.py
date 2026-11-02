@@ -259,6 +259,18 @@ class AddSettings(BaseSettings):
     provisioning_factory_store_path: str = "/factory-firmware"
     provisioning_public_ws_url: str = "wss://autoattn.slichealth.com/companion/v1/stream"
     provisioning_hardware_profile: str = "esp32s3-16mb-zone-lite-v1"
+    # The State Life Device Installer (Windows app) API, /api/v1/installer/*
+    # (docs/esp-installer-server.md). It builds per-board settings through the
+    # protected provisioner, so it also needs ADD_PROVISIONING_ENABLED. False
+    # is the kill switch: every installer route except capabilities refuses.
+    # Signed installer bundles are read from a read-only store.
+    installer_enabled: bool = True
+    installer_bundle_store_path: str = "/installer-bundles"
+    installer_min_app_version: str = "1.0.0"
+    installer_package_limit: int = Field(default=30, ge=1, le=1000)
+    installer_event_limit: int = Field(default=240, ge=1, le=10_000)
+    installer_rate_window_seconds: int = Field(default=10 * 60, ge=60, le=24 * 60 * 60)
+    installer_provisioner_timeout_seconds: float = Field(default=90.0, ge=5.0, le=300.0)
 
     @property
     def resolved_checkin_notify_url(self) -> str | None:

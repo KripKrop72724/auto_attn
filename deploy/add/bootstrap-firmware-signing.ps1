@@ -1,8 +1,13 @@
+[CmdletBinding(DefaultParameterSetName = 'DeviceBootstrap')]
 param(
     [Parameter(Mandatory = $true)][string]$VaultDirectory,
     [Parameter(Mandatory = $true)][string]$UnsignedDirectory,
     [Parameter(Mandatory = $true)][string]$OutputDirectory,
-    [Parameter(Mandatory = $true)][ValidatePattern('^[0-9a-fA-F]{2}(:[0-9a-fA-F]{2}){5}$')][string]$DeviceMac,
+    [Parameter(Mandatory = $true, ParameterSetName = 'DeviceBootstrap')][ValidatePattern('^[0-9a-fA-F]{2}(:[0-9a-fA-F]{2}){5}$')][string]$DeviceMac,
+    # One MAC-independent installer bundle for every new board of a family
+    # (docs/esp-installer-bundles.md): signed with the existing vault only,
+    # written to an empty OutputDirectory with its own signed manifest.
+    [Parameter(Mandatory = $true, ParameterSetName = 'InstallerBundle')][switch]$InstallerBundle,
     [Parameter(Mandatory = $true)][ValidatePattern('^[0-9a-fA-F]{40}$')][string]$GitSha,
     [ValidateSet('zkt', 'hikvision')][string]$FirmwareFamily = 'zkt',
     [ValidateSet('factory', 'usb-wifi-rescue', 'usb-wifi-rescue-seed')][string]$ImageRole = 'factory',
@@ -23,6 +28,9 @@ $GitSha = $GitSha.ToLowerInvariant()
 # The empty SPIFFS image of the 8 MiB storage partition. Zone Lite never
 # formats storage, so a blank partition would never mount.
 $storagePartitionSize = 0x800000
+# The exact empty SPIFFS bytes bench-verified on new boards on 29 Oct 2026
+# (add-ci.yml pins them too); installer bundles carry no other storage image.
+$emptyStorageSha256 = 'f39db7c1c7626ee6156dbab5da7912968040a489d1d927c1fb288d1f42c5ec70'
 
 function Get-AvailableReleaseImage {
     param(
@@ -54,8 +62,10 @@ function Get-AvailableReleaseImage {
         throw "$Purpose image does not match its signed manifest"
     }
     return @{
+        Directory = $releaseDirectory
         Image = $image
         Version = [version][string]$releaseManifest.version
+        Manifest = $releaseManifest
         Record = [ordered]@{
             release_id = [string]$releaseManifest.release_id
             version = [string]$releaseManifest.version
@@ -64,6 +74,62 @@ function Get-AvailableReleaseImage {
             application_sha256 = [string]$releaseManifest.application_sha256
         }
     }
+}
+
+function Invoke-InstallerPython {
+    param(
+        [Parameter(Mandatory = $true)][string[]]$Arguments,
+        [Parameter(Mandatory = $true)][string]$Failure
+    )
+    $preference = $ErrorActionPreference
+    try {
+        # Windows PowerShell 5.1 turns native stderr into ErrorRecords; keep
+        # the tool's own refusal as the reason.
+        $ErrorActionPreference = 'Continue'
+        $lines = @(& python @Arguments 2>&1 | ForEach-Object { "$_" } | Where-Object { $_ })
+        $exitCode = $LASTEXITCODE
+    } finally { $ErrorActionPreference = $preference }
+    if ($exitCode -ne 0) { throw "$Failure`: $($lines | Select-Object -Last 1)" }
+    return [string]($lines | Select-Object -Last 1)
+}
+
+function Assert-InstallerSigningVault {
+    # Installer bundles reuse the fleet keys and never make new ones: a board
+    # whose bootloader trusts other keys could never boot ADD's releases.
+    $existingVault = Join-Path $VaultDirectory 'vault-manifest.json'
+    if (-not (Test-Path -LiteralPath $existingVault -PathType Leaf)) { throw 'An installer bundle cannot create or replace signing keys' }
+    $existingManifest = Get-Content -LiteralPath $existingVault -Raw | ConvertFrom-Json
+    $activeKey = @($existingManifest.keys | Where-Object { $_.state -eq 'ACTIVE' })
+    if (@($existingManifest.keys).Count -ne 3 -or $activeKey.Count -ne 1 -or $activeKey[0].number -ne 1) {
+        throw 'Expected existing active bootstrap signer is unavailable'
+    }
+    foreach ($number in 1..3) {
+        foreach ($name in @("key-$number.dpapi", "key-$number.entropy", "key-$number-public.pem")) {
+            if (-not (Test-Path -LiteralPath (Join-Path $VaultDirectory $name) -PathType Leaf)) {
+                throw 'Existing installer bundle signing vault is incomplete'
+            }
+        }
+    }
+    $activePublicKey = (Get-FileHash -LiteralPath (Join-Path $VaultDirectory 'key-1-public.pem') -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($activePublicKey -ne [string]$activeKey[0].key_id) {
+        throw 'Vault key 1 public key does not match its recorded key ID'
+    }
+}
+
+if ($InstallerBundle) {
+    # Every installer refusal happens before the vault, the output or any key
+    # is touched.
+    if ($ImageRole -ne 'factory') { throw 'An installer bundle carries only the factory role' }
+    if ($FirmwareFamily -eq 'zkt' -and -not $ProductionReleaseDirectory) {
+        throw 'A ZKT installer bundle boots an exact AVAILABLE production release from ota_0'
+    }
+    if ($FirmwareFamily -eq 'hikvision' -and ($ProductionReleaseDirectory -or $RollbackPredecessorDirectory)) {
+        throw 'A Hikvision installer bundle boots its exact-source build from factory and carries no production release or rollback predecessor'
+    }
+    if ((Test-Path -LiteralPath $OutputDirectory) -and @(Get-ChildItem -LiteralPath $OutputDirectory -Force).Count) {
+        throw 'Installer bundle output directory must be new or empty'
+    }
+    Assert-InstallerSigningVault
 }
 
 $productionRelease = $null
@@ -93,6 +159,37 @@ if ($ProductionReleaseDirectory) {
     }
     if ((Get-Item -LiteralPath $storageSource).Length -ne $storagePartitionSize) {
         throw 'Empty storage image does not cover the 8 MiB storage partition'
+    }
+}
+if ($InstallerBundle) {
+    $storageSource = Join-Path $UnsignedDirectory 'storage-empty.bin'
+    if (-not (Test-Path -LiteralPath $storageSource -PathType Leaf)) {
+        throw 'Unsigned firmware package is missing storage-empty.bin, the empty SPIFFS image a new board writes to storage'
+    }
+    if ((Get-FileHash -LiteralPath $storageSource -Algorithm SHA256).Hash.ToLowerInvariant() -ne $emptyStorageSha256) {
+        throw 'Empty storage image is not the bench-verified empty SPIFFS of the 8 MiB storage partition'
+    }
+    if ($productionRelease) {
+        # A production release starts storage only beside a predecessor it
+        # qualifies; its signed manifest lists those exact application digests.
+        $qualified = $production.Manifest.queue_storage.allowed_bootstrap_images
+        $qualifiedDigest = if ($qualified) { $qualified.PSObject.Properties[$rollbackPredecessor.version] } else { $null }
+        if (-not $qualifiedDigest -or [string]$qualifiedDigest.Value -ne $rollbackPredecessor.application_sha256) {
+            throw "Production release $($productionRelease.version) does not qualify $($rollbackPredecessor.version) as its ota_1 rollback image"
+        }
+        foreach ($release in @($production, $predecessor)) {
+            Invoke-InstallerPython -Failure 'Release application identity does not match its signed manifest' -Arguments @(
+                (Join-Path $PSScriptRoot '../../scripts/build_installer_bundle_manifest.py'), 'identity',
+                '--image', $release.Image, '--family', 'zkt', '--version', $release.Record.version,
+                '--app-digest', $release.Record.application_sha256
+            ) | Out-Null
+        }
+        # Every installed app refuses an ota_1 image outside its own
+        # QUALIFIED_PREDECESSORS, whatever this release qualifies.
+        Invoke-InstallerPython -Failure 'Every installed app would refuse this bundle' -Arguments @(
+            (Join-Path $PSScriptRoot '../../scripts/build_installer_bundle_manifest.py'), 'predecessor',
+            '--version', $rollbackPredecessor.version, '--app-digest', $rollbackPredecessor.application_sha256
+        ) | Out-Null
     }
 }
 Add-Type -AssemblyName System.Security
@@ -143,6 +240,15 @@ $unsigned = (Resolve-Path $UnsignedDirectory).Path
 if ($ImageRole -eq 'factory') {
     & python scripts/check_firmware_identity.py (Join-Path $unsigned 'zone_lite.bin') --family $FirmwareFamily
     if ($LASTEXITCODE -ne 0) { throw 'Factory application identity does not match firmware family' }
+    if ($productionRelease) {
+        # ADD records a revocation only in its database; the store stays
+        # unmarked. Before the vault is touched, deployed ADD must still offer
+        # both releases as AVAILABLE and unrevoked, with these exact bytes.
+        Invoke-InstallerPython -Failure 'A revoked or unpublished release is never signed' -Arguments @(
+            (Join-Path $PSScriptRoot '../../scripts/build_installer_bundle_manifest.py'), 'add-available',
+            '--require-all', $production.Directory, $predecessor.Directory
+        ) | Out-Null
+    }
 } else {
     if ($FirmwareFamily -ne 'zkt' -or $DeviceMac.ToLowerInvariant() -ne '14:c1:9f:46:ae:1c' -or $env:ADD_FACTORY_VERSION) {
         throw 'USB rescue signing is HIL-only for the exact spare and cannot publish a factory bundle'
@@ -191,6 +297,7 @@ if ($LASTEXITCODE -ne 0) { throw 'Could not restrict firmware-vault ACLs' }
 $vaultManifest = Join-Path $VaultDirectory 'vault-manifest.json'
 if (-not (Test-Path -LiteralPath $vaultManifest -PathType Leaf)) {
     if ($ImageRole -ne 'factory') { throw 'USB rescue must never generate a replacement vault' }
+    if ($InstallerBundle) { throw 'An installer bundle must never generate a replacement vault' }
     $staging = Join-Path $env:TEMP ('zone-lite-vault-staging-' + [guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path $staging | Out-Null
     $container = 'zone-lite-keygen-' + [guid]::NewGuid().ToString('N')
@@ -326,6 +433,90 @@ try {
     }
     finally {
         & docker rm -f $container 2>$null | Out-Null
+    }
+
+    if ($InstallerBundle) {
+        # The bundle carries no MAC and none of the per-device package files
+        # below: its images and a canonical manifest signed by vault key 1.
+        $bundleArguments = @(
+            (Join-Path $PSScriptRoot '../../scripts/build_installer_bundle_manifest.py'), 'build',
+            '--output', $output, '--family', $FirmwareFamily, '--git-sha', $GitSha,
+            '--bootloader', (Join-Path $work 'bootloader-signed.bin'),
+            '--partition-table', (Join-Path $unsigned 'partition-table.bin'),
+            '--storage', (Join-Path $unsigned 'storage-empty.bin')
+        )
+        if ($productionRelease) {
+            # The exact published bytes, as ADD verifies them, not this build's.
+            $bundleArguments += @(
+                '--factory', $productionImage,
+                '--factory-version', $productionRelease.version,
+                '--factory-app-digest', $productionRelease.application_sha256,
+                '--predecessor', $rollbackPredecessorImage,
+                '--predecessor-version', $rollbackPredecessor.version,
+                '--predecessor-app-digest', $rollbackPredecessor.application_sha256
+            )
+        }
+        else {
+            $bundleArguments += @('--factory', (Join-Path $work 'zone-lite-signed.bin'))
+        }
+        $bundleId = Invoke-InstallerPython -Arguments $bundleArguments -Failure 'Installer bundle manifest generation failed'
+        $signatureBinary = Join-Path $work 'manifest.sig.bin'
+        $manifestContainer = 'zone-lite-installer-sign-' + [guid]::NewGuid().ToString('N')
+        try {
+            # Same isolated-container signing as the factory manifest below,
+            # then an independent check against the vault's public key.
+            Invoke-DockerText @(
+                'create', '--name', $manifestContainer, 'espressif/idf:v5.5.3',
+                'tail', '-f', '/dev/null'
+            ) | Out-Null
+            Invoke-DockerText @('start', $manifestContainer) | Out-Null
+            Invoke-DockerText @('exec', $manifestContainer, '/bin/mkdir', '-p', '/bundle', '/work') | Out-Null
+            Invoke-DockerText @(
+                'cp', (Join-Path $output 'manifest.json'),
+                "${manifestContainer}:/bundle/manifest.json"
+            ) | Out-Null
+            Invoke-DockerText @(
+                'cp', (Join-Path $work 'key-1.pem'),
+                "${manifestContainer}:/work/key-1.pem"
+            ) | Out-Null
+            Invoke-DockerText @(
+                'cp', (Join-Path $VaultDirectory 'key-1-public.pem'),
+                "${manifestContainer}:/work/key-1-public.pem"
+            ) | Out-Null
+            Invoke-DockerText @(
+                'exec', $manifestContainer,
+                'openssl', 'dgst', '-sha256',
+                '-sigopt', 'rsa_padding_mode:pss',
+                '-sigopt', 'rsa_pss_saltlen:32',
+                '-sign', '/work/key-1.pem',
+                '-out', '/bundle/manifest.sig.bin',
+                '/bundle/manifest.json'
+            ) | Out-Null
+            Invoke-DockerText @(
+                'exec', $manifestContainer,
+                'openssl', 'dgst', '-sha256',
+                '-sigopt', 'rsa_padding_mode:pss',
+                '-sigopt', 'rsa_pss_saltlen:32',
+                '-verify', '/work/key-1-public.pem',
+                '-signature', '/bundle/manifest.sig.bin',
+                '/bundle/manifest.json'
+            ) | Out-Null
+            Invoke-DockerText @(
+                'cp', "${manifestContainer}:/bundle/manifest.sig.bin",
+                $signatureBinary
+            ) | Out-Null
+        }
+        finally {
+            & docker rm -f $manifestContainer 2>$null | Out-Null
+        }
+        [IO.File]::WriteAllText(
+            (Join-Path $output 'manifest.sig'),
+            [Convert]::ToBase64String([IO.File]::ReadAllBytes($signatureBinary)),
+            (New-Object Text.UTF8Encoding($false))
+        )
+        Write-Host "Created signed installer bundle $bundleId; private keys remain DPAPI-protected in $VaultDirectory"
+        # The finally block below still clears the plaintext keys.
+        return
     }
 
     Copy-Item -LiteralPath (Join-Path $work 'bootloader-signed.bin') -Destination (Join-Path $output 'bootloader-signed.bin')

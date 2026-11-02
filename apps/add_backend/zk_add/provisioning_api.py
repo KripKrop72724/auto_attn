@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import json
 import logging
+import math
 import re
 import secrets
 import threading
@@ -116,6 +117,17 @@ class FixedWindowLimiter:
             events.append(now)
             self._events[key] = events
             return True
+
+    def retry_after(self, key: str) -> int:
+        """Whole seconds until allow(key) can pass again, at least 1."""
+        now = time.monotonic()
+        with self._lock:
+            events = [value for value in self._events.get(key, []) if value > now - self.seconds]
+        if len(events) < self.limit:
+            return 1
+        # allow() records requests in time order and never records a refusal, so
+        # a slot frees when the oldest request that keeps the key full expires.
+        return max(1, math.ceil(events[len(events) - self.limit] + self.seconds - now))
 
 
 pairing_limiter = FixedWindowLimiter(10, 15 * 60)

@@ -131,6 +131,21 @@ def test_sanitizer_recursively_redacts_every_secret_class():
     assert "never-store-me" not in str(sanitized)
 
 
+def test_sanitizer_judges_each_whole_key_before_cutting_it_to_80_characters():
+    # Only 80 characters of a name are kept. A secret name after the cut, or
+    # split by it, still hides the value, at every depth (review SV3).
+    long_names = {"k" * 90 + "password": "never-store-me", "x" * 76 + "_comm_key": 7}
+    sanitized = sanitize_event_details(
+        {**long_names, "nested": [dict(long_names)], "y" * 85 + "_token": "kept"}
+    )
+    hidden = {name[:80]: "[REDACTED]" for name in long_names}
+    assert sanitized == {**hidden, "nested": [hidden], "y" * 80: "kept"}
+    # A caller's extra secret words are judged on the whole name too.
+    assert sanitize_event_details(
+        {"nested": {"y" * 85 + "_token": "never-store-me"}}, extra_secret_parts=("token",)
+    ) == {"nested": {"y" * 80: "[REDACTED]"}}
+
+
 def test_provisioning_events_are_monotonic_idempotent_and_terminal(provisioning_db: Session):
     companion = ProvisioningCompanion(
         installation_id="installation-identity-0001",

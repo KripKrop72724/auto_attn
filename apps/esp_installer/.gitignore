@@ -1,0 +1,6 @@
+# Generated at release-build time from GitHub secrets; never commit.
+src/sl_installer/resources/field_defaults.json
+build/
+dist/
+*.egg-info/
+__pycache__/

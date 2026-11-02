@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 240" width="320" height="240">
+  <title>The head office server is not answering.</title>
+  <rect x="88" y="52" width="144" height="16" rx="4" fill="#475467"/>
+  <rect x="98" y="66" width="124" height="152" fill="#d0d5dd"/>
+  <rect x="112" y="80" width="24" height="16" rx="2" fill="#0094da"/>
+  <rect x="148" y="80" width="24" height="16" rx="2" fill="#ffffff"/>
+  <rect x="184" y="80" width="24" height="16" rx="2" fill="#0094da"/>
+  <rect x="112" y="108" width="24" height="16" rx="2" fill="#ffffff"/>
+  <rect x="148" y="108" width="24" height="16" rx="2" fill="#0094da"/>
+  <rect x="184" y="108" width="24" height="16" rx="2" fill="#ffffff"/>
+  <rect x="112" y="136" width="24" height="16" rx="2" fill="#0094da"/>
+  <rect x="148" y="136" width="24" height="16" rx="2" fill="#ffffff"/>
+  <rect x="184" y="136" width="24" height="16" rx="2" fill="#0094da"/>
+  <rect x="112" y="164" width="24" height="16" rx="2" fill="#ffffff"/>
+  <rect x="148" y="164" width="24" height="16" rx="2" fill="#0094da"/>
+  <rect x="184" y="164" width="24" height="16" rx="2" fill="#ffffff"/>
+  <rect x="146" y="190" width="28" height="28" rx="2" fill="#475467"/>
+  <rect x="70" y="216" width="180" height="6" rx="3" fill="#98a2b3"/>
+  <circle cx="228" cy="58" r="26" fill="#f79009"/>
+  <rect x="225" y="42" width="6" height="22" rx="3" fill="#ffffff"/>
+  <circle cx="228" cy="73" r="3.5" fill="#ffffff"/>
+</svg>
