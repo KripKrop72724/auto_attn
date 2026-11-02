@@ -801,6 +801,7 @@ def auto_certify_zkt(session: Session, connector: Connector, zkt: ZKTDevice) -> 
             "user_write": bool(writable), "create_user": bool(writable and not stable_writes),
             "delete_user": bool(writable),
             "user_role_write": bool(writable and not temporary_exception and not stable_writes),
+            "stable_fact_writes": bool(stable_writes),
             "write_exception_expires_at": None if permanent_exception else "2026-10-15T16:00:00Z" if temporary_exception else "",
             "write_exception_permanent": permanent_exception,
             "write_exception_pending_firmware": permanent_requested and not permanent_exception,
@@ -5749,6 +5750,8 @@ def update_device_user_command(
     session.refresh(user)
     if user.lifecycle_state != "ACTIVE" or not user.present:
         raise ValueError("Device user is not active.")
+    if (zkt.capability_profile or {}).get("stable_fact_writes") and (user.privilege or 0) != 0:
+        raise ValueError("This terminal only allows renaming regular users from ADD.")
     if user.row_version != expected_version:
         raise ValueError("User changed since it was loaded. Refresh and retry.")
     ensure_no_active_user_operation(session, zkt=zkt, user=user)

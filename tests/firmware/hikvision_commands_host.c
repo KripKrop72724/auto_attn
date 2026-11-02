@@ -11,6 +11,7 @@ static cJSON *person;
 static unsigned writes, sequence;
 static bool timeout_write, ignore_write, delete_pending, corrupt_write, volatile_reads, corrupt_name;
 static unsigned door_opens;
+static bool corrupt_face;
 uint32_t esp_random(void){return ++sequence;}
 hik_result_t hik_http_verify_identity(void){return HIK_OK;}
 /* Hash stand-in exercises precondition handling, not the pinned crypto library. */
@@ -64,6 +65,7 @@ hik_result_t hik_http_request(esp_http_client_method_t method,const char *path,
     }
     if(corrupt_write)field(person,"doorRight",cJSON_CreateString("2"));
     if(corrupt_name)field(person,"name",cJSON_CreateString("Truncat"));
+    if(corrupt_face)field(person,"numOfFace",cJSON_CreateNumber(0));
    }else if(strstr(path,"/Delete")){
     assert(method==HTTP_METHOD_PUT);
     cJSON *list=cJSON_GetObjectItem(cJSON_GetObjectItem(req,"UserInfoDetail"),"EmployeeNoList");
@@ -124,6 +126,10 @@ static void test_stable_profile(void){
  /* A rename the terminal did not apply exactly is not verified. */
  c=stable_command("UPDATE_USER");strcpy(c.name,"Ali Raza-1234512345671");corrupt_name=true;
  assert(hik_profile_command(&c,&receipt)!=HIK_OK && !receipt);corrupt_name=false;
+ /* Nor one that dropped the enrolled face while applying the name. */
+ c=stable_command("UPDATE_USER");strcpy(c.name,"Ali Raza-1234512345671");corrupt_face=true;
+ assert(hik_profile_command(&c,&receipt)!=HIK_OK && !receipt);corrupt_face=false;
+ field(person,"numOfFace",cJSON_CreateNumber(1));
  c=stable_command("DELETE_USER");
  assert(hik_profile_command(&c,&receipt)==HIK_OK && !person);cJSON_Delete(receipt);
  strcpy(config.hik_profile,"ds-k1t342efwx-v3.3.5-220310-poll5-pilot-v1");volatile_reads=false;

@@ -187,7 +187,7 @@ def test_stable_fact_profile_allows_only_rename_and_delete_with_version_five(db,
     assert require_writable_user_profile(connector, 'user_write') is terminal
     assert require_writable_user_profile(connector, 'delete_user') is terminal
     assert not capability['create_user'] and not capability['user_role_write']
-    assert not capability['delete_all_credentials']
+    assert not capability['delete_all_credentials'] and capability['stable_fact_writes']
     with pytest.raises(ValueError, match='read-only'):
         require_writable_user_profile(connector, 'create_user')
 

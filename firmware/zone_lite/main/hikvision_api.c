@@ -453,6 +453,9 @@ cJSON *hik_profile_stable_facts(const cJSON *profile)
     }
     return facts;
 }
+/* Also unchanged across a rename or a delete precondition: credentials,
+ * rights and validity. A terminal that disturbs them fails verification. */
+static const char *const protected_keys[] = {"numOfFace", "numOfFP", "numOfCard", "doorRight", "RightPlan", "Valid"};
 bool hik_profile_equal(const cJSON *a, const cJSON *b)
 {
     if (!a || !b) return false;
@@ -460,6 +463,11 @@ bool hik_profile_equal(const cJSON *a, const cJSON *b)
     cJSON *left = hik_profile_stable_facts(a), *right = hik_profile_stable_facts(b);
     bool same = left && right && cJSON_Compare(left, right, true);
     cJSON_Delete(left); cJSON_Delete(right);
+    for (unsigned i = 0; same && i < sizeof(protected_keys) / sizeof(protected_keys[0]); i++) {
+        const cJSON *x = cJSON_GetObjectItemCaseSensitive(a, protected_keys[i]);
+        const cJSON *y = cJSON_GetObjectItemCaseSensitive(b, protected_keys[i]);
+        same = (!x && !y) || (x && y && cJSON_Compare(x, y, true));
+    }
     return same;
 }
 bool hik_user_matches_created_profile(const cJSON *actual, const cJSON *desired)
