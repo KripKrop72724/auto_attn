@@ -156,6 +156,40 @@ def test_a_hikvision_certificate_may_fill_one_nvs_string(provisioner):
     assert provisioner.builds[0].request["hik_ca_pem"] == certificate
 
 
+def load_nvs_check():
+    path = ROOT / "tests" / "firmware" / "tools" / "check_provisioning_nvs.py"
+    spec = importlib.util.spec_from_file_location("check_provisioning_nvs_for_v2", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.mark.parametrize("configuration", [
+    zkt(),
+    hik(hik_transport="https", hik_port=443, hik_ca_pem="c" * 3967),
+], ids=["zkt", "hikvision-3967-byte-ca"])
+def test_the_package_request_lays_out_on_full_provisioning_pages(provisioner, configuration):
+    # The builder lays out exactly these rows (provision_zone_lite.nvs_layout, checked
+    # against ESP-IDF's generator by tests/firmware/tools/check_provisioning_nvs.py):
+    # the values are unchanged, the rows the firmware never writes fill FULL pages, the
+    # Wi-Fi, COMM key and host rows end one of them, and only the rows a board writes
+    # on its first online run follow on the ACTIVE page.
+    response = post(provisioner, request_body(configuration))
+    assert response.status_code == 201, response.text
+    check = load_nvs_check()
+    tool = check.tools()
+    request = provisioner.builds[0].request
+    rows = tool.nvs_rows({**request, "ords_base_url": "https://ords-test.example.invalid/ords/x",
+                          "ords_username": "test-only-user", "ords_password": "test-only-password"},
+                         tool.derive_bootstrap_secret(request["target_mac"], "test-only-fleet-root"))
+    layout = tool.nvs_layout(rows)
+    check.assert_planned_layout(rows, layout)
+    pages = check.simulate_pages(layout)
+    assert len(pages) == (3 if configuration.get("hik_ca_pem") else 2)
+    assert {key for key, _ in pages[-1]} == {"zkt_serial", "add_ws", "conn_id", "dev_token"}
+    assert {"wifi_ssid", "wifi_pass", "zkt_key"} <= {key for page in pages[:-1] for key, _ in page}
+
+
 def _without(values: dict, key: str) -> dict:
     return {name: value for name, value in values.items() if name != key}
 

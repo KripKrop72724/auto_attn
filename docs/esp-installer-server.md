@@ -237,6 +237,56 @@ It reads no factory bundle and writes no artifact file. Failures are 422
 `{"code": "INVALID_FIELD", "field"}` (never with values) or 500 `{"code": "BUILD_FAILED"}`.
 `/internal/v1/packages` is unchanged.
 
+### NVS layout
+
+On 2 Nov 2026, new boards with ZKT 2.7.8 lost `zone_cfg` on their second boot. The firmware
+then logs "No encrypted per-device provisioning namespace" and stays inert. In the old image,
+`zone_cfg` sat on page 0, the ACTIVE page, which the first run then wrote to. Fleet boards that
+keep `zone_cfg` on old FULL pages are not affected. Every builder now lays the image out so
+that normal operation never writes a page that holds provisioning data. This covers the
+provisioner, the device-provisioning workflow and `provision_zone_lite.py`, which all call
+`build_nvs_partition`.
+
+- **Page 0 onward (FULL):** the namespace entry, then every row the firmware never writes: the
+  zone, ORDS, bootstrap secret, telnet and Hikvision terminal rows, and the CA. `_padN` keys
+  fill each of these pages to exactly 126 entries; the firmware never reads them. ESP-IDF's
+  generator then marks these pages FULL. A FULL page with no erased entry is never the active
+  page and never a garbage-collection victim, so no runtime write programs it. That holds while
+  every read verifies: on any page, ESP-IDF erases an entry whose CRC fails.
+- **The end of the last FULL page with room:** `wifi_ssid`, `wifi_pass`, `zkt_key` and
+  `hik_host`. Only an operator's action rewrites them: Wi-Fi saved by the setup portal or the
+  USB rescue, an authenticated COMM-key change and, in Hikvision builds from main, a
+  re-discovered terminal host. A board needs them to come back online, so they stay off the
+  page that takes the runtime writes. A rewrite erases the old entry here, which programs this
+  page's last entry-state word. That word holds only these rows and one-entry padding: never
+  the namespace entry, and no part of a longer item. The new value then lives with the runtime
+  writes. After a rewrite the page holds a few erased entries. ESP-IDF reclaims the page with
+  the most erased entries, which in a 400-boot replay was never this one.
+- **The next page (ACTIVE):** `zkt_serial`, `add_ws`, `conn_id` and `dev_token`. A new board
+  writes them on its first online run, at onboarding and when it pins the ZKT serial. Every
+  image holds them empty, and ADD issues the connector identity again when a board onboards.
+  Every runtime write goes to this page or a later one.
+- **At least two pages stay erased.** ZKT uses one FULL page, and four pages stay erased.
+  Hikvision needs a second FULL page once its CA leaves page 0 no room for the end rows:
+  above 1823 bytes with the test values, and above 1311 bytes with every Hikvision field at its
+  maximum length. The 3967-byte maximum always needs it. Values and their limits are unchanged.
+  The padding takes 68 to 81 entries for ZKT and 4 to 132 for Hikvision, of the 630 entries
+  that writes can use.
+
+String values reach the image as the generator stores them. A JSON null becomes an empty
+string, CR and CRLF become LF, and a continuation line that starts with `#` is dropped, such as
+a `# Subject:` line in a CA bundle. The builder writes the values that way, so such a value no
+longer fails the build.
+
+Before generating, the builder checks that the plan holds exactly the rows it was given. After
+generating, it checks the image. The page headers and entry-state bitmaps are plaintext. The
+builder decrypts the entries with the image's XTS key, in memory only. The check requires every
+provisioning page to be FULL with 126 entries, the end rows in an entry-state word of their own,
+the first-run rows on one later ACTIVE page, two erased pages, and every value stored as
+planned. Otherwise the build fails (`BUILD_FAILED`). `tests/firmware/tools/check_provisioning_nvs.py`
+runs in espressif/idf:v5.5.3 in CI. It pins the generator's page-fit rules: a string ends by
+entry 124, and a number may take entry 125.
+
 ## Onboarding change
 
 `/device/v2/onboard` now answers **409** instead of 500 when the MAC is registered for the other

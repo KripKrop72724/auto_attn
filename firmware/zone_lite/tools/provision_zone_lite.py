@@ -18,11 +18,15 @@ import os
 from pathlib import Path
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
+from typing import NoReturn
+import zlib
 
 from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 import base64
 
@@ -32,6 +36,41 @@ NVS_HMAC_SALT = b"state-life-zone-lite-nvs-hmac-v1"
 MAC_PATTERN = re.compile(r"MAC:\s*([0-9a-f:]{17})", re.IGNORECASE)
 NVS_PARTITION_SIZE = 0x6000
 NVS_PARTITION_OFFSET = "0x11000"
+# Pages of the generated NVS (esp-idf-nvs-partition-gen 0.1.9, as ESP-IDF 5.5.3's
+# nvs_flash reads them): a 32-byte header, a 2-bit state per entry, 126 entries.
+NVS_PAGE_SIZE = 0x1000
+NVS_PAGE_COUNT = NVS_PARTITION_SIZE // NVS_PAGE_SIZE
+NVS_PAGE_ENTRIES = 126
+NVS_ENTRY_SIZE = 32
+NVS_PAGE_ACTIVE = 0xFFFFFFFE
+NVS_PAGE_FULL = 0xFFFFFFFC
+NVS_PRIMITIVES = {
+    "u8": (0x01, "<B"), "i8": (0x11, "<b"), "u16": (0x02, "<H"), "i16": (0x12, "<h"),
+    "u32": (0x04, "<I"), "i32": (0x14, "<i"), "u64": (0x08, "<Q"), "i64": (0x18, "<q"),
+}
+NVS_STRING = 0x21
+NVS_XTS_KEY_SIZE = 64
+# The zone_cfg rows a running board rewrites itself (zone_config.c of ZKT 2.7.8,
+# HIK 3.1.1 and main, and the USB Wi-Fi rescue). No other provisioned row is ever
+# written after installation.
+NVS_MUTABLE_KEYS = frozenset({
+    "wifi_ssid", "wifi_pass", "zkt_key", "zkt_serial", "add_ws", "conn_id", "dev_token", "hik_host",
+})
+# Of those, the rows only an operator's action rewrites: Wi-Fi saved by the setup
+# portal or the USB rescue, an authenticated COMM-key change and, in Hikvision
+# builds from main, a re-discovered terminal host. A board needs them to come back
+# online, so nvs_layout keeps them on a FULL page.
+NVS_TAIL_KEYS = frozenset({"wifi_ssid", "wifi_pass", "zkt_key", "hik_host"})
+# The rows a new board writes on its first online run: the ADD connector identity
+# and the pinned ZKT serial. Every image holds them empty and ADD issues the
+# identity again when a board onboards, so they start the ACTIVE page.
+NVS_ACTIVE_KEYS = NVS_MUTABLE_KEYS - NVS_TAIL_KEYS
+# Entries per 32-bit word of a page's entry-state bitmap (2 bits each). Erasing an
+# entry programs the whole word that holds its state.
+NVS_STATE_WORD_ENTRIES = 16
+NVS_PADDING_PREFIX = "_pad"
+# The page ESP-IDF keeps erased for its garbage collection, and one more.
+NVS_MIN_BLANK_PAGES = 2
 SECURE_SDKCONFIG_VALUES = (
     "CONFIG_NVS_ENCRYPTION=y",
     "CONFIG_NVS_SEC_KEY_PROTECT_USING_HMAC=y",
@@ -254,6 +293,345 @@ def find_nvs_generator(idf_path: Path) -> Path:
     return candidate
 
 
+def nvs_string_value(value: object) -> str:
+    """A string row's value as it reaches the image, which nvs_layout writes to the CSV.
+
+    csv writes None as an empty field. nvs_partition_gen reads the CSV with universal
+    newlines (CR and CRLF become LF) and drops every line that starts with '#' before
+    parsing it, so a multi-line value (a CA bundle with '# Subject:' lines) loses
+    those continuation lines, each with its newline; the earlier builder stored the
+    values that way too. Written to the CSV this way, a value's last line can no
+    longer take the closing quote with it.
+    """
+    lines = ("" if value is None else str(value)).replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    return "".join(line + "\n" * (index < len(lines) - 1) for index, line in enumerate(lines)
+                   if not (index and line.startswith("#")))
+
+
+def nvs_stored_string(value: object) -> bytes:
+    """A string row's bytes in the image: nvs_string_value and the NUL."""
+    return nvs_string_value(value).encode("utf-8") + b"\0"
+
+
+def _nvs_normalized(row: list[object]) -> list[object]:
+    """A row with its string value as it reaches the image."""
+    key, kind, encoding, value = row
+    return [key, kind, encoding, nvs_string_value(value) if encoding == "string" else value]
+
+
+def nvs_row_entries(row: list[object]) -> int:
+    """The 32-byte entries a row takes: one for a namespace or a number, else a header
+    plus the string's data entries."""
+    _key, kind, encoding, _value = row
+    if kind == "namespace" or encoding in NVS_PRIMITIVES:
+        return 1
+    if encoding == "string":
+        return 1 + -(-len(nvs_stored_string(row[3])) // NVS_ENTRY_SIZE)
+    raise ValueError("Unsupported provisioning NVS encoding")
+
+
+def nvs_row_fits(used: int, row: list[object]) -> bool:
+    """nvs_partition_gen 0.1.9's rule: a number may take the last entry (125); a string
+    and its NUL must end by entry 124, or the generator starts a new page for it."""
+    if row[1] == "namespace" or row[2] in NVS_PRIMITIVES:
+        return used < NVS_PAGE_ENTRIES
+    return used + nvs_row_entries(row) < NVS_PAGE_ENTRIES
+
+
+def _nvs_padding(free: int, first: int, single: bool = False) -> list[list[object]]:
+    """Rows the firmware never reads that take exactly `free` entries: a string, then
+    one u8 (so the string never takes entry 125), or a u8 per entry when free < 3 or
+    `single` asks for one-entry rows only."""
+    rows: list[list[object]] = []
+    if free >= 3 and not single:
+        filler = "0" * ((free - 2) * NVS_ENTRY_SIZE - 1)
+        rows.append([f"{NVS_PADDING_PREFIX}{first}", "data", "string", filler])
+        free = 1
+    start = first + len(rows)
+    rows.extend([f"{NVS_PADDING_PREFIX}{start + index}", "data", "u8", 0] for index in range(free))
+    return rows
+
+
+def nvs_layout(rows: list[list[object]]) -> list[list[object]]:
+    """Order nvs_rows() for the image so that normal operation never writes a page
+    holding provisioning data.
+
+    1. The namespace entry and every row the firmware never writes, largest first,
+       on pages padded with _padN keys to exactly 126 entries. The generator marks
+       those pages FULL. ESP-IDF 5.5.3 programs a FULL page only to erase an entry on
+       it, and reclaims only pages that have erased entries.
+    2. NVS_TAIL_KEYS (Wi-Fi, COMM key, Hikvision host) end the last such page that
+       has room, from a state-word boundary: the bitmap words holding their states
+       hold nothing but them and one-entry padding. An operator's rewrite of one
+       erases its entry there, which programs only those words: never the namespace
+       entry's, and no other row's. No entry there belongs to an item that starts
+       before them, so a word that a faulty flash garbles when it is reprogrammed
+       cannot make ESP-IDF's load-time repairs erase their way into the rest of the
+       page.
+    3. NVS_ACTIVE_KEYS, which a new board writes on its first online run, start the
+       next page. It stays ACTIVE and takes every runtime write.
+
+    String values are given as they reach the image (nvs_string_value).
+    """
+    if not rows or rows[0][1] != "namespace" or any(row[1] == "namespace" for row in rows[1:]):
+        raise ValueError("Provisioning NVS rows must hold exactly one namespace")
+    if any(str(row[0]).startswith(NVS_PADDING_PREFIX) for row in rows):
+        raise ValueError("Provisioning NVS keys may not use the padding prefix")
+    rows = [_nvs_normalized(row) for row in rows]
+    pages: list[list[list[object]]] = [[rows[0]]]
+    used = [nvs_row_entries(rows[0])]
+    fixed = [row for row in rows[1:] if row[0] not in NVS_MUTABLE_KEYS]
+    # Largest first (stable): a long Hikvision CA may need a page of its own.
+    for row in sorted(fixed, key=nvs_row_entries, reverse=True):
+        page = next((index for index, count in enumerate(used) if nvs_row_fits(count, row)), None)
+        if page is None:
+            if not nvs_row_fits(0, row):
+                raise ValueError("A provisioning value does not fit one NVS page")
+            pages.append([])
+            used.append(0)
+            page = len(pages) - 1
+        pages[page].append(row)
+        used[page] += nvs_row_entries(row)
+    # Strings first: a number may take entry 125, a string may not, so a u8 closes
+    # a tail that ends with a string.
+    tail = sorted((row for row in rows[1:] if row[0] in NVS_TAIL_KEYS), key=lambda row: row[2] in NVS_PRIMITIVES)
+    closing = bool(tail) and tail[-1][2] not in NVS_PRIMITIVES
+    start = NVS_PAGE_ENTRIES - sum(nvs_row_entries(row) for row in tail) - int(closing)
+    boundary = start // NVS_STATE_WORD_ENTRIES * NVS_STATE_WORD_ENTRIES
+    target = None
+    if tail:
+        if start < 0:
+            raise ValueError("Provisioning values do not fit one NVS page")
+        target = next((index for index in reversed(range(len(pages))) if used[index] <= boundary), None)
+        if target is None:
+            pages.append([])
+            used.append(0)
+            target = len(pages) - 1
+    active = [row for row in rows[1:] if row[0] in NVS_ACTIVE_KEYS]
+    active_used = 0
+    for row in active:
+        if not nvs_row_fits(active_used, row):
+            raise ValueError("Provisioning values do not fit the NVS partition")
+        active_used += nvs_row_entries(row)
+    # Only a row after it makes the generator mark the last padded page FULL.
+    if not active or len(pages) + 1 + NVS_MIN_BLANK_PAGES > NVS_PAGE_COUNT:
+        raise ValueError("Provisioning values do not fit the NVS partition")
+    layout: list[list[object]] = []
+    padding = 0
+    for index, (page, count) in enumerate(zip(pages, used)):
+        layout.extend(page)
+        if index == target:
+            filler = _nvs_padding(boundary - count, padding)
+            filler += _nvs_padding(start - boundary, padding + len(filler), single=True)
+        else:
+            filler = _nvs_padding(NVS_PAGE_ENTRIES - count, padding)
+        padding += len(filler)
+        layout.extend(filler)
+        if index == target:
+            layout.extend(tail)
+            if closing:
+                layout.append([f"{NVS_PADDING_PREFIX}{padding}", "data", "u8", 0])
+                padding += 1
+    layout.extend(active)
+    return layout
+
+
+def _nvs_decrypt(xts_key: bytes, offset: int, entry: bytes) -> bytes:
+    """One entry, decrypted as ESP-IDF does: AES-XTS, tweak = its partition offset."""
+    decryptor = Cipher(algorithms.AES(xts_key), modes.XTS(offset.to_bytes(16, "little"))).decryptor()
+    return decryptor.update(entry) + decryptor.finalize()
+
+
+def nvs_image_pages(image: bytes, xts_key: bytes) -> list[dict]:
+    """Each page's plaintext header and entry states, and its decrypted items.
+
+    An item is (entry index, entries, namespace index, type, key, value bytes); a
+    string's value is its stored bytes with the NUL. Reading stops at the first entry that is
+    not written or whose header or data CRC does not verify (`intact` is False).
+    """
+    pages = []
+    for number in range(len(image) // NVS_PAGE_SIZE):
+        base = number * NVS_PAGE_SIZE
+        raw = image[base:base + NVS_PAGE_SIZE]
+        if raw == b"\xff" * NVS_PAGE_SIZE:
+            pages.append({"blank": True})
+            continue
+        state, sequence = struct.unpack_from("<II", raw)
+        states = [(raw[32 + index // 4] >> (index % 4 * 2)) & 3 for index in range(NVS_PAGE_ENTRIES)]
+
+        def entry(index: int) -> bytes:
+            offset = NVS_ENTRY_SIZE * (2 + index)
+            return _nvs_decrypt(xts_key, base + offset, raw[offset:offset + NVS_ENTRY_SIZE])
+
+        items, index, intact = [], 0, True
+        while index < NVS_PAGE_ENTRIES and states[index] == 2:
+            header = entry(index)
+            span = header[2]
+            if (zlib.crc32(header[:4] + header[8:], 0xFFFFFFFF) != struct.unpack_from("<I", header, 4)[0]
+                    or not span or index + span > NVS_PAGE_ENTRIES
+                    or any(entry_state != 2 for entry_state in states[index:index + span])):
+                intact = False
+                break
+            value = header[24:]
+            if header[1] == NVS_STRING:
+                size = struct.unpack_from("<H", header, 24)[0]
+                value = b"".join(entry(part) for part in range(index + 1, index + span))[:size]
+                if (len(value) != size
+                        or zlib.crc32(value, 0xFFFFFFFF) != struct.unpack_from("<I", header, 28)[0]):
+                    intact = False
+                    break
+            key = header[8:24].split(b"\0", 1)[0].decode("ascii", "replace")
+            items.append((index, span, header[0], header[1], key, value))
+            index += span
+        pages.append({
+            "blank": False, "state": state, "sequence": sequence, "version": raw[8],
+            "header_ok": zlib.crc32(raw[4:28], 0xFFFFFFFF) == struct.unpack_from("<I", raw, 28)[0],
+            "written": states.count(2), "states": states, "items": items, "intact": intact,
+        })
+    return pages
+
+
+def _nvs_expected(row: list[object]) -> tuple[int, int, bytes]:
+    """(namespace index, type, value bytes) the generator writes for a row."""
+    _key, kind, encoding, value = row
+    if kind == "namespace":
+        return 0, NVS_PRIMITIVES["u8"][0], b"\x01" + b"\xff" * 7
+    if encoding == "string":
+        return 1, NVS_STRING, nvs_stored_string(value)
+    code, layout = NVS_PRIMITIVES[encoding]
+    packed = struct.pack(layout, int(value))
+    return 1, code, packed + b"\xff" * (8 - len(packed))
+
+
+def check_nvs_layout(image: bytes, xts_key: bytes, layout: list[list[object]]) -> None:
+    """Refuse a generated image unless it holds nvs_layout()'s rows as planned.
+
+    Headers and entry states are plaintext; the entries are decrypted with the
+    image's own XTS key, in memory only. Every page holding the namespace entry, a
+    row the firmware never writes, an NVS_TAIL_KEYS row or padding must be FULL with
+    all 126 entries written; the state words of the tail rows must hold nothing but
+    them and one-entry padding; the NVS_ACTIVE_KEYS rows must be on one later page
+    that is ACTIVE; at least NVS_MIN_BLANK_PAGES pages must be blank; and every row
+    must be stored once with its value. Errors name keys and pages, never values.
+    """
+
+    def fail(reason: str) -> NoReturn:
+        raise RuntimeError(f"Provisioning NVS layout check failed: {reason}")
+
+    if len(image) != NVS_PARTITION_SIZE or len(xts_key) != NVS_XTS_KEY_SIZE:
+        fail("wrong image or key size")
+    pages = nvs_image_pages(image, xts_key)
+    data_pages = [number for number, page in enumerate(pages) if not page["blank"]]
+    if data_pages != list(range(len(data_pages))):
+        fail("data pages are not the first pages")
+    # (namespace index, key) -> (page, entry index, entries, type, value bytes)
+    found: dict[tuple[int, str], tuple[int, int, int, int, bytes]] = {}
+    for number in data_pages:
+        page = pages[number]
+        written = page["written"]
+        if (not page["header_ok"] or page["sequence"] != number or page["version"] != 0xFE
+                or page["state"] not in (NVS_PAGE_ACTIVE, NVS_PAGE_FULL) or not page["intact"]
+                or page["states"] != [2] * written + [3] * (NVS_PAGE_ENTRIES - written)):
+            fail(f"page {number} is not a clean generated page")
+        for index, span, namespace, kind, key, value in page["items"]:
+            if (namespace, key) in found:
+                fail(f"{key} is stored twice")
+            found[(namespace, key)] = (number, index, span, kind, value)
+    expected = {}
+    for row in layout:
+        namespace, kind, value = _nvs_expected(row)
+        expected[(namespace, str(row[0]))] = (kind, value)
+    if set(found) != set(expected):
+        fail("the stored keys differ from the planned rows: "
+             + ", ".join(sorted(key for _, key in set(found) ^ set(expected))))
+    for item, (kind, value) in expected.items():
+        if found[item][3:] != (kind, value):
+            fail(f"{item[1]} is not stored as planned")
+    if found[(0, str(layout[0][0]))][:2] != (0, 0):
+        fail("the namespace entry is not the first entry")
+    full_pages = {0} | {found[(1, str(row[0]))][0] for row in layout[1:] if row[0] not in NVS_ACTIVE_KEYS}
+    active_pages = {found[(1, str(row[0]))][0] for row in layout[1:] if row[0] in NVS_ACTIVE_KEYS}
+    for number in sorted(full_pages):
+        if pages[number]["state"] != NVS_PAGE_FULL or pages[number]["written"] != NVS_PAGE_ENTRIES:
+            fail(f"page {number} holds provisioning rows but is not FULL with 126 entries")
+    if (len(active_pages) != 1 or min(active_pages) <= max(full_pages)
+            or pages[min(active_pages)]["state"] != NVS_PAGE_ACTIVE):
+        fail("the rows written on the first online run are not on one later ACTIVE page")
+    tail = [found[(1, str(row[0]))] for row in layout[1:] if row[0] in NVS_TAIL_KEYS]
+    if tail:
+        number = tail[0][0]
+        boundary = min(item[1] for item in tail) // NVS_STATE_WORD_ENTRIES * NVS_STATE_WORD_ENTRIES
+        sharing = sorted(
+            key for index, span, _namespace, _kind, key, _value in pages[number]["items"]
+            if index + span > boundary and key not in NVS_TAIL_KEYS
+            and not (key.startswith(NVS_PADDING_PREFIX) and span == 1)
+        )
+        if any(item[0] != number for item in tail) or sharing:
+            fail("the Wi-Fi, COMM key and host rows do not have their state words to themselves"
+                 + (f" (also there: {', '.join(sharing)})" if sharing else ""))
+    if sum(page["blank"] for page in pages) < NVS_MIN_BLANK_PAGES:
+        fail(f"fewer than {NVS_MIN_BLANK_PAGES} pages are left erased")
+
+
+def build_nvs_partition(
+    rows: list[list[object]], hmac_key_path: Path, directory: Path, generator: Path
+) -> Path:
+    """Generate the encrypted provisioning NVS for nvs_rows() in `directory`.
+
+    The rows are laid out by nvs_layout, which must hold exactly the given rows
+    besides padding; ESP-IDF's generator derives the XTS keys from the HMAC eFuse key
+    and encrypts the image, and check_nvs_layout must pass before the image
+    (provision.bin) is used.
+    """
+    layout = nvs_layout(rows)
+    planned = [row for row in layout if not str(row[0]).startswith(NVS_PADDING_PREFIX)]
+    by_key = {str(row[0]): row[1:] for row in planned}
+    given = {str(row[0]): _nvs_normalized(row)[1:] for row in rows}
+    if layout[:1] != [_nvs_normalized(rows[0])] or len(planned) != len(rows) or by_key != given:
+        changed = (set(by_key) ^ set(given)) | {key for key in by_key.keys() & given.keys()
+                                                 if by_key[key] != given[key]}
+        raise RuntimeError("Provisioning NVS layout check failed: the plan does not hold the given rows"
+                           + (": " + ", ".join(sorted(changed)) if changed else ""))
+    csv_path = directory / "provision.csv"
+    binary_path = directory / "provision.bin"
+    nvs_key_path = directory / "nvs-xts-key.bin"
+    with csv_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["key", "type", "encoding", "value"])
+        writer.writerows(layout)
+    run(
+        [
+            sys.executable,
+            str(generator),
+            "generate-key",
+            "--key_protect_hmac",
+            "--kp_hmac_inputkey",
+            str(hmac_key_path),
+            "--keyfile",
+            str(nvs_key_path),
+            "--outdir",
+            str(directory),
+        ]
+    )
+    run(
+        [
+            sys.executable,
+            str(generator),
+            "encrypt",
+            str(csv_path),
+            str(binary_path),
+            hex(NVS_PARTITION_SIZE),
+            "--inputkey",
+            str(nvs_key_path),
+        ]
+    )
+    image = binary_path.read_bytes()
+    if len(image) != NVS_PARTITION_SIZE:
+        raise RuntimeError("Generated NVS partition has the wrong size")
+    check_nvs_layout(image, nvs_key_path.read_bytes()[:NVS_XTS_KEY_SIZE], layout)
+    return binary_path
+
+
 def validate_secure_build_config(project: Path) -> None:
     """Refuse provisioning unless the effective image uses HMAC-backed NVS.
 
@@ -440,42 +818,12 @@ def main() -> None:
     validate_secure_build_config(project)
     with tempfile.TemporaryDirectory(prefix="zone-lite-provision-") as directory:
         temporary = Path(directory)
-        csv_path = temporary / "provision.csv"
-        binary_path = temporary / "provision.bin"
         readback_path = temporary / "readback.bin"
         hmac_key_path = temporary / "hmac-key.bin"
-        nvs_key_path = temporary / "nvs-xts-key.bin"
         summary_path = temporary / "efuse-summary.json"
         hmac_key_path.write_bytes(nvs_hmac_key)
-        with csv_path.open("w", newline="", encoding="utf-8") as handle:
-            writer = csv.writer(handle)
-            writer.writerow(["key", "type", "encoding", "value"])
-            writer.writerows(nvs_rows(config, bootstrap_secret))
-        run(
-            [
-                sys.executable,
-                str(generator),
-                "generate-key",
-                "--key_protect_hmac",
-                "--kp_hmac_inputkey",
-                str(hmac_key_path),
-                "--keyfile",
-                str(nvs_key_path),
-                "--outdir",
-                str(temporary),
-            ]
-        )
-        run(
-            [
-                sys.executable,
-                str(generator),
-                "encrypt",
-                str(csv_path),
-                str(binary_path),
-                hex(NVS_PARTITION_SIZE),
-                "--inputkey",
-                str(nvs_key_path),
-            ]
+        binary_path = build_nvs_partition(
+            nvs_rows(config, bootstrap_secret), hmac_key_path, temporary, generator
         )
         ensure_nvs_hmac_key(
             espefuse=args.espefuse,

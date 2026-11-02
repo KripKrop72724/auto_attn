@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import csv
 from datetime import datetime, timezone
 import hashlib
 import ipaddress
@@ -12,13 +11,12 @@ import json
 import os
 from pathlib import Path
 import re
-import subprocess
-import sys
 import tempfile
 
 from provision_zone_lite import (
     NVS_PARTITION_OFFSET,
     NVS_PARTITION_SIZE,
+    build_nvs_partition,
     derive_bootstrap_secret,
     derive_nvs_hmac_key,
     find_nvs_generator,
@@ -132,48 +130,14 @@ def main() -> None:
 
     with tempfile.TemporaryDirectory(prefix="zone-lite-package-") as directory:
         temporary = Path(directory)
-        csv_path = temporary / "provision.csv"
-        binary_path = temporary / "provision.bin"
         hmac_path = temporary / "hmac-key.bin"
-        nvs_key_path = temporary / "nvs-xts-key.bin"
         hmac_path.write_bytes(hmac_key)
-        with csv_path.open("w", newline="", encoding="utf-8") as handle:
-            writer = csv.writer(handle)
-            writer.writerow(["key", "type", "encoding", "value"])
-            writer.writerows(nvs_rows(config, bootstrap_secret))
-        subprocess.run(
-            [
-                sys.executable,
-                str(generator),
-                "generate-key",
-                "--key_protect_hmac",
-                "--kp_hmac_inputkey",
-                str(hmac_path),
-                "--keyfile",
-                str(nvs_key_path),
-                "--outdir",
-                str(temporary),
-            ],
-            check=True,
-            stdout=subprocess.DEVNULL,
-        )
-        subprocess.run(
-            [
-                sys.executable,
-                str(generator),
-                "encrypt",
-                str(csv_path),
-                str(binary_path),
-                hex(NVS_PARTITION_SIZE),
-                "--inputkey",
-                str(nvs_key_path),
-            ],
-            check=True,
-            stdout=subprocess.DEVNULL,
+        # Laid out and checked page by page (provision_zone_lite.nvs_layout);
+        # a failed check fails the build.
+        binary_path = build_nvs_partition(
+            nvs_rows(config, bootstrap_secret), hmac_path, temporary, generator
         )
         plaintext = binary_path.read_bytes()
-        if len(plaintext) != NVS_PARTITION_SIZE:
-            raise RuntimeError("Generated NVS partition has the wrong size")
         aad = {
             "schema_version": 1,
             "firmware_family": request["firmware_family"],

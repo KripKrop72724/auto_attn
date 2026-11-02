@@ -66,7 +66,9 @@ Production configuration is stored in encrypted NVS, not a compiled header. The 
 2. derives a per-MAC onboarding secret from `ADD_FLEET_ROOT_SECRET` using HKDF;
 3. derives a separate HMAC key domain for ESP-IDF encrypted NVS;
 4. protects that HMAC key in read/write-protected eFuse BLOCK_KEY0;
-5. generates an encrypted 24 KiB NVS partition in an OS temporary directory;
+5. generates an encrypted 24 KiB NVS partition in an OS temporary directory, laid out so that
+   normal operation never writes the pages that hold provisioning data (see "NVS layout" in
+   [esp-installer-server.md](../../docs/esp-installer-server.md));
 6. flashes firmware and NVS in one transaction; and
 7. reads NVS back and verifies its SHA-256 before deleting temporary material.
 
