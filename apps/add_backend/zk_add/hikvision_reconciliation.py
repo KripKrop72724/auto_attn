@@ -171,9 +171,10 @@ def terminal_answering(terminal, now=None) -> bool:
     """The ESP's latest check reached the terminal's event search with HTTP 200.
 
     Firmware reports the terminal OFFLINE whenever a poll fails, including a
-    saved-anchor mismatch at the events stage. That failure needs an
-    authenticated, serial-verified response, so the terminal itself answers.
-    Every history page is identity-checked again by the ESP before it runs.
+    saved-anchor mismatch (6) or a page its own checks reject (7) at the events
+    stage. Both need an authenticated, serial-verified response, so the
+    terminal itself answers. Every history page is identity-checked again by
+    the ESP before it runs, and ADD validates each page itself.
     """
     from zk_add.settings import settings
 
@@ -182,7 +183,7 @@ def terminal_answering(terminal, now=None) -> bool:
     age = ((now or utc_now()) - ensure_utc(terminal.last_seen_at)).total_seconds()
     health = (terminal.capability_profile or {}).get("hikvision_health") or {}
     return (0 <= age <= settings.offline_after_seconds and health.get("poll_stage") == "events"
-            and health.get("poll_http_status") == 200 and health.get("poll_error") in {0, 6})
+            and health.get("poll_http_status") == 200 and health.get("poll_error") in {0, 6, 7})
 
 
 def _poll_custody(model, connector, policy) -> tuple:
