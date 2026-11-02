@@ -7,8 +7,8 @@ import os
 import pytest
 from PySide6.QtCore import QTimer
 
-from sl_installer.core import fakes
-from sl_installer.core.api import Family, InstallMode, StepId, steps_for
+from sl_installer.core import fakes, texts
+from sl_installer.core.api import Family, InstallMode, ReplugPhase, Severity, StepId, steps_for
 from sl_installer.ui import pages
 
 
@@ -19,6 +19,7 @@ def assert_engine_never_ran_on_gui_thread(h):
 
 def test_happy_zkt_end_to_end(harness):
     h = harness("happy_zkt")
+    h.hold("restart_unplug")  # to look at the screen between the two starts
     ticks = []
     clock = QTimer()
     clock.setInterval(10)
@@ -61,19 +62,44 @@ def test_happy_zkt_end_to_end(harness):
     ]
     assert not h.window.top_bar.sign_out_button.isEnabled()
     h.wait_page(pages.FIRST_START, timeout=8000)
-    h.wait(lambda: h.page(pages.FIRST_START).result.isVisible(), timeout=8000)
     first_start = h.page(pages.FIRST_START)
-    assert first_start.result.advice.code == "FIRST_START_OK"
+    # The first start passed. One more, deliberate replug: nothing says "ready" yet.
+    h.wait(
+        lambda: first_start.again and first_start.phase is ReplugPhase.WAITING_UNPLUG,
+        timeout=8000,
+    )
+    notice = first_start.result.advice
+    assert notice.code == "RESTART_CHECK" and notice.severity is Severity.INFO
+    assert notice.what_happened.startswith("The board started for LF-ZONE-BLD9-04, device")
+    assert notice.what_to_do == (texts.RESTART_REPLUG, "Do not press any button.")
+    assert "The setup is not finished." in notice.what_happened
+    assert first_start.title_label.text() == "Start the board again"
+    assert first_start.cards["unplug"].title.text() == "Unplug the cable again"
+    assert not first_start.primary_button.isVisible()  # no Next before the second start
+    assert not h.window.top_bar.sign_out_button.isEnabled()  # the board is being watched
+    h.wait(lambda: [report[2] for report in h.world.reports] == ["BOOT_OK"])
+    h.release("restart_unplug")
+    h.first_start_done()
+    assert first_start.result.advice.code == "START_CHECKS_OK"
+    assert first_start.result.advice.what_happened.startswith(texts.SETTINGS_KEPT)
     assert "LF-ZONE-BLD9-04" in first_start.result.advice.what_happened
     assert any("started for LF-ZONE-BLD9-04" in line for line in first_start.console.shown_lines)
-    # Head office hears how the first start went, under the install's request number.
-    h.wait(lambda: [report[2] for report in h.world.reports] == ["BOOT_OK"])
-    assert h.world.reports[0][0] == h.controller.session.summary.request_id
+    # Head office hears how both starts went, under the install's request number, and
+    # both starts' console lines go to this install's log.
+    h.wait(lambda: [report[2] for report in h.world.reports] == ["BOOT_OK", "RESTART_OK"])
+    request_id = h.controller.session.summary.request_id
+    assert {report[0] for report in h.world.reports} == {request_id}
     assert h.world.reports[0][3]["zone_id_seen"] == "LF-ZONE-BLD9-04"
+    assert h.world.reports[1][3]["settings_kept"] is True
+    assert h.world.transcripts == [request_id, request_id]
+    # The restart check knows what the first start showed.
+    assert h.world.first_starts == [h.controller.session.boot]
     h.click_primary(pages.FIRST_START)
     h.wait_page(pages.DONE)
 
     done = h.page(pages.DONE)
+    assert done.kept_settings
+    assert done.subtitle_label.text().startswith(f"{texts.SETTINGS_KEPT} Take the board")
     assert done.credentials.values["hotspot"].text() == "SLIC ATTENDANCE-3D31"
     assert done.credentials.values["password"].text() == "test-hotspot-pass"
     assert done.credentials.values["address"].text() == "http://192.168.254.1"
@@ -86,6 +112,7 @@ def test_happy_zkt_end_to_end(harness):
     with open(path, encoding="utf-8") as handle:
         record = handle.read()
     assert "LF-ZONE-BLD9-04" in record and "test-wifi-pass" not in record
+    assert "First start: ok" in record and "After a restart: ok" in record
 
     h.click_primary(pages.DONE)  # Set up another board
     h.wait_page(pages.MACHINE)
@@ -135,10 +162,47 @@ def test_happy_hik_end_to_end(harness):
     assert config.hik.source_epoch == ""  # the engine fills <zone>-<date>
     h.page(pages.CONFIRM).understand.setChecked(True)
     h.click_primary(pages.CONFIRM)
-    h.wait(lambda: h.page(pages.FIRST_START).result.isVisible(), timeout=8000)
+    h.first_start_done()
+    # Hikvision boards get the restart check too.
+    assert h.page(pages.FIRST_START).result.advice.code == "START_CHECKS_OK"
+    assert h.world.called("boot.wait_restart") == 1
     h.click_primary(pages.FIRST_START)
     h.wait_page(pages.DONE)
     assert h.page(pages.DONE).hik_notice.isVisible()
+    assert h.page(pages.DONE).kept_settings
+    assert_engine_never_ran_on_gui_thread(h)
+
+
+def test_board_that_loses_its_settings_on_restart_never_reaches_done(harness):
+    # 2 Nov 2026: two new boards started well once, then had no settings at every later start.
+    h = harness("settings_lost_on_restart")
+    h.start_install()
+    h.first_start_done()
+    first_start = h.page(pages.FIRST_START)
+    advice = first_start.result.advice
+    # The engine's words, also without advice, with the board ID for its label.
+    assert advice == texts.settings_lost_on_restart("ac:27:6e:a4:3d:30")
+    assert any("AC:27:6E:A4:3D:30" in step for step in advice.what_to_do)
+    assert any("no settings" in line for line in first_start.console.shown_lines)
+    assert not first_start.primary_button.isVisible()  # no Next: never called ready
+    assert first_start.secondary_button.text() == "Go back to the start"
+    assert first_start.result.reference.text() == "Reference: SETTINGS_LOST_ON_RESTART"
+    h.controller._first_start_next()  # even if asked, Done does not open
+    assert h.controller.current == pages.FIRST_START
+
+    # Head office hears it, and the setup record is kept for the help file without a click.
+    h.wait(lambda: sorted(report[2] for report in h.world.reports) == ["BOOT_OK", "RESTART_FAILED"])
+    (detail,) = [report[3] for report in h.world.reports if report[2] == "RESTART_FAILED"]
+    assert detail["outcome"] == "settings_lost" and detail["settings_kept"] is False
+    h.wait(lambda: h.controller.session.record_path is not None)
+    with open(h.controller.session.record_path, encoding="utf-8") as handle:
+        record = handle.read()
+    assert "First start: ok" in record and "After a restart: settings_lost" in record
+    assert h.world.called("records.save_install_record") == 1
+    assert h.window.top_bar.sign_out_button.isEnabled()
+
+    first_start.secondary_button.click()  # Go back to the start
+    h.wait_page(pages.HOME)
     assert_engine_never_ran_on_gui_thread(h)
 
 

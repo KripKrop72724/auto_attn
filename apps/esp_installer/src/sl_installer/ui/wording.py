@@ -325,6 +325,14 @@ HELP_TOPICS: Dict[str, HelpTopic] = {
                 "4. Watch the light",
                 "The light on the board comes on after a few seconds.",
             ),
+            # No picture: the steps are the same as 1 to 3, and item 3 shows plugging in.
+            HelpItem(
+                None,
+                "5. Once more",
+                "When the board has started, the app asks you to unplug it and plug it back in "
+                "one more time. This checks that the board keeps its settings. If the board "
+                "loses its settings, the app tells you what to do.",
+            ),
         ),
     ),
     "done": HelpTopic(
@@ -777,9 +785,80 @@ def network_problem(status: api.ConnectivityStatus) -> Advice:
     )
 
 
-def boot_fallback(report: api.BootReport, expect: Optional[api.InstallConfig]) -> Advice:
-    """Advice for a first start that went wrong, when the engine gave none."""
+def restart_check(first: api.BootReport) -> Advice:
+    """The card over the second replug, once the first start has passed.
+
+    The restart check is deliberate: the board must keep its settings when it starts
+    again (core/console.py judge). The card must not read as the end of the setup: only
+    the second start may say the board started correctly. It says the setup is not
+    finished, for whoever would take the board away now. The page's subtitle says why
+    the check is made, so the card does not repeat it.
+    """
+    if first.zone_id_seen:
+        device = f", device number {first.device_id_seen}" if first.device_id_seen else ""
+        happened = f"The board started for {first.zone_id_seen}{device}."
+    else:
+        # The start line, with the zone, came before the app could read the board.
+        happened = "The board started."
+    return Advice(
+        "RESTART_CHECK",
+        "One more check",
+        f"{happened} The setup is not finished. Do not take the board to a site yet.",
+        (texts.RESTART_REPLUG, "Do not press any button."),
+        Severity.INFO,
+        None,
+    )
+
+
+def start_checks_ok(first: api.BootReport, second: api.BootReport) -> Advice:
+    """The last card of the first-start screen: both starts passed.
+
+    One sentence a line, so the ZONE ID, which the person checks against head office's
+    list, never breaks at one of its hyphens.
+    """
+    zone = second.zone_id_seen or first.zone_id_seen
+    device = second.device_id_seen or first.device_id_seen
+    version = second.app_version_seen or first.app_version_seen
+    seen = [texts.SETTINGS_KEPT]
+    if zone:
+        number = f", device number {device}" if device else ""
+        seen.append(f"Its settings are for {zone}{number}.")
+    if version:
+        seen.append(f"Its software is version {version}.")
+    return Advice(
+        "START_CHECKS_OK",
+        "The board kept its settings",
+        "\n".join(seen),
+        (),
+        Severity.SUCCESS,
+        "success",
+    )
+
+
+DONE_SUBTITLE = "Take the board to the site. Then follow the steps below."
+
+
+def done_subtitle(kept_settings: bool) -> str:
+    """The Done screen's lead. It says the board kept its settings (texts.SETTINGS_KEPT)
+    only once the restart check passed, and in the subtitle, so what the person needs at
+    the site stays in view on a small screen."""
+    return f"{texts.SETTINGS_KEPT} {DONE_SUBTITLE}" if kept_settings else DONE_SUBTITLE
+
+
+def boot_fallback(
+    report: api.BootReport,
+    expect: Optional[api.InstallConfig],
+    board_id: Optional[str] = None,
+) -> Advice:
+    """Advice for a watched start that went wrong, when the engine gave none.
+
+    ``board_id`` goes on the label of a board that lost its settings.
+    """
     outcome = report.outcome
+    if outcome is BootOutcome.SETTINGS_LOST:
+        return texts.settings_lost_on_restart(board_id)
+    if outcome is BootOutcome.SETTINGS_NOT_SEEN:
+        return texts.SETTINGS_NOT_SEEN
     if outcome is BootOutcome.WRONG_SETTINGS:
         seen = report.zone_id_seen or "another zone"
         wanted = expect.zone_id if expect else "the zone you chose"

@@ -155,9 +155,11 @@ def test_install_record_has_the_facts_and_no_secrets(tmp_path):
     assert path.name == "setup-LF-ZONE-GUJRAT-01-1-ac276ea43d30-20261101-153000.txt"
     for fact in ("ac:27:6e:a4:3d:30", "LF-ZONE-GUJRAT-01", "Gujrat · Device 1 (Life)",
                  "SLIC ATTENDANCE-3D31", "http://192.168.254.1", "ZKT 2.9.1",
-                 "The board started correctly", "version 2.9.1", "RE7"):
+                 "  First start:      Passed", "version 2.9.1", "RE7"):
         assert fact in text
     assert "test-wifi-pass" not in text and "1979" not in text
+    # No restart check yet: no words of success.
+    assert "started correctly" not in text and "  After a restart:  Not watched." in text
 
 
 def test_hikvision_record_omits_the_machine_password(tmp_path):
@@ -181,6 +183,73 @@ def test_help_file_zips_redacted_logs_and_records(tmp_path):
         assert {"about-this-computer.txt", "logs/installer.log", "logs/installer.log.1"} <= names
         assert any(name.startswith("records/setup-") for name in names)
         assert "test-admin-pass" not in archive.read("logs/installer.log").decode()
+
+
+def restart_report(outcome=BootOutcome.OK):
+    advice = {BootOutcome.OK: texts.settings_kept("LF-ZONE-GUJRAT-01", "1", "2.9.1"),
+              BootOutcome.SETTINGS_LOST: texts.SETTINGS_LOST_ON_RESTART,
+              BootOutcome.NOT_REPLUGGED: texts.NOT_REPLUGGED}[outcome]
+    seen = ("LF-ZONE-GUJRAT-01", "1", "2.9.1") if outcome is BootOutcome.OK else (None,) * 3
+    return BootReport(outcome, *seen, advice=advice)
+
+
+def test_record_calls_the_board_ready_only_after_the_restart_check(tmp_path):
+    records = Records(tmp_path / "records", tmp_path / "logs", "1.0.0")
+    kept = records.install_record_text(summary(), boot_ok(), restart_report())
+    assert "\nHow the board started\n" in kept
+    assert f"  Result:           {texts.SETTINGS_KEPT}" in kept
+    assert "  First start:      Passed" in kept and "  After a restart:  Passed" in kept
+    assert kept.count("  Seen:             zone LF-ZONE-GUJRAT-01, device 1, version 2.9.1") == 2
+    # The words of success are said once, in the Result line, after both starts passed.
+    assert kept.count("started correctly") == 1
+
+    lost = records.install_record_text(summary(), boot_ok(),
+                                       restart_report(BootOutcome.SETTINGS_LOST))
+    assert ("  Result:           The board lost its settings when it restarted. Do not install "
+            "it at a site.") in lost
+    assert "  After a restart:  The board lost its settings" in lost
+    for text in (lost,
+                 records.install_record_text(summary(), boot_ok()),  # not watched yet
+                 records.install_record_text(summary(), boot_ok(),
+                                             restart_report(BootOutcome.NOT_REPLUGGED)),
+                 records.install_record_text(summary(), BootReport(
+                     BootOutcome.NO_OUTPUT, advice=texts.NO_OUTPUT))):
+        assert texts.SETTINGS_KEPT not in text and "kept its settings" not in text
+        # Not even the first start's own title: a board that must not go to a site
+        # never reads "started correctly" in its record.
+        assert "started correctly" not in text
+    assert "  First start:      Passed" in lost
+    assert "  After a restart:  Not watched." in records.install_record_text(summary(), boot_ok())
+
+
+def test_saved_record_holds_the_restart_check(tmp_path):
+    records = Records(tmp_path / "records", tmp_path / "logs", "1.0.0",
+                      now=lambda: datetime(2026, 11, 2, 9, 0, 0))
+    path = Path(records.save_install_record(summary(), boot_ok(),
+                                            restart_report(BootOutcome.SETTINGS_LOST)))
+    text = path.read_text(encoding="utf-8")
+    assert "The board lost its settings when it restarted." in text
+
+
+def test_help_file_carries_the_newest_boards_console_logs_redacted(tmp_path):
+    import os
+
+    from sl_installer.core.records import HELP_FILE_CONSOLE_LOGS
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    for index in range(HELP_FILE_CONSOLE_LOGS + 2):
+        path = logs / f"console-ac276ea43d30-sli-{index:02d}.log"
+        path.write_text(f"=== First start ===\n    1.0  password=test-admin-pass {index}\n",
+                        encoding="utf-8")
+        os.utime(path, (1_000_000 + index, 1_000_000 + index))
+    records = Records(tmp_path / "records", logs, "1.0.0")
+    with zipfile.ZipFile(records.save_help_file()) as archive:
+        names = [name for name in archive.namelist() if name.startswith("logs/console-")]
+        assert len(names) == HELP_FILE_CONSOLE_LOGS
+        newest = f"logs/console-ac276ea43d30-sli-{HELP_FILE_CONSOLE_LOGS + 1:02d}.log"
+        assert newest in names and "logs/console-ac276ea43d30-sli-00.log" not in names
+        packed = "".join(archive.read(name).decode("utf-8") for name in names)
+    assert "test-admin-pass" not in packed and "=== First start ===" in packed
 
 
 # ------------------------------------------------------- validation, naming
@@ -309,6 +378,9 @@ def all_texts():
     yield texts.family_mismatch(Family.HIKVISION)
     yield texts.device_id_in_use("1", "ZONE-X", "2")
     yield texts.boot_ok("Z", "1", "2.9.1")
+    yield texts.settings_kept("Z", "1", "2.9.1")
+    yield texts.settings_lost_on_restart("ac:27:6e:a4:3d:30")
+    yield texts.settings_lost_on_restart("AC276EA43D30", changed=True)
     yield texts.wrong_settings("zone A", "zone B")
     yield texts.wifi_placeholder("RE7", "SLIC ATTENDANCE-3D31")
     yield texts.wifi_not_joining("SiteNet", None)

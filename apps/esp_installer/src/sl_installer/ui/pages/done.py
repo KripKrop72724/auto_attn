@@ -30,9 +30,10 @@ class DonePage(BasePage):
     help_topic = "done"
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
-        super().__init__(
-            "The board is ready", "Take the board to the site. Then follow the steps below.", parent
-        )
+        super().__init__("The board is ready", wording.DONE_SUBTITLE, parent)
+        # True once the board kept its settings through the restart check: the subtitle
+        # then says so (wording.done_subtitle).
+        self.kept_settings = False
         # What the person needs at the site comes first; what was set comes after.
         self.hik_notice = Notice()
         self.hik_notice.hide()
@@ -100,8 +101,11 @@ class DonePage(BasePage):
         hotspot_password: str,
         hikvision: bool,
         title: str = "The board is ready",
+        kept_settings: bool = False,
     ) -> None:
-        self.set_title(title)
+        """``kept_settings``: the board passed the restart check, and the screen says so."""
+        self.set_title(title, wording.done_subtitle(kept_settings))
+        self.kept_settings = kept_settings
         self.facts.set_rows(rows)
         hotspot = naming.hotspot_name(mac) or "SLIC ATTENDANCE"
         while self._steps_holder.count():

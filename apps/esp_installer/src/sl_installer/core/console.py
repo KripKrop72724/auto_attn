@@ -1,4 +1,4 @@
-"""Reads the board's console and decides how its first start went.
+"""Reads the board's console and decides how its first start, and the next one, went.
 
 The app console is a copy on the native USB-Serial/JTAG port (UART0 on the other
 socket is the main one). The USB copy drops text nobody reads and the port
@@ -6,6 +6,17 @@ disappears on every chip reset, so the port is reopened as fast as it comes back
 Even so, a start's first lines can be gone before the PC lists the port again: the
 start line comes under 2 s after power-on. The verdict (judge) therefore also takes
 any later line of the running program as the start.
+
+A good first start is not enough: on 2 Nov 2026 two new boards started well once,
+then had no settings at every later start. So every install watches one more start,
+after a deliberate replug (wait_restart), with the same rules and one more: it passes
+only when the board names its settings again for the expected zone (the settings
+line, or the start line with zone and device). Missing or unreadable settings then
+mean the board lost them when it restarted, and so do other settings than its first
+start showed.
+
+Each watched start's lines are kept, redacted like installer.log, in a small file per
+install in the log folder (ConsoleLog), and the help file carries them to head office.
 
 Opening must not move DTR/RTS: on USB-Serial/JTAG, RTS high with DTR low resets
 the chip. Windows (usbser.sys) applies both lines in one request, so they are
@@ -23,10 +34,12 @@ port reopen.
 """
 from __future__ import annotations
 
+import os
 import re
 import sys
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional, Pattern, Sequence, Tuple
+from pathlib import Path
+from typing import IO, Callable, Dict, List, Optional, Pattern, Sequence, Tuple
 
 from . import texts
 from .api import (Advice, BootOutcome, BootReport, CancelToken, ConsoleEvent, ConsoleKind,
@@ -42,6 +55,10 @@ BAUD = 115200
 UNPLUG_TIMEOUT_S = 300.0
 REPLUG_TIMEOUT_S = 300.0
 STORAGE_WAIT_S = 25.0
+# Per-install console logs (ConsoleLog): a 2-minute start prints well under 50 KB.
+CONSOLE_LOG_PREFIX = "console-"
+CONSOLE_LOG_MAX_BYTES = 256 * 1024
+CONSOLE_LOGS_KEPT = 20
 _ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 _IDF = re.compile(r"^([EWIDV]) \((\d+)\) ([^:]+?): (.*)$")
 _SLOTS = {0x20000: "factory", 0x2A0000: "ota_0", 0x520000: "ota_1"}
@@ -284,6 +301,126 @@ def _is_busy(error: Exception) -> bool:
                           text, re.I))
 
 
+# -------------------------------------------------------------- console log
+
+_LINE_MAX = 1000           # characters kept of one console line
+_FRAME_SLACK = 16 * 1024   # room past the cap for the heading and result of later starts
+_SAFE_NAME = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def _safe_name(value: str) -> str:
+    return _SAFE_NAME.sub("-", value).strip("-.")[:64] or "board"
+
+
+def console_log_files(folder: Path) -> List[Path]:
+    """The per-install console logs in ``folder``, newest first."""
+    if not folder.is_dir():
+        return []
+    found = []
+    for path in folder.glob(f"{CONSOLE_LOG_PREFIX}*.log"):
+        try:
+            found.append((path.stat().st_mtime, path.name, path))
+        except OSError:
+            continue
+    return [path for _when, _name, path in sorted(found, reverse=True)]
+
+
+def prune_console_logs(folder: Path, keep: int) -> None:
+    """Delete all but the ``keep`` newest console logs in ``folder``."""
+    for path in console_log_files(folder)[max(keep, 0):]:
+        try:
+            path.unlink()
+        except OSError as error:
+            log.warning("could not remove %s: %s", path.name, error)
+
+
+class ConsoleLog:
+    """What the board printed in one install's watched starts, for head office.
+
+    One file per install in the log folder; each watched start (the first start, the
+    restart check, every Try again) is one section of it. Lines are redacted as in
+    installer.log (logging_setup.redact: registered secrets, secret-looking names and
+    long blobs). The file stops growing at ``max_bytes``. A problem with the file only
+    ends the log, never the watch.
+    """
+
+    def __init__(self, path: Path, clock: Clock, max_bytes: int = CONSOLE_LOG_MAX_BYTES) -> None:
+        self.path = path
+        self._clock = clock
+        self._max = max_bytes
+        self._handle: Optional[IO[str]] = None
+        self._size = 0
+        self._began = 0.0
+        self._full = False
+
+    def begin(self, title: str) -> None:
+        """A new watched start: its heading, with this computer's date and time."""
+        self.close()
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self._handle = open(self.path, "a", encoding="utf-8")
+            self._size = self.path.stat().st_size
+        except OSError as error:
+            log.warning("console log %s not kept: %s", self.path.name, error)
+            self.close()
+            return
+        self._began = self._clock.monotonic()
+        self._full = False
+        moment = self._clock.now_utc().astimezone().strftime("%Y-%m-%d %H:%M:%S %z")
+        self._write(f"=== {title}, {moment} ===", frame=True)
+
+    def note(self, text: str) -> None:
+        """Something the app saw itself, such as the unplug or the port opening."""
+        self._entry(f"# {text}")
+
+    def line(self, text: str) -> None:
+        """One line as the board printed it (without colours), redacted."""
+        cleaned = _ANSI.sub("", text).strip()
+        if cleaned:
+            self._entry(redact(cleaned)[:_LINE_MAX])
+
+    def end(self, report: BootReport) -> None:
+        advice = report.advice.code if report.advice else "-"
+        self._write(f"=== Result: {report.outcome.value} ({advice}) ===", frame=True)
+        self._write("", frame=True)
+        self.close()
+
+    def close(self) -> None:
+        handle, self._handle = self._handle, None
+        if handle is not None:
+            try:
+                handle.close()
+            except OSError:
+                pass
+
+    def _entry(self, text: str) -> None:
+        if self._handle is None or self._full:
+            return
+        entry = f"{self._clock.monotonic() - self._began:7.1f}  {text}"
+        if self._size + len(entry.encode("utf-8")) + len(os.linesep) > self._max:
+            self._full = True
+            self._write("# The rest of this start is not kept: this file is full.", frame=True)
+            return
+        self._write(entry)
+
+    def _write(self, text: str, frame: bool = False) -> None:
+        if self._handle is None or (frame and self._size > self._max + _FRAME_SLACK):
+            return
+        try:
+            self._handle.write(text + "\n")
+            self._handle.flush()
+        except OSError as error:
+            log.warning("console log %s stopped: %s", self.path.name, error)
+            self.close()
+            return
+        self._size += len(text.encode("utf-8")) + len(os.linesep)
+
+
+def _note(record: Optional[ConsoleLog], text: str) -> None:
+    if record is not None:
+        record.note(text)
+
+
 # ------------------------------------------------------------------- watcher
 
 class _Usb:
@@ -304,59 +441,117 @@ class _Watch:
 
 
 class BootWatcher:
-    """BootService: replug guidance, then the first start's verdict from the console."""
+    """BootService: replug guidance, then the verdict of each watched start from the console.
+
+    With ``console_logs`` (the app's log folder) the lines of every watched start of an
+    install that names itself (``transcript``) are kept there (ConsoleLog).
+    """
 
     MAX_OTHER_EVENTS = 200
     MAX_KEPT_EVENTS = 2000
 
     def __init__(self, usb: _Usb, clock: Optional[Clock] = None,
                  opener: Optional[SerialOpener] = None,
-                 placeholder_ssids: Sequence[str] = ("RE7",)) -> None:
+                 placeholder_ssids: Sequence[str] = ("RE7",),
+                 console_logs: Optional[Path] = None) -> None:
         self._usb = usb
         self._clock = clock or Clock()
         self._open = opener or open_serial
         self._placeholders = tuple(placeholder_ssids)
+        self._console_logs = console_logs
 
-    # ---------------------------------------------------------- first boot
+    # ------------------------------------------------------ watched starts
 
     def wait_first_boot(self, mac: str, expect: InstallConfig, on_phase: PhaseFn,
                         on_event: EventFn, cancel: CancelToken,
-                        timeout_s: float = 120.0) -> BootReport:
+                        timeout_s: float = 120.0,
+                        transcript: Optional[str] = None) -> BootReport:
         # The replug can take minutes; a PC that sleeps meanwhile never sees the start.
         with keep_awake():
-            return self._wait_first_boot(mac, expect, on_phase, on_event, cancel, timeout_s)
+            return self._wait_start(mac, expect, on_phase, on_event, cancel, timeout_s,
+                                    restart=False, transcript=transcript)
 
-    def _wait_first_boot(self, mac: str, expect: InstallConfig, on_phase: PhaseFn,
-                         on_event: EventFn, cancel: CancelToken,
-                         timeout_s: float) -> BootReport:
+    def wait_restart(self, mac: str, expect: InstallConfig, on_phase: PhaseFn,
+                     on_event: EventFn, cancel: CancelToken,
+                     timeout_s: float = 120.0,
+                     transcript: Optional[str] = None,
+                     first: Optional[BootReport] = None) -> BootReport:
+        """The restart check: after a good first start, one more replug and its start.
+
+        Watched like the first start, with the same phases, timeouts and board-ID rules,
+        and judged with ``restart``: the board must name its settings again (judge).
+        ``first`` is the first start's report: settings other than it showed were lost.
+        """
+        with keep_awake():
+            return self._wait_start(mac, expect, on_phase, on_event, cancel, timeout_s,
+                                    restart=True, transcript=transcript, first=first)
+
+    def _wait_start(self, mac: str, expect: InstallConfig, on_phase: PhaseFn,
+                    on_event: EventFn, cancel: CancelToken, timeout_s: float, *,
+                    restart: bool, transcript: Optional[str],
+                    first: Optional[BootReport] = None) -> BootReport:
         mac = normalize_mac(mac) or mac
+        record = self._console_log(mac, transcript)
+        if record is not None:
+            record.begin("Second start, after a restart" if restart else "First start")
+        try:
+            report = self._watch_start(mac, expect, on_phase, on_event, cancel, timeout_s,
+                                       restart=restart, record=record, first=first)
+        except BaseException:
+            if record is not None:
+                record.close()
+            raise
+        if record is not None:
+            record.end(report)
+        return report
+
+    def _watch_start(self, mac: str, expect: InstallConfig, on_phase: PhaseFn,
+                     on_event: EventFn, cancel: CancelToken, timeout_s: float, *,
+                     restart: bool, record: Optional[ConsoleLog],
+                     first: Optional[BootReport] = None) -> BootReport:
         on_phase(ReplugPhase.WAITING_UNPLUG)
         if not self._wait_presence(mac, present=False, timeout=UNPLUG_TIMEOUT_S, cancel=cancel):
             return self._report_early(cancel)
+        _note(record, "the board was unplugged")
         on_phase(ReplugPhase.WAITING_REPLUG)
         if not self._wait_presence(mac, present=True, timeout=REPLUG_TIMEOUT_S, cancel=cancel):
             return self._report_early(cancel)
+        _note(record, "the board was plugged in again")
         on_phase(ReplugPhase.WATCHING)
         watch = _Watch(started=self._clock.monotonic(), events=[])
         decided: List[BootReport] = []
 
         def check(_event: Optional[ConsoleEvent]) -> bool:
-            verdict = judge(watch, expect, self._clock.monotonic(), timeout_s, final=False)
+            verdict = judge(watch, expect, self._clock.monotonic(), timeout_s, final=False,
+                            restart=restart, first=first, board_id=mac)
             if verdict is not None:
                 decided.append(verdict)
             return verdict is not None
 
         self._read(mac, watch, on_event, cancel, deadline=watch.started + timeout_s,
-                   stop=check)
+                   stop=check, record=record)
         if cancel.cancelled and not decided:
             return BootReport(BootOutcome.CANCELLED, events=tuple(watch.events),
                               advice=texts.CANCELLED)
         report = decided[0] if decided else judge(watch, expect, self._clock.monotonic(),
-                                                  timeout_s, final=True)
+                                                  timeout_s, final=True, restart=restart,
+                                                  first=first, board_id=mac)
         assert report is not None
-        log.info("first start of %s: %s (%d events, %d resets)", mac, report.outcome.value,
+        log.info("%s of %s: %s (%d events, %d resets)",
+                 "second start" if restart else "first start", mac, report.outcome.value,
                  len(watch.events), watch.resets)
         return report
+
+    def _console_log(self, mac: str, transcript: Optional[str]) -> Optional[ConsoleLog]:
+        """The install's console log, or None when nothing is to be kept."""
+        if self._console_logs is None or not transcript:
+            return None
+        board = _safe_name((normalize_mac(mac) or mac).replace(":", ""))
+        path = self._console_logs / f"{CONSOLE_LOG_PREFIX}{board}-{_safe_name(transcript)}.log"
+        if not path.exists():
+            # A new install's file: only the newest others stay, so the folder stays small.
+            prune_console_logs(self._console_logs, CONSOLE_LOGS_KEPT - 1)
+        return ConsoleLog(path, self._clock)
 
     def _report_early(self, cancel: CancelToken) -> BootReport:
         if cancel.cancelled:
@@ -387,7 +582,7 @@ class BootWatcher:
 
     def _read(self, mac: str, watch: _Watch, on_event: EventFn, cancel: CancelToken, *,
               deadline: Optional[float], stop: Optional[Callable[[Optional[ConsoleEvent]], bool]],
-              fixed_port: Optional[str] = None) -> None:
+              fixed_port: Optional[str] = None, record: Optional[ConsoleLog] = None) -> None:
         parser = ConsoleParser(mac)
         handle = None
         reader = LineReader()
@@ -412,6 +607,7 @@ class BootWatcher:
                     except Exception as error:  # the port is not ready or another app has it
                         if _is_busy(error) and not watch.port_busy:
                             watch.port_busy = True
+                            _note(record, "another program is using the port")
                             busy = ConsoleEvent(ConsoleKind.OTHER, "port busy",
                                                 {"signal": "port_busy"},
                                                 self._clock.monotonic() - watch.started)
@@ -419,6 +615,7 @@ class BootWatcher:
                             on_event(busy)
                         self._clock.sleep(0.1, cancel)
                         continue
+                    _note(record, f"the port {port} is open")
                     if was_open:
                         watch.resets += 1
                         watch.reset_times += (now - watch.started,)
@@ -429,13 +626,14 @@ class BootWatcher:
                 except Exception:  # the chip reset and USB went away
                     _close(handle)
                     handle = None
+                    _note(record, "the port closed")
                     for line in reader.flush():
-                        self._emit(parser, line, watch, on_event)
+                        self._emit(parser, line, watch, on_event, record)
                     if stop and stop(None):
                         return
                     continue
                 for line in reader.feed(chunk or b""):
-                    event = self._emit(parser, line, watch, on_event)
+                    event = self._emit(parser, line, watch, on_event, record)
                     if stop and event is not None and stop(event):
                         return
                 if not chunk:
@@ -446,7 +644,9 @@ class BootWatcher:
             _close(handle)
 
     def _emit(self, parser: ConsoleParser, line: str, watch: _Watch,
-              on_event: EventFn) -> Optional[ConsoleEvent]:
+              on_event: EventFn, record: Optional[ConsoleLog] = None) -> Optional[ConsoleEvent]:
+        if record is not None:
+            record.line(line)  # every line, also those past the screen's limits below
         event = parser.parse(line, self._clock.monotonic() - watch.started)
         if event is None:
             return None
@@ -558,8 +758,19 @@ def crash_loop(events: Sequence[ConsoleEvent], port_reopens: int = 0) -> bool:
 
 
 def judge(watch: _Watch, expect: InstallConfig, now: float, timeout_s: float, *,
-          final: bool) -> Optional[BootReport]:
-    """The first start's outcome, or None while it is still too early to say."""
+          final: bool, restart: bool = False, first: Optional[BootReport] = None,
+          board_id: Optional[str] = None) -> Optional[BootReport]:
+    """A watched start's outcome, or None while it is still too early to say.
+
+    ``restart`` judges the restart check, the start after the good first one, with one
+    more rule: it passes only when the board names its settings again, in the settings
+    line for the expected zone or the start line with zone and device. Missing or
+    unreadable settings then mean it lost them when it restarted (SETTINGS_LOST), and so
+    do a zone or device other than the first start (``first``) showed. A board that runs
+    without either line (both came before the port opened) cannot show that it kept them
+    (SETTINGS_NOT_SEEN). Everything else is judged as at the first start. ``board_id``
+    goes into the lost-settings advice, for the board's label.
+    """
     events = watch.events
     started = _first(events, ConsoleKind.APP_STARTED)
     loaded = _first(events, ConsoleKind.PROVISIONING_LOADED)
@@ -574,18 +785,38 @@ def judge(watch: _Watch, expect: InstallConfig, now: float, timeout_s: float, *,
         return BootReport(outcome, zone_id_seen=zone_seen, device_id_seen=device_seen,
                           app_version_seen=version_seen, events=tuple(events), advice=advice)
 
+    def changed_since_first(zone: Optional[str], device: Optional[str]) -> bool:
+        """At the restart check: other settings than the first start showed for this setup.
+
+        Writing them again would last only until the next restart, as with lost ones. A
+        value the first start did not see (its lines came before the port opened) is
+        judged as at the first start.
+        """
+        if not restart or first is None or first.outcome is not BootOutcome.OK:
+            return False
+        return ((first.zone_id_seen is not None and not _same(zone, first.zone_id_seen))
+                or (device is not None and first.device_id_seen is not None
+                    and not _same(device, first.device_id_seen)))
+
     kinds = {event.kind for event in events}
     if ConsoleKind.NVS_KEY_DANGER in kinds:
         return report(BootOutcome.SECURITY_KEY_PROBLEM, texts.SECURITY_KEY_LOST)
     if ConsoleKind.FAMILY_MISMATCH in kinds:
         return report(BootOutcome.FAMILY_MISMATCH, texts.FAMILY_MISMATCH_LOOP)
     if kinds & {ConsoleKind.NVS_FAILED, ConsoleKind.SETTINGS_MISSING}:
+        if restart:
+            # It read them at the first start (the 2 Nov 2026 boards): writing them again
+            # would last only until the next restart.
+            return report(BootOutcome.SETTINGS_LOST, texts.settings_lost_on_restart(board_id))
         return report(BootOutcome.SECURITY_KEY_PROBLEM, texts.SETTINGS_UNREADABLE)
     if ConsoleKind.PSRAM_FAILED in kinds:
         return report(BootOutcome.FAULTY_RESTART_LOOP, texts.PSRAM_FAILED)
 
     expected = f"zone {expect.zone_id}, device {expect.device_id}"
     if loaded and not _same(loaded.data.get("zone_id"), expect.zone_id):
+        if changed_since_first(loaded.data.get("zone_id"), None):
+            return report(BootOutcome.SETTINGS_LOST,
+                          texts.settings_lost_on_restart(board_id, changed=True))
         return report(BootOutcome.WRONG_SETTINGS, texts.wrong_settings(
             f"zone {loaded.data.get('zone_id')}", expected))
 
@@ -606,6 +837,9 @@ def judge(watch: _Watch, expect: InstallConfig, now: float, timeout_s: float, *,
     if running:
         if started and not (_same(started.data.get("zone_id"), expect.zone_id)
                             and _same(started.data.get("device_id"), expect.device_id)):
+            if changed_since_first(started.data.get("zone_id"), started.data.get("device_id")):
+                return report(BootOutcome.SETTINGS_LOST,
+                              texts.settings_lost_on_restart(board_id, changed=True))
             return report(BootOutcome.WRONG_SETTINGS, texts.wrong_settings(
                 f"zone {started.data.get('zone_id')}, device {started.data.get('device_id')}",
                 expected))
@@ -618,11 +852,23 @@ def judge(watch: _Watch, expect: InstallConfig, now: float, timeout_s: float, *,
         went_down = any(event.at >= since for event in events
                         if _panic(event) not in (None, "task_watchdog"))
         if not went_down:
-            ok = texts.boot_ok(zone_seen, device_seen, version_seen)
+            if not restart:
+                outcome, advice = BootOutcome.OK, texts.boot_ok(zone_seen, device_seen,
+                                                               version_seen)
+            elif started or loaded:
+                # Either line matched what was set (WRONG_SETTINGS above otherwise), and the
+                # program runs: the settings survived the restart. Not before a line of the
+                # running program: "provisioning is required" can follow the settings line.
+                outcome, advice = BootOutcome.OK, texts.settings_kept(zone_seen, device_seen,
+                                                                     version_seen)
+            else:
+                # Both lines are printed once, before this one: they came before the port
+                # opened and cannot come again in this start.
+                outcome, advice = BootOutcome.SETTINGS_NOT_SEEN, texts.SETTINGS_NOT_SEEN
             if ConsoleKind.STORAGE_READY in kinds:
-                return report(BootOutcome.OK, ok)
+                return report(outcome, advice)
             if final or now - watch.started - running.at >= STORAGE_WAIT_S:
-                return report(BootOutcome.OK, ok)
+                return report(outcome, advice)
             return None
     else:
         period = _restart_period(watch.reset_times)

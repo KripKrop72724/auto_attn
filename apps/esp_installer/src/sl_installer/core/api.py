@@ -393,6 +393,9 @@ class BootOutcome(str, enum.Enum):
     FAMILY_MISMATCH = "family_mismatch"
     NOT_REPLUGGED = "not_replugged"          # timed out waiting for unplug/replug
     CANCELLED = "cancelled"
+    # The restart check only (BootService.wait_restart):
+    SETTINGS_LOST = "settings_lost"          # missing or unreadable settings after a restart
+    SETTINGS_NOT_SEEN = "settings_not_seen"  # running, but no line named its settings
 
 
 @dataclass(frozen=True)
@@ -474,9 +477,25 @@ class InstallService(Protocol):
 
 
 class BootService(Protocol):
+    """Replug guidance and the verdict of a watched start.
+
+    Every install watches two starts: the first one (``wait_first_boot``) and, once
+    that passed, one more after a deliberate replug (``wait_restart``), which passes
+    only when the board shows its settings again: a board must keep them through a
+    restart. ``first`` is the first start's report: other settings than it showed count
+    as lost. ``transcript`` names the install (its request ID); the board's lines of
+    each watched start then go, redacted, into that install's console log.
+    """
+
     def wait_first_boot(self, mac: str, expect: InstallConfig, on_phase: PhaseFn,
                         on_event: EventFn, cancel: CancelToken,
-                        timeout_s: float = 120.0) -> BootReport: ...
+                        timeout_s: float = 120.0,
+                        transcript: Optional[str] = None) -> BootReport: ...
+    def wait_restart(self, mac: str, expect: InstallConfig, on_phase: PhaseFn,
+                     on_event: EventFn, cancel: CancelToken,
+                     timeout_s: float = 120.0,
+                     transcript: Optional[str] = None,
+                     first: Optional[BootReport] = None) -> BootReport: ...
     def watch_console(self, candidate: UsbCandidate, on_event: EventFn,
                       cancel: CancelToken) -> None: ...
 
@@ -488,7 +507,9 @@ class DiagnosisServiceProto(Protocol):
 
 
 class RecordsService(Protocol):
-    def save_install_record(self, summary: InstallSummary, boot: BootReport) -> str: ...
+    # ``restart``: the restart check (BootService.wait_restart), None when not watched.
+    def save_install_record(self, summary: InstallSummary, boot: BootReport,
+                            restart: Optional[BootReport] = None) -> str: ...
     def save_help_file(self) -> str: ...   # ZIP of redacted logs for head office
 
 

@@ -37,7 +37,7 @@ from ..core.api import (
     Severity,
     StepId,
 )
-from ..core.installer import report_boot
+from ..core.installer import report_boot, report_restart
 from . import naming, wording
 from .pages import (
     CHECK_BOARD,
@@ -143,7 +143,8 @@ class Session:
     mode: Optional[InstallMode] = None
     config: Optional[api.InstallConfig] = None
     summary: Optional[api.InstallSummary] = None
-    boot: Optional[api.BootReport] = None
+    boot: Optional[api.BootReport] = None  # the first start
+    restart: Optional[api.BootReport] = None  # the restart check, after a good first start
     install_step: Optional[StepId] = None
     installing: bool = False
     user_cancelled: bool = False
@@ -227,6 +228,21 @@ class Controller(QObject):
             return (
                 "The board is being set up. Closing the app now could damage the board. "
                 "Please wait until the app says it is finished."
+            )
+        return None
+
+    def close_question(self) -> Optional[str]:
+        """Words to ask before the window closes, or None.
+
+        While the restart check runs, the board has started once and nothing stops a
+        person in a hurry from taking it away: closing the app then skips the check that
+        shows it keeps its settings. The check can take minutes, so this only asks.
+        """
+        boot = self.session.boot
+        if self.running("boot") and boot is not None and boot.outcome is BootOutcome.OK:
+            return (
+                "The app has not finished checking this board. If you close the app now, "
+                "do not install the board at a site."
             )
         return None
 
@@ -1230,6 +1246,11 @@ class Controller(QObject):
         self.show(MACHINE)
 
     # ============================================================ first start
+    #
+    # Two watched starts: the first one, then, once it passed, the restart check (one more
+    # deliberate replug). Only a board that names its settings again at the second start
+    # gets Next and the Done screen: on 2 Nov 2026 two new boards started well once and
+    # had lost their settings at every later start.
 
     def _enter_first_start(self) -> None:
         session, page = self.session, self.page(FIRST_START)
@@ -1238,17 +1259,31 @@ class Controller(QObject):
         if board is None or config is None:
             self.go_home()
             return
-        mac = session.summary.mac if session.summary else board.mac
+        session.boot = session.restart = None
+        mac, transcript = self._watched_board()
 
         def work(operation: Operation) -> object:
             on_phase = self.runner.relay(page.set_phase, operation)
             on_event = self.runner.relay(page.add_event, operation)
             return self.services.boot.wait_first_boot(
-                mac, config, on_phase, on_event, operation.token, FIRST_BOOT_TIMEOUT_S
+                mac,
+                config,
+                on_phase,
+                on_event,
+                operation.token,
+                FIRST_BOOT_TIMEOUT_S,
+                transcript=transcript,
             )
 
         self._run("boot", work, self._booted, self._boot_failed)
         self._update_sign_out()
+
+    def _watched_board(self) -> Tuple[str, Optional[str]]:
+        """The board ID to watch, and the install whose console log keeps what it says."""
+        session = self.session
+        summary, board = session.summary, session.board
+        mac = summary.mac if summary else (board.mac if board else "")
+        return mac, summary.request_id if summary else None
 
     def _booted(self, report: object) -> None:
         session, page = self.session, self.page(FIRST_START)
@@ -1259,43 +1294,97 @@ class Controller(QObject):
         session.boot = report
         self._report_boot(report)
         if report.outcome is BootOutcome.OK:
-            seen = []
-            if report.zone_id_seen:
-                device = f", device number {report.device_id_seen}" if report.device_id_seen else ""
-                seen.append(f"It started for {report.zone_id_seen}{device}.")
-            else:
-                # The start line, with the zone, came before the app could read the board.
-                seen.append("It started and is working.")
-            if report.app_version_seen:
-                seen.append(f"Its software is version {report.app_version_seen}.")
-            page.show_result(
-                Advice(
-                    "FIRST_START_OK",
-                    "The board started correctly",
-                    " ".join(seen),
-                    (),
-                    Severity.SUCCESS,
-                    "success",
-                ),
-                [("Next", "next", "primary")],
-            )
+            # Not the end: the board must also keep its settings when it starts again.
+            self._start_restart_check()
             return
         advice = report.advice or wording.boot_fallback(report, session.config)
         page.show_result(advice, self._boot_actions(report.outcome, advice))
 
-    def _report_boot(self, report: api.BootReport) -> None:
-        """Tell head office how the first start went; best effort, off the GUI thread."""
+    def _start_restart_check(self) -> None:
+        """One more replug, and the second start watched the same way (BootService)."""
+        session, page = self.session, self.page(FIRST_START)
+        config, first = session.config, session.boot
+        if config is None or first is None or session.board is None:
+            self.go_home()
+            return
+        session.restart = None
+        mac, transcript = self._watched_board()
+        page.start_again(wording.restart_check(first))
+
+        def work(operation: Operation) -> object:
+            on_phase = self.runner.relay(page.set_phase, operation)
+            on_event = self.runner.relay(page.add_event, operation)
+            # With the first start's report: other settings than it showed were not kept.
+            return self.services.boot.wait_restart(
+                mac,
+                config,
+                on_phase,
+                on_event,
+                operation.token,
+                FIRST_BOOT_TIMEOUT_S,
+                transcript=transcript,
+                first=first,
+            )
+
+        self._run("boot", work, self._restarted, self._boot_failed)
+        self._update_sign_out()
+
+    def _restarted(self, report: object) -> None:
+        session, page = self.session, self.page(FIRST_START)
+        self._update_sign_out()
+        if not isinstance(report, api.BootReport):
+            self._boot_failed(RuntimeError("no restart report"))
+            return
+        session.restart = report
+        self._report_boot(report, restart=True)
+        if report.outcome is BootOutcome.OK and session.boot is not None:
+            page.show_result(
+                wording.start_checks_ok(session.boot, report), [("Next", "next", "primary")]
+            )
+            return
+        mac, _transcript = self._watched_board()
+        advice = report.advice or wording.boot_fallback(report, session.config, mac)
+        if report.outcome is BootOutcome.SETTINGS_LOST:
+            # The advice says to send a help file to head office: it carries this record.
+            self._keep_record()
+        page.show_result(advice, self._boot_actions(report.outcome, advice))
+
+    def _report_boot(self, report: api.BootReport, restart: bool = False) -> None:
+        """Tell head office how a watched start went; best effort, off the GUI thread."""
         summary = self.session.summary
         if summary is None or report.outcome is BootOutcome.CANCELLED:
             return
         server = self.services.server
+        send = report_restart if restart else report_boot
         self.runner.start(
-            lambda: report_boot(server, summary, report),
-            on_error=lambda error: log.info("first start not reported: %s", error),
+            lambda: send(server, summary, report),
+            on_error=lambda error: log.info("start not reported: %s", error),
+        )
+
+    def _keep_record(self) -> None:
+        """Save the setup record without being asked, for a board that must not be used."""
+        session = self.session
+        summary, boot, restart = session.summary, session.boot, session.restart
+        if summary is None or boot is None:
+            return
+
+        def kept(path: object) -> None:
+            session.record_path = str(path)
+            log.info("setup record kept: %s", path)
+
+        self._run(
+            "record",
+            lambda _op: self.services.records.save_install_record(summary, boot, restart),
+            kept,
+            lambda error: log.info("setup record not kept: %s", error),
         )
 
     @staticmethod
     def _boot_actions(outcome: Optional[BootOutcome], advice: Advice) -> List[Tuple[str, str, str]]:
+        if outcome is BootOutcome.SETTINGS_LOST:
+            # Writing the settings again would last only until the next restart, so the board
+            # must not go to a site: nothing to try again or fix here (the advice says so).
+            return [("Go back to the start", "home", "secondary")]
         settings_fix = outcome in (
             BootOutcome.WRONG_SETTINGS,
             BootOutcome.STORAGE_PROBLEM,
@@ -1318,10 +1407,18 @@ class Controller(QObject):
         self.page(FIRST_START).show_result(advice, self._boot_actions(None, advice))
 
     def _first_start_next(self) -> None:
-        self.show(DONE)
+        # Done says the board is ready: only once it kept its settings through a restart.
+        restart = self.session.restart
+        if restart is not None and restart.outcome is BootOutcome.OK:
+            self.show(DONE)
 
     def _first_start_retry(self) -> None:
-        self._enter_first_start()
+        boot = self.session.boot
+        if boot is not None and boot.outcome is BootOutcome.OK:
+            # The first start passed already: only the restart check is watched again.
+            self._start_restart_check()
+        else:
+            self._enter_first_start()
 
     def _first_start_fix_settings(self) -> None:
         # Checking the board again leads to "Change its settings", with these details filled in.
@@ -1346,12 +1443,14 @@ class Controller(QObject):
             if session.mode is InstallMode.CHANGE_SETTINGS
             else "The board is ready"
         )
+        restart = session.restart
         page.show_done(
             rows,
             mac,
             self.services.defaults.setup_ap_password,
             values is not None and values.family is Family.HIKVISION,
             title,
+            kept_settings=restart is not None and restart.outcome is BootOutcome.OK,
         )
 
     def _done_save_record(self) -> None:
@@ -1359,6 +1458,7 @@ class Controller(QObject):
         if session.summary is None:
             return
         summary, boot = session.summary, session.boot or api.BootReport(BootOutcome.OK)
+        restart = session.restart
         page = self.page(DONE)
         page.set_secondary("Saving", "save_record")
         page.secondary_button.setEnabled(False)
@@ -1376,7 +1476,7 @@ class Controller(QObject):
 
         self._run(
             "record",
-            lambda _op: self.services.records.save_install_record(summary, boot),
+            lambda _op: self.services.records.save_install_record(summary, boot, restart),
             done,
             failed,
         )

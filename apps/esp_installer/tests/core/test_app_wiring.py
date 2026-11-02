@@ -4,15 +4,16 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from sl_installer import __main__ as entry
 from sl_installer import config as app_config
 from sl_installer.config import AppConfig, load_config, load_field_defaults
-from sl_installer.core import bench, selftest
-from sl_installer.core.api import (FieldDefaults, HardwareVerdict, PresenceReport, PresenceState,
-                                   SecurityState, Services)
+from sl_installer.core import bench, selftest, texts
+from sl_installer.core.api import (BootOutcome, BootReport, FieldDefaults, HardwareVerdict,
+                                   PresenceReport, PresenceState, SecurityState, Services)
 from sl_installer.core.esptool_runner import ToolResult, ToolRunner
 from sl_installer.core.factory import make_services
 from sl_installer.core.single_instance import LOCK_FILE_NAME, InstanceLock
@@ -408,3 +409,126 @@ def test_bench_settings_change_needs_no_bundle(monkeypatch, capsys, allowed):
         out = capsys.readouterr().out
         assert "This app cannot change this board's settings" in out and "Set up before" in out
     assert asked == []  # no board software asked for, nothing run
+
+
+def bench_services(first, restart):
+    """Services for the bench's install path: a new board, then the two watched starts."""
+    from sl_installer.core.api import (BundleInfo, DeviceRecord, Family, InstallSummary,
+                                       ReplugPhase)
+    bundle = BundleInfo("zkt-2.9.1-e89380a1", Family.ZKT, "ZKT 2.9.1", "2.9.1", True,
+                        "AVAILABLE")
+    seen = SimpleNamespace(starts=[], events=[], saved=[], firsts=[])
+
+    class Board:
+        port, mac, chip, flash_size_mb, psram_mb = support.PORT, support.MAC, "ESP32-S3", 16, 8
+        hardware, security, secure_download_mode = (HardwareVerdict.OK, SecurityState.BLANK,
+                                                    False)
+
+    def watched(name, report):
+        def wait(mac, expect, on_phase, on_event, cancel, timeout_s=120.0, transcript=None,
+                 **restart):
+            seen.starts.append((name, mac, transcript))
+            if "first" in restart:
+                seen.firsts.append(restart.pop("first"))
+            assert not restart, restart
+            for phase in ReplugPhase:
+                on_phase(phase)
+            return report
+        return staticmethod(wait)
+
+    class Fake:
+        defaults = FieldDefaults(wifi_password="test-wifi-pass", zkt_comm_key=1979)
+
+        class server:
+            login = staticmethod(lambda user, password: user)
+            bundles = staticmethod(lambda family: [bundle])
+            device = staticmethod(lambda mac: DeviceRecord(known=False, mac=mac))
+            report = staticmethod(lambda request_id, mac, kind, detail: seen.events.append(
+                (request_id, kind, detail)))
+
+        class usb:
+            snapshot = staticmethod(lambda: PresenceReport(
+                PresenceState.ONE_BOARD, board=support.FakeUsb().candidate()))
+
+        class boards:
+            inspect = staticmethod(lambda candidate, cancel: Board())
+
+        class installer:
+            run = staticmethod(lambda mode, board, config, on_step, cancel: InstallSummary(
+                "sli-bench-0001", mode, board.mac, config, bundle, "2026-11-02T09:00:00Z",
+                "2026-11-02T09:03:00Z"))
+
+        class boot:
+            wait_first_boot = watched("first start", first)
+            wait_restart = watched("restart check", restart)
+
+        class records:
+            save_install_record = staticmethod(
+                lambda summary, boot, restart=None: seen.saved.append((boot, restart))
+                or "setup-record.txt")
+
+    return Fake, seen
+
+
+def bench_install(monkeypatch, services) -> int:
+    monkeypatch.setattr("getpass.getpass", lambda prompt="": "test-admin-pass")
+    monkeypatch.setattr("builtins.input", lambda prompt="": support.MAC)  # the typed board ID
+    args = bench.parser().parse_args(["install", "--username", "u", "--family", "zkt",
+                                      "--zone-id", "lf-zone-x-01", "--bundle-id",
+                                      "zkt-2.9.1-e89380a1"])
+    return bench.cmd_install(services, args)
+
+
+FIRST_OK = BootReport(BootOutcome.OK, "LF-ZONE-X-01", "1", "2.9.1",
+                      advice=texts.boot_ok("LF-ZONE-X-01", "1", "2.9.1"))
+
+
+@pytest.mark.parametrize("restart, code, kind", [
+    (BootReport(BootOutcome.OK, "LF-ZONE-X-01", "1", "2.9.1",
+                advice=texts.settings_kept("LF-ZONE-X-01", "1", "2.9.1")), 0, "RESTART_OK"),
+    (BootReport(BootOutcome.SETTINGS_LOST, advice=texts.SETTINGS_LOST_ON_RESTART), 4,
+     "RESTART_FAILED"),
+], ids=["kept", "lost"])
+def test_bench_install_checks_that_the_board_keeps_its_settings(monkeypatch, capsys, restart,
+                                                                code, kind):
+    services, seen = bench_services(FIRST_OK, restart)
+    assert bench_install(monkeypatch, services) == code
+    out = capsys.readouterr().out
+    # Both starts are watched, the second after one more replug, with the install's log.
+    assert seen.starts == [("first start", support.MAC, "sli-bench-0001"),
+                           ("restart check", support.MAC, "sli-bench-0001")]
+    assert seen.firsts == [FIRST_OK]  # the restart check compares with the first start
+    assert f"One more check. {texts.RESTART_REPLUG}" in out
+    # A good first start gets no words of success before the restart check.
+    before = out.split("One more check")[0]
+    assert "started correctly" not in before and "BOOT_OK" not in before
+    assert "First start: ok zone=LF-ZONE-X-01 device=1 version=2.9.1" in before
+    assert ">> Unplug the board again now." in out and ">> Watching the second start..." in out
+    assert [(request, sent) for request, sent, _detail in seen.events] == [
+        ("sli-bench-0001", "BOOT_OK"), ("sli-bench-0001", kind)]
+    assert seen.events[1][2]["settings_kept"] is (code == 0)
+    assert seen.saved == [(FIRST_OK, restart)]
+    # The bench says the board is ready only when it kept its settings.
+    assert (texts.SETTINGS_KEPT in out) is (code == 0)
+    if code:
+        assert texts.SETTINGS_LOST_ON_RESTART.title in out
+
+
+def test_bench_install_watches_no_restart_after_a_failed_first_start(monkeypatch, capsys):
+    first = BootReport(BootOutcome.NO_OUTPUT, advice=texts.NO_OUTPUT)
+    services, seen = bench_services(first, None)
+    assert bench_install(monkeypatch, services) == 4
+    out = capsys.readouterr().out
+    assert [name for name, _mac, _transcript in seen.starts] == ["first start"]
+    assert [sent for _request, sent, _detail in seen.events] == ["BOOT_FAILED"]
+    assert seen.saved == [(first, None)]
+    assert "One more check" not in out and texts.SETTINGS_KEPT not in out
+
+
+def test_factory_keeps_console_logs_next_to_the_app_log(tmp_path):
+    import logging
+    try:
+        services = make_services(load_config(data_dir=tmp_path))
+    finally:
+        logging.getLogger("sl_installer").propagate = True
+    assert services.boot._console_logs == tmp_path / "logs"  # type: ignore[attr-defined]

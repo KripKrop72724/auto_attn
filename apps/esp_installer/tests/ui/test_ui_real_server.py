@@ -327,15 +327,27 @@ class Rig:
         self.click_primary(pages.CONFIRM)
         self.wait_page(pages.INSTALLING)
 
-    def replug(self, lines: List[str]) -> None:
+    def replug(self, lines: List[str], again: bool = False) -> None:
+        """As the real-engine rig: ``again`` is the restart check's replug."""
         first_start = self.page(pages.FIRST_START)
         self.wait_page(pages.FIRST_START)
-        self.wait(lambda: first_start.phase is ReplugPhase.WAITING_UNPLUG)
+        self.wait(
+            lambda: first_start.again is again and first_start.phase is ReplugPhase.WAITING_UNPLUG
+        )
         self.console.lines = lines
         self.ports.plugged = False
         self.wait(lambda: first_start.phase is ReplugPhase.WAITING_REPLUG)
         self.ports.plugged = True
-        self.wait(lambda: first_start.result.isVisible())
+        self.wait(
+            lambda: (not again and first_start.again)
+            or (first_start.result.isVisible() and not self.controller.running("boot"))
+        )
+
+    def replug_twice(self, lines: List[str]) -> None:
+        """The first start, then the restart check, where the board kept its settings."""
+        self.replug(lines)
+        assert self.page(pages.FIRST_START).result.advice.code == "RESTART_CHECK"
+        self.replug([line for line in lines if "secure_boot" not in line], again=True)
 
     def package_request(self, mode: InstallMode, **config) -> PackageRequest:
         return PackageRequest(
@@ -401,9 +413,9 @@ def test_new_board_package_and_events_from_the_real_head_office(rig, office, tmp
     assert r.page(pages.CHECKING).result.advice.code == "NEW_BOARD"
     r.click_primary(pages.CHECKING)
     r.confirm_and_install()
-    r.replug(real_engine.boot_lines(ZONE))
+    r.replug_twice(real_engine.boot_lines(ZONE))
     first_start = r.page(pages.FIRST_START)
-    assert first_start.result.advice.code == "FIRST_START_OK", first_start.result.advice
+    assert first_start.result.advice.code == "START_CHECKS_OK", first_start.result.advice
     r.click_primary(pages.FIRST_START)
     r.wait_page(pages.DONE)
 
@@ -414,10 +426,14 @@ def test_new_board_package_and_events_from_the_real_head_office(rig, office, tmp
     (issued,) = office.audits("INSTALLER_PACKAGE_ISSUED")
     assert issued.target_id == MAC and issued.actor == ADMIN
     assert issued.after["mode"] == "new_board" and issued.after["bundle_id"] == bundle.bundle_id
-    r.wait(lambda: events(office)[-1:] == ["INSTALLER_BOOT_OK"])
+    r.wait(lambda: events(office)[-1:] == ["INSTALLER_RESTART_OK"])
     kinds = events(office)
     assert kinds[0] == "INSTALLER_STARTED" and "INSTALLER_KEY_LOCKED" in kinds
-    assert kinds[-2:] == ["INSTALLER_COMPLETED", "INSTALLER_BOOT_OK"]
+    assert kinds[-3:] == ["INSTALLER_COMPLETED", "INSTALLER_BOOT_OK", "INSTALLER_RESTART_OK"]
+    # ADD keeps the restart check's detail as sent: no name of it looks secret to ADD.
+    (restart,) = office.audits("INSTALLER_RESTART_OK")
+    assert restart.after["settings_kept"] is True and restart.after["zone_id_seen"] == ZONE
+    assert restart.after["advice"] == "RESTART_OK"
     assert len({row.request_id for row in office.audits() if row.action in kinds}) == 1
     for row in office.audits():
         assert "test-wifi-pass" not in json.dumps(row.after or {})
@@ -456,9 +472,9 @@ def test_new_hikvision_board_package_from_the_real_head_office(rig, office, tmp_
         )
         for line in real_engine.boot_lines("LF-ZONE-JHELUM-01", version="3.1.1")
     ]
-    r.replug(lines)
+    r.replug_twice(lines)
     first_start = r.page(pages.FIRST_START)
-    assert first_start.result.advice.code == "FIRST_START_OK", first_start.result.advice
+    assert first_start.result.advice.code == "START_CHECKS_OK", first_start.result.advice
 
     # ADD took the app's Hikvision settings as they are, and passed them on.
     (issued,) = office.audits("INSTALLER_PACKAGE_ISSUED")
@@ -528,9 +544,9 @@ def test_never_online_board_gets_new_settings_without_published_software(rig, of
     r.wait(lambda: fix.primary_button.isEnabled())
     r.click_primary(pages.FIX_SETTINGS)
     r.confirm_and_install()
-    r.replug(real_engine.boot_lines(SITE_ZONE))
+    r.replug_twice(real_engine.boot_lines(SITE_ZONE))
     first_start = r.page(pages.FIRST_START)
-    assert first_start.result.advice.code == "FIRST_START_OK", first_start.result.advice
+    assert first_start.result.advice.code == "START_CHECKS_OK", first_start.result.advice
 
     assert r.board.flash[0x11000] == office.provisioner.nvs and r.board.burned_key is None
     (issued,) = office.audits("INSTALLER_PACKAGE_ISSUED")
@@ -566,8 +582,8 @@ def test_failure_after_the_burn_tells_head_office_and_the_setup_can_finish(rig, 
     assert checking.result.advice.code == "RESUME", checking.result.advice
     r.click_primary(pages.CHECKING)
     r.confirm_and_install()
-    r.replug(real_engine.boot_lines(ZONE))
-    assert r.page(pages.FIRST_START).result.advice.code == "FIRST_START_OK"
+    r.replug_twice(real_engine.boot_lines(ZONE))
+    assert r.page(pages.FIRST_START).result.advice.code == "START_CHECKS_OK"
     modes = [row.after["mode"] for row in office.audits("INSTALLER_PACKAGE_ISSUED")]
     assert modes == ["new_board", "resume"]
 

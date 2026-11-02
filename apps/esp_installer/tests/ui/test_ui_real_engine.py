@@ -83,6 +83,20 @@ def boot_lines(zone: str, device: str = "1", version: str = "2.9.1") -> List[str
     ]
 
 
+def restart_lines(zone: str, device: str = "1", version: str = "2.9.1") -> List[str]:
+    """The next start of a board that kept its settings (Secure Boot is on already)."""
+    return [line for line in boot_lines(zone, device, version) if "secure_boot" not in line]
+
+
+# The next start of the two boards of 2 Nov 2026: the settings were gone (firmware's words).
+SETTINGS_LOST = [
+    "E (1530) zone_config: No encrypted per-device provisioning namespace; firmware remains "
+    "inert",
+    "E (1540) zone_lite: Encrypted per-device provisioning is required; network startup is "
+    "blocked",
+]
+
+
 class Ports:
     """The computer's serial ports: the board's own USB port while it is plugged in."""
 
@@ -206,6 +220,7 @@ class Rig:
         self.server = HeadOffice(store, self.bundle)
         work = tmp_path / "work"
         self.work = work
+        self.logs = tmp_path / "logs"
         self.services = api.Services(
             server=self.server,
             connectivity=Online(),
@@ -220,9 +235,15 @@ class Rig:
                 clock=clock,
                 temp_root=work,
             ),
-            boot=BootWatcher(usb, clock, opener=self.console.open, placeholder_ssids=("RE7",)),
+            boot=BootWatcher(
+                usb,
+                clock,
+                opener=self.console.open,
+                placeholder_ssids=("RE7",),
+                console_logs=self.logs,
+            ),
             diagnosis=Diagnoser(("RE7",)),
-            records=Records(tmp_path / "records", tmp_path / "logs", "1.0.0"),
+            records=Records(tmp_path / "records", self.logs, "1.0.0"),
             defaults=FieldDefaults(
                 wifi_password="test-wifi-pass", setup_ap_password="test-hotspot-pass"
             ),
@@ -268,18 +289,29 @@ class Rig:
         self.click_primary(pages.CONFIRM)
         self.wait_page(pages.INSTALLING)
 
-    def replug(self, lines: List[str]) -> None:
-        """Unplug when the screen asks, wait, plug back in; the board then prints ``lines``."""
+    def replug(self, lines: List[str], again: bool = False) -> None:
+        """Unplug when the screen asks, wait, plug back in; the board then prints ``lines``.
+
+        ``again``: the restart check's replug, which the screen asks for once the first
+        start has passed.
+        """
         first_start = self.page(pages.FIRST_START)
         self.wait_page(pages.FIRST_START)
-        self.wait(lambda: first_start.phase is ReplugPhase.WAITING_UNPLUG)
+        self.wait(
+            lambda: first_start.again is again and first_start.phase is ReplugPhase.WAITING_UNPLUG
+        )
         self.console.lines = lines
         self.ports.plugged = False
         self.wait(lambda: first_start.phase is ReplugPhase.WAITING_REPLUG)
         self.ports.plugged = True
-        self.wait(lambda: first_start.result.isVisible())
+        self.watched(again)
 
-    def replug_missing_the_start(self, missed: List[str], lines: List[str]) -> None:
+    def replug_again(self, lines: List[str]) -> None:
+        self.replug(lines, again=True)
+
+    def replug_missing_the_start(
+        self, missed: List[str], lines: List[str], again: bool = False
+    ) -> None:
         """As replug, but the board prints ``missed`` before the app has its port open.
 
         The console drops them, as USB-Serial/JTAG does: the board prints from power-on,
@@ -287,7 +319,9 @@ class Rig:
         """
         first_start = self.page(pages.FIRST_START)
         self.wait_page(pages.FIRST_START)
-        self.wait(lambda: first_start.phase is ReplugPhase.WAITING_UNPLUG)
+        self.wait(
+            lambda: first_start.again is again and first_start.phase is ReplugPhase.WAITING_UNPLUG
+        )
         self.console.drop_unread = True
         self.ports.plugged = False
         self.wait(lambda: first_start.phase is ReplugPhase.WAITING_REPLUG)
@@ -295,7 +329,16 @@ class Rig:
         self.ports.plugged = True
         self.wait(lambda: self.console.held)
         self.console.prints(lines)
-        self.wait(lambda: first_start.result.isVisible())
+        self.watched(again)
+
+    def watched(self, again: bool) -> None:
+        """Wait for the start's verdict: the restart check asking for its replug after a good
+        first start, or the screen's last card."""
+        first_start = self.page(pages.FIRST_START)
+        self.wait(
+            lambda: (not again and first_start.again)
+            or (first_start.result.isVisible() and not self.controller.running("boot"))
+        )
 
     def close(self) -> None:
         self.controller.session.installing = False
@@ -364,24 +407,39 @@ def test_new_zkt_board_end_to_end_on_the_real_engine(rig):
     r.confirm_and_install()
     r.replug(boot_lines(ZONE))
     first_start = r.page(pages.FIRST_START)
-    assert first_start.result.advice.code == "FIRST_START_OK", first_start.result.advice
+    # The first start passed. The screen asks for one more replug and says nothing is ready.
+    assert first_start.again and first_start.result.advice.code == "RESTART_CHECK"
+    assert not first_start.primary_button.isVisible()
+    r.replug_again(restart_lines(ZONE))
+    assert first_start.result.advice.code == "START_CHECKS_OK", first_start.result.advice
     r.click_primary(pages.FIRST_START)
     r.wait_page(pages.DONE)
     done = r.page(pages.DONE)
+    assert done.kept_settings and done.subtitle_label.text().startswith(texts.SETTINGS_KEPT)
     assert done.credentials.values["hotspot"].text() == "SLIC ATTENDANCE-3D31"
     assert done.credentials.values["password"].text() == "test-hotspot-pass"
     done.secondary_button.click()  # Save a record, through the real records service
     r.wait(lambda: done.saved.isVisible())
     record = Path(r.controller.session.record_path).read_text(encoding="utf-8")
     assert ZONE in record and "test-wifi-pass" not in record
+    assert f"Result:           {texts.SETTINGS_KEPT}" in record
     r.window.open_help(done.help_topic)
     r.window.help_panel.save_button.click()  # Help > Save a help file
     r.wait(lambda: r.window.help_panel.saved.isVisible())
     with zipfile.ZipFile(r.window.help_panel._saved_path) as archive:
         names = archive.namelist()
         packed = b"".join(archive.read(name) for name in names)
+        # What the board printed in both starts, in this install's console log.
+        request_id = r.controller.session.summary.request_id
+        (console_log,) = [name for name in names if name.startswith("logs/console-")]
+        assert console_log == f"logs/console-ac276ea43d30-{request_id}.log"
+        printed = archive.read(console_log).decode("utf-8")
     assert any(name.startswith("records/") for name in names)
     assert b"test-wifi-pass" not in packed and r.server.hmac_key.hex().encode() not in packed
+    assert printed.count("=== First start") == 1 and printed.count("=== Second start") == 1
+    assert printed.count(f"Loaded per-device provisioning for zone={ZONE}") == 2
+    assert "=== Result: ok (BOOT_OK) ===" in printed
+    assert "=== Result: ok (RESTART_OK) ===" in printed
 
     # The board got the bundle, its own key, and the start-up program last.
     board, bundle = r.board, r.bundle
@@ -412,11 +470,12 @@ def test_new_zkt_board_end_to_end_on_the_real_engine(rig):
     key_file = Path(burn_seen.call.args[burn_seen.call.args.index("BLOCK_KEY0") + 1])
     assert not key_file.exists() and not list(r.work.glob("sl-install-*"))
 
-    # Head office heard every milestone, then how the first start went.
+    # Head office heard every milestone, then how both starts went.
     kinds = [event[2] for event in r.server.events]
     assert kinds[0] == "STARTED" and "KEY_LOCKED" in kinds
-    r.wait(lambda: [event[2] for event in r.server.events][-1:] == ["BOOT_OK"])
-    assert [event[2] for event in r.server.events][-2:] == ["COMPLETED", "BOOT_OK"]
+    r.wait(lambda: [event[2] for event in r.server.events][-1:] == ["RESTART_OK"])
+    assert [event[2] for event in r.server.events][-3:] == ["COMPLETED", "BOOT_OK", "RESTART_OK"]
+    assert r.server.events[-1][3]["settings_kept"] is True
     assert len({event[0] for event in r.server.events}) == 1  # one request number throughout
     assert r.tool_calls and not any(gui for gui, _held in r.tool_calls), "ran on the GUI thread"
     assert not any(held for _gui, held in r.tool_calls)  # the port was free for every call
@@ -451,7 +510,9 @@ def test_new_hikvision_board_end_to_end_on_the_real_engine(rig):
     ]
     r.replug(lines)
     first_start = r.page(pages.FIRST_START)
-    assert first_start.result.advice.code == "FIRST_START_OK", first_start.result.advice
+    assert first_start.result.advice.code == "RESTART_CHECK", first_start.result.advice
+    r.replug_again([line for line in lines if "secure_boot" not in line])
+    assert first_start.result.advice.code == "START_CHECKS_OK", first_start.result.advice
 
     # What the screens typed reached head office as the engine completed it.
     (request,) = r.server.requests
@@ -501,8 +562,13 @@ def test_start_line_printed_before_the_port_opened_still_ends_on_done(rig):
 
     first_start = r.page(pages.FIRST_START)
     advice = first_start.result.advice
-    assert advice.code == "FIRST_START_OK", advice
-    assert advice.what_happened == "It started and is working."  # no zone or device claimed
+    # A good first start, but no zone or device claimed: on to the restart check.
+    assert advice.code == "RESTART_CHECK", advice
+    assert advice.what_happened.startswith("The board started. The setup is not finished. ")
+    assert not first_start.primary_button.isVisible()
+    r.console.drop_unread = False  # the computer opens the port in time for this start
+    r.replug_again(restart_lines(ZONE))
+    assert first_start.result.advice.code == "START_CHECKS_OK", first_start.result.advice
     assert first_start.primary_button.text() == "Next"
     r.click_primary(pages.FIRST_START)
     r.wait_page(pages.DONE)
@@ -512,10 +578,71 @@ def test_start_line_printed_before_the_port_opened_still_ends_on_done(rig):
     done.secondary_button.click()  # Save a record
     r.wait(lambda: done.saved.isVisible())
     record = Path(r.controller.session.record_path).read_text(encoding="utf-8")
-    assert "The board started correctly" in record and "Seen:" not in record
-    r.wait(lambda: [event[2] for event in r.server.events][-1:] == ["BOOT_OK"])
-    detail = r.server.events[-1][3]
+    first, again = record.split("  First start:")[1].split("  After a restart:")
+    assert first.strip() == "Passed" and "Seen:" not in first
+    assert again.lstrip().startswith("Passed") and f"zone {ZONE}, device 1" in again
+    r.wait(lambda: [event[2] for event in r.server.events][-2:] == ["BOOT_OK", "RESTART_OK"])
+    detail = r.server.events[-2][3]
     assert (detail["zone_id_seen"], detail["device_id_seen"]) == (None, None)
+
+
+def test_board_that_loses_its_settings_on_restart_is_never_called_ready(rig):
+    # 2 Nov 2026, two new boards: a good first start, then no settings at the next start.
+    r = rig(support.FakeBoard())
+    set_up_new_zkt_board(r)
+    r.replug(boot_lines(ZONE))
+    first_start = r.page(pages.FIRST_START)
+    assert first_start.result.advice.code == "RESTART_CHECK"
+    r.replug_again(restart_lines(ZONE)[:7] + SETTINGS_LOST)
+    advice = first_start.result.advice
+    # The engine's words, with this board's ID for the label it needs.
+    assert advice == texts.settings_lost_on_restart(support.MAC), advice
+    assert "Do not use this board. If it came from a site, do not put it back." in (
+        advice.what_to_do
+    )
+    assert any("AC:27:6E:A4:3D:30" in step for step in advice.what_to_do)
+    assert not first_start.primary_button.isVisible()  # no Next, so never the Done screen
+    assert first_start.secondary_button.text() == "Go back to the start"
+    assert any(line == "The board has no settings." for line in first_start.console.shown_lines)
+
+    # Head office hears it: the first start went well, the restart lost the settings.
+    r.wait(lambda: [event[2] for event in r.server.events][-1:] == ["RESTART_FAILED"])
+    kinds = [event[2] for event in r.server.events]
+    assert kinds[-3:] == ["COMPLETED", "BOOT_OK", "RESTART_FAILED"]
+    detail = r.server.events[-1][3]
+    assert detail["outcome"] == "settings_lost" and detail["settings_kept"] is False
+    assert detail["advice"] == "SETTINGS_LOST_ON_RESTART"
+    # The setup record is kept without a click, so the help file carries it, and it says so.
+    r.wait(lambda: r.controller.session.record_path is not None)
+    record = Path(r.controller.session.record_path).read_text(encoding="utf-8")
+    assert "lost its settings when it restarted. Do not install it at a site." in record
+    assert texts.SETTINGS_KEPT not in record
+    (console_log,) = list(r.logs.glob("console-*.log"))
+    printed = console_log.read_text(encoding="utf-8")
+    assert "No encrypted per-device provisioning namespace" in printed
+    assert "=== Result: settings_lost (SETTINGS_LOST_ON_RESTART) ===" in printed
+
+
+def test_restart_check_needs_the_line_that_names_the_settings(rig):
+    # The first start may pass on any line of the running program; the restart check may not.
+    r = rig(support.FakeBoard())
+    set_up_new_zkt_board(r)
+    r.replug(boot_lines(ZONE))
+    lines = restart_lines(ZONE)
+    start = next(index for index, line in enumerate(lines) if "Zone Lite starting" in line)
+    r.replug_missing_the_start(lines[: start + 1], lines[start + 1 :], again=True)
+    first_start = r.page(pages.FIRST_START)
+    advice = first_start.result.advice
+    assert advice is texts.SETTINGS_NOT_SEEN, advice
+    assert first_start.primary_button.text() == "Try again"
+    r.wait(lambda: [event[2] for event in r.server.events][-1:] == ["RESTART_FAILED"])
+    assert r.server.events[-1][3]["settings_kept"] is None  # neither kept nor lost: not seen
+
+    # Try again watches the restart check once more, not the first start.
+    r.click_primary(pages.FIRST_START)
+    r.console.drop_unread = False
+    r.replug_again(restart_lines(ZONE))
+    assert first_start.result.advice.code == "START_CHECKS_OK", first_start.result.advice
 
 
 def test_lines_without_a_start_are_not_a_silent_board(rig, monkeypatch):
@@ -571,15 +698,17 @@ def test_failure_after_the_key_is_finished_without_a_second_burn(rig):
     r.confirm_and_install()
     assert r.controller.session.mode is InstallMode.RESUME
     r.replug(boot_lines(ZONE))
+    r.replug_again(restart_lines(ZONE))
     first_start = r.page(pages.FIRST_START)
-    assert first_start.result.advice.code == "FIRST_START_OK", first_start.result.advice
+    assert first_start.result.advice.code == "START_CHECKS_OK", first_start.result.advice
 
     assert len(esptool_args(r, "burn-key")) == 1  # the resume did not burn again
     assert r.board.flash[0x0] == r.bundle.files["bootloader-signed.bin"]
     commands = [command_of(seen.call.args) for seen in r.runner.seen]
     assert commands[-2:] == ["write-flash", "verify-flash"]  # the start-up program, last
+    r.wait(lambda: [event[2] for event in r.server.events][-1:] == ["RESTART_OK"])
     kinds = [event[2] for event in r.server.events]
-    assert "FAILED" in kinds and kinds[-2:] == ["COMPLETED", "BOOT_OK"]
+    assert "FAILED" in kinds and kinds[-3:] == ["COMPLETED", "BOOT_OK", "RESTART_OK"]
 
 
 def test_secured_board_settings_change_on_the_real_engine(rig):
@@ -605,9 +734,10 @@ def test_secured_board_settings_change_on_the_real_engine(rig):
     r.click_primary(pages.FIX_SETTINGS)
     r.confirm_and_install()
     assert r.controller.session.mode is InstallMode.CHANGE_SETTINGS
-    r.replug(boot_lines(ZONE))
+    r.replug(restart_lines(ZONE))
+    r.replug_again(restart_lines(ZONE))  # new settings must survive a restart too
     first_start = r.page(pages.FIRST_START)
-    assert first_start.result.advice.code == "FIRST_START_OK", first_start.result.advice
+    assert first_start.result.advice.code == "START_CHECKS_OK", first_start.result.advice
 
     # Secure Download Mode: one blind ROM write of the settings, empty storage and the blank
     # redo area, in that order, no key.

@@ -1,10 +1,10 @@
-"""Keeps Windows awake while a board is set up and while its first start is watched.
+"""Keeps Windows awake while a board is set up and while its starts are watched.
 
 A laptop on battery may sleep, or enter Modern Standby when its screen times out,
 after a few idle minutes. USB is then suspended under esptool and the setup fails
 halfway, or the replug is never seen. Serial traffic does not count as activity, so
-the install (Installer.run) and the first-start watch (BootWatcher.wait_first_boot)
-each ask Windows to stay awake while they run.
+the install (Installer.run) and each watched start (BootWatcher.wait_first_boot and
+wait_restart) ask Windows to stay awake while they run.
 
 The request belongs to the calling thread (SetThreadExecutionState), so it is made
 and cleared on the same worker thread, also when the work fails. The screen is kept

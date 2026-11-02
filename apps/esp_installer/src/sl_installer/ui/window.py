@@ -159,5 +159,22 @@ class MainWindow(QMainWindow):
             event.ignore()
             QMessageBox.warning(self, "Please wait", reason)
             return
+        question = self.controller.close_question()
+        if question and not self.confirm_close(question):
+            event.ignore()
+            return
         self.controller.shutdown()
         event.accept()
+
+    def confirm_close(self, words: str) -> bool:
+        """Ask before closing while a board is still being checked; True closes the app."""
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("The check is not finished")
+        box.setText(words)
+        close = box.addButton("Close the app", QMessageBox.ButtonRole.DestructiveRole)
+        keep = box.addButton("Keep the app open", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(keep)
+        box.setEscapeButton(keep)
+        box.exec()
+        return box.clickedButton() is close

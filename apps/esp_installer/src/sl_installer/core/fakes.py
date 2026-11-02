@@ -84,6 +84,8 @@ SCENARIOS: Tuple[str, ...] = (
     "zone_not_writable",
     "secured_hik_fix_settings",
     "installer_off",
+    # Every story's board keeps its settings at the restart check; this one does not.
+    "settings_lost_on_restart",
 )
 
 # Boards that are already set up and locked for State Life in these stories.
@@ -204,6 +206,10 @@ class FakeWorld:
         self.pace = pace
         self.calls: List[Call] = []
         self.reports: List[Tuple[str, str, str, Dict[str, object]]] = []
+        # The install each watched start was asked to keep the console lines of.
+        self.transcripts: List[Optional[str]] = []
+        # The first start's report each restart check was given.
+        self.first_starts: List[Optional[BootReport]] = []
         self.login_attempts = 0
         self.inspections = 0
         self.install_runs = 0
@@ -829,9 +835,69 @@ def first_boot_lines(
     return lines
 
 
+def settings_lost_lines(config: api.InstallConfig) -> List[ConsoleEvent]:
+    """The next start of the 2 Nov 2026 boards: no settings, so the board stays still."""
+    lines = first_boot_lines(config, config.zone_id, new_board=False)[:3]
+    lines += [
+        _line(
+            ConsoleKind.SETTINGS_MISSING,
+            "E (902) zone_config: No encrypted per-device provisioning namespace; firmware "
+            "remains inert",
+            0.9,
+        ),
+        _line(
+            ConsoleKind.SETTINGS_MISSING,
+            "E (905) zone_lite: Encrypted per-device provisioning is required; network startup "
+            "is blocked",
+            0.9,
+        ),
+    ]
+    return lines
+
+
 class FakeBoot:
     def __init__(self, world: FakeWorld) -> None:
         self.world = world
+
+    def wait_restart(
+        self,
+        mac: str,
+        expect: api.InstallConfig,
+        on_phase: api.PhaseFn,
+        on_event: api.EventFn,
+        cancel: api.CancelToken,
+        timeout_s: float = 120.0,
+        transcript: Optional[str] = None,
+        first: Optional[BootReport] = None,
+    ) -> BootReport:
+        """The restart check: one more replug; the board names its settings again."""
+        world = self.world
+        world.note("boot.wait_restart")
+        world.transcripts.append(transcript)
+        world.first_starts.append(first)
+        on_phase(ReplugPhase.WAITING_UNPLUG)
+        if world.pause("restart_unplug", cancel, 6):
+            return BootReport(BootOutcome.CANCELLED)
+        on_phase(ReplugPhase.WAITING_REPLUG)
+        if world.pause("restart_replug", cancel, 6):
+            return BootReport(BootOutcome.CANCELLED)
+        on_phase(ReplugPhase.WATCHING)
+        lost = world.scenario == "settings_lost_on_restart"
+        if lost:
+            lines = settings_lost_lines(expect)
+        else:
+            lines = first_boot_lines(expect, expect.zone_id, new_board=False)
+        for event in lines:
+            if world.pause("restart_line", cancel, 1):
+                return BootReport(BootOutcome.CANCELLED, events=tuple(lines))
+            on_event(event)
+        version = bundle_by_id(expect.bundle_id).version
+        if lost:
+            # No advice: the screens then use the engine's own words for this outcome.
+            return BootReport(BootOutcome.SETTINGS_LOST, None, None, version, tuple(lines))
+        return BootReport(
+            BootOutcome.OK, expect.zone_id, expect.device_id, version, tuple(lines)
+        )
 
     def wait_first_boot(
         self,
@@ -841,9 +907,11 @@ class FakeBoot:
         on_event: api.EventFn,
         cancel: api.CancelToken,
         timeout_s: float = 120.0,
+        transcript: Optional[str] = None,
     ) -> BootReport:
         world = self.world
         world.note("boot.wait_first_boot")
+        world.transcripts.append(transcript)
         on_phase(ReplugPhase.WAITING_UNPLUG)
         if world.pause("unplug", cancel, 6):
             return BootReport(BootOutcome.CANCELLED)
@@ -1148,7 +1216,9 @@ class FakeRecords:
     def __init__(self, world: FakeWorld) -> None:
         self.world = world
 
-    def save_install_record(self, summary: api.InstallSummary, boot: BootReport) -> str:
+    def save_install_record(
+        self, summary: api.InstallSummary, boot: BootReport, restart: Optional[BootReport] = None
+    ) -> str:
         self.world.note("records.save_install_record")
         config = summary.config
         path = os.path.join(
@@ -1163,6 +1233,7 @@ class FakeRecords:
             f"Device number: {config.device_id}",
             f"Board software: {summary.bundle.label}",
             f"First start: {boot.outcome.value}",
+            f"After a restart: {restart.outcome.value if restart else 'not watched'}",
         ]
         with open(path, "w", encoding="utf-8") as handle:
             handle.write("\n".join(lines) + "\n")

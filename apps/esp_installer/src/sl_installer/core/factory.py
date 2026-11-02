@@ -58,7 +58,8 @@ def make_services(cfg: AppConfig) -> Services:
         boards=BoardInspector(runner, temp_root=cfg.work_dir),
         installer=Installer(runner=runner, server=server, usb=usb, store=store,
                             app_version=cfg.app_version, clock=clock, temp_root=cfg.work_dir),
-        boot=BootWatcher(usb, clock, placeholder_ssids=placeholders),
+        # Each watched start's lines go, redacted, to a per-install file next to installer.log.
+        boot=BootWatcher(usb, clock, placeholder_ssids=placeholders, console_logs=cfg.logs_dir),
         diagnosis=Diagnoser(placeholders),
         records=Records(cfg.records_dir, cfg.logs_dir, cfg.app_version),
         defaults=defaults,
