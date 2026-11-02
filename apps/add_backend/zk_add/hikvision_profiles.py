@@ -1,6 +1,7 @@
 """Publish profile inventories only after two complete, matching bounded scans."""
 import hashlib
 import json
+import logging
 
 from pydantic import BaseModel, Field, StrictInt
 from sqlalchemy import ForeignKey, Integer, String, Text
@@ -12,6 +13,8 @@ from zk_add.models import Connector
 from zk_add.schemas import UserSnapshotRequest, UserSnapshotRow
 from zk_add.time_utils import utc_now
 
+logger = logging.getLogger(__name__)
+
 
 class HikvisionProfileScan(Base):
     __tablename__ = "add_hikvision_profile_scans"
@@ -22,6 +25,33 @@ class HikvisionProfileScan(Base):
     total: Mapped[int] = mapped_column(Integer)
     data_encrypted: Mapped[str] = mapped_column(Text)
     last_page_digest: Mapped[str] = mapped_column(String(64))
+
+
+# The profile facts ADD reads. A read-only terminal may report other fields
+# that change between two reads of an unchanged user (Jhelum's DS-K1T321MFWX);
+# they cannot stop the snapshot, and its state fingerprint covers only these.
+STABLE_PROFILE_KEYS = ("employeeNo", "name", "userType", "localUIRight")
+VOLATILE_FLAG = "hikvision_profile_volatile_fields"
+
+
+def _stable(profile: dict) -> dict:
+    return {key: profile.get(key) for key in STABLE_PROFILE_KEYS}
+
+
+def _changed_fields(first: dict, second: dict) -> list[str]:
+    """Field names (never values) that differ while the stable facts match.
+
+    Raises when the inventories differ in membership or in a stable fact.
+    """
+    if set(first) != set(second):
+        raise ValueError("HIKVISION_PROFILE_SCAN_CHANGED_MEMBERS")
+    fields = set()
+    for employee, before in first.items():
+        after = second[employee]
+        if not isinstance(before, dict) or not isinstance(after, dict) or _stable(before) != _stable(after):
+            raise ValueError("HIKVISION_PROFILE_SCAN_CHANGED_FACTS")
+        fields |= {key for key in set(before) | set(after) if before.get(key) != after.get(key)}
+    return sorted(str(key)[:40] for key in fields if str(key).isascii())[:20]
 
 
 class ProfilePage(BaseModel):
@@ -91,8 +121,19 @@ def accept_profile_page(session: Session, connector: Connector, payload: dict) -
         else:
             first = {key: json.loads(raw) for key, raw in data["first"].items()}
             second = {key: json.loads(raw) for key, raw in data["second"].items()}
+            capability = dict(terminal.capability_profile or {})
+            volatile = capability.get(VOLATILE_FLAG)
             if first != second:
-                raise ValueError("HIKVISION_PROFILE_SCAN_CHANGED")
+                # A write-qualified profile must read back exactly.
+                if capability.get("user_write") is True:
+                    raise ValueError("HIKVISION_PROFILE_SCAN_CHANGED")
+                fields = _changed_fields(first, second)
+                if sorted(set(volatile or []) | set(fields)) != volatile:
+                    volatile = sorted(set(volatile or []) | set(fields))[:20]
+                    capability[VOLATILE_FLAG] = volatile
+                    terminal.capability_profile = capability
+                    logger.warning("Hikvision profile fields change between reads for %s: %s",
+                                   connector.connector_id, ",".join(volatile))
             users = []
             for employee, profile in second.items():
                 raw = data["second"][employee]
@@ -102,7 +143,9 @@ def accept_profile_page(session: Session, connector: Connector, payload: dict) -
                     profile.get("localUIRight") is False else 14,
                     terminal_identity_fingerprint=hashlib.sha256(
                         f"{page.terminal_serial}\n{employee}".encode()).hexdigest(),
-                    terminal_state_fingerprint=hashlib.sha256(raw.encode()).hexdigest(),
+                    terminal_state_fingerprint=hashlib.sha256((
+                        json.dumps(_stable(profile), sort_keys=True, separators=(",", ":"))
+                        if volatile else raw).encode()).hexdigest(),
                 ))
             _replace_user_snapshot(session, connector=connector, snapshot=UserSnapshotRequest(
                 snapshot_id=page.snapshot_id, complete=True, stable=True,

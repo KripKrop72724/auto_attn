@@ -195,3 +195,48 @@ def test_hikvision_commands_require_bound_readback_receipts(db, operation, evide
     applied = apply_command_update(session, connector=connector, command_id=command.command_id,
                                    status='SUCCEEDED', result=result, error_code=None, error_message=None)
     assert applied.status == ('SUCCEEDED' if evidence == 'valid' else 'FAILED')
+
+
+def volatile_page(phase, counter, snapshot="c" * 32):
+    raw = json.dumps({"employeeNo": "00111", "name": "Test-1234512345671", "userType": "normal",
+                      "localUIRight": False, "openDoorTime": counter}, separators=(",", ":"))
+    return dict(snapshot_id=snapshot, terminal_serial="terminal", phase=phase,
+                position=0, total=1, records=[raw])
+
+
+def test_read_only_terminal_publishes_despite_fields_that_change_between_reads(db):
+    # Jhelum's DS-K1T321MFWX reports profile fields that differ between two
+    # reads of an unchanged user; only the facts ADD reads must match.
+    session, connector = db
+    accept_profile_page(session, connector, volatile_page(1, 1))
+    assert accept_profile_page(session, connector, volatile_page(2, 2))["published"]
+    session.commit()
+    terminal = connector.zkt_device
+    assert terminal.capability_profile["hikvision_profile_volatile_fields"] == ["openDoorTime"]
+    user = session.scalar(select(DeviceUser))
+    fingerprint, version = user.terminal_state_fingerprint, user.row_version
+    # A later snapshot (exact this time, or with the counter moved on) keeps
+    # the stable fingerprint, so users do not churn.
+    accept_profile_page(session, connector, volatile_page(1, 7, "d" * 32))
+    assert accept_profile_page(session, connector, volatile_page(2, 7, "d" * 32))["published"]
+    session.commit()
+    user = session.scalar(select(DeviceUser))
+    assert user.terminal_state_fingerprint == fingerprint and user.row_version == version
+
+
+def test_write_qualified_or_identity_changes_still_refuse_a_snapshot(db):
+    session, connector = db
+    terminal = connector.zkt_device
+    terminal.capability_profile = {**(terminal.capability_profile or {}), "user_write": True}
+    session.commit()
+    accept_profile_page(session, connector, volatile_page(1, 1))
+    with pytest.raises(ValueError, match="SCAN_CHANGED"):
+        accept_profile_page(session, connector, volatile_page(2, 2))
+    session.rollback()
+    terminal.capability_profile = {**terminal.capability_profile, "user_write": False}
+    session.commit()
+    accept_profile_page(session, connector, {**page(), "snapshot_id": "e" * 32})
+    with pytest.raises(ValueError, match="SCAN_CHANGED"):
+        accept_profile_page(session, connector, {**page(phase=2, name="Renamed-1234512345671"), "snapshot_id": "e" * 32})
+    session.rollback()
+    assert session.scalar(select(func.count()).select_from(DeviceUser)) == 0
