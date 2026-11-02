@@ -784,6 +784,85 @@ def test_a_board_this_computer_gives_no_board_id_for_is_only_read(rig):
     assert {command_of(seen.call.args) for seen in r.runner.seen} <= read_only
 
 
+def test_a_board_running_other_software_is_found_once_it_is_in_setup_mode(rig):
+    # A new board with its maker's demo, as on the Mac bench (2 Nov 2026): Espressif's USB
+    # defaults instead of the board's own USB-Serial/JTAG with its board ID.
+    r = rig(support.FakeBoard())
+    r.ports.info = SimpleNamespace(device="/dev/ttyACM0", vid=0x303A, pid=0x4001,
+                                   serial_number="123456", description="Espressif Device")
+    r.sign_in()
+    r.page(pages.HOME).action.emit("setup")
+    r.wait_page(pages.MACHINE)
+    r.page(pages.MACHINE).zkt_card.click()
+    r.wait_page(pages.DETAILS)
+    form = r.page(pages.DETAILS).form
+    r.wait(lambda: form.selected_bundle_id() == r.bundle.bundle_id)
+    form.zone_id.setText(ZONE)
+    r.click_primary(pages.DETAILS)
+    r.wait_page(pages.CONNECT)
+    connect = r.page(pages.CONNECT)
+    r.wait(lambda: connect.problem.isVisible())
+    assert connect.problem.advice is texts.SETUP_MODE_NEEDED  # not "Connect the board"
+    assert connect.waiting.isVisible() and not connect.primary_button.isEnabled()
+    r.qtbot.wait(700)  # the watcher keeps looking, and nothing touches that port
+    assert connect.problem.advice is texts.SETUP_MODE_NEEDED and r.runner.seen == []
+
+    # BOOT held through RST: the board restarts in setup mode, as its own USB-Serial/JTAG.
+    # The steps stay up through the short gap, until Board found takes their place.
+    r.ports.plugged = False
+    r.wait(lambda: r.controller.session.presence.state is api.PresenceState.NO_BOARD)
+    r.qtbot.wait(500)
+    assert connect.problem.isVisible() and connect.problem.advice is texts.SETUP_MODE_NEEDED
+    r.ports.info = SimpleNamespace(device="/dev/ttyACM1", vid=0x303A, pid=0x1001,
+                                   serial_number=support.MAC.upper(),
+                                   description="USB JTAG/serial debug unit")
+    r.ports.plugged = True
+    r.wait(lambda: connect.primary_button.isEnabled())
+    assert connect.found.isVisible() and not connect.problem.isVisible()
+    r.click_primary(pages.CONNECT)
+    checking = r.page(pages.CHECKING)
+    r.wait(lambda: checking.result.isVisible())
+    assert checking.result.advice.code == "NEW_BOARD", checking.result.advice
+    args = r.runner.seen[0].call.args
+    assert args[args.index("--port") + 1] == "/dev/ttyACM1"
+
+
+def test_try_again_on_a_board_back_in_its_own_software_asks_for_setup_mode(rig):
+    # Found in setup mode, then replugged as PORT_BUSY says: the maker's demo starts again
+    # (303A:4001), so the old port is gone although the board is plugged in.
+    r = rig(support.FakeBoard())
+    r.board.failures["get-security-info"] = support.Failure(2, support.PORT_BUSY)
+    r.sign_in()
+    r.page(pages.HOME).action.emit("setup")
+    r.wait_page(pages.MACHINE)
+    r.page(pages.MACHINE).zkt_card.click()
+    r.wait_page(pages.DETAILS)
+    form = r.page(pages.DETAILS).form
+    r.wait(lambda: form.selected_bundle_id() == r.bundle.bundle_id)
+    form.zone_id.setText(ZONE)
+    r.click_primary(pages.DETAILS)
+    r.board_found()
+    checking = r.page(pages.CHECKING)
+    r.wait(lambda: checking.result.isVisible())
+    assert checking.result.advice.code == "PORT_BUSY"
+    r.ports.info = SimpleNamespace(device="/dev/ttyACM1", vid=0x303A, pid=0x4001,
+                                   serial_number="123456", description="Espressif Device")
+    calls = len(r.runner.seen)
+    r.click_primary(pages.CHECKING)  # Try again
+    r.wait(lambda: checking.result.isVisible()
+           and checking.result.advice is texts.AUTO_DOWNLOAD_FAILED)  # not "unplugged"
+    assert len(r.runner.seen) == calls  # nothing ran on the old port, nor on that one
+    assert checking.primary_button.text() == "Try again"
+    # BOOT held through RST: setup mode, under yet another port name.
+    r.ports.info = SimpleNamespace(device="/dev/ttyACM2", vid=0x303A, pid=0x1001,
+                                   serial_number=support.MAC.upper(),
+                                   description="USB JTAG/serial debug unit")
+    r.click_primary(pages.CHECKING)
+    r.wait(lambda: checking.result.isVisible() and checking.result.advice.code == "NEW_BOARD")
+    ports = {seen.call.args[seen.call.args.index("--port") + 1] for seen in r.runner.seen[calls:]}
+    assert ports == {"/dev/ttyACM2"}
+
+
 def test_try_again_follows_the_board_to_a_socket_that_gives_no_board_id(rig):
     r = rig(support.FakeBoard())
     r.board.failures["get-security-info"] = support.Failure(2, support.PORT_GONE)

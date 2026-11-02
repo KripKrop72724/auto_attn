@@ -233,8 +233,9 @@ Screens:
    - **Advanced (collapsed):** Wi-Fi name and password (visible with the eye), ZKT port, comm key, preferred IP, device ID.
    - **HIK only:** machine address (required, LAN IPv4), password (required), model (sets the profile) and the machine's serial number (required: the firmware will not talk to a terminal without it). Advanced holds username (admin), port (80) and connection (HTTP digest only). HTTPS is not offered and is refused in the field defaults and the bench: without the machine's own certificate (`hik_ca_pem`), which the app cannot add, the board checks a LAN terminal against the public certificate authorities and never connects. The source epoch is automatic: `<zone_id lower>-<yyyymmdd>`, or the epoch ADD already has for the MAC.
 5. **Connect the board.** A live USB watcher with a picture of the cable and the socket marked USB.
-   - **No board for 15 s:** cable, port and socket tips.
+   - **No board for 15 s:** cable, port and socket tips, then setup mode by hand (BOOT and RST) before "may be faulty": a maker's demo that offers no serial port (a USB keyboard or drive) lists nothing until the board is in setup mode.
    - **Bridge chip only:** "use the socket marked USB".
+   - **Espressif chip in another USB mode** (303A but not 1001, e.g. a new board's demo at 303A:4001): "Put the board into setup mode" (hold BOOT, press and release RST, let go of BOOT), then Board found and Next. Still there after 5 s: unplug, and hold BOOT while plugging back in; after 3 tries, a help file for head office, never "faulty". The advice stays up through a restart gap of up to 3 s instead of flashing away. It comes before the bridge advice: only the socket marked USB shows an Espressif chip. Accepted: any other Espressif USB serial gadget on the computer looks the same, and a 1001 port next to such a gadget is the board (its ID is shown; writes stay bound to it).
    - **Several boards:** "connect only one".
    - **Slow restart loop** (the port comes back about every 10 s or more slowly, with no output): "This board is faulty", put it aside; ADD gets `BOARD_FAULTY`.
    - **Fast restart loop:** "The board keeps restarting": a power or cable problem first (short cable, another socket), then Check again. Never called faulty.
@@ -245,6 +246,7 @@ Screens:
    - wrong board or secured by someone else → stop.
    - **USB gives no board ID** (rule 9): "This computer cannot read the board ID", with Try again. Try again, like every retry of the check, reads the board where USB lists it now, so a cable moved to another socket is followed.
    - **Auto download mode fails:** show manual steps: hold BOOT, tap RST, release BOOT, Try again.
+   - **Board back in its own software** (no 303A:1001 port but another 303A one, e.g. replugged after Board found): the same manual steps and Try again, never "unplugged" for a board that is plugged in.
 7. **Confirm.** A summary of the board, place and firmware, plus "This prepares the board for State Life for good" and an "I understand" checkbox.
 8. **Installing.** The steps from `steps_for(mode)` with progress, and a "Keep the cable plugged in" banner. Cancel works only before the key step.
 9. **First start.**
@@ -270,7 +272,7 @@ Faulty board signature: USB appears for about 10 s, then vanishes, in a loop, wi
 |---|---|
 | `add_client.py` | httpx client: login/logout, session, CSRF, silent re-login, client-side login throttle, typed errors. TLS uses `truststore` when available, otherwise certifi. Server `https://autoattn.slichealth.com`, overridable only with `--server` for tests. |
 | `connectivity.py` | Internet check: `http://www.msftconnecttest.com/connecttest.txt` → "Microsoft Connect Test". Server check: `GET /health/live`. Runs every 15 s. |
-| `usb.py` | pyserial enumeration; VID/PID classes (303A:1001 native; 10C4, 1A86, 0403 bridges); MAC from the USB serial when it is a whole MAC, with a Windows cfgmgr32 parent-device fallback; presence timeline and restart-loop detection. A lone board without an ID is found only for reading (console, replug). |
+| `usb.py` | pyserial enumeration; VID/PID classes (303A:1001 native; 10C4, 1A86, 0403 bridges; other 303A PIDs: not in setup mode, never read or written; each presence change is logged with the ports' USB IDs, for help files); MAC from the USB serial when it is a whole MAC, with a Windows cfgmgr32 parent-device fallback; presence timeline and restart-loop detection. A lone board without an ID is found only for reading (console, replug). |
 | `esptool_runner.py` | Runs bundled esptool/espefuse as child processes (`<exe> --tool esptool …` when frozen, `python -m esptool` in dev). Parses progress, applies timeouts and cancellation, captures logs with redaction, maps known failures to codes. |
 | `board.py` | `get-security-info` (works in SDM); for non-SDM boards also `chip-id`, `flash-id`, and `espefuse summary --format json`; classifies `SecurityState` and `HardwareVerdict`. Reads espefuse 5 JSON fields `value`/`readable`/`writeable` (there is no `raw_value`). |
 | `bundles.py` | Catalogue, download with progress into `%LOCALAPPDATA%\StateLife\DeviceInstaller\bundles`, full verification on every use. |

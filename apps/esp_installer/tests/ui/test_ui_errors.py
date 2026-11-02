@@ -6,13 +6,15 @@ import sys
 
 import pytest
 
-from sl_installer.core import texts
+from sl_installer.core import fakes, texts
 from sl_installer.core.api import (
     BootOutcome,
     BootReport,
     Family,
     InstallerError,
     InstallMode,
+    PresenceReport,
+    PresenceState,
     ReplugPhase,
     StepId,
     StepProgress,
@@ -83,6 +85,61 @@ def test_wrong_socket(harness):
     assert connect.problem.advice.code == "USB_WRONG_SOCKET"
     assert connect.problem.advice.illustration == "usb_socket"
     assert not connect.primary_button.isEnabled()
+
+
+def test_board_running_other_software_then_found_in_setup_mode(harness):
+    h = harness("other_usb_mode")
+    h.hold("setup_mode")
+    h.to_connect()
+    connect = h.page(pages.CONNECT)
+    h.wait(lambda: connect.problem.isVisible())
+    advice = connect.problem.advice
+    assert advice.code == "USB_SETUP_MODE_NEEDED" and advice.illustration == "boot_button"
+    # The story shows the engine's own steps, so its screenshot shows them too.
+    assert (advice.title, advice.what_happened, advice.what_to_do) == (
+        texts.SETUP_MODE_NEEDED.title,
+        texts.SETUP_MODE_NEEDED.what_happened,
+        texts.SETUP_MODE_NEEDED.what_to_do,
+    )
+    assert connect.waiting.isVisible()  # still looking: the board is found by itself
+    assert not connect.primary_button.isEnabled() and not connect.found.isVisible()
+    h.qtbot.wait(50)
+    assert h.world.called("boards.inspect") == 0
+    h.release("setup_mode")  # BOOT held through RST: the board restarts in setup mode
+    h.wait(lambda: connect.primary_button.isEnabled())
+    assert not connect.problem.isVisible() and connect.found.isVisible()
+    assert h.controller.current == pages.CONNECT  # it waits for Next, as the last step says
+    h.click_primary(pages.CONNECT)
+    h.wait_page(pages.CHECKING)
+    h.wait(lambda: h.page(pages.CHECKING).result.isVisible())
+    assert h.page(pages.CHECKING).result.advice.code == "NEW_BOARD"
+
+
+def test_setup_mode_steps_stay_up_while_the_board_restarts(harness):
+    # RST without BOOT, or the board's own software, restarts it: gone for a moment, then
+    # back in that software. Its steps stay up instead of flashing away while being read.
+    h = harness("other_usb_mode")
+    h.hold("setup_mode")  # the story sends nothing more: the test sends the reports
+    h.to_connect()
+    connect = h.page(pages.CONNECT)
+    h.wait(lambda: connect.problem.isVisible())
+    h.idle("presence_advice")
+    explained = h.world.called("diagnosis.diagnose")
+    gap = [PresenceReport(PresenceState.NO_BOARD, seconds_in_state=s) for s in (0.0, 1.0, 2.9)]
+    back = PresenceReport(PresenceState.OTHER_USB_MODE, (fakes.OTHER_USB,), seconds_in_state=0.0)
+    for report in gap + [back]:
+        h.controller._on_presence(report)
+        assert connect.problem.isVisible(), report
+        assert connect.problem.advice.code == "USB_SETUP_MODE_NEEDED"
+    h.qtbot.wait(50)
+    assert h.world.called("diagnosis.diagnose") == explained  # the same advice stayed up
+    # Gone for longer: unplugged, so the screen looks for the board again.
+    for report in gap + [PresenceReport(PresenceState.NO_BOARD, seconds_in_state=3.0)]:
+        h.controller._on_presence(report)
+    assert not connect.problem.isVisible() and connect.waiting.isVisible()
+    h.controller._on_presence(back)  # plugged in again, still in its own software
+    h.wait(lambda: connect.problem.isVisible())
+    assert connect.problem.advice.code == "USB_SETUP_MODE_NEEDED"
 
 
 def test_several_boards(harness):

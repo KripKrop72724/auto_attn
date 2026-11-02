@@ -424,6 +424,41 @@ def test_light_guide_is_complete():
         "WIFI_CONNECTING"]
 
 
+def test_setup_mode_advice_names_the_board_buttons_and_the_connect_screen_s_next():
+    advice = texts.SETUP_MODE_NEEDED
+    assert advice.title == texts.AUTO_DOWNLOAD_FAILED.title == "Put the board into setup mode"
+    # The button steps the app already gives when it cannot start setup mode by itself.
+    assert advice.what_to_do[:3] == texts.AUTO_DOWNLOAD_FAILED.what_to_do[:3] == (
+        "Hold down the BOOT button on the board.",
+        "While you hold BOOT, press and release the RST button.",
+        "Let go of BOOT.")
+    assert advice.illustration == texts.AUTO_DOWNLOAD_FAILED.illustration == "boot_button"
+    assert advice.severity is texts.WRONG_SOCKET.severity
+    # Connect does not move on by itself: it says Board found and waits for Next.
+    assert advice.what_to_do[3] == ("The app then finds the board by itself. When this "
+                                    "screen says Board found, click Next.")
+    # When the buttons do not work: unplug, and hold BOOT while the board goes back in.
+    unplug, replug, last = advice.what_to_do[4:]
+    assert unplug.startswith("If you still see this message") and "unplug the board" in unplug
+    assert replug.startswith("Hold down BOOT while you plug the board back into the socket "
+                             "marked USB.") and replug.endswith("Then let go of BOOT.")
+    # Then a help file for head office: a board running other software is not faulty, and
+    # a new board's demo is normal (not UNSECURED_USED's "another tool changed it").
+    assert last.startswith("If you still see this message after 3 tries, open Help.")
+    assert "Save a help file" in last and "head office" in last
+    assert advice.what_happened.endswith("This is normal for a new board.")
+    words = " ".join((advice.title, advice.what_happened) + advice.what_to_do)
+    assert words.isascii() and "other software" in advice.what_happened
+    # The board's buttons and its socket's mark.
+    assert set(re.findall(r"\b[A-Z]{2,}\b", words)) == {"BOOT", "RST", "USB"}
+    # Connect's only way on, and the help file's button inside Help.
+    assert re.findall(r"\b[Cc]lick (\w+)", words) == ["Next", "Save"]
+    for sentence in re.split(r"(?<=\.) ", words.replace(advice.title, "", 1).strip()):
+        assert len(sentence.split()) <= 14, sentence  # short sentences
+    # Shown where the board is connected but not ready: no cable or faulty-board tips.
+    assert not re.search(r"cable|faulty|hub|aside", words, re.I)
+
+
 def test_resume_advice_keeps_the_cause_steps():
     advice = texts.resume_needed(texts.AUTO_DOWNLOAD_FAILED)
     assert advice.code == "RESUME_NEEDED" and advice.illustration == "boot_button"

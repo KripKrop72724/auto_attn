@@ -109,11 +109,16 @@ hik_result_t hik_history_bounds(uint32_t *first, uint32_t *last, uint32_t *count
     if (result == HIK_OK && (first_again != *first || total < *count)) return HIK_BINDING;
     return result;
 }
+/* Compact facts about the last events page the checks below rejected, so a
+ * terminal that answers differently can be diagnosed from ADD logs alone. */
+static char history_reject[160];
+const char *hik_history_last_reject(void) { return history_reject; }
 hik_result_t hik_history_page(hik_search_t *s, hik_record_fn fn, void *context)
 {
     if (!s || !fn || !s->first_serial || s->first_serial > s->last_serial || s->last_serial > 3000000000U)
         return HIK_CONFIGURATION;
     if (s->complete) return HIK_OK;
+    history_reject[0] = 0;
     /* Search positions belong to a short-lived terminal session. Resume from
      * the durable source serial, with a fresh session and position zero. */
     for (unsigned i = 0; i < 4; i++) snprintf(s->search_id + i * 8, 9, "%08lx", (unsigned long)esp_random());
@@ -140,6 +145,14 @@ hik_result_t hik_history_page(hik_search_t *s, hik_record_fn fn, void *context)
     const char *status = string(page, "responseStatusStrg");
     const char *id = string(page, "searchID");
     uint32_t count = 0, total = 0;
+    uint32_t raw_count = 0, raw_total = 0, raw_first = 0, raw_last = 0;
+    bool counts = integer(cJSON_GetObjectItemCaseSensitive(page, "numOfMatches"), &raw_count);
+    counts = integer(cJSON_GetObjectItemCaseSensitive(page, "totalMatches"), &raw_total) && counts;
+    int raw_rows = cJSON_IsArray(rows) ? cJSON_GetArraySize(rows) : 0;
+    if (raw_rows) {
+        (void)integer(cJSON_GetObjectItemCaseSensitive(cJSON_GetArrayItem(rows, 0), "serialNo"), &raw_first);
+        (void)integer(cJSON_GetObjectItemCaseSensitive(cJSON_GetArrayItem(rows, raw_rows - 1), "serialNo"), &raw_last);
+    }
     valid = id && !strcmp(id, s->search_id) && status &&
         integer(cJSON_GetObjectItemCaseSensitive(page, "numOfMatches"), &count) &&
         integer(cJSON_GetObjectItemCaseSensitive(page, "totalMatches"), &total) &&
@@ -154,17 +167,28 @@ hik_result_t hik_history_page(hik_search_t *s, hik_record_fn fn, void *context)
     bool end = valid && count == total &&
         (!strcmp(status, "OK") || (!strcmp(status, "NO MATCH") && !count && !total));
     valid = valid && (end || (count && !strcmp(status, "MORE") && count < total));
+    bool header_valid = valid;
     uint32_t previous = s->previous_serial;
-    unsigned index=0;
+    unsigned index=0, bad_row=0;
     cJSON *row;
     cJSON_ArrayForEach(row, rows) {
         uint32_t serial;
         if(index++<overlap)continue;
         if (!integer(cJSON_GetObjectItemCaseSensitive(row, "serialNo"), &serial) ||
-            serial < s->first_serial || serial > s->last_serial || serial <= previous) { valid = false; break; }
+            serial < s->first_serial || serial > s->last_serial || serial <= previous) {
+            valid = false; bad_row = index; break;
+        }
         previous = serial;
     }
-    if (!valid) result = HIK_PARSE;
+    if (!valid) {
+        result = HIK_PARSE;
+        snprintf(history_reject, sizeof(history_reject),
+            "page=%s; id=%s; status=%.12s; counts=%s; num=%lu; total=%lu; rows=%d; first=%lu; last=%lu; begin=%lu; bad_row=%u",
+            header_valid ? "rows" : "header", id && !strcmp(id, s->search_id) ? "match" : "differs",
+            status ? status : "none", counts ? "yes" : "no", (unsigned long)raw_count, (unsigned long)raw_total,
+            cJSON_IsArray(rows) ? raw_rows : -1, (unsigned long)raw_first, (unsigned long)raw_last,
+            (unsigned long)request_begin, bad_row);
+    }
     else {
         index=0;
         cJSON_ArrayForEach(row, rows) {
@@ -182,6 +206,131 @@ hik_result_t hik_history_page(hik_search_t *s, hik_record_fn fn, void *context)
     }
     cJSON_Delete(response);
     return result;
+}
+static hik_result_t range_request(const char *search_id, uint32_t position, unsigned size,
+    uint32_t begin, uint32_t end, cJSON **response)
+{
+    cJSON *body = cJSON_CreateObject();
+    cJSON *cond = body ? cJSON_AddObjectToObject(body, "AcsEventCond") : NULL;
+    bool valid = cond && cJSON_AddStringToObject(cond, "searchID", search_id) &&
+        cJSON_AddNumberToObject(cond, "searchResultPosition", position) &&
+        cJSON_AddNumberToObject(cond, "maxResults", size) &&
+        cJSON_AddNumberToObject(cond, "major", 0) && cJSON_AddNumberToObject(cond, "minor", 0) &&
+        cJSON_AddBoolToObject(cond, "picEnable", false) &&
+        cJSON_AddNumberToObject(cond, "beginSerialNo", begin) &&
+        cJSON_AddNumberToObject(cond, "endSerialNo", end);
+    hik_result_t result = valid ? request_json(HTTP_METHOD_POST,
+        "/ISAPI/AccessControl/AcsEvent?format=json", body, response) : HIK_NETWORK;
+    cJSON_Delete(body);
+    if (result == HIK_PARSE)
+        snprintf(history_reject, sizeof(history_reject), "range=json; position=%lu; begin=%lu; end=%lu",
+            (unsigned long)position, (unsigned long)begin, (unsigned long)end);
+    return result;
+}
+static void new_search_id(char search_id[33])
+{
+    for (unsigned i = 0; i < 4; i++) snprintf(search_id + i * 8, 9, "%08lx", (unsigned long)esp_random());
+}
+hik_result_t hik_history_count(uint32_t begin, uint32_t end, uint32_t *total)
+{
+    if (!total || !begin || begin > end || end > 3000000000U) return HIK_CONFIGURATION;
+    *total = 0; history_reject[0] = 0;
+    char search_id[33]; new_search_id(search_id);
+    cJSON *response = NULL;
+    hik_result_t result = range_request(search_id, 0, 1, begin, end, &response);
+    if (result != HIK_OK) return result;
+    cJSON *page = cJSON_GetObjectItemCaseSensitive(response, "AcsEvent");
+    const char *id = string(page, "searchID");
+    uint32_t count = 0;
+    bool valid = id && !strcmp(id, search_id) && string(page, "responseStatusStrg") &&
+        integer(cJSON_GetObjectItemCaseSensitive(page, "numOfMatches"), &count) &&
+        integer(cJSON_GetObjectItemCaseSensitive(page, "totalMatches"), total) &&
+        count <= 1 && count <= *total && *total <= 150000;
+    cJSON_Delete(response);
+    if (!valid) {
+        snprintf(history_reject, sizeof(history_reject), "count=header; begin=%lu; end=%lu",
+            (unsigned long)begin, (unsigned long)end);
+        *total = 0;
+        return HIK_PARSE;
+    }
+    return HIK_OK;
+}
+hik_result_t hik_history_range(uint32_t begin, uint32_t end, unsigned max_pages,
+    hik_range_fn fn, void *context)
+{
+    if (!fn || !begin || begin > end || end > 3000000000U || !max_pages || max_pages > 100)
+        return HIK_CONFIGURATION;
+    history_reject[0] = 0;
+    /* One terminal search session, paged by position. Some terminals (Jhelum's
+     * DS-K1T321MFWX) sort by event time, and a clock that restarts at 2015 on
+     * every power-up puts boot records before older punches. So rows may come
+     * in any serial order; only the requested serial range is trusted.
+     * Equal timestamps may be ordered differently between page requests, so a
+     * serial seen twice means another was skipped: with a stable total and no
+     * repeats, every row in the range was read exactly once. */
+    uint32_t *seen = malloc(sizeof(uint32_t) * 20 * max_pages);
+    if (!seen) return HIK_CUSTODY;
+    char search_id[33]; new_search_id(search_id);
+    uint32_t position = 0, expected_total = 0, seen_count = 0;
+    hik_result_t outcome = HIK_OVERSIZED;
+    for (unsigned pages = 0; pages < max_pages; pages++) {
+        cJSON *response = NULL;
+        hik_result_t result = range_request(search_id, position, 20, begin, end, &response);
+        if (result != HIK_OK) { outcome = result; break; }
+        cJSON *page = cJSON_GetObjectItemCaseSensitive(response, "AcsEvent");
+        cJSON *rows = cJSON_GetObjectItemCaseSensitive(page, "InfoList");
+        const char *status = string(page, "responseStatusStrg");
+        const char *id = string(page, "searchID");
+        uint32_t count = 0, total = 0, bad_serial = 0;
+        int size = cJSON_IsArray(rows) ? cJSON_GetArraySize(rows) : 0;
+        const char *reject = NULL;
+        if (!id || strcmp(id, search_id)) reject = "search_id";
+        else if (!status || !integer(cJSON_GetObjectItemCaseSensitive(page, "numOfMatches"), &count) ||
+            !integer(cJSON_GetObjectItemCaseSensitive(page, "totalMatches"), &total)) reject = "counts";
+        else if (count > 20 || count > total || total > 150000 || (uint32_t)size != count ||
+            (!cJSON_IsArray(rows) && rows)) reject = "rows";
+        else if (pages && total != expected_total) reject = "total_changed";
+        else if (position + count == total
+            ? strcmp(status, "OK") && !(!total && !strcmp(status, "NO MATCH"))
+            : !count || position + count > total || strcmp(status, "MORE")) reject = "completion";
+        cJSON *row;
+        if (!reject) cJSON_ArrayForEach(row, rows) {
+            if (!integer(cJSON_GetObjectItemCaseSensitive(row, "serialNo"), &bad_serial) ||
+                bad_serial < begin || bad_serial > end) { reject = "serial_scope"; break; }
+            for (uint32_t i = 0; i < seen_count && !reject; i++)
+                if (seen[i] == bad_serial) reject = "duplicate_serial";
+            if (reject) break;
+            seen[seen_count++] = bad_serial;
+        }
+        if (reject) {
+            snprintf(history_reject, sizeof(history_reject),
+                "range=%s; status=%.12s; num=%lu; total=%lu; rows=%d; position=%lu; begin=%lu; end=%lu; serial=%lu",
+                reject, status ? status : "none", (unsigned long)count, (unsigned long)total, size,
+                (unsigned long)position, (unsigned long)begin, (unsigned long)end, (unsigned long)bad_serial);
+            cJSON_Delete(response);
+            outcome = HIK_PARSE;
+            break;
+        }
+        bool kept = true;
+        cJSON_ArrayForEach(row, rows) {
+            uint32_t serial = 0;
+            (void)integer(cJSON_GetObjectItemCaseSensitive(row, "serialNo"), &serial);
+            char *raw = cJSON_PrintUnformatted(row);
+            kept = raw && fn(context, raw, strlen(raw), serial);
+            free(raw);
+            if (!kept) break;
+        }
+        cJSON_Delete(response);
+        if (!kept) { outcome = HIK_CUSTODY; break; }
+        expected_total = total;
+        position += count;
+        if (position == total) { outcome = HIK_OK; break; }
+    }
+    if (outcome == HIK_OVERSIZED)
+        snprintf(history_reject, sizeof(history_reject), "range=page_limit; position=%lu; total=%lu; begin=%lu",
+            (unsigned long)position, (unsigned long)expected_total, (unsigned long)begin);
+    free(seen);
+    return outcome;
 }
 hik_result_t hik_user_read(const char *employee, cJSON **profile)
 {

@@ -25,7 +25,7 @@ from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple
 from PySide6.QtCore import QObject, QTimer, QUrl, Signal
 from PySide6.QtGui import QDesktopServices
 
-from ..core import api
+from ..core import api, texts
 from ..core.api import (
     Advice,
     BootOutcome,
@@ -65,6 +65,9 @@ CONNECTIVITY_INTERVAL_MS = 15000
 # on every connectivity check while Home says setup cannot be used (review E7).
 CAPABILITIES_REFRESH_S = 180.0
 NO_BOARD_TIPS_AFTER_S = 15.0
+# A board running other software is gone this long at most while it restarts (RST, or
+# its own software): its setup-mode steps stay up meanwhile instead of flashing away.
+SETUP_MODE_GAP_S = 3.0
 FIRST_BOOT_TIMEOUT_S = 120.0
 DIAGNOSE_DELAY_MS = 700
 
@@ -668,6 +671,13 @@ class Controller(QObject):
             return
         self.session.candidate = None
         if state is PresenceState.NO_BOARD and report.seconds_in_state < NO_BOARD_TIPS_AFTER_S:
+            if (
+                self._presence_state is PresenceState.OTHER_USB_MODE
+                and report.seconds_in_state < SETUP_MODE_GAP_S
+            ):
+                # Restarting: the steps stay up until it is back in its own software (the
+                # same advice, not shown again) or in setup mode (Board found).
+                return
             if self._presence_state is not None:
                 page.show_waiting()
             self._presence_state, self._presence_fast = None, False
@@ -764,16 +774,22 @@ class Controller(QObject):
 
         Plugged into another socket it has a new port name, so Try again reads it there
         instead of failing on the old one. Reading is all a check does.
+
+        A board that runs other software is back in it after a replug or a press of RST
+        (Connect's setup-mode advice, core/usb.py): with no native port but such a one,
+        the old port is gone, and "unplugged" would be wrong. The way on is setup mode
+        by hand, then Try again.
         """
         try:
-            natives = [
-                item
-                for item in self.services.usb.snapshot().candidates
-                if item.kind is api.UsbKind.NATIVE
-            ]
+            listed = self.services.usb.snapshot().candidates
         except Exception:  # the old port may still be right
             log.info("could not list the boards again", exc_info=True)
             return candidate
+        natives = [item for item in listed if item.kind is api.UsbKind.NATIVE]
+        if not natives and any(item.kind is api.UsbKind.OTHER for item in listed):
+            raise api.InstallerError(
+                texts.AUTO_DOWNLOAD_FAILED, cause="no board in setup mode, other software on USB"
+            )
         same = [item for item in natives if candidate.mac and item.mac == candidate.mac]
         if same:
             return same[0]
