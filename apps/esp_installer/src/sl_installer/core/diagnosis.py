@@ -74,6 +74,8 @@ def _presence(presence: PresenceReport) -> Optional[Advice]:
         return texts.restart_loop_faulty(period)
     if state is PresenceState.SEVERAL_BOARDS:
         return texts.SEVERAL_BOARDS
+    if state is PresenceState.OTHER_USB_MODE:
+        return texts.SETUP_MODE_NEEDED
     if state is PresenceState.WRONG_SOCKET:
         return texts.WRONG_SOCKET
     if state is PresenceState.NO_BOARD:

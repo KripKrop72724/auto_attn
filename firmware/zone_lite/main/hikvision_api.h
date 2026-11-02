@@ -10,6 +10,16 @@ typedef struct {
 typedef bool (*hik_record_fn)(void *, const char *, size_t);
 void hik_search_init(hik_search_t *, uint32_t first_serial, uint32_t last_serial);
 hik_result_t hik_history_page(hik_search_t *, hik_record_fn, void *);
+/* Facts about the last events page rejected with HIK_PARSE (empty if none). */
+const char *hik_history_last_reject(void);
+typedef bool (*hik_range_fn)(void *, const char *raw, size_t length, uint32_t serial);
+/* Every event with begin <= serialNo <= end, in whatever order the terminal
+ * returns them, through one paged search session (at most max_pages pages).
+ * HIK_OK only after the whole range was read with a stable total and no
+ * serial seen twice. max_pages is at most 100. */
+hik_result_t hik_history_range(uint32_t begin, uint32_t end, unsigned max_pages, hik_range_fn, void *);
+/* totalMatches for [begin, end] from a one-row search (no rows are kept). */
+hik_result_t hik_history_count(uint32_t begin, uint32_t end, uint32_t *total);
 /* A bounded observation of retained history, never a coverage certificate. */
 hik_result_t hik_history_bounds(uint32_t *first, uint32_t *last, uint32_t *count);
 hik_result_t hik_history_response(const cJSON *request, cJSON **response);

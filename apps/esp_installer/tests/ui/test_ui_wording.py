@@ -148,6 +148,21 @@ def test_help_topics_use_existing_pictures():
             assert item.text.endswith(".")
 
 
+def test_connect_help_shows_how_to_put_the_board_into_setup_mode():
+    # Connect's own advice can ask for setup mode: Help there shows the same buttons.
+    item = next(i for i in wording.HELP_TOPICS["connect"].items if i.picture == "boot_button")
+    assert item.heading == texts.SETUP_MODE_NEEDED.title
+    for words in ("Hold down the BOOT button.", "press and release the RST button",
+                  "Then let go of BOOT.", "unplug the board", "Hold down BOOT while you plug"):
+        assert words in item.text, words
+    assert "Try again" not in item.text  # a button Connect does not have
+
+
+def test_no_board_fallback_says_how_to_start_setup_mode_before_faulty():
+    steps = wording.presence_advice(PresenceReport(PresenceState.NO_BOARD)).what_to_do
+    assert steps[-2] == texts.SETUP_MODE_TIP and "faulty" in steps[-1]
+
+
 # "Click Fix settings and type it under The attendance machine, Machine comm key.": a step
 # that sends the person to a field names the part of the form it is in (review CR3).
 FIELD_DIRECTION = re.compile(

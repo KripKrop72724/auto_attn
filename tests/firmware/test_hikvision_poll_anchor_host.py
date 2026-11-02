@@ -14,7 +14,14 @@ def test_inclusive_poll_anchor_gates_durable_records(tmp_path):
 #include <assert.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <string.h>
+typedef enum {HIK_OK,HIK_CONFIGURATION,HIK_NETWORK,HIK_AUTH,HIK_HTTP_STATUS,HIK_OVERSIZED,HIK_BINDING,HIK_PARSE,HIK_CUSTODY} hik_result_t;
+/* A terminal holding 1000 events at serials 5000, 5003, ... 7997. */
+static unsigned count_calls;
+static hik_result_t hik_history_count(uint32_t begin,uint32_t end,uint32_t *total){
+ ++count_calls;*total=0;for(uint32_t s=5000;s<8000;s+=3)if(s>=begin&&s<=end)++*total;return HIK_OK;
+}
 static unsigned writes;
 static bool custody_ok = true;
 /* Deterministic digest stand-in: test ordering/custody, not SHA's implementation. */
@@ -62,6 +69,46 @@ int main(void){
  assert(!poll_record(&p,fresh,strlen(fresh))&&!writes); /* changed facts remain blocked */
  p=(page_context_t){.expected_anchor=fixed,.digest_record=immutable};
  assert(poll_record(&p,presentation,strlen(presentation))&&!p.legacy_upgraded&&!writes);
+ /* 3.1.2 unordered ranges: the anchor is found by serial, not position, and
+  * the checkpoint follows the highest admitted serial, not the last row. */
+ writes=0;
+ range_context_t r={.page={.expected_anchor=expected},.anchor_serial=3199};
+ assert(anchor_row(&r,fresh,strlen(fresh),3198)&&!r.page.anchor_seen&&!writes); /* neighbour */
+ assert(anchor_row(&r,anchor,strlen(anchor),3199)&&r.page.anchor_seen&&!writes);
+ assert(anchor_row(&r,fresh,strlen(fresh),3199)&&!writes); /* already proved */
+ r.page.expected_anchor=NULL;
+ const char *a="boot record 3852",*b="boot record 3290",*c="punch 3900";
+ unsigned char top[32];mbedtls_sha256((const unsigned char *)c,strlen(c),top,0);
+ assert(range_row(&r,anchor,strlen(anchor),3199)&&!writes); /* the anchor again */
+ assert(range_row(&r,a,strlen(a),3852)&&range_row(&r,b,strlen(b),3290));
+ assert(range_row(&r,c,strlen(c),3900)&&range_row(&r,"punch 3300",10,3300));
+ assert(writes==4&&r.page.count==4&&r.max_serial==3900&&!memcmp(r.max_digest,top,32));
+ /* A wrong anchor admits nothing, wherever it sorts. */
+ r=(range_context_t){.page={.expected_anchor=expected},.anchor_serial=3199};writes=0;
+ assert(!anchor_row(&r,fresh,strlen(fresh),3199)&&r.page.anchor_conflict&&!writes);
+ /* The anchor row met again in the main read must carry the proved facts. */
+ r=(range_context_t){.anchor_serial=3199,.recheck_anchor=true,.page={.digest_record=immutable}};
+ immutable(anchor,strlen(anchor),r.anchor_stable);writes=0;
+ assert(range_row(&r,anchor,strlen(anchor),3199)&&!writes&&!r.page.anchor_conflict);
+ assert(!range_row(&r,fresh,strlen(fresh),3199)&&r.page.anchor_conflict&&!writes);
+ /* A backlog is cut into a window of exactly 400 events; a smaller multi-page
+  * tail ends at its newest serial so new punches stay outside the window; a
+  * single page is read whole. */
+ uint32_t end=0,inside=0;
+ assert(poll_window_end(5000,&end)==HIK_OK&&end<3000000000U&&count_calls<40);
+ hik_history_count(5000,end,&inside);assert(inside==400);
+ hik_history_count(5000,end-1,&inside);assert(inside==399);
+ assert(poll_window_end(7000,&end)==HIK_OK&&end==7997);
+ hik_history_count(7000,end,&inside);assert(inside==333);
+ assert(poll_window_end(7950,&end)==HIK_OK&&end==3000000000U);
+ /* A first install starts at the newest 20 serials, whatever the time order. */
+ uint32_t tail=0;
+ assert(poll_tail_begin(&tail)==HIK_OK);
+ hik_history_count(tail,3000000000U,&inside);assert(inside==20);
+ hik_history_count(tail-1,3000000000U,&inside);assert(inside==21);
+ /* A failed durable append keeps the checkpoint where it was. */
+ r=(range_context_t){.anchor_serial=10};custody_ok=false;
+ assert(!range_row(&r,c,strlen(c),12)&&!r.max_serial);custody_ok=true;
  return 0;
 }
 '''

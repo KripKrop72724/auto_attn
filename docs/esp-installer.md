@@ -88,13 +88,14 @@ to sleep while it sets up a board and while it watches the board start.
 | The app says there is no internet | Check the network cable or Wi-Fi. Open any website to test. The app checks again by itself. |
 | The app cannot reach head office | Wait a few minutes and try again. If it goes on, call head office. |
 | The app pauses sign-in | You typed a wrong password 3 times. Wait 10 minutes, then try again. More wrong tries would also lock your dashboard sign-in. |
-| No board is found | Use a different USB cable: some cables only charge. Try another USB socket on the computer. |
+| No board is found | Use a different USB cable: some cables only charge. Try another USB socket on the computer. Some new boards only show up in setup mode: hold down the **BOOT** button. While you hold it, press and release **RST**. Then let go of **BOOT**. |
 | "Use the socket marked USB" | The cable is in the other socket on the board. Move it to the socket marked **USB**. |
+| "Put the board into setup mode" on the **Connect the board** screen | The board is running other software. This is normal for a new board. Hold down the **BOOT** button. While you hold it, press and release **RST**. Let go of **BOOT**. When the screen says **Board found**, click **Next**. If the message is still there after 5 seconds, unplug the board, hold down **BOOT** while you plug it back into the socket marked **USB**, then let go of **BOOT**. If it is still there after 3 tries, click **Help**, then **Save a help file**, and send the file to head office. |
 | "Connect only one board" | Unplug every other board. |
 | "This computer cannot read the board ID" | This computer, or the USB socket or hub, does not tell the app which board it is, so the app will not write to the board there. Plug the cable straight into another USB socket on the computer, not into a hub. Then click **Try again** (on **Check or fix a board**: **Check again**). If that does not help, use another computer. |
 | "The board keeps restarting" | Usually the cable or the USB socket does not give enough power. Use a short cable straight into the computer, not a hub, or another USB socket. Then click **Check again** (or **Try again** after the first start). |
 | "This board is faulty" | Put a FAULTY label on it, keep it aside and tell head office. |
-| The app cannot start the board's setup mode | Hold the **BOOT** button. Press and release **RST**. Release **BOOT**. Click **Try again**. |
+| The app cannot start the board's setup mode | Hold down the **BOOT** button. While you hold it, press and release **RST**. Let go of **BOOT**. Click **Try again**. |
 | Setup stopped before the end | Do what the screen says, then click **Finish the setup**. If the app was closed: choose **Set up a new board**, type the same details and connect the same board. The check then offers **Finish the setup**. |
 | The board started with other settings | Click **Fix settings**. The app checks the board again and offers **Change its settings**. |
 | "The app did not see the board start" | Unplug the board, wait 3 seconds and plug it back in without pressing any button. Click **Try again**. If it happens again, click **Check the board**. |

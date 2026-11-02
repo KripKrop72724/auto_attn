@@ -172,6 +172,15 @@ def test_bridge_socket_is_refused_without_touching_the_board():
     assert caught.value.advice is texts.WRONG_SOCKET and runner.calls == []
 
 
+def test_a_board_running_other_software_is_never_inspected():
+    # 303A:4001: only the board's own USB-Serial/JTAG socket is ever read or written.
+    runner = FakeRunner(FakeBoard())
+    other = UsbCandidate("COM8", UsbKind.OTHER, 0x303A, 0x4001, None, "USB Serial Device (COM8)")
+    with pytest.raises(InstallerError):
+        BoardInspector(runner).inspect(other, CancelToken())
+    assert runner.calls == []
+
+
 def test_efuse_mac_mismatch_means_another_board():
     fake = FakeBoard()
     fake.summary["MAC"]["value"] = f"{support.OTHER_MAC} (OK)"

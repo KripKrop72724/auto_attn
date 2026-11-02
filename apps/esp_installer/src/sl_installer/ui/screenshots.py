@@ -266,6 +266,11 @@ def _connect_problem(d: Driver) -> None:
     d.wait(lambda: d.page(pages.CONNECT).problem.isVisible(), "connect problem")
 
 
+def _connect_setup_mode(d: Driver) -> None:
+    d.hold("setup_mode")  # the board keeps running its other software
+    _connect_problem(d)
+
+
 def _connect_found(d: Driver) -> None:
     d.board_found()
 
@@ -443,6 +448,7 @@ SCENES: Tuple[Scene, ...] = (
     ("connect-looking", "no_board_then_found", _connect_waiting),
     ("connect-no-board-tips", "no_board_then_found", _connect_tips),
     ("connect-wrong-socket", "wrong_socket", _connect_problem),
+    ("connect-setup-mode", "other_usb_mode", _connect_setup_mode),
     ("connect-several-boards", "several_boards", _connect_problem),
     ("connect-faulty-board", "faulty_restart_loop", _connect_problem),
     ("connect-fast-restart-loop", "fast_restart_loop", _connect_problem),

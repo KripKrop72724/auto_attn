@@ -8,7 +8,7 @@ ROOT = Path(__file__).resolve().parents[2]
 
 def test_light_audit_durable_resume_backpressure_and_source_change(tmp_path):
     source = (ROOT / 'firmware/zone_lite/main/hikvision_runtime.c').read_text()
-    pages = source[source.index('typedef struct {\n    unsigned char digest[32];'):source.index('static void poll_task(')]
+    pages = source[source.index('typedef struct {\n    unsigned char digest[32];'):source.index('/* Unordered range reads (3.1.2).')]
     light = source[source.index('/* Low-rate independent audit.'):source.index('static void history_task(')]
     harness = r'''
 #include <assert.h>

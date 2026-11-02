@@ -60,12 +60,20 @@ NO_BOARD = _a(
     "Wait a few seconds.",
     severity=Severity.INFO, illustration="usb_socket")
 
+# Some new boards run a maker's demo that gives the computer no port to list, such as a
+# USB keyboard or USB drive (ESP-IDF tusb_hid, tusb_msc at 303A:4002, serial "123456"):
+# they show up only in setup mode. So "no board" advice says how before "faulty" (also
+# ui/wording.presence_advice).
+SETUP_MODE_TIP = ("Some new boards only show up in setup mode. Hold down the BOOT button. "
+                  "While you hold it, press and release the RST button. Then let go of BOOT.")
+
 NO_BOARD_TIPS = _a(
     "NO_BOARD_TIPS", "Still no board",
     "The computer still cannot see the board.",
     "Use the cable that came with the board. Some cables only charge and cannot carry data.",
     "Check that the cable is in the socket on the board marked USB.",
     "Try another USB socket on this computer.",
+    SETUP_MODE_TIP,
     "If nothing works after 3 tries, the board may be faulty. Put it aside and use another one.",
     severity=Severity.WARNING, illustration="cable")
 
@@ -76,6 +84,29 @@ WRONG_SOCKET = _a(
     "Unplug the cable from the board.",
     "Plug it into the socket marked USB.",
     severity=Severity.WARNING, illustration="usb_socket")
+
+# Connect, when the cable is in the socket marked USB but other software runs the board,
+# such as a maker's demo on a new board (core/usb.py, OTHER_USB_MODE). The button steps
+# are AUTO_DOWNLOAD_FAILED's. In setup mode the board shows up as usual: Connect says
+# Board found and waits for Next, it does not move on by itself. Connect keeps this
+# advice up through the short gap while the board restarts (ui/controller), so "still
+# see this message" means the buttons did not work: holding BOOT while the board is
+# plugged back in starts setup mode too. After that, a help file for head office; a
+# board that runs other software is never called faulty here.
+SETUP_MODE_NEEDED = _a(
+    "SETUP_MODE_NEEDED", "Put the board into setup mode",
+    "The board is running other software, so the app cannot set it up yet. "
+    "This is normal for a new board.",
+    "Hold down the BOOT button on the board.",
+    "While you hold BOOT, press and release the RST button.",
+    "Let go of BOOT.",
+    "The app then finds the board by itself. When this screen says Board found, click Next.",
+    "If you still see this message after 5 seconds, unplug the board.",
+    "Hold down BOOT while you plug the board back into the socket marked USB. "
+    "Then let go of BOOT.",
+    "If you still see this message after 3 tries, open Help. "
+    "Click Save a help file and send it to head office.",
+    severity=Severity.WARNING, illustration="boot_button")
 
 SEVERAL_BOARDS = _a(
     "SEVERAL_BOARDS", "Connect only one board",
@@ -1018,7 +1049,8 @@ def led_states(rhythm: Optional[str] = None, colour: Optional[str] = None
 
 STATIC: Dict[str, Advice] = {
     advice.code: advice for advice in (
-        NO_BOARD, NO_BOARD_TIPS, WRONG_SOCKET, SEVERAL_BOARDS, BOARD_DISCONNECTED, PORT_BUSY,
+        NO_BOARD, NO_BOARD_TIPS, WRONG_SOCKET, SETUP_MODE_NEEDED, SEVERAL_BOARDS,
+        BOARD_DISCONNECTED, PORT_BUSY,
         BOARD_ID_UNKNOWN, BOARD_ID_NOT_READABLE, AUTO_DOWNLOAD_FAILED, CABLE_PROBLEM,
         CONNECTION_LOST, TOOL_TIMEOUT,
         TOOL_FAILED, TOOL_MISSING, WRONG_CHIP, WRONG_FLASH_SIZE, WRONG_PSRAM, SECURED_OTHER,
