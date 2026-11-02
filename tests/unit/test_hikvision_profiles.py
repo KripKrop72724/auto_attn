@@ -294,3 +294,16 @@ def test_write_qualified_or_identity_changes_still_refuse_a_snapshot(db):
         accept_profile_page(session, connector, {**page(phase=2, name="Renamed-1234512345671"), "snapshot_id": "e" * 32})
     session.rollback()
     assert session.scalar(select(func.count()).select_from(DeviceUser)) == 0
+
+
+def test_heartbeat_schema_accepts_stable_fact_command_version():
+    # Jhelum's 3.1.4 reports profile_command_version 5 in every heartbeat.
+    from zk_add import schemas
+    field = next(model for model in vars(schemas).values()
+                 if isinstance(model, type) and issubclass(model, schemas.BaseModel)
+                 and "profile_command_version" in getattr(model, "model_fields", {}))
+    from pydantic import TypeAdapter
+    adapter = TypeAdapter(field.model_fields["profile_command_version"].annotation)
+    assert adapter.validate_python(5) == 5
+    with pytest.raises(Exception):
+        adapter.validate_python(6)

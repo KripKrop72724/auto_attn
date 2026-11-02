@@ -137,7 +137,7 @@ def test_signed_repair_heartbeat_is_accepted_and_keeps_approval(target, version,
     assert terminal.certification_state == "PROFILE_EXCEPTION"
     assert require_writable_user_profile(connector, "user_write") is terminal
     assert terminal.capability_profile["hikvision_health"]["qualification_state"] == "NOT_QUALIFIED"
-    data["terminal"]["profile_command_version"] = 5
+    data["terminal"]["profile_command_version"] = 6  # 5 is the stable-fact profile
     with pytest.raises(ValueError):
         HeartbeatPayload.model_validate(data)
 
