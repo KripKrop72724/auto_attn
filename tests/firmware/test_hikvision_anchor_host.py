@@ -56,7 +56,15 @@ int main(int argc,char **argv){
     expected = hashlib.sha256(facts.encode()).hexdigest()
     assert result[:3] == [expected] * 3
     assert all(value != expected and value != "INVALID" for value in result[3:8])
-    assert result[8:] == ["INVALID"] * len(invalid)
+    assert result[8:8 + len(invalid)] == ["INVALID"] * len(invalid)
+    # Jhelum's DS-K1T321MFWX restarts its clock at 2015-01-01 on power-up; its
+    # boot records (2/1024) must still have stable facts or custody stops.
+    boot = json.dumps(dict(serialNo=3199, major=2, minor=1024, time="2015-01-01T00:00:06+05:00"),
+                      separators=(",", ":"))
+    late = subprocess.check_output([str(exe), boot, boot.replace("2015-01-01", "1969-12-31")],
+                                   text=True).splitlines()
+    assert late[0] == hashlib.sha256(b"HIK_ANCHOR_V2\n3199\n2\n1024\n\n1420052406").hexdigest()
+    assert late[1] == "INVALID"
 
 
 def test_bld1_legacy_proof_is_bound_to_exact_hardware_and_saved_record(tmp_path):

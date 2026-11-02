@@ -2,7 +2,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <ctype.h>
-bool hik_clock_parse(const char *s, int64_t *epoch)
+static bool parse_from(const char *s, int64_t *epoch, int first_year)
 {
     if (!s || !epoch) return false;
     size_t n = strlen(s);
@@ -23,7 +23,7 @@ bool hik_clock_parse(const char *s, int64_t *epoch)
     }
     static const int md[]={31,28,31,30,31,30,31,31,30,31,30,31};
     bool leap=y%4==0 && (y%100!=0 || y%400==0);
-    if(y<2020 || y>2099 || m<1 || m>12 || d<1 || d>md[m-1]+(m==2 && leap) || h>23 || mi>59 || se>59) return false;
+    if(y<first_year || y>2099 || m<1 || m>12 || d<1 || d>md[m-1]+(m==2 && leap) || h>23 || mi>59 || se>59) return false;
     int64_t days=0;
     for(int year=1970;year<y;year++) days+=365+(year%4==0 && (year%100!=0 || year%400==0));
     for(int month=1;month<m;month++) days+=md[month-1]+(month==2 && leap);
@@ -31,3 +31,7 @@ bool hik_clock_parse(const char *s, int64_t *epoch)
     *epoch=(days+d-1)*86400+h*3600+mi*60+se-offset;
     return true;
 }
+bool hik_clock_parse(const char *s, int64_t *epoch) { return parse_from(s, epoch, 2020); }
+/* Event facts keep what the terminal recorded: a clock that restarts at
+ * 2015-01-01 on power-up still dates real (boot, door) events. */
+bool hik_clock_parse_event(const char *s, int64_t *epoch) { return parse_from(s, epoch, 1970); }

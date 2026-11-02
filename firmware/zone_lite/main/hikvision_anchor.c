@@ -22,7 +22,7 @@ bool hik_anchor_digest(const char *body,size_t length,unsigned char digest[32])
     const char *id=cJSON_IsString(employee)?employee->valuestring:"";
     bool valid=cJSON_IsObject(row) && number(row,"serialNo",3000000000U,&serial) && serial &&
         number(row,"major",65535,&major) && number(row,"minor",65535,&minor) &&
-        cJSON_IsString(time) && hik_clock_parse(time->valuestring,&epoch) &&
+        cJSON_IsString(time) && hik_clock_parse_event(time->valuestring,&epoch) &&
         (!employee || cJSON_IsNull(employee) || cJSON_IsString(employee)) &&
         strlen(id)<=32 && strspn(id,"0123456789")==strlen(id);
     const char *keys[]={"serialNo","major","minor","time","employeeNoString"};
