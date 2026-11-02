@@ -1,6 +1,7 @@
 """USB discovery, the Windows device-tree fallback and restart-loop detection."""
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
@@ -26,6 +27,11 @@ def native(port="COM5", serial="AC:27:6E:A4:3D:30"):
     return Port(port, 0x303A, 0x1001, serial, "USB Serial Device (COM5)")
 
 
+def other_mode(port="/dev/cu.usbmodem1234561"):
+    """A new board running its maker's demo, as the Mac bench saw it on 2 Nov 2026."""
+    return Port(port, 0x303A, 0x4001, "123456", "Espressif Device")
+
+
 def test_classify_native_bridge_other():
     candidate = classify_port(native())
     assert candidate.kind is UsbKind.NATIVE and candidate.mac == MAC
@@ -37,6 +43,20 @@ def test_classify_native_bridge_other():
     assert classify_port(Port("COM8", 0x303A, 0x0002)).kind is UsbKind.OTHER
     assert classify_port(Port("COM1", None, None)) is None          # a built-in serial port
     assert classify_port(Port("COM9", 0x8087, 0x0AAA)) is None      # Bluetooth and the like
+
+
+def test_an_espressif_chip_running_other_software_is_no_board():
+    candidate = classify_port(other_mode())
+    assert candidate.kind is UsbKind.OTHER and candidate.mac is None
+    assert (candidate.vid, candidate.pid) == (0x303A, 0x4001)
+    # Not even a device-tree MAC for its port makes it a board.
+    assert classify_port(other_mode("COM8"), {"COM8": MAC}).mac is None
+    watcher = UsbWatcher(lambda: [other_mode()], FakeClock(), tree_macs=dict)
+    report = watcher.snapshot()
+    assert report.state is PresenceState.OTHER_USB_MODE and report.board is None
+    assert [c.kind for c in report.candidates] == [UsbKind.OTHER]
+    # The installer and the first start find boards with find(): never this port.
+    assert watcher.find(MAC) == (None, 0)
 
 
 class FakeTree(DeviceTree):
@@ -126,12 +146,21 @@ def scripted(clock, timeline):
     ([native(), native("COM9", "AC:27:6E:A4:CE:A8")], PresenceState.SEVERAL_BOARDS),
     ([Port("COM3", 0x10C4, 0xEA60)], PresenceState.WRONG_SOCKET),
     ([native(), Port("COM3", 0x10C4, 0xEA60)], PresenceState.ONE_BOARD),
+    ([other_mode()], PresenceState.OTHER_USB_MODE),
+    # Only the socket marked USB shows an Espressif chip, so setup mode is the advice.
+    ([Port("COM3", 0x10C4, 0xEA60), other_mode()], PresenceState.OTHER_USB_MODE),
+    # Never several boards, and any native board is the one to use.
+    ([other_mode(), other_mode("/dev/cu.usbmodem1234563")], PresenceState.OTHER_USB_MODE),
+    ([native(), other_mode()], PresenceState.ONE_BOARD),
+    ([native(), other_mode(), other_mode("COM8")], PresenceState.ONE_BOARD),
+    ([native(), native("COM9", "AC:27:6E:A4:CE:A8"), other_mode()],
+     PresenceState.SEVERAL_BOARDS),
 ])
 def test_presence_states(ports, state):
     report = UsbWatcher(lambda: ports, FakeClock(), tree_macs=dict).snapshot()
     assert report.state is state
     if state is PresenceState.ONE_BOARD:
-        assert report.board.mac == MAC
+        assert report.board.mac == MAC and report.board.kind is UsbKind.NATIVE
 
 
 def test_seconds_in_state_grows():
@@ -196,6 +225,55 @@ def test_loop_ends_when_the_board_stays():
     reports = run_watcher(watcher, clock, 80)
     assert any(r.state is PresenceState.RESTART_LOOP for r in reports)
     assert reports[-1].state is PresenceState.ONE_BOARD
+
+
+def test_other_software_that_keeps_restarting_is_never_a_restart_loop():
+    # Its own software may restart with the faulty board's rhythm; it is still no board.
+    clock = FakeClock()
+    timeline = [(moment, [other_mode()] if ports else [])
+                for moment, ports in loop_timeline(10.3, 9.5)]
+    watcher = UsbWatcher(scripted(clock, timeline), clock, tree_macs=dict)
+    reports = run_watcher(watcher, clock, 35)
+    assert {r.state for r in reports} == {PresenceState.OTHER_USB_MODE, PresenceState.NO_BOARD}
+    assert all(r.board is None and r.loop_period_s is None for r in reports)
+    assert watcher._timeline._events == {}  # only native ports are on the timeline
+
+
+def test_setup_mode_turns_the_other_usb_mode_into_the_board():
+    # The bench, 2 Nov 2026: BOOT held through RST, then 303A:1001 with the board's MAC.
+    clock = FakeClock()
+    timeline = [(0, [other_mode()]), (20, []), (21, [native("/dev/cu.usbmodem101")])]
+    watcher = UsbWatcher(scripted(clock, timeline), clock, tree_macs=dict)
+    reports = run_watcher(watcher, clock, 30)
+    states = [r.state for r in reports]
+    assert states[0] is PresenceState.OTHER_USB_MODE and states[-1] is PresenceState.ONE_BOARD
+    assert PresenceState.NO_BOARD in states and PresenceState.RESTART_LOOP not in states
+    assert reports[-1].board.mac == MAC and reports[-1].board.port == "/dev/cu.usbmodem101"
+    assert reports[-1].seconds_in_state < 10  # a new state, counted from when it began
+
+
+def test_each_presence_change_is_logged_with_the_usb_ids():
+    # A help file then shows what USB showed, e.g. a board still in its maker's demo.
+    lines: List[str] = []
+    handler = logging.Handler(logging.INFO)
+    handler.emit = lambda record: lines.append(record.getMessage())
+    logger = logging.getLogger("sl_installer.usb")
+    level = logger.level
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    try:
+        clock = FakeClock()
+        timeline = [(0, [other_mode(), Port("COM3", 0x10C4, None)]), (20, []),
+                    (21, [native("/dev/cu.usbmodem101")])]
+        run_watcher(UsbWatcher(scripted(clock, timeline), clock, tree_macs=dict), clock, 30)
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(level)
+    assert lines == [
+        "usb other_usb_mode: /dev/cu.usbmodem1234561 other 303A:4001, COM3 bridge 10C4:????",
+        "usb no_board: no ports",
+        "usb one_board: /dev/cu.usbmodem101 native 303A:1001",
+    ]
 
 
 def test_timeline_marks_a_disappearance_seen_by_the_console():

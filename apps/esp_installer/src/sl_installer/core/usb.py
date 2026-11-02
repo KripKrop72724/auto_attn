@@ -5,6 +5,25 @@ marked USB) can be set up: its USB serial number is the board MAC, which is the
 only identity a board in Secure Download Mode still gives. USB-UART bridges
 (CP210x, CH34x, FTDI) mean the cable is in the other socket.
 
+Another Espressif device (VID 0x303A, another PID) is a board in the socket marked
+USB that runs software of its own. A new board with a maker's demo shows as 303A:4001
+with serial number "123456", the ESP-IDF TinyUSB defaults (2 Nov 2026 bench). The
+cable is in the right socket, so that is OTHER_USB_MODE even next to a bridge: held
+through a reset, BOOT starts the board in setup mode, as 303A:1001 with its MAC. An
+OTHER port is never inspected or written, counts for neither SEVERAL_BOARDS nor a
+restart loop, and gives way to any native port. A demo that offers no serial port
+(a USB keyboard or drive) is not listed at all: that is NO_BOARD, whose tips say how
+to start setup mode too.
+
+Known trade-offs, accepted: any other Espressif USB serial gadget on the computer
+looks the same, so with one attached Connect asks for setup mode before a board is
+plugged in, and a board in its COM socket is not told to use the other socket. That
+is rare on field laptops, and BOOT and RST do no harm. The chip offers one USB mode
+at a time, so a native port next to an OTHER one is two devices; the native one is
+the board (ONE_BOARD): Connect shows its board ID and every write stays bound to it.
+SEVERAL_BOARDS there would stop setups next to such a gadget, and could flash while a
+board switches modes.
+
 pyserial 3.5 on Windows reads the serial number from the parent of the COM
 interface with CM_Get_Parent/CM_Get_Device_IDW, but it raises from comports() if
 the walk fails, and for some hubs returns nothing. ``device_tree_macs`` reads the
@@ -69,6 +88,12 @@ def serial_mac(value: object) -> Optional[str]:
     """
     text = str(value or "").strip()
     return normalize_mac(text) if _SERIAL_MAC.fullmatch(text) else None
+
+
+def usb_id(candidate: UsbCandidate) -> str:
+    """VID:PID as hex, "303A:4001"; ???? for a part the system did not give."""
+    return ":".join("????" if value is None else f"{value:04X}"
+                    for value in (candidate.vid, candidate.pid))
 
 
 def classify_port(info: object, macs: Optional[Dict[str, str]] = None) -> Optional[UsbCandidate]:
@@ -339,12 +364,18 @@ class UsbWatcher:
                 state, board = PresenceState.ONE_BOARD, natives[0]
             elif len(natives) > 1:
                 state = PresenceState.SEVERAL_BOARDS
+            elif any(c.kind is UsbKind.OTHER for c in candidates):
+                # Before a bridge: only the socket marked USB shows an Espressif chip.
+                state = PresenceState.OTHER_USB_MODE
             elif any(c.kind is UsbKind.BRIDGE for c in candidates):
                 state = PresenceState.WRONG_SOCKET
             else:
                 state = PresenceState.NO_BOARD
             if state is not self._state:
                 self._state, self._since = state, now
+                # For a help file: what USB showed, e.g. a board still in its own software.
+                log.info("usb %s: %s", state.value, ", ".join(
+                    f"{c.port} {c.kind.value} {usb_id(c)}" for c in candidates) or "no ports")
             return PresenceReport(state, candidates, board, period, round(now - self._since, 1))
 
     def watch(self, on_report: PresenceFn, cancel: CancelToken, interval_s: float = 0.3) -> None:

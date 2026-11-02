@@ -230,6 +230,34 @@ def test_bench_parser_and_confirmation(monkeypatch, capsys):
     bench._confirm("Type the board ID.", support.MAC)
 
 
+def test_bench_says_to_put_a_board_running_other_software_into_setup_mode(capsys):
+    from types import SimpleNamespace
+
+    from sl_installer.core.diagnosis import Diagnoser
+    from sl_installer.core.usb import UsbWatcher
+
+    port = SimpleNamespace(device="/dev/cu.usbmodem1234561", vid=0x303A, pid=0x4001,
+                           serial_number="123456", description="Espressif Device")
+    inspected = []
+
+    class Fake:
+        usb = UsbWatcher(lambda: [port], support.FakeClock(), tree_macs=dict)
+        diagnosis = Diagnoser()
+
+        class boards:
+            inspect = staticmethod(lambda candidate, cancel: inspected.append(candidate))
+
+    with pytest.raises(SystemExit) as stop:
+        bench.cmd_inspect(Fake, bench.parser().parse_args(["inspect"]))
+    assert stop.value.code == 2 and inspected == []  # nothing was read from that port
+    out = capsys.readouterr().out
+    assert "Put the board into setup mode  (SETUP_MODE_NEEDED)" in out
+    assert "Hold down the BOOT button on the board." in out
+    assert ("/dev/cu.usbmodem1234561 (Espressif Device): Espressif USB 303A:4001, not the "
+            "board's own USB-Serial/JTAG 303A:1001.") in out
+    assert out.rstrip().endswith("Put the board into setup mode, then run this command again.")
+
+
 def test_another_python_can_run_the_tools_from_a_checkout(monkeypatch, tmp_path):
     monkeypatch.delenv(app_config.TOOL_PYTHON_ENV, raising=False)
     assert load_config(data_dir=tmp_path).tool_python is None

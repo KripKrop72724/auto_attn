@@ -52,9 +52,30 @@ def test_restart_loop_is_the_first_thing_said():
     (PresenceReport(PresenceState.SEVERAL_BOARDS), "SEVERAL_BOARDS"),
     (PresenceReport(PresenceState.NO_BOARD, seconds_in_state=3), "NO_BOARD"),
     (PresenceReport(PresenceState.NO_BOARD, seconds_in_state=15), "NO_BOARD_TIPS"),
+    (PresenceReport(PresenceState.OTHER_USB_MODE), "SETUP_MODE_NEEDED"),
 ])
 def test_presence(presence, code):
     assert codes(diagnose(presence))[0] == code
+
+
+@pytest.mark.parametrize("seconds", [0.5, 15, 120])
+def test_a_board_running_other_software_needs_setup_mode_not_a_new_cable(seconds):
+    other = UsbCandidate("COM8", UsbKind.OTHER, 0x303A, 0x4001, None, "USB Serial Device (COM8)")
+    presence = PresenceReport(PresenceState.OTHER_USB_MODE, (other,), seconds_in_state=seconds)
+    advice = diagnose(presence)
+    # The board is connected: never the no-board tips, however long it stays like this.
+    assert advice == [texts.SETUP_MODE_NEEDED]
+    assert advice[0].illustration == "boot_button" and advice[0].severity is Severity.WARNING
+    assert "faulty" not in " ".join((advice[0].what_happened,) + advice[0].what_to_do).lower()
+
+
+def test_no_board_tips_say_how_to_start_setup_mode_before_faulty():
+    # A maker's demo with no serial port (a USB keyboard or drive) lists nothing at all
+    # until the board is in setup mode: a good board must not be put aside first.
+    steps = diagnose(PresenceReport(PresenceState.NO_BOARD, seconds_in_state=20))[0].what_to_do
+    assert steps[-2] == texts.SETUP_MODE_TIP and "faulty" in steps[-1]
+    assert "Hold down the BOOT button." in steps[-2] and "Then let go of BOOT." in steps[-2]
+    assert "While you hold it, press and release the RST button." in steps[-2]
 
 
 def test_charge_only_cable_is_mentioned_after_15_seconds():

@@ -62,6 +62,7 @@ SCENARIOS: Tuple[str, ...] = (
     "happy_hik",
     "no_board_then_found",
     "wrong_socket",
+    "other_usb_mode",
     "several_boards",
     "faulty_restart_loop",
     "secured_board_fix_settings",
@@ -163,6 +164,8 @@ NATIVE_OTHER = UsbCandidate(
 BRIDGE = UsbCandidate(
     "COM7", UsbKind.BRIDGE, 0x1A86, 0x55D3, None, "USB-Enhanced-SERIAL CH343 (COM7)"
 )
+# A new board running its maker's demo: Espressif's USB defaults, no board ID.
+OTHER_USB = UsbCandidate("COM8", UsbKind.OTHER, 0x303A, 0x4001, None, "USB Serial Device (COM8)")
 
 
 @dataclass(frozen=True)
@@ -531,6 +534,8 @@ def _report(
         return PresenceReport(state, (NATIVE,), NATIVE, None, seconds)
     if state is PresenceState.WRONG_SOCKET:
         return PresenceReport(state, (BRIDGE,), None, None, seconds)
+    if state is PresenceState.OTHER_USB_MODE:
+        return PresenceReport(state, (OTHER_USB,), None, None, seconds)
     if state is PresenceState.SEVERAL_BOARDS:
         return PresenceReport(state, (NATIVE, NATIVE_OTHER), None, None, seconds)
     if state is PresenceState.RESTART_LOOP:
@@ -553,6 +558,13 @@ class FakeUsb:
             ]
         if scenario == "wrong_socket":
             return [(_report(PresenceState.WRONG_SOCKET, 1.0), "board_found", 3)]
+        if scenario == "other_usb_mode":
+            # BOOT held through RST: the board restarts and comes back in setup mode.
+            return [
+                (_report(PresenceState.OTHER_USB_MODE, 1.0), "", 0),
+                (_report(PresenceState.NO_BOARD, 0.0), "setup_mode", 30),
+                (_report(PresenceState.ONE_BOARD, 0.5), "board_found", 3),
+            ]
         if scenario == "several_boards":
             return [(_report(PresenceState.SEVERAL_BOARDS, 1.0), "board_found", 3)]
         if scenario == "faulty_restart_loop":
@@ -960,6 +972,9 @@ class FakeDiagnosis:
                         "Plug it into the socket marked USB on the board.",
                         "Plug the other end straight into this computer, not into a hub.",
                         "Try another socket on the computer.",
+                        "Some new boards only show up in setup mode. Hold down the BOOT button. "
+                        "While you hold it, press and release the RST button. Then let go of "
+                        "BOOT.",
                         "If nothing changes after 3 tries, put the board aside and use another.",
                     ),
                     Severity.WARNING,
@@ -978,6 +993,29 @@ class FakeDiagnosis:
                     ),
                     Severity.WARNING,
                     "usb_socket",
+                )
+            )
+        elif state is PresenceState.OTHER_USB_MODE:
+            found.append(
+                _advice(
+                    "USB_SETUP_MODE_NEEDED",
+                    "Put the board into setup mode",
+                    "The board is running other software, so the app cannot set it up yet. "
+                    "This is normal for a new board.",
+                    (
+                        "Hold down the BOOT button on the board.",
+                        "While you hold BOOT, press and release the RST button.",
+                        "Let go of BOOT.",
+                        "The app then finds the board by itself. When this screen says Board "
+                        "found, click Next.",
+                        "If you still see this message after 5 seconds, unplug the board.",
+                        "Hold down BOOT while you plug the board back into the socket marked "
+                        "USB. Then let go of BOOT.",
+                        "If you still see this message after 3 tries, open Help. Click Save a "
+                        "help file and send it to head office.",
+                    ),
+                    Severity.WARNING,
+                    "boot_button",
                 )
             )
         elif state is PresenceState.SEVERAL_BOARDS:
