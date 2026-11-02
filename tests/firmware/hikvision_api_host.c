@@ -24,7 +24,38 @@ hik_result_t hik_http_request(esp_http_client_method_t method, const char *path,
 {
     cJSON *req = cJSON_Parse(body); assert(req);
     cJSON *out = cJSON_CreateObject();
-    if (strstr(path, "/AcsEvent?") && mode >= 10) {
+    if (strstr(path, "/AcsEvent?") && mode >= 40) {
+        /* Jhelum DS-K1T321MFWX: rows sorted by event time; boot records dated
+         * 2015 sort before earlier punches, so serials arrive out of order. */
+        static const unsigned order[] = {3290, 3294, 3306, 3311, 3503, 3852, 3161, 3162, 3175, 3177,
+            3178, 3188, 3189, 3199, 3200, 3223, 3224, 3277, 3278, 3300, 3301, 3302, 3400, 3853, 3860,
+            3861, 3862, 3863, 3864, 3865, 3866}; /* 24 from 3199: two pages */
+        cJSON *cond = cJSON_GetObjectItem(req, "AcsEventCond");
+        unsigned begin = (unsigned)cJSON_GetObjectItem(cond, "beginSerialNo")->valuedouble;
+        unsigned end = (unsigned)cJSON_GetObjectItem(cond, "endSerialNo")->valuedouble;
+        unsigned position = (unsigned)cJSON_GetObjectItem(cond, "searchResultPosition")->valuedouble;
+        unsigned size = (unsigned)cJSON_GetObjectItem(cond, "maxResults")->valuedouble;
+        unsigned matched[32], total = 0;
+        for (unsigned i = 0; i < sizeof(order) / sizeof(order[0]); i++)
+            if ((mode == 41 ? order[i] > begin : order[i] >= begin) && order[i] <= end) matched[total++] = order[i];
+        if (mode == 42 && position) total--;           /* the terminal changed mid-read */
+        /* Equal timestamps reordered between requests: page 2 repeats a row
+         * from page 1 and the row it displaced is never returned. */
+        if (mode == 45 && position) matched[position] = matched[3];
+        unsigned count = position < total ? (total - position < size ? total - position : size) : 0;
+        cJSON *page = cJSON_AddObjectToObject(out, "AcsEvent");
+        cJSON_AddStringToObject(page, "searchID", cJSON_GetObjectItem(cond, "searchID")->valuestring);
+        cJSON_AddNumberToObject(page, "numOfMatches", count);
+        cJSON_AddNumberToObject(page, "totalMatches", total);
+        cJSON_AddStringToObject(page, "responseStatusStrg", !total ? "NO MATCH" :
+            position + count == total && mode != 43 ? "OK" : "MORE");
+        cJSON *rows = cJSON_AddArrayToObject(page, "InfoList");
+        for (unsigned i = 0; i < count; i++) {
+            cJSON *row = cJSON_CreateObject();
+            cJSON_AddNumberToObject(row, "serialNo", mode == 44 && i == 3 ? begin - 5 : matched[position + i]);
+            cJSON_AddItemToArray(rows, row);
+        }
+    } else if (strstr(path, "/AcsEvent?") && mode >= 10) {
         cJSON *cond = cJSON_GetObjectItem(req, "AcsEventCond");
         if (mode == 30) {
             assert(!strcmp(cJSON_GetObjectItem(cond, "employeeNoString")->valuestring, "00111"));
@@ -136,8 +167,69 @@ static void test_user_pages(void)
     assert(hik_user_page(&scan, save_user, NULL) == HIK_OK && scan.complete && !scan.total);
     mode = 0; received = 0;
 }
+static unsigned range_rows, range_max, range_seen[64];
+static bool range_saved(void *ctx, const char *raw, size_t length, uint32_t serial)
+{
+    if (ctx) return false;
+    cJSON *r = cJSON_ParseWithLength(raw, length);
+    assert(r && cJSON_GetObjectItem(r, "serialNo")->valuedouble == serial);
+    cJSON_Delete(r);
+    assert(range_rows < 64); range_seen[range_rows++] = serial;
+    if (serial > range_max) range_max = serial;
+    return true;
+}
+static void test_unordered_ranges(void)
+{
+    /* Inclusive and exclusive lower bounds both deliver every later serial. */
+    for (mode = 40; mode <= 41; mode++) {
+        range_rows = range_max = 0;
+        assert(hik_history_range(3199, 3000000000U, 50, range_saved, NULL) == HIK_OK);
+        assert(range_max == 3866 && range_rows == (mode == 40 ? 24 : 23));
+        bool found_3853 = false, found_3200 = false;
+        for (unsigned i = 0; i < range_rows; i++) {
+            assert(range_seen[i] >= 3199);
+            found_3853 |= range_seen[i] == 3853; found_3200 |= range_seen[i] == 3200;
+        }
+        assert(found_3853 && found_3200);
+    }
+    /* The anchor window finds 3199 wherever the terminal sorts it. */
+    mode = 40; range_rows = 0;
+    assert(hik_history_range(3198, 3200, 1, range_saved, NULL) == HIK_OK && range_rows == 2);
+    /* A total that changes between pages, a wrong completion status, or a
+     * row outside the requested range is never accepted as complete. */
+    mode = 42; range_rows = 0;
+    assert(hik_history_range(3199, 3000000000U, 50, range_saved, NULL) == HIK_PARSE);
+    assert(strstr(hik_history_last_reject(), "range=total_changed"));
+    mode = 43;
+    assert(hik_history_range(3199, 3000000000U, 50, range_saved, NULL) == HIK_PARSE);
+    assert(strstr(hik_history_last_reject(), "range=completion"));
+    mode = 44;
+    assert(hik_history_range(3199, 3000000000U, 50, range_saved, NULL) == HIK_PARSE);
+    assert(strstr(hik_history_last_reject(), "range=serial_scope"));
+    mode = 45;
+    assert(hik_history_range(3199, 3000000000U, 50, range_saved, NULL) == HIK_PARSE);
+    assert(strstr(hik_history_last_reject(), "range=duplicate_serial"));
+    /* Counts come from totalMatches of a one-row search. */
+    mode = 40; uint32_t waiting = 99;
+    assert(hik_history_count(3199, 3000000000U, &waiting) == HIK_OK && waiting == 24);
+    assert(hik_history_count(3199, 3300, &waiting) == HIK_OK && waiting == 9);
+    assert(hik_history_count(4000, 3000000000U, &waiting) == HIK_OK && !waiting);
+    /* A stale reason never survives a later successful read. */
+    range_rows = 0;
+    assert(hik_history_range(3199, 3000000000U, 50, range_saved, NULL) == HIK_OK);
+    assert(!strlen(hik_history_last_reject()));
+    /* Too many pages, custody failure, and an empty range. */
+    mode = 40;
+    assert(hik_history_range(1, 3000000000U, 1, range_saved, NULL) == HIK_OVERSIZED);
+    assert(hik_history_range(3199, 3000000000U, 50, range_saved, (void *)1) == HIK_CUSTODY);
+    range_rows = 0;
+    assert(hik_history_range(4000, 3000000000U, 50, range_saved, NULL) == HIK_OK && !range_rows);
+    assert(hik_history_range(0, 10, 50, range_saved, NULL) == HIK_CONFIGURATION);
+    mode = 0;
+}
 int main(void)
 {
+    test_unordered_ranges();
     test_user_pages();
     hik_search_t s;
     for(unsigned semantics=0;semantics<2;semantics++){
