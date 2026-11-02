@@ -397,13 +397,15 @@ static void poll_task(void *arg)
         led_status_set(status);
         if (result != previous_result || status != previous_led || started - last_report_us >= 60000000) {
             char host[64]; zone_config_copy_hik_host(host, sizeof(host));
-            char message[384];
-            snprintf(message, sizeof(message), "Poll %s; reason=%s; stage=%s; http=%u; failures=%u; terminal=%s; duration_ms=%lu; cursor=%lu; queued=%lu; storage=%s; source_worker=%s",
+            char message[576];
+            snprintf(message, sizeof(message), "Poll %s; reason=%s; stage=%s; http=%u; failures=%u; terminal=%s; duration_ms=%lu; cursor=%lu; queued=%lu; storage=%s; source_worker=%s%s%s",
                 result == HIK_OK ? "OK" : "retrying", hik_reason(result), poll_stages[stage], atomic_load(&poll_http_status),
                 atomic_load(&poll_failures), host,
                 (unsigned long)((esp_timer_get_time() - started) / 1000), (unsigned long)cursor.serial,
                 (unsigned long)depth, storage.persistence_verified && !storage.last_error ? "verified" : "unverified",
-                workers_ready ? "running" : "waiting");
+                workers_ready ? "running" : "waiting",
+                result == HIK_PARSE && stage == 3 ? "; rejected " : "",
+                result == HIK_PARSE && stage == 3 ? hik_history_last_reject() : "");
             ESP_LOGI(TAG, "%s", message);
             if (add_connector_log(result == HIK_OK ? "INFO" : "WARN", "hikvision", "HIK_POLL_STATUS", message)) {
                 previous_result = result; previous_led = status; last_report_us = started;

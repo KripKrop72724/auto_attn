@@ -109,6 +109,10 @@ hik_result_t hik_history_bounds(uint32_t *first, uint32_t *last, uint32_t *count
     if (result == HIK_OK && (first_again != *first || total < *count)) return HIK_BINDING;
     return result;
 }
+/* Compact facts about the last events page the checks below rejected, so a
+ * terminal that answers differently can be diagnosed from ADD logs alone. */
+static char history_reject[160];
+const char *hik_history_last_reject(void) { return history_reject; }
 hik_result_t hik_history_page(hik_search_t *s, hik_record_fn fn, void *context)
 {
     if (!s || !fn || !s->first_serial || s->first_serial > s->last_serial || s->last_serial > 3000000000U)
@@ -140,6 +144,14 @@ hik_result_t hik_history_page(hik_search_t *s, hik_record_fn fn, void *context)
     const char *status = string(page, "responseStatusStrg");
     const char *id = string(page, "searchID");
     uint32_t count = 0, total = 0;
+    uint32_t raw_count = 0, raw_total = 0, raw_first = 0, raw_last = 0;
+    bool counts = integer(cJSON_GetObjectItemCaseSensitive(page, "numOfMatches"), &raw_count);
+    counts = integer(cJSON_GetObjectItemCaseSensitive(page, "totalMatches"), &raw_total) && counts;
+    int raw_rows = cJSON_IsArray(rows) ? cJSON_GetArraySize(rows) : 0;
+    if (raw_rows) {
+        (void)integer(cJSON_GetObjectItemCaseSensitive(cJSON_GetArrayItem(rows, 0), "serialNo"), &raw_first);
+        (void)integer(cJSON_GetObjectItemCaseSensitive(cJSON_GetArrayItem(rows, raw_rows - 1), "serialNo"), &raw_last);
+    }
     valid = id && !strcmp(id, s->search_id) && status &&
         integer(cJSON_GetObjectItemCaseSensitive(page, "numOfMatches"), &count) &&
         integer(cJSON_GetObjectItemCaseSensitive(page, "totalMatches"), &total) &&
@@ -154,17 +166,28 @@ hik_result_t hik_history_page(hik_search_t *s, hik_record_fn fn, void *context)
     bool end = valid && count == total &&
         (!strcmp(status, "OK") || (!strcmp(status, "NO MATCH") && !count && !total));
     valid = valid && (end || (count && !strcmp(status, "MORE") && count < total));
+    bool header_valid = valid;
     uint32_t previous = s->previous_serial;
-    unsigned index=0;
+    unsigned index=0, bad_row=0;
     cJSON *row;
     cJSON_ArrayForEach(row, rows) {
         uint32_t serial;
         if(index++<overlap)continue;
         if (!integer(cJSON_GetObjectItemCaseSensitive(row, "serialNo"), &serial) ||
-            serial < s->first_serial || serial > s->last_serial || serial <= previous) { valid = false; break; }
+            serial < s->first_serial || serial > s->last_serial || serial <= previous) {
+            valid = false; bad_row = index; break;
+        }
         previous = serial;
     }
-    if (!valid) result = HIK_PARSE;
+    if (!valid) {
+        result = HIK_PARSE;
+        snprintf(history_reject, sizeof(history_reject),
+            "page=%s; id=%s; status=%.12s; counts=%s; num=%lu; total=%lu; rows=%d; first=%lu; last=%lu; begin=%lu; bad_row=%u",
+            header_valid ? "rows" : "header", id && !strcmp(id, s->search_id) ? "match" : "differs",
+            status ? status : "none", counts ? "yes" : "no", (unsigned long)raw_count, (unsigned long)raw_total,
+            cJSON_IsArray(rows) ? raw_rows : -1, (unsigned long)raw_first, (unsigned long)raw_last,
+            (unsigned long)request_begin, bad_row);
+    }
     else {
         index=0;
         cJSON_ArrayForEach(row, rows) {
