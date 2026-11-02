@@ -159,6 +159,16 @@ class Harness:
         self.click_primary(pages.CONFIRM)
         self.wait_page(pages.INSTALLING)
 
+    def first_start_done(self, timeout: int = 8000) -> None:
+        """Wait for the first-start screen's last card: both starts passed, or one failed.
+
+        After a good first start the screen shows a card too, over the restart check's
+        steps, while the second start is still being watched.
+        """
+        self.wait_page(pages.FIRST_START, timeout)
+        page = self.page(pages.FIRST_START)
+        self.wait(lambda: page.result.isVisible() and not self.controller.running("boot"), timeout)
+
     def to_done(self, family: api.Family = api.Family.ZKT) -> None:
         self.start_install(family)
         self.wait_page(pages.FIRST_START, timeout=8000)

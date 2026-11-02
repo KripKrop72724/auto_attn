@@ -204,3 +204,59 @@ def test_connection_offers_only_normal_http(harness, page_id):
     form.fill(dataclasses.replace(form.values(), hik_transport="https"))
     assert transport.currentData() == "http_digest"
     assert form.values().hik_transport == "http_digest" and form.values().hik_port == 80
+
+
+def test_first_start_page_says_when_it_is_the_restart_check(harness):
+    from sl_installer.core.api import BootOutcome, BootReport, ReplugPhase
+    from sl_installer.ui import wording
+
+    page = harness("happy_zkt").page(pages.FIRST_START)
+    page.start_again(wording.restart_check(BootReport(BootOutcome.OK, "LF-ZONE-BLD9-04", "1")))
+    assert page.again and page.title_label.text() == "Start the board again"
+    assert page.subtitle_label.text() == "The board must keep its settings when it starts again."
+    assert [card.title.text() for card in page.cards.values()] == [
+        "Unplug the cable again",
+        "Wait 3 seconds",
+        "Plug it back in",
+    ]
+    assert page.result.isVisibleTo(page) and page.result.advice.code == "RESTART_CHECK"
+    assert not page.primary_button.isVisibleTo(page)
+    page.set_phase(ReplugPhase.WATCHING)
+    assert page.watch_words.text() == (
+        "Watching the board start again. This can take up to 2 minutes."
+    )
+    page.start()  # the first start's own words again
+    assert not page.again and page.title_label.text() == "Start the board"
+    assert page.cards["unplug"].title.text() == "Unplug the cable"
+    assert not page.result.isVisibleTo(page)
+
+
+def test_restart_check_keeps_the_replug_words_in_view_on_a_small_screen(harness):
+    # The card over the restart check pushes the steps down; their live words must stay
+    # in view, also at the smallest supported size.
+    from PySide6.QtCore import QPoint
+
+    from sl_installer.core.api import ReplugPhase
+
+    h = harness("happy_zkt")
+    h.window.resize(1024, 700)
+    h.hold("restart_unplug")
+    h.hold("restart_replug")
+    h.start_install()
+    page = h.page(pages.FIRST_START)
+    h.wait(lambda: page.again and page.phase is ReplugPhase.WAITING_UNPLUG, 8000)
+
+    def in_view(widget) -> bool:
+        viewport = page.scroll.viewport()
+        top = widget.mapTo(viewport, QPoint(0, 0)).y()
+        return widget.isVisible() and top >= 0 and top + widget.height() <= viewport.height()
+
+    unplug = page.cards["unplug"].note
+    h.wait(lambda: in_view(unplug))
+    assert unplug.text() == "Pull the cable out now."
+    h.release("restart_unplug")
+    h.wait(lambda: page.phase is ReplugPhase.WAITING_REPLUG)
+    page.start_countdown(0)  # the 3 seconds are over
+    replug = page.cards["replug"].note
+    h.wait(lambda: in_view(replug))
+    assert replug.text() == "Plug it back in now. Do not press any button."

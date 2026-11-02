@@ -692,6 +692,24 @@ def test_boot_and_faulty_board_reports(rig):
     assert request_id.startswith("sli-")
 
 
+@pytest.mark.parametrize("outcome, advice, kind, kept", [
+    ("ok", texts.settings_kept("Z", "1", "2.9.1"), "RESTART_OK", True),
+    ("settings_lost", texts.SETTINGS_LOST_ON_RESTART, "RESTART_FAILED", False),
+    ("settings_not_seen", texts.SETTINGS_NOT_SEEN, "RESTART_FAILED", None),
+    ("not_replugged", texts.NOT_REPLUGGED, "RESTART_FAILED", None),
+])
+def test_restart_check_report(rig, outcome, advice, kind, kept):
+    from sl_installer.core.api import BootOutcome, BootReport
+    from sl_installer.core.installer import report_restart
+    summary = rig.run()
+    report_restart(rig.server, summary, BootReport(BootOutcome(outcome), "Z", None, "2.9.1",
+                                                   advice=advice))
+    request_id, mac, sent, detail = rig.server.events[-1]
+    assert (request_id, mac, sent) == (summary.request_id, MAC, kind)
+    assert detail == {"outcome": outcome, "zone_id_seen": "Z", "device_id_seen": None,
+                      "app_version_seen": "2.9.1", "advice": advice.code, "settings_kept": kept}
+
+
 def test_change_settings_refuses_a_flash_chip_that_is_not_16_mb(tmp_path, store):
     rig = Rig(tmp_path, store, None, FakeBoard(efuse_state="secured-not-sdm", flash_mb=8))
     board = blank_board(security=SecurityState.SECURED_STATE_LIFE, flash_size_mb=8)

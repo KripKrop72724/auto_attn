@@ -28,10 +28,10 @@ from pathlib import Path
 from typing import Callable, List, Optional, Protocol, Tuple
 
 from . import texts, validation
-from .api import (Advice, BoardInfo, BootReport, BundleInfo, CancelToken, DeviceRecord,
-                  EncryptedPackage, Family, HardwareVerdict, InstallConfig, InstallerError,
-                  InstallMode, InstallSummary, LocalBundle, PackageRequest, ProgressFn,
-                  SecurityState, ServerService, StepId, StepProgress, UsbCandidate)
+from .api import (Advice, BoardInfo, BootOutcome, BootReport, BundleInfo, CancelToken,
+                  DeviceRecord, EncryptedPackage, Family, HardwareVerdict, InstallConfig,
+                  InstallerError, InstallMode, InstallSummary, LocalBundle, PackageRequest,
+                  ProgressFn, SecurityState, ServerService, StepId, StepProgress, UsbCandidate)
 from .board import (classify_efuses, classify_sdm, efuse_mac, key0_locked_hmac,
                     parse_banner, parse_security_info, read_summary_file)
 from .bundles import BundleStore, flash_ranges
@@ -631,16 +631,36 @@ def _older(version: str, minimum: str) -> bool:
         return False
 
 
+def _start_detail(boot: BootReport) -> dict:
+    return {"outcome": boot.outcome.value, "zone_id_seen": boot.zone_id_seen,
+            "device_id_seen": boot.device_id_seen, "app_version_seen": boot.app_version_seen,
+            "advice": boot.advice.code if boot.advice else None}
+
+
 def report_boot(server: ServerService, summary: InstallSummary, boot: BootReport) -> None:
     """Tell ADD how the first start went (call after wait_first_boot)."""
-    detail = {"outcome": boot.outcome.value, "zone_id_seen": boot.zone_id_seen,
-              "device_id_seen": boot.device_id_seen, "app_version_seen": boot.app_version_seen,
-              "advice": boot.advice.code if boot.advice else None}
     try:
         server.report(summary.request_id, summary.mac,
-                      "BOOT_OK" if boot.outcome.value == "ok" else "BOOT_FAILED", detail)
+                      "BOOT_OK" if boot.outcome is BootOutcome.OK else "BOOT_FAILED",
+                      _start_detail(boot))
     except Exception as error:
         log.warning("could not report first start: %s", error)
+
+
+def report_restart(server: ServerService, summary: InstallSummary, restart: BootReport) -> None:
+    """Tell ADD how the restart check went (call after wait_restart).
+
+    RESTART_OK: the board named its settings again after a restart, so it keeps them.
+    RESTART_FAILED says why not; ``settings_kept`` is False when they were lost and None
+    when the second start did not show either way.
+    """
+    kept = {BootOutcome.OK: True, BootOutcome.SETTINGS_LOST: False}.get(restart.outcome)
+    try:
+        server.report(summary.request_id, summary.mac,
+                      "RESTART_OK" if restart.outcome is BootOutcome.OK else "RESTART_FAILED",
+                      {**_start_detail(restart), "settings_kept": kept})
+    except Exception as error:
+        log.warning("could not report the restart check: %s", error)
 
 
 def report_faulty_board(server: ServerService, mac: str, period_s: Optional[float],

@@ -330,9 +330,21 @@ def _first_start_watching(d: Driver) -> None:
     page.reveal(page.watch)
 
 
-def _first_start_result(d: Driver) -> None:
+def _first_start_again(d: Driver) -> None:
+    # The first start passed: the same steps once more, for the restart check.
+    d.hold("restart_unplug")
     d.first_start()
-    d.wait(lambda: d.page(pages.FIRST_START).result.isVisible(), "first start result")
+    page = d.page(pages.FIRST_START)
+    d.wait(lambda: page.again and page.phase is ReplugPhase.WAITING_UNPLUG, "unplug again")
+
+
+def _first_start_result(d: Driver) -> None:
+    # The last card: both starts passed, or the one that did not.
+    d.first_start()
+    page = d.page(pages.FIRST_START)
+    d.wait(
+        lambda: page.result.isVisible() and not d.controller.running("boot"), "first start result"
+    )
 
 
 def _done(d: Driver) -> None:
@@ -463,8 +475,10 @@ SCENES: Tuple[Scene, ...] = (
     ("first-start-wait", "happy_zkt", _first_start_wait),
     ("first-start-replug", "happy_zkt", _first_start_replug),
     ("first-start-watching", "happy_zkt", _first_start_watching),
+    ("first-start-again", "happy_zkt", _first_start_again),
     ("first-start-ok", "happy_zkt", _first_start_result),
     ("first-start-wrong-zone", "first_boot_wrong_zone", _first_start_result),
+    ("first-start-settings-lost", "settings_lost_on_restart", _first_start_result),
     ("done-zkt", "happy_zkt", _done),
     ("done-hik", "happy_hik", _done_hik),
     ("done-record-saved", "happy_zkt", _done_saved),

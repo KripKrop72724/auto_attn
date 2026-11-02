@@ -9,6 +9,9 @@
 It goes on only after you type the board ID (new board or resume) or the ZONE ID
 (changing settings): the key burn is permanent and a settings change loses the
 board's unsent records. Passwords are asked for, never taken from the command line.
+After the write it watches the first start, then asks for one more replug and
+watches the restart check, as the window does: it exits 0 only when the board kept
+its settings through that restart. ADD hears both, and the setup record holds both.
 
 Every command line the engine builds is esptool 5.1.0's, so ``inspect`` and
 ``install`` first check that the tools say 5.1.0 and stop before touching the board
@@ -31,12 +34,13 @@ from typing import List, Optional, Sequence
 
 from ..config import TOOL_PYTHON_ENV, AppConfig, load_config
 from . import texts
-from .api import (STEP_LABELS, Advice, BoardInfo, CancelToken, ConsoleEvent, Family,
-                  HikSettings, InstallConfig, InstallerError, InstallMode, PresenceReport,
-                  PresenceState, ReplugPhase, SecurityState, Services, StepProgress, ZktSettings,
-                  steps_for)
+from .api import (STEP_LABELS, Advice, BoardInfo, BootOutcome, BootReport, CancelToken,
+                  ConsoleEvent, Family, HikSettings, InstallConfig, InstallerError, InstallMode,
+                  PhaseFn, PresenceReport, PresenceState, ReplugPhase, SecurityState, Services,
+                  StepProgress, ZktSettings, steps_for)
 from .esptool_runner import TOOL_VERSION, SubprocessRunner, tool_version_problems
 from .factory import make_services
+from .installer import report_boot, report_restart
 from .naming import hotspot_name, public_name_preview
 from .single_instance import LOCK_FILE_NAME, InstanceLock
 
@@ -233,20 +237,45 @@ def cmd_install(services: Services, args: argparse.Namespace) -> int:
         _print_advice([error.advice])
         return 3
     print("\nWritten. Now unplug the board, wait 3 seconds and plug it back in.")
+    boot = services.boot.wait_first_boot(board.mac, summary.config,
+                                         _phases("Unplug the board now", "the first start"),
+                                         _print_event, CancelToken(), timeout_s=args.boot_seconds,
+                                         transcript=summary.request_id)
+    # A good first start gets no words of success: they come only after the restart check.
+    _print_start("First start", boot, advice=boot.outcome is not BootOutcome.OK)
+    report_boot(services.server, summary, boot)
+    restart: Optional[BootReport] = None
+    if boot.outcome is BootOutcome.OK:
+        # One good start is not enough: a board must keep its settings through a restart.
+        print(f"\nOne more check. {texts.RESTART_REPLUG}")
+        restart = services.boot.wait_restart(board.mac, summary.config,
+                                             _phases("Unplug the board again now",
+                                                     "the second start"),
+                                             _print_event, CancelToken(),
+                                             timeout_s=args.boot_seconds,
+                                             transcript=summary.request_id, first=boot)
+        _print_start("Second start", restart)
+        report_restart(services.server, summary, restart)
+    print("Record saved:", services.records.save_install_record(summary, boot, restart))
+    if restart is not None and restart.outcome is BootOutcome.OK:
+        print(texts.SETTINGS_KEPT)
+        return 0
+    return 4
 
+
+def _phases(unplug: str, watching: str) -> PhaseFn:
     def on_phase(phase: ReplugPhase) -> None:
-        print({ReplugPhase.WAITING_UNPLUG: ">> Unplug the board now.",
+        print({ReplugPhase.WAITING_UNPLUG: f">> {unplug}.",
                ReplugPhase.WAITING_REPLUG: ">> Wait 3 seconds, then plug it back in.",
-               ReplugPhase.WATCHING: ">> Watching the first start..."}[phase], flush=True)
+               ReplugPhase.WATCHING: f">> Watching {watching}..."}[phase], flush=True)
+    return on_phase
 
-    boot = services.boot.wait_first_boot(board.mac, summary.config, on_phase, _print_event,
-                                         CancelToken(), timeout_s=args.boot_seconds)
-    print(f"\nFirst start: {boot.outcome.value} zone={boot.zone_id_seen} "
-          f"device={boot.device_id_seen} version={boot.app_version_seen}")
-    if boot.advice:
-        _print_advice([boot.advice])
-    print("Record saved:", services.records.save_install_record(summary, boot))
-    return 0 if boot.outcome.value == "ok" else 4
+
+def _print_start(name: str, report: BootReport, advice: bool = True) -> None:
+    print(f"\n{name}: {report.outcome.value} zone={report.zone_id_seen} "
+          f"device={report.device_id_seen} version={report.app_version_seen}")
+    if advice and report.advice:
+        _print_advice([report.advice])
 
 
 def parser() -> argparse.ArgumentParser:

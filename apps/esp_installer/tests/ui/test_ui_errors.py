@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import sys
+
 import pytest
 
 from sl_installer.core import texts
@@ -11,6 +13,7 @@ from sl_installer.core.api import (
     Family,
     InstallerError,
     InstallMode,
+    ReplugPhase,
     StepId,
     StepProgress,
     steps_for,
@@ -139,10 +142,15 @@ def test_already_set_up_board_gets_new_settings(harness):
         StepId.PREPARE_FILES.value,
         StepId.WRITE_SETTINGS.value,
     ]
-    h.wait(lambda: h.page(pages.FIRST_START).result.isVisible(), timeout=8000)
+    # New settings must survive a restart too: Fix settings gets the restart check.
+    h.first_start_done()
+    assert h.page(pages.FIRST_START).result.advice.code == "START_CHECKS_OK"
+    assert h.world.called("boot.wait_restart") == 1
     h.click_primary(pages.FIRST_START)
     h.wait_page(pages.DONE)
     assert h.page(pages.DONE).title_label.text() == "The new settings are on the board"
+    assert h.page(pages.DONE).kept_settings
+    assert h.page(pages.DONE).subtitle_label.text().startswith(texts.SETTINGS_KEPT)
 
 
 def test_check_board_then_fix_settings_from_head_office_record(harness):
@@ -178,7 +186,9 @@ def test_resume_after_key(harness):
     h.click_primary(pages.CONFIRM)
     h.wait_page(pages.INSTALLING)
     assert StepId.LOCK_KEY.value not in h.page(pages.INSTALLING).steps.keys()
-    h.wait(lambda: h.page(pages.FIRST_START).result.isVisible(), timeout=8000)
+    h.first_start_done()
+    assert h.page(pages.FIRST_START).result.advice.code == "START_CHECKS_OK"
+    assert h.world.called("boot.wait_restart") == 1
 
 
 def test_install_error_before_key_try_again(harness):
@@ -314,14 +324,56 @@ class FailingInstaller:
 
 
 class FinishedBoot:
-    def __init__(self, report: BootReport) -> None:
-        self.report = report
+    """Watched starts that end at once: the first start gives ``report``, and each restart
+    check the next of ``restarts``, as the real engine's BootWatcher returns them."""
 
-    def wait_first_boot(self, mac, expect, on_phase, on_event, cancel, timeout_s=120.0):
+    def __init__(self, report: BootReport, *restarts: BootReport) -> None:
+        self.report = report
+        self.restarts = list(restarts)
+        self.calls = []
+        self.firsts = []
+
+    def wait_first_boot(
+        self, mac, expect, on_phase, on_event, cancel, timeout_s=120.0, transcript=None
+    ):
+        self.calls.append("first start")
         return self.report
+
+    def wait_restart(
+        self,
+        mac,
+        expect,
+        on_phase,
+        on_event,
+        cancel,
+        timeout_s=120.0,
+        transcript=None,
+        first=None,
+    ):
+        self.calls.append("restart check")
+        self.firsts.append(first)
+        return self.restarts.pop(0)
 
     def watch_console(self, candidate, on_event, cancel):
         cancel.wait(60)
+
+
+FIRST_OK = BootReport(
+    BootOutcome.OK,
+    "LF-ZONE-BLD9-04",
+    "1",
+    "2.7.8",
+    advice=texts.boot_ok("LF-ZONE-BLD9-04", "1", "2.7.8"),
+)
+RESTART_OK = BootReport(
+    BootOutcome.OK,
+    "LF-ZONE-BLD9-04",
+    "1",
+    "2.7.8",
+    advice=texts.settings_kept("LF-ZONE-BLD9-04", "1", "2.7.8"),
+)
+# The buttons a step could name; Help is on every screen and holds "Save a help file".
+BUTTONS = ("Try again", "Fix settings", "Next", "Check the board", "Finish the setup")
 
 
 @pytest.mark.parametrize(
@@ -415,3 +467,201 @@ def test_board_that_made_its_own_key_is_not_offered_a_fix(harness):
     h.wait(lambda: first_start.result.isVisible(), timeout=8000)
     assert not first_start.primary_button.isVisible()
     assert first_start.secondary_button.text() == "Check the board"
+
+
+# ----------------------------------------------------- the restart check (second start)
+
+
+@pytest.mark.parametrize(
+    "restart, primary, secondary, kept",
+    [
+        (
+            BootReport(BootOutcome.SETTINGS_LOST, advice=texts.SETTINGS_LOST_ON_RESTART),
+            None,
+            "Go back to the start",
+            False,
+        ),
+        (
+            BootReport(BootOutcome.SETTINGS_NOT_SEEN, advice=texts.SETTINGS_NOT_SEEN),
+            "Try again",
+            "Check the board",
+            None,
+        ),
+        (
+            BootReport(BootOutcome.NO_OUTPUT, advice=texts.NO_OUTPUT),
+            "Try again",
+            "Check the board",
+            None,
+        ),
+        (
+            BootReport(BootOutcome.NOT_REPLUGGED, advice=texts.NOT_REPLUGGED),
+            "Try again",
+            "Check the board",
+            None,
+        ),
+        (
+            BootReport(BootOutcome.FAULTY_RESTART_LOOP, advice=texts.CRASH_LOOP),
+            "Try again",
+            "Check the board",
+            None,
+        ),
+        (
+            BootReport(
+                BootOutcome.WRONG_SETTINGS,
+                advice=texts.wrong_settings("zone A, device 1", "zone B, device 1"),
+            ),
+            "Fix settings",
+            "Check the board",
+            None,
+        ),
+    ],
+    ids=lambda item: item.outcome.value if isinstance(item, BootReport) else None,
+)
+def test_engine_restart_advice_names_the_button_on_screen(
+    harness, restart, primary, secondary, kept
+):
+    # A second start that does not pass gets the first start's ways on, except a board that
+    # lost its settings: it must not go to a site, so it gets no button but Help.
+    h = harness("happy_zkt")
+    h.services.boot = FinishedBoot(FIRST_OK, restart)
+    h.start_install()
+    h.first_start_done()
+    first_start = h.page(pages.FIRST_START)
+    assert first_start.result.advice is restart.advice
+    if primary is None:
+        assert not first_start.primary_button.isVisible()
+    else:
+        assert first_start.primary_button.text() == primary
+    assert first_start.secondary_button.text() == secondary
+    on_screen = {primary, secondary}
+    for step in restart.advice.what_to_do:
+        for words in BUTTONS:
+            if words not in on_screen:
+                assert f"click {words}".lower() not in step.lower(), (words, step)
+    h.controller._first_start_next()  # never Done after a failed restart check
+    assert h.controller.current == pages.FIRST_START
+    # Two reports from two workers: their order is not what this checks.
+    h.wait(lambda: sorted(report[2] for report in h.world.reports) == ["BOOT_OK", "RESTART_FAILED"])
+    (detail,) = [report[3] for report in h.world.reports if report[2] == "RESTART_FAILED"]
+    assert detail["advice"] == restart.advice.code and detail["settings_kept"] is kept
+
+
+def test_try_again_after_the_restart_check_watches_only_the_restart_again(harness):
+    h = harness("happy_zkt")
+    boot = FinishedBoot(
+        FIRST_OK, BootReport(BootOutcome.NOT_REPLUGGED, advice=texts.NOT_REPLUGGED), RESTART_OK
+    )
+    h.services.boot = boot
+    h.start_install()
+    h.first_start_done()
+    first_start = h.page(pages.FIRST_START)
+    assert first_start.result.advice.code == "NOT_REPLUGGED"
+    h.click_primary(pages.FIRST_START)  # Try again
+    h.wait(
+        lambda: first_start.result.advice.code == "START_CHECKS_OK"
+        and not h.controller.running("boot")
+    )
+    assert boot.calls == ["first start", "restart check", "restart check"]
+    h.wait(
+        lambda: sorted(report[2] for report in h.world.reports)
+        == ["BOOT_OK", "RESTART_FAILED", "RESTART_OK"]
+    )
+    h.click_primary(pages.FIRST_START)  # Next
+    h.wait_page(pages.DONE)
+    assert h.page(pages.DONE).kept_settings
+    # Each restart check was given the first start's report.
+    assert boot.firsts == [FIRST_OK, FIRST_OK]
+
+
+def test_try_again_after_a_failed_first_start_watches_the_first_start_again(harness):
+    h = harness("happy_zkt")
+    boot = FinishedBoot(BootReport(BootOutcome.NO_OUTPUT, advice=texts.NO_OUTPUT))
+    h.services.boot = boot
+    h.start_install()
+    h.first_start_done()
+    h.click_primary(pages.FIRST_START)  # Try again
+    h.wait(lambda: boot.calls == ["first start", "first start"])
+    h.first_start_done()
+    assert not h.page(pages.FIRST_START).again  # never the restart check after a failure
+
+
+def test_closing_during_the_restart_check_asks_first(harness, monkeypatch):
+    # Once the board has started, nothing else stops a person in a hurry from taking it
+    # away: closing the app then would skip the check that it keeps its settings.
+    from PySide6.QtGui import QCloseEvent
+
+    h = harness("happy_zkt")
+    h.hold("unplug")
+    h.start_install()
+    first_start = h.page(pages.FIRST_START)
+    h.wait(lambda: first_start.phase is ReplugPhase.WAITING_UNPLUG, timeout=8000)
+    assert h.controller.close_question() is None  # the first start: as before
+    h.hold("restart_unplug")
+    h.release("unplug")
+    h.wait(
+        lambda: first_start.again and first_start.phase is ReplugPhase.WAITING_UNPLUG,
+        timeout=8000,
+    )
+    assert h.controller.close_blocker() is None  # it asks only: the check can take minutes
+    question = h.controller.close_question()
+    assert question == (
+        "The app has not finished checking this board. If you close the app now, do not "
+        "install the board at a site."
+    )
+    answers = [False, True]
+    asked = []
+    monkeypatch.setattr(
+        h.window, "confirm_close", lambda words: asked.append(words) or answers.pop(0)
+    )
+    kept_open = QCloseEvent()
+    h.window.closeEvent(kept_open)  # Keep the app open
+    assert not kept_open.isAccepted() and asked == [question]
+    assert h.controller.running("boot")  # the restart check goes on
+    closed = QCloseEvent()
+    h.window.closeEvent(closed)  # Close the app
+    assert closed.isAccepted() and not h.controller.running("boot")
+
+
+def test_nothing_to_ask_once_the_restart_check_has_finished(harness):
+    h = harness("happy_zkt")
+    h.start_install()
+    h.first_start_done()
+    assert h.page(pages.FIRST_START).result.advice.code == "START_CHECKS_OK"
+    assert h.controller.close_question() is None
+
+
+@pytest.mark.parametrize("words, closes", [("Keep the app open", False), ("Close the app", True)])
+def test_close_question_buttons(harness, words, closes):
+    from PySide6.QtCore import QTimer
+    from PySide6.QtWidgets import QApplication, QMessageBox
+
+    h = harness("happy_zkt")
+    shown = []
+    tries = [0]
+
+    def answer() -> None:
+        boxes = [
+            widget
+            for widget in QApplication.topLevelWidgets()
+            if isinstance(widget, QMessageBox) and widget.isVisible()
+        ]
+        if not boxes:  # not open yet
+            tries[0] += 1
+            if tries[0] < 250:
+                QTimer.singleShot(20, answer)
+            return
+        box = boxes[0]
+        shown.append((box.windowTitle(), box.text(), [b.text() for b in box.buttons()]))
+        for button in box.buttons():
+            if button.text() == words:
+                button.click()
+                return
+        box.reject()  # never left open: the asserts below say what was wrong
+
+    QTimer.singleShot(0, answer)
+    assert h.window.confirm_close("The app has not finished checking this board.") is closes
+    (title, text, buttons) = shown[0]
+    if sys.platform != "darwin":  # Qt drops a message box's title on macOS
+        assert title == "The check is not finished"
+    assert text == "The app has not finished checking this board."
+    assert sorted(buttons) == ["Close the app", "Keep the app open"]

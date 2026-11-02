@@ -64,6 +64,9 @@ unless head office tells you otherwise.
    summary. Tick **I understand** and click **Start the setup**.
 8. Wait while the app sets up the board. **Keep the cable plugged in.**
 9. When the app asks, unplug the cable. Wait 3 seconds. Plug it back in.
+   When the board has started, the app asks you to do it once more: unplug
+   the board again, wait 3 seconds, and plug it back in. The app checks that
+   the board keeps its settings.
 10. The app watches the board start. When it says **The board is ready**:
     - write down the board's Wi-Fi name and the board's Wi-Fi password shown
       on the screen;
@@ -98,6 +101,8 @@ to sleep while it sets up a board and while it watches the board start.
 | Setup stopped before the end | Do what the screen says, then click **Finish the setup**. If the app was closed: choose **Set up a new board**, type the same details and connect the same board. The check then offers **Finish the setup**. |
 | The board started with other settings | Click **Fix settings**. The app checks the board again and offers **Change its settings**. |
 | "The app did not see the board start" | Unplug the board, wait 3 seconds and plug it back in without pressing any button. Click **Try again**. If it happens again, click **Check the board**. |
+| "The board lost its settings" | It lost them when it restarted, or it came back with other settings. Do not use the board; if it came from a site, do not put it back. Unplug it, put a label on it that says DO NOT USE with its board ID (the screen shows it), and keep it aside; do not throw it away. Click **Help**, then **Save a help file**, at once (before you set up another board), and send the file to head office. |
+| "The app did not see the board read its settings" | Click **Try again**. When the screen asks, unplug the board, wait 3 seconds and plug it back in without pressing any button. If it happens again, do not install the board: put it aside, click **Help**, then **Save a help file**, and send the file to head office. |
 | "This app cannot change this board's settings" | The board was locked in an older way. Leave it as it is and call head office with the board ID. |
 | "The app is already open" | Only one window of the app can run. Use the window that is open; look for its icon on the taskbar. |
 | Setup or the uninstaller says the app is running | Close the app. If it is setting up a board, wait until it has finished. Then click **OK**. |
@@ -134,6 +139,31 @@ to sleep while it sets up a board and while it watches the board start.
 Pull requests that touch `apps/esp_installer/**` run the same steps without
 any secrets. They make a **TEST** Setup (`...-Setup-<version>-TEST.exe`) and
 the app shows a **TEST BUILD** banner. Never give a TEST Setup to the sites.
+
+### Check the restart check on Windows before the first share
+
+The restart check (part 2, step 9) passes only when the app sees the board name
+its settings after the second replug. The board prints those lines once, about
+1.1 s after it gets power. On the Mac the app's first line after a replug came
+at about 0.9 s; nobody has measured a Windows laptop yet, and Windows can list
+the port later. A computer that opens the port too late fails every restart
+check with "The app did not see the board read its settings", so no setup on it
+can finish. Before you share the first Setup that has the restart check:
+
+1. On a Windows 11 field laptop, set up one new board with that Setup, or watch
+   the first supervised setup at a site.
+2. Both starts must pass, and the app must reach **The board is ready**.
+3. Open `%LOCALAPPDATA%\StateLife\DeviceInstaller\logs\console-<board ID>-<request>.log`.
+   In its second start, the first line the board printed after `the port ... is
+   open` carries the time since power-on in brackets, for example `I (942)`. It
+   must come well before the settings line, `I (1106) zone_config: Loaded
+   per-device provisioning for zone=...`.
+4. Look at a few more starts: on the same board, **Check or fix a board** then
+   **Fix settings** watches both starts again.
+
+If that laptop keeps saying "The app did not see the board read its settings",
+do not share the Setup. Ask the owner whether a later line of the board's
+program may count at the restart check.
 
 ### Where the Setup appears
 
@@ -282,7 +312,12 @@ while they run.
   `5&2B33E3B5&0&12`, which never counts as a board ID): the check says "This
   computer cannot read the board ID" and offers no setup, finish or settings
   change there.
-- While a board is being set up, and while its first start is watched, the app
+- Every setup watches two starts: the first one and, after one more replug,
+  the restart check, which passes only when the board shows its settings again
+  for the same zone. What the board prints in each watched start is kept,
+  redacted like the log, in `logs\console-<board ID>-<request>.log` (one file
+  per setup, at most 256 KB, the newest 20); a help file carries the newest 10.
+- While a board is being set up, and while its starts are watched, the app
   asks Windows to keep the computer and the screen awake
   (`SetThreadExecutionState`, `core/keepawake.py`): a laptop that sleeps
   halfway suspends USB under esptool.

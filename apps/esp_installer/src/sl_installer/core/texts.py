@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
 from .api import Advice, Family, Severity
+from .naming import normalize_mac
 
 ILLUSTRATIONS = (
     "unplug", "replug", "usb_socket", "boot_button", "cable", "faulty_board", "hotspot", "wait",
@@ -750,6 +751,79 @@ def wrong_settings(seen: str, expected: str) -> Advice:
         "Click Fix settings to write the right settings.")
 
 
+# ------------------------------------------------ the restart check (second start)
+
+# After a good first start the board is started once more, by hand: a board must keep its
+# settings through a restart (2 Nov 2026: two new boards started well once, then lost them
+# at every later start). The screens and the bench ask for it in these words.
+RESTART_REPLUG = ("Unplug the board again, wait 3 seconds, and plug it back in. "
+                  "The app checks that the board keeps its settings.")
+
+# The only words that call a setup a success. The first-start screen, the Done screen and
+# the setup record use them once the restart check passed, and never before.
+SETTINGS_KEPT = "The board started correctly and kept its settings after a restart."
+
+
+def settings_kept(zone_id: Optional[str], device_id: Optional[str],
+                  version: Optional[str]) -> Advice:
+    """The restart check passed: the second start named the settings again (console.judge)."""
+    parts = [f"zone {zone_id}"] if zone_id else []
+    if device_id:
+        parts.append(f"device {device_id}")
+    if version:
+        parts.append(f"version {version}")
+    happened = (f"The board started again with {', '.join(parts)}." if parts
+                else "The board started again with its settings.")
+    return _a("RESTART_OK", "The board kept its settings", happened, severity=Severity.SUCCESS)
+
+
+def settings_lost_on_restart(board_id: Optional[str] = None, changed: bool = False) -> Advice:
+    """The second start had no readable settings, or other ones (console.judge).
+
+    Writing them again does not help (Fix settings lasts only until the next restart), so
+    the board must not go to a site. It looks like a good board, so it gets a label with
+    its ID (``board_id``, which the start screen does not show elsewhere). ``changed``: it
+    named other settings than at its first start. With missing settings it stays still
+    (solid red light); with unreadable ones it can keep restarting. The steps name no
+    button: the screen offers only "Go back to the start".
+    """
+    if changed:
+        happened = ("Its first start went well, but when the board restarted it had other "
+                    "settings. It does not keep the settings it is given.")
+    else:
+        happened = ("Its first start went well, but when the board restarted it had lost its "
+                    "settings. It cannot work like this.")
+    shown = (normalize_mac(board_id) or board_id).upper() if board_id else None
+    label = ("Put a label on it that says DO NOT USE and its board ID, " + shown + "."
+             if shown else "Put a label on it that says DO NOT USE and its board ID.")
+    return _a(
+        "SETTINGS_LOST_ON_RESTART", "The board lost its settings", happened,
+        "Do not use this board. If it came from a site, do not put it back.",
+        f"Unplug it. {label} Keep it aside. Do not throw it away.",
+        "Open Help and click Save a help file now, before you set up another board. Send the "
+        "file to head office.",
+        illustration="unplug", can_retry=False)
+
+
+# Without the board ID: the catalogue's copy, and the screens' fallback when none is known.
+SETTINGS_LOST_ON_RESTART = settings_lost_on_restart()
+
+# The second start ran, but its settings line and start line came before the app had the
+# port open (console module notes), so nothing showed which settings it has. Try again
+# watches a new replug, so the replug comes after the click. A computer that always opens
+# the port too late would repeat this, so the board stays away from the sites then.
+SETTINGS_NOT_SEEN = _a(
+    "SETTINGS_NOT_SEEN", "The app did not see the board read its settings",
+    "The board started again, but the app missed the message that shows its settings. The "
+    "app cannot tell yet whether the board kept them.",
+    "Click Try again.",
+    "When the screen asks, unplug the board, wait 3 seconds, and plug it back in. Do not "
+    "press any button.",
+    "If it happens again, do not install the board. Put it aside. Open Help, click Save a "
+    "help file and send it to head office.",
+    severity=Severity.WARNING, illustration="replug")
+
+
 def wifi_placeholder(ssid: str, hotspot: Optional[str]) -> Advice:
     name = hotspot or "SLIC ATTENDANCE"
     return _a(
@@ -1031,6 +1105,7 @@ STATIC: Dict[str, Advice] = {
         APP_TOO_OLD, SERVER_ERROR,
         NOT_FOUND, LOGIN_FAILED, ACCOUNT_LOCKED, SESSION_EXPIRED, STEP_UP_FAILED, NO_INTERNET,
         SERVER_UNREACHABLE, SECURE_CONNECTION_FAILED, NOT_REPLUGGED, NO_OUTPUT, START_NOT_SEEN,
+        SETTINGS_LOST_ON_RESTART, SETTINGS_NOT_SEEN,
         DOWNLOAD_MODE_STUCK, SECURITY_KEY_LOST, SETTINGS_UNREADABLE, FAMILY_MISMATCH_LOOP,
         STORAGE_PROBLEM, STORAGE_CHECKING, PSRAM_FAILED, CRASH_LOOP, POWER_PROBLEM,
         TEST_FIRMWARE, WRONG_START_COPY, HEAD_OFFICE_UNREACHABLE, TIME_SERVICE_BLOCKED,

@@ -6,8 +6,8 @@ import sys
 import pytest
 
 from sl_installer.core import console, texts
-from sl_installer.core.api import (BootOutcome, CancelToken, ConsoleKind, Family, HikSettings,
-                                   ReplugPhase)
+from sl_installer.core.api import (BootOutcome, BootReport, CancelToken, ConsoleKind, Family,
+                                   HikSettings, ReplugPhase)
 from sl_installer.core.console import BootWatcher, ConsoleParser, LineReader, judge
 
 from . import support
@@ -201,20 +201,22 @@ GOOD_BOOT = [
 ]
 
 
-def watcher_with(script_steps, *, mac=MAC, drop_unread=False):
+def watcher_with(script_steps, *, mac=MAC, drop_unread=False, console_logs=None):
     clock = FakeClock()
     usb = FakeUsb(mac=mac)
     script = SerialScript(clock, usb, drop_unread=drop_unread)
     for moment, action, value in script_steps:
         script.at(clock.now + moment, action, value)
     clock.hooks.append(script.tick)
-    return BootWatcher(usb, clock, opener=script.opener), script, clock
+    return (BootWatcher(usb, clock, opener=script.opener, console_logs=console_logs), script,
+            clock)
 
 
-def first_boot(watcher, timeout=120.0, cancel=None, config=None):
+def first_boot(watcher, timeout=120.0, cancel=None, config=None, transcript=None):
     phases, events = [], []
     report = watcher.wait_first_boot(MAC, config or support.zkt_config(), phases.append,
-                                     events.append, cancel or CancelToken(), timeout_s=timeout)
+                                     events.append, cancel or CancelToken(), timeout_s=timeout,
+                                     transcript=transcript)
     return report, phases, events
 
 
@@ -602,3 +604,304 @@ def test_board_that_sent_lines_but_no_start_is_not_called_silent(lines):
     report = first_boot(watcher, timeout=30)[0]
     assert report.outcome is BootOutcome.NO_OUTPUT and report.advice is texts.START_NOT_SEEN
     assert "faulty" not in " ".join(report.advice.what_to_do)
+
+
+# ----------------------------------------------- the restart check (the second start)
+
+# The next start of a board that kept its settings: Secure Boot is on already.
+RESTART_BOOT = [line for line in GOOD_BOOT if "secure_boot" not in line]
+# 2 Nov 2026, two new ZKT 2.7.8 boards: a good first start, then at the next start this.
+SETTINGS_GONE = RESTART_BOOT[:8] + [
+    "E (1530) zone_config: No encrypted per-device provisioning namespace; firmware remains "
+    "inert",
+    "E (1540) zone_lite: Encrypted per-device provisioning is required; network startup is "
+    "blocked",
+]
+
+
+def second_start(watcher, timeout=120.0, cancel=None, config=None, transcript=None,
+                 first=None):
+    phases, events = [], []
+    report = watcher.wait_restart(MAC, config or support.zkt_config(), phases.append,
+                                  events.append, cancel or CancelToken(), timeout_s=timeout,
+                                  transcript=transcript, first=first)
+    return report, phases, events
+
+
+# A first start that showed this setup's settings: zone, device and version.
+FIRST_SEEN = BootReport(BootOutcome.OK, "LF-ZONE-GUJRAT-01", "1", "2.9.1")
+
+
+def lost_advice(report, changed=False):
+    """The lost-settings advice, with the board ID for its label."""
+    assert report.outcome is BootOutcome.SETTINGS_LOST
+    assert report.advice == texts.settings_lost_on_restart(MAC, changed=changed)
+    assert report.advice.code == "SETTINGS_LOST_ON_RESTART" and not report.advice.can_retry
+    assert any("AC:27:6E:A4:3D:30" in step for step in report.advice.what_to_do)
+    return report.advice
+
+
+def watch_of(*lines):
+    parser = ConsoleParser(MAC)
+    return console._Watch(started=0.0, events=[parser.parse(line, 1.0) for line in lines])
+
+
+def test_restart_check_passes_when_the_board_names_its_settings_again():
+    watcher, script, _clock = watcher_with([
+        (1.0, "unplug", None), (4.0, "plug", None), (4.5, "print", RESTART_BOOT)])
+    report, phases, _events = second_start(watcher)
+    # The same replug as the first start.
+    assert phases == [ReplugPhase.WAITING_UNPLUG, ReplugPhase.WAITING_REPLUG,
+                      ReplugPhase.WATCHING]
+    assert report.outcome is BootOutcome.OK
+    assert (report.zone_id_seen, report.device_id_seen, report.app_version_seen) == (
+        "LF-ZONE-GUJRAT-01", "1", "2.9.1")
+    assert report.advice.code == "RESTART_OK"
+    assert report.advice.title == "The board kept its settings"
+    assert script.opened
+
+
+def test_settings_gone_at_the_next_start_are_lost_not_unreadable():
+    watcher, _script, _clock = watcher_with([
+        (1.0, "unplug", None), (4.0, "plug", None), (4.5, "print", SETTINGS_GONE)])
+    report, _phases, events = second_start(watcher)
+    assert ConsoleKind.SETTINGS_MISSING in {event.kind for event in events}
+    lost_advice(report)
+    # The first start keeps its own verdict for the same lines.
+    assert judge(watch_of(*SETTINGS_GONE), support.zkt_config(), 2.0, 120.0,
+                 final=False).advice is texts.SETTINGS_UNREADABLE
+
+
+@pytest.mark.parametrize("line", [
+    "E (1520) zone_lite: Encrypted NVS initialization failed (ESP_ERR_NVS_CORRUPT_KEY_PART); "
+    "preserving provisioning data and staying inert",
+    "E (1525) zone_config: Could not open encrypted provisioning namespace: ESP_FAIL",
+])
+def test_unreadable_settings_at_the_next_start_are_lost(line):
+    report = judge(watch_of(*RESTART_BOOT[:8], line), support.zkt_config(), 2.0, 120.0,
+                   final=False, restart=True, board_id=MAC)
+    lost_advice(report)
+    # Unreadable settings can make the board restart again and again: no "solid red".
+    assert "red" not in report.advice.what_happened
+
+
+def test_the_settings_line_can_be_followed_by_settings_missing():
+    # zone_config reads the namespace (the settings line), then app_main may still stop:
+    # "provisioning is required" when the board's provisioned flag is gone.
+    loaded = RESTART_BOOT[8]
+    assert judge(watch_of(loaded), support.zkt_config(), 2.0, 120.0, final=False,
+                 restart=True) is None  # watch on: the settings line alone is not enough
+    report = judge(watch_of(loaded, SETTINGS_GONE[-1]), support.zkt_config(), 2.0, 120.0,
+                   final=False, restart=True)
+    assert report.outcome is BootOutcome.SETTINGS_LOST
+    # Time up with the settings line only: the first start's words for a start not seen.
+    report = judge(watch_of(loaded), support.zkt_config(), 121.0, 120.0, final=True,
+                   restart=True)
+    assert report.outcome is BootOutcome.NO_OUTPUT and report.advice is texts.START_NOT_SEEN
+
+
+@pytest.mark.parametrize("lines, zone, device", [
+    (RESTART_BOOT[8:], "LF-ZONE-GUJRAT-01", "1"),          # settings line and start line
+    ([RESTART_BOOT[8], *RESTART_BOOT[10:]], "LF-ZONE-GUJRAT-01", None),  # settings line only
+    (RESTART_BOOT[9:], "LF-ZONE-GUJRAT-01", "1"),          # start line only
+])
+def test_restart_check_takes_either_line_that_names_the_settings(lines, zone, device):
+    report = judge(watch_of(*lines), support.zkt_config(), 2.0, 120.0, final=False,
+                   restart=True)
+    assert report.outcome is BootOutcome.OK and report.advice.code == "RESTART_OK"
+    assert (report.zone_id_seen, report.device_id_seen) == (zone, device)
+
+
+def test_restart_check_without_either_line_is_not_a_success():
+    # Both lines came before the port opened: running, but nothing shows which settings.
+    running = RESTART_BOOT[10:]  # storage and Wi-Fi only
+    first = judge(watch_of(*running), support.zkt_config(), 2.0, 120.0, final=False)
+    assert first.outcome is BootOutcome.OK  # the first start passes on these
+    report = judge(watch_of(*running), support.zkt_config(), 2.0, 120.0, final=False,
+                   restart=True)
+    assert report.outcome is BootOutcome.SETTINGS_NOT_SEEN
+    assert report.advice is texts.SETTINGS_NOT_SEEN and report.advice.can_retry
+
+
+def test_restart_check_with_the_lines_lost_before_the_port_opened():
+    lines = RESTART_BOOT
+    watcher, script, _clock = start_missed(lines[:10], lines[10:])
+    report = second_start(watcher)[0]
+    assert lines[8] in script.dropped and lines[9] in script.dropped
+    assert report.outcome is BootOutcome.SETTINGS_NOT_SEEN
+
+
+def test_restart_check_names_other_settings_as_the_first_start_does():
+    lines = [line.replace("GUJRAT-01", "GUJRAT-02") for line in RESTART_BOOT]
+    watcher, _script, _clock = watcher_with([(1, "unplug", None), (2, "plug", None),
+                                             (2.2, "print", lines)])
+    report = second_start(watcher)[0]
+    assert report.outcome is BootOutcome.WRONG_SETTINGS
+    assert "LF-ZONE-GUJRAT-02" in report.advice.what_happened
+    # Nor can a first start that showed neither line tell what the board had then.
+    missed = BootReport(BootOutcome.OK, None, None, "2.9.1")
+    report = judge(watch_of(*lines[8:]), support.zkt_config(), 2.0, 120.0, final=False,
+                   restart=True, first=missed, board_id=MAC)
+    assert report.outcome is BootOutcome.WRONG_SETTINGS
+
+
+def test_other_settings_than_at_the_first_start_were_not_kept():
+    # The first start showed this setup's zone; the next start names another one. Fix
+    # settings would last only until the next restart, as with lost settings.
+    lines = [line.replace("GUJRAT-01", "GUJRAT-02") for line in RESTART_BOOT]
+    watcher, _script, _clock = watcher_with([(1, "unplug", None), (2, "plug", None),
+                                             (2.2, "print", lines)])
+    report = second_start(watcher, first=FIRST_SEEN)[0]
+    advice = lost_advice(report, changed=True)
+    assert "other settings" in advice.what_happened
+    assert report.zone_id_seen == "LF-ZONE-GUJRAT-02"
+    config = support.zkt_config()
+    # The settings line alone, also with the zone gone from the settings.
+    for line in (RESTART_BOOT[8].replace("GUJRAT-01", "GUJRAT-02"),
+                 "I (1600) zone_config: Loaded per-device provisioning for zone="):
+        lost_advice(judge(watch_of(line), config, 2.0, 120.0, final=False, restart=True,
+                          first=FIRST_SEEN, board_id=MAC), changed=True)
+    # Another device number, when the first start showed the device.
+    other_device = RESTART_BOOT[9].replace("device_id=1", "device_id=2")
+    lost_advice(judge(watch_of(other_device, *RESTART_BOOT[10:]), config, 2.0, 120.0,
+                      final=False, restart=True, first=FIRST_SEEN, board_id=MAC),
+                changed=True)
+    # A first start that showed only the zone cannot tell about the device.
+    zone_only = BootReport(BootOutcome.OK, "LF-ZONE-GUJRAT-01", None, "2.9.1")
+    report = judge(watch_of(other_device, *RESTART_BOOT[10:]), config, 2.0, 120.0,
+                   final=False, restart=True, first=zone_only, board_id=MAC)
+    assert report.outcome is BootOutcome.WRONG_SETTINGS
+    # The same settings again pass, also when given the first start.
+    report = judge(watch_of(*RESTART_BOOT[8:]), config, 2.0, 120.0, final=False,
+                   restart=True, first=FIRST_SEEN, board_id=MAC)
+    assert report.outcome is BootOutcome.OK and report.advice.code == "RESTART_OK"
+
+
+def test_restart_check_judged_when_its_time_is_up():
+    # The watch can end before the storage line (a short bench --boot-seconds, or a first
+    # program line late in the watch): the restart rule holds then too.
+    wifi = RESTART_BOOT[11]
+    assert "Connecting to Wi-Fi" in wifi
+    watcher, _script, _clock = watcher_with([
+        (1.0, "unplug", None), (4.0, "plug", None), (4.5, "print", RESTART_BOOT[:8] + [wifi])])
+    report = second_start(watcher, timeout=10)[0]
+    assert report.outcome is BootOutcome.SETTINGS_NOT_SEEN
+    assert report.advice is texts.SETTINGS_NOT_SEEN
+    watcher, _script, _clock = watcher_with([
+        (1.0, "unplug", None), (4.0, "plug", None), (4.5, "print", RESTART_BOOT[:9] + [wifi])])
+    report = second_start(watcher, timeout=10)[0]
+    assert report.outcome is BootOutcome.OK and report.advice.code == "RESTART_OK"
+    assert report.zone_id_seen == "LF-ZONE-GUJRAT-01"
+
+
+@pytest.mark.parametrize("steps, timeout, outcome, advice", [
+    ([(1, "unplug", None), (2, "plug", None)], 30, BootOutcome.NO_OUTPUT, texts.NO_OUTPUT),
+    ([], 120, BootOutcome.NOT_REPLUGGED, texts.NOT_REPLUGGED),
+    ([(1, "unplug", None)], 120, BootOutcome.NOT_REPLUGGED, texts.NOT_REPLUGGED),
+], ids=["silent", "not-unplugged", "not-plugged-back"])
+def test_restart_check_reuses_the_first_start_advice(steps, timeout, outcome, advice):
+    watcher, _script, _clock = watcher_with(steps)
+    report = second_start(watcher, timeout=timeout)[0]
+    assert report.outcome is outcome and report.advice is advice
+
+
+def test_crash_loop_at_the_restart_check_reuses_the_first_start_advice():
+    watcher, _script, _clock = crash_every(3.0, first=RESTART_BOOT[:10], then=RESTART_BOOT[4:10])
+    report = second_start(watcher)[0]
+    assert report.outcome is BootOutcome.FAULTY_RESTART_LOOP and report.advice is texts.CRASH_LOOP
+
+
+def test_restart_check_keeps_the_pc_awake(monkeypatch):
+    from sl_installer.core import keepawake
+    calls = []
+    monkeypatch.setattr(keepawake, "_set_state", lambda flags: calls.append(flags) or True)
+    watcher, _script, _clock = watcher_with([
+        (1.0, "unplug", None), (4.0, "plug", None), (4.5, "print", RESTART_BOOT)])
+    assert second_start(watcher)[0].outcome is BootOutcome.OK
+    assert calls == [keepawake.AWAKE, keepawake.RELEASED]
+
+
+# ------------------------------------------------------- the install's console log
+
+def test_each_watched_start_is_kept_in_the_installs_console_log(tmp_path):
+    from sl_installer.core.logging_setup import register_secret
+    register_secret("test-wifi-pass")
+    # Before the storage line, at which the first start's verdict ends the watch.
+    secret_lines = ["I (1800) zone_lite: debug password=test-wifi-pass",
+                    "I (1810) zone_lite: joining test-wifi-pass now"]
+    watcher, _script, _clock = watcher_with([
+        (1.0, "unplug", None), (4.0, "plug", None),
+        (4.5, "print", [G + GOOD_BOOT[0] + N] + GOOD_BOOT[1:11] + secret_lines + GOOD_BOOT[11:]),
+        (60.0, "unplug", None), (63.0, "plug", None), (63.5, "print", SETTINGS_GONE)],
+        console_logs=tmp_path)
+    first = first_boot(watcher, transcript="sli-0123456789abcdef")[0]
+    again = second_start(watcher, transcript="sli-0123456789abcdef")[0]
+    assert (first.outcome, again.outcome) == (BootOutcome.OK, BootOutcome.SETTINGS_LOST)
+    (path,) = tmp_path.iterdir()
+    assert path.name == "console-ac276ea43d30-sli-0123456789abcdef.log"
+    text = path.read_text(encoding="utf-8")
+    first_part, second_part = text.split("=== Second start, after a restart, ")
+    assert first_part.startswith("=== First start, ")
+    assert "# the board was unplugged" in first_part and "the port" in first_part
+    # Every line as the board printed it, without colours, in order.
+    assert "ESP-ROM:esp32s3-20210327" in first_part and "\x1b" not in text
+    assert first_part.index("Loaded per-device provisioning") < first_part.index("Storage ready")
+    assert "=== Result: ok (BOOT_OK) ===" in first_part
+    assert "No encrypted per-device provisioning namespace" in second_part
+    assert "Loaded per-device provisioning" not in second_part
+    assert "=== Result: settings_lost (SETTINGS_LOST_ON_RESTART) ===" in second_part
+    # Redacted as installer.log is: registered secrets and secret-looking names.
+    assert "test-wifi-pass" not in text
+    assert "password=[redacted]" in text and "joining [redacted] now" in text
+
+
+def test_no_console_log_without_a_log_folder_or_an_install(tmp_path):
+    steps = [(1.0, "unplug", None), (4.0, "plug", None), (4.5, "print", GOOD_BOOT)]
+    watcher, _script, _clock = watcher_with(steps)
+    assert first_boot(watcher, transcript="sli-1")[0].outcome is BootOutcome.OK
+    watcher, _script, _clock = watcher_with(steps, console_logs=tmp_path)
+    assert first_boot(watcher)[0].outcome is BootOutcome.OK
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_a_console_log_problem_never_stops_the_watch(tmp_path):
+    blocked = tmp_path / "not-a-folder"
+    blocked.write_text("", encoding="utf-8")
+    watcher, _script, _clock = watcher_with(
+        [(1.0, "unplug", None), (4.0, "plug", None), (4.5, "print", GOOD_BOOT)],
+        console_logs=blocked)
+    assert first_boot(watcher, transcript="sli-1")[0].outcome is BootOutcome.OK
+
+
+def test_console_log_stops_growing_at_its_size(tmp_path):
+    log = console.ConsoleLog(tmp_path / "console-x.log", FakeClock(), max_bytes=4000)
+    for section in range(3):
+        log.begin(f"Start {section}")
+        for index in range(400):
+            log.line(f"I ({index}) zone_lite: a line the board printed, number {index}")
+        log.end(BootReport(BootOutcome.OK))
+    text = (tmp_path / "console-x.log").read_text(encoding="utf-8")
+    size = (tmp_path / "console-x.log").stat().st_size
+    assert 4000 - 200 < size < 4000 + 1000
+    assert text.count("this file is full") == 3 and text.count("=== Result: ok (-) ===") == 3
+    assert "number 0" in text and "number 399" not in text
+
+
+def test_old_console_logs_go_so_the_folder_stays_small(tmp_path):
+    import os
+    for index in range(console.CONSOLE_LOGS_KEPT + 5):
+        path = tmp_path / f"console-ac276ea43d30-sli-{index:02d}.log"
+        path.write_text("x\n", encoding="utf-8")
+        os.utime(path, (1_000_000 + index, 1_000_000 + index))
+    (tmp_path / "installer.log").write_text("kept\n", encoding="utf-8")
+    watcher, _script, _clock = watcher_with(
+        [(1.0, "unplug", None), (4.0, "plug", None), (4.5, "print", GOOD_BOOT)],
+        console_logs=tmp_path)
+    assert first_boot(watcher, transcript="sli-new")[0].outcome is BootOutcome.OK
+    kept = console.console_log_files(tmp_path)
+    assert len(kept) == console.CONSOLE_LOGS_KEPT
+    names = {path.name for path in kept}
+    assert "console-ac276ea43d30-sli-new.log" in names
+    assert "console-ac276ea43d30-sli-24.log" in names and "console-ac276ea43d30-sli-05.log" \
+        not in names
+    assert (tmp_path / "installer.log").exists()

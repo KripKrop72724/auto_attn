@@ -11,12 +11,15 @@ import pytest
 
 from sl_installer.core import texts
 from sl_installer.core.api import (
+    BootOutcome,
+    BootReport,
     ConsoleEvent,
     ConsoleKind,
     Family,
     FieldDefaults,
     PresenceReport,
     PresenceState,
+    Severity,
 )
 from sl_installer.ui import naming, pictures, wording
 from sl_installer.ui.pages.settings_form import SettingsForm
@@ -184,3 +187,116 @@ def test_steps_name_the_part_of_the_form_where_the_field_is():
         # Fix settings opens the fix form; "Change the details" goes back to either form.
         allowed = fix if "Fix settings" in step else fix | details
         assert place in allowed, (step, sorted(allowed))
+
+
+# ----------------------------------------------------- the restart check (second start)
+
+
+def test_restart_check_asks_for_a_second_deliberate_replug():
+    assert texts.RESTART_REPLUG == (
+        "Unplug the board again, wait 3 seconds, and plug it back in. "
+        "The app checks that the board keeps its settings."
+    )
+    advice = wording.restart_check(BootReport(BootOutcome.OK, "LF-ZONE-BLD9-04", "1", "2.7.8"))
+    assert advice.title == "One more check" and advice.severity is Severity.INFO
+    # The requested sentence as it is, then the replug's own warning.
+    assert advice.what_to_do == (texts.RESTART_REPLUG, "Do not press any button.")
+    # The setup is not finished: whoever would take the board away now is told so.
+    assert advice.what_happened == (
+        "The board started for LF-ZONE-BLD9-04, device number 1. The setup is not finished. "
+        "Do not take the board to a site yet."
+    )
+    # Not the end of the setup: no word of success before the second start.
+    words = " ".join((advice.title, advice.what_happened) + advice.what_to_do)
+    assert not re.search(r"correctly|ready|kept|working", words), words
+    lost_start = wording.restart_check(BootReport(BootOutcome.OK))
+    assert lost_start.what_happened.startswith("The board started. The setup is not finished.")
+    # The page's subtitle says why; the card does not say it a second time.
+    assert words.count("keeps its settings") == 1
+
+
+def test_success_is_said_only_with_the_settings_kept():
+    assert texts.SETTINGS_KEPT == (
+        "The board started correctly and kept its settings after a restart."
+    )
+    first = BootReport(BootOutcome.OK, "LF-ZONE-BLD9-04", None, None)
+    second = BootReport(BootOutcome.OK, "LF-ZONE-BLD9-04", "1", "2.7.8")
+    ok = wording.start_checks_ok(first, second)
+    assert ok.severity is Severity.SUCCESS and ok.title == "The board kept its settings"
+    # A sentence a line: the ZONE ID never breaks at one of its hyphens.
+    assert ok.what_happened.split("\n") == [
+        texts.SETTINGS_KEPT,
+        "Its settings are for LF-ZONE-BLD9-04, device number 1.",
+        "Its software is version 2.7.8.",
+    ]
+    # The Done screen says it in its subtitle, and only after the restart check passed.
+    assert wording.done_subtitle(True) == (
+        f"{texts.SETTINGS_KEPT} Take the board to the site. Then follow the steps below."
+    )
+    assert wording.done_subtitle(False) == wording.DONE_SUBTITLE
+    assert "kept" not in wording.DONE_SUBTITLE and "correctly" not in wording.DONE_SUBTITLE
+
+
+def test_lost_settings_keep_the_board_away_from_the_site():
+    advice = texts.settings_lost_on_restart("ac:27:6e:a4:3d:30")
+    words = " ".join((advice.title, advice.what_happened) + advice.what_to_do)
+    assert advice.code == "SETTINGS_LOST_ON_RESTART"
+    assert advice.title == "The board lost its settings" and "restarted" in advice.what_happened
+    assert "correctly" not in words  # never read as a success
+    assert advice.what_to_do[0] == (
+        "Do not use this board. If it came from a site, do not put it back."
+    )
+    # It looks like a good board: a label with its ID, which the start screen shows nowhere.
+    assert advice.what_to_do[1] == (
+        "Unplug it. Put a label on it that says DO NOT USE and its board ID, "
+        "AC:27:6E:A4:3D:30. Keep it aside. Do not throw it away."
+    )
+    # The help file now, while it still holds this board's record and console lines.
+    assert advice.what_to_do[2] == (
+        "Open Help and click Save a help file now, before you set up another board. Send the "
+        "file to head office."
+    )
+    # Missing settings leave the board still; unreadable ones can make it restart.
+    assert "solid red" not in words and "It cannot work like this." in words
+    assert not advice.can_retry and advice.illustration == "unplug"
+    # The screen offers only Go back to the start: no step may name another button.
+    assert not re.search(r"\bclick (Try again|Next|Fix settings|Check the board)\b", words, re.I)
+    changed = texts.settings_lost_on_restart("ac:27:6e:a4:3d:30", changed=True)
+    assert changed.code == advice.code and changed.what_to_do == advice.what_to_do
+    assert "it had other settings" in changed.what_happened
+    # Without a board ID (the catalogue's copy) the label step still reads well.
+    assert texts.SETTINGS_LOST_ON_RESTART.what_to_do[1] == (
+        "Unplug it. Put a label on it that says DO NOT USE and its board ID. Keep it aside. "
+        "Do not throw it away."
+    )
+    # The screens fall back to the engine's own words for both new outcomes.
+    lost = BootReport(BootOutcome.SETTINGS_LOST)
+    assert wording.boot_fallback(lost, None, "ac:27:6e:a4:3d:30") == advice
+    assert wording.boot_fallback(lost, None) == texts.SETTINGS_LOST_ON_RESTART
+    assert (
+        wording.boot_fallback(BootReport(BootOutcome.SETTINGS_NOT_SEEN), None)
+        is texts.SETTINGS_NOT_SEEN
+    )
+
+
+def test_settings_not_seen_is_a_retry_not_a_fault():
+    advice = texts.SETTINGS_NOT_SEEN
+    assert advice.severity is Severity.WARNING and advice.can_retry
+    # Try again watches a new replug: the click comes first, then the replug it asks for.
+    assert advice.what_to_do[0] == "Click Try again."
+    assert advice.what_to_do[1].startswith("When the screen asks, unplug the board")
+    assert "Do not press any button." in advice.what_to_do[1]
+    # A computer that keeps missing the line must not send boards to the sites unchecked.
+    assert advice.what_to_do[2].startswith("If it happens again, do not install the board.")
+    assert "Put it aside." in advice.what_to_do[2] and "Save a help file" in advice.what_to_do[2]
+    assert "faulty" not in " ".join(advice.what_to_do).lower()
+    assert "So it cannot" not in advice.what_happened
+    assert "The app cannot tell yet" in advice.what_happened
+
+
+def test_first_start_help_tells_of_the_second_replug():
+    item = wording.HELP_TOPICS["first_start"].items[-1]
+    # No picture: item 3 shows plugging in already.
+    assert item.heading == "5. Once more" and item.picture is None
+    assert "one more time" in item.text and "keeps its settings" in item.text
+    assert "the app tells you what to do" in item.text
