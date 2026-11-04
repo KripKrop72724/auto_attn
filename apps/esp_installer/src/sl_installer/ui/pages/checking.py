@@ -61,8 +61,9 @@ class CheckingPage(BasePage):
         rows = [
             ("Board ID", naming.board_id(board.mac)),
             ("Board type", wording.HARDWARE_WORDS.get(board.hardware, "")),
-            ("Setup state", wording.SECURITY_WORDS.get(board.security, "")),
         ]
+        rows += wording.refused_hardware_rows(board)
+        rows.append(("Setup state", wording.SECURITY_WORDS.get(board.security, "")))
         if record is not None and record.known:
             place = record.zone_id or "-"
             if record.device_id:

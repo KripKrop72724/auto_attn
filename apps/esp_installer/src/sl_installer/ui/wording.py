@@ -26,6 +26,7 @@ from ..core.api import (
     Severity,
     StepId,
 )
+from ..core.board import hardware_advice
 from ..core.usb import FAST_LOOP_PERIOD
 from . import naming
 
@@ -52,6 +53,8 @@ HARDWARE_WORDS: Dict[HardwareVerdict, str] = {
     HardwareVerdict.WRONG_CHIP: "Wrong. State Life cannot use this kind.",
     HardwareVerdict.WRONG_FLASH_SIZE: "Wrong. State Life cannot use this kind.",
     HardwareVerdict.WRONG_PSRAM: "Wrong. State Life cannot use this kind.",
+    HardwareVerdict.FLASH_CHIP_UNSUPPORTED: "Not usable. Its memory chip cannot run our software.",
+    HardwareVerdict.BOARD_TYPE_UNSUPPORTED: "Not supported yet. State Life cannot use this type.",
     HardwareVerdict.NOT_CHECKED: "Not checked. A locked board cannot show it.",
 }
 
@@ -126,11 +129,18 @@ _CONSOLE: Dict[ConsoleKind, Tuple[str, str, Severity]] = {
         Severity.WARNING,
     ),
     ConsoleKind.PANIC: ("The board hit a problem and restarted.", "", Severity.ERROR),
+    ConsoleKind.BOOTLOADER_FAILED: (
+        "The board's start-up program stopped with an error.",
+        "",
+        Severity.ERROR,
+    ),
 }
 
 
 def console_words(event: ConsoleEvent) -> Optional[Tuple[str, Severity]]:
     """What a console line means in plain words; None for lines people need not see."""
+    if event.kind is ConsoleKind.BOOTLOADER_FAILED and event.data.get("reason") == "xmc_flash":
+        return "The board's start-up program cannot use its memory chip.", Severity.ERROR
     entry = _CONSOLE.get(event.kind)
     if entry is None:
         return None
@@ -533,9 +543,35 @@ def presence_advice(report: api.PresenceReport) -> Optional[Advice]:
     return None
 
 
+def hardware_refusal(board: api.BoardInfo) -> Optional[Advice]:
+    """Why the board check refused this board's hardware (core/board.py), or None.
+
+    Nothing may be written to such a board, whatever head office says about it: the
+    screens show this before anything else and offer only another board.
+    """
+    if board.hardware in HARDWARE_OK:
+        return None
+    return board_refusal(board)
+
+
+def refused_hardware_rows(board: api.BoardInfo) -> Tuple[Tuple[str, str], ...]:
+    """What the board check measured on a refused board, for the facts beside the advice."""
+    if board.hardware in HARDWARE_OK:
+        return ()
+    rows = []
+    if board.flash_id:
+        rows.append(("Memory chip ID", board.flash_id))
+    if board.hardware_detail and board.hardware is not HardwareVerdict.FLASH_CHIP_UNSUPPORTED:
+        rows.append(("Found", board.hardware_detail))
+    return tuple(rows)
+
+
 def board_refusal(board: api.BoardInfo) -> Optional[Advice]:
     """Why a board cannot be used at all, or None if it can."""
     if board.hardware not in HARDWARE_OK:
+        specific = hardware_advice(board)
+        if specific is not None:
+            return specific
         return Advice(
             "WRONG_BOARD_TYPE",
             "This is the wrong kind of board",
@@ -921,6 +957,8 @@ def boot_fallback(
             ("Click Fix settings and choose the right machine type.",),
             Severity.ERROR,
         )
+    if outcome is BootOutcome.STARTUP_REFUSED:
+        return texts.startup_refused(report.board_said)
     if outcome is BootOutcome.NOT_REPLUGGED:
         return Advice(
             "BOOT_NOT_REPLUGGED",

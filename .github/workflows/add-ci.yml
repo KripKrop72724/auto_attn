@@ -41,6 +41,7 @@ jobs:
           ./tests/firmware/test_usb_wifi_rescue_signing.ps1
           ./tests/firmware/test_bootstrap_production_signing.ps1
           ./tests/firmware/test_installer_bundle_publication.ps1
+          ./tests/firmware/test_installer_app_publication.ps1
       - name: Verify USB rescue signing refusals in PowerShell Core
         shell: pwsh
         run: ./tests/firmware/test_usb_wifi_rescue_signing.ps1
@@ -453,7 +454,7 @@ jobs:
         run: python scripts/update_ci_test_durations.py --check scripts/ci_test_durations.json .ci/junit-*.xml
 
   frontend:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04  # Playwright 1.x has no browsers for ubuntu-latest (26.04) yet
     timeout-minutes: 15
     defaults:
       run:

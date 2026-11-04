@@ -13,6 +13,12 @@ The security key file exists only for the burn call, in a private temporary
 directory, and is overwritten and deleted straight after it. Cancel works until
 the key step starts. After the burn every failure says the board must be resumed.
 Windows is kept awake for the whole run (keepawake.py).
+
+A new board or a resume needs hardware the board check passed (board.py hardware
+gate) and, once the bundle is verified, a chip revision every one of its images
+starts on, both before head office is asked or anything is written. A refused board
+is reported to ADD (BOARD_REFUSED). esptool's XMC startup warning in any later call
+also stops the run: such a board would never start (board.py notes).
 """
 from __future__ import annotations
 
@@ -32,9 +38,10 @@ from .api import (Advice, BoardInfo, BootOutcome, BootReport, BundleInfo, Cancel
                   DeviceRecord, EncryptedPackage, Family, HardwareVerdict, InstallConfig,
                   InstallerError, InstallMode, InstallSummary, LocalBundle, PackageRequest,
                   ProgressFn, SecurityState, ServerService, StepId, StepProgress, UsbCandidate)
-from .board import (classify_efuses, classify_sdm, efuse_mac, key0_locked_hmac,
-                    parse_banner, parse_security_info, read_summary_file)
-from .bundles import BundleStore, flash_ranges
+from .board import (XMC_STARTUP_FAILED, classify_efuses, classify_sdm,
+                    efuse_mac, hardware_advice, key0_locked_hmac, parse_banner,
+                    parse_security_info, read_summary_file, refusal_detail, revision_words)
+from .bundles import BundleStore, chip_revision_window, flash_ranges
 from .clock import Clock, iso_utc
 from .envelope import EnvelopeError, OneTimeKey, OpenedPackage, open_package
 from .esptool_runner import (ESPEFUSE, PROGRESS_LINE, ToolCall, ToolResult, ToolRunner,
@@ -43,7 +50,7 @@ from .flashplan import (NVS_OFFSET, NVS_SIZE, REDO_AREA_OFFSET, REDO_AREA_SIZE, 
                         STORAGE_SIZE, FlashPlan, FlashRange, PlanError, PlannedCall, Purpose,
                         build_plan, espefuse_args, with_port)
 from .keepawake import keep_awake
-from .logging_setup import get_logger, register_secret
+from .logging_setup import get_logger, redact, register_secret
 
 log = get_logger("installer")
 
@@ -285,6 +292,13 @@ class Installer:
             advice = texts.ALREADY_SET_UP if board.security is SecurityState.SECURED_STATE_LIFE \
                 else texts.MODE_NOT_ALLOWED
             raise InstallerError(advice, cause=f"{mode.value} on a {board.security.value} board")
+        if mode is not InstallMode.CHANGE_SETTINGS and board.hardware is not HardwareVerdict.OK:
+            refusal = hardware_advice(board)
+            if refusal is not None:
+                # The board check said so already; this guards every other way in.
+                report_board_refused(self._server, board, refusal)
+                raise InstallerError(refusal, cause=f"{mode.value} on {board.hardware.value} "
+                                                    "hardware")
         if mode is not InstallMode.CHANGE_SETTINGS and (
                 board.hardware is not HardwareVerdict.OK or board.secure_download_mode):
             raise InstallerError(texts.MODE_NOT_ALLOWED,
@@ -344,6 +358,7 @@ class Installer:
             bundle = self._server.fetch_bundle(run.config.bundle_id, on_bytes, run.cancel)
             if bundle.info.family is not run.config.family:
                 raise InstallerError(texts.BUNDLE_WRONG_FAMILY, cause="bundle family")
+            self._check_chip_revision(run, bundle)
         self._check_cancel(run)
 
         # Made before head office is asked, so a full disk stops the run first.
@@ -371,6 +386,25 @@ class Installer:
         plan = build_plan(run.mode, run.board.port, run.config.family, ranges, run.work)
         self._emit(run, step, 1.0, "Ready")
         return info, plan
+
+    def _check_chip_revision(self, run: _Run, bundle: LocalBundle) -> None:
+        """Every image of the bundle starts on this chip revision (bundles.chip_revision_window).
+
+        The board check knows only ESP-IDF's default range; the bundle's own headers decide.
+        A revision esptool did not print is not checked here.
+        """
+        revision = run.board.chip_revision
+        low, high = chip_revision_window(bundle)
+        if revision is None or (low <= revision and (high is None or revision <= high)):
+            return
+        needed = (f"{revision_words(low)} or newer" if high is None
+                  else f"{revision_words(low)} to {revision_words(high)}")
+        detail = f"chip revision {revision_words(revision)}; this board software needs {needed}"
+        board = replace(run.board, hardware=HardwareVerdict.BOARD_TYPE_UNSUPPORTED,
+                        hardware_detail=detail)
+        advice = texts.board_type_unsupported(detail)
+        self._report_refused(run, board, advice)
+        raise InstallerError(advice, cause=detail)
 
     def _complete(self, config: InstallConfig, record: DeviceRecord) -> InstallConfig:
         if config.family is not Family.HIKVISION or config.hik is None:
@@ -420,9 +454,28 @@ class Installer:
         if not result.ok:
             raise InstallerError(advice_for(result), step=run.step,
                                  cause=failure_cause(result))
+        self._check_flash_chip(run, result)
         self._check(run, planned, result)
         if progress:
             progress.emit(planned.total_bytes or 1, force=True)
+
+    def _check_flash_chip(self, run: _Run, result: ToolResult) -> None:
+        """esptool's "XMC flash boot-up fix failed": our bootloader could never start this board.
+
+        The board check refuses such a board first; this stops a run that got past it
+        before the key is locked (a new board) or before more is written (a resume).
+        A listed XMC chip that recovers in the flow prints only the first warning and is
+        fine (board.flash_chip_starts). A finished board (settings change) has started
+        with its chip already.
+        """
+        if (run.mode is InstallMode.CHANGE_SETTINGS
+                or not XMC_STARTUP_FAILED.search(result.output)):
+            return
+        board = replace(run.board, hardware=HardwareVerdict.FLASH_CHIP_UNSUPPORTED)
+        advice = texts.flash_chip_unsupported(board.flash_id, locked=run.key_burned)
+        self._report_refused(run, board, advice)
+        raise InstallerError(advice, step=run.step, irreversible_done=run.key_burned,
+                             cause=f"{result.call.label}: esptool ran the XMC startup flow")
 
     def _progress_for(self, run: _Run, planned: PlannedCall) -> Optional[_Progress]:
         if not planned.ranges:
@@ -613,6 +666,15 @@ class Installer:
         except Exception as error:
             log.warning("could not report %s: %s", kind, error)
 
+    def _report_refused(self, run: _Run, board: BoardInfo, advice: Advice) -> None:
+        """BOARD_REFUSED under this run's request ID, with exactly the contract's detail."""
+        try:
+            self._server.report(run.request_id, board.mac, "BOARD_REFUSED",
+                                refusal_detail(board, advice))
+        except Exception as error:
+            log.warning("could not report a refused board: %s", error)
+
+
 
 _MILESTONES = {
     StepId.CLEAR_START_AREA: "START_AREA_CLEARED",
@@ -631,10 +693,16 @@ def _older(version: str, minimum: str) -> bool:
         return False
 
 
+BOARD_SAID_MAX = 200
+
+
 def _start_detail(boot: BootReport) -> dict:
+    # board_said: the board's own line that decided a failed start, redacted (again: ADD
+    # keeps it), at most 200 characters.
+    said = redact(boot.board_said)[:BOARD_SAID_MAX] if boot.board_said else None
     return {"outcome": boot.outcome.value, "zone_id_seen": boot.zone_id_seen,
             "device_id_seen": boot.device_id_seen, "app_version_seen": boot.app_version_seen,
-            "advice": boot.advice.code if boot.advice else None}
+            "advice": boot.advice.code if boot.advice else None, "board_said": said}
 
 
 def report_boot(server: ServerService, summary: InstallSummary, boot: BootReport) -> None:
@@ -661,6 +729,14 @@ def report_restart(server: ServerService, summary: InstallSummary, restart: Boot
                       {**_start_detail(restart), "settings_kept": kept})
     except Exception as error:
         log.warning("could not report the restart check: %s", error)
+
+
+def report_board_refused(server: ServerService, board: BoardInfo, advice: Advice) -> None:
+    """ADD's BOARD_REFUSED event: the hardware gate refused this board (board.py)."""
+    try:
+        server.report(new_request_id(), board.mac, "BOARD_REFUSED", refusal_detail(board, advice))
+    except Exception as error:
+        log.warning("could not report a refused board: %s", error)
 
 
 def report_faulty_board(server: ServerService, mac: str, period_s: Optional[float],

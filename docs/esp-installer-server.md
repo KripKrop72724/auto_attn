@@ -4,8 +4,9 @@ The Windows installer app (design: `docs/esp-installer-design.md`) talks to ADD 
 `https://autoattn.slichealth.com/api/v1/installer/*`. ADD keeps every secret. The protected
 provisioner builds each board's encrypted settings (NVS) and HMAC eFuse key from the fleet root,
 and encrypts both to the app's one-time X25519 key. Firmware comes from signed installer bundles
-in a read-only store. Code: `apps/add_backend/zk_add/installer_api.py` and
-`apps/add_provisioner/app.py`.
+in a read-only store. The dashboard's Prepare page offers the app itself for download from
+another read-only store ("App store" below). Code: `apps/add_backend/zk_add/installer_api.py`,
+`apps/add_backend/zk_add/installer_apps.py` and `apps/add_provisioner/app.py`.
 
 ## Routes
 
@@ -23,6 +24,8 @@ also needs the admin `password` in the body (step-up) on every call.
 | `GET /zones` | `{zones: [{zone_id, zone_name, device_ids, families}]}` for active connectors |
 | `POST /packages` | 201 `{request_id, provisioning_manifest, provisioning_ciphertext_b64, hmac_ciphertext_b64}` |
 | `POST /events` | `{request_id, mac, kind, detail}`, then 204 |
+| `GET /apps` | `{latest: {version, git_sha, published_at, files: [{platform, arch, kind, filename, size, sha256, download_path}]} \| null, min_app_version}`, for the dashboard's download card |
+| `GET /apps/{version}/{filename}` | The app file as an attachment; only files that the version's manifest lists. Header `X-Content-SHA256`. |
 
 Notes:
 
@@ -126,7 +129,7 @@ submitted value. Other ADD routes keep their own error shape.
 | 401 | `AUTH_REQUIRED`, `SESSION_EXPIRED` | No session, or the session has expired. Sign in again. |
 | 403 | `CSRF_INVALID` | The CSRF token is missing or wrong. |
 | 403 | `PASSWORD_REJECTED` (`field: password`) | The step-up password was not accepted. |
-| 404 | `BUNDLE_NOT_FOUND`, `FILE_NOT_FOUND`, `NOT_FOUND` | Unknown, unverified or unlisted bundle or file; or an unknown path. |
+| 404 | `BUNDLE_NOT_FOUND`, `FILE_NOT_FOUND`, `NOT_FOUND` | Unknown, unverified or unlisted bundle or file, or app version or file; or an unknown path. |
 | 409 | `INSTALLER_DISABLED` | The kill switch is on, or provisioning is off. Every route except capabilities. |
 | 409 | `BUNDLE_UNAVAILABLE`, `BUNDLE_FAMILY_MISMATCH` (`field: bundle_id`) | The bundle of a `new_board` or `resume` package is missing, unverified, or for the other family. |
 | 409 | `FAMILY_MISMATCH` (`field: firmware_family`, `known_family`) | ADD knows this MAC as the other family. |
@@ -143,6 +146,7 @@ submitted value. Other ADD routes keep their own error shape.
 | --- | --- | --- |
 | `ADD_INSTALLER_ENABLED` | `true` | Kill switch. The installer also needs `ADD_PROVISIONING_ENABLED=true`. |
 | `ADD_INSTALLER_BUNDLE_STORE_PATH` | `/installer-bundles` | The store inside add-api. |
+| `ADD_INSTALLER_APP_STORE_PATH` | `/installer-apps` | The app store inside add-api. |
 | `ADD_INSTALLER_MIN_APP_VERSION` | `1.0.0` | Older apps get 426 on `POST /packages`. |
 | `ADD_INSTALLER_PACKAGE_LIMIT` / `ADD_INSTALLER_EVENT_LIMIT` | `30` / `240` | Per user, per window. All field staff share the single admin account, so these limits are fleet-wide. |
 | `ADD_INSTALLER_RATE_WINDOW_SECONDS` | `600` | The rate-limit window. It slides: each request counts until it is this old. |
@@ -202,6 +206,64 @@ be read` and left out too. Neither ever breaks the other bundles or causes a 500
 each bundle in full when it first sees it, and again when any file in its directory changes. To
 withdraw a bundle, move its directory out of the store.
 
+## App store
+
+The Prepare page ("Prepare an ESP32" on the Firmware page) shows a **State Life Device
+Installer** card. It reads `GET /apps` and offers the newest app for the visitor's computer:
+Windows or Mac, with a smaller link for the other one. It shows the version, the size and the
+SHA-256, how to open the app the first time, and an empty state when nothing is published.
+Both routes use the dashboard's admin session and the installer kill switch, like every other
+installer route.
+
+- **Host directory:** `ADD_INSTALLER_APP_STORE_HOST_PATH`. Set it as a repository variable,
+  or to the same value in both the `firmware-signing` (publish) and `add-production` (deploy)
+  environments; otherwise the two use different folders. The default is
+  `C:\Users\Public\Documents\StateLife\AttendanceDeviceDashboard\installer-apps`.
+- **Mount:** read-only into add-api only, at `/installer-apps`.
+- **Creation:** `deploy.ps1` creates the directory when it is missing. An empty or missing store
+  is valid: `latest` is then `null`.
+- **Layout:** `<store>/<version>/manifest.json` and the files it lists. A published version
+  directory is never rewritten with different bytes.
+
+`manifest.json` is UTF-8 without a byte order mark:
+
+```json
+{"schema": 1, "product": "state-life-device-installer", "version": "1.1.0",
+ "git_sha": "<40 hex>", "published_at": "2026-11-04T09:30:00Z", "files": [
+  {"platform": "windows", "arch": "x64", "kind": "setup",
+   "filename": "StateLife-Device-Installer-Setup-1.1.0.exe", "size": 86123456, "sha256": "<64 hex>"},
+  {"platform": "macos", "arch": "arm64", "kind": "dmg",
+   "filename": "StateLife-Device-Installer-1.1.0-macOS-arm64.dmg", "size": 99614720, "sha256": "<64 hex>"}]}
+```
+
+A version is offered only when all of these hold:
+
+- The directory name is three numbers with dots between them, such as `1.1.0` (at most 32
+  characters), and equals `version`. Other names are ignored.
+- The directory, `manifest.json` and every listed file are real: a symlink is refused.
+- The manifest is at most 64 KiB of JSON with no repeated key, `schema` is the number 1, the
+  `product` is `state-life-device-installer`, `git_sha` is a full lower-case commit and
+  `published_at` is a UTC time ending in `Z`. Other keys are ignored.
+- `files` lists one or two files, at most one per platform: `windows` is `x64` `setup` ending in
+  `.exe`, and `macos` is `arm64` `dmg` ending in `.dmg`.
+- Each file name matches `[A-Za-z0-9._-]+`, does not start with a dot, has at most 100
+  characters and is not a TEST build (`-TEST.` or `-TEST-` in its name).
+- Each file is a regular file directly in the directory, with the listed `size` (at most 2 GiB)
+  and the listed lower-case `sha256`.
+
+The highest valid version is `latest`; versions compare as numbers, so 1.10.0 is above 1.9.0. A
+version that fails is logged once (`Installer app <version> skipped: <reason>`) and left out,
+so an older valid version is offered instead. ADD hashes each file once and again only when
+its size or modification time changes; an older version is hashed only when every newer one
+fails. `GET /apps/{version}/{filename}` serves any valid version, not only the newest. It
+checks the version the same way first, and answers 404 `FILE_NOT_FOUND` for anything else. The
+download is `application/vnd.microsoft.portable-executable` (the Setup) or
+`application/x-apple-diskimage` (the disk image), with `Content-Disposition: attachment`.
+
+add-web's nginx passes app downloads through unbuffered: buffering 100 MB for a slow site
+link would fill its 32 MB temporary space. To withdraw a version, move its directory out of
+the store.
+
 ## Audit
 
 - **`INSTALLER_PACKAGE_ISSUED`:** one row per package. Actor: the admin username. Target: `esp`
@@ -218,6 +280,10 @@ withdraw a bundle, move its directory out of the store.
   firmware's own `wifi_pass`, `hik_pass`, `tel_pass` and `zkt_key`. A harmless key with such a part
   (for example `key_burned`) is redacted too, so report such facts under another name. ADD keeps
   only the first 80 characters of a key, but it judges the whole key. The outcome is `REPORTED`.
+- **`INSTALLER_APP_DOWNLOADED`:** one row per app download, written and committed before the
+  file is sent. Actor: the admin username. Target: `installer_app` and the version. `after`
+  holds the `version`, `platform`, `arch`, `filename`, `size` and `sha256`. The outcome is
+  `SUCCESS`. A refused download writes no row.
 
 ## Provisioner
 
@@ -307,3 +373,6 @@ rolled back: no nonce, site or connector change is kept.
 - **Store files:** the store's files are not ACL-restricted, like the other stores under Public
   Documents. Changing a file only makes its bundle unavailable, because every file must match the
   signed manifest.
+- **App store:** the app manifest is not signed. Anyone who can write to the app store's host
+  directory can change a file and its listed SHA-256 together, and ADD would then offer that
+  file. The SHA-256 only proves a copy matches what the store holds.

@@ -4,6 +4,9 @@
 # resource and sl_installer/resources/field_defaults.json that this file uses.
 # The same executable also runs the bundled esptool and espefuse when it is
 # started as "<exe> --tool esptool|espefuse ..." (see sl_installer/__main__.py).
+# On macOS the folder becomes "State Life Device Installer.app" for Apple
+# Silicon, with the Info.plist entries build.py wrote to macos-info.json.
+import json
 import os
 import sys
 from pathlib import Path
@@ -97,22 +100,39 @@ a.datas = [entry for entry in a.datas if wanted(entry[0])]
 
 pyz = PYZ(a.pure)  # noqa: F821 - defined by PyInstaller
 
-exe = EXE(  # noqa: F821 - defined by PyInstaller
-    pyz,
-    a.scripts,
-    # UTF-8 mode: the same text encoding as the Linux and macOS test runs,
-    # instead of the Windows ANSI code page.
-    [("X utf8", None, "OPTION")],
-    exclude_binaries=True,
-    name=APP_NAME,
-    console=False,
-    disable_windowed_traceback=False,
-    icon=str(BUILD / "branding" / "app.ico"),
-    version=str(BUILD / "version-info.txt"),
-    upx=False,
-)
+if sys.platform == "darwin":
+    exe = EXE(  # noqa: F821 - defined by PyInstaller
+        pyz,
+        a.scripts,
+        [("X utf8", None, "OPTION")],
+        exclude_binaries=True,
+        name=APP_NAME,
+        console=False,
+        disable_windowed_traceback=False,
+        argv_emulation=False,
+        # Apple Silicon only: universal libraries are cut down to their arm64 part.
+        target_arch="arm64",
+        codesign_identity=None,  # ad hoc; build.py signs the finished app again
+        entitlements_file=None,
+        upx=False,
+    )
+else:
+    exe = EXE(  # noqa: F821 - defined by PyInstaller
+        pyz,
+        a.scripts,
+        # UTF-8 mode: the same text encoding as the Linux and macOS test runs,
+        # instead of the Windows ANSI code page.
+        [("X utf8", None, "OPTION")],
+        exclude_binaries=True,
+        name=APP_NAME,
+        console=False,
+        disable_windowed_traceback=False,
+        icon=str(BUILD / "branding" / "app.ico"),
+        version=str(BUILD / "version-info.txt"),
+        upx=False,
+    )
 
-COLLECT(  # noqa: F821 - defined by PyInstaller
+coll = COLLECT(  # noqa: F821 - defined by PyInstaller
     exe,
     a.binaries,
     a.datas,
@@ -120,3 +140,14 @@ COLLECT(  # noqa: F821 - defined by PyInstaller
     upx=False,
     name=APP_NAME,
 )
+
+if sys.platform == "darwin":
+    INFO = json.loads((BUILD / "macos-info.json").read_text(encoding="utf-8"))
+    BUNDLE(  # noqa: F821 - defined by PyInstaller
+        coll,
+        name=f"{APP_NAME}.app",
+        icon=str(BUILD / "branding" / "app.icns"),
+        bundle_identifier=INFO["CFBundleIdentifier"],
+        version=INFO["CFBundleShortVersionString"],
+        info_plist=INFO,
+    )

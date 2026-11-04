@@ -30,6 +30,7 @@ from ..core.api import (
     Advice,
     BootOutcome,
     BundleInfo,
+    ConsoleKind,
     Family,
     InstallMode,
     PresenceState,
@@ -37,7 +38,7 @@ from ..core.api import (
     Severity,
     StepId,
 )
-from ..core.installer import report_boot, report_restart
+from ..core.installer import report_board_refused, report_boot, report_restart
 from . import naming, wording
 from .pages import (
     CHECK_BOARD,
@@ -180,6 +181,7 @@ class Controller(QObject):
         self._came_from = ""
         self._ops: Dict[str, Operation] = {}
         self._faulty_reported: Set[str] = set()
+        self._refused_reported: Set[Tuple[str, str]] = set()  # (board ID, advice code)
         self._presence_state: Optional[PresenceState] = None
         self._presence_fast = False
         self._loop_board: Optional[api.UsbCandidate] = None  # in a fast restart loop
@@ -727,6 +729,18 @@ class Controller(QObject):
             failed,
         )
 
+    def _report_refused(self, board: api.BoardInfo, advice: Advice) -> None:
+        """ADD's BOARD_REFUSED event for a board the hardware check refused, once a session."""
+        key = (board.mac, advice.code)
+        if not board.mac or key in self._refused_reported:
+            return
+        self._refused_reported.add(key)
+        server = self.services.server
+        self.runner.start(
+            lambda: report_board_refused(server, board, advice),
+            on_error=lambda error: log.info("refused board not reported: %s", error),
+        )
+
     def _report_faulty(self, report: api.PresenceReport) -> None:
         board = report.board
         mac = board.mac if board is not None else None
@@ -844,6 +858,14 @@ class Controller(QObject):
         session.board, session.record = board, record
         session.candidate = outcome.candidate or session.candidate
         page.show_facts(board, record)
+        hardware = wording.hardware_refusal(board)
+        if hardware is not None:
+            # A board the software cannot start: first, whatever head office says, and the
+            # only way on is another board. Nothing was written to it.
+            session.mode = None
+            self._report_refused(board, hardware)
+            page.show_result(hardware, secondary=("Use another board", "another"))
+            return
         if outcome.lookup_error is not None:
             advice = advice_of(outcome.lookup_error)
             page.show_result(
@@ -1264,7 +1286,7 @@ class Controller(QObject):
 
         def work(operation: Operation) -> object:
             on_phase = self.runner.relay(page.set_phase, operation)
-            on_event = self.runner.relay(page.add_event, operation)
+            on_event = self.runner.relay(self._on_boot_event, operation)
             return self.services.boot.wait_first_boot(
                 mac,
                 config,
@@ -1277,6 +1299,16 @@ class Controller(QObject):
 
         self._run("boot", work, self._booted, self._boot_failed)
         self._update_sign_out()
+
+    def _on_boot_event(self, event: api.ConsoleEvent) -> None:
+        """A line of a watched start; the board's own Wi-Fi shows as soon as it is open."""
+        page = self.page(FIRST_START)
+        page.add_event(event)
+        if event.kind is ConsoleKind.SETUP_AP_OPEN:
+            mac, _transcript = self._watched_board()
+            page.show_hotspot(
+                self._hotspot_name(mac, event), self.services.defaults.setup_ap_password
+            )
 
     def _watched_board(self) -> Tuple[str, Optional[str]]:
         """The board ID to watch, and the install whose console log keeps what it says."""
@@ -1313,7 +1345,7 @@ class Controller(QObject):
 
         def work(operation: Operation) -> object:
             on_phase = self.runner.relay(page.set_phase, operation)
-            on_event = self.runner.relay(page.add_event, operation)
+            on_event = self.runner.relay(self._on_boot_event, operation)
             # With the first start's report: other settings than it showed were not kept.
             return self.services.boot.wait_restart(
                 mac,
@@ -1527,6 +1559,10 @@ class Controller(QObject):
         session.board, session.record = outcome.board, outcome.record
         session.candidate = outcome.candidate or session.candidate
         page.show_board(outcome.board)
+        hardware = wording.hardware_refusal(outcome.board)
+        if hardware is not None:
+            # The advice list says what is wrong (the diagnosis puts it first).
+            self._report_refused(outcome.board, hardware)
         if outcome.lookup_error is not None:
             page.show_record_problem(advice_of(outcome.lookup_error))
         elif outcome.record is not None:
@@ -1591,20 +1627,41 @@ class Controller(QObject):
             listed.insert(0, refusal)
         page.show_advice_list(listed)
         about_wifi = any(item.code in WIFI_ADVICE for item in listed)
-        mac = (
-            board.mac
-            if board is not None
-            else (session.candidate.mac if session.candidate else None)
-        )
+        mac = self._checked_board_id()
         set_up = board is not None and board.security is SecurityState.SECURED_STATE_LIFE
-        if mac and (set_up or about_wifi):
+        opened = self._hotspot_opened()
+        if opened is not None or (mac and (set_up or about_wifi)):
             page.show_hotspot(
-                naming.hotspot_name(mac),
+                self._hotspot_name(mac, opened),
                 self.services.defaults.setup_ap_password,
-                open_steps=about_wifi,
+                open_steps=about_wifi or opened is not None,
             )
         else:
             page.hide_hotspot()
+
+    def _checked_board_id(self) -> Optional[str]:
+        session = self.session
+        if session.board is not None:
+            return session.board.mac
+        return session.candidate.mac if session.candidate else None
+
+    def _hotspot_opened(self) -> Optional[api.ConsoleEvent]:
+        """The board's line on Check a board saying its own Wi-Fi is open, if any."""
+        return next(
+            (
+                event
+                for event in reversed(self.session.events)
+                if event.kind is ConsoleKind.SETUP_AP_OPEN
+            ),
+            None,
+        )
+
+    @staticmethod
+    def _hotspot_name(mac: Optional[str], opened: Optional[api.ConsoleEvent]) -> Optional[str]:
+        """Its name from the board ID, else as the board's line gave it (else the pattern)."""
+        if mac:
+            return naming.hotspot_name(mac)
+        return opened.data.get("ssid") if opened is not None else None
 
     def _board_check_failed(self, error: BaseException) -> None:
         advice = advice_of(error)
@@ -1625,7 +1682,15 @@ class Controller(QObject):
     def _on_check_event(self, event: api.ConsoleEvent) -> None:
         self.session.events.append(event)
         self.session.events = self.session.events[-200:]
-        self.page(CHECK_BOARD).add_event(event)
+        page = self.page(CHECK_BOARD)
+        page.add_event(event)
+        if event.kind is ConsoleKind.SETUP_AP_OPEN:
+            # Its name and password at once, not only after the advice is worked out.
+            page.show_hotspot(
+                self._hotspot_name(self._checked_board_id(), event),
+                self.services.defaults.setup_ap_password,
+                open_steps=True,
+            )
         if not self._diagnose_timer.isActive():
             self._diagnose_timer.start()
 

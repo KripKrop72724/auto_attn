@@ -31,6 +31,13 @@ A crash does not drop the port: ESP-IDF 5.5.3 restarts the ESP32-S3 after a pani
 with a CPU reset that keeps USB-Serial/JTAG connected (esp_restart_noos), so the
 console's own "Rebooting..." and ROM reset lines are what show a crash loop, not a
 port reopen.
+
+The second-stage bootloader can refuse to start the program at all, with an E line of
+its own (BOOTLOADER_FAILED): on 3 Nov 2026 two boards with an XMC flash chip printed
+"XMC flash startup fail" and "failed when running XMC startup flow, reboot!" every few
+milliseconds for good. The judge puts such a start first, before any power or
+restart-loop advice, unless the program ran after the line (the bootloader can fall
+back to another copy). Those lines always reach the screen's "board's own words".
 """
 from __future__ import annotations
 
@@ -80,6 +87,30 @@ def _rule(tag: Optional[str], pattern: str, kind: ConsoleKind, *keys: str,
 
 
 _HIK_REASON = re.compile(r"^Poll retrying; reason=(\w+); stage=(\w+); http=(\d+)")
+
+# Second-stage bootloader tags (ESP-IDF 5.5.3 bootloader_support, bootloader_start.c).
+# The first set logs only in the bootloader; the shared ones also in the running program
+# (an OTA check of another copy), so their E lines count only after a ROM start line.
+_BOOTLOADER_TAGS = re.compile(r"^(?:boot|boot\.esp32s3|bootloader_flash|flash_parts|qio_mode|"
+                              r"flash_encrypt|bootloader_random)$")
+_SHARED_BOOT_TAGS = re.compile(r"^(?:boot_comm|esp_image|efuse|secure_boot\w*)$")
+_ROM_LINE = re.compile(r"^(?:ESP-ROM:|rst:0x)")
+# (what the line says, reason, fatal): a fatal line always ends in bootloader_reset(); after
+# the others the bootloader may still start another copy of the program.
+_BOOT_FAILURES: Sequence[Tuple[Pattern, str, bool]] = (
+    (re.compile(r"XMC flash startup fail|failed when running XMC startup flow|"
+                r"XMC chip detected .* while support disabled"), "xmc_flash", True),
+    (re.compile(r"load partition table error|Failed to verify partition table|"
+                r"partition \d+ invalid magic number"), "partition_table", True),
+    (re.compile(r"No bootable app partitions"), "no_app", True),
+    (re.compile(r"failed to load bootloader image header"), "bootloader_image", True),
+    (re.compile(r"is not bootable"), "no_app", False),
+    (re.compile(r"chip revision check failed|mismatch chip ID"), "chip_revision", False),
+    (re.compile(r"Image hash failed|invalid magic|invalid segment|Checksum failed"), "image",
+     False),
+    (re.compile(r"Secure Boot V2 verification failed|secure boot verification failed", re.I),
+     "secure_boot", False),
+)
 
 _RULES: Sequence[_Rule] = (
     # ROM and second-stage bootloader
@@ -182,6 +213,9 @@ class ConsoleParser:
         self._project: Optional[str] = None
         self._error_check: Optional[str] = None
         self._hotspot = hotspot_name(mac)
+        # Who prints now: "bootloader" after a ROM start line, "program" once a line of the
+        # running program came, None before either (the port opened halfway).
+        self._stage: Optional[str] = None
 
     def parse(self, line: str, at: float = 0.0) -> Optional[ConsoleEvent]:
         text = _ANSI.sub("", line).strip()
@@ -189,10 +223,14 @@ class ConsoleParser:
             return None
         raw = redact(text)
         tag = ""
+        level = ""
         message = text
         prefix = _IDF.match(text)
         if prefix:
-            tag, message = prefix.group(3).strip(), prefix.group(4).strip()
+            level, tag, message = prefix.group(1), prefix.group(3).strip(), prefix.group(4).strip()
+        event = self._bootloader(level, tag, message, raw, at)
+        if event is not None:
+            return event
         event = self._special(tag, message, raw, at)
         if event is not None:
             return event
@@ -211,6 +249,32 @@ class ConsoleParser:
                 data["ssid"] = self._hotspot
             return ConsoleEvent(rule.kind, raw, data, at)
         return ConsoleEvent(ConsoleKind.OTHER, raw, {}, at)
+
+    def _bootloader(self, level: str, tag: str, message: str, raw: str,
+                    at: float) -> Optional[ConsoleEvent]:
+        """A second-stage bootloader error (BOOTLOADER_FAILED), following who prints now."""
+        if _ROM_LINE.match(message) or (tag == "boot" and "2nd stage bootloader" in message):
+            self._stage = "bootloader"
+            return None
+        if not tag:
+            return None
+        if _BOOTLOADER_TAGS.match(tag):
+            self._stage = "bootloader"
+        elif not _SHARED_BOOT_TAGS.match(tag):
+            self._stage = "program"
+            return None
+        if tag == "bootloader_flash" and "XM25QHxxC startup flow" in message:
+            # The bootloader runs the XMC startup flow; whether it worked comes next.
+            return ConsoleEvent(ConsoleKind.OTHER, raw, {"signal": "xmc_flow"}, at)
+        if level != "E" or self._stage != "bootloader":
+            return None
+        reason, fatal = "other", False
+        for pattern, name, always in _BOOT_FAILURES:
+            if pattern.search(message):
+                reason, fatal = name, always
+                break
+        return ConsoleEvent(ConsoleKind.BOOTLOADER_FAILED, raw,
+                            {"reason": reason, "fatal": "1" if fatal else "0"}, at)
 
     def _special(self, tag: str, message: str, raw: str, at: float) -> Optional[ConsoleEvent]:
         if tag == "app_init":
@@ -304,6 +368,7 @@ def _is_busy(error: Exception) -> bool:
 # -------------------------------------------------------------- console log
 
 _LINE_MAX = 1000           # characters kept of one console line
+_ERROR_LINE = re.compile(r"^E \(\d+\) ")
 _FRAME_SLACK = 16 * 1024   # room past the cap for the heading and result of later starts
 _SAFE_NAME = re.compile(r"[^A-Za-z0-9._-]+")
 
@@ -438,6 +503,7 @@ class _Watch:
     resets: int = 0
     reset_times: Tuple[float, ...] = ()
     port_busy: bool = False
+    last_error: Optional[str] = None  # the newest E line the board printed, redacted
 
 
 class BootWatcher:
@@ -650,6 +716,8 @@ class BootWatcher:
         event = parser.parse(line, self._clock.monotonic() - watch.started)
         if event is None:
             return None
+        if _ERROR_LINE.match(event.raw) or event.kind is ConsoleKind.BOOTLOADER_FAILED:
+            watch.last_error = event.raw
         if event.kind is ConsoleKind.OTHER and not event.data:
             watch.other_lines += 1
             if watch.other_lines > self.MAX_OTHER_EVENTS:
@@ -726,6 +794,91 @@ def _after_start(event: ConsoleEvent) -> bool:
     return event.kind in _AFTER_START
 
 
+def _shows_progress(event: ConsoleEvent) -> bool:
+    """A line that shows the start went on past the bootloader's checks."""
+    if event.kind is ConsoleKind.BOOT_BANNER:
+        # "Loaded app from partition" (the bootloader found a copy) or "Calling app_main()".
+        return "offset" in event.data or event.data.get("app_main") == "1"
+    return event.kind not in (ConsoleKind.BOOTLOADER_FAILED, ConsoleKind.PANIC,
+                              ConsoleKind.OTHER) or _after_start(event)
+
+
+def _is_rom_start(event: ConsoleEvent) -> bool:
+    return event.kind is ConsoleKind.BOOT_BANNER and bool(
+        event.data.get("rom") or event.data.get("reset_reason"))
+
+
+def startup_refusal(events: Sequence[ConsoleEvent], final: bool = True
+                    ) -> Optional[ConsoleEvent]:
+    """The bootloader line that stopped the board's start, or None (module notes).
+
+    Each start begins at a ROM start line. A start counts as refused when it has a
+    bootloader error and nothing after that error shows the start going on, and either
+    the error always ends the start (fatal), the board started again after it, or the
+    watch is over (``final``). A later start that went on clears it. The XMC line is
+    preferred; otherwise the first error of that start, the cause the others follow.
+
+    While the watch runs (not ``final``) one refused start is not enough: the bootloader
+    resets itself after an error, so a one-off fault (a glitchy plug-in) is followed by a
+    good start. Only two refused starts in a row, the newest ones, count then; the real
+    XMC loop repeats every ~0.1 s, so it is still caught at once.
+    """
+    starts: List[List[ConsoleEvent]] = [[]]
+    for event in events:
+        if _is_rom_start(event) and starts[-1]:
+            starts.append([])
+        starts[-1].append(event)
+    found: Optional[ConsoleEvent] = None
+    # Per start: its refusing line, None when it went on, OPEN when it says neither yet.
+    verdicts: List[object] = []
+    for index, start in enumerate(starts):
+        refusals = [position for position, event in enumerate(start)
+                    if event.kind is ConsoleKind.BOOTLOADER_FAILED]
+        if not refusals:
+            if any(_shows_progress(event) for event in start):
+                found = None
+                verdicts.append(None)
+            else:
+                verdicts.append(_OPEN)
+            continue
+        if any(_shows_progress(event) for event in start[refusals[-1] + 1:]):
+            found = None
+            verdicts.append(None)
+            continue
+        errors = [start[position] for position in refusals]
+        fatal = any(event.data.get("fatal") == "1" for event in errors)
+        if fatal or final or index < len(starts) - 1:
+            found = next((event for event in errors if event.data.get("reason") == "xmc_flash"),
+                         errors[0])
+            verdicts.append(found)
+        else:
+            verdicts.append(_OPEN)
+    if final:
+        return found
+    # Starts that say neither way (the ROM prints two start lines per restart) are skipped;
+    # only a start that went on breaks the run.
+    in_a_row = 0
+    for verdict in reversed(verdicts):
+        if verdict is None:
+            break
+        if verdict is not _OPEN:
+            in_a_row += 1
+    return found if in_a_row >= 2 else None
+
+
+_OPEN = object()  # startup_refusal: a start that has not shown either way yet
+
+
+REFUSAL_QUOTE_MAX = 160  # characters of the board's line quoted in the advice
+
+
+def refusal_advice(event: ConsoleEvent) -> Advice:
+    """What to say about a start the bootloader refused (startup_refusal)."""
+    if event.data.get("reason") == "xmc_flash":
+        return texts.flash_chip_unsupported(at_start=True)
+    return texts.startup_refused(event.raw[:REFUSAL_QUOTE_MAX])
+
+
 def crashes(events: Sequence[ConsoleEvent]) -> List[ConsoleEvent]:
     """Lines that show the board crashed: Guru Meditation, abort, a failed error check."""
     return [event for event in events
@@ -742,6 +895,32 @@ def restarts_seen(events: Sequence[ConsoleEvent], port_reopens: int = 0) -> int:
     resets = sum(1 for event in events if event.kind is ConsoleKind.BOOT_BANNER
                  and event.data.get("reset_reason") not in (None, "", "POWERON"))
     return max(port_reopens, rebooting, resets)
+
+
+# Lines only our program prints: once one is seen, a crash is the program's, not the board's.
+_PROGRAM_KINDS = frozenset({
+    ConsoleKind.APP_STARTED, ConsoleKind.PROVISIONING_LOADED, ConsoleKind.NVS_KEY_DANGER,
+    ConsoleKind.NVS_FAILED, ConsoleKind.SETTINGS_MISSING, ConsoleKind.FAMILY_MISMATCH,
+}) | _AFTER_START
+
+
+def crash_advice(events: Sequence[ConsoleEvent]) -> Advice:
+    """CRASH_LOOP once our program has run in this watch; STARTUP_CRASH, a faulty board,
+    when the starts reached ESP-IDF's own start-up and crashed before our program
+    (texts.STARTUP_CRASH).
+
+    A crash loop prints every start again, so a program that crashes later still shows
+    its app_main line from the next start. Without any line of the start (the port
+    opened late) it stays CRASH_LOOP: nothing shows where the board crashed.
+    """
+    if any((event.kind is ConsoleKind.BOOT_BANNER and event.data.get("app_main") == "1")
+           or event.kind in _PROGRAM_KINDS or _after_start(event) for event in events):
+        return texts.CRASH_LOOP
+    reached_startup = any(
+        (event.kind is ConsoleKind.BOOT_BANNER and "offset" in event.data)
+        or event.kind in (ConsoleKind.PSRAM_OK, ConsoleKind.PSRAM_FAILED, ConsoleKind.APP_VERSION)
+        for event in events)
+    return texts.STARTUP_CRASH if reached_startup else texts.CRASH_LOOP
 
 
 def crash_loop(events: Sequence[ConsoleEvent], port_reopens: int = 0) -> bool:
@@ -781,9 +960,14 @@ def judge(watch: _Watch, expect: InstallConfig, now: float, timeout_s: float, *,
     device_seen = started.data.get("device_id") if started else None
     version_seen = version.data.get("version") if version else None
 
-    def report(outcome: BootOutcome, advice: Optional[Advice]) -> BootReport:
+    def report(outcome: BootOutcome, advice: Optional[Advice],
+               said: Optional[ConsoleEvent] = None) -> BootReport:
+        # board_said: the line that decided a failed start, else the newest E line.
+        line = said.raw if said is not None else (
+            None if outcome is BootOutcome.OK else watch.last_error)
         return BootReport(outcome, zone_id_seen=zone_seen, device_id_seen=device_seen,
-                          app_version_seen=version_seen, events=tuple(events), advice=advice)
+                          app_version_seen=version_seen, events=tuple(events), advice=advice,
+                          board_said=line)
 
     def changed_since_first(zone: Optional[str], device: Optional[str]) -> bool:
         """At the restart check: other settings than the first start showed for this setup.
@@ -799,34 +983,47 @@ def judge(watch: _Watch, expect: InstallConfig, now: float, timeout_s: float, *,
                     and not _same(device, first.device_id_seen)))
 
     kinds = {event.kind for event in events}
+    # The bootloader refused to start the program: first, before any power or restart-loop
+    # advice, which would send the person after cables (3 Nov 2026, the XMC boards).
+    refused = startup_refusal(events, final=final or now - watch.started >= timeout_s)
+    if refused is not None:
+        return report(BootOutcome.STARTUP_REFUSED, refusal_advice(refused), refused)
     if ConsoleKind.NVS_KEY_DANGER in kinds:
-        return report(BootOutcome.SECURITY_KEY_PROBLEM, texts.SECURITY_KEY_LOST)
+        return report(BootOutcome.SECURITY_KEY_PROBLEM, texts.SECURITY_KEY_LOST,
+                      _first(events, ConsoleKind.NVS_KEY_DANGER))
     if ConsoleKind.FAMILY_MISMATCH in kinds:
-        return report(BootOutcome.FAMILY_MISMATCH, texts.FAMILY_MISMATCH_LOOP)
+        return report(BootOutcome.FAMILY_MISMATCH, texts.FAMILY_MISMATCH_LOOP,
+                      _first(events, ConsoleKind.FAMILY_MISMATCH))
     if kinds & {ConsoleKind.NVS_FAILED, ConsoleKind.SETTINGS_MISSING}:
+        line = next(event for event in events
+                    if event.kind in (ConsoleKind.NVS_FAILED, ConsoleKind.SETTINGS_MISSING))
         if restart:
             # It read them at the first start (the 2 Nov 2026 boards): writing them again
             # would last only until the next restart.
-            return report(BootOutcome.SETTINGS_LOST, texts.settings_lost_on_restart(board_id))
-        return report(BootOutcome.SECURITY_KEY_PROBLEM, texts.SETTINGS_UNREADABLE)
+            return report(BootOutcome.SETTINGS_LOST, texts.settings_lost_on_restart(board_id),
+                          line)
+        return report(BootOutcome.SECURITY_KEY_PROBLEM, texts.SETTINGS_UNREADABLE, line)
     if ConsoleKind.PSRAM_FAILED in kinds:
-        return report(BootOutcome.FAULTY_RESTART_LOOP, texts.PSRAM_FAILED)
+        return report(BootOutcome.FAULTY_RESTART_LOOP, texts.PSRAM_FAILED,
+                      _first(events, ConsoleKind.PSRAM_FAILED))
 
     expected = f"zone {expect.zone_id}, device {expect.device_id}"
     if loaded and not _same(loaded.data.get("zone_id"), expect.zone_id):
         if changed_since_first(loaded.data.get("zone_id"), None):
             return report(BootOutcome.SETTINGS_LOST,
-                          texts.settings_lost_on_restart(board_id, changed=True))
+                          texts.settings_lost_on_restart(board_id, changed=True), loaded)
         return report(BootOutcome.WRONG_SETTINGS, texts.wrong_settings(
-            f"zone {loaded.data.get('zone_id')}", expected))
+            f"zone {loaded.data.get('zone_id')}", expected), loaded)
 
     # Restarts come from the console as well as from port reopens: a crash keeps the
     # port open (see the module notes).
-    brownout = any(_panic(event) == "brownout" for event in events)
+    brownout = next((event for event in events if _panic(event) == "brownout"), None)
     if brownout and restarts_seen(events, watch.resets) >= 1:
-        return report(BootOutcome.FAULTY_RESTART_LOOP, texts.POWER_PROBLEM)
+        return report(BootOutcome.FAULTY_RESTART_LOOP, texts.POWER_PROBLEM, brownout)
     if crash_loop(events, watch.resets):
-        return report(BootOutcome.FAULTY_RESTART_LOOP, texts.CRASH_LOOP)
+        crashed = crashes(events)
+        return report(BootOutcome.FAULTY_RESTART_LOOP, crash_advice(events),
+                      crashed[0] if crashed else None)
 
     # The start line can be printed before the app has the port open after the replug,
     # and then it is lost (module notes). A later line of the program shows the start as
@@ -839,12 +1036,13 @@ def judge(watch: _Watch, expect: InstallConfig, now: float, timeout_s: float, *,
                             and _same(started.data.get("device_id"), expect.device_id)):
             if changed_since_first(started.data.get("zone_id"), started.data.get("device_id")):
                 return report(BootOutcome.SETTINGS_LOST,
-                              texts.settings_lost_on_restart(board_id, changed=True))
+                              texts.settings_lost_on_restart(board_id, changed=True), started)
             return report(BootOutcome.WRONG_SETTINGS, texts.wrong_settings(
                 f"zone {started.data.get('zone_id')}, device {started.data.get('device_id')}",
-                expected))
+                expected), started)
         if ConsoleKind.STORAGE_FAILED in kinds:
-            return report(BootOutcome.STORAGE_PROBLEM, texts.STORAGE_PROBLEM)
+            return report(BootOutcome.STORAGE_PROBLEM, texts.STORAGE_PROBLEM,
+                          _first(events, ConsoleKind.STORAGE_FAILED))
         # A board that went down after it started is never a good start: watch on, and
         # say what happened when the time is up. A watchdog warning alone is no crash.
         # Without the start line its time is unknown, so then any crash seen counts.
@@ -874,7 +1072,7 @@ def judge(watch: _Watch, expect: InstallConfig, now: float, timeout_s: float, *,
         period = _restart_period(watch.reset_times)
         if watch.resets >= 2 and period is not None:
             if any(event.kind is ConsoleKind.PANIC for event in events):
-                return report(BootOutcome.FAULTY_RESTART_LOOP, texts.CRASH_LOOP)
+                return report(BootOutcome.FAULTY_RESTART_LOOP, crash_advice(events))
             meaningful = [event for event in events if event.kind is not ConsoleKind.BOOT_BANNER]
             if not meaningful and 6.0 <= period <= 16.0:
                 return report(BootOutcome.FAULTY_RESTART_LOOP, texts.restart_loop_faulty(period))
@@ -886,9 +1084,11 @@ def judge(watch: _Watch, expect: InstallConfig, now: float, timeout_s: float, *,
         return None
     # Time is up. A board that crashed is not "silent", even if it crashed only once.
     if brownout:
-        return report(BootOutcome.FAULTY_RESTART_LOOP, texts.POWER_PROBLEM)
+        return report(BootOutcome.FAULTY_RESTART_LOOP, texts.POWER_PROBLEM, brownout)
     if crashes(events) or any(_panic(event) == "rebooting" for event in events):
-        return report(BootOutcome.FAULTY_RESTART_LOOP, texts.CRASH_LOOP)
+        crashed = crashes(events)
+        return report(BootOutcome.FAULTY_RESTART_LOOP, crash_advice(events),
+                      crashed[0] if crashed else None)
     if any(event.data.get("download_mode") == "1" for event in events):
         return report(BootOutcome.NO_OUTPUT, texts.DOWNLOAD_MODE_STUCK)
     if watch.port_busy and all(event.data.get("signal") == "port_busy" for event in events):

@@ -38,6 +38,7 @@ from .api import (STEP_LABELS, Advice, BoardInfo, BootOutcome, BootReport, Cance
                   ConsoleEvent, Family, HikSettings, InstallConfig, InstallerError, InstallMode,
                   PhaseFn, PresenceReport, PresenceState, ReplugPhase, SecurityState, Services,
                   StepProgress, UsbKind, ZktSettings, steps_for)
+from .board import hardware_advice, revision_words
 from .esptool_runner import TOOL_VERSION, SubprocessRunner, tool_version_problems
 from .factory import make_services
 from .installer import report_boot, report_restart
@@ -65,7 +66,10 @@ def _print_board(board: BoardInfo) -> None:
     print(f"Port:            {board.port}")
     print(f"Chip:            {board.chip}")
     print(f"Flash / PSRAM:   {board.flash_size_mb} MB / {board.psram_mb} MB")
-    print(f"Hardware:        {board.hardware.value}")
+    print(f"Flash chip ID:   {board.flash_id or '-'}   chip revision: "
+          f"{revision_words(board.chip_revision)}")
+    detail = f" ({board.hardware_detail})" if board.hardware_detail else ""
+    print(f"Hardware:        {board.hardware.value}{detail}")
     print(f"Security:        {board.security.value}")
     print(f"Download mode:   {'secure' if board.secure_download_mode else 'normal'}")
     print(f"Hotspot:         {hotspot_name(board.mac)}")
@@ -198,8 +202,11 @@ def cmd_install(services: Services, args: argparse.Namespace) -> int:
     board = services.boards.inspect(report.board, CancelToken())
     _print_board(board)
     mode = _MODES.get(board.security)
-    if mode is None:
-        _print_advice(services.diagnosis.diagnose(board, report, None, ()))
+    refusal = hardware_advice(board)
+    if mode is None or (refusal is not None and mode is not InstallMode.CHANGE_SETTINGS):
+        # The board check's own refusal first: the install would stop on it anyway.
+        _print_advice([refusal] if refusal is not None and mode is not None
+                      else services.diagnosis.diagnose(board, report, None, ()))
         return 2
     config = _install_config(services, args)
     device = services.server.device(board.mac)

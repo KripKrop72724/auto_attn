@@ -1,14 +1,21 @@
 # State Life Device Installer
 
-The State Life Device Installer is a Windows app for staff at the sites. It
-prepares a new board for a ZKTeco or Hikvision attendance machine, checks a
-board that is not working, and says plainly what to press, unplug or plug back
-in. The approved design is in [esp-installer-design.md](esp-installer-design.md).
+The State Life Device Installer is a Windows and Mac app for staff at the
+sites. It prepares a new board for a ZKTeco or Hikvision attendance machine,
+checks a board that is not working, and says plainly what to press, unplug or
+plug back in. The approved design is in
+[esp-installer-design.md](esp-installer-design.md).
 
 Parts 1 to 3 are for the people who use the app. Parts 4 and 5 are for head
 office and developers.
 
 ## 1. Install the app
+
+There is a Windows app and a Mac app. Both work the same way. Head office
+gives you the file, or you download it in the dashboard: open **Prepare an
+ESP32** and download the app for Windows or for Mac.
+
+### On Windows
 
 You need:
 
@@ -20,7 +27,9 @@ You need:
 
 You do not need an administrator password. The app installs only for you.
 
-1. Copy the Setup file onto the computer. It can come by WhatsApp, by email or
+1. Get the Setup file. In the dashboard, open **Firmware**, then **Prepare an
+   ESP32**, and click **Download for Windows** on the "State Life Device
+   Installer" card. It can also come from head office by WhatsApp, by email or
    on a USB stick. Put it in your **Downloads** folder.
 2. Double-click the Setup file.
 3. Windows may show a blue box that says **"Windows protected your PC"**.
@@ -45,9 +54,58 @@ Find **State Life Device Installer** and click **Uninstall**. The app asks if
 you also want to delete the saved install records and logs. Choose **No**,
 unless head office tells you otherwise.
 
+### On a Mac
+
+You need:
+
+- a Mac with an Apple chip (M1 or newer). To check, click the Apple menu,
+  then **About This Mac**. It must say **Chip Apple M...**. A Mac with an
+  Intel processor cannot run the app;
+- macOS 12 (Monterey) or newer;
+- internet on that Mac;
+- the file from head office or the dashboard, called
+  `StateLife-Device-Installer-<version>-macOS-arm64.dmg`;
+- your ADD username and password (the same ones you use for the dashboard).
+
+1. Double-click the `.dmg` file in your **Downloads** folder. A window opens.
+   It shows the app and a folder called **Applications**.
+2. Drag **State Life Device Installer** onto **Applications**.
+3. Close the window. In the Finder sidebar, click the eject button next to
+   **State Life Device Installer**.
+4. Open your **Applications** folder and double-click
+   **State Life Device Installer**.
+5. The Mac says the app was **not opened**, or that Apple **cannot check it**
+   for malicious software. This is normal for this app. It appears because the
+   app does not have a paid Apple certificate. Click **Done** (or **OK**).
+   Do not click **Move to Bin** (or **Move to Trash**).
+6. Click the Apple menu, then **System Settings**, then
+   **Privacy & Security**. Scroll down to **Security**. It says that
+   **State Life Device Installer** was blocked. Click **Open Anyway**.
+   On macOS 12, click the Apple menu, then **System Preferences**, then
+   **Security & Privacy**, then **General**, then **Open Anyway**.
+7. Type your Mac password if the Mac asks for it. Then click **Open Anyway**
+   (or **Open**) once more. The app opens.
+
+You only do steps 5 to 7 once. After that, open the app from **Applications**
+or **Launchpad**.
+
+Most Macs only have the small, oval USB-C sockets. If the board's cable does
+not fit, use a USB-C cable or a USB-C adapter.
+
+**A new version:** quit the app first (click **State Life Device Installer**
+in the menu bar, then **Quit**). Then do steps 1 to 7 again. When the Mac asks,
+choose **Replace**.
+
+**Removing the app:** quit the app. Drag **State Life Device Installer** from
+**Applications** to the **Bin** (or **Trash**). The saved install records and logs stay on
+the Mac, in your user folder under
+`Library/Application Support/StateLife/DeviceInstaller`. Do not delete them,
+unless head office tells you to.
+
 ## 2. Use the app
 
-1. Open **State Life Device Installer** from the desktop or the Start menu.
+1. Open **State Life Device Installer** from the desktop or the Start menu
+   (on a Mac: from **Applications** or **Launchpad**).
 2. Sign in with your ADD username and password.
 3. Choose **Set up a new board**, or **Check or fix a board**.
 4. Choose the attendance machine: **ZKTeco** or **Hikvision**.
@@ -79,14 +137,21 @@ unless head office tells you otherwise.
 
 Press **Help** on any screen to see pictures of what to do.
 
-Keep the computer plugged in to power if you can. The app stops it from going
-to sleep while it sets up a board and while it watches the board start.
+Keep the computer plugged in to power if you can. On Windows, the app stops it
+from going to sleep while it sets up a board and while it watches the board
+start. On a Mac, keep it plugged in and keep the lid open until the app says
+**The board is ready**.
 
 ## 3. If something goes wrong
 
 | What you see | What to do |
 |---|---|
 | "Windows protected your PC" and no **Run anyway** button | Click **More info** first. If there is still no button, this computer blocks new apps. Ask head office for help. |
+| On a Mac: the app was "not opened", or Apple "cannot check it" | Click **Done**, then use **Open Anyway** in **Privacy & Security** (part 1, "On a Mac", steps 5 to 7). |
+| On a Mac: there is no **Open Anyway** button | Open the app once more from **Applications** and click **Done**. The button appears for about an hour after that. If it still does not appear, this Mac blocks new apps. Ask head office for help. |
+| On a Mac: the app "is damaged and can't be opened" | Delete the `.dmg` file and download it again from the dashboard. If it happens again, ask head office. |
+| On a Mac: "not supported on this type of Mac" | This Mac has an Intel processor. The app needs a Mac with an Apple chip. Use another Mac or a Windows computer. |
+| On a Mac: "You can't use this version of the application with this version of macOS" | The app needs macOS 12 or newer. Update the Mac first, in **System Settings**, then **General**, then **Software Update**. |
 | Your antivirus removes or blocks the Setup file | Ask your IT person to allow it. Head office can check the file with `SHA256SUMS.txt`. |
 | The app says there is no internet | Check the network cable or Wi-Fi. Open any website to test. The app checks again by itself. |
 | The app cannot reach head office | Wait a few minutes and try again. If it goes on, call head office. |
@@ -96,6 +161,9 @@ to sleep while it sets up a board and while it watches the board start.
 | "Put the board into setup mode" on the **Connect the board** screen | The board is running other software. This is normal for a new board. Hold down the **BOOT** button. While you hold it, press and release **RST**. Let go of **BOOT**. When the screen says **Board found**, click **Next**. If the message is still there after 5 seconds, unplug the board, hold down **BOOT** while you plug it back into the socket marked **USB**, then let go of **BOOT**. If it is still there after 3 tries, click **Help**, then **Save a help file**, and send the file to head office. |
 | "Connect only one board" | Unplug every other board. |
 | "This computer cannot read the board ID" | This computer, or the USB socket or hub, does not tell the app which board it is, so the app will not write to the board there. Plug the cable straight into another USB socket on the computer, not into a hub. Then click **Try again** (on **Check or fix a board**: **Check again**). If that does not help, use another computer. |
+| "This board's memory chip cannot run our software" | The board's memory (flash) chip is one our software cannot start, for example the XMC chip with ID 20 70 18. The board is not broken, but it cannot be used. Put it aside and use another board. Tell the seller the chip ID the screen shows. |
+| "This board type is not supported yet" | The board is not the ESP32-S3 N16R8 type (16 MB memory, 8 MB extra memory of type AP_3v3). Use another board. |
+| "The board's start-up program stopped" | The board printed an error before our software could start; the screen shows the line. Do not use the board. Click **Help**, then **Save a help file**, and send the file to head office. |
 | "The board keeps restarting" | Usually the cable or the USB socket does not give enough power. Use a short cable straight into the computer, not a hub, or another USB socket. Then click **Check again** (or **Try again** after the first start). |
 | "This board is faulty" | Put a FAULTY label on it, keep it aside and tell head office. |
 | The app cannot start the board's setup mode | Hold down the **BOOT** button. While you hold it, press and release **RST**. Let go of **BOOT**. Click **Try again**. |
@@ -105,7 +173,7 @@ to sleep while it sets up a board and while it watches the board start.
 | "The board lost its settings" | It lost them when it restarted, or it came back with other settings. Do not use the board; if it came from a site, do not put it back. Unplug it, put a label on it that says DO NOT USE with its board ID (the screen shows it), and keep it aside; do not throw it away. Click **Help**, then **Save a help file**, at once (before you set up another board), and send the file to head office. |
 | "The app did not see the board read its settings" | Click **Try again**. When the screen asks, unplug the board, wait 3 seconds and plug it back in without pressing any button. If it happens again, do not install the board: put it aside, click **Help**, then **Save a help file**, and send the file to head office. |
 | "This app cannot change this board's settings" | The board was locked in an older way. Leave it as it is and call head office with the board ID. |
-| "The app is already open" | Only one window of the app can run. Use the window that is open; look for its icon on the taskbar. |
+| "The app is already open" | Only one window of the app can run. Use the window that is open; look for its icon on the taskbar (on a Mac, in the Dock). |
 | Setup or the uninstaller says the app is running | Close the app. If it is setting up a board, wait until it has finished. Then click **OK**. |
 | "Please wait a moment" | Head office is busy. Wait as many minutes as the screen says, then click **Try again**. |
 | Anything else | Click **Help**, then **Save a help file**. Send the file to head office. It contains no passwords. |
@@ -130,16 +198,46 @@ to sleep while it sets up a board and while it watches the board start.
      -f confirmation="BUILD INSTALLER RELEASE"
    ```
 
-   Any other branch or confirmation skips the job. Approve the
-   `firmware-signing` environment if GitHub asks.
-4. The job runs on a clean `windows-2022` machine. It installs the
-   hash-locked packages, runs the app tests, builds the app with the secrets,
-   then installs the Setup silently, runs `--tool esptool version`,
-   `--self-test` and `--screenshots`, uninstalls it and checks that it is gone.
+   Any other branch or confirmation skips the jobs. Approve the
+   `firmware-signing` environment if GitHub asks: the two build jobs and the
+   publish run (step 5) each use it. This run publishes nothing.
+4. Two build jobs run side by side:
+   - **release** on a clean `windows-2022` machine. It installs the
+     hash-locked packages, runs the app tests, builds the app with the
+     secrets, then installs the Setup silently, runs `--tool esptool version`,
+     `--self-test` and `--screenshots`, uninstalls it and checks that it is
+     gone.
+   - **macos-release** on a clean `macos-14` machine (Apple Silicon). It
+     installs the same locks, runs the app tests, builds the Mac app with the
+     same secrets and makes the disk image. Then `packaging/smoke_test_macos.sh`
+     opens the image read-only, checks the app's signature, Info.plist and
+     Apple Silicon code, runs `--tool esptool version`, `--tool espefuse`,
+     `--self-test` and `--screenshots` without a screen, copies the app the
+     way a drag to Applications does, and checks the copy.
+5. Download both builds from that run and test them on real boards (a new ZKT
+   board, a new Hikvision board, and a board the check must refuse), and check
+   the restart check on Windows (below). Only then publish them, with a second
+   run that names the tested build run:
 
-Pull requests that touch `apps/esp_installer/**` run the same steps without
-any secrets. They make a **TEST** Setup (`...-Setup-<version>-TEST.exe`) and
-the app shows a **TEST BUILD** banner. Never give a TEST Setup to the sites.
+   ```sh
+   gh workflow run esp-installer-release.yml --ref main \
+     -f confirmation="PUBLISH INSTALLER APP" -f release_run_id=<build run ID>
+   ```
+
+   **publish** runs on the ADD server's own runner (`[self-hosted, Windows,
+   X64]`, `firmware-signing` again). It checks that the named run is a
+   successful dispatch of this workflow on `main`, downloads that run's two
+   builds (it never rebuilds, so ADD offers exactly the tested files) and runs
+   `deploy/add/publish-installer-app.ps1`, which checks each file against its
+   build's `SHA256SUMS.txt` and puts both into ADD's installer app store
+   (below). ADD then offers them on the **Prepare an ESP32** page. The run's
+   summary names the published version.
+
+Pull requests that touch `apps/esp_installer/**` run the same build and smoke
+steps without any secrets, and publish nothing. They make a **TEST** Setup
+(`...-Setup-<version>-TEST.exe`) and a **TEST** disk image
+(`...-<version>-macOS-arm64-TEST.dmg`), and the app shows a **TEST BUILD**
+banner. Never give a TEST build to the sites.
 
 ### Check the restart check on Windows before the first share
 
@@ -166,35 +264,95 @@ If that laptop keeps saying "The app did not see the board read its settings",
 do not share the Setup. Ask the owner whether a later line of the board's
 program may count at the restart check.
 
-### Where the Setup appears
+### Where the builds appear
 
-The run page lists the artifact `StateLife-Device-Installer-Setup-<version>`.
-It holds the Setup `.exe`, `SHA256SUMS.txt` and the screenshots, and is kept
-for 30 days. To download it from a terminal:
+The run page lists two artifacts, kept for 30 days:
+
+- `StateLife-Device-Installer-Setup-<version>`: the Setup `.exe`,
+  `SHA256SUMS.txt` and the screenshots;
+- `StateLife-Device-Installer-<version>-macOS-arm64`: the disk image `.dmg`,
+  `SHA256SUMS.txt` and the Mac screenshots.
+
+Inside each, the files keep the build's folders (`apps/esp_installer/dist`
+and `smoke/screenshots`). To download them from a terminal:
 
 ```sh
 gh run list --workflow esp-installer-release.yml --limit 5
 gh run download <run-id> --name StateLife-Device-Installer-Setup-<version>
+gh run download <run-id> --name StateLife-Device-Installer-<version>-macOS-arm64
 ```
 
-The smoke-test logs are in `esp-installer-smoke-logs-<commit>`.
+The smoke-test logs are in `esp-installer-smoke-logs-<commit>` (Windows) and
+`esp-installer-macos-smoke-logs-<commit>` (Mac).
+
+### ADD's installer app store
+
+The **Prepare an ESP32** page offers the newest published version for each
+platform from a store on the ADD host:
+
+- **Host directory:** `ADD_INSTALLER_APP_STORE_HOST_PATH`. When it is unset,
+  `C:\Users\Public\Documents\StateLife\AttendanceDeviceDashboard\installer-apps`.
+  Two environments read the variable: the publish job in `firmware-signing`
+  and ADD's deploy in `add-production`. Set it as a repository variable, or
+  to the same path in both, so that ADD reads the directory the apps are
+  written to.
+- **Mount:** read-only into add-api at `/installer-apps`.
+- **Layout:** `<store>\<version>\manifest.json` and the two files it lists.
+  `manifest.json` is UTF-8 without a byte-order mark:
+
+  ```json
+  {"schema": 1, "product": "state-life-device-installer", "version": "1.1.0",
+   "git_sha": "<40 hex>", "published_at": "2026-11-04T09:05:19Z", "files": [
+    {"platform": "windows", "arch": "x64", "kind": "setup",
+     "filename": "StateLife-Device-Installer-Setup-1.1.0.exe", "size": <bytes>, "sha256": "<64 hex>"},
+    {"platform": "macos", "arch": "arm64", "kind": "dmg",
+     "filename": "StateLife-Device-Installer-1.1.0-macOS-arm64.dmg", "size": <bytes>, "sha256": "<64 hex>"}]}
+  ```
+
+`publish-installer-app.ps1` publishes only the release files of exactly the
+version both builds carry, and only when each matches its `SHA256SUMS.txt`. It
+copies them into `<store>\.staging`, writes the manifest last, checks every
+file again and then renames the folder to `<store>\<version>` in one step, so
+ADD never sees half a version. It then checks the published files once more.
+
+- A published version is never rewritten. Publishing the same files again
+  (for example, re-running the publish job) changes nothing. Another build of
+  the same version is refused: raise `__version__` and build again.
+- Older versions and everything else in the store stay as they are.
+- To withdraw a version, move its folder out of the store.
+
+To publish by hand on the ADD host, from a checkout, with both downloaded
+artifacts:
+
+```powershell
+.\deploy\add\publish-installer-app.ps1 `
+  -WindowsDirectory <Windows artifact>\apps\esp_installer\dist `
+  -MacDirectory <Mac artifact>\apps\esp_installer\dist `
+  -Version <version> -GitSha <the 40-hex commit both builds came from>
+```
 
 ### Share it
 
-- **WhatsApp:** send the `.exe` as a **Document**, not as a photo or video.
-- **Email:** Gmail and many other mail systems block `.exe` files, even
-  inside a `.zip`. Send a shared-folder link instead.
-- **USB stick:** copy the `.exe` onto it.
-- Tell the sites to expect the "Windows protected your PC" screen (part 1).
+- **The dashboard:** once published, anyone with an ADD sign-in downloads the
+  right file from **Prepare an ESP32**.
+- **WhatsApp:** send the `.exe` or `.dmg` as a **Document**, not as a photo or
+  video.
+- **Email:** Gmail and many other mail systems block `.exe` and `.dmg` files,
+  even inside a `.zip`. Send a shared-folder link instead.
+- **USB stick:** copy the file onto it.
+- Tell the sites to expect the "Windows protected your PC" screen, or on a
+  Mac the **Open Anyway** step (part 1).
 - To prove a copy is unchanged, compare its SHA-256 with `SHA256SUMS.txt`:
   `Get-FileHash .\StateLife-Device-Installer-Setup-<version>.exe` in
-  PowerShell, or `certutil -hashfile <file> SHA256`.
+  PowerShell, `certutil -hashfile <file> SHA256`, or on a Mac
+  `shasum -a 256 <file>` in Terminal.
 
 ### Update the field defaults secret
 
 The defaults that look secret (Wi-Fi password, comm key, hotspot password)
 never go into git. A release build reads them from the environment and bakes
-them into the app. To change one, update the secret, then build a new release.
+them into the app; the Windows and the Mac build read the same secrets. To
+change one, update the secret, then build a new release.
 
 `ESP_INSTALLER_FIELD_DEFAULTS_JSON` is one JSON object with exactly these keys:
 
@@ -253,6 +411,7 @@ apps/esp_installer/
     launcher.py               PyInstaller entry script
     installer.iss             Inno Setup 6 script
     smoke_test.ps1            install, check and uninstall a built Setup (Windows PowerShell 5.1)
+    smoke_test_macos.sh       open a built disk image, check the app and a copy of it (macOS)
     update_locks.py           regenerates both locks
     notices.py                writes THIRD-PARTY-NOTICES.txt from the installed packages
     licenses/                 licence texts that some packages do not ship
@@ -337,7 +496,7 @@ docker run --rm -v "$PWD":/w -w /w/apps/esp_installer -e PYTHONPATH=src \
 
 | Command | What it does |
 |---|---|
-| `State Life Device Installer.exe` | the app |
+| `State Life Device Installer.exe` (Mac: `State Life Device Installer.app/Contents/MacOS/State Life Device Installer`) | the app |
 | `... --tool esptool ARGS` / `--tool espefuse ARGS` | runs the bundled tool and exits with its code. The engine starts the frozen app like this where a source checkout runs `python -m esptool`. Output is UTF-8. |
 | `... --self-test` | runs `sl_installer.core.selftest.run()`, opens and closes the window on fake services, then builds the real services and a window on them without starting it (nothing is contacted); prints `PROBLEM:` lines and exits 0 or 1 |
 | `... --screenshots DIR` | saves every screen as PNG files in `DIR` |
@@ -354,13 +513,22 @@ docker run --rm -v "$PWD":/w -w /w/apps/esp_installer -e PYTHONPATH=src \
    `--release` refuses to build without the secrets;
 2. makes `app.ico` (16-256 px) and the Inno Setup pictures (100-250 % scale)
    from `apps/add_frontend/public/state-life-logo.png` into `build/branding`;
-3. writes the version resource and `THIRD-PARTY-NOTICES.txt`;
+   on macOS also `app.icns` (16-1024 px: the logo on a white rounded square);
+3. writes the version resource and `THIRD-PARTY-NOTICES.txt`; on macOS also
+   `build/macos-info.json`, the Info.plist entries;
 4. runs PyInstaller into `dist/State Life Device Installer/`, then adds
    `EULA.txt`, the notices and `licenses/esptool-5.1.0.tar.gz` (the exact
-   esptool source, checked against the lock's hash);
-5. checks that the folder has every resource and tool data file;
-6. on Windows, runs Inno Setup 6 (`ISCC.exe`, or the path in `ISCC`) and
-   writes `dist/SHA256SUMS.txt`.
+   esptool source, checked against the lock's hash). On macOS the result is
+   `dist/State Life Device Installer.app`, and these files go into its
+   `Contents/Resources`;
+5. on macOS, signs the finished app ad hoc (`codesign --sign -`), checks its
+   Info.plist, and checks that every program file in it has Apple Silicon code
+   and needs no newer macOS than `LSMinimumSystemVersion`;
+6. checks that the folder has every resource and tool data file;
+7. on Windows, runs Inno Setup 6 (`ISCC.exe`, or the path in `ISCC`); on
+   macOS, makes the disk image with `hdiutil` (the app and a link to
+   `/Applications`, compressed, then verified). Either way it writes
+   `dist/SHA256SUMS.txt`.
 
 On Windows, with Python 3.12 and Inno Setup 6:
 
@@ -368,8 +536,28 @@ On Windows, with Python 3.12 and Inno Setup 6:
 python -m pip install --require-hashes --no-deps -r apps\esp_installer\requirements-build.lock
 python -m pip install --require-hashes --no-build-isolation -r apps\esp_installer\requirements.lock -r apps\esp_installer\requirements-build.lock
 python apps\esp_installer\packaging\build.py
-powershell -File apps\esp_installer\packaging\smoke_test.ps1 -Setup apps\esp_installer\dist\StateLife-Device-Installer-Setup-1.0.0-TEST.exe -OutputDir smoke
+powershell -File apps\esp_installer\packaging\smoke_test.ps1 -Setup apps\esp_installer\dist\StateLife-Device-Installer-Setup-1.1.0-TEST.exe -OutputDir smoke
 ```
+
+On a Mac with Apple Silicon and Python 3.12, in a throwaway virtual
+environment under the ignored `build` folder (never with the release
+secrets set):
+
+```sh
+cd apps/esp_installer
+python3.12 -m venv build/venv-mac
+build/venv-mac/bin/python -m pip install --require-hashes --no-deps -r requirements-build.lock
+build/venv-mac/bin/python -m pip install --require-hashes --no-build-isolation -r requirements.lock -r requirements-build.lock
+build/venv-mac/bin/python packaging/build.py
+packaging/smoke_test_macos.sh dist/StateLife-Device-Installer-1.1.0-macOS-arm64-TEST.dmg smoke
+rm -rf build/venv-mac build/pyinstaller dist
+```
+
+The smoke test keeps the app's data in a scratch folder
+(`SL_INSTALLER_DATA_DIR`), so it never touches the Mac's own
+`~/Library/Application Support/StateLife`. On 4 Nov 2026, on an M-series Mac,
+a TEST build took about 30 seconds once the packages were installed. The app
+was 84 MB and the disk image 37 MB, and the smoke test took about 45 seconds.
 
 PyPI has esptool 5.1.0 only as source, so the first command installs the
 locked setuptools and the second builds esptool with it
@@ -387,9 +575,10 @@ docker run --rm -v "$PWD":/w -w /w/apps/esp_installer esp-installer-dev:local sh
 ```
 
 What the bundle keeps: Qt Core, Gui, Widgets and Svg, with only the
-`qwindows` platform plugin, the styles, the SVG and ICO image plugins and the
-SVG icon engine. No Qt translations, no software OpenGL, no UPX. The app runs
-in Python's UTF-8 mode.
+`qwindows` platform plugin (macOS: `qcocoa`, and `qoffscreen` for the smoke
+test), the styles, the SVG and ICO image plugins and the SVG icon engine. No
+Qt translations, no software OpenGL, no UPX. The app runs in Python's UTF-8
+mode.
 
 ### Locks
 
@@ -402,9 +591,12 @@ docker run --rm -v "$PWD":/w -w /w/apps/esp_installer esp-installer-dev:local \
 ```
 
 It adds the packages that only Windows needs (colorama, pefile,
-pywin32-ctypes), takes each file's SHA-256 from PyPI, and fails unless every
-pin has a Windows x64 / CPython 3.12 wheel (esptool: its source release) and
-all of its Windows dependencies are locked.
+pywin32-ctypes) and the one that only macOS needs (macholib, for PyInstaller),
+takes each file's SHA-256 from PyPI, and fails unless every pin has a wheel
+for both targets (esptool: its source release) and all of its dependencies on
+each target are locked. The targets are Windows x64 and macOS arm64, both
+CPython 3.12. A Mac wheel counts only if it runs on macOS 12
+(`MACOS_MINIMUM`, the app's `LSMinimumSystemVersion`).
 
 ### Installer details
 
@@ -432,6 +624,27 @@ all of its Windows dependencies are locked.
   off is the computer owner's decision: on many Windows versions it cannot be
   turned back on without resetting Windows. Code-signing the Setup is the only
   fix that needs no change on the computer.
+
+### Mac app details
+
+- Apple Silicon only (arm64): PyInstaller keeps only the arm64 part of every
+  library (`target_arch="arm64"`), and the build checks every program file.
+- Bundle ID `com.statelife.deviceinstaller`; the version is `__version__`.
+- `LSMinimumSystemVersion` is **12.0**, not 11.0: the Qt 6.9 libraries in
+  PySide6 6.9.2 need macOS 12. Change `MACOS_MINIMUM` in `build.py` and
+  `update_locks.py` together.
+- Info.plist also sets `NSHighResolutionCapable` and
+  `NSRequiresAquaSystemAppearance` (the app draws its own light colours, so
+  dark mode never mixes in dark system controls).
+- The app is signed ad hoc, not with a paid Apple certificate, and it is not
+  notarised (the same owner decision as Windows). So macOS blocks it the first
+  time, and the person allows it once with **Open Anyway** (part 1).
+- There is no installer and no uninstaller: the person drags the app to
+  Applications, and drags it to the Bin to remove it. The app keeps its data
+  in `~/Library/Application Support/StateLife/DeviceInstaller`
+  (`sl_installer/config.py`).
+- `THIRD-PARTY-NOTICES.txt`, `EULA.txt` and the esptool source are in the
+  app's `Contents/Resources`.
 
 ### Licences
 

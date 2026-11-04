@@ -1,8 +1,12 @@
 name: ESP installer release
 
-# Pull requests build a TEST installer: no secrets, and the app shows a
-# "TEST BUILD" banner. A dispatch on main with the confirmation builds the
-# field release, with the field defaults from the firmware-signing environment.
+# Pull requests build a TEST installer for Windows and a TEST disk image for
+# macOS (Apple Silicon): no secrets, and the app shows a "TEST BUILD" banner.
+# A dispatch on main with BUILD INSTALLER RELEASE builds both field releases, with
+# the field defaults from the firmware-signing environment, and publishes nothing.
+# After those exact builds pass the real-board test, a second dispatch with
+# PUBLISH INSTALLER APP and that build run's ID copies them, unchanged, to ADD's
+# installer app store, where the "Prepare an ESP32" page offers them.
 on:
   pull_request:
     paths:
@@ -11,9 +15,14 @@ on:
   workflow_dispatch:
     inputs:
       confirmation:
-        description: Type BUILD INSTALLER RELEASE to build the field release from main
+        description: BUILD INSTALLER RELEASE builds the field release from main; PUBLISH INSTALLER APP publishes a tested build
         required: true
         type: string
+      release_run_id:
+        description: PUBLISH INSTALLER APP only - the ID of the successful BUILD INSTALLER RELEASE run whose builds were tested
+        required: false
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -74,11 +83,58 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
+  macos-test-build:
+    if: github.event_name == 'pull_request'
+    runs-on: macos-14
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install the locked packages
+        run: |
+          # esptool is published only as source: install the locked setuptools
+          # first and build esptool with it, so every download is hash-checked.
+          python -m pip install --disable-pip-version-check --require-hashes --no-deps -r apps/esp_installer/requirements-build.lock
+          python -m pip install --disable-pip-version-check --require-hashes --no-build-isolation -r apps/esp_installer/requirements.lock -r apps/esp_installer/requirements-build.lock
+          python -m pip check
+      - name: Run the app tests without a screen
+        working-directory: apps/esp_installer
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -m pytest -q
+      - name: Build the TEST app and disk image
+        run: python apps/esp_installer/packaging/build.py
+      - name: Open the disk image and check the app
+        run: |
+          dmg=$(ls apps/esp_installer/dist/StateLife-Device-Installer-*-macOS-arm64-TEST.dmg)
+          [ "$(printf '%s\n' "$dmg" | wc -l)" -eq 1 ] || { echo "Expected one TEST disk image: $dmg"; exit 1; }
+          apps/esp_installer/packaging/smoke_test_macos.sh "$dmg" smoke
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: esp-installer-macos-test-${{ github.sha }}
+          path: |
+            apps/esp_installer/dist/StateLife-Device-Installer-*-macOS-arm64*.dmg
+            apps/esp_installer/dist/SHA256SUMS.txt
+            smoke/
+          if-no-files-found: warn
+          retention-days: 7
+
   release:
     if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.confirmation == 'BUILD INSTALLER RELEASE'
     runs-on: windows-2022
     environment: firmware-signing
     timeout-minutes: 60
+    outputs:
+      artifact: ${{ steps.smoke.outputs.artifact }}
+      version: ${{ steps.smoke.outputs.version }}
     defaults:
       run:
         shell: powershell
@@ -124,6 +180,7 @@ jobs:
           ./apps/esp_installer/packaging/smoke_test.ps1 -Setup $setup.FullName -OutputDir smoke
           # Windows PowerShell's Out-File would add a byte-order mark.
           [IO.File]::AppendAllText($env:GITHUB_OUTPUT, "artifact=$($setup.BaseName)`n")
+          [IO.File]::AppendAllText($env:GITHUB_OUTPUT, "version=$($setup.BaseName -replace '^StateLife-Device-Installer-Setup-', '')`n")
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.smoke.outputs.artifact }}
@@ -140,3 +197,148 @@ jobs:
           path: smoke/
           if-no-files-found: ignore
           retention-days: 7
+
+  macos-release:
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.confirmation == 'BUILD INSTALLER RELEASE'
+    runs-on: macos-14
+    environment: firmware-signing
+    timeout-minutes: 60
+    outputs:
+      artifact: ${{ steps.smoke.outputs.artifact }}
+      version: ${{ steps.smoke.outputs.version }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install the locked packages
+        run: |
+          # esptool is published only as source: install the locked setuptools
+          # first and build esptool with it, so every download is hash-checked.
+          python -m pip install --disable-pip-version-check --require-hashes --no-deps -r apps/esp_installer/requirements-build.lock
+          python -m pip install --disable-pip-version-check --require-hashes --no-build-isolation -r apps/esp_installer/requirements.lock -r apps/esp_installer/requirements-build.lock
+          python -m pip check
+      - name: Run the app tests without a screen
+        working-directory: apps/esp_installer
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -m pytest -q
+      - name: Build the release app and disk image
+        # The only step that sees the secrets. build.py never prints them and
+        # also masks the values inside the JSON secret.
+        env:
+          ESP_INSTALLER_FIELD_DEFAULTS_JSON: ${{ secrets.ESP_INSTALLER_FIELD_DEFAULTS_JSON }}
+          ZONE_LITE_SETUP_PASSWORD: ${{ secrets.ZONE_LITE_SETUP_PASSWORD }}
+        run: python apps/esp_installer/packaging/build.py --release
+      - name: Open the disk image and check the app
+        id: smoke
+        run: |
+          dmg=$(ls apps/esp_installer/dist/StateLife-Device-Installer-*-macOS-arm64*.dmg)
+          [ "$(printf '%s\n' "$dmg" | wc -l)" -eq 1 ] || { echo "Expected one disk image: $dmg"; exit 1; }
+          case "$dmg" in *-TEST.dmg) echo "The release step produced a TEST build"; exit 1 ;; esac
+          apps/esp_installer/packaging/smoke_test_macos.sh "$dmg" smoke
+          name=$(basename "$dmg" .dmg)
+          version=${name#StateLife-Device-Installer-}
+          echo "artifact=$name" >> "$GITHUB_OUTPUT"
+          echo "version=${version%-macOS-arm64}" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.smoke.outputs.artifact }}
+          path: |
+            apps/esp_installer/dist/StateLife-Device-Installer-*-macOS-arm64.dmg
+            apps/esp_installer/dist/SHA256SUMS.txt
+            smoke/screenshots/
+          if-no-files-found: error
+          retention-days: 30
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: esp-installer-macos-smoke-logs-${{ github.sha }}
+          path: smoke/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  publish:
+    # Its own dispatch, after the real-board test of the exact field builds: it copies
+    # that build run's artifacts to ADD's installer app store (read-only
+    # /installer-apps in add-api) and never rebuilds, so ADD offers the tested bytes.
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.confirmation == 'PUBLISH INSTALLER APP'
+    runs-on: [self-hosted, Windows, X64]
+    environment: firmware-signing
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Check that the tested run is a successful field build from main
+        id: build
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ inputs.release_run_id }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+          if ($env:RUN_ID -notmatch '^[0-9]+$') {
+            throw 'release_run_id must be the numeric ID of a BUILD INSTALLER RELEASE run'
+          }
+          $headers = @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = 'application/vnd.github+json' }
+          $run = Invoke-RestMethod -Headers $headers -Uri "$env:GITHUB_API_URL/repos/$env:GITHUB_REPOSITORY/actions/runs/$env:RUN_ID"
+          if (-not ([string]$run.path).StartsWith('.github/workflows/esp-installer-release.yml') -or
+              $run.event -ne 'workflow_dispatch' -or $run.head_branch -ne 'main' -or
+              $run.conclusion -ne 'success' -or $run.head_sha -notmatch '^[0-9a-f]{40}$') {
+            throw "Run $env:RUN_ID is not a successful dispatch of this workflow on main"
+          }
+          [IO.File]::AppendAllText($env:GITHUB_OUTPUT, "sha=$($run.head_sha)`n")
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: StateLife-Device-Installer-*
+          path: installer-app
+          run-id: ${{ inputs.release_run_id }}
+          github-token: ${{ github.token }}
+      - name: Check both builds against their SHA256SUMS and publish them
+        env:
+          ADD_INSTALLER_APP_STORE_HOST_PATH: ${{ vars.ADD_INSTALLER_APP_STORE_HOST_PATH }}
+          BUILD_SHA: ${{ steps.build.outputs.sha }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Each artifact keeps its build's folders (apps/esp_installer/dist); the one
+          # SHA256SUMS.txt next to the .exe or the .dmg marks the build folder.
+          function Get-BuildFolder {
+            param([string]$Extension)
+            $files = @(Get-ChildItem -LiteralPath 'installer-app' -Recurse -File -Filter "*$Extension")
+            if ($files.Count -ne 1) { throw "The tested run must hold exactly one $Extension build" }
+            $folder = $files[0].DirectoryName
+            if (-not (Test-Path -LiteralPath (Join-Path $folder 'SHA256SUMS.txt') -PathType Leaf)) {
+              throw "No SHA256SUMS.txt beside $($files[0].Name)"
+            }
+            return @{ Folder = $folder; Name = $files[0].Name }
+          }
+          $windows = Get-BuildFolder '.exe'
+          $mac = Get-BuildFolder '.dmg'
+          if ($windows.Name -notmatch '^StateLife-Device-Installer-Setup-([0-9]+\.[0-9]+\.[0-9]+)\.exe$') {
+            throw "Unexpected Windows build $($windows.Name)"
+          }
+          $windowsVersion = $Matches[1]
+          if ($mac.Name -notmatch '^StateLife-Device-Installer-([0-9]+\.[0-9]+\.[0-9]+)-macOS-arm64\.dmg$' -or
+              $Matches[1] -cne $windowsVersion) {
+            throw "The Windows build ($($windows.Name)) and the macOS build ($($mac.Name)) must carry the same version"
+          }
+          # The publisher checks each file against its SHA256SUMS.txt before
+          # anything is written, and again where ADD reads it.
+          $version = ./deploy/add/publish-installer-app.ps1 `
+            -WindowsDirectory $windows.Folder `
+            -MacDirectory $mac.Folder `
+            -Version $windowsVersion `
+            -GitSha $env:BUILD_SHA
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "Published State Life Device Installer ``$version`` for Windows and macOS from run $env:GITHUB_RUN_ID's tested build"

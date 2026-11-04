@@ -1,5 +1,5 @@
 """Regenerate requirements.lock and requirements-build.lock, then prove they
-install on the release target (Windows x64, CPython 3.12).
+install on both release targets (Windows x64 and macOS arm64, CPython 3.12).
 
 Run it inside the dev container, from apps/esp_installer:
 
@@ -7,13 +7,14 @@ Run it inside the dev container, from apps/esp_installer:
         sh -c "pip install -q pip-tools==7.6.2 && python packaging/update_locks.py"
 
 pip-compile resolves for the machine it runs on, so packages that only
-Windows needs are listed here explicitly and pinned without markers: a lock
-made in the Linux container must still install on Windows under
-``--require-hashes``. Each pin then gets the SHA-256 of every file PyPI has
-for that version (Windows, Linux and macOS wheels and the sdist), read from
-PyPI's JSON API instead of downloading hundreds of megabytes of Qt wheels.
-The check at the end needs a Windows x64 / CPython 3.12 wheel for every pin
-and walks the dependencies again with Windows markers.
+Windows or only macOS needs are listed here explicitly and pinned without
+markers: a lock made in the Linux container must still install on Windows
+and on the Mac under ``--require-hashes``. Each pin then gets the SHA-256 of
+every file PyPI has for that version (Windows, Linux and macOS wheels and the
+sdist), read from PyPI's JSON API instead of downloading hundreds of megabytes
+of Qt wheels. The check at the end needs a wheel for every pin on each target
+(Windows x64, and macOS arm64 no newer than MACOS_MINIMUM) and walks the
+dependencies again with that target's markers.
 """
 from __future__ import annotations
 
@@ -25,7 +26,7 @@ import sys
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Dict, Iterable, List
+from typing import Dict, Iterable, List, NamedTuple, Set
 
 from packaging import tags
 from packaging.markers import default_environment
@@ -48,13 +49,19 @@ WINDOWS_BUILD = [
     "pefile>=2022.5.30,!=2024.8.26",  # PyInstaller on Windows
     "pywin32-ctypes>=0.2.1",  # PyInstaller on Windows
 ]
+# Needed on macOS only, for the same reason.
+MACOS_BUILD = ["macholib>=1.8"]  # PyInstaller on macOS
 # PyPI has esptool only as source. The workflow installs this locked
 # setuptools first and builds esptool with --no-build-isolation, so even the
 # build backend is hash-checked.
 BUILD_BACKEND = ["setuptools>=64"]
 # Pure-Python packages that PyPI has only as source; every other pin needs a
-# Windows wheel.
+# wheel for each target.
 SOURCE_ONLY = {"esptool"}
+# The oldest macOS the Mac app runs on (Qt 6.9's wheels need 12.0). It is
+# LSMinimumSystemVersion in the app's Info.plist (packaging/build.py), so a
+# wheel built for a newer macOS would break the app there.
+MACOS_MINIMUM = (12, 0)
 
 WINDOWS_ENVIRONMENT = dict(
     default_environment(),
@@ -71,6 +78,33 @@ WINDOWS_ENVIRONMENT = dict(
 WINDOWS_TAGS = set(tags.cpython_tags((3, 12), ["cp312"], ["win_amd64"])) | set(
     tags.compatible_tags((3, 12), "cp312", ["win_amd64"])
 )
+MACOS_ENVIRONMENT = dict(
+    default_environment(),
+    implementation_name="cpython",
+    os_name="posix",
+    platform_machine="arm64",
+    platform_python_implementation="CPython",
+    platform_system="Darwin",
+    python_full_version="3.12.10",
+    python_version="3.12",
+    sys_platform="darwin",
+    extra="",
+)
+_MACOS_PLATFORMS = list(tags.mac_platforms(MACOS_MINIMUM, "arm64"))
+MACOS_TAGS = set(tags.cpython_tags((3, 12), ["cp312"], _MACOS_PLATFORMS)) | set(
+    tags.compatible_tags((3, 12), "cp312", _MACOS_PLATFORMS)
+)
+
+
+class Target(NamedTuple):
+    name: str
+    wheel_tags: Set[tags.Tag]
+    environment: Dict[str, str]
+
+
+WINDOWS = Target("Windows x64 / CPython 3.12", WINDOWS_TAGS, WINDOWS_ENVIRONMENT)
+MACOS = Target(f"macOS {MACOS_MINIMUM[0]} arm64 / CPython 3.12", MACOS_TAGS, MACOS_ENVIRONMENT)
+TARGETS = (WINDOWS, MACOS)
 
 
 def compile_lock(source: Path, output: Path) -> None:
@@ -99,7 +133,8 @@ def write_inputs(pyproject: Dict[str, object]) -> None:
     (WORK / "build.in").write_text(
         "# Written by packaging/update_locks.py from pyproject.toml.\n"
         "-c runtime-pins.txt\n"
-        + "\n".join(list(extras["build"]) + list(extras["dev"]) + WINDOWS_BUILD + BUILD_BACKEND)
+        + "\n".join(list(extras["build"]) + list(extras["dev"]) + WINDOWS_BUILD + MACOS_BUILD
+                    + BUILD_BACKEND)
         + "\n",
         encoding="utf-8",
     )
@@ -139,7 +174,9 @@ def add_hashes(lock: Path, releases: Dict[str, Dict[str, object]]) -> None:
     lock.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def windows_requirements(release: Dict[str, object]) -> "List[str] | None":
+def target_requirements(release: Dict[str, object], target: Target) -> "List[str] | None":
+    """The release's requirements as the target installs it, or None when the
+    target cannot install it (no wheel for it and not a source-only package)."""
     if canonicalize_name(release["info"]["name"]) in SOURCE_ONLY:
         if any(item["packagetype"] == "sdist" for item in release["urls"]):
             return list(release["info"].get("requires_dist") or [])
@@ -147,7 +184,7 @@ def windows_requirements(release: Dict[str, object]) -> "List[str] | None":
     for item in release["urls"]:
         if item["packagetype"] != "bdist_wheel":
             continue
-        if not parse_wheel_filename(item["filename"])[3] & WINDOWS_TAGS:
+        if not parse_wheel_filename(item["filename"])[3] & target.wheel_tags:
             continue
         try:  # PEP 658: the index serves each wheel's METADATA beside it.
             with urllib.request.urlopen(item["url"] + ".metadata", timeout=60) as response:
@@ -158,22 +195,23 @@ def windows_requirements(release: Dict[str, object]) -> "List[str] | None":
     return None
 
 
-def check_windows(locks: Iterable[Path], releases: Dict[str, Dict[str, object]]) -> List[str]:
+def check_target(locks: Iterable[Path], releases: Dict[str, Dict[str, object]],
+                 target: Target) -> List[str]:
     pins = dict(pin_of(line) for lock in locks for line in requirement_lines(lock))
     problems = []
     for owner in sorted(pins):
-        requirements = windows_requirements(releases[owner])
+        requirements = target_requirements(releases[owner], target)
         if requirements is None:
-            problems.append(f"{owner}=={pins[owner]} has no Windows x64 / CPython 3.12 wheel"
+            problems.append(f"{owner}=={pins[owner]} has no {target.name} wheel"
                             " (or, if listed in SOURCE_ONLY, no source release)")
             continue
         for line in requirements:
             requirement = Requirement(line)
-            if requirement.marker and not requirement.marker.evaluate(WINDOWS_ENVIRONMENT):
+            if requirement.marker and not requirement.marker.evaluate(target.environment):
                 continue
             name = canonicalize_name(requirement.name)
             if name not in pins:
-                problems.append(f"{owner} needs {requirement} on Windows, but it is not locked")
+                problems.append(f"{owner} needs {requirement} on {target.name}, but it is not locked")
             elif not requirement.specifier.contains(pins[name], prereleases=True):
                 problems.append(f"{owner} needs {requirement}, but {name}=={pins[name]} is locked")
     return problems
@@ -190,12 +228,14 @@ def main() -> int:
     add_hashes(RUNTIME_LOCK, releases)
     compile_lock(WORK / "build.in", BUILD_LOCK)
     add_hashes(BUILD_LOCK, releases)
-    problems = check_windows([RUNTIME_LOCK, BUILD_LOCK], releases)
+    problems = [problem for target in TARGETS
+                for problem in check_target([RUNTIME_LOCK, BUILD_LOCK], releases, target)]
     for problem in problems:
         print(f"PROBLEM: {problem}")
     if problems:
         return 1
-    print("Locks written; every pin has a Windows x64 / CPython 3.12 wheel and its dependencies.")
+    print("Locks written; every pin has a wheel and its dependencies on "
+          + " and on ".join(target.name for target in TARGETS) + ".")
     return 0
 
 

@@ -1,0 +1,45 @@
+=== First start, 2026-11-03 17:00:25 +0500 ===
+    6.8  # the board was unplugged
+   12.4  # the board was plugged in again
+   12.4  # the port COM13 is open
+   12.5  ESP-ROM:esp32s3-20210327
+   12.5  Build:Mar 27 2021
+   12.5  rst:0x3 (RTC_SW_SYS_RST),boot:0x28 (SPI_FAST_FLASH_BOOT)
+   12.5  Saved PC:0x403cd339
+   12.5  SPIWP:0xee
+   12.5  mode:DIO, clock div:1
+   12.5  load:0x3fce2980,len:0x2d94
+   12.5  load:0x403c8700,len:0xd24
+   12.5  load:0x403cb700,len:0x4f2c
+   12.5  entry 0x403c8924
+   12.5  I (29) boot: ESP-IDF v5.5.3 2nd stage bootloader
+   12.5  I (29) boot: compile time Nov  2 2026 04:52:02
+   12.5  I (29) boot: Multicore bootloader
+   12.5  I (29) bootloader_flash: XM25QHxxC startup flow
+   12.5  E (35) bootloader_flash: XMC flash startup fail
+   12.5  E (37) boot.esp32s3: failed when running XMC startup flow, reboot!
+   12.6  ESP-ROM:esp32s3-20210327
+   12.6  Build:Mar 27 2021
+   12.6  rst:0x3 (RTC_SW_SYS_RST),boot:0x28 (SPI_FAST_FLASH_BOOT)
+   12.6  Saved PC:0x403cd339
+   12.6  SPIWP:0xee
+   12.6  mode:DIO, clock div:1
+   12.6  load:0x3fce2980,len:0x2d94
+   12.6  load:0x403c8700,len:0xd24
+   12.6  load:0x403cb700,len:0x4f2c
+   12.6  entry 0x403c8924
+   12.6  I (29) boot: ESP-IDF v5.5.3 2nd stage bootloader
+   12.6  I (29) boot: compile time Nov  2 2026 04:52:02
+   12.6  I (29) boot: Multicore bootloader
+   12.6  I (29) bootloader_flash: XM25QHxxC startup flow
+   12.6  E (35) bootloader_flash: XMC flash startup fail
+   12.6  E (37) boot.esp32s3: failed when running XMC startup flow, reboot!
+   12.6  ESP-ROM:esp32s3-20210327
+   12.6  Build:Mar 27 2021
+   12.6  rst:0x3 (RTC_SW_SYS_RST),boot:0x28 (SPI_FAST_FLASH_BOOT)
+   12.6  Saved PC:0x403cd339
+   12.6  SPIWP:0xee
+   12.6  mode:DIO, clock div:1
+   12.6  load:0x3fce2980,len:0x2d94
+   12.6  load:0x403c8700,len:0xd24
+   12.6  load:0x403cb700,len:0x4f2c

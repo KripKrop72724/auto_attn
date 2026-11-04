@@ -270,3 +270,43 @@ def test_light_hint():
     hint = next(a for a in diagnose(lines=["I (3000) zone_lite: Connecting to Wi-Fi SSID RE7"])
                 if a.code.startswith("LED_HINT"))
     assert "blue" in hint.title and hint.severity is Severity.INFO
+
+
+# ------------------------------------------------- boards the software cannot start
+
+XMC_LOOP = ("ESP-ROM:esp32s3-20210327", "rst:0x3 (RTC_SW_SYS_RST),boot:0x28 (SPI_FAST_FLASH_BOOT)",
+            "I (29) boot: ESP-IDF v5.5.3 2nd stage bootloader",
+            "I (29) bootloader_flash: XM25QHxxC startup flow",
+            "E (35) bootloader_flash: XMC flash startup fail",
+            "E (37) boot.esp32s3: failed when running XMC startup flow, reboot!")
+
+
+def test_bootloader_refusal_outranks_the_fast_restart_loop():
+    # 3 Nov 2026: the XMC boards were called a cable or power problem.
+    fast = PresenceReport(PresenceState.RESTART_LOOP, board=ONE.board, loop_period_s=2.0)
+    advice = diagnose(fast, lines=XMC_LOOP * 3)
+    assert advice[0].code == "FLASH_CHIP_UNSUPPORTED" and "RESTART_LOOP_FAST" in codes(advice)
+    other = diagnose(lines=XMC_LOOP[:3] + ("E (40) boot: load partition table error!",))
+    assert other[0].code == "STARTUP_REFUSED"
+    assert '"E (40) boot: load partition table error!"' in other[0].what_happened
+
+
+def test_a_bootloader_error_the_board_got_past_is_not_said():
+    lines = XMC_LOOP[:3] + ("E (58) boot: OTA app partition slot 0 is not bootable",
+                            "I (95) boot: Loaded app from partition at offset 0x20000",
+                            "I (1) zone_lite: Connecting to Wi-Fi SSID RE7")
+    assert "STARTUP_REFUSED" not in codes(diagnose(lines=lines))
+
+
+@pytest.mark.parametrize("hardware, detail, code", [
+    (HardwareVerdict.FLASH_CHIP_UNSUPPORTED, "memory chip 20 70 18", "FLASH_CHIP_UNSUPPORTED"),
+    (HardwareVerdict.BOARD_TYPE_UNSUPPORTED, "extra memory 8 MB, type AP_1v8",
+     "BOARD_TYPE_UNSUPPORTED"),
+])
+def test_refused_hardware_comes_first_with_what_was_measured(hardware, detail, code):
+    board = secured(hardware=hardware, security=SecurityState.KEY_BURNED_NOT_STARTED,
+                    secure_download_mode=False, flash_id="20 70 18", hardware_detail=detail)
+    advice = diagnose(board=board)
+    assert advice[0].code == code and "UNFINISHED_SETUP" in codes(advice)
+    shown = "20 70 18" if code == "FLASH_CHIP_UNSUPPORTED" else detail
+    assert shown in advice[0].what_happened

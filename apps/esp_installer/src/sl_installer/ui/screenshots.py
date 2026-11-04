@@ -352,6 +352,15 @@ def _first_start_result(d: Driver) -> None:
     )
 
 
+def _first_start_hotspot(d: Driver) -> None:
+    # The board opened its own Wi-Fi while it was watched: its name and password show.
+    _first_start_result(d)
+    page = d.page(pages.FIRST_START)
+    d.wait(lambda: not page.hotspot_card.isHidden(), "hotspot card")
+    d.settle()
+    page.scroll.ensureWidgetVisible(page.hotspot_card, 20, 20)
+
+
 def _done(d: Driver) -> None:
     d.done()
 
@@ -378,6 +387,12 @@ def _check_board_hotspot(d: Driver) -> None:
     d.wait(lambda: page.hotspot_steps.expanded, "hotspot steps")
     d.settle()
     page.scroll.ensureWidgetVisible(page.hotspot_card, 20, 20)
+
+
+def _check_board_refused(d: Driver) -> None:
+    # A board the software cannot start: the advice comes first, with what was measured.
+    d.check_board()
+    d.wait(lambda: bool(d.page(pages.CHECK_BOARD).shown_codes()), "advice")
 
 
 def _check_board_settled(d: Driver) -> None:
@@ -473,6 +488,9 @@ SCENES: Tuple[Scene, ...] = (
     ("checking-locked-by-others", "secured_other", _checked),
     ("checking-family-mismatch", "family_mismatch", _checked),
     ("checking-settings-not-allowed", "settings_change_not_allowed", _checked),
+    ("checking-memory-chip-unsupported", "flash_chip_unsupported", _checked),
+    ("checking-memory-chip-locked-board", "flash_chip_key_burned", _checked),
+    ("checking-board-type-unsupported", "board_type_unsupported", _checked),
     ("confirm", "happy_zkt", _confirm),
     ("installing", "happy_zkt", _installing),
     ("installing-error-before-key", "install_error_before_key", _install_failed),
@@ -485,6 +503,8 @@ SCENES: Tuple[Scene, ...] = (
     ("first-start-ok", "happy_zkt", _first_start_result),
     ("first-start-wrong-zone", "first_boot_wrong_zone", _first_start_result),
     ("first-start-settings-lost", "settings_lost_on_restart", _first_start_result),
+    ("first-start-startup-refused", "startup_refused", _first_start_result),
+    ("first-start-hotspot-open", "hotspot_at_start", _first_start_hotspot),
     ("done-zkt", "happy_zkt", _done),
     ("done-hik", "happy_hik", _done_hik),
     ("done-record-saved", "happy_zkt", _done_saved),
@@ -492,6 +512,7 @@ SCENES: Tuple[Scene, ...] = (
     ("check-board-hotspot", "secured_board_fix_settings", _check_board_hotspot),
     ("check-board-head-office-unreachable", "lookup_fails", _check_board_settled),
     ("check-board-settings-not-allowed", "settings_change_not_allowed", _check_board_settled),
+    ("check-board-memory-chip-unsupported", "flash_chip_key_burned", _check_board_refused),
     ("fix-settings", "secured_board_fix_settings", _fix_settings),
     ("fix-settings-comm-key", "secured_board_fix_settings", _fix_settings_machine),
     ("fix-settings-hik", "secured_hik_fix_settings", _fix_settings_machine),

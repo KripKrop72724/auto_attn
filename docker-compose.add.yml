@@ -106,6 +106,14 @@ services:
         read_only: true
         bind:
           create_host_path: true
+      # Release builds of the State Life Device Installer app, offered for
+      # download on the dashboard. An empty store is valid, like the bundles.
+      - type: bind
+        source: ${ADD_INSTALLER_APP_STORE_HOST_PATH:-./.installer-apps}
+        target: /installer-apps
+        read_only: true
+        bind:
+          create_host_path: true
       - type: volume
         source: add-provisioning-artifacts
         target: /provisioning-artifacts

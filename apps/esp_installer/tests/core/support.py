@@ -135,6 +135,39 @@ FLASH_ID_16MB = "\n".join([
     "Device: 4018", "Detected flash size: 16MB", "Flash type set in eFuse: quad (4 data lines)",
     "Flash voltage set by eFuse: 3.3V", "", "Staying in bootloader."])
 
+# esptool 5.1.0 flash_xmc_startup on an XMC XM25QH128A (20 70 18), every run (3 Nov 2026).
+XMC_WARNING = "\n".join([
+    "Warning: XMC flash chip boot-up failure detected! Running XMC25QHxxC startup flow.",
+    "Warning: XMC flash boot-up fix failed.", "XMC flash chip boot-up fix successful!"])
+# esptool 5.1.0 after a flow that put a listed XMC chip right: no "fix failed" line.
+XMC_RECOVERED = "\n".join([
+    "Warning: XMC flash chip boot-up failure detected! Running XMC25QHxxC startup flow.",
+    "XMC flash chip boot-up fix successful!"])
+
+
+def flash_id_output(maker: str, device: str, *, size: str = "16MB", kind: str = "quad",
+                    xmc: bool = False, recovered: bool = False) -> str:
+    """esptool 5.1.0 flash-id's lines after the banner, for any chip.
+
+    ``xmc``: the XMC flow ran and failed; ``recovered``: it ran and the chip recovered.
+    """
+    lines = ["Enabling default SPI flash mode..."]
+    if xmc:
+        lines.append(XMC_WARNING)
+    elif recovered:
+        lines.append(XMC_RECOVERED)
+    lines += ["Flash Memory Information:", "=========================",
+              f"Manufacturer: {maker}", f"Device: {device}", f"Detected flash size: {size}",
+              f"Flash type set in eFuse: {kind} ({4 if kind == 'quad' else 8} data lines)",
+              "Flash voltage set by eFuse: 3.3V", "Staying in bootloader."]
+    return "\n".join(lines)
+
+
+def board_sample(name: str) -> str:
+    """A real esptool output or console log (fixtures/boards, redacted, no secrets)."""
+    return (FIXTURES / "boards" / name).read_text(encoding="utf-8")
+
+
 FAILED_TO_CONNECT = ("A fatal error occurred: Failed to connect to ESP32-S3: No serial data "
                      "received.\nFor troubleshooting steps visit: https://docs.espressif.com/"
                      "projects/esptool/en/latest/troubleshooting.html")
@@ -184,8 +217,13 @@ class FakeBoard:
 
     def __init__(self, mac: str = MAC, *, efuse_state: str = "blank", sdm: bool = False,
                  chip: str = "ESP32-S3 (QFN56) (revision v0.2)", flash_mb: int = 16,
-                 psram: str = "Embedded PSRAM 8MB (AP_3v3)") -> None:
+                 psram: str = "Embedded PSRAM 8MB (AP_3v3)",
+                 outputs: Optional[Dict[str, str]] = None, xmc_warning: bool = False) -> None:
         self.mac = mac
+        # Whole outputs to answer instead of the simulated ones, by command: real samples.
+        self.outputs: Dict[str, str] = dict(outputs or {})
+        # esptool's XMC startup warning on every call that attaches the flash (the stub).
+        self.xmc_warning = xmc_warning
         self.summary = efuse(efuse_state, mac) if efuse_state != "sdm" else None
         self.sdm = sdm
         self.chip = chip
@@ -200,6 +238,9 @@ class FakeBoard:
         self.sdm_flags = 0xC5
 
     # -- helpers
+    def _xmc(self) -> str:
+        return ("\n" + XMC_WARNING) if self.xmc_warning else ""
+
     def _banner(self) -> str:
         return connect_banner(self.reported_mac or self.mac, sdm=self.sdm, chip=self.chip,
                               features=self.features)
@@ -237,6 +278,8 @@ class FakeBoard:
                 failure.then(self)
             return failure.returncode, failure.output
         assert "--after" not in args or args[args.index("--after") + 1] == "no-reset"
+        if command in self.outputs:
+            return 0, self.outputs[command]
         if command == "get-security-info":
             flags = self.sdm_flags if self.sdm else (1 if self._secure_boot() else 0)
             return 0, self._banner() + "\n" + security_report(
@@ -253,8 +296,9 @@ class FakeBoard:
             self.erased.append((start, size))
             for offset in [o for o in self.flash if start <= o < start + size]:
                 del self.flash[offset]
-            return 0, self._banner() + "\nErasing flash memory region (this may take a while " \
-                "depending on size)...\nFlash memory region erased successfully in 0.3 seconds."
+            return 0, self._banner() + self._xmc() + "\nErasing flash memory region (this may " \
+                "take a while depending on size)...\nFlash memory region erased successfully " \
+                "in 0.3 seconds."
         if command in ("write-flash", "verify-flash"):
             pairs = _pairs(args[args.index(command) + 1:])
             stub = "--no-stub" not in args

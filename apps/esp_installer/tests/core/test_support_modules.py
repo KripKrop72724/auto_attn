@@ -595,4 +595,5 @@ def test_field_labels_cover_the_payload():
 def test_api_dataclasses_are_unchanged_here():
     # The engine relies on these fields; api.py is the shared contract.
     assert [f.name for f in fields(BootReport)] == [
-        "outcome", "zone_id_seen", "device_id_seen", "app_version_seen", "events", "advice"]
+        "outcome", "zone_id_seen", "device_id_seen", "app_version_seen", "events", "advice",
+        "board_said"]
