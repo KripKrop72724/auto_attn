@@ -20,7 +20,7 @@ from zk_add.models import (AttendanceEvent, OrdsOutbox, TerminalRecordManifest,
     TerminalSourceEpoch, ZktCustodyWork, ZktDerivedEvidence, ZktOccurrenceAlias,
     ZktSourceAttendance, ZktSourceCutover)
 from zk_add.time_utils import ensure_utc, utc_now
-from zk_add.zkt_decode import DECODER_VERSION, MODEL_PROFILES, decode_source
+from zk_add.zkt_decode import DECODER_VERSION, MODEL_PROFILES, SOURCE_SIZES, decode_source
 from zk_add import zkt_derived_evidence as derived
 
 POLICY = "EXPERIMENTAL_SOURCE_ATTENDANCE_V1"
@@ -52,7 +52,7 @@ def _cutover(session, connector):
     if (terminal is None or epoch is None or connector.firmware_family != "zkt"
             or epoch.zkt_device_id != terminal.id or cutover.terminal_serial != terminal.serial
             or cutover.terminal_serial != terminal.confirmed_serial or cutover.model != terminal.model
-            or cutover.model not in MODEL_PROFILES or cutover.record_size not in {8, 16, 40}
+            or cutover.model not in MODEL_PROFILES or cutover.record_size not in SOURCE_SIZES
             or type(cutover.first_new_ordinal) is not int or not 0 <= cutover.first_new_ordinal < 2**31
             or not isinstance(value, dict) or not isinstance(value.get("boot_id"), str)
             or not 1 <= len(value["boot_id"]) <= 100

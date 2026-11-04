@@ -57,6 +57,7 @@ from zk_add.identity_provenance import historical_identity_is_supported
 from zk_add.settings import settings
 from zk_add.source_newest_slot import UNSETTLED_CONDITION, is_unsettled_newest
 from zk_add.time_utils import ensure_utc, utc_now
+from zk_add.zkt_decode import SOURCE_SIZES
 
 
 SAFE_LANE = "SAFE_DELIVERY"
@@ -952,7 +953,7 @@ def _exact_device_user(session: Session, manifest: TerminalRecordManifest) -> De
 
 
 def _decode_zkt_record(manifest: TerminalRecordManifest) -> dict:
-    if not manifest.protected_raw_record or manifest.record_size not in {8, 16, 40}:
+    if not manifest.protected_raw_record or manifest.record_size not in SOURCE_SIZES:
         raise RecoveryError("The preserved ZKT record cannot be decoded safely.", "SOURCE_NOT_PARSEABLE")
     try:
         raw = base64.b64decode(decrypt_text(manifest.protected_raw_record), validate=True)
@@ -973,6 +974,7 @@ def _decode_zkt_record(manifest: TerminalRecordManifest) -> dict:
         timestamp = int.from_bytes(raw[4:8], "little")
         status, punch = raw[8], raw[9]
     else:
+        # 40 bytes, or 49 whose 9-byte tail is never decoded.
         uid = str(int.from_bytes(raw[0:2], "little"))
         try:
             user_id = raw[2:26].split(b"\x00", 1)[0].decode("utf-8").strip()

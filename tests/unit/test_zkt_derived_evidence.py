@@ -46,6 +46,8 @@ def source_observation(size, **updates):
         raw[26] = 7
         struct.pack_into("<I", raw, 27, ENCODED)
         raw[31] = 2
+        if size == 49:  # MB40-VL/ID (ZAM180_TFT) tail after the 40-byte record.
+            raw[40:44] = b"\xff255"
     return observation(raw_format="SOURCE_RECORD", raw_b64=base64.b64encode(raw).decode(),
                        raw_digest=hashlib.sha256(raw).hexdigest(), **updates)
 
@@ -175,7 +177,7 @@ def test_independent_steps_batch_writes_and_rollback_together(store, monkeypatch
         assert count(db, AttendanceEvent) == count(db, OrdsOutbox) == 0
 
 
-@pytest.mark.parametrize("size", [8, 16, 40])
+@pytest.mark.parametrize("size", [8, 16, 40, 49])
 def test_historical_uid_stays_separate_and_receipts_do_not_change(custody, size):
     db, connector = custody
     value = source_observation(size)
@@ -192,6 +194,7 @@ def test_historical_uid_stays_separate_and_receipts_do_not_change(custody, size)
     facts = evidence["records"][0]["facts"]
     assert facts["user_id"] == (None if size == 8 else "123")
     assert facts["attendance_uid"] == (None if size == 16 else 456)
+    assert (facts["offset"], facts["length"]) == (0, size)
     assert facts["local_time"] == "2026-10-03T09:14:22+05:00"
     assert facts["utc_time"] == "2026-10-03T04:14:22+00:00"
     assert receipt.protected_observation == original

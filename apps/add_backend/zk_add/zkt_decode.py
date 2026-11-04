@@ -13,7 +13,13 @@ import struct
 from zk_add.zkt_packet import PACKET_MAX
 
 PAKISTAN_TIME = timezone(timedelta(hours=5))
-SOURCE_SIZES = frozenset({8, 16, 40})
+# ZKTeco MB40-VL/ID (platform ZAM180_TFT) appends a 9-byte tail (0xff or 0x00,
+# ASCII "255", zeros) to the 40-byte record. Only its 40-byte prefix is
+# decoded; all 49 bytes stay the custody, digest and length evidence.
+TAILED_SOURCE_SIZE = 49
+SOURCE_SIZES = frozenset({8, 16, 40, TAILED_SOURCE_SIZE})
+# Layouts with the attendance record UID at bytes 0-1 and a text user ID at 2-25.
+TEXT_SOURCE_SIZES = frozenset({40, TAILED_SOURCE_SIZE})
 LIVE_SIZES = frozenset({12, 32, 36, 52})
 MODEL_PROFILES = {
     "G3": "zkt-g3-v1",
@@ -99,7 +105,7 @@ def _facts(user_id: str | None, attendance_uid: int | None, encoded: int,
 def decode_source(raw: bytes, *, record_size: int, offset: int = 0) -> PunchFacts:
     if record_size not in SOURCE_SIZES or len(raw) != record_size or offset < 0:
         raise DecodeError("SOURCE_RECORD_BOUNDARY")
-    # The 8/40-byte historical UID is an attendance field. It is never silently
+    # The 8/40/49-byte historical UID is an attendance field. It is never silently
     # joined to the current enrollment table, including when user_id is absent.
     attendance_uid = int.from_bytes(raw[:2], "little") if record_size != 16 else None
     if record_size == 8:
@@ -108,7 +114,7 @@ def decode_source(raw: bytes, *, record_size: int, offset: int = 0) -> PunchFact
         return _facts(str(int.from_bytes(raw[:4], "little")), None,
                       int.from_bytes(raw[4:8], "little"), raw[8], raw[9], offset, 16)
     return _facts(_text_id(raw[2:26]), attendance_uid, int.from_bytes(raw[27:31], "little"),
-                  raw[26], raw[31], offset, 40)
+                  raw[26], raw[31], offset, record_size)
 
 
 def decode_live_record(raw: bytes, *, record_size: int, offset: int = 0) -> PunchFacts:

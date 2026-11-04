@@ -121,6 +121,7 @@ def normal_source_ownership_proven(session, event, connector):
     from zk_add.attendance_recovery import _decode_zkt_record
     from zk_add.models import TerminalRecordManifest, TerminalSourceEpoch
     from zk_add.time_utils import ensure_utc
+    from zk_add.zkt_decode import TEXT_SOURCE_SIZES
 
     # Only the owner's records prove its row. A moved terminal's later baseline
     # under another connector links its replay to this row without owning it.
@@ -151,7 +152,7 @@ def normal_source_ownership_proven(session, event, connector):
             return False
         decoded = _decode_zkt_record(manifest)
         record_uid_matches = bool(
-            manifest.record_size == 40 and decoded["uid"] == manifest.observed_uid
+            manifest.record_size in TEXT_SOURCE_SIZES and decoded["uid"] == manifest.observed_uid
             and decoded["uid"] == (event.raw_event or {}).get("attendance_record_uid")
             and manifest.observed_user_id == event.user_id
             and (event.raw_event or {}).get("terminal_provenance") == "VERIFIED_SOURCE_REPLAY"
@@ -736,7 +737,7 @@ def database_report(direct_run_id=None, attendance_event_ids=None):
                         OR (m.observed_user_id IS NOT NULL
                           AND m.observed_user_id <> e.user_id)
                         OR (m.observed_uid IS NOT NULL AND m.observed_uid <> e.uid
-                          AND NOT COALESCE(m.record_size=40 AND
+                          AND NOT COALESCE(m.record_size IN (40, 49) AND
                             m.observed_uid=(e.raw_event ->> 'attendance_record_uid'), false))
                         OR m.disposition NOT IN
                           ('EVENT','BLOCKED_IDENTITY','TERMINAL_DUPLICATE')))

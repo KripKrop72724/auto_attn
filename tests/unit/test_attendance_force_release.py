@@ -552,7 +552,9 @@ def test_oracle_authentication_fault_remains_pending_and_visible(store):
         assert "credentials" in force.items_page(db, job)["rows"][0]["reason"]
 
 
-def test_legitimate_uidless_format_and_harmless_historical_name_truncation(store):
+# 16: a numeric user ID; 49: MB40-VL/ID's 40-byte record plus a 9-byte tail.
+@pytest.mark.parametrize("record_size", [16, 49])
+def test_legitimate_uidless_format_and_harmless_historical_name_truncation(store, record_size):
     from zk_add.models import TerminalRecordManifest
 
     sessions, _, _ = store
@@ -566,7 +568,7 @@ def test_legitimate_uidless_format_and_harmless_historical_name_truncation(store
         event.uid = None
         event.display_name = "Correct Na"
         manifest = db.scalar(select(TerminalRecordManifest))
-        manifest.record_size = 16
+        manifest.record_size = record_size
         manifest.observed_user_id = event.user_id
         db.flush()
         assert force.identity_proof(db, event, connector, task)[1] is None
