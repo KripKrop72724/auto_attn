@@ -1,4 +1,6 @@
 import {
+  lazy,
+  Suspense,
   useCallback,
   useEffect,
   useMemo,
@@ -24,6 +26,9 @@ import { Icon } from '../Icon'
 import type { FirmwareSection } from '../types'
 
 type Toast = ReturnType<typeof useToast>
+
+// Its own chunk: the Prepare page's bundle budget has no room for the card.
+const InstallerAppDownload = lazy(() => import('./InstallerAppDownload'))
 
 const bundleSchema = z.object({
   firmware_family: z.enum(['zkt', 'hikvision']).default('zkt'),
@@ -323,6 +328,7 @@ export default function FirmwareProvisioning({
     zone_name: '',
   })
   const [errors, setErrors] = useState<Record<string, string>>({})
+  const [appRefresh, setAppRefresh] = useState(0)
   const headingRef = useRef<HTMLHeadingElement>(null)
   const platform = useMemo(platformChoice, [])
   const physicalUnsupported =
@@ -803,7 +809,13 @@ export default function FirmwareProvisioning({
         title="Firmware"
         description="Signed releases, device preparation, and audited rollouts to exact device scopes."
         action={
-          <button className="button secondary" onClick={() => void load()}>
+          <button
+            className="button secondary"
+            onClick={() => {
+              setAppRefresh((value) => value + 1)
+              void load()
+            }}
+          >
             <Icon name="refresh" /> Refresh
           </button>
         }
@@ -835,6 +847,9 @@ export default function FirmwareProvisioning({
           ),
         )}
       </nav>
+      <Suspense fallback={null}>
+        <InstallerAppDownload toast={toast} refreshKey={appRefresh} />
+      </Suspense>
       <p className="firmware-prepare-intro">
         Prepare a Zone Lite ESP32 over USB. ADD applies the approved signed
         firmware, writes encrypted site settings, verifies every range, and

@@ -285,6 +285,17 @@ const factoryBundle = {
   published_at: '2026-08-09T10:00:00Z',
 }
 
+const installerApps = {
+  latest: {
+    version: '1.1.0', git_sha: 'f'.repeat(40), published_at: '2026-11-04T09:30:00Z',
+    files: [
+      { platform: 'windows', arch: 'x64', kind: 'setup', filename: 'StateLife-Device-Installer-Setup-1.1.0.exe', size: 86_123_456, sha256: 'd'.repeat(64), download_path: '/api/v1/installer/apps/1.1.0/StateLife-Device-Installer-Setup-1.1.0.exe' },
+      { platform: 'macos', arch: 'arm64', kind: 'dmg', filename: 'StateLife-Device-Installer-1.1.0-macOS-arm64.dmg', size: 99_614_720, sha256: 'e'.repeat(64), download_path: '/api/v1/installer/apps/1.1.0/StateLife-Device-Installer-1.1.0-macOS-arm64.dmg' },
+    ],
+  },
+  min_app_version: '1.0.0',
+}
+
 async function mockDashboard(page: Page) {
   await page.route('**/events/**', (route) => route.abort())
   await page.route('**/api/**', async (route) => {
@@ -320,6 +331,7 @@ async function mockDashboard(page: Page) {
     else if (url.pathname === '/api/v1/provisioning/capabilities') json = { enabled: true, supported_platforms: ['windows-x64', 'macos-arm64'], hardware_profile: 'esp32s3-16mb-zone-lite-v1', companion_min_version: '1.0.0', latest_bundle: factoryBundle, can_start: true }
     else if (url.pathname === '/api/v1/provisioning/companions') json = { rows: [] }
     else if (url.pathname === '/api/v1/provisioning/sessions') json = { rows: [] }
+    else if (url.pathname === '/api/v1/installer/apps') json = installerApps
     else if (url.pathname === '/api/v1/provisioning/companion-releases/latest') json = { platform: url.searchParams.get('platform'), version: '1.0.0', filename: 'add-provisioning-companion-windows-x64.exe', sha256: 'c'.repeat(64), size: 123456, git_sha: factoryBundle.git_sha, download_url: '/api/v1/provisioning/companion-releases/windows-x64/download', os_signed: false }
     else if (url.pathname === `/api/v1/devices/${device.connector_id}/attendance-repairs/preflight`) json = { preview_enabled: true, execution_enabled: true, eligible: true, ready_now: true, requires_source_reconciliation: false, hard_blockers: [], waitable_blockers: [], limits: { employees: 500, events: 250000, oracle_batch: 100 }, source_certificate: attendanceRepairCandidates.source_certificate, terminal: { serial: device.zkt.serial, snapshot_complete: true, snapshot_stable: true, snapshot_revision: 9, attendance_count: 42 }, oracle: { available: true, capabilities: { contract_version: '1' } }, worker: { active_jobs: 0, review_items: 0, stale_leases: 0, oldest_job_age_seconds: 0 } }
     else if (url.pathname === `/api/v1/devices/${device.connector_id}/attendance-repair-candidates/query`) json = attendanceRepairCandidates
@@ -1001,6 +1013,12 @@ test('physical provisioning environment is responsive, explicit, and accessible'
   await expect(page.getByRole('heading', { name: 'Connect the provisioning companion' })).toBeVisible()
   await expect(page.getByText('c'.repeat(64))).toBeVisible()
   await expect(page.getByText(/not OS code-signed/i)).toBeVisible()
+  // The State Life Device Installer card leads the page: Windows first on Windows.
+  const installer = page.getByRole('region', { name: 'State Life Device Installer' })
+  await expect(installer.getByRole('link', { name: 'Download for Windows' })).toHaveAttribute('href', installerApps.latest.files[0].download_path)
+  await expect(installer.getByRole('link', { name: 'Download for Mac' })).toHaveAttribute('href', installerApps.latest.files[1].download_path)
+  await expect(installer.getByText('d'.repeat(64))).toBeVisible()
+  await expect(installer.getByText(/Windows protected your PC/)).toBeVisible()
   const dimensions = await page.evaluate(() => ({
     viewport: window.innerWidth,
     content: document.documentElement.scrollWidth,
