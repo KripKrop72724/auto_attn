@@ -268,6 +268,8 @@ jobs:
       # State Life Device Installer bundles; every step of this job, deploy.ps1
       # and the later compose calls alike, sees the same store.
       ADD_INSTALLER_BUNDLE_STORE_HOST_PATH: ${{ vars.ADD_INSTALLER_BUNDLE_STORE_HOST_PATH || 'C:\Users\Public\Documents\StateLife\AttendanceDeviceDashboard\installer-bundles' }}
+      # The installer app's own release builds, offered on the dashboard.
+      ADD_INSTALLER_APP_STORE_HOST_PATH: ${{ vars.ADD_INSTALLER_APP_STORE_HOST_PATH || 'C:\Users\Public\Documents\StateLife\AttendanceDeviceDashboard\installer-apps' }}
       ADD_DEPLOY_FIRMWARE_SIGNING_PUBLIC_KEY_PEM_B64: ${{ vars.ADD_FIRMWARE_SIGNING_PUBLIC_KEY_PEM_B64 }}
     steps:
       - uses: actions/checkout@v4
