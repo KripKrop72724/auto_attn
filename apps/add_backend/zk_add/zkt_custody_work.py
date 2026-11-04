@@ -25,6 +25,7 @@ from zk_add.models import Connector, TerminalRecordManifest, TerminalSourceEpoch
 from zk_add import zkt_derived_evidence as derived
 from zk_add.time_utils import utc_now
 from zk_add.settings import settings
+from zk_add.zkt_decode import SOURCE_SIZES
 from zk_add.zkt_packet import FRAGMENT_DATA, PACKET_MAX, parse_fragment, reassemble
 
 PRIORITY_BURST = 8
@@ -73,7 +74,7 @@ def attach_source_work(session: Session, connector: Connector,
                 or manifest.terminal_serial != connector.zkt_device.serial
                 or not manifest.canonical_source or not manifest.source_epoch_id
                 or manifest.disposition != "RAW_PRESERVED" or manifest.attendance_event_id is not None
-                or not manifest.protected_raw_record or manifest.record_size not in {8, 16, 40}):
+                or not manifest.protected_raw_record or manifest.record_size not in SOURCE_SIZES):
             raise ValueError("SOURCE_WORK_BINDING")
         prior = existing.get(manifest.id)
         if prior:

@@ -114,7 +114,7 @@ def seal_baseline(db, connector, request):
 
 
 @pytest.mark.parametrize("path", ["baseline", "tail"])
-@pytest.mark.parametrize("size", [8, 16, 40])
+@pytest.mark.parametrize("size", [8, 16, 40, 49])
 def test_atomic_custody_replays_without_attendance_or_polling_unchanged_holds(source_store, path, size):
     with source_store() as db:
         connector, request = prepare(db, path, size)

@@ -70,7 +70,7 @@ function boundaryLabel(value: SourceBoundary | undefined, fresh: boolean, now: n
   if (value.state === 'HELD') return `${fresh ? '' : 'Previous report: '}${humanizeStatus(value.reason)}`
   if (value.state !== 'VERIFIED_SOURCE_ANCHOR' || value.reason !== 'SOURCE_BOUNDARY_MATCHES_ADD_CUSTODY'
     || !counter(value.next_ordinal) || value.next_ordinal > 0x7fffffff
-    || !(value.next_ordinal === 0 ? value.record_size === 0 : [8, 16, 40].includes(value.record_size || 0))
+    || !(value.next_ordinal === 0 ? value.record_size === 0 : [8, 16, 40, 49].includes(value.record_size || 0))
     || !timestamp(value.sampled_at) || Date.parse(value.sampled_at) > now + 1000
     || typeof value.writer_digest !== 'string' || typeof value.capture_epoch !== 'string' || typeof value.source_epoch !== 'string'
     || !/^[a-f0-9]{64}$/.test(value.writer_digest || '') || !/^[a-f0-9]{32}$/.test(value.capture_epoch || '')

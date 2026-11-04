@@ -26,7 +26,7 @@ from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, ValidationErro
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "apps/add_backend"))
 from zk_add.zkt_decode import (  # noqa: E402
-    DECODER_VERSION, MODEL_PROFILES, DecodeError, decode_live_packet, decode_source,
+    DECODER_VERSION, MODEL_PROFILES, SOURCE_SIZES, DecodeError, decode_live_packet, decode_source,
 )
 
 MAX_FILE_BYTES = 4 * 1024 * 1024
@@ -75,7 +75,7 @@ class Case(Strict):
     @model_validator(mode="after")
     def coordinates(self):
         if self.kind == "SOURCE_RECORD":
-            if (self.record_size not in {8, 16, 40} or self.ordinal is None
+            if (self.record_size not in SOURCE_SIZES or self.ordinal is None
                     or self.source_epoch is None or self.expected_session is not None):
                 raise ValueError("SOURCE_COORDINATES_REQUIRED")
         elif (self.record_size not in {12, 32, 36, 52} or self.expected_session is None

@@ -400,7 +400,7 @@ def _uid_optional(session, event, connector):
                 TerminalRecordManifest.connector_id == connector.id,
                 TerminalRecordManifest.terminal_serial == event.device_serial,
                 TerminalRecordManifest.disposition == "EVENT",
-                TerminalRecordManifest.record_size.in_([16, 40]),
+                TerminalRecordManifest.record_size.in_([16, 40, 49]),
                 TerminalRecordManifest.observed_user_id == event.user_id,
             )
             .limit(1)

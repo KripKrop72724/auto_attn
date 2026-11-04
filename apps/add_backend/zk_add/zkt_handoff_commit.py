@@ -321,7 +321,7 @@ def commit_handoff(session, connector_id, *, release_id, actor, idempotency_key,
             ReconciliationCoverage.active.is_(True),
         )
     )
-    if boundary["record_size"] not in {16, 40}:
+    if boundary["record_size"] not in {16, 40, 49}:
         # A zero boundary has no inferred layout; eight-byte attendance has no
         # independently supported textual user reference in this contract.
         raise ValueError("HANDOFF_SOURCE_LAYOUT_NOT_DELIVERABLE")

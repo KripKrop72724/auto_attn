@@ -33,7 +33,7 @@ static unsigned calls, fail_at, builds;
 static bool raw_only, writer_ready;
 static bool zj_runtime_raw_source_required(void) {return raw_only;}
 static bool zj_runtime_writer_ready(void) {return writer_ready;}
-static uint8_t encoded_input[40]; static size_t encoded_length;
+static uint8_t encoded_input[ZKT_RECORD_MAX_BYTES]; static size_t encoded_length;
 static void *allocate(size_t size) { if (++calls == fail_at) return NULL; return malloc(size); }
 typedef struct {int unused;} user_table_t;
 static const char *g_device_serial="synthetic-terminal";
@@ -51,7 +51,7 @@ static void json_add_utf8_string(cJSON *row,const char *name,const char *value) 
     cJSON_AddStringToObject(row,name,value);
 }
 static void sha256_bytes_hex(const uint8_t *raw,size_t length,char out[65]) {
-    assert(raw && length<=40); memset(out,'a',64); out[64]=0;
+    assert(raw && length<=ZKT_RECORD_MAX_BYTES); memset(out,'a',64); out[64]=0;
 }
 static void sha256_hex(const char *in,char out[65]) {assert(in[0]);memset(out,'b',64);out[64]=0;}
 static bool encode_record_base64(const uint8_t *raw,size_t length,char *out,size_t size) {
@@ -92,6 +92,12 @@ static void check(const uint8_t *raw,unsigned size,const char *expected,bool has
         assert(!strcmp(cJSON_GetStringValue(cJSON_GetObjectItem(row,"observed_uid")),"40"));
         assert(!strcmp(cJSON_GetStringValue(cJSON_GetObjectItem(row,"error_code")),"HISTORICAL_IDENTITY_EVIDENCE_REQUIRED"));
     }
+    if(size==49 && !strcmp(expected,"EVENT")) {
+        /* Fields come from the 40-byte prefix; the tail is only raw evidence. */
+        assert(!strcmp(cJSON_GetStringValue(cJSON_GetObjectItem(row,"observed_uid")),"40"));
+        assert(!strcmp(cJSON_GetStringValue(cJSON_GetObjectItem(row,"observed_user_id")),"1234"));
+        assert(cJSON_GetNumberValue(cJSON_GetObjectItem(row,"raw_timestamp"))==859972462.0);
+    }
     if(!strcmp(expected,"RAW_PRESERVED")) {
         assert(!builds && cJSON_IsNull(cJSON_GetObjectItem(digest_row,"event_uid")));
         assert(!cJSON_HasObjectItem(row,"raw_timestamp") && !cJSON_HasObjectItem(row,"observed_uid"));
@@ -110,7 +116,7 @@ static void check(const uint8_t *raw,unsigned size,const char *expected,bool has
 }
 int main(void) {
     cJSON_Hooks hooks={allocate,free};cJSON_InitHooks(&hooks);
-    uint8_t raw[40]={40};uint32_t time=859972462U;
+    uint8_t raw[ZKT_RECORD_MAX_BYTES]={40};uint32_t time=859972462U;
     for(unsigned i=0;i<4;++i) raw[27+i]=(uint8_t)(time>>(i*8));
     check(raw,40,"IDENTITY_UNRESOLVED",false);
     memset(raw+2,' ',24);check(raw,40,"IDENTITY_UNRESOLVED",false);
@@ -123,8 +129,17 @@ int main(void) {
     memset(raw,0,sizeof(raw));raw[0]=7;
     for(unsigned i=0;i<4;++i) raw[4+i]=(uint8_t)(time>>(i*8));
     check(raw,16,"EVENT",true);
+    /* Synthetic MB40-VL/ID record: user "1234" and the observed ff "255" tail. */
+    static const uint8_t tail[9]={0xff,'2','5','5'};
+    memset(raw,0,sizeof(raw));raw[0]=40;memcpy(raw+2,"1234",4);raw[26]=15;memcpy(raw+40,tail,9);
+    for(unsigned i=0;i<4;++i) raw[27+i]=(uint8_t)(time>>(i*8));
+    check(raw,49,"EVENT",true);
+    raw[40]=0;check(raw,49,"EVENT",true);
+    memset(raw+2,' ',24);check(raw,49,"IDENTITY_UNRESOLVED",false);
+    memset(raw+2,0,24);raw[2]=1;check(raw,49,"MALFORMED",false);
+    raw[2]='7';memset(raw+27,0,4);check(raw,49,"INVALID_TIME",false);
     raw_only=writer_ready=true;
-    const unsigned sizes[]={8,16,40};
+    const unsigned sizes[]={8,16,40,49};
     for(unsigned i=0;i<sizeof(sizes)/sizeof(sizes[0]);++i) {
         unsigned size=sizes[i];
         memset(raw,0xff,sizeof(raw));check(raw,size,"RAW_PRESERVED",false);
@@ -136,6 +151,8 @@ int main(void) {
     assert(!calls&&!builds&&!encoded_length&&!strcmp(disposition,"unchanged"));
     writer_ready=true;
     assert(!append_terminal_source_record(rows,canonical,raw,39,NULL,3,NULL,&disposition));
+    assert(!append_terminal_source_record(rows,canonical,raw,48,NULL,3,NULL,&disposition));
+    assert(!append_terminal_source_record(rows,canonical,raw,50,NULL,3,NULL,&disposition));
     assert(!append_terminal_source_record(rows,canonical,raw,40,NULL,UINT32_MAX,NULL,&disposition));
     assert(!calls&&!builds&&!encoded_length);
     assert(append_terminal_source_record(rows,canonical,raw,40,NULL,3,NULL,&disposition));
