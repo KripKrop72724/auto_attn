@@ -50,3 +50,60 @@ int main(void) {
                     "-Werror", "-fsanitize=address,undefined", "-I", str(main),
                     str(unit), str(main / "zkt_record.c"), "-o", str(executable)], check=True)
     subprocess.run([str(executable)], check=True)
+
+
+def test_tailed_49_byte_records_decode_only_their_40_byte_prefix(tmp_path):
+    """Synthetic MB40-VL/ID (ZAM180_TFT) layout: 40 bytes plus a 9-byte tail."""
+    main = ROOT / "firmware/zone_lite/main"
+    unit = tmp_path / "records49.c"
+    unit.write_text(r'''
+#include "zkt_record.h"
+#include <assert.h>
+#include <string.h>
+int main(void) {
+    const uint32_t sizes[]={40,16,8,ZKT_RECORD_TAILED_BYTES};
+    /* LHRCENTRAL-01 on 4 Nov 2026: payload=651357 count=13293. */
+    assert(zkt_record_size(651357,13293,sizes,4)==49);
+    assert(zkt_record_size(651357,13294,sizes,4)==0);
+    assert(zkt_record_size(651357,0,sizes,4)==49); /* No other width divides it. */
+    /* A count always names one width; without one, 40 and 49 stay ambiguous. */
+    assert(zkt_record_size(1960,49,sizes,4)==40 && zkt_record_size(1960,40,sizes,4)==49);
+    assert(zkt_record_size(1960,0,sizes,4)==0);
+    assert(zkt_record_size(8000000,200000,sizes,4)==40 && zkt_record_size(160,4,sizes,4)==40);
+    assert(zkt_record_size(3200000,200000,sizes,4)==16 && zkt_record_size(1600000,200000,sizes,4)==8);
+    uint32_t offset,length;
+    assert(zkt_record_range(651361,49,13292,13293,&offset,&length));
+    assert(offset==4+13292*49 && length==49);
+    assert(!zkt_record_range(651361,49,13292,13294,&offset,&length));
+    assert(!zkt_record_range(651361,40,0,1,&offset,&length));
+    static const uint8_t tails[2][9]={{0xff,'2','5','5'},{0x00,'2','5','5'}};
+    uint8_t raw[ZKT_RECORD_MAX_BYTES]={0x2a,0x05,'1','2','3','4'};
+    raw[26]=15;raw[27]=0x6e;raw[28]=0x23;raw[29]=0x42;raw[30]=0x33;
+    zkt_record_t prefix,record;
+    assert(zkt_record_decode(raw,40,&prefix));
+    for(unsigned i=0;i<2;++i){
+        memcpy(raw+40,tails[i],9);
+        assert(zkt_record_decode(raw,49,&record) && !memcmp(&record,&prefix,sizeof(record)));
+        assert(record.attendance_uid==0x052a && !strcmp(record.user_id,"1234"));
+        assert(record.encoded_time==859972462U && record.status==15 && !record.punch);
+        assert(!zkt_record_identity_missing(raw,49));
+    }
+    /* The tail is never read as identity, time or status. */
+    memset(raw+40,0xff,9);
+    assert(zkt_record_decode(raw,49,&record) && !memcmp(&record,&prefix,sizeof(record)));
+    for(unsigned size=41;size<=64;++size)
+        if(size!=49) assert(!zkt_record_decode(raw,size,&record) && !zkt_record_identity_missing(raw,size));
+    memset(raw+2,' ',24);
+    assert(!zkt_record_decode(raw,49,&record) && zkt_record_identity_missing(raw,49));
+    memset(raw+2,0,24);
+    assert(!zkt_record_decode(raw,49,&record) && zkt_record_identity_missing(raw,49));
+    raw[2]=1;
+    assert(!zkt_record_decode(raw,49,&record) && !zkt_record_identity_missing(raw,49));
+    return 0;
+}
+''')
+    executable = tmp_path / "records49"
+    subprocess.run([shutil.which("cc"), "-std=c11", "-g", "-O1", "-Wall", "-Wextra",
+                    "-Werror", "-fsanitize=address,undefined", "-I", str(main),
+                    str(unit), str(main / "zkt_record.c"), "-o", str(executable)], check=True)
+    subprocess.run([str(executable)], check=True)
