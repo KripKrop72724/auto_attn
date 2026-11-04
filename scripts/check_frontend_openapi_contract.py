@@ -143,6 +143,13 @@ def main() -> None:
         assert "idempotency_key" in optional["properties"] and not optional.get("required")
     reconciliation_parameters = {row["name"] for row in paths["/api/v1/reconciliations"]["get"]["parameters"]}
     assert {"include_archived", "cursor", "limit", "status_group", "zone_id", "q"}.issubset(reconciliation_parameters)
+    # The Prepare page's installer download card reads the newest app and links
+    # to its files; both are plain GETs with no query or body.
+    assert "get" in paths["/api/v1/installer/apps"]
+    assert "parameters" not in paths["/api/v1/installer/apps"]["get"]
+    download = paths["/api/v1/installer/apps/{version}/{filename}"]["get"]
+    assert {row["name"] for row in download["parameters"] if row["in"] == "path"} == {"version", "filename"}
+    assert "requestBody" not in download
     print("Frontend OpenAPI safety contracts are synchronized.")
 
 

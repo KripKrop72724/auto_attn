@@ -607,6 +607,22 @@ $environment["ADD_INSTALLER_BUNDLE_STORE_HOST_PATH"] = $installerBundleStore
 # Compose prefers the process environment to .env.add, and an unset GitHub
 # variable arrives as an empty value that would select the checkout default.
 $env:ADD_INSTALLER_BUNDLE_STORE_HOST_PATH = $installerBundleStore
+# Release builds of the installer app itself, offered for download on the
+# dashboard and mounted read-only into add-api the same way. An empty store
+# is valid.
+$installerAppStore = $env:ADD_INSTALLER_APP_STORE_HOST_PATH
+if ([string]::IsNullOrWhiteSpace($installerAppStore)) {
+    $installerAppStore = $environment["ADD_INSTALLER_APP_STORE_HOST_PATH"]
+}
+if ([string]::IsNullOrWhiteSpace($installerAppStore)) {
+    $installerAppStore = "C:\Users\Public\Documents\StateLife\AttendanceDeviceDashboard\installer-apps"
+}
+if (-not [IO.Path]::IsPathRooted($installerAppStore)) {
+    throw "ADD_INSTALLER_APP_STORE_HOST_PATH must be an absolute directory."
+}
+New-Item -ItemType Directory -Path $installerAppStore -Force | Out-Null
+$environment["ADD_INSTALLER_APP_STORE_HOST_PATH"] = $installerAppStore
+$env:ADD_INSTALLER_APP_STORE_HOST_PATH = $installerAppStore
 # These deployment coordinates are locked product requirements, not operator
 # secrets. Canonicalizing them migrates older protected environments safely.
 $environment["ADD_ADMIN_COOKIE_SECURE"] = "true"
