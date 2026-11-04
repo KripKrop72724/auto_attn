@@ -170,6 +170,58 @@ function Assert-DockerCapacity {
             "Allocate at least 48 GB RAM and 24 logical CPUs to Docker before deploying ADD."
         )
     }
+    return $actualMemoryBytes
+}
+
+function ConvertTo-ComposeByteCount {
+    param([Parameter(Mandatory = $true)][string] $Value)
+    # Compose v2 renders mem_limit as plain bytes; older releases kept the
+    # unit ("32g"). Accept both.
+    $match = [regex]::Match($Value.Trim(), '^(?<number>[0-9]+(\.[0-9]+)?)\s*(?<unit>[bkmgt]?)b?$', 'IgnoreCase')
+    if (-not $match.Success) {
+        throw "A service memory limit in the rendered compose configuration is not a size."
+    }
+    $multiplier = switch ($match.Groups["unit"].Value.ToLowerInvariant()) {
+        "k" { 1KB }
+        "m" { 1MB }
+        "g" { 1GB }
+        "t" { 1TB }
+        default { 1 }
+    }
+    return [int64]([double]::Parse($match.Groups["number"].Value, [Globalization.CultureInfo]::InvariantCulture) * $multiplier)
+}
+
+function Assert-ComposeMemoryFits {
+    param([Parameter(Mandatory = $true)][int64] $DockerMemoryBytes)
+    # The per-service limits must fit inside the Docker VM with room for the
+    # VM itself and the image build; otherwise the VM's OOM killer picks the
+    # largest process, which is PostgreSQL. Totals only are printed.
+    $headroomBytes = [int64](4GB)
+    $rendered = Invoke-Docker -Arguments ($compose + @("config", "--format", "json")) -Capture
+    $start = $rendered.IndexOf("{")
+    if ($start -lt 0) {
+        throw "The rendered compose configuration could not be read."
+    }
+    try {
+        $config = $rendered.Substring($start) | ConvertFrom-Json
+    } catch {
+        throw "The rendered compose configuration is not valid JSON."
+    }
+    $totalBytes = [int64]0
+    foreach ($service in $config.services.PSObject.Properties) {
+        $limit = $service.Value.PSObject.Properties["mem_limit"]
+        if ($null -ne $limit -and $null -ne $limit.Value -and "$($limit.Value)" -ne "") {
+            $totalBytes += ConvertTo-ComposeByteCount -Value "$($limit.Value)"
+        }
+    }
+    if ($totalBytes -gt ($DockerMemoryBytes - $headroomBytes)) {
+        $totalGb = [math]::Round($totalBytes / 1GB, 1)
+        $dockerGb = [math]::Round($DockerMemoryBytes / 1GB, 1)
+        throw (
+            "ADD's container memory limits add up to $totalGb GB but Docker exposes $dockerGb GB " +
+            "(4 GB must stay free). Lower ADD_POSTGRES_MEMORY_LIMIT / ADD_API_MEMORY_LIMIT or give Docker more RAM."
+        )
+    }
 }
 
 function Write-DeployTiming {
@@ -540,6 +592,82 @@ if (-not [string]::IsNullOrWhiteSpace($env:ADD_DEPLOY_RECONCILIATION_SELF_HEALIN
 if (-not [string]::IsNullOrWhiteSpace($env:ADD_DEPLOY_RECONCILIATION_DEVICE_CONCURRENCY)) {
     $environment["ADD_RECONCILIATION_DEVICE_CONCURRENCY"] = $env:ADD_DEPLOY_RECONCILIATION_DEVICE_CONCURRENCY
 }
+# Database capacity (docs/production-runbook.md, "Database capacity"). The
+# sizes shipped in .env.add.example before November 2026 are dropped so the
+# current docker-compose.add.yml and settings.py defaults apply; any other
+# protected value is kept. A repository variable then overrides either one.
+# Only the ADD_DEPLOY_ names reach this process: Compose prefers the process
+# environment to .env.add, so the raw names stay in the protected file only.
+# Values are validated but never printed.
+$retiredCapacityDefaults = @{
+    "ADD_POSTGRES_MEMORY_LIMIT" = "16g"
+    "ADD_POSTGRES_SHM_SIZE" = "2gb"
+    "ADD_POSTGRES_SHARED_BUFFERS" = "4GB"
+    "ADD_POSTGRES_EFFECTIVE_CACHE_SIZE" = "12GB"
+    "ADD_POSTGRES_MAINTENANCE_WORK_MEM" = "1GB"
+    "ADD_API_MEMORY_LIMIT" = "8g"
+    "ADD_DATABASE_POOL_SIZE" = "20"
+    "ADD_DATABASE_MAX_OVERFLOW" = "20"
+    "ADD_DATABASE_POOL_TIMEOUT_SECONDS" = "5"
+}
+foreach ($capacityName in @($retiredCapacityDefaults.Keys)) {
+    if ($environment.ContainsKey($capacityName) -and
+        ([string]$environment[$capacityName]).Trim() -ceq $retiredCapacityDefaults[$capacityName]) {
+        $environment.Remove($capacityName)
+    }
+}
+$dockerSizePattern = '^[1-9][0-9]*([mMgG]|[mMgG][bB])$'
+$postgresSizePattern = '^[1-9][0-9]*(kB|MB|GB)$'
+$capacityPatterns = [ordered]@{
+    "POSTGRES_MEMORY_LIMIT" = $dockerSizePattern
+    "POSTGRES_SHM_SIZE" = $dockerSizePattern
+    "POSTGRES_SHARED_BUFFERS" = $postgresSizePattern
+    "POSTGRES_EFFECTIVE_CACHE_SIZE" = $postgresSizePattern
+    "POSTGRES_MAINTENANCE_WORK_MEM" = $postgresSizePattern
+    "POSTGRES_WORK_MEM" = $postgresSizePattern
+    "POSTGRES_MAX_CONNECTIONS" = '^[1-9][0-9]{1,3}$'
+    "API_MEMORY_LIMIT" = $dockerSizePattern
+    "DATABASE_POOL_SIZE" = '^[1-9][0-9]{0,2}$'
+    "DATABASE_MAX_OVERFLOW" = '^[0-9]{1,3}$'
+    "DATABASE_POOL_TIMEOUT_SECONDS" = '^[1-9][0-9]?$'
+}
+foreach ($capacitySuffix in $capacityPatterns.Keys) {
+    $deployValue = [Environment]::GetEnvironmentVariable("ADD_DEPLOY_$capacitySuffix")
+    if ([string]::IsNullOrWhiteSpace($deployValue)) {
+        continue
+    }
+    $deployValue = $deployValue.Trim()
+    if ($deployValue -cnotmatch $capacityPatterns[$capacitySuffix]) {
+        throw "ADD_DEPLOY_$capacitySuffix must match $($capacityPatterns[$capacitySuffix])."
+    }
+    $environment["ADD_$capacitySuffix"] = $deployValue
+}
+# The API's pool (size + overflow) must leave PostgreSQL connections for
+# deploy backups, restore checks, migrations and operators. Defaults:
+# settings.py 40 + 40, docker-compose.add.yml max_connections 200.
+$capacityNumbers = @{
+    "ADD_DATABASE_POOL_SIZE" = 40
+    "ADD_DATABASE_MAX_OVERFLOW" = 40
+    "ADD_POSTGRES_MAX_CONNECTIONS" = 200
+}
+foreach ($capacityName in @($capacityNumbers.Keys)) {
+    if (-not $environment.ContainsKey($capacityName)) {
+        continue
+    }
+    $parsedNumber = 0
+    if (-not [int]::TryParse(([string]$environment[$capacityName]).Trim(), [ref]$parsedNumber)) {
+        throw "$capacityName must be a whole number."
+    }
+    $capacityNumbers[$capacityName] = $parsedNumber
+}
+if ($capacityNumbers["ADD_DATABASE_POOL_SIZE"] -lt 5 -or $capacityNumbers["ADD_DATABASE_POOL_SIZE"] -gt 100 -or
+    $capacityNumbers["ADD_DATABASE_MAX_OVERFLOW"] -lt 0 -or $capacityNumbers["ADD_DATABASE_MAX_OVERFLOW"] -gt 100) {
+    throw "ADD_DATABASE_POOL_SIZE must be 5-100 and ADD_DATABASE_MAX_OVERFLOW 0-100."
+}
+if ($capacityNumbers["ADD_DATABASE_POOL_SIZE"] + $capacityNumbers["ADD_DATABASE_MAX_OVERFLOW"] + 20 -gt
+    $capacityNumbers["ADD_POSTGRES_MAX_CONNECTIONS"]) {
+    throw "The ADD database pool (size + overflow) must leave at least 20 of ADD_POSTGRES_MAX_CONNECTIONS free."
+}
 # Safe repair is check-only until production canaries are explicitly enabled.
 foreach ($repairFlag in @("PREVIEW", "EXECUTION")) {
     $deployValue = [Environment]::GetEnvironmentVariable("ADD_DEPLOY_ATTENDANCE_SAFE_REPAIR_${repairFlag}_ENABLED")
@@ -802,8 +930,9 @@ try {
     Copy-Item -LiteralPath ".env.add" -Destination $pendingEnvironment
 
     Invoke-Docker -Arguments @("info") | Out-Null
-    Assert-DockerCapacity
+    $dockerMemoryBytes = Assert-DockerCapacity
     Invoke-Docker -Arguments ($compose + @("config", "--quiet"))
+    Assert-ComposeMemoryFits -DockerMemoryBytes $dockerMemoryBytes
 
     # Image tags are rollback candidates only after a completed release wrote
     # immutable metadata. A failed first build can leave production-named tags
@@ -837,7 +966,10 @@ try {
     if ($preWatchdogImage) { Invoke-Docker -Arguments @("tag", $preWatchdogImage, $rollbackWatchdogTag) }
 
     # Bring only durable dependencies online first, then take a binary-safe logical backup.
-    Invoke-Docker -Arguments ($compose + @("up", "-d", "--wait", "--wait-timeout", "120", "postgres", "redis"))
+    # A changed PostgreSQL configuration recreates the container: the old one
+    # gets up to its 180 s stop_grace_period for a clean checkpoint, and the
+    # new one up to its 120 s start_period plus retries for crash recovery.
+    Invoke-Docker -Arguments ($compose + @("up", "-d", "--wait", "--wait-timeout", "300", "postgres", "redis"))
     $postgresContainer = Get-PostgresContainer
     if (-not $postgresContainer) { throw "PostgreSQL container was not created." }
     $preRevision = Get-DatabaseRevision -DatabaseUser $dbUser -DatabaseName $dbName

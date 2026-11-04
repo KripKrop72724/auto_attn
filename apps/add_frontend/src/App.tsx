@@ -22,6 +22,8 @@ import { AppShell } from './AppShell'
 import { Icon } from './Icon'
 import { dashboardRoute, firmwareSection, routeDeviceId, routePath } from './routing'
 import { useRealtime, type RealtimeTopic } from './realtime'
+import { useThrottledRunner } from './lib/throttle'
+import { formatMetricsTime } from './lib/metricsTime'
 import {
   firmwareLabel, humanizeStatus, isOnlineState, normalizedStatus, statusPattern, terminalLinkNeedsAttention,
   terminalLinkPattern, type StatusPattern,
@@ -457,6 +459,12 @@ export function Metric({ label, value, detail, icon, tone = 'neutral', onClick }
     : <article className={`metric-card metric-${tone}`}>{content}</article>
 }
 
+// The server may serve cached overview metrics; say how old they are. Older
+// backends omit the field and nothing is shown.
+export function metricsTime(overview: Overview) {
+  return formatMetricsTime(overview.metrics_computed_at)
+}
+
 // Availability is only calm when nearly every connector is online.
 export const availabilityTone = (percent: number, total: number): MetricTone =>
   !total ? 'neutral' : percent >= 95 ? 'positive' : percent >= 80 ? 'warning' : 'critical'
@@ -519,6 +527,7 @@ function FleetView({
   const delivery = overview.ords_delivery
   const recovery = overview.attendance_recovery?.delivery
   const backlogStale = Boolean(delivery?.oldest_backlog_at && Date.now() - +new Date(delivery.oldest_backlog_at) > 15 * 60_000)
+  const metricsAsOf = metricsTime(overview)
   const filtered = Boolean(needle) || (inventory === 'fleet' && filter !== 'ALL')
   const clearFilters = () => { setQuery(''); setFilter('ALL') }
   const showAttention = () => { setInventory('fleet'); setFilter('ATTENTION'); setMode('list') }
@@ -529,6 +538,9 @@ function FleetView({
         description={inventory === 'fleet'
           ? 'Live health of every Zone Lite connector and its attendance terminal.'
           : 'Backup devices, kept apart from fleet health, outages, and the operations queue.'}
+        action={inventory === 'fleet' && metricsAsOf
+          ? <span className="fleet-toolbar-note" title="Time the server computed these fleet metrics"><Icon name="clock" /> Metrics as of {metricsAsOf}</span>
+          : undefined}
       />
       <div className="section-tabs fleet-inventory-tabs" role="tablist" aria-label="Device inventory">
         <button role="tab" aria-selected={inventory === 'fleet'} className={inventory === 'fleet' ? 'active' : ''} onClick={() => setInventory('fleet')}><Icon name="grid" /> Active fleet <span className="tab-count">{activeDevices.length}</span></button>
@@ -753,6 +765,12 @@ export function resolutionSummary(kind: string, actor?: string | null) {
   return actor ? `${label} (${actor})` : label
 }
 
+// Realtime refresh bounds. Heartbeats and command updates refresh the device
+// list; alerts and the periodic resync refresh the heavier overview.
+export const DEVICE_REFRESH_MS = 3_000
+export const FLEET_OVERVIEW_REFRESH_MS = 15_000
+export const BACKGROUND_OVERVIEW_REFRESH_MS = 60_000
+
 const DeviceDrawer = lazy(() => import('./features/DeviceDrawer').then((module) => ({ default: module.DeviceDrawer })))
 
 function DashboardApp() {
@@ -765,7 +783,8 @@ function DashboardApp() {
   const [authState, setAuthState] = useState<'loading' | 'anonymous' | 'authenticated'>('loading')
   const [username, setUsername] = useState('')
   const devices = useDevices()
-  const fleetRequest = useRef(0)
+  const deviceRequest = useRef(0)
+  const overviewRequest = useRef(0)
   const [overview, setOverview] = useState<Overview>({ total: 0, open_alerts: 0, active_leases: 0 })
   const [loading, setLoading] = useState(true)
   const [revisions, setRevisions] = useState<Record<RealtimeTopic, number>>({
@@ -873,24 +892,61 @@ function DashboardApp() {
     if (match && drawer?.connector_id !== match.connector_id) setDrawer(match)
   }, [devices, drawer, location.pathname])
 
-  const refreshFleet = useCallback(async () => {
-    const request = ++fleetRequest.current
-    setLoading(true)
+  // Devices and overview refresh apart: heartbeats and commands only change the
+  // device list, while the overview aggregates the whole attendance and ORDS
+  // backlog and is far heavier on a busy server. Background refreshes never
+  // touch the loading state, so a live page does not flicker.
+  const reportFleetError = useCallback((reason: unknown) => {
+    if (reason instanceof ApiError && reason.status === 401) setAuthState('anonymous')
+    else toast.error(reason instanceof Error ? reason.message : 'Unable to refresh fleet.')
+  }, [toast.error])
+
+  const refreshDevices = useCallback(async () => {
+    const request = ++deviceRequest.current
     try {
-      const [counts, fleet] = await Promise.all([
-        queryClient.fetchQuery({ queryKey: ['overview'], queryFn: ({ signal }) => api<Overview>('/api/v1/overview', { signal }), staleTime: 0 }),
-        queryClient.fetchQuery({ queryKey: ['devices'], queryFn: ({ signal }) => api<{ rows: Device[] }>('/api/v1/devices', { signal }), staleTime: 0 }),
-      ])
-      if (request !== fleetRequest.current) return
-      setOverview(counts)
+      const fleet = await queryClient.fetchQuery({ queryKey: ['devices'], queryFn: ({ signal }) => api<{ rows: Device[] }>('/api/v1/devices', { signal }), staleTime: 0 })
+      if (request !== deviceRequest.current) return
       deviceSnapshots.replaceFleet(fleet.rows)
     } catch (reason) {
-      if (reason instanceof ApiError && reason.status === 401) setAuthState('anonymous')
-      else toast.error(reason instanceof Error ? reason.message : 'Unable to refresh fleet.')
+      if (request === deviceRequest.current) reportFleetError(reason)
     } finally {
-      if (request === fleetRequest.current) setLoading(false)
+      if (request === deviceRequest.current) setLoading(false)
     }
-  }, [toast.error])
+  }, [reportFleetError])
+
+  const refreshOverview = useCallback(async () => {
+    const request = ++overviewRequest.current
+    try {
+      const counts = await queryClient.fetchQuery({ queryKey: ['overview'], queryFn: ({ signal }) => api<Overview>('/api/v1/overview', { signal }), staleTime: 0 })
+      if (request !== overviewRequest.current) return
+      setOverview(counts)
+    } catch (reason) {
+      if (request === overviewRequest.current) reportFleetError(reason)
+    }
+  }, [reportFleetError])
+
+  // Only the Fleet page shows the overview metrics; elsewhere the shell needs
+  // just the alert count, so the overview refreshes at most once a minute.
+  const viewRef = useRef(view)
+  viewRef.current = view
+  const deviceRefresh = useThrottledRunner(refreshDevices, DEVICE_REFRESH_MS)
+  const overviewRefresh = useThrottledRunner(
+    refreshOverview,
+    () => viewRef.current === 'fleet' ? FLEET_OVERVIEW_REFRESH_MS : BACKGROUND_OVERVIEW_REFRESH_MS,
+  )
+
+  const invalidateFleetRequests = useCallback(() => {
+    ++deviceRequest.current
+    ++overviewRequest.current
+    deviceRefresh.cancel()
+    overviewRefresh.cancel()
+  }, [deviceRefresh, overviewRefresh])
+
+  // Explicit refresh after an operator action: both at once, never overlapping
+  // a request already in flight.
+  const refreshFleet = useCallback(async () => {
+    await Promise.all([deviceRefresh.runNow(), overviewRefresh.runNow()])
+  }, [deviceRefresh, overviewRefresh])
 
   const handleRealtimeTopics = useCallback((topics: ReadonlySet<RealtimeTopic>) => {
     setRevisions((current) => {
@@ -904,8 +960,11 @@ function DashboardApp() {
       })
       return next
     })
-    if (['device', 'resync', 'command', 'attendance', 'alert'].some(topic => topics.has(topic as RealtimeTopic))) void refreshFleet()
-  }, [refreshFleet])
+    // Attendance never refreshes the overview directly: a punch release emits
+    // thousands of batches, and the periodic resync picks the backlog up.
+    if (topics.has('device') || topics.has('command') || topics.has('resync')) deviceRefresh.schedule()
+    if (topics.has('alert') || topics.has('resync')) overviewRefresh.schedule()
+  }, [deviceRefresh, overviewRefresh])
   const realtime = useRealtime(authState === 'authenticated', handleRealtimeTopics)
 
   useEffect(() => {
@@ -922,19 +981,29 @@ function DashboardApp() {
     const handleSessionExpired = () => {
       setCsrfToken('')
       setAuthState('anonymous')
-      ++fleetRequest.current
+      invalidateFleetRequests()
       deviceSnapshots.clear()
       queryClient.clear()
       setDrawer(null)
     }
     window.addEventListener('add:session-expired', handleSessionExpired)
     return () => window.removeEventListener('add:session-expired', handleSessionExpired)
-  }, [])
+  }, [invalidateFleetRequests])
 
   useEffect(() => {
     if (authState !== 'authenticated') return
+    setLoading(true)
     void refreshFleet()
   }, [authState, refreshFleet])
+
+  // Returning to the Fleet page brings its metrics up to date (immediately when
+  // the last overview is older than the Fleet interval).
+  const previousView = useRef(view)
+  useEffect(() => {
+    if (previousView.current === view) return
+    previousView.current = view
+    if (authState === 'authenticated' && view === 'fleet') overviewRefresh.schedule()
+  }, [authState, overviewRefresh, view])
 
   const login = async (loginUsername: string, password: string) => {
     const response = await api<{ username: string; csrf_token: string }>('/api/v1/auth/login', {
@@ -950,7 +1019,7 @@ function DashboardApp() {
     try { await api('/api/v1/auth/logout', { method: 'POST', body: '{}' }) } finally {
       setCsrfToken('')
       setAuthState('anonymous')
-      ++fleetRequest.current
+      invalidateFleetRequests()
       deviceSnapshots.clear()
       queryClient.clear()
     }

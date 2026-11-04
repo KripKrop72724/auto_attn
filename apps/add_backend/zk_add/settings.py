@@ -20,9 +20,13 @@ class AddSettings(BaseSettings):
     port: int = 8096
     data_dir: Path = Path.cwd() / "local-data" / "add"
     database_url: str | None = None
-    database_pool_size: int = Field(default=20, ge=5, le=100)
-    database_max_overflow: int = Field(default=20, ge=0, le=100)
-    database_pool_timeout_seconds: int = Field(default=5, ge=1, le=30)
+    # One Uvicorn process owns every request thread and background loop, so its
+    # pool is the whole of ADD's database concurrency. 40 + 40 stays well under
+    # PostgreSQL max_connections (200 in docker-compose.add.yml); a request
+    # waits up to the pool timeout for a connection before failing fast.
+    database_pool_size: int = Field(default=40, ge=5, le=100)
+    database_max_overflow: int = Field(default=40, ge=0, le=100)
+    database_pool_timeout_seconds: int = Field(default=10, ge=1, le=30)
     database_pool_recycle_seconds: int = Field(default=30 * 60, ge=60, le=24 * 60 * 60)
     database_connect_timeout_seconds: int = Field(default=5, ge=1, le=30)
     database_statement_timeout_ms: int = Field(default=30_000, ge=1_000, le=5 * 60 * 1000)

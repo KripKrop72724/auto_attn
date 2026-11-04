@@ -24,8 +24,9 @@ Confirm the runner service is running as `NT AUTHORITY\NETWORK SERVICE`, that th
 member of `docker-users`, Docker Desktop/service is running, and the runner can execute
 `docker info`. Restart the runner after group membership changes.
 
-Allocate at least 48 GB RAM and 24 logical CPUs to Docker itself. The deployment preflight rejects
-a smaller Docker VM/engine allocation even when the Windows host has spare capacity.
+Allocate at least 48 GB RAM and 24 logical CPUs to Docker itself, and enough RAM for ADD's
+container memory limits plus 4 GB (about 60 GB at the default sizes). The deployment preflight
+rejects a smaller Docker VM/engine allocation even when the Windows host has spare capacity.
 
 Create the production environment outside the checkout. Preferred path:
 
@@ -141,8 +142,9 @@ own probe. The watchdog has no network interface and no application secrets. Its
 mount grants host-engine control by necessity; no application container receives that mount, and
 the Compose contract test enforces that boundary.
 
-Production defaults reserve 16 GB for PostgreSQL, 8 GB for ADD API, 4 GB for the protected
-provisioner, 2 GB for Redis, 1 GB for the web container, and 256 MB for the stack watchdog.
+Production defaults cap PostgreSQL at 32 GB, ADD API at 16 GB, the protected provisioner at
+4 GB, Redis at 2 GB, the web container at 1 GB, and the stack watchdog at 256 MB (see
+[Database capacity](#database-capacity)). These are ceilings, not reservations.
 Configure Docker Desktop/Engine with at least 48 GB RAM, 24 logical CPUs, and adequate free disk.
 The containers have no per-service CPU cap, so ADD may use the available Docker CPUs whenever it
 needs them. The Windows server's physical RAM and cores do not help ADD if Docker's own VM/resource
@@ -295,6 +297,78 @@ Interpret deployment probe results in this order:
   credentials or response bodies.
 - HTTP `400`/`413`/`422` applies to individual payloads; ADD quarantines those rows and continues with
   newer attendance.
+
+### Database capacity
+
+Sizing for the production Docker VM (62.6 GB RAM, 48 logical CPUs), which also runs the rest of the
+stack, about eight small unrelated containers and image builds:
+
+| Setting | Default | Override (repository variable / `.env.add`) |
+| --- | --- | --- |
+| PostgreSQL container memory | 32 GB | `ADD_POSTGRES_MEMORY_LIMIT` |
+| PostgreSQL `/dev/shm` (parallel query) | 4 GB | `ADD_POSTGRES_SHM_SIZE` |
+| `shared_buffers` | 8 GB | `ADD_POSTGRES_SHARED_BUFFERS` |
+| `effective_cache_size` | 24 GB | `ADD_POSTGRES_EFFECTIVE_CACHE_SIZE` |
+| `maintenance_work_mem` | 2 GB | `ADD_POSTGRES_MAINTENANCE_WORK_MEM` |
+| `work_mem` | 32 MB | `ADD_POSTGRES_WORK_MEM` |
+| `max_connections` | 200 | `ADD_POSTGRES_MAX_CONNECTIONS` |
+| ADD API container memory | 16 GB | `ADD_API_MEMORY_LIMIT` |
+| API database pool / overflow | 40 / 40 | `ADD_DATABASE_POOL_SIZE` / `ADD_DATABASE_MAX_OVERFLOW` |
+| API pool wait | 10 s | `ADD_DATABASE_POOL_TIMEOUT_SECONDS` |
+
+`effective_cache_size` is only a planner hint. The container's page cache counts against its
+memory limit, so the hint stays below 32 GB rather than describing the whole VM. Fixed settings in
+`docker-compose.add.yml`: up to 16 parallel workers (4 per query), SSD costs
+(`random_page_cost=1.1`, `effective_io_concurrency=200`), JIT off, 8 GB `max_wal_size`, six
+autovacuum workers every 15 s with a 2000 cost limit, `pg_stat_statements`, I/O timing, and logs for
+statements over 2 s (never their parameters), temporary files over 16 MB, and lock waits.
+PostgreSQL gets 180 s to stop cleanly and 120 s to start before its health check counts.
+
+Worst case at these defaults: 8 GB shared buffers + six autovacuum workers (at most 1 GB each) +
+80 pool connections using a few `work_mem` each stays well inside 32 GB. ADD still runs a single
+Uvicorn worker, so the pool of 40 + 40 is the whole API's database concurrency; it must leave at
+least 20 of `max_connections` free for backups, restore checks, migrations and operators, and
+`deploy.ps1` refuses a deployment that does not.
+
+To change a value, set the repository variable of the same name (for example
+`ADD_POSTGRES_SHARED_BUFFERS=6GB`). The deploy job passes it to `deploy.ps1` only as
+`ADD_DEPLOY_POSTGRES_SHARED_BUFFERS`, which validates the format (PostgreSQL sizes `kB`/`MB`/`GB`,
+Docker sizes `m`/`g`/`mb`/`gb`, whole numbers otherwise) and writes it into the protected
+`.env.add`. Never add a raw `ADD_POSTGRES_*` name to the workflow environment: Compose prefers the
+process environment, even an empty value, to `.env.add`. A protected environment that still holds
+the sizes shipped before November 2026 (`16g`, `2gb`, `4GB`, `12GB`, `1GB`, API `8g`, pool
+`20`/`20`/`5`) has those exact values dropped on the next deployment so the defaults above apply;
+any other value there is kept until a repository variable overrides it. Changing a PostgreSQL
+setting recreates the PostgreSQL container during the deployment's first step, before the backup:
+up to about 3-5 minutes of database downtime (a clean stop of up to 180 s, then startup or crash
+recovery), during which devices keep their punches and retry uploads. A rollback after a failed
+deployment restarts PostgreSQL again with the previous sizes. Schedule the first deployment of a
+sizing change outside punch peaks.
+
+`deploy.ps1` also adds up every service's rendered `mem_limit` and refuses a deployment whose total
+is more than Docker's memory minus 4 GB (the defaults total about 55 GB), so a smaller Docker VM
+cannot pass the 48 GB floor and then leave the OOM killer to pick PostgreSQL. The stack watchdog
+restarts an unhealthy container with that container's own stop grace period when it is longer than
+the watchdog's 30 s default, so PostgreSQL also gets its 180 s clean stop there.
+
+Migration `20261105_0061` adds three small dashboard indexes
+(`ix_add_ords_outbox_last_attempt_at`, `ix_add_attendance_held_received`,
+`ix_add_attendance_unacked_id`), lowers the autovacuum thresholds of `add_attendance_events`,
+`add_ords_outbox` and `add_terminal_record_manifest` to 2% (analyze 1%), and creates the
+`pg_stat_statements` extension. Indexes are built with `CREATE INDEX CONCURRENTLY` within a 90 s
+budget (60 s per index), so attendance keeps flowing. A build that runs out of time or cannot get
+its lock within 5 s is cancelled and its half-built index removed; ADD runs without it and the
+API log names the command (`Run while ADD is up: ...`). Run that command from `psql` in the
+PostgreSQL container while ADD is up. An index already present but not valid is never touched by
+the migration; check `pg_stat_progress_create_index`, and once no build of it is running, run the
+logged `DROP INDEX CONCURRENTLY IF EXISTS ...` and then the `CREATE INDEX CONCURRENTLY ...`.
+
+To see the slowest statements after a busy period:
+
+```sql
+SELECT calls, round(total_exec_time) AS total_ms, round(mean_exec_time) AS mean_ms, left(query, 120)
+FROM pg_stat_statements ORDER BY total_exec_time DESC LIMIT 20;
+```
 
 ### Device WebSocket channel
 

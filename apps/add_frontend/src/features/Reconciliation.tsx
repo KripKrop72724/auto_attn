@@ -24,6 +24,7 @@ import { Icon } from '../Icon'
 import { AnchoredLayer } from '../AnchoredLayer'
 import { AttendanceRecovery } from './AttendanceRecovery'
 import type {
+  AttendanceRecoverySummary,
   Device,
   HikvisionHistoryScope,
   ReconciliationDivergenceDetail,
@@ -153,6 +154,7 @@ function useThrottledValue<T>(value: T, intervalMs: number): T {
 }
 
 const REVISION_REFRESH_MS = 5000
+const RECOVERY_COUNT_REFRESH_MS = 60_000
 const JOB_PAGE = 40
 const BULK_REQUEST_LIMIT = 100
 
@@ -1530,6 +1532,7 @@ export function ReconciliationView({
   const [exceptionDrawer, setExceptionDrawer] =
     useState<SourceException | null>(null)
   const [recoveryCount, setRecoveryCount] = useState(0)
+  const [recoveryRefresh, setRecoveryRefresh] = useState(0)
   const [exceptionDraft, setExceptionDraft] = useState<ExceptionFilters>({
     ...defaultExceptionFilters,
     job_id: initial.get('job_id') || '',
@@ -1769,23 +1772,46 @@ export function ReconciliationView({
   useEffect(() => {
     void loadExceptions()
   }, [loadExceptions])
+  // The recovery summary scans the whole attendance and ORDS backlog. The tab
+  // count loads once, then once a minute, never per realtime revision. While
+  // the Recovery tab is open it takes the count from that tab's own summary.
+  const applyRecoverySummary = useCallback(
+    (summary: Pick<AttendanceRecoverySummary, 'delivery'>) =>
+      setRecoveryCount(
+        summary.delivery.safe_retryable +
+          summary.delivery.identity_held +
+          summary.delivery.permanent_review,
+      ),
+    [],
+  )
+  const sectionRef = useRef(section)
+  sectionRef.current = section
   useEffect(() => {
-    void api<{
-      delivery: {
-        safe_retryable: number
-        identity_held: number
-        permanent_review: number
-      }
-    }>('/api/v2/attendance-recovery/summary')
-      .then((result) =>
-        setRecoveryCount(
-          result.delivery.safe_retryable +
-            result.delivery.identity_held +
-            result.delivery.permanent_review,
-        ),
+    let active = true
+    let inFlight = false
+    const loadCount = () => {
+      if (inFlight || sectionRef.current === 'recovery') return
+      inFlight = true
+      void api<Pick<AttendanceRecoverySummary, 'delivery'>>(
+        '/api/v2/attendance-recovery/summary',
       )
-      .catch(() => setRecoveryCount(0))
-  }, [refreshRevision])
+        .then((result) => {
+          if (active) applyRecoverySummary(result)
+        })
+        .catch(() => {
+          if (active) setRecoveryCount(0)
+        })
+        .finally(() => {
+          inFlight = false
+        })
+    }
+    loadCount()
+    const timer = window.setInterval(loadCount, RECOVERY_COUNT_REFRESH_MS)
+    return () => {
+      active = false
+      window.clearInterval(timer)
+    }
+  }, [applyRecoverySummary])
   useEffect(
     () => () => {
       jobAbortRef.current?.abort()
@@ -2059,7 +2085,7 @@ export function ReconciliationView({
                   ? refreshJobsAndReadiness()
                   : section === 'exceptions'
                     ? loadExceptions({ quiet: true })
-                    : api('/api/v2/attendance-recovery/summary').then(() => undefined))
+                    : setRecoveryRefresh((current) => current + 1))
               }
             >
               <Icon name="refresh" /> Refresh
@@ -2102,7 +2128,12 @@ export function ReconciliationView({
           id="reconciliation-recovery-panel"
           aria-labelledby="reconciliation-recovery-tab"
         >
-          <AttendanceRecovery revision={revision} toast={toast} />
+          <AttendanceRecovery
+            revision={refreshRevision}
+            refreshToken={recoveryRefresh}
+            onSummary={applyRecoverySummary}
+            toast={toast}
+          />
         </div>
       ) : section === 'jobs' ? (
         <div

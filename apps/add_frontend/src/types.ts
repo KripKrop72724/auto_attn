@@ -596,6 +596,10 @@ export interface CommKeyReveal {
 }
 
 export interface Overview {
+  /** When the server computed the cached delivery/recovery sections (ISO). */
+  metrics_computed_at?: string | null
+  /** How long those sections may be reused (0 when computed for this request). */
+  metrics_max_age_seconds?: number
   total: number
   spares?: number
   online?: number
@@ -792,6 +796,9 @@ export type AttendanceRecoveryAction =
 
 export interface AttendanceRecoverySummary {
   schema_version: string
+  /** When the server computed these figures (ISO); they are shared for a few seconds. */
+  metrics_computed_at?: string | null
+  metrics_max_age_seconds?: number
   preview_enabled: boolean
   execution_enabled: boolean
   correction_enabled?: boolean

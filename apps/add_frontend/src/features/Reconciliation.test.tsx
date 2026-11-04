@@ -954,6 +954,35 @@ describe('One-click reconcile', () => {
   })
 })
 
+describe('Recovery tab count', () => {
+  beforeEach(() => window.history.replaceState(null, '', '/reconciliation'))
+  afterEach(() => { cleanup(); vi.unstubAllGlobals() })
+
+  it('reads the recovery summary once on mount, not on every realtime revision', async () => {
+    let summaryCalls = 0
+    const listCalls: string[] = []
+    const fallback = reconciliationFetch()
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = new URL(String(input), 'https://add.test').pathname
+      if (path === '/api/v2/attendance-recovery/summary') {
+        summaryCalls += 1
+        return json({ delivery: { safe_retryable: 4, identity_held: 2, permanent_review: 1 } })
+      }
+      if (path === '/api/v1/reconciliations' && (!init?.method || init.method === 'GET')) listCalls.push(path)
+      return fallback(input, init)
+    }))
+    const view = render(<Harness revision={0} />)
+    expect(await screen.findByRole('tab', { name: /Recovery\s*7/ })).toBeTruthy()
+    await waitFor(() => expect(listCalls.length).toBeGreaterThan(0))
+    const before = listCalls.length
+
+    view.rerender(<Harness revision={1} />)
+    // The jobs list still refreshes for the revision; the heavy summary does not.
+    await waitFor(() => expect(listCalls.length).toBeGreaterThan(before))
+    expect(summaryCalls).toBe(1)
+  })
+})
+
 describe('Hikvision recent-tail job card', () => {
   afterEach(() => { cleanup(); vi.unstubAllGlobals() })
 
