@@ -5,7 +5,8 @@ route, X-CSRF-Token on mutations and a password step-up for each package.
 Every secret stays on the server. The protected provisioner builds a board's
 encrypted settings (NVS) and HMAC eFuse key and encrypts both to the app's
 one-time X25519 key. Firmware comes from signed installer bundles in a
-read-only store.
+read-only store. The dashboard offers the app itself for download from
+another read-only store (installer_apps.py).
 
 Errors on these routes are {"code", "message", "field" (optional)}. "detail"
 stays what ADD's usual handler sends: the same object for installer refusals,
@@ -58,6 +59,7 @@ from zk_add.audit import append_audit
 from zk_add.device_health import evaluate_health
 from zk_add.hikvision_delivery import HikvisionPolicy
 from zk_add.hikvision_evidence import HikvisionEvidence
+from zk_add.installer_apps import app_store
 from zk_add.models import AuditEvent, Connector, PublicDeviceStatus
 from zk_add.ota import FirmwareRelease
 from zk_add.provisioning import (
@@ -1311,6 +1313,80 @@ def installer_bundle_file(
         media_type="application/octet-stream",
         filename=name,
         headers={"Cache-Control": "private, no-store", "X-Content-SHA256": bundle.files[name][1]},
+    )
+
+
+@router.get("/apps")
+def installer_apps(auth: tuple[Session, AdminContext] = Depends(installer_admin)):
+    """The newest published app for the dashboard's download card."""
+    release = app_store.latest()
+    latest = None
+    if release is not None:
+        latest = {
+            "version": release.version,
+            "git_sha": release.git_sha,
+            "published_at": release.published_at,
+            "files": [
+                {
+                    "platform": item.platform,
+                    "arch": item.arch,
+                    "kind": item.kind,
+                    "filename": item.filename,
+                    "size": item.size,
+                    "sha256": item.sha256,
+                    "download_path": f"{PREFIX}/apps/{release.version}/{item.filename}",
+                }
+                for item in release.files
+            ],
+        }
+    return {"latest": latest, "min_app_version": settings.installer_min_app_version}
+
+
+@router.get("/apps/{version}/{filename}")
+def installer_app_file(
+    request: Request,
+    version: str,
+    filename: str,
+    auth: tuple[Session, AdminContext] = Depends(installer_admin),
+):
+    db, context = auth
+    release = app_store.get(version)
+    item = release.file(filename) if release is not None else None
+    if item is None:
+        raise InstallerError(
+            404, "FILE_NOT_FOUND", "This copy of the app is not on the head office server."
+        )
+    append_audit(
+        db,
+        actor=context.username,
+        action="INSTALLER_APP_DOWNLOADED",
+        target_type="installer_app",
+        target_id=release.version,
+        outcome="SUCCESS",
+        ip_address=client_ip(request),
+        after={
+            "version": release.version,
+            "platform": item.platform,
+            "arch": item.arch,
+            "filename": item.filename,
+            "size": item.size,
+            "sha256": item.sha256,
+        },
+    )
+    # The download is audited durably before it starts; the request's session
+    # closes only after the whole file is sent, so nothing stays open meanwhile.
+    db.commit()
+    # The file was verified (size and SHA-256) as a regular file directly in
+    # its version directory, and has not changed since.
+    return FileResponse(
+        item.path,
+        media_type=item.media_type,
+        filename=item.filename,
+        headers={
+            "Cache-Control": "private, no-store",
+            "X-Content-SHA256": item.sha256,
+            "X-Content-Type-Options": "nosniff",
+        },
     )
 
 

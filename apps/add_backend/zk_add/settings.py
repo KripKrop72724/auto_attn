@@ -263,9 +263,11 @@ class AddSettings(BaseSettings):
     # (docs/esp-installer-server.md). It builds per-board settings through the
     # protected provisioner, so it also needs ADD_PROVISIONING_ENABLED. False
     # is the kill switch: every installer route except capabilities refuses.
-    # Signed installer bundles are read from a read-only store.
+    # Signed installer bundles are read from a read-only store, and so are the
+    # app's own release builds that the dashboard offers for download.
     installer_enabled: bool = True
     installer_bundle_store_path: str = "/installer-bundles"
+    installer_app_store_path: str = "/installer-apps"
     installer_min_app_version: str = "1.0.0"
     installer_package_limit: int = Field(default=30, ge=1, le=1000)
     installer_event_limit: int = Field(default=240, ge=1, le=10_000)
