@@ -230,6 +230,14 @@ def _release_app_mutex(handle: Optional[int]) -> None:
     kernel32.CloseHandle(handle)
 
 
+def already_open_words(platform: Optional[str] = None) -> str:
+    """The second copy's message: where to find the open window on this computer."""
+    where = ("in the Dock at the bottom of the screen" if (platform or sys.platform) == "darwin"
+             else "on the taskbar at the bottom of the screen")
+    return ("The app is already open.\n\nUse the window that is open. If you cannot see it, "
+            f"click its icon {where}.")
+
+
 def _already_open() -> int:
     """What a second copy of the app shows before it stops."""
     from PySide6.QtWidgets import QMessageBox
@@ -238,10 +246,7 @@ def _already_open() -> int:
     from sl_installer.ui.window import TITLE
 
     ensure_app()
-    QMessageBox.information(
-        None, TITLE,
-        "The app is already open.\n\nUse the window that is open. If you cannot see it, "
-        "click its icon on the taskbar at the bottom of the screen.")
+    QMessageBox.information(None, TITLE, already_open_words())
     return 0
 
 

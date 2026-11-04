@@ -535,3 +535,12 @@ def test_factory_keeps_console_logs_next_to_the_app_log(tmp_path):
     finally:
         logging.getLogger("sl_installer").propagate = True
     assert services.boot._console_logs == tmp_path / "logs"  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize("platform, where", [
+    ("win32", "click its icon on the taskbar at the bottom of the screen."),
+    ("darwin", "click its icon in the Dock at the bottom of the screen."),
+])
+def test_already_open_says_where_the_window_is(platform, where):
+    words = entry.already_open_words(platform)
+    assert words.startswith("The app is already open.") and words.endswith(where)
