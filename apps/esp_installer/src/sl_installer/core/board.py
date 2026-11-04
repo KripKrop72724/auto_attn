@@ -16,6 +16,26 @@ mode, so it only starts again after the person unplugs and replugs it.
 The board ID is the banner MAC, or the USB serial number in SDM, whose banner has
 none. When both are there they must agree: a USB board ID that is not the chip's
 is refused here, because every install call finds the board by it.
+
+The hardware gate (hardware_gate) refuses, before anything is written or burned,
+every board our firmware cannot start. On 3 Nov 2026 two ESP32-S3 N16R8 boards with
+an XMC XM25QH128A flash chip (JEDEC 20 70 18) got their HMAC key and then looped for
+good in the ESP-IDF 5.5.3 bootloader ("XMC flash startup fail"). That bootloader's
+bootloader_flash_xmc_startup() accepts a chip whose ID is on is_xmc_chip_strict()'s
+list; otherwise, when the SFDP maker byte is XMC's (0x20), it runs the XM25QHxxC
+startup flow and stops the boot unless the ID is then on the list. esptool 5.1.0 runs
+the same check before flash-id (cmds.py flash_xmc_startup) and prints "XMC flash chip
+boot-up failure detected" exactly when that flow runs. The gate refuses a board when:
+
+* esptool printed "XMC flash boot-up fix failed": the flow ran and the ID is still off
+  the list, which is exactly when the bootloader stops. esptool's check is the
+  bootloader's, SFDP byte included, so a listed XMC chip that recovers in the flow, and
+  a 0x20 chip whose SFDP byte is not XMC's (the bootloader skips the flow for it), pass;
+* the flash is not 16 MB, or the flash-type eFuse says octal (8 data lines);
+* the embedded PSRAM is not exactly "8MB (AP_3v3)" (none at all: WRONG_PSRAM);
+* the chip revision is above v0.99, the range ESP-IDF 5.5.3 builds for the ESP32-S3
+  by default (the installer checks the chosen bundle's own image headers again);
+* the chip is not an ESP32-S3.
 """
 from __future__ import annotations
 
@@ -28,8 +48,8 @@ from pathlib import Path
 from typing import Dict, Optional, Tuple
 
 from . import texts
-from .api import (BoardInfo, CancelToken, HardwareVerdict, InstallerError, SecurityState,
-                  UsbCandidate, UsbKind)
+from .api import (Advice, BoardInfo, CancelToken, HardwareVerdict, InstallerError,
+                  SecurityState, UsbCandidate, UsbKind)
 from .esptool_runner import ESPEFUSE, ESPTOOL, ToolCall, ToolResult, ToolRunner, advice_for, \
     failure_cause
 from .flashplan import espefuse_args, esptool_args
@@ -41,6 +61,11 @@ log = get_logger("board")
 REQUIRED_CHIP = "ESP32-S3"
 REQUIRED_FLASH_MB = 16
 REQUIRED_PSRAM_MB = 8
+REQUIRED_PSRAM_VENDOR = "AP_3v3"
+# ESP-IDF 5.5.3's default ESP32-S3 range (CONFIG_ESP32S3_REV_MIN_FULL / _MAX_FULL),
+# major * 100 + minor: v0.0 to v0.99.
+DEFAULT_CHIP_REVISIONS = (0, 99)
+XMC_VENDOR_ID = 0x20
 
 SECURE_BOOT_EN = 1 << 0
 AGGRESSIVE_REVOKE = 1 << 1
@@ -63,7 +88,18 @@ _SECURE_BOOT = re.compile(r"^\s*Secure Boot:\s+(Enabled|Disabled)", re.M)
 _FLASH_ENC = re.compile(r"^\s*Flash Encryption:\s+(Enabled|Disabled)", re.M)
 _FLASH_SIZE = re.compile(r"Detected flash size:\s*(\d+)\s*MB", re.I)
 _PSRAM = re.compile(r"Embedded PSRAM\s+(\d+)\s*MB", re.I)
+_PSRAM_PART = re.compile(r"(?:Unknown )?Embedded PSRAM[^,]*", re.I)
+_PSRAM_VENDOR = re.compile(r"Embedded PSRAM\s+\d+\s*MB\s*\(([^)]*)\)", re.I)
 _WRONG_CHIP = re.compile(r"This chip is ([\w-]+), not ESP32-S3")
+_CHIP_REVISION = re.compile(r"\(revision v(\d+)\.(\d+)\)")
+# esptool 5.1.0 print_flash_id and flash_id (cmds.py).
+_FLASH_MAKER = re.compile(r"^\s*Manufacturer:\s*([0-9a-fA-F]{1,2})\s*$", re.M)
+_FLASH_DEVICE = re.compile(r"^\s*Device:\s*([0-9a-fA-F]{1,4})\s*$", re.M)
+_FLASH_TYPE = re.compile(r"Flash type set in eFuse:\s*(quad|octal)", re.I)
+# esptool 5.1.0 flash_xmc_startup (cmds.py): the first when the bootloader would run the
+# XM25QHxxC startup flow, the second when the ID is still off the list after it.
+XMC_STARTUP_NEEDED = re.compile(r"XMC flash chip boot-up failure detected")
+XMC_STARTUP_FAILED = re.compile(r"XMC flash boot-up fix failed")
 
 
 @dataclass(frozen=True)
@@ -127,6 +163,93 @@ def parse_flash_size_mb(output: str) -> Optional[int]:
 def parse_psram_mb(features: Optional[str]) -> int:
     found = _PSRAM.search(features or "")
     return int(found.group(1)) if found else 0
+
+
+def parse_psram(features: Optional[str]) -> Optional[str]:
+    """The embedded PSRAM as esptool names it ("Embedded PSRAM 8MB (AP_3v3)"), or None."""
+    found = _PSRAM_PART.search(features or "")
+    return found.group(0).strip() if found else None
+
+
+def parse_chip_revision(chip_line: Optional[str]) -> Optional[int]:
+    """"ESP32-S3 (QFN56) (revision v0.2)" -> 2, ESP-IDF's major * 100 + minor."""
+    found = _CHIP_REVISION.search(chip_line or "")
+    return int(found.group(1)) * 100 + int(found.group(2)) if found else None
+
+
+def revision_words(revision: Optional[int]) -> str:
+    return f"v{revision // 100}.{revision % 100}" if revision is not None else "unknown"
+
+
+@dataclass(frozen=True)
+class FlashChip:
+    """What esptool's flash-id says about the flash chip."""
+
+    maker: Optional[int]           # JEDEC manufacturer ("Manufacturer: 20")
+    device: Optional[int]          # memory type << 8 | capacity ("Device: 7018")
+    size_mb: Optional[int]
+    octal: Optional[bool]          # the flash-type eFuse; None when esptool did not say
+    xmc_startup_needed: bool = False
+    xmc_startup_failed: bool = False
+
+    @property
+    def jedec_id(self) -> Optional[str]:
+        """"20 70 18": maker, memory type and capacity, the bytes ESP-IDF reads."""
+        if self.maker is None or self.device is None:
+            return None
+        return f"{self.maker:02x} {self.device >> 8 & 0xFF:02x} {self.device & 0xFF:02x}"
+
+
+def parse_flash_chip(output: str) -> FlashChip:
+    maker = _FLASH_MAKER.search(output)
+    device = _FLASH_DEVICE.search(output)
+    kind = _FLASH_TYPE.search(output)
+    return FlashChip(
+        maker=int(maker.group(1), 16) if maker else None,
+        device=int(device.group(1), 16) if device else None,
+        size_mb=parse_flash_size_mb(output),
+        octal=(kind.group(1).lower() == "octal") if kind else None,
+        xmc_startup_needed=bool(XMC_STARTUP_NEEDED.search(output)),
+        xmc_startup_failed=bool(XMC_STARTUP_FAILED.search(output)))
+
+
+def is_xmc_chip_strict(maker: Optional[int], device: Optional[int]) -> bool:
+    """ESP-IDF 5.5.3 bootloader_flash.c is_xmc_chip_strict(), on esptool's numbers.
+
+    The bootloader's rdid is maker << 16 | memory type << 8 | capacity; esptool prints
+    the maker and then memory type and capacity as "Device".
+    """
+    if maker != XMC_VENDOR_ID or device is None:
+        return False
+    mfid, cpid = (device >> 8) & 0xFF, device & 0xFF
+    if mfid == 0x40:
+        return 0x13 <= cpid <= 0x20
+    if mfid == 0x41:
+        return 0x17 <= cpid <= 0x20
+    if mfid == 0x50:
+        return 0x15 <= cpid <= 0x16
+    return False
+
+
+def flash_chip_starts(chip: FlashChip) -> bool:
+    """Whether our bootloader gets past its XMC startup check with this chip (module notes)."""
+    if chip.xmc_startup_failed:
+        return False
+    if chip.xmc_startup_needed:
+        # The flow ran: the ID esptool read after it decides, as in the bootloader.
+        return is_xmc_chip_strict(chip.maker, chip.device)
+    # No flow: the ID is on the list, or the SFDP maker byte is not XMC's.
+    return True
+
+
+def efuse_flash_octal(summary: Dict[str, object]) -> Optional[bool]:
+    """FLASH_TYPE from an espefuse JSON summary ("4 data lines" / "8 data lines")."""
+    value = _field(summary, "FLASH_TYPE").get("value")
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    return "8" in str(value)
 
 
 def classify_sdm(info: SecurityInfo) -> SecurityState:
@@ -215,21 +338,78 @@ def efuse_evidence(summary: Dict[str, object]) -> Dict[str, object]:
         }
     for name in ("SECURE_BOOT_EN", "ENABLE_SECURITY_DOWNLOAD", "DIS_DOWNLOAD_MODE",
                  "SPI_BOOT_CRYPT_CNT", "DIS_USB_JTAG", "SOFT_DIS_JTAG", "DIS_PAD_JTAG",
-                 "PSRAM_CAP", "FLASH_CAP", "PKG_VERSION"):
+                 "PSRAM_CAP", "PSRAM_VENDOR", "FLASH_CAP", "FLASH_TYPE", "FLASH_VENDOR",
+                 "PKG_VERSION"):
         if name in summary:
             evidence[name.lower()] = _field(summary, name).get("value")
     return evidence
 
 
-def hardware_verdict(chip: Optional[str], flash_mb: Optional[int], psram_mb: int
-                     ) -> HardwareVerdict:
+def _extra_memory_words(psram: str) -> str:
+    """esptool's "Embedded PSRAM 8MB (AP_1v8)" as the screens say it: "8 MB, type AP_1v8"."""
+    size = parse_psram_mb(psram)
+    vendor = _PSRAM_VENDOR.search(psram)
+    kind = vendor.group(1).strip() if vendor else ""
+    words = f"{size} MB" if size else "of unknown size"
+    return f"{words}, type {kind}" if kind else f"{words}, type not given"
+
+
+def hardware_gate(chip: Optional[str], chip_line: Optional[str], features: Optional[str],
+                  flash: FlashChip, summary: Optional[Dict[str, object]] = None
+                  ) -> Tuple[HardwareVerdict, str]:
+    """The board's hardware verdict, and for a refused board what did not fit (module notes).
+
+    The memory chip comes first: it is the one fault that leaves a locked board looping.
+    The detail is what the screens show next to the advice ("The app found: ..."); the
+    log and ADD keep esptool's own words (evidence, refusal_detail).
+    """
     if chip != REQUIRED_CHIP:
-        return HardwareVerdict.WRONG_CHIP
-    if flash_mb != REQUIRED_FLASH_MB:
-        return HardwareVerdict.WRONG_FLASH_SIZE
-    if psram_mb != REQUIRED_PSRAM_MB:
-        return HardwareVerdict.WRONG_PSRAM
-    return HardwareVerdict.OK
+        return HardwareVerdict.WRONG_CHIP, f"chip {chip or 'unknown'}"
+    if not flash_chip_starts(flash):
+        return (HardwareVerdict.FLASH_CHIP_UNSUPPORTED,
+                f"memory chip {flash.jedec_id or 'of unknown make'}")
+    if flash.size_mb != REQUIRED_FLASH_MB:
+        size = f"{flash.size_mb} MB" if flash.size_mb is not None else "of unknown size"
+        return HardwareVerdict.WRONG_FLASH_SIZE, f"memory chip {size}"
+    octal = flash.octal if flash.octal is not None else efuse_flash_octal(summary or {})
+    if octal:
+        return HardwareVerdict.BOARD_TYPE_UNSUPPORTED, "memory chip with 8 data lines (octal)"
+    psram = parse_psram(features)
+    if psram is None:
+        return HardwareVerdict.WRONG_PSRAM, "no extra memory"
+    vendor = _PSRAM_VENDOR.search(psram)
+    if (parse_psram_mb(psram) != REQUIRED_PSRAM_MB or not vendor
+            or vendor.group(1).strip() != REQUIRED_PSRAM_VENDOR):
+        return HardwareVerdict.BOARD_TYPE_UNSUPPORTED, f"extra memory {_extra_memory_words(psram)}"
+    revision = parse_chip_revision(chip_line)
+    low, high = DEFAULT_CHIP_REVISIONS
+    if revision is not None and not low <= revision <= high:
+        return HardwareVerdict.BOARD_TYPE_UNSUPPORTED, f"chip revision {revision_words(revision)}"
+    return HardwareVerdict.OK, ""
+
+
+def hardware_advice(board: BoardInfo, locked: Optional[bool] = None) -> Optional[Advice]:
+    """What to tell the person about a board the hardware gate refused, or None.
+
+    ``locked``: an earlier setup locked the board's key (the default follows its state).
+    """
+    verdict = board.hardware
+    if locked is None:
+        locked = board.security is SecurityState.KEY_BURNED_NOT_STARTED
+    if verdict is HardwareVerdict.FLASH_CHIP_UNSUPPORTED:
+        return texts.flash_chip_unsupported(board.flash_id, locked=locked)
+    if verdict is HardwareVerdict.BOARD_TYPE_UNSUPPORTED:
+        return texts.board_type_unsupported(board.hardware_detail)
+    return {HardwareVerdict.WRONG_CHIP: texts.WRONG_CHIP,
+            HardwareVerdict.WRONG_FLASH_SIZE: texts.WRONG_FLASH_SIZE,
+            HardwareVerdict.WRONG_PSRAM: texts.WRONG_PSRAM}.get(verdict)
+
+
+def refusal_detail(board: BoardInfo, advice: Advice) -> Dict[str, object]:
+    """ADD's BOARD_REFUSED event detail (no secrets: the board's own hardware facts)."""
+    return {"reason": advice.code, "flash_id": board.flash_id,
+            "chip": board.evidence.get("chip_line") or board.chip,
+            "features": board.evidence.get("features")}
 
 
 def read_summary_file(path: Path) -> Dict[str, object]:
@@ -298,20 +478,30 @@ class BoardInspector:
                           cancel)
         if not flash.ok:
             raise InstallerError(advice_for(flash), cause=failure_cause(flash))
-        flash_mb = parse_flash_size_mb(flash.output)
+        chip = parse_flash_chip(flash.output)
         psram_mb = parse_psram_mb(banner.features)
-        verdict = hardware_verdict(banner.chip, flash_mb, psram_mb)
-        evidence.update({"flash_size_mb": flash_mb, "psram_mb": psram_mb})
+        revision = parse_chip_revision(banner.chip_line)
+        evidence.update({"flash_size_mb": chip.size_mb, "psram_mb": psram_mb,
+                         "flash_id": chip.jedec_id, "flash_octal": chip.octal,
+                         "xmc_startup_needed": chip.xmc_startup_needed,
+                         "xmc_startup_failed": chip.xmc_startup_failed})
 
-        state, note = self._efuse_state(port, mac, cancel, evidence)
+        state, note, summary = self._efuse_state(port, mac, cancel, evidence)
         if note:
             evidence["note"] = note
-        log.info("board %s: hardware %s, security %s", mac, verdict.value, state.value)
-        return BoardInfo(port, mac, banner.chip, flash_mb, psram_mb, verdict, state, False,
-                         evidence)
+        verdict, detail = hardware_gate(banner.chip, banner.chip_line, banner.features, chip,
+                                        summary)
+        if detail:
+            evidence["hardware_detail"] = detail
+        log.info("board %s: hardware %s%s, security %s", mac, verdict.value,
+                 f" ({detail})" if detail else "", state.value)
+        return BoardInfo(port, mac, banner.chip, chip.size_mb, psram_mb, verdict, state, False,
+                         evidence, flash_id=chip.jedec_id, chip_revision=revision,
+                         hardware_detail=detail)
 
     def _efuse_state(self, port: str, mac: str, cancel: CancelToken,
-                     evidence: Dict[str, object]) -> Tuple[SecurityState, Optional[str]]:
+                     evidence: Dict[str, object]
+                     ) -> Tuple[SecurityState, Optional[str], Dict[str, object]]:
         if self._temp_root is not None:
             self._temp_root.mkdir(parents=True, exist_ok=True)
         work = Path(tempfile.mkdtemp(prefix="sl-inspect-",
@@ -327,10 +517,11 @@ class BoardInspector:
         finally:
             shutil.rmtree(work, ignore_errors=True)
         if not summary:
-            return SecurityState.UNKNOWN, None
+            return SecurityState.UNKNOWN, None, {}
         evidence["efuse"] = efuse_evidence(summary)
         reported = efuse_mac(summary)
         if reported and reported != mac:
             raise InstallerError(texts.BOARD_SWAPPED,
                                  cause=f"eFuse MAC {reported} differs from {mac}")
-        return classify_efuses(summary)
+        state, note = classify_efuses(summary)
+        return state, note, summary

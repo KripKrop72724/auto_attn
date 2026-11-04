@@ -161,6 +161,10 @@ class ImageFacts:
     project: Optional[str]
     version: Optional[str]
     signatures: Tuple[SignatureBlock, ...] = ()
+    # esp_image_header_t min_chip_rev_full / max_chip_rev_full (major * 100 + minor);
+    # ESP-IDF treats a maximum of 0 or 0xFFFF as not set.
+    min_chip_rev: int = 0
+    max_chip_rev: int = 0xFFFF
 
 
 def _c_string(raw: bytes) -> str:
@@ -199,8 +203,44 @@ def parse_image(data: bytes) -> ImageFacts:
     if len(data) >= 112 and struct.unpack_from("<I", data, 32)[0] == APP_DESC_MAGIC:
         version = _c_string(data[48:80])
         project = _c_string(data[80:112])
+    min_rev, max_rev = struct.unpack_from("<HH", data, 15)
     return ImageFacts(chip_id, digest, digest_valid, project, version,
-                      signature_blocks(data))
+                      signature_blocks(data), min_rev, max_rev)
+
+
+def header_chip_revisions(data: bytes) -> Tuple[int, int]:
+    """(min_chip_rev_full, max_chip_rev_full) of an image's 24-byte header."""
+    if len(data) < 24 or data[0] != ESP_IMAGE_MAGIC:
+        raise ImageError("not an ESP image")
+    return struct.unpack_from("<HH", data, 15)
+
+
+APP_ROLES = ("factory", "ota_0", "ota_1")
+
+
+def chip_revision_window(bundle: LocalBundle) -> Tuple[int, Optional[int]]:
+    """The chip revisions every image of ``bundle`` starts on: (lowest, highest or None).
+
+    As ESP-IDF 5.5.3 checks them (bootloader_common_check_chip_revision_validity): the
+    bootloader checks its own minimum, and each app's minimum and maximum (a maximum of
+    0 or 0xFFFF is not set). The maximum is waived on a chip with the
+    DISABLE_WAFER_VERSION_MAJOR eFuse, which the app does not count on.
+    """
+    checked = check_manifest(bundle.manifest, bundle.info.bundle_id)
+    directory = Path(bundle.directory)
+    low, high = 0, None
+    for role, entry in checked.images.items():
+        if role != "bootloader" and role not in APP_ROLES:
+            continue
+        try:
+            with (directory / entry.name).open("rb") as handle:
+                minimum, maximum = header_chip_revisions(handle.read(24))
+        except (OSError, ImageError) as error:
+            raise _not_trusted(f"{role} header: {error}") from error
+        low = max(low, minimum)
+        if role != "bootloader" and maximum not in (0, 0xFFFF):
+            high = maximum if high is None else min(high, maximum)
+    return low, high
 
 
 def signature_blocks(data: bytes) -> Tuple[SignatureBlock, ...]:

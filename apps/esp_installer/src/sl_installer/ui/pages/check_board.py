@@ -141,6 +141,7 @@ class CheckBoardPage(BasePage):
             (
                 ("Board ID", naming.board_id(board.mac)),
                 ("Type", wording.HARDWARE_WORDS.get(board.hardware, "")),
+                *wording.refused_hardware_rows(board),
                 ("Setup", wording.SECURITY_WORDS.get(board.security, "")),
             )
         )

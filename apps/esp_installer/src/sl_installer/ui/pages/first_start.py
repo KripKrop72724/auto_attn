@@ -2,6 +2,8 @@
 
 Once the board has started well, the same steps once more (``start_again``): the
 restart check, which shows that the board keeps its settings when it starts again.
+When the board says it opened its own Wi-Fi, its name and password show here too
+(``show_hotspot``), as on Check a board and the last screen.
 """
 
 from __future__ import annotations
@@ -13,7 +15,16 @@ from PySide6.QtWidgets import QHBoxLayout, QWidget
 
 from ...core.api import Advice, ConsoleEvent, ReplugPhase
 from .. import theme
-from ..widgets import AdviceCard, AnimatedPicture, BasePage, Card, Spinner, StateIcon, text
+from ..widgets import (
+    AdviceCard,
+    AnimatedPicture,
+    BasePage,
+    Card,
+    HotspotDetails,
+    Spinner,
+    StateIcon,
+    text,
+)
 from ..widgets import motion
 from ..widgets.console import ConsoleView
 from . import FIRST_START
@@ -103,6 +114,20 @@ class FirstStartPage(BasePage):
         self.watch.body.addWidget(self.console)
         self.content.addWidget(self.watch)
 
+        # The board's own Wi-Fi, once the board says it is open (the setup hotspot).
+        self.hotspot_card = Card("The board's own Wi-Fi is open")
+        self.hotspot_card.body.addWidget(
+            text(
+                "The board has opened its own Wi-Fi. To choose the site's Wi-Fi now, join it "
+                "from a phone with these details.",
+                "muted",
+            )
+        )
+        self.hotspot = HotspotDetails()
+        self.hotspot_card.body.addWidget(self.hotspot)
+        self.hotspot_card.hide()
+        self.content.addWidget(self.hotspot_card)
+
         self.phase: Optional[ReplugPhase] = None
         self.again = False  # True during the restart check
         self.countdown = 0
@@ -136,6 +161,7 @@ class FirstStartPage(BasePage):
             card.note.setText("")
         self.watch.hide()
         self.console.clear()
+        self.hide_hotspot()  # the replug closes it; the board says so again if it opens
         self.set_primary(None)
         self.set_secondary(None)
 
@@ -194,6 +220,16 @@ class FirstStartPage(BasePage):
 
     def add_event(self, event: ConsoleEvent) -> None:
         self.console.add(event)
+
+    def show_hotspot(self, name: Optional[str], password: str) -> None:
+        """The board's own Wi-Fi is open: its name and password (HotspotDetails)."""
+        self.hotspot.set_hotspot(name, password)
+        if self.hotspot_card.isHidden():
+            self.hotspot_card.show()
+            self.reveal(self.hotspot_card)
+
+    def hide_hotspot(self) -> None:
+        self.hotspot_card.hide()
 
     def show_result(self, advice: Advice, actions: Sequence[Tuple[str, str, str]] = ()) -> None:
         """The outcome card at the top; its buttons go in the footer."""

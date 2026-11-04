@@ -905,3 +905,166 @@ def test_old_console_logs_go_so_the_folder_stays_small(tmp_path):
     assert "console-ac276ea43d30-sli-24.log" in names and "console-ac276ea43d30-sli-05.log" \
         not in names
     assert (tmp_path / "installer.log").exists()
+
+
+# ------------------------------------------- the bootloader refuses to start the program
+
+def xmc_loop_lines():
+    """The board's own lines of the real 3 Nov 2026 loop (fixtures/boards), oldest first."""
+    lines = []
+    for row in support.board_sample("xmc-20-7018-first-start-console.txt").splitlines():
+        text = row[9:] if row[:9].strip().replace(".", "").isdigit() else ""
+        if text and not text.startswith("#"):
+            lines.append(text)
+    return lines
+
+
+@pytest.mark.parametrize("line, reason, fatal", [
+    ("E (35) bootloader_flash: XMC flash startup fail", "xmc_flash", "1"),
+    ("E (37) boot.esp32s3: failed when running XMC startup flow, reboot!", "xmc_flash", "1"),
+    ("E (40) boot: load partition table error!", "partition_table", "1"),
+    ("E (40) boot: Failed to verify partition table", "partition_table", "1"),
+    ("E (41) flash_parts: partition 3 invalid magic number 0x0", "partition_table", "1"),
+    ("E (60) boot: No bootable app partitions in the partition table", "no_app", "1"),
+    ("E (20) boot: failed to load bootloader image header!", "bootloader_image", "1"),
+    ("E (58) boot: Factory app partition is not bootable", "no_app", "0"),
+    ("E (57) esp_image: Image hash failed - image is corrupt", "image", "0"),
+    ("E (57) esp_image: image at 0x20000 has invalid magic byte (nothing flashed here?)",
+     "image", "0"),
+    ("E (50) boot_comm: chip revision check failed. Required >= v0.3, found v0.2.",
+     "chip_revision", "0"),
+    ("E (90) secure_boot_v2: Secure Boot V2 verification failed.", "secure_boot", "0"),
+    ("E (90) boot: something else went wrong", "other", "0"),
+])
+def test_bootloader_failure_lines(line, reason, fatal):
+    parser = ConsoleParser(MAC)
+    parser.parse("ESP-ROM:esp32s3-20210327")  # the bootloader prints now
+    event = parser.parse(line, 0.2)
+    assert event.kind is ConsoleKind.BOOTLOADER_FAILED, event
+    assert event.data == {"reason": reason, "fatal": fatal}
+
+
+def test_shared_tags_count_only_while_the_bootloader_prints():
+    # The running program checks other copies too (OTA): its esp_image errors are no refusal.
+    line = "E (9000) esp_image: image at 0x520000 has invalid magic byte (nothing flashed here?)"
+    unknown = ConsoleParser(MAC)
+    assert unknown.parse(line).kind is ConsoleKind.OTHER  # the port opened halfway
+    running = ConsoleParser(MAC)
+    running.parse("ESP-ROM:esp32s3-20210327")
+    running.parse("I (1700) zone_lite: Zone Lite starting zone=Z device_id=1")
+    assert running.parse(line).kind is ConsoleKind.OTHER
+    # Bootloader-only tags always count; info lines never.
+    assert unknown.parse("E (35) bootloader_flash: XMC flash startup fail").kind is \
+        ConsoleKind.BOOTLOADER_FAILED
+    flow = unknown.parse("I (29) bootloader_flash: XM25QHxxC startup flow")
+    assert flow.kind is ConsoleKind.OTHER and flow.data == {"signal": "xmc_flow"}
+    assert unknown.parse("I (29) boot: Multicore bootloader").kind is ConsoleKind.OTHER
+    # The bootloader's own lines showed who prints now (the ROM line came before the port).
+    assert unknown.parse(line).kind is ConsoleKind.BOOTLOADER_FAILED
+
+
+def test_real_xmc_loop_says_the_memory_chip_not_the_cable():
+    lines = xmc_loop_lines()
+    assert "E (35) bootloader_flash: XMC flash startup fail" in lines
+    watcher, script, clock = watcher_with([(1, "unplug", None), (2, "plug", None),
+                                           (2.2, "print", lines)])
+    started = clock.now
+    report, _phases, events = first_boot(watcher)
+    assert report.outcome is BootOutcome.STARTUP_REFUSED
+    assert report.advice.code == "FLASH_CHIP_UNSUPPORTED" and not report.advice.can_retry
+    assert "memory chip" in report.advice.what_happened
+    assert report.board_said == "E (35) bootloader_flash: XMC flash startup fail"
+    assert clock.now - started < 10  # said at once, not after 120 s
+    assert any(event.kind is ConsoleKind.BOOTLOADER_FAILED for event in events)
+
+
+def test_xmc_loop_beats_the_fast_restart_loop():
+    # A computer that loses the port at every restart: the loop of a power problem, but the
+    # board's own words say it is the memory chip.
+    xmc = ["ESP-ROM:esp32s3-20210327", "rst:0x3 (RTC_SW_SYS_RST),boot:0x28 (SPI_FAST_FLASH_BOOT)",
+           "I (29) boot: ESP-IDF v5.5.3 2nd stage bootloader",
+           "I (29) bootloader_flash: XM25QHxxC startup flow",
+           "E (35) bootloader_flash: XMC flash startup fail",
+           "E (37) boot.esp32s3: failed when running XMC startup flow, reboot!"]
+    steps = [(1, "unplug", None)]
+    for cycle in range(5):
+        moment = 3 + cycle * 3.0
+        steps += [(moment, "plug", None), (moment + 0.2, "print", xmc),
+                  (moment + 2.4, "unplug", None)]
+    watcher, _script, _clock = watcher_with(steps)
+    report = first_boot(watcher)[0]
+    assert report.outcome is BootOutcome.STARTUP_REFUSED
+    assert report.advice.code == "FLASH_CHIP_UNSUPPORTED"
+
+
+def test_other_refusals_quote_the_line_and_ask_for_a_help_file():
+    lines = ["ESP-ROM:esp32s3-20210327", "rst:0x1 (POWERON),boot:0x8 (SPI_FAST_FLASH_BOOT)",
+             "I (30) boot: ESP-IDF v5.5.3 2nd stage bootloader",
+             "E (57) esp_image: Image hash failed - image is corrupt",
+             "E (58) boot: Factory app partition is not bootable",
+             "E (60) boot: No bootable app partitions in the partition table"]
+    watcher, _script, _clock = watcher_with([(1, "unplug", None), (2, "plug", None),
+                                             (2.2, "print", lines)])
+    report = first_boot(watcher)[0]
+    assert report.outcome is BootOutcome.STARTUP_REFUSED
+    advice = report.advice
+    assert advice.code == "STARTUP_REFUSED" and not advice.can_retry
+    # The first error of that start is the cause the others follow.
+    assert '"E (57) esp_image: Image hash failed - image is corrupt"' in advice.what_happened
+    assert any("Save a help file" in step for step in advice.what_to_do)
+    assert report.board_said == "E (57) esp_image: Image hash failed - image is corrupt"
+
+
+def test_a_refusal_the_bootloader_recovers_from_is_a_good_start():
+    # ota_0 is damaged, the bootloader falls back to the factory copy and the program runs.
+    lines = (GOOD_BOOT[:3] + ["E (57) esp_image: Image hash failed - image is corrupt",
+                              "E (58) boot: OTA app partition slot 0 is not bootable",
+                              "I (95) boot: Loaded app from partition at offset 0x20000"]
+             + GOOD_BOOT[5:])
+    watcher, _script, _clock = watcher_with([(1, "unplug", None), (2, "plug", None),
+                                             (2.2, "print", lines)])
+    assert first_boot(watcher)[0].outcome is BootOutcome.OK
+
+
+def test_a_refusal_that_may_recover_waits_for_a_restart_or_the_end():
+    parser = ConsoleParser(MAC)
+    lines = ["ESP-ROM:esp32s3-20210327", "rst:0x1 (POWERON),boot:0x8 (SPI_FAST_FLASH_BOOT)",
+             "E (58) boot: Factory app partition is not bootable"]
+    watch = console._Watch(started=0.0, events=[parser.parse(line, 0.2) for line in lines])
+    config = support.zkt_config()
+    assert judge(watch, config, 5.0, 120.0, final=False) is None
+    assert judge(watch, config, 121.0, 120.0, final=True).outcome is BootOutcome.STARTUP_REFUSED
+    # The bootloader started the board again: the refusal stands.
+    watch.events += [parser.parse(line, 0.4) for line in lines[:2]]
+    assert judge(watch, config, 5.0, 120.0, final=False).outcome is BootOutcome.STARTUP_REFUSED
+
+
+def test_bootloader_lines_reach_the_screen_past_the_other_line_limit():
+    # Check a board shows everything the board says; ROM lines are capped, refusals not.
+    cancel = CancelToken()
+    lines = xmc_loop_lines() * 30
+    watcher, _script, clock = watcher_with([(0.5, "print", lines)])
+    clock.hooks.append(lambda now: cancel.cancel() if now > 1010 else None)
+    seen = []
+    watcher.watch_console(support.FakeUsb().candidate(), seen.append, cancel)
+    refusals = [event for event in seen if event.kind is ConsoleKind.BOOTLOADER_FAILED]
+    others = [event for event in seen if event.kind is ConsoleKind.OTHER and not event.data]
+    assert len(others) == BootWatcher.MAX_OTHER_EVENTS
+    assert len(refusals) == sum(1 for line in lines if line.startswith("E ("))
+
+
+def test_failed_starts_keep_the_line_that_decided_them():
+    lines = GOOD_BOOT[:9] + ["E (1520) zone_lite: Encrypted NVS initialization failed (X); "
+                             "preserving provisioning data and staying inert"]
+    watcher, _s, _c = watcher_with([(1, "unplug", None), (2, "plug", None), (2.2, "print", lines)])
+    report = first_boot(watcher)[0]
+    assert report.board_said == lines[-1]
+    good, _s, _c = watcher_with([(1, "unplug", None), (2, "plug", None),
+                                 (2.2, "print", GOOD_BOOT)])
+    assert first_boot(good)[0].board_said is None
+    # Without a line that decided it, the newest error line the board printed.
+    silent = ["ESP-ROM:esp32s3-20210327", "E (900) zone_lite: something odd"]
+    watcher, _s, _c = watcher_with([(1, "unplug", None), (2, "plug", None),
+                                    (2.2, "print", silent)])
+    report = first_boot(watcher, timeout=30)[0]
+    assert report.outcome is BootOutcome.NO_OUTPUT and report.board_said == silent[-1]

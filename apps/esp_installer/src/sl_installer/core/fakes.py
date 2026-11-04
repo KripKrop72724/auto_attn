@@ -29,6 +29,7 @@ import zipfile
 from dataclasses import dataclass, replace
 from typing import Dict, List, Optional, Sequence, Tuple
 
+from .. import __version__
 from . import api
 from .api import (
     Advice,
@@ -56,6 +57,7 @@ from .api import (
     UsbKind,
     ZoneSummary,
 )
+from .naming import hotspot_name
 
 SCENARIOS: Tuple[str, ...] = (
     "happy_zkt",
@@ -86,7 +88,37 @@ SCENARIOS: Tuple[str, ...] = (
     "installer_off",
     # Every story's board keeps its settings at the restart check; this one does not.
     "settings_lost_on_restart",
+    # Boards the software cannot start (1.1.0 board check): an XMC memory chip on a new
+    # board and on one an earlier setup locked (3 Nov 2026), and an unsupported board type.
+    "flash_chip_unsupported",
+    "flash_chip_key_burned",
+    "board_type_unsupported",
+    # The board's start-up program stops at the first start.
+    "startup_refused",
+    # The board opens its own Wi-Fi while the restart check watches it.
+    "hotspot_at_start",
 )
+
+# Boards the board check refuses, by story: (verdict, memory chip ID, what did not fit, as
+# core/board.py hardware_gate words it for the screens).
+_REFUSED_HARDWARE: Dict[str, Tuple[HardwareVerdict, str, str]] = {
+    "flash_chip_unsupported": (
+        HardwareVerdict.FLASH_CHIP_UNSUPPORTED,
+        "20 70 18",
+        "memory chip 20 70 18",
+    ),
+    "flash_chip_key_burned": (
+        HardwareVerdict.FLASH_CHIP_UNSUPPORTED,
+        "20 70 18",
+        "memory chip 20 70 18",
+    ),
+    "board_type_unsupported": (
+        HardwareVerdict.BOARD_TYPE_UNSUPPORTED,
+        "c8 40 18",
+        "extra memory 8 MB, type AP_1v8",
+    ),
+}
+CHIP_LINE = "ESP32-S3 (QFN56) (revision v0.2)"
 
 # Boards that are already set up and locked for State Life in these stories.
 _SECURED_STORIES = (
@@ -117,15 +149,27 @@ TEST_DEFAULTS = FieldDefaults(
     is_test_build=True,
 )
 
+# ADD marks the newest published bundle of each family recommended (ZKT 2.8.1 and
+# Hikvision 3.1.4 from 4 Nov 2026); the older ones stay on offer. The IDs are made up.
 BUNDLES: Tuple[BundleInfo, ...] = (
+    BundleInfo(
+        "zkt-2.8.1-5d0e7a13",
+        Family.ZKT,
+        "ZKT 2.8.1",
+        "2.8.1",
+        True,
+        "AVAILABLE",
+        "Production release for ZKTeco machines.",
+        6_356_992,
+    ),
     BundleInfo(
         "zkt-2.7.8-b8d0ca7e",
         Family.ZKT,
         "ZKT 2.7.8",
         "2.7.8",
-        True,
+        False,
         "AVAILABLE",
-        "Production release for ZKTeco machines.",
+        "The release before 2.8.1.",
         6_291_456,
     ),
     BundleInfo(
@@ -139,13 +183,23 @@ BUNDLES: Tuple[BundleInfo, ...] = (
         6_225_920,
     ),
     BundleInfo(
+        "hikvision-3.1.4-24442b6-9c51e0d7",
+        Family.HIKVISION,
+        "Hikvision 3.1.4",
+        "3.1.4",
+        True,
+        "FIELD_BASELINE",
+        "Field build for Hikvision machines.",
+        5_832_704,
+    ),
+    BundleInfo(
         "hikvision-3.1.1-dc7d9c3-21ac81b2",
         Family.HIKVISION,
         "Hikvision 3.1.1",
         "3.1.1",
-        True,
+        False,
         "FIELD_BASELINE",
-        "Field build for Hikvision machines.",
+        "The field build before 3.1.4.",
         5_767_168,
     ),
 )
@@ -217,6 +271,7 @@ class FakeWorld:
         self.signed_in: Optional[str] = None
         self.board_state = {
             "resume_after_key": SecurityState.KEY_BURNED_NOT_STARTED,
+            "flash_chip_key_burned": SecurityState.KEY_BURNED_NOT_STARTED,
             "secured_other": SecurityState.SECURED_OTHER,
             **{story: SecurityState.SECURED_STATE_LIFE for story in _SECURED_STORIES},
         }.get(scenario, SecurityState.BLANK)
@@ -643,6 +698,23 @@ class FakeBoards:
             )
         state = world.board_state
         mac = candidate.mac or BOARD_MAC
+        refused = _REFUSED_HARDWARE.get(world.scenario)
+        if refused is not None:
+            verdict, flash_id, found = refused
+            return api.BoardInfo(
+                candidate.port,
+                mac,
+                "ESP32-S3",
+                16,
+                8,
+                verdict,
+                state,
+                False,
+                {"chip_line": CHIP_LINE, "flash_id": flash_id},
+                flash_id=flash_id,
+                chip_revision=2,
+                hardware_detail=found,
+            )
         if state in (SecurityState.SECURED_STATE_LIFE, SecurityState.SECURED_OTHER):
             return api.BoardInfo(
                 candidate.port,
@@ -669,6 +741,8 @@ class FakeBoards:
                 if state is SecurityState.KEY_BURNED_NOT_STARTED
                 else "USER"
             },
+            flash_id="c8 40 18",
+            chip_revision=2,
         )
 
 
@@ -835,6 +909,63 @@ def first_boot_lines(
     return lines
 
 
+# The board's start-up program finds no copy of the software it can start (a damaged
+# write): ESP-IDF 5.5.3's bootloader says so and restarts, again and again.
+STARTUP_REFUSED_LINE = "E (52) boot: Factory app partition is not bootable"
+
+
+def startup_refused_lines() -> List[ConsoleEvent]:
+    lines: List[ConsoleEvent] = []
+    for cycle in range(2):
+        at = 0.1 + cycle * 0.1
+        lines += [
+            _line(ConsoleKind.BOOT_BANNER, "ESP-ROM:esp32s3-20210327", at, rom="esp32s3-20210327"),
+            _line(
+                ConsoleKind.BOOT_BANNER,
+                "rst:0x3 (RTC_SW_SYS_RST),boot:0x8 (SPI_FAST_FLASH_BOOT)",
+                at,
+                reset_code="3",
+                reset_reason="RTC_SW_SYS_RST",
+                boot_mode="8",
+            ),
+            _line(
+                ConsoleKind.BOOT_BANNER,
+                "I (29) boot: ESP-IDF v5.5.3 2nd stage bootloader",
+                at,
+                idf="v5.5.3",
+            ),
+            _line(
+                ConsoleKind.BOOTLOADER_FAILED,
+                "E (48) esp_image: Image hash failed - image is corrupt",
+                at,
+                reason="image",
+                fatal="0",
+            ),
+            _line(
+                ConsoleKind.BOOTLOADER_FAILED, STARTUP_REFUSED_LINE, at, reason="no_app", fatal="0"
+            ),
+            _line(
+                ConsoleKind.BOOTLOADER_FAILED,
+                "E (55) boot: No bootable app partitions in the partition table",
+                at,
+                reason="no_app",
+                fatal="1",
+            ),
+        ]
+    return lines
+
+
+def hotspot_line(mac: str) -> ConsoleEvent:
+    """The board opened its own Wi-Fi (firmware wifi_setup), named from its board ID."""
+    return _line(
+        ConsoleKind.SETUP_AP_OPEN,
+        "W (121400) wifi_setup: Wi-Fi setup access point enabled (recovery mode)",
+        121.4,
+        mode="recovery",
+        ssid=hotspot_name(mac) or "SLIC ATTENDANCE",
+    )
+
+
 def settings_lost_lines(config: api.InstallConfig) -> List[ConsoleEvent]:
     """The next start of the 2 Nov 2026 boards: no settings, so the board stays still."""
     lines = first_boot_lines(config, config.zone_id, new_board=False)[:3]
@@ -887,6 +1018,8 @@ class FakeBoot:
             lines = settings_lost_lines(expect)
         else:
             lines = first_boot_lines(expect, expect.zone_id, new_board=False)
+        if world.scenario == "hotspot_at_start":
+            lines.append(hotspot_line(mac))
         for event in lines:
             if world.pause("restart_line", cancel, 1):
                 return BootReport(BootOutcome.CANCELLED, events=tuple(lines))
@@ -919,6 +1052,31 @@ class FakeBoot:
         if world.pause("replug", cancel, 6):
             return BootReport(BootOutcome.CANCELLED)
         on_phase(ReplugPhase.WATCHING)
+        if world.scenario == "startup_refused":
+            lines = startup_refused_lines()
+            for event in lines:
+                if world.pause("boot_line", cancel, 1):
+                    return BootReport(BootOutcome.CANCELLED, events=tuple(lines))
+                on_event(event)
+            # The engine's words for it (console.judge): the line it quotes is the cause.
+            return BootReport(
+                BootOutcome.STARTUP_REFUSED,
+                events=tuple(lines),
+                advice=_advice(
+                    "STARTUP_REFUSED",
+                    "The board's start-up program stopped",
+                    "The board's start-up program refused to start the board's software. "
+                    'It said: "E (48) esp_image: Image hash failed - image is corrupt".',
+                    (
+                        "Open Help, click Save a help file and send it to head office.",
+                        "Put the board aside until head office tells you what to do.",
+                    ),
+                    Severity.ERROR,
+                    "unplug",
+                    can_retry=False,
+                ),
+                board_said="E (48) esp_image: Image hash failed - image is corrupt",
+            )
         wrong = world.scenario == "first_boot_wrong_zone"
         zone_seen = "ZONE-MULTAN-01" if wrong else expect.zone_id
         lines = first_boot_lines(
@@ -1267,7 +1425,7 @@ def make_fake_services(scenario: str, *, pace: float = 0.01) -> api.Services:
         diagnosis=FakeDiagnosis(world),
         records=FakeRecords(world),
         defaults=TEST_DEFAULTS,
-        app_version="1.0.0",
+        app_version=__version__,
     )
 
 
