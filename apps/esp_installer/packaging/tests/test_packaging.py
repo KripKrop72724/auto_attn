@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import struct
 import sys
+import urllib.error
 from pathlib import Path
 
 import pytest
@@ -201,14 +202,63 @@ def test_hashes_are_added_in_pip_compile_layout(tmp_path):
     assert list(update_locks.requirement_lines(lock)) == ['foo==1.0 ; python_version >= "3.10"']
 
 
-def test_a_lock_needs_a_windows_wheel_unless_source_only():
-    linux_only = {"info": {"name": "foo", "requires_dist": []}, "urls": [
-        {"packagetype": "bdist_wheel", "filename": "foo-1.0-cp312-cp312-manylinux_2_28_x86_64.whl"},
-        {"packagetype": "sdist", "filename": "foo-1.0.tar.gz"}]}
-    assert update_locks.windows_requirements(linux_only) is None
-    source_only = {"info": {"name": "esptool", "requires_dist": ["pyserial>=3.3"]},
-                   "urls": [{"packagetype": "sdist", "filename": "esptool-5.1.0.tar.gz"}]}
-    assert update_locks.windows_requirements(source_only) == ["pyserial>=3.3"]
+def _release(name, files, requires=()):
+    return {"info": {"name": name, "requires_dist": list(requires)},
+            "urls": [{"packagetype": "sdist" if file.endswith(".tar.gz") else "bdist_wheel",
+                      "filename": file, "url": f"https://files.example/{file}"}
+                     for file in files]}
+
+
+@pytest.fixture
+def no_wheel_metadata(monkeypatch):
+    """Wheels without PEP 658 metadata: the release's requires_dist counts."""
+    def refuse(url, timeout):
+        raise urllib.error.HTTPError(url, 404, "no metadata", None, None)
+    monkeypatch.setattr(update_locks.urllib.request, "urlopen", refuse)
+
+
+def test_a_lock_needs_a_wheel_for_each_target_unless_source_only(no_wheel_metadata):
+    linux_only = _release("foo", ["foo-1.0-cp312-cp312-manylinux_2_28_x86_64.whl",
+                                  "foo-1.0.tar.gz"])
+    for target in update_locks.TARGETS:
+        assert update_locks.target_requirements(linux_only, target) is None
+    source_only = _release("esptool", ["esptool-5.1.0.tar.gz"], ["pyserial>=3.3"])
+    for target in update_locks.TARGETS:
+        assert update_locks.target_requirements(source_only, target) == ["pyserial>=3.3"]
+    windows_only = _release("foo", ["foo-1.0-cp312-cp312-win_amd64.whl"], ["bar"])
+    assert update_locks.target_requirements(windows_only, update_locks.WINDOWS) == ["bar"]
+    assert update_locks.target_requirements(windows_only, update_locks.MACOS) is None
+
+
+@pytest.mark.parametrize("wheel, fits", [
+    ("foo-1.0-cp312-cp312-macosx_11_0_arm64.whl", True),
+    ("foo-1.0-cp312-cp312-macosx_12_0_arm64.whl", True),
+    ("foo-1.0-cp39-abi3-macosx_12_0_universal2.whl", True),
+    ("foo-1.0-py3-none-macosx_10_13_universal2.whl", True),
+    ("foo-1.0-py3-none-any.whl", True),
+    # Built for a newer macOS than the app promises (LSMinimumSystemVersion).
+    ("foo-1.0-cp312-cp312-macosx_14_0_arm64.whl", False),
+    ("foo-1.0-cp312-cp312-macosx_10_13_x86_64.whl", False),
+    ("foo-1.0-cp311-cp311-macosx_11_0_arm64.whl", False),
+])
+def test_a_mac_wheel_must_fit_apple_silicon_and_the_oldest_macos(no_wheel_metadata, wheel, fits):
+    found = update_locks.target_requirements(_release("foo", [wheel]), update_locks.MACOS)
+    assert (found is not None) is fits
+
+
+def test_each_target_needs_its_own_dependencies_locked(no_wheel_metadata, tmp_path):
+    lock = tmp_path / "requirements.lock"
+    lock.write_text("pyinstaller==6.22.3 \\\n    --hash=sha256:" + "a" * 64 + "\n",
+                    encoding="utf-8")
+    releases = {"pyinstaller": _release("pyinstaller", [
+        "pyinstaller-6.22.3-py3-none-win_amd64.whl",
+        "pyinstaller-6.22.3-py3-none-macosx_10_13_universal2.whl"], [
+        'macholib>=1.8; sys_platform == "darwin"',
+        'pefile!=2024.8.26,>=2022.5.30; sys_platform == "win32"'])}
+    windows = update_locks.check_target([lock], releases, update_locks.WINDOWS)
+    macos = update_locks.check_target([lock], releases, update_locks.MACOS)
+    assert len(windows) == 1 and "pefile" in windows[0] and "Windows" in windows[0]
+    assert len(macos) == 1 and "macholib" in macos[0] and "macOS" in macos[0]
 
 
 def test_committed_locks_pin_the_agreed_versions():
@@ -222,7 +272,8 @@ def test_committed_locks_pin_the_agreed_versions():
     assert pins["httpx"] == "0.28.1"
     assert pins["bitstring"].startswith("4.")  # espefuse needs bitstring.BitStream
     assert pins["pyinstaller"].startswith("6.")
-    for name in ("colorama", "pefile", "pywin32-ctypes", "setuptools", "truststore", "certifi"):
+    for name in ("colorama", "pefile", "pywin32-ctypes", "macholib", "setuptools", "truststore",
+                 "certifi"):
         assert name in pins
     for name in ("requirements.lock", "requirements-build.lock"):
         lines = (app / name).read_text(encoding="utf-8").splitlines()
