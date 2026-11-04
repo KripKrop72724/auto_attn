@@ -1,5 +1,9 @@
 # Zone Lite 2.8.1: the rollback-slot storage gate
 
+[2.8.2](zone-lite-2.8.2-release.md) is 2.8.1 with the 49-byte attendance
+records of MB40-VL/ID terminals (LHRCENTRAL); its gate is 2.8.1's, with 2.8.1
+added to the predecessor list.
+
 2.8.1 is 2.8.0 (secure-pull terminals, [2.8.0 release](zone-lite-2.8.0-release.md))
 with one change: the direct role's storage gate also accepts an other OTA
 slot that the bootloader can never boot. A rollback or an interrupted

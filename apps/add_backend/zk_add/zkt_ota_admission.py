@@ -136,7 +136,8 @@ def unconfirmed_terminal_offer(connector, release) -> bool:
     their terminal yet (a SenseFace behind 2.7.x answers CONNECT with 6001;
     2.8.0 is the image that logs in). The ESP itself stays exact: one of the 17
     on its own connector and MAC, or a ZKT ESP added later. HIL_ONLY images
-    keep the 17 with their confirmed terminals, a terminal confirmed by an
+    keep the 17 with their confirmed terminals (the HIL_ONLY 2.8.2 also its
+    LHRCENTRAL targets, ``zkt282_lhrcentral``), a terminal confirmed by an
     administrator still needs a qualified model (``admitted_addition``), and
     the K50 keeps its reviewed path. ADD's predecessor and storage checks still
     decide whether the running image may take the release.
@@ -163,6 +164,7 @@ def pending_offer_hold(session, connector, release=None):
     """
     from zk_add.ota import FirmwareRelease
     from zk_add.zkt274_bld9_k50 import offer_location
+    from zk_add.zkt282_lhrcentral import admits as lhrcentral_282_admits
 
     if connector.firmware_family != "zkt":
         return None
@@ -172,10 +174,12 @@ def pending_offer_hold(session, connector, release=None):
         return None
     target = BY_ID.get(connector.connector_id)
     # Outside the exact 17: the one reviewed K50 with its exact signed 2.4.12
-    # bridge or 2.7.4, later qualified additions for production images, and
-    # any exact ESP whose terminal is not confirmed for production images.
+    # bridge or 2.7.4, the LHRCENTRAL ESPs named by the HIL_ONLY 2.8.2, later
+    # qualified additions for production images, and any exact ESP whose
+    # terminal is not confirmed for production images.
     if (not (target is not None and target_matches(target.identity, connector))
-            and offer_location(release, connector) is None and not admitted_addition(connector, release)
+            and offer_location(release, connector) is None and not lhrcentral_282_admits(connector, release)
+            and not admitted_addition(connector, release)
             and not unconfirmed_terminal_offer(connector, release)):
         return "NATIONWIDE_EXACT_TARGET_REQUIRED"
     if not connector.connected:

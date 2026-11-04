@@ -515,7 +515,8 @@ def test_other_returns_keep_previous_firmware_observed(db, lifetime, last_code, 
     assert run.status == "PAUSED"
 
 
-@pytest.mark.parametrize("version", ["2.6.17", "2.6.24", "2.7.0", "2.7.6", "2.7.7", "2.7.8", "2.8.0", "2.8.1"])
+@pytest.mark.parametrize("version", ["2.6.17", "2.6.24", "2.7.0", "2.7.6", "2.7.7", "2.7.8", "2.8.0", "2.8.1",
+                                     "2.8.2"])
 def test_releases_with_their_own_return_evidence_are_never_classified(version):
     deployment = SimpleNamespace(status="BOOTED_PENDING", previous_version="2.6.15")
     evidence = {"target_boot": {"last_progress_code": None, "failure_reports": [],
@@ -761,15 +762,25 @@ def test_rollback_slot_residue_is_labelled_but_stays_degraded(db):
     assert evaluate_health(db, device).derived_lifecycle == "DEGRADED"
 
 
-@pytest.mark.parametrize("target", ["2.7.8", "2.8.0", "2.8.1"])
+@pytest.mark.parametrize("target", ["2.7.8", "2.8.0", "2.8.1", "2.8.2"])
 def test_rollback_slot_residue_counts_every_later_platform_download(db, target):
-    """2.6.15 refuses 2.8.0 and 2.8.1 in its other slot as it refuses every 2.7.x."""
+    """2.6.15 refuses 2.8.0 to 2.8.2 in its other slot as it refuses every 2.7.x."""
     device = esp(db, MULTAN_02, "ZONE-MULTAN-02")
     residue_record(db, device, target=target)
     residue_heartbeat(db, device, 1)
     latch = alert(db, device, "ESP_DURABILITY_FAULT").details["latch"]
     assert latch["kind"] == "OTA_ROLLBACK_SLOT_RESIDUE" and latch["residue"]["target_version"] == target
     assert evaluate_health(db, device).last_error_code == "OTA_ROLLBACK_SLOT_RESIDUE"
+
+
+def test_only_the_old_gates_refuse_2_8_2_in_their_other_slot():
+    """2.6.15, 2.7.8 and 2.8.0 list no 2.8.x after them; 2.8.1 starts storage
+    beside a slot the bootloader never selects, so it is never residue."""
+    from zk_add.ota_interruption import _refused_in_other_slot
+    for running in ((2, 6, 15), (2, 7, 8), (2, 8, 0)):
+        assert _refused_in_other_slot(running, (2, 8, 2))
+    assert not _refused_in_other_slot((2, 8, 1), (2, 8, 2))
+    assert not _refused_in_other_slot((2, 8, 2), (2, 8, 1))
 
 
 @pytest.mark.parametrize("change", [
@@ -857,8 +868,11 @@ def test_residue_images_are_the_exact_published_predecessors():
         "2.8.0": ("zone_lite.c:3875", "UNKNOWN", "2.8.1")}
 
 
-@pytest.mark.parametrize("firmware,target", [("2.7.8", "2.8.0"), ("2.7.8", "2.8.1"), ("2.8.0", "2.8.1")])
+@pytest.mark.parametrize("firmware,target", [("2.7.8", "2.8.0"), ("2.7.8", "2.8.1"), ("2.8.0", "2.8.1"),
+                                             ("2.7.8", "2.8.2"), ("2.8.0", "2.8.2")])
 def test_rollback_slot_residue_labels_a_stuck_2_7_8_or_2_8_0_and_names_2_8_1(db, firmware, target):
+    """A 2.8.2 rollback or stopped download leaves 2.7.8 (LHRCENTRAL) or 2.8.0 the
+    same way; 2.8.1 still clears it, and so does 2.8.2 once it installs."""
     device = stuck_esp(db, firmware, target)
     stuck_heartbeat(db, device, 1, firmware)
     # Durability UNKNOWN is not a fault, so the LED row alone carries the label.
