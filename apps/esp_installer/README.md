@@ -1,6 +1,6 @@
 # State Life Device Installer
 
-A Windows 10/11 app (PySide6, with esptool 5.1.0 bundled) that site staff use
+A Windows 10/11 and macOS (Apple Silicon) app (PySide6, with esptool 5.1.0 bundled) that site staff use
 to prepare Zone Lite ESP32-S3 boards for ZKTeco or Hikvision attendance
 machines, to find faulty boards, and to get plain instructions. It ships as a
 PyInstaller folder inside an Inno Setup installer.

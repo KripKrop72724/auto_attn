@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "state-life-device-installer"
 dynamic = ["version"]
-description = "Windows app that prepares and checks Zone Lite boards for State Life attendance machines."
+description = "Windows and macOS app that prepares and checks Zone Lite boards for State Life attendance machines."
 readme = "README.md"
 requires-python = ">=3.9"
 # Release builds install requirements.lock and requirements-build.lock, which

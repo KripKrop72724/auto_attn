@@ -27,7 +27,9 @@ You need:
 
 You do not need an administrator password. The app installs only for you.
 
-1. Copy the Setup file onto the computer. It can come by WhatsApp, by email or
+1. Get the Setup file. In the dashboard, open **Firmware**, then **Prepare an
+   ESP32**, and click **Download for Windows** on the "State Life Device
+   Installer" card. It can also come from head office by WhatsApp, by email or
    on a USB stick. Put it in your **Downloads** folder.
 2. Double-click the Setup file.
 3. Windows may show a blue box that says **"Windows protected your PC"**.
@@ -159,6 +161,9 @@ start. On a Mac, keep it plugged in and keep the lid open until the app says
 | "Put the board into setup mode" on the **Connect the board** screen | The board is running other software. This is normal for a new board. Hold down the **BOOT** button. While you hold it, press and release **RST**. Let go of **BOOT**. When the screen says **Board found**, click **Next**. If the message is still there after 5 seconds, unplug the board, hold down **BOOT** while you plug it back into the socket marked **USB**, then let go of **BOOT**. If it is still there after 3 tries, click **Help**, then **Save a help file**, and send the file to head office. |
 | "Connect only one board" | Unplug every other board. |
 | "This computer cannot read the board ID" | This computer, or the USB socket or hub, does not tell the app which board it is, so the app will not write to the board there. Plug the cable straight into another USB socket on the computer, not into a hub. Then click **Try again** (on **Check or fix a board**: **Check again**). If that does not help, use another computer. |
+| "This board's memory chip cannot run our software" | The board's memory (flash) chip is one our software cannot start, for example the XMC chip with ID 20 70 18. The board is not broken, but it cannot be used. Put it aside and use another board. Tell the seller the chip ID the screen shows. |
+| "This board type is not supported yet" | The board is not the ESP32-S3 N16R8 type (16 MB memory, 8 MB extra memory of type AP_3v3). Use another board. |
+| "The board's start-up program stopped" | The board printed an error before our software could start; the screen shows the line. Do not use the board. Click **Help**, then **Save a help file**, and send the file to head office. |
 | "The board keeps restarting" | Usually the cable or the USB socket does not give enough power. Use a short cable straight into the computer, not a hub, or another USB socket. Then click **Check again** (or **Try again** after the first start). |
 | "This board is faulty" | Put a FAULTY label on it, keep it aside and tell head office. |
 | The app cannot start the board's setup mode | Hold down the **BOOT** button. While you hold it, press and release **RST**. Let go of **BOOT**. Click **Try again**. |
@@ -168,7 +173,7 @@ start. On a Mac, keep it plugged in and keep the lid open until the app says
 | "The board lost its settings" | It lost them when it restarted, or it came back with other settings. Do not use the board; if it came from a site, do not put it back. Unplug it, put a label on it that says DO NOT USE with its board ID (the screen shows it), and keep it aside; do not throw it away. Click **Help**, then **Save a help file**, at once (before you set up another board), and send the file to head office. |
 | "The app did not see the board read its settings" | Click **Try again**. When the screen asks, unplug the board, wait 3 seconds and plug it back in without pressing any button. If it happens again, do not install the board: put it aside, click **Help**, then **Save a help file**, and send the file to head office. |
 | "This app cannot change this board's settings" | The board was locked in an older way. Leave it as it is and call head office with the board ID. |
-| "The app is already open" | Only one window of the app can run. Use the window that is open; look for its icon on the taskbar. |
+| "The app is already open" | Only one window of the app can run. Use the window that is open; look for its icon on the taskbar (on a Mac, in the Dock). |
 | Setup or the uninstaller says the app is running | Close the app. If it is setting up a board, wait until it has finished. Then click **OK**. |
 | "Please wait a moment" | Head office is busy. Wait as many minutes as the screen says, then click **Try again**. |
 | Anything else | Click **Help**, then **Save a help file**. Send the file to head office. It contains no passwords. |
