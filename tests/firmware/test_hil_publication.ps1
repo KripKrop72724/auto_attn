@@ -345,6 +345,34 @@ foreach ($earlierMarker in @($securePullMarker, $exceptionMarker, $reformatMarke
     try { Get-FirmwareStorageContract -ImagePath $contractImage -Version '2.8.1' | Out-Null } catch { $rejected = $true }
     if (-not $rejected) { throw '2.8.1 accepted an earlier platform storage contract' }
 }
+# 2.8.2 (2.8.1 with 49-byte attendance records) also rolls back to 2.8.1, the
+# rollback-slot gate image, so its devices upgrade in place, and keeps 2.7.8
+# and 2.8.0; its marker is 178 characters.
+$records49Marker = $slotGateMarker + ',2.8.1'
+if ($records49Marker.Length -ne 178) { throw '2.8.2 marker length changed' }
+[IO.File]::WriteAllText($contractImage, $records49Marker + [char]0)
+$records49Contract = Get-FirmwareStorageContract -ImagePath $contractImage -Version '2.8.2'
+if ($records49Contract.allowed_bootstrap_versions.Count -ne 20 -or $records49Contract.allowed_bootstrap_images.Count -ne 20 -or
+    ($records49Contract.allowed_bootstrap_versions[0..18] -join ',') -cne ($slotGateContract.allowed_bootstrap_versions -join ',') -or
+    $records49Contract.allowed_bootstrap_versions[19] -ne '2.8.1' -or
+    $records49Contract.allowed_bootstrap_images['2.8.1'] -ne '21238fa36df844642545e8c2f6bcfec03be37470890b776a600c39c0cdd1f5f0' -or
+    $records49Contract.allowed_bootstrap_images['2.8.0'] -ne '21ac81b292b463cf7fa1bf0d6ce364a49493951836ad962a19dcae049f40ed76' -or
+    $records49Contract.allowed_bootstrap_images['2.7.8'] -ne 'b8d0ca7e20d28d4114cff56fc69676e681a37bf9f7e831a243a65f9a1a972a3e' -or
+    @($slotGateContract.allowed_bootstrap_versions | Where-Object { $records49Contract.allowed_bootstrap_images[$_] -cne $slotGateContract.allowed_bootstrap_images[$_] }).Count -ne 0 -or
+    $slotGateContract.allowed_bootstrap_images.Count -ne 19) {
+    throw '2.8.2 rollback targets changed'
+}
+foreach ($platformVersion in @('2.7.1', '2.7.2', '2.7.3', '2.7.4', '2.7.5', '2.7.6', '2.7.7', '2.7.8', '2.8.0', '2.8.1')) {
+    $rejected = $false
+    try { Get-FirmwareStorageContract -ImagePath $contractImage -Version $platformVersion | Out-Null } catch { $rejected = $true }
+    if (-not $rejected) { throw "$platformVersion accepted the 2.8.2 storage contract" }
+}
+foreach ($earlierMarker in @($slotGateMarker, $securePullMarker, $exceptionMarker, $reformatMarker, $repairMarker, $inventoryMarker, $traceMarker, $platformMarker, $fleetMarker)) {
+    [IO.File]::WriteAllText($contractImage, $earlierMarker + [char]0)
+    $rejected = $false
+    try { Get-FirmwareStorageContract -ImagePath $contractImage -Version '2.8.2' | Out-Null } catch { $rejected = $true }
+    if (-not $rejected) { throw '2.8.2 accepted an earlier platform storage contract' }
+}
 [IO.File]::WriteAllText($contractImage, $fleetMarker + [char]0)
 $rejected = $false
 try { Get-FirmwareStorageContract -ImagePath $contractImage -Version '2.7.3' | Out-Null } catch { $rejected = $true }
@@ -817,6 +845,83 @@ foreach ($platformVersion in @('2.8.1', '2.8.0', '2.7.8', '2.7.7', '2.7.6', '2.7
     if ($platformMarker.targets.Count -ne 17 -or $platformMarker.targets[0].connector_id -cne '2ca9a4c2-5ae4-4330-8d14-840223672897') {
         throw "$platformVersion HIL marker is incomplete"
     }
+}
+# 2.8.2 may instead reach an exact ordered prefix of the three LHRCENTRAL ESPs
+# (MB40-VL/ID terminals with 49-byte records), pinned by hardware ID and
+# terminal serial; connector IDs here are synthetic.
+. (Join-Path $repo 'deploy/add/firmware-2-8-2-hil-scope.ps1')
+$lhrPins = Get-Zkt282LhrcentralPins
+if (($lhrPins | ForEach-Object { "$($_.name)=$($_.mac)=$($_.terminal_serial)" }) -join ',' -cne
+    'LHRCENTRAL-01=ac:27:6e:a3:44:68=COVP232060159,LHRCENTRAL-02=14:c1:9f:46:97:d0=COVP232060174,LHRCENTRAL-03=a4:cb:8f:d4:55:28=COVP232060177') {
+    throw '2.8.2 LHRCENTRAL pins changed'
+}
+$lhrConnectors = @('0c1e0001-0000-4000-8000-000000000001', '0c1e0002-0000-4000-8000-000000000002', '0c1e0003-0000-4000-8000-000000000003')
+function New-LhrcentralRows([int[]]$Indexes) {
+    $rows = @()
+    foreach ($index in $Indexes) {
+        $rows += [pscustomobject][ordered]@{ connector_id = $lhrConnectors[$index]; mac = $lhrPins[$index].mac; terminal_serial = $lhrPins[$index].terminal_serial }
+    }
+    return ,$rows
+}
+function ConvertTo-ScopeJson($Rows) { return (ConvertTo-Json -InputObject @($Rows) -Depth 5 -Compress) }
+$nationwideRows = ConvertFrom-Json -InputObject $nationwide
+$nationwideRows = @($nationwideRows)
+foreach ($accepted in @((ConvertTo-ScopeJson (New-LhrcentralRows @(0))), (ConvertTo-ScopeJson (New-LhrcentralRows @(0, 1))),
+                        (ConvertTo-ScopeJson (New-LhrcentralRows @(0, 1, 2))), $nationwide,
+                        (ConvertTo-ScopeJson @($nationwideRows[0..1])))) {
+    Assert-Zkt282HilScope -HilTargetsJson $accepted
+}
+$lhrMutations = [ordered]@{
+    'order' = (New-LhrcentralRows @(1, 0, 2)); 'gap' = (New-LhrcentralRows @(0, 2)); 'repeat' = (New-LhrcentralRows @(0, 1, 2, 0))
+    'later-first' = (New-LhrcentralRows @(1)); 'after-nationwide' = @($nationwideRows[0]) + (New-LhrcentralRows @(0))
+    'adhoc' = (ConvertFrom-Json -InputObject $targets)
+}
+foreach ($mutation in @('serial', 'mac', 'connector-case', 'connector-name', 'connector-repeat', 'extra-key', 'missing-key')) {
+    $rows = New-LhrcentralRows @(0, 1, 2)
+    switch ($mutation) {
+        'serial' { $rows[1].terminal_serial = $lhrPins[2].terminal_serial }
+        'mac' { $rows[2].mac = '00:11:22:33:44:55' }
+        'connector-case' { $rows[0].connector_id = $rows[0].connector_id.ToUpperInvariant() }
+        'connector-name' { $rows[0].connector_id = 'LHRCENTRAL-01' }
+        'connector-repeat' { $rows[1].connector_id = $rows[0].connector_id }
+        'extra-key' { $rows[0] | Add-Member -MemberType NoteProperty -Name zone_id -Value 'LF-ZONE-LHRCENTRAL-01' }
+        'missing-key' { $rows[0] = [pscustomobject][ordered]@{ mac = $rows[0].mac; terminal_serial = $rows[0].terminal_serial } }
+    }
+    $lhrMutations[$mutation] = $rows
+}
+foreach ($mutation in $lhrMutations.Keys) {
+    $rejected = $false
+    try { Assert-Zkt282HilScope -HilTargetsJson (ConvertTo-ScopeJson $lhrMutations[$mutation]) } catch { $rejected = $true }
+    if (-not $rejected) { throw "2.8.2 HIL scope accepted $mutation" }
+}
+foreach ($invalid in @('', '[]', '{}', '["LHRCENTRAL-01"]')) {
+    $rejected = $false
+    try { Assert-Zkt282HilScope -HilTargetsJson $invalid } catch { $rejected = $true }
+    if (-not $rejected) { throw "2.8.2 HIL scope accepted '$invalid'" }
+}
+$lhrImage = Join-Path $source 'zone-lite-2.8.2.bin'
+[IO.File]::WriteAllText($lhrImage, 'ZKT 2.8.2 fixture, not deployable firmware')
+$manifest.version='2.8.2'
+$manifest.release_id='zone-lite-2.8.2'
+$manifest.image_name='zone-lite-2.8.2.bin'
+$manifest.image_sha256=(Get-FileHash $lhrImage).Hash.ToLowerInvariant()
+$manifest.image_size=(Get-Item $lhrImage).Length
+Write-TestManifest
+$lhrScope = ConvertTo-ScopeJson (New-LhrcentralRows @(0, 1, 2))
+foreach ($arguments in @(@{ PublicationMode = 'AVAILABLE' }, @{ PublicationMode = 'HIL_ONLY'; HilTargetsJson = $targets },
+                         @{ PublicationMode = 'HIL_ONLY'; HilTargetMac = 'ac:27:6e:a3:44:68' },
+                         @{ PublicationMode = 'HIL_ONLY'; HilTargetsJson = (ConvertTo-ScopeJson $lhrMutations['serial']) },
+                         @{ PublicationMode = 'HIL_ONLY'; HilTargetsJson = (ConvertTo-ScopeJson $lhrMutations['order']) })) {
+    $rejected = $false
+    try { & $publish -SourceDirectory $source -StoreDirectory $store -Version 2.8.2 @arguments } catch { $rejected = $true }
+    if (-not $rejected) { throw 'Unscoped 2.8.2 publication accepted' }
+}
+& $publish -SourceDirectory $source -StoreDirectory $store -Version 2.8.2 -PublicationMode HIL_ONLY -HilTargetsJson $lhrScope
+$lhrMarker = Get-Content -LiteralPath (Join-Path $store '2.8.2/.hil-only.json') -Raw | ConvertFrom-Json
+if (@($lhrMarker.targets).Count -ne 3 -or $lhrMarker.targets[0].mac -cne 'ac:27:6e:a3:44:68' -or
+    $lhrMarker.targets[2].terminal_serial -cne 'COVP232060177' -or $lhrMarker.targets[1].connector_id -cne $lhrConnectors[1] -or
+    $lhrMarker.application_sha256 -cne ('e'*64)) {
+    throw '2.8.2 LHRCENTRAL HIL marker is incomplete'
 }
 # The later BLD5 extension changes only the quarantine marker of the exact
 # already published image; it cannot authorize another image or device.
