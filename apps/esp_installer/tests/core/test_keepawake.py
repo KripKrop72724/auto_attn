@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import sys
 import threading
 
 import pytest
@@ -52,7 +53,8 @@ def test_each_thread_holds_its_own(states):
     assert states == [keepawake.AWAKE, keepawake.AWAKE, keepawake.RELEASED, keepawake.RELEASED]
 
 
-@pytest.mark.skipif(os.name == "nt", reason="Windows really sets the state")
+@pytest.mark.skipif(os.name == "nt" or sys.platform == "darwin",
+                    reason="Windows and macOS really keep the computer awake")
 def test_does_nothing_off_windows():
     assert keepawake._set_state(keepawake.AWAKE) is False
     with keepawake.keep_awake():
@@ -63,3 +65,12 @@ def test_does_nothing_off_windows():
 def test_windows_accepts_the_request():
     assert keepawake._set_state(keepawake.AWAKE) is True
     assert keepawake._set_state(keepawake.RELEASED) is True
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS only")
+def test_macos_runs_and_stops_caffeinate():
+    assert keepawake._set_state(keepawake.AWAKE) is True
+    process = keepawake._local.caffeinate
+    assert process.poll() is None
+    assert keepawake._set_state(keepawake.RELEASED) is True
+    assert process.wait(timeout=5) is not None

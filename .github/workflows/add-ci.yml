@@ -454,7 +454,7 @@ jobs:
         run: python scripts/update_ci_test_durations.py --check scripts/ci_test_durations.json .ci/junit-*.xml
 
   frontend:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04  # Playwright 1.x has no browsers for ubuntu-latest (26.04) yet
     timeout-minutes: 15
     defaults:
       run:
