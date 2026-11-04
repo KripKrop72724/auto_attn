@@ -215,8 +215,9 @@ SHA-256, how to open the app the first time, and an empty state when nothing is 
 Both routes use the dashboard's admin session and the installer kill switch, like every other
 installer route.
 
-- **Host directory:** `ADD_INSTALLER_APP_STORE_HOST_PATH`, an `add-production` GitHub
-  variable. The default is
+- **Host directory:** `ADD_INSTALLER_APP_STORE_HOST_PATH`. Set it as a repository variable,
+  or to the same value in both the `firmware-signing` (publish) and `add-production` (deploy)
+  environments; otherwise the two use different folders. The default is
   `C:\Users\Public\Documents\StateLife\AttendanceDeviceDashboard\installer-apps`.
 - **Mount:** read-only into add-api only, at `/installer-apps`.
 - **Creation:** `deploy.ps1` creates the directory when it is missing. An empty or missing store

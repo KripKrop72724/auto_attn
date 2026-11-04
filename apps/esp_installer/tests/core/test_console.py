@@ -408,12 +408,13 @@ def test_crash_loop_after_the_start_is_never_a_good_start():
     assert len(script.opened) == 1  # the port stayed open the whole time
 
 
-def test_crash_loop_before_the_start_is_not_a_silent_board():
+def test_crash_loop_before_the_program_starts_is_a_faulty_board():
+    # The start reached ESP-IDF's own start-up and crashed before our program: the board.
     watcher, script, clock = crash_every(3.0, first=GOOD_BOOT[:9], then=[])
     started = clock.now
     report = first_boot(watcher)[0]
     assert report.outcome is BootOutcome.FAULTY_RESTART_LOOP
-    assert report.advice is texts.CRASH_LOOP
+    assert report.advice is texts.STARTUP_CRASH and not report.advice.can_retry
     assert clock.now - started < 60  # said as soon as it showed, not after 120 s
     assert len(script.opened) == 1
 
@@ -1034,8 +1035,12 @@ def test_a_refusal_that_may_recover_waits_for_a_restart_or_the_end():
     config = support.zkt_config()
     assert judge(watch, config, 5.0, 120.0, final=False) is None
     assert judge(watch, config, 121.0, 120.0, final=True).outcome is BootOutcome.STARTUP_REFUSED
-    # The bootloader started the board again: the refusal stands.
+    # The bootloader started the board again: one refused start may still be a one-off.
     watch.events += [parser.parse(line, 0.4) for line in lines[:2]]
+    assert judge(watch, config, 5.0, 120.0, final=False) is None
+    # Refused again, and started again: two in a row, the refusal stands.
+    watch.events += [parser.parse(line, 0.6) for line in lines[2:]]
+    watch.events += [parser.parse(line, 0.8) for line in lines[:2]]
     assert judge(watch, config, 5.0, 120.0, final=False).outcome is BootOutcome.STARTUP_REFUSED
 
 

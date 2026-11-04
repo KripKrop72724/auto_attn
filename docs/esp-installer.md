@@ -200,7 +200,7 @@ start. On a Mac, keep it plugged in and keep the lid open until the app says
 
    Any other branch or confirmation skips the jobs. Approve the
    `firmware-signing` environment if GitHub asks: the two build jobs and the
-   publish job (step 5) each use it.
+   publish run (step 5) each use it. This run publishes nothing.
 4. Two build jobs run side by side:
    - **release** on a clean `windows-2022` machine. It installs the
      hash-locked packages, runs the app tests, builds the app with the
@@ -214,12 +214,24 @@ start. On a Mac, keep it plugged in and keep the lid open until the app says
      Apple Silicon code, runs `--tool esptool version`, `--tool espefuse`,
      `--self-test` and `--screenshots` without a screen, copies the app the
      way a drag to Applications does, and checks the copy.
-5. When both pass, **publish** runs on the ADD server's own runner
-   (`[self-hosted, Windows, X64]`, `firmware-signing` again). It downloads both
-   builds and runs `deploy/add/publish-installer-app.ps1`, which checks each
-   file against its build's `SHA256SUMS.txt` and puts both into ADD's installer
-   app store (below). ADD then offers them on the **Prepare an ESP32** page.
-   The run's summary names the published version.
+5. Download both builds from that run and test them on real boards (a new ZKT
+   board, a new Hikvision board, and a board the check must refuse), and check
+   the restart check on Windows (below). Only then publish them, with a second
+   run that names the tested build run:
+
+   ```sh
+   gh workflow run esp-installer-release.yml --ref main \
+     -f confirmation="PUBLISH INSTALLER APP" -f release_run_id=<build run ID>
+   ```
+
+   **publish** runs on the ADD server's own runner (`[self-hosted, Windows,
+   X64]`, `firmware-signing` again). It checks that the named run is a
+   successful dispatch of this workflow on `main`, downloads that run's two
+   builds (it never rebuilds, so ADD offers exactly the tested files) and runs
+   `deploy/add/publish-installer-app.ps1`, which checks each file against its
+   build's `SHA256SUMS.txt` and puts both into ADD's installer app store
+   (below). ADD then offers them on the **Prepare an ESP32** page. The run's
+   summary names the published version.
 
 Pull requests that touch `apps/esp_installer/**` run the same build and smoke
 steps without any secrets, and publish nothing. They make a **TEST** Setup

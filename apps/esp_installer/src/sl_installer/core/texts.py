@@ -785,6 +785,17 @@ PSRAM_FAILED = _a(
     "Use one of the approved boards.",
     illustration="faulty_board", can_retry=False)
 
+# A crash before our program starts is in ESP-IDF's own start-up, the same in every
+# release: on our boards it has always been the extra memory (PSRAM), as on Gujrat-01,
+# Gilgit's spare and two ac:27:6e:a4 boards on 4 Nov 2026 (console.crash_advice).
+STARTUP_CRASH = _a(
+    "STARTUP_CRASH", "This board is faulty",
+    "The board crashes while it starts, before our software runs. "
+    "This is a fault in the board itself, usually its extra memory.",
+    "Unplug it, put a FAULTY label on it and keep it aside.",
+    "Use another board.",
+    illustration="faulty_board", can_retry=False)
+
 CRASH_LOOP = _a(
     "CRASH_LOOP", "The board keeps crashing",
     "The board starts and then crashes, again and again.",

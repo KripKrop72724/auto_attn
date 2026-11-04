@@ -2,9 +2,11 @@ name: ESP installer release
 
 # Pull requests build a TEST installer for Windows and a TEST disk image for
 # macOS (Apple Silicon): no secrets, and the app shows a "TEST BUILD" banner.
-# A dispatch on main with the confirmation builds both field releases, with the
-# field defaults from the firmware-signing environment, and then publishes them
-# to ADD's installer app store, where the "Prepare an ESP32" page offers them.
+# A dispatch on main with BUILD INSTALLER RELEASE builds both field releases, with
+# the field defaults from the firmware-signing environment, and publishes nothing.
+# After those exact builds pass the real-board test, a second dispatch with
+# PUBLISH INSTALLER APP and that build run's ID copies them, unchanged, to ADD's
+# installer app store, where the "Prepare an ESP32" page offers them.
 on:
   pull_request:
     paths:
@@ -13,9 +15,14 @@ on:
   workflow_dispatch:
     inputs:
       confirmation:
-        description: Type BUILD INSTALLER RELEASE to build the field release from main
+        description: BUILD INSTALLER RELEASE builds the field release from main; PUBLISH INSTALLER APP publishes a tested build
         required: true
         type: string
+      release_run_id:
+        description: PUBLISH INSTALLER APP only - the ID of the successful BUILD INSTALLER RELEASE run whose builds were tested
+        required: false
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -257,13 +264,16 @@ jobs:
           retention-days: 7
 
   publish:
-    # Both field builds of this commit go to ADD's installer app store (read-only
-    # /installer-apps in add-api), where the "Prepare an ESP32" page offers them.
-    needs: [release, macos-release]
-    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.confirmation == 'BUILD INSTALLER RELEASE'
+    # Its own dispatch, after the real-board test of the exact field builds: it copies
+    # that build run's artifacts to ADD's installer app store (read-only
+    # /installer-apps in add-api) and never rebuilds, so ADD offers the tested bytes.
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.confirmation == 'PUBLISH INSTALLER APP'
     runs-on: [self-hosted, Windows, X64]
     environment: firmware-signing
     timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
     defaults:
       run:
         shell: powershell
@@ -271,37 +281,64 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+      - name: Check that the tested run is a successful field build from main
+        id: build
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ inputs.release_run_id }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+          if ($env:RUN_ID -notmatch '^[0-9]+$') {
+            throw 'release_run_id must be the numeric ID of a BUILD INSTALLER RELEASE run'
+          }
+          $headers = @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = 'application/vnd.github+json' }
+          $run = Invoke-RestMethod -Headers $headers -Uri "$env:GITHUB_API_URL/repos/$env:GITHUB_REPOSITORY/actions/runs/$env:RUN_ID"
+          if (-not ([string]$run.path).StartsWith('.github/workflows/esp-installer-release.yml') -or
+              $run.event -ne 'workflow_dispatch' -or $run.head_branch -ne 'main' -or
+              $run.conclusion -ne 'success' -or $run.head_sha -notmatch '^[0-9a-f]{40}$') {
+            throw "Run $env:RUN_ID is not a successful dispatch of this workflow on main"
+          }
+          [IO.File]::AppendAllText($env:GITHUB_OUTPUT, "sha=$($run.head_sha)`n")
       - uses: actions/download-artifact@v4
         with:
-          name: ${{ needs.release.outputs.artifact }}
-          path: installer-app-windows
-      - uses: actions/download-artifact@v4
-        with:
-          name: ${{ needs.macos-release.outputs.artifact }}
-          path: installer-app-macos
+          pattern: StateLife-Device-Installer-*
+          path: installer-app
+          run-id: ${{ inputs.release_run_id }}
+          github-token: ${{ github.token }}
       - name: Check both builds against their SHA256SUMS and publish them
         env:
           ADD_INSTALLER_APP_STORE_HOST_PATH: ${{ vars.ADD_INSTALLER_APP_STORE_HOST_PATH }}
-          WINDOWS_VERSION: ${{ needs.release.outputs.version }}
-          MAC_VERSION: ${{ needs.macos-release.outputs.version }}
+          BUILD_SHA: ${{ steps.build.outputs.sha }}
         run: |
           $ErrorActionPreference = 'Stop'
-          if ($env:WINDOWS_VERSION -notmatch '^[0-9]+\.[0-9]+\.[0-9]+$' -or $env:MAC_VERSION -cne $env:WINDOWS_VERSION) {
-            throw "The Windows build ($env:WINDOWS_VERSION) and the macOS build ($env:MAC_VERSION) must carry the same version"
-          }
-          # Each artifact keeps its build's folders (apps/esp_installer/dist),
-          # so find the one SHA256SUMS.txt in it.
+          # Each artifact keeps its build's folders (apps/esp_installer/dist); the one
+          # SHA256SUMS.txt next to the .exe or the .dmg marks the build folder.
           function Get-BuildFolder {
-            param([string]$Artifact)
-            $sums = @(Get-ChildItem -LiteralPath $Artifact -Recurse -File -Filter 'SHA256SUMS.txt')
-            if ($sums.Count -ne 1) { throw "$Artifact must hold exactly one SHA256SUMS.txt" }
-            return $sums[0].DirectoryName
+            param([string]$Extension)
+            $files = @(Get-ChildItem -LiteralPath 'installer-app' -Recurse -File -Filter "*$Extension")
+            if ($files.Count -ne 1) { throw "The tested run must hold exactly one $Extension build" }
+            $folder = $files[0].DirectoryName
+            if (-not (Test-Path -LiteralPath (Join-Path $folder 'SHA256SUMS.txt') -PathType Leaf)) {
+              throw "No SHA256SUMS.txt beside $($files[0].Name)"
+            }
+            return @{ Folder = $folder; Name = $files[0].Name }
+          }
+          $windows = Get-BuildFolder '.exe'
+          $mac = Get-BuildFolder '.dmg'
+          if ($windows.Name -notmatch '^StateLife-Device-Installer-Setup-([0-9]+\.[0-9]+\.[0-9]+)\.exe$') {
+            throw "Unexpected Windows build $($windows.Name)"
+          }
+          $windowsVersion = $Matches[1]
+          if ($mac.Name -notmatch '^StateLife-Device-Installer-([0-9]+\.[0-9]+\.[0-9]+)-macOS-arm64\.dmg$' -or
+              $Matches[1] -cne $windowsVersion) {
+            throw "The Windows build ($($windows.Name)) and the macOS build ($($mac.Name)) must carry the same version"
           }
           # The publisher checks each file against its SHA256SUMS.txt before
           # anything is written, and again where ADD reads it.
           $version = ./deploy/add/publish-installer-app.ps1 `
-            -WindowsDirectory (Get-BuildFolder 'installer-app-windows') `
-            -MacDirectory (Get-BuildFolder 'installer-app-macos') `
-            -Version $env:WINDOWS_VERSION `
-            -GitSha $env:GITHUB_SHA
-          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "Published State Life Device Installer ``$version`` for Windows and macOS"
+            -WindowsDirectory $windows.Folder `
+            -MacDirectory $mac.Folder `
+            -Version $windowsVersion `
+            -GitSha $env:BUILD_SHA
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "Published State Life Device Installer ``$version`` for Windows and macOS from run $env:GITHUB_RUN_ID's tested build"

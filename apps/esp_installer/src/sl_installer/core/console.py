@@ -93,7 +93,7 @@ _HIK_REASON = re.compile(r"^Poll retrying; reason=(\w+); stage=(\w+); http=(\d+)
 # (an OTA check of another copy), so their E lines count only after a ROM start line.
 _BOOTLOADER_TAGS = re.compile(r"^(?:boot|boot\.esp32s3|bootloader_flash|flash_parts|qio_mode|"
                               r"flash_encrypt|bootloader_random)$")
-_SHARED_BOOT_TAGS = re.compile(r"^(?:boot_comm|esp_image|secure_boot\w*)$")
+_SHARED_BOOT_TAGS = re.compile(r"^(?:boot_comm|esp_image|efuse|secure_boot\w*)$")
 _ROM_LINE = re.compile(r"^(?:ESP-ROM:|rst:0x)")
 # (what the line says, reason, fatal): a fatal line always ends in bootloader_reset(); after
 # the others the bootloader may still start another copy of the program.
@@ -817,6 +817,11 @@ def startup_refusal(events: Sequence[ConsoleEvent], final: bool = True
     the error always ends the start (fatal), the board started again after it, or the
     watch is over (``final``). A later start that went on clears it. The XMC line is
     preferred; otherwise the first error of that start, the cause the others follow.
+
+    While the watch runs (not ``final``) one refused start is not enough: the bootloader
+    resets itself after an error, so a one-off fault (a glitchy plug-in) is followed by a
+    good start. Only two refused starts in a row, the newest ones, count then; the real
+    XMC loop repeats every ~0.1 s, so it is still caught at once.
     """
     starts: List[List[ConsoleEvent]] = [[]]
     for event in events:
@@ -824,22 +829,44 @@ def startup_refusal(events: Sequence[ConsoleEvent], final: bool = True
             starts.append([])
         starts[-1].append(event)
     found: Optional[ConsoleEvent] = None
+    # Per start: its refusing line, None when it went on, OPEN when it says neither yet.
+    verdicts: List[object] = []
     for index, start in enumerate(starts):
         refusals = [position for position, event in enumerate(start)
                     if event.kind is ConsoleKind.BOOTLOADER_FAILED]
         if not refusals:
             if any(_shows_progress(event) for event in start):
                 found = None
+                verdicts.append(None)
+            else:
+                verdicts.append(_OPEN)
             continue
         if any(_shows_progress(event) for event in start[refusals[-1] + 1:]):
             found = None
+            verdicts.append(None)
             continue
         errors = [start[position] for position in refusals]
         fatal = any(event.data.get("fatal") == "1" for event in errors)
         if fatal or final or index < len(starts) - 1:
             found = next((event for event in errors if event.data.get("reason") == "xmc_flash"),
                          errors[0])
-    return found
+            verdicts.append(found)
+        else:
+            verdicts.append(_OPEN)
+    if final:
+        return found
+    # Starts that say neither way (the ROM prints two start lines per restart) are skipped;
+    # only a start that went on breaks the run.
+    in_a_row = 0
+    for verdict in reversed(verdicts):
+        if verdict is None:
+            break
+        if verdict is not _OPEN:
+            in_a_row += 1
+    return found if in_a_row >= 2 else None
+
+
+_OPEN = object()  # startup_refusal: a start that has not shown either way yet
 
 
 REFUSAL_QUOTE_MAX = 160  # characters of the board's line quoted in the advice
@@ -868,6 +895,32 @@ def restarts_seen(events: Sequence[ConsoleEvent], port_reopens: int = 0) -> int:
     resets = sum(1 for event in events if event.kind is ConsoleKind.BOOT_BANNER
                  and event.data.get("reset_reason") not in (None, "", "POWERON"))
     return max(port_reopens, rebooting, resets)
+
+
+# Lines only our program prints: once one is seen, a crash is the program's, not the board's.
+_PROGRAM_KINDS = frozenset({
+    ConsoleKind.APP_STARTED, ConsoleKind.PROVISIONING_LOADED, ConsoleKind.NVS_KEY_DANGER,
+    ConsoleKind.NVS_FAILED, ConsoleKind.SETTINGS_MISSING, ConsoleKind.FAMILY_MISMATCH,
+}) | _AFTER_START
+
+
+def crash_advice(events: Sequence[ConsoleEvent]) -> Advice:
+    """CRASH_LOOP once our program has run in this watch; STARTUP_CRASH, a faulty board,
+    when the starts reached ESP-IDF's own start-up and crashed before our program
+    (texts.STARTUP_CRASH).
+
+    A crash loop prints every start again, so a program that crashes later still shows
+    its app_main line from the next start. Without any line of the start (the port
+    opened late) it stays CRASH_LOOP: nothing shows where the board crashed.
+    """
+    if any((event.kind is ConsoleKind.BOOT_BANNER and event.data.get("app_main") == "1")
+           or event.kind in _PROGRAM_KINDS or _after_start(event) for event in events):
+        return texts.CRASH_LOOP
+    reached_startup = any(
+        (event.kind is ConsoleKind.BOOT_BANNER and "offset" in event.data)
+        or event.kind in (ConsoleKind.PSRAM_OK, ConsoleKind.PSRAM_FAILED, ConsoleKind.APP_VERSION)
+        for event in events)
+    return texts.STARTUP_CRASH if reached_startup else texts.CRASH_LOOP
 
 
 def crash_loop(events: Sequence[ConsoleEvent], port_reopens: int = 0) -> bool:
@@ -969,7 +1022,7 @@ def judge(watch: _Watch, expect: InstallConfig, now: float, timeout_s: float, *,
         return report(BootOutcome.FAULTY_RESTART_LOOP, texts.POWER_PROBLEM, brownout)
     if crash_loop(events, watch.resets):
         crashed = crashes(events)
-        return report(BootOutcome.FAULTY_RESTART_LOOP, texts.CRASH_LOOP,
+        return report(BootOutcome.FAULTY_RESTART_LOOP, crash_advice(events),
                       crashed[0] if crashed else None)
 
     # The start line can be printed before the app has the port open after the replug,
@@ -1019,7 +1072,7 @@ def judge(watch: _Watch, expect: InstallConfig, now: float, timeout_s: float, *,
         period = _restart_period(watch.reset_times)
         if watch.resets >= 2 and period is not None:
             if any(event.kind is ConsoleKind.PANIC for event in events):
-                return report(BootOutcome.FAULTY_RESTART_LOOP, texts.CRASH_LOOP)
+                return report(BootOutcome.FAULTY_RESTART_LOOP, crash_advice(events))
             meaningful = [event for event in events if event.kind is not ConsoleKind.BOOT_BANNER]
             if not meaningful and 6.0 <= period <= 16.0:
                 return report(BootOutcome.FAULTY_RESTART_LOOP, texts.restart_loop_faulty(period))
@@ -1034,7 +1087,7 @@ def judge(watch: _Watch, expect: InstallConfig, now: float, timeout_s: float, *,
         return report(BootOutcome.FAULTY_RESTART_LOOP, texts.POWER_PROBLEM, brownout)
     if crashes(events) or any(_panic(event) == "rebooting" for event in events):
         crashed = crashes(events)
-        return report(BootOutcome.FAULTY_RESTART_LOOP, texts.CRASH_LOOP,
+        return report(BootOutcome.FAULTY_RESTART_LOOP, crash_advice(events),
                       crashed[0] if crashed else None)
     if any(event.data.get("download_mode") == "1" for event in events):
         return report(BootOutcome.NO_OUTPUT, texts.DOWNLOAD_MODE_STUCK)

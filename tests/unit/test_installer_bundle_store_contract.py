@@ -93,7 +93,9 @@ def test_deploy_passes_and_creates_the_app_store_like_the_bundle_store():
 def test_the_dashboard_streams_app_downloads_without_buffering():
     # A buffered 100 MB download would fill add-web's 32 MB nginx tmpfs on a slow link.
     nginx = (ROOT / "apps/add_frontend/nginx.conf").read_text(encoding="utf-8")
-    block = nginx[nginx.index("location /api/v1/installer/apps/ {"):]
+    block = nginx[nginx.index("location /api/v1/installer/apps {"):]
     block = block[:block.index("}")]
     assert "proxy_pass http://add-api:8096;" in block
     assert "proxy_buffering off;" in block
+    # A trailing slash would make nginx redirect the catalogue itself (review, 4 Nov 2026).
+    assert "location /api/v1/installer/apps/ {" not in nginx

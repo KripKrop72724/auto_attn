@@ -1,0 +1,159 @@
+Guru Meditation Error: Core  0 panic'ed (LoadProhibited). Exception was unhandled.
+Core  0 register dump:
+PC      : 0x403828a1  PS      : 0x00060034  A0      : 0x80376ab5  A1      : 0x3fceb0a0
+A2      : 0x3fca3948  A3      : 0x00000000  A4      : 0x00060024  A5      : 0x3fceb108
+A6      : 0x0000000a  A7      : 0x00000000  A8      : 0x00000000  A9      : 0x00000000
+A10     : 0x50000000  A11     : 0x00000001  A12     : 0x3fceb310  A13     : 0x3fceb2a0
+A14     : 0x3fceb310  A15     : 0x0000002a  SAR     : 0x0000000c  EXCCAUSE: 0x0000001c
+EXCVADDR: 0x00000004  LBEG    : 0x400570e8  LEND    : 0x400570f3  LCOUNT  : 0xffffffff
+Backtrace: 0x4038289e:0x3fceb0a0 0x40376ab2:0x3fceb0d0 0x420219a4:0x3fceb0f0 0x42006701:0x3fceb130 0x40375755:0x3fceb180 0x40376dbc:0x3fceb1a0 0x4200a4be:0x3fceb260 0x4200a80c:0x3fceb280 0x42005c64:0x3fceb2a0 0x40375595:0x3fceb310 0x403ccefb:0x3fceb340 0x403cd3f3:0x3fceb380 0x403c8989:0x3fceb4b0 0x40045c01:0x3fceb570 0x40043ab6:0x3fceb6f0 0x40034c45:0x3fceb710
+ELF file SHA256:
+Rebooting...
+ESP-ROM:esp32s3-20210327
+Build:Mar 27 2021
+rst:0xc (RTC_SW_CPU_RST),boot:0x8 (SPI_FAST_FLASH_BOOT)
+Saved PC:0x4037d0b9
+SPIWP:0xee
+mode:DIO, clock div:1
+Valid secure boot key blocks: 0 1 2
+secure boot verification succeeded
+load:0x3fce2980,len:0x2d78
+load:0x403c8700,len:0xd0c
+load:0x403cb700,len:0x4f2c
+entry 0x403c8920
+I (63) boot: ESP-IDF v5.5.3 2nd stage bootloader
+I (63) boot: Multicore bootloader
+I (63) boot: chip revision: v0.2
+I (64) boot: efuse block revision: v1.4
+I (66) boot.esp32s3: Boot SPI Speed : 80MHz
+I (69) boot.esp32s3: SPI Mode       : DIO
+I (73) boot.esp32s3: SPI Flash Size : 16MB
+I (77) boot: Enabling RNG early entropy source...
+I (82) boot: Partition Table:
+I (84) boot: ## Label            Usage          Type ST Offset   Length
+I (90) boot:  0 nvs              WiFi data        01 02 00011000 00006000
+I (97) boot:  1 otadata          OTA data         01 00 00017000 00002000
+I (103) boot:  2 phy_init         RF data          01 01 00019000 00001000
+I (110) boot:  3 factory          factory app      00 00 00020000 00280000
+I (117) boot:  4 ota_0            OTA app          00 10 002a0000 00280000
+I (123) boot:  5 ota_1            OTA app          00 11 00520000 00280000
+I (130) boot:  6 storage          Unknown data     01 82 007a0000 00800000
+I (137) boot: End of partition table
+I (140) esp_image: segment 0: paddr=002a0020 vaddr=3c100020 size=4e440h (320576) map
+I (204) esp_image: segment 1: paddr=002ee468 vaddr=3fc96b00 size=01bb0h (  7088) load
+I (206) esp_image: segment 2: paddr=002f0020 vaddr=42000020 size=fe4e0h (1041632) map
+I (391) esp_image: segment 3: paddr=003ee508 vaddr=3fc986b0 size=0aa48h ( 43592) load
+I (400) esp_image: segment 4: paddr=003f8f58 vaddr=40374000 size=12a60h ( 76384) load
+I (417) esp_image: segment 5: paddr=0040b9c0 vaddr=500002f8 size=00020h (    32) load
+I (418) esp_image: segment 6: paddr=0040b9e8 vaddr=00000000 size=045e8h ( 17896)
+I (424) esp_image: Verifying image signature...
+I (426) secure_boot_v2: Verifying with RSA-PSS...
+I (433) secure_boot_v2: Signature verified successfully!
+I (444) boot: Loaded app from partition at offset 0x2a0000
+I (444) secure_boot_v2: enabling secure boot v2...
+I (444) secure_boot_v2: secure boot v2 is already enabled, continuing..
+I (451) boot: Disabling RNG early entropy source...
+I (467) octal_psram: vendor id    : 0x0d (AP)
+I (467) octal_psram: dev id       : 0x02 (generation 3)
+I (468) octal_psram: density      : 0x03 (64 Mbit)
+I (470) octal_psram: good-die     : 0x01 (Pass)
+I (474) octal_psram: Latency      : 0x01 (Fixed)
+I (478) octal_psram: VCC          : 0x01 (3V)
+I (482) octal_psram: SRF          : 0x01 (Fast Refresh)
+I (487) octal_psram: BurstType    : 0x01 (Hybrid Wrap)
+I (492) octal_psram: BurstLen     : 0x01 (32 Byte)
+I (497) octal_psram: Readlatency  : 0x02 (10 cycles@Fixed)
+I (502) octal_psram: DriveStrength: 0x00 (1/1)
+I (506) MSPI Timing: Enter psram timing tuning
+I (511) esp_psram: Found 8MB PSRAM device
+I (514) esp_psram: Speed: 80MHz
+I (517) cpu_start: Multicore app
+I (943) esp_psram: SPI SRAM memory test OK
+I (951) cpu_start: GPIO 44 and 43 are used as console UART I/O pins
+I (951) cpu_start: Pro cpu start user code
+I (952) cpu_start: cpu freq: 240000000 Hz
+I (953) app_init: Application information:
+I (957) app_init: Project name:     zone_lite
+I (961) app_init: App version:      2.8.1
+I (965) app_init: ELF file SHA256:  95ed56fe2...
+I (969) app_init: ESP-IDF:          v5.5.3
+I (973) efuse_init: Min chip rev:     v0.0
+I (977) efuse_init: Max chip rev:     v0.99
+I (981) efuse_init: Chip rev:         v0.2
+I (985) heap_init: Initializing. RAM available for dynamic allocation:
+I (991) heap_init: At 3FCAECE8 len 0003AA28 (234 KiB): RAM
+I (996) heap_init: At 3FCE9710 len 00005724 (21 KiB): RAM
+I (1001) heap_init: At 3FCF0000 len 00008000 (32 KiB): DRAM
+I (1006) heap_init: At 600FE000 len 00001FE8 (7 KiB): RTCRAM
+Guru Meditation Error: Core  0 panic'ed (IllegalInstruction). Exception was unhandled.
+Guru Meditation Error: Core  0 panic'ed (LoadProhibited). Exception was unhandled.
+Core  0 register dump:
+PC      : 0x403828a1  PS      : 0x00060034  A0      : 0x80376ab5  A1      : 0x3fceb0a0
+A2      : 0x3fca3948  A3      : 0x00000000  A4      : 0x00060024  A5      : 0x3fceb108
+A6      : 0x0000000a  A7      : 0x00000000  A8      : 0x00000000  A9      : 0x00000000
+A10     : 0x50000000  A11     : 0x00000001  A12     : 0x3fceb310  A13     : 0x3fceb2a0
+A14     : 0x3fceb310  A15     : 0x0000002a  SAR     : 0x0000000c  EXCCAUSE: 0x0000001c
+EXCVADDR: 0x00000004  LBEG    : 0x400570e8  LEND    : 0x400570f3  LCOUNT  : 0xffffffff
+Backtrace: 0x4038289e:0x3fceb0a0 0x40376ab2:0x3fceb0d0 0x420219a4:0x3fceb0f0 0x42006701:0x3fceb130 0x40375755:0x3fceb180 0x40376dbc:0x3fceb1a0 0x4200a4be:0x3fceb260 0x4200a80c:0x3fceb280 0x42005c64:0x3fceb2a0 0x40375595:0x3fceb310 0x403ccefb:0x3fceb340 0x403cd3f3:0x3fceb380 0x403c8989:0x3fceb4b0 0x40045c01:0x3fceb570 0x40043ab6:0x3fceb6f0 0x40034c45:0x3fceb710
+ELF file SHA256:
+Rebooting...
+ESP-ROM:esp32s3-20210327
+Build:Mar 27 2021
+rst:0xc (RTC_SW_CPU_RST),boot:0x8 (SPI_FAST_FLASH_BOOT)
+Saved PC:0x4037d0b9
+SPIWP:0xee
+mode:DIO, clock div:1
+Valid secure boot key blocks: 0 1 2
+secure boot verification succeeded
+load:0x3fce2980,len:0x2d78
+load:0x403c8700,len:0xd0c
+load:0x403cb700,len:0x4f2c
+entry 0x403c8920
+I (63) boot: ESP-IDF v5.5.3 2nd stage bootloader
+I (63) boot: Multicore bootloader
+I (63) boot: chip revision: v0.2
+I (64) boot: efuse block revision: v1.4
+I (66) boot.esp32s3: Boot SPI Speed : 80MHz
+I (69) boot.esp32s3: SPI Mode       : DIO
+I (73) boot.esp32s3: SPI Flash Size : 16MB
+I (77) boot: Enabling RNG early entropy source...
+I (82) boot: Partition Table:
+I (84) boot: ## Label            Usage          Type ST Offset   Length
+I (90) boot:  0 nvs              WiFi data        01 02 00011000 00006000
+I (97) boot:  1 otadata          OTA data         01 00 00017000 00002000
+I (103) boot:  2 phy_init         RF data          01 01 00019000 00001000
+I (110) boot:  3 factory          factory app      00 00 00020000 00280000
+I (117) boot:  4 ota_0            OTA app          00 10 002a0000 00280000
+I (123) boot:  5 ota_1            OTA app          00 11 00520000 00280000
+I (130) boot:  6 storage          Unknown data     01 82 007a0000 00800000
+I (137) boot: End of partition table
+I (140) esp_image: segment 0: paddr=002a0020 vaddr=3c100020 size=4e440h (320576) map
+I (204) esp_image: segment 1: paddr=002ee468 vaddr=3fc96b00 size=01bb0h (  7088) load
+I (206) esp_image: segment 2: paddr=002f0020 vaddr=42000020 size=fe4e0h (1041632) map
+I (391) esp_image: segment 3: paddr=003ee508 vaddr=3fc986b0 size=0aa48h ( 43592) load
+I (400) esp_image: segment 4: paddr=003f8f58 vaddr=40374000 size=12a60h ( 76384) load
+I (417) esp_image: segment 5: paddr=0040b9c0 vaddr=500002f8 size=00020h (    32) load
+I (418) esp_image: segment 6: paddr=0040b9e8 vaddr=00000000 size=045e8h ( 17896)
+I (424) esp_image: Verifying image signature...
+I (426) secure_boot_v2: Verifying with RSA-PSS...
+I (433) secure_boot_v2: Signature verified successfully!
+I (444) boot: Loaded app from partition at offset 0x2a0000
+I (444) secure_boot_v2: enabling secure boot v2...
+I (444) secure_boot_v2: secure boot v2 is already enabled, continuing..
+I (451) boot: Disabling RNG early entropy source...
+I (467) octal_psram: vendor id    : 0x0d (AP)
+I (467) octal_psram: dev id       : 0x02 (generation 3)
+I (468) octal_psram: density      : 0x03 (64 Mbit)
+I (470) octal_psram: good-die     : 0x01 (Pass)
+I (474) octal_psram: Latency      : 0x01 (Fixed)
+I (478) octal_psram: VCC          : 0x01 (3V)
+I (482) octal_psram: SRF          : 0x01 (Fast Refresh)
+I (487) octal_psram: BurstType    : 0x01 (Hybrid Wrap)
+I (492) octal_psram: BurstLen     : 0x01 (32 Byte)
+I (497) octal_psram: Readlatency  : 0x02 (10 cycles@Fixed)
+I (502) octal_psram: DriveStrength: 0x00 (1/1)
+I (506) MSPI Timing: Enter psram timing tuning
+I (511) esp_psram: Found 8MB PSRAM device
+I (514) esp_psram: Speed: 80MHz
+I (517) cpu_start: Multicore app
+Guru Meditation Error: Core  0 panic'ed (LoadProhibited). Exception was unhandled.

@@ -16,7 +16,7 @@ from . import texts
 from .api import (Advice, BoardInfo, ConsoleEvent, ConsoleKind, DeviceRecord, HardwareVerdict,
                   PresenceReport, PresenceState, SecurityState, Severity)
 from .board import hardware_advice
-from .console import crash_loop, refusal_advice, startup_refusal
+from .console import crash_advice, crash_loop, refusal_advice, startup_refusal
 from .naming import hotspot_name
 from .validation import version_tuple
 
@@ -158,7 +158,7 @@ def _power(events: Sequence[ConsoleEvent]) -> Optional[Advice]:
 
 def _crashes(events: Sequence[ConsoleEvent]) -> Optional[Advice]:
     # The same rule as the first start's verdict (console.judge), so the two agree.
-    return texts.CRASH_LOOP if crash_loop(events) else None
+    return crash_advice(events) if crash_loop(events) else None
 
 
 def _download_mode(events: Sequence[ConsoleEvent]) -> Optional[Advice]:
