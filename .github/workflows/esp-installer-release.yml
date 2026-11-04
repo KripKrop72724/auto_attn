@@ -3,7 +3,8 @@ name: ESP installer release
 # Pull requests build a TEST installer for Windows and a TEST disk image for
 # macOS (Apple Silicon): no secrets, and the app shows a "TEST BUILD" banner.
 # A dispatch on main with the confirmation builds both field releases, with the
-# field defaults from the firmware-signing environment.
+# field defaults from the firmware-signing environment, and then publishes them
+# to ADD's installer app store, where the "Prepare an ESP32" page offers them.
 on:
   pull_request:
     paths:
@@ -124,6 +125,9 @@ jobs:
     runs-on: windows-2022
     environment: firmware-signing
     timeout-minutes: 60
+    outputs:
+      artifact: ${{ steps.smoke.outputs.artifact }}
+      version: ${{ steps.smoke.outputs.version }}
     defaults:
       run:
         shell: powershell
@@ -169,6 +173,7 @@ jobs:
           ./apps/esp_installer/packaging/smoke_test.ps1 -Setup $setup.FullName -OutputDir smoke
           # Windows PowerShell's Out-File would add a byte-order mark.
           [IO.File]::AppendAllText($env:GITHUB_OUTPUT, "artifact=$($setup.BaseName)`n")
+          [IO.File]::AppendAllText($env:GITHUB_OUTPUT, "version=$($setup.BaseName -replace '^StateLife-Device-Installer-Setup-', '')`n")
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.smoke.outputs.artifact }}
@@ -191,6 +196,9 @@ jobs:
     runs-on: macos-14
     environment: firmware-signing
     timeout-minutes: 60
+    outputs:
+      artifact: ${{ steps.smoke.outputs.artifact }}
+      version: ${{ steps.smoke.outputs.version }}
     defaults:
       run:
         shell: bash
@@ -227,7 +235,10 @@ jobs:
           [ "$(printf '%s\n' "$dmg" | wc -l)" -eq 1 ] || { echo "Expected one disk image: $dmg"; exit 1; }
           case "$dmg" in *-TEST.dmg) echo "The release step produced a TEST build"; exit 1 ;; esac
           apps/esp_installer/packaging/smoke_test_macos.sh "$dmg" smoke
-          echo "artifact=$(basename "$dmg" .dmg)" >> "$GITHUB_OUTPUT"
+          name=$(basename "$dmg" .dmg)
+          version=${name#StateLife-Device-Installer-}
+          echo "artifact=$name" >> "$GITHUB_OUTPUT"
+          echo "version=${version%-macOS-arm64}" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.smoke.outputs.artifact }}
@@ -244,3 +255,53 @@ jobs:
           path: smoke/
           if-no-files-found: ignore
           retention-days: 7
+
+  publish:
+    # Both field builds of this commit go to ADD's installer app store (read-only
+    # /installer-apps in add-api), where the "Prepare an ESP32" page offers them.
+    needs: [release, macos-release]
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.confirmation == 'BUILD INSTALLER RELEASE'
+    runs-on: [self-hosted, Windows, X64]
+    environment: firmware-signing
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.release.outputs.artifact }}
+          path: installer-app-windows
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.macos-release.outputs.artifact }}
+          path: installer-app-macos
+      - name: Check both builds against their SHA256SUMS and publish them
+        env:
+          ADD_INSTALLER_APP_STORE_HOST_PATH: ${{ vars.ADD_INSTALLER_APP_STORE_HOST_PATH }}
+          WINDOWS_VERSION: ${{ needs.release.outputs.version }}
+          MAC_VERSION: ${{ needs.macos-release.outputs.version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:WINDOWS_VERSION -notmatch '^[0-9]+\.[0-9]+\.[0-9]+$' -or $env:MAC_VERSION -cne $env:WINDOWS_VERSION) {
+            throw "The Windows build ($env:WINDOWS_VERSION) and the macOS build ($env:MAC_VERSION) must carry the same version"
+          }
+          # Each artifact keeps its build's folders (apps/esp_installer/dist),
+          # so find the one SHA256SUMS.txt in it.
+          function Get-BuildFolder {
+            param([string]$Artifact)
+            $sums = @(Get-ChildItem -LiteralPath $Artifact -Recurse -File -Filter 'SHA256SUMS.txt')
+            if ($sums.Count -ne 1) { throw "$Artifact must hold exactly one SHA256SUMS.txt" }
+            return $sums[0].DirectoryName
+          }
+          # The publisher checks each file against its SHA256SUMS.txt before
+          # anything is written, and again where ADD reads it.
+          $version = ./deploy/add/publish-installer-app.ps1 `
+            -WindowsDirectory (Get-BuildFolder 'installer-app-windows') `
+            -MacDirectory (Get-BuildFolder 'installer-app-macos') `
+            -Version $env:WINDOWS_VERSION `
+            -GitSha $env:GITHUB_SHA
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "Published State Life Device Installer ``$version`` for Windows and macOS"

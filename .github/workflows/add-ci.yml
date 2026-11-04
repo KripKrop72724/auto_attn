@@ -41,6 +41,7 @@ jobs:
           ./tests/firmware/test_usb_wifi_rescue_signing.ps1
           ./tests/firmware/test_bootstrap_production_signing.ps1
           ./tests/firmware/test_installer_bundle_publication.ps1
+          ./tests/firmware/test_installer_app_publication.ps1
       - name: Verify USB rescue signing refusals in PowerShell Core
         shell: pwsh
         run: ./tests/firmware/test_usb_wifi_rescue_signing.ps1
