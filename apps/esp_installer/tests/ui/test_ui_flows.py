@@ -36,7 +36,7 @@ def test_happy_zkt_end_to_end(harness):
     assert form.preview_name.text() == "Building 9 · Device 4"
     assert form.preview_group.text() == "Life group"
     assert form.device_id.text() == "1"
-    assert form.bundle.currentText() == "ZKT 2.7.8 (recommended)"
+    assert form.bundle.currentText() == "ZKT 2.8.1 (recommended)"
     assert form.wifi_ssid.text() == "RE7" and form.wifi_password.text() == "test-wifi-pass"
     assert not form.advanced.expanded
 
@@ -129,7 +129,7 @@ def test_happy_hik_end_to_end(harness):
     h.to_details(Family.HIKVISION)
     form = h.page(pages.DETAILS).form
     assert form.machine_card.isVisible()
-    assert form.bundle.currentText() == "Hikvision 3.1.1 (recommended)"
+    assert form.bundle.currentText() == "Hikvision 3.1.4 (recommended)"
     form.zone_id.setText("LF-ZONE-JHELUM-01")
     h.click_primary(pages.DETAILS)  # machine address, password and serial are missing
     assert h.controller.current == pages.DETAILS
