@@ -44,6 +44,7 @@ from zk_add.storage_recovery import (
 )
 from zk_add.models import Connector, DeviceTelemetry, utc_column
 from zk_add import zkt274_bld9_k50 as bld9_k50
+from zk_add import zkt282_lhrcentral as lhrcentral_282
 from zk_add.settings import settings
 from zk_add.terminal_families import require_family_match, release_family, require_production_qualification
 from zk_add.time_utils import ensure_utc, utc_now
@@ -335,6 +336,11 @@ def _parse_release_hil_targets(identity: tuple, raw: Any) -> list[HilTarget]:
     k50_targets = bld9_k50.exposure(identity, raw)
     if k50_targets is not None:
         return k50_targets
+    # zone-lite-2.8.2 may instead reach the reviewed LHRCENTRAL ESPs, outside
+    # the 17, whose MB40-VL/ID terminals return 49-byte records.
+    lhrcentral_targets = lhrcentral_282.exposure(identity, raw)
+    if lhrcentral_targets is not None:
+        return lhrcentral_targets
     if identity[1] in FLEET_PLATFORM_VERSIONS and identity[0] == f"zone-lite-{identity[1]}":
         from zk_add.zkt_bridge_contract import bridge_hil_targets
         return bridge_hil_targets(raw)
@@ -686,17 +692,20 @@ def _storage_predecessor_exclusion(session: Session, release: FirmwareRelease, c
             release.version in FLEET_PLATFORM_VERSIONS and qualified_version in {
                 "2.6.6", "2.6.7", "2.6.8", "2.6.9", "2.6.10", "2.6.12", "2.6.13", "2.6.14", "2.6.15"}) or (
             # Neither were 2.7.2 to 2.7.7, the HIL-only 2.7 platform images.
-            release.version in {"2.7.3", "2.7.4", "2.7.5", "2.7.6", "2.7.7", "2.7.8", "2.8.0", "2.8.1"} and qualified_version == "2.7.2") or (
-            release.version in {"2.7.4", "2.7.5", "2.7.6", "2.7.7", "2.7.8", "2.8.0", "2.8.1"} and qualified_version == "2.7.3") or (
-            release.version in {"2.7.5", "2.7.6", "2.7.7", "2.7.8", "2.8.0", "2.8.1"} and qualified_version == "2.7.4") or (
-            release.version in {"2.7.6", "2.7.7", "2.7.8", "2.8.0", "2.8.1"} and qualified_version == "2.7.5") or (
-            release.version in {"2.7.7", "2.7.8", "2.8.0", "2.8.1"} and qualified_version == "2.7.6") or (
-            release.version in {"2.7.8", "2.8.0", "2.8.1"} and qualified_version == "2.7.7") or (
+            release.version in {"2.7.3", "2.7.4", "2.7.5", "2.7.6", "2.7.7", "2.7.8", "2.8.0", "2.8.1", "2.8.2"} and qualified_version == "2.7.2") or (
+            release.version in {"2.7.4", "2.7.5", "2.7.6", "2.7.7", "2.7.8", "2.8.0", "2.8.1", "2.8.2"} and qualified_version == "2.7.3") or (
+            release.version in {"2.7.5", "2.7.6", "2.7.7", "2.7.8", "2.8.0", "2.8.1", "2.8.2"} and qualified_version == "2.7.4") or (
+            release.version in {"2.7.6", "2.7.7", "2.7.8", "2.8.0", "2.8.1", "2.8.2"} and qualified_version == "2.7.5") or (
+            release.version in {"2.7.7", "2.7.8", "2.8.0", "2.8.1", "2.8.2"} and qualified_version == "2.7.6") or (
+            release.version in {"2.7.8", "2.8.0", "2.8.1", "2.8.2"} and qualified_version == "2.7.7") or (
             # 2.7.8 was promoted (AVAILABLE, 29 Oct 2026); like every earlier
-            # 2.7 predecessor, 2.8.0 and 2.8.1 take it published in either state.
-            release.version in {"2.8.0", "2.8.1"} and qualified_version == "2.7.8") or (
+            # 2.7 predecessor, 2.8.0 to 2.8.2 take it published in either state.
+            release.version in {"2.8.0", "2.8.1", "2.8.2"} and qualified_version == "2.7.8") or (
             # 2.8.0 is HIL_ONLY (30 Oct 2026) and may never be promoted.
-            release.version == "2.8.1" and qualified_version == "2.8.0")
+            release.version in {"2.8.1", "2.8.2"} and qualified_version == "2.8.0") or (
+            # 2.8.1 was promoted (AVAILABLE, 4 Nov 2026); 2.8.2 takes it published
+            # in either state, as every earlier predecessor.
+            release.version == "2.8.2" and qualified_version == "2.8.1")
         allowed_state = {"AVAILABLE", "HIL_ONLY"} if hil_retry else {"AVAILABLE"}
         predecessor = session.scalar(select(FirmwareRelease).where(
             FirmwareRelease.release_id == f"zone-lite-{qualified_version}",

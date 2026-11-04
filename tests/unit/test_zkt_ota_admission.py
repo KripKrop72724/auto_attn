@@ -563,6 +563,7 @@ def test_an_esp_whose_terminal_is_not_confirmed_takes_production_images_only(sto
         assert pending_offer_hold(db, device, release) is None
         assert pending_offer_hold(db, device, secure_pull_release(db, version="2.7.8")) is None
         assert pending_offer_hold(db, device, secure_pull_release(db, version="2.8.1")) is None
+        assert pending_offer_hold(db, device, secure_pull_release(db, version="2.8.2")) is None
         # HIL_ONLY images keep the 17 with their confirmed terminals.
         release.state = "HIL_ONLY"
         assert pending_offer_hold(db, device, release) == "NATIONWIDE_EXACT_TARGET_REQUIRED"

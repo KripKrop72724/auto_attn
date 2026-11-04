@@ -1,4 +1,4 @@
-"""ZKT 2.7 platform images (2.7.1-2.7.8, 2.8.0, 2.8.1) in the 2.6.15 fleet's legacy authority.
+"""ZKT 2.7 platform images (2.7.1-2.7.8, 2.8.0-2.8.2) in the 2.6.15 fleet's legacy authority.
 
 Their HIL scope is an exact prefix of the signed nationwide list. Each target
 starts independently; the fleet reservation guard paces the offers."""
@@ -11,8 +11,9 @@ from sqlalchemy.orm import Session
 
 from zk_add.storage_contract import (FLEET_BASELINE_IMAGES, FLEET_PLATFORM_VERSIONS, INVENTORY_BASELINE_IMAGES,
                                      EXCEPTION_BASELINE_IMAGES, PLATFORM_BASELINE_IMAGES, REFORMAT_BASELINE_IMAGES,
-                                     REPAIR_BASELINE_IMAGES, SECURE_PULL_BASELINE_IMAGES, SLOT_RULE_BASELINE_IMAGES,
-                                     TRACE_BASELINE_IMAGES, platform_baselines, validate_storage_contract)
+                                     RECORD49_BASELINE_IMAGES, REPAIR_BASELINE_IMAGES, SECURE_PULL_BASELINE_IMAGES,
+                                     SLOT_RULE_BASELINE_IMAGES, TRACE_BASELINE_IMAGES, platform_baselines,
+                                     validate_storage_contract)
 from zk_add.zkt_bridge_contract import signed_hil_targets
 from zk_add.zkt270_scope import TARGETS
 
@@ -117,20 +118,23 @@ def test_contract_admits_the_fleet_image_as_a_rollback_target(version):
     assert contract["allowed_bootstrap_images"]["2.6.15"] == FLEET_2615
     # 2.7.3 and later accept 2.7.2, the image 3FL runs; 2.7.4 and later accept
     # 2.7.3; 2.7.5 and later accept 2.7.4; 2.7.6 and later accept 2.7.5; 2.7.7
-    # and later accept 2.7.6; 2.7.8 and later accept 2.7.7; 2.8.0 and 2.8.1
-    # accept 2.7.8, the production image; only 2.8.1 accepts 2.8.0.
+    # and later accept 2.7.6; 2.7.8 and later accept 2.7.7; 2.8.0 and later
+    # accept 2.7.8, the production image; 2.8.1 and 2.8.2 accept 2.8.0; only
+    # 2.8.2 accepts 2.8.1.
     assert ("2.7.2" in contract["allowed_bootstrap_versions"]) == (
-        version in {"2.7.3", "2.7.4", "2.7.5", "2.7.6", "2.7.7", "2.7.8", "2.8.0", "2.8.1"})
+        version in {"2.7.3", "2.7.4", "2.7.5", "2.7.6", "2.7.7", "2.7.8", "2.8.0", "2.8.1", "2.8.2"})
     assert ("2.7.3" in contract["allowed_bootstrap_versions"]) == (
-        version in {"2.7.4", "2.7.5", "2.7.6", "2.7.7", "2.7.8", "2.8.0", "2.8.1"})
+        version in {"2.7.4", "2.7.5", "2.7.6", "2.7.7", "2.7.8", "2.8.0", "2.8.1", "2.8.2"})
     assert ("2.7.4" in contract["allowed_bootstrap_versions"]) == (
-        version in {"2.7.5", "2.7.6", "2.7.7", "2.7.8", "2.8.0", "2.8.1"})
+        version in {"2.7.5", "2.7.6", "2.7.7", "2.7.8", "2.8.0", "2.8.1", "2.8.2"})
     assert ("2.7.5" in contract["allowed_bootstrap_versions"]) == (
-        version in {"2.7.6", "2.7.7", "2.7.8", "2.8.0", "2.8.1"})
-    assert ("2.7.6" in contract["allowed_bootstrap_versions"]) == (version in {"2.7.7", "2.7.8", "2.8.0", "2.8.1"})
-    assert ("2.7.7" in contract["allowed_bootstrap_versions"]) == (version in {"2.7.8", "2.8.0", "2.8.1"})
-    assert ("2.7.8" in contract["allowed_bootstrap_versions"]) == (version in {"2.8.0", "2.8.1"})
-    assert ("2.8.0" in contract["allowed_bootstrap_versions"]) == (version == "2.8.1")
+        version in {"2.7.6", "2.7.7", "2.7.8", "2.8.0", "2.8.1", "2.8.2"})
+    assert ("2.7.6" in contract["allowed_bootstrap_versions"]) == (
+        version in {"2.7.7", "2.7.8", "2.8.0", "2.8.1", "2.8.2"})
+    assert ("2.7.7" in contract["allowed_bootstrap_versions"]) == (version in {"2.7.8", "2.8.0", "2.8.1", "2.8.2"})
+    assert ("2.7.8" in contract["allowed_bootstrap_versions"]) == (version in {"2.8.0", "2.8.1", "2.8.2"})
+    assert ("2.8.0" in contract["allowed_bootstrap_versions"]) == (version in {"2.8.1", "2.8.2"})
+    assert ("2.8.1" in contract["allowed_bootstrap_versions"]) == (version == "2.8.2")
     if version == "2.8.0":
         assert contract["allowed_bootstrap_images"]["2.7.8"] == (
             "b8d0ca7e20d28d4114cff56fc69676e681a37bf9f7e831a243a65f9a1a972a3e")
@@ -141,6 +145,12 @@ def test_contract_admits_the_fleet_image_as_a_rollback_target(version):
         assert contract["allowed_bootstrap_images"]["2.8.0"] == (
             "21ac81b292b463cf7fa1bf0d6ce364a49493951836ad962a19dcae049f40ed76")
         assert contract["allowed_bootstrap_versions"][-1] == "2.8.0" and len(contract["allowed_bootstrap_versions"]) == 19
+    if version == "2.8.2":
+        assert contract["allowed_bootstrap_images"]["2.8.0"] == (
+            "21ac81b292b463cf7fa1bf0d6ce364a49493951836ad962a19dcae049f40ed76")
+        assert contract["allowed_bootstrap_images"]["2.8.1"] == (
+            "21238fa36df844642545e8c2f6bcfec03be37470890b776a600c39c0cdd1f5f0")
+        assert contract["allowed_bootstrap_versions"][-1] == "2.8.1" and len(contract["allowed_bootstrap_versions"]) == 20
     with pytest.raises(ValueError):
         validate_storage_contract(manifest(version, minimum_bootstrap_version="2.2.0"), version)
     without_fleet = manifest(version)
@@ -178,7 +188,7 @@ def test_fleet_guard_offers_every_target_at_once_once_journal_releases_exist(pla
 
 
 def test_later_platform_images_upgrade_3fl_in_place_from_2_7_2(platform):
-    """3FL runs the exact HIL-only 2.7.2; 2.7.3 to 2.8.1 may replace it in place
+    """3FL runs the exact HIL-only 2.7.2; 2.7.3 to 2.8.2 may replace it in place
     (3FL's own 2.7.2 guard refuses every OTA; it takes 2.7.7 or later by USB)."""
     from zk_add import ota
     from zk_add.ota import preview_campaign_scope
@@ -194,7 +204,7 @@ def test_later_platform_images_upgrade_3fl_in_place_from_2_7_2(platform):
     device.ota_running_partition = "ota_1"
     device.ota_image_sha256 = PLATFORM_BASELINE_IMAGES["2.7.2"]
     session.flush()
-    if release.version in {"2.7.3", "2.7.4", "2.7.5", "2.7.6", "2.7.7", "2.7.8", "2.8.0", "2.8.1"}:
+    if release.version in {"2.7.3", "2.7.4", "2.7.5", "2.7.6", "2.7.7", "2.7.8", "2.8.0", "2.8.1", "2.8.2"}:
         scope, run = start(session, release, device.zone_id)
         assert [row["connector_id"] for row in scope["eligible"]] == [device.connector_id]
         assert offer(session, device)["version"] == release.version
@@ -223,7 +233,7 @@ def test_later_platform_images_upgrade_a_2_7_3_device_in_place(platform):
     device.firmware_version = "zone-lite-2.7.3"
     device.ota_image_sha256 = TRACE_BASELINE_IMAGES["2.7.3"]
     session.flush()
-    if release.version in {"2.7.4", "2.7.5", "2.7.6", "2.7.7", "2.7.8", "2.8.0", "2.8.1"}:
+    if release.version in {"2.7.4", "2.7.5", "2.7.6", "2.7.7", "2.7.8", "2.8.0", "2.8.1", "2.8.2"}:
         scope, _run = start(session, release, device.zone_id)
         assert [row["connector_id"] for row in scope["eligible"]] == [device.connector_id]
     else:
@@ -233,7 +243,7 @@ def test_later_platform_images_upgrade_a_2_7_3_device_in_place(platform):
 
 def test_later_platform_images_upgrade_a_2_7_4_device_in_place(platform):
     """The 2.7.4 HIL devices (Peshawar 06 before 2.7.5, ZONE-BLD9-01's K50 and
-    the others it reached) take 2.7.5 to 2.8.1 in place, and only from the
+    the others it reached) take 2.7.5 to 2.8.2 in place, and only from the
     exact signed 2.7.4 bytes."""
     from zk_add import ota
     from zk_add.ota import preview_campaign_scope
@@ -248,7 +258,7 @@ def test_later_platform_images_upgrade_a_2_7_4_device_in_place(platform):
     device.firmware_version = "zone-lite-2.7.4"
     device.ota_image_sha256 = INVENTORY_BASELINE_IMAGES["2.7.4"]
     session.flush()
-    if release.version in {"2.7.5", "2.7.6", "2.7.7", "2.7.8", "2.8.0", "2.8.1"}:
+    if release.version in {"2.7.5", "2.7.6", "2.7.7", "2.7.8", "2.8.0", "2.8.1", "2.8.2"}:
         scope, _run = start(session, release, device.zone_id)
         assert [row["connector_id"] for row in scope["eligible"]] == [device.connector_id]
         assert offer(session, device)["version"] == release.version
@@ -263,13 +273,13 @@ def test_later_platform_images_upgrade_a_2_7_4_device_in_place(platform):
 
 
 def test_later_platform_images_need_the_published_2_7_4_to_upgrade_in_place(platform):
-    """ADD offers 2.7.5 to 2.8.1 to a 2.7.4 device only while that exact
+    """ADD offers 2.7.5 to 2.8.2 to a 2.7.4 device only while that exact
     release is published (HIL_ONLY or AVAILABLE), as for every earlier
     predecessor."""
     from zk_add import ota
     from zk_add.ota import preview_campaign_scope
     session, release, devices = platform
-    if release.version not in {"2.7.5", "2.7.6", "2.7.7", "2.7.8", "2.8.0", "2.8.1"}:
+    if release.version not in {"2.7.5", "2.7.6", "2.7.7", "2.7.8", "2.8.0", "2.8.1", "2.8.2"}:
         return
     device = devices[2]
     device.firmware_version = "zone-lite-2.7.4"
@@ -291,7 +301,7 @@ def test_later_platform_images_need_the_published_2_7_4_to_upgrade_in_place(plat
 
 def test_later_platform_images_upgrade_a_2_7_5_device_in_place(platform):
     """The 2.7.5 HIL devices (Peshawar 06, Karachi 01 and the others it
-    reaches) take 2.7.6 to 2.8.1 in place, and only from the exact signed 2.7.5
+    reaches) take 2.7.6 to 2.8.2 in place, and only from the exact signed 2.7.5
     bytes (application 430e2daf..., HIL run 39371984527)."""
     from zk_add import ota
     from zk_add.ota import preview_campaign_scope
@@ -306,7 +316,7 @@ def test_later_platform_images_upgrade_a_2_7_5_device_in_place(platform):
     device.firmware_version = "zone-lite-2.7.5"
     device.ota_image_sha256 = REPAIR_BASELINE_IMAGES["2.7.5"]
     session.flush()
-    if release.version in {"2.7.6", "2.7.7", "2.7.8", "2.8.0", "2.8.1"}:
+    if release.version in {"2.7.6", "2.7.7", "2.7.8", "2.8.0", "2.8.1", "2.8.2"}:
         scope, _run = start(session, release, device.zone_id)
         assert [row["connector_id"] for row in scope["eligible"]] == [device.connector_id]
         assert offer(session, device)["version"] == release.version
@@ -321,13 +331,13 @@ def test_later_platform_images_upgrade_a_2_7_5_device_in_place(platform):
 
 
 def test_later_platform_images_need_the_published_2_7_5_to_upgrade_in_place(platform):
-    """ADD offers 2.7.6 to 2.8.1 to a 2.7.5 device only while that exact
+    """ADD offers 2.7.6 to 2.8.2 to a 2.7.5 device only while that exact
     release is published (HIL_ONLY or AVAILABLE), as for every earlier
     predecessor."""
     from zk_add import ota
     from zk_add.ota import preview_campaign_scope
     session, release, devices = platform
-    if release.version not in {"2.7.6", "2.7.7", "2.7.8", "2.8.0", "2.8.1"}:
+    if release.version not in {"2.7.6", "2.7.7", "2.7.8", "2.8.0", "2.8.1", "2.8.2"}:
         return
     device = devices[1]
     device.firmware_version = "zone-lite-2.7.5"
@@ -357,7 +367,7 @@ def _release_2_7_6(state):
 
 
 def test_later_platform_images_upgrade_a_2_7_6_device_in_place(platform):
-    """The 2.7.6 HIL devices take 2.7.7 to 2.8.1 in place, and only from the exact
+    """The 2.7.6 HIL devices take 2.7.7 to 2.8.2 in place, and only from the exact
     signed 2.7.6 bytes (ADD's published zone-lite-2.7.6, application
     9d705076...)."""
     from zk_add.ota import preview_campaign_scope
@@ -368,7 +378,7 @@ def test_later_platform_images_upgrade_a_2_7_6_device_in_place(platform):
     device.firmware_version = "zone-lite-2.7.6"
     device.ota_image_sha256 = REFORMAT_BASELINE_IMAGES["2.7.6"]
     session.flush()
-    if release.version in {"2.7.7", "2.7.8", "2.8.0", "2.8.1"}:
+    if release.version in {"2.7.7", "2.7.8", "2.8.0", "2.8.1", "2.8.2"}:
         scope, _run = start(session, release, device.zone_id)
         assert [row["connector_id"] for row in scope["eligible"]] == [device.connector_id]
         assert offer(session, device)["version"] == release.version
@@ -383,12 +393,12 @@ def test_later_platform_images_upgrade_a_2_7_6_device_in_place(platform):
 
 
 def test_later_platform_images_need_the_published_2_7_6_to_upgrade_in_place(platform):
-    """ADD offers 2.7.7 to 2.8.1 to a 2.7.6 device only while that exact
+    """ADD offers 2.7.7 to 2.8.2 to a 2.7.6 device only while that exact
     release is published (HIL_ONLY or AVAILABLE), as for every earlier
     predecessor."""
     from zk_add.ota import preview_campaign_scope
     session, release, devices = platform
-    if release.version not in {"2.7.7", "2.7.8", "2.8.0", "2.8.1"}:
+    if release.version not in {"2.7.7", "2.7.8", "2.8.0", "2.8.1", "2.8.2"}:
         return
     device = devices[1]
     device.firmware_version = "zone-lite-2.7.6"
@@ -415,7 +425,7 @@ def _release_2_7_7(state):
 
 def test_later_platform_images_upgrade_a_2_7_7_device_in_place(platform):
     """The 2.7.7 HIL devices (Swat; 13FL and P02 if they ever confirm it) take
-    2.7.8 to 2.8.1 in place, and only from the exact signed 2.7.7 bytes (ADD's
+    2.7.8 to 2.8.2 in place, and only from the exact signed 2.7.7 bytes (ADD's
     published zone-lite-2.7.7, application 6d9ee63d..., HIL run
     40326022451)."""
     from zk_add.ota import preview_campaign_scope
@@ -426,7 +436,7 @@ def test_later_platform_images_upgrade_a_2_7_7_device_in_place(platform):
     device.firmware_version = "zone-lite-2.7.7"
     device.ota_image_sha256 = EXCEPTION_BASELINE_IMAGES["2.7.7"]
     session.flush()
-    if release.version in {"2.7.8", "2.8.0", "2.8.1"}:
+    if release.version in {"2.7.8", "2.8.0", "2.8.1", "2.8.2"}:
         scope, _run = start(session, release, device.zone_id)
         assert [row["connector_id"] for row in scope["eligible"]] == [device.connector_id]
         assert offer(session, device)["version"] == release.version
@@ -441,11 +451,11 @@ def test_later_platform_images_upgrade_a_2_7_7_device_in_place(platform):
 
 
 def test_later_platform_images_need_the_published_2_7_7_to_upgrade_in_place(platform):
-    """ADD offers 2.7.8 to 2.8.1 to a 2.7.7 device only while that exact release
+    """ADD offers 2.7.8 to 2.8.2 to a 2.7.7 device only while that exact release
     is published (HIL_ONLY or AVAILABLE), as for every earlier predecessor."""
     from zk_add.ota import preview_campaign_scope
     session, release, devices = platform
-    if release.version not in {"2.7.8", "2.8.0", "2.8.1"}:
+    if release.version not in {"2.7.8", "2.8.0", "2.8.1", "2.8.2"}:
         return
     device = devices[1]
     device.firmware_version = "zone-lite-2.7.7"
@@ -475,18 +485,20 @@ def _release_2_7_8(state, application=APPLICATION_2_7_8):
 
 
 def test_later_platform_images_upgrade_a_2_7_8_device_in_place(platform):
-    """The fleet's 2.7.8 devices (the production image) take 2.8.0 or 2.8.1 in
-    place, and only from the exact signed 2.7.8 bytes (application b8d0ca7e...)."""
+    """The fleet's 2.7.8 devices (the production image, LHRCENTRAL's included)
+    take 2.8.0 to 2.8.2 in place, and only from the exact signed 2.7.8 bytes
+    (application b8d0ca7e...)."""
     from zk_add.ota import preview_campaign_scope
     session, release, devices = platform
-    assert SECURE_PULL_BASELINE_IMAGES["2.7.8"] == SLOT_RULE_BASELINE_IMAGES["2.7.8"] == APPLICATION_2_7_8
+    assert (SECURE_PULL_BASELINE_IMAGES["2.7.8"] == SLOT_RULE_BASELINE_IMAGES["2.7.8"]
+            == RECORD49_BASELINE_IMAGES["2.7.8"] == APPLICATION_2_7_8)
     if release.version != "2.7.8":
         session.add(_release_2_7_8("AVAILABLE"))
     device = devices[1]
     device.firmware_version = "zone-lite-2.7.8"
     device.ota_image_sha256 = APPLICATION_2_7_8
     session.flush()
-    if release.version in {"2.8.0", "2.8.1"}:
+    if release.version in {"2.8.0", "2.8.1", "2.8.2"}:
         scope, _run = start(session, release, device.zone_id)
         assert [row["connector_id"] for row in scope["eligible"]] == [device.connector_id]
         assert offer(session, device)["version"] == release.version
@@ -500,11 +512,11 @@ def test_later_platform_images_upgrade_a_2_7_8_device_in_place(platform):
             preview_campaign_scope(session, release_public_id=release.release_id, zone_id=device.zone_id)
 
 
-@pytest.mark.parametrize("platform", ["2.8.0", "2.8.1"], indirect=True)
+@pytest.mark.parametrize("platform", ["2.8.0", "2.8.1", "2.8.2"], indirect=True)
 @pytest.mark.parametrize("change", ["digest", "factory", "unpublished"])
 def test_later_platform_images_refuse_a_2_7_8_device_off_the_exact_published_bytes(platform, change):
     """The device's running image, its slot and ADD's published 2.7.8 must all
-    be the exact bytes 2.8.0 and 2.8.1 sign as their predecessor."""
+    be the exact bytes 2.8.0 to 2.8.2 sign as their predecessor."""
     from zk_add.ota import preview_campaign_scope
     session, release, devices = platform
     session.add(_release_2_7_8("AVAILABLE", "0" * 64 if change == "unpublished" else APPLICATION_2_7_8))
@@ -518,12 +530,12 @@ def test_later_platform_images_refuse_a_2_7_8_device_off_the_exact_published_byt
 
 
 def test_later_platform_images_need_the_published_2_7_8_to_upgrade_in_place(platform):
-    """ADD offers 2.8.0 or 2.8.1 to a 2.7.8 device only while that exact release
+    """ADD offers 2.8.0 to 2.8.2 to a 2.7.8 device only while that exact release
     is published: AVAILABLE, as in production, or HIL_ONLY, as every earlier 2.7
     predecessor; never once it is revoked."""
     from zk_add.ota import preview_campaign_scope
     session, release, devices = platform
-    if release.version not in {"2.8.0", "2.8.1"}:
+    if release.version not in {"2.8.0", "2.8.1", "2.8.2"}:
         return
     device = devices[1]
     device.firmware_version = "zone-lite-2.7.8"
@@ -544,11 +556,11 @@ def test_later_platform_images_need_the_published_2_7_8_to_upgrade_in_place(plat
     assert offer(session, device)["version"] == release.version
 
 
-@pytest.mark.parametrize("platform", ["2.8.0", "2.8.1"], indirect=True)
+@pytest.mark.parametrize("platform", ["2.8.0", "2.8.1", "2.8.2"], indirect=True)
 def test_a_later_2_7_8_esp_behind_a_secure_pull_terminal_takes_2_8_x_once_available(platform, monkeypatch):
     """Gilgit (30 Oct 2026): a later ESP on the exact production 2.7.8, behind a
-    SenseFace it cannot log in to, outside the 17. The HIL_ONLY 2.8.0 or 2.8.1
-    never reaches it; the AVAILABLE one does, through the exact 2.7.8 check."""
+    SenseFace it cannot log in to, outside the 17. The HIL_ONLY 2.8.0 to 2.8.2
+    never reach it; the AVAILABLE one does, through the exact 2.7.8 check."""
     from zk_add import ota
     from zk_add.models import Connector
     from zk_add.ota import _storage_predecessor_exclusion, preview_campaign_scope
@@ -595,22 +607,22 @@ def _release_2_8_0(state, application=APPLICATION_2_8_0):
         state=state, manifest={"application_sha256": application})
 
 
-def test_only_2_8_1_upgrades_a_2_8_0_device_in_place(platform):
-    """The 2.8.0 HIL devices take 2.8.1 in place, and only from the exact signed
-    2.8.0 bytes (application 21ac81b2...)."""
+def test_later_platform_images_upgrade_a_2_8_0_device_in_place(platform):
+    """The 2.8.0 HIL devices take 2.8.1 or 2.8.2 in place, and only from the
+    exact signed 2.8.0 bytes (application 21ac81b2...)."""
     from zk_add.ota import preview_campaign_scope
     session, release, devices = platform
-    assert SLOT_RULE_BASELINE_IMAGES["2.8.0"] == APPLICATION_2_8_0
+    assert SLOT_RULE_BASELINE_IMAGES["2.8.0"] == RECORD49_BASELINE_IMAGES["2.8.0"] == APPLICATION_2_8_0
     if release.version != "2.8.0":
         session.add(_release_2_8_0("HIL_ONLY"))
     device = devices[1]
     device.firmware_version = "zone-lite-2.8.0"
     device.ota_image_sha256 = APPLICATION_2_8_0
     session.flush()
-    if release.version == "2.8.1":
+    if release.version in {"2.8.1", "2.8.2"}:
         scope, _run = start(session, release, device.zone_id)
         assert [row["connector_id"] for row in scope["eligible"]] == [device.connector_id]
-        assert offer(session, device)["version"] == "2.8.1"
+        assert offer(session, device)["version"] == release.version
         # A 2.8.0 claim on other bytes (2.7.8's) is refused.
         device.ota_image_sha256 = APPLICATION_2_7_8
         session.flush()
@@ -621,11 +633,11 @@ def test_only_2_8_1_upgrades_a_2_8_0_device_in_place(platform):
             preview_campaign_scope(session, release_public_id=release.release_id, zone_id=device.zone_id)
 
 
-@pytest.mark.parametrize("platform", ["2.8.1"], indirect=True)
+@pytest.mark.parametrize("platform", ["2.8.1", "2.8.2"], indirect=True)
 @pytest.mark.parametrize("change", ["digest", "factory", "unpublished"])
-def test_2_8_1_refuses_a_2_8_0_device_off_the_exact_published_bytes(platform, change):
+def test_later_platform_images_refuse_a_2_8_0_device_off_the_exact_published_bytes(platform, change):
     """The device's running image, its slot and ADD's published 2.8.0 must all
-    be the exact bytes 2.8.1 signs as its predecessor."""
+    be the exact bytes 2.8.1 and 2.8.2 sign as their predecessor."""
     from zk_add.ota import preview_campaign_scope
     session, release, devices = platform
     session.add(_release_2_8_0("HIL_ONLY", "0" * 64 if change == "unpublished" else APPLICATION_2_8_0))
@@ -638,11 +650,11 @@ def test_2_8_1_refuses_a_2_8_0_device_off_the_exact_published_bytes(platform, ch
         preview_campaign_scope(session, release_public_id=release.release_id, zone_id=device.zone_id)
 
 
-@pytest.mark.parametrize("platform", ["2.8.1"], indirect=True)
-def test_2_8_1_needs_the_published_2_8_0_to_upgrade_in_place(platform):
-    """ADD offers 2.8.1 to a 2.8.0 device only while that exact release is
-    published: HIL_ONLY, as 2.8.0 is and may stay, or AVAILABLE once promoted;
-    never once it is revoked."""
+@pytest.mark.parametrize("platform", ["2.8.1", "2.8.2"], indirect=True)
+def test_later_platform_images_need_the_published_2_8_0_to_upgrade_in_place(platform):
+    """ADD offers 2.8.1 or 2.8.2 to a 2.8.0 device only while that exact release
+    is published: HIL_ONLY, as 2.8.0 is and may stay, or AVAILABLE once
+    promoted; never once it is revoked."""
     from zk_add.ota import preview_campaign_scope
     session, release, devices = platform
     device = devices[1]
@@ -661,8 +673,95 @@ def test_2_8_1_needs_the_published_2_8_0_to_upgrade_in_place(platform):
     session.flush()
     scope, _run = start(session, release, device.zone_id)
     assert [row["connector_id"] for row in scope["eligible"]] == [device.connector_id]
-    assert offer(session, device)["version"] == "2.8.1"
-    assert offer(session, device)["version"] == "2.8.1"
+    assert offer(session, device)["version"] == release.version
+    assert offer(session, device)["version"] == release.version
+    # Revoked while offered: the next assignment request is refused.
+    predecessor.state = "REVOKED"
+    session.flush()
+    assert offer(session, device) is None
+
+
+# ADD's published zone-lite-2.8.1: the rollback-slot gate image at 037d9b7, AVAILABLE since 4 November 2026.
+APPLICATION_2_8_1 = "21238fa36df844642545e8c2f6bcfec03be37470890b776a600c39c0cdd1f5f0"
+
+
+def _release_2_8_1(state, application=APPLICATION_2_8_1):
+    from zk_add import ota
+    return ota.FirmwareRelease(
+        release_id="zone-lite-2.8.1", version="2.8.1", git_sha="037d9b7fde73bffe7cb18a13365830d8fb822cda",
+        image_sha256="3d9cdf1827290fa9b40a75a70d03e813f26128bcf3caf58ff8256bf10f6f4cbb", image_size=1511424,
+        signing_key_id="production-key", partition_layout=ota.OTA_LAYOUT, minimum_bootstrap_version="2.4.12",
+        storage_name="published/2.8.1.bin", manifest_signature="test-signature", state=state,
+        manifest={"application_sha256": application})
+
+
+def test_only_2_8_2_upgrades_a_2_8_1_device_in_place(platform):
+    """The 2.8.1 devices take 2.8.2 in place, and only from the exact signed
+    2.8.1 bytes (application 21238fa3...)."""
+    from zk_add.ota import preview_campaign_scope
+    session, release, devices = platform
+    assert RECORD49_BASELINE_IMAGES["2.8.1"] == APPLICATION_2_8_1
+    if release.version != "2.8.1":
+        session.add(_release_2_8_1("AVAILABLE"))
+    device = devices[1]
+    device.firmware_version = "zone-lite-2.8.1"
+    device.ota_image_sha256 = APPLICATION_2_8_1
+    session.flush()
+    if release.version == "2.8.2":
+        scope, _run = start(session, release, device.zone_id)
+        assert [row["connector_id"] for row in scope["eligible"]] == [device.connector_id]
+        assert offer(session, device)["version"] == "2.8.2"
+        # A 2.8.1 claim on other bytes (2.8.0's) is refused.
+        device.ota_image_sha256 = APPLICATION_2_8_0
+        session.flush()
+        with pytest.raises(ValueError, match="exactly one eligible connector"):
+            preview_campaign_scope(session, release_public_id=release.release_id, zone_id=device.zone_id)
+    else:
+        with pytest.raises(ValueError, match="exactly one eligible connector"):
+            preview_campaign_scope(session, release_public_id=release.release_id, zone_id=device.zone_id)
+
+
+@pytest.mark.parametrize("platform", ["2.8.2"], indirect=True)
+@pytest.mark.parametrize("change", ["digest", "factory", "unpublished"])
+def test_2_8_2_refuses_a_2_8_1_device_off_the_exact_published_bytes(platform, change):
+    """The device's running image, its slot and ADD's published 2.8.1 must all
+    be the exact bytes 2.8.2 signs as its predecessor."""
+    from zk_add.ota import preview_campaign_scope
+    session, release, devices = platform
+    session.add(_release_2_8_1("AVAILABLE", "0" * 64 if change == "unpublished" else APPLICATION_2_8_1))
+    device = devices[1]
+    device.firmware_version = "zone-lite-2.8.1"
+    device.ota_image_sha256 = "0" * 64 if change == "digest" else APPLICATION_2_8_1
+    device.ota_running_partition = "factory" if change == "factory" else "ota_1"
+    session.flush()
+    with pytest.raises(ValueError, match="DIRECT_BOOTSTRAP_IMAGE_UNVERIFIED"):
+        preview_campaign_scope(session, release_public_id=release.release_id, zone_id=device.zone_id)
+
+
+@pytest.mark.parametrize("platform", ["2.8.2"], indirect=True)
+def test_2_8_2_needs_the_published_2_8_1_to_upgrade_in_place(platform):
+    """ADD offers 2.8.2 to a 2.8.1 device only while that exact release is
+    published: AVAILABLE, as 2.8.1 is since 4 November, or HIL_ONLY, as every
+    earlier predecessor; never once it is revoked."""
+    from zk_add.ota import preview_campaign_scope
+    session, release, devices = platform
+    device = devices[1]
+    device.firmware_version = "zone-lite-2.8.1"
+    device.ota_image_sha256 = APPLICATION_2_8_1
+    predecessor = _release_2_8_1("REVOKED")
+    session.add(predecessor)
+    session.flush()
+    with pytest.raises(ValueError, match="DIRECT_BOOTSTRAP_IMAGE_UNVERIFIED"):
+        preview_campaign_scope(session, release_public_id=release.release_id, zone_id=device.zone_id)
+    predecessor.state = "HIL_ONLY"
+    session.flush()
+    scope = preview_campaign_scope(session, release_public_id=release.release_id, zone_id=device.zone_id)
+    assert [row["connector_id"] for row in scope["eligible"]] == [device.connector_id]
+    predecessor.state = "AVAILABLE"
+    session.flush()
+    scope, _run = start(session, release, device.zone_id)
+    assert [row["connector_id"] for row in scope["eligible"]] == [device.connector_id]
+    assert offer(session, device)["version"] == "2.8.2"
     # Revoked while offered: the next assignment request is refused.
     predecessor.state = "REVOKED"
     session.flush()
@@ -710,6 +809,7 @@ def test_scope_is_an_exact_nationwide_prefix_and_needs_hil(platform, monkeypatch
     ("zone-lite-2.7.8", False, False), ("zone-lite-2.7.8", True, True),
     ("zone-lite-2.8.0", False, False), ("zone-lite-2.8.0", True, True),
     ("zone-lite-2.8.1", False, False), ("zone-lite-2.8.1", True, True),
+    ("zone-lite-2.8.2", False, False), ("zone-lite-2.8.2", True, True),
     ("zone-lite-2.7.0", False, True),
     ("zone-lite-2.6.16", False, True),
 ])
@@ -767,7 +867,7 @@ def test_k50_exposure_is_exact_to_the_signed_2_7_4_bytes_and_list():
     # Only the exact 2.7.4 identity: not another 2.7 image, nor other source or bytes.
     for identity in (*(k50_identity(release_id=f"zone-lite-{version}", version=version)
                        for version in ("2.7.1", "2.7.2", "2.7.3", "2.7.5", "2.7.6", "2.7.7", "2.7.8", "2.8.0",
-                                       "2.8.1")),
+                                       "2.8.1", "2.8.2")),
                      k50_identity(git_sha="0" * 40), k50_identity(image_sha256="0" * 64),
                      k50_identity(application_sha256="0" * 64), k50_identity(release_id="zone-lite-2.7.4-k50")):
         with pytest.raises(ValueError):
