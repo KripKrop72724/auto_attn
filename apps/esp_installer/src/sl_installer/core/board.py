@@ -27,12 +27,10 @@ startup flow and stops the boot unless the ID is then on the list. esptool 5.1.0
 the same check before flash-id (cmds.py flash_xmc_startup) and prints "XMC flash chip
 boot-up failure detected" exactly when that flow runs. The gate refuses a board when:
 
-* esptool printed that warning, or its "XMC flash boot-up fix failed". The warning
-  alone is decisive on purpose (1.1.0 scope, 4 Nov 2026): it also refuses a listed XMC
-  chip that needed the flow, which the bootloader would then start;
-* the chip ID is XMC's (0x20) and not on is_xmc_chip_strict()'s list. Without the
-  SFDP byte, which only esptool and the bootloader read, a 0x20 chip of another maker
-  (Micron) that the bootloader would start is refused too;
+* esptool printed "XMC flash boot-up fix failed": the flow ran and the ID is still off
+  the list, which is exactly when the bootloader stops. esptool's check is the
+  bootloader's, SFDP byte included, so a listed XMC chip that recovers in the flow, and
+  a 0x20 chip whose SFDP byte is not XMC's (the bootloader skips the flow for it), pass;
 * the flash is not 16 MB, or the flash-type eFuse says octal (8 data lines);
 * the embedded PSRAM is not exactly "8MB (AP_3v3)" (none at all: WRONG_PSRAM);
 * the chip revision is above v0.99, the range ESP-IDF 5.5.3 builds for the ESP32-S3
@@ -235,9 +233,13 @@ def is_xmc_chip_strict(maker: Optional[int], device: Optional[int]) -> bool:
 
 def flash_chip_starts(chip: FlashChip) -> bool:
     """Whether our bootloader gets past its XMC startup check with this chip (module notes)."""
-    if chip.xmc_startup_needed or chip.xmc_startup_failed:
+    if chip.xmc_startup_failed:
         return False
-    return chip.maker != XMC_VENDOR_ID or is_xmc_chip_strict(chip.maker, chip.device)
+    if chip.xmc_startup_needed:
+        # The flow ran: the ID esptool read after it decides, as in the bootloader.
+        return is_xmc_chip_strict(chip.maker, chip.device)
+    # No flow: the ID is on the list, or the SFDP maker byte is not XMC's.
+    return True
 
 
 def efuse_flash_octal(summary: Dict[str, object]) -> Optional[bool]:

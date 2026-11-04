@@ -38,7 +38,7 @@ from .api import (Advice, BoardInfo, BootOutcome, BootReport, BundleInfo, Cancel
                   DeviceRecord, EncryptedPackage, Family, HardwareVerdict, InstallConfig,
                   InstallerError, InstallMode, InstallSummary, LocalBundle, PackageRequest,
                   ProgressFn, SecurityState, ServerService, StepId, StepProgress, UsbCandidate)
-from .board import (XMC_STARTUP_FAILED, XMC_STARTUP_NEEDED, classify_efuses, classify_sdm,
+from .board import (XMC_STARTUP_FAILED, classify_efuses, classify_sdm,
                     efuse_mac, hardware_advice, key0_locked_hmac, parse_banner,
                     parse_security_info, read_summary_file, refusal_detail, revision_words)
 from .bundles import BundleStore, chip_revision_window, flash_ranges
@@ -460,15 +460,16 @@ class Installer:
             progress.emit(planned.total_bytes or 1, force=True)
 
     def _check_flash_chip(self, run: _Run, result: ToolResult) -> None:
-        """esptool's XMC startup warning: our bootloader could never start this board.
+        """esptool's "XMC flash boot-up fix failed": our bootloader could never start this board.
 
         The board check refuses such a board first; this stops a run that got past it
         before the key is locked (a new board) or before more is written (a resume).
-        A finished board (settings change) has started with its chip already.
+        A listed XMC chip that recovers in the flow prints only the first warning and is
+        fine (board.flash_chip_starts). A finished board (settings change) has started
+        with its chip already.
         """
-        if run.mode is InstallMode.CHANGE_SETTINGS or not (
-                XMC_STARTUP_NEEDED.search(result.output)
-                or XMC_STARTUP_FAILED.search(result.output)):
+        if (run.mode is InstallMode.CHANGE_SETTINGS
+                or not XMC_STARTUP_FAILED.search(result.output)):
             return
         board = replace(run.board, hardware=HardwareVerdict.FLASH_CHIP_UNSUPPORTED)
         advice = texts.flash_chip_unsupported(board.flash_id, locked=run.key_burned)

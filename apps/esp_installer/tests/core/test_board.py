@@ -179,28 +179,44 @@ def test_gigadevice_board_passes():
     assert board.hardware_advice(info) is None
 
 
-@pytest.mark.parametrize("maker, device, starts", [
-    (0x0B, 0x4018, True), (0xC2, 0x2018, True), (0xC8, 0x4018, True),   # XTX, Macronix, GD
+@pytest.mark.parametrize("maker, device, listed", [
     (0x20, 0x7018, False),                                               # XM25QH128A
     (0x20, 0x4018, True), (0x20, 0x4013, True), (0x20, 0x4020, True),    # strict list, 0x40
     (0x20, 0x4012, False), (0x20, 0x4021, False),
     (0x20, 0x4117, True), (0x20, 0x4120, True), (0x20, 0x4116, False),   # 0x41
     (0x20, 0x5015, True), (0x20, 0x5016, True), (0x20, 0x5017, False),   # 0x50
-    (0x20, 0x6018, False),
+    (0x20, 0x6018, False), (0x0B, 0x4018, False), (0xC8, 0x4018, False),
 ])
-def test_flash_chip_rule_matches_the_bootloader(maker, device, starts):
+def test_strict_list_matches_the_bootloader(maker, device, listed):
     # ESP-IDF 5.5.3 bootloader_flash.c is_xmc_chip_strict, on esptool's printed numbers.
-    chip = board.FlashChip(maker, device, 16, False)
+    assert board.is_xmc_chip_strict(maker, device) is listed
+
+
+@pytest.mark.parametrize("maker, device, needed, failed, starts", [
+    (0x0B, 0x4018, False, False, True), (0xC2, 0x2018, False, False, True),  # XTX, Macronix
+    (0xC8, 0x4018, False, False, True),                                       # GigaDevice
+    (0x20, 0x4018, False, False, True),      # listed XMC: no flow
+    (0x20, 0x4018, True, False, True),       # listed XMC that recovered in the flow
+    (0x20, 0x7018, True, True, False),       # XM25QH128A: the flow ran and failed
+    (0x20, 0x7018, True, False, False),      # flow ran, ID still off the list
+    (0x20, 0xBA18, False, False, True),      # 0x20 chip whose SFDP byte is not XMC's
+])
+def test_flash_chip_rule_follows_esptools_xmc_check(maker, device, needed, failed, starts):
+    # esptool's check is the bootloader's (SFDP byte included): its lines decide.
+    chip = board.FlashChip(maker, device, 16, False, xmc_startup_needed=needed,
+                           xmc_startup_failed=failed)
     assert board.flash_chip_starts(chip) is starts
-    assert board.is_xmc_chip_strict(maker, device) is (maker == 0x20 and starts)
 
 
-@pytest.mark.parametrize("warning", [True, False])
-def test_esptool_xmc_warning_is_decisive(warning):
-    # 20 40 18 is on the strict list; esptool's startup warning still refuses it.
-    output = support.connect_banner(MAC) + support.flash_id_output("20", "4018", xmc=warning)
-    info, _ = inspect(FakeBoard(outputs={"flash-id": output}))
-    expected = HardwareVerdict.FLASH_CHIP_UNSUPPORTED if warning else HardwareVerdict.OK
+@pytest.mark.parametrize("output, expected", [
+    (dict(xmc=True), HardwareVerdict.FLASH_CHIP_UNSUPPORTED),
+    (dict(recovered=True), HardwareVerdict.OK),
+    (dict(), HardwareVerdict.OK),
+])
+def test_esptool_xmc_fix_failed_decides(output, expected):
+    # 20 40 18 is on the strict list: only esptool's "fix failed" refuses it.
+    text = support.connect_banner(MAC) + support.flash_id_output("20", "4018", **output)
+    info, _ = inspect(FakeBoard(outputs={"flash-id": text}))
     assert info.hardware is expected and info.flash_id == "20 40 18"
 
 

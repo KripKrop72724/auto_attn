@@ -250,6 +250,33 @@ def test_the_pc_is_kept_awake_for_the_whole_install(rig, monkeypatch):
     assert states == [keepawake.AWAKE, keepawake.RELEASED]
 
 
+def test_keep_awake_runs_caffeinate_on_macos(monkeypatch):
+    from sl_installer.core import keepawake
+
+    started, stopped = [], []
+
+    class FakeProcess:
+        def __init__(self, args, **kwargs):
+            started.append(args)
+
+        def poll(self):
+            return None if not stopped else 0
+
+        def terminate(self):
+            stopped.append(True)
+
+        def wait(self, timeout=None):
+            return 0
+
+    monkeypatch.setattr(keepawake.sys, "platform", "darwin")
+    monkeypatch.setattr(keepawake.subprocess, "Popen", FakeProcess)
+    with keepawake.keep_awake():
+        with keepawake.keep_awake():   # nested: still one caffeinate
+            assert len(started) == 1 and not stopped
+    assert started == [[keepawake.CAFFEINATE, "-dis", "-w", str(keepawake.os.getpid())]]
+    assert stopped == [True]
+
+
 def test_change_settings_refuses_a_board_that_lost_the_fingerprint(tmp_path, store):
     fake = FakeBoard(efuse_state="sdm", sdm=True)
     fake.sdm_purposes = (9, 10, 11, 0, 0, 0, 12)

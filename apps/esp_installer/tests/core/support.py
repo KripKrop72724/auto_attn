@@ -139,14 +139,23 @@ FLASH_ID_16MB = "\n".join([
 XMC_WARNING = "\n".join([
     "Warning: XMC flash chip boot-up failure detected! Running XMC25QHxxC startup flow.",
     "Warning: XMC flash boot-up fix failed.", "XMC flash chip boot-up fix successful!"])
+# esptool 5.1.0 after a flow that put a listed XMC chip right: no "fix failed" line.
+XMC_RECOVERED = "\n".join([
+    "Warning: XMC flash chip boot-up failure detected! Running XMC25QHxxC startup flow.",
+    "XMC flash chip boot-up fix successful!"])
 
 
 def flash_id_output(maker: str, device: str, *, size: str = "16MB", kind: str = "quad",
-                    xmc: bool = False) -> str:
-    """esptool 5.1.0 flash-id's lines after the banner, for any chip."""
+                    xmc: bool = False, recovered: bool = False) -> str:
+    """esptool 5.1.0 flash-id's lines after the banner, for any chip.
+
+    ``xmc``: the XMC flow ran and failed; ``recovered``: it ran and the chip recovered.
+    """
     lines = ["Enabling default SPI flash mode..."]
     if xmc:
         lines.append(XMC_WARNING)
+    elif recovered:
+        lines.append(XMC_RECOVERED)
     lines += ["Flash Memory Information:", "=========================",
               f"Manufacturer: {maker}", f"Device: {device}", f"Detected flash size: {size}",
               f"Flash type set in eFuse: {kind} ({4 if kind == 'quad' else 8} data lines)",
