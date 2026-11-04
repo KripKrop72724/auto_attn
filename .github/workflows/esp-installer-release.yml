@@ -1,8 +1,9 @@
 name: ESP installer release
 
-# Pull requests build a TEST installer: no secrets, and the app shows a
-# "TEST BUILD" banner. A dispatch on main with the confirmation builds the
-# field release, with the field defaults from the firmware-signing environment.
+# Pull requests build a TEST installer for Windows and a TEST disk image for
+# macOS (Apple Silicon): no secrets, and the app shows a "TEST BUILD" banner.
+# A dispatch on main with the confirmation builds both field releases, with the
+# field defaults from the firmware-signing environment.
 on:
   pull_request:
     paths:
@@ -74,6 +75,50 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
+  macos-test-build:
+    if: github.event_name == 'pull_request'
+    runs-on: macos-14
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install the locked packages
+        run: |
+          # esptool is published only as source: install the locked setuptools
+          # first and build esptool with it, so every download is hash-checked.
+          python -m pip install --disable-pip-version-check --require-hashes --no-deps -r apps/esp_installer/requirements-build.lock
+          python -m pip install --disable-pip-version-check --require-hashes --no-build-isolation -r apps/esp_installer/requirements.lock -r apps/esp_installer/requirements-build.lock
+          python -m pip check
+      - name: Run the app tests without a screen
+        working-directory: apps/esp_installer
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -m pytest -q
+      - name: Build the TEST app and disk image
+        run: python apps/esp_installer/packaging/build.py
+      - name: Open the disk image and check the app
+        run: |
+          dmg=$(ls apps/esp_installer/dist/StateLife-Device-Installer-*-macOS-arm64-TEST.dmg)
+          [ "$(printf '%s\n' "$dmg" | wc -l)" -eq 1 ] || { echo "Expected one TEST disk image: $dmg"; exit 1; }
+          apps/esp_installer/packaging/smoke_test_macos.sh "$dmg" smoke
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: esp-installer-macos-test-${{ github.sha }}
+          path: |
+            apps/esp_installer/dist/StateLife-Device-Installer-*-macOS-arm64*.dmg
+            apps/esp_installer/dist/SHA256SUMS.txt
+            smoke/
+          if-no-files-found: warn
+          retention-days: 7
+
   release:
     if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.confirmation == 'BUILD INSTALLER RELEASE'
     runs-on: windows-2022
@@ -137,6 +182,65 @@ jobs:
         if: always()
         with:
           name: esp-installer-smoke-logs-${{ github.sha }}
+          path: smoke/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  macos-release:
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.confirmation == 'BUILD INSTALLER RELEASE'
+    runs-on: macos-14
+    environment: firmware-signing
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install the locked packages
+        run: |
+          # esptool is published only as source: install the locked setuptools
+          # first and build esptool with it, so every download is hash-checked.
+          python -m pip install --disable-pip-version-check --require-hashes --no-deps -r apps/esp_installer/requirements-build.lock
+          python -m pip install --disable-pip-version-check --require-hashes --no-build-isolation -r apps/esp_installer/requirements.lock -r apps/esp_installer/requirements-build.lock
+          python -m pip check
+      - name: Run the app tests without a screen
+        working-directory: apps/esp_installer
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -m pytest -q
+      - name: Build the release app and disk image
+        # The only step that sees the secrets. build.py never prints them and
+        # also masks the values inside the JSON secret.
+        env:
+          ESP_INSTALLER_FIELD_DEFAULTS_JSON: ${{ secrets.ESP_INSTALLER_FIELD_DEFAULTS_JSON }}
+          ZONE_LITE_SETUP_PASSWORD: ${{ secrets.ZONE_LITE_SETUP_PASSWORD }}
+        run: python apps/esp_installer/packaging/build.py --release
+      - name: Open the disk image and check the app
+        id: smoke
+        run: |
+          dmg=$(ls apps/esp_installer/dist/StateLife-Device-Installer-*-macOS-arm64*.dmg)
+          [ "$(printf '%s\n' "$dmg" | wc -l)" -eq 1 ] || { echo "Expected one disk image: $dmg"; exit 1; }
+          case "$dmg" in *-TEST.dmg) echo "The release step produced a TEST build"; exit 1 ;; esac
+          apps/esp_installer/packaging/smoke_test_macos.sh "$dmg" smoke
+          echo "artifact=$(basename "$dmg" .dmg)" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.smoke.outputs.artifact }}
+          path: |
+            apps/esp_installer/dist/StateLife-Device-Installer-*-macOS-arm64.dmg
+            apps/esp_installer/dist/SHA256SUMS.txt
+            smoke/screenshots/
+          if-no-files-found: error
+          retention-days: 30
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: esp-installer-macos-smoke-logs-${{ github.sha }}
           path: smoke/
           if-no-files-found: ignore
           retention-days: 7
