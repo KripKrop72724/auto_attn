@@ -1,8 +1,14 @@
-"""Tests for the release tooling: field defaults, icon, locks and the entry point."""
+"""Tests for the release tooling: field defaults, icon, locks, the Mac app and
+disk image, and the entry point."""
 from __future__ import annotations
 
 import json
+import os
+import plistlib
+import re
+import shutil
 import struct
+import subprocess
 import sys
 import urllib.error
 from pathlib import Path
@@ -164,6 +170,38 @@ def test_version_resource_is_filled_in(tmp_path, monkeypatch):
 
 # --------------------------------------------------------------------- icon
 
+def _png_size(data):
+    assert data.startswith(b"\x89PNG\r\n\x1a\n") and data[12:16] == b"IHDR"
+    return struct.unpack(">II", data[16:24])
+
+
+def test_mac_icon_has_every_iconset_size(tmp_path):
+    pytest.importorskip("PySide6")
+    path = tmp_path / "app.icns"
+    build.write_icns(build._square_logo(), path)
+    data = path.read_bytes()
+    assert data[:4] == b"icns" and struct.unpack(">I", data[4:8])[0] == len(data)
+    offset, found = 8, []
+    while offset < len(data):
+        kind, length = data[offset:offset + 4].decode("ascii"), struct.unpack(
+            ">I", data[offset + 4:offset + 8])[0]
+        found.append((kind, _png_size(data[offset + 8:offset + length])))
+        offset += length
+    assert offset == len(data)
+    assert found == [(kind, (pixels, pixels)) for kind, pixels in build.ICNS_IMAGES]
+    # A standard .iconset: 16, 32, 128, 256 and 512 points at 1x and 2x.
+    assert sorted(pixels for _, pixels in build.ICNS_IMAGES) == [
+        16, 32, 32, 64, 128, 256, 256, 512, 512, 1024]
+
+
+def test_mac_icon_is_a_rounded_white_square_with_room_around_it():
+    pytest.importorskip("PySide6")
+    icon = build._mac_icon(build._square_logo(), 256)
+    assert icon.pixelColor(2, 2).alpha() == 0  # transparent corner of the canvas
+    assert 0 < icon.pixelColor(36, 36).alpha() < 128  # shadow beside the rounded corner
+    top = icon.pixelColor(128, 34)  # inside the body, above the logo
+    assert (top.alpha(), top.name()) == (255, "#ffffff")
+
 def test_icon_has_every_size(tmp_path):
     pytest.importorskip("PySide6")
     path = tmp_path / "app.ico"
@@ -259,6 +297,10 @@ def test_each_target_needs_its_own_dependencies_locked(no_wheel_metadata, tmp_pa
     macos = update_locks.check_target([lock], releases, update_locks.MACOS)
     assert len(windows) == 1 and "pefile" in windows[0] and "Windows" in windows[0]
     assert len(macos) == 1 and "macholib" in macos[0] and "macOS" in macos[0]
+
+
+def test_the_mac_app_and_the_locks_agree_on_the_oldest_macos():
+    assert build.MACOS_MINIMUM == ".".join(str(part) for part in update_locks.MACOS_MINIMUM)
 
 
 def test_committed_locks_pin_the_agreed_versions():
@@ -411,11 +453,14 @@ def test_good_server_addresses_are_kept(url, kept, tmp_path):
 
 # ------------------------------------------------------------------ notices
 
+NOTICE_VERSIONS = {"qt": "6.9.2", "pyside6-essentials": "6.9.2", "esptool": "5.1.0",
+                   "pyinstaller": "6.22.0"}
+
+
 def test_notices_give_the_flasher_stubs_true_licence():
     import notices
 
-    text = notices._summary("1.2.3", {"qt": "6.9.2", "pyside6-essentials": "6.9.2",
-                                      "esptool": "5.1.0", "pyinstaller": "6.22.0"})
+    text = notices._summary("1.2.3", NOTICE_VERSIONS, platform="win32")
     words = " ".join(text.split())
     assert "a small part of the app hands the arguments over to esptool" in words
     assert 'esptool\'s source code is in "licenses\\esptool-5.1.0.tar.gz"' in words
@@ -426,6 +471,27 @@ def test_notices_give_the_flasher_stubs_true_licence():
         < stub.index("Apache-2.0 or MIT")
     assert "runs only esptool's code" not in words and "complete source" not in words
     assert max(len(line) for line in text.splitlines()) <= len(notices.RULE)
+
+
+def test_mac_notices_name_the_folders_inside_the_app():
+    import notices
+
+    text = notices._summary("1.2.3", NOTICE_VERSIONS, platform="darwin")
+    words = " ".join(text.split())
+    assert "_internal" not in text and "\\" not in text and ".exe" not in text
+    assert "the macOS build of Python" in words
+    assert ('"Contents/Frameworks/PySide6" and "Contents/Frameworks/shiboken6" folders'
+            in words)
+    assert 'is in "Contents/Resources/licenses/esptool-5.1.0.tar.gz" inside the app' in words
+    stub = words[words.index("esptool flasher stub"):]
+    assert '"Contents/Resources/esptool/targets/stub_flasher/1"' in stub
+    assert stub.index("GPL-2.0-or-later") < stub.index("stub_flasher/2") \
+        < stub.index("Apache-2.0 or MIT")
+    assert 'the start-up program in "Contents/MacOS"' in words
+    assert max(len(line) for line in text.splitlines()) <= len(notices.RULE)
+    # The same summary apart from where the files are.
+    windows = notices._summary("1.2.3", NOTICE_VERSIONS, platform="win32")
+    assert len(text.splitlines()) == len(windows.splitlines()) + 1
 
 
 def test_the_notice_matches_the_stub_esptool_loads():
@@ -470,3 +536,219 @@ def test_setup_waits_for_the_mutex_the_window_holds():
             settings.setdefault(name, []).append(value.strip())
     assert settings["AppMutex"] == [entry.APP_MUTEX]
     assert settings["CloseApplications"] == ["yes"]  # "force" could stop a board mid-write
+
+
+# -------------------------------------------------------------------- macOS
+
+def _macho(cpu, minimum=None, old_style=False):
+    """A thin 64-bit Mach-O header with one version load command."""
+    commands = b""
+    if minimum is not None:
+        version = (minimum[0] << 16) | (minimum[1] << 8)
+        if old_style:
+            commands = struct.pack("<IIII", build.LC_VERSION_MIN_MACOSX, 16, version, 0)
+        else:
+            commands = struct.pack("<IIIIII", build.LC_BUILD_VERSION, 24,
+                                   build.PLATFORM_MACOS, version, 0, 0)
+    count = 1 if commands else 0
+    return struct.pack("<IIIIIIII", 0xFEEDFACF, cpu, 0, 6, count, len(commands), 0, 0) + commands
+
+
+ARM64, X86_64 = 0x0100000C, 0x01000007
+
+
+def _fat(*slices):
+    header = struct.pack(">II", 0xCAFEBABE, len(slices))
+    offset = 8 + 20 * len(slices)
+    entries, body = b"", b""
+    for cpu, data in slices:
+        entries += struct.pack(">IIIII", cpu, 0, offset + len(body), len(data), 0)
+        body += data
+    return header + entries + body
+
+
+def test_mach_o_slices_and_their_oldest_macos():
+    assert build.macho_slices(_macho(ARM64, (12, 0))) == {"arm64": (12, 0)}
+    assert build.macho_slices(_macho(X86_64, (10, 13), old_style=True)) == {"x86_64": (10, 13)}
+    assert build.macho_slices(_macho(ARM64)) == {"arm64": None}
+    universal = _fat((X86_64, _macho(X86_64, (10, 9))), (ARM64, _macho(ARM64, (11, 0))))
+    assert build.macho_slices(universal) == {"x86_64": (10, 9), "arm64": (11, 0)}
+    assert build.macho_slices(b"#!/bin/sh\n") is None
+    # A Java class file starts with the same four bytes as a universal binary.
+    assert build.macho_slices(b"\xca\xfe\xba\xbe\x00\x00\x00\x34" + b"\0" * 64) is None
+
+
+def test_every_program_file_must_run_on_apple_silicon_and_the_oldest_macos(tmp_path):
+    app = tmp_path / "App.app"
+    (app / "Contents" / "Frameworks").mkdir(parents=True)
+    good = app / "Contents" / "Frameworks" / "good.dylib"
+    good.write_bytes(_macho(ARM64, (12, 0)))
+    (app / "Contents" / "Frameworks" / "universal.so").write_bytes(
+        _fat((X86_64, _macho(X86_64, (10, 9))), (ARM64, _macho(ARM64, (11, 0)))))
+    (app / "Contents" / "Frameworks" / "notes.txt").write_text("not a program", encoding="utf-8")
+    try:  # a link is not a program file of its own
+        (app / "Contents" / "link.dylib").symlink_to(good)
+    except OSError:
+        pass  # Windows without the right to make links
+    build.check_macos_binaries(app)
+
+    (app / "Contents" / "Frameworks" / "newer.dylib").write_bytes(_macho(ARM64, (13, 0)))
+    (app / "Contents" / "Frameworks" / "intel.so").write_bytes(_macho(X86_64, (10, 9)))
+    with pytest.raises(SystemExit) as stop:
+        build.check_macos_binaries(app)
+    text = str(stop.value)
+    assert "Contents/Frameworks/newer.dylib needs macOS 13.0" in text.replace("\\", "/")
+    assert "intel.so has no Apple Silicon code (x86_64)" in text
+    assert "good.dylib" not in text and "universal.so" not in text
+
+
+def test_info_plist_names_the_app_for_apple_silicon():
+    info = build.macos_info("1.1.0")
+    assert info["CFBundleIdentifier"] == "com.statelife.deviceinstaller"
+    assert info["CFBundleName"] == info["CFBundleDisplayName"] == build.APP_NAME
+    assert info["CFBundleShortVersionString"] == info["CFBundleVersion"] == "1.1.0"
+    assert info["LSMinimumSystemVersion"] == build.MACOS_MINIMUM == "12.0"
+    assert info["NSHighResolutionCapable"] is True
+    assert info["LSArchitecturePriority"] == ["arm64"]
+    plistlib.dumps(info)  # only types a property list can hold
+
+
+def test_the_spec_reads_the_info_plist_build_wrote(tmp_path, monkeypatch):
+    monkeypatch.setattr(build, "BUILD", tmp_path)
+    build.write_macos_info("1.1.0")
+    written = json.loads((tmp_path / "macos-info.json").read_text(encoding="utf-8"))
+    assert written == build.macos_info("1.1.0")
+    spec = (PACKAGING / "sl_installer.spec").read_text(encoding="utf-8")
+    assert 'BUILD / "macos-info.json"' in spec and 'target_arch="arm64"' in spec
+    assert 'icon=str(BUILD / "branding" / "app.icns")' in spec
+
+
+def _write_plist(app, info):
+    (app / "Contents").mkdir(parents=True, exist_ok=True)
+    with (app / "Contents" / "Info.plist").open("wb") as handle:
+        plistlib.dump(info, handle)
+
+
+def test_the_built_info_plist_is_checked(tmp_path, monkeypatch):
+    app = tmp_path / f"{build.APP_NAME}.app"
+    monkeypatch.setattr(build, "MAC_APP", app)
+    _write_plist(app, dict(build.macos_info("1.1.0"), CFBundleExecutable=build.APP_NAME))
+    build.check_info_plist("1.1.0")
+    _write_plist(app, dict(build.macos_info("1.1.0"), CFBundleExecutable=build.APP_NAME,
+                           LSMinimumSystemVersion="11.0"))
+    with pytest.raises(SystemExit, match="LSMinimumSystemVersion"):
+        build.check_info_plist("1.1.0")
+    with pytest.raises(SystemExit, match="CFBundleShortVersionString"):
+        build.check_info_plist("1.1.1")
+
+
+@pytest.mark.parametrize("release, name", [
+    (True, "StateLife-Device-Installer-1.1.0-macOS-arm64.dmg"),
+    (False, "StateLife-Device-Installer-1.1.0-macOS-arm64-TEST.dmg"),
+])
+def test_disk_image_names(release, name):
+    assert build.dmg_name("1.1.0", release) == name
+    assert re.fullmatch(r"[A-Za-z0-9._-]+", name)  # ADD's installer app store accepts it
+
+
+def _record_runs(monkeypatch, codes=()):
+    """Record every command build.py runs; hand out the given exit codes first."""
+    runs, pending = [], list(codes)
+
+    def run(command, check=False, env=None, **kwargs):
+        runs.append((list(command), env))
+        code = pending.pop(0) if pending else 0
+        if check and code:
+            raise subprocess.CalledProcessError(code, command)
+        return subprocess.CompletedProcess(command, code)
+
+    monkeypatch.setattr(build.subprocess, "run", run)
+    monkeypatch.setattr(build.time, "sleep", lambda seconds: None)
+    return runs
+
+
+def test_the_finished_app_is_signed_ad_hoc_without_the_secrets(secrets, monkeypatch, tmp_path):
+    secrets()
+    monkeypatch.setattr(build, "MAC_APP", tmp_path / "App.app")
+    runs = _record_runs(monkeypatch)
+    build.sign_app()
+    app = str(tmp_path / "App.app")
+    assert [command for command, _ in runs] == [
+        ["codesign", "--force", "--sign", "-", app],
+        ["codesign", "--verify", "--deep", "--strict", app]]
+    for _, env in runs:
+        assert build.DEFAULTS_ENV not in env and build.SETUP_PASSWORD_ENV not in env
+
+
+def test_the_disk_image_holds_the_app_and_a_link_to_applications(monkeypatch, tmp_path):
+    monkeypatch.setattr(build, "BUILD", tmp_path / "build")
+    monkeypatch.setattr(build, "DIST", tmp_path / "dist")
+    monkeypatch.setattr(build, "MAC_APP", tmp_path / "dist" / f"{build.APP_NAME}.app")
+    staging = tmp_path / "build" / "dmg"
+    seen = {}
+
+    def look(command, env):
+        if command[:2] == ["hdiutil", "create"]:
+            seen["link"] = os.readlink(staging / "Applications")
+    runs = _record_runs(monkeypatch, codes=[0, 1, 0])  # hdiutil is busy once
+    recorded = build.subprocess.run
+
+    def run(command, check=False, env=None, **kwargs):
+        look(list(command), env)
+        return recorded(command, check=check, env=env, **kwargs)
+
+    monkeypatch.setattr(build.subprocess, "run", run)
+    dmg = build.build_dmg("1.1.0", release=False)
+    assert dmg == tmp_path / "dist" / "StateLife-Device-Installer-1.1.0-macOS-arm64-TEST.dmg"
+    commands = [command for command, _ in runs]
+    assert commands[0] == ["ditto", str(build.MAC_APP), str(staging / build.MAC_APP.name)]
+    create = ["hdiutil", "create", "-volname", f"{build.APP_NAME} 1.1.0 TEST", "-srcfolder",
+              str(staging), "-fs", "HFS+", "-format", "UDZO", "-imagekey", "zlib-level=9",
+              "-ov", str(dmg)]
+    assert commands[1:] == [create, create, ["hdiutil", "verify", "-quiet", str(dmg)]]
+    assert seen["link"] == "/Applications"
+    assert not staging.exists()
+
+
+def test_the_disk_image_step_gives_up_after_three_tries(monkeypatch, tmp_path):
+    monkeypatch.setattr(build, "BUILD", tmp_path / "build")
+    monkeypatch.setattr(build, "DIST", tmp_path / "dist")
+    runs = _record_runs(monkeypatch, codes=[0, 1, 1, 1])
+    with pytest.raises(SystemExit, match="hdiutil could not make"):
+        build.build_dmg("1.1.0", release=True)
+    assert [command[:2] for command, _ in runs] == [["ditto", str(build.MAC_APP)]] + [
+        ["hdiutil", "create"]] * 3
+
+
+def test_the_mac_app_must_hold_everything_it_loads(monkeypatch, tmp_path):
+    app = tmp_path / f"{build.APP_NAME}.app"
+    monkeypatch.setattr(build, "MAC_APP", app)
+    monkeypatch.setattr(sys, "platform", "darwin")
+    with pytest.raises(SystemExit) as stop:
+        build.check_app_folder(release=False)
+    missing = [line.strip() for line in str(stop.value).splitlines()[1:]]
+    monkeypatch.undo()
+    for name in ("Contents/MacOS/State Life Device Installer", "Contents/Info.plist",
+                 "Contents/Resources/EULA.txt", "Contents/Resources/THIRD-PARTY-NOTICES.txt",
+                 "Contents/Resources/app.icns",
+                 "Contents/Frameworks/PySide6/Qt/plugins/platforms/libqcocoa.dylib",
+                 "Contents/Frameworks/esptool/targets/stub_flasher/1/esp32s3.json"):
+        assert str(Path(name)) in missing
+    for name in missing:
+        (app / name).parent.mkdir(parents=True, exist_ok=True)
+        (app / name).write_bytes(b"")
+    monkeypatch.setattr(build, "MAC_APP", app)
+    monkeypatch.setattr(sys, "platform", "darwin")
+    build.check_app_folder(release=False)
+    (app / "Contents" / "Frameworks" / "sl_installer" / "resources" /
+     build.FIELD_DEFAULTS.name).write_text("{}", encoding="utf-8")
+    with pytest.raises(SystemExit, match="TEST build must not contain"):
+        build.check_app_folder(release=False)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="the Mac smoke test is a bash script")
+def test_the_mac_smoke_test_is_an_executable_bash_script():
+    script = PACKAGING / "smoke_test_macos.sh"
+    assert os.access(script, os.X_OK)
+    if shutil.which("bash"):
+        subprocess.run(["bash", "-n", str(script)], check=True)
