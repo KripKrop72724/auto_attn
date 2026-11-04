@@ -53,6 +53,10 @@ bool ug_direct_predecessor_matches(const char *version, const uint8_t digest[32]
      * upgrade in place. */
     static const char platform_280[] =
         "21ac81b292b463cf7fa1bf0d6ce364a49493951836ad962a19dcae049f40ed76";
+    /* 2.8.1: the rollback-slot gate image (AVAILABLE 4 Nov 2026), so its
+     * devices upgrade in place. */
+    static const char platform_281[] =
+        "21238fa36df844642545e8c2f6bcfec03be37470890b776a600c39c0cdd1f5f0";
     const char *expected = !strcmp(version, "2.4.12") ? baseline_2412 :
         !strcmp(version, "2.5.2") ? baseline_252 :
         !strcmp(version, "2.6.6") ? hil_266 :
@@ -71,7 +75,8 @@ bool ug_direct_predecessor_matches(const char *version, const uint8_t digest[32]
         !strcmp(version, "2.7.6") ? platform_276 :
         !strcmp(version, "2.7.7") ? platform_277 :
         !strcmp(version, "2.7.8") ? platform_278 :
-        !strcmp(version, "2.8.0") ? platform_280 : NULL;
+        !strcmp(version, "2.8.0") ? platform_280 :
+        !strcmp(version, "2.8.1") ? platform_281 : NULL;
     if (!expected) return false;
     static const char hex[] = "0123456789abcdef";
     for (unsigned i = 0; i < 32; ++i) {
