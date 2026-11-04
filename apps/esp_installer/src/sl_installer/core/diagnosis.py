@@ -15,7 +15,8 @@ from typing import Callable, List, Optional, Sequence, Tuple
 from . import texts
 from .api import (Advice, BoardInfo, ConsoleEvent, ConsoleKind, DeviceRecord, HardwareVerdict,
                   PresenceReport, PresenceState, SecurityState, Severity)
-from .console import crash_loop
+from .board import hardware_advice
+from .console import crash_loop, refusal_advice, startup_refusal
 from .naming import hotspot_name
 from .validation import version_tuple
 
@@ -86,11 +87,10 @@ def _presence(presence: PresenceReport) -> Optional[Advice]:
 
 
 def _hardware(board: Optional[BoardInfo]) -> Optional[Advice]:
-    if board is None:
+    """The hardware gate's refusal (board.py), with what it measured."""
+    if board is None or board.hardware in (HardwareVerdict.OK, HardwareVerdict.NOT_CHECKED):
         return None
-    return {HardwareVerdict.WRONG_CHIP: texts.WRONG_CHIP,
-            HardwareVerdict.WRONG_FLASH_SIZE: texts.WRONG_FLASH_SIZE,
-            HardwareVerdict.WRONG_PSRAM: texts.WRONG_PSRAM}.get(board.hardware)
+    return hardware_advice(board)
 
 
 def _security(board: Optional[BoardInfo]) -> Optional[Advice]:
@@ -123,6 +123,12 @@ def _last(events: Sequence[ConsoleEvent], kinds: Sequence[ConsoleKind]
 
 def _signal(events: Sequence[ConsoleEvent], name: str) -> bool:
     return any(event.data.get("signal") == name for event in events)
+
+
+def _startup_refused(events: Sequence[ConsoleEvent]) -> Optional[Advice]:
+    # The same rule as the first start's verdict (console.judge): before power advice.
+    refused = startup_refusal(events)
+    return refusal_advice(refused) if refused is not None else None
 
 
 def _key_lost(events: Sequence[ConsoleEvent]) -> Optional[Advice]:
@@ -189,8 +195,8 @@ def _start_copy(events: Sequence[ConsoleEvent]) -> Optional[Advice]:
     return None
 
 
-_CONSOLE_FAULTS = (_key_lost, _family, _settings, _psram, _power, _crashes, _download_mode,
-                   _storage, _port_busy, _test_firmware, _start_copy)
+_CONSOLE_FAULTS = (_startup_refused, _key_lost, _family, _settings, _psram, _power, _crashes,
+                   _download_mode, _storage, _port_busy, _test_firmware, _start_copy)
 
 
 def _wifi(events: Sequence[ConsoleEvent], placeholders: Sequence[str],

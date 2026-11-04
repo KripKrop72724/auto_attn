@@ -554,7 +554,7 @@ def test_an_esptool_answer_without_the_board_id_stops_a_new_board(rig):
     (InstallMode.RESUME, blank_board(), texts.MODE_NOT_ALLOWED),
     (InstallMode.CHANGE_SETTINGS, blank_board(), texts.MODE_NOT_ALLOWED),
     (InstallMode.NEW_BOARD, blank_board(hardware=HardwareVerdict.WRONG_PSRAM),
-     texts.MODE_NOT_ALLOWED),
+     texts.WRONG_PSRAM),
     (InstallMode.NEW_BOARD, blank_board(security=SecurityState.SECURED_OTHER),
      texts.MODE_NOT_ALLOWED),
     # Every mode writes the redo area at the end of a 16 MB chip.
@@ -707,7 +707,124 @@ def test_restart_check_report(rig, outcome, advice, kind, kept):
     request_id, mac, sent, detail = rig.server.events[-1]
     assert (request_id, mac, sent) == (summary.request_id, MAC, kind)
     assert detail == {"outcome": outcome, "zone_id_seen": "Z", "device_id_seen": None,
-                      "app_version_seen": "2.9.1", "advice": advice.code, "settings_kept": kept}
+                      "app_version_seen": "2.9.1", "advice": advice.code, "board_said": None,
+                      "settings_kept": kept}
+
+
+def test_failed_starts_carry_the_boards_own_words(rig):
+    from sl_installer.core.api import BootOutcome, BootReport
+    from sl_installer.core.installer import report_boot, report_restart
+    summary = rig.run()
+    line = "E (35) bootloader_flash: XMC flash startup fail"
+    report_boot(rig.server, summary, BootReport(BootOutcome.STARTUP_REFUSED,
+                                                advice=texts.STARTUP_REFUSED, board_said=line))
+    assert rig.server.events[-1][2] == "BOOT_FAILED"
+    assert rig.server.events[-1][3]["board_said"] == line
+    # Redacted again and cut to 200 characters: ADD keeps it.
+    long = "E (902) zone_lite: password=test-wifi-pass " + "x" * 400
+    report_restart(rig.server, summary, BootReport(BootOutcome.SETTINGS_LOST, board_said=long))
+    said = rig.server.events[-1][3]["board_said"]
+    assert rig.server.events[-1][2] == "RESTART_FAILED"
+    assert len(said) == 200 and "test-wifi-pass" not in said
+
+
+# ------------------------------------------------- boards the software cannot start
+
+XMC_BOARD = dict(hardware=HardwareVerdict.FLASH_CHIP_UNSUPPORTED, flash_id="20 70 18",
+                 hardware_detail="memory chip 20 70 18",
+                 evidence={"chip_line": "ESP32-S3 (QFN56) (revision v0.2)",
+                           "features": "Wi-Fi, Embedded PSRAM 8MB (AP_3v3)"})
+
+
+@pytest.mark.parametrize("mode, security", [
+    (InstallMode.NEW_BOARD, SecurityState.BLANK),
+    # The two 3 Nov 2026 boards: key burned, never started. Never written again.
+    (InstallMode.RESUME, SecurityState.KEY_BURNED_NOT_STARTED),
+])
+def test_xmc_board_is_refused_before_anything_is_written(tmp_path, store, zkt_bundle, mode,
+                                                         security):
+    fake = FakeBoard(efuse_state="key-burned" if mode is InstallMode.RESUME else "blank")
+    rig = Rig(tmp_path, store, zkt_bundle, fake)
+    with pytest.raises(InstallerError) as caught:
+        rig.run(mode, blank_board(security=security, **XMC_BOARD))
+    advice = caught.value.advice
+    assert advice.code == "FLASH_CHIP_UNSUPPORTED" and not advice.can_retry
+    assert ("earlier setup locked" in advice.what_happened) is (mode is InstallMode.RESUME)
+    assert rig.runner.calls == [] and rig.server.requests == [] and rig.fake.flash == {}
+    assert rig.fake.burned_key is None
+    (_request, mac, kind, detail), = rig.server.events
+    assert (mac, kind) == (MAC, "BOARD_REFUSED")
+    assert detail == {"reason": "FLASH_CHIP_UNSUPPORTED", "flash_id": "20 70 18",
+                      "chip": "ESP32-S3 (QFN56) (revision v0.2)",
+                      "features": "Wi-Fi, Embedded PSRAM 8MB (AP_3v3)"}
+
+
+def test_board_type_is_refused_before_anything_is_written(rig):
+    board = blank_board(hardware=HardwareVerdict.BOARD_TYPE_UNSUPPORTED,
+                        hardware_detail="extra memory 8 MB, type AP_1v8")
+    with pytest.raises(InstallerError) as caught:
+        rig.run(board=board)
+    assert caught.value.advice.code == "BOARD_TYPE_UNSUPPORTED"
+    assert "The app found: extra memory 8 MB, type AP_1v8." in caught.value.advice.what_happened
+    assert rig.runner.calls == [] and rig.kinds() == ["BOARD_REFUSED"]
+
+
+def test_esptools_xmc_warning_stops_a_new_board_before_its_key(tmp_path, store, zkt_bundle):
+    # A board that got past the check (an older one): the first erase shows the warning,
+    # as the stub printed it on 3 Nov 2026.
+    assert support.XMC_WARNING in support.board_sample("xmc-20-7018-erase-region.txt")
+    rig = Rig(tmp_path, store, zkt_bundle, FakeBoard(xmc_warning=True))
+    with pytest.raises(InstallerError) as caught:
+        rig.run()
+    assert caught.value.advice.code == "FLASH_CHIP_UNSUPPORTED"
+    assert not caught.value.irreversible_done
+    assert rig.purposes()[-1] == "clear start area" and rig.fake.burned_key is None
+    assert rig.kinds()[-2:] == ["BOARD_REFUSED", "FAILED"]
+    refused, failed = rig.server.events[-2:]
+    assert refused[0] == failed[0]  # the run's request ID ties them together
+    assert sorted(refused[3]) == ["chip", "features", "flash_id", "reason"]
+    assert refused[3]["reason"] == "FLASH_CHIP_UNSUPPORTED"
+
+
+def test_esptools_xmc_warning_stops_a_resume(tmp_path, store, zkt_bundle):
+    rig = Rig(tmp_path, store, zkt_bundle, FakeBoard(efuse_state="key-burned", xmc_warning=True))
+    with pytest.raises(InstallerError) as caught:
+        rig.run(InstallMode.RESUME, blank_board(security=SecurityState.KEY_BURNED_NOT_STARTED))
+    advice = caught.value.advice
+    assert advice.code == "FLASH_CHIP_UNSUPPORTED" and caught.value.irreversible_done
+    assert "Do not try to set it up again." in advice.what_to_do
+    assert rig.fake.flash == {}  # stopped at the first erase
+
+
+def test_the_bundles_chip_revisions_decide(rig, monkeypatch, zkt_bundle, store):
+    from sl_installer.core import installer as installer_module
+    from sl_installer.core.bundles import chip_revision_window
+    # The test images leave the maximum unset, like an image built without one.
+    fetched = store.fetch(support.FakeSource(zkt_bundle), zkt_bundle.bundle_id, None,
+                          CancelToken())
+    assert chip_revision_window(fetched) == (0, None)
+    monkeypatch.setattr(installer_module, "chip_revision_window", lambda bundle: (0, 1))
+    with pytest.raises(InstallerError) as caught:
+        rig.run(board=blank_board(chip_revision=2))
+    advice = caught.value.advice
+    assert advice.code == "BOARD_TYPE_UNSUPPORTED" and not advice.can_retry
+    assert "chip revision v0.2; this board software needs v0.0 to v0.1" in advice.what_happened
+    # Before head office makes the settings and before anything is written.
+    assert rig.server.requests == [] and rig.runner.calls == [] and rig.fake.flash == {}
+    assert rig.kinds()[-2:] == ["BOARD_REFUSED", "FAILED"]
+    monkeypatch.setattr(installer_module, "chip_revision_window", lambda bundle: (0, 99))
+    rig.run(board=blank_board(chip_revision=2))
+    assert rig.fake.burned_key is not None
+
+
+def test_image_header_chip_revisions():
+    from sl_installer.core.bundles import ImageError, header_chip_revisions
+    header = bytearray(24)
+    header[0] = 0xE9
+    header[15:19] = (3).to_bytes(2, "little") + (99).to_bytes(2, "little")
+    assert header_chip_revisions(bytes(header)) == (3, 99)
+    with pytest.raises(ImageError):
+        header_chip_revisions(b"\x00" * 24)
 
 
 def test_change_settings_refuses_a_flash_chip_that_is_not_16_mb(tmp_path, store):

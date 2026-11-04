@@ -318,6 +318,7 @@ def test_bench_install_stops_without_the_typed_board_id(monkeypatch, tmp_path):
         port, mac, chip, flash_size_mb, psram_mb = support.PORT, support.MAC, "ESP32-S3", 16, 8
         hardware, security, secure_download_mode = (HardwareVerdict.OK, SecurityState.BLANK,
                                                     False)
+        flash_id, chip_revision, hardware_detail = "c8 40 18", 2, ""
 
     class Fake:
         defaults = FieldDefaults(wifi_password="test-wifi-pass", zkt_comm_key=1979)
@@ -372,6 +373,7 @@ def test_bench_settings_change_needs_no_bundle(monkeypatch, capsys, allowed):
         port, mac, chip, flash_size_mb, psram_mb = support.PORT, support.MAC, "ESP32-S3", None, None
         hardware, security, secure_download_mode = (HardwareVerdict.NOT_CHECKED,
                                                     SecurityState.SECURED_STATE_LIFE, True)
+        flash_id, chip_revision, hardware_detail = None, None, ""
 
     asked = []
 
@@ -423,6 +425,7 @@ def bench_services(first, restart):
         port, mac, chip, flash_size_mb, psram_mb = support.PORT, support.MAC, "ESP32-S3", 16, 8
         hardware, security, secure_download_mode = (HardwareVerdict.OK, SecurityState.BLANK,
                                                     False)
+        flash_id, chip_revision, hardware_detail = "c8 40 18", 2, ""
 
     def watched(name, report):
         def wait(mac, expect, on_phase, on_event, cancel, timeout_s=120.0, transcript=None,

@@ -116,7 +116,13 @@ class HardwareVerdict(str, enum.Enum):
     OK = "ok"                    # ESP32-S3, 16 MB flash, 8 MB embedded PSRAM
     WRONG_CHIP = "wrong_chip"
     WRONG_FLASH_SIZE = "wrong_flash_size"
-    WRONG_PSRAM = "wrong_psram"
+    WRONG_PSRAM = "wrong_psram"  # no embedded PSRAM at all
+    # The ESP-IDF 5.5.3 bootloader cannot start this flash chip (an XMC part off its strict
+    # list, e.g. XM25QH128A 20/7018): the board loops in the bootloader for good.
+    FLASH_CHIP_UNSUPPORTED = "flash_chip_unsupported"
+    # A board our firmware is not built for: octal flash, PSRAM other than 8 MB AP_3v3, or a
+    # chip revision outside the firmware images' range.
+    BOARD_TYPE_UNSUPPORTED = "board_type_unsupported"
     NOT_CHECKED = "not_checked"  # secured boards cannot report flash/PSRAM
 
 
@@ -140,6 +146,13 @@ class BoardInfo:
     security: SecurityState
     secure_download_mode: bool
     evidence: Dict[str, object] = field(default_factory=dict)  # redacted raw facts for the log
+    # What the hardware gate measured (board.py), for its advice, the screens and ADD's
+    # BOARD_REFUSED event: the flash chip's JEDEC ID as esptool prints it ("20 70 18":
+    # maker, type, size), the chip revision as ESP-IDF counts it (major * 100 + minor,
+    # so v0.2 is 2) and, for a refused board, what did not fit, in esptool's words.
+    flash_id: Optional[str] = None
+    chip_revision: Optional[int] = None
+    hardware_detail: str = ""
 
 
 # ------------------------------------------------------------------- server
@@ -371,6 +384,10 @@ class ConsoleKind(str, enum.Enum):
     TERMINAL_AUTH_FAILED = "terminal_auth_failed"
     TERMINAL_SECURE_PULL = "terminal_secure_pull"  # CONNECT answered 6001 (SenseFace etc.)
     TERMINAL_UNREACHABLE = "terminal_unreachable"
+    # The second-stage bootloader refused to start the program (an E line of its own,
+    # e.g. "XMC flash startup fail"). data: reason (xmc_flash, partition_table, no_app,
+    # image, chip_revision, secure_boot, other) and fatal ("1" when it always restarts).
+    BOOTLOADER_FAILED = "bootloader_failed"
     PANIC = "panic"                          # crash / abort / watchdog
     OTHER = "other"
 
@@ -392,6 +409,7 @@ class BootOutcome(str, enum.Enum):
     STORAGE_PROBLEM = "storage_problem"
     FAMILY_MISMATCH = "family_mismatch"
     NOT_REPLUGGED = "not_replugged"          # timed out waiting for unplug/replug
+    STARTUP_REFUSED = "startup_refused"      # the bootloader stopped before the program
     CANCELLED = "cancelled"
     # The restart check only (BootService.wait_restart):
     SETTINGS_LOST = "settings_lost"          # missing or unreadable settings after a restart
@@ -406,6 +424,8 @@ class BootReport:
     app_version_seen: Optional[str] = None
     events: Tuple[ConsoleEvent, ...] = ()
     advice: Optional[Advice] = None
+    # The board's own line that decided a failed start (redacted), for ADD and support.
+    board_said: Optional[str] = None
 
 
 class ReplugPhase(str, enum.Enum):

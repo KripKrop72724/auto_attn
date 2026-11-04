@@ -251,6 +251,64 @@ WRONG_PSRAM = _a(
     "Use one of the approved boards.",
     illustration="faulty_board", can_retry=False)
 
+# Boards the State Life software cannot start (board.py hardware gate), refused before
+# anything is written. The board itself works, so it is "not broken": with another
+# memory chip or board type the same model works. A board an earlier setup locked
+# (``locked``) stays with head office; a new one can go back to the seller.
+def flash_chip_unsupported(flash_id: Optional[str] = None, *, locked: bool = False,
+                           at_start: bool = False) -> Advice:
+    """The memory chip our start-up program cannot start (XMC 20 70 18, 3 Nov 2026).
+
+    ``at_start``: seen in the board's own words while it started (console.judge), after
+    a setup wrote it; ``flash_id`` is the chip ID the check measured, when known.
+    """
+    shown = f" Its memory chip ID is {flash_id}." if flash_id else ""
+    if at_start:
+        happened = ("The board's start-up program stopped because it cannot use this board's "
+                    "memory chip. The board restarts again and again and can never start.")
+    elif locked:
+        happened = ("This board has a memory chip that the State Life software cannot start "
+                    "with. An earlier setup locked the board, but it can never start. The app "
+                    "did not write to it again.")
+    else:
+        happened = ("This board has a memory chip that the State Life software cannot start "
+                    "with. The app did not change anything on the board.")
+    if at_start or locked:
+        tell = (f"Tell head office the board ID and the memory chip ID, {flash_id}."
+                if flash_id else "Tell head office the board ID.")
+        steps: Tuple[str, ...] = (
+            "Put this board aside. It is not broken, but it cannot be used.",
+            "Do not try to set it up again.", "Use another board.", tell)
+    else:
+        tell = (f"Tell the seller the memory chip ID, {flash_id}, and ask for boards with "
+                "another memory chip." if flash_id
+                else "Tell the seller, and ask for boards with another memory chip.")
+        steps = ("Put this board aside. It is not broken.", "Use another board.", tell)
+    return _a("FLASH_CHIP_UNSUPPORTED", "This board's memory chip cannot run our software",
+              happened + shown, *steps, illustration="unplug", can_retry=False)
+
+
+FLASH_CHIP_UNSUPPORTED = flash_chip_unsupported()
+
+
+def board_type_unsupported(found: str = "") -> Advice:
+    """A board type the software is not built for: ``found`` is what the board check
+    measured that did not fit (board.hardware_gate, e.g. "extra memory 8 MB, type AP_1v8"),
+    for head office."""
+    shown = f" The app found: {found}." if found else ""
+    return _a(
+        "BOARD_TYPE_UNSUPPORTED", "This board type is not supported yet",
+        "The State Life software cannot run on this type of board yet. The app did not change "
+        "anything on the board." + shown,
+        "Put this board aside. It is not broken.",
+        "Use another board.",
+        "Tell head office what the app found." if found else "Tell head office.",
+        illustration="unplug", can_retry=False)
+
+
+BOARD_TYPE_UNSUPPORTED = board_type_unsupported()
+
+
 SECURED_OTHER = _a(
     "SECURED_OTHER", "This board is locked by someone else",
     "This board has been locked with another organisation's keys. It can never be used "
@@ -734,6 +792,22 @@ CRASH_LOOP = _a(
     "If it keeps crashing, open Help, click Save a help file and send it to head office.",
     illustration="replug")
 
+def startup_refused(line: Optional[str] = None) -> Advice:
+    """The board's start-up program (ESP-IDF's second-stage bootloader) stopped with an
+    error of its own before the board's software ran (console.judge). ``line`` is that
+    error as the board printed it, redacted; it is quoted so head office can read it."""
+    said = f' It said: "{line}".' if line else ""
+    return _a(
+        "STARTUP_REFUSED", "The board's start-up program stopped",
+        "The board's start-up program refused to start the board's software." + said,
+        "Open Help, click Save a help file and send it to head office.",
+        "Put the board aside until head office tells you what to do.",
+        illustration="unplug", can_retry=False)
+
+
+STARTUP_REFUSED = startup_refused()
+
+
 POWER_PROBLEM = _a(
     "POWER_PROBLEM", "The board is not getting enough power",
     "The board switched itself off because the power dropped.",
@@ -1127,7 +1201,8 @@ STATIC: Dict[str, Advice] = {
         BOARD_DISCONNECTED, PORT_BUSY,
         BOARD_ID_UNKNOWN, BOARD_ID_NOT_READABLE, AUTO_DOWNLOAD_FAILED, CABLE_PROBLEM,
         CONNECTION_LOST, TOOL_TIMEOUT,
-        TOOL_FAILED, TOOL_MISSING, WRONG_CHIP, WRONG_FLASH_SIZE, WRONG_PSRAM, SECURED_OTHER,
+        TOOL_FAILED, TOOL_MISSING, WRONG_CHIP, WRONG_FLASH_SIZE, WRONG_PSRAM,
+        FLASH_CHIP_UNSUPPORTED, BOARD_TYPE_UNSUPPORTED, STARTUP_REFUSED, SECURED_OTHER,
         UNSECURED_USED, SECURITY_UNKNOWN, FIRST_START_UNFINISHED, ALREADY_SET_UP,
         UNFINISHED_SETUP, BOARD_SWAPPED, MODE_NOT_ALLOWED, CANCELLED, COPY_CHECK_FAILED,
         KEY_NOT_LOCKED, KEY_STATE_UNCLEAR, KEY_CHECK_FAILED, RESUME_NEEDED,
