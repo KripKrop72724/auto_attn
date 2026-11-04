@@ -576,6 +576,8 @@ def test_mach_o_slices_and_their_oldest_macos():
     assert build.macho_slices(b"#!/bin/sh\n") is None
     # A Java class file starts with the same four bytes as a universal binary.
     assert build.macho_slices(b"\xca\xfe\xba\xbe\x00\x00\x00\x34" + b"\0" * 64) is None
+    assert build.macho_slices(b"\xca\xfe\xba\xbe\x00\x00") is None  # cut short
+    assert build.macho_slices(b"\xca\xfe\xba\xbe\x00\x00\x00\x02" + b"\0" * 20) is None
 
 
 def test_every_program_file_must_run_on_apple_silicon_and_the_oldest_macos(tmp_path):

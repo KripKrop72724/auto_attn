@@ -446,7 +446,8 @@ def check_app_folder(release: bool) -> None:
 
 # ------------------------------------------------------------------- macOS
 
-MACHO_HEADS = {b"\xcf\xfa\xed\xfe", b"\xce\xfa\xed\xfe", b"\xca\xfe\xba\xbe", b"\xca\xfe\xba\xbf"}
+THIN_HEADS = (b"\xcf\xfa\xed\xfe", b"\xce\xfa\xed\xfe")  # 64-bit and 32-bit Mach-O
+FAT_HEADS = (b"\xca\xfe\xba\xbe", b"\xca\xfe\xba\xbf")  # universal, 32- and 64-bit offsets
 CPU_TYPES = {0x0100000C: "arm64", 0x01000007: "x86_64", 0x00000007: "i386"}
 LC_VERSION_MIN_MACOSX = 0x24
 LC_BUILD_VERSION = 0x32
@@ -454,7 +455,7 @@ PLATFORM_MACOS = 1
 
 
 def _thin_macho(data: bytes) -> Optional[Dict[str, Optional[Tuple[int, int]]]]:
-    if len(data) < 28 or data[:4] not in (b"\xcf\xfa\xed\xfe", b"\xce\xfa\xed\xfe"):
+    if len(data) < 28 or data[:4] not in THIN_HEADS:
         return None
     cpu_type, _, _, commands, _, _ = struct.unpack_from("<IiIIII", data, 4)
     offset = 32 if data[0] == 0xCF else 28
@@ -479,11 +480,14 @@ def _thin_macho(data: bytes) -> Optional[Dict[str, Optional[Tuple[int, int]]]]:
 def macho_slices(data: bytes) -> Optional[Dict[str, Optional[Tuple[int, int]]]]:
     """{architecture: the oldest macOS it runs on (major, minor), or None if it
     does not say} for each slice of a Mach-O file; None for any other file."""
-    if data[:4] not in (b"\xca\xfe\xba\xbe", b"\xca\xfe\xba\xbf"):
+    if data[:4] not in FAT_HEADS:
         return _thin_macho(data)
+    if len(data) < 8:
+        return None
     wide = data[3] == 0xBF
     (count,) = struct.unpack_from(">I", data, 4)
-    if not 0 < count < 32:  # Java class files start with the same bytes.
+    # Java class files start with the same bytes, followed by their version.
+    if not 0 < count < 32 or 8 + (32 if wide else 20) * count > len(data):
         return None
     slices: Dict[str, Optional[Tuple[int, int]]] = {}
     for index in range(count):
@@ -507,7 +511,7 @@ def check_macos_binaries(app: Path) -> None:
         if path.is_symlink() or not path.is_file():
             continue
         with path.open("rb") as handle:
-            if handle.read(4) not in MACHO_HEADS:
+            if handle.read(4) not in THIN_HEADS + FAT_HEADS:
                 continue
         slices = macho_slices(path.read_bytes())
         if slices is None:
