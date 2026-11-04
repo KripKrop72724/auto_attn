@@ -204,6 +204,23 @@ def test_current_scope_shows_the_2_8_1_candidate_above_hil_only_2_8_0_and_produc
     assert superseded.state == "HIL_ONLY"
 
 
+def test_current_scope_shows_the_2_8_2_candidate_above_production_2_8_1(db):
+    """2.8.2 publishes HIL_ONLY (to LHRCENTRAL) above the production 2.8.1;
+    2.7.8 stays current while the LHRCENTRAL ESPs and the rest of the fleet run it."""
+    release(db, "2.7.8")
+    release(db, "2.8.0", "HIL_ONLY")
+    release(db, "2.8.1")
+    candidate = release(db, "2.8.2", "HIL_ONLY")
+    db.commit()
+    assert versions(release_page(db, scope="current")) == ["2.8.2", "2.8.1"]
+    device(db, "zone-lite-2.7.8")
+    db.commit()
+    assert versions(release_page(db, scope="current")) == ["2.8.2", "2.8.1", "2.7.8"]
+    candidate.state = "AVAILABLE"
+    db.commit()
+    assert versions(release_page(db, scope="current")) == ["2.8.2", "2.7.8"]
+
+
 def test_current_scope_keeps_a_release_with_a_live_campaign(db):
     active = release(db, "2.6.9", "HIL_ONLY")
     paused = release(db, "2.6.10", "HIL_ONLY")

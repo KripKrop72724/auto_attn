@@ -2,6 +2,7 @@
 #include "zkt_journal_state.h"
 #include "zkt_journal_compat.h"
 #include "durable_queue.h"
+#include "zkt_record.h"
 #include <string.h>
 
 #define ZSB_BYTES 160U
@@ -30,7 +31,8 @@ static inline bool zsb_facts_valid(const zsb_facts_t *f)
 {
     if (!f || f->next_ordinal > INT32_MAX) return false;
     if (!f->next_ordinal) return !f->record_size && !zsb_nonzero(f->anchor_digest, 32);
-    return (f->record_size == 8 || f->record_size == 16 || f->record_size == 40) &&
+    return (f->record_size == 8 || f->record_size == 16 || f->record_size == 40 ||
+            f->record_size == ZKT_RECORD_TAILED_BYTES) &&
         zsb_nonzero(f->anchor_digest, 32);
 }
 /* A count sampled before preparing a terminal buffer is usable only when
@@ -45,7 +47,7 @@ static inline bool zsb_source_size(int32_t count, uint32_t buffer_bytes,
     if (!count) return declared_bytes == 0;
     if (declared_bytes % (uint32_t)count) return false;
     uint32_t size = declared_bytes / (uint32_t)count;
-    if (size != 8 && size != 16 && size != 40) return false;
+    if (size != 8 && size != 16 && size != 40 && size != ZKT_RECORD_TAILED_BYTES) return false;
     *record_size = size;
     return true;
 }

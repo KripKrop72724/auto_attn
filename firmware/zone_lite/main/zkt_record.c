@@ -19,8 +19,10 @@ const char *zkt_model_profile(const char *model)
 
 bool zkt_record_decode(const uint8_t *raw, size_t length, zkt_record_t *out)
 {
-    if (!raw || !out || (length != 8 && length != 16 && length != 40)) return false;
+    if (!raw || !out || (length != 8 && length != 16 && length != 40 &&
+        length != ZKT_RECORD_TAILED_BYTES)) return false;
     memset(out, 0, sizeof(*out));
+    if (length == ZKT_RECORD_TAILED_BYTES) length = 40; /* The tail is never decoded. */
     if (length == 16) {
         snprintf(out->user_id, sizeof(out->user_id), "%lu", (unsigned long)le32(raw));
         out->encoded_time=le32(raw+4); out->status=raw[8]; out->punch=raw[9];
@@ -46,7 +48,7 @@ bool zkt_record_identity_missing(const uint8_t *raw, size_t length)
 {
     if (!raw) return false;
     if (length == 8) return true; /* Attendance UID has no enrollment proof. */
-    if (length != 40) return false;
+    if (length != 40 && length != ZKT_RECORD_TAILED_BYTES) return false;
     for (size_t i = 2; i < 26 && raw[i]; ++i)
         if (raw[i] != ' ') return false;
     return true;
@@ -64,6 +66,15 @@ uint32_t zkt_record_size(uint32_t bytes, uint32_t count,
         selected=size;
     }
     return selected;
+}
+
+bool zkt_record_width_proven(uint32_t bytes, uint32_t size, const uint8_t *record)
+{
+    if (size != ZKT_RECORD_TAILED_BYTES || bytes % 8) return true;
+    if (!record || (record[40] && record[40] != 0xff) || memcmp(record + 41, "255", 3)) return false;
+    for (size_t i = 44; i < ZKT_RECORD_TAILED_BYTES; ++i)
+        if (record[i]) return false;
+    return true;
 }
 
 bool zkt_record_range(uint32_t prepared_bytes, uint32_t size,

@@ -113,7 +113,7 @@ def test_authenticated_internal_inconsistency_cannot_prove_record_coverage(custo
     assert count(db, AttendanceEvent) == count(db, OrdsOutbox) == 0
 
 
-@pytest.mark.parametrize("size", [8, 16, 40])
+@pytest.mark.parametrize("size", [8, 16, 40, 49])
 def test_complete_source_chain_retains_original_bytes_and_historical_uid(custody, size):
     import base64
     db, connector = custody

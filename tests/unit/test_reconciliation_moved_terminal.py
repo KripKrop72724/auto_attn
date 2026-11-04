@@ -149,7 +149,13 @@ def record8(user_id: str, encoded: int, *, record_uid: int, status=1, punch=0) -
     return bytes(raw)
 
 
-LAYOUTS = {40: record40, 16: record16, 8: record8}
+def record49(user_id: str, encoded: int, *, record_uid: int, status=1, punch=0) -> bytes:
+    """MB40-VL/ID (ZAM180_TFT): the 40-byte record, then 0xff, ASCII "255" and zeros."""
+    return record40(user_id, encoded, record_uid=record_uid, status=status, punch=punch) + (
+        b"\xff255" + bytes(5))
+
+
+LAYOUTS = {40: record40, 16: record16, 8: record8, 49: record49}
 
 
 def _event_uid(serial: str, device_event_time: str, punch: int, user_id: str) -> str:  # build_event_uid
@@ -693,7 +699,7 @@ def test_tail_of_a_moved_terminal_commits_its_own_punches(db) -> None:
 
 # --- Other record layouts: regression -------------------------------------
 
-@pytest.mark.parametrize("layout", [40, 16, 8])
+@pytest.mark.parametrize("layout", [40, 16, 8, 49])
 def test_first_chunk_of_each_record_layout_commits(db, layout) -> None:
     bld9 = _bld9(db)
     job, chunk = first_chunk(db, bld9, terminal_log(layout))
@@ -714,7 +720,27 @@ def test_first_chunk_of_each_record_layout_commits(db, layout) -> None:
     assert not _job_events(db, job, "SOURCE_REPLAY_RETAINED_ELSEWHERE")
 
 
-@pytest.mark.parametrize("layout", [40, 16])
+def test_49_byte_records_keep_all_bytes_and_read_the_40_byte_prefix(db) -> None:
+    """LHRCENTRAL's MB40-VL/ID log: each record is the 40-byte record plus a 9-byte tail."""
+    raws, bld9 = terminal_log(49), _bld9(db)
+    job, chunk = first_chunk(db, bld9, raws)
+
+    job, committed, _duplicate = apply_reconciliation_chunk(db, connector=bld9, payload=chunk)
+
+    assert job.record_size == 49 and committed.accepted_count == 100 - PREFIX
+    for row, raw in zip(_manifests(db, bld9), raws, strict=False):
+        assert row.record_size == 49 and row.raw_record_digest == _sha256(raw)
+        assert row.observed_uid == str(int.from_bytes(raw[0:2], "little"))
+        if row.attendance_event_id:
+            event = db.get(AttendanceEvent, row.attendance_event_id)
+            assert row.observed_user_id == event.user_id == raw[2:26].rstrip(b"\0").decode()
+            # The same punch as the 40-byte record: the tail adds no identity.
+            forty = source_row(raw[:40], row.ordinal, serial=K50, captured_at="2026-08-20T00:00:00Z")[0]
+            assert event.event_uid == forty["event"]["event_uid"]
+            assert event.raw_event["attendance_record_uid"] == row.observed_uid
+
+
+@pytest.mark.parametrize("layout", [40, 16, 49])
 def test_same_connector_replay_keeps_its_verified_provenance_upgrade(db, layout) -> None:
     raws = terminal_log(layout)
     bld9 = _bld9(db)
@@ -733,7 +759,7 @@ def test_same_connector_replay_keeps_its_verified_provenance_upgrade(db, layout)
     assert not _job_events(db, job, "SOURCE_REPLAY_RETAINED_ELSEWHERE")
 
 
-@pytest.mark.parametrize("layout", [40, 16])
+@pytest.mark.parametrize("layout", [40, 16, 49])
 def test_moved_terminal_replay_of_each_layout_commits(db, layout) -> None:
     raws = terminal_log(layout)
     three_fl = three_fl_owned_the_terminal(db, raws)

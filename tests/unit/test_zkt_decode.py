@@ -1,11 +1,13 @@
 """Synthetic facts are codec tests, never installed-model qualification."""
+from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 import struct
 
 import pytest
 
-from zk_add.zkt_decode import (DecodeError, MODEL_PROFILES, PAKISTAN_TIME, decode_live_packet,
-                               decode_live_record, decode_source, decode_time, encode_time)
+from zk_add.zkt_decode import (DecodeError, MODEL_PROFILES, PAKISTAN_TIME, PunchFacts,
+                               decode_live_packet, decode_live_record, decode_source, decode_time,
+                               encode_time)
 
 
 LOCAL = datetime(2026, 10, 3, 9, 14, 22, tzinfo=PAKISTAN_TIME)
@@ -30,7 +32,11 @@ def packet(body, *, command=500, session=23):
     return struct.pack("<HHHH", command, 4321, session, 9) + body
 
 
-@pytest.mark.parametrize("size", [8, 16, 40])
+# The 9-byte tail MB40-VL/ID (ZAM180_TFT) terminals append to the 40-byte record.
+TAIL = bytes.fromhex("ff3235350000000000")
+
+
+@pytest.mark.parametrize("size", [8, 16, 40, 49])
 def test_source_layouts_preserve_facts_and_do_not_join_historical_uid(size):
     raw = bytearray(size)
     if size == 8:
@@ -44,6 +50,7 @@ def test_source_layouts_preserve_facts_and_do_not_join_historical_uid(size):
         raw[26] = 7
         struct.pack_into("<I", raw, 27, ENCODED)
         raw[31] = 2
+        raw[40:] = TAIL[:size - 40]
     original = bytes(raw)
     facts = decode_source(original, record_size=size, offset=104)
     assert facts.user_id == (None if size == 8 else "123")
@@ -52,6 +59,29 @@ def test_source_layouts_preserve_facts_and_do_not_join_historical_uid(size):
     assert facts.utc_time == datetime(2026, 10, 3, 4, 14, 22, tzinfo=timezone.utc)
     assert (facts.status, facts.punch, facts.encoded_time, facts.offset, facts.length) == (7, 2, ENCODED, 104, size)
     assert bytes(raw) == original
+
+
+@pytest.mark.parametrize("lead", [0xFF, 0x00])
+def test_49_byte_record_decodes_only_its_40_byte_prefix(lead):
+    prefix = bytearray(40)
+    struct.pack_into("<H", prefix, 0, 1322)
+    prefix[2:6] = b"1234"
+    prefix[26] = 15
+    struct.pack_into("<I", prefix, 27, ENCODED)
+    raw = bytes(prefix) + bytes([lead]) + TAIL[1:]
+    facts = decode_source(raw, record_size=49, offset=4 + 1321 * 49)
+    expected = decode_source(bytes(prefix), record_size=40, offset=4 + 1321 * 49)
+    assert facts == PunchFacts(**{**asdict(expected), "length": 49})
+    assert (facts.user_id, facts.attendance_uid, facts.status, facts.punch) == ("1234", 1322, 15, 0)
+    # The tail is never identity, time or status evidence.
+    assert decode_source(bytes(prefix) + b"\x7f" * 9, record_size=49) == decode_source(raw, record_size=49)
+    for size in (40, 48, 50):
+        with pytest.raises(DecodeError, match="SOURCE_RECORD_BOUNDARY"):
+            decode_source(raw, record_size=size)
+    with pytest.raises(DecodeError, match="SOURCE_RECORD_BOUNDARY"):
+        decode_source(raw + b"\0", record_size=49)
+    with pytest.raises(DecodeError, match="INVALID_USER_REFERENCE"):
+        decode_source(raw[:2] + b" " * 24 + raw[26:], record_size=49)
 
 
 @pytest.mark.parametrize("size", [12, 32, 36, 52])

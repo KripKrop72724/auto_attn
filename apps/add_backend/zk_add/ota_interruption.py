@@ -24,9 +24,9 @@ Nothing here reboots, re-installs or starts an attempt on its own:
   ROLLED_BACK BOOTLOADER_ROLLBACK first. Only the owner's one-click "Retry same
   target" makes a new attempt.
 
-Every other running version (2.4.12, 2.5.2, 2.6.16+, every 2.7.x, 2.8.0 and 2.8.1) and
+Every other running version (2.4.12, 2.5.2, 2.6.16+, every 2.7.x and 2.8.0 to 2.8.2) and
 every target with its own return evidence (the journal bridges, 2.7.0, the 2.6.24+
-recovery images, 2.7.6, 2.7.7, 2.7.8, 2.8.0 and 2.8.1) keep the existing fail-closed path unchanged.
+recovery images, 2.7.6, 2.7.7, 2.7.8 and 2.8.0 to 2.8.2) keep the existing fail-closed path unchanged.
 
 Lock order, everywhere: connector, then deployment, then campaign (the
 WebSocket heartbeat locks its connector first, record_progress and the HTTPS
@@ -123,10 +123,10 @@ IMAGE_VERIFY_RETRY_LIMIT = 2
 RETRY_NOT_RETRYABLE = ("Only a target boot that ADD classified TARGET_BOOT_INTERRUPTED, or a downloaded image that "
                        "did not verify on the ESP (PARTITION_HASH_FAILED), can be retried.")
 # Journal bridges, the 2.7.0 writer, the one-shot recovery images, the 2.7.6
-# last-resort reformat and the confirm-first exception of 2.7.7, 2.7.8, 2.8.0 and
-# 2.8.1 carry their own return evidence, rollback expectations and HIL acceptance flows.
+# last-resort reformat and the confirm-first exception of 2.7.7, 2.7.8 and 2.8.0
+# to 2.8.2 carry their own return evidence, rollback expectations and HIL acceptance flows.
 _OWN_RETURN_EVIDENCE = frozenset({"2.6.16", "2.6.17", "2.6.18", "2.6.19", "2.6.20", "2.6.21", "2.6.22",
-                                  "2.6.23", "2.7.0", "2.7.6", "2.7.7", "2.7.8", "2.8.0", "2.8.1",
+                                  "2.6.23", "2.7.0", "2.7.6", "2.7.7", "2.7.8", "2.8.0", "2.8.1", "2.8.2",
                                   *RECOVERY_RELEASE_IDS})
 _RECONCILE_ACTIVITIES = frozenset({"FULL_RECONCILE", "HISTORICAL_RECONCILE", "LIGHT_RECONCILE"})
 
@@ -723,7 +723,7 @@ def classify_return(deployment: FirmwareDeployment, release: FirmwareRelease | N
         reasons.append("TARGET_HAS_OWN_RETURN_EVIDENCE")
     if not in_scope_version(deployment.previous_version):
         # 2.4.12 and 2.5.2 write through plain SPIFFS after a torn first boot
-        # (owner decision 6); 2.6.16+, 2.7.x, 2.8.0 and 2.8.1 report their own returns.
+        # (owner decision 6); 2.6.16+, 2.7.x and 2.8.0 to 2.8.2 report their own returns.
         reasons.append("PREVIOUS_FIRMWARE_OUT_OF_SCOPE")
     if deployment.status != "BOOTED_PENDING" or target.get("reported_reconciling"):
         reasons.append("TARGET_REPORTED_CONFIRMATION")
@@ -1191,11 +1191,11 @@ def _refused_in_other_slot(running: tuple[int, int, int], target: tuple[int, int
     """A later image the running residue image (device_health.RESIDUE_IMAGES) refuses in its
     other slot: 2.6.15 lists 2.4.12 to 2.6.14, 2.7.8 also 2.6.15 and 2.7.2 to 2.7.7, 2.8.0 also 2.7.8."""
     if running == (2, 6, 15):
-        # 2.6.15 refuses 2.8.0 and 2.8.1 in its other slot as it refuses every 2.7.x.
-        return target[:2] == (2, 7) or target in {(2, 8, 0), (2, 8, 1)}
+        # 2.6.15 refuses 2.8.0 to 2.8.2 in its other slot as it refuses every 2.7.x.
+        return target[:2] == (2, 7) or target in {(2, 8, 0), (2, 8, 1), (2, 8, 2)}
     if running == (2, 7, 8):
-        return target in {(2, 8, 0), (2, 8, 1)}
-    return running == (2, 8, 0) and target == (2, 8, 1)
+        return target in {(2, 8, 0), (2, 8, 1), (2, 8, 2)}
+    return running == (2, 8, 0) and target in {(2, 8, 1), (2, 8, 2)}
 
 
 def rollback_slot_residue_record(session: Session, connector: Connector) -> dict | None:
@@ -1203,8 +1203,8 @@ def rollback_slot_residue_record(session: Session, connector: Connector) -> dict
 
     The ESP runs 2.6.15, 2.7.8 or 2.8.0. The latest successful deployment on
     this ESP must be that image's install, and a later deployment of an image
-    it refuses in its other slot (any 2.7.x, 2.8.0 or 2.8.1 for 2.6.15; 2.8.0
-    or 2.8.1 for 2.7.8; 2.8.1 for 2.8.0) must have reported written bytes. A
+    it refuses in its other slot (any 2.7.x or 2.8.0 to 2.8.2 for 2.6.15; 2.8.0
+    to 2.8.2 for 2.7.8; 2.8.1 or 2.8.2 for 2.8.0) must have reported written bytes. A
     connector row is one ESP: onboarding keys it by the ESP's hardware ID and never
     rebinds it, so a replacement ESP is a new connector with no such record.
     """

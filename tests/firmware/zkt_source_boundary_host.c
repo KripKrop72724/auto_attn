@@ -22,11 +22,14 @@ static bool write_blob(void *unused, const char *key, const uint8_t *in, size_t 
 int main(void)
 {
     uint32_t size;
-    for (unsigned bytes = 8; bytes <= 40; bytes += 8) {
-        bool supported = bytes == 8 || bytes == 16 || bytes == 40;
+    for (unsigned bytes = 1; bytes <= 64; ++bytes) {
+        bool supported = bytes == 8 || bytes == 16 || bytes == 40 || bytes == 49;
         assert(zsb_source_size(200000, 200000 * bytes + 4, 200000 * bytes, &size) == supported);
         assert(size == (supported ? bytes : 0));
     }
+    /* LHRCENTRAL-01's 49-byte MB40-VL/ID log, and the same bytes one record short. */
+    assert(zsb_source_size(13293, 651361, 651357, &size) && size == 49);
+    assert(!zsb_source_size(13292, 651361, 651357, &size) && !size);
     assert(zsb_source_size(0, 4, 0, &size) && !size);
     assert(!zsb_source_size(-1, 4, 0, &size));
     assert(!zsb_source_size(1, 4, 0, &size));
@@ -76,9 +79,9 @@ int main(void)
         assert(out.facts.next_ordinal == (committed ? proposed.next_ordinal : later.next_ordinal));
     }
     present=false; calls=writes=fail_at=0;
-    for (unsigned n=1; n<48; ++n) {
+    for (unsigned n=1; n<64; ++n) {
         proposed.record_size=n;
-        if (n==8 || n==16 || n==40) continue;
+        if (n==8 || n==16 || n==40 || n==49) continue;
         assert(zsb_open(port, &identity, &proposed, &out) == ZJ_INVALID && !writes);
     }
     proposed.next_ordinal=UINT32_MAX; proposed.record_size=40;

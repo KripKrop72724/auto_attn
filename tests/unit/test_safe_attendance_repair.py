@@ -357,7 +357,9 @@ def test_reconciled_unknown_identity_releases_only_with_retained_interval(store)
         assert not repair.delivery_proof_valid(db, event, connector)
 
 
-def test_40_byte_record_uid_and_equivalent_history_release_unknown_identity(store):
+# 49: MB40-VL/ID (ZAM180_TFT) records, the 40-byte record plus a 9-byte tail.
+@pytest.mark.parametrize("record_size", [40, 49])
+def test_40_byte_record_uid_and_equivalent_history_release_unknown_identity(store, record_size):
     sessions, connector_id, uid = store
     with sessions() as db:
         connector = db.scalar(select(Connector).where(Connector.connector_id == connector_id))
@@ -391,7 +393,7 @@ def test_40_byte_record_uid_and_equivalent_history_release_unknown_identity(stor
         manifest = db.scalar(select(TerminalRecordManifest).where(
             TerminalRecordManifest.attendance_event_id == event.id
         ))
-        manifest.record_size = 40
+        manifest.record_size = record_size
         manifest.observed_uid = "28943"
         manifest.disposition = "BLOCKED_IDENTITY"
         db.flush()
@@ -420,7 +422,7 @@ def test_40_byte_record_uid_and_equivalent_history_release_unknown_identity(stor
         manifest.record_size = 8
         db.flush()
         assert identity_evidence(db, event, connector) is None
-        manifest.record_size = 40
+        manifest.record_size = record_size
         event.raw_event = {"attendance_record_uid": "wrong"}
         db.flush()
         assert identity_evidence(db, event, connector) is None

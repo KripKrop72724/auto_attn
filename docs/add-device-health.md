@@ -127,7 +127,9 @@ minutes earlier.
   2.8.1 for 2.7.8, 2.8.1 for 2.8.0). Those images report durability UNKNOWN
   rather than DEGRADED without an I/O error, so the label goes on
   `ESP_LOCAL_FAILURE` only, and the remedy reads "offer 2.8.1". 2.6.15's
-  rule is unchanged.
+  rule is unchanged. A 2.8.2 download or rollback is such a later download
+  for 2.6.15, 2.7.8 and 2.8.0 alike (LHRCENTRAL's ESPs run 2.7.8); the
+  remedy still reads "offer 2.8.1", and re-offering 2.8.2 clears it too.
 - **Interrupted target boot.** For a 2.6.0-2.6.15 ESP, a return to the
   previous firmware is labelled `TARGET_BOOT_INTERRUPTED` (error code
   `OTA_TARGET_BOOT_INTERRUPTED`) when the new image never reported

@@ -2227,7 +2227,7 @@ static void zkt_preserve_first_source_boundary(int sock, zk_context_t *ctx)
     if (result == ZJ_EMPTY) {
         int32_t users = 0, records = 0;
         zk_bounded_buffer_t source = {0};
-        uint8_t header[4], raw[40];
+        uint8_t header[4], raw[ZKT_RECORD_MAX_BYTES];
         zsb_facts_t facts = {0};
         bool ok = zk_get_counts(sock, ctx, &users, &records) && records >= 0 &&
             zk_prepare_bounded_buffer(sock, ctx, CMD_ATTLOG_RRQ, 0, &source);
@@ -2238,6 +2238,7 @@ static void zkt_preserve_first_source_boundary(int sock, zk_context_t *ctx)
             facts.sampled_uptime_ms = (uint64_t)uptime_ms();
             if (records) ok = zk_read_bounded_range(sock, ctx, &source,
                 4 + ((uint32_t)records - 1) * facts.record_size, raw, facts.record_size) &&
+                zkt_record_width_proven(read_le32(header), facts.record_size, raw) &&
                 mbedtls_sha256(raw, facts.record_size, facts.anchor_digest, 0) == 0;
         }
         /* Never wait on storage with a prepared terminal buffer retained.
@@ -2737,7 +2738,8 @@ static uint32_t choose_zk_record_size(
     uint32_t size = zkt_record_size(total_size, reported_count, preferred_sizes, preferred_count);
     if (size || !zk_legacy_framing()) return size;
     /* 2.6.15 selection: the reported count's exact size, otherwise the first
-     * preferred size that divides the table. */
+     * preferred size that divides the table. Attendance tables list 49 last,
+     * so 8/16/40 keep their 2.6.15 order. */
     if (reported_count > 0 && total_size % reported_count == 0) {
         for (size_t i = 0; i < preferred_count && !size; i++) {
             if (total_size / reported_count == preferred_sizes[i]) size = preferred_sizes[i];
@@ -4484,7 +4486,7 @@ static bool attendance_record_timestamp(
         *timestamp_out = read_le32(record + 3);
     } else if (record_size == 16) {
         *timestamp_out = read_le32(record + 4);
-    } else if (record_size == 40) {
+    } else if (record_size == 40 || record_size == ZKT_RECORD_TAILED_BYTES) {
         *timestamp_out = read_le32(record + 27);
     } else {
         return false;
@@ -4602,7 +4604,8 @@ static bool parse_attendance_record(
     uint8_t status = decoded.status;
     uint8_t punch = decoded.punch;
     uint16_t record_uid = decoded.attendance_uid;
-    bool snapshot_identity = record_size == 16 || record_size == 40;
+    bool snapshot_identity = record_size == 16 || record_size == 40 ||
+        record_size == ZKT_RECORD_TAILED_BYTES;
     // Historical attendance UIDs are audit evidence, never enrollment UIDs.
     // A snapshot can supply separately verified current identity evidence;
     // ADD must still prove continuity at the historical time.
@@ -4681,7 +4684,8 @@ static bool append_terminal_source_record(
     if (raw_only && !zj_runtime_writer_ready()) return false;
 #endif
     if (!cJSON_IsArray(records) || !cJSON_IsArray(canonical) || records == canonical ||
-        !record || (record_size != 8 && record_size != 16 && record_size != 40) ||
+        !record || (record_size != 8 && record_size != 16 && record_size != 40 &&
+            record_size != ZKT_RECORD_TAILED_BYTES) ||
         ordinal == UINT32_MAX || (!raw_only && (!users || !capturetype))) return false;
     /* The source stream consumes no live flash reserve. ADD commits each raw
      * range before the source cursor moves; a held writer cannot substitute a
@@ -4713,7 +4717,7 @@ static bool append_terminal_source_record(
             sizeof(observed_user_id),
             "%lu",
             (unsigned long)read_le32(record));
-    } else if (!raw_only && record_size == 40) {
+    } else if (!raw_only && (record_size == 40 || record_size == ZKT_RECORD_TAILED_BYTES)) {
         snprintf(
             observed_uid,
             sizeof(observed_uid),
@@ -4873,7 +4877,7 @@ static source_snapshot_result_t zk_validate_source_snapshot(
         return SOURCE_SNAPSHOT_RETRY;
     }
     uint32_t total_size = read_le32(header);
-    static const uint32_t sizes[] = {40, 16, 8};
+    static const uint32_t sizes[] = {40, 16, 8, ZKT_RECORD_TAILED_BYTES};
     uint32_t record_size = latest_records == 0 && total_size == 0 ? 40 :
         choose_zk_record_size(total_size, (uint32_t)latest_records,
             sizes, sizeof(sizes) / sizeof(*sizes));
@@ -4901,7 +4905,7 @@ static source_snapshot_result_t zk_validate_source_snapshot(
                 return SOURCE_SNAPSHOT_HOLD;
             }
             uint32_t fresh_size = 0;
-            unsigned candidates = 0;
+            unsigned candidates = 0, legacy_candidates = 0;
             for (size_t i = 0; i < sizeof(sizes) / sizeof(*sizes); ++i) {
                 if (!total_size || total_size % sizes[i]) continue;
                 uint32_t prepared_count = total_size / sizes[i];
@@ -4909,8 +4913,14 @@ static source_snapshot_result_t zk_validate_source_snapshot(
                     prepared_count < cutoff || prepared_count < assignment->committed_next_ordinal) continue;
                 fresh_size = sizes[i];
                 ++candidates;
+                if (sizes[i] != ZKT_RECORD_TAILED_BYTES) ++legacy_candidates;
             }
-            if (fresh_records > latest_records && candidates == 1) {
+            /* 8/16/40 decide exactly as before 49 was known. A 49-byte width
+             * alone also explains an append; beside one 8/16/40 width it is
+             * still retried, but neither width is claimed. */
+            bool explained = legacy_candidates == 1 || (!legacy_candidates && candidates == 1);
+            if (candidates != 1) fresh_size = 0;
+            if (fresh_records > latest_records && explained) {
                 char message[176];
                 snprintf(message, sizeof(message),
                     "Append snapshot changed count %ld to %ld (prepared=%lu payload=%lu width=%lu); no source records committed.",
@@ -4929,12 +4939,20 @@ static source_snapshot_result_t zk_validate_source_snapshot(
         return SOURCE_SNAPSHOT_HOLD;
     }
     if (cutoff > 0) {
-        uint8_t first_record[40];
+        uint8_t first_record[ZKT_RECORD_MAX_BYTES];
         ok = zk_read_bounded_range(sock, ctx, source, 4, first_record, record_size);
         if (!ok) {
             (void)zk_release_source_snapshot(sock, ctx, source);
             add_connector_log("WARN", "reconcile", "SOURCE_RANGE_READ_RETRY",
                 "Source first anchor was not read completely; no anchor divergence was inferred.");
+            return SOURCE_SNAPSHOT_RETRY;
+        }
+        if (!zkt_record_width_proven(total_size, record_size, first_record)) {
+            /* An 8/16/40-byte log that grew after the count can match 49 by
+             * size. Without the tail it stays a retry, like other growth. */
+            (void)zk_release_source_snapshot(sock, ctx, source);
+            add_connector_log("WARN", "reconcile", "SOURCE_RANGE_SNAPSHOT_RETRY",
+                "A 49-byte width also fits a grown 8/16/40-byte log and the first record lacks the 49-byte tail; no source records committed.");
             return SOURCE_SNAPSHOT_RETRY;
         }
         sha256_bytes_hex(first_record, record_size, first_digest);
@@ -4948,7 +4966,7 @@ static source_snapshot_result_t zk_validate_source_snapshot(
         return SOURCE_SNAPSHOT_HOLD;
     }
     if (assignment->committed_next_ordinal > 0) {
-        uint8_t predecessor[40];
+        uint8_t predecessor[ZKT_RECORD_MAX_BYTES];
         char predecessor_digest[65];
         uint32_t predecessor_offset = 4 + (assignment->committed_next_ordinal - 1) * record_size;
         ok = zk_read_bounded_range(sock, ctx, source, predecessor_offset, predecessor, record_size);
@@ -5008,13 +5026,13 @@ static bool process_add_reconciliation_assignment(
         bool probe_ok = zk_read_bounded_range(
             sock, ctx, &probe_source, 0, probe_header, sizeof(probe_header));
         uint32_t probe_total = probe_ok ? read_le32(probe_header) : 0;
-        static const uint32_t probe_record_sizes[] = {40, 16, 8};
+        static const uint32_t probe_record_sizes[] = {40, 16, 8, ZKT_RECORD_TAILED_BYTES};
         uint32_t probe_record_size = probe_ok ? choose_zk_record_size(
             probe_total,
             (uint32_t)latest_records,
             probe_record_sizes,
             sizeof(probe_record_sizes) / sizeof(probe_record_sizes[0])) : 0;
-        uint8_t probe_raw[40];
+        uint8_t probe_raw[ZKT_RECORD_MAX_BYTES];
         if (probe_record_size > 0) {
             probe_ok = zk_read_bounded_range(
                 sock,
@@ -5022,7 +5040,8 @@ static bool process_add_reconciliation_assignment(
                 &probe_source,
                 4 + assignment->probe_ordinal * probe_record_size,
                 probe_raw,
-                probe_record_size);
+                probe_record_size) &&
+                zkt_record_width_proven(probe_total, probe_record_size, probe_raw);
         } else {
             probe_ok = false;
         }
@@ -5401,7 +5420,7 @@ static bool process_add_incremental_tail(
     uint8_t header[4];
     bool ok = zk_read_bounded_range(sock, ctx, &source, 0, header, sizeof(header));
     uint32_t total_size = ok ? read_le32(header) : 0;
-    static const uint32_t attendance_record_sizes[] = {40, 16, 8};
+    static const uint32_t attendance_record_sizes[] = {40, 16, 8, ZKT_RECORD_TAILED_BYTES};
     uint32_t record_size = choose_zk_record_size(
         total_size,
         (uint32_t)latest_records,
@@ -5424,7 +5443,8 @@ static bool process_add_incremental_tail(
         &source,
         4 + start * record_size,
         raw,
-        raw_length);
+        raw_length) &&
+        zkt_record_width_proven(total_size, record_size, raw);
     zk_close_bounded_buffer(sock, ctx, &source);
     cJSON *records = ok ? cJSON_CreateArray() : NULL;
     cJSON *canonical = ok ? cJSON_CreateArray() : NULL;
@@ -5736,7 +5756,7 @@ static bool reconcile_attendance_dump(
             return false;
         }
         uint32_t total_size = read_le32(data);
-        static const uint32_t attendance_record_sizes[] = {40, 16, 8};
+        static const uint32_t attendance_record_sizes[] = {40, 16, 8, ZKT_RECORD_TAILED_BYTES};
         record_size = choose_zk_record_size(
             total_size,
             (uint32_t)records,

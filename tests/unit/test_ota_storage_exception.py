@@ -360,7 +360,7 @@ def test_the_inventory_and_reclaim_keep_the_2_7_8_fields():
     assert reclaim is not None and reclaim.area_skip is None
 
 
-def test_the_floor_latch_migration_is_the_single_head_after_mains_public_status():
+def test_the_floor_latch_migration_follows_mains_public_status_on_one_head():
     # 2.7.7's column follows main's #421 migration; two heads would stop the
     # API container's "alembic upgrade head".
     from pathlib import Path
@@ -372,5 +372,8 @@ def test_the_floor_latch_migration_is_the_single_head_after_mains_public_status(
     config = Config(str(root / "alembic.ini"))
     config.set_main_option("script_location", str(root / "migrations"))
     script = ScriptDirectory.from_config(config)
-    assert script.get_heads() == ["20261026_0059_ota_floor_latch"]
+    heads = script.get_heads()
+    assert len(heads) == 1
+    chain = [revision.revision for revision in script.walk_revisions("base", heads[0])]
+    assert "20261026_0059_ota_floor_latch" in chain
     assert script.get_revision("20261026_0059_ota_floor_latch").down_revision == "20261024_0058_public_status"

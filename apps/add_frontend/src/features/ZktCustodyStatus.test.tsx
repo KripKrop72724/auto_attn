@@ -142,6 +142,18 @@ describe('ZKT custody evidence', () => {
     expect(screen.getByText('No committed local handoff receipt')).toBeTruthy()
     expect(screen.getByText('Not established by custody')).toBeTruthy()
   })
+  it.each([[49, true], [48, false]])('accepts a %i-byte source boundary only for a known record width', async (size, known) => {
+    vi.mocked(fetch).mockResolvedValue(response(fixture({ source_boundary: {
+      state: 'VERIFIED_SOURCE_ANCHOR', reason: 'SOURCE_BOUNDARY_MATCHES_ADD_CUSTODY',
+      migration_certified: false, delivery_permission: 'NOT_EVALUATED',
+      source_epoch: '12345678-1234-1234-1234-123456789012', next_ordinal: 13293, record_size: size,
+      writer_digest: 'a'.repeat(64), capture_epoch: 'b'.repeat(32),
+      sampled_at: new Date().toISOString(),
+    } })))
+    mount()
+    expect(await screen.findByText(known ? 'Boundary matches preserved source bytes in ADD'
+      : 'Source boundary evidence unavailable')).toBeTruthy()
+  })
   it('ages the boundary heartbeat independently of a fresh custody query', async () => {
     vi.mocked(fetch).mockResolvedValue(response(fixture({ source_boundary: {
       state: 'VERIFIED_SOURCE_ANCHOR', reason: 'SOURCE_BOUNDARY_MATCHES_ADD_CUSTODY',

@@ -12,7 +12,7 @@ from sqlalchemy.exc import DBAPIError
 
 from zk_add.models import Connector, ReconciliationCoverage, TerminalRecordManifest, TerminalSourceEpoch, ZKTDevice
 from zk_add.time_utils import utc_now
-from zk_add.zkt_decode import DecodeError, PAKISTAN_TIME, decode_time, encode_time
+from zk_add.zkt_decode import SOURCE_SIZES, DecodeError, PAKISTAN_TIME, decode_time, encode_time
 
 WINDOW_DAYS = 30
 MINUTE_GROUP_LIMIT = 33 * 24 * 60  # Packed ZKT calendars can include nonexistent dates.
@@ -106,7 +106,7 @@ def _measure_source_load(session, connector, *, now: datetime | None = None):
     unusable = or_(manifest.raw_timestamp.is_(None), manifest.raw_timestamp < 0,
                    manifest.raw_timestamp >= 100 * 12 * 31 * 86400,
                    manifest.disposition.in_(["INVALID_TIME", "MALFORMED"]),
-                   manifest.record_size.is_(None), manifest.record_size.not_in([8, 16, 40]))
+                   manifest.record_size.is_(None), manifest.record_size.not_in(sorted(SOURCE_SIZES)))
     inventory_query = select(func.count(manifest.id).label("inventory_count"),
         func.min(manifest.ordinal).label("first_ordinal"), func.max(manifest.ordinal).label("last_ordinal"),
         func.coalesce(func.sum(case((unusable, 1), else_=0)), 0).label("unusable_count"),

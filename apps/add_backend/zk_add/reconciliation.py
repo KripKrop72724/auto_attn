@@ -53,6 +53,7 @@ from zk_add.schemas import (
 from zk_add.settings import settings
 from zk_add.storage_contract import FLEET_PLATFORM_VERSIONS
 from zk_add.time_utils import ensure_utc, utc_now
+from zk_add.zkt_decode import SOURCE_SIZES, TEXT_SOURCE_SIZES
 
 
 TERMINAL_JOB_STATES = {"COMPLETED", "CANCELLED", "FAILED", "INVALIDATED"}
@@ -1122,14 +1123,15 @@ def _source_identity_missing(source) -> bool:
     """Negative evidence only: this does not qualify any profile or identity.
 
     Called after raw length/digest verification. An 8-byte attendance UID is
-    not an enrollment reference; a 40-byte empty text field supplies neither.
+    not an enrollment reference; an empty 40- or 49-byte text field supplies
+    neither.
     Legacy claims remain encrypted evidence, never a reason to infer an ID.
     """
     if source.event is None:
         return False
     raw = base64.b64decode(source.raw_record_b64, validate=True)
     return len(raw) == 8 or (
-        len(raw) == 40 and not raw[2:26].split(b"\0", 1)[0].rstrip(b" ")
+        len(raw) in TEXT_SOURCE_SIZES and not raw[2:26].split(b"\0", 1)[0].rstrip(b" ")
     )
 
 
@@ -2066,7 +2068,7 @@ def _retained_coverage_proof(session, job, coverage):
             or prior_job.zkt_device_id != job.zkt_device_id or prior_job.connector_id != job.connector_id
             or prior_job.terminal_serial != job.terminal_serial
             or prior_job.terminal_generation != job.terminal_generation
-            or job.record_size not in {8, 16, 40} or prior_job.record_size != job.record_size):
+            or job.record_size not in SOURCE_SIZES or prior_job.record_size != job.record_size):
         raise ValueError("SOURCE_COVERAGE_RETENTION_BINDING_MISMATCH")
     if coverage.source_committed_cursor < job.cutoff_count:
         raise ValueError("SOURCE_COVERAGE_RETENTION_COUNT_REGRESSION")
@@ -2130,7 +2132,7 @@ def _raw_present(row):
 def _ledger_row_valid(*, serial, connector_id, size, raw, key, occurrence, present, expected_serial,
                       expected_connector, expected_size=None) -> bool:
     """The checks _canonical_inventory_proof applies to one canonical ledger row."""
-    return (serial == expected_serial and connector_id == expected_connector and size in {8, 16, 40}
+    return (serial == expected_serial and connector_id == expected_connector and size in SOURCE_SIZES
             and (expected_size is None or size == expected_size) and bool(present)
             and bool(_DIGEST.fullmatch(raw or "")) and bool(_DIGEST.fullmatch(key or ""))
             and occurrence is not None and occurrence >= 1)
@@ -2161,7 +2163,7 @@ def _generation_lineage_proof(session, job, coverage, *, cutoff, latest_count):
     epoch = session.get(TerminalSourceEpoch, job.source_epoch_id) if job.source_epoch_id else None
     if (epoch is None or epoch.state != "ACTIVE" or epoch.zkt_device_id != job.zkt_device_id
             or epoch.terminal_generation != job.terminal_generation or not job.terminal_serial
-            or job.record_size not in {8, 16, 40}):
+            or job.record_size not in SOURCE_SIZES):
         raise _LineageHold(SOURCE_GENERATION_JOB_EVIDENCE_INVALID, {"reason": "JOB_EPOCH_BINDING"})
     old_cursor = coverage.source_committed_cursor
     if not (0 <= cutoff <= COVERAGE_PROOF_MAX_RECORDS and 0 <= old_cursor <= COVERAGE_PROOF_MAX_RECORDS):

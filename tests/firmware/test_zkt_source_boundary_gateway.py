@@ -88,6 +88,7 @@ int main(int argc,char **argv){
     binary = tmp_path / "boundary-gateway"
     subprocess.run([shutil.which("cc"), "-std=c11", "-D_POSIX_C_SOURCE=200809L", "-g", "-O1", "-Wall", "-Wextra", "-Werror",
                     "-fsanitize=address,undefined", "-fno-omit-frame-pointer", "-I", str(main),
-                    str(unit), str(main / "durable_queue.c"), "-o", str(binary)], check=True)
+                    str(unit), str(main / "durable_queue.c"), str(main / "zkt_record.c"),
+                    "-o", str(binary)], check=True)
     for scenario in range(13):
         subprocess.run([str(binary), str(scenario)], check=True, timeout=10)

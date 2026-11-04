@@ -711,7 +711,7 @@ static int stale_record(void)
 static int floor_versions(void)
 {
     EXPECT(sx_version_redo_aware("2.7.6") && sx_version_redo_aware("2.7.7") && sx_version_redo_aware("2.7.10"));
-    EXPECT(sx_version_redo_aware("zone-lite-2.7.7") && sx_version_redo_aware("2.8.0") && sx_version_redo_aware("2.8.1") && sx_version_redo_aware("3.0.0"));
+    EXPECT(sx_version_redo_aware("zone-lite-2.7.7") && sx_version_redo_aware("2.8.0") && sx_version_redo_aware("2.8.1") && sx_version_redo_aware("2.8.2") && sx_version_redo_aware("3.0.0"));
     EXPECT(!sx_version_redo_aware("2.7.5") && !sx_version_redo_aware("2.5.2") && !sx_version_redo_aware("2.6.27"));
     EXPECT(!sx_version_redo_aware("2.7.0") && !sx_version_redo_aware("2.4.12") && !sx_version_redo_aware("1.9.9"));
     EXPECT(!sx_version_redo_aware("") && !sx_version_redo_aware(NULL) && !sx_version_redo_aware("2.7"));

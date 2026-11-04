@@ -18,8 +18,9 @@ param(
     # An older published AVAILABLE release, flashed to ota_1. 2.7.x and 2.8.0
     # direct upgrade builds start storage only when the other OTA slot holds a
     # qualified predecessor (exact application digest) as their rollback image;
-    # 2.8.1 also when it is VALID and the other slot has no entry the bootloader
-    # selects, as the flash tool leaves ota_1, but every bootstrap carries one.
+    # 2.8.1 and 2.8.2 also when it is VALID and the other slot has no entry the
+    # bootloader selects, as the flash tool leaves ota_1, but every bootstrap
+    # carries one.
     [string]$RollbackPredecessorDirectory = ''
 )
 

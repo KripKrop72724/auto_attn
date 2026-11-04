@@ -514,7 +514,8 @@ class StorageDiagnostics(BaseModel):
     local_failure_last_source: str | None = Field(default=None, max_length=80)
     local_failures: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
     local_failure_recoveries: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
-    # 2.8.1's compiled predecessor marker is 172 characters (2.8.0's 166, 2.7.8's 160).
+    # 2.8.2's compiled predecessor marker is 178 characters (2.8.1's 172, 2.8.0's 166,
+    # 2.7.8's 160).
     upgrade_contract: str | None = Field(default=None, max_length=256)
     upgrade_error: str | None = Field(default=None, max_length=80)
     upgrade_ready: bool | None = None
@@ -757,7 +758,7 @@ class SourceBoundaryDiagnostics(BaseModel):
     migration_certified: Literal[False]
     result: Literal["OK", "EMPTY", "FULL", "IO", "CORRUPT", "STALE", "INVALID", "UNCERTAIN", "NOT_OBSERVED", "UNKNOWN"]
     next_ordinal: int | None = Field(default=None, ge=0, le=2**31 - 1)
-    record_size: Literal[0, 8, 16, 40] | None = None
+    record_size: Literal[0, 8, 16, 40, 49] | None = None
     capture_epoch: str | None = Field(default=None, pattern=r"^[a-f0-9]{32}$")
     writer_digest: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
     terminal_digest: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
@@ -1165,7 +1166,7 @@ class ReconciliationAnchorRequest(SourceEpochRequest):
     terminal_generation: int = Field(ge=1)
     cutoff_count: int = Field(ge=0)
     latest_terminal_count: int = Field(ge=0)
-    record_size: Literal[8, 16, 40]
+    record_size: Literal[8, 16, 40, 49]
     source_total_bytes: int = Field(ge=4, le=128 * 1024 * 1024)
     first_anchor_digest: str = Field(
         min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$"
@@ -1216,7 +1217,7 @@ class SourceProbeResultRequest(SourceEpochRequest):
     generation: int = Field(ge=1)
     terminal_serial: str = Field(min_length=1, max_length=120)
     latest_terminal_count: int = Field(ge=0)
-    record_size: Literal[8, 16, 40]
+    record_size: Literal[8, 16, 40, 49]
     ordinal: int = Field(ge=0)
     record: ReconciliationSourceRecord
 
@@ -1264,7 +1265,7 @@ class ReconciliationManifestRequest(SourceEpochRequest):
 class SourceTailChunkRequest(SourceEpochRequest):
     terminal_serial: str = Field(min_length=1, max_length=120)
     terminal_generation: int = Field(ge=1)
-    record_size: Literal[8, 16, 40]
+    record_size: Literal[8, 16, 40, 49]
     start_ordinal: int = Field(ge=0)
     end_ordinal: int = Field(ge=1)
     latest_terminal_count: int = Field(ge=1)

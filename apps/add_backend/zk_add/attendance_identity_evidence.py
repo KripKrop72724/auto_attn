@@ -21,6 +21,7 @@ from zk_add.models import (
 )
 from zk_add.settings import settings
 from zk_add.time_utils import ensure_utc
+from zk_add.zkt_decode import TEXT_SOURCE_SIZES
 
 
 @dataclass(frozen=True)
@@ -179,12 +180,13 @@ def manifest_identity_matches_event(manifest, event: AttendanceEvent) -> bool:
         return False
     if not manifest.observed_uid or not event.uid or manifest.observed_uid == event.uid:
         return True
-    # On some 40-byte ZKT records the first two bytes identify the attendance
-    # record, not the enrolled person. The firmware retains both namespaces.
+    # On some 40- and 49-byte ZKT records the first two bytes identify the
+    # attendance record, not the enrolled person. The firmware retains both
+    # namespaces.
     # Outside the near-live window, source_evidence requires a retained,
     # fingerprint-bound identity interval at punch time for every such record.
     return bool(
-        manifest.record_size == 40
+        manifest.record_size in TEXT_SOURCE_SIZES
         and (event.raw_event or {}).get("attendance_record_uid") == manifest.observed_uid
         and event.identity_terminal_fingerprint
         and (
@@ -326,11 +328,11 @@ def source_evidence(
                 "digest": manifest.raw_record_digest,
                 "generation": manifest.generation,
                 "epoch_id": manifest.source_epoch_id,
-                # A delayed 40-byte record carries a record UID rather than
-                # the enrolled UID. Its exact user ID must also be backed by
-                # a retained, fingerprint-bound identity interval.
+                # A delayed 40- or 49-byte record carries a record UID rather
+                # than the enrolled UID. Its exact user ID must also be backed
+                # by a retained, fingerprint-bound identity interval.
                 "requires_retained_identity": bool(
-                    manifest.record_size == 40
+                    manifest.record_size in TEXT_SOURCE_SIZES
                     and manifest.observed_uid != event.uid
                     and not near_live_reconcile_capture(event)
                 ),
