@@ -5,7 +5,7 @@ it and proves that it is gone. Run it in Windows PowerShell 5.1 (as on the
 field PCs) on a machine where the app is not installed.
 
 .EXAMPLE
-powershell -File packaging\smoke_test.ps1 -Setup dist\StateLife-Device-Installer-Setup-1.0.0-TEST.exe -OutputDir smoke
+powershell -File packaging\smoke_test.ps1 -Setup dist\StateLife-Device-Installer-Setup-1.1.0-TEST.exe -OutputDir smoke
 #>
 param(
     [Parameter(Mandatory = $true)] [string] $Setup,

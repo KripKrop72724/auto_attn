@@ -98,11 +98,47 @@ def _python_licence() -> str:
     raise FileNotFoundError("the Python licence text (LICENSE.txt) was not found")
 
 
-def _summary(app_version: str, versions: Dict[str, str]) -> str:
+def _wording(platform: str, esptool: str) -> Dict[str, str]:
+    """Where the frozen app keeps the parts the summary names: PyInstaller's
+    "_internal" folder on Windows, the app's Contents folder on macOS. Each
+    value is whole lines of the summary, already wrapped to fit."""
+    if platform == "darwin":
+        lines = {
+            "python_build": ["macOS"],
+            "qt_files": ['the files in the "Contents/Frameworks/PySide6" and',
+                         '"Contents/Frameworks/shiboken6" folders.'],
+            "esptool_source": [
+                f'is in "Contents/Resources/licenses/esptool-{esptool}.tar.gz" inside the',
+                f"app and at https://github.com/espressif/esptool/tree/v{esptool}."],
+            "stub_1": ['"Contents/Resources/esptool/targets/stub_flasher/1". Its source code is'],
+            "stub_2": ['"Contents/Resources/esptool/targets/stub_flasher/2", which the app',
+                       "does not use, are under the Apache-2.0 or MIT licence; their licence",
+                       "files are in that folder."],
+            "start_up": ['in "Contents/MacOS"'],
+        }
+    else:
+        lines = {
+            "python_build": ["Windows"],
+            "qt_files": ['the files in the "_internal\\PySide6" and "_internal\\shiboken6" folders.'],
+            "esptool_source": [
+                f'is in "licenses\\esptool-{esptool}.tar.gz" in the app folder and at',
+                f"https://github.com/espressif/esptool/tree/v{esptool}."],
+            "stub_1": ['"_internal\\esptool\\targets\\stub_flasher\\1". Its source code is'],
+            "stub_2": ['"_internal\\esptool\\targets\\stub_flasher\\2", which the app does not',
+                       "use, are under the Apache-2.0 or MIT licence; their licence files are",
+                       "in that folder."],
+            "start_up": ["inside the app's .exe"],
+        }
+    # The body lines of the summary sit 6 spaces in before textwrap.dedent.
+    return {key: ("\n" + " " * 6).join(value) for key, value in lines.items()}
+
+
+def _summary(app_version: str, versions: Dict[str, str], platform: str = sys.platform) -> str:
     qt, pyside, esptool, pyinstaller = (
         versions["qt"], versions["pyside6-essentials"], versions["esptool"], versions["pyinstaller"])
     python = ".".join(str(part) for part in sys.version_info[:3])
     qt_minor = ".".join(qt.split(".")[:2])
+    w = _wording(platform, esptool)
     text = f"""
     State Life Device Installer {app_version}: third-party notices
 
@@ -114,14 +150,14 @@ def _summary(app_version: str, versions: Dict[str, str]) -> str:
 
     Python {python}
       Licence: Python Software Foundation License (PSF-2.0). The licence text,
-      with the notices for the libraries that the Windows build of Python
+      with the notices for the libraries that the {w['python_build']} build of Python
       contains (such as OpenSSL, libffi, zlib, bzip2, xz, expat, SQLite and
       mpdecimal), is in the "Python" section below.
 
     Qt {qt} and PySide6 {pyside} (Qt for Python)
       Licence: GNU Lesser General Public License version 3 (LGPL-3.0-only).
       The app uses Qt and PySide6 as unmodified, dynamically linked libraries:
-      the files in the "_internal\\PySide6" and "_internal\\shiboken6" folders.
+      {w['qt_files']}
       You may replace them with your own builds of the same versions.
       Source code: https://download.qt.io/official_releases/qt/{qt_minor}/{qt}/
       and https://download.qt.io/official_releases/QtForPython/ (PySide6 {pyside}).
@@ -135,22 +171,19 @@ def _summary(app_version: str, versions: Dict[str, str]) -> str:
       program: it starts its own executable with "--tool esptool" or
       "--tool espefuse". In that process a small part of the app hands the
       arguments over to esptool, which does the rest. esptool's source code
-      is in "licenses\\esptool-{esptool}.tar.gz" in the app folder and at
-      https://github.com/espressif/esptool/tree/v{esptool}.
+      {w['esptool_source']}
 
     esptool flasher stub (esptool-legacy-flasher-stub {STUB_RELEASE})
       Licence: GNU General Public License version 2 or later
       (GPL-2.0-or-later). To write a board, esptool loads this small program
       into the board's memory. The app uses only this stub, the files in
-      "_internal\\esptool\\targets\\stub_flasher\\1". Its source code is
+      {w['stub_1']}
       published at
       {STUB_SOURCE}
       and State Life head office can supply a copy on request. The stubs in
-      "_internal\\esptool\\targets\\stub_flasher\\2", which the app does not
-      use, are under the Apache-2.0 or MIT licence; their licence files are
-      in that folder.
+      {w['stub_2']}
 
-    PyInstaller {pyinstaller} (the start-up program inside the app's .exe)
+    PyInstaller {pyinstaller} (the start-up program {w['start_up']})
       Licence: GPL-2.0-or-later with the PyInstaller bootloader exception,
       which allows it to be used in programs under other licences.
 
@@ -168,7 +201,8 @@ def _section(title: str, licence: str, home: str, texts: Iterable[Tuple[str, str
     return "\n".join(lines) + "\n"
 
 
-def write_notices(output: Path, app_version: str, runtime_lock: Path) -> None:
+def write_notices(output: Path, app_version: str, runtime_lock: Path,
+                  platform: str = sys.platform) -> None:
     from PySide6.QtCore import qVersion
 
     distributions = [metadata.distribution(name) for name in locked_names(runtime_lock)]
@@ -176,7 +210,7 @@ def write_notices(output: Path, app_version: str, runtime_lock: Path) -> None:
     versions = {_canonical(dist.metadata["Name"]): dist.version for dist in distributions}
     versions["qt"] = qVersion()
 
-    parts = [_summary(app_version, versions), ""]
+    parts = [_summary(app_version, versions, platform), ""]
     python = ".".join(str(part) for part in sys.version_info[:3])
     parts.append(_section(f"Python {python}", "PSF-2.0", "https://www.python.org/",
                           [("LICENSE.txt", _python_licence())]))

@@ -1,4 +1,4 @@
-"""Build the State Life Device Installer for Windows.
+"""Build the State Life Device Installer for Windows or macOS.
 
     python packaging/build.py              TEST build when the secrets are absent
     python packaging/build.py --release    must find both secrets (field release)
@@ -6,8 +6,11 @@
 Steps: field defaults, icon and installer pictures, version resource,
 third-party notices, the PyInstaller folder (dist/State Life Device Installer),
 the esptool source that its GPL licence asks us to pass on, the Inno Setup
-installer and SHA256SUMS.txt. Outside Windows the installer step is skipped;
-that is how the dev container checks the PyInstaller recipe.
+installer and SHA256SUMS.txt. On macOS (Apple Silicon) the same steps make
+dist/State Life Device Installer.app instead, signed ad hoc, and a disk image
+(StateLife-Device-Installer-<version>-macOS-arm64.dmg) in place of the
+installer. Elsewhere the installer step is skipped; that is how the dev
+container checks the PyInstaller recipe.
 
 Release secrets, read from the environment and never printed:
     ESP_INSTALLER_FIELD_DEFAULTS_JSON  JSON object with the api.FieldDefaults keys
@@ -30,9 +33,10 @@ import string
 import struct
 import subprocess
 import sys
+import time
 import urllib.request
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 PACKAGING = Path(__file__).resolve().parent
 APP = PACKAGING.parent
@@ -43,7 +47,14 @@ DIST = APP / "dist"
 BRANDING = BUILD / "branding"
 APP_NAME = "State Life Device Installer"
 APP_DIR = DIST / APP_NAME
+MAC_APP = DIST / f"{APP_NAME}.app"
 SETUP_PREFIX = "StateLife-Device-Installer-Setup-"
+DMG_PREFIX = "StateLife-Device-Installer-"
+PUBLISHER = "State Life Insurance Corporation of Pakistan"
+BUNDLE_ID = "com.statelife.deviceinstaller"
+# The oldest macOS the Mac app runs on: Qt 6.9's libraries need 12.0. The same
+# as update_locks.MACOS_MINIMUM, which keeps newer wheels out of the locks.
+MACOS_MINIMUM = "12.0"
 LOGO = REPO / "apps" / "add_frontend" / "public" / "state-life-logo.png"
 RESOURCES = SRC / "sl_installer" / "resources"
 FIELD_DEFAULTS = RESOURCES / "field_defaults.json"
@@ -60,6 +71,9 @@ WIZARD_SIZES = {100: (164, 314), 125: (192, 386), 150: (246, 459), 175: (273, 55
                 200: (328, 604), 225: (355, 700), 250: (410, 797)}
 WIZARD_SMALL_SIZES = {100: (55, 55), 125: (64, 68), 150: (83, 80), 175: (92, 97),
                       200: (110, 106), 225: (119, 123), 250: (138, 140)}
+# The PNGs of a standard macOS .iconset (16 to 512 points, at 1x and 2x).
+ICNS_IMAGES = (("icp4", 16), ("ic11", 32), ("icp5", 32), ("ic12", 64), ("ic07", 128),
+               ("ic13", 256), ("ic08", 256), ("ic14", 512), ("ic09", 512), ("ic10", 1024))
 
 sys.path.insert(0, str(SRC))
 sys.path.insert(0, str(PACKAGING))
@@ -160,10 +174,54 @@ def _wizard_picture(square, width: int, height: int, small: bool):
     return canvas.convertToFormat(QImage.Format.Format_RGB888)
 
 
+def _mac_icon(square, size: int = 1024):
+    """The logo on a white rounded square, on Apple's icon grid (an 824-point
+    body on a 1024-point canvas) with a soft shadow, so it shows on white."""
+    from PySide6.QtCore import QRectF, Qt
+    from PySide6.QtGui import QColor, QImage, QPainter, QPen
+
+    unit = size / 1024
+    canvas = QImage(size, size, QImage.Format.Format_ARGB32_Premultiplied)
+    canvas.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(canvas)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+    body = QRectF(100 * unit, 100 * unit, 824 * unit, 824 * unit)
+    radius = 185 * unit
+    painter.setPen(Qt.PenStyle.NoPen)
+    for layer in range(12, 0, -1):
+        spread = layer * 2.5 * unit
+        painter.setBrush(QColor(0, 0, 0, 5))
+        painter.drawRoundedRect(body.adjusted(-spread, -spread + 10 * unit, spread,
+                                              spread + 10 * unit),
+                                radius + spread, radius + spread)
+    painter.setBrush(QColor(WHITE))
+    painter.setPen(QPen(QColor(0, 0, 0, 28), 2 * unit))
+    painter.drawRoundedRect(body, radius, radius)
+    side = round(824 * 0.72 * unit)
+    painter.drawImage(round((size - side) / 2), round((size - side) / 2),
+                      _scaled(square, side, side))
+    painter.end()
+    return canvas
+
+
+def write_icns(square, path: Path) -> None:
+    """A macOS .icns: every size of a standard .iconset as PNG data."""
+    master = _mac_icon(square)
+    entries = []
+    for kind, pixels in ICNS_IMAGES:
+        png = _png_bytes(_scaled(master, pixels, pixels))
+        entries.append(kind.encode("ascii") + struct.pack(">I", 8 + len(png)) + png)
+    body = b"".join(entries)
+    path.write_bytes(b"icns" + struct.pack(">I", 8 + len(body)) + body)
+
+
 def make_branding() -> None:
     BRANDING.mkdir(parents=True, exist_ok=True)
     square = _square_logo()
     write_icon(square, BRANDING / "app.ico")
+    if sys.platform == "darwin":
+        write_icns(square, BRANDING / "app.icns")
     for scale, (width, height) in WIZARD_SIZES.items():
         _wizard_picture(square, width, height, small=False).save(
             str(BRANDING / f"wizard-{scale}.bmp"), "BMP")
@@ -278,6 +336,29 @@ def write_version_info(version: str, release: bool) -> None:
         build_kind="Release build" if release else "TEST BUILD"), encoding="utf-8")
 
 
+def macos_info(version: str) -> Dict[str, object]:
+    """The Mac app's Info.plist entries; sl_installer.spec hands them to BUNDLE."""
+    return {
+        "CFBundleName": APP_NAME,
+        "CFBundleDisplayName": APP_NAME,
+        "CFBundleIdentifier": BUNDLE_ID,
+        "CFBundleShortVersionString": version,
+        "CFBundleVersion": version,
+        "LSMinimumSystemVersion": MACOS_MINIMUM,
+        "LSArchitecturePriority": ["arm64"],
+        "LSApplicationCategoryType": "public.app-category.utilities",
+        "NSHighResolutionCapable": True,
+        # The app draws its own light colours; keep the system's controls light too.
+        "NSRequiresAquaSystemAppearance": True,
+        "NSHumanReadableCopyright": f"Copyright (C) {PUBLISHER}",
+    }
+
+
+def write_macos_info(version: str) -> None:
+    (BUILD / "macos-info.json").write_text(json.dumps(macos_info(version), indent=2) + "\n",
+                                           encoding="utf-8")
+
+
 def run_pyinstaller() -> None:
     subprocess.run(
         [sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean", "--log-level", "WARN",
@@ -315,9 +396,20 @@ def esptool_source(destination: Path) -> Path:
     return Path(shutil.copy2(cached, destination / name))
 
 
+def app_layout() -> Tuple[Path, Path, Path]:
+    """(the app, the folder PyInstaller unpacks to, the folder for the licences).
+
+    The Mac app keeps its code in Contents/Frameworks and its data files in
+    Contents/Resources, where PyInstaller links each file into Frameworks too.
+    """
+    if sys.platform == "darwin":
+        return MAC_APP, MAC_APP / "Contents" / "Frameworks", MAC_APP / "Contents" / "Resources"
+    return APP_DIR, APP_DIR / "_internal", APP_DIR
+
+
 def check_app_folder(release: bool) -> None:
     """Fail now, not on a field PC, when something the app loads is missing."""
-    internal = APP_DIR / "_internal"
+    root, internal, documents = app_layout()
     bundled_defaults = internal / "sl_installer" / "resources" / FIELD_DEFAULTS.name
     if bundled_defaults.exists() != release:
         raise SystemExit(f"A {'release' if release else 'TEST'} build must "
@@ -329,19 +421,162 @@ def check_app_folder(release: bool) -> None:
         internal / "esptool" / "targets" / "stub_flasher" / "1" / "esp32s3.json",
         internal / "espefuse" / "efuse_defs" / "esp32s3.yaml",
         internal / "certifi" / "cacert.pem",
-        APP_DIR / "EULA.txt",
-        APP_DIR / "THIRD-PARTY-NOTICES.txt",
+        documents / "EULA.txt",
+        documents / "THIRD-PARTY-NOTICES.txt",
     ]
     if sys.platform == "win32":
         required += [APP_DIR / f"{APP_NAME}.exe",
                      internal / "PySide6" / "plugins" / "platforms" / "qwindows.dll"]
+    elif sys.platform == "darwin":
+        plugins = internal / "PySide6" / "Qt" / "plugins"
+        required += [MAC_APP / "Contents" / "MacOS" / APP_NAME,
+                     MAC_APP / "Contents" / "Info.plist",
+                     documents / "app.icns",
+                     plugins / "platforms" / "libqcocoa.dylib",
+                     plugins / "platforms" / "libqoffscreen.dylib",
+                     plugins / "styles" / "libqmacstyle.dylib"]
     elif sys.platform.startswith("linux"):
         required += [APP_DIR / APP_NAME,
                      internal / "PySide6" / "Qt" / "plugins" / "platforms" / "libqoffscreen.so"]
-    missing = [str(path.relative_to(APP_DIR)) for path in required if not path.is_file()]
+    missing = [str(path.relative_to(root)) for path in required if not path.is_file()]
     if missing:
         raise SystemExit("The app folder is missing:\n  " + "\n  ".join(missing))
-    print(f"App folder checked: {sum(1 for p in APP_DIR.rglob('*') if p.is_file())} files.")
+    print(f"App folder checked: {sum(1 for p in root.rglob('*') if p.is_file())} files.")
+
+
+# ------------------------------------------------------------------- macOS
+
+THIN_HEADS = (b"\xcf\xfa\xed\xfe", b"\xce\xfa\xed\xfe")  # 64-bit and 32-bit Mach-O
+FAT_HEADS = (b"\xca\xfe\xba\xbe", b"\xca\xfe\xba\xbf")  # universal, 32- and 64-bit offsets
+CPU_TYPES = {0x0100000C: "arm64", 0x01000007: "x86_64", 0x00000007: "i386"}
+LC_VERSION_MIN_MACOSX = 0x24
+LC_BUILD_VERSION = 0x32
+PLATFORM_MACOS = 1
+
+
+def _thin_macho(data: bytes) -> Optional[Dict[str, Optional[Tuple[int, int]]]]:
+    if len(data) < 28 or data[:4] not in THIN_HEADS:
+        return None
+    cpu_type, _, _, commands, _, _ = struct.unpack_from("<IiIIII", data, 4)
+    offset = 32 if data[0] == 0xCF else 28
+    minimum = None
+    for _ in range(commands):
+        if offset + 16 > len(data):
+            return None
+        command, size = struct.unpack_from("<II", data, offset)
+        if command == LC_BUILD_VERSION:
+            platform, version = struct.unpack_from("<II", data, offset + 8)
+            if platform == PLATFORM_MACOS:
+                minimum = version
+        elif command == LC_VERSION_MIN_MACOSX:
+            (minimum,) = struct.unpack_from("<I", data, offset + 8)
+        if size < 8:
+            return None
+        offset += size
+    version = None if minimum is None else (minimum >> 16, (minimum >> 8) & 0xFF)
+    return {CPU_TYPES.get(cpu_type, hex(cpu_type)): version}
+
+
+def macho_slices(data: bytes) -> Optional[Dict[str, Optional[Tuple[int, int]]]]:
+    """{architecture: the oldest macOS it runs on (major, minor), or None if it
+    does not say} for each slice of a Mach-O file; None for any other file."""
+    if data[:4] not in FAT_HEADS:
+        return _thin_macho(data)
+    if len(data) < 8:
+        return None
+    wide = data[3] == 0xBF
+    (count,) = struct.unpack_from(">I", data, 4)
+    # Java class files start with the same bytes, followed by their version.
+    if not 0 < count < 32 or 8 + (32 if wide else 20) * count > len(data):
+        return None
+    slices: Dict[str, Optional[Tuple[int, int]]] = {}
+    for index in range(count):
+        if wide:
+            _, _, offset, size, _, _ = struct.unpack_from(">IIQQII", data, 8 + 32 * index)
+        else:
+            _, _, offset, size, _ = struct.unpack_from(">IIIII", data, 8 + 20 * index)
+        thin = _thin_macho(data[offset:offset + size])
+        if thin is None:
+            return None
+        slices.update(thin)
+    return slices
+
+
+def check_macos_binaries(app: Path) -> None:
+    """Every program file in the app must run on Apple Silicon with the oldest
+    macOS that Info.plist promises (LSMinimumSystemVersion)."""
+    oldest = tuple(int(part) for part in MACOS_MINIMUM.split("."))
+    problems, checked = [], 0
+    for path in sorted(app.rglob("*")):
+        if path.is_symlink() or not path.is_file():
+            continue
+        with path.open("rb") as handle:
+            if handle.read(4) not in THIN_HEADS + FAT_HEADS:
+                continue
+        slices = macho_slices(path.read_bytes())
+        if slices is None:
+            continue
+        checked += 1
+        name = path.relative_to(app)
+        if "arm64" not in slices:
+            problems.append(f"{name} has no Apple Silicon code ({', '.join(sorted(slices))})")
+        elif slices["arm64"] and slices["arm64"] > oldest:
+            problems.append(f"{name} needs macOS {slices['arm64'][0]}.{slices['arm64'][1]}")
+    if problems:
+        raise SystemExit(f"These files break LSMinimumSystemVersion {MACOS_MINIMUM} or "
+                         "Apple Silicon:\n  " + "\n  ".join(problems))
+    print(f"{checked} program files run on Apple Silicon with macOS {MACOS_MINIMUM} or newer.")
+
+
+def check_info_plist(version: str) -> None:
+    import plistlib
+
+    with (MAC_APP / "Contents" / "Info.plist").open("rb") as handle:
+        info = plistlib.load(handle)
+    wrong = sorted(key for key, value in macos_info(version).items() if info.get(key) != value)
+    if wrong or info.get("CFBundleExecutable") != APP_NAME:
+        raise SystemExit(f"Info.plist has other values for {wrong or ['CFBundleExecutable']}")
+    print(f"Info.plist checked: {BUNDLE_ID} {version}, macOS {MACOS_MINIMUM} or newer.")
+
+
+def sign_app() -> None:
+    """Sign the finished app ad hoc. PyInstaller signed its parts, but the
+    licences added afterwards would break the seal over Contents/Resources."""
+    subprocess.run(["codesign", "--force", "--sign", "-", str(MAC_APP)], check=True,
+                   env=clean_environment())
+    subprocess.run(["codesign", "--verify", "--deep", "--strict", str(MAC_APP)], check=True,
+                   env=clean_environment())
+    print(f"Signed ad hoc: {MAC_APP.name}")
+
+
+def dmg_name(version: str, release: bool) -> str:
+    return f"{DMG_PREFIX}{version}-macOS-arm64{'' if release else '-TEST'}.dmg"
+
+
+def build_dmg(version: str, release: bool) -> Path:
+    """A compressed disk image with the app and a link to Applications, so the
+    person drags one onto the other."""
+    staging = BUILD / "dmg"
+    shutil.rmtree(staging, ignore_errors=True)
+    staging.mkdir(parents=True)
+    # ditto keeps the app's links, permissions and signature exactly.
+    subprocess.run(["ditto", str(MAC_APP), str(staging / MAC_APP.name)], check=True,
+                   env=clean_environment())
+    (staging / "Applications").symlink_to("/Applications")
+    dmg = DIST / dmg_name(version, release)
+    volume = f"{APP_NAME} {version}{'' if release else ' TEST'}"
+    command = ["hdiutil", "create", "-volname", volume, "-srcfolder", str(staging),
+               "-fs", "HFS+", "-format", "UDZO", "-imagekey", "zlib-level=9", "-ov", str(dmg)]
+    # hdiutil sometimes answers "Resource busy" on a busy machine; try again.
+    for attempt in range(1, 4):
+        if subprocess.run(command, env=clean_environment()).returncode == 0:
+            break
+        if attempt == 3:
+            raise SystemExit(f"hdiutil could not make {dmg.name}")
+        time.sleep(10 * attempt)
+    subprocess.run(["hdiutil", "verify", "-quiet", str(dmg)], check=True, env=clean_environment())
+    shutil.rmtree(staging)
+    return dmg
 
 
 # ---------------------------------------------------------------- installer
@@ -386,11 +621,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--release", action="store_true",
                         help="fail unless the field defaults secrets are set")
     parser.add_argument("--no-installer", action="store_true",
-                        help="stop after the app folder (automatic outside Windows)")
+                        help="stop after the app folder (automatic outside Windows and macOS)")
     options = parser.parse_args(argv)
 
     BUILD.mkdir(parents=True, exist_ok=True)
-    for old in list(DIST.glob(f"{SETUP_PREFIX}*.exe")) + [DIST / "SHA256SUMS.txt"]:
+    for old in (list(DIST.glob(f"{SETUP_PREFIX}*.exe")) + list(DIST.glob(f"{DMG_PREFIX}*.dmg"))
+                + [DIST / "SHA256SUMS.txt"]):
         if old.is_file():
             old.unlink()
     version = app_version()
@@ -401,6 +637,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         make_branding()
         step("Version resource and third-party notices")
         write_version_info(version, release)
+        if sys.platform == "darwin":
+            write_macos_info(version)
         import notices
 
         notices.write_notices(BUILD / "THIRD-PARTY-NOTICES.txt", version, RUNTIME_LOCK)
@@ -410,18 +648,28 @@ def main(argv: Optional[List[str]] = None) -> int:
         # The bundle has its copy; do not leave release values in the source tree.
         FIELD_DEFAULTS.unlink(missing_ok=True)
     step("Licences and source code")
-    shutil.copy2(PACKAGING / "EULA.txt", APP_DIR / "EULA.txt")
-    shutil.copy2(BUILD / "THIRD-PARTY-NOTICES.txt", APP_DIR / "THIRD-PARTY-NOTICES.txt")
-    print(f"Passed on {esptool_source(APP_DIR / 'licenses').name}")
+    root, _, documents = app_layout()
+    shutil.copy2(PACKAGING / "EULA.txt", documents / "EULA.txt")
+    shutil.copy2(BUILD / "THIRD-PARTY-NOTICES.txt", documents / "THIRD-PARTY-NOTICES.txt")
+    print(f"Passed on {esptool_source(documents / 'licenses').name}")
+    if sys.platform == "darwin":
+        step("Signature")
+        sign_app()
+        check_info_plist(version)
+        check_macos_binaries(MAC_APP)
     check_app_folder(release)
 
-    if options.no_installer or sys.platform != "win32":
-        print(f"\nApp folder ready (no installer on {sys.platform}): {APP_DIR}")
+    if options.no_installer or sys.platform not in ("win32", "darwin"):
+        print(f"\nApp folder ready (no installer on {sys.platform}): {root}")
         return 0
-    step("Inno Setup")
-    setup = build_installer(version, release)
-    sums = write_checksums([setup])
-    print(f"\n{'Release' if release else 'TEST'} installer: {setup}\nChecksums: {sums}")
+    if sys.platform == "darwin":
+        step("Disk image")
+        package = build_dmg(version, release)
+    else:
+        step("Inno Setup")
+        package = build_installer(version, release)
+    sums = write_checksums([package])
+    print(f"\n{'Release' if release else 'TEST'} installer: {package}\nChecksums: {sums}")
     return 0
 
 
