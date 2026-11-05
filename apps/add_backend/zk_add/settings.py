@@ -183,6 +183,12 @@ class AddSettings(BaseSettings):
     ords_timeout_seconds: int = 20
     ords_delivery_batch_size: int = 100
     ords_delivery_concurrency: int = 8
+    # Administrator force-released punches each need an Oracle content check
+    # before their POST, which can take tens of seconds. A delivery batch takes
+    # at most this many of them and checks them in parallel, so live punches in
+    # the next batch never wait behind a long run of forced ones.
+    ords_forced_batch_size: int = 8
+    ords_forced_concurrency: int = 8
     ords_firmware_audit_batch_size: int = 500
     ords_membership_reverify_seconds: int = 24 * 60 * 60
 

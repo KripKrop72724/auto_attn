@@ -79,6 +79,8 @@ ORDS_DELIVERY_CONCURRENCY = max(
     1,
     min(settings.ords_delivery_concurrency, ORDS_DELIVERY_BATCH_SIZE),
 )
+ORDS_FORCED_BATCH_SIZE = max(1, min(settings.ords_forced_batch_size, 64))
+ORDS_FORCED_CONCURRENCY = max(1, min(settings.ords_forced_concurrency, ORDS_FORCED_BATCH_SIZE))
 ORDS_FIRMWARE_AUDIT_BATCH_SIZE = max(
     1,
     min(settings.ords_firmware_audit_batch_size, 500),
@@ -860,8 +862,19 @@ def fair_ords_candidate_order(
     return [*priority, *history]
 
 
-def claim_ords_batch(limit: int) -> list[tuple[int, dict, int, bool]]:
+def claim_ords_batch(
+    limit: int, forced_limit: int | None = None
+) -> list[tuple[int, dict, int, bool]]:
+    """Claim up to ``limit`` rows, of which at most ``forced_limit`` are forced releases.
+
+    A forced release waits for an Oracle content check before its POST, and the
+    whole batch waits for its slowest claim. Unclaimed forced rows stay PENDING
+    for the next batch, so live punches are never queued behind a long run of
+    them (4 Nov 2026: 85 forced claims on one slot stalled live delivery).
+    """
     claims: list[tuple[int, dict, int, bool]] = []
+    forced_cap = ORDS_FORCED_BATCH_SIZE if forced_limit is None else max(0, forced_limit)
+    forced_claimed = 0
     with session_scope() as session:
         now = utc_now()
         # A process interruption after claiming a row must not strand it in
@@ -1006,6 +1019,9 @@ def claim_ords_batch(limit: int) -> list[tuple[int, dict, int, bool]]:
                     row.last_error = "The approved punch changed or its user/CNIC is unavailable."
                     row.next_attempt_at = None
                     continue
+                if forced_claimed >= forced_cap:
+                    continue  # Stays PENDING for a later batch.
+                forced_claimed += 1
                 row.status = "IN_FLIGHT"
                 row.attempt_count += 1
                 row.last_attempt_at = now
@@ -1080,6 +1096,9 @@ def claim_ords_batch(limit: int) -> list[tuple[int, dict, int, bool]]:
                     row.last_error = "The approved identity or source changed. Review this forced release."
                     row.next_attempt_at = None
                     continue
+                if forced_claimed >= forced_cap:
+                    continue  # Stays PENDING for a later batch.
+                forced_claimed += 1
             row.status = "IN_FLIGHT"
             row.attempt_count += 1
             row.last_attempt_at = now
@@ -1941,19 +1960,21 @@ async def deliver_ords_batch(
         claims, journal = await asyncio.to_thread(split_zkt_claims, claims)
         from zk_add.attendance_force_delivery import split_claims, deliver_forced
         claims, forced = await asyncio.to_thread(split_claims, claims)
-        # Reserve service for live claims while slow content verification runs.
-        # Each lane commits its receipts independently of the other's network wait.
-        if forced and (claims or journal) and concurrency > 1:
-            background_slots = min(4, max(1, concurrency // 5))
+        # Live claims keep their full concurrency while the (few, capped)
+        # forced claims run their slow content checks in parallel beside them.
+        # Each lane commits its receipts independently of the other's network
+        # wait; the next batch waits only for the slowest single forced claim.
+        forced_slots = max(1, min(len(forced), ORDS_FORCED_CONCURRENCY))
+        if forced and (claims or journal):
             await asyncio.gather(
-                _deliver_priority_claims(claims, journal, concurrency=concurrency - background_slots, limit=limit),
-                deliver_forced(forced, concurrency=background_slots),
+                _deliver_priority_claims(claims, journal, concurrency=concurrency, limit=limit),
+                deliver_forced(forced, concurrency=forced_slots),
             )
         else:
             if claims or journal:
                 await _deliver_priority_claims(claims, journal, concurrency=concurrency, limit=limit)
             if forced:
-                await deliver_forced(forced, concurrency=concurrency)
+                await deliver_forced(forced, concurrency=forced_slots)
 
 
 async def _deliver_priority_claims(claims, journal, *, concurrency, limit):

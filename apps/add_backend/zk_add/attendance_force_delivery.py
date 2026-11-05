@@ -307,7 +307,7 @@ def persist_result(claim, classification, token=None, error_code=None, matched_e
 async def deliver_forced(claims, *, concurrency):
     from zk_add.worker import event_uid_is_valid
 
-    semaphore = asyncio.Semaphore(max(1, min(concurrency, 4)))
+    semaphore = asyncio.Semaphore(max(1, min(concurrency, 64)))
 
     async def one(claim):
         classification, token, code = "UNKNOWN", None, None
