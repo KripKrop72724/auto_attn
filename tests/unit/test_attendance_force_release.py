@@ -921,3 +921,28 @@ def test_forced_lane_lets_every_check_finish_before_raising(monkeypatch):
     asyncio.run(scenario())
     # The slower sibling still completed before the error reached the caller.
     assert finished == [2]
+
+
+def test_forced_rate_defaults_and_production_overrides_are_wired():
+    from pathlib import Path
+
+    import yaml
+
+    from zk_add.settings import AddSettings
+
+    fields = AddSettings.model_fields
+    assert fields["ords_forced_batch_size"].default == 8
+    assert fields["ords_forced_concurrency"].default == 8
+    root = Path(__file__).resolve().parents[2]
+    workflow = yaml.safe_load((root / ".github/workflows/add-deploy.yml").read_text(encoding="utf-8"))
+    deploy_jobs = [job for job in workflow["jobs"].values()
+                   if "ADD_DEPLOY_ORDS_PASSWORD" in job.get("env", {})]
+    assert deploy_jobs
+    deploy = (root / "deploy/add/deploy.ps1").read_text(encoding="utf-8")
+    for suffix, limits in (("ORDS_FORCED_BATCH_SIZE", "@(0, 64)"), ("ORDS_FORCED_CONCURRENCY", "@(1, 64)")):
+        for job in deploy_jobs:
+            assert job["env"][f"ADD_DEPLOY_{suffix}"] == "${{ vars.ADD_" + suffix + " }}"
+            # Compose prefers the process environment, even empty, to .env.add.
+            assert f"ADD_{suffix}" not in job["env"]
+        assert f'"{suffix}" = {limits}' in deploy
+    assert '$environment["ADD_$forcedSuffix"] = [string]$parsedNumber' in deploy

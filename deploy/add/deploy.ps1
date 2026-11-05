@@ -592,6 +592,26 @@ if (-not [string]::IsNullOrWhiteSpace($env:ADD_DEPLOY_RECONCILIATION_SELF_HEALIN
 if (-not [string]::IsNullOrWhiteSpace($env:ADD_DEPLOY_RECONCILIATION_DEVICE_CONCURRENCY)) {
     $environment["ADD_RECONCILIATION_DEVICE_CONCURRENCY"] = $env:ADD_DEPLOY_RECONCILIATION_DEVICE_CONCURRENCY
 }
+# Forced-release delivery rate (settings.py ords_forced_*). Batch size 0 pauses
+# forced delivery; live delivery is never affected by either value.
+$forcedRateLimits = [ordered]@{
+    "ORDS_FORCED_BATCH_SIZE" = @(0, 64)
+    "ORDS_FORCED_CONCURRENCY" = @(1, 64)
+}
+foreach ($forcedSuffix in $forcedRateLimits.Keys) {
+    $deployValue = [Environment]::GetEnvironmentVariable("ADD_DEPLOY_$forcedSuffix")
+    if ([string]::IsNullOrWhiteSpace($deployValue)) {
+        continue
+    }
+    $parsedNumber = 0
+    $limits = $forcedRateLimits[$forcedSuffix]
+    if ($deployValue.Trim() -cnotmatch '^[0-9]{1,2}$' -or
+        -not [int]::TryParse($deployValue.Trim(), [ref]$parsedNumber) -or
+        $parsedNumber -lt $limits[0] -or $parsedNumber -gt $limits[1]) {
+        throw "ADD_DEPLOY_$forcedSuffix must be a whole number from $($limits[0]) to $($limits[1])."
+    }
+    $environment["ADD_$forcedSuffix"] = [string]$parsedNumber
+}
 # Database capacity (docs/production-runbook.md, "Database capacity"). The
 # sizes shipped in .env.add.example before November 2026 are dropped so the
 # current docker-compose.add.yml and settings.py defaults apply; any other
