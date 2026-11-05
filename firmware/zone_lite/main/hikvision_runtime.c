@@ -114,10 +114,18 @@ static uint32_t poll_delay_ms(int64_t elapsed_us)
 }
 /* 3.1.6 failure back-off. 3.1.5 retried a failed events read 250 ms after a
  * slow poll, so a slow terminal (Mirpur-02, DS-K1T342MFWX-E1 V4.38.0) that had
- * already timed out was hit again at once and never recovered. After
- * consecutive network/authentication failures, or failures while reading
- * events, the next poll waits 2, 5, 15, 30 and then 60 s; one good poll
- * restores the 2 s cadence. Other failures keep the normal cadence. */
+ * already timed out was hit again at once and never recovered. Its failures
+ * were HIK_NETWORK (timeouts) and HIK_AUTH (401 on a saturated Digest round),
+ * the two results that mean "the terminal is not answering properly". After
+ * consecutive such failures, at any stage, the next poll waits 2, 5, 15, 30
+ * and then 60 s; one good poll restores the 2 s cadence.
+ *
+ * Deterministic rejects (HIK_PARSE, HIK_OVERSIZED, HIK_BINDING, HIK_CUSTODY,
+ * HIK_HTTP_STATUS, ...) say nothing about terminal load and keep the normal
+ * 2 s / 250 ms cadence: the background workers (ADD history assignments, the
+ * light audit, profile-command user scans) get one slot per poll, so backing
+ * off there would slow a history backfill or a REFRESH_USERS ~30x while the
+ * terminal is perfectly reachable. They neither add to nor reset the count. */
 static const uint32_t poll_backoff_steps_ms[] = {2000, 5000, 15000, 30000, 60000};
 static uint32_t poll_backoff_ms(unsigned failing)
 {
@@ -125,16 +133,16 @@ static uint32_t poll_backoff_ms(unsigned failing)
     if (!failing) return 0;
     return poll_backoff_steps_ms[failing < steps ? failing - 1 : steps - 1];
 }
-static bool poll_backs_off(hik_result_t result, unsigned stage)
+static bool poll_backs_off(hik_result_t result)
 {
-    return result != HIK_OK && (stage == 3 || result == HIK_NETWORK || result == HIK_AUTH);
+    return result == HIK_NETWORK || result == HIK_AUTH;
 }
 /* Delay before the next poll; *failing counts consecutive back-off failures. */
-static uint32_t poll_next_delay_ms(int64_t elapsed_us, hik_result_t result, unsigned stage, unsigned *failing)
+static uint32_t poll_next_delay_ms(int64_t elapsed_us, hik_result_t result, unsigned *failing)
 {
     uint32_t delay = poll_delay_ms(elapsed_us);
     if (result == HIK_OK) { *failing = 0; return delay; }
-    if (!poll_backs_off(result, stage)) return delay;
+    if (!poll_backs_off(result)) return delay;
     if (*failing < 1000) ++*failing;
     uint32_t backoff = poll_backoff_ms(*failing);
     return backoff > delay ? backoff : delay;
@@ -405,17 +413,26 @@ static hik_result_t window_count(poll_request_t *req, const char *name, unsigned
  *   probe is one short and the second is exact: 3 searches.
  * Each probe sits at the lowest end the counts so far allow, so a probe that
  * holds target events is the smallest such end. Only a sparse range (deleted
- * or skipped serials) goes past POLL_WINDOW_PROBES; it then gallops upward
- * and bisects between the last short probe and the first full one, never from
- * 3e9, within POLL_WINDOW_SEARCHES searches in all.
+ * or skipped serials) goes past POLL_WINDOW_PROBES; it then gallops upward at
+ * most POLL_WINDOW_GALLOP steps and bisects between the last short end and the
+ * first full one (or 3e9), never from 3e9 when the gallop found a full end.
  *
- * Should the window ever end above the smallest such serial (the search cap,
- * or a count that moved between searches), it holds more than target events
- * and new punches may land inside it during the read. The range read then
- * sees its total change and rejects the read (total_changed): the checkpoint
- * stays where it was and the next poll retries. It never loses custody. */
+ * The bisection always runs to hi - lo == 1, with no search cap: a capped
+ * search that stopped early would return an end far above the smallest one
+ * (e.g. a serial gap of 1e9 above the anchor), the window could then exceed
+ * POLL_RANGE_MAX_PAGES pages and every poll would fail HIK_OVERSIZED for good.
+ * A uint32 range bisects in at most 32 steps, so a poll makes at most
+ * 1 + POLL_WINDOW_PROBES + POLL_WINDOW_GALLOP + 32 = 44 searches even in the
+ * worst sparse case (3.1.5's bound), and 2-3 in the dense common case.
+ *
+ * Should the window still end above the smallest such serial (a count that
+ * moved between searches), it holds at most a few more than target events and
+ * new punches may land inside it during the read. The range read then sees its
+ * total change and rejects the read (total_changed): the checkpoint stays
+ * where it was and the next poll retries with fresh counts. It never loses
+ * custody. */
 #define POLL_WINDOW_PROBES 3
-#define POLL_WINDOW_SEARCHES 40
+#define POLL_WINDOW_GALLOP 8
 static hik_result_t poll_window_end(uint32_t from, uint32_t *end, poll_request_t *req)
 {
     const uint32_t top = 3000000000U;
@@ -435,10 +452,11 @@ static hik_result_t poll_window_end(uint32_t from, uint32_t *end, poll_request_t
         lo = (uint32_t)probe; short_by = target - in_window;
         probe += short_by;
     }
-    /* Sparse serials: gallop up from the last short probe, then bisect. */
+    /* Sparse serials: a bounded gallop up from the last short probe, then a
+     * bisection that always converges (hi is top if the gallop found none). */
     unsigned step_index = 0;
     uint64_t step = (uint64_t)short_by * 2;
-    while (hi == top && req->searches < POLL_WINDOW_SEARCHES) {
+    for (unsigned gallop = 0; gallop < POLL_WINDOW_GALLOP && hi == top; gallop++) {
         uint64_t candidate = (uint64_t)lo + step;
         if (candidate >= top) break;
         uint32_t in_window = 0;
@@ -447,7 +465,7 @@ static hik_result_t poll_window_end(uint32_t from, uint32_t *end, poll_request_t
         if (in_window >= target) hi = (uint32_t)candidate;
         else { lo = (uint32_t)candidate; step *= 2; }
     }
-    while (hi - lo > 1 && req->searches < POLL_WINDOW_SEARCHES) {
+    while (hi - lo > 1) {
         uint32_t mid = lo + (hi - lo) / 2, in_window = 0;
         result = window_count(req, "bisect", ++step_index, from, mid, &in_window);
         if (result != HIK_OK) return result;
@@ -619,9 +637,10 @@ static void poll_task(void *arg)
         atomic_store(&poll_tick, (uint32_t)(esp_timer_get_time() / 1000));
         background_slot = true;
         xSemaphoreGive(request_lock);
-        uint32_t delay_ms = poll_next_delay_ms(esp_timer_get_time() - started, result, stage, &backoff_failures);
-        /* The audit and history workers keep their one slot per poll. Waiting
-         * out a back-off is a live poll task, so the boot-health / OTA tick
+        uint32_t delay_ms = poll_next_delay_ms(esp_timer_get_time() - started, result, &backoff_failures);
+        /* The audit and history workers keep their one slot per poll; only a
+         * load failure (network/auth) stretches that. Waiting out a back-off
+         * is a live poll task, so the boot-health / OTA tick
          * stays fresh while the terminal is left alone. */
         while (delay_ms) {
             uint32_t slice = delay_ms > 1000 ? 1000 : delay_ms;
