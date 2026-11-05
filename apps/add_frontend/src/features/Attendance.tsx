@@ -130,17 +130,7 @@ function AllAttendanceEvents({
   rowsRef.current = rows
   const [pendingRows, setPendingRows] = useState<AttendanceEvent[]>([])
   const [nextCursor, setNextCursor] = useState<number | null>(null)
-  // The Fleet tile links here with ?unknown_synced=1 to open that section.
-  const [filters, setFilters] = useState<AttendanceFilters>(() => (
-    new URLSearchParams(window.location.search).get('unknown_synced') ? { ...emptyFilters, unknown_synced: 'true' } : emptyFilters
-  ))
-  useEffect(() => {
-    const params = new URLSearchParams(window.location.search)
-    if (!params.has('unknown_synced')) return
-    params.delete('unknown_synced')
-    const rest = params.toString()
-    window.history.replaceState(window.history.state, '', `${window.location.pathname}${rest ? `?${rest}` : ''}`)
-  }, [])
+  const [filters, setFilters] = useState<AttendanceFilters>(emptyFilters)
   const [pageSize, setPageSize] = useState(100)
   const [selected, setSelected] = useState<Map<number, AttendanceEvent>>(new Map())
   const [singleSendRequest, setSingleSendRequest] = useState(0)

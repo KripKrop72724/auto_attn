@@ -7,8 +7,6 @@ import { UnknownIdentityAutoRelease } from './UnknownIdentityAutoRelease'
 export type UnknownSyncedSummary = {
   count: number
   devices: Array<{ connector_id: string; display_name: string; zone_id: string; count: number }>
-  event_ids: number[]
-  truncated: boolean
 }
 type QuickRun = {
   job_id: string; selected: number; ready: number; skipped: number;
@@ -48,6 +46,10 @@ const skipLabel = (code: string) => SKIP_TEXT[code] || humanizeStatus(code).toLo
  * one-shot "Release all now"); a manual selection is still sent from here. No
  * reason or password: ADD's direct send checks still run per punch, and
  * anything that needs a person stays held for the per-punch "Send to ORDS".
+ *
+ * The switch and its progress always show: they read only the worker's saved
+ * counts. The heavy live filter (and its count) runs only when the operator
+ * turns the filter on.
  */
 export function UnknownSyncedRelease({ active, onToggle, selectedIds, clearSelection, refresh, toast }: {
   active: boolean; onToggle: () => void; selectedIds: number[]; clearSelection: () => void; refresh: () => void;
@@ -60,7 +62,7 @@ export function UnknownSyncedRelease({ active, onToggle, selectedIds, clearSelec
   const load = useCallback(async () => {
     try {
       const value = await api<UnknownSyncedSummary>(`${root}/unknown-synced`)
-      setSummary({ ...value, event_ids: Array.isArray(value.event_ids) ? value.event_ids : [], devices: Array.isArray(value.devices) ? value.devices : [] })
+      setSummary({ count: typeof value.count === 'number' ? value.count : 0, devices: Array.isArray(value.devices) ? value.devices : [] })
       setError('')
     } catch (failure) { setError(failure instanceof Error ? failure.message : 'ADD could not count these punches.') }
   }, [])
@@ -112,7 +114,7 @@ export function UnknownSyncedRelease({ active, onToggle, selectedIds, clearSelec
       </div>}
     </div>
     {active && summary && summary.devices.length > 0 && <p className="attendance-unknown-synced-devices">{summary.devices.slice(0, 8).map((device) => `${device.display_name}: ${device.count.toLocaleString()}`).join(' · ')}{summary.devices.length > 8 ? ` · and ${summary.devices.length - 8} more devices` : ''}</p>}
-    {active && <UnknownIdentityAutoRelease toast={toast} onChanged={refresh} />}
+    <UnknownIdentityAutoRelease toast={toast} onChanged={refresh} />
     {error && <p className="message pattern-blocked" role="alert">{error}</p>}
     {outcome && <div className="attendance-direct-progress" role="status" aria-live="polite">
       <div className="attendance-direct-counts"><span><strong>{outcome.sent.toLocaleString()}</strong> queued for Oracle</span><span><strong>{outcome.skipped.toLocaleString()}</strong> skipped</span>{outcome.notMatching > 0 && <span><strong>{outcome.notMatching.toLocaleString()}</strong> already released</span>}</div>

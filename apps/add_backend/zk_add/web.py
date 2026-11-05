@@ -758,13 +758,21 @@ def list_direct_ords_runs(
     return {"rows": [direct_ords.serialize(db, row) for row in rows]}
 
 
-# The ledger's "select all" covers this many punches; larger backlogs release in rounds.
+# With ?ids=true the summary also lists up to this many punch IDs, newest first.
 UNKNOWN_SYNCED_ID_LIMIT = 10_000
 
 
 @app.get("/api/v2/attendance-direct-ords/unknown-synced")
-def unknown_synced_summary(auth: tuple[Session, AdminContext] = Depends(require_admin)):
-    """Count and IDs of held "Unknown identity · CNIC on synced user" punches."""
+def unknown_synced_summary(
+    ids: bool = Query(default=False),
+    auth: tuple[Session, AdminContext] = Depends(require_admin),
+):
+    """Count per device of held "Unknown identity · CNIC on synced user" punches.
+
+    Releasing all of them is server-side (attendance_unknown_auto_release), so
+    the sorted ID list is read only on request: it is a second full pass of
+    the filter.
+    """
     db, _context = auth
     condition = unknown_synced_cnic_expression()
     devices = db.execute(
@@ -775,7 +783,7 @@ def unknown_synced_summary(auth: tuple[Session, AdminContext] = Depends(require_
         .order_by(func.count(AttendanceEvent.id).desc())
     ).all()
     total = sum(row[3] for row in devices)
-    event_ids = direct_ords.unknown_synced_event_ids(db, limit=UNKNOWN_SYNCED_ID_LIMIT)
+    event_ids = direct_ords.unknown_synced_event_ids(db, limit=UNKNOWN_SYNCED_ID_LIMIT) if ids else []
     return {
         "count": total,
         "devices": [
@@ -783,7 +791,7 @@ def unknown_synced_summary(auth: tuple[Session, AdminContext] = Depends(require_
             for connector_id, name, zone_id, count in devices
         ],
         "event_ids": event_ids,
-        "truncated": total > len(event_ids),
+        "truncated": ids and total > len(event_ids),
     }
 
 

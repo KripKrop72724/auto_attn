@@ -23,6 +23,8 @@ export type AutoReleaseStatus = {
   drain_requested_at: string | null
   drain_requested_by: string | null
   drain_completed_at: string | null
+  /** After a full pass: older held punches are read again from then (new ones meanwhile). */
+  resting_until: string | null
   backlog: { count: number | null; counted_at: string | null; remaining_estimate: number | null }
   progress: {
     ready: number
@@ -81,6 +83,7 @@ export function normalizeAutoReleaseStatus(raw: unknown): AutoReleaseStatus | nu
     drain_requested_at: text(value.drain_requested_at),
     drain_requested_by: text(value.drain_requested_by),
     drain_completed_at: text(value.drain_completed_at),
+    resting_until: text(value.resting_until),
     backlog: {
       count: maybeNumber(backlog.count),
       counted_at: text(backlog.counted_at),

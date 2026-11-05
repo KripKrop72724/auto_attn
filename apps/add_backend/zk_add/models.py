@@ -2387,9 +2387,16 @@ class UnknownIdentityAutoRelease(Base):
     scan_cursor_id: Mapped[int | None] = mapped_column(Integer)
     scan_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     scan_idle_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # While resting after an empty pass: only punches above this ID are read.
+    idle_head_id: Mapped[int | None] = mapped_column(Integer)
+    # Any read of held punches (batch or not); paces scans like batches.
+    last_scan_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     # Computed by the worker at most every count interval, never per request.
     backlog_count: Mapped[int | None] = mapped_column(Integer)
     backlog_counted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Last count started (successful or not) and failures in a row: the gate and its back-off.
+    count_attempted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    count_failures: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
     stats: Mapped[dict] = mapped_column(JSON, default=dict)
     stats_counted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_batch_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

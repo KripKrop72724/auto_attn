@@ -554,6 +554,8 @@ describe('State Life ADD interface', () => {
     const tile = await screen.findByRole('button', { name: /Unknown-identity release: OFF\. Turned off by StateHealthAdmin 2 h ago · 108,000 held/ })
     fireEvent.click(tile)
     await waitFor(() => expect(window.location.pathname).toBe('/attendance'))
+    // Plain Attendance: the panel shows there without turning on the heavy filter.
+    expect(window.location.search).toBe('')
   })
 
   it('opens on the Pakistan map and preserves the complete list behind an in-memory toggle', async () => {

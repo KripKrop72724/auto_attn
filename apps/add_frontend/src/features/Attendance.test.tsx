@@ -10,6 +10,7 @@ import type {
 } from '../types'
 import { AttendanceView } from './Attendance'
 import { queryClient } from '../data'
+import { autoReleaseQueryKey } from './unknownAutoRelease'
 import { directSendDecisions } from './DirectOrdsSend'
 import type { DirectOrdsPreviewRow } from '../types'
 
@@ -208,6 +209,9 @@ const releaseJob = (
 
 describe('Live attendance workspace', () => {
   beforeEach(() => {
+    // The automatic-release panel always shows on this page and has its own
+    // tests; a saved "no status" keeps these fetch counts about the ledger.
+    queryClient.setQueryData(autoReleaseQueryKey, null)
     window.history.replaceState(null, '', '/attendance')
     IntersectionObserverStub.instance = null
     vi.stubGlobal('IntersectionObserver', IntersectionObserverStub)
@@ -417,6 +421,7 @@ describe('Live attendance workspace', () => {
   })
 
   it('lists unknown identities with a synced CNIC, shows the server-side automatic release and releases a selection without a reason or password', async () => {
+    queryClient.removeQueries({ queryKey: autoReleaseQueryKey })
     const unknown = (id: number) => event({
       id, event_uid: `unknown-${id}`, display_name: null, cnic_masked: null, ords_status: 'BLOCKED_IDENTITY',
       direct_ords_identity: { eligible: true, cnic_source: 'SYNCED_USER', exclusion: null, punch_time_cnic: 'NONE', cnic_choice_required: true },
@@ -424,7 +429,7 @@ describe('Live attendance workspace', () => {
     const fetchMock = vi.fn(async (path: RequestInfo | URL, init?: RequestInit) => {
       const url = String(path)
       if (url === '/api/v2/attendance-direct-ords/unknown-synced') {
-        return response({ count: 3, devices: [{ connector_id: device.connector_id, display_name: device.display_name, zone_id: 'ZONE-ONE', count: 3 }], event_ids: [12, 11, 10], truncated: false })
+        return response({ count: 3, devices: [{ connector_id: device.connector_id, display_name: device.display_name, zone_id: 'ZONE-ONE', count: 3 }], event_ids: [], truncated: false })
       }
       if (url === '/api/v2/unknown-identity-auto-release') {
         return response({
@@ -444,11 +449,13 @@ describe('Live attendance workspace', () => {
     vi.stubGlobal('fetch', fetchMock)
     render(<AttendanceView {...attendanceProps} />)
     await screen.findByRole('article', { name: /Ayesha Khan/i })
-    expect(fetchMock.mock.calls.some(([path]) => String(path).includes('unknown-synced'))).toBe(false)
-    fireEvent.click(screen.getByRole('button', { name: /Unknown identity · CNIC on synced user/i }))
-    // Releasing all of them is server-side now: the switch and its progress, no browser loop.
+    // Releasing all of them is server-side now: the switch and its progress
+    // show without the heavy filter (they read the worker's saved counts).
     const control = await screen.findByRole('switch', { name: /Automatic release/i })
     expect(control.getAttribute('aria-checked')).toBe('true')
+    expect(fetchMock.mock.calls.some(([path]) => String(path).includes('unknown-synced'))).toBe(false)
+    expect(fetchMock.mock.calls.some(([path]) => String(path).includes('unknown_synced_cnic=true'))).toBe(false)
+    fireEvent.click(screen.getByRole('button', { name: /Unknown identity · CNIC on synced user/i }))
     expect(screen.queryByRole('button', { name: /Release all \d/ })).toBeNull()
     await waitFor(() => expect(fetchMock.mock.calls.some(([path]) => String(path).includes('unknown_synced_cnic=true'))).toBe(true))
     const rows = await screen.findAllByRole('article', { name: /Unknown identity/i })

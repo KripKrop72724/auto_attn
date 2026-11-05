@@ -25,7 +25,7 @@ const REASON_MAX = 500
 
 const errorText = (code: string, at: string) => {
   if (code === 'ADD_BUSY') return `ADD's database was busy ${at}; the next batch tries again by itself.`
-  if (code === 'COUNT_BUSY') return `The backlog count was skipped ${at} because the database was busy; it is counted again within a minute.`
+  if (code === 'COUNT_BUSY') return `The backlog count was skipped ${at} because the database was busy; it is tried again in a minute, and less often while the database stays busy.`
   if (code === 'BATCH_FAILED') return `A batch failed ${at}; the releaser moved on and keeps going.`
   return `The last batch ${at} stopped with “${humanizeStatus(code)}”; the releaser moved on and keeps going.`
 }
@@ -61,10 +61,13 @@ function stateSentence(status: AutoReleaseStatus) {
 export function UnknownIdentityAutoRelease({ toast, onChanged }: { toast?: Toast; onChanged?: () => void }) {
   const query = useUnknownAutoReleaseStatus(true)
   const status = query.data
+  // What the dialog changes: the switch (ON/OFF) or stopping a running Release all while OFF.
   const [target, setTarget] = useState<boolean | null>(null)
+  const [stopDrain, setStopDrain] = useState(false)
   const [starting, setStarting] = useState(false)
   const [failure, setFailure] = useState<OperatorFailure | null>(null)
   const switchRef = useRef<HTMLButtonElement>(null)
+  const stopRef = useRef<HTMLButtonElement>(null)
 
   if (query.isPending) {
     return <p className="unknown-auto-release-loading" role="status">Loading automatic release…</p>
@@ -106,9 +109,10 @@ export function UnknownIdentityAutoRelease({ toast, onChanged }: { toast?: Toast
   const done = progress.confirmed_total
   const share = remaining === null || done + remaining === 0 ? null : Math.round((done / (done + remaining)) * 100)
   const errorAt = status.last_error_at ? formatAgo(secondsSince(status.last_error_at, status.server_time)) : 'recently'
+  const openSwitch = (next: boolean, stopping = false) => { setStopDrain(stopping); setTarget(next) }
 
   return (
-    <section className="unknown-auto-release" aria-labelledby="unknown-auto-release-title" aria-busy={query.isFetching}>
+    <section id="unknown-identity-auto-release" className="unknown-auto-release" aria-labelledby="unknown-auto-release-title" aria-busy={query.isFetching}>
       <header className="unknown-auto-release-head">
         <div className="unknown-auto-release-title">
           <h3 id="unknown-auto-release-title">Automatic release to Oracle</h3>
@@ -124,7 +128,7 @@ export function UnknownIdentityAutoRelease({ toast, onChanged }: { toast?: Toast
             aria-checked={status.enabled}
             aria-describedby="unknown-auto-release-state"
             className="auto-release-switch"
-            onClick={() => setTarget(!status.enabled)}
+            onClick={() => openSwitch(!status.enabled)}
           >
             <span className="auto-release-switch-track" aria-hidden="true"><span /></span>
             <span>Automatic release</span>
@@ -133,6 +137,11 @@ export function UnknownIdentityAutoRelease({ toast, onChanged }: { toast?: Toast
           {!status.enabled && status.allowed && !status.drain_active && (
             <button className="button primary" type="button" disabled={starting} onClick={() => void releaseAll()}>
               <Icon name="refresh" /> {starting ? 'Starting…' : 'Release all now'}
+            </button>
+          )}
+          {!status.enabled && status.drain_active && (
+            <button ref={stopRef} className="button secondary" type="button" onClick={() => openSwitch(false, true)}>
+              <Icon name="pause" /> Stop Release all
             </button>
           )}
         </div>
@@ -145,6 +154,9 @@ export function UnknownIdentityAutoRelease({ toast, onChanged }: { toast?: Toast
       {query.isError && <p className="unknown-auto-release-note attention-copy" role="status">The last refresh failed; showing figures from {formatAgo(secondsSince(status.server_time, null))}.</p>}
       {status.backpressure && status.active && (
         <p className="unknown-auto-release-note" role="status"><Icon name="pause" /> Paused for Oracle: {punchCount(progress.in_flight)} are already waiting (limit {status.in_flight_limit.toLocaleString()}). ADD adds the next batch when Oracle catches up, so live punches keep priority.</p>
+      )}
+      {status.resting_until && status.active && !status.backpressure && (
+        <p className="unknown-auto-release-note" role="status">Every such punch has been checked. ADD reads the older held ones again from {dateTime(status.resting_until)} (when skipped punches may be retried); new punches are still picked up every few seconds.</p>
       )}
       {status.last_error_code && <p className="unknown-auto-release-note attention-copy" role="status"><Icon name="alert" /> {errorText(status.last_error_code, errorAt)}</p>}
 
@@ -205,13 +217,16 @@ export function UnknownIdentityAutoRelease({ toast, onChanged }: { toast?: Toast
       {target !== null && (
         <AutoReleaseSwitchDialog
           target={target}
+          stopDrain={stopDrain}
           status={status}
-          returnFocusRef={switchRef}
+          returnFocusRef={stopDrain ? stopRef : switchRef}
           onClose={() => setTarget(null)}
           onSaved={(value) => {
             storeAutoReleaseStatus(value)
             setTarget(null)
-            toast?.notice(`Automatic release is now ${target ? 'ON' : 'OFF'}. The change was audited.`)
+            toast?.notice(stopDrain
+              ? 'Release all stopped; automatic release stays OFF. The change was audited.'
+              : `Automatic release is now ${target ? 'ON' : 'OFF'}. The change was audited.`)
             onChanged?.()
             void query.refetch()
           }}
@@ -223,12 +238,15 @@ export function UnknownIdentityAutoRelease({ toast, onChanged }: { toast?: Toast
 
 export function AutoReleaseSwitchDialog({
   target,
+  stopDrain = false,
   status,
   onClose,
   onSaved,
   returnFocusRef,
 }: {
   target: boolean
+  /** Switch stays OFF; only the running Release all now stops (sent as enabled=false). */
+  stopDrain?: boolean
   status: AutoReleaseStatus
   onClose: () => void
   onSaved: (status: AutoReleaseStatus | null) => void
@@ -267,7 +285,7 @@ export function AutoReleaseSwitchDialog({
   return (
     <Dialog
       titleId={titleId}
-      title={target ? 'Turn automatic release ON' : 'Turn automatic release OFF'}
+      title={target ? 'Turn automatic release ON' : stopDrain ? 'Stop Release all now' : 'Turn automatic release OFF'}
       description="Needs your administrator password and a written reason. The change is audited."
       onClose={() => { if (!busy) onClose() }}
       className="operator-action-dialog"
@@ -286,10 +304,11 @@ export function AutoReleaseSwitchDialog({
           <div className="message pattern-waiting" role="note">
             <Icon name="alert" />
             <div>
-              <p><strong>ADD stops creating new release batches straight away.</strong></p>
+              <p><strong>ADD stops creating new release batches straight away.</strong> A batch being prepared at this moment is discarded.</p>
               <p>Punches already queued{status.progress.in_flight ? ` (${punchCount(status.progress.in_flight)} now)` : ''} still go to Oracle and are confirmed there. They cannot be unsent.</p>
-              <p>New punches of this kind stay held until this is turned back ON or someone clicks Release all now.</p>
-              {status.drain_active && <p>This also stops the Release all now that is running.</p>}
+              {stopDrain
+                ? <p>This stops the Release all now that is running. Automatic release stays OFF; the rest of these punches stay held until it is turned ON or Release all is started again.</p>
+                : <p>New punches of this kind stay held until this is turned back ON or someone clicks Release all now.</p>}
             </div>
           </div>
         )}
@@ -315,7 +334,7 @@ export function AutoReleaseSwitchDialog({
         <div className="dialog-actions">
           <button type="button" className="button secondary" disabled={busy} onClick={onClose}>Cancel</button>
           <button type="submit" className="button primary" disabled={!canSubmit}>
-            <Icon name="shield" /> {busy ? 'Saving…' : target ? 'Turn ON' : 'Turn OFF'}
+            <Icon name="shield" /> {busy ? 'Saving…' : target ? 'Turn ON' : stopDrain ? 'Stop Release all' : 'Turn OFF'}
           </button>
         </div>
       </form>

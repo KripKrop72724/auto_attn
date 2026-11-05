@@ -127,14 +127,17 @@ def unknown_punches(sessions, count: int) -> list[int]:
 class FakeRelease:
     """Stands in for quick_release: one run whose items get the planned status."""
 
-    def __init__(self, monkeypatch, *, statuses=None, nothing=False):
+    def __init__(self, monkeypatch, *, statuses=None, nothing=False, during=None):
         self.calls: list[list[int]] = []
         self.statuses = statuses or {}
         self.nothing = nothing
+        self.during = during
         monkeypatch.setattr(direct, "quick_release", self)
 
     def __call__(self, session, *, actor, event_ids, idempotency_key):
         self.calls.append(list(event_ids))
+        if self.during is not None:
+            self.during(session)
         if self.nothing:
             raise RecoveryError("gone", "NOTHING_TO_RELEASE")
         statuses = [self.statuses.get(event_id, "READY") for event_id in event_ids]
@@ -337,18 +340,70 @@ def test_skipped_punches_are_not_picked_again_until_the_retry_window(backend, mo
     fake = FakeRelease(monkeypatch, statuses={event_id: "SKIPPED" for event_id in ids})
     now = utc_now()
     assert step(sessions, now) == "BATCH"
-    # Still in the unknown-identity filter, but tried: nothing to pick, and the
-    # releaser rests instead of rescanning every tick.
-    assert step(sessions, now + timedelta(seconds=6)) == "NOTHING_LEFT"
+    # The pass reached the oldest punch. They are still in the unknown-identity
+    # filter, but tried: the releaser rests (reading only newer punches) for
+    # SCAN_REST_SECONDS, not one count interval, instead of rescanning them.
+    rest = auto.ensure_utc(state(sessions).scan_idle_until)
+    assert rest >= now + timedelta(seconds=auto.SCAN_REST_SECONDS)
+    assert step(sessions, now + timedelta(seconds=6)) == "IDLE"
     assert step(sessions, now + timedelta(seconds=12)) == "IDLE"
     assert len(fake.calls) == 1
     with sessions() as db:
         assert direct.unknown_synced_event_ids(db) == sorted(ids, reverse=True)
+        assert auto.status(db, now=now + timedelta(seconds=12))["resting_until"] is not None
         job = db.scalar(select(Job))
         job.created_at = utc_now() - timedelta(hours=25)
         db.commit()
-    assert step(sessions, now + timedelta(seconds=80)) == "BATCH"
+    assert step(sessions, now + timedelta(seconds=80)) == "IDLE"
+    assert len(fake.calls) == 1
+    assert step(sessions, rest + timedelta(seconds=1)) == "BATCH"
     assert fake.calls[-1] == sorted(ids, reverse=True)
+
+
+def test_the_rest_ends_when_the_first_tried_punch_may_be_retried(backend, monkeypatch):
+    sessions = backend
+    ids = unknown_punches(sessions, 3)
+    monkeypatch.setattr(auto, "SCAN_REST_SECONDS", 10 * 3600)
+    now = utc_now()
+    tried = FakeRelease(monkeypatch, statuses={event_id: "SKIPPED" for event_id in ids})
+    with sessions() as db:
+        tried(db, actor=auto.AUTO_ACTOR, event_ids=ids[1:], idempotency_key="earlier-run-0001")
+        db.scalar(select(Job)).created_at = now - timedelta(hours=24) + timedelta(seconds=100)
+        db.commit()
+    fake = FakeRelease(monkeypatch)
+    assert step(sessions, now) == "BATCH"
+    assert fake.calls == [[ids[0]]]
+    rest = auto.ensure_utc(state(sessions).scan_idle_until)
+    assert now + timedelta(seconds=99) <= rest <= now + timedelta(seconds=101)
+    assert step(sessions, now + timedelta(seconds=50)) == "IDLE"
+    assert step(sessions, rest + timedelta(seconds=1)) == "BATCH"
+    assert fake.calls[-1] == sorted(ids[1:], reverse=True)
+
+
+def test_while_resting_only_new_punches_are_read_and_released(backend, monkeypatch):
+    sessions = backend
+    ids = unknown_punches(sessions, 2)
+    fake = FakeRelease(monkeypatch, statuses={event_id: "SKIPPED" for event_id in ids})
+    now = utc_now()
+    assert step(sessions, now) == "BATCH"
+    head = state(sessions).idle_head_id
+    assert head == max(ids)
+    with sessions() as db:
+        newcomer = db.get(AttendanceEvent, ids[0])
+        columns = [c.key for c in AttendanceEvent.__table__.columns if c.key not in {"id", "event_uid"}]
+        copy = AttendanceEvent(**{key: getattr(newcomer, key) for key in columns})
+        copy.event_uid = "e" * 64
+        db.add(copy)
+        db.commit()
+        new_id = copy.id
+    fake.statuses = {}
+    assert step(sessions, now + timedelta(seconds=2)) == "INTERVAL"  # reads are paced while resting too
+    assert step(sessions, now + timedelta(seconds=6)) == "BATCH"
+    assert fake.calls[-1] == [new_id]
+    assert state(sessions).scan_head_id is None  # still resting; no full pass started
+    assert step(sessions, now + timedelta(seconds=12)) == "IDLE"
+    assert state(sessions).idle_head_id == new_id
+    assert len(fake.calls) == 2
 
 
 def test_each_batch_reads_a_bounded_window_of_held_punches(backend, monkeypatch):
@@ -365,9 +420,12 @@ def test_each_batch_reads_a_bounded_window_of_held_punches(backend, monkeypatch)
     # Two held punches per batch are read; the four newest were tried today.
     assert step(sessions, now) == "SCANNING"
     assert state(sessions).scan_cursor_id == ids[3]
-    assert step(sessions, now + timedelta(seconds=1)) == "SCANNING"
+    # A read that found nothing is paced like a batch.
+    assert step(sessions, now + timedelta(seconds=1)) == "INTERVAL"
+    assert state(sessions).scan_cursor_id == ids[3]
+    assert step(sessions, now + timedelta(seconds=6)) == "SCANNING"
     assert state(sessions).scan_cursor_id == ids[1]
-    assert step(sessions, now + timedelta(seconds=2)) == "BATCH"
+    assert step(sessions, now + timedelta(seconds=12)) == "BATCH"
     assert fake.calls == [[ids[0]]]
     assert state(sessions).scan_head_id is None
 
@@ -402,8 +460,110 @@ def test_nothing_to_release_moves_on_without_an_error(backend, monkeypatch):
     row = state(sessions)
     assert row.last_error_code is None and row.last_batch_size == 1
     assert row.scan_head_id is None  # the pass ended; the punch is not retried in a loop
-    assert step(sessions, now + timedelta(seconds=6)) in {"BATCH", "NOTHING_TO_RELEASE"}
-    assert len(fake.calls) <= 2
+    assert step(sessions, now + timedelta(seconds=6)) == "IDLE"
+    assert len(fake.calls) == 1
+
+
+def test_switching_off_while_a_batch_is_built_discards_the_batch(backend, monkeypatch):
+    sessions = backend
+    unknown_punches(sessions, 3)
+    with sessions() as db:
+        auto._ensure(db)
+        db.commit()
+        postgres = db.get_bind().dialect.name == "postgresql"
+
+    def switch_off(session):
+        if postgres:
+            # A real concurrent OFF, committed while the batch is being built.
+            with sessions() as other:
+                auto.control(other, actor="owner", request=auto.AutoReleaseControlRequest(
+                    enabled=False, reason="Oracle maintenance", password="unused-here",
+                    idempotency_key="switch-off-race-1"))
+                other.commit()
+        else:
+            # SQLite tests share one connection: the same change inside the transaction.
+            session.execute(auto.update(State).where(State.id == 1).values(enabled=False))
+
+    fake = FakeRelease(monkeypatch, during=switch_off)
+    assert step(sessions) == "OFF"
+    assert len(fake.calls) == 1
+    with sessions() as db:
+        assert db.scalar(select(func.count(Job.id))) == 0
+        assert db.scalar(select(func.count(Item.id))) == 0
+        row = db.get(State, 1)
+        assert row.batches_created == 0 and row.last_batch_at is None
+    if postgres:
+        # The administrator's committed OFF stands; the next tick stays OFF.
+        assert state(sessions).enabled is False
+        assert step(sessions, utc_now() + timedelta(seconds=10)) == "OFF"
+        assert len(fake.calls) == 1
+
+
+def test_stopping_release_all_while_a_batch_is_built_discards_the_batch(backend, monkeypatch):
+    sessions = backend
+    unknown_punches(sessions, 2)
+    with sessions() as db:
+        auto._ensure(db).enabled = False
+        db.commit()
+        auto.request_drain(db, actor="owner", request=auto.AutoReleaseDrainRequest(idempotency_key="drain-race-1"))
+        db.commit()
+
+    def stop(session):
+        session.execute(auto.update(State).where(State.id == 1).values(
+            drain_requested_at=None, drain_requested_by=None))
+
+    FakeRelease(monkeypatch, during=stop)
+    assert step(sessions, utc_now() + timedelta(seconds=1)) == "OFF"
+    with sessions() as db:
+        assert db.scalar(select(func.count(Job.id))) == 0
+
+
+def test_a_count_that_times_out_waits_its_interval_and_backs_off(backend, monkeypatch):
+    from sqlalchemy.exc import OperationalError
+
+    class Canceled(Exception):
+        sqlstate = "57014"
+
+    sessions = backend
+    with sessions() as db:
+        auto._ensure(db).enabled = False  # counts run while OFF too; no batch in the way
+        db.commit()
+    real = auto.refresh_counts
+    calls = []
+
+    def timeout(*_args, **_kwargs):
+        calls.append(1)
+        raise OperationalError("SELECT count(...)", {}, Canceled("canceling statement due to statement timeout"))
+
+    monkeypatch.setattr(auto, "refresh_counts", timeout)
+    assert auto.tick() == "OFF"
+    row = state(sessions)
+    assert len(calls) == 1 and row.last_error_code == "COUNT_BUSY" and row.count_failures == 1
+    assert row.count_attempted_at is not None and row.backlog_counted_at is None
+    # The next worker loop does not start the heavy count again.
+    assert auto.tick() == "OFF" and len(calls) == 1
+
+    def age(seconds):
+        with sessions() as db:
+            db.get(State, 1).count_attempted_at = utc_now() - timedelta(seconds=seconds)
+            db.commit()
+
+    age(61)  # one failure: twice the count interval
+    auto.tick()
+    assert len(calls) == 1
+    age(121)
+    auto.tick()
+    assert len(calls) == 2 and state(sessions).count_failures == 2
+    age(121)  # two failures: four intervals
+    auto.tick()
+    assert len(calls) == 2
+
+    monkeypatch.setattr(auto, "refresh_counts", real)
+    age(241)
+    auto.tick()
+    row = state(sessions)
+    assert row.count_failures == 0 and row.backlog_counted_at is not None
+    assert row.backlog_count is not None
 
 
 def test_real_quick_release_queues_and_the_counts_feed_the_status(backend):

@@ -20,14 +20,22 @@ module only decides when and which punches to hand it:
   to that approval.
 * Bounded reads. Each batch reads the next newest punches below a saved
   cursor, plus any punch that arrived since the pass started, so a pass over
-  the whole backlog reads it once. A pass that finds nothing rests for
-  ``count_interval_seconds``.
+  the whole backlog reads it once. Reads are paced like batches (at most one
+  every ``min_interval_seconds``, whether or not they found anything). When a
+  pass reaches the oldest punch the releaser rests until the first punch it
+  tried becomes eligible again, at most ``SCAN_REST_SECONDS``; while resting
+  it reads only punches saved since (a short index range), so new punches are
+  not delayed.
 * The backlog count and the progress totals are computed here at most every
   ``count_interval_seconds`` and saved with a timestamp; the status endpoint
-  reads them and the few active runs, never the whole table.
+  reads them and the few active runs, never the whole table. The attempt is
+  saved before the count runs, so a count that times out waits its interval
+  too, and failures in a row back off further.
 
-Turning the switch OFF only stops new batches: punches already approved stay
-in their Direct ORDS runs and follow through to Oracle, which cannot be undone.
+Turning the switch OFF only stops new batches: a batch being built when the
+switch turns OFF is discarded (the switch is re-read under its row lock before
+the batch is saved). Punches already approved stay in their Direct ORDS runs
+and follow through to Oracle, which cannot be undone.
 """
 
 from __future__ import annotations
@@ -64,6 +72,10 @@ IN_FLIGHT_STATUSES = ("READY", "WAITING_ORACLE")
 # Held punch IDs read per filter query, and at most per batch (head and tail each).
 SCAN_WINDOW = 500
 SCAN_BUDGET = 5_000
+# Longest rest after a pass found nothing more to release (new punches are still read).
+SCAN_REST_SECONDS = 15 * 60
+# A count that failed this many times in a row waits 2**n count intervals (n capped).
+COUNT_BACKOFF_STEPS = 4
 AUDIT_TARGET = "unknown_identity_auto_release"
 
 
@@ -139,6 +151,13 @@ def _tried_recently(cutoff):
 
 def _due(stamp, now, seconds) -> bool:
     return stamp is None or now >= ensure_utc(stamp) + timedelta(seconds=seconds)
+
+
+def _count_due(state: State, now) -> bool:
+    """Gated on the last attempt, not the last success, with back-off after failures."""
+    failures = min(int(state.count_failures or 0), COUNT_BACKOFF_STEPS)
+    interval = settings.unknown_identity_auto_release_count_interval_seconds * (2 ** failures)
+    return _due(state.count_attempted_at or state.backlog_counted_at, now, interval)
 
 
 # Worker ----------------------------------------------------------------------
@@ -219,11 +238,53 @@ def _pick(session, state: State, now, limit: int):
             cursor = lowest
         picked += tail
     scan = (
-        {"scan_head_id": None, "scan_cursor_id": None, "scan_started_at": started}
+        # Resting after the pass reads only punches above the pass head.
+        {"scan_head_id": None, "scan_cursor_id": None, "scan_started_at": started, "idle_head_id": head}
         if pass_done else
         {"scan_head_id": head, "scan_cursor_id": cursor, "scan_started_at": started}
     )
     return picked, scan, pass_done, started
+
+
+def _pick_new(session, state: State, now, limit: int):
+    """While resting: only punches saved since the last read, a short index range above ``idle_head_id``."""
+    cutoff = now - timedelta(hours=settings.unknown_identity_auto_release_retry_hours)
+    top = session.scalar(select(func.max(AttendanceEvent.id))) or 0
+    above = state.idle_head_id if state.idle_head_id is not None else top
+    picked, _lowest, done = _scan(session, below=None, above=above, need=limit, budget=SCAN_BUDGET, cutoff=cutoff)
+    # Every held punch above ``above`` was read: next time start from the newest seen now.
+    scan = {"idle_head_id": max(top, above)} if done and len(picked) < limit else {}
+    return picked, scan
+
+
+def _rest_until(session, now):
+    """After a full pass: until the first punch this releaser tried may be retried, within bounds.
+
+    Nothing below the pass head can become eligible earlier, except a punch
+    whose roster or CNIC changed or whose other approval ended; those wait at
+    most ``SCAN_REST_SECONDS``.
+    """
+    retry = timedelta(hours=settings.unknown_identity_auto_release_retry_hours)
+    rest = now + timedelta(seconds=SCAN_REST_SECONDS)
+    oldest = session.scalar(
+        select(func.min(Job.created_at)).where(_auto_jobs(), Job.created_at >= now - retry)
+    )
+    if oldest is not None:
+        rest = min(rest, ensure_utc(oldest) + retry)
+    return max(rest, now + timedelta(seconds=settings.unknown_identity_auto_release_count_interval_seconds))
+
+
+def _still_releasing(session) -> bool:
+    """The switch as committed now, read under its row lock.
+
+    ``control`` changes the row under the same lock, so an OFF committed while
+    this batch was being built is seen here, and an OFF that arrives after this
+    read waits until the batch is saved (it was created before the OFF).
+    """
+    row = session.execute(
+        select(State.enabled, State.drain_requested_at).where(State.id == 1).with_for_update()
+    ).one()
+    return bool(row.enabled) or row.drain_requested_at is not None
 
 
 def run_once(session, *, now=None) -> str:
@@ -239,18 +300,24 @@ def run_once(session, *, now=None) -> str:
     drain_at = state.drain_requested_at
     if not (state.enabled or drain_at):
         return "OFF"
-    if not _due(state.last_batch_at, now, settings.unknown_identity_auto_release_min_interval_seconds):
+    # Every read of held punches is paced, whether or not it finds a batch.
+    if not _due(
+        state.last_scan_at or state.last_batch_at, now,
+        settings.unknown_identity_auto_release_min_interval_seconds,
+    ):
         return "INTERVAL"
-    if state.scan_idle_until is not None and now < ensure_utc(state.scan_idle_until):
-        return "IDLE"
     in_flight = sum(_in_flight(session).values())
     if in_flight >= settings.unknown_identity_auto_release_in_flight_limit:
         return "BACKPRESSURE"
     limit = settings.unknown_identity_auto_release_batch_size
     batch_number = (state.batches_created or 0) + 1
-    ids, scan, pass_done, started = _pick(session, state, now, limit)
+    if state.scan_idle_until is not None and now < ensure_utc(state.scan_idle_until):
+        ids, scan = _pick_new(session, state, now, limit)
+        pass_done, started, outcome = False, None, "IDLE"
+    else:
+        ids, scan, pass_done, started = _pick(session, state, now, limit)
+        outcome = "NOTHING_LEFT" if pass_done else "SCANNING"
     values: dict = dict(scan)
-    outcome = "NOTHING_LEFT" if pass_done else "SCANNING"
     if ids:
         outcome = "BATCH"
         key = f"auto-unknown-release-{batch_number}-{_digest(sorted(ids))[:16]}"
@@ -265,22 +332,26 @@ def run_once(session, *, now=None) -> str:
             outcome = exc.code
             if exc.code != "NOTHING_TO_RELEASE":
                 values.update(last_error_code=exc.code[:80], last_error_at=now)
+        if not _still_releasing(session):
+            # Switched OFF (or Release all stopped) while this batch was being
+            # built: discard it; nothing of it is saved or sent.
+            session.rollback()
+            return "OFF"
         if job is not None:
             job.scope = {**(job.scope or {}), SCOPE_FLAG: True, "batch_number": batch_number}
             values.update(last_batch_job_id=job.job_id)
         values.update(
-            # The interval runs from the end of this batch: a slow batch is
-            # followed by the full pause, never by the next batch at once.
             last_batch_at=max(now, utc_now()), last_batch_size=len(ids),
             batches_created=State.batches_created + 1,
             punches_submitted=State.punches_submitted + len(ids),
         )
-    elif pass_done:
-        values["scan_idle_until"] = now + timedelta(
-            seconds=settings.unknown_identity_auto_release_count_interval_seconds
-        )
-    if outcome in {"BATCH", "NOTHING_LEFT", "NOTHING_TO_RELEASE", "SCANNING"}:
+    if pass_done:
+        values["scan_idle_until"] = _rest_until(session, now)
+    if outcome in {"BATCH", "NOTHING_LEFT", "NOTHING_TO_RELEASE", "SCANNING", "IDLE"}:
         values.update(last_error_code=None, last_error_at=None)
+    # The pause runs from the end of this read: a slow batch or scan is
+    # followed by the full pause, never by the next read at once.
+    values["last_scan_at"] = max(now, utc_now())
     values["updated_at"] = now
     session.execute(update(State).where(State.id == 1).values(**values))
     if pass_done and drain_at is not None and started >= ensure_utc(drain_at):
@@ -292,14 +363,29 @@ def run_once(session, *, now=None) -> str:
     return outcome
 
 
+def claim_count(session, *, now=None) -> bool:
+    """Whether a count is due; if so, save the attempt first (commit before counting).
+
+    A count that then times out still waits its interval (doubled for every
+    failure in a row), so it never turns into a retry loop on a busy database.
+    """
+    now = now or utc_now()
+    state = _lock(session)
+    if not _count_due(state, now):
+        return False
+    state.count_attempted_at = now
+    return True
+
+
 def refresh_counts(session, *, now=None, force: bool = False) -> bool:
     """Backlog count and progress totals, at most every count interval."""
     now = now or utc_now()
     state = _ensure(session)
-    if not force and not _due(
-        state.backlog_counted_at, now, settings.unknown_identity_auto_release_count_interval_seconds
-    ):
+    if not force and not _count_due(state, now):
         return False
+    if session.get_bind().dialect.name == "postgresql":
+        # Bounded like the dashboard's scans; SET LOCAL ends with the transaction.
+        session.execute(text("SET LOCAL statement_timeout = '20s'"))
     backlog = session.scalar(
         select(func.count(AttendanceEvent.id)).where(unknown_synced_cnic_expression())
     )
@@ -328,6 +414,7 @@ def refresh_counts(session, *, now=None, force: bool = False) -> bool:
     ) or 0
     session.execute(update(State).where(State.id == 1).values(
         backlog_count=int(backlog or 0), backlog_counted_at=now,
+        count_attempted_at=now, count_failures=0,
         stats={
             "items_by_status": by_status,
             "confirmed_last_hour": confirmed_last_hour,
@@ -339,14 +426,15 @@ def refresh_counts(session, *, now=None, force: bool = False) -> bool:
     return True
 
 
-def _record_error(code: str) -> None:
+def _record_error(code: str, *, count_failed: bool = False) -> None:
     try:
         with session_scope() as session:
             _ensure(session)
             now = utc_now()
-            session.execute(update(State).where(State.id == 1).values(
-                last_error_code=code, last_error_at=now, updated_at=now,
-            ))
+            values = {"last_error_code": code, "last_error_at": now, "updated_at": now}
+            if count_failed:
+                values["count_failures"] = State.count_failures + 1
+            session.execute(update(State).where(State.id == 1).values(**values))
     except Exception:  # noqa: BLE001 - telemetry only; the worker loop reports the original error.
         pass
 
@@ -368,13 +456,18 @@ def tick() -> str:
     except Exception:
         _record_error("BATCH_FAILED")
         raise
+    counting = False
     try:
         with session_scope() as session:
-            refresh_counts(session)
+            counting = claim_count(session)
+        if counting:
+            # The attempt is committed above, so a timeout here is not retried at once.
+            with session_scope() as session:
+                refresh_counts(session, force=True)
     except OperationalError as exc:
         if not database_busy(exc):
             raise
-        _record_error("COUNT_BUSY")
+        _record_error("COUNT_BUSY", count_failed=counting)
     return outcome
 
 
@@ -483,6 +576,12 @@ def status(session, *, now=None) -> dict:
         "drain_requested_at": _iso(state.drain_requested_at) if state is not None else None,
         "drain_requested_by": state.drain_requested_by if state is not None else None,
         "drain_completed_at": _iso(state.drain_completed_at) if state is not None else None,
+        # After a full pass: older punches are read again from then; new ones meanwhile.
+        "resting_until": (
+            _iso(state.scan_idle_until)
+            if state is not None and state.scan_idle_until is not None and now < ensure_utc(state.scan_idle_until)
+            else None
+        ),
         "backlog": {
             "count": backlog,
             "counted_at": _iso(state.backlog_counted_at) if state is not None else None,

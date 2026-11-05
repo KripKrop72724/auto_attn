@@ -121,6 +121,49 @@ describe('automatic release of unknown-identity punches', () => {
     expect(screen.queryByRole('button', { name: /Release all now/i })).toBeNull()
   })
 
+  it('lets an administrator stop a running Release all while the switch stays OFF', async () => {
+    const draining = status({
+      enabled: false, active: true, drain_active: true, changed_by: 'StateHealthAdmin', changed_at: '2026-11-05T12:00:00Z',
+      drain_requested_by: 'Operator', drain_requested_at: '2026-11-05T13:00:00Z',
+    })
+    const fetchMock = vi.fn(async (path: RequestInfo | URL, init?: RequestInit) => {
+      if (String(path) === `${PATH}/control` && init?.method === 'POST') {
+        return response(status({ enabled: false, active: false, drain_active: false, changed_by: 'StateHealthAdmin', changed_at: '2026-11-05T14:00:10Z' }))
+      }
+      return response(draining)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const notices = toast()
+    render(<UnknownIdentityAutoRelease toast={notices} />)
+    expect(await screen.findByText('OFF · Release all running')).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: /Stop Release all/ }))
+    const dialog = screen.getByRole('dialog', { name: 'Stop Release all now' })
+    expect(dialog.textContent).toMatch(/stops the Release all now that is running/)
+    expect(dialog.textContent).toMatch(/Automatic release stays OFF/)
+    expect(dialog.textContent).toMatch(/cannot be unsent/)
+    const submit = within(dialog).getByRole('button', { name: /Stop Release all/ })
+    expect(submit.hasAttribute('disabled')).toBe(true)
+    fireEvent.change(within(dialog).getByLabelText(/Audited reason/), { target: { value: 'Oracle is slow today' } })
+    fireEvent.change(within(dialog).getByLabelText(/Administrator password/), { target: { value: 'right-password' } })
+    fireEvent.click(submit)
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
+    expect(notices.notice).toHaveBeenCalledWith('Release all stopped; automatic release stays OFF. The change was audited.')
+    const post = fetchMock.mock.calls.find(([path, init]) => String(path) === `${PATH}/control` && init?.method === 'POST')
+    const body = JSON.parse(String(post?.[1]?.body))
+    expect(body.enabled).toBe(false)
+    expect(body.reason).toBe('Oracle is slow today')
+    // The switch itself still offers only Turn ON.
+    fireEvent.click(screen.getByRole('switch', { name: /Automatic release/i }))
+    expect(screen.getByRole('dialog', { name: 'Turn automatic release ON' })).toBeTruthy()
+  })
+
+  it('says when every punch has been checked and the next full read is due', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => response(status({ resting_until: '2026-11-05T14:15:00Z' }))))
+    render(<UnknownIdentityAutoRelease />)
+    expect(await screen.findByText(/Every such punch has been checked/)).toBeTruthy()
+    expect(screen.getByText(/new punches are still picked up/)).toBeTruthy()
+  })
+
   it('says when the deployment blocks automatic release', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => response(status({ allowed: false, enabled: false, active: false }))))
     render(<UnknownIdentityAutoRelease />)
