@@ -200,6 +200,8 @@ static void test_unordered_ranges(void)
     mode = 42; range_rows = 0;
     assert(hik_history_range(3199, 3000000000U, 50, range_saved, NULL) == HIK_PARSE);
     assert(strstr(hik_history_last_reject(), "range=total_changed"));
+    /* 3.1.6: the failing sub-request is named (page 2) with its elapsed ms. */
+    assert(hik_history_last_page() == 2 && hik_history_last_request_ms() == 1);
     mode = 43;
     assert(hik_history_range(3199, 3000000000U, 50, range_saved, NULL) == HIK_PARSE);
     assert(strstr(hik_history_last_reject(), "range=completion"));
@@ -212,6 +214,7 @@ static void test_unordered_ranges(void)
     /* Counts come from totalMatches of a one-row search. */
     mode = 40; uint32_t waiting = 99;
     assert(hik_history_count(3199, 3000000000U, &waiting) == HIK_OK && waiting == 24);
+    assert(!hik_history_last_page() && hik_history_last_request_ms() == 1);
     assert(hik_history_count(3199, 3300, &waiting) == HIK_OK && waiting == 9);
     assert(hik_history_count(4000, 3000000000U, &waiting) == HIK_OK && !waiting);
     /* A stale reason never survives a later successful read. */

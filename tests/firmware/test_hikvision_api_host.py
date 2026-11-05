@@ -16,6 +16,10 @@ def test_hikvision_bounded_history_and_verified_writes(tmp_path):
     (tmp_path / "esp_http_client.h").write_text(
         "#pragma once\ntypedef enum {HTTP_METHOD_GET, HTTP_METHOD_POST, HTTP_METHOD_PUT} esp_http_client_method_t;\n"
     )
+    (tmp_path / "esp_timer.h").write_text(
+        "#pragma once\n#include <stdint.h>\n"
+        "static inline int64_t esp_timer_get_time(void) { static int64_t now; return now += 1000; }\n"
+    )
     (tmp_path / "esp_random.h").write_text("#include <stdint.h>\nuint32_t esp_random(void);\n")
     main = ROOT / "firmware/zone_lite/main"
     executable = tmp_path / "hik-api"

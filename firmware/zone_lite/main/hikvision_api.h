@@ -18,6 +18,10 @@ typedef bool (*hik_range_fn)(void *, const char *raw, size_t length, uint32_t se
  * HIK_OK only after the whole range was read with a stable total and no
  * serial seen twice. max_pages is at most 100. */
 hik_result_t hik_history_range(uint32_t begin, uint32_t end, unsigned max_pages, hik_range_fn, void *);
+/* The last AcsEvent request made by hik_history_count/hik_history_range: its
+ * 1-based page within the range read (0 for a count) and its elapsed ms. */
+unsigned hik_history_last_page(void);
+unsigned hik_history_last_request_ms(void);
 /* totalMatches for [begin, end] from a one-row search (no rows are kept). */
 hik_result_t hik_history_count(uint32_t begin, uint32_t end, uint32_t *total);
 /* A bounded observation of retained history, never a coverage certificate. */

@@ -15,13 +15,23 @@ def test_inclusive_poll_anchor_gates_durable_records(tmp_path):
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 typedef enum {HIK_OK,HIK_CONFIGURATION,HIK_NETWORK,HIK_AUTH,HIK_HTTP_STATUS,HIK_OVERSIZED,HIK_BINDING,HIK_PARSE,HIK_CUSTODY} hik_result_t;
-/* A terminal holding 1000 events at serials 5000, 5003, ... 7997. */
-static unsigned count_calls;
+/* terminal 0: 1000 events at sparse serials 5000, 5003, ... 7997.
+ * terminal 1/2: Mirpur-02 shape, dense serials 1..newest with a committed
+ * anchor at 23088 and 1000 waiting; 1 counts beginSerialNo inclusively,
+ * 2 exclusively. fail_at makes that count call fail like a slow terminal. */
+static unsigned count_calls, terminal, fail_at;
+static uint32_t newest = 24088;
 static hik_result_t hik_history_count(uint32_t begin,uint32_t end,uint32_t *total){
- ++count_calls;*total=0;for(uint32_t s=5000;s<8000;s+=3)if(s>=begin&&s<=end)++*total;return HIK_OK;
+ ++count_calls;*total=0;
+ if(fail_at && count_calls==fail_at)return HIK_NETWORK;
+ if(!terminal){for(uint32_t s=5000;s<8000;s+=3)if(s>=begin&&s<=end)++*total;return HIK_OK;}
+ uint32_t lo=terminal==1?begin:begin+1, hi=end<newest?end:newest;
+ *total=hi>=lo?hi-lo+1:0;return HIK_OK;
 }
+static unsigned hik_history_last_request_ms(void){return 10000+count_calls;}
 static unsigned writes;
 static bool custody_ok = true;
 /* Deterministic digest stand-in: test ordering/custody, not SHA's implementation. */
@@ -36,6 +46,7 @@ static bool immutable(const char *body,size_t n,unsigned char out[32]){
  mbedtls_sha256((const unsigned char*)facts,strlen(facts),out,0);return true;
 }
 /* PRODUCTION */
+static unsigned searches_for(uint32_t from,uint32_t *end);
 int main(void){
  const char *anchor="committed source record", *fresh="new source record";
  unsigned char expected[32], next[32];
@@ -93,14 +104,45 @@ int main(void){
  assert(!range_row(&r,fresh,strlen(fresh),3199)&&r.page.anchor_conflict&&!writes);
  /* A backlog is cut into a window of exactly 400 events; a smaller multi-page
   * tail ends at its newest serial so new punches stay outside the window; a
-  * single page is read whole. */
+  * single page is read whole. Sparse serials stay within the search cap. */
  uint32_t end=0,inside=0;
- assert(poll_window_end(5000,&end)==HIK_OK&&end<3000000000U&&count_calls<40);
+ assert(searches_for(5000,&end)<=40&&end<3000000000U);
  hik_history_count(5000,end,&inside);assert(inside==400);
  hik_history_count(5000,end-1,&inside);assert(inside==399);
- assert(poll_window_end(7000,&end)==HIK_OK&&end==7997);
+ assert(searches_for(7000,&end)<=40&&end==7997);
  hik_history_count(7000,end,&inside);assert(inside==333);
- assert(poll_window_end(7950,&end)==HIK_OK&&end==3000000000U);
+ assert(searches_for(7950,&end)==1&&end==3000000000U);
+ /* 3.1.6: a dense backlog of 1000 is sized in at most 3 searches (3.1.5 made
+  * ~33), and the window is still the smallest one holding 400 counted rows. */
+ for(terminal=1;terminal<=2;terminal++){
+  unsigned used=searches_for(23088,&end);
+  assert(used==(terminal==1?2u:3u));
+  hik_history_count(23088,end,&inside);assert(inside==400);
+  hik_history_count(23088,end-1,&inside);assert(inside==399);
+  assert(end==(terminal==1?23487u:23488u));
+  /* A small multi-page tail ends exactly at the newest serial, so a punch
+   * arriving mid-read (serial newest+1) cannot change the window total. */
+  newest=23118;
+  assert(searches_for(23088,&end)<=3&&end==newest);
+  newest=23100;assert(searches_for(23088,&end)==1&&end==3000000000U);
+  newest=24088;
+ }
+ /* A failing sub-request is named with its elapsed time. */
+ terminal=2;
+ const char *names[]={"count0","probe","probe#2"};
+ for(unsigned i=0;i<3;i++){
+  poll_request_t q={0};fail_at=count_calls+1+i;
+  assert(poll_window_end(23088,&end,&q)==HIK_NETWORK);
+  assert(!strcmp(q.name,names[i])&&q.ms==10000+count_calls&&q.searches==i+1);
+  char text[64];poll_request_text(text,sizeof(text),&q);
+  char want[64];snprintf(want,sizeof(want),"; request=%s; request_ms=%u",names[i],10000+count_calls);
+  assert(!strcmp(text,want));
+ }
+ fail_at=0;terminal=0;
+ {poll_request_t q={0};char text[64];poll_request_note(&q,"page",7);
+  poll_request_text(text,sizeof(text),&q);assert(!strncmp(text,"; request=page#7; request_ms=",29));
+  q=(poll_request_t){0};poll_request_text(text,sizeof(text),&q);
+  assert(!strncmp(text,"; request=none; request_ms=0",28));}
  /* A first install starts at the newest 20 serials, whatever the time order. */
  uint32_t tail=0;
  assert(poll_tail_begin(&tail)==HIK_OK);
@@ -110,6 +152,11 @@ int main(void){
  r=(range_context_t){.anchor_serial=10};custody_ok=false;
  assert(!range_row(&r,c,strlen(c),12)&&!r.max_serial);custody_ok=true;
  return 0;
+}
+static unsigned searches_for(uint32_t from,uint32_t *end){
+ poll_request_t q={0};unsigned before=count_calls;
+ assert(poll_window_end(from,end,&q)==HIK_OK);assert(q.searches==count_calls-before);
+ return q.searches;
 }
 '''
     unit = tmp_path / "poll-anchor.c"
@@ -128,6 +175,7 @@ def test_slow_poll_yields_one_bounded_background_slot(tmp_path):
 #include <assert.h>
 #include <stdbool.h>
 #include <stdint.h>
+typedef enum {HIK_OK,HIK_CONFIGURATION,HIK_NETWORK,HIK_AUTH,HIK_HTTP_STATUS,HIK_OVERSIZED,HIK_BINDING,HIK_PARSE,HIK_CUSTODY} hik_result_t;
 /* PRODUCTION */
 int main(void){
  assert(!take_background_slot());
@@ -138,6 +186,25 @@ int main(void){
  assert(poll_delay_ms(4800000)==250);
  assert(poll_delay_ms(7000000)==250);
  background_slot=true;assert(take_background_slot());
+ /* 3.1.6 back-off: failed events reads (any reason) and network/auth
+  * failures at any stage wait 2, 5, 15, 30, then 60 s; success resets. */
+ unsigned failing=0;
+ assert(poll_next_delay_ms(1000000,HIK_OK,4,&failing)==1000&&!failing);
+ static const uint32_t expected[]={2000,5000,15000,30000,60000,60000,60000};
+ for(unsigned i=0;i<7;i++){
+  hik_result_t why=i%3==0?HIK_NETWORK:i%3==1?HIK_AUTH:HIK_PARSE;
+  assert(poll_next_delay_ms(10000000,why,3,&failing)==expected[i]&&failing==i+1);
+ }
+ assert(poll_next_delay_ms(0,HIK_OK,4,&failing)==2000&&!failing);
+ assert(poll_next_delay_ms(7000000,HIK_OK,4,&failing)==250&&!failing);
+ assert(poll_next_delay_ms(100000,HIK_NETWORK,1,&failing)==2000&&failing==1); /* identity */
+ assert(poll_next_delay_ms(100000,HIK_AUTH,1,&failing)==5000&&failing==2);
+ assert(poll_next_delay_ms(100000,HIK_OK,3,&failing)==1900&&!failing);
+ /* Other failures outside the events stage keep the normal cadence. */
+ assert(poll_next_delay_ms(1000000,HIK_CUSTODY,0,&failing)==1000&&!failing);
+ assert(poll_next_delay_ms(1000000,HIK_BINDING,1,&failing)==1000&&!failing);
+ assert(poll_backoff_ms(0)==0&&poll_backoff_ms(1)==2000&&poll_backoff_ms(999)==60000);
+ assert(poll_backs_off(HIK_BINDING,3)&&!poll_backs_off(HIK_OK,3)&&!poll_backs_off(HIK_HTTP_STATUS,2));
  return 0;
 }
 """
