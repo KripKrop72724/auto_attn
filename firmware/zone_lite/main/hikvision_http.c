@@ -9,6 +9,8 @@
 
 static int last_http_status;
 int hik_http_last_status(void) { return last_http_status; }
+static void (*volatile progress_hook)(void);
+void hik_http_set_progress_hook(void (*hook)(void)) { progress_hook = hook; }
 
 typedef struct { bool digest; char content_type[300]; } headers_t;
 static esp_err_t header_event(esp_http_client_event_t *e)
@@ -38,7 +40,7 @@ static hik_result_t open_request_at(esp_http_client_method_t method, const char 
     if (report_status) last_http_status = 0;
     if (!config_valid() || !host || !*host || strlen(host) >= 64 ||
         strspn(host, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-") != strlen(host) ||
-        timeout_ms < 1000 || timeout_ms > 10000 || !path ||
+        timeout_ms < HIK_HTTP_MIN_TIMEOUT_MS || timeout_ms > HIK_HTTP_SEARCH_TIMEOUT_MS || !path ||
         strncmp(path, "/ISAPI/", 7) || strlen(path) > 180) return HIK_CONFIGURATION;
     const zone_config_t *c = zone_config_get();
     char url[300];
@@ -103,7 +105,7 @@ static hik_result_t open_request_at(esp_http_client_method_t method, const char 
     esp_http_client_cleanup(client);
     return result;
 }
-static hik_result_t request_at(esp_http_client_method_t method, const char *path,
+static hik_result_t request_once(esp_http_client_method_t method, const char *path,
     const char *body, const char *host, int timeout_ms, bool require_digest, bool report_status, char *response, size_t capacity, size_t *length)
 {
     if (!response || capacity < 2 || !length) return HIK_CONFIGURATION;
@@ -129,11 +131,24 @@ static hik_result_t request_at(esp_http_client_method_t method, const char *path
     esp_http_client_cleanup(client);
     return result;
 }
+static hik_result_t request_at(esp_http_client_method_t method, const char *path,
+    const char *body, const char *host, int timeout_ms, bool require_digest, bool report_status, char *response, size_t capacity, size_t *length)
+{
+    hik_result_t result = request_once(method, path, body, host, timeout_ms, require_digest, report_status, response, capacity, length);
+    void (*hook)(void) = progress_hook;
+    if (hook) hook();
+    return result;
+}
+hik_result_t hik_http_request_timeout(esp_http_client_method_t method, const char *path,
+    const char *body, int timeout_ms, char *response, size_t capacity, size_t *length)
+{
+    char host[64]; zone_config_copy_hik_host(host, sizeof(host));
+    return request_at(method, path, body, host, timeout_ms, false, true, response, capacity, length);
+}
 hik_result_t hik_http_request(esp_http_client_method_t method, const char *path,
     const char *body, char *response, size_t capacity, size_t *length)
 {
-    char host[64]; zone_config_copy_hik_host(host, sizeof(host));
-    return request_at(method, path, body, host, 10000, false, true, response, capacity, length);
+    return hik_http_request_timeout(method, path, body, HIK_HTTP_TIMEOUT_MS, response, capacity, length);
 }
 static hik_result_t verify_identity_at(const char *host, int timeout_ms, bool require_digest, bool report_status)
 {
@@ -159,7 +174,7 @@ hik_result_t hik_http_verify_identity_at(const char *host, int timeout_ms)
 hik_result_t hik_http_verify_identity(void)
 {
     char host[64]; zone_config_copy_hik_host(host, sizeof(host));
-    return verify_identity_at(host, 10000, false, true);
+    return verify_identity_at(host, HIK_HTTP_TIMEOUT_MS, false, true);
 }
 hik_result_t hik_http_stream_with_state(hik_message_fn callback, void *context, void (*state)(bool))
 {
@@ -167,11 +182,11 @@ hik_result_t hik_http_stream_with_state(hik_message_fn callback, void *context, 
     char host[64]; zone_config_copy_hik_host(host, sizeof(host));
     /* A long-lived stream owns its client and cannot overwrite poll diagnostics.
      * Identity and stream use the same copied address even during rediscovery. */
-    hik_result_t result = verify_identity_at(host, 10000, true, false);
+    hik_result_t result = verify_identity_at(host, HIK_HTTP_TIMEOUT_MS, true, false);
     if (result != HIK_OK) return result;
     headers_t headers = {0};
     esp_http_client_handle_t client;
-    result = open_request_at(HTTP_METHOD_GET, "/ISAPI/Event/notification/alertStream", NULL, host, 10000, true, false, &headers, &client);
+    result = open_request_at(HTTP_METHOD_GET, "/ISAPI/Event/notification/alertStream", NULL, host, HIK_HTTP_TIMEOUT_MS, true, false, &headers, &client);
     if (result != HIK_OK) return result;
     /* Some terminal firmwares send idle heartbeats every 30 seconds. Keep the
      * established read bounded without reconnecting between those heartbeats. */

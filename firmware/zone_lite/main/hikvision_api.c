@@ -24,21 +24,35 @@ static bool employee_valid(const char *s)
     /* First certified profile uses numeric strings; no integer conversion. */
     return strspn(s, "0123456789") == strlen(s);
 }
-static hik_result_t request_json(esp_http_client_method_t method, const char *path,
-    cJSON *body, cJSON **out)
+static hik_result_t request_json_timeout(esp_http_client_method_t method, const char *path,
+    cJSON *body, int timeout_ms, cJSON **out)
 {
     *out = NULL;
     char *request = cJSON_PrintUnformatted(body);
     char *response = malloc(RESPONSE_BYTES);
     if (!request || !response) { free(request); free(response); return HIK_NETWORK; }
     size_t length;
-    hik_result_t result = hik_http_request(method, path, request, response, RESPONSE_BYTES, &length);
+    hik_result_t result = hik_http_request_timeout(method, path, request, timeout_ms, response, RESPONSE_BYTES, &length);
     if (result == HIK_OK) {
         *out = cJSON_ParseWithLength(response, length);
         if (!cJSON_IsObject(*out)) { cJSON_Delete(*out); *out = NULL; result = HIK_PARSE; }
     }
     free(request); free(response);
     return result;
+}
+static hik_result_t request_json(esp_http_client_method_t method, const char *path,
+    cJSON *body, cJSON **out)
+{
+    return request_json_timeout(method, path, body, HIK_HTTP_TIMEOUT_MS, out);
+}
+/* 3.1.7: every AcsEvent search (live poll anchor/count/probe/page, light audit
+ * bounds/page, ADD history pages) goes through here with the longer search
+ * timeout. A time-sorted terminal answers a +-1 serial search in just over
+ * 10 s (Mirpur-02, request_ms=10058/10332). */
+static hik_result_t acs_event_search(cJSON *body, cJSON **out)
+{
+    return request_json_timeout(HTTP_METHOD_POST, "/ISAPI/AccessControl/AcsEvent?format=json",
+        body, HIK_HTTP_SEARCH_TIMEOUT_MS, out);
 }
 void hik_search_init(hik_search_t *s, uint32_t first, uint32_t last)
 {
@@ -62,7 +76,7 @@ hik_result_t hik_history_response(const cJSON *request, cJSON **response)
     const cJSON *end = cJSON_GetObjectItemCaseSensitive(cond, "endSerialNo");
     if ((begin || end) && (!integer(begin, &first) || !integer(end, &last) || !first || first > last))
         return HIK_CONFIGURATION;
-    return request_json(HTTP_METHOD_POST, "/ISAPI/AccessControl/AcsEvent?format=json", (cJSON *)request, response);
+    return acs_event_search((cJSON *)request, response);
 }
 static hik_result_t boundary_at(uint32_t position, uint32_t *serial, uint32_t *total)
 {
@@ -75,8 +89,7 @@ static hik_result_t boundary_at(uint32_t position, uint32_t *serial, uint32_t *t
         cJSON_AddNumberToObject(cond, "major", 0) && cJSON_AddNumberToObject(cond, "minor", 0) &&
         cJSON_AddBoolToObject(cond, "picEnable", false);
     cJSON *response = NULL;
-    hik_result_t result = valid ? request_json(HTTP_METHOD_POST,
-        "/ISAPI/AccessControl/AcsEvent?format=json", body, &response) : HIK_NETWORK;
+    hik_result_t result = valid ? acs_event_search(body, &response) : HIK_NETWORK;
     cJSON_Delete(body);
     if (result != HIK_OK) return result;
     cJSON *page = cJSON_GetObjectItemCaseSensitive(response, "AcsEvent");
@@ -137,8 +150,7 @@ hik_result_t hik_history_page(hik_search_t *s, hik_record_fn fn, void *context)
         cJSON_AddNumberToObject(cond, "beginSerialNo", request_begin) &&
         cJSON_AddNumberToObject(cond, "endSerialNo", s->last_serial);
     cJSON *response = NULL;
-    hik_result_t result = valid ? request_json(HTTP_METHOD_POST,
-        "/ISAPI/AccessControl/AcsEvent?format=json", body, &response) : HIK_NETWORK;
+    hik_result_t result = valid ? acs_event_search(body, &response) : HIK_NETWORK;
     cJSON_Delete(body);
     if (result != HIK_OK) return result;
     cJSON *page = cJSON_GetObjectItemCaseSensitive(response, "AcsEvent");
@@ -226,8 +238,7 @@ static hik_result_t range_request(const char *search_id, uint32_t position, unsi
         cJSON_AddBoolToObject(cond, "picEnable", false) &&
         cJSON_AddNumberToObject(cond, "beginSerialNo", begin) &&
         cJSON_AddNumberToObject(cond, "endSerialNo", end);
-    hik_result_t result = valid ? request_json(HTTP_METHOD_POST,
-        "/ISAPI/AccessControl/AcsEvent?format=json", body, response) : HIK_NETWORK;
+    hik_result_t result = valid ? acs_event_search(body, response) : HIK_NETWORK;
     int64_t elapsed = (esp_timer_get_time() - started) / 1000;
     request_ms = elapsed < 0 ? 0 : (unsigned)elapsed;
     cJSON_Delete(body);

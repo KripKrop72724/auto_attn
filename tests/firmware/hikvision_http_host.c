@@ -56,7 +56,31 @@ int esp_http_client_close(esp_http_client_handle_t c){
 int esp_http_client_cleanup(esp_http_client_handle_t c){free(c);return 0;}
 static hik_result_t request(void){char response[256];size_t n;return hik_http_request(HTTP_METHOD_POST,
  "/ISAPI/AccessControl/AcsEvent?format=json","{}",response,sizeof(response),&n);}
+static unsigned progress_calls;
+static void progress(void){progress_calls++;}
+/* 3.1.7: AcsEvent searches get 25 s via the explicit API; everything else 10 s. */
+static void test_timeouts(void){
+ char response[256];size_t n;const char *acs="/ISAPI/AccessControl/AcsEvent?format=json";
+ hik_http_set_progress_hook(progress);progress_calls=0;challenges=1;identity_body=NULL;
+ assert(HIK_HTTP_TIMEOUT_MS==10000&&HIK_HTTP_SEARCH_TIMEOUT_MS==25000&&HIK_HTTP_MIN_TIMEOUT_MS==1000);
+ assert(hik_http_request(HTTP_METHOD_POST,acs,"{}",response,sizeof(response),&n)==HIK_OK);
+ assert(requested_timeout==10000&&progress_calls==1);
+ assert(hik_http_request_timeout(HTTP_METHOD_POST,acs,"{}",HIK_HTTP_SEARCH_TIMEOUT_MS,response,sizeof(response),&n)==HIK_OK);
+ assert(requested_timeout==25000&&strstr(requested_url,"/AcsEvent?")&&progress_calls==2);
+ assert(hik_http_request_timeout(HTTP_METHOD_POST,acs,"{}",1000,response,sizeof(response),&n)==HIK_OK&&requested_timeout==1000);
+ requested_timeout=0;
+ assert(hik_http_request_timeout(HTTP_METHOD_POST,acs,"{}",25001,response,sizeof(response),&n)==HIK_CONFIGURATION);
+ assert(hik_http_request_timeout(HTTP_METHOD_POST,acs,"{}",999,response,sizeof(response),&n)==HIK_CONFIGURATION);
+ assert(requested_timeout==0&&progress_calls==5); /* rejected requests are still a completed call */
+ /* A failing request is reported too: a slow terminal that times out is not a hung worker. */
+ retry_transport_failure=true;assert(request()==HIK_NETWORK&&progress_calls==6);retry_transport_failure=false;
+ identity_body="<DeviceInfo><serialNumber>test</serialNumber></DeviceInfo>";
+ assert(hik_http_verify_identity()==HIK_OK&&requested_timeout==10000&&strstr(requested_url,"deviceInfo")&&progress_calls==7);
+ identity_body=NULL;hik_http_set_progress_hook(NULL);
+ assert(request()==HIK_OK&&progress_calls==7);
+}
 int main(void){
+ test_timeouts();
  for(challenges=1;challenges<=2;challenges++){
   auth_calls=closes=0;char response[256];size_t n;
   assert(hik_http_request(HTTP_METHOD_POST,"/ISAPI/AccessControl/AcsEvent?format=json","{}",response,sizeof(response),&n)==HIK_OK);
@@ -86,6 +110,7 @@ int main(void){
  assert(!strcmp(config.hik_host,"192.0.2.1"));
  challenges=1;retry_transport_failure=true;assert(request()==HIK_NETWORK&&hik_http_last_status()==0);retry_transport_failure=false;
  assert(hik_http_stream_with_state(stream_record,(void*)42,stream_state)==HIK_NETWORK);
+ assert(strstr(requested_url,"alertStream")&&requested_timeout==10000);
  assert(stream_opens==1&&stream_closes==2&&stream_records==1&&hik_http_last_status()==0);
  accept_stream=false;assert(hik_http_stream_with_state(stream_record,(void*)42,stream_state)==HIK_CUSTODY);
  assert(stream_opens==2&&stream_closes==4&&stream_records==2&&hik_http_last_status()==0);
