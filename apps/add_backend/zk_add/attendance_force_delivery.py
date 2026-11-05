@@ -359,4 +359,10 @@ async def deliver_forced(claims, *, concurrency):
                 code = getattr(exc, "code", "ORACLE_CONTENT_VERIFICATION_PENDING")
             await asyncio.to_thread(persist_result, claim, classification, token, code, matched_event_uid)
 
-    await asyncio.gather(*(one(claim) for claim in claims))
+    # Let every check finish before an error propagates: the caller releases
+    # the delivery lock on return, and a re-claim of a row whose check is still
+    # running could POST it twice.
+    results = await asyncio.gather(*(one(claim) for claim in claims), return_exceptions=True)
+    for result in results:
+        if isinstance(result, BaseException):
+            raise result

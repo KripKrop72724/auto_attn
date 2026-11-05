@@ -892,3 +892,32 @@ def test_forced_only_batch_checks_in_parallel(monkeypatch):
     monkeypatch.setattr(delivery, "deliver_forced", forced)
     asyncio.run(worker.deliver_ords_batch(limit=100, concurrency=8))
     assert seen == {"forced": 4}
+
+
+def test_forced_lane_lets_every_check_finish_before_raising(monkeypatch):
+    import asyncio
+
+    finished = []
+
+    async def scenario():
+        async def fake_verify(claim):
+            await asyncio.sleep(0.05 if claim["row_id"] == 2 else 0)
+            return "MATCH", "0" * 64
+
+        def fake_persist(claim, *args):
+            if claim["row_id"] == 1:
+                raise RuntimeError("persist failed")
+            finished.append(claim["row_id"])
+
+        monkeypatch.setattr(delivery, "verify", fake_verify)
+        monkeypatch.setattr(delivery, "persist_result", fake_persist)
+        claims = [
+            {"row_id": index, "direct": False, "payload": {"event_uid": "a" * 64}}
+            for index in (1, 2)
+        ]
+        with pytest.raises(RuntimeError):
+            await delivery.deliver_forced(claims, concurrency=2)
+
+    asyncio.run(scenario())
+    # The slower sibling still completed before the error reached the caller.
+    assert finished == [2]

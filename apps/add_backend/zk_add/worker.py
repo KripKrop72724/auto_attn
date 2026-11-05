@@ -79,8 +79,9 @@ ORDS_DELIVERY_CONCURRENCY = max(
     1,
     min(settings.ords_delivery_concurrency, ORDS_DELIVERY_BATCH_SIZE),
 )
-ORDS_FORCED_BATCH_SIZE = max(1, min(settings.ords_forced_batch_size, 64))
-ORDS_FORCED_CONCURRENCY = max(1, min(settings.ords_forced_concurrency, ORDS_FORCED_BATCH_SIZE))
+# 0 stops forced-release delivery entirely (an operator kill switch).
+ORDS_FORCED_BATCH_SIZE = max(0, min(settings.ords_forced_batch_size, 64))
+ORDS_FORCED_CONCURRENCY = max(1, min(settings.ords_forced_concurrency, max(1, ORDS_FORCED_BATCH_SIZE)))
 ORDS_FIRMWARE_AUDIT_BATCH_SIZE = max(
     1,
     min(settings.ords_firmware_audit_batch_size, 500),
