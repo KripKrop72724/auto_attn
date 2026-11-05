@@ -114,7 +114,7 @@ def _lock(session, connector_id, actor, idempotency_key):
     if not actor or len(actor) > 120 or not idempotency_key or len(idempotency_key) > 120:
         raise ValueError("HANDOFF_ACTOR_AND_KEY_REQUIRED")
     connector = session.scalar(
-        select(Connector).where(Connector.connector_id == connector_id).with_for_update().execution_options(populate_existing=True)
+        select(Connector).where(Connector.connector_id == connector_id).with_for_update(key_share=True).execution_options(populate_existing=True)
     )
     if connector is None:
         raise ValueError("HANDOFF_CONNECTOR_NOT_FOUND")

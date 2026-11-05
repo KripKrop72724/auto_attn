@@ -811,6 +811,10 @@ def test_hundred_thousand_backlog_keeps_login_and_live_delivery_responsive(force
     from test_attendance_force_release import sync
 
     sessions, connector_id, _ = force_pg
+    # Production steps 25 punches per tick; proving the budget at a step of 100
+    # (four times the work under the connector lock) keeps this load test at
+    # ~1000 ticks.
+    monkeypatch.setattr(force, "STEP_BATCH", 100)
     with sessions() as db:
         table = AttendanceEvent.__table__
         columns = [c.name for c in table.columns if c.name != "id"]
@@ -971,3 +975,141 @@ def test_populated_upgrade_backfills_holds_and_rollback_preserves_approval(
     with pytest.raises(DBAPIError, match="content verification"):
         with engine.begin() as conn:
             conn.execute(text("UPDATE add_attendance_events SET ords_status='ACKED'"))
+
+
+def _hold_child_row_key_share(sessions, connector_pk):
+    """An open transaction holding FOR KEY SHARE on the connector, as every
+    foreign-key check does (bulk recovery items, direct ORDS rows, logs)."""
+    from zk_add.models import DeviceLog
+    from zk_add.time_utils import utc_now
+
+    holder = sessions()
+    holder.add(DeviceLog(connector_id=connector_pk, boot_id="fk-holder", sequence=1,
+                         level="INFO", subsystem="test", message="fk", context={},
+                         received_at=utc_now()))
+    holder.flush()
+    return holder
+
+
+def _log_envelope(connector, seq, boot="lock-mode-boot"):
+    from zk_add.schemas import Envelope
+    from zk_add.time_utils import utc_now
+
+    return Envelope(message_id=f"lock-mode-{seq}", connector_id=connector.connector_id,
+                    boot_id=boot, seq=seq, sent_at=utc_now(), type="log",
+                    payload={"level": "INFO", "message": "ok"})
+
+
+def test_device_messages_do_not_wait_for_foreign_key_inserts(force_pg):
+    """Production 5 Nov: bulk child-row inserts and device messages blocked each other.
+
+    persist_envelope and record_envelope_rejection lock the connector FOR NO
+    KEY UPDATE, which never conflicts with a foreign-key check's KEY SHARE.
+    """
+    import time
+    from zk_add import web
+    from zk_add.models import DeviceLog
+
+    sessions, _connector_id, _uid = force_pg
+    with sessions() as db:
+        connector = db.scalar(select(Connector))
+        pk = connector.id
+    holder = _hold_child_row_key_share(sessions, pk)
+    try:
+        with ThreadPoolExecutor(1) as pool:
+            began = time.monotonic()
+            outcome = pool.submit(web.persist_envelope, pk, _log_envelope(connector, 1)).result(10)
+            pool.submit(web.record_envelope_rejection, pk, _log_envelope(connector, 2),
+                        ValueError("bad")).result(10)
+            elapsed = time.monotonic() - began
+        assert outcome.ack["type"] == "ack"
+        assert elapsed < 3, "a device message waited behind a foreign-key check"
+    finally:
+        holder.rollback()
+        holder.close()
+    with sessions() as db:
+        assert db.scalar(select(func.count(DeviceLog.id)).where(
+            DeviceLog.boot_id == "lock-mode-boot")) == 2
+
+
+def test_device_messages_still_serialize_on_the_connector_row(force_pg):
+    """FOR NO KEY UPDATE still excludes another connector locker (a reconnect race)."""
+    from zk_add import web
+
+    sessions, _connector_id, _uid = force_pg
+    with sessions() as db:
+        connector = db.scalar(select(Connector))
+        pk = connector.id
+    holder = sessions()
+    try:
+        holder.scalar(select(Connector).where(Connector.id == pk).with_for_update(key_share=True))
+        holder.execute(text("SET LOCAL lock_timeout = '300ms'"))
+        with ThreadPoolExecutor(1) as pool:
+            def blocked():
+                with sessions() as db:
+                    db.execute(text("SET LOCAL lock_timeout = '300ms'"))
+                    db.scalar(select(Connector).where(Connector.id == pk)
+                              .with_for_update(key_share=True))
+            with pytest.raises(DBAPIError, match="lock timeout"):
+                pool.submit(blocked).result(10)
+    finally:
+        holder.rollback()
+        holder.close()
+    assert web.persist_envelope(pk, _log_envelope(connector, 3)).ack["type"] == "ack"
+
+
+def test_force_tick_skips_a_busy_device_without_marking_it(force_pg):
+    """The force tick takes FOR NO KEY UPDATE SKIP LOCKED and never waits on a device."""
+    import time
+    from sqlalchemy import event as sa_event
+    from zk_add.models import AttendanceForceReleaseTask as Task
+
+    sessions, connector_id, _uid = force_pg
+    with sessions() as db:
+        force.create_check(
+            db,
+            actor="operator",
+            request=ForceCheckRequest(
+                scope="SELECTED", connector_ids=[connector_id], idempotency_key="pg-busy-device"
+            ),
+        )
+        db.commit()
+        task = db.scalar(select(Task))
+        before = (task.status, task.updated_at, task.user_cursor, task.error_code)
+        job_updated = db.scalar(select(Job)).updated_at
+        pk = task.connector_id
+    seen = []
+    engine = sessions.kw["bind"]
+
+    def record(_conn, _cursor, statement, *_args):
+        if "add_connectors" in statement and "FOR" in statement:
+            seen.append(" ".join(statement.split()))
+
+    sa_event.listen(engine, "before_cursor_execute", record)
+    holder = sessions()
+    try:
+        # A device message transaction holding its connector row.
+        holder.scalar(select(Connector).where(Connector.id == pk).with_for_update(key_share=True))
+        began = time.monotonic()
+        tick(sessions)
+        assert time.monotonic() - began < 3
+    finally:
+        holder.rollback()
+        holder.close()
+    with sessions() as db:
+        task = db.scalar(select(Task))
+        assert (task.status, task.updated_at, task.user_cursor, task.error_code) == before
+        assert task.status != "UNAVAILABLE"
+        job = db.scalar(select(Job))
+        assert job.updated_at == job_updated and job.status == "CHECKING"
+    assert any("FOR NO KEY UPDATE SKIP LOCKED" in sql for sql in seen), seen
+    # A foreign-key check (KEY SHARE) does not make the device look busy.
+    holder = _hold_child_row_key_share(sessions, pk)
+    try:
+        tick(sessions)
+    finally:
+        holder.rollback()
+        holder.close()
+    sa_event.remove(engine, "before_cursor_execute", record)
+    with sessions() as db:
+        assert db.scalar(select(Task)).status == "SYNC_PENDING"

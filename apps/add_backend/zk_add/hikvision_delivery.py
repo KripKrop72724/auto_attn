@@ -257,7 +257,7 @@ def configure_policy(
     from zk_add.audit import append_audit
     from zk_add.models import AuditEvent
 
-    session.scalar(select(Connector).where(Connector.id == connector.id).with_for_update())
+    session.scalar(select(Connector).where(Connector.id == connector.id).with_for_update(key_share=True))
     terminal = connector.zkt_device
     if (
         connector.firmware_family != "hikvision"

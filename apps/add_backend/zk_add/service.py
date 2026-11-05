@@ -537,7 +537,7 @@ def record_device_reported_return(
         return None
     # Re-read under the lock: the return boot's first heartbeat may have
     # committed a newer boot_id since this request authenticated.
-    session.scalar(select(Connector).where(Connector.id == connector.id).with_for_update()
+    session.scalar(select(Connector).where(Connector.id == connector.id).with_for_update(key_share=True)
                    .execution_options(populate_existing=True))
     deployment = session.scalar(select(FirmwareDeployment).where(
         FirmwareDeployment.deployment_id == deployment_public_id,

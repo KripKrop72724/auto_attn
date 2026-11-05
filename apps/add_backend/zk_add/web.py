@@ -614,6 +614,10 @@ DASHBOARD_METRICS_STALE_SECONDS = 120
 # With no usable value (cold start), a request waits this long for the refresh
 # another request is running, then answers 503 instead of holding its thread.
 DASHBOARD_METRICS_WAIT_SECONDS = 30
+# Release and recovery actions mark the figures out of date instead of dropping
+# them. A bulk release posts hundreds of these a minute; the figures refresh at
+# most once per this many seconds and viewers keep the last value meanwhile.
+DASHBOARD_METRICS_MARK_MIN_AGE_SECONDS = 5
 
 
 def _dashboard_metrics(session: Session) -> dict:
@@ -692,15 +696,19 @@ def dashboard_metrics(db: Session) -> tuple[dict, datetime, int]:
 
 
 def invalidate_dashboard_metrics_after_commit(db: Session) -> None:
-    """Recompute the cached delivery/recovery figures once this request commits.
+    """Mark the cached delivery/recovery figures out of date once this commits.
 
     For operator actions that change attendance delivery (releases, recovery
-    controls), so the next Refresh shows their effect instead of figures up to
-    a TTL old. A rolled-back request leaves the cache alone.
+    controls), so a Refresh a few seconds later shows their effect instead of
+    figures up to a TTL old. It does not drop the figures: during a bulk
+    release every viewer would otherwise wait on a full recompute after each
+    POST. A rolled-back request leaves the cache alone.
     """
 
     def _invalidate(_session) -> None:
-        dashboard_cache.invalidate(DASHBOARD_METRICS_KEY)
+        dashboard_cache.mark_stale(
+            DASHBOARD_METRICS_KEY, DASHBOARD_METRICS_MARK_MIN_AGE_SECONDS
+        )
 
     sa_event.listen(db, "after_commit", _invalidate, once=True)
 
@@ -4429,7 +4437,7 @@ def acknowledge_alert(
     if row is None:
         raise HTTPException(status_code=404, detail="Alert not found.")
     # Heartbeats lock the connector before its alerts; keep the same order.
-    db.scalar(select(Connector).where(Connector.id == row.connector_id).with_for_update())
+    db.scalar(select(Connector).where(Connector.id == row.connector_id).with_for_update(key_share=True))
     row = db.scalar(
         select(DeviceAlert)
         .where(DeviceAlert.id == alert_id)
@@ -5359,7 +5367,7 @@ def record_envelope_rejection(connector_pk: int, envelope: Envelope, error: Exce
     # Which custody record was refused, so its later acceptance can be proven.
     evidence = refused_copy(envelope.payload) if envelope.type == "queue_evidence" else None
     with session_scope() as db:
-        connector = db.scalar(select(Connector).where(Connector.id == connector_pk).with_for_update())
+        connector = db.scalar(select(Connector).where(Connector.id == connector_pk).with_for_update(key_share=True))
         if connector is None:
             return
         alert = record_message_rejection(
@@ -5430,7 +5438,7 @@ def persist_envelope(connector_pk: int, envelope: Envelope) -> EnvelopeOutcome |
         # Separate sockets may overlap during reconnect. Serialize sequence checks
         # and acceptance for the same connector before acknowledging either socket.
         connector = db.scalar(
-            select(Connector).where(Connector.id == connector_pk).with_for_update()
+            select(Connector).where(Connector.id == connector_pk).with_for_update(key_share=True)
         )
         if connector is None:
             return
@@ -6692,7 +6700,7 @@ async def firmware_progress(
         # owner's pause or cancel (or this ESP's own heartbeat) waits instead
         # of deadlocking. Every report already took this row lock when it
         # committed its ota_state; it is only taken first now.
-        db.execute(_select(Connector.id).where(Connector.id == connector.id).with_for_update())
+        db.execute(_select(Connector.id).where(Connector.id == connector.id).with_for_update(key_share=True))
         from zk_add.legacy_bld5_bridge import accept_legacy_progress
 
         legacy = accept_legacy_progress(

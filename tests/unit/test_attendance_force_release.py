@@ -958,3 +958,90 @@ def test_forced_batch_never_exceeds_its_concurrency():
     assert forced_rate(0, 8) == (0, 8)
     assert forced_rate(8, 0) == (1, 1)
     assert forced_rate(500, 500) == (64, 64)
+
+
+def test_small_step_batch_still_finishes_check_and_release(store, monkeypatch):
+    """Each tick works on STEP_BATCH punches; the exact-boundary batch still completes.
+
+    With one punch and a step of one, the first scan tick sees a full step, so
+    completion is known on the following (empty) tick; a full release step
+    that leaves nothing READY finishes the device at once.
+    """
+    sessions, connector_id, _uid = store
+    monkeypatch.setattr(force, "STEP_BATCH", 1)
+    with sessions() as db:
+        job = force.create_check(
+            db,
+            actor="operator",
+            request=ForceCheckRequest(
+                scope="SELECTED", connector_ids=[connector_id], idempotency_key="small-step"
+            ),
+        )
+        job_id = job.job_id
+        db.commit()
+    tick(sessions)  # baseline
+    tick(sessions)  # enqueue refresh
+    sync(sessions)
+    tick(sessions)  # accept refresh
+    tick(sessions)  # classify one punch: a full step, not finished yet
+    with sessions() as db:
+        assert db.scalar(select(Task)).status == "CHECKING"
+        assert db.scalar(select(Task)).checked_count == 1
+        assert db.scalar(select(Job)).status == "CHECKING"
+    tick(sessions)  # empty step: finished
+    with sessions() as db:
+        assert db.scalar(select(Task)).checked_count == 1
+        job = db.scalar(select(Job))
+        assert job.status == "CHECKED"
+        assert (job.requested_count, job.eligible_count) == (1, 1)
+        assert db.scalar(select(func.count(Item.id))) == 1
+    approve(store, job_id)
+    with sessions() as db:
+        assert db.scalar(select(Task)).status == "RELEASING"
+    tick(sessions)  # release one punch: a full step, and the device's last
+    with sessions() as db:
+        # The job leaves RUNNING on this tick, so the device must be done now.
+        assert db.scalar(select(Task)).status == "DONE"
+        assert db.scalar(select(Item)).status == "WAITING_ORACLE"
+        assert db.scalar(select(Job)).status == "WAITING_ORACLE"
+        assert db.scalar(select(func.count(Decision.id))) == 1
+    claims = claim_ords_batch(1)
+    _ordinary, forced = delivery.split_claims(claims)
+    delivery.persist_result(forced[0], "MATCH", "c" * 64)
+    tick(sessions)
+    with sessions() as db:
+        assert db.scalar(select(Job)).status == "COMPLETED"
+
+
+def test_busy_device_lock_leaves_the_task_and_job_untouched(store, monkeypatch):
+    """A device row locked by its own message transaction is skipped this tick.
+
+    SQLite has no row locks, so the SKIP LOCKED miss is simulated; the
+    PostgreSQL test proves the real lock.
+    """
+    sessions, connector_id, _uid = store
+    with sessions() as db:
+        force.create_check(
+            db,
+            actor="operator",
+            request=ForceCheckRequest(
+                scope="SELECTED", connector_ids=[connector_id], idempotency_key="busy-device"
+            ),
+        )
+        db.commit()
+        before_task = db.scalar(select(Task))
+        before = (before_task.status, before_task.updated_at, before_task.user_cursor,
+                  before_task.error_code)
+        job_updated = db.scalar(select(Job)).updated_at
+    original = force._lock_next_task
+    monkeypatch.setattr(force, "_lock_next_task", lambda session, job: (force._BUSY, None))
+    tick(sessions)
+    with sessions() as db:
+        task = db.scalar(select(Task))
+        assert (task.status, task.updated_at, task.user_cursor, task.error_code) == before
+        assert db.scalar(select(Job)).updated_at == job_updated
+        assert db.scalar(select(Job)).status == "CHECKING"
+    monkeypatch.setattr(force, "_lock_next_task", original)
+    tick(sessions)
+    with sessions() as db:
+        assert db.scalar(select(Task)).status == "SYNC_PENDING"  # the baseline step ran
