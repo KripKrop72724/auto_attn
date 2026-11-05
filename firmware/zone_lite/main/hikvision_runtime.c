@@ -96,6 +96,37 @@ static void append_clock_evidence(cJSON *root)
 }
 static SemaphoreHandle_t request_lock, source_upload_lock;
 static QueueHandle_t profile_commands;
+/* 3.1.7 request progress. Event searches may now take up to 25 s each, so a
+ * dense poll (identity, clock, anchor, count0, probes, pages) or a light-audit
+ * bounds step (3 searches) can hold the terminal for longer than the 90 s that
+ * boot health / OTA confirmation allow between poll_tick and history_tick
+ * updates. Every finished terminal request (OK or failed: each is bounded by
+ * its own timeout) made by the request_lock holder is real progress: it
+ * refreshes that worker's tick and the shared progress stamp. A worker that is
+ * truly stuck finishes no request and its tick still goes stale. The stream
+ * task's identity check runs without request_lock and is ignored here. */
+static atomic_uint request_progress_ms;
+static TaskHandle_t volatile poll_worker, history_worker;
+static void request_progress(void)
+{
+    TaskHandle_t self = xTaskGetCurrentTaskHandle();
+    if (!request_lock || xSemaphoreGetMutexHolder(request_lock) != self) return;
+    uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
+    atomic_store(&request_progress_ms, now);
+    if (self == poll_worker) atomic_store(&poll_tick, now);
+    else if (self == history_worker) atomic_store(&history_tick, now);
+}
+/* The poll task waits for a terminal held by the history/audit or profile
+ * worker. While that holder keeps finishing requests the poll task is merely
+ * queued behind it, so its tick follows the shared progress stamp; a holder
+ * that stops finishing requests leaves poll_tick stale as before. */
+static void poll_take_request_lock(void)
+{
+    while (xSemaphoreTake(request_lock, pdMS_TO_TICKS(1000)) != pdTRUE) {
+        uint32_t progress = atomic_load(&request_progress_ms), tick = atomic_load(&poll_tick);
+        if (tick && (int32_t)(progress - tick) > 0) atomic_store(&poll_tick, progress);
+    }
+}
 /* Protected by request_lock: at most one bounded background page per poll. */
 static bool background_slot;
 static bool take_background_slot(void)
@@ -501,8 +532,9 @@ static void poll_task(void *arg)
     hik_result_t previous_result = HIK_CONFIGURATION;
     led_status_t previous_led = LED_STATUS_BOOTING;
     unsigned backoff_failures = 0;
+    poll_worker = xTaskGetCurrentTaskHandle();
     for (;;) {
-        xSemaphoreTake(request_lock, portMAX_DELAY);
+        poll_take_request_lock();
         int64_t started = esp_timer_get_time();
         if (last_start_us) atomic_store(&last_poll_interval_ms, (unsigned)((started - last_start_us) / 1000));
         last_start_us = started;
@@ -766,6 +798,7 @@ static void light_step(void)
 static void history_task(void *arg)
 {
     (void)arg;
+    history_worker = xTaskGetCurrentTaskHandle();
     char *assignment = malloc(2048);
     if (!assignment) { vTaskDelete(NULL); return; }
     for (;;) {
@@ -1029,6 +1062,7 @@ void hikvision_gateway_task(void *argument)
             vTaskDelay(pdMS_TO_TICKS(5000));
         }
     }
+    hik_http_set_progress_hook(request_progress);
     int64_t next_worker_warning = 0;
     for (;;) {
         /* Start evidence delivery before optional scans can consume heap. */

@@ -134,6 +134,16 @@ static void test_stable_profile(void){
  assert(hik_profile_command(&c,&receipt)==HIK_OK && !person);cJSON_Delete(receipt);
  strcpy(config.hik_profile,"ds-k1t342efwx-v3.3.5-220310-poll5-pilot-v1");volatile_reads=false;
 }
+/* 3.1.7: user/profile/command requests keep the 10 s timeout; only AcsEvent
+ * searches get the 25 s search timeout. */
+static unsigned user_requests;
+hik_result_t hik_http_request_timeout(esp_http_client_method_t method,const char *path,
+ const char *body,int timeout_ms,char *response,size_t capacity,size_t *length){
+ bool search=!strncmp(path,"/ISAPI/AccessControl/AcsEvent",29);
+ assert(timeout_ms==(search?HIK_HTTP_SEARCH_TIMEOUT_MS:HIK_HTTP_TIMEOUT_MS));
+ if(!search)user_requests++;
+ return hik_http_request(method,path,body,response,capacity,length);
+}
 int main(void){
  test_stable_profile();
  hik_api_use_stable_profiles(false);
@@ -191,5 +201,6 @@ int main(void){
  c=existing_command("UPDATE_USER");strcpy(c.name,"Changed");corrupt_write=true;
  assert(hik_profile_command(&c,&receipt)!=HIK_OK && !receipt);
  cJSON_Delete(person);
+ assert(user_requests>0);
  puts("Verified CRUD, role preservation, stale state, lost ACK and pending deletion passed");return 0;
 }

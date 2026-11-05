@@ -230,6 +230,18 @@ static void test_unordered_ranges(void)
     assert(hik_history_range(0, 10, 50, range_saved, NULL) == HIK_CONFIGURATION);
     mode = 0;
 }
+/* 3.1.7: every AcsEvent search gets the 25 s search timeout; users,
+ * profiles and writes keep 10 s. Counted per path so main() can prove that
+ * each history API (page, bounds, count, range, ADD response) used it. */
+static unsigned search_requests, other_requests;
+hik_result_t hik_http_request_timeout(esp_http_client_method_t method, const char *path,
+    const char *body, int timeout_ms, char *response, size_t capacity, size_t *length)
+{
+    bool search = !strncmp(path, "/ISAPI/AccessControl/AcsEvent", 29);
+    assert(timeout_ms == (search ? HIK_HTTP_SEARCH_TIMEOUT_MS : HIK_HTTP_TIMEOUT_MS));
+    if (search) search_requests++; else other_requests++;
+    return hik_http_request(method, path, body, response, capacity, length);
+}
 int main(void)
 {
     test_unordered_ranges();
@@ -278,5 +290,14 @@ int main(void)
     cJSON *filtered = cJSON_Parse("{\"AcsEventCond\":{\"searchID\":\"filtered\",\"searchResultPosition\":0,\"maxResults\":20,\"major\":0,\"minor\":0,\"picEnable\":false,\"beginSerialNo\":1,\"endSerialNo\":30009,\"employeeNoString\":\"00111\"}}");
     assert(hik_history_response(filtered, &response) == HIK_OK && response);
     cJSON_Delete(response); cJSON_Delete(filtered);
+    assert(HIK_HTTP_TIMEOUT_MS == 10000 && HIK_HTTP_SEARCH_TIMEOUT_MS == 25000);
+    unsigned before = search_requests, users = other_requests;
+    mode = 10;
+    assert(hik_history_bounds(&first, &last, &count) == HIK_OK && search_requests == before + 3);
+    mode = 0; received = 0; before = search_requests; hik_search_init(&s, 30001, 330000);
+    assert(hik_history_page(&s, saved, NULL) == HIK_OK && search_requests == before + 1);
+    before = search_requests; uint32_t total = 0;
+    (void)hik_history_count(1, 3000000000U, &total); assert(search_requests == before + 1);
+    assert(other_requests == users && users > 0);
     puts("150000 bounded source records, custody failures and verified CRUD passed");
 }
