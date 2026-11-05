@@ -46,7 +46,7 @@ def upgrade() -> None:
             sa.Column("backlog_counted_at", sa.DateTime(timezone=True)),
             sa.Column("count_attempted_at", sa.DateTime(timezone=True)),
             sa.Column("count_failures", sa.Integer(), nullable=False, server_default="0"),
-            sa.Column("stats", sa.JSON()),
+            sa.Column("stats", sa.JSON(), nullable=False, server_default=sa.text("'{}'")),
             sa.Column("stats_counted_at", sa.DateTime(timezone=True)),
             sa.Column("last_batch_at", sa.DateTime(timezone=True)),
             sa.Column("last_batch_size", sa.Integer(), nullable=False, server_default="0"),
