@@ -758,13 +758,21 @@ def list_direct_ords_runs(
     return {"rows": [direct_ords.serialize(db, row) for row in rows]}
 
 
-# The ledger's "select all" covers this many punches; larger backlogs release in rounds.
+# With ?ids=true the summary also lists up to this many punch IDs, newest first.
 UNKNOWN_SYNCED_ID_LIMIT = 10_000
 
 
 @app.get("/api/v2/attendance-direct-ords/unknown-synced")
-def unknown_synced_summary(auth: tuple[Session, AdminContext] = Depends(require_admin)):
-    """Count and IDs of held "Unknown identity · CNIC on synced user" punches."""
+def unknown_synced_summary(
+    ids: bool = Query(default=False),
+    auth: tuple[Session, AdminContext] = Depends(require_admin),
+):
+    """Count per device of held "Unknown identity · CNIC on synced user" punches.
+
+    Releasing all of them is server-side (attendance_unknown_auto_release), so
+    the sorted ID list is read only on request: it is a second full pass of
+    the filter.
+    """
     db, _context = auth
     condition = unknown_synced_cnic_expression()
     devices = db.execute(
@@ -775,7 +783,7 @@ def unknown_synced_summary(auth: tuple[Session, AdminContext] = Depends(require_
         .order_by(func.count(AttendanceEvent.id).desc())
     ).all()
     total = sum(row[3] for row in devices)
-    event_ids = direct_ords.unknown_synced_event_ids(db, limit=UNKNOWN_SYNCED_ID_LIMIT)
+    event_ids = direct_ords.unknown_synced_event_ids(db, limit=UNKNOWN_SYNCED_ID_LIMIT) if ids else []
     return {
         "count": total,
         "devices": [
@@ -783,7 +791,7 @@ def unknown_synced_summary(auth: tuple[Session, AdminContext] = Depends(require_
             for connector_id, name, zone_id, count in devices
         ],
         "event_ids": event_ids,
-        "truncated": total > len(event_ids),
+        "truncated": ids and total > len(event_ids),
     }
 
 
@@ -814,6 +822,51 @@ def quick_release_direct_ords(
         "not_matching": not_matching,
         "skipped_by_reason": direct_ords.skipped_by_reason(db, job),
     }
+
+
+from zk_add import attendance_unknown_auto_release as unknown_auto_release  # noqa: E402
+
+
+@app.get("/api/v2/unknown-identity-auto-release")
+def unknown_identity_auto_release_status(auth: tuple[Session, AdminContext] = Depends(require_admin)):
+    """The automatic release switch and its progress, from saved counts (no backlog scan)."""
+    db, _context = auth
+    return unknown_auto_release.status(db)
+
+
+@app.post("/api/v2/unknown-identity-auto-release/control")
+def control_unknown_identity_auto_release(
+    request: Request,
+    body: unknown_auto_release.AutoReleaseControlRequest,
+    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+):
+    """Turn the automatic release ON or OFF: password and a written reason, audited."""
+    db, context = auth
+    require_step_up(body.password.get_secret_value(), db, context)
+    try:
+        unknown_auto_release.control(db, actor=context.username, request=body, ip_address=client_ip(request))
+        db.flush()
+    except unknown_auto_release.AutoReleaseError as exc:
+        raise HTTPException(status_code=409, detail={"code": exc.code, "message": str(exc)}) from exc
+    return unknown_auto_release.status(db)
+
+
+@app.post("/api/v2/unknown-identity-auto-release/release-all", status_code=202)
+def release_all_unknown_identity(
+    request: Request,
+    body: unknown_auto_release.AutoReleaseDrainRequest,
+    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+):
+    """One click: the worker releases every such punch, paced, until none is left untried."""
+    db, context = auth
+    try:
+        outcome = unknown_auto_release.request_drain(
+            db, actor=context.username, request=body, ip_address=client_ip(request),
+        )
+        db.flush()
+    except unknown_auto_release.AutoReleaseError as exc:
+        raise HTTPException(status_code=409, detail={"code": exc.code, "message": str(exc)}) from exc
+    return {**unknown_auto_release.status(db), "outcome": outcome}
 
 
 @app.post("/api/v2/attendance-direct-ords/preview")

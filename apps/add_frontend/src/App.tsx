@@ -24,6 +24,7 @@ import { dashboardRoute, firmwareSection, routeDeviceId, routePath } from './rou
 import { useRealtime, type RealtimeTopic } from './realtime'
 import { useThrottledRunner } from './lib/throttle'
 import { formatMetricsTime } from './lib/metricsTime'
+import { autoReleaseHeadline, useUnknownAutoReleaseStatus } from './features/unknownAutoRelease'
 import {
   firmwareLabel, humanizeStatus, isOnlineState, normalizedStatus, statusPattern, terminalLinkNeedsAttention,
   terminalLinkPattern, type StatusPattern,
@@ -469,6 +470,15 @@ export function metricsTime(overview: Overview) {
 export const availabilityTone = (percent: number, total: number): MetricTone =>
   !total ? 'neutral' : percent >= 95 ? 'positive' : percent >= 80 ? 'warning' : 'critical'
 
+// The owner's automatic release of unknown-identity punches, at a glance. It
+// polls its own small status (saved counts only) and hides for non-admins.
+function UnknownReleaseMetric({ onOpen }: { onOpen: () => void }) {
+  const { data } = useUnknownAutoReleaseStatus(true)
+  if (!data) return null
+  const headline = autoReleaseHeadline(data)
+  return <Metric label="Unknown-identity release" value={headline.value} detail={headline.detail} icon="refresh" tone={headline.tone} onClick={onOpen} />
+}
+
 function FleetView({
   devices,
   overview,
@@ -477,6 +487,7 @@ function FleetView({
   onManageUsers,
   onNavigateAlerts,
   onNavigateReconciliation,
+  onNavigateUnknownRelease,
 }: {
   devices: Device[]
   overview: Overview
@@ -485,6 +496,7 @@ function FleetView({
   onManageUsers: (device: Device) => void
   onNavigateAlerts: () => void
   onNavigateReconciliation: () => void
+  onNavigateUnknownRelease: () => void
 }) {
   const [query, setQuery] = useState('')
   const [filter, setFilter] = useState('ALL')
@@ -564,6 +576,7 @@ function FleetView({
           tone={(recovery?.safe_retryable ?? 0) > 0 ? 'warning' : 'neutral'}
           onClick={onNavigateReconciliation}
         />
+        <UnknownReleaseMetric onOpen={onNavigateUnknownRelease} />
         <Metric label="Enrollment leases" value={overview.active_leases} detail="Temporary administrator access" icon="shield" />
       </section> : <section className="spare-inventory-banner" aria-label="Spare inventory monitoring policy">
         <span className="spare-inventory-icon"><Icon name="shield" /></span>
@@ -1052,7 +1065,7 @@ function DashboardApp() {
   return (
     <>
       <AppShell workspaceRef={workspaceRef} username={username} route={view} openAlertCount={overview.open_unacknowledged_alerts ?? overview.open_alerts} onNavigate={setView} onLogout={() => void logout()} realtimeState={realtime.state} lastSyncAt={realtime.lastSyncAt}>
-        {view === 'fleet' && <FleetView devices={devices} overview={overview} loading={loading} onInspect={inspectDevice} onManageUsers={manageUsers} onNavigateAlerts={() => navigate('/alerts')} onNavigateReconciliation={() => navigate('/reconciliation?tab=recovery')} />}
+        {view === 'fleet' && <FleetView devices={devices} overview={overview} loading={loading} onInspect={inspectDevice} onManageUsers={manageUsers} onNavigateAlerts={() => navigate('/alerts')} onNavigateReconciliation={() => navigate('/reconciliation?tab=recovery')} onNavigateUnknownRelease={() => navigate('/attendance')} />}
         {view === 'users' && <Suspense fallback={<WorkspaceLoading label="Opening users" />}><UsersView devices={devices} selectedDeviceId={selectedDeviceId} onSelectDevice={selectUserDevice} revision={revisions.users + revisions.identity + revisions.command} toast={toast} refreshFleet={refreshFleet} /></Suspense>}
         {view === 'attendance' && <Suspense fallback={<WorkspaceLoading label="Opening attendance" />}><AttendanceView devices={devices} revision={revisions.attendance} realtimeState={realtime.state} realtimeLastSyncAt={realtime.lastSyncAt} toast={toast} /></Suspense>}
         {view === 'reconciliation' && <Suspense fallback={<WorkspaceLoading label="Opening reconciliation" />}><ReconciliationView devices={devices} revision={revisions.reconciliation + revisions.attendance} toast={toast} /></Suspense>}
