@@ -272,7 +272,7 @@ def reserve_trial(session, release, campaign, deployment, connector):
 
 def _trial(session, connector, deployment_id, *, require_new_boot):
     from zk_add.ota import FirmwareDeployment, FirmwareCampaign, FirmwareEvent, FirmwareRelease
-    connector = session.scalar(select(Connector).where(Connector.id == connector.id).with_for_update()
+    connector = session.scalar(select(Connector).where(Connector.id == connector.id).with_for_update(key_share=True)
         .execution_options(populate_existing=True))
     pin = _target(session, connector)
     deployment = session.scalar(select(FirmwareDeployment).where(FirmwareDeployment.deployment_id == deployment_id,

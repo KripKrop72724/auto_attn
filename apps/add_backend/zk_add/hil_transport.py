@@ -158,7 +158,7 @@ def start_interruption(session, run_id, *, actor, idempotency_key):
     connector_id = session.scalar(select(FirmwareHilRun.connector_id).where(FirmwareHilRun.run_id == run_id))
     if connector_id is None:
         raise ValueError("HIL observation was not found")
-    connector = session.scalar(select(Connector).where(Connector.id == connector_id).with_for_update())
+    connector = session.scalar(select(Connector).where(Connector.id == connector_id).with_for_update(key_share=True))
     run = session.scalar(select(FirmwareHilRun).where(FirmwareHilRun.run_id == run_id)
         .with_for_update().execution_options(populate_existing=True))
     existing = (run.result or {}).get(KEY)
@@ -265,7 +265,7 @@ def enforce_transport(session, connector, *, transport):
         return
     # HTTP authentication has not locked the connector row. Take it first so
     # restoration cannot invert ingestion/start's connector -> run lock order.
-    if session.scalar(select(Connector.id).where(Connector.id == connector.id).with_for_update()) is None:
+    if session.scalar(select(Connector.id).where(Connector.id == connector.id).with_for_update(key_share=True)) is None:
         return
     run = session.scalar(select(FirmwareHilRun).where(FirmwareHilRun.id == run.id)
         .with_for_update().execution_options(populate_existing=True))

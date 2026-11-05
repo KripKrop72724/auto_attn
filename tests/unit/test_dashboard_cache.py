@@ -446,20 +446,121 @@ def test_request_sessions_on_another_engine_compute_live(db: Session, monkeypatc
     assert summary["delivery"]["held_without_outbox"] == 1
 
 
-def test_operator_actions_invalidate_the_figures_only_after_commit(shared_engine_client):
+def test_operator_actions_mark_the_figures_stale_only_after_commit(
+    shared_engine_client, monkeypatch, clock
+):
     client, sessions = shared_engine_client
-    assert client.get("/api/v1/overview").status_code == 200
-    assert web.DASHBOARD_METRICS_KEY in dashboard_cache._entries
+    calls = []
+
+    def counted(session):
+        calls.append(1)
+        return ords_outbox_coverage(session)
+
+    monkeypatch.setattr(web, "ords_outbox_coverage", counted)
+    first = client.get("/api/v1/overview").json()
+    assert web.DASHBOARD_METRICS_KEY in dashboard_cache._entries and len(calls) == 1
+    state = dashboard_cache._states[web.DASHBOARD_METRICS_KEY]
 
     with sessions() as session:
         web.invalidate_dashboard_metrics_after_commit(session)
         session.rollback()
-    assert web.DASHBOARD_METRICS_KEY in dashboard_cache._entries, "a rolled-back action keeps the figures"
+    assert state.stale_mark is None, "a rolled-back action leaves the figures alone"
 
+    clock.now += 1
     with sessions() as session:
         web.invalidate_dashboard_metrics_after_commit(session)
         session.commit()
-    assert web.DASHBOARD_METRICS_KEY not in dashboard_cache._entries
+    # Marked, not dropped: viewers are never left without figures.
+    assert web.DASHBOARD_METRICS_KEY in dashboard_cache._entries
+    assert state.stale_mark == clock.now
+    # Younger than the coalescing window: still served as is.
+    assert client.get("/api/v1/overview").json()["metrics_computed_at"] == first["metrics_computed_at"]
+    assert len(calls) == 1
+    clock.now += web.DASHBOARD_METRICS_MARK_MIN_AGE_SECONDS
+    client.get("/api/v1/overview")
+    assert len(calls) == 2, "the next Refresh after the window shows the action's effect"
+
+
+def test_mark_stale_coalesces_a_burst_into_one_refresh_per_window(clock):
+    calls = []
+
+    def compute():
+        calls.append(clock.now)
+        return len(calls)
+
+    assert dashboard_cache.get_or_compute("k", 15, compute) == 1
+    for _ in range(200):  # a bulk release: hundreds of marks
+        dashboard_cache.mark_stale("k", 5)
+        assert dashboard_cache.get_or_compute("k", 15, compute) == 1
+    clock.now += 5
+    assert dashboard_cache.get_or_compute("k", 15, compute) == 2
+    # Marks keep arriving: at most one refresh per window, never a dropped value.
+    for _ in range(3):
+        for _ in range(50):
+            dashboard_cache.mark_stale("k", 5)
+            clock.now += 0.04
+            dashboard_cache.get_or_compute("k", 15, compute)
+        clock.now += 5
+    assert dashboard_cache.get_or_compute("k", 15, compute) == len(calls)
+    gaps = [b - a for a, b in zip(calls, calls[1:])]
+    assert all(gap >= 5 for gap in gaps), gaps
+    assert len(calls) <= 6
+    # Without further marks the value is fresh for the normal TTL.
+    count = len(calls)
+    clock.now += 14
+    assert dashboard_cache.get_or_compute("k", 15, compute) == count
+
+
+def test_mark_during_a_running_refresh_is_not_lost(clock):
+    started = threading.Event()
+    release = threading.Event()
+    calls = []
+
+    def compute():
+        calls.append(1)
+        if len(calls) == 2:
+            started.set()
+            assert release.wait(5)
+        return len(calls)
+
+    assert dashboard_cache.get_or_compute("k", 15, compute) == 1
+    dashboard_cache.mark_stale("k", 5)
+    clock.now += 5
+    refresher = threading.Thread(target=lambda: dashboard_cache.get_or_compute("k", 15, compute))
+    refresher.start()
+    assert started.wait(5)
+    # Another viewer gets the previous value at once while the refresh runs.
+    began = time.monotonic()
+    assert dashboard_cache.get_or_compute("k", 15, compute) == 1
+    assert time.monotonic() - began < 1
+    clock.now += 1
+    dashboard_cache.mark_stale("k", 5)  # a release committed during the refresh
+    release.set()
+    refresher.join(5)
+    # The refresh's value is kept (stale-while-revalidate) ...
+    assert dashboard_cache.get_or_compute("k", 15, compute) == 2
+    # ... but it predates the mark, so it is refreshed once the window passes.
+    clock.now += 5
+    assert dashboard_cache.get_or_compute("k", 15, compute) == 3
+    assert len(calls) == 3
+
+
+def test_mark_stale_keeps_the_back_off_after_a_failed_refresh(clock):
+    _prime_stale(clock)
+    calls = []
+
+    def failing():
+        calls.append(1)
+        raise _busy()
+
+    assert dashboard_cache.get_or_compute("k", 15, failing, stale_s=120) == "good"
+    dashboard_cache.mark_stale("k", 5)
+    clock.now += 6
+    # Still inside the failure back-off: the mark does not hammer the database.
+    assert dashboard_cache.get_or_compute("k", 15, failing, stale_s=120) == "good"
+    assert len(calls) == 1
+    clock.now += 15
+    assert dashboard_cache.get_or_compute("k", 15, lambda: "fresh", stale_s=120) == "fresh"
 
 
 def test_release_and_recovery_endpoints_register_the_invalidation():

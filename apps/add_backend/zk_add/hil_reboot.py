@@ -160,7 +160,7 @@ def start_reboot(session, run_id, *, actor, idempotency_key):
     connector_id = session.scalar(select(FirmwareHilRun.connector_id).where(FirmwareHilRun.run_id == run_id))
     if connector_id is None:
         raise ValueError("HIL observation was not found")
-    connector = session.scalar(select(Connector).where(Connector.id == connector_id).with_for_update())
+    connector = session.scalar(select(Connector).where(Connector.id == connector_id).with_for_update(key_share=True))
     run = session.scalar(select(FirmwareHilRun).where(FirmwareHilRun.run_id == run_id)
         .with_for_update().execution_options(populate_existing=True))
     existing = (run.result or {}).get(KEY)
@@ -228,7 +228,7 @@ def _run_for_command(session, command, *, lock=False):
 
 def lock_reboot_command(session, command):
     """Serialize cancellation, result handling and dispatch bookkeeping."""
-    session.scalar(select(Connector.id).where(Connector.id == command.connector_id).with_for_update())
+    session.scalar(select(Connector.id).where(Connector.id == command.connector_id).with_for_update(key_share=True))
     session.refresh(command)
 
 

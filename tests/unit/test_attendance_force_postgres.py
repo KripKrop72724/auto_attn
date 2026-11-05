@@ -14,7 +14,7 @@ from sqlalchemy.exc import DBAPIError
 from test_attendance_repair import repair_store as repair_store
 from test_safe_attendance_repair import store as store
 from test_safe_attendance_repair_postgres import postgres_store as postgres_store
-from test_attendance_force_release import checked, approve, tick
+from test_attendance_force_release import checked, approve, step_scope, tick
 from zk_add import attendance_force_release as force, attendance_force_delivery as delivery
 from zk_add import attendance_direct_ords as direct
 from zk_add.attendance_direct_ords_schemas import DirectOrdsStartRequest
@@ -811,6 +811,9 @@ def test_hundred_thousand_backlog_keeps_login_and_live_delivery_responsive(force
     from test_attendance_force_release import sync
 
     sessions, connector_id, _ = force_pg
+    # Production values: 25 punches per step, up to 4 steps per worker tick, so
+    # ~1000 ticks clear the 100k scan exactly as the old 100-per-tick did.
+    assert force.STEP_BATCH * force.STEPS_PER_TICK == 100
     with sessions() as db:
         table = AttendanceEvent.__table__
         columns = [c.name for c in table.columns if c.name != "id"]
@@ -847,12 +850,13 @@ def test_hundred_thousand_backlog_keeps_login_and_live_delivery_responsive(force
     tick(sessions)
     scanning = Event()
     durations = []
+    scope = step_scope(sessions)
 
     def scan():
         for _ in range(1002):
             scanning.set()
             started = monotonic()
-            tick(sessions)
+            force.tick(scope)
             durations.append(monotonic() - started)
             with sessions() as db:
                 if db.scalar(select(Job.status).where(Job.job_id == job_id)) == "CHECKED":
@@ -882,7 +886,7 @@ def test_hundred_thousand_backlog_keeps_login_and_live_delivery_responsive(force
         job = db.scalar(select(Job).where(Job.job_id == job_id))
         assert force.counts(db, job)["ready"] == 100000
     approve(force_pg, job_id)
-    tick(sessions)  # Exactly 100 decisions/outbox rows, while the rest stay held.
+    force.tick(scope)  # Exactly 100 decisions/outbox rows (4 steps), the rest stay held.
     with sessions() as db:
         original = db.scalar(select(AttendanceEvent).order_by(AttendanceEvent.id))
         user = db.scalar(select(DeviceUser))
@@ -971,3 +975,249 @@ def test_populated_upgrade_backfills_holds_and_rollback_preserves_approval(
     with pytest.raises(DBAPIError, match="content verification"):
         with engine.begin() as conn:
             conn.execute(text("UPDATE add_attendance_events SET ords_status='ACKED'"))
+
+
+def _hold_child_row_key_share(sessions, connector_pk):
+    """An open transaction holding FOR KEY SHARE on the connector, as every
+    foreign-key check does (bulk recovery items, direct ORDS rows, logs)."""
+    from zk_add.models import DeviceLog
+    from zk_add.time_utils import utc_now
+
+    holder = sessions()
+    holder.add(DeviceLog(connector_id=connector_pk, boot_id="fk-holder", sequence=1,
+                         level="INFO", subsystem="test", message="fk", context={},
+                         received_at=utc_now()))
+    holder.flush()
+    return holder
+
+
+def _log_envelope(connector, seq, boot="lock-mode-boot"):
+    from zk_add.schemas import Envelope
+    from zk_add.time_utils import utc_now
+
+    return Envelope(message_id=f"lock-mode-{seq}", connector_id=connector.connector_id,
+                    boot_id=boot, seq=seq, sent_at=utc_now(), type="log",
+                    payload={"level": "INFO", "message": "ok"})
+
+
+def test_device_messages_do_not_wait_for_foreign_key_inserts(force_pg):
+    """Production 5 Nov: bulk child-row inserts and device messages blocked each other.
+
+    persist_envelope and record_envelope_rejection lock the connector FOR NO
+    KEY UPDATE, which never conflicts with a foreign-key check's KEY SHARE.
+    """
+    import time
+    from zk_add import web
+    from zk_add.models import DeviceLog
+
+    sessions, _connector_id, _uid = force_pg
+    with sessions() as db:
+        connector = db.scalar(select(Connector))
+        pk = connector.id
+    holder = _hold_child_row_key_share(sessions, pk)
+    try:
+        with ThreadPoolExecutor(1) as pool:
+            began = time.monotonic()
+            outcome = pool.submit(web.persist_envelope, pk, _log_envelope(connector, 1)).result(10)
+            pool.submit(web.record_envelope_rejection, pk, _log_envelope(connector, 2),
+                        ValueError("bad")).result(10)
+            elapsed = time.monotonic() - began
+        assert outcome.ack["type"] == "ack"
+        assert elapsed < 3, "a device message waited behind a foreign-key check"
+    finally:
+        holder.rollback()
+        holder.close()
+    with sessions() as db:
+        assert db.scalar(select(func.count(DeviceLog.id)).where(
+            DeviceLog.boot_id == "lock-mode-boot")) == 2
+
+
+def test_device_messages_still_serialize_on_the_connector_row(force_pg):
+    """FOR NO KEY UPDATE still excludes another connector locker (a reconnect race)."""
+    from zk_add import web
+
+    sessions, _connector_id, _uid = force_pg
+    with sessions() as db:
+        connector = db.scalar(select(Connector))
+        pk = connector.id
+    holder = sessions()
+    try:
+        holder.scalar(select(Connector).where(Connector.id == pk).with_for_update(key_share=True))
+        holder.execute(text("SET LOCAL lock_timeout = '300ms'"))
+        with ThreadPoolExecutor(1) as pool:
+            def blocked():
+                with sessions() as db:
+                    db.execute(text("SET LOCAL lock_timeout = '300ms'"))
+                    db.scalar(select(Connector).where(Connector.id == pk)
+                              .with_for_update(key_share=True))
+            with pytest.raises(DBAPIError, match="lock timeout"):
+                pool.submit(blocked).result(10)
+    finally:
+        holder.rollback()
+        holder.close()
+    assert web.persist_envelope(pk, _log_envelope(connector, 3)).ack["type"] == "ack"
+
+
+def test_force_tick_skips_a_busy_device_without_marking_it(force_pg):
+    """The force tick takes FOR NO KEY UPDATE SKIP LOCKED and never waits on a device."""
+    import time
+    from sqlalchemy import event as sa_event
+    from zk_add.models import AttendanceForceReleaseTask as Task
+
+    sessions, connector_id, _uid = force_pg
+    with sessions() as db:
+        force.create_check(
+            db,
+            actor="operator",
+            request=ForceCheckRequest(
+                scope="SELECTED", connector_ids=[connector_id], idempotency_key="pg-busy-device"
+            ),
+        )
+        db.commit()
+        task = db.scalar(select(Task))
+        before = (task.status, task.updated_at, task.user_cursor, task.error_code)
+        job_updated = db.scalar(select(Job)).updated_at
+        pk = task.connector_id
+    seen = []
+    engine = sessions.kw["bind"]
+
+    def record(_conn, _cursor, statement, *_args):
+        if "add_connectors" in statement and "FOR" in statement:
+            seen.append(" ".join(statement.split()))
+
+    sa_event.listen(engine, "before_cursor_execute", record)
+    holder = sessions()
+    try:
+        # A device message transaction holding its connector row.
+        holder.scalar(select(Connector).where(Connector.id == pk).with_for_update(key_share=True))
+        began = time.monotonic()
+        tick(sessions)
+        assert time.monotonic() - began < 3
+    finally:
+        holder.rollback()
+        holder.close()
+    with sessions() as db:
+        task = db.scalar(select(Task))
+        assert (task.status, task.updated_at, task.user_cursor, task.error_code) == before
+        assert task.status != "UNAVAILABLE"
+        job = db.scalar(select(Job))
+        assert job.updated_at == job_updated and job.status == "CHECKING"
+    assert any("FOR NO KEY UPDATE SKIP LOCKED" in sql for sql in seen), seen
+    # A foreign-key check (KEY SHARE) does not make the device look busy.
+    holder = _hold_child_row_key_share(sessions, pk)
+    try:
+        tick(sessions)
+    finally:
+        holder.rollback()
+        holder.close()
+    sa_event.remove(engine, "before_cursor_execute", record)
+    with sessions() as db:
+        assert db.scalar(select(Task)).status == "SYNC_PENDING"
+
+
+def test_production_step_keeps_the_lock_short_and_the_old_throughput(force_pg):
+    """At the real STEP_BATCH, each step holds the device row briefly and the
+    worker still clears 100 punches per force tick (the pre-change rate).
+
+    Between steps the connector row is free: a device message's NOWAIT lock
+    succeeds, so heartbeats and attendance never queue behind a whole tick.
+    """
+    from contextlib import contextmanager
+    from math import ceil
+    from time import monotonic
+    from sqlalchemy import literal, String
+    from zk_add.models import AttendanceRecoveryItem as Item
+    from test_attendance_force_release import sync
+
+    sessions, connector_id, _ = force_pg
+    backlog = 1000
+    assert force.STEP_BATCH == 25 and force.STEPS_PER_TICK * force.STEP_BATCH == 100
+    with sessions() as db:
+        table = AttendanceEvent.__table__
+        columns = [c.name for c in table.columns if c.name != "id"]
+        source = table.alias("original")
+        series = func.generate_series(1, backlog - 1).table_valued("value").render_derived()
+        values = [
+            func.concat(
+                func.md5(series.c.value.cast(String)),
+                func.md5(literal("force-step-") + series.c.value.cast(String)),
+            )
+            if name == "event_uid"
+            else source.c[name]
+            for name in columns
+        ]
+        db.execute(
+            table.insert().from_select(
+                columns, select(*values).select_from(source.join(series, literal(True)))
+            )
+        )
+        db.commit()
+        job = force.create_check(
+            db,
+            actor="operator",
+            request=ForceCheckRequest(
+                scope="SELECTED", connector_ids=[connector_id], idempotency_key="step-throughput"
+            ),
+        )
+        job_id = job.job_id
+        pk = db.scalar(select(Connector.id))
+        db.commit()
+
+    steps = []
+    free_between = []
+
+    @contextmanager
+    def scope():
+        # A device message arriving between steps must get its row at once.
+        with sessions() as probe:
+            probe.execute(text("SET LOCAL lock_timeout = '50ms'"))
+            try:
+                probe.scalar(
+                    select(Connector.id)
+                    .where(Connector.id == pk)
+                    .with_for_update(key_share=True, nowait=True)
+                )
+                free_between.append(True)
+            except DBAPIError:
+                free_between.append(False)
+            probe.rollback()
+        began = monotonic()
+        with sessions() as db:
+            yield db
+            db.commit()
+        steps.append(monotonic() - began)
+
+    force.tick(scope)  # baseline
+    force.tick(scope)  # refresh command
+    sync(sessions)
+    force.tick(scope)  # accept refresh
+    steps.clear()
+    scan_ticks = 0
+    while scan_ticks < 4 * ceil(backlog / force.STEP_BATCH):
+        force.tick(scope)
+        scan_ticks += 1
+        with sessions() as db:
+            if db.scalar(select(Job.status).where(Job.job_id == job_id)) == "CHECKED":
+                break
+    with sessions() as db:
+        assert db.scalar(select(Job.status).where(Job.job_id == job_id)) == "CHECKED"
+        assert db.scalar(select(func.count(Item.id)).where(Item.status == "READY")) == backlog
+    # 1000 punches at 25 per step and 4 steps per tick: 10 full ticks plus the
+    # empty finishing step. One step per tick would need 41.
+    assert scan_ticks <= ceil(backlog / 100) + 1, (scan_ticks, steps)
+    assert max(steps) < force.TICK_BUDGET_SECONDS, steps
+    approve(force_pg, job_id)
+    steps.clear()
+    release_ticks = 0
+    while release_ticks < 4 * ceil(backlog / force.STEP_BATCH):
+        force.tick(scope)
+        release_ticks += 1
+        with sessions() as db:
+            if not db.scalar(select(Item.id).where(Item.status == "READY").limit(1)):
+                break
+    with sessions() as db:
+        assert db.scalar(select(func.count(Decision.id))) == backlog
+        assert db.scalar(select(func.count(Item.id)).where(Item.status == "READY")) == 0
+    assert release_ticks <= ceil(backlog / 100) + 1, (release_ticks, steps)
+    assert max(steps) < force.TICK_BUDGET_SECONDS, steps
+    assert free_between and all(free_between), "a step left the connector row locked"

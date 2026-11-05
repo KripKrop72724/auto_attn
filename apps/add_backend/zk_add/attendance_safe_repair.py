@@ -403,7 +403,7 @@ def start_check(
         if task.connector_id not in actionable:
             continue
         connector = session.scalar(
-            select(Connector).where(Connector.id == task.connector_id).with_for_update()
+            select(Connector).where(Connector.id == task.connector_id).with_for_update(key_share=True)
         )
         if not allowed(connector) or not _task_matches(task, connector):
             raise RecoveryError(
@@ -930,7 +930,7 @@ def delivery_coverage(session: Session, connector_id: str | None = None) -> dict
 
 def assert_no_active_safe_repair(session: Session, connector_id: int) -> None:
     # All operator entry points take this same connector lock before checking.
-    session.scalar(select(Connector).where(Connector.id == connector_id).with_for_update())
+    session.scalar(select(Connector).where(Connector.id == connector_id).with_for_update(key_share=True))
     if session.scalar(
         select(Job.id)
         .join(Item, Item.job_id == Job.id)

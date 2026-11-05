@@ -20,6 +20,14 @@ Rules, per key:
 * :func:`invalidate` also discards a refresh that was already running when it
   was called, so a settings change cannot be overwritten by figures computed
   before it.
+* :func:`mark_stale` is the cheap form for bulk operator actions (hundreds of
+  releases a minute). It keeps the value and only marks it out of date: one
+  later read refreshes it while the other readers keep getting the previous
+  value (as for an expired TTL). Marks are coalesced: a value younger than
+  ``min_age_s`` is still served, so a burst of marks costs at most one refresh
+  per ``min_age_s``. A mark is never lost; a value whose compute started
+  before the latest mark stays out of date, and a back-off after a failed
+  refresh is kept.
 
 Endpoints are synchronous FastAPI handlers, so they run in anyio's thread pool:
 the guards are ``threading`` locks, not asyncio ones. The cache lives in the
@@ -56,6 +64,9 @@ class CacheEntry:
     stored_at: float
     # wall clock when the compute started, for reporting how old the figures are
     computed_at: datetime
+    # monotonic time the compute started; a mark_stale() at or after it
+    # means the value may predate the change (None: same as stored_at)
+    started: float | None = None
 
 
 @dataclass
@@ -68,6 +79,10 @@ class _KeyState:
     last_error: BaseException | None = None
     # monotonic time before which a usable stale value is served without a refresh
     retry_after: float = 0.0
+    # monotonic time of the latest mark_stale(), and how old a value must be
+    # before that mark takes effect
+    stale_mark: float | None = None
+    stale_min_age: float = 0.0
 
 
 # Indirection so tests can move time forward.
@@ -87,8 +102,16 @@ def _state_for(key: str) -> _KeyState:
         return state
 
 
-def _fresh(entry: CacheEntry | None, ttl_s: float) -> bool:
-    return entry is not None and _clock() - entry.stored_at < ttl_s
+def _fresh(entry: CacheEntry | None, ttl_s: float, state: _KeyState) -> bool:
+    if entry is None:
+        return False
+    age = _clock() - entry.stored_at
+    if age >= ttl_s:
+        return False
+    mark = state.stale_mark
+    started = entry.stored_at if entry.started is None else entry.started
+    # Marked after this value's compute began: out of date once old enough.
+    return mark is None or mark < started or age < state.stale_min_age
 
 
 def _usable(entry: CacheEntry | None, stale_s: float) -> bool:
@@ -112,7 +135,7 @@ def get_or_compute_entry(
 
     state = _state_for(key)
     entry = _entries.get(key)
-    if _fresh(entry, ttl_s):
+    if _fresh(entry, ttl_s, state):
         return entry  # type: ignore[return-value]
     if _usable(entry, stale_s) and _clock() < state.retry_after:
         # A refresh failed moments ago; do not start another one yet.
@@ -131,7 +154,7 @@ def get_or_compute_entry(
     try:
         # Another thread may have refreshed the value while this one waited.
         entry = _entries.get(key)
-        if _fresh(entry, ttl_s):
+        if _fresh(entry, ttl_s, state):
             return entry  # type: ignore[return-value]
         if waited and state.failure_seq != seen_failures:
             # The refresh this caller waited for failed; do not repeat it.
@@ -146,6 +169,7 @@ def get_or_compute_entry(
         with _registry_lock:
             generation = state.generation
         started_at = utc_now()
+        started = _clock()
         try:
             value = compute()
         except Exception as error:
@@ -163,7 +187,9 @@ def get_or_compute_entry(
             raise
         state.last_error = None
         state.retry_after = 0.0
-        new_entry = CacheEntry(value=value, stored_at=_clock(), computed_at=started_at)
+        new_entry = CacheEntry(
+            value=value, stored_at=_clock(), computed_at=started_at, started=started
+        )
         with _registry_lock:
             if _states.get(key) is state and state.generation == generation:
                 _entries[key] = new_entry
@@ -203,6 +229,19 @@ def invalidate(key: str | None = None) -> None:
             if state is not None:
                 state.generation += 1
                 state.retry_after = 0.0
+
+
+def mark_stale(key: str, min_age_s: float = 0.0) -> None:
+    """Mark ``key`` out of date without dropping it (see the module docstring).
+
+    O(1) and safe to call on every bulk mutation: readers keep the previous
+    value while one of them refreshes it, at most once per ``min_age_s``.
+    """
+
+    state = _state_for(key)
+    with _registry_lock:
+        state.stale_mark = _clock()
+        state.stale_min_age = min_age_s
 
 
 def reset() -> None:

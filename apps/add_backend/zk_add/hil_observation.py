@@ -413,7 +413,7 @@ def complete_full_run(session, run_id, *, actor):
     # supersession. Evidence must come from the locking transaction's reads.
     session.expire_all()
     connector_id = session.scalar(select(FirmwareHilRun.connector_id).where(FirmwareHilRun.run_id == run_id))
-    connector = session.scalar(select(Connector).where(Connector.id == connector_id).with_for_update()
+    connector = session.scalar(select(Connector).where(Connector.id == connector_id).with_for_update(key_share=True)
                                .execution_options(populate_existing=True)) if connector_id else None
     run = session.scalar(select(FirmwareHilRun).where(FirmwareHilRun.run_id == run_id).with_for_update()
                          .execution_options(populate_existing=True))

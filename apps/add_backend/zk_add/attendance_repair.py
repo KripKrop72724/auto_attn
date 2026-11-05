@@ -2182,7 +2182,7 @@ def create_repair_job(
         )
     start_utc, end_utc = _date_scope(date_from, date_to)
     locked_connector = session.scalar(
-        select(Connector).where(Connector.id == connector.id).with_for_update()
+        select(Connector).where(Connector.id == connector.id).with_for_update(key_share=True)
     )
     if locked_connector is None or locked_connector.zkt_device is None:
         raise RepairError("The selected terminal no longer exists.", code="NO_TERMINAL")
@@ -2498,7 +2498,7 @@ def create_exact_release_job(
         }
     )
     locked_connector = session.scalar(
-        select(Connector).where(Connector.id == connector.id).with_for_update()
+        select(Connector).where(Connector.id == connector.id).with_for_update(key_share=True)
     )
     if locked_connector is None or locked_connector.zkt_device is None:
         raise RepairError("The selected terminal no longer exists.", code="NO_TERMINAL")

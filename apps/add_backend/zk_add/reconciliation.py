@@ -467,7 +467,7 @@ def create_reconciliation_job(
             scope != "ALL_RECORDS" and connector.firmware_family != "hikvision"):
         raise ValueError(HIKVISION_ONLY_SCOPE_MESSAGE)
     locked_connector = session.scalar(
-        select(Connector).where(Connector.id == connector.id).with_for_update()
+        select(Connector).where(Connector.id == connector.id).with_for_update(key_share=True)
     )
     if locked_connector is None:
         raise ValueError("Connector no longer exists.")
@@ -560,7 +560,7 @@ def control_reconciliation_job(
     digest_exclude = {"connector_generation"} if (
         expected_state is not None and expected_state.connector_generation is None) else set()
     connector = session.scalar(select(Connector).where(Connector.id == job.connector_id)
-        .with_for_update().execution_options(populate_existing=True))
+        .with_for_update(key_share=True).execution_options(populate_existing=True))
     locked = session.scalar(
         select(ReconciliationJob)
         .where(ReconciliationJob.id == job.id)
@@ -2578,7 +2578,7 @@ def apply_reconciliation_manifest(
 ) -> ReconciliationJob:
     # Match WebSocket ingestion's connector-first ordering for HTTP callers as
     # well. Tail extension and final certification must see one serialized cut.
-    session.scalar(select(Connector.id).where(Connector.id == connector.id).with_for_update())
+    session.scalar(select(Connector.id).where(Connector.id == connector.id).with_for_update(key_share=True))
     job = _device_job(session, connector, payload.job_id)
     _require_source_epoch(session, connector, job, payload.source_epoch)
     if job.capture_certified_at is not None:
@@ -2886,7 +2886,7 @@ def apply_source_tail_chunk(
     invalidates source coverage.
     """
 
-    session.scalar(select(Connector.id).where(Connector.id == connector.id).with_for_update())
+    session.scalar(select(Connector.id).where(Connector.id == connector.id).with_for_update(key_share=True))
     zkt = connector.zkt_device
     if zkt is None:
         raise ValueError("Connector has no assigned ZKT terminal.")

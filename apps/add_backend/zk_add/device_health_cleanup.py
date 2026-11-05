@@ -99,7 +99,7 @@ def _scope(session: Session, connector_ids, *, lock: bool) -> list[Connector]:
     else:
         statement = statement.where(Connector.active == True, Connector.is_spare == False)  # noqa: E712
     if lock:
-        statement = statement.with_for_update().execution_options(populate_existing=True)
+        statement = statement.with_for_update(key_share=True).execution_options(populate_existing=True)
     connectors = session.scalars(statement).all()
     missing = set(connector_ids or ()) - {connector.connector_id for connector in connectors}
     if missing:

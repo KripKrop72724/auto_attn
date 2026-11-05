@@ -53,7 +53,7 @@ def start_run(
         raise ValueError("HIL deployment was not found")
     # Match ingestion, recovery controls and finalization: connector first.
     # The initial lookup grants no scope and is rechecked under those locks.
-    connector = session.scalar(select(Connector).where(Connector.id == connector_id).with_for_update())
+    connector = session.scalar(select(Connector).where(Connector.id == connector_id).with_for_update(key_share=True))
     deployment = session.scalar(select(FirmwareDeployment).where(
         FirmwareDeployment.deployment_id == deployment_id).with_for_update()
         .execution_options(populate_existing=True))

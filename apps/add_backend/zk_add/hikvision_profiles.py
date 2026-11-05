@@ -89,7 +89,7 @@ def accept_profile_page(session: Session, connector: Connector, payload: dict) -
     digest = hashlib.sha256(page.model_dump_json().encode()).hexdigest()
     # Serialize publication and staging for this connector. SQLite safely ignores
     # FOR UPDATE; production PostgreSQL holds it until custody commits.
-    session.refresh(connector, with_for_update=True)
+    session.refresh(connector, with_for_update={"key_share": True})
     scan = session.get(HikvisionProfileScan, connector.id)
     if scan and scan.snapshot_id == page.snapshot_id and scan.last_page_digest == digest:
         return {"snapshot_id": page.snapshot_id, "published": scan.phase == 3}
