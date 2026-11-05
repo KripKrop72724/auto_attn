@@ -20,7 +20,10 @@ def clone(original, index):
     return AttendanceEvent(**values)
 
 
-def test_batch_reuses_shared_reads_without_reusing_record_decisions(store):
+def test_batch_reuses_shared_reads_without_reusing_record_decisions(store, monkeypatch):
+    # One scan step of 100 records: read reuse is per step, whatever its size
+    # (production steps are STEP_BATCH = 25, covered by the force-release tests).
+    monkeypatch.setattr(force, "STEP_BATCH", 100)
     sessions, _, _ = store
     job_id = checked(store)
     with sessions() as db:
