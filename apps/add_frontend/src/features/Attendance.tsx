@@ -130,7 +130,17 @@ function AllAttendanceEvents({
   rowsRef.current = rows
   const [pendingRows, setPendingRows] = useState<AttendanceEvent[]>([])
   const [nextCursor, setNextCursor] = useState<number | null>(null)
-  const [filters, setFilters] = useState<AttendanceFilters>(emptyFilters)
+  // The Fleet tile links here with ?unknown_synced=1 to open that section.
+  const [filters, setFilters] = useState<AttendanceFilters>(() => (
+    new URLSearchParams(window.location.search).get('unknown_synced') ? { ...emptyFilters, unknown_synced: 'true' } : emptyFilters
+  ))
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search)
+    if (!params.has('unknown_synced')) return
+    params.delete('unknown_synced')
+    const rest = params.toString()
+    window.history.replaceState(window.history.state, '', `${window.location.pathname}${rest ? `?${rest}` : ''}`)
+  }, [])
   const [pageSize, setPageSize] = useState(100)
   const [selected, setSelected] = useState<Map<number, AttendanceEvent>>(new Map())
   const [singleSendRequest, setSingleSendRequest] = useState(0)
@@ -453,7 +463,7 @@ function AllAttendanceEvents({
 
         {notifySummary && <CheckinNotifySummary summary={notifySummary} toast={toast} onChanged={() => void refreshFeed(true)} />}
         {(error || validationError) && <div className="message pattern-blocked operational-error" role="alert"><Icon name="alert" /><span>{validationError || error}</span><button className="button secondary" type="button" onClick={() => void replaceFeed()}>Retry</button></div>}
-        <UnknownSyncedRelease active={Boolean(filters.unknown_synced)} onToggle={() => { setSelected(new Map()); setFilters((current) => ({ ...current, unknown_synced: current.unknown_synced ? '' : 'true' })) }} selectedIds={[...selected.keys()]} clearSelection={() => setSelected(new Map())} refresh={refreshDirectProgress} />
+        <UnknownSyncedRelease active={Boolean(filters.unknown_synced)} onToggle={() => { setSelected(new Map()); setFilters((current) => ({ ...current, unknown_synced: current.unknown_synced ? '' : 'true' })) }} selectedIds={[...selected.keys()]} clearSelection={() => setSelected(new Map())} refresh={refreshDirectProgress} toast={toast} />
         <DirectOrdsSend selected={[...selected.values()]} clearSelection={() => setSelected(new Map())} refresh={refreshDirectProgress} openRequest={singleSendRequest} selectControl={<label className="attendance-select-all"><input type="checkbox" checked={selectableRows.length > 0 && selectableRows.every((row) => selected.has(row.id))} disabled={!selectableRows.length || selected.size >= 500 && !selectableRows.every((row) => selected.has(row.id))} onChange={(event) => setSelected((current) => { const next = new Map(current); selectableRows.forEach((row) => { if (event.target.checked && next.size < 500) next.set(row.id, row); else if (!event.target.checked) next.delete(row.id) }); return next })} /> Select loaded punches</label>} />
         <div className="sr-only" aria-live="polite">{announcement}</div>
         <div ref={topSentinel} className="attendance-top-sentinel" aria-hidden="true" />

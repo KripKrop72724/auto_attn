@@ -516,6 +516,7 @@ describe('State Life ADD interface', () => {
   afterEach(() => {
     cleanup()
     vi.unstubAllGlobals()
+    queryClient.clear()
   })
 
   it('builds an exact device-scoped bulk deletion confirmation', () => {
@@ -533,6 +534,26 @@ describe('State Life ADD interface', () => {
     expect(screen.getByText('ORDS delivery queue')).toBeTruthy()
     expect(await screen.findByText('12')).toBeTruthy()
     expect(await screen.findByText(/3 retrying · 2 identity blocked · 1 quarantined/i)).toBeTruthy()
+  })
+
+  it('shows the unknown-identity automatic release on Fleet and opens it on Attendance', async () => {
+    const base = fetchStub()
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input) === '/api/v2/unknown-identity-auto-release') {
+        return response({
+          allowed: true, enabled: false, active: false, changed_by: 'StateHealthAdmin',
+          changed_at: '2026-11-05T12:00:05Z', reason: 'Oracle maintenance', drain_active: false,
+          backlog: { count: 108000, counted_at: '2026-11-05T14:00:00Z', remaining_estimate: 108000 },
+          progress: { ready: 0, waiting_oracle: 0, in_flight: 0, confirmed_total: 0, confirmed_last_hour: 0, skipped_total: 0, skipped_by_reason: [] },
+          rate_per_min: 0, eta_minutes: null, in_flight_limit: 1500, server_time: '2026-11-05T14:00:05Z',
+        })
+      }
+      return base(input, init)
+    }))
+    render(<App />)
+    const tile = await screen.findByRole('button', { name: /Unknown-identity release: OFF\. Turned off by StateHealthAdmin 2 h ago · 108,000 held/ })
+    fireEvent.click(tile)
+    await waitFor(() => expect(window.location.pathname).toBe('/attendance'))
   })
 
   it('opens on the Pakistan map and preserves the complete list behind an in-memory toggle', async () => {
