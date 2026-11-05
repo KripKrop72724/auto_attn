@@ -14,7 +14,7 @@ from sqlalchemy.exc import DBAPIError
 from test_attendance_repair import repair_store as repair_store
 from test_safe_attendance_repair import store as store
 from test_safe_attendance_repair_postgres import postgres_store as postgres_store
-from test_attendance_force_release import checked, approve, tick
+from test_attendance_force_release import checked, approve, step_scope, tick
 from zk_add import attendance_force_release as force, attendance_force_delivery as delivery
 from zk_add import attendance_direct_ords as direct
 from zk_add.attendance_direct_ords_schemas import DirectOrdsStartRequest
@@ -811,10 +811,9 @@ def test_hundred_thousand_backlog_keeps_login_and_live_delivery_responsive(force
     from test_attendance_force_release import sync
 
     sessions, connector_id, _ = force_pg
-    # Production steps 25 punches per tick; proving the budget at a step of 100
-    # (four times the work under the connector lock) keeps this load test at
-    # ~1000 ticks.
-    monkeypatch.setattr(force, "STEP_BATCH", 100)
+    # Production values: 25 punches per step, up to 4 steps per worker tick, so
+    # ~1000 ticks clear the 100k scan exactly as the old 100-per-tick did.
+    assert force.STEP_BATCH * force.STEPS_PER_TICK == 100
     with sessions() as db:
         table = AttendanceEvent.__table__
         columns = [c.name for c in table.columns if c.name != "id"]
@@ -851,12 +850,13 @@ def test_hundred_thousand_backlog_keeps_login_and_live_delivery_responsive(force
     tick(sessions)
     scanning = Event()
     durations = []
+    scope = step_scope(sessions)
 
     def scan():
         for _ in range(1002):
             scanning.set()
             started = monotonic()
-            tick(sessions)
+            force.tick(scope)
             durations.append(monotonic() - started)
             with sessions() as db:
                 if db.scalar(select(Job.status).where(Job.job_id == job_id)) == "CHECKED":
@@ -886,7 +886,7 @@ def test_hundred_thousand_backlog_keeps_login_and_live_delivery_responsive(force
         job = db.scalar(select(Job).where(Job.job_id == job_id))
         assert force.counts(db, job)["ready"] == 100000
     approve(force_pg, job_id)
-    tick(sessions)  # Exactly 100 decisions/outbox rows, while the rest stay held.
+    force.tick(scope)  # Exactly 100 decisions/outbox rows (4 steps), the rest stay held.
     with sessions() as db:
         original = db.scalar(select(AttendanceEvent).order_by(AttendanceEvent.id))
         user = db.scalar(select(DeviceUser))
@@ -1113,3 +1113,111 @@ def test_force_tick_skips_a_busy_device_without_marking_it(force_pg):
     sa_event.remove(engine, "before_cursor_execute", record)
     with sessions() as db:
         assert db.scalar(select(Task)).status == "SYNC_PENDING"
+
+
+def test_production_step_keeps_the_lock_short_and_the_old_throughput(force_pg):
+    """At the real STEP_BATCH, each step holds the device row briefly and the
+    worker still clears 100 punches per force tick (the pre-change rate).
+
+    Between steps the connector row is free: a device message's NOWAIT lock
+    succeeds, so heartbeats and attendance never queue behind a whole tick.
+    """
+    from contextlib import contextmanager
+    from math import ceil
+    from time import monotonic
+    from sqlalchemy import literal, String
+    from zk_add.models import AttendanceRecoveryItem as Item
+    from test_attendance_force_release import sync
+
+    sessions, connector_id, _ = force_pg
+    backlog = 1000
+    assert force.STEP_BATCH == 25 and force.STEPS_PER_TICK * force.STEP_BATCH == 100
+    with sessions() as db:
+        table = AttendanceEvent.__table__
+        columns = [c.name for c in table.columns if c.name != "id"]
+        source = table.alias("original")
+        series = func.generate_series(1, backlog - 1).table_valued("value").render_derived()
+        values = [
+            func.concat(
+                func.md5(series.c.value.cast(String)),
+                func.md5(literal("force-step-") + series.c.value.cast(String)),
+            )
+            if name == "event_uid"
+            else source.c[name]
+            for name in columns
+        ]
+        db.execute(
+            table.insert().from_select(
+                columns, select(*values).select_from(source.join(series, literal(True)))
+            )
+        )
+        db.commit()
+        job = force.create_check(
+            db,
+            actor="operator",
+            request=ForceCheckRequest(
+                scope="SELECTED", connector_ids=[connector_id], idempotency_key="step-throughput"
+            ),
+        )
+        job_id = job.job_id
+        pk = db.scalar(select(Connector.id))
+        db.commit()
+
+    steps = []
+    free_between = []
+
+    @contextmanager
+    def scope():
+        # A device message arriving between steps must get its row at once.
+        with sessions() as probe:
+            probe.execute(text("SET LOCAL lock_timeout = '50ms'"))
+            try:
+                probe.scalar(
+                    select(Connector.id)
+                    .where(Connector.id == pk)
+                    .with_for_update(key_share=True, nowait=True)
+                )
+                free_between.append(True)
+            except DBAPIError:
+                free_between.append(False)
+            probe.rollback()
+        began = monotonic()
+        with sessions() as db:
+            yield db
+            db.commit()
+        steps.append(monotonic() - began)
+
+    force.tick(scope)  # baseline
+    force.tick(scope)  # refresh command
+    sync(sessions)
+    force.tick(scope)  # accept refresh
+    steps.clear()
+    scan_ticks = 0
+    while scan_ticks < 4 * ceil(backlog / force.STEP_BATCH):
+        force.tick(scope)
+        scan_ticks += 1
+        with sessions() as db:
+            if db.scalar(select(Job.status).where(Job.job_id == job_id)) == "CHECKED":
+                break
+    with sessions() as db:
+        assert db.scalar(select(Job.status).where(Job.job_id == job_id)) == "CHECKED"
+        assert db.scalar(select(func.count(Item.id)).where(Item.status == "READY")) == backlog
+    # 1000 punches at 25 per step and 4 steps per tick: 10 full ticks plus the
+    # empty finishing step. One step per tick would need 41.
+    assert scan_ticks <= ceil(backlog / 100) + 1, (scan_ticks, steps)
+    assert max(steps) < force.TICK_BUDGET_SECONDS, steps
+    approve(force_pg, job_id)
+    steps.clear()
+    release_ticks = 0
+    while release_ticks < 4 * ceil(backlog / force.STEP_BATCH):
+        force.tick(scope)
+        release_ticks += 1
+        with sessions() as db:
+            if not db.scalar(select(Item.id).where(Item.status == "READY").limit(1)):
+                break
+    with sessions() as db:
+        assert db.scalar(select(func.count(Decision.id))) == backlog
+        assert db.scalar(select(func.count(Item.id)).where(Item.status == "READY")) == 0
+    assert release_ticks <= ceil(backlog / 100) + 1, (release_ticks, steps)
+    assert max(steps) < force.TICK_BUDGET_SECONDS, steps
+    assert free_between and all(free_between), "a step left the connector row locked"

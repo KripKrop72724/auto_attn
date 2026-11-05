@@ -6,6 +6,7 @@ device and Oracle network operations are handled by the existing transports.
 
 from datetime import datetime, timedelta
 import re
+from time import monotonic
 from uuid import uuid4
 
 from sqlalchemy import func, or_, select
@@ -62,6 +63,12 @@ BATCH = 100
 STEP_BATCH = 25
 # Candidate devices tried per tick when another transaction holds a lock.
 LOCK_CANDIDATES = 5
+# tick() runs up to this many scan/release steps, each in its own transaction
+# so the connector lock is released between them. 4 x STEP_BATCH keeps the old
+# 100 punches per worker pass. It stops early once TICK_BUDGET_SECONDS have
+# passed, so a slow database never makes the shared repair loop wait longer.
+STEPS_PER_TICK = 4
+TICK_BUDGET_SECONDS = 1.5
 ACTIVE = {"CHECKING", "RUNNING", "WAITING_ORACLE", "PAUSED", "STOPPING"}
 TERMINAL = {"COMPLETED", "COMPLETED_WITH_REVIEW", "STOPPED", "EXPIRED"}
 MESSAGES = {
@@ -1215,6 +1222,12 @@ def _settle(session, job):
 
 
 def advance_once(session):
+    """Advance the oldest active job by one step.
+
+    Returns True only when the step scanned or released punches on a device,
+    the work that tick() may repeat in a fresh transaction. Every other
+    outcome (no job, busy devices, baseline/sync steps, settlement) is falsy.
+    """
     _lock_scheduler(session)
     job = session.scalar(
         select(Job)
@@ -1224,7 +1237,8 @@ def advance_once(session):
         .with_for_update(skip_locked=True)
     )
     if not job:
-        return
+        return False
+    progressed = False
     has_ready = session.scalar(
         select(Item.id).where(Item.job_id == job.id, Item.status == "READY").limit(1)
     )
@@ -1248,7 +1262,7 @@ def advance_once(session):
         if task is _BUSY:
             # Every candidate device is inside its own message transaction.
             # Leave tasks and job untouched; the next tick tries again.
-            return
+            return False
         if task:
             if not _binding(task, connector):
                 _unavailable(task, "TERMINAL_CHANGED")
@@ -1264,8 +1278,10 @@ def advance_once(session):
                 _accept_sync(session, task, connector, releasing=job.status == "RUNNING")
             elif task.status == "CHECKING":
                 _scan(session, job, task, connector)
+                progressed = True
             elif task.status == "RELEASING":
                 _release_batch(session, job, task, connector)
+                progressed = True
             if task.status == "UNAVAILABLE" and job.status == "RUNNING":
                 for item in session.scalars(
                     select(Item)
@@ -1285,16 +1301,29 @@ def advance_once(session):
     elif job.status != "PAUSED":
         _settle(session, job)
     job.updated_at = utc_now()
+    return progressed
 
 
-def tick():
-    from zk_add.db import session_scope
+def tick(scope=None):
+    """Run up to STEPS_PER_TICK steps within TICK_BUDGET_SECONDS.
 
+    Each step commits on its own, so a device's messages can take its
+    connector row between steps; a step that finds the device busy (SKIP
+    LOCKED) or has no scan/release work ends the tick. A failure keeps the
+    steps already committed, as separate ticks would.
+    """
+    if scope is None:
+        from zk_add.db import session_scope as scope
+
+    started = monotonic()
     try:
-        with session_scope() as session:
-            advance_once(session)
+        for _ in range(STEPS_PER_TICK):
+            with scope() as session:
+                progressed = advance_once(session)
+            if not progressed or monotonic() - started >= TICK_BUDGET_SECONDS:
+                break
     except Exception:
-        with session_scope() as session:
+        with scope() as session:
             job = session.scalar(
                 select(Job)
                 .where(Job.action == ACTION, Job.status.in_(ACTIVE))

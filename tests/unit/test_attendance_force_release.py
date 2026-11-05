@@ -56,6 +56,23 @@ def store(repair_store, monkeypatch):
     return sessions, connector_id, event_uid
 
 
+def step_scope(sessions, log=None):
+    """A session_scope() over the test database for the production force.tick()."""
+    from contextlib import contextmanager
+
+    @contextmanager
+    def scope():
+        with sessions() as db:
+            if log is not None:
+                log.append("begin")
+            yield db
+            db.commit()
+            if log is not None:
+                log.append("commit")
+
+    return scope
+
+
 def tick(sessions, *, rollback=False):
     with sessions() as db:
         force.advance_once(db)
@@ -1045,3 +1062,107 @@ def test_busy_device_lock_leaves_the_task_and_job_untouched(store, monkeypatch):
     tick(sessions)
     with sessions() as db:
         assert db.scalar(select(Task)).status == "SYNC_PENDING"  # the baseline step ran
+
+
+def test_tick_repeats_steps_in_separate_transactions_until_no_work(store, monkeypatch):
+    """STEPS_PER_TICK x STEP_BATCH keeps the old 100 punches per worker pass.
+
+    Each step commits before the next begins, so the connector lock is never
+    held across steps; a falsy step (no scan/release work, busy device) ends
+    the tick at once.
+    """
+    sessions, _connector_id, _uid = store
+    assert force.STEPS_PER_TICK * force.STEP_BATCH == force.BATCH
+    results = iter([True, True, True, True, True])
+    monkeypatch.setattr(force, "advance_once", lambda session: next(results))
+    log = []
+    force.tick(step_scope(sessions, log))
+    assert log == ["begin", "commit"] * force.STEPS_PER_TICK
+    results = iter([True, False, True])
+    log.clear()
+    force.tick(step_scope(sessions, log))
+    assert log == ["begin", "commit"] * 2
+    results = iter([None])
+    log.clear()
+    force.tick(step_scope(sessions, log))
+    assert log == ["begin", "commit"]
+
+
+def test_tick_stops_when_its_time_budget_is_spent(store, monkeypatch):
+    sessions, _connector_id, _uid = store
+    clock = iter([0.0, force.TICK_BUDGET_SECONDS + 0.01, 99.0, 99.0])
+    monkeypatch.setattr(force, "monotonic", lambda: next(clock))
+    calls = []
+    monkeypatch.setattr(force, "advance_once", lambda session: calls.append(1) or True)
+    force.tick(step_scope(sessions))
+    assert calls == [1]
+
+
+def test_tick_failure_keeps_committed_steps_and_records_the_error(store, monkeypatch):
+    sessions, connector_id, _uid = store
+    with sessions() as db:
+        force.create_check(
+            db,
+            actor="operator",
+            request=ForceCheckRequest(
+                scope="SELECTED", connector_ids=[connector_id], idempotency_key="tick-fail"
+            ),
+        )
+        db.commit()
+    real = force.advance_once
+    calls = []
+
+    def flaky(session):
+        calls.append(1)
+        if len(calls) == 2:
+            raise RuntimeError("database went away")
+        real(session)
+        return True
+
+    monkeypatch.setattr(force, "advance_once", flaky)
+    with pytest.raises(RuntimeError):
+        force.tick(step_scope(sessions))
+    with sessions() as db:
+        assert db.scalar(select(Task)).status == "SYNC_PENDING"  # step one committed
+        assert "could not be saved" in db.scalar(select(Job)).last_error
+
+
+def test_production_tick_scans_several_steps_but_waits_for_device_steps(store, monkeypatch):
+    """Baseline and sync steps stay one per tick; scan steps run back to back."""
+    sessions, connector_id, _uid = store
+    monkeypatch.setattr(force, "STEP_BATCH", 1)
+    with sessions() as db:
+        job = force.create_check(
+            db,
+            actor="operator",
+            request=ForceCheckRequest(
+                scope="SELECTED", connector_ids=[connector_id], idempotency_key="multi-step"
+            ),
+        )
+        job_id = job.job_id
+        db.commit()
+    log = []
+    scope = step_scope(sessions, log)
+    force.tick(scope)  # baseline only
+    assert log == ["begin", "commit"]
+    with sessions() as db:
+        assert db.scalar(select(Task)).status == "SYNC_PENDING"
+    force.tick(scope)  # enqueue refresh only
+    with sessions() as db:
+        assert db.scalar(select(Task)).status == "SYNCING"
+    sync(sessions)
+    force.tick(scope)  # accept refresh only
+    with sessions() as db:
+        assert db.scalar(select(Task)).status == "CHECKING"
+    log.clear()
+    force.tick(scope)  # full scan step, then the empty finishing step, then nothing
+    assert log == ["begin", "commit"] * 3
+    with sessions() as db:
+        assert db.scalar(select(Job)).status == "CHECKED"
+        assert db.scalar(select(Task)).checked_count == 1
+    approve(store, job_id)
+    force.tick(scope)
+    with sessions() as db:
+        assert db.scalar(select(Task)).status == "DONE"
+        assert db.scalar(select(Item)).status == "WAITING_ORACLE"
+        assert db.scalar(select(func.count(Decision.id))) == 1
