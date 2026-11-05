@@ -83,26 +83,35 @@ def event_ords_status_counts(session: Session) -> dict[str | None, int]:
 def ords_outbox_coverage(session: Session) -> dict:
     """Split unacknowledged events without an outbox row by why they have none.
 
-    One grouped anti-join replaces the former single count, so the overview
-    pays for this check once. The decision table is small and indexed by
-    event, so the extra outer join is a hash lookup per outbox-less row.
+    One grouped pass replaces the former single count, so the overview pays for
+    this check once. Both checks are correlated EXISTS lookups on indexed event
+    columns: PostgreSQL plans the outbox one as a real anti-join with a sound
+    row estimate, and the decision one as a per-row index probe. The earlier
+    LEFT JOIN ... IS NULL form was estimated at one row, so once the decision
+    table grew past a few hundred rows (5 Nov 2026: ~15,000 Force release and
+    Direct ORDS decisions) PostgreSQL chose a nested loop over every held punch
+    x every decision and the overview hit its 20 s statement timeout.
     """
 
-    decided = (
-        select(AttendanceForceReleaseDecision.attendance_event_id.label("event_id"))
-        .distinct()
-        .subquery()
+    has_outbox = (
+        select(OrdsOutbox.id).where(OrdsOutbox.attendance_event_id == AttendanceEvent.id).exists()
     )
-    has_decision = decided.c.event_id.is_not(None)
-    rows = session.execute(
-        select(AttendanceEvent.ords_status, has_decision, func.count(AttendanceEvent.id))
-        .outerjoin(OrdsOutbox, OrdsOutbox.attendance_event_id == AttendanceEvent.id)
-        .outerjoin(decided, decided.c.event_id == AttendanceEvent.id)
+    has_decision = (
+        select(AttendanceForceReleaseDecision.id)
+        .where(AttendanceForceReleaseDecision.attendance_event_id == AttendanceEvent.id)
+        .exists()
+    )
+    unqueued = (
+        select(AttendanceEvent.ords_status.label("ords_status"), has_decision.label("decided"))
         .where(
-            OrdsOutbox.id.is_(None),
+            ~has_outbox,
             ~AttendanceEvent.ords_status.in_(tuple(ORDS_ACKNOWLEDGED_STATUSES)),
         )
-        .group_by(AttendanceEvent.ords_status, has_decision)
+        .subquery()
+    )
+    rows = session.execute(
+        select(unqueued.c.ords_status, unqueued.c.decided, func.count())
+        .group_by(unqueued.c.ords_status, unqueued.c.decided)
     ).all()
     by_status: dict[str, int] = {}
     buckets = {"missing": 0, "held": 0, "review": 0}
