@@ -27,7 +27,9 @@ typedef enum {HIK_OK,HIK_CONFIGURATION,HIK_NETWORK,HIK_AUTH,HIK_HTTP_STATUS,HIK_
 static unsigned count_calls, terminal, fail_at;
 static uint32_t newest = 24088, gap;
 static uint32_t span(uint32_t lo,uint32_t hi,uint32_t a,uint32_t b){
- if(lo<a)lo=a; if(hi>b)hi=b; return hi>=lo?hi-lo+1:0;
+ if(lo<a)lo=a;
+ if(hi>b)hi=b;
+ return hi>=lo?hi-lo+1:0;
 }
 static hik_result_t hik_history_count(uint32_t begin,uint32_t end,uint32_t *total){
  ++count_calls;*total=0;
