@@ -1,5 +1,6 @@
 #include "hikvision_api.h"
 #include "esp_random.h"
+#include "esp_timer.h"
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -207,9 +208,15 @@ hik_result_t hik_history_page(hik_search_t *s, hik_record_fn fn, void *context)
     cJSON_Delete(response);
     return result;
 }
+/* Which AcsEvent request of the last count/range call ran last, and how long
+ * it took, so a failing poll can say which sub-request failed (3.1.6). */
+static unsigned request_ms, request_page;
+unsigned hik_history_last_request_ms(void) { return request_ms; }
+unsigned hik_history_last_page(void) { return request_page; }
 static hik_result_t range_request(const char *search_id, uint32_t position, unsigned size,
     uint32_t begin, uint32_t end, cJSON **response)
 {
+    int64_t started = esp_timer_get_time();
     cJSON *body = cJSON_CreateObject();
     cJSON *cond = body ? cJSON_AddObjectToObject(body, "AcsEventCond") : NULL;
     bool valid = cond && cJSON_AddStringToObject(cond, "searchID", search_id) &&
@@ -221,6 +228,8 @@ static hik_result_t range_request(const char *search_id, uint32_t position, unsi
         cJSON_AddNumberToObject(cond, "endSerialNo", end);
     hik_result_t result = valid ? request_json(HTTP_METHOD_POST,
         "/ISAPI/AccessControl/AcsEvent?format=json", body, response) : HIK_NETWORK;
+    int64_t elapsed = (esp_timer_get_time() - started) / 1000;
+    request_ms = elapsed < 0 ? 0 : (unsigned)elapsed;
     cJSON_Delete(body);
     if (result == HIK_PARSE)
         snprintf(history_reject, sizeof(history_reject), "range=json; position=%lu; begin=%lu; end=%lu",
@@ -234,7 +243,7 @@ static void new_search_id(char search_id[33])
 hik_result_t hik_history_count(uint32_t begin, uint32_t end, uint32_t *total)
 {
     if (!total || !begin || begin > end || end > 3000000000U) return HIK_CONFIGURATION;
-    *total = 0; history_reject[0] = 0;
+    *total = 0; history_reject[0] = 0; request_page = 0; request_ms = 0;
     char search_id[33]; new_search_id(search_id);
     cJSON *response = NULL;
     hik_result_t result = range_request(search_id, 0, 1, begin, end, &response);
@@ -260,7 +269,7 @@ hik_result_t hik_history_range(uint32_t begin, uint32_t end, unsigned max_pages,
 {
     if (!fn || !begin || begin > end || end > 3000000000U || !max_pages || max_pages > 100)
         return HIK_CONFIGURATION;
-    history_reject[0] = 0;
+    history_reject[0] = 0; request_page = 0; request_ms = 0;
     /* One terminal search session, paged by position. Some terminals (Jhelum's
      * DS-K1T321MFWX) sort by event time, and a clock that restarts at 2015 on
      * every power-up puts boot records before older punches. So rows may come
@@ -275,6 +284,7 @@ hik_result_t hik_history_range(uint32_t begin, uint32_t end, unsigned max_pages,
     hik_result_t outcome = HIK_OVERSIZED;
     for (unsigned pages = 0; pages < max_pages; pages++) {
         cJSON *response = NULL;
+        request_page = pages + 1;
         hik_result_t result = range_request(search_id, position, 20, begin, end, &response);
         if (result != HIK_OK) { outcome = result; break; }
         cJSON *page = cJSON_GetObjectItemCaseSensitive(response, "AcsEvent");

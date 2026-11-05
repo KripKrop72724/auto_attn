@@ -13,6 +13,10 @@ def test_verified_profile_commands_and_retries(tmp_path):
     if not (cjson / 'cJSON.c').is_file():
         pytest.skip('Pinned ESP-IDF cJSON source required')
     (tmp_path / 'esp_http_client.h').write_text('#pragma once\ntypedef enum {HTTP_METHOD_GET,HTTP_METHOD_POST,HTTP_METHOD_PUT} esp_http_client_method_t;\n')
+    (tmp_path / 'esp_timer.h').write_text(
+        "#pragma once\n#include <stdint.h>\n"
+        "static inline int64_t esp_timer_get_time(void) { static int64_t now; return now += 1000; }\n"
+    )
     (tmp_path / 'esp_random.h').write_text('#include <stdint.h>\nuint32_t esp_random(void);\n')
     (tmp_path / 'esp_err.h').write_text('#pragma once\ntypedef int esp_err_t;\n')
     (tmp_path / 'mbedtls').mkdir()

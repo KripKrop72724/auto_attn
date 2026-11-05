@@ -112,6 +112,41 @@ static uint32_t poll_delay_ms(int64_t elapsed_us)
      * not a reason to starve all background progress after an overrun. */
     return remaining > 250000 ? (uint32_t)(remaining / 1000) : 250;
 }
+/* 3.1.6 failure back-off. 3.1.5 retried a failed events read 250 ms after a
+ * slow poll, so a slow terminal (Mirpur-02, DS-K1T342MFWX-E1 V4.38.0) that had
+ * already timed out was hit again at once and never recovered. Its failures
+ * were HIK_NETWORK (timeouts) and HIK_AUTH (401 on a saturated Digest round),
+ * the two results that mean "the terminal is not answering properly". After
+ * consecutive such failures, at any stage, the next poll waits 2, 5, 15, 30
+ * and then 60 s; one good poll restores the 2 s cadence.
+ *
+ * Deterministic rejects (HIK_PARSE, HIK_OVERSIZED, HIK_BINDING, HIK_CUSTODY,
+ * HIK_HTTP_STATUS, ...) say nothing about terminal load and keep the normal
+ * 2 s / 250 ms cadence: the background workers (ADD history assignments, the
+ * light audit, profile-command user scans) get one slot per poll, so backing
+ * off there would slow a history backfill or a REFRESH_USERS ~30x while the
+ * terminal is perfectly reachable. They neither add to nor reset the count. */
+static const uint32_t poll_backoff_steps_ms[] = {2000, 5000, 15000, 30000, 60000};
+static uint32_t poll_backoff_ms(unsigned failing)
+{
+    const unsigned steps = sizeof(poll_backoff_steps_ms) / sizeof(poll_backoff_steps_ms[0]);
+    if (!failing) return 0;
+    return poll_backoff_steps_ms[failing < steps ? failing - 1 : steps - 1];
+}
+static bool poll_backs_off(hik_result_t result)
+{
+    return result == HIK_NETWORK || result == HIK_AUTH;
+}
+/* Delay before the next poll; *failing counts consecutive back-off failures. */
+static uint32_t poll_next_delay_ms(int64_t elapsed_us, hik_result_t result, unsigned *failing)
+{
+    uint32_t delay = poll_delay_ms(elapsed_us);
+    if (result == HIK_OK) { *failing = 0; return delay; }
+    if (!poll_backs_off(result)) return delay;
+    if (*failing < 1000) ++*failing;
+    uint32_t backoff = poll_backoff_ms(*failing);
+    return backoff > delay ? backoff : delay;
+}
 /* A single encrypted NVS blob commits the cursor and its source binding. Queue
  * persistence always precedes this write. A failed commit replays observations. */
 typedef struct {
@@ -335,26 +370,109 @@ static bool range_row(void *context, const char *body, size_t length, uint32_t s
  * completely before the checkpoint moves, so no poll needs an unbounded scan. */
 #define POLL_WINDOW_ROWS 400
 #define POLL_RANGE_MAX_PAGES (POLL_WINDOW_ROWS / 20 + 2)
+/* 3.1.6 diagnostics: the AcsEvent sub-request a poll made last (anchor,
+ * count0, probe, probe#n, bisect#n or page#p) and its elapsed milliseconds,
+ * reported when the events stage fails. */
+typedef struct { char name[24]; unsigned ms, searches; } poll_request_t;
+static void poll_request_note(poll_request_t *req, const char *name, unsigned index)
+{
+    if (index) snprintf(req->name, sizeof(req->name), "%s#%u", name, index);
+    else snprintf(req->name, sizeof(req->name), "%s", name);
+    req->ms = hik_history_last_request_ms();
+}
+static void poll_request_text(char *out, size_t size, const poll_request_t *req)
+{
+    snprintf(out, size, "; request=%s; request_ms=%u", req->name[0] ? req->name : "none", req->ms);
+}
+static hik_result_t window_count(poll_request_t *req, const char *name, unsigned index,
+    uint32_t from, uint32_t end, uint32_t *total)
+{
+    hik_result_t result = hik_history_count(from, end, total);
+    poll_request_note(req, name, index);
+    req->searches++;
+    return result;
+}
 /* The read window [from, end]. Up to one page is read whole. Otherwise end is
  * the smallest serial whose window already holds min(waiting, POLL_WINDOW_ROWS)
  * events: punches that arrive meanwhile take higher serials, stay outside it
  * and cannot change its total mid-read; they are read by the next poll. One
- * serial adds at most one event, so the window holds exactly that many. */
-static hik_result_t poll_window_end(uint32_t from, uint32_t *end)
+ * serial adds at most one event, so the window holds exactly that many.
+ *
+ * 3.1.5 found end by bisecting from 3e9: ~33 searches per poll, each a new
+ * AcsEvent search (two connections with the Digest round). A slow terminal
+ * then timed out every poll. Serials are dense here (one serial per event of
+ * any major, since major=0), so 3.1.6 asks where the window must end instead:
+ *
+ * - count(from, x) <= x - from + 1, so no end below from + target - 1 can hold
+ *   target events. That is the first probe. On an inclusive-begin terminal the
+ *   anchor row at 'from' is counted in both waiting and the probe, so a dense
+ *   backlog is done in 2 searches.
+ * - If a probe holds c < target events, every serial above it adds at most one
+ *   event, so no end below probe + (target - c) can be enough: that is the next
+ *   probe. An exclusive-begin terminal does not count the anchor, so its first
+ *   probe is one short and the second is exact: 3 searches.
+ * Each probe sits at the lowest end the counts so far allow, so a probe that
+ * holds target events is the smallest such end. Only a sparse range (deleted
+ * or skipped serials) goes past POLL_WINDOW_PROBES; it then gallops upward at
+ * most POLL_WINDOW_GALLOP steps and bisects between the last short end and the
+ * first full one (or 3e9), never from 3e9 when the gallop found a full end.
+ *
+ * The bisection always runs to hi - lo == 1, with no search cap: a capped
+ * search that stopped early would return an end far above the smallest one
+ * (e.g. a serial gap of 1e9 above the anchor), the window could then exceed
+ * POLL_RANGE_MAX_PAGES pages and every poll would fail HIK_OVERSIZED for good.
+ * A uint32 range bisects in at most 32 steps, so a poll makes at most
+ * 1 + POLL_WINDOW_PROBES + POLL_WINDOW_GALLOP + 32 = 44 searches even in the
+ * worst sparse case (3.1.5's bound), and 2-3 in the dense common case.
+ *
+ * Should the window still end above the smallest such serial (a count that
+ * moved between searches), it holds at most a few more than target events and
+ * new punches may land inside it during the read. The range read then sees its
+ * total change and rejects the read (total_changed): the checkpoint stays
+ * where it was and the next poll retries with fresh counts. It never loses
+ * custody. */
+#define POLL_WINDOW_PROBES 3
+#define POLL_WINDOW_GALLOP 8
+static hik_result_t poll_window_end(uint32_t from, uint32_t *end, poll_request_t *req)
 {
+    const uint32_t top = 3000000000U;
     uint32_t waiting = 0;
-    *end = 3000000000U;
-    hik_result_t result = hik_history_count(from, *end, &waiting);
+    *end = top;
+    hik_result_t result = window_count(req, "count0", 0, from, top, &waiting);
     if (result != HIK_OK || waiting <= 20) return result;
     uint32_t target = waiting < POLL_WINDOW_ROWS ? waiting : POLL_WINDOW_ROWS;
-    uint32_t lo = from, hi = *end; /* count(from, lo) < target <= count(from, hi) */
-    while (result == HIK_OK && hi - lo > 1) {
+    /* count(from, lo) < target <= count(from, hi); lo == from is never counted. */
+    uint32_t lo = from, hi = top, short_by = target;
+    uint64_t probe = (uint64_t)from + target - 1;
+    for (unsigned probes = 0; probes < POLL_WINDOW_PROBES && probe < hi; probes++) {
+        uint32_t in_window = 0;
+        result = window_count(req, "probe", probes ? probes + 1 : 0, from, (uint32_t)probe, &in_window);
+        if (result != HIK_OK) return result;
+        if (in_window >= target) { *end = (uint32_t)probe; return HIK_OK; }
+        lo = (uint32_t)probe; short_by = target - in_window;
+        probe += short_by;
+    }
+    /* Sparse serials: a bounded gallop up from the last short probe, then a
+     * bisection that always converges (hi is top if the gallop found none). */
+    unsigned step_index = 0;
+    uint64_t step = (uint64_t)short_by * 2;
+    for (unsigned gallop = 0; gallop < POLL_WINDOW_GALLOP && hi == top; gallop++) {
+        uint64_t candidate = (uint64_t)lo + step;
+        if (candidate >= top) break;
+        uint32_t in_window = 0;
+        result = window_count(req, "bisect", ++step_index, from, (uint32_t)candidate, &in_window);
+        if (result != HIK_OK) return result;
+        if (in_window >= target) hi = (uint32_t)candidate;
+        else { lo = (uint32_t)candidate; step *= 2; }
+    }
+    while (hi - lo > 1) {
         uint32_t mid = lo + (hi - lo) / 2, in_window = 0;
-        result = hik_history_count(from, mid, &in_window);
-        if (result == HIK_OK) { if (in_window >= target) hi = mid; else lo = mid; }
+        result = window_count(req, "bisect", ++step_index, from, mid, &in_window);
+        if (result != HIK_OK) return result;
+        if (in_window >= target) hi = mid; else lo = mid;
     }
     *end = hi;
-    return result;
+    return HIK_OK;
 }
 /* First install: the newest 20 serials. Position-based bounds assume serial
  * order, which a time-sorted terminal does not give. */
@@ -382,6 +500,7 @@ static void poll_task(void *arg)
     int64_t last_anchor_report_us = -60000000;
     hik_result_t previous_result = HIK_CONFIGURATION;
     led_status_t previous_led = LED_STATUS_BOOTING;
+    unsigned backoff_failures = 0;
     for (;;) {
         xSemaphoreTake(request_lock, portMAX_DELAY);
         int64_t started = esp_timer_get_time();
@@ -391,6 +510,7 @@ static void poll_task(void *arg)
         background_slot = false;
         hik_result_t result = HIK_OK;
         unsigned stage = 0;
+        poll_request_t request = {0};
         if (!loaded) {
             loaded = checkpoint_load(&cursor, &present);
             if (!loaded) result = HIK_CUSTODY;
@@ -431,6 +551,7 @@ static void poll_task(void *arg)
                  * proved; it only arises from a terminal holding one event.) */
                 result = hik_history_range(cursor.serial > 1 ? cursor.serial - 1 : 1,
                     cursor.serial < 3000000000U ? cursor.serial + 1 : cursor.serial, 1, anchor_row, &range);
+                poll_request_note(&request, "anchor", 0);
                 if (range.page.anchor_conflict || (result == HIK_OK && !range.page.anchor_seen))
                     result = HIK_BINDING;
                 range.page.expected_anchor = NULL;
@@ -443,9 +564,11 @@ static void poll_task(void *arg)
                 memcpy(range.anchor_stable, upgraded ? upgraded_anchor : cursor.anchor, 32);
             }
             uint32_t from = range.anchor_serial ? range.anchor_serial : begin, end = 3000000000U;
-            if (result == HIK_OK) result = poll_window_end(from, &end);
-            if (result == HIK_OK)
+            if (result == HIK_OK) result = poll_window_end(from, &end, &request);
+            if (result == HIK_OK) {
                 result = hik_history_range(from, end, POLL_RANGE_MAX_PAGES, range_row, &range);
+                poll_request_note(&request, "page", hik_history_last_page());
+            }
             if (range.page.anchor_conflict) result = HIK_BINDING;
             if (range.page.anchor_conflict && started - last_anchor_report_us >= 60000000) {
                 char expected[65], observed[65], message[224];
@@ -496,13 +619,14 @@ static void poll_task(void *arg)
         led_status_set(status);
         if (result != previous_result || status != previous_led || started - last_report_us >= 60000000) {
             char host[64]; zone_config_copy_hik_host(host, sizeof(host));
-            char message[576];
-            snprintf(message, sizeof(message), "Poll %s; reason=%s; stage=%s; http=%u; failures=%u; terminal=%s; duration_ms=%lu; cursor=%lu; queued=%lu; storage=%s; source_worker=%s%s%s",
+            char message[576], request_text[64] = "";
+            if (result != HIK_OK && stage == 3) poll_request_text(request_text, sizeof(request_text), &request);
+            snprintf(message, sizeof(message), "Poll %s; reason=%s; stage=%s; http=%u; failures=%u; terminal=%s; duration_ms=%lu; cursor=%lu; queued=%lu; storage=%s; source_worker=%s%s%s%s",
                 result == HIK_OK ? "OK" : "retrying", hik_reason(result), poll_stages[stage], atomic_load(&poll_http_status),
                 atomic_load(&poll_failures), host,
                 (unsigned long)((esp_timer_get_time() - started) / 1000), (unsigned long)cursor.serial,
                 (unsigned long)depth, storage.persistence_verified && !storage.last_error ? "verified" : "unverified",
-                workers_ready ? "running" : "waiting",
+                workers_ready ? "running" : "waiting", request_text,
                 (result == HIK_PARSE || result == HIK_OVERSIZED) && stage == 3 ? "; rejected " : "",
                 (result == HIK_PARSE || result == HIK_OVERSIZED) && stage == 3 ? hik_history_last_reject() : "");
             ESP_LOGI(TAG, "%s", message);
@@ -513,7 +637,17 @@ static void poll_task(void *arg)
         atomic_store(&poll_tick, (uint32_t)(esp_timer_get_time() / 1000));
         background_slot = true;
         xSemaphoreGive(request_lock);
-        vTaskDelay(pdMS_TO_TICKS(poll_delay_ms(esp_timer_get_time() - started)));
+        uint32_t delay_ms = poll_next_delay_ms(esp_timer_get_time() - started, result, &backoff_failures);
+        /* The audit and history workers keep their one slot per poll; only a
+         * load failure (network/auth) stretches that. Waiting out a back-off
+         * is a live poll task, so the boot-health / OTA tick
+         * stays fresh while the terminal is left alone. */
+        while (delay_ms) {
+            uint32_t slice = delay_ms > 1000 ? 1000 : delay_ms;
+            vTaskDelay(pdMS_TO_TICKS(slice));
+            delay_ms -= slice;
+            atomic_store(&poll_tick, (uint32_t)(esp_timer_get_time() / 1000));
+        }
     }
 }
 /* Low-rate independent audit. It preserves retained records through the same
