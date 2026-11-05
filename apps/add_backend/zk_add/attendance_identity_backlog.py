@@ -106,7 +106,7 @@ def zone_connectors(session: Session, zone_id: str, *, lock: bool = False) -> li
         .order_by(Connector.id)
     )
     if lock:
-        query = query.with_for_update()
+        query = query.with_for_update(key_share=True)
     return [row for row in session.scalars(query).all() if row.zkt_device is not None]
 
 

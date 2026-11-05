@@ -2,12 +2,11 @@ import { useCallback, useEffect, useState } from 'react'
 import { api, ApiError } from '../api'
 import { idempotency } from '../App'
 import { humanizeStatus } from '../status'
+import { UnknownIdentityAutoRelease } from './UnknownIdentityAutoRelease'
 
 export type UnknownSyncedSummary = {
   count: number
   devices: Array<{ connector_id: string; display_name: string; zone_id: string; count: number }>
-  event_ids: number[]
-  truncated: boolean
 }
 type QuickRun = {
   job_id: string; selected: number; ready: number; skipped: number;
@@ -42,13 +41,19 @@ const SKIP_TEXT: Record<string, string> = {
 const skipLabel = (code: string) => SKIP_TEXT[code] || humanizeStatus(code).toLowerCase()
 
 /**
- * One click lists every held "Unknown identity · CNIC on synced user" punch and
- * sends the selected ones, or all of them, to Oracle. No reason or password:
- * ADD's direct send checks still run per punch, and anything that needs a person
- * to decide stays held for the per-punch "Send to ORDS" dialog.
+ * One click lists every held "Unknown identity · CNIC on synced user" punch.
+ * Releasing all of them is server-side (the automatic release switch, or its
+ * one-shot "Release all now"); a manual selection is still sent from here. No
+ * reason or password: ADD's direct send checks still run per punch, and
+ * anything that needs a person stays held for the per-punch "Send to ORDS".
+ *
+ * The switch and its progress always show: they read only the worker's saved
+ * counts. The heavy live filter (and its count) runs only when the operator
+ * turns the filter on.
  */
-export function UnknownSyncedRelease({ active, onToggle, selectedIds, clearSelection, refresh }: {
+export function UnknownSyncedRelease({ active, onToggle, selectedIds, clearSelection, refresh, toast }: {
   active: boolean; onToggle: () => void; selectedIds: number[]; clearSelection: () => void; refresh: () => void;
+  toast?: { notice: (message: string) => void; error: (message: string) => void };
 }) {
   const [summary, setSummary] = useState<UnknownSyncedSummary | null>(null)
   const [progress, setProgress] = useState<{ done: number; total: number } | null>(null)
@@ -57,7 +62,7 @@ export function UnknownSyncedRelease({ active, onToggle, selectedIds, clearSelec
   const load = useCallback(async () => {
     try {
       const value = await api<UnknownSyncedSummary>(`${root}/unknown-synced`)
-      setSummary({ ...value, event_ids: Array.isArray(value.event_ids) ? value.event_ids : [], devices: Array.isArray(value.devices) ? value.devices : [] })
+      setSummary({ count: typeof value.count === 'number' ? value.count : 0, devices: Array.isArray(value.devices) ? value.devices : [] })
       setError('')
     } catch (failure) { setError(failure instanceof Error ? failure.message : 'ADD could not count these punches.') }
   }, [])
@@ -99,18 +104,17 @@ export function UnknownSyncedRelease({ active, onToggle, selectedIds, clearSelec
   }
 
   const count = summary?.count ?? 0
-  const all = summary?.event_ids ?? []
   return <section className={`attendance-unknown-synced ${active ? 'is-active' : ''}`} aria-label="Unknown identity with a CNIC on the synced user">
     <div className="attendance-unknown-synced-bar">
       <button className={`button ${active ? 'primary' : 'secondary'}`} type="button" aria-pressed={active} onClick={onToggle}>
         Unknown identity · CNIC on synced user{active && <span className="attendance-unknown-synced-count">{summary ? count.toLocaleString() : '…'}</span>}
       </button>
-      {active && <div className="attendance-direct-actions">
-        {selectedIds.length > 0 && <button className="button secondary" type="button" disabled={Boolean(progress)} onClick={() => void release(selectedIds)}>Release {punches(selectedIds.length)} selected</button>}
-        <button className="button primary" type="button" disabled={!all.length || Boolean(progress)} onClick={() => void release(all)}>{progress ? `Releasing ${progress.done.toLocaleString()} of ${progress.total.toLocaleString()}…` : `Release all ${count.toLocaleString()} to Oracle`}</button>
+      {active && (selectedIds.length > 0 || progress) && <div className="attendance-direct-actions">
+        <button className="button secondary" type="button" disabled={Boolean(progress)} onClick={() => void release(selectedIds)}>{progress ? `Releasing ${progress.done.toLocaleString()} of ${progress.total.toLocaleString()}…` : `Release ${punches(selectedIds.length)} selected`}</button>
       </div>}
     </div>
-    {active && summary && summary.devices.length > 0 && <p className="attendance-unknown-synced-devices">{summary.devices.slice(0, 8).map((device) => `${device.display_name}: ${device.count.toLocaleString()}`).join(' · ')}{summary.devices.length > 8 ? ` · and ${summary.devices.length - 8} more devices` : ''}{summary.truncated ? ` · Release all sends the newest ${all.length.toLocaleString()}; click again for the rest.` : ''}</p>}
+    {active && summary && summary.devices.length > 0 && <p className="attendance-unknown-synced-devices">{summary.devices.slice(0, 8).map((device) => `${device.display_name}: ${device.count.toLocaleString()}`).join(' · ')}{summary.devices.length > 8 ? ` · and ${summary.devices.length - 8} more devices` : ''}</p>}
+    <UnknownIdentityAutoRelease toast={toast} onChanged={refresh} />
     {error && <p className="message pattern-blocked" role="alert">{error}</p>}
     {outcome && <div className="attendance-direct-progress" role="status" aria-live="polite">
       <div className="attendance-direct-counts"><span><strong>{outcome.sent.toLocaleString()}</strong> queued for Oracle</span><span><strong>{outcome.skipped.toLocaleString()}</strong> skipped</span>{outcome.notMatching > 0 && <span><strong>{outcome.notMatching.toLocaleString()}</strong> already released</span>}</div>

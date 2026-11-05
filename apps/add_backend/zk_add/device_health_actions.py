@@ -67,7 +67,7 @@ def _rederive(session: Session, connector: Connector, *, source: str) -> Health:
 
 def _lock_connector(session: Session, *, connector_pk: int | None = None, connector_id: str | None = None):
     clause = Connector.id == connector_pk if connector_pk is not None else Connector.connector_id == connector_id
-    return session.scalar(select(Connector).where(clause).with_for_update())
+    return session.scalar(select(Connector).where(clause).with_for_update(key_share=True))
 
 
 def resolve_alert_by_operator(session: Session, *, alert_id: int, actor: str, reason: str, idempotency_key: str,

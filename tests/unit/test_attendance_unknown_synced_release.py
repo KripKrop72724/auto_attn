@@ -46,8 +46,11 @@ def test_filter_and_summary_count_only_held_unnamed_punches_with_one_synced_cnic
         assert page["rows"][0]["direct_ords_identity"]["cnic_source"] == "SYNCED_USER"
         summary = client.get("/api/v2/attendance-direct-ords/unknown-synced").json()
         assert summary["count"] == 1
-        assert summary["event_ids"] == [event_id]
-        assert summary["truncated"] is False
+        # The sorted ID list is a second pass of the filter: only on request.
+        assert summary["event_ids"] == [] and summary["truncated"] is False
+        listed = client.get("/api/v2/attendance-direct-ords/unknown-synced", params={"ids": "true"}).json()
+        assert listed["event_ids"] == [event_id]
+        assert listed["truncated"] is False
         assert summary["devices"][0]["connector_id"] == connector_id
         assert summary["devices"][0]["count"] == 1
         assert CORRECT_CNIC not in str(summary)

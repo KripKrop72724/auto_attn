@@ -991,7 +991,7 @@ def review_attendance_quarantine(
         connector = session.scalar(
             select(Connector)
             .where(Connector.id == receipt.connector_id)
-            .with_for_update()
+            .with_for_update(key_share=True)
         )
         session.refresh(item)
     if item.review_idempotency_key == idempotency_key:

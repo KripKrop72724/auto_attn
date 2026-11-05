@@ -2362,5 +2362,52 @@ class PublicDeviceStatus(Base):
     updated_at: Mapped[datetime] = utc_column()
 
 
+class UnknownIdentityAutoRelease(Base):
+    """The owner's switch for releasing unknown-identity punches automatically.
+
+    A singleton (id 1). A missing row means ON. See
+    zk_add/attendance_unknown_auto_release.py; migration 20261105_0062.
+    """
+
+    __tablename__ = "add_unknown_identity_auto_release"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=False, default=1)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default=text("true"))
+    changed_by: Mapped[str | None] = mapped_column(String(120))
+    changed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    reason_encrypted: Mapped[str | None] = mapped_column(Text)
+    control_key: Mapped[str | None] = mapped_column(String(120))
+    # One-shot "Release all now" while the switch is OFF.
+    drain_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    drain_requested_by: Mapped[str | None] = mapped_column(String(120))
+    drain_key: Mapped[str | None] = mapped_column(String(120))
+    drain_completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Scan position of the current pass (newest first).
+    scan_head_id: Mapped[int | None] = mapped_column(Integer)
+    scan_cursor_id: Mapped[int | None] = mapped_column(Integer)
+    scan_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    scan_idle_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # While resting after an empty pass: only punches above this ID are read.
+    idle_head_id: Mapped[int | None] = mapped_column(Integer)
+    # Any read of held punches (batch or not); paces scans like batches.
+    last_scan_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Computed by the worker at most every count interval, never per request.
+    backlog_count: Mapped[int | None] = mapped_column(Integer)
+    backlog_counted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Last count started (successful or not) and failures in a row: the gate and its back-off.
+    count_attempted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    count_failures: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    stats: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict, server_default=text("'{}'"))
+    stats_counted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_batch_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_batch_size: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    last_batch_job_id: Mapped[str | None] = mapped_column(String(36))
+    batches_created: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    punches_submitted: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    last_error_code: Mapped[str | None] = mapped_column(String(80))
+    last_error_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = utc_column()
+
+
 from zk_add import attendance_manual_guard as _attendance_manual_guard  # noqa: E402,F401
 from zk_add import checkin_notify as _checkin_notify  # noqa: E402,F401

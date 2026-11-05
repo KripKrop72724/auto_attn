@@ -614,6 +614,10 @@ DASHBOARD_METRICS_STALE_SECONDS = 120
 # With no usable value (cold start), a request waits this long for the refresh
 # another request is running, then answers 503 instead of holding its thread.
 DASHBOARD_METRICS_WAIT_SECONDS = 30
+# Release and recovery actions mark the figures out of date instead of dropping
+# them. A bulk release posts hundreds of these a minute; the figures refresh at
+# most once per this many seconds and viewers keep the last value meanwhile.
+DASHBOARD_METRICS_MARK_MIN_AGE_SECONDS = 5
 
 
 def _dashboard_metrics(session: Session) -> dict:
@@ -692,15 +696,19 @@ def dashboard_metrics(db: Session) -> tuple[dict, datetime, int]:
 
 
 def invalidate_dashboard_metrics_after_commit(db: Session) -> None:
-    """Recompute the cached delivery/recovery figures once this request commits.
+    """Mark the cached delivery/recovery figures out of date once this commits.
 
     For operator actions that change attendance delivery (releases, recovery
-    controls), so the next Refresh shows their effect instead of figures up to
-    a TTL old. A rolled-back request leaves the cache alone.
+    controls), so a Refresh a few seconds later shows their effect instead of
+    figures up to a TTL old. It does not drop the figures: during a bulk
+    release every viewer would otherwise wait on a full recompute after each
+    POST. A rolled-back request leaves the cache alone.
     """
 
     def _invalidate(_session) -> None:
-        dashboard_cache.invalidate(DASHBOARD_METRICS_KEY)
+        dashboard_cache.mark_stale(
+            DASHBOARD_METRICS_KEY, DASHBOARD_METRICS_MARK_MIN_AGE_SECONDS
+        )
 
     sa_event.listen(db, "after_commit", _invalidate, once=True)
 
@@ -758,13 +766,21 @@ def list_direct_ords_runs(
     return {"rows": [direct_ords.serialize(db, row) for row in rows]}
 
 
-# The ledger's "select all" covers this many punches; larger backlogs release in rounds.
+# With ?ids=true the summary also lists up to this many punch IDs, newest first.
 UNKNOWN_SYNCED_ID_LIMIT = 10_000
 
 
 @app.get("/api/v2/attendance-direct-ords/unknown-synced")
-def unknown_synced_summary(auth: tuple[Session, AdminContext] = Depends(require_admin)):
-    """Count and IDs of held "Unknown identity · CNIC on synced user" punches."""
+def unknown_synced_summary(
+    ids: bool = Query(default=False),
+    auth: tuple[Session, AdminContext] = Depends(require_admin),
+):
+    """Count per device of held "Unknown identity · CNIC on synced user" punches.
+
+    Releasing all of them is server-side (attendance_unknown_auto_release), so
+    the sorted ID list is read only on request: it is a second full pass of
+    the filter.
+    """
     db, _context = auth
     condition = unknown_synced_cnic_expression()
     devices = db.execute(
@@ -775,7 +791,7 @@ def unknown_synced_summary(auth: tuple[Session, AdminContext] = Depends(require_
         .order_by(func.count(AttendanceEvent.id).desc())
     ).all()
     total = sum(row[3] for row in devices)
-    event_ids = direct_ords.unknown_synced_event_ids(db, limit=UNKNOWN_SYNCED_ID_LIMIT)
+    event_ids = direct_ords.unknown_synced_event_ids(db, limit=UNKNOWN_SYNCED_ID_LIMIT) if ids else []
     return {
         "count": total,
         "devices": [
@@ -783,7 +799,7 @@ def unknown_synced_summary(auth: tuple[Session, AdminContext] = Depends(require_
             for connector_id, name, zone_id, count in devices
         ],
         "event_ids": event_ids,
-        "truncated": total > len(event_ids),
+        "truncated": ids and total > len(event_ids),
     }
 
 
@@ -814,6 +830,51 @@ def quick_release_direct_ords(
         "not_matching": not_matching,
         "skipped_by_reason": direct_ords.skipped_by_reason(db, job),
     }
+
+
+from zk_add import attendance_unknown_auto_release as unknown_auto_release  # noqa: E402
+
+
+@app.get("/api/v2/unknown-identity-auto-release")
+def unknown_identity_auto_release_status(auth: tuple[Session, AdminContext] = Depends(require_admin)):
+    """The automatic release switch and its progress, from saved counts (no backlog scan)."""
+    db, _context = auth
+    return unknown_auto_release.status(db)
+
+
+@app.post("/api/v2/unknown-identity-auto-release/control")
+def control_unknown_identity_auto_release(
+    request: Request,
+    body: unknown_auto_release.AutoReleaseControlRequest,
+    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+):
+    """Turn the automatic release ON or OFF: password and a written reason, audited."""
+    db, context = auth
+    require_step_up(body.password.get_secret_value(), db, context)
+    try:
+        unknown_auto_release.control(db, actor=context.username, request=body, ip_address=client_ip(request))
+        db.flush()
+    except unknown_auto_release.AutoReleaseError as exc:
+        raise HTTPException(status_code=409, detail={"code": exc.code, "message": str(exc)}) from exc
+    return unknown_auto_release.status(db)
+
+
+@app.post("/api/v2/unknown-identity-auto-release/release-all", status_code=202)
+def release_all_unknown_identity(
+    request: Request,
+    body: unknown_auto_release.AutoReleaseDrainRequest,
+    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+):
+    """One click: the worker releases every such punch, paced, until none is left untried."""
+    db, context = auth
+    try:
+        outcome = unknown_auto_release.request_drain(
+            db, actor=context.username, request=body, ip_address=client_ip(request),
+        )
+        db.flush()
+    except unknown_auto_release.AutoReleaseError as exc:
+        raise HTTPException(status_code=409, detail={"code": exc.code, "message": str(exc)}) from exc
+    return {**unknown_auto_release.status(db), "outcome": outcome}
 
 
 @app.post("/api/v2/attendance-direct-ords/preview")
@@ -4429,7 +4490,7 @@ def acknowledge_alert(
     if row is None:
         raise HTTPException(status_code=404, detail="Alert not found.")
     # Heartbeats lock the connector before its alerts; keep the same order.
-    db.scalar(select(Connector).where(Connector.id == row.connector_id).with_for_update())
+    db.scalar(select(Connector).where(Connector.id == row.connector_id).with_for_update(key_share=True))
     row = db.scalar(
         select(DeviceAlert)
         .where(DeviceAlert.id == alert_id)
@@ -5359,7 +5420,7 @@ def record_envelope_rejection(connector_pk: int, envelope: Envelope, error: Exce
     # Which custody record was refused, so its later acceptance can be proven.
     evidence = refused_copy(envelope.payload) if envelope.type == "queue_evidence" else None
     with session_scope() as db:
-        connector = db.scalar(select(Connector).where(Connector.id == connector_pk).with_for_update())
+        connector = db.scalar(select(Connector).where(Connector.id == connector_pk).with_for_update(key_share=True))
         if connector is None:
             return
         alert = record_message_rejection(
@@ -5430,7 +5491,7 @@ def persist_envelope(connector_pk: int, envelope: Envelope) -> EnvelopeOutcome |
         # Separate sockets may overlap during reconnect. Serialize sequence checks
         # and acceptance for the same connector before acknowledging either socket.
         connector = db.scalar(
-            select(Connector).where(Connector.id == connector_pk).with_for_update()
+            select(Connector).where(Connector.id == connector_pk).with_for_update(key_share=True)
         )
         if connector is None:
             return
@@ -6692,7 +6753,7 @@ async def firmware_progress(
         # owner's pause or cancel (or this ESP's own heartbeat) waits instead
         # of deadlocking. Every report already took this row lock when it
         # committed its ota_state; it is only taken first now.
-        db.execute(_select(Connector.id).where(Connector.id == connector.id).with_for_update())
+        db.execute(_select(Connector.id).where(Connector.id == connector.id).with_for_update(key_share=True))
         from zk_add.legacy_bld5_bridge import accept_legacy_progress
 
         legacy = accept_legacy_progress(

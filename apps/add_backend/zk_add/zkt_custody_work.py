@@ -444,7 +444,7 @@ def advance_work_batch(session: Session, *, limit: int = 100, after_connector: i
             break
         attempted += 1
         connector = session.scalar(select(Connector).where(Connector.id == connector_id)
-            .with_for_update(skip_locked=True))
+            .with_for_update(key_share=True, skip_locked=True))
         if connector is None:
             locked += 1
             cursor = connector_id
@@ -526,7 +526,7 @@ def backfill_work(session: Session, *, limit: int = 100) -> int:
     repaired = 0
     for receipt in rows:
         connector = session.scalar(select(Connector).where(Connector.id == receipt.connector_id)
-                                   .with_for_update(skip_locked=True))
+                                   .with_for_update(key_share=True, skip_locked=True))
         if connector is None:
             continue
         if session.scalar(select(ZktCustodyWorkReceipt.id).where(

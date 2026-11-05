@@ -397,6 +397,7 @@ async def _safe_attendance_repair_loop(stop: asyncio.Event) -> None:
     from zk_add.attendance_force_release import tick as force_tick
     from zk_add.attendance_direct_ords import tick as direct_tick
     from zk_add.attendance_identity_backlog import tick as backlog_tick
+    from zk_add.attendance_unknown_auto_release import tick as unknown_release_tick
 
     while not stop.is_set():
         for work, code in (
@@ -404,6 +405,7 @@ async def _safe_attendance_repair_loop(stop: asyncio.Event) -> None:
             (force_tick, "MANUAL_FORCE_RELEASE_WORKER_ERROR"),
             (direct_tick, "DIRECT_ORDS_WORKER_ERROR"),
             (backlog_tick, "IDENTITY_BACKLOG_RELEASE_WORKER_ERROR"),
+            (unknown_release_tick, "UNKNOWN_IDENTITY_AUTO_RELEASE_WORKER_ERROR"),
         ):
             try:
                 await asyncio.to_thread(work)
@@ -524,7 +526,7 @@ def mark_stale_connectors(now: datetime) -> list[dict]:
                 Connector.active == True,  # noqa: E712
                 Connector.last_seen_at.is_not(None), Connector.last_seen_at < stale,
                 or_(Connector.connected == True, Connector.lifecycle_state.not_in(kept)),  # noqa: E712
-            ).order_by(Connector.id).with_for_update(skip_locked=True)
+            ).order_by(Connector.id).with_for_update(key_share=True, skip_locked=True)
         ).all():
             connector.connected = False
             connector.last_disconnect_at = now
@@ -546,7 +548,7 @@ def mark_stale_connectors(now: datetime) -> list[dict]:
                 Connector.last_seen_at.is_not(None), Connector.last_seen_at < silent_for,
                 Connector.last_disconnect_at.is_not(None), Connector.last_disconnect_at >= disconnected_since,
                 Connector.id.not_in(open_offline),
-            ).order_by(Connector.id).with_for_update(skip_locked=True)
+            ).order_by(Connector.id).with_for_update(key_share=True, skip_locked=True)
         ).all():
             upsert_alert(session, connector, code="ESP_OFFLINE", severity="HIGH",
                          message="ESP heartbeat is stale.",
@@ -572,7 +574,7 @@ def _mark_stale_heartbeats(now: datetime, stale: datetime) -> list[dict]:
                 Connector.lifecycle_state.not_in(
                     ["OFFLINE", "DEGRADED", "QUARANTINED_DUPLICATE_SERIAL", "ONBOARDING"]),
                 Connector.id.in_(select(ZKTDevice.connector_id).where(ZKTDevice.last_seen_at < silent)),
-            ).order_by(Connector.id).with_for_update(skip_locked=True)
+            ).order_by(Connector.id).with_for_update(key_share=True, skip_locked=True)
         ).all():
             health = apply_device_health(session, connector, source="SWEEP", now=now)
             updates.append({"connector_id": connector.connector_id, "state": health.derived_lifecycle})

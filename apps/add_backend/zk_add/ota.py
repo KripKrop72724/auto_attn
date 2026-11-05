@@ -1398,7 +1398,7 @@ def control_campaign(session: Session, *, campaign_public_id: str, action: str,
         select(FirmwareDeployment.connector_id).where(
             FirmwareDeployment.campaign_id == campaign_row,
             FirmwareDeployment.status.in_(["OFFERED", "DOWNLOADING"]))))
-        .order_by(Connector.id).with_for_update()).all()
+        .order_by(Connector.id).with_for_update(key_share=True)).all()
     session.scalars(select(FirmwareDeployment.id).where(FirmwareDeployment.campaign_id == campaign_row)
                     .order_by(FirmwareDeployment.id).with_for_update()).all()
     campaign = session.scalar(select(FirmwareCampaign).where(FirmwareCampaign.id == campaign_row)
@@ -1486,7 +1486,7 @@ def record_progress(
     # heartbeat and of campaign control. This transition also updates the
     # connector's ota_state, so taking that row last could deadlock with a
     # pause or cancel. A lock this transaction already holds is not waited on.
-    session.execute(select(Connector.id).where(Connector.id == connector.id).with_for_update())
+    session.execute(select(Connector.id).where(Connector.id == connector.id).with_for_update(key_share=True))
     deployment = session.scalar(select(FirmwareDeployment).where(
         FirmwareDeployment.deployment_id == deployment_public_id,
         FirmwareDeployment.connector_id == connector.id).with_for_update().execution_options(populate_existing=True))

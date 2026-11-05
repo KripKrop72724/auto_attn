@@ -1481,7 +1481,7 @@ def create_source_correction_job(
 def _create_timestamp_correction(session: Session, job: AttendanceRecoveryJob, item: AttendanceRecoveryItem) -> None:
     if not item.corrected_device_time:
         raise RecoveryError("A corrected timestamp is required.", "CORRECTED_TIME_REQUIRED")
-    connector = session.scalar(select(Connector).where(Connector.id == item.connector_id).with_for_update())
+    connector = session.scalar(select(Connector).where(Connector.id == item.connector_id).with_for_update(key_share=True))
     if connector is None or not _execution_allowed(connector.zone_id, correction=True):
         raise RecoveryError("Timestamp correction is disabled for this zone.", "CORRECTION_DISABLED")
     source_model = TerminalRecordManifest if item.source_kind == "ZKT_MANIFEST" else HikvisionEvidence

@@ -414,7 +414,7 @@ def lock_campaign_scope(session, release_public_id):
     if release is None or not applies(release):
         return
     list(session.scalars(select(Connector).where(Connector.connector_id.in_(
-        [item.identity.connector_id for item in TARGETS])).order_by(Connector.id).with_for_update()
+        [item.identity.connector_id for item in TARGETS])).order_by(Connector.id).with_for_update(key_share=True)
         .execution_options(populate_existing=True)))
     session.scalar(select(FirmwareRelease).where(FirmwareRelease.id == release.id).with_for_update()
         .execution_options(populate_existing=True))

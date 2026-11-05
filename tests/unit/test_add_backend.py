@@ -7117,3 +7117,128 @@ def test_browser_stream_finishes_auth_transaction_before_first_event(db, monkeyp
     else:
         assert subscriptions == []
         assert ensure_utc(db.get(AdminSession, row_id).last_seen_at) == previous_seen
+
+
+def _connector_lock_sites():
+    """Every row lock taken on add_connectors in the backend, as (place, kwargs)."""
+    import ast
+    from pathlib import Path
+
+    import zk_add
+
+    def root_select(node):
+        while True:
+            if isinstance(node, ast.Call):
+                if isinstance(node.func, ast.Name) and node.func.id in {"select", "_select"}:
+                    return node
+                node = node.func
+            elif isinstance(node, ast.Attribute):
+                node = node.value
+            else:
+                return None
+
+    def model(select_call):
+        if not select_call.args:
+            return None
+        arg = select_call.args[0]
+        while isinstance(arg, ast.Attribute):
+            arg = arg.value
+        return arg.id if isinstance(arg, ast.Name) else None
+
+    sites = []
+    for path in sorted(Path(zk_add.__file__).parent.rglob("*.py")):
+        tree = ast.parse(path.read_text())
+        # Statements built in a variable and locked later: the model is the one
+        # of the nearest earlier select() assigned to that name.
+        assigns = sorted(
+            (node.lineno, target.id, node.value)
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Assign)
+            for target in node.targets
+            if isinstance(target, ast.Name)
+        )
+
+        def variable_model(name, line):
+            for lineno, target, value in reversed(assigns):
+                if target == name and lineno < line and (call := root_select(value)):
+                    return model(call)
+            return None
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+                continue
+            place = f"{path.name}:{node.lineno}"
+            if node.func.attr == "with_for_update":
+                receiver = node.func.value
+                call = root_select(receiver)
+                base = receiver
+                while isinstance(base, (ast.Call, ast.Attribute)):
+                    base = base.func if isinstance(base, ast.Call) else base.value
+                if (call is not None and model(call) == "Connector") or (
+                    call is None
+                    and isinstance(base, ast.Name)
+                    and variable_model(base.id, node.lineno) == "Connector"
+                ):
+                    sites.append((place, {k.arg: ast.unparse(k.value) for k in node.keywords}))
+            elif node.func.attr in {"refresh", "get"} and node.args:
+                target = ast.unparse(node.args[0])
+                for keyword in node.keywords:
+                    if keyword.arg == "with_for_update" and target in {"connector", "Connector"}:
+                        sites.append((place, {"refresh": ast.unparse(keyword.value)}))
+    return sites
+
+
+def test_every_connector_row_lock_is_for_no_key_update():
+    """Connector locks must not block foreign-key checks (KEY SHARE).
+
+    Production 5 Nov 2026: a plain FOR UPDATE on add_connectors conflicted with
+    the KEY SHARE lock every insert into its ~30 child tables takes, so bulk
+    releases and device messages hit lock_timeout. No code changes a connector
+    key column, so FOR NO KEY UPDATE gives the same mutual exclusion between
+    lockers. Mixing modes would let a nested plain lock upgrade the row inside
+    a device-message transaction, so every site uses the same one.
+    """
+    sites = _connector_lock_sites()
+    assert len(sites) >= 35, sites  # the scan still finds the known lock sites
+    plain = [
+        place for place, kwargs in sites
+        if kwargs.get("key_share") != "True" and kwargs.get("refresh") != "{'key_share': True}"
+    ]
+    assert plain == []
+
+
+def test_device_message_transactions_lock_the_connector_for_no_key_update(db, monkeypatch):
+    from sqlalchemy.dialects import postgresql
+
+    connector = connector_fixture(db)
+    pk, public_id = connector.id, connector.connector_id
+    locks = []
+
+    @sqlalchemy_event.listens_for(db, "do_orm_execute")
+    def capture(state):
+        arg = getattr(state.statement, "_for_update_arg", None)
+        if arg is not None and "add_connectors" in str(state.statement):
+            locks.append(str(state.statement.compile(dialect=postgresql.dialect())))
+
+    @contextmanager
+    def shared_scope():
+        try:
+            yield db
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+
+    monkeypatch.setattr(add_web, "session_scope", shared_scope)
+
+    def envelope(seq):
+        return Envelope(
+            schema_version="2", message_id=f"lock-mode-{seq}", connector_id=public_id,
+            boot_id="lock-mode-boot", seq=seq, sent_at=utc_now(), type="log",
+            payload={"level": "INFO", "subsystem": "firmware", "message": "ok"},
+        )
+
+    assert add_web.persist_envelope(pk, envelope(1)).ack["type"] == "ack"
+    add_web.record_envelope_rejection(pk, envelope(2), ValueError("bad"))
+    assert len(locks) >= 2
+    for sql in locks:
+        assert "FOR NO KEY UPDATE" in sql, sql

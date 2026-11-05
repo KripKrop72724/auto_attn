@@ -188,7 +188,7 @@ def lock_for_assignment(session: Session, connector: Connector,
     its journal untouched.
     """
     def lock() -> FirmwareDeployment | None:
-        session.scalar(select(Connector).where(Connector.id == connector.id).with_for_update(nowait=True)
+        session.scalar(select(Connector).where(Connector.id == connector.id).with_for_update(key_share=True, nowait=True)
                        .execution_options(populate_existing=True))
         return session.scalar(select(FirmwareDeployment).where(FirmwareDeployment.id == deployment.id)
                               .with_for_update(nowait=True).execution_options(populate_existing=True))
@@ -504,7 +504,7 @@ def fail_held_download(session: Session, deployment: FirmwareDeployment, *, reas
     re-offer and no grant since the ESP reported the stop, so nothing can be
     writing the slot (the same outcome as the first sticky error before).
     """
-    session.scalar(select(Connector.id).where(Connector.id == deployment.connector_id).with_for_update())
+    session.scalar(select(Connector.id).where(Connector.id == deployment.connector_id).with_for_update(key_share=True))
     locked = session.scalar(select(FirmwareDeployment).where(FirmwareDeployment.id == deployment.id)
                             .with_for_update().execution_options(populate_existing=True))
     if locked is None or locked.status not in {"OFFERED", "DOWNLOADING"}:
