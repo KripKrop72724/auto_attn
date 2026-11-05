@@ -11,28 +11,70 @@ services:
     image: postgres:16-alpine
     init: true
     restart: unless-stopped
+    # Sized for the production Docker VM (62.6 GB, 48 CPUs), which also runs
+    # add-api (16 GB cap), Redis, the provisioner and image builds. Every size
+    # is overridable through .env.add; deploy.ps1 copies validated ADD_DEPLOY_*
+    # repository variables there (docs/production-runbook.md, "Database
+    # capacity"). effective_cache_size is a planner hint: this container's page
+    # cache counts against mem_limit, so the hint stays below that limit.
     command:
       - postgres
       - -c
-      - shared_buffers=${ADD_POSTGRES_SHARED_BUFFERS:-4GB}
+      - shared_buffers=${ADD_POSTGRES_SHARED_BUFFERS:-8GB}
       - -c
-      - effective_cache_size=${ADD_POSTGRES_EFFECTIVE_CACHE_SIZE:-12GB}
+      - effective_cache_size=${ADD_POSTGRES_EFFECTIVE_CACHE_SIZE:-24GB}
       - -c
-      - maintenance_work_mem=${ADD_POSTGRES_MAINTENANCE_WORK_MEM:-1GB}
+      - maintenance_work_mem=${ADD_POSTGRES_MAINTENANCE_WORK_MEM:-2GB}
       - -c
-      - work_mem=16MB
+      - work_mem=${ADD_POSTGRES_WORK_MEM:-32MB}
       - -c
-      - max_connections=200
+      - max_connections=${ADD_POSTGRES_MAX_CONNECTIONS:-200}
+      - -c
+      - max_worker_processes=24
+      - -c
+      - max_parallel_workers=16
+      - -c
+      - max_parallel_workers_per_gather=4
+      - -c
+      - max_parallel_maintenance_workers=4
+      - -c
+      - random_page_cost=1.1
+      - -c
+      - effective_io_concurrency=200
+      - -c
+      - jit=off
+      - -c
+      - wal_buffers=64MB
       - -c
       - checkpoint_timeout=15min
       - -c
       - checkpoint_completion_target=0.9
       - -c
-      - max_wal_size=4GB
+      - max_wal_size=8GB
       - -c
-      - min_wal_size=1GB
+      - min_wal_size=2GB
       - -c
       - wal_compression=on
+      - -c
+      - autovacuum_max_workers=6
+      - -c
+      - autovacuum_naptime=15s
+      - -c
+      - autovacuum_vacuum_cost_limit=2000
+      - -c
+      - shared_preload_libraries=pg_stat_statements
+      - -c
+      - pg_stat_statements.track=top
+      - -c
+      - track_io_timing=on
+      # Slow statements are logged without their bind parameters, which can
+      # hold employee names or lookup values.
+      - -c
+      - log_min_duration_statement=2000
+      - -c
+      - log_parameter_max_length=0
+      - -c
+      - log_temp_files=16MB
       - -c
       - log_lock_waits=on
       - -c
@@ -48,9 +90,14 @@ services:
       interval: 5s
       timeout: 4s
       retries: 20
+      # Crash recovery after an unclean stop replays up to max_wal_size.
+      start_period: 120s
+    # A clean stop writes a final checkpoint of up to shared_buffers; Docker's
+    # 10 s default would kill it and force crash recovery on the next start.
+    stop_grace_period: 180s
     networks: [add-private]
-    mem_limit: ${ADD_POSTGRES_MEMORY_LIMIT:-16g}
-    shm_size: ${ADD_POSTGRES_SHM_SIZE:-2gb}
+    mem_limit: ${ADD_POSTGRES_MEMORY_LIMIT:-32g}
+    shm_size: ${ADD_POSTGRES_SHM_SIZE:-4gb}
     logging: *default-logging
     labels:
       add.selfheal: "true"
@@ -140,9 +187,13 @@ services:
       interval: 10s
       timeout: 8s
       retries: 6
-      start_period: 60s
+      # Covers `alembic upgrade head` before Uvicorn starts: migration
+      # 20261105_0061 may spend up to ~140 s building indexes. Docker reports
+      # healthy at the first passing check, so a normal start is not delayed;
+      # deploy.ps1 waits up to 240 s.
+      start_period: 180s
     networks: [add-private, provisioning-private]
-    mem_limit: ${ADD_API_MEMORY_LIMIT:-8g}
+    mem_limit: ${ADD_API_MEMORY_LIMIT:-16g}
     pids_limit: 1024
     stop_grace_period: 30s
     logging: *default-logging

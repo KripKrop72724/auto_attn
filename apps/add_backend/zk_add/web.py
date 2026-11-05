@@ -9,6 +9,7 @@ import logging
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Literal
 from uuid import uuid4
 
@@ -31,14 +32,16 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.concurrency import run_in_threadpool
 from sqlalchemy import and_, case, func, or_, select, text
+from sqlalchemy import event as sa_event
 from sqlalchemy.exc import IntegrityError, OperationalError, SQLAlchemyError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from zk_add import APP_VERSION
 from zk_add.hil_transport import TransportInterrupted, enforce_transport
 from zk_add import attendance_force_release as force_release
 from zk_add import attendance_direct_ords as direct_ords
 from zk_add import checkin_notify
+from zk_add import dashboard_cache
 from zk_add import public_status
 from zk_add import source_newest_slot as newest_slot
 from zk_add.attendance_cnic_link import cnic_not_linked_expression, unknown_synced_cnic_expression
@@ -212,7 +215,7 @@ from zk_add.comm_keys import (
     serialize_operation as serialize_comm_key_operation,
 )
 from zk_add.worker import maintenance_loop, ords_delivery_metrics
-from zk_add.ords_outbox_coverage import ords_outbox_coverage
+from zk_add.ords_outbox_coverage import event_ords_status_counts, ords_outbox_coverage
 from zk_add.attendance_repair import attendance_release_states, repair_worker_metrics
 from zk_add.attendance_recovery import (
     RecoveryError,
@@ -224,6 +227,7 @@ from zk_add.attendance_recovery import (
     reveal_hikvision_source_evidence,
     list_recovery_items,
     recovery_summary,
+    recovery_summary_flags,
     serialize_recovery_job,
     sign_recovery_preview,
     verify_recovery_preview,
@@ -597,16 +601,121 @@ def session_info(auth: tuple[Session, AdminContext] = Depends(require_admin)):
     return {"authenticated": True, "username": context.username, "csrf_token": context.csrf_token}
 
 
+# The overview's delivery, repair, recovery and check-in sections scan the
+# whole attendance and outbox tables. The Fleet and Reconciliation pages poll
+# them on every realtime event, so one computation is shared by every browser
+# for this many seconds (single-flight: concurrent requests wait for it).
+DASHBOARD_METRICS_KEY = "dashboard-metrics"
+DASHBOARD_METRICS_TTL_SECONDS = 15
+# A failed refresh (statement timeout, busy database) serves the last value
+# while it is younger than this, instead of failing the page. The same value is
+# served while another request refreshes it.
+DASHBOARD_METRICS_STALE_SECONDS = 120
+# With no usable value (cold start), a request waits this long for the refresh
+# another request is running, then answers 503 instead of holding its thread.
+DASHBOARD_METRICS_WAIT_SECONDS = 30
+
+
+def _dashboard_metrics(session: Session) -> dict:
+    """The overview's heavy, read-only sections, computed together.
+
+    The delivery and recovery sections report the same outbox anti-join and
+    the same per-status event counts; each scan runs once and is shared.
+    """
+
+    coverage = ords_outbox_coverage(session)
+    status_counts = event_ords_status_counts(session)
+    return {
+        "ords_delivery": ords_delivery_metrics(
+            session, outbox_coverage=coverage, event_status_counts=status_counts
+        ),
+        "attendance_repair": repair_worker_metrics(session),
+        "attendance_recovery": recovery_summary(
+            session, outbox_coverage=coverage, event_status_counts=status_counts
+        ),
+        "checkin_notifications": checkin_notify.overview(session),
+    }
+
+
+def _compute_shared_dashboard_metrics() -> dict:
+    """Compute the cached sections on a session of their own.
+
+    The request's session only authenticates, so a slow or cancelled scan
+    never aborts its transaction. On PostgreSQL the scans get a larger
+    work_mem (hash aggregates over ~600k events) and a bounded run time.
+    """
+
+    session = SessionLocal()
+    try:
+        if session.get_bind().dialect.name == "postgresql":
+            session.execute(text("SET LOCAL statement_timeout = '20s'"))
+            session.execute(text("SET LOCAL work_mem = '64MB'"))
+        return _dashboard_metrics(session)
+    finally:
+        # Read-only: close() rolls the transaction back and ends SET LOCAL.
+        session.close()
+
+
+def _dashboard_cache_applies(db: Session) -> bool:
+    """The process cache holds figures for the application's own database only.
+
+    A request session bound elsewhere (a test or tool engine) computes live.
+    """
+
+    return db.get_bind() is SessionLocal.kw.get("bind")
+
+
+def dashboard_metrics(db: Session) -> tuple[dict, datetime, int]:
+    """Return (sections, computed_at, max_age_seconds) for the overview."""
+
+    if not _dashboard_cache_applies(db):
+        computed_at = utc_now()
+        return _dashboard_metrics(db), computed_at, 0
+    # End the request's transaction (authentication, live counts) before a
+    # possible wait, so its pooled connection never sits idle in a transaction.
+    db.commit()
+    try:
+        entry = dashboard_cache.get_or_compute_entry(
+            DASHBOARD_METRICS_KEY,
+            DASHBOARD_METRICS_TTL_SECONDS,
+            _compute_shared_dashboard_metrics,
+            stale_s=DASHBOARD_METRICS_STALE_SECONDS,
+            wait_s=DASHBOARD_METRICS_WAIT_SECONDS,
+        )
+    except dashboard_cache.DashboardCacheUnavailable as error:
+        raise HTTPException(
+            status_code=503,
+            detail="Dashboard figures are being refreshed. Try again shortly.",
+            headers={"Retry-After": "5"},
+        ) from error
+    return entry.value, entry.computed_at, DASHBOARD_METRICS_TTL_SECONDS
+
+
+def invalidate_dashboard_metrics_after_commit(db: Session) -> None:
+    """Recompute the cached delivery/recovery figures once this request commits.
+
+    For operator actions that change attendance delivery (releases, recovery
+    controls), so the next Refresh shows their effect instead of figures up to
+    a TTL old. A rolled-back request leaves the cache alone.
+    """
+
+    def _invalidate(_session) -> None:
+        dashboard_cache.invalidate(DASHBOARD_METRICS_KEY)
+
+    sa_event.listen(db, "after_commit", _invalidate, once=True)
+
+
 @app.get("/api/v1/overview")
 def overview(auth: tuple[Session, AdminContext] = Depends(require_admin)):
     db, _context = auth
+    # Device and alert counts stay live: they are cheap and change with
+    # operator actions such as marking a spare.
     result = fleet_counts(db)
-    # Both summaries report the same anti-join; run it once per request.
-    coverage = ords_outbox_coverage(db)
-    result["ords_delivery"] = ords_delivery_metrics(db, outbox_coverage=coverage)
-    result["attendance_repair"] = repair_worker_metrics(db)
-    result["attendance_recovery"] = recovery_summary(db, outbox_coverage=coverage)
-    result["checkin_notifications"] = checkin_notify.overview(db)
+    metrics, computed_at, max_age = dashboard_metrics(db)
+    # Shallow copies: the cached sections are shared between requests.
+    result.update({key: dict(value) for key, value in metrics.items()})
+    result["metrics_computed_at"] = computed_at.isoformat()
+    result["metrics_max_age_seconds"] = max_age
     return result
 
 
@@ -685,6 +794,7 @@ def quick_release_direct_ords(
 ):
     """One click, no reason or password: send selected unknown-identity punches now."""
     db, context = auth
+    invalidate_dashboard_metrics_after_commit(db)
     try:
         job, not_matching = direct_ords.quick_release(
             db, actor=context.username, event_ids=body.event_ids, idempotency_key=body.idempotency_key,
@@ -722,6 +832,7 @@ def start_direct_ords_run(
     auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
 ):
     db, context = auth
+    invalidate_dashboard_metrics_after_commit(db)
     require_step_up(body.password.get_secret_value(), db, context)
     try:
         job = direct_ords.create(db, actor=context.username, request=body)
@@ -763,6 +874,7 @@ def recheck_direct_ords_legacy(
     auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
 ):
     db, context = auth
+    invalidate_dashboard_metrics_after_commit(db)
     require_step_up(body.password.get_secret_value(), db, context)
     job = _direct_ords_job(db, job_id)
     try:
@@ -827,6 +939,7 @@ def start_identity_backlog_release(
 ):
     """Owner step-up: release a zone's held dump punches that pass the same proof."""
     db, context = auth
+    invalidate_dashboard_metrics_after_commit(db)
     require_step_up(body.password.get_secret_value(), db, context)
     try:
         job = identity_backlog.create_release(
@@ -867,6 +980,7 @@ def stop_identity_backlog_release(
     auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
 ):
     db, context = auth
+    invalidate_dashboard_metrics_after_commit(db)
     require_step_up(body.password.get_secret_value(), db, context)
     job = identity_backlog.stop(
         db, _identity_backlog_job(db, job_id), actor=context.username,
@@ -880,6 +994,7 @@ def stop_identity_backlog_release(
 def create_force_check(body: ForceCheckRequest,
     auth: tuple[Session, AdminContext] = Depends(require_admin_mutation)):
     db, context = auth
+    invalidate_dashboard_metrics_after_commit(db)
     try:
         job = force_release.create_check(db, actor=context.username, request=body)
         db.flush()
@@ -914,6 +1029,7 @@ def get_force_items(job_id: str, cursor: int = Query(default=0, ge=0),
 def start_force_run(job_id: str, body: ForceStartRequest,
     auth: tuple[Session, AdminContext] = Depends(require_admin_mutation)):
     db, context = auth
+    invalidate_dashboard_metrics_after_commit(db)
     require_step_up(body.password.get_secret_value(), db, context)
     try:
         job = force_release.start(db, _force_job(db, job_id), actor=context.username,
@@ -928,6 +1044,7 @@ def start_force_run(job_id: str, body: ForceStartRequest,
 def control_force_run(job_id: str, body: ForceControlRequest,
     auth: tuple[Session, AdminContext] = Depends(require_admin_mutation)):
     db, context = auth
+    invalidate_dashboard_metrics_after_commit(db)
     require_step_up(body.password.get_secret_value(), db, context)
     try:
         job = force_release.control(db, _force_job(db, job_id), actor=context.username,
@@ -992,7 +1109,19 @@ def attendance_recovery_summary(
     auth: tuple[Session, AdminContext] = Depends(require_admin),
 ):
     db, _context = auth
-    return recovery_summary(db)
+    if not _dashboard_cache_applies(db):
+        computed_at = utc_now()
+        summary = recovery_summary(db)
+        max_age = 0
+    else:
+        # The same cached computation as the overview's attendance_recovery.
+        metrics, computed_at, max_age = dashboard_metrics(db)
+        summary = dict(metrics["attendance_recovery"])
+    # Feature flags come from settings and are always current.
+    summary.update(recovery_summary_flags())
+    summary["metrics_computed_at"] = computed_at.isoformat()
+    summary["metrics_max_age_seconds"] = max_age
+    return summary
 
 
 @app.post("/api/v2/attendance-recovery/preview")
@@ -1045,6 +1174,7 @@ def control_attendance_recovery_job(
     auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
 ):
     db, context = auth
+    invalidate_dashboard_metrics_after_commit(db)
     if _recovery_job_or_404(db, job_id).action == force_release.ACTION:
         raise HTTPException(status_code=409, detail="Use this saved run's Force release controls.")
     if isinstance(body, SafeRepairControlRequest):
@@ -1294,7 +1424,10 @@ def list_devices(
     auth: tuple[Session, AdminContext] = Depends(require_admin),
 ):
     db, _context = auth
-    statement = select(Connector).order_by(Connector.display_name.asc())
+    # serialize_connector reads connector.zkt_device: load them in one query.
+    statement = (
+        select(Connector).options(selectinload(Connector.zkt_device)).order_by(Connector.display_name.asc())
+    )
     if state:
         statement = statement.where(Connector.lifecycle_state == state.upper())
     if q:
@@ -4041,6 +4174,8 @@ def update_checkin_notification_settings(
     except checkin_notify.CheckinNotifyError as error:
         raise HTTPException(status_code=error.status, detail=error.detail) from error
     db.commit()
+    # The overview shows the check-in mode; do not let it lag the switch.
+    dashboard_cache.invalidate(DASHBOARD_METRICS_KEY)
     return result
 
 

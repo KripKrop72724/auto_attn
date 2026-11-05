@@ -38,6 +38,7 @@ from zk_add.models import (
 from zk_add.hikvision_evidence import HikvisionEvidence
 from zk_add.ords_outbox_coverage import (
     IDENTITY_HELD_WITHOUT_OUTBOX_STATUSES,
+    event_ords_status_counts,
     ords_outbox_coverage,
 )
 from zk_add.ords_states import (
@@ -589,12 +590,37 @@ def build_recovery_preview(session: Session, *, action: str, filters: Any) -> di
     }
 
 
-def recovery_summary(session: Session, *, outbox_coverage: dict | None = None) -> dict:
+def recovery_summary_flags() -> dict:
+    """The settings-derived part of the recovery summary (cheap, never cached)."""
+
+    return {
+        "preview_enabled": settings.attendance_recovery_preview_enabled,
+        "execution_enabled": settings.attendance_recovery_execution_enabled,
+        "correction_enabled": settings.attendance_source_correction_enabled,
+        "allowed_zones": [z.strip() for z in settings.attendance_recovery_allowed_zones.split(",") if z.strip()],
+    }
+
+
+def recovery_summary(
+    session: Session,
+    *,
+    outbox_coverage: dict | None = None,
+    event_status_counts: dict[str | None, int] | None = None,
+) -> dict:
+    """Summarise delivery and source backlogs for the Reconciliation page.
+
+    ``outbox_coverage`` and ``event_status_counts`` (raw stored ords_status ->
+    count, as :func:`event_ords_status_counts` returns) let a caller that
+    already ran those scans share them; without them this queries itself.
+    """
+
     now = utc_now()
-    status_rows = session.execute(
-        select(AttendanceEvent.ords_status, func.count(AttendanceEvent.id)).group_by(AttendanceEvent.ords_status)
-    ).all()
-    status_counts = {normalize_ords_status(status): int(count) for status, count in status_rows}
+    if event_status_counts is None:
+        event_status_counts = event_ords_status_counts(session)
+    status_counts: dict[str, int] = {}
+    for status, count in event_status_counts.items():
+        key = normalize_ords_status(status)
+        status_counts[key] = status_counts.get(key, 0) + int(count)
     coverage = outbox_coverage if outbox_coverage is not None else ords_outbox_coverage(session)
     stale_in_flight = int(
         session.scalar(
@@ -647,10 +673,7 @@ def recovery_summary(session: Session, *, outbox_coverage: dict | None = None) -
     ).all()
     return {
         "schema_version": "1",
-        "preview_enabled": settings.attendance_recovery_preview_enabled,
-        "execution_enabled": settings.attendance_recovery_execution_enabled,
-        "correction_enabled": settings.attendance_source_correction_enabled,
-        "allowed_zones": [z.strip() for z in settings.attendance_recovery_allowed_zones.split(",") if z.strip()],
+        **recovery_summary_flags(),
         "delivery": {
             "safe_retryable": safe,
             # Deliverable rows (and decided holds) without an outbox; identity

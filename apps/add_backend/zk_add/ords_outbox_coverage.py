@@ -64,6 +64,22 @@ def outbox_coverage_bucket(status: str | None, *, release_decided: bool = False)
     return "review"
 
 
+def event_ords_status_counts(session: Session) -> dict[str | None, int]:
+    """Count retained attendance events by their stored, un-normalised ords_status.
+
+    The overview needs these counts twice (the recovery summary's status tiles
+    and the delivery backlog's BLOCKED_IDENTITY count); one grouped scan serves
+    both. Keys are the raw stored values, including ``None``, so a caller that
+    compares with equality (``== "BLOCKED_IDENTITY"``) gets exactly what its own
+    query would have counted.
+    """
+
+    rows = session.execute(
+        select(AttendanceEvent.ords_status, func.count(AttendanceEvent.id)).group_by(AttendanceEvent.ords_status)
+    ).all()
+    return {status: int(count) for status, count in rows}
+
+
 def ords_outbox_coverage(session: Session) -> dict:
     """Split unacknowledged events without an outbox row by why they have none.
 

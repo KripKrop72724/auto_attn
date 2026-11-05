@@ -177,7 +177,19 @@ def ords_failure_category(
     return f"HTTP_{status}"
 
 
-def ords_delivery_metrics(session: Session, *, outbox_coverage: dict | None = None) -> dict:
+def ords_delivery_metrics(
+    session: Session,
+    *,
+    outbox_coverage: dict | None = None,
+    event_status_counts: dict[str | None, int] | None = None,
+) -> dict:
+    """Delivery backlog figures for the overview.
+
+    ``event_status_counts`` maps the raw stored attendance ords_status to its
+    count (see ``event_ords_status_counts``). When given, BLOCKED_IDENTITY is
+    read from it by exact key, the same equality the fallback query uses.
+    """
+
     rows = session.execute(
         select(OrdsOutbox.status, func.count(OrdsOutbox.id)).group_by(OrdsOutbox.status)
     ).all()
@@ -195,14 +207,17 @@ def ords_delivery_metrics(session: Session, *, outbox_coverage: dict | None = No
         for status, count in counts.items()
         if status.upper() in ORDS_MEMBERSHIP_REVERIFY_STATUSES
     )
-    blocked_identity = int(
-        session.scalar(
-            select(func.count(AttendanceEvent.id)).where(
-                AttendanceEvent.ords_status == "BLOCKED_IDENTITY"
+    if event_status_counts is not None:
+        blocked_identity = int(event_status_counts.get("BLOCKED_IDENTITY", 0))
+    else:
+        blocked_identity = int(
+            session.scalar(
+                select(func.count(AttendanceEvent.id)).where(
+                    AttendanceEvent.ords_status == "BLOCKED_IDENTITY"
+                )
             )
+            or 0
         )
-        or 0
-    )
     quarantined = sum(
         count for status, count in counts.items() if status.upper().startswith("QUARANTINED")
     )

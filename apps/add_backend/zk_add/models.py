@@ -459,6 +459,21 @@ Index(
         "ords_status in ('BLOCKED_IDENTITY','QUARANTINED_IDENTITY_REUSE')"
     ),
 )
+# Dashboard backlog reads (migration 20261105_0061_dashboard_indexes).
+Index(
+    "ix_add_attendance_held_received",
+    AttendanceEvent.received_at,
+    postgresql_include=["ords_status", "identity_content_status"],
+    postgresql_where=text("ords_status IN ('BLOCKED_IDENTITY','QUARANTINED_IDENTITY_REUSE')"),
+    sqlite_where=text("ords_status IN ('BLOCKED_IDENTITY','QUARANTINED_IDENTITY_REUSE')"),
+)
+Index(
+    "ix_add_attendance_unacked_id",
+    AttendanceEvent.id,
+    postgresql_include=["ords_status"],
+    postgresql_where=text("ords_status NOT IN ('ACKED','ACKED_CHECK')"),
+    sqlite_where=text("ords_status NOT IN ('ACKED','ACKED_CHECK')"),
+)
 
 
 class ZktObservationReceipt(Base):
@@ -1070,7 +1085,7 @@ class OrdsOutbox(Base):
     payload_hash: Mapped[str | None] = mapped_column(String(64))
     attempt_count: Mapped[int] = mapped_column(Integer, default=0)
     next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
-    last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
     acknowledged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_http_status: Mapped[int | None] = mapped_column(Integer)
     last_error: Mapped[str | None] = mapped_column(Text)

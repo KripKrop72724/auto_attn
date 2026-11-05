@@ -7,12 +7,14 @@ import App, {
   confirmationMatches,
   formatAlertDiagnostics,
   identityConflictText,
+  metricsTime,
   pktInputToUtc,
   pktTodayBounds,
   StatusBadge,
   validateUserDraft,
 } from './App'
 import { api } from './api'
+import { queryClient } from './data'
 import type { Device, DeviceUser, Overview } from './types'
 
 const maskedCnic = '*****-****567-1'
@@ -1166,5 +1168,113 @@ describe('user-operation safety rules', () => {
     expect(confirmationMatches('Ayesha Fatima', user)).toBe(true)
     expect(confirmationMatches('1007', user)).toBe(true)
     expect(confirmationMatches('Ayesha', user)).toBe(false)
+  })
+})
+
+// Captures realtime listeners so a test can emit topics like the server does.
+class CapturingEventSource {
+  static latest: CapturingEventSource | null = null
+  static CLOSED = 2
+  readyState = 1
+  onopen: (() => void) | null = null
+  onmessage: ((event: MessageEvent) => void) | null = null
+  onerror: (() => void) | null = null
+  listeners = new Map<string, Array<() => void>>()
+  constructor(_url: string, _options?: EventSourceInit) {
+    CapturingEventSource.latest = this
+  }
+  addEventListener(name: string, listener: () => void) {
+    this.listeners.set(name, [...(this.listeners.get(name) || []), listener])
+  }
+  close() {}
+  emit(name: string) {
+    this.listeners.get(name)?.forEach((listener) => listener())
+  }
+}
+
+describe('realtime refresh budget', () => {
+  const calls = (fetchMock: ReturnType<typeof fetchStub>, pathname: string) =>
+    fetchMock.mock.calls.filter(([input]) => new URL(String(input), 'https://add.test').pathname === pathname).length
+
+  beforeEach(() => {
+    // A request still in flight from an earlier test must not satisfy this one.
+    queryClient.clear()
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    window.history.replaceState({}, '', '/fleet')
+    vi.stubGlobal('EventSource', CapturingEventSource)
+  })
+
+  afterEach(() => {
+    cleanup()
+    vi.useRealTimers()
+    vi.unstubAllGlobals()
+    CapturingEventSource.latest = null
+  })
+
+  it('refreshes devices on device events at most every 3 s and never refetches the overview for punches', async () => {
+    const fetchMock = fetchStub()
+    vi.stubGlobal('fetch', fetchMock)
+    render(<App />)
+    await screen.findByRole('heading', { name: 'Fleet', level: 1 })
+    await waitFor(() => expect(calls(fetchMock, '/api/v1/devices')).toBe(1))
+    expect(calls(fetchMock, '/api/v1/overview')).toBe(1)
+    const stream = await waitFor(() => {
+      expect(CapturingEventSource.latest).toBeTruthy()
+      return CapturingEventSource.latest as CapturingEventSource
+    })
+
+    // A force release streams thousands of attendance batches.
+    for (let index = 0; index < 40; index += 1) {
+      stream.emit('attendance_batch')
+      stream.emit('attendance')
+      await vi.advanceTimersByTimeAsync(150)
+    }
+    expect(calls(fetchMock, '/api/v1/overview')).toBe(1)
+    expect(calls(fetchMock, '/api/v1/devices')).toBe(1)
+
+    // Ten heartbeats and command updates in 1.5 s: one immediate device-list
+    // read and one trailing read for the rest, never one per event.
+    for (let index = 0; index < 10; index += 1) {
+      stream.emit(index % 2 ? 'heartbeat' : 'command_update')
+      await vi.advanceTimersByTimeAsync(150)
+    }
+    expect(calls(fetchMock, '/api/v1/devices')).toBe(2)
+    await vi.advanceTimersByTimeAsync(3000)
+    await waitFor(() => expect(calls(fetchMock, '/api/v1/devices')).toBe(3))
+    await vi.advanceTimersByTimeAsync(6000)
+    expect(calls(fetchMock, '/api/v1/devices')).toBe(3)
+    expect(calls(fetchMock, '/api/v1/overview')).toBe(1)
+    // The list never falls back to its loading state during a background refresh.
+    expect(screen.queryByText(/loading live fleet/i)).toBeNull()
+  })
+
+  it('refreshes the overview for alerts at most every 15 s on the Fleet page', async () => {
+    const fetchMock = fetchStub()
+    vi.stubGlobal('fetch', fetchMock)
+    render(<App />)
+    await screen.findByRole('heading', { name: 'Fleet', level: 1 })
+    await waitFor(() => expect(calls(fetchMock, '/api/v1/overview')).toBe(1))
+    const stream = CapturingEventSource.latest as CapturingEventSource
+    const start = Date.now()
+
+    stream.emit('alert')
+    await vi.advanceTimersByTimeAsync(500)
+    stream.emit('alert')
+    await vi.advanceTimersByTimeAsync(Math.max(0, start + 13_000 - Date.now()))
+    expect(calls(fetchMock, '/api/v1/overview')).toBe(1)
+    await vi.advanceTimersByTimeAsync(Math.max(0, start + 15_500 - Date.now()))
+    await waitFor(() => expect(calls(fetchMock, '/api/v1/overview')).toBe(2))
+    // Alerts do not re-read the device list.
+    expect(calls(fetchMock, '/api/v1/devices')).toBe(1)
+  })
+})
+
+describe('overview metrics time', () => {
+  it('formats the server computation time and stays silent when the backend omits it', () => {
+    const base: Overview = { total: 1, open_alerts: 0, active_leases: 0 }
+    expect(metricsTime(base)).toBeNull()
+    expect(metricsTime({ ...base, metrics_computed_at: 'not-a-date' } as Overview)).toBeNull()
+    expect(metricsTime({ ...base, metrics_computed_at: '2026-11-04T09:15:42Z' } as Overview))
+      .toBe(new Date('2026-11-04T09:15:42Z').toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }))
   })
 })

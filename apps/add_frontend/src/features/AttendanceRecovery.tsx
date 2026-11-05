@@ -1,8 +1,10 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { api, queryString } from '../api'
 import { Metric, StatusBadge, idempotency, relativeTime, useToast } from '../App'
 import { Icon } from '../Icon'
 import { humanizeStatus } from '../status'
+import { useThrottledRunner } from '../lib/throttle'
+import { formatMetricsTime } from '../lib/metricsTime'
 import type {
   AttendanceRecoveryAction,
   AttendanceRecoveryJob,
@@ -49,7 +51,24 @@ export function withoutOutboxTone(delivery?: RecoveryDelivery): 'positive' | 'wa
   return delivery?.missing_outbox ? 'warning' : 'positive'
 }
 
-export function AttendanceRecovery({ revision, toast }: { revision: number; toast: Toast }) {
+// Automatic (realtime) refreshes of the recovery summary and the source
+// correction lists start at most this often and never overlap. The summary
+// counts the whole attendance and ORDS backlog, which is heavy during a large
+// release or reconcile.
+export const RECOVERY_SUMMARY_REFRESH_MS = 15_000
+
+export function AttendanceRecovery({
+  revision,
+  toast,
+  refreshToken = 0,
+  onSummary,
+}: {
+  revision: number
+  toast: Toast
+  /** Changes when the operator presses the page Refresh button. */
+  refreshToken?: number
+  onSummary?: (summary: AttendanceRecoverySummary) => void
+}) {
   const [summary, setSummary] = useState<AttendanceRecoverySummary | null>(null)
   const [summaryError, setSummaryError] = useState('')
   const [action, setAction] = useState<AttendanceRecoveryAction>('RETRY_DELIVERY')
@@ -81,10 +100,14 @@ export function AttendanceRecovery({ revision, toast }: { revision: number; toas
   const [controlBusy, setControlBusy] = useState(false)
   const [controlConfirmation, setControlConfirmation] = useState('')
 
+  const onSummaryRef = useRef(onSummary)
+  onSummaryRef.current = onSummary
   const loadSummary = useCallback(async () => {
     try {
       setSummaryError('')
-      setSummary(await api<AttendanceRecoverySummary>('/api/v2/attendance-recovery/summary'))
+      const result = await api<AttendanceRecoverySummary>('/api/v2/attendance-recovery/summary')
+      setSummary(result)
+      onSummaryRef.current?.(result)
     } catch (error) {
       setSummaryError(error instanceof Error ? error.message : 'Recovery summary could not be loaded.')
     }
@@ -104,10 +127,25 @@ export function AttendanceRecovery({ revision, toast }: { revision: number; toas
     }
   }, [])
 
+  const summaryRefresh = useThrottledRunner(loadSummary, RECOVERY_SUMMARY_REFRESH_MS)
+  const sourceRefresh = useThrottledRunner(loadSourceExceptions, RECOVERY_SUMMARY_REFRESH_MS)
+  const refreshNow = useCallback(() => {
+    void summaryRefresh.runNow()
+    void sourceRefresh.runNow()
+  }, [sourceRefresh, summaryRefresh])
+
+  // First load and every explicit Refresh run at once (after any request in
+  // flight); realtime revisions are throttled.
   useEffect(() => {
-    void loadSummary()
-    void loadSourceExceptions()
-  }, [loadSourceExceptions, loadSummary, revision])
+    refreshNow()
+  }, [refreshNow, refreshToken])
+  const revisionRef = useRef(revision)
+  useEffect(() => {
+    if (revisionRef.current === revision) return
+    revisionRef.current = revision
+    summaryRefresh.schedule()
+    sourceRefresh.schedule()
+  }, [revision, sourceRefresh, summaryRefresh])
 
   useEffect(() => {
     if (!job || ['COMPLETED', 'COMPLETED_WITH_ATTENTION', 'CANCELLED'].includes(job.status)) return
@@ -254,6 +292,7 @@ export function AttendanceRecovery({ revision, toast }: { revision: number; toas
   }
 
   const delivery = summary?.delivery
+  const summaryAsOf = formatMetricsTime(summary?.metrics_computed_at)
   return (
     <div className="reconciliation-recovery">
       <section className="metric-grid reconciliation-metrics" aria-label="Recovery health">
@@ -263,7 +302,8 @@ export function AttendanceRecovery({ revision, toast }: { revision: number; toas
         <Metric label="Identity held" value={(delivery?.identity_held ?? 0).toLocaleString()} detail="Read-only evidence lane" icon="shield" tone={delivery?.identity_held ? 'warning' : 'positive'} />
         <Metric label="Source review" value={(delivery?.permanent_review ?? 0).toLocaleString()} detail={`${summary?.source.zkt_invalid_time ?? 0} invalid ZKT timestamps`} icon="alert" tone={delivery?.permanent_review ? 'critical' : 'positive'} />
       </section>
-      {(summaryError || previewError) && <div className="inline-retry pattern-blocked" role="alert"><Icon name="alert" /><span>{summaryError || previewError}</span><button className="button secondary" onClick={() => void loadSummary()}>Retry</button></div>}
+      {summaryAsOf && <p className="fleet-toolbar-note recovery-metrics-note" title="Time the server computed these recovery figures"><Icon name="clock" /> Figures as of {summaryAsOf}</p>}
+      {(summaryError || previewError) && <div className="inline-retry pattern-blocked" role="alert"><Icon name="alert" /><span>{summaryError || previewError}</span><button className="button secondary" onClick={() => void summaryRefresh.runNow()}>Retry</button></div>}
       <section className="panel recovery-action-panel">
         <div className="panel-header"><div><p className="eyebrow">SAFE DELIVERY LANE</p><h2>Recover preserved attendance in bulk</h2><p>Identity-held and unsafe rows are automatically excluded. Preview freezes the exact rows before approval.</p></div><StatusBadge state={summary?.execution_enabled ? 'READY' : 'PREVIEW ONLY'} /></div>
         <div className="recovery-filters">

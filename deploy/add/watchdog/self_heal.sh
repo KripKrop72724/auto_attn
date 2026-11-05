@@ -63,8 +63,19 @@ while true; do
         echo "ADD watchdog restart cooldown active name=$name." >&2
         continue
       fi
-      echo "ADD watchdog restarting unhealthy container name=$name." >&2
-      timeout "$((grace + 15))" docker restart --time "$grace" "$container_id" >/dev/null
+      # A service with a longer stop_grace_period (PostgreSQL writes a final
+      # checkpoint of up to shared_buffers) keeps it here too; cutting it to
+      # $grace would kill it mid-checkpoint and force crash recovery.
+      stop_grace="$grace"
+      stop_timeout="$(
+        timeout 10 docker inspect --format '{{.Config.StopTimeout}}' "$container_id" 2>/dev/null
+      )"
+      case "$stop_timeout" in
+        ''|*[!0-9]*) ;;
+        *) if [ "$stop_timeout" -gt "$grace" ]; then stop_grace="$stop_timeout"; fi ;;
+      esac
+      echo "ADD watchdog restarting unhealthy container name=$name grace_seconds=$stop_grace." >&2
+      timeout "$((stop_grace + 15))" docker restart --time "$stop_grace" "$container_id" >/dev/null
       restart_status=$?
       if [ "$restart_status" -ne 0 ]; then
         echo "ADD watchdog restart failed name=$name exit_code=$restart_status." >&2
