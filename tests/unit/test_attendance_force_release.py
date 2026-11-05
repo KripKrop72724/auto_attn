@@ -819,3 +819,105 @@ def test_manual_sync_concurrency_and_partial_device_availability(store):
             select(DeviceCommand).where(DeviceCommand.command_type == "REFRESH_USERS")
         ).all()
         assert len(commands) == 2 and len({c.idempotency_key for c in commands}) == 2
+
+
+def test_forced_claims_are_capped_per_batch_and_stay_pending(store):
+    sessions, _, _ = store
+    job_id = checked(store)
+    approve(store, job_id)
+    tick(sessions, rollback=True)
+    tick(sessions)
+    with sessions() as db:
+        row = db.scalar(select(OrdsOutbox))
+        assert row.status == "PENDING" and row.attempt_count == 0
+    # A full forced quota for this batch leaves the approved punch untouched.
+    assert claim_ords_batch(10, forced_limit=0) == []
+    with sessions() as db:
+        row = db.scalar(select(OrdsOutbox))
+        assert row.status == "PENDING" and row.attempt_count == 0
+        assert row.last_attempt_at is None
+    claims = claim_ords_batch(10, forced_limit=1)
+    assert len(claims) == 1
+    ordinary, forced = delivery.split_claims(claims)
+    assert not ordinary and len(forced) == 1
+
+
+def test_forced_lane_runs_beside_live_at_full_live_concurrency(monkeypatch):
+    import asyncio
+    from zk_add import worker
+
+    monkeypatch.setattr(settings, "ords_base_url", "https://ords.invalid")
+    monkeypatch.setattr(settings, "ords_username", "test")
+    monkeypatch.setattr(settings, "ords_password", "test")
+    monkeypatch.setattr(worker, "_ords_request_lock", asyncio.Lock())
+    monkeypatch.setattr(worker, "ords_circuit_is_open", lambda: False)
+    monkeypatch.setattr(worker, "ORDS_FORCED_CONCURRENCY", 8)
+    monkeypatch.setattr(worker, "claim_ords_batch", lambda _: ["live", "f1", "f2", "f3"])
+    monkeypatch.setattr("zk_add.zkt_oracle_delivery.split_claims", lambda rows: (rows, []))
+    monkeypatch.setattr(delivery, "split_claims", lambda _: (["live"], ["f1", "f2", "f3"]))
+    seen = {}
+
+    async def ordinary(claims, **kwargs):
+        seen["live"] = kwargs["concurrency"]
+
+    async def forced(claims, **kwargs):
+        seen["forced"] = kwargs["concurrency"]
+
+    monkeypatch.setattr(worker, "_deliver_ordinary_claims", ordinary)
+    monkeypatch.setattr(delivery, "deliver_forced", forced)
+    asyncio.run(worker.deliver_ords_batch(limit=100, concurrency=8))
+    # Live keeps all of its slots; the three forced checks run in parallel.
+    assert seen == {"live": 8, "forced": 3}
+
+
+def test_forced_only_batch_checks_in_parallel(monkeypatch):
+    import asyncio
+    from zk_add import worker
+
+    monkeypatch.setattr(settings, "ords_base_url", "https://ords.invalid")
+    monkeypatch.setattr(settings, "ords_username", "test")
+    monkeypatch.setattr(settings, "ords_password", "test")
+    monkeypatch.setattr(worker, "_ords_request_lock", asyncio.Lock())
+    monkeypatch.setattr(worker, "ords_circuit_is_open", lambda: False)
+    monkeypatch.setattr(worker, "ORDS_FORCED_CONCURRENCY", 4)
+    claimed = [f"f{index}" for index in range(6)]
+    monkeypatch.setattr(worker, "claim_ords_batch", lambda _: claimed)
+    monkeypatch.setattr("zk_add.zkt_oracle_delivery.split_claims", lambda rows: (rows, []))
+    monkeypatch.setattr(delivery, "split_claims", lambda rows: ([], list(rows)))
+    seen = {}
+
+    async def forced(claims, **kwargs):
+        seen["forced"] = kwargs["concurrency"]
+
+    monkeypatch.setattr(delivery, "deliver_forced", forced)
+    asyncio.run(worker.deliver_ords_batch(limit=100, concurrency=8))
+    assert seen == {"forced": 4}
+
+
+def test_forced_lane_lets_every_check_finish_before_raising(monkeypatch):
+    import asyncio
+
+    finished = []
+
+    async def scenario():
+        async def fake_verify(claim):
+            await asyncio.sleep(0.05 if claim["row_id"] == 2 else 0)
+            return "MATCH", "0" * 64
+
+        def fake_persist(claim, *args):
+            if claim["row_id"] == 1:
+                raise RuntimeError("persist failed")
+            finished.append(claim["row_id"])
+
+        monkeypatch.setattr(delivery, "verify", fake_verify)
+        monkeypatch.setattr(delivery, "persist_result", fake_persist)
+        claims = [
+            {"row_id": index, "direct": False, "payload": {"event_uid": "a" * 64}}
+            for index in (1, 2)
+        ]
+        with pytest.raises(RuntimeError):
+            await delivery.deliver_forced(claims, concurrency=2)
+
+    asyncio.run(scenario())
+    # The slower sibling still completed before the error reached the caller.
+    assert finished == [2]

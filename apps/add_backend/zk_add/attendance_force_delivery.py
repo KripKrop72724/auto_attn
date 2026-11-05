@@ -307,7 +307,7 @@ def persist_result(claim, classification, token=None, error_code=None, matched_e
 async def deliver_forced(claims, *, concurrency):
     from zk_add.worker import event_uid_is_valid
 
-    semaphore = asyncio.Semaphore(max(1, min(concurrency, 4)))
+    semaphore = asyncio.Semaphore(max(1, min(concurrency, 64)))
 
     async def one(claim):
         classification, token, code = "UNKNOWN", None, None
@@ -359,4 +359,10 @@ async def deliver_forced(claims, *, concurrency):
                 code = getattr(exc, "code", "ORACLE_CONTENT_VERIFICATION_PENDING")
             await asyncio.to_thread(persist_result, claim, classification, token, code, matched_event_uid)
 
-    await asyncio.gather(*(one(claim) for claim in claims))
+    # Let every check finish before an error propagates: the caller releases
+    # the delivery lock on return, and a re-claim of a row whose check is still
+    # running could POST it twice.
+    results = await asyncio.gather(*(one(claim) for claim in claims), return_exceptions=True)
+    for result in results:
+        if isinstance(result, BaseException):
+            raise result
