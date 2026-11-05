@@ -593,7 +593,9 @@ if (-not [string]::IsNullOrWhiteSpace($env:ADD_DEPLOY_RECONCILIATION_DEVICE_CONC
     $environment["ADD_RECONCILIATION_DEVICE_CONCURRENCY"] = $env:ADD_DEPLOY_RECONCILIATION_DEVICE_CONCURRENCY
 }
 # Forced-release delivery rate (settings.py ords_forced_*). Batch size 0 pauses
-# forced delivery; live delivery is never affected by either value.
+# forced delivery. Live punches wait for at most one batch, which lasts about
+# one Oracle check only while every forced claim runs at once, so the batch
+# size may not exceed the concurrency.
 $forcedRateLimits = [ordered]@{
     "ORDS_FORCED_BATCH_SIZE" = @(0, 64)
     "ORDS_FORCED_CONCURRENCY" = @(1, 64)
@@ -611,6 +613,17 @@ foreach ($forcedSuffix in $forcedRateLimits.Keys) {
         throw "ADD_DEPLOY_$forcedSuffix must be a whole number from $($limits[0]) to $($limits[1])."
     }
     $environment["ADD_$forcedSuffix"] = [string]$parsedNumber
+}
+$forcedRate = @{ "ADD_ORDS_FORCED_BATCH_SIZE" = 8; "ADD_ORDS_FORCED_CONCURRENCY" = 8 }
+foreach ($forcedName in @($forcedRate.Keys)) {
+    $parsedNumber = 0
+    if ($environment.ContainsKey($forcedName) -and
+        [int]::TryParse(([string]$environment[$forcedName]).Trim(), [ref]$parsedNumber)) {
+        $forcedRate[$forcedName] = $parsedNumber
+    }
+}
+if ($forcedRate["ADD_ORDS_FORCED_BATCH_SIZE"] -gt $forcedRate["ADD_ORDS_FORCED_CONCURRENCY"]) {
+    throw "ADD_ORDS_FORCED_BATCH_SIZE may not exceed ADD_ORDS_FORCED_CONCURRENCY: a larger batch stalls live delivery."
 }
 # Database capacity (docs/production-runbook.md, "Database capacity"). The
 # sizes shipped in .env.add.example before November 2026 are dropped so the

@@ -946,3 +946,15 @@ def test_forced_rate_defaults_and_production_overrides_are_wired():
             assert f"ADD_{suffix}" not in job["env"]
         assert f'"{suffix}" = {limits}' in deploy
     assert '$environment["ADD_$forcedSuffix"] = [string]$parsedNumber' in deploy
+    assert '$forcedRate["ADD_ORDS_FORCED_BATCH_SIZE"] -gt $forcedRate["ADD_ORDS_FORCED_CONCURRENCY"]' in deploy
+
+
+def test_forced_batch_never_exceeds_its_concurrency():
+    from zk_add.worker import forced_rate
+
+    assert forced_rate(64, 8) == (8, 8)
+    assert forced_rate(8, 8) == (8, 8)
+    assert forced_rate(4, 8) == (4, 8)
+    assert forced_rate(0, 8) == (0, 8)
+    assert forced_rate(8, 0) == (1, 1)
+    assert forced_rate(500, 500) == (64, 64)

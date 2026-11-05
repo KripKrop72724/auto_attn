@@ -188,8 +188,9 @@ class AddSettings(BaseSettings):
     # at most this many of them and checks them in parallel, so live punches in
     # the next batch never wait behind a long run of forced ones. A batch lasts
     # about as long as its slowest check, so the batch size sets the release
-    # rate: 4 gave ~5 confirmations a minute on 5 Nov 2026. 0 pauses forced
-    # delivery. Production overrides: ADD_ORDS_FORCED_BATCH_SIZE / _CONCURRENCY
+    # rate: 4 gave ~5 confirmations a minute on 5 Nov 2026. The batch is capped
+    # at the concurrency so all of it runs at once. 0 pauses forced delivery.
+    # Production overrides: ADD_ORDS_FORCED_BATCH_SIZE / _CONCURRENCY
     # repository variables (deploy/add/deploy.ps1).
     ords_forced_batch_size: int = 8
     ords_forced_concurrency: int = 8
