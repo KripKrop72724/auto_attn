@@ -816,6 +816,51 @@ def quick_release_direct_ords(
     }
 
 
+from zk_add import attendance_unknown_auto_release as unknown_auto_release  # noqa: E402
+
+
+@app.get("/api/v2/unknown-identity-auto-release")
+def unknown_identity_auto_release_status(auth: tuple[Session, AdminContext] = Depends(require_admin)):
+    """The automatic release switch and its progress, from saved counts (no backlog scan)."""
+    db, _context = auth
+    return unknown_auto_release.status(db)
+
+
+@app.post("/api/v2/unknown-identity-auto-release/control")
+def control_unknown_identity_auto_release(
+    request: Request,
+    body: unknown_auto_release.AutoReleaseControlRequest,
+    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+):
+    """Turn the automatic release ON or OFF: password and a written reason, audited."""
+    db, context = auth
+    require_step_up(body.password.get_secret_value(), db, context)
+    try:
+        unknown_auto_release.control(db, actor=context.username, request=body, ip_address=client_ip(request))
+        db.flush()
+    except unknown_auto_release.AutoReleaseError as exc:
+        raise HTTPException(status_code=409, detail={"code": exc.code, "message": str(exc)}) from exc
+    return unknown_auto_release.status(db)
+
+
+@app.post("/api/v2/unknown-identity-auto-release/release-all", status_code=202)
+def release_all_unknown_identity(
+    request: Request,
+    body: unknown_auto_release.AutoReleaseDrainRequest,
+    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+):
+    """One click: the worker releases every such punch, paced, until none is left untried."""
+    db, context = auth
+    try:
+        outcome = unknown_auto_release.request_drain(
+            db, actor=context.username, request=body, ip_address=client_ip(request),
+        )
+        db.flush()
+    except unknown_auto_release.AutoReleaseError as exc:
+        raise HTTPException(status_code=409, detail={"code": exc.code, "message": str(exc)}) from exc
+    return {**unknown_auto_release.status(db), "outcome": outcome}
+
+
 @app.post("/api/v2/attendance-direct-ords/preview")
 def preview_direct_ords_run(
     body: DirectOrdsPreviewRequest,

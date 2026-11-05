@@ -121,6 +121,19 @@ class AddSettings(BaseSettings):
     # still wait for Oracle.
     attendance_identity_backlog_batch_size: int = Field(default=25, ge=1, le=200)
     attendance_identity_backlog_in_flight_limit: int = Field(default=100, ge=1, le=1000)
+    # Unknown identity · CNIC on synced user (attendance_unknown_auto_release):
+    # the owner's switch keeps the one-click release running from the worker.
+    # ``allowed`` is the deployment's hard kill switch over the owner's switch.
+    # One batch of ``batch_size`` at most every ``min_interval_seconds``, none
+    # while ``in_flight_limit`` of its approved punches still wait for Oracle;
+    # a skipped punch is tried again after ``retry_hours``; the backlog count
+    # and progress totals are refreshed every ``count_interval_seconds``.
+    unknown_identity_auto_release_allowed: bool = True
+    unknown_identity_auto_release_batch_size: int = Field(default=50, ge=1, le=500)
+    unknown_identity_auto_release_min_interval_seconds: int = Field(default=5, ge=1, le=3600)
+    unknown_identity_auto_release_in_flight_limit: int = Field(default=1500, ge=1, le=20_000)
+    unknown_identity_auto_release_retry_hours: int = Field(default=24, ge=1, le=24 * 30)
+    unknown_identity_auto_release_count_interval_seconds: int = Field(default=60, ge=10, le=3600)
     # Held full-history, dump and 15-minute reconcile rows a source chunk
     # links to their saved record are released in the chunk's transaction,
     # at most this many per chunk (0: none); the next roster snapshot
