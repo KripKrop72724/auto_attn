@@ -315,6 +315,8 @@ stack, about eight small unrelated containers and image builds:
 | ADD API container memory | 16 GB | `ADD_API_MEMORY_LIMIT` |
 | API database pool / overflow | 40 / 40 | `ADD_DATABASE_POOL_SIZE` / `ADD_DATABASE_MAX_OVERFLOW` |
 | API pool wait | 10 s | `ADD_DATABASE_POOL_TIMEOUT_SECONDS` |
+| Forced-release punches per ORDS batch (0 pauses them) | 8 | `ADD_ORDS_FORCED_BATCH_SIZE` |
+| Forced-release Oracle checks in parallel | 8 | `ADD_ORDS_FORCED_CONCURRENCY` |
 
 `effective_cache_size` is only a planner hint. The container's page cache counts against its
 memory limit, so the hint stays below 32 GB rather than describing the whole VM. Fixed settings in

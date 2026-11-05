@@ -249,6 +249,8 @@ jobs:
       ADD_DEPLOY_DEVICE_HEALTH_CLEANUP_APPLY_ENABLED: ${{ vars.ADD_DEVICE_HEALTH_CLEANUP_APPLY_ENABLED }}
       ADD_DEPLOY_RECONCILIATION_SELF_HEALING_ENABLED: ${{ vars.ADD_RECONCILIATION_SELF_HEALING_ENABLED }}
       ADD_DEPLOY_RECONCILIATION_DEVICE_CONCURRENCY: ${{ vars.ADD_RECONCILIATION_DEVICE_CONCURRENCY }}
+      ADD_DEPLOY_ORDS_FORCED_BATCH_SIZE: ${{ vars.ADD_ORDS_FORCED_BATCH_SIZE }}
+      ADD_DEPLOY_ORDS_FORCED_CONCURRENCY: ${{ vars.ADD_ORDS_FORCED_CONCURRENCY }}
       # Optional database capacity overrides (docs/production-runbook.md,
       # "Database capacity"). Only ADD_DEPLOY_ names belong here: Compose
       # would let a raw ADD_POSTGRES_* process variable, even an empty one,

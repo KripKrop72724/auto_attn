@@ -79,9 +79,18 @@ ORDS_DELIVERY_CONCURRENCY = max(
     1,
     min(settings.ords_delivery_concurrency, ORDS_DELIVERY_BATCH_SIZE),
 )
-# 0 stops forced-release delivery entirely (an operator kill switch).
-ORDS_FORCED_BATCH_SIZE = max(0, min(settings.ords_forced_batch_size, 64))
-ORDS_FORCED_CONCURRENCY = max(1, min(settings.ords_forced_concurrency, max(1, ORDS_FORCED_BATCH_SIZE)))
+# Every forced claim in a batch runs at once: a batch larger than the
+# concurrency would hold the ORDS lock for several check waves and stall live
+# delivery (5 Nov 2026), so the batch never exceeds it. 0 stops forced-release
+# delivery entirely (an operator kill switch).
+def forced_rate(batch_size: int, concurrency: int) -> tuple[int, int]:
+    slots = max(1, min(concurrency, 64))
+    return max(0, min(batch_size, slots)), slots
+
+
+ORDS_FORCED_BATCH_SIZE, ORDS_FORCED_CONCURRENCY = forced_rate(
+    settings.ords_forced_batch_size, settings.ords_forced_concurrency
+)
 ORDS_FIRMWARE_AUDIT_BATCH_SIZE = max(
     1,
     min(settings.ords_firmware_audit_batch_size, 500),
