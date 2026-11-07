@@ -1,0 +1,17 @@
+[
+  {
+    "name": "FSDMAIN-01",
+    "mac": "30:30:f9:17:87:2c",
+    "terminal_serial": "CKPG231060360"
+  },
+  {
+    "name": "FSDMAIN-02",
+    "mac": "8c:bf:ea:17:95:d0",
+    "terminal_serial": "AF4C204260255"
+  },
+  {
+    "name": "FSDMAIN-03",
+    "mac": "30:30:f9:1f:90:10",
+    "terminal_serial": "AF4C225060506"
+  }
+]

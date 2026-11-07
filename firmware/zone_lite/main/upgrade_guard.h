@@ -6,7 +6,7 @@
 #define UG_ALL_QUEUE_READERS 0x3fU
 #define UG_COMPAT_VERSION "2.5.4"
 #define UG_CANDIDATE_VERSION "2.6.0"
-#define UG_DIRECT_VERSION "2.8.2"
+#define UG_DIRECT_VERSION "2.8.3"
 bool ug_direct_predecessor_matches(const char *version, const uint8_t digest[32]);
 /* ZKT 2.8.1: the other OTA slot is a rollback target only while the
  * bootloader could select it. A VALID image whose other slot holds no

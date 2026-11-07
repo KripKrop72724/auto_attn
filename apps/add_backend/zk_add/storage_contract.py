@@ -13,8 +13,9 @@ DIRECT_VERSION = "2.6.1"
 # 2.7.8 accepts the held spans ESP-IDF reads as ENOENT and says why it refuses.
 # 2.8.0 also talks to secure-pull terminals (CONNECT 6001: SenseFace, SpeedFace);
 # 2.8.1 also starts storage when a confirmed image's other slot cannot boot;
-# 2.8.2 also reads the 49-byte records of MB40-VL/ID (ZAM180_TFT) terminals.
-FLEET_PLATFORM_VERSIONS = ("2.7.1", "2.7.2", "2.7.3", "2.7.4", "2.7.5", "2.7.6", "2.7.7", "2.7.8", "2.8.0", "2.8.1", "2.8.2")
+# 2.8.2 also reads the 49-byte records of MB40-VL/ID (ZAM180_TFT) terminals;
+# 2.8.3 also holds 4096 terminal users (uFace800 at FSDMAIN has 2,500).
+FLEET_PLATFORM_VERSIONS = ("2.7.1", "2.7.2", "2.7.3", "2.7.4", "2.7.5", "2.7.6", "2.7.7", "2.7.8", "2.8.0", "2.8.1", "2.8.2", "2.8.3")
 FLEET_PLATFORM_VERSION = FLEET_PLATFORM_VERSIONS[-1]
 DIRECT_VERSIONS = (DIRECT_VERSION, "2.6.2", "2.6.3", "2.6.4", "2.6.5", "2.6.6", "2.6.7", "2.6.8", "2.6.9", "2.6.10", "2.6.11", "2.6.12", "2.6.13", "2.6.14", "2.6.15", *FLEET_PLATFORM_VERSIONS)
 DIRECT_BASELINES = ("2.4.12", "2.5.2")
@@ -150,11 +151,12 @@ RECORD49_BASELINE_IMAGES = {
     "2.8.1": "21238fa36df844642545e8c2f6bcfec03be37470890b776a600c39c0cdd1f5f0",
 }
 RECORD49_MARKER = SLOT_RULE_MARKER + ",2.8.1"
+# 2.8.3 keeps exactly 2.8.2's predecessors and marker (owner decision, 7 Nov 2026).
 
 
 def platform_baselines(version: str) -> tuple[tuple[str, ...], dict[str, str]]:
     """The rollback predecessors a 2.7 platform image accepts."""
-    if version == "2.8.2":
+    if version in {"2.8.2", "2.8.3"}:
         return RECORD49_BASELINES, RECORD49_BASELINE_IMAGES
     if version == "2.8.1":
         return SLOT_RULE_BASELINES, SLOT_RULE_BASELINE_IMAGES

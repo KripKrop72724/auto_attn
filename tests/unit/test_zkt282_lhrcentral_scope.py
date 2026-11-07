@@ -88,7 +88,7 @@ def test_scope_is_an_exact_ordered_prefix_of_the_three_pins():
             _parse_release_hil_targets(IDENTITY, scope)
 
 
-@pytest.mark.parametrize("version", ["2.7.8", "2.8.0", "2.8.1"])
+@pytest.mark.parametrize("version", ["2.7.8", "2.8.0", "2.8.1", "2.8.3"])
 def test_no_other_image_may_reach_lhrcentral_as_hil(version):
     from zk_add.ota import _parse_release_hil_targets
     identity = (f"zone-lite-{version}", version, *IDENTITY[2:])

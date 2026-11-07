@@ -529,7 +529,8 @@ class ResidueImage(NamedTuple):
 # UNKNOWN (DEGRADED only with an error), so the latch is on ESP_LOCAL_FAILURE
 # alone. 2.8.1 lists both and also starts storage when a confirmed image's
 # other slot cannot boot: the remedy is to offer it (AVAILABLE to the whole
-# fleet). 2.8.2 does the same, but is HIL_ONLY to LHRCENTRAL first.
+# fleet). 2.8.2 and 2.8.3 do the same, but are HIL_ONLY first (to LHRCENTRAL
+# and FSDMAIN).
 RESIDUE_IMAGES = {
     RESIDUE_FIRMWARE_VERSION: ResidueImage(RESIDUE_APPLICATION_SHA256, RESIDUE_LED_SOURCE, "DEGRADED", None),
     "2.7.8": ResidueImage("b8d0ca7e20d28d4114cff56fc69676e681a37bf9f7e831a243a65f9a1a972a3e",

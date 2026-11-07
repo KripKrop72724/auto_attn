@@ -165,18 +165,18 @@ int main(void)
     strcpy(previous_app.version,"2.6.14");assert(storage_upgrade_init());
     /* The 2.7 platform rolls back to the fleet's exact signed 2.6.15. */
     strcpy(previous_app.version,"2.6.15");assert(storage_upgrade_init());
-    assert(!strcmp(UG_DIRECT_VERSION,"2.8.2"));
+    assert(!strcmp(UG_DIRECT_VERSION,"2.8.3"));
     assert(!strcmp(strstr(storage_upgrade_contract(),",2.6.15,"),",2.6.15,2.7.2,2.7.3,2.7.4,2.7.5,2.7.6,2.7.7,2.7.8,2.8.0,2.8.1"));
     /* The marker is 178 characters; ADD's heartbeat field keeps 256. */
     assert(strlen(storage_upgrade_contract())==178);
     assert(!strcmp(storage_upgrade_rollback_slot(),"PREDECESSOR") &&
            !strcmp(storage_upgrade_rollback_slot_state(),"VALID"));
-    /* 2.8.2 also rolls back to 2.7.2 (3FL), 2.7.3, 2.7.4, 2.7.5, 2.7.6 and
+    /* 2.8.3 (as 2.8.2) also rolls back to 2.7.2 (3FL), 2.7.3, 2.7.4, 2.7.5, 2.7.6 and
      * 2.7.7 (their HIL devices), 2.7.8 (production since 29 October), 2.8.0
      * (the secure-pull image) and 2.8.1 (AVAILABLE since 4 November), and to
      * no other 2.7 or 2.8 image: 2.7.1 with 2.7.2's digest is still refused,
-     * so are 2.7.5 to 2.8.1 on other bytes, and so is a 2.8.2 in the other
-     * slot while it is selectable. */
+     * so are 2.7.5 to 2.8.1 on other bytes, and so is a 2.8.2 or 2.8.3 in the
+     * other slot while it is selectable. */
     strcpy(previous_app.version,"2.7.2");assert(storage_upgrade_init());
     strcpy(previous_app.version,"2.7.3");assert(storage_upgrade_init());
     strcpy(previous_app.version,"2.7.4");assert(storage_upgrade_init());
@@ -194,6 +194,7 @@ int main(void)
     failure=7;assert(!storage_upgrade_init());failure=0;
     strcpy(previous_app.version,"2.7.1");assert(!storage_upgrade_init());
     strcpy(previous_app.version,"2.8.2");assert(!storage_upgrade_init());
+    strcpy(previous_app.version,"2.8.3");assert(!storage_upgrade_init());
     assert(!strcmp(storage_upgrade_rollback_slot(),"UNQUALIFIED"));
     strcpy(previous_app.version,"2.6.15");
     failure=7;assert(!storage_upgrade_init());failure=0;
@@ -205,7 +206,8 @@ int main(void)
     current.subtype=0;assert(!storage_upgrade_init());current.subtype=17;
     previous.address=current.address;assert(!storage_upgrade_init());previous.address=0x2a0000;
     strcpy(app.version,UG_CANDIDATE_VERSION);assert(!storage_upgrade_init());
-    /* This build runs only as 2.8.2, never under 2.8.1's or 2.8.0's descriptor. */
+    /* This build runs only as 2.8.3, never under 2.8.2's, 2.8.1's or 2.8.0's descriptor. */
+    strcpy(app.version,"2.8.2");assert(!storage_upgrade_init());
     strcpy(app.version,"2.8.1");assert(!storage_upgrade_init());
     strcpy(app.version,"2.8.0");assert(!storage_upgrade_init());
     strcpy(app.version,UG_DIRECT_VERSION);

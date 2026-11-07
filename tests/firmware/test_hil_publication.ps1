@@ -362,6 +362,13 @@ if ($records49Contract.allowed_bootstrap_versions.Count -ne 20 -or $records49Con
     $slotGateContract.allowed_bootstrap_images.Count -ne 19) {
     throw '2.8.2 rollback targets changed'
 }
+# 2.8.3 (2.8.2 holding 4096 terminal users) keeps exactly 2.8.2's rollback
+# targets and 178-character marker; 2.8.2 is not one of them.
+$userCapContract = Get-FirmwareStorageContract -ImagePath $contractImage -Version '2.8.3'
+if ((ConvertTo-Json -InputObject $userCapContract -Depth 5 -Compress) -cne (ConvertTo-Json -InputObject $records49Contract -Depth 5 -Compress) -or
+    $userCapContract.allowed_bootstrap_versions -contains '2.8.2') {
+    throw '2.8.3 rollback targets differ from 2.8.2'
+}
 foreach ($platformVersion in @('2.7.1', '2.7.2', '2.7.3', '2.7.4', '2.7.5', '2.7.6', '2.7.7', '2.7.8', '2.8.0', '2.8.1')) {
     $rejected = $false
     try { Get-FirmwareStorageContract -ImagePath $contractImage -Version $platformVersion | Out-Null } catch { $rejected = $true }
@@ -369,9 +376,11 @@ foreach ($platformVersion in @('2.7.1', '2.7.2', '2.7.3', '2.7.4', '2.7.5', '2.7
 }
 foreach ($earlierMarker in @($slotGateMarker, $securePullMarker, $exceptionMarker, $reformatMarker, $repairMarker, $inventoryMarker, $traceMarker, $platformMarker, $fleetMarker)) {
     [IO.File]::WriteAllText($contractImage, $earlierMarker + [char]0)
-    $rejected = $false
-    try { Get-FirmwareStorageContract -ImagePath $contractImage -Version '2.8.2' | Out-Null } catch { $rejected = $true }
-    if (-not $rejected) { throw '2.8.2 accepted an earlier platform storage contract' }
+    foreach ($records49Version in @('2.8.2', '2.8.3')) {
+        $rejected = $false
+        try { Get-FirmwareStorageContract -ImagePath $contractImage -Version $records49Version | Out-Null } catch { $rejected = $true }
+        if (-not $rejected) { throw "$records49Version accepted an earlier platform storage contract" }
+    }
 }
 [IO.File]::WriteAllText($contractImage, $fleetMarker + [char]0)
 $rejected = $false
@@ -922,6 +931,86 @@ if (@($lhrMarker.targets).Count -ne 3 -or $lhrMarker.targets[0].mac -cne 'ac:27:
     $lhrMarker.targets[2].terminal_serial -cne 'COVP232060177' -or $lhrMarker.targets[1].connector_id -cne $lhrConnectors[1] -or
     $lhrMarker.application_sha256 -cne ('e'*64)) {
     throw '2.8.2 LHRCENTRAL HIL marker is incomplete'
+}
+# 2.8.3 may instead reach an exact ordered prefix of the FSDMAIN ESPs (at most
+# three; uFace800 terminals with more than 2048 users), pinned the same way;
+# connector IDs here are synthetic.
+. (Join-Path $repo 'deploy/add/firmware-2-8-3-hil-scope.ps1')
+$fsdPins = Get-Zkt283FsdmainPins
+if (($fsdPins | ForEach-Object { "$($_.name)=$($_.mac)=$($_.terminal_serial)" }) -join ',' -cne
+    'FSDMAIN-01=30:30:f9:17:87:2c=CKPG231060360,FSDMAIN-02=8c:bf:ea:17:95:d0=AF4C204260255,FSDMAIN-03=30:30:f9:1f:90:10=AF4C225060506') {
+    throw '2.8.3 FSDMAIN pins changed'
+}
+function New-FsdmainRows([int[]]$Indexes) {
+    $rows = @()
+    foreach ($index in $Indexes) {
+        $rows += [pscustomobject][ordered]@{ connector_id = $lhrConnectors[$index]; mac = $fsdPins[$index].mac; terminal_serial = $fsdPins[$index].terminal_serial }
+    }
+    return ,$rows
+}
+foreach ($accepted in @((ConvertTo-ScopeJson (New-FsdmainRows @(0))), (ConvertTo-ScopeJson (New-FsdmainRows @(0, 1))),
+                        $nationwide, (ConvertTo-ScopeJson @($nationwideRows[0..1])))) {
+    Assert-Zkt283HilScope -HilTargetsJson $accepted
+}
+$fsdMutations = [ordered]@{
+    'order' = (New-FsdmainRows @(1, 0)); 'repeat' = (New-FsdmainRows @(0, 1, 0)); 'later-first' = (New-FsdmainRows @(1))
+    'after-nationwide' = @($nationwideRows[0]) + (New-FsdmainRows @(0)); 'lhrcentral' = (New-LhrcentralRows @(0))
+    'adhoc' = (ConvertFrom-Json -InputObject $targets)
+    # A distinct third ESP is refused while only two are pinned.
+    'third-unpinned' = (New-FsdmainRows @(0, 1)) + @([pscustomobject][ordered]@{
+        connector_id = '0c1e0103-0000-4000-8000-000000000003'; mac = '30:30:f9:17:87:03'; terminal_serial = 'CKPG231060363' })
+}
+foreach ($mutation in @('serial', 'mac', 'connector-case', 'connector-name', 'connector-repeat', 'extra-key', 'missing-key')) {
+    $rows = New-FsdmainRows @(0, 1)
+    switch ($mutation) {
+        'serial' { $rows[1].terminal_serial = $fsdPins[0].terminal_serial }
+        'mac' { $rows[1].mac = '00:11:22:33:44:55' }
+        'connector-case' { $rows[0].connector_id = $rows[0].connector_id.ToUpperInvariant() }
+        'connector-name' { $rows[0].connector_id = 'FSDMAIN-01' }
+        'connector-repeat' { $rows[1].connector_id = $rows[0].connector_id }
+        'extra-key' { $rows[0] | Add-Member -MemberType NoteProperty -Name zone_id -Value 'LF-ZONE-FSDMAIN-01' }
+        'missing-key' { $rows[0] = [pscustomobject][ordered]@{ mac = $rows[0].mac; terminal_serial = $rows[0].terminal_serial } }
+    }
+    $fsdMutations[$mutation] = $rows
+}
+foreach ($mutation in $fsdMutations.Keys) {
+    $rejected = $false
+    try { Assert-Zkt283HilScope -HilTargetsJson (ConvertTo-ScopeJson $fsdMutations[$mutation]) } catch { $rejected = $true }
+    if (-not $rejected) { throw "2.8.3 HIL scope accepted $mutation" }
+}
+foreach ($invalid in @('', '[]', '{}', '["FSDMAIN-01"]')) {
+    $rejected = $false
+    try { Assert-Zkt283HilScope -HilTargetsJson $invalid } catch { $rejected = $true }
+    if (-not $rejected) { throw "2.8.3 HIL scope accepted '$invalid'" }
+}
+# 2.8.2 never reaches the FSDMAIN ESPs.
+$rejected = $false
+try { Assert-Zkt282HilScope -HilTargetsJson (ConvertTo-ScopeJson (New-FsdmainRows @(0))) } catch { $rejected = $true }
+if (-not $rejected) { throw '2.8.2 HIL scope accepted an FSDMAIN ESP' }
+$fsdImage = Join-Path $source 'zone-lite-2.8.3.bin'
+[IO.File]::WriteAllText($fsdImage, 'ZKT 2.8.3 fixture, not deployable firmware')
+$manifest.version='2.8.3'
+$manifest.release_id='zone-lite-2.8.3'
+$manifest.image_name='zone-lite-2.8.3.bin'
+$manifest.image_sha256=(Get-FileHash $fsdImage).Hash.ToLowerInvariant()
+$manifest.image_size=(Get-Item $fsdImage).Length
+Write-TestManifest
+$fsdScope = ConvertTo-ScopeJson (New-FsdmainRows @(0, 1))
+foreach ($arguments in @(@{ PublicationMode = 'AVAILABLE' }, @{ PublicationMode = 'HIL_ONLY'; HilTargetsJson = $targets },
+                         @{ PublicationMode = 'HIL_ONLY'; HilTargetMac = '30:30:f9:17:87:2c' },
+                         @{ PublicationMode = 'HIL_ONLY'; HilTargetsJson = $lhrScope },
+                         @{ PublicationMode = 'HIL_ONLY'; HilTargetsJson = (ConvertTo-ScopeJson $fsdMutations['serial']) },
+                         @{ PublicationMode = 'HIL_ONLY'; HilTargetsJson = (ConvertTo-ScopeJson $fsdMutations['order']) })) {
+    $rejected = $false
+    try { & $publish -SourceDirectory $source -StoreDirectory $store -Version 2.8.3 @arguments } catch { $rejected = $true }
+    if (-not $rejected) { throw 'Unscoped 2.8.3 publication accepted' }
+}
+& $publish -SourceDirectory $source -StoreDirectory $store -Version 2.8.3 -PublicationMode HIL_ONLY -HilTargetsJson $fsdScope
+$fsdMarker = Get-Content -LiteralPath (Join-Path $store '2.8.3/.hil-only.json') -Raw | ConvertFrom-Json
+if (@($fsdMarker.targets).Count -ne 2 -or $fsdMarker.targets[0].mac -cne '30:30:f9:17:87:2c' -or
+    $fsdMarker.targets[1].terminal_serial -cne 'AF4C204260255' -or $fsdMarker.targets[1].connector_id -cne $lhrConnectors[1] -or
+    $fsdMarker.application_sha256 -cne ('e'*64)) {
+    throw '2.8.3 FSDMAIN HIL marker is incomplete'
 }
 # The later BLD5 extension changes only the quarantine marker of the exact
 # already published image; it cannot authorize another image or device.

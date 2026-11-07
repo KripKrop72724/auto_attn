@@ -162,7 +162,7 @@ The rig must deliberately remove power during download and again during first bo
 
 Published versions are immutable. If a defect is found, revoke the release and publish a new version. Never replace a `.bin` or manifest under an existing version.
 
-ZKT 2.7.1 and later platform images (2.7.x, 2.8.0, 2.8.1, 2.8.2) follow the
+ZKT 2.7.1 and later platform images (2.7.x, 2.8.0 to 2.8.3) follow the
 fleet path instead: `Zone Lite quarantined HIL candidate` publishes them
 HIL_ONLY to an exact prefix of the signed nationwide 17
 (`deploy/add/hil-targets-zkt-270.json`), the owner runs one-zone campaigns,
@@ -170,7 +170,9 @@ and `Zone Lite fleet-proven ZKT promotion` promotes the exact bytes to
 AVAILABLE on field evidence. 2.8.2 may instead be published to an exact
 ordered prefix of the three LHRCENTRAL ESPs, whose MB40-VL/ID terminals
 return 49-byte attendance records (`deploy/add/hil-pins-2.8.2-lhrcentral.json`;
-[2.8.2 release](zone-lite-2.8.2-release.md)). No other version and no ad hoc
+[2.8.2 release](zone-lite-2.8.2-release.md)). 2.8.3 (4096 terminal users) may
+instead reach an exact ordered prefix of the FSDMAIN ESPs
+(`deploy/add/hil-pins-2.8.3-fsdmain.json`; [2.8.3 release](zone-lite-2.8.3-release.md)). No other version and no ad hoc
 list reaches an ESP outside the 17 as HIL.
 
 ## Campaign procedure

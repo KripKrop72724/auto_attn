@@ -86,7 +86,7 @@ def test_2_8_2_refuses_a_legacy_mac(tmp_path):
     assert result.returncode != 0
 
 
-@pytest.mark.parametrize("version", ["2.7.8", "2.8.0", "2.8.1"])
+@pytest.mark.parametrize("version", ["2.7.8", "2.8.0", "2.8.1", "2.8.3"])
 def test_no_other_platform_image_reaches_lhrcentral(tmp_path, version):
     result, _output = run(tmp_path, version, LHRCENTRAL)
     assert result.returncode != 0 and "exact ordered nationwide prefix" in result.stderr
@@ -96,4 +96,4 @@ def test_no_other_platform_image_reaches_lhrcentral(tmp_path, version):
 
 def test_2_8_2_builds_as_the_direct_role():
     text = WORKFLOW.read_text(encoding="utf-8")
-    assert '"$EXPECTED_VERSION" == "2.8.1" || "$EXPECTED_VERSION" == "2.8.2" ) ]]; then direct_mode=ON; fi' in text
+    assert '"$EXPECTED_VERSION" == "2.8.1" || "$EXPECTED_VERSION" == "2.8.2" || ' in text
