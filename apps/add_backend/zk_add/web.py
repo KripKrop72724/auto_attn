@@ -273,8 +273,10 @@ from zk_add.source_tail_authority import (
 
 
 logger = logging.getLogger(__name__)
-# A larger device frame (text length) closes the stream with 4400.
-DEVICE_MESSAGE_MAX_LENGTH = 512 * 1024
+# A larger device frame (text length) closes the stream with 4400. A complete
+# user snapshot from a 2,500-user ZKT terminal is about 0.7 MB in one message,
+# and zone-lite 2.8.3 holds up to 4,096 users, so 512 KiB was too small.
+DEVICE_MESSAGE_MAX_LENGTH = 2 * 1024 * 1024
 # Waits between connect-bootstrap attempts after a database fault.
 STREAM_BOOTSTRAP_RETRY_SECONDS = (1.0, 2.0)
 comm_key_reveal_rate_limiter = LoginRateLimiter(
