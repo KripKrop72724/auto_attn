@@ -464,7 +464,7 @@ def test_invalid_and_binary_frames_are_answered_in_order_without_closing(backend
 @pytest.mark.parametrize(
     ("make_frame", "close"),
     [
-        (lambda: "x" * (512 * 1024 + 1), (4400, "Message too large")),
+        (lambda: "x" * (add_web.DEVICE_MESSAGE_MAX_LENGTH + 1), (4400, "Message too large")),
         (lambda: json.dumps(envelope(1, connector_id="ZL-SOMEONE-ELSE")), (4403, None)),
     ],
 )
@@ -1059,7 +1059,7 @@ def test_session_end_names_this_servers_own_close(backend, caplog):
         stream = asyncio.create_task(add_web.device_stream(websocket))
         websocket.feed(1)
         await until(lambda: acked(websocket) == [1])
-        websocket.feed_text("x" * (512 * 1024 + 1))
+        websocket.feed_text("x" * (add_web.DEVICE_MESSAGE_MAX_LENGTH + 1))
         websocket.feed(3)
         await asyncio.wait_for(stream, 3)
 
@@ -1158,3 +1158,8 @@ def test_session_logs_never_carry_tokens_payloads_or_peer_close_reasons(backend,
     assert "ADD device session ended" in text
     for secret in ("device-token", "35202", "PAYLOAD-NAME-MARKER", "PEER-REASON-MARKER"):
         assert secret not in text
+
+
+def test_full_large_terminal_user_snapshot_fits_one_device_message():
+    # A complete 2,500-user ZKT snapshot is about 0.7 MB; 2.8.3 holds 4,096.
+    assert add_web.DEVICE_MESSAGE_MAX_LENGTH == 2 * 1024 * 1024
