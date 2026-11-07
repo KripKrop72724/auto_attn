@@ -1,7 +1,8 @@
 name: Zone Lite fleet-proven ZKT promotion
 
-# ZKT 2.7.x and 2.8.0 to 2.8.2 images are published HIL_ONLY to the signed
-# nationwide scope (2.8.2 to the three LHRCENTRAL ESPs) and proven on the
+# ZKT 2.7.x and 2.8.0 to 2.8.3 images are published HIL_ONLY to the signed
+# nationwide scope (2.8.2 to the three LHRCENTRAL ESPs, 2.8.3 to the FSDMAIN
+# ESPs) and proven on the
 # field fleet itself, not on a single canary or the bench gate. This promotes
 # the exact published bytes to AVAILABLE once enough of that fleet has run
 # them, healthy, for the soak period. ADD's exact-identity nationwide guard
@@ -15,7 +16,7 @@ on:
         required: true
         type: string
       version:
-        description: ZKT 2.7.x, 2.8.0, 2.8.1 or 2.8.2 SemVer version, without a v prefix
+        description: ZKT 2.7.x, 2.8.0, 2.8.1, 2.8.2 or 2.8.3 SemVer version, without a v prefix
         required: true
         type: string
       minimum_field_devices:
@@ -63,9 +64,10 @@ jobs:
         run: |
           set -euo pipefail
           # Any 2.7.x, or exactly 2.8.0 (2.7.8 with secure-pull terminals),
-          # 2.8.1 (2.8.0 with the rollback-slot gate fix) or 2.8.2 (2.8.1 with
-          # the 49-byte records of MB40-VL/ID terminals).
-          [[ "$INPUT_VERSION" == '2.8.0' || "$INPUT_VERSION" == '2.8.1' || "$INPUT_VERSION" == '2.8.2' ]] || [[ "$INPUT_VERSION" =~ ^2\.7\.[0-9]+$ ]]
+          # 2.8.1 (2.8.0 with the rollback-slot gate fix), 2.8.2 (2.8.1 with
+          # the 49-byte records of MB40-VL/ID terminals) or 2.8.3 (2.8.2 with
+          # 4096 terminal users).
+          [[ "$INPUT_VERSION" == '2.8.0' || "$INPUT_VERSION" == '2.8.1' || "$INPUT_VERSION" == '2.8.2' || "$INPUT_VERSION" == '2.8.3' ]] || [[ "$INPUT_VERSION" =~ ^2\.7\.[0-9]+$ ]]
           [[ "$INPUT_COMMIT_SHA" =~ ^[0-9a-f]{40}$ ]]
           [[ "$INPUT_MINIMUM_FIELD_DEVICES" =~ ^[0-9]+$ ]]
           [[ "$INPUT_MINIMUM_SOAK_HOURS" =~ ^[0-9]+$ ]]

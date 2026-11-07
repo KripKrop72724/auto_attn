@@ -143,6 +143,14 @@ try {
             RollbackPredecessorDirectory = (New-SyntheticRelease -Version $version)
         } "Rollback predecessor $([regex]::Escape($version)) must be older than production release 2\.8\.2"
     }
+    # 2.8.3 may keep 2.8.1 in ota_1 (it does not accept 2.8.2).
+    $userCap = New-SyntheticRelease -Version '2.8.3'
+    foreach ($version in @('2.8.3', '2.10.0')) {
+        Assert-Refused "Predecessor $version beside production 2.8.3" @{
+            ProductionReleaseDirectory = $userCap
+            RollbackPredecessorDirectory = (New-SyntheticRelease -Version $version)
+        } "Rollback predecessor $([regex]::Escape($version)) must be older than production release 2\.8\.3"
+    }
     Assert-Refused 'Production release whose image differs from its manifest' @{
         ProductionReleaseDirectory = (New-SyntheticRelease -Version '2.7.8' -Tampered)
         RollbackPredecessorDirectory = $predecessor

@@ -514,7 +514,7 @@ class StorageDiagnostics(BaseModel):
     local_failure_last_source: str | None = Field(default=None, max_length=80)
     local_failures: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
     local_failure_recoveries: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
-    # 2.8.2's compiled predecessor marker is 178 characters (2.8.1's 172, 2.8.0's 166,
+    # 2.8.2's and 2.8.3's compiled predecessor marker is 178 characters (2.8.1's 172, 2.8.0's 166,
     # 2.7.8's 160).
     upgrade_contract: str | None = Field(default=None, max_length=256)
     upgrade_error: str | None = Field(default=None, max_length=80)

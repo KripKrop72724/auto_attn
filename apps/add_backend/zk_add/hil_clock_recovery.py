@@ -7,13 +7,13 @@ from datetime import datetime, timedelta
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from zk_add import zkt274_bld9_k50 as bld9_k50
 from zk_add.models import Connector, DeviceTelemetry
 from zk_add.ota import (
     FirmwareCampaign,
     FirmwareDeployment,
     FirmwareRelease,
     _application_sha256,
+    _hil_target_admits,
     _permitted_hil_targets,
     _storage_predecessor_exclusion,
     _versions_match,
@@ -81,7 +81,7 @@ def trusted_hil_clock_matches(
         targets = _permitted_hil_targets(session, release)
     except ValueError:
         return False
-    if not targets or not any(bld9_k50.admits(target, connector) for target in targets):
+    if not targets or not any(_hil_target_admits(release, target, connector) for target in targets):
         return False
     baseline_running = any(
         _versions_match(connector.firmware_version, version) for version in DIRECT_BASELINES

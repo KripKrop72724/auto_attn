@@ -54,7 +54,7 @@ if (-not [string]::IsNullOrWhiteSpace($HilTargetsJson)) {
     # wrap that pipeline in @(), which creates a nested array on that runtime.
     $parsedTargets = ConvertFrom-Json -InputObject $HilTargetsJson
     $parsedTargets = @($parsedTargets)
-    $targetLimit = if ($journalBridge -or $Version -in @('2.7.1', '2.7.2', '2.7.3', '2.7.4', '2.7.5', '2.7.6', '2.7.7', '2.7.8', '2.8.0', '2.8.1', '2.8.2')) { 17 } else { 8 }
+    $targetLimit = if ($journalBridge -or $Version -in @('2.7.1', '2.7.2', '2.7.3', '2.7.4', '2.7.5', '2.7.6', '2.7.7', '2.7.8', '2.8.0', '2.8.1', '2.8.2', '2.8.3')) { 17 } else { 8 }
     if ($parsedTargets.Count -lt 1 -or $parsedTargets.Count -gt $targetLimit) { throw 'HIL requires an ordered list within the release target limit' }
     foreach ($target in $parsedTargets) {
         $keys = @($target.PSObject.Properties | ForEach-Object { [string]$_.Name })
@@ -197,6 +197,15 @@ if ($Version -eq '2.8.2') {
     }
     . (Join-Path $PSScriptRoot 'firmware-2-8-2-hil-scope.ps1')
     Assert-Zkt282HilScope -HilTargetsJson $HilTargetsJson
+}
+if ($Version -eq '2.8.3') {
+    # An exact prefix of the nationwide scope, or of the FSDMAIN ESPs.
+    if ($manifest.firmware_family -cne 'zkt' -or $PublicationMode -ne 'HIL_ONLY' -or
+        -not [string]::IsNullOrWhiteSpace($HilTargetMac)) {
+        throw "ZKT $Version must first be published only to an exact prefix of its nationwide or FSDMAIN scope"
+    }
+    . (Join-Path $PSScriptRoot 'firmware-2-8-3-hil-scope.ps1')
+    Assert-Zkt283HilScope -HilTargetsJson $HilTargetsJson
 }
 if ($manifest.firmware_family -eq 'zkt' -and $Version -eq '2.6.15') {
     if ($PublicationMode -ne 'HIL_ONLY' -or -not [string]::IsNullOrWhiteSpace($HilTargetMac)) {

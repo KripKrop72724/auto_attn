@@ -218,6 +218,15 @@ def test_legacy_records_partial_snapshots_and_flapping_disable_writes():
     assert "ZONE_LITE_DISCOVERY_FULL_SCAN_INTERVAL_MS (15 * 60 * 1000)" in source
 
 
+def test_user_table_holds_the_fsdmain_uface800_users():
+    """ZKT 2.8.3: LF-ZONE-FSDMAIN's uFace800 terminals hold 2,500 users; at 2048
+    the snapshot was truncated and the credential policy disconnected the ESP."""
+    source = (FIRMWARE / "main" / "zone_lite.c").read_text(encoding="utf-8")
+    assert "#define MAX_USERS 4096\n" in source and "#define MAX_USERS 2048" not in source
+    assert "zkt_user_t rows[MAX_USERS];" in source
+    assert "users->complete = parsed_users <= MAX_USERS;" in source
+
+
 def test_reconcile_and_restart_cadence_are_production_defaults():
     source = (FIRMWARE / "main" / "zone_lite.c").read_text(encoding="utf-8")
     defaults = (FIRMWARE / "main" / "zone_lite_config.example.h").read_text(encoding="utf-8")

@@ -45,6 +45,7 @@ from zk_add.storage_recovery import (
 from zk_add.models import Connector, DeviceTelemetry, utc_column
 from zk_add import zkt274_bld9_k50 as bld9_k50
 from zk_add import zkt282_lhrcentral as lhrcentral_282
+from zk_add import zkt283_fsdmain as fsdmain_283
 from zk_add.settings import settings
 from zk_add.terminal_families import require_family_match, release_family, require_production_qualification
 from zk_add.time_utils import ensure_utc, utc_now
@@ -341,6 +342,11 @@ def _parse_release_hil_targets(identity: tuple, raw: Any) -> list[HilTarget]:
     lhrcentral_targets = lhrcentral_282.exposure(identity, raw)
     if lhrcentral_targets is not None:
         return lhrcentral_targets
+    # zone-lite-2.8.3 may instead reach the reviewed FSDMAIN ESPs, outside the
+    # 17, whose uFace800 terminals hold more than 2048 users.
+    fsdmain_targets = fsdmain_283.exposure(identity, raw)
+    if fsdmain_targets is not None:
+        return fsdmain_targets
     if identity[1] in FLEET_PLATFORM_VERSIONS and identity[0] == f"zone-lite-{identity[1]}":
         from zk_add.zkt_bridge_contract import bridge_hil_targets
         return bridge_hil_targets(raw)
@@ -349,6 +355,12 @@ def _parse_release_hil_targets(identity: tuple, raw: Any) -> list[HilTarget]:
     if identity == HIL_2615_BLD5_IDENTITY and raw == [target.model_dump() for target in HIL_2615_CITY_TARGETS]:
         return list(HIL_2615_CITY_TARGETS)
     return parse_hil_targets(raw)
+
+
+def _hil_target_admits(release: FirmwareRelease, target: HilTarget, connector: Connector) -> bool:
+    """An exact permitted target (the K50 only in its own zone). The HIL_ONLY
+    2.8.3 also admits its FSDMAIN pins while their binding awaits the device ACK."""
+    return bld9_k50.admits(target, connector) or fsdmain_283.target_admits(release, target, connector)
 
 
 def _permitted_hil_targets(session: Session, release: FirmwareRelease) -> list[HilTarget] | None:
@@ -692,20 +704,20 @@ def _storage_predecessor_exclusion(session: Session, release: FirmwareRelease, c
             release.version in FLEET_PLATFORM_VERSIONS and qualified_version in {
                 "2.6.6", "2.6.7", "2.6.8", "2.6.9", "2.6.10", "2.6.12", "2.6.13", "2.6.14", "2.6.15"}) or (
             # Neither were 2.7.2 to 2.7.7, the HIL-only 2.7 platform images.
-            release.version in {"2.7.3", "2.7.4", "2.7.5", "2.7.6", "2.7.7", "2.7.8", "2.8.0", "2.8.1", "2.8.2"} and qualified_version == "2.7.2") or (
-            release.version in {"2.7.4", "2.7.5", "2.7.6", "2.7.7", "2.7.8", "2.8.0", "2.8.1", "2.8.2"} and qualified_version == "2.7.3") or (
-            release.version in {"2.7.5", "2.7.6", "2.7.7", "2.7.8", "2.8.0", "2.8.1", "2.8.2"} and qualified_version == "2.7.4") or (
-            release.version in {"2.7.6", "2.7.7", "2.7.8", "2.8.0", "2.8.1", "2.8.2"} and qualified_version == "2.7.5") or (
-            release.version in {"2.7.7", "2.7.8", "2.8.0", "2.8.1", "2.8.2"} and qualified_version == "2.7.6") or (
-            release.version in {"2.7.8", "2.8.0", "2.8.1", "2.8.2"} and qualified_version == "2.7.7") or (
+            release.version in {"2.7.3", "2.7.4", "2.7.5", "2.7.6", "2.7.7", "2.7.8", "2.8.0", "2.8.1", "2.8.2", "2.8.3"} and qualified_version == "2.7.2") or (
+            release.version in {"2.7.4", "2.7.5", "2.7.6", "2.7.7", "2.7.8", "2.8.0", "2.8.1", "2.8.2", "2.8.3"} and qualified_version == "2.7.3") or (
+            release.version in {"2.7.5", "2.7.6", "2.7.7", "2.7.8", "2.8.0", "2.8.1", "2.8.2", "2.8.3"} and qualified_version == "2.7.4") or (
+            release.version in {"2.7.6", "2.7.7", "2.7.8", "2.8.0", "2.8.1", "2.8.2", "2.8.3"} and qualified_version == "2.7.5") or (
+            release.version in {"2.7.7", "2.7.8", "2.8.0", "2.8.1", "2.8.2", "2.8.3"} and qualified_version == "2.7.6") or (
+            release.version in {"2.7.8", "2.8.0", "2.8.1", "2.8.2", "2.8.3"} and qualified_version == "2.7.7") or (
             # 2.7.8 was promoted (AVAILABLE, 29 Oct 2026); like every earlier
-            # 2.7 predecessor, 2.8.0 to 2.8.2 take it published in either state.
-            release.version in {"2.8.0", "2.8.1", "2.8.2"} and qualified_version == "2.7.8") or (
+            # 2.7 predecessor, 2.8.0 to 2.8.3 take it published in either state.
+            release.version in {"2.8.0", "2.8.1", "2.8.2", "2.8.3"} and qualified_version == "2.7.8") or (
             # 2.8.0 is HIL_ONLY (30 Oct 2026) and may never be promoted.
-            release.version in {"2.8.1", "2.8.2"} and qualified_version == "2.8.0") or (
-            # 2.8.1 was promoted (AVAILABLE, 4 Nov 2026); 2.8.2 takes it published
-            # in either state, as every earlier predecessor.
-            release.version == "2.8.2" and qualified_version == "2.8.1")
+            release.version in {"2.8.1", "2.8.2", "2.8.3"} and qualified_version == "2.8.0") or (
+            # 2.8.1 was promoted (AVAILABLE, 4 Nov 2026); 2.8.2 and 2.8.3 take it
+            # published in either state, as every earlier predecessor.
+            release.version in {"2.8.2", "2.8.3"} and qualified_version == "2.8.1")
         allowed_state = {"AVAILABLE", "HIL_ONLY"} if hil_retry else {"AVAILABLE"}
         predecessor = session.scalar(select(FirmwareRelease).where(
             FirmwareRelease.release_id == f"zone-lite-{qualified_version}",
@@ -796,9 +808,12 @@ def _campaign_scope(
             require_family_match(connector.firmware_family, release.manifest or {})
         except ValueError:
             reason = "FIRMWARE_FAMILY_MISMATCH"
-        if permitted_targets and not any(target_matches(target, connector) for target in permitted_targets):
+        if permitted_targets and not any(target_matches(target, connector)
+                                         or fsdmain_283.target_admits(release, target, connector)
+                                         for target in permitted_targets):
             reason = "HIL_EXACT_IDENTITY_MISMATCH"
-        elif permitted_targets and not any(bld9_k50.admits(target, connector) for target in permitted_targets):
+        elif permitted_targets and not any(_hil_target_admits(release, target, connector)
+                                           for target in permitted_targets):
             # The reviewed ZONE-BLD9-01 K50 is a 2.7.4 target only in that zone.
             reason = "HIL_TARGET_ZONE_MISMATCH"
         if bridge_target:
@@ -816,7 +831,7 @@ def _campaign_scope(
             eligible = [row for row in eligible if row.hardware_id.lower() == hil_target_mac]
         else:
             eligible = [row for row in eligible if any(
-                bld9_k50.admits(target, row) for target in permitted_targets
+                _hil_target_admits(release, target, row) for target in permitted_targets
             )]
         if len(eligible) != 1:
             if permitted_targets is not None:
@@ -1272,7 +1287,7 @@ def assignment_for_connector(session: Session, *, connector: Connector, public_b
         except ValueError:
             return refused("HIL_TARGETS_INVALID")
         if permitted_targets:
-            if not any(bld9_k50.admits(target, connector) for target in permitted_targets):
+            if not any(_hil_target_admits(release, target, connector) for target in permitted_targets):
                 return refused("HIL_TARGET_NOT_ADMITTED")
         else:
             target = str((release.manifest or {}).get("_hil_target_mac") or "").lower()
@@ -2225,7 +2240,7 @@ def resolve_download(session: Session, token: str) -> tuple[FirmwareRelease, Pat
         connector = session.get(Connector, grant.connector_id)
         permitted_targets = _permitted_hil_targets(session, release)
         if permitted_targets:
-            if connector is None or not any(bld9_k50.admits(item, connector) for item in permitted_targets):
+            if connector is None or not any(_hil_target_admits(release, item, connector) for item in permitted_targets):
                 raise ValueError("HIL firmware grant exact target mismatch.")
         else:
             if not settings.firmware_hil_enabled or not target or target != configured:
