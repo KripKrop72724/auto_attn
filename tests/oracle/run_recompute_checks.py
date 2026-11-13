@@ -4,7 +4,9 @@ Never accepts a DSN, production connection, credential or source-data export.
 The container must carry our test label and sit alone on a labelled internal-only network.
 Schemas RECOMP_OLD (exact production procedure, no extra index), RECOMP_NEW (the real
 migration file applied), RECOMP_GUARD, RECOMP_ODD, RECOMP_BLOCKED (a test DDL trigger refuses
-the replacement) and RECOMP_LAB are recreated and filled only with deterministic synthetic rows.
+the replacement), RECOMP_BUSY (a second session holds a long call in a caller), RECOMP_RESTORE
+(a test DDL trigger breaks a caller just before the replacement) and RECOMP_LAB are recreated
+and filled only with deterministic synthetic rows.
 """
 from pathlib import Path
 import argparse
@@ -20,6 +22,9 @@ ORACLE = ROOT / "deploy/add/oracle"
 TESTS = ROOT / "tests/oracle"
 MIGRATION = ORACLE / "20261113_recompute_daily_flags_by_day.sql"
 ROLLBACK = ORACLE / "20261113_recompute_daily_flags_by_day_rollback.sql"
+# The RECOMP_BUSY session stays in a caller this long; the migration's guard
+# triggers above 60 s and recompute_busy_wait.sql starts it after 62 s.
+HOLD_SECONDS = 100
 INSTALLER = ORACLE / "slic_zkt_truth_api.sql"
 PRODUCTION = TESTS / "recompute_production_procedure.sql"
 # DBMS_OUTPUT is enabled per container, so switch to the PDB before enabling it.
@@ -30,6 +35,8 @@ HEADER = (
 )
 FINAL_MARKERS = (
     "ORACLE_RECOMPUTE_BLOCKED_DDL_PASSED",
+    "ORACLE_RECOMPUTE_BUSY_GUARD_PASSED",
+    "ORACLE_RECOMPUTE_RESTORE_PASSED",
     "ORACLE_RECOMPUTE_MIGRATION_PASSED",
     "ORACLE_RECOMPUTE_EQUIVALENCE_PASSED",
     "ORACLE_RECOMPUTE_TIMING_PASSED",
@@ -106,6 +113,12 @@ def check_sources():
         for dml in ("insert into hr_raw", "update hr_raw", "delete from hr_raw", "merge into hr_raw"):
             if dml in outside:
                 raise SystemExit(f"Migration scripts must not run attendance DML ({dml})")
+        # The owner pastes these into APEX SQL Commands, which prompts for
+        # :name bind variables (and substitutes &name), even inside literals.
+        apex_syntax = re.findall(r":[A-Za-z_]\w*|&\w+", script)
+        if apex_syntax:
+            raise SystemExit(f"Migration scripts must not contain APEX bind or substitution "
+                             f"syntax: {apex_syntax}")
     return production
 
 
@@ -133,6 +146,29 @@ def sqlplus(container, script, title):
     print(f"===== {title}: exit {code} after {time.monotonic() - started:.0f} s =====",
           flush=True)
     return code, "".join(lines)
+
+
+def start_background(container, script):
+    """Start one sqlplus session that runs alongside the next ones; finish() collects it."""
+    process = subprocess.Popen(
+        ["docker", "exec", "-i", container, "sqlplus", "-s", "/ as sysdba"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    process.stdin.write(script)
+    process.stdin.close()
+    # communicate() must not flush the closed pipe (ValueError before Python 3.10).
+    process.stdin = None
+    return process
+
+
+def finish(process, title, timeout):
+    try:
+        output, _ = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        output, _ = process.communicate()
+    print(f"===== {title} =====\n{output}===== {title}: exit {process.returncode} =====",
+          flush=True)
+    return process.returncode, output
 
 
 def in_schema(schema, script):
@@ -167,6 +203,10 @@ def build_scripts(args):
     setup += schema("recomp_odd", unexpected)
     setup += schema("recomp_blocked", production_file)
     setup += (TESTS / "recompute_blocked_setup.sql").read_text()
+    setup += schema("recomp_busy", production_file)
+    setup += (TESTS / "recompute_busy_setup.sql").read_text()
+    setup += schema("recomp_restore", production_file)
+    setup += (TESTS / "recompute_restore_setup.sql").read_text()
     setup += (TESTS / "recompute_lab.sql").read_text()
     # SQL*Plus drops DBMS_OUTPUT of a failing block, so list errors first, then fail.
     setup += """
@@ -203,9 +243,16 @@ end;
     rollback = ROLLBACK.read_text()
     refusal = HEADER + in_schema("recomp_odd", migration) + "exit success commit\n"
     blocked = HEADER + in_schema("recomp_blocked", migration) + "exit success commit\n"
+    holder = HEADER + block(
+        f"recomp_busy.slic_zkt_identity_repair_api.hold_for_test({HOLD_SECONDS});\n"
+        "    dbms_output.put_line('recompute_busy_holder=released');") + "exit success commit\n"
+    busy = (HEADER + (TESTS / "recompute_busy_wait.sql").read_text()
+            + in_schema("recomp_busy", migration) + "exit success commit\n")
+    restore = HEADER + in_schema("recomp_restore", migration) + "exit success commit\n"
 
     main_sql = HEADER
     main_sql += (TESTS / "recompute_verify_blocked.sql").read_text()
+    main_sql += (TESTS / "recompute_verify_guards.sql").read_text()
     main_sql += in_schema("recomp_new", migration)
     main_sql += in_schema("recomp_new", migration)
     main_sql += in_schema("recomp_guard", migration)
@@ -257,7 +304,7 @@ end;
 /
 exit success commit
 """
-    return setup, refusal, blocked, main_sql
+    return setup, refusal, blocked, holder, busy, restore, main_sql
 
 
 def main():
@@ -276,11 +323,12 @@ def main():
     check_sources()
     print("Source checks passed: migration and rollback embed the exact production procedure; "
           "the installer embeds exactly the migrated procedure.", flush=True)
-    setup, refusal, blocked, main_sql = build_scripts(args)
+    setup, refusal, blocked, holder, busy, restore, main_sql = build_scripts(args)
     if args.write_sql:
         folder = Path(args.write_sql)
         folder.mkdir(parents=True, exist_ok=True)
         for name, script in (("setup", setup), ("refusal", refusal), ("blocked", blocked),
+                             ("holder", holder), ("busy", busy), ("restore", restore),
                              ("main", main_sql)):
             (folder / f"recompute_{name}.sql").write_text(script)
         return
@@ -301,6 +349,25 @@ def main():
             or "ORA-20975" in stopped):
         raise SystemExit("Migration did not stop with ORA-20978 (cause ORA-20990, no ORA-20975)"
                          " when the procedure could not be replaced")
+    holding = start_background(args.container, holder)
+    code, refused_busy = sqlplus(args.container, busy,
+                                 "migration must refuse while a long call runs in a caller")
+    held_code, held = finish(holding, "long call held in RECOMP_BUSY", HOLD_SECONDS + 120)
+    if held_code or "recompute_busy_holder=released" not in held:
+        raise SystemExit("The session holding a long call in RECOMP_BUSY did not finish cleanly")
+    if (code == 0 or "recompute_busy_holder=seen" not in refused_busy
+            or "ORA-20970" not in refused_busy
+            or "recompute_index=" in refused_busy):
+        raise SystemExit("Migration did not refuse with ORA-20970 before step 2 while a long"
+                         " call was running")
+    code, restored = sqlplus(args.container, restore,
+                             "migration must restore the previous procedure when validation"
+                             " fails after the replacement")
+    if (code == 0 or "ORA-20979" not in restored or "ORA-20975" in restored
+            or "Compile errors: slic_zkt_identity_repair_api package line" not in restored
+            or "recompute_daily_flags=previous version restored after" not in restored):
+        raise SystemExit("Migration did not restore with ORA-20979 (with the compile errors,"
+                         " no ORA-20975) when validation failed after the replacement")
     code, output = sqlplus(args.container, main_sql,
                            "migration, equivalence, timing, rollback and re-apply")
 
@@ -314,6 +381,7 @@ def main():
         "recompute_daily_flags=restored the 13 Nov 2026 production version": 2,
         "recompute_index=hr_raw_attn_cnic_date_i dropped": 1,
         "recompute_index=hr_raw_attn_cnic_date_i not present; nothing dropped": 1,
+        "recompute_long_calls=none over 60 s": 4,
     }
     problems = [f"{text!r}: expected {count}, saw {output.count(text)}"
                 for text, count in expected_counts.items() if output.count(text) != count]

@@ -38,8 +38,14 @@ whenever sqlerror exit failure rollback
 
   Guards: nothing changes unless the installed procedure is the 13 Nov 2026
   production version (or already this version) and the table and dependent
-  packages look as expected. If the new procedure or a dependent does not
-  compile, the exact previous procedure is restored automatically. If Oracle
+  packages look as expected. It also stops before any change (ORA-20970)
+  while V$SESSION shows a call that has run for more than 60 s in the
+  procedure, SLIC_ZKT_TRUTH_API or SLIC_ZKT_IDENTITY_REPAIR_API (a reconcile
+  or an ADD identity-repair batch), because the replacement would wait for
+  it. If this schema cannot read V$SESSION, the line recompute_long_calls
+  says so and the script goes on. If the new procedure or a dependent does
+  not compile, the exact previous procedure is restored automatically and
+  ORA-20979 says so, with the cause and the first compile errors. If Oracle
   could not replace the procedure at all (for example ORA-04021 after waiting
   for running calls), the previous version is still installed: ORA-20978
   says so and no second replacement is attempted. Running the script again
@@ -47,21 +53,27 @@ whenever sqlerror exit failure rollback
 
   How to apply (off-hours, when few punches arrive), as the schema that owns
   HR_RAW_ATTN_CAPTURE_EVENTS (the APEX parsing schema, SLIC_HRM):
-  - APEX > SQL Workshop > SQL Scripts: paste or upload this whole file, Run.
-    Or SQL Commands: paste only the block from DECLARE to the final END;
-    and Run. Lines starting with recompute_ report each step.
+  - APEX > SQL Workshop > SQL Commands: paste only the block from DECLARE to
+    the final END; and Run. The SET and WHENEVER lines above it are for
+    SQL*Plus, and SQL Commands rejects them; SQL Scripts was not tried.
+    DBMS Output lines starting with recompute_ report each step.
   - Expect new punches to wait while it runs. The ONLINE index build briefly
     waits for in-flight punch transactions. Replacing the procedure waits
     until every running call of it has finished, and new punches queue
     behind it meanwhile: about 30 s for a punch today, but as long as the
-    longest call in flight, and a reconcile request naming many
-    employee-days runs far longer (one full-table lock query per
-    employee-day, measured at 1.7 s each, plus about 27 s). So run it when
-    no reconcile is in progress. If Oracle gives up waiting (ORA-04021 after
-    about 15 minutes, or ORA-04020), nothing was replaced; run it again later.
+    longest call in flight. A reconcile request naming many employee-days
+    runs far longer (one full-table lock query per employee-day, measured at
+    1.7 s each, plus about 27 s), and so does an ADD identity-repair request
+    (up to 100 punches, about 30 s each, in one call). So pause any ADD
+    identity-repair run first and run this when no reconcile is in progress;
+    the 60 s guard only sees calls that are already running. If Oracle gives
+    up waiting (ORA-04021 after about 15 minutes, or ORA-04020), nothing was
+    replaced; run it again later.
     Replacing the procedure may mark the two dependent package bodies
-    INVALID; this script recompiles them within seconds (Oracle would also do
-    it on their next call).
+    INVALID; this script recompiles them. If a running call keeps one in use
+    until Oracle gives up (ORA-04021 or ORA-04020), it is reported as INVALID
+    "in use by a running call" and left for Oracle to compile on its next
+    call; the new procedure stays.
   - Undo: 20261113_recompute_daily_flags_by_day_rollback.sql restores the
     exact production procedure and drops HR_RAW_ATTN_CNIC_DATE_I.
 */
@@ -309,6 +321,10 @@ begin
     end loop;
 end slic_zkt_recompute_daily_flags;~';
 
+    -- A call running longer than this in the procedure or its callers is a
+    -- reconcile or an identity-repair batch, not a single punch (about 30 s).
+    c_long_call_seconds constant pls_integer := 60;
+
     l_installed clob;
     l_previous_ddl clob;
     l_state varchar2(30);
@@ -318,14 +334,24 @@ end slic_zkt_recompute_daily_flags;~';
     l_changed boolean := false;
     l_replaced boolean;
     l_error varchar2(4000);
+    l_compile_errors varchar2(1000);
+    -- '|NAME TYPE|' of each dependent that running calls kept in use until
+    -- Oracle gave up compiling it (ORA-04021 or ORA-04020); never retried.
+    l_busy varchar2(4000);
+    l_long_calls number;
+    l_longest_call number;
+    l_long_sid number;
+    l_long_module varchar2(200);
 
     function normalized(p_source in clob) return clob is
         l_text clob := p_source;
     begin
         -- Compare logic, not layout: drop comments, whitespace and case.
+        -- \s is the whitespace class; it avoids colon-letter text, which
+        -- APEX SQL Commands may take for a bind variable.
         l_text := regexp_replace(l_text, '--[^' || chr(10) || ']*', '');
         l_text := regexp_replace(l_text, '/\*.*?\*/', '', 1, 0, 'n');
-        l_text := lower(regexp_replace(l_text, '[[:space:]]+', ''));
+        l_text := lower(regexp_replace(l_text, '\s+', ''));
         return regexp_replace(
             l_text,
             '^createorreplace(editionable|noneditionable)?',
@@ -382,6 +408,7 @@ end slic_zkt_recompute_daily_flags;~';
         l_name varchar2(300) :=
             dbms_assert.enquote_name(l_owner, false) || '.'
             || dbms_assert.enquote_name(p_name, false);
+        l_stack varchar2(4000);
     begin
         if p_type = 'PACKAGE BODY' then
             execute immediate 'alter package ' || l_name || ' compile body reuse settings';
@@ -394,18 +421,78 @@ end slic_zkt_recompute_daily_flags;~';
         end if;
     exception
         when others then
+            l_stack := dbms_utility.format_error_stack;
             -- ORA-24344 = compiled with errors; the status check reports it.
-            if sqlcode <> -24344 then
+            if sqlcode = -24344 then
+                null;
+            elsif p_name <> c_procedure
+                  and (instr(l_stack, 'ORA-04021') > 0 or instr(l_stack, 'ORA-04020') > 0) then
+                -- Running calls kept this caller in use until Oracle gave up
+                -- waiting; validate_and_report decides what that means.
+                l_busy := substr(l_busy || '|' || p_name || ' ' || p_type || '|', 1, 4000);
+            else
                 raise;
             end if;
     end compile_object;
+
+    function is_busy(p_name in varchar2, p_type in varchar2) return boolean is
+    begin
+        return nvl(instr(l_busy, '|' || p_name || ' ' || p_type || '|'), 0) > 0;
+    end is_busy;
 
     -- Recompile anything Oracle left INVALID after the procedure changed, then
     -- require the procedure, SLIC_ZKT_TRUTH_API and (when present)
     -- SLIC_ZKT_IDENTITY_REPAIR_API plus every other dependent to be VALID.
     procedure validate_and_report(p_stage in varchar2) is
         l_status varchar2(30);
-        l_problems pls_integer := 0;
+        l_problems varchar2(1000);
+
+        -- After the procedure changed, a dependent that running calls kept in
+        -- use is INVALID without errors and Oracle compiles it on its next
+        -- call: report it, but it is no reason to undo the change. Before
+        -- anything changed it still stops the script.
+        function left_for_oracle(p_name in varchar2, p_type in varchar2) return boolean is
+            l_errors number;
+        begin
+            if p_stage = 'before' or l_status <> 'INVALID' or not is_busy(p_name, p_type) then
+                return false;
+            end if;
+            select count(*)
+              into l_errors
+              from all_errors
+             where owner = l_owner
+               and name = p_name
+               and type = p_type
+               and attribute = 'ERROR';
+            return l_errors = 0;
+        end left_for_oracle;
+
+        procedure report(
+            p_label in varchar2,
+            p_name in varchar2,
+            p_type in varchar2,
+            p_problem in boolean
+        ) is
+            l_line varchar2(400) :=
+                'recompute_' || p_stage || ': ' || p_label || lower(p_name)
+                || ' ' || lower(p_type) || '=';
+        begin
+            if left_for_oracle(p_name, p_type) then
+                dbms_output.put_line(
+                    l_line || 'INVALID (in use by a running call; Oracle compiles it on its next call)'
+                );
+            else
+                dbms_output.put_line(l_line || l_status);
+                if p_problem then
+                    l_problems := substr(
+                        l_problems || ' ' || lower(p_name) || ' ' || lower(p_type)
+                        || '=' || l_status || ';',
+                        1,
+                        1000
+                    );
+                end if;
+            end if;
+        end report;
     begin
         if object_status(c_procedure, 'PROCEDURE') <> 'VALID' then
             compile_object(c_procedure, 'PROCEDURE');
@@ -419,7 +506,8 @@ end slic_zkt_recompute_daily_flags;~';
                and d.referenced_type = 'PROCEDURE'
              order by 1, 2
         ) loop
-            if object_status(dependent.object_name, dependent.object_type) <> 'VALID' then
+            if object_status(dependent.object_name, dependent.object_type) <> 'VALID'
+               and not is_busy(dependent.object_name, dependent.object_type) then
                 compile_object(dependent.object_name, dependent.object_type);
             end if;
         end loop;
@@ -436,18 +524,17 @@ end slic_zkt_recompute_daily_flags;~';
             select 'SLIC_ZKT_IDENTITY_REPAIR_API', 'PACKAGE BODY', 0 from dual
         ) loop
             l_status := object_status(required.object_name, required.object_type);
-            if l_status = 'INVALID' then
+            if l_status = 'INVALID'
+               and not is_busy(required.object_name, required.object_type) then
                 compile_object(required.object_name, required.object_type);
                 l_status := object_status(required.object_name, required.object_type);
             end if;
-            dbms_output.put_line(
-                'recompute_' || p_stage || ': ' || lower(required.object_name)
-                || ' ' || lower(required.object_type) || '=' || l_status
+            report(
+                '',
+                required.object_name,
+                required.object_type,
+                l_status <> 'VALID' and (required.mandatory = 1 or l_status <> 'ABSENT')
             );
-            if l_status <> 'VALID'
-               and (required.mandatory = 1 or l_status <> 'ABSENT') then
-                l_problems := l_problems + 1;
-            end if;
         end loop;
 
         for dependent in (
@@ -461,23 +548,56 @@ end slic_zkt_recompute_daily_flags;~';
              order by 1, 2
         ) loop
             l_status := object_status(dependent.object_name, dependent.object_type);
-            dbms_output.put_line(
-                'recompute_' || p_stage || ': dependent ' || lower(dependent.object_name)
-                || ' ' || lower(dependent.object_type) || '=' || l_status
-            );
-            if l_status <> 'VALID' then
-                l_problems := l_problems + 1;
-            end if;
+            report('dependent ', dependent.object_name, dependent.object_type, l_status <> 'VALID');
         end loop;
 
-        if l_problems > 0 then
+        if l_problems is not null then
             raise_application_error(
                 -20971,
-                'recompute ' || p_stage || ': ' || l_problems
-                || ' required object(s) are not VALID; see ALL_ERRORS.'
+                'recompute ' || p_stage || ': not VALID (see ALL_ERRORS):' || l_problems
             );
         end if;
     end validate_and_report;
+
+    -- The first compile errors of the procedure and the objects checked with
+    -- it, read before a restore recompiles them and so clears them.
+    function compile_errors return varchar2 is
+        l_text varchar2(1000);
+    begin
+        for err in (
+            select e.name, e.type, e.line, e.text
+              from all_errors e
+             where e.owner = l_owner
+               and e.attribute = 'ERROR'
+               and (
+                       e.name in (c_procedure, 'SLIC_ZKT_TRUTH_API', 'SLIC_ZKT_IDENTITY_REPAIR_API')
+                       or e.name in (
+                              select d.name
+                                from all_dependencies d
+                               where d.owner = l_owner
+                                 and d.referenced_owner = l_owner
+                                 and d.referenced_name = c_procedure
+                                 and d.referenced_type = 'PROCEDURE'
+                          )
+                   )
+             order by e.name, e.type, e.sequence
+        ) loop
+            exit when nvl(length(l_text), 0) > 600;
+            l_text := substr(
+                l_text || ' ' || lower(err.name) || ' ' || lower(err.type) || ' line '
+                || err.line || ': ' || replace(replace(err.text, chr(10), ' '), chr(13), ' '),
+                1,
+                1000
+            );
+        end loop;
+        if l_text is null then
+            return null;
+        end if;
+        return ' Compile errors:' || l_text;
+    exception
+        when others then
+            return ' Compile errors not read: ' || sqlerrm;
+    end compile_errors;
 begin
     dbms_output.put_line('recompute_schema=' || l_owner);
 
@@ -592,6 +712,50 @@ begin
         );
     end loop;
 
+    -- A long call in the procedure or its callers (a reconcile or an ADD
+    -- identity-repair batch) would hold up the replacement while every new
+    -- punch queues behind it, so stop before anything changes. V$SESSION may
+    -- not be readable from this schema; then say so and go on. No bind
+    -- variables: APEX SQL Commands would prompt for them.
+    begin
+        execute immediate
+            'select count(*), max(s.last_call_et),'
+            || ' max(s.sid) keep (dense_rank last order by s.last_call_et),'
+            || ' max(s.module) keep (dense_rank last order by s.last_call_et)'
+            || ' from v$session s'
+            || ' where s.status = ''ACTIVE'''
+            || ' and s.sid <> to_number(sys_context(''userenv'', ''sid''))'
+            || ' and s.last_call_et > ' || to_char(c_long_call_seconds)
+            || ' and exists (select null from all_objects o'
+            || ' where o.owner = ' || dbms_assert.enquote_literal(l_owner)
+            || ' and o.object_name in (''SLIC_ZKT_RECOMPUTE_DAILY_FLAGS'','
+            || ' ''SLIC_ZKT_TRUTH_API'', ''SLIC_ZKT_IDENTITY_REPAIR_API'')'
+            || ' and o.object_id in (s.plsql_entry_object_id, s.plsql_object_id))'
+            into l_long_calls, l_longest_call, l_long_sid, l_long_module;
+    exception
+        when others then
+            l_long_calls := null;
+            dbms_output.put_line(
+                'recompute_long_calls=not checked, V$SESSION is not readable here ('
+                || sqlerrm || '); check for long calls by hand'
+            );
+    end;
+    if l_long_calls > 0 then
+        raise_application_error(
+            -20970,
+            l_long_calls || ' call(s) in ' || c_procedure || ' or the packages that call it'
+            || ' have been running for more than ' || c_long_call_seconds || ' s (longest '
+            || l_longest_call || ' s, SID ' || l_long_sid || ', module ' || l_long_module
+            || '): a reconcile or an identity-repair batch. Replacing the procedure now would'
+            || ' make every new punch wait for it; nothing was changed. Run this script again'
+            || ' when it has finished.'
+        );
+    elsif l_long_calls = 0 then
+        dbms_output.put_line(
+            'recompute_long_calls=none over ' || c_long_call_seconds || ' s'
+        );
+    end if;
+
     -- Dependents must already compile before anything changes.
     validate_and_report('before');
 
@@ -646,10 +810,13 @@ exception
                     -20978,
                     c_procedure || ' was not replaced; the previous version is still'
                     || ' installed and nothing needed restoring. Run this script again'
-                    || ' later, when no reconcile is in progress. Cause: ' || l_error,
+                    || ' later, when no reconcile or identity-repair batch is running.'
+                    || ' Cause: ' || l_error,
                     true
                 );
             end if;
+            -- Restoring recompiles the objects, which clears their errors.
+            l_compile_errors := compile_errors;
             begin
                 execute immediate l_previous_ddl;
                 validate_and_report('restored');
@@ -657,12 +824,30 @@ exception
                 when others then
                     raise_application_error(
                         -20975,
-                        'Per-employee-day recompute failed and automatic restoration'
-                        || ' also failed: ' || l_error
+                        substr(
+                            'Per-employee-day recompute failed and automatic restoration'
+                            || ' also failed: ' || sqlerrm || ' First failure: ' || l_error
+                            || l_compile_errors,
+                            1,
+                            2000
+                        )
                     );
             end;
             dbms_output.put_line(
                 'recompute_daily_flags=previous version restored after: ' || l_error
+            );
+            -- Say it in the error itself: a client may not show the DBMS
+            -- Output of a block that ends in an error.
+            raise_application_error(
+                -20979,
+                substr(
+                    'The per-employee-day ' || c_procedure || ' failed, so the previous'
+                    || ' version was restored and is installed again (the index stays).'
+                    || ' Cause: ' || l_error || l_compile_errors,
+                    1,
+                    2000
+                ),
+                true
             );
         end if;
         raise;

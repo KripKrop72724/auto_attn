@@ -15,8 +15,9 @@ whenever sqlerror exit failure rollback
      SLIC_ZKT_IDENTITY_REPAIR_API bodies) and reports it.
 
   No attendance row is inserted, updated, deleted or merged. Apply it like the
-  migration: off-hours, APEX SQL Scripts (whole file) or SQL Commands (the
-  block from DECLARE to the final END;).
+  migration: off-hours, as SLIC_HRM, in APEX SQL Workshop > SQL Commands,
+  pasting only the block from DECLARE to the final END; (SQL Commands rejects
+  the SET and WHENEVER lines above it; SQL Scripts was not tried).
 */
 declare
     c_table constant varchar2(128) := 'HR_RAW_ATTN_CAPTURE_EVENTS';
@@ -150,9 +151,11 @@ end slic_zkt_recompute_daily_flags;~';
         l_text clob := p_source;
     begin
         -- Compare logic, not layout: drop comments, whitespace and case.
+        -- \s is the whitespace class; it avoids colon-letter text, which
+        -- APEX SQL Commands may take for a bind variable.
         l_text := regexp_replace(l_text, '--[^' || chr(10) || ']*', '');
         l_text := regexp_replace(l_text, '/\*.*?\*/', '', 1, 0, 'n');
-        l_text := lower(regexp_replace(l_text, '[[:space:]]+', ''));
+        l_text := lower(regexp_replace(l_text, '\s+', ''));
         return regexp_replace(
             l_text,
             '^createorreplace(editionable|noneditionable)?',
