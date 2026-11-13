@@ -54,8 +54,9 @@ begin
     require(index_count('RECOMP_OLD') = 2, 'OLD must keep only PK and UK');
 
     require(index_count('RECOMP_GUARD') = 3, 'GUARD must keep PK, UK and its own index only');
+    -- A TIMESTAMP WITH TIME ZONE key is stored as a hidden SYS_NC expression column.
     require(
-        index_columns('RECOMP_GUARD', 'HR_RAW_ATTN_DAY_IDX') = 'CNIC,ATTENDANCE_DATE,EVENT_TIMESTAMP',
+        index_columns('RECOMP_GUARD', 'HR_RAW_ATTN_DAY_IDX') like 'CNIC,ATTENDANCE_DATE,%',
         'GUARD lost its existing index'
     );
     require(
