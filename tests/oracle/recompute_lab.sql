@@ -437,12 +437,17 @@ create or replace package body recompute_lab as
         l_prev_cnic number;
         l_prev_local timestamp;
         l_event varchar2(4000);
+        l_pick pls_integer;
     begin
         if l_r < 0.05 then
             bump('special_bodies');
             pick_day(l_cnic, l_local);
             l_event := event_json(cnic_json(l_cnic), timestamp_json(l_local));
-            return case trunc(dbms_random.value(1, 11))
+            l_pick := trunc(dbms_random.value(1, 11));
+            if l_pick in (4, 5) then
+                bump('malformed_json_bodies');
+            end if;
+            return case l_pick
                 when 1 then null
                 when 2 then '{}'
                 when 3 then '{"events":[]}'
@@ -484,13 +489,29 @@ create or replace package body recompute_lab as
         return '{"events":[' || l_body || ']}';
     end next_body;
 
+    procedure insert_copy_to_new(p_next in number, p_inserted in number) is
+    begin
+        insert into recomp_new.hr_raw_attn_capture_events
+        select *
+          from recomp_old.hr_raw_attn_capture_events
+         where raw_capture_id > p_next
+           and raw_capture_id <= p_next + p_inserted;
+        if sql%rowcount <> p_inserted then
+            raise_application_error(-20091, 'post_live copy mismatch');
+        end if;
+        add_stat('next_id', p_inserted);
+    end insert_copy_to_new;
+
     -- What post_live does before it calls the procedure: insert the request's
     -- valid events with F/F flags (identical rows into both schemas).
     procedure insert_like_post_live(p_call in pls_integer, p_body in clob) is
         l_next number := stat('next_id');
         l_inserted number := 0;
         l_ts timestamp with time zone;
+        e_malformed_json exception;
+        pragma exception_init(e_malformed_json, -40441);
     begin
+        savepoint before_post_live;
         for ev in (
             select trim(j.cnic) cnic, j.event_timestamp, j.raw_punch
               from json_table(
@@ -520,18 +541,17 @@ create or replace package body recompute_lab as
                 );
             end if;
         end loop;
-        insert into recomp_new.hr_raw_attn_capture_events
-        select *
-          from recomp_old.hr_raw_attn_capture_events
-         where raw_capture_id > l_next
-           and raw_capture_id <= l_next + l_inserted;
-        if sql%rowcount <> l_inserted then
-            raise_application_error(-20091, 'post_live copy mismatch');
-        end if;
-        add_stat('next_id', l_inserted);
+        insert_copy_to_new(l_next, l_inserted);
         bump('post_live_calls');
         bump('post_live_rows', l_inserted);
+    exception
+        when e_malformed_json then
+            -- post_live answers 400 "Malformed JSON payload" and never calls
+            -- the procedure; the body still goes to both procedures below.
+            rollback to savepoint before_post_live;
+            bump('post_live_rejected_malformed');
     end insert_like_post_live;
+
 
     -- Stale flags written identically into both schemas between calls.
     procedure dirty_rows(p_rows in pls_integer) is
@@ -724,6 +744,7 @@ create or replace package body recompute_lab as
             select column_value name
               from table(sys.odcivarchar2list(
                        'calls', 'events', 'multi_event_bodies', 'special_bodies',
+                       'malformed_json_bodies',
                        'post_live_calls', 'post_live_rows', 'dirtied_rows',
                        'row_writes', 'calls_writing_rows', 'duplicate_day_events',
                        'day_existing', 'day_31_plus', 'day_random', 'day_far',
