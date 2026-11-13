@@ -39,6 +39,9 @@ begin
             execute immediate 'alter table recomp_restore.recompute_restore_probe'
                 || ' rename column probe_value_gone to probe_value';
         end if;
+        -- DDL in a system trigger does not commit by itself; without this the
+        -- autonomous transaction is rolled back with ORA-06519 (run 43513234008).
+        commit;
     end if;
 end;
 /
