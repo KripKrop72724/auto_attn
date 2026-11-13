@@ -778,6 +778,94 @@ def test_a_check_left_unapproved_past_its_preview_releases_its_punches(backend, 
     assert fake.calls[-1] == [fresh]
 
 
+def test_a_check_expiring_between_counts_frees_its_punches_in_the_status_at_once(backend, monkeypatch):
+    """The saved held count is dropped once a check it covered expires, and counted again then."""
+    sessions = backend
+    monkeypatch.setattr(settings, "unknown_identity_auto_release_batch_size", 5)
+    ids = unknown_punches(sessions, 20)
+    now = utc_now()
+    other_run(sessions, ids, action=force_release.ACTION, status="CHECKED",
+              preview_expires_at=now + timedelta(seconds=30))
+    with sessions() as db:
+        assert auto.refresh_counts(db, now=now, force=True) is True
+        db.commit()
+        backlog = auto.status(db, now=now)["backlog"]
+        assert auto._held_until(db.get(State, 1).stats) == now + timedelta(seconds=30)
+        assert auto.claim_count(db, now=now + timedelta(seconds=29)) is False
+        db.rollback()
+    assert backlog["held_by_other_approval"] == 20 and backlog["remaining_estimate"] == 0
+
+    later = now + timedelta(seconds=40)  # the check expired; the next count is 20 s off
+    with sessions() as db:
+        backlog = auto.status(db, now=later)["backlog"]
+    assert backlog["held_by_other_approval"] == 0 and backlog["remaining_estimate"] == 20
+    fake = FakeRelease(monkeypatch)
+    assert step(sessions, later) == "BATCH"
+    assert fake.calls == [sorted(ids, reverse=True)[:5]]
+    with sessions() as db:
+        body = auto.status(db, now=later)
+    # The five picked are this releaser's queue, never also subtracted as held elsewhere.
+    assert body["progress"]["ready"] == 5
+    assert body["backlog"]["held_by_other_approval"] == 0 and body["backlog"]["remaining_estimate"] == 20
+
+    # The count is due at once, but only once: a failed recount waits its interval.
+    with sessions() as db:
+        assert auto.claim_count(db, now=later) is True
+        db.commit()
+    with sessions() as db:
+        assert auto.claim_count(db, now=later + timedelta(seconds=5)) is False
+        db.rollback()
+        assert auto.refresh_counts(db, now=later, force=True) is True
+        db.commit()
+        body = auto.status(db, now=later)
+        assert db.get(State, 1).stats["held_until"] is None
+    assert body["backlog"]["held_by_other_approval"] == 0 and body["backlog"]["remaining_estimate"] == 20
+
+
+def test_a_held_count_that_times_out_keeps_the_backlog_count(backend, monkeypatch):
+    """Only the figure for punches other approvals hold is lost, without a COUNT_BUSY back-off."""
+    from sqlalchemy import event
+    from sqlalchemy.exc import OperationalError
+
+    class Canceled(Exception):
+        sqlstate = "57014"
+
+    sessions = backend
+    ids = unknown_punches(sessions, 3)
+    with sessions() as db:
+        auto._ensure(db).enabled = False  # counts run while OFF too; no batch in the way
+        db.commit()
+        engine = db.get_bind()
+    other_run(sessions, ids[:2], action=force_release.ACTION, status="PAUSED")
+    timed_out = []
+
+    def held_count_times_out(_conn, _cursor, statement, _parameters, _context, _executemany):
+        # The held count is the only count that looks at check previews.
+        if "count(" in statement and "preview_expires_at" in statement:
+            timed_out.append(statement)
+            raise OperationalError(statement, {}, Canceled("canceling statement due to statement timeout"))
+
+    event.listen(engine, "before_cursor_execute", held_count_times_out)
+    try:
+        assert auto.tick() == "OFF"
+    finally:
+        event.remove(engine, "before_cursor_execute", held_count_times_out)
+    assert len(timed_out) == 1
+    row = state(sessions)
+    assert row.backlog_count == 3 and row.backlog_counted_at is not None
+    assert row.count_failures == 0 and row.last_error_code is None
+    assert row.stats["held_by_other_approval"] is None and row.stats["held_until"] is None
+    with sessions() as db:
+        backlog = auto.status(db)["backlog"]
+    assert backlog["held_by_other_approval"] == 0 and backlog["remaining_estimate"] == 3
+
+    with sessions() as db:
+        assert auto.refresh_counts(db, force=True) is True
+        db.commit()
+        backlog = auto.status(db)["backlog"]
+    assert backlog["held_by_other_approval"] == 2 and backlog["remaining_estimate"] == 1
+
+
 def test_a_busy_database_is_recorded_not_raised(backend, monkeypatch):
     from sqlalchemy.exc import OperationalError
 
