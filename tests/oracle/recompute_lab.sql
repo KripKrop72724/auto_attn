@@ -376,7 +376,7 @@ create or replace package body recompute_lab as
             return '"' || to_char(l_utc - interval '4' hour, c_iso) || '-04:00"';
         elsif l_r < 0.80 then
             bump('ts_other_offset');
-            return '"' || to_char(l_utc + interval '570' minute(3), c_iso) || '+09:30"';
+            return '"' || to_char(l_utc + numtodsinterval(570, 'MINUTE'), c_iso) || '+09:30"';
         elsif l_r < 0.82 then
             bump('ts_other_offset');
             return '"' || to_char(l_utc, c_iso) || '+00:00"';
@@ -488,34 +488,38 @@ create or replace package body recompute_lab as
     -- valid events with F/F flags (identical rows into both schemas).
     procedure insert_like_post_live(p_call in pls_integer, p_body in clob) is
         l_next number := stat('next_id');
-        l_inserted number;
+        l_inserted number := 0;
+        l_ts timestamp with time zone;
     begin
-        insert into recomp_old.hr_raw_attn_capture_events (
-            raw_capture_id, event_uid, zone_id, device_id, device_serial, user_id,
-            employee_name, event_timestamp, clock_diff_seconds, capture_type,
-            trust_status, received_at, attendance_date, check_in, check_out,
-            raw_punch, datasync, source, cnic
-        )
-        select l_next + rownum,
-               'L' || to_char(p_call) || '-' || to_char(rownum),
-               'LAB-ZONE', 'LAB-DEVICE', 'LAB-SERIAL', 'LIVE', 'Synthetic Live',
-               recomp_old.slic_zkt_truth_api.parse_event_timestamp(j.event_timestamp),
-               0, 'LIVE', 'TRUSTED_LIVE', systimestamp,
-               recomp_old.slic_zkt_truth_api.attendance_date_for(
-                   recomp_old.slic_zkt_truth_api.parse_event_timestamp(j.event_timestamp)
-               ),
-               'F', 'F', nvl(j.raw_punch, 'F'), 0, 'LAB', to_number(trim(j.cnic))
-          from json_table(
-                   p_body,
-                   '$.events[*]'
-                   columns
-                       cnic varchar2(13) path '$.cnic' null on error,
-                       event_timestamp varchar2(80) path '$.timestamp' null on error,
-                       raw_punch varchar2(1) path '$.raw_punch' null on error
-               ) j
-         where regexp_like(trim(j.cnic), '^[0-9]{13}$')
-           and recomp_old.slic_zkt_truth_api.parse_event_timestamp(j.event_timestamp) is not null;
-        l_inserted := sql%rowcount;
+        for ev in (
+            select trim(j.cnic) cnic, j.event_timestamp, j.raw_punch
+              from json_table(
+                       p_body,
+                       '$.events[*]'
+                       columns
+                           cnic varchar2(13) path '$.cnic' null on error,
+                           event_timestamp varchar2(80) path '$.timestamp' null on error,
+                           raw_punch varchar2(1) path '$.raw_punch' null on error
+                   ) j
+        ) loop
+            l_ts := recomp_old.slic_zkt_truth_api.parse_event_timestamp(ev.event_timestamp);
+            if regexp_like(ev.cnic, '^[0-9]{13}$') and l_ts is not null then
+                l_inserted := l_inserted + 1;
+                insert into recomp_old.hr_raw_attn_capture_events (
+                    raw_capture_id, event_uid, zone_id, device_id, device_serial, user_id,
+                    employee_name, event_timestamp, clock_diff_seconds, capture_type,
+                    trust_status, received_at, attendance_date, check_in, check_out,
+                    raw_punch, datasync, source, cnic
+                ) values (
+                    l_next + l_inserted,
+                    'L' || to_char(p_call) || '-' || to_char(l_inserted),
+                    'LAB-ZONE', 'LAB-DEVICE', 'LAB-SERIAL', 'LIVE', 'Synthetic Live',
+                    l_ts, 0, 'LIVE', 'TRUSTED_LIVE', systimestamp,
+                    recomp_old.slic_zkt_truth_api.attendance_date_for(l_ts),
+                    'F', 'F', nvl(ev.raw_punch, 'F'), 0, 'LAB', to_number(ev.cnic)
+                );
+            end if;
+        end loop;
         insert into recomp_new.hr_raw_attn_capture_events
         select *
           from recomp_old.hr_raw_attn_capture_events
