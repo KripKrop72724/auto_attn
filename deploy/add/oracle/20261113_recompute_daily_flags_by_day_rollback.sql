@@ -22,6 +22,8 @@ declare
     c_table constant varchar2(128) := 'HR_RAW_ATTN_CAPTURE_EVENTS';
     c_index constant varchar2(128) := 'HR_RAW_ATTN_CNIC_DATE_I';
     c_procedure constant varchar2(128) := 'SLIC_ZKT_RECOMPUTE_DAILY_FLAGS';
+    -- The schema being changed: the APEX parsing schema (SLIC_HRM).
+    l_owner constant varchar2(128) := sys_context('userenv', 'current_schema');
 
     -- Exact production source read from USER_SOURCE on 13 Nov 2026.
     c_production_ddl constant varchar2(32767) := q'~create or replace procedure slic_zkt_recompute_daily_flags(
@@ -169,8 +171,9 @@ end slic_zkt_recompute_daily_flags;~';
         dbms_lob.createtemporary(l_source, true);
         for source_line in (
             select text
-              from user_source
-             where name = c_procedure
+              from all_source
+             where owner = l_owner
+               and name = c_procedure
                and type = 'PROCEDURE'
              order by line
         ) loop
@@ -192,8 +195,9 @@ end slic_zkt_recompute_daily_flags;~';
     begin
         select status
           into l_status
-          from user_objects
-         where object_name = p_name
+          from all_objects
+         where owner = l_owner
+           and object_name = p_name
            and object_type = p_type;
         return l_status;
     exception
@@ -202,7 +206,9 @@ end slic_zkt_recompute_daily_flags;~';
     end object_status;
 
     procedure compile_object(p_name in varchar2, p_type in varchar2) is
-        l_name varchar2(200) := dbms_assert.enquote_name(p_name, false);
+        l_name varchar2(300) :=
+            dbms_assert.enquote_name(l_owner, false) || '.'
+            || dbms_assert.enquote_name(p_name, false);
     begin
         if p_type = 'PACKAGE BODY' then
             execute immediate 'alter package ' || l_name || ' compile body reuse settings';
@@ -233,8 +239,9 @@ end slic_zkt_recompute_daily_flags;~';
         end if;
         for dependent in (
             select distinct d.name object_name, d.type object_type
-              from user_dependencies d
-             where d.referenced_owner = sys_context('userenv', 'current_schema')
+              from all_dependencies d
+             where d.owner = l_owner
+               and d.referenced_owner = l_owner
                and d.referenced_name = c_procedure
                and d.referenced_type = 'PROCEDURE'
              order by 1, 2
@@ -272,8 +279,9 @@ end slic_zkt_recompute_daily_flags;~';
 
         for dependent in (
             select distinct d.name object_name, d.type object_type
-              from user_dependencies d
-             where d.referenced_owner = sys_context('userenv', 'current_schema')
+              from all_dependencies d
+             where d.owner = l_owner
+               and d.referenced_owner = l_owner
                and d.referenced_name = c_procedure
                and d.referenced_type = 'PROCEDURE'
                and d.name not in ('SLIC_ZKT_TRUTH_API', 'SLIC_ZKT_IDENTITY_REPAIR_API')
@@ -293,14 +301,12 @@ end slic_zkt_recompute_daily_flags;~';
             raise_application_error(
                 -20971,
                 'recompute ' || p_stage || ': ' || l_problems
-                || ' required object(s) are not VALID; see USER_ERRORS.'
+                || ' required object(s) are not VALID; see ALL_ERRORS.'
             );
         end if;
     end validate_and_report;
 begin
-    dbms_output.put_line(
-        'recompute_schema=' || sys_context('userenv', 'current_schema')
-    );
+    dbms_output.put_line('recompute_schema=' || l_owner);
 
     if same_source(installed_source, c_production_ddl) then
         dbms_output.put_line(
@@ -316,11 +322,15 @@ begin
 
     select count(*)
       into l_count
-      from user_indexes
-     where index_name = c_index
+      from all_indexes
+     where owner = l_owner
+       and index_name = c_index
+       and table_owner = l_owner
        and table_name = c_table;
     if l_count = 1 then
-        execute immediate 'drop index hr_raw_attn_cnic_date_i online';
+        execute immediate
+            'drop index ' || dbms_assert.enquote_name(l_owner, false)
+            || '.hr_raw_attn_cnic_date_i online';
         dbms_output.put_line('recompute_index=hr_raw_attn_cnic_date_i dropped');
     else
         dbms_output.put_line('recompute_index=hr_raw_attn_cnic_date_i not present; nothing dropped');

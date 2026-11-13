@@ -42,7 +42,8 @@ whenever sqlerror exit failure rollback
   compile, the exact previous procedure is restored automatically. Running
   the script again is safe: finished steps are reported and skipped.
 
-  How to apply (off-hours, when few punches arrive):
+  How to apply (off-hours, when few punches arrive), as the schema that owns
+  HR_RAW_ATTN_CAPTURE_EVENTS (the APEX parsing schema, SLIC_HRM):
   - APEX > SQL Workshop > SQL Scripts: paste or upload this whole file, Run.
     Or SQL Commands: paste only the block from DECLARE to the final END;
     and Run. Lines starting with recompute_ report each step.
@@ -59,6 +60,8 @@ declare
     c_table constant varchar2(128) := 'HR_RAW_ATTN_CAPTURE_EVENTS';
     c_index constant varchar2(128) := 'HR_RAW_ATTN_CNIC_DATE_I';
     c_procedure constant varchar2(128) := 'SLIC_ZKT_RECOMPUTE_DAILY_FLAGS';
+    -- The schema being changed: the APEX parsing schema (SLIC_HRM).
+    l_owner constant varchar2(128) := sys_context('userenv', 'current_schema');
 
     -- The production procedure this replaces, exactly as read from
     -- USER_SOURCE on 13 Nov 2026 (identical to the rollback script).
@@ -331,8 +334,9 @@ end slic_zkt_recompute_daily_flags;~';
         dbms_lob.createtemporary(l_source, true);
         for source_line in (
             select text
-              from user_source
-             where name = c_procedure
+              from all_source
+             where owner = l_owner
+               and name = c_procedure
                and type = 'PROCEDURE'
              order by line
         ) loop
@@ -354,8 +358,9 @@ end slic_zkt_recompute_daily_flags;~';
     begin
         select status
           into l_status
-          from user_objects
-         where object_name = p_name
+          from all_objects
+         where owner = l_owner
+           and object_name = p_name
            and object_type = p_type;
         return l_status;
     exception
@@ -364,7 +369,9 @@ end slic_zkt_recompute_daily_flags;~';
     end object_status;
 
     procedure compile_object(p_name in varchar2, p_type in varchar2) is
-        l_name varchar2(200) := dbms_assert.enquote_name(p_name, false);
+        l_name varchar2(300) :=
+            dbms_assert.enquote_name(l_owner, false) || '.'
+            || dbms_assert.enquote_name(p_name, false);
     begin
         if p_type = 'PACKAGE BODY' then
             execute immediate 'alter package ' || l_name || ' compile body reuse settings';
@@ -395,8 +402,9 @@ end slic_zkt_recompute_daily_flags;~';
         end if;
         for dependent in (
             select distinct d.name object_name, d.type object_type
-              from user_dependencies d
-             where d.referenced_owner = sys_context('userenv', 'current_schema')
+              from all_dependencies d
+             where d.owner = l_owner
+               and d.referenced_owner = l_owner
                and d.referenced_name = c_procedure
                and d.referenced_type = 'PROCEDURE'
              order by 1, 2
@@ -434,8 +442,9 @@ end slic_zkt_recompute_daily_flags;~';
 
         for dependent in (
             select distinct d.name object_name, d.type object_type
-              from user_dependencies d
-             where d.referenced_owner = sys_context('userenv', 'current_schema')
+              from all_dependencies d
+             where d.owner = l_owner
+               and d.referenced_owner = l_owner
                and d.referenced_name = c_procedure
                and d.referenced_type = 'PROCEDURE'
                and d.name not in ('SLIC_ZKT_TRUTH_API', 'SLIC_ZKT_IDENTITY_REPAIR_API')
@@ -455,20 +464,19 @@ end slic_zkt_recompute_daily_flags;~';
             raise_application_error(
                 -20971,
                 'recompute ' || p_stage || ': ' || l_problems
-                || ' required object(s) are not VALID; see USER_ERRORS.'
+                || ' required object(s) are not VALID; see ALL_ERRORS.'
             );
         end if;
     end validate_and_report;
 begin
-    dbms_output.put_line(
-        'recompute_schema=' || sys_context('userenv', 'current_schema')
-    );
+    dbms_output.put_line('recompute_schema=' || l_owner);
 
     -- 1. Preflight. Nothing is changed unless all of this holds.
     select count(*)
       into l_count
-      from user_tab_columns
-     where table_name = c_table
+      from all_tab_columns
+     where owner = l_owner
+       and table_name = c_table
        and (
                (column_name = 'CNIC' and data_type = 'NUMBER')
                or (column_name = 'ATTENDANCE_DATE' and data_type = 'DATE')
@@ -504,9 +512,10 @@ begin
 
     select count(*)
       into l_count
-      from user_indexes
-     where index_name = c_index
-       and table_name <> c_table;
+      from all_indexes
+     where owner = l_owner
+       and index_name = c_index
+       and (table_owner <> l_owner or table_name <> c_table);
     if l_count <> 0 then
         raise_application_error(
             -20976,
@@ -516,20 +525,21 @@ begin
 
     for candidate in (
         select i.index_name, i.status, i.visibility
-          from user_indexes i
-         where i.table_name = c_table
+          from all_indexes i
+         where i.table_owner = l_owner
+           and i.table_name = c_table
            and (
                    select c.column_name
-                     from user_ind_columns c
-                    where c.index_name = i.index_name
-                      and c.table_name = i.table_name
+                     from all_ind_columns c
+                    where c.index_owner = i.owner
+                      and c.index_name = i.index_name
                       and c.column_position = 1
                ) = 'CNIC'
            and (
                    select c.column_name
-                     from user_ind_columns c
-                    where c.index_name = i.index_name
-                      and c.table_name = i.table_name
+                     from all_ind_columns c
+                    where c.index_owner = i.owner
+                      and c.index_name = i.index_name
                       and c.column_position = 2
                ) = 'ATTENDANCE_DATE'
          order by case when i.index_name = c_index then 0 else 1 end,
@@ -558,8 +568,9 @@ begin
 
     for trigger_row in (
         select trigger_name, trigger_type
-          from user_triggers
-         where table_name = c_table
+          from all_triggers
+         where table_owner = l_owner
+           and table_name = c_table
            and triggering_event like '%UPDATE%'
          order by trigger_name
     ) loop
@@ -577,8 +588,9 @@ begin
     -- 2. Index (ONLINE: inserts and updates continue while it builds).
     if l_usable_index is null then
         execute immediate
-            'create index hr_raw_attn_cnic_date_i'
-            || ' on hr_raw_attn_capture_events (cnic, attendance_date) online';
+            'create index ' || dbms_assert.enquote_name(l_owner, false)
+            || '.hr_raw_attn_cnic_date_i on ' || dbms_assert.enquote_name(l_owner, false)
+            || '.hr_raw_attn_capture_events (cnic, attendance_date) online';
         dbms_output.put_line('recompute_index=hr_raw_attn_cnic_date_i created online');
     else
         dbms_output.put_line(

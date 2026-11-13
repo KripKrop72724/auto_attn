@@ -10,21 +10,29 @@ declare
         end if;
     end require;
 
+    -- Every non-blank line identical and in the same order (indentation kept;
+    -- SQL*Plus may drop blank lines when it creates the reference copy).
     function source_diff(p_owner in varchar2) return number is
         l_diff number;
     begin
+        with lines as (
+            select owner,
+                   row_number() over (partition by owner order by line) line_no,
+                   rtrim(text, ' ' || chr(10) || chr(13)) text
+              from dba_source
+             where owner in (p_owner, 'RECOMP_OLD')
+               and name = 'SLIC_ZKT_RECOMPUTE_DAILY_FLAGS'
+               and type = 'PROCEDURE'
+               and rtrim(text, ' ' || chr(10) || chr(13)) is not null
+        )
         select count(*) into l_diff from (
-            (select line, rtrim(text, ' ' || chr(10) || chr(13)) text from dba_source
-              where owner = p_owner and name = 'SLIC_ZKT_RECOMPUTE_DAILY_FLAGS' and type = 'PROCEDURE'
+            (select line_no, text from lines where owner = p_owner
              minus
-             select line, rtrim(text, ' ' || chr(10) || chr(13)) from dba_source
-              where owner = 'RECOMP_OLD' and name = 'SLIC_ZKT_RECOMPUTE_DAILY_FLAGS' and type = 'PROCEDURE')
+             select line_no, text from lines where owner = 'RECOMP_OLD')
             union all
-            (select line, rtrim(text, ' ' || chr(10) || chr(13)) from dba_source
-              where owner = 'RECOMP_OLD' and name = 'SLIC_ZKT_RECOMPUTE_DAILY_FLAGS' and type = 'PROCEDURE'
+            (select line_no, text from lines where owner = 'RECOMP_OLD'
              minus
-             select line, rtrim(text, ' ' || chr(10) || chr(13)) from dba_source
-              where owner = p_owner and name = 'SLIC_ZKT_RECOMPUTE_DAILY_FLAGS' and type = 'PROCEDURE')
+             select line_no, text from lines where owner = p_owner)
         );
         return l_diff;
     end source_diff;
