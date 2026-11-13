@@ -33,36 +33,44 @@ create or replace procedure slic_zkt_recompute_daily_flags(
     p_body in clob
 ) authid definer
 as
+    -- Each distinct (CNIC text, attendance date) named by the request, in
+    -- the same order and with the same filters as the original cursor.
+    type t_cnic_list is table of varchar2(13);
+    type t_date_list is table of date;
+    l_cnics t_cnic_list;
+    l_dates t_date_list;
 begin
-    -- Lock affected normal-punch rows in a deterministic order. The caller
-    -- owns the transaction; any later failure rolls back both insertion and
-    -- flag correction together.
-    for affected_day in (
-        select distinct
-               trim(j.cnic) cnic,
-               slic_zkt_truth_api.attendance_date_for(
-                   slic_zkt_truth_api.parse_event_timestamp(j.event_timestamp)
-               ) attendance_date
-          from json_table(
-                   p_body,
-                   '$.events[*]'
-                   columns
-                       cnic varchar2(13) path '$.cnic' null on error,
-                       event_timestamp varchar2(80) path '$.timestamp' null on error
-               ) j
-         where trim(j.cnic) is not null
-           and slic_zkt_truth_api.parse_event_timestamp(j.event_timestamp) is not null
-         order by cnic, attendance_date
-    ) loop
+    select distinct
+           trim(j.cnic) cnic,
+           slic_zkt_truth_api.attendance_date_for(
+               slic_zkt_truth_api.parse_event_timestamp(j.event_timestamp)
+           ) attendance_date
+      bulk collect into l_cnics, l_dates
+      from json_table(
+               p_body,
+               '$.events[*]'
+               columns
+                   cnic varchar2(13) path '$.cnic' null on error,
+                   event_timestamp varchar2(80) path '$.timestamp' null on error
+           ) j
+     where trim(j.cnic) is not null
+       and slic_zkt_truth_api.parse_event_timestamp(j.event_timestamp) is not null
+     order by cnic, attendance_date;
+
+    -- Lock affected normal-punch rows in a deterministic order: every
+    -- employee-day first, sorted by CNIC then date, before any row changes.
+    -- The caller owns the transaction; any later failure rolls back both
+    -- insertion and flag correction together.
+    for i in 1 .. l_cnics.count loop
         for locked_event in (
             select d.event_uid
-             from hr_raw_attn_capture_events d
+              from hr_raw_attn_capture_events d
              where d.raw_punch = 'F'
                and slic_zkt_truth_api.attendance_timestamp_is_plausible(
                        d.event_timestamp
                    ) = 1
-               and d.cnic = affected_day.cnic
-               and d.attendance_date = affected_day.attendance_date
+               and d.cnic = l_cnics(i)
+               and d.attendance_date = l_dates(i)
              order by d.event_timestamp, d.event_uid
              for update
         ) loop
@@ -70,84 +78,70 @@ begin
         end loop;
     end loop;
 
-    update hr_raw_attn_capture_events d
-       set d.check_in = 'F',
-           d.check_out = 'F',
-           d.datasync = 0
-     where d.raw_punch = 'F'
-       and slic_zkt_truth_api.attendance_timestamp_is_plausible(
-               d.event_timestamp
-           ) = 1
-       and (d.check_in <> 'F' or d.check_out <> 'F')
-       and exists (
-               select 1
-                 from json_table(
-                          p_body,
-                          '$.events[*]'
-                          columns
-                              cnic varchar2(13) path '$.cnic' null on error,
-                              event_timestamp varchar2(80) path '$.timestamp' null on error
-                      ) j
-                where trim(j.cnic) = d.cnic
-                  and slic_zkt_truth_api.attendance_date_for(
-                          slic_zkt_truth_api.parse_event_timestamp(
-                              j.event_timestamp
-                          )
-                      ) = d.attendance_date
-           );
+    -- The UPDATE and MERGE below are the original statements restricted to
+    -- one employee-day at a time, so each reads only that day's rows through
+    -- the (CNIC, ATTENDANCE_DATE) index instead of testing every table row
+    -- against the request JSON. Employee-days are independent partitions,
+    -- so the resulting rows are identical.
+    for i in 1 .. l_cnics.count loop
+        update hr_raw_attn_capture_events d
+           set d.check_in = 'F',
+               d.check_out = 'F',
+               d.datasync = 0
+         where d.raw_punch = 'F'
+           and slic_zkt_truth_api.attendance_timestamp_is_plausible(
+                   d.event_timestamp
+               ) = 1
+           and (d.check_in <> 'F' or d.check_out <> 'F')
+           and d.cnic = l_cnics(i)
+           and d.attendance_date = l_dates(i);
+    end loop;
 
-    merge into hr_raw_attn_capture_events d
-    using (
-        select ranked.event_uid,
-               case when ranked.rn_in = 1 then 'T' else 'F' end check_in,
-               case
-                   when ranked.normal_count > 1 and ranked.rn_out = 1
-                   then 'T'
-                   else 'F'
-               end check_out
-          from (
-              select stored.event_uid,
-                     row_number() over (
-                         partition by stored.cnic, stored.attendance_date
-                         order by stored.event_timestamp, stored.event_uid
-                     ) rn_in,
-                     row_number() over (
-                         partition by stored.cnic, stored.attendance_date
-                         order by stored.event_timestamp desc, stored.event_uid desc
-                     ) rn_out,
-                     count(*) over (
-                         partition by stored.cnic, stored.attendance_date
-                     ) normal_count
-               from hr_raw_attn_capture_events stored
-               where stored.raw_punch = 'F'
-                 and slic_zkt_truth_api.attendance_timestamp_is_plausible(
-                         stored.event_timestamp
-                     ) = 1
-                 and exists (
-                         select 1
-                           from json_table(
-                                    p_body,
-                                    '$.events[*]'
-                                    columns
-                                        cnic varchar2(13) path '$.cnic' null on error,
-                                        event_timestamp varchar2(80) path '$.timestamp' null on error
-                                ) j
-                          where trim(j.cnic) = stored.cnic
-                            and slic_zkt_truth_api.attendance_date_for(
-                                    slic_zkt_truth_api.parse_event_timestamp(
-                                        j.event_timestamp
-                                    )
-                                ) = stored.attendance_date
-                     )
-          ) ranked
-    ) desired
-       on (d.event_uid = desired.event_uid)
-     when matched then update set
-          d.check_in = desired.check_in,
-          d.check_out = desired.check_out,
-          d.datasync = 0
-      where d.check_in <> desired.check_in
-         or d.check_out <> desired.check_out;
+    for i in 1 .. l_cnics.count loop
+        merge into hr_raw_attn_capture_events d
+        using (
+            select ranked.event_uid,
+                   case when ranked.rn_in = 1 then 'T' else 'F' end check_in,
+                   case
+                       when ranked.normal_count > 1 and ranked.rn_out = 1
+                       then 'T'
+                       else 'F'
+                   end check_out
+              from (
+                  select stored.event_uid,
+                         row_number() over (
+                             partition by stored.cnic, stored.attendance_date
+                             order by stored.event_timestamp, stored.event_uid
+                         ) rn_in,
+                         row_number() over (
+                             partition by stored.cnic, stored.attendance_date
+                             order by stored.event_timestamp desc, stored.event_uid desc
+                         ) rn_out,
+                         count(*) over (
+                             partition by stored.cnic, stored.attendance_date
+                         ) normal_count
+                   from hr_raw_attn_capture_events stored
+                   where stored.raw_punch = 'F'
+                     and slic_zkt_truth_api.attendance_timestamp_is_plausible(
+                             stored.event_timestamp
+                         ) = 1
+                     and stored.cnic = l_cnics(i)
+                     and stored.attendance_date = l_dates(i)
+              ) ranked
+        ) desired
+           -- EVENT_UID is unique, so a matched row is the ranked row itself;
+           -- the day predicates are always true for it and only let Oracle
+           -- reach the target through the same index.
+           on (d.event_uid = desired.event_uid
+               and d.cnic = l_cnics(i)
+               and d.attendance_date = l_dates(i))
+         when matched then update set
+              d.check_in = desired.check_in,
+              d.check_out = desired.check_out,
+              d.datasync = 0
+          where d.check_in <> desired.check_in
+             or d.check_out <> desired.check_out;
+    end loop;
 end slic_zkt_recompute_daily_flags;
 /
 
