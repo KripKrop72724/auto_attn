@@ -22,10 +22,11 @@ MIGRATION = ORACLE / "20261113_recompute_daily_flags_by_day.sql"
 ROLLBACK = ORACLE / "20261113_recompute_daily_flags_by_day_rollback.sql"
 INSTALLER = ORACLE / "slic_zkt_truth_api.sql"
 PRODUCTION = TESTS / "recompute_production_procedure.sql"
+# DBMS_OUTPUT is enabled per container, so switch to the PDB before enabling it.
 HEADER = (
     "set echo off\nset feedback off\nset linesize 32767\nset trimout on\n"
-    "set serveroutput on size unlimited format wrapped\n"
     "whenever sqlerror exit failure rollback\nalter session set container = FREEPDB1;\n"
+    "set serveroutput on size unlimited format wrapped\n"
 )
 FINAL_MARKERS = (
     "ORACLE_RECOMPUTE_MIGRATION_PASSED",
