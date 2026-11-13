@@ -708,6 +708,39 @@ def test_only_runs_that_may_still_send_hold_their_ready_punches(backend, monkeyp
     assert body["backlog"]["remaining_estimate"] == len(free)
 
 
+def test_a_punch_held_elsewhere_and_already_counted_here_is_subtracted_once(backend, monkeypatch):
+    """Skipped here, or in this releaser's own queue, and later held READY by an administrator."""
+    sessions = backend
+    monkeypatch.setattr(settings, "unknown_identity_auto_release_batch_size", 10)
+    ids = unknown_punches(sessions, 20)
+    now = utc_now()
+    newest = sorted(ids, reverse=True)[:10]
+    skipped, queued = newest[:6], newest[6:]
+    fake = FakeRelease(monkeypatch, statuses={event_id: "SKIPPED" for event_id in skipped})
+    assert step(sessions, now) == "BATCH"
+    assert fake.calls == [newest]
+    # A paused administrator's run holds the six skipped punches and two of the queued ones.
+    other_run(sessions, skipped + queued[:2], action=force_release.ACTION, status="PAUSED")
+    with sessions() as db:
+        auto.refresh_counts(db, now=now, force=True)
+        db.commit()
+        body = auto.status(db, now=now)
+    assert body["backlog"]["count"] == 20
+    assert body["progress"]["skipped_total"] == 6 and body["progress"]["ready"] == 4
+    assert body["backlog"]["held_by_other_approval"] == 0  # all eight already counted here
+    assert body["backlog"]["remaining_estimate"] == 10 + 4  # never picked, plus its own queue
+
+    # A held punch this releaser never touched still counts as held elsewhere.
+    unpicked = sorted(set(ids) - set(newest))
+    other_run(sessions, unpicked[:3], action=force_release.ACTION, status="PAUSED")
+    with sessions() as db:
+        auto.refresh_counts(db, now=now, force=True)
+        db.commit()
+        backlog = auto.status(db, now=now)["backlog"]
+    assert backlog["held_by_other_approval"] == 3
+    assert backlog["remaining_estimate"] == 7 + 4
+
+
 def test_a_check_left_unapproved_past_its_preview_releases_its_punches(backend, monkeypatch):
     """13 Nov 2026: 7,462 punches stayed READY in force release checks never started."""
     sessions = backend

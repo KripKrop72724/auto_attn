@@ -191,13 +191,30 @@ def _tried_recently(cutoff, now):
     )
 
 
-def _held_by_other_approval(now):
-    """A punch READY in a live approval that is not this releaser's own run."""
-    return (
-        select(Item.id).join(Job, Job.id == Item.job_id).where(
-            Item.attendance_event_id == AttendanceEvent.id,
-            held_by_live_approval(now), ~_auto_jobs(),
+def _recent_skips(cutoff):
+    """This releaser's SKIPPED items from runs since ``cutoff`` (the panel's skipped count)."""
+    return and_(_auto_jobs(), Job.created_at >= cutoff, Item.status == "SKIPPED")
+
+
+def _own_ready():
+    """This releaser's READY items in its active runs (the panel's ready count)."""
+    return and_(_auto_jobs(), Job.status.in_(direct.ACTIVE), Item.status == "READY")
+
+
+def _held_by_other_approval(now, cutoff):
+    """A punch READY in a live approval that is not this releaser's own run.
+
+    Leaves out a punch the panel already subtracts as this releaser's recent
+    skip or its own READY item, so "Still to release" never subtracts it twice.
+    """
+    def item_of_punch(*where):
+        return select(Item.id).join(Job, Job.id == Item.job_id).where(
+            Item.attendance_event_id == AttendanceEvent.id, *where,
         ).exists()
+
+    return and_(
+        item_of_punch(held_by_live_approval(now), ~_auto_jobs()),
+        ~item_of_punch(or_(_recent_skips(cutoff), _own_ready())),
     )
 
 
@@ -443,16 +460,16 @@ def refresh_counts(session, *, now=None, force: bool = False) -> bool:
     if session.get_bind().dialect.name == "postgresql":
         # Bounded like the dashboard's scans; SET LOCAL ends with the transaction.
         session.execute(text("SET LOCAL statement_timeout = '20s'"))
+    cutoff = now - timedelta(hours=settings.unknown_identity_auto_release_retry_hours)
     # One scan of the filter: the held punches, and how many of them a live
     # approval other than this releaser still holds READY (left to it).
     backlog, held_elsewhere = session.execute(
         select(
             func.count(AttendanceEvent.id),
-            func.sum(case((_held_by_other_approval(now), 1), else_=0)),
+            func.sum(case((_held_by_other_approval(now, cutoff), 1), else_=0)),
         ).where(unknown_synced_cnic_expression())
     ).one()
     hour_ago = now - timedelta(hours=1)
-    cutoff = now - timedelta(hours=settings.unknown_identity_auto_release_retry_hours)
     by_status, confirmed_last_hour = {}, 0
     for status, count, recent in session.execute(
         select(
@@ -462,7 +479,7 @@ def refresh_counts(session, *, now=None, force: bool = False) -> bool:
     ).all():
         by_status[status] = int(count)
         confirmed_last_hour += int(recent or 0)
-    recent_skips = and_(_auto_jobs(), Job.created_at >= cutoff, Item.status == "SKIPPED")
+    recent_skips = _recent_skips(cutoff)
     skipped = {
         code or "UNKNOWN": int(count)
         for code, count in session.execute(
