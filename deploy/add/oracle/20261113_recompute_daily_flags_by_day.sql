@@ -39,17 +39,26 @@ whenever sqlerror exit failure rollback
   Guards: nothing changes unless the installed procedure is the 13 Nov 2026
   production version (or already this version) and the table and dependent
   packages look as expected. If the new procedure or a dependent does not
-  compile, the exact previous procedure is restored automatically. Running
-  the script again is safe: finished steps are reported and skipped.
+  compile, the exact previous procedure is restored automatically. If Oracle
+  could not replace the procedure at all (for example ORA-04021 after waiting
+  for running calls), the previous version is still installed: ORA-20978
+  says so and no second replacement is attempted. Running the script again
+  is safe: finished steps are reported and skipped.
 
   How to apply (off-hours, when few punches arrive), as the schema that owns
   HR_RAW_ATTN_CAPTURE_EVENTS (the APEX parsing schema, SLIC_HRM):
   - APEX > SQL Workshop > SQL Scripts: paste or upload this whole file, Run.
     Or SQL Commands: paste only the block from DECLARE to the final END;
     and Run. Lines starting with recompute_ report each step.
-  - Expect new punches to wait for up to about a minute: the ONLINE index
-    build briefly waits for in-flight punch transactions, and replacing the
-    procedure waits for running recompute calls (about 30 s each today).
+  - Expect new punches to wait while it runs. The ONLINE index build briefly
+    waits for in-flight punch transactions. Replacing the procedure waits
+    until every running call of it has finished, and new punches queue
+    behind it meanwhile: about 30 s for a punch today, but as long as the
+    longest call in flight, and a reconcile request naming many
+    employee-days runs far longer (one full-table lock query per
+    employee-day, measured at 1.7 s each, plus about 27 s). So run it when
+    no reconcile is in progress. If Oracle gives up waiting (ORA-04021 after
+    about 15 minutes, or ORA-04020), nothing was replaced; run it again later.
     Replacing the procedure may mark the two dependent package bodies
     INVALID; this script recompiles them within seconds (Oracle would also do
     it on their next call).
@@ -307,6 +316,7 @@ end slic_zkt_recompute_daily_flags;~';
     l_unusable_index varchar2(400);
     l_count number;
     l_changed boolean := false;
+    l_replaced boolean;
     l_error varchar2(4000);
 
     function normalized(p_source in clob) return clob is
@@ -619,6 +629,27 @@ exception
     when others then
         l_error := sqlerrm;
         if l_changed then
+            -- Restore only when the installed procedure really changed (the
+            -- new version compiled with errors, or a dependent did not
+            -- compile). When the replacement itself failed, for example
+            -- ORA-04021 or ORA-04020 while running calls kept the procedure
+            -- in use, the previous version is untouched and a second DDL
+            -- would only make punches wait again.
+            begin
+                l_replaced := not same_source(installed_source, l_installed);
+            exception
+                when others then
+                    l_replaced := true;
+            end;
+            if not l_replaced then
+                raise_application_error(
+                    -20978,
+                    c_procedure || ' was not replaced; the previous version is still'
+                    || ' installed and nothing needed restoring. Run this script again'
+                    || ' later, when no reconcile is in progress. Cause: ' || l_error,
+                    true
+                );
+            end if;
             begin
                 execute immediate l_previous_ddl;
                 validate_and_report('restored');

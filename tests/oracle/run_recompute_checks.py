@@ -3,8 +3,8 @@
 Never accepts a DSN, production connection, credential or source-data export.
 The container must carry our test label and sit alone on a labelled internal-only network.
 Schemas RECOMP_OLD (exact production procedure, no extra index), RECOMP_NEW (the real
-migration file applied), RECOMP_GUARD, RECOMP_ODD and RECOMP_LAB are recreated and filled
-only with deterministic synthetic rows.
+migration file applied), RECOMP_GUARD, RECOMP_ODD, RECOMP_BLOCKED (a test DDL trigger refuses
+the replacement) and RECOMP_LAB are recreated and filled only with deterministic synthetic rows.
 """
 from pathlib import Path
 import argparse
@@ -29,6 +29,7 @@ HEADER = (
     "set serveroutput on size unlimited format wrapped\n"
 )
 FINAL_MARKERS = (
+    "ORACLE_RECOMPUTE_BLOCKED_DDL_PASSED",
     "ORACLE_RECOMPUTE_MIGRATION_PASSED",
     "ORACLE_RECOMPUTE_EQUIVALENCE_PASSED",
     "ORACLE_RECOMPUTE_TIMING_PASSED",
@@ -143,7 +144,7 @@ def block(statement):
 
 
 def build_scripts(args):
-    """Return the setup, refusal and main sqlplus scripts."""
+    """Return the setup, refusal, blocked and main sqlplus scripts."""
     template = (TESTS / "recompute_schema.sql").read_text()
     truth_body = (TESTS / "recompute_truth_api_body.sql").read_text()
     production_file = PRODUCTION.read_text()
@@ -164,6 +165,8 @@ def build_scripts(args):
     setup += ("create index recomp_guard.hr_raw_attn_day_idx on "
               "recomp_guard.hr_raw_attn_capture_events (cnic, attendance_date, event_timestamp);\n")
     setup += schema("recomp_odd", unexpected)
+    setup += schema("recomp_blocked", production_file)
+    setup += (TESTS / "recompute_blocked_setup.sql").read_text()
     setup += (TESTS / "recompute_lab.sql").read_text()
     # SQL*Plus drops DBMS_OUTPUT of a failing block, so list errors first, then fail.
     setup += """
@@ -199,8 +202,10 @@ end;
     migration = MIGRATION.read_text()
     rollback = ROLLBACK.read_text()
     refusal = HEADER + in_schema("recomp_odd", migration) + "exit success commit\n"
+    blocked = HEADER + in_schema("recomp_blocked", migration) + "exit success commit\n"
 
     main_sql = HEADER
+    main_sql += (TESTS / "recompute_verify_blocked.sql").read_text()
     main_sql += in_schema("recomp_new", migration)
     main_sql += in_schema("recomp_new", migration)
     main_sql += in_schema("recomp_guard", migration)
@@ -208,6 +213,7 @@ end;
     for first in range(1, args.calls + 1, args.batch):
         last = min(first + args.batch - 1, args.calls)
         main_sql += block(f"recomp_lab.recompute_lab.run_equivalence({first}, {last});")
+    main_sql += block("recomp_lab.recompute_lab.run_fixed_cases;")
     main_sql += block(f"recomp_lab.recompute_lab.report_equivalence({args.calls});")
     main_sql += "drop trigger recomp_old.hr_raw_attn_count_writes;\n"
     main_sql += "drop trigger recomp_new.hr_raw_attn_count_writes;\n"
@@ -251,14 +257,14 @@ end;
 /
 exit success commit
 """
-    return setup, refusal, main_sql
+    return setup, refusal, blocked, main_sql
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--container")
     parser.add_argument("--write-sql", metavar="DIR",
-                        help="only write the three sqlplus scripts to DIR for review")
+                        help="only write the four sqlplus scripts to DIR for review")
     parser.add_argument("--calls", type=int, default=600)
     parser.add_argument("--batch", type=int, default=50)
     parser.add_argument("--grow-rows", type=int, default=780000)
@@ -270,24 +276,31 @@ def main():
     check_sources()
     print("Source checks passed: migration and rollback embed the exact production procedure; "
           "the installer embeds exactly the migrated procedure.", flush=True)
-    setup, refusal, main_sql = build_scripts(args)
+    setup, refusal, blocked, main_sql = build_scripts(args)
     if args.write_sql:
         folder = Path(args.write_sql)
         folder.mkdir(parents=True, exist_ok=True)
-        for name, script in (("setup", setup), ("refusal", refusal), ("main", main_sql)):
+        for name, script in (("setup", setup), ("refusal", refusal), ("blocked", blocked),
+                             ("main", main_sql)):
             (folder / f"recompute_{name}.sql").write_text(script)
         return
     if not args.container:
         raise SystemExit("--container is required")
     require_isolated(args.container)
 
-    code, _ = sqlplus(args.container, setup, "setup: OLD/NEW/GUARD/ODD schemas and seed data")
+    code, _ = sqlplus(args.container, setup, "setup: OLD/NEW/GUARD/ODD/BLOCKED schemas and seed data")
     if code:
         raise SystemExit("Recompute test setup failed")
     code, refused = sqlplus(args.container, refusal,
                             "migration must refuse an unexpected installed procedure")
     if code == 0 or "ORA-20974" not in refused:
         raise SystemExit("Migration did not refuse an unexpected procedure with ORA-20974")
+    code, stopped = sqlplus(args.container, blocked,
+                            "migration must not retry when the replacement itself fails")
+    if (code == 0 or "ORA-20978" not in stopped or "ORA-20990" not in stopped
+            or "ORA-20975" in stopped):
+        raise SystemExit("Migration did not stop with ORA-20978 (cause ORA-20990, no ORA-20975)"
+                         " when the procedure could not be replaced")
     code, output = sqlplus(args.container, main_sql,
                            "migration, equivalence, timing, rollback and re-apply")
 

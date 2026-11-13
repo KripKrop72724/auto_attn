@@ -30,6 +30,7 @@ create table employee_days (
 );
 create table big_days (idx number primary key, cnic number not null, attendance_date date not null);
 create table cnic_list (idx number primary key, cnic number not null);
+create table short_days (idx number primary key, cnic number not null, attendance_date date not null);
 create table timing_days (idx number primary key, cnic number not null, attendance_date date not null);
 create table run_stats (name varchar2(40) primary key, value number not null);
 
@@ -37,6 +38,7 @@ create or replace package recompute_lab authid definer as
     procedure generate_seed;
     procedure load_seed;
     procedure run_equivalence(p_first_call in pls_integer, p_last_call in pls_integer);
+    procedure run_fixed_cases;
     procedure report_equivalence(p_min_calls in pls_integer);
     procedure grow_tables(p_rows in pls_integer);
     procedure run_timing(
@@ -61,6 +63,7 @@ create or replace package body recompute_lab as
     g_counts t_counts;
     g_day_count number;
     g_big_count number;
+    g_short_count number;
     g_cnic_total number;
     g_seed_total number;
 
@@ -135,6 +138,7 @@ create or replace package body recompute_lab as
         delete from employee_days;
         delete from big_days;
         delete from cnic_list;
+        delete from short_days;
         delete from run_stats;
         dbms_random.seed(20261113);
         for c in 1 .. c_cnic_count loop
@@ -237,17 +241,27 @@ create or replace package body recompute_lab as
         select row_number() over (order by cnic, attendance_date), cnic, attendance_date
           from employee_days
          where row_count >= 31;
+        -- Days of the short CNIC numbers: requests can name them with leading
+        -- zeros or surrounding spaces and still fit VARCHAR2(13).
+        insert into short_days (idx, cnic, attendance_date)
+        select row_number() over (order by cnic, attendance_date), cnic, attendance_date
+          from employee_days
+         where cnic < 1000000000000;
         add_stat('next_id', 9000000);
         commit;
         select count(*) into g_seed_total from seed_events;
         select count(*) into g_day_count from employee_days;
         select count(*) into g_big_count from big_days;
+        select count(*) into g_short_count from short_days;
         dbms_output.put_line(
             'recompute_seed rows=' || g_seed_total || ' employee_days=' || g_day_count
-            || ' days_31_plus=' || g_big_count
+            || ' days_31_plus=' || g_big_count || ' short_cnic_days=' || g_short_count
         );
         if g_big_count = 0 then
             raise_application_error(-20090, 'Seed data has no employee-day with 31+ rows.');
+        end if;
+        if g_short_count = 0 then
+            raise_application_error(-20090, 'Seed data has no short-CNIC employee-day.');
         end if;
     end generate_seed;
 
@@ -262,6 +276,7 @@ create or replace package body recompute_lab as
     begin
         select count(*) into g_day_count from employee_days;
         select count(*) into g_big_count from big_days;
+        select count(*) into g_short_count from short_days;
         select count(*) into g_cnic_total from cnic_list;
         select count(*) into g_seed_total from seed_index;
     end load_counts;
@@ -344,11 +359,21 @@ create or replace package body recompute_lab as
             bump('cnic_json_number');
             return l_text;
         elsif l_r < 0.92 then
-            bump('cnic_leading_zero');
+            -- Counted as leading zeros only when the text really changes.
+            if length(l_text) < 13 then
+                bump('cnic_leading_zero');
+            else
+                bump('cnic_leading_zero_noop');
+            end if;
             return '"' || lpad(l_text, 13, '0') || '"';
         elsif l_r < 0.97 then
-            -- Trimmed when it still fits VARCHAR2(13), else NULL ON ERROR.
-            bump('cnic_padded');
+            -- Trimmed when it still fits VARCHAR2(13), else NULL ON ERROR
+            -- (then the event is dropped like a missing CNIC).
+            if length(l_text) <= 11 then
+                bump('cnic_padded');
+            else
+                bump('cnic_padded_overflow');
+            end if;
             return '" ' || l_text || ' "';
         end if;
         bump('cnic_too_long');
@@ -428,6 +453,56 @@ create or replace package body recompute_lab as
         return '{' || l_parts || '}';
     end event_json;
 
+    -- A valid timestamp inside PKT day p_day, in one of the accepted forms.
+    function valid_timestamp_json(p_day in date) return varchar2 is
+        l_local timestamp := cast(p_day as timestamp)
+            + numtodsinterval(trunc(dbms_random.value(0, 86400)), 'SECOND');
+        l_r number := dbms_random.value;
+    begin
+        if l_r < 0.4 then
+            return '"' || to_char(l_local, c_iso) || '+05:00"';
+        elsif l_r < 0.7 then
+            return '"' || to_char(l_local, c_naive) || '"';
+        end if;
+        return '"' || to_char(l_local - interval '5' hour, c_iso) || 'Z"';
+    end valid_timestamp_json;
+
+    -- One stored short-CNIC employee-day named several times in the same
+    -- request: always with leading zeros, plus 1-3 of the plain, JSON-number
+    -- and space-padded forms. The leading-zero text trims to a different
+    -- string than the others, so the procedure sees the same employee-day
+    -- under two CNIC texts (the per-day UPDATE and MERGE run twice for it).
+    procedure add_short_cnic_group(p_body in out nocopy clob) is
+        l_idx pls_integer := random_index(g_short_count);
+        l_cnic number;
+        l_day date;
+        l_text varchar2(40);
+        l_forms pls_integer;
+        l_cnic_json varchar2(40);
+    begin
+        select cnic, attendance_date into l_cnic, l_day from short_days where idx = l_idx;
+        l_text := to_char(l_cnic, 'FM9999999999999');
+        p_body := p_body || ','
+            || event_json('"' || lpad(l_text, 13, '0') || '"', valid_timestamp_json(l_day));
+        bump('cnic_leading_zero');
+        l_forms := trunc(dbms_random.value(1, 4));
+        for f in 1 .. l_forms loop
+            case trunc(dbms_random.value(1, 4))
+                when 1 then
+                    l_cnic_json := '"' || l_text || '"';
+                when 2 then
+                    l_cnic_json := l_text;
+                else
+                    l_cnic_json := '" ' || l_text || ' "';
+                    bump('cnic_padded');
+            end case;
+            p_body := p_body || ',' || event_json(l_cnic_json, valid_timestamp_json(l_day));
+        end loop;
+        bump('short_cnic_groups');
+        bump('same_day_two_cnic_texts');
+        bump('events', 1 + l_forms);
+    end add_short_cnic_group;
+
     function next_body return clob is
         l_r number := dbms_random.value;
         l_events pls_integer;
@@ -485,6 +560,9 @@ create or replace package body recompute_lab as
         bump('events', l_events);
         if l_events > 1 then
             bump('multi_event_bodies');
+        end if;
+        if dbms_random.value < 0.12 then
+            add_short_cnic_group(l_body);
         end if;
         return '{"events":[' || l_body || ']}';
     end next_body;
@@ -734,6 +812,171 @@ create or replace package body recompute_lab as
         );
     end run_equivalence;
 
+    -- Independent check of one stored employee-day in NEW after a fixed case.
+    -- Recomputed: exactly one check-in on the first normal punch and one
+    -- check-out on the last. Not named by the request: still all stale T/T.
+    procedure check_fixed_day(
+        p_case in pls_integer,
+        p_body in clob,
+        p_cnic in number,
+        p_day in date,
+        p_recomputed in boolean
+    ) is
+        l_rows number;
+        l_in number;
+        l_out number;
+        l_first varchar2(600);
+        l_last varchar2(600);
+        l_first_in varchar2(4);
+        l_last_out varchar2(4);
+    begin
+        select count(*),
+               count(case when check_in = 'T' then 1 end),
+               count(case when check_out = 'T' then 1 end),
+               min(event_uid) keep (dense_rank first order by event_timestamp, event_uid),
+               max(event_uid) keep (dense_rank last order by event_timestamp, event_uid)
+          into l_rows, l_in, l_out, l_first, l_last
+          from recomp_new.hr_raw_attn_capture_events
+         where cnic = p_cnic
+           and attendance_date = p_day
+           and raw_punch = 'F'
+           and recomp_old.slic_zkt_truth_api.attendance_timestamp_is_plausible(
+                   event_timestamp
+               ) = 1;
+        if l_rows < 2 then
+            fail(p_case, 'fixed case day ' || to_char(p_day, 'YYYY-MM-DD')
+                || ' has fewer than 2 normal punches', p_body);
+        end if;
+        if p_recomputed then
+            select check_in into l_first_in from recomp_new.hr_raw_attn_capture_events
+             where event_uid = l_first;
+            select check_out into l_last_out from recomp_new.hr_raw_attn_capture_events
+             where event_uid = l_last;
+            if l_in <> 1 or l_out <> 1 or l_first_in <> 'T' or l_last_out <> 'T' then
+                fail(p_case, 'fixed case day ' || to_char(p_day, 'YYYY-MM-DD')
+                    || ' flags wrong: rows=' || l_rows || ' in=' || l_in || ' out=' || l_out,
+                    p_body);
+            end if;
+        elsif l_in <> l_rows or l_out <> l_rows then
+            fail(p_case, 'fixed case changed day ' || to_char(p_day, 'YYYY-MM-DD')
+                || ' that the request did not name', p_body);
+        end if;
+    end check_fixed_day;
+
+    -- Fixed requests naming stored short-CNIC days with leading zeros,
+    -- surrounding spaces and as a JSON number, including the same
+    -- employee-day under two different CNIC texts in one request. Before
+    -- each call both days get stale T/T flags in both schemas, so every
+    -- call must rewrite rows, and must write exactly the same rows.
+    procedure run_fixed_cases is
+        type t_bodies is table of varchar2(4000);
+        type t_flags is table of varchar2(2);
+        l_cnic number;
+        l_day1 date;
+        l_day2 date;
+        l_text varchar2(13);
+        l_zero varchar2(13);
+        l_d1 varchar2(10);
+        l_d2 varchar2(10);
+        l_bodies t_bodies;
+        l_names t_flags;
+        l_body clob;
+        l_old_code number;
+        l_new_code number;
+        l_old_writes number;
+        l_new_writes number;
+        l_seconds number;
+        l_writes number := 0;
+
+        function ev(p_cnic_json in varchar2, p_ts in varchar2) return varchar2 is
+        begin
+            return '{"cnic":' || p_cnic_json || ',"timestamp":"' || p_ts || '"}';
+        end ev;
+    begin
+        g_counts.delete;
+        -- The lowest short CNIC with two or more stored days of 2+ normal
+        -- punches; its first and last such day.
+        with good_days as (
+            select o.cnic, o.attendance_date
+              from recomp_old.hr_raw_attn_capture_events o
+             where o.cnic < 1000000000000
+               and o.raw_punch = 'F'
+               and recomp_old.slic_zkt_truth_api.attendance_timestamp_is_plausible(
+                       o.event_timestamp
+                   ) = 1
+             group by o.cnic, o.attendance_date
+            having count(*) >= 2
+        )
+        select cnic, min(attendance_date), max(attendance_date)
+          into l_cnic, l_day1, l_day2
+          from good_days
+         where cnic = (
+                   select min(cnic)
+                     from (select cnic from good_days group by cnic having count(*) >= 2)
+               )
+         group by cnic;
+        if l_day1 = l_day2 then
+            raise_application_error(-20102, 'Fixed cases need two short-CNIC days with 2+ punches.');
+        end if;
+        l_text := to_char(l_cnic, 'FM9999999999999');
+        l_zero := lpad(l_text, 13, '0');
+        l_d1 := to_char(l_day1, 'YYYY-MM-DD');
+        l_d2 := to_char(l_day2, 'YYYY-MM-DD');
+        -- Which days each body names: '1' day1 only, '2' day2 only, '12' both.
+        l_bodies := t_bodies(
+            ev('"' || l_text || '"', l_d1 || 'T09:00:00+05:00') || ','
+                || ev('"' || l_zero || '"', l_d1 || ' 18:30:00'),
+            ev('"' || l_zero || '"', l_d1 || 'T04:00:00Z') || ','
+                || ev('" ' || l_text || ' "', l_d1 || 'T12:00:00+05:00'),
+            ev('" ' || l_text || ' "', l_d1 || ' 10:00:00'),
+            ev('"' || l_zero || '"', l_d1 || ' 10:00:00'),
+            ev(l_text, l_d1 || ' 08:00:00') || ','
+                || ev('"' || l_zero || '"', l_d2 || 'T17:00:00+05:00') || ','
+                || ev('" ' || l_text || ' "', l_d2 || ' 09:00:00') || ','
+                || ev('"' || l_text || '"', l_d1 || 'T19:00:00+05:00'),
+            ev('"' || l_zero || '"', l_d2 || ' 11:00:00') || ','
+                || ev('"' || l_text || '"', l_d1 || ' 11:00:00') || ','
+                || ev('"' || l_zero || '"', l_d1 || ' 12:00:00'),
+            ev('" ' || l_text || ' "', l_d2 || 'T06:00:00Z') || ','
+                || ev(l_text, l_d2 || ' 07:00:00')
+        );
+        l_names := t_flags('1', '1', '1', '1', '12', '12', '2');
+        for c in 1 .. l_bodies.count loop
+            l_body := '{"events":[' || l_bodies(c) || ']}';
+            update recomp_old.hr_raw_attn_capture_events
+               set check_in = 'T', check_out = 'T', datasync = 1
+             where cnic = l_cnic and attendance_date in (l_day1, l_day2);
+            update recomp_new.hr_raw_attn_capture_events
+               set check_in = 'T', check_out = 'T', datasync = 1
+             where cnic = l_cnic and attendance_date in (l_day1, l_day2);
+            commit;
+            call_recompute('RECOMP_OLD', l_body, l_old_code, l_old_writes, l_seconds);
+            call_recompute('RECOMP_NEW', l_body, l_new_code, l_new_writes, l_seconds);
+            if l_old_code <> 0 or l_new_code <> 0 then
+                fail(c, 'fixed case raised: old_sqlcode=' || l_old_code
+                    || ' new_sqlcode=' || l_new_code, l_body);
+            end if;
+            if l_old_writes <> l_new_writes or l_old_writes = 0 then
+                fail(c, 'fixed case row writes: old=' || l_old_writes
+                    || ' new=' || l_new_writes, l_body);
+            end if;
+            assert_identical(c, l_body);
+            check_fixed_day(c, l_body, l_cnic, l_day1, instr(l_names(c), '1') > 0);
+            check_fixed_day(c, l_body, l_cnic, l_day2, instr(l_names(c), '2') > 0);
+            commit;
+            bump('fixed_cases');
+            bump('fixed_case_row_writes', l_old_writes);
+            l_writes := l_writes + l_old_writes;
+        end loop;
+        persist_counts;
+        commit;
+        dbms_output.put_line(
+            'recompute_fixed_cases=' || l_bodies.count || ' identical; short cnic ' || l_text
+            || ' as "' || l_zero || '", " ' || l_text || ' " and a JSON number on '
+            || l_d1 || ' and ' || l_d2 || '; row_writes=' || l_writes
+        );
+    end run_fixed_cases;
+
     procedure report_equivalence(p_min_calls in pls_integer) is
         l_rows number;
         l_days number;
@@ -750,6 +993,8 @@ create or replace package body recompute_lab as
                        'day_existing', 'day_31_plus', 'day_random', 'day_far',
                        'cnic_unknown', 'cnic_json_number', 'cnic_leading_zero',
                        'cnic_padded', 'cnic_too_long', 'cnic_missing_or_blank',
+                       'short_cnic_groups', 'same_day_two_cnic_texts', 'fixed_cases',
+                       'fixed_case_row_writes',
                        'ts_offset_pkt', 'ts_naive_pkt', 'ts_utc_z', 'ts_utc_lower_z',
                        'ts_other_offset', 'ts_padded', 'ts_garbage'))
         ) loop
@@ -760,6 +1005,22 @@ create or replace package body recompute_lab as
         if stat('calls') < p_min_calls then
             raise_application_error(-20094, 'Only ' || stat('calls') || ' equivalence calls ran.');
         end if;
+        -- Short CNIC text that really changes: leading zeros, trimmed spaces,
+        -- and one employee-day named under two CNIC texts in one request.
+        for minimum in (
+            select 'cnic_leading_zero' name, 20 needed from dual
+            union all select 'cnic_padded', 10 from dual
+            union all select 'same_day_two_cnic_texts', 20 from dual
+            union all select 'fixed_cases', 7 from dual
+        ) loop
+            if stat(minimum.name) < minimum.needed then
+                raise_application_error(
+                    -20093,
+                    'Equivalence coverage too low: ' || minimum.name || '=' || stat(minimum.name)
+                    || ' (need ' || minimum.needed || ')'
+                );
+            end if;
+        end loop;
         select count(*) into l_rows from recomp_old.hr_raw_attn_capture_events;
         select count(*) into l_days from (
             select distinct cnic, attendance_date from recomp_old.hr_raw_attn_capture_events
@@ -779,6 +1040,10 @@ create or replace package body recompute_lab as
             || ' post_live_rows=' || stat('post_live_rows')
             || ' row_writes=' || stat('row_writes')
             || ' calls_writing_rows=' || stat('calls_writing_rows')
+            || ' cnic_leading_zero=' || stat('cnic_leading_zero')
+            || ' cnic_padded=' || stat('cnic_padded')
+            || ' same_day_two_cnic_texts=' || stat('same_day_two_cnic_texts')
+            || ' fixed_cases=' || stat('fixed_cases')
             || ' table_rows=' || l_rows || ' employee_days=' || l_days
             || ' days_31_plus=' || l_big
             || ' old_s=' || round(stat('old_ms') / 1000, 1)
