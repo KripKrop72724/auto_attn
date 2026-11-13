@@ -58,6 +58,7 @@ describe('automatic release of unknown-identity punches', () => {
     expect(screen.getByText('ON · releasing automatically')).toBeTruthy()
     expect(screen.getByText('75,000')).toBeTruthy()
     expect(screen.getByText('counted 45 s ago')).toBeTruthy()
+    expect(screen.queryByText(/held by another approval/)).toBeNull()
     expect(screen.getByText('1,500')).toBeTruthy()
     expect(screen.getByText(/40 queued · 1,460 sent, awaiting confirmation/)).toBeTruthy()
     expect(screen.getByText('31,000')).toBeTruthy()
@@ -72,6 +73,15 @@ describe('automatic release of unknown-identity punches', () => {
     expect(screen.getByText(/Last batch 10 s ago: 50 punches/)).toBeTruthy()
     // ON: nothing to click, so no one-shot button.
     expect(screen.queryByRole('button', { name: /Release all now/i })).toBeNull()
+  })
+
+  it('says how many held punches another approval still holds, outside Still to release', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => response(status({
+      backlog: { count: 7482, counted_at: '2026-11-05T13:59:20Z', remaining_estimate: 20, held_by_other_approval: 7462 },
+    }))))
+    render(<UnknownIdentityAutoRelease />)
+    const line = await screen.findByText('7,462 held by another approval')
+    expect(line.closest('dd')?.querySelector('strong')?.textContent).toBe('20')
   })
 
   it('shows a counting state before the worker’s first count', async () => {
@@ -238,6 +248,8 @@ describe('automatic release helpers', () => {
   it('ignores answers that are not a status', () => {
     expect(normalizeAutoReleaseStatus({ rows: [] })).toBeNull()
     expect(normalizeAutoReleaseStatus(null)).toBeNull()
+    // An older ADD without the held count reads as none held.
+    expect(normalizeAutoReleaseStatus(status())?.backlog.held_by_other_approval).toBe(0)
   })
 
   it('formats durations and the Fleet headline', () => {

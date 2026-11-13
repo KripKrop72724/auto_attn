@@ -173,7 +173,8 @@ export function UnknownIdentityAutoRelease({ toast, onChanged }: { toast?: Toast
         <div>
           <dt>Still to release</dt>
           <dd><strong>{remaining === null ? '…' : remaining.toLocaleString()}</strong>
-            <small>{backlog.counted_at ? `counted ${formatAgo(countedAgo)}` : 'counting · the first count arrives within a minute'}</small></dd>
+            <small>{backlog.counted_at ? `counted ${formatAgo(countedAgo)}` : 'counting · the first count arrives within a minute'}</small>
+            {backlog.held_by_other_approval > 0 && <small>{backlog.held_by_other_approval.toLocaleString()} held by another approval</small>}</dd>
         </div>
         <div>
           <dt>Waiting for Oracle</dt>

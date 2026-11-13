@@ -25,7 +25,13 @@ export type AutoReleaseStatus = {
   drain_completed_at: string | null
   /** After a full pass: older held punches are read again from then (new ones meanwhile). */
   resting_until: string | null
-  backlog: { count: number | null; counted_at: string | null; remaining_estimate: number | null }
+  backlog: {
+    count: number | null
+    counted_at: string | null
+    remaining_estimate: number | null
+    /** Held punches another live approval holds READY; left out of remaining_estimate. */
+    held_by_other_approval: number
+  }
   progress: {
     ready: number
     waiting_oracle: number
@@ -88,6 +94,7 @@ export function normalizeAutoReleaseStatus(raw: unknown): AutoReleaseStatus | nu
       count: maybeNumber(backlog.count),
       counted_at: text(backlog.counted_at),
       remaining_estimate: maybeNumber(backlog.remaining_estimate),
+      held_by_other_approval: count(backlog.held_by_other_approval),
     },
     progress: {
       ready,
