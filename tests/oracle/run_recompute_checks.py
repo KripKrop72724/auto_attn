@@ -164,9 +164,8 @@ def build_scripts(args):
               "recomp_guard.hr_raw_attn_capture_events (cnic, attendance_date, event_timestamp);\n")
     setup += schema("recomp_odd", unexpected)
     setup += (TESTS / "recompute_lab.sql").read_text()
+    # SQL*Plus drops DBMS_OUTPUT of a failing block, so list errors first, then fail.
     setup += """
-declare
-    l_bad number := 0;
 begin
     for broken in (
         select owner, object_name, object_type, status from dba_objects
@@ -174,13 +173,19 @@ begin
     ) loop
         dbms_output.put_line('INVALID ' || broken.owner || '.' || broken.object_name
             || ' ' || broken.object_type);
-        l_bad := l_bad + 1;
     end loop;
-    for err in (select owner, name, type, line, text from dba_errors
+    for err in (select owner, name, type object_type, line, text from dba_errors
                  where owner like 'RECOMP\\_%' escape '\\' order by owner, name, sequence) loop
-        dbms_output.put_line(err.owner || '.' || err.name || ' ' || err.type || ' line '
+        dbms_output.put_line(err.owner || '.' || err.name || ' ' || err.object_type || ' line '
             || err.line || ': ' || err.text);
     end loop;
+end;
+/
+declare
+    l_bad number;
+begin
+    select count(*) into l_bad from dba_objects
+     where owner like 'RECOMP\\_%' escape '\\' and status <> 'VALID';
     if l_bad > 0 then
         raise_application_error(-20140, 'Recompute test schemas did not compile');
     end if;
