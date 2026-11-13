@@ -50,7 +50,7 @@ end recompute_lab;
 create or replace package body recompute_lab as
     c_first_day constant date := date '2026-09-01';
     c_day_span constant pls_integer := 61;
-    c_cnic_count constant pls_integer := 240;
+    c_cnic_count constant pls_integer := 360;
     c_grow_first_day constant date := date '2024-12-01';
     c_grow_cnic_base constant number := 4100000000000;
     c_grow_id_base constant number := 10000000;

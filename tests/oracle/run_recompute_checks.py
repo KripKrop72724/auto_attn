@@ -259,8 +259,8 @@ def main():
     parser.add_argument("--container")
     parser.add_argument("--write-sql", metavar="DIR",
                         help="only write the three sqlplus scripts to DIR for review")
-    parser.add_argument("--calls", type=int, default=320)
-    parser.add_argument("--batch", type=int, default=40)
+    parser.add_argument("--calls", type=int, default=600)
+    parser.add_argument("--batch", type=int, default=50)
     parser.add_argument("--grow-rows", type=int, default=780000)
     parser.add_argument("--old-timing-calls", type=int, default=3)
     parser.add_argument("--new-timing-calls", type=int, default=60)
