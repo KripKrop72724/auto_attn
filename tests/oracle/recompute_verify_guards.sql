@@ -84,6 +84,10 @@ begin
      where owner = 'RECOMP_RESTORE' and index_name = 'HR_RAW_ATTN_CNIC_DATE_I'
        and status = 'VALID';
     require(l_count = 1, 'RESTORE lost the index from step 2');
+    select count(*) into l_count from dba_tab_columns
+     where owner = 'RECOMP_RESTORE' and table_name = 'RECOMPUTE_RESTORE_PROBE'
+       and column_name = 'PROBE_VALUE';
+    require(l_count = 1, 'RESTORE test column was not renamed back by the restoring CREATE');
     select count(*) into l_count from dba_errors where owner = 'RECOMP_RESTORE';
     require(l_count = 0, 'RESTORE objects still have compile errors');
     require_all_valid('RECOMP_RESTORE');

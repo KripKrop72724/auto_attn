@@ -46,6 +46,33 @@ FINAL_MARKERS = (
 )
 
 
+RESTORE_DIAGNOSTICS = """
+declare
+    l_next number;
+begin
+    select last_number into l_next from dba_sequences
+     where sequence_owner = 'RECOMP_RESTORE' and sequence_name = 'RECOMPUTE_DDL_ATTEMPTS';
+    dbms_output.put_line('restore_diag attempts=' || (l_next - 1));
+    for o in (select object_name, object_type, status from dba_objects
+               where owner = 'RECOMP_RESTORE' order by 1, 2) loop
+        dbms_output.put_line('restore_diag ' || o.object_name || ' ' || o.object_type || '='
+            || o.status);
+    end loop;
+    for c in (select column_name from dba_tab_columns
+               where owner = 'RECOMP_RESTORE' and table_name = 'RECOMPUTE_RESTORE_PROBE') loop
+        dbms_output.put_line('restore_diag probe column ' || c.column_name);
+    end loop;
+    for e in (select name, type, line, text from dba_errors
+               where owner = 'RECOMP_RESTORE' order by name, type, sequence) loop
+        dbms_output.put_line('restore_diag error ' || e.name || ' ' || e.type || ' line '
+            || e.line || ' ' || e.text);
+    end loop;
+end;
+/
+exit success commit
+"""
+
+
 def require_isolated(container):
     inspected = subprocess.run(["docker", "inspect", container], check=True,
                                capture_output=True, text=True)
@@ -364,8 +391,9 @@ def main():
                              "migration must restore the previous procedure when validation"
                              " fails after the replacement")
     if (code == 0 or "ORA-20979" not in restored or "ORA-20975" in restored
-            or "Compile errors: slic_zkt_identity_repair_api package line" not in restored
+            or "Compile errors: slic_zkt_identity_repair_api package body line" not in restored
             or "recompute_daily_flags=previous version restored after" not in restored):
+        sqlplus(args.container, HEADER + RESTORE_DIAGNOSTICS, "RECOMP_RESTORE diagnostics")
         raise SystemExit("Migration did not restore with ORA-20979 (with the compile errors,"
                          " no ORA-20975) when validation failed after the replacement")
     code, output = sqlplus(args.container, main_sql,
