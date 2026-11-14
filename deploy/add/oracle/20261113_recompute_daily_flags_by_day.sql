@@ -1,0 +1,855 @@
+set define off
+set serveroutput on
+whenever sqlerror exit failure rollback
+
+/*
+  SLIC_ZKT_RECOMPUTE_DAILY_FLAGS: recompute each affected employee-day through
+  an index instead of scanning the whole raw-capture table for every punch.
+
+  Why (production SLIC_HRM, Oracle 19c EE 19.26, 32 CPUs, measured read-only
+  on 13 Nov 2026):
+  - Every inserted punch calls this procedure inside its own transaction
+    (SLIC_ZKT_TRUTH_API body lines 443 and 912, SLIC_ZKT_IDENTITY_REPAIR_API
+    body line 757).
+  - V$SQL per execution: MERGE 14.9 s (14.8 s CPU, 7,533 buffer gets),
+    UPDATE 12.5 s (12.5 s CPU), lock SELECT ... FOR UPDATE 1.7 s (mostly lock
+    wait) and the punch INSERT 3.8 s (lock wait behind other recomputes).
+  - The MERGE plan is TABLE ACCESS FULL HR_RAW_ATTN_CAPTURE_EVENTS +
+    FILTER(JSONTABLE EVALUATION): the request JSON is parsed again for every
+    one of the 932,366 rows (7,623 blocks). The table has only PK_RAW and
+    UK_HR_RAW_ATTN_EVENT_UID; an employee-day holds 2 rows on average (max 31).
+
+  What this script does:
+  1. Creates index HR_RAW_ATTN_CNIC_DATE_I on (CNIC, ATTENDANCE_DATE) ONLINE,
+     so punches keep flowing while it builds. Skipped when a usable index
+     already starts with exactly (CNIC, ATTENDANCE_DATE).
+  2. Replaces SLIC_ZKT_RECOMPUTE_DAILY_FLAGS: same signature, AUTHID DEFINER,
+     same results and the same lock order. It still locks every affected
+     employee-day first (sorted by CNIC, then date), then runs the same
+     UPDATE and then the same MERGE, but once per affected (CNIC,
+     ATTENDANCE_DATE), so each statement reads about 2 rows through the index.
+     CI (tests/oracle/run_recompute_checks.py) runs this exact file and
+     proves identical rows against the exact production procedure, and at
+     least 50x less time per call on a table of about 800,000 rows.
+  3. Recompiles anything left INVALID (the SLIC_ZKT_TRUTH_API and
+     SLIC_ZKT_IDENTITY_REPAIR_API bodies call the procedure) and reports it.
+
+  No attendance row is inserted, updated, deleted or merged by this script.
+
+  Guards: nothing changes unless the installed procedure is the 13 Nov 2026
+  production version (or already this version) and the table and dependent
+  packages look as expected. It also stops before any change (ORA-20970)
+  while V$SESSION shows a call that has run for more than 60 s in the
+  procedure, SLIC_ZKT_TRUTH_API or SLIC_ZKT_IDENTITY_REPAIR_API (a reconcile
+  or an ADD identity-repair batch), because the replacement would wait for
+  it. If this schema cannot read V$SESSION, the line recompute_long_calls
+  says so and the script goes on. If the new procedure or a dependent does
+  not compile, the exact previous procedure is restored automatically and
+  ORA-20979 says so, with the cause and the first compile errors. If Oracle
+  could not replace the procedure at all (for example ORA-04021 after waiting
+  for running calls), the previous version is still installed: ORA-20978
+  says so and no second replacement is attempted. Running the script again
+  is safe: finished steps are reported and skipped.
+
+  How to apply (off-hours, when few punches arrive), as the schema that owns
+  HR_RAW_ATTN_CAPTURE_EVENTS (the APEX parsing schema, SLIC_HRM):
+  - APEX > SQL Workshop > SQL Commands: paste only the block from DECLARE to
+    the final END; and Run. The SET and WHENEVER lines above it are for
+    SQL*Plus, and SQL Commands rejects them; SQL Scripts was not tried.
+    DBMS Output lines starting with recompute_ report each step.
+  - Expect new punches to wait while it runs. The ONLINE index build briefly
+    waits for in-flight punch transactions. Replacing the procedure waits
+    until every running call of it has finished, and new punches queue
+    behind it meanwhile: about 30 s for a punch today, but as long as the
+    longest call in flight. A reconcile request naming many employee-days
+    runs far longer (one full-table lock query per employee-day, measured at
+    1.7 s each, plus about 27 s), and so does an ADD identity-repair request
+    (up to 100 punches, about 30 s each, in one call). So pause any ADD
+    identity-repair run first and run this when no reconcile is in progress;
+    the 60 s guard only sees calls that are already running. If Oracle gives
+    up waiting (ORA-04021 after about 15 minutes, or ORA-04020), nothing was
+    replaced; run it again later.
+    Replacing the procedure may mark the two dependent package bodies
+    INVALID; this script recompiles them. If a running call keeps one in use
+    until Oracle gives up (ORA-04021 or ORA-04020), it is reported as INVALID
+    "in use by a running call" and left for Oracle to compile on its next
+    call; the new procedure stays.
+  - Undo: 20261113_recompute_daily_flags_by_day_rollback.sql restores the
+    exact production procedure and drops HR_RAW_ATTN_CNIC_DATE_I.
+*/
+declare
+    c_table constant varchar2(128) := 'HR_RAW_ATTN_CAPTURE_EVENTS';
+    c_index constant varchar2(128) := 'HR_RAW_ATTN_CNIC_DATE_I';
+    c_procedure constant varchar2(128) := 'SLIC_ZKT_RECOMPUTE_DAILY_FLAGS';
+    -- The schema being changed: the APEX parsing schema (SLIC_HRM).
+    l_owner constant varchar2(128) := sys_context('userenv', 'current_schema');
+
+    -- The production procedure this replaces, exactly as read from
+    -- USER_SOURCE on 13 Nov 2026 (identical to the rollback script).
+    c_production_ddl constant varchar2(32767) := q'~create or replace procedure slic_zkt_recompute_daily_flags(
+  p_body in clob
+) authid definer
+as
+begin
+  for affected_day in (
+    select distinct
+      trim(j.cnic) cnic,
+      slic_zkt_truth_api.attendance_date_for(
+        slic_zkt_truth_api.parse_event_timestamp(j.event_timestamp)
+      ) attendance_date
+    from json_table(
+      p_body,
+      '$.events[*]'
+      columns
+        cnic varchar2(13) path '$.cnic' null on error,
+        event_timestamp varchar2(80) path '$.timestamp' null on error
+    ) j
+    where trim(j.cnic) is not null
+      and slic_zkt_truth_api.parse_event_timestamp(j.event_timestamp) is not null
+    order by cnic, attendance_date
+  ) loop
+    for locked_event in (
+      select d.event_uid
+      from hr_raw_attn_capture_events d
+      where d.raw_punch = 'F'
+        and slic_zkt_truth_api.attendance_timestamp_is_plausible(
+          d.event_timestamp
+        ) = 1
+        and d.cnic = affected_day.cnic
+        and d.attendance_date = affected_day.attendance_date
+      order by d.event_timestamp, d.event_uid
+      for update
+    ) loop
+      null;
+    end loop;
+  end loop;
+
+  update hr_raw_attn_capture_events d
+  set d.check_in = 'F',
+      d.check_out = 'F',
+      d.datasync = 0
+  where d.raw_punch = 'F'
+    and slic_zkt_truth_api.attendance_timestamp_is_plausible(
+      d.event_timestamp
+    ) = 1
+    and (d.check_in <> 'F' or d.check_out <> 'F')
+    and exists (
+      select 1
+      from json_table(
+        p_body,
+        '$.events[*]'
+        columns
+          cnic varchar2(13) path '$.cnic' null on error,
+          event_timestamp varchar2(80) path '$.timestamp' null on error
+      ) j
+      where trim(j.cnic) = d.cnic
+        and slic_zkt_truth_api.attendance_date_for(
+          slic_zkt_truth_api.parse_event_timestamp(
+            j.event_timestamp
+          )
+        ) = d.attendance_date
+    );
+
+  merge into hr_raw_attn_capture_events d
+  using (
+    select ranked.event_uid,
+      case when ranked.rn_in = 1 then 'T' else 'F' end check_in,
+      case
+        when ranked.normal_count > 1 and ranked.rn_out = 1
+        then 'T'
+        else 'F'
+      end check_out
+    from (
+      select stored.event_uid,
+        row_number() over (
+          partition by stored.cnic, stored.attendance_date
+          order by stored.event_timestamp, stored.event_uid
+        ) rn_in,
+        row_number() over (
+          partition by stored.cnic, stored.attendance_date
+          order by stored.event_timestamp desc, stored.event_uid desc
+        ) rn_out,
+        count(*) over (
+          partition by stored.cnic, stored.attendance_date
+        ) normal_count
+      from hr_raw_attn_capture_events stored
+      where stored.raw_punch = 'F'
+        and slic_zkt_truth_api.attendance_timestamp_is_plausible(
+          stored.event_timestamp
+        ) = 1
+        and exists (
+          select 1
+          from json_table(
+            p_body,
+            '$.events[*]'
+            columns
+              cnic varchar2(13) path '$.cnic' null on error,
+              event_timestamp varchar2(80) path '$.timestamp' null on error
+          ) j
+          where trim(j.cnic) = stored.cnic
+            and slic_zkt_truth_api.attendance_date_for(
+              slic_zkt_truth_api.parse_event_timestamp(
+                j.event_timestamp
+              )
+            ) = stored.attendance_date
+        )
+    ) ranked
+  ) desired
+  on (d.event_uid = desired.event_uid)
+  when matched then update set
+    d.check_in = desired.check_in,
+    d.check_out = desired.check_out,
+    d.datasync = 0
+  where d.check_in <> desired.check_in
+     or d.check_out <> desired.check_out;
+end slic_zkt_recompute_daily_flags;~';
+
+    -- The per-employee-day procedure (identical to the copy embedded in
+    -- deploy/add/oracle/slic_zkt_truth_api.sql).
+    c_per_day_ddl constant varchar2(32767) := q'~create or replace procedure slic_zkt_recompute_daily_flags(
+    p_body in clob
+) authid definer
+as
+    -- Each distinct (CNIC text, attendance date) named by the request, in
+    -- the same order and with the same filters as the original cursor.
+    type t_cnic_list is table of varchar2(13);
+    type t_date_list is table of date;
+    l_cnics t_cnic_list;
+    l_dates t_date_list;
+begin
+    select distinct
+           trim(j.cnic) cnic,
+           slic_zkt_truth_api.attendance_date_for(
+               slic_zkt_truth_api.parse_event_timestamp(j.event_timestamp)
+           ) attendance_date
+      bulk collect into l_cnics, l_dates
+      from json_table(
+               p_body,
+               '$.events[*]'
+               columns
+                   cnic varchar2(13) path '$.cnic' null on error,
+                   event_timestamp varchar2(80) path '$.timestamp' null on error
+           ) j
+     where trim(j.cnic) is not null
+       and slic_zkt_truth_api.parse_event_timestamp(j.event_timestamp) is not null
+     order by cnic, attendance_date;
+
+    -- Lock affected normal-punch rows in a deterministic order: every
+    -- employee-day first, sorted by CNIC then date, before any row changes.
+    -- The caller owns the transaction; any later failure rolls back both
+    -- insertion and flag correction together.
+    for i in 1 .. l_cnics.count loop
+        for locked_event in (
+            select d.event_uid
+              from hr_raw_attn_capture_events d
+             where d.raw_punch = 'F'
+               and slic_zkt_truth_api.attendance_timestamp_is_plausible(
+                       d.event_timestamp
+                   ) = 1
+               and d.cnic = l_cnics(i)
+               and d.attendance_date = l_dates(i)
+             order by d.event_timestamp, d.event_uid
+             for update
+        ) loop
+            null;
+        end loop;
+    end loop;
+
+    -- The UPDATE and MERGE below are the original statements restricted to
+    -- one employee-day at a time, so each reads only that day's rows through
+    -- the (CNIC, ATTENDANCE_DATE) index instead of testing every table row
+    -- against the request JSON. Employee-days are independent partitions,
+    -- so the resulting rows are identical.
+    for i in 1 .. l_cnics.count loop
+        update hr_raw_attn_capture_events d
+           set d.check_in = 'F',
+               d.check_out = 'F',
+               d.datasync = 0
+         where d.raw_punch = 'F'
+           and slic_zkt_truth_api.attendance_timestamp_is_plausible(
+                   d.event_timestamp
+               ) = 1
+           and (d.check_in <> 'F' or d.check_out <> 'F')
+           and d.cnic = l_cnics(i)
+           and d.attendance_date = l_dates(i);
+    end loop;
+
+    for i in 1 .. l_cnics.count loop
+        merge into hr_raw_attn_capture_events d
+        using (
+            select ranked.event_uid,
+                   case when ranked.rn_in = 1 then 'T' else 'F' end check_in,
+                   case
+                       when ranked.normal_count > 1 and ranked.rn_out = 1
+                       then 'T'
+                       else 'F'
+                   end check_out
+              from (
+                  select stored.event_uid,
+                         row_number() over (
+                             partition by stored.cnic, stored.attendance_date
+                             order by stored.event_timestamp, stored.event_uid
+                         ) rn_in,
+                         row_number() over (
+                             partition by stored.cnic, stored.attendance_date
+                             order by stored.event_timestamp desc, stored.event_uid desc
+                         ) rn_out,
+                         count(*) over (
+                             partition by stored.cnic, stored.attendance_date
+                         ) normal_count
+                   from hr_raw_attn_capture_events stored
+                   where stored.raw_punch = 'F'
+                     and slic_zkt_truth_api.attendance_timestamp_is_plausible(
+                             stored.event_timestamp
+                         ) = 1
+                     and stored.cnic = l_cnics(i)
+                     and stored.attendance_date = l_dates(i)
+              ) ranked
+        ) desired
+           -- EVENT_UID is unique, so a matched row is the ranked row itself;
+           -- the day predicates are always true for it and only let Oracle
+           -- reach the target through the same index.
+           on (d.event_uid = desired.event_uid
+               and d.cnic = l_cnics(i)
+               and d.attendance_date = l_dates(i))
+         when matched then update set
+              d.check_in = desired.check_in,
+              d.check_out = desired.check_out,
+              d.datasync = 0
+          where d.check_in <> desired.check_in
+             or d.check_out <> desired.check_out;
+    end loop;
+end slic_zkt_recompute_daily_flags;~';
+
+    -- A call running longer than this in the procedure or its callers is a
+    -- reconcile or an identity-repair batch, not a single punch (about 30 s).
+    c_long_call_seconds constant pls_integer := 60;
+
+    l_installed clob;
+    l_previous_ddl clob;
+    l_state varchar2(30);
+    l_usable_index varchar2(128);
+    l_unusable_index varchar2(400);
+    l_count number;
+    l_changed boolean := false;
+    l_replaced boolean;
+    l_error varchar2(4000);
+    l_compile_errors varchar2(1000);
+    -- '|NAME TYPE|' of each dependent that running calls kept in use until
+    -- Oracle gave up compiling it (ORA-04021 or ORA-04020); never retried.
+    l_busy varchar2(4000);
+    l_long_calls number;
+    l_longest_call number;
+    l_long_sid number;
+    l_long_module varchar2(200);
+
+    function normalized(p_source in clob) return clob is
+        l_text clob := p_source;
+    begin
+        -- Compare logic, not layout: drop comments, whitespace and case.
+        -- \s is the whitespace class; it avoids colon-letter text, which
+        -- APEX SQL Commands may take for a bind variable.
+        l_text := regexp_replace(l_text, '--[^' || chr(10) || ']*', '');
+        l_text := regexp_replace(l_text, '/\*.*?\*/', '', 1, 0, 'n');
+        l_text := lower(regexp_replace(l_text, '\s+', ''));
+        return regexp_replace(
+            l_text,
+            '^createorreplace(editionable|noneditionable)?',
+            ''
+        );
+    end normalized;
+
+    function same_source(p_left in clob, p_right in clob) return boolean is
+    begin
+        return nvl(dbms_lob.compare(normalized(p_left), normalized(p_right)), 1) = 0;
+    end same_source;
+
+    function installed_source return clob is
+        l_source clob;
+    begin
+        dbms_lob.createtemporary(l_source, true);
+        for source_line in (
+            select text
+              from all_source
+             where owner = l_owner
+               and name = c_procedure
+               and type = 'PROCEDURE'
+             order by line
+        ) loop
+            if source_line.text is not null then
+                dbms_lob.writeappend(
+                    l_source,
+                    length(source_line.text),
+                    source_line.text
+                );
+            end if;
+        end loop;
+        return l_source;
+    end installed_source;
+
+    function object_status(p_name in varchar2, p_type in varchar2)
+        return varchar2
+    is
+        l_status varchar2(30);
+    begin
+        select status
+          into l_status
+          from all_objects
+         where owner = l_owner
+           and object_name = p_name
+           and object_type = p_type;
+        return l_status;
+    exception
+        when no_data_found then
+            return 'ABSENT';
+    end object_status;
+
+    procedure compile_object(p_name in varchar2, p_type in varchar2) is
+        l_name varchar2(300) :=
+            dbms_assert.enquote_name(l_owner, false) || '.'
+            || dbms_assert.enquote_name(p_name, false);
+        l_stack varchar2(4000);
+    begin
+        if p_type = 'PACKAGE BODY' then
+            execute immediate 'alter package ' || l_name || ' compile body reuse settings';
+        elsif p_type = 'PACKAGE' then
+            execute immediate 'alter package ' || l_name || ' compile specification reuse settings';
+        elsif p_type = 'TYPE BODY' then
+            execute immediate 'alter type ' || l_name || ' compile body reuse settings';
+        elsif p_type in ('PROCEDURE', 'FUNCTION', 'TRIGGER') then
+            execute immediate 'alter ' || lower(p_type) || ' ' || l_name || ' compile reuse settings';
+        end if;
+    exception
+        when others then
+            l_stack := dbms_utility.format_error_stack;
+            -- ORA-24344 = compiled with errors; the status check reports it.
+            if sqlcode = -24344 then
+                null;
+            elsif p_name <> c_procedure
+                  and (instr(l_stack, 'ORA-04021') > 0 or instr(l_stack, 'ORA-04020') > 0) then
+                -- Running calls kept this caller in use until Oracle gave up
+                -- waiting; validate_and_report decides what that means.
+                l_busy := substr(l_busy || '|' || p_name || ' ' || p_type || '|', 1, 4000);
+            else
+                raise;
+            end if;
+    end compile_object;
+
+    function is_busy(p_name in varchar2, p_type in varchar2) return boolean is
+    begin
+        return nvl(instr(l_busy, '|' || p_name || ' ' || p_type || '|'), 0) > 0;
+    end is_busy;
+
+    -- Recompile anything Oracle left INVALID after the procedure changed, then
+    -- require the procedure, SLIC_ZKT_TRUTH_API and (when present)
+    -- SLIC_ZKT_IDENTITY_REPAIR_API plus every other dependent to be VALID.
+    procedure validate_and_report(p_stage in varchar2) is
+        l_status varchar2(30);
+        l_problems varchar2(1000);
+
+        -- After the procedure changed, a dependent that running calls kept in
+        -- use is INVALID without errors and Oracle compiles it on its next
+        -- call: report it, but it is no reason to undo the change. Before
+        -- anything changed it still stops the script.
+        function left_for_oracle(p_name in varchar2, p_type in varchar2) return boolean is
+            l_errors number;
+        begin
+            if p_stage = 'before' or l_status <> 'INVALID' or not is_busy(p_name, p_type) then
+                return false;
+            end if;
+            select count(*)
+              into l_errors
+              from all_errors
+             where owner = l_owner
+               and name = p_name
+               and type = p_type
+               and attribute = 'ERROR';
+            return l_errors = 0;
+        end left_for_oracle;
+
+        procedure report(
+            p_label in varchar2,
+            p_name in varchar2,
+            p_type in varchar2,
+            p_problem in boolean
+        ) is
+            l_line varchar2(400) :=
+                'recompute_' || p_stage || ': ' || p_label || lower(p_name)
+                || ' ' || lower(p_type) || '=';
+        begin
+            if left_for_oracle(p_name, p_type) then
+                dbms_output.put_line(
+                    l_line || 'INVALID (in use by a running call; Oracle compiles it on its next call)'
+                );
+            else
+                dbms_output.put_line(l_line || l_status);
+                if p_problem then
+                    l_problems := substr(
+                        l_problems || ' ' || lower(p_name) || ' ' || lower(p_type)
+                        || '=' || l_status || ';',
+                        1,
+                        1000
+                    );
+                end if;
+            end if;
+        end report;
+    begin
+        if object_status(c_procedure, 'PROCEDURE') <> 'VALID' then
+            compile_object(c_procedure, 'PROCEDURE');
+        end if;
+        for dependent in (
+            select distinct d.name object_name, d.type object_type
+              from all_dependencies d
+             where d.owner = l_owner
+               and d.referenced_owner = l_owner
+               and d.referenced_name = c_procedure
+               and d.referenced_type = 'PROCEDURE'
+             order by 1, 2
+        ) loop
+            if object_status(dependent.object_name, dependent.object_type) <> 'VALID'
+               and not is_busy(dependent.object_name, dependent.object_type) then
+                compile_object(dependent.object_name, dependent.object_type);
+            end if;
+        end loop;
+
+        for required in (
+            select c_procedure object_name, 'PROCEDURE' object_type, 1 mandatory from dual
+            union all
+            select 'SLIC_ZKT_TRUTH_API', 'PACKAGE', 1 from dual
+            union all
+            select 'SLIC_ZKT_TRUTH_API', 'PACKAGE BODY', 1 from dual
+            union all
+            select 'SLIC_ZKT_IDENTITY_REPAIR_API', 'PACKAGE', 0 from dual
+            union all
+            select 'SLIC_ZKT_IDENTITY_REPAIR_API', 'PACKAGE BODY', 0 from dual
+        ) loop
+            l_status := object_status(required.object_name, required.object_type);
+            if l_status = 'INVALID'
+               and not is_busy(required.object_name, required.object_type) then
+                compile_object(required.object_name, required.object_type);
+                l_status := object_status(required.object_name, required.object_type);
+            end if;
+            report(
+                '',
+                required.object_name,
+                required.object_type,
+                l_status <> 'VALID' and (required.mandatory = 1 or l_status <> 'ABSENT')
+            );
+        end loop;
+
+        for dependent in (
+            select distinct d.name object_name, d.type object_type
+              from all_dependencies d
+             where d.owner = l_owner
+               and d.referenced_owner = l_owner
+               and d.referenced_name = c_procedure
+               and d.referenced_type = 'PROCEDURE'
+               and d.name not in ('SLIC_ZKT_TRUTH_API', 'SLIC_ZKT_IDENTITY_REPAIR_API')
+             order by 1, 2
+        ) loop
+            l_status := object_status(dependent.object_name, dependent.object_type);
+            report('dependent ', dependent.object_name, dependent.object_type, l_status <> 'VALID');
+        end loop;
+
+        if l_problems is not null then
+            raise_application_error(
+                -20971,
+                'recompute ' || p_stage || ': not VALID (see ALL_ERRORS):' || l_problems
+            );
+        end if;
+    end validate_and_report;
+
+    -- The first compile errors of the procedure and the objects checked with
+    -- it, read before a restore recompiles them and so clears them.
+    function compile_errors return varchar2 is
+        l_text varchar2(1000);
+    begin
+        for err in (
+            select e.name, e.type, e.line, e.text
+              from all_errors e
+             where e.owner = l_owner
+               and e.attribute = 'ERROR'
+               and (
+                       e.name in (c_procedure, 'SLIC_ZKT_TRUTH_API', 'SLIC_ZKT_IDENTITY_REPAIR_API')
+                       or e.name in (
+                              select d.name
+                                from all_dependencies d
+                               where d.owner = l_owner
+                                 and d.referenced_owner = l_owner
+                                 and d.referenced_name = c_procedure
+                                 and d.referenced_type = 'PROCEDURE'
+                          )
+                   )
+             order by e.name, e.type, e.sequence
+        ) loop
+            exit when nvl(length(l_text), 0) > 600;
+            l_text := substr(
+                l_text || ' ' || lower(err.name) || ' ' || lower(err.type) || ' line '
+                || err.line || ': ' || replace(replace(err.text, chr(10), ' '), chr(13), ' '),
+                1,
+                1000
+            );
+        end loop;
+        if l_text is null then
+            return null;
+        end if;
+        return ' Compile errors:' || l_text;
+    exception
+        when others then
+            return ' Compile errors not read: ' || sqlerrm;
+    end compile_errors;
+begin
+    dbms_output.put_line('recompute_schema=' || l_owner);
+
+    -- 1. Preflight. Nothing is changed unless all of this holds.
+    select count(*)
+      into l_count
+      from all_tab_columns
+     where owner = l_owner
+       and table_name = c_table
+       and (
+               (column_name = 'CNIC' and data_type = 'NUMBER')
+               or (column_name = 'ATTENDANCE_DATE' and data_type = 'DATE')
+           );
+    if l_count <> 2 then
+        raise_application_error(
+            -20972,
+            c_table || ' lacks NUMBER CNIC or DATE ATTENDANCE_DATE; nothing was changed.'
+        );
+    end if;
+
+    l_installed := installed_source;
+    if nvl(dbms_lob.getlength(l_installed), 0) = 0 then
+        raise_application_error(
+            -20973,
+            c_procedure || ' is not installed; nothing was changed.'
+        );
+    end if;
+    l_previous_ddl := 'create or replace ' || l_installed;
+
+    if same_source(l_installed, c_per_day_ddl) then
+        l_state := 'per_employee_day';
+    elsif same_source(l_installed, c_production_ddl) then
+        l_state := 'production';
+    else
+        raise_application_error(
+            -20974,
+            c_procedure || ' differs from both the 13 Nov 2026 production version'
+            || ' and the per-employee-day version; nothing was changed.'
+        );
+    end if;
+    dbms_output.put_line('recompute_installed_procedure=' || l_state);
+
+    select count(*)
+      into l_count
+      from all_indexes
+     where owner = l_owner
+       and index_name = c_index
+       and (table_owner <> l_owner or table_name <> c_table);
+    if l_count <> 0 then
+        raise_application_error(
+            -20976,
+            c_index || ' already names an index on another table; nothing was changed.'
+        );
+    end if;
+
+    for candidate in (
+        select i.index_name, i.status, i.visibility
+          from all_indexes i
+         where i.table_owner = l_owner
+           and i.table_name = c_table
+           and (
+                   select c.column_name
+                     from all_ind_columns c
+                    where c.index_owner = i.owner
+                      and c.index_name = i.index_name
+                      and c.column_position = 1
+               ) = 'CNIC'
+           and (
+                   select c.column_name
+                     from all_ind_columns c
+                    where c.index_owner = i.owner
+                      and c.index_name = i.index_name
+                      and c.column_position = 2
+               ) = 'ATTENDANCE_DATE'
+         order by case when i.index_name = c_index then 0 else 1 end,
+                  i.index_name
+    ) loop
+        if candidate.status in ('VALID', 'N/A')
+           and candidate.visibility = 'VISIBLE' then
+            l_usable_index := candidate.index_name;
+            exit;
+        end if;
+        l_unusable_index := substr(
+            l_unusable_index || ' ' || candidate.index_name || ' ('
+            || candidate.status || ', ' || candidate.visibility || ')',
+            1,
+            400
+        );
+    end loop;
+    if l_usable_index is null and l_unusable_index is not null then
+        raise_application_error(
+            -20977,
+            'Index on (CNIC, ATTENDANCE_DATE) exists but is not usable:'
+            || l_unusable_index || '. Rebuild it or make it VISIBLE, then re-run;'
+            || ' nothing was changed.'
+        );
+    end if;
+
+    for trigger_row in (
+        select trigger_name, trigger_type
+          from all_triggers
+         where table_owner = l_owner
+           and table_name = c_table
+           and triggering_event like '%UPDATE%'
+         order by trigger_name
+    ) loop
+        -- Row-level effects are identical. A statement-level UPDATE trigger
+        -- would fire once per affected employee-day instead of once per call.
+        dbms_output.put_line(
+            'recompute_info: update trigger ' || lower(trigger_row.trigger_name)
+            || ' (' || lower(trigger_row.trigger_type) || ')'
+        );
+    end loop;
+
+    -- A long call in the procedure or its callers (a reconcile or an ADD
+    -- identity-repair batch) would hold up the replacement while every new
+    -- punch queues behind it, so stop before anything changes. V$SESSION may
+    -- not be readable from this schema; then say so and go on. No bind
+    -- variables: APEX SQL Commands would prompt for them.
+    begin
+        execute immediate
+            'select count(*), max(s.last_call_et),'
+            || ' max(s.sid) keep (dense_rank last order by s.last_call_et),'
+            || ' max(s.module) keep (dense_rank last order by s.last_call_et)'
+            || ' from v$session s'
+            || ' where s.status = ''ACTIVE'''
+            || ' and s.sid <> to_number(sys_context(''userenv'', ''sid''))'
+            || ' and s.last_call_et > ' || to_char(c_long_call_seconds)
+            || ' and exists (select null from all_objects o'
+            || ' where o.owner = ' || dbms_assert.enquote_literal(l_owner)
+            || ' and o.object_name in (''SLIC_ZKT_RECOMPUTE_DAILY_FLAGS'','
+            || ' ''SLIC_ZKT_TRUTH_API'', ''SLIC_ZKT_IDENTITY_REPAIR_API'')'
+            || ' and o.object_id in (s.plsql_entry_object_id, s.plsql_object_id))'
+            into l_long_calls, l_longest_call, l_long_sid, l_long_module;
+    exception
+        when others then
+            l_long_calls := null;
+            dbms_output.put_line(
+                'recompute_long_calls=not checked, V$SESSION is not readable here ('
+                || sqlerrm || '); check for long calls by hand'
+            );
+    end;
+    if l_long_calls > 0 then
+        raise_application_error(
+            -20970,
+            l_long_calls || ' call(s) in ' || c_procedure || ' or the packages that call it'
+            || ' have been running for more than ' || c_long_call_seconds || ' s (longest '
+            || l_longest_call || ' s, SID ' || l_long_sid || ', module ' || l_long_module
+            || '): a reconcile or an identity-repair batch. Replacing the procedure now would'
+            || ' make every new punch wait for it; nothing was changed. Run this script again'
+            || ' when it has finished.'
+        );
+    elsif l_long_calls = 0 then
+        dbms_output.put_line(
+            'recompute_long_calls=none over ' || c_long_call_seconds || ' s'
+        );
+    end if;
+
+    -- Dependents must already compile before anything changes.
+    validate_and_report('before');
+
+    -- 2. Index (ONLINE: inserts and updates continue while it builds).
+    if l_usable_index is null then
+        execute immediate
+            'create index ' || dbms_assert.enquote_name(l_owner, false)
+            || '.hr_raw_attn_cnic_date_i on ' || dbms_assert.enquote_name(l_owner, false)
+            || '.hr_raw_attn_capture_events (cnic, attendance_date) online';
+        dbms_output.put_line('recompute_index=hr_raw_attn_cnic_date_i created online');
+    else
+        dbms_output.put_line(
+            'recompute_index=' || lower(l_usable_index)
+            || ' already covers (cnic, attendance_date); no index created'
+        );
+    end if;
+
+    -- 3. Procedure.
+    if l_state = 'production' then
+        l_changed := true;
+        execute immediate c_per_day_ddl;
+        validate_and_report('after');
+        l_changed := false;
+        dbms_output.put_line(
+            'recompute_daily_flags=replaced with the per-employee-day version'
+        );
+    else
+        validate_and_report('after');
+        dbms_output.put_line(
+            'recompute_daily_flags=already the per-employee-day version; not replaced'
+        );
+    end if;
+    dbms_output.put_line('attendance_rows_changed=0');
+exception
+    when others then
+        l_error := sqlerrm;
+        if l_changed then
+            -- Restore only when the installed procedure really changed (the
+            -- new version compiled with errors, or a dependent did not
+            -- compile). When the replacement itself failed, for example
+            -- ORA-04021 or ORA-04020 while running calls kept the procedure
+            -- in use, the previous version is untouched and a second DDL
+            -- would only make punches wait again.
+            begin
+                l_replaced := not same_source(installed_source, l_installed);
+            exception
+                when others then
+                    l_replaced := true;
+            end;
+            if not l_replaced then
+                raise_application_error(
+                    -20978,
+                    c_procedure || ' was not replaced; the previous version is still'
+                    || ' installed and nothing needed restoring. Run this script again'
+                    || ' later, when no reconcile or identity-repair batch is running.'
+                    || ' Cause: ' || l_error,
+                    true
+                );
+            end if;
+            -- Restoring recompiles the objects, which clears their errors.
+            l_compile_errors := compile_errors;
+            begin
+                execute immediate l_previous_ddl;
+                validate_and_report('restored');
+            exception
+                when others then
+                    raise_application_error(
+                        -20975,
+                        substr(
+                            'Per-employee-day recompute failed and automatic restoration'
+                            || ' also failed: ' || sqlerrm || ' First failure: ' || l_error
+                            || l_compile_errors,
+                            1,
+                            2000
+                        )
+                    );
+            end;
+            dbms_output.put_line(
+                'recompute_daily_flags=previous version restored after: ' || l_error
+            );
+            -- Say it in the error itself: a client may not show the DBMS
+            -- Output of a block that ends in an error.
+            raise_application_error(
+                -20979,
+                substr(
+                    'The per-employee-day ' || c_procedure || ' failed, so the previous'
+                    || ' version was restored and is installed again (the index stays).'
+                    || ' Cause: ' || l_error || l_compile_errors,
+                    1,
+                    2000
+                ),
+                true
+            );
+        end if;
+        raise;
+end;
+/

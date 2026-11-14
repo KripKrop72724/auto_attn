@@ -733,7 +733,7 @@ jobs:
 
   oracle-projection:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
         with:
@@ -742,6 +742,8 @@ jobs:
         run: |
           python3 tests/oracle/oracle_test_container.py start --container zkt-oracle-ci
           python3 tests/oracle/run_projection_checks.py --container zkt-oracle-ci
+      - name: Prove the per-employee-day daily-flag recompute equals production and is faster
+        run: python3 tests/oracle/run_recompute_checks.py --container zkt-oracle-ci
       - name: Remove the isolated Oracle test database
         if: always()
         run: python3 tests/oracle/oracle_test_container.py stop --container zkt-oracle-ci
