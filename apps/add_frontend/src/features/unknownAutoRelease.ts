@@ -25,7 +25,13 @@ export type AutoReleaseStatus = {
   drain_completed_at: string | null
   /** After a full pass: older held punches are read again from then (new ones meanwhile). */
   resting_until: string | null
-  backlog: { count: number | null; counted_at: string | null; remaining_estimate: number | null }
+  backlog: {
+    count: number | null
+    counted_at: string | null
+    remaining_estimate: number | null
+    /** Held punches another release run or check still holds READY; left out of remaining_estimate. */
+    held_by_other_approval: number
+  }
   progress: {
     ready: number
     waiting_oracle: number
@@ -88,6 +94,7 @@ export function normalizeAutoReleaseStatus(raw: unknown): AutoReleaseStatus | nu
       count: maybeNumber(backlog.count),
       counted_at: text(backlog.counted_at),
       remaining_estimate: maybeNumber(backlog.remaining_estimate),
+      held_by_other_approval: count(backlog.held_by_other_approval),
     },
     progress: {
       ready,
@@ -187,9 +194,18 @@ export const punchCount = (value: number) => `${value.toLocaleString()} ${value 
 /** What is still to release: the server's estimate, else the raw held count. */
 export const remainingOf = (status: AutoReleaseStatus) => status.backlog.remaining_estimate ?? status.backlog.count
 
+/** Held punches another release run or check holds: theirs to send, not counted in what is left here. */
+export function elsewhereText(status: AutoReleaseStatus) {
+  const held = status.backlog.held_by_other_approval
+  return held > 0 ? `${held.toLocaleString()} in another release run or check` : null
+}
+
 export function etaText(status: AutoReleaseStatus) {
   const remaining = remainingOf(status)
-  if (remaining === 0 || status.eta_minutes === 0) return 'nothing left to release'
+  if (remaining === 0 || status.eta_minutes === 0) {
+    const elsewhere = elsewhereText(status)
+    return elsewhere ? `nothing left here · ${elsewhere}` : 'nothing left to release'
+  }
   if (status.eta_minutes === null) return status.rate_per_min === null ? 'speed is measured after the first count' : 'no confirmations in the last hour yet'
   return `about ${formatDuration(status.eta_minutes)} left`
 }
@@ -199,7 +215,8 @@ export type AutoReleaseTone = 'positive' | 'warning' | 'neutral'
 /** One line for the Fleet tile: state, tone and the few numbers that matter. */
 export function autoReleaseHeadline(status: AutoReleaseStatus): { value: string; tone: AutoReleaseTone; detail: string } {
   const remaining = remainingOf(status)
-  const left = remaining === null ? 'counting' : `${remaining.toLocaleString()} left`
+  const elsewhere = elsewhereText(status)
+  const left = remaining === null ? 'counting' : `${remaining.toLocaleString()} left${elsewhere ? ` here · ${elsewhere}` : ''}`
   const flow = `${status.progress.in_flight.toLocaleString()} waiting for Oracle · ${status.progress.confirmed_last_hour.toLocaleString()} confirmed last hour`
   if (!status.allowed) {
     return { value: 'Blocked', tone: 'warning', detail: 'Turned off for this ADD deployment; nothing is released automatically.' }
@@ -214,6 +231,6 @@ export function autoReleaseHeadline(status: AutoReleaseStatus): { value: string;
   return {
     value: 'OFF',
     tone: 'warning',
-    detail: `Turned off${status.changed_by ? ` by ${status.changed_by}` : ''}${since} · ${remaining === null ? 'backlog not counted yet' : `${remaining.toLocaleString()} held`}`,
+    detail: `Turned off${status.changed_by ? ` by ${status.changed_by}` : ''}${since} · ${remaining === null ? 'backlog not counted yet' : `${remaining.toLocaleString()} held${elsewhere ? ` · ${elsewhere}` : ''}`}`,
   }
 }

@@ -6,6 +6,7 @@ import { humanizeStatus } from '../status'
 import { explainOperatorError, OperatorFailureMessage, type OperatorFailure } from './AlertResolveDialog'
 import {
   AUTO_RELEASE_PATH,
+  elsewhereText,
   etaText,
   formatAgo,
   normalizeAutoReleaseStatus,
@@ -105,6 +106,7 @@ export function UnknownIdentityAutoRelease({ toast, onChanged }: { toast?: Toast
   const badge = stateBadge(status)
   const { progress, backlog } = status
   const remaining = remainingOf(status)
+  const elsewhere = elsewhereText(status)
   const countedAgo = secondsSince(backlog.counted_at, status.server_time)
   const done = progress.confirmed_total
   const share = remaining === null || done + remaining === 0 ? null : Math.round((done / (done + remaining)) * 100)
@@ -173,7 +175,8 @@ export function UnknownIdentityAutoRelease({ toast, onChanged }: { toast?: Toast
         <div>
           <dt>Still to release</dt>
           <dd><strong>{remaining === null ? '…' : remaining.toLocaleString()}</strong>
-            <small>{backlog.counted_at ? `counted ${formatAgo(countedAgo)}` : 'counting · the first count arrives within a minute'}</small></dd>
+            <small>{backlog.counted_at ? `counted ${formatAgo(countedAgo)}` : 'counting · the first count arrives within a minute'}</small>
+            {elsewhere && <small>{`+ ${elsewhere} (not counted above)`}</small>}</dd>
         </div>
         <div>
           <dt>Waiting for Oracle</dt>

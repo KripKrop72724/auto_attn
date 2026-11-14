@@ -16,8 +16,10 @@ module only decides when and which punches to hand it:
   lane stays bounded and live delivery keeps its priority.
 * No re-picking. A punch the checks skipped stays in the unknown-identity
   filter; it is tried again at most every ``retry_hours`` (a roster or CNIC
-  may be fixed later). A punch another approval already holds READY is left
-  to that approval.
+  may be fixed later). A punch another approval holds READY is left to that
+  approval while the approval can still send it; a READY item of a run that
+  ended, or of a check whose preview expired before anyone approved it, no
+  longer holds the punch (``held_by_live_approval``).
 * Bounded reads. Each batch reads the next newest punches below a saved
   cursor, plus any punch that arrived since the pass started, so a pass over
   the whole backlog reads it once. Reads are paced like batches (at most one
@@ -30,7 +32,9 @@ module only decides when and which punches to hand it:
   ``count_interval_seconds`` and saved with a timestamp; the status endpoint
   reads them and the few active runs, never the whole table. The attempt is
   saved before the count runs, so a count that times out waits its interval
-  too, and failures in a row back off further.
+  too, and failures in a row back off further. The punches other approvals
+  hold are counted separately, so a timeout there loses only that figure; the
+  figure is dropped when a check it covered expires, and counted again then.
 
 Turning the switch OFF only stops new batches: a batch being built when the
 switch turns OFF is discarded (the switch is re-read under its row lock before
@@ -41,13 +45,15 @@ and follow through to Oracle, which cannot be undone.
 from __future__ import annotations
 
 import math
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
 from sqlalchemy import and_, case, func, or_, select, text, update
 from sqlalchemy.exc import OperationalError
 
 from zk_add import attendance_direct_ords as direct
+from zk_add import attendance_force_release as force_release
+from zk_add import attendance_safe_repair as safe_repair
 from zk_add.attendance_cnic_link import UNKNOWN_SYNCED_HELD_STATUSES, unknown_synced_cnic_expression
 from zk_add.attendance_recovery import RecoveryError, _digest
 from zk_add.audit import append_audit
@@ -60,7 +66,7 @@ from zk_add.models import (
     UnknownIdentityAutoRelease as State,
 )
 from zk_add.settings import settings
-from zk_add.time_utils import ensure_utc, iso_utc, utc_now
+from zk_add.time_utils import ensure_utc, iso_utc, parse_datetime, utc_now
 
 
 # Runs this releaser creates carry this actor (indexed) and a scope flag.
@@ -77,6 +83,19 @@ SCAN_REST_SECONDS = 15 * 60
 # A count that failed this many times in a row waits 2**n count intervals (n capped).
 COUNT_BACKOFF_STEPS = 4
 AUDIT_TARGET = "unknown_identity_auto_release"
+# The runs that save READY items, and the statuses in which each never acts on
+# them again: a Direct ORDS send completes only once no item is READY; a force
+# release or repair run ends in its TERMINAL statuses. Any other action or
+# status (running, waiting, paused, stopping, a check still in progress) may
+# still send, so its READY items keep holding their punches.
+ENDED_RUN_STATUSES = {
+    direct.ACTION: ("COMPLETED", "COMPLETED_WITH_REVIEW"),
+    force_release.ACTION: tuple(sorted(force_release.TERMINAL)),
+    safe_repair.ACTION: tuple(sorted(safe_repair.TERMINAL)),
+}
+# Checks never approved stay CHECKED; their start refuses an expired preview
+# (verify_recovery_preview: PREVIEW_EXPIRED), so they can never send either.
+PREVIEW_CHECK_ACTIONS = (force_release.ACTION, safe_repair.ACTION)
 
 
 class AutoReleaseControlRequest(BaseModel):
@@ -139,13 +158,65 @@ def _in_flight(session) -> dict[str, int]:
     return {status: int(counts.get(status, 0)) for status in IN_FLIGHT_STATUSES}
 
 
-def _tried_recently(cutoff):
-    """A punch this releaser checked since ``cutoff``, or one any approval holds READY."""
+def _run_never_acts_again(now):
+    """Runs (``Job``) that will never act on their READY items again.
+
+    Ended runs, and force release or repair checks still CHECKED whose preview
+    expired by ``now``: their start refuses an expired preview. Nothing else
+    counts as dead, so a punch is never handed to two approvals that may send.
+    """
+    expired_check = and_(
+        Job.action.in_(PREVIEW_CHECK_ACTIONS),
+        Job.status == "CHECKED",
+        Job.preview_expires_at.is_not(None),
+        Job.preview_expires_at <= now,
+    )
+    ended = [
+        and_(Job.action == action, Job.status.in_(statuses))
+        for action, statuses in ENDED_RUN_STATUSES.items()
+    ]
+    return or_(expired_check, *ended)
+
+
+def held_by_live_approval(now):
+    """A READY item (``Item`` joined to its ``Job``) whose run may still send its punch."""
+    return and_(Item.status == "READY", ~_run_never_acts_again(now))
+
+
+def _tried_recently(cutoff, now):
+    """A punch this releaser checked since ``cutoff``, or one a live approval holds READY."""
     return (
         select(Item.id).join(Job, Job.id == Item.job_id).where(
             Item.attendance_event_id == AttendanceEvent.id,
-            or_(and_(_auto_jobs(), Job.created_at >= cutoff), Item.status == "READY"),
+            or_(and_(_auto_jobs(), Job.created_at >= cutoff), held_by_live_approval(now)),
         ).exists()
+    )
+
+
+def _recent_skips(cutoff):
+    """This releaser's SKIPPED items from runs since ``cutoff`` (the panel's skipped count)."""
+    return and_(_auto_jobs(), Job.created_at >= cutoff, Item.status == "SKIPPED")
+
+
+def _own_ready():
+    """This releaser's READY items in its active runs (the panel's ready count)."""
+    return and_(_auto_jobs(), Job.status.in_(direct.ACTIVE), Item.status == "READY")
+
+
+def _held_by_other_approval(now, cutoff):
+    """A punch READY in a live approval that is not this releaser's own run.
+
+    Leaves out a punch the panel already subtracts as this releaser's recent
+    skip or its own READY item, so "Still to release" never subtracts it twice.
+    """
+    def item_of_punch(*where):
+        return select(Item.id).join(Job, Job.id == Item.job_id).where(
+            Item.attendance_event_id == AttendanceEvent.id, *where,
+        ).exists()
+
+    return and_(
+        item_of_punch(held_by_live_approval(now), ~_auto_jobs()),
+        ~item_of_punch(or_(_recent_skips(cutoff), _own_ready())),
     )
 
 
@@ -153,11 +224,34 @@ def _due(stamp, now, seconds) -> bool:
     return stamp is None or now >= ensure_utc(stamp) + timedelta(seconds=seconds)
 
 
+def _held_until(stats) -> datetime | None:
+    """When the saved count of punches other approvals hold goes stale, if ever.
+
+    The earliest preview expiry of a check still unapproved when counted: from
+    then the punches it held are this releaser's to release.
+    """
+    value = (stats or {}).get("held_until")
+    try:
+        return parse_datetime(value) if isinstance(value, str) else None
+    except ValueError:
+        return None
+
+
 def _count_due(state: State, now) -> bool:
-    """Gated on the last attempt, not the last success, with back-off after failures."""
+    """Gated on the last attempt, not the last success, with back-off after failures.
+
+    Also due once when a check the held count covered has expired, so its
+    punches are not left out of "Still to release" for a whole interval.
+    """
     failures = min(int(state.count_failures or 0), COUNT_BACKOFF_STEPS)
+    attempted = state.count_attempted_at or state.backlog_counted_at
+    until = _held_until(state.stats)
+    if failures == 0 and until is not None and now >= until and (
+        attempted is None or ensure_utc(attempted) < until
+    ):
+        return True
     interval = settings.unknown_identity_auto_release_count_interval_seconds * (2 ** failures)
-    return _due(state.count_attempted_at or state.backlog_counted_at, now, interval)
+    return _due(attempted, now, interval)
 
 
 # Worker ----------------------------------------------------------------------
@@ -176,7 +270,7 @@ def _held_window(session, *, below, above, size):
     return list(session.scalars(query.order_by(AttendanceEvent.id.desc()).limit(size)).all())
 
 
-def _scan(session, *, below, above, need, budget, cutoff):
+def _scan(session, *, below, above, need, budget, cutoff, now):
     """Matching punches, newest first, reading at most ``budget`` held rows.
 
     The full filter (two correlated lookups per punch) runs only on a window
@@ -194,7 +288,7 @@ def _scan(session, *, below, above, need, budget, cutoff):
             matches = list(session.scalars(
                 select(AttendanceEvent.id).where(
                     AttendanceEvent.id.in_(window),
-                    unknown_synced_cnic_expression(), ~_tried_recently(cutoff),
+                    unknown_synced_cnic_expression(), ~_tried_recently(cutoff, now),
                 ).order_by(AttendanceEvent.id.desc())
             ).all())
             wanted = need - len(found)
@@ -228,11 +322,14 @@ def _pick(session, state: State, now, limit: int):
     else:
         head, cursor, started = state.scan_head_id, state.scan_cursor_id, ensure_utc(state.scan_started_at)
     budget = SCAN_BUDGET
-    picked, _lowest, _done = _scan(session, below=None, above=head, need=limit, budget=budget, cutoff=cutoff)
+    picked, _lowest, _done = _scan(
+        session, below=None, above=head, need=limit, budget=budget, cutoff=cutoff, now=now,
+    )
     pass_done = False
     if len(picked) < limit:
         tail, lowest, pass_done = _scan(
-            session, below=cursor, above=None, need=limit - len(picked), budget=budget, cutoff=cutoff,
+            session, below=cursor, above=None, need=limit - len(picked), budget=budget,
+            cutoff=cutoff, now=now,
         )
         if lowest is not None:
             cursor = lowest
@@ -251,7 +348,9 @@ def _pick_new(session, state: State, now, limit: int):
     cutoff = now - timedelta(hours=settings.unknown_identity_auto_release_retry_hours)
     top = session.scalar(select(func.max(AttendanceEvent.id))) or 0
     above = state.idle_head_id if state.idle_head_id is not None else top
-    picked, _lowest, done = _scan(session, below=None, above=above, need=limit, budget=SCAN_BUDGET, cutoff=cutoff)
+    picked, _lowest, done = _scan(
+        session, below=None, above=above, need=limit, budget=SCAN_BUDGET, cutoff=cutoff, now=now,
+    )
     # Every held punch above ``above`` was read: next time start from the newest seen now.
     scan = {"idle_head_id": max(top, above)} if done and len(picked) < limit else {}
     return picked, scan
@@ -261,8 +360,8 @@ def _rest_until(session, now):
     """After a full pass: until the first punch this releaser tried may be retried, within bounds.
 
     Nothing below the pass head can become eligible earlier, except a punch
-    whose roster or CNIC changed or whose other approval ended; those wait at
-    most ``SCAN_REST_SECONDS``.
+    whose roster or CNIC changed or whose other approval ended (or whose check
+    expired unapproved); those wait at most ``SCAN_REST_SECONDS``.
     """
     retry = timedelta(hours=settings.unknown_identity_auto_release_retry_hours)
     rest = now + timedelta(seconds=SCAN_REST_SECONDS)
@@ -389,8 +488,9 @@ def refresh_counts(session, *, now=None, force: bool = False) -> bool:
     backlog = session.scalar(
         select(func.count(AttendanceEvent.id)).where(unknown_synced_cnic_expression())
     )
-    hour_ago = now - timedelta(hours=1)
     cutoff = now - timedelta(hours=settings.unknown_identity_auto_release_retry_hours)
+    held_elsewhere, held_until = _count_held_elsewhere(session, now, cutoff)
+    hour_ago = now - timedelta(hours=1)
     by_status, confirmed_last_hour = {}, 0
     for status, count, recent in session.execute(
         select(
@@ -400,7 +500,7 @@ def refresh_counts(session, *, now=None, force: bool = False) -> bool:
     ).all():
         by_status[status] = int(count)
         confirmed_last_hour += int(recent or 0)
-    recent_skips = and_(_auto_jobs(), Job.created_at >= cutoff, Item.status == "SKIPPED")
+    recent_skips = _recent_skips(cutoff)
     skipped = {
         code or "UNKNOWN": int(count)
         for code, count in session.execute(
@@ -420,10 +520,39 @@ def refresh_counts(session, *, now=None, force: bool = False) -> bool:
             "confirmed_last_hour": confirmed_last_hour,
             "skipped_recent": int(skipped_total),
             "skipped_by_reason": skipped,
+            "held_by_other_approval": held_elsewhere,
+            "held_until": _iso(held_until),
         },
         stats_counted_at=now,
     ))
     return True
+
+
+def _count_held_elsewhere(session, now, cutoff):
+    """Held punches a live approval other than this releaser holds READY, and until when.
+
+    Its own statements in a savepoint, after the backlog count: if they run
+    out of time only this figure is lost (None: nothing is left out of "Still
+    to release"), never the backlog count.
+    """
+    try:
+        with session.begin_nested():
+            held = session.scalar(
+                select(func.count(AttendanceEvent.id))
+                .where(unknown_synced_cnic_expression(), _held_by_other_approval(now, cutoff))
+            )
+            until = session.scalar(
+                select(func.min(Job.preview_expires_at)).where(
+                    Job.action.in_(PREVIEW_CHECK_ACTIONS), Job.status == "CHECKED",
+                    Job.preview_expires_at > now,
+                )
+            )
+    except OperationalError as exc:
+        if not database_busy(exc):
+            raise
+        return None, None
+    held = int(held or 0)
+    return held, until if held else None
 
 
 def _record_error(code: str, *, count_failed: bool = False) -> None:
@@ -560,7 +689,16 @@ def status(session, *, now=None) -> dict:
     skipped_recent = int(stats.get("skipped_recent") or 0)
     rate = round(confirmed_last_hour / 60, 2) if state is not None and state.stats_counted_at else None
     backlog = state.backlog_count if state is not None else None
-    remaining = None if backlog is None else max(0, backlog - skipped_recent - ready) + ready + waiting
+    # Held punches another live approval holds READY are its to send, not this
+    # releaser's; once a check counted there has expired they are its own again.
+    until = _held_until(stats)
+    held_elsewhere = int(stats.get("held_by_other_approval") or 0)
+    if until is not None and now >= until:
+        held_elsewhere = 0
+    remaining = (
+        None if backlog is None
+        else max(0, backlog - skipped_recent - ready - held_elsewhere) + ready + waiting
+    )
     allowed = settings.unknown_identity_auto_release_allowed
     enabled = True if state is None else bool(state.enabled)
     drain_active = state is not None and state.drain_requested_at is not None
@@ -586,6 +724,7 @@ def status(session, *, now=None) -> dict:
             "count": backlog,
             "counted_at": _iso(state.backlog_counted_at) if state is not None else None,
             "remaining_estimate": remaining,
+            "held_by_other_approval": None if backlog is None else held_elsewhere,
         },
         "progress": {
             "ready": ready,

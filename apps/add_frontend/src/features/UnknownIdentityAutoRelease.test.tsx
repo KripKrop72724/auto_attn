@@ -4,6 +4,7 @@ import { queryClient } from '../data'
 import { UnknownIdentityAutoRelease } from './UnknownIdentityAutoRelease'
 import {
   autoReleaseHeadline,
+  etaText,
   formatDuration,
   normalizeAutoReleaseStatus,
   type AutoReleaseStatus,
@@ -58,6 +59,7 @@ describe('automatic release of unknown-identity punches', () => {
     expect(screen.getByText('ON · releasing automatically')).toBeTruthy()
     expect(screen.getByText('75,000')).toBeTruthy()
     expect(screen.getByText('counted 45 s ago')).toBeTruthy()
+    expect(screen.queryByText(/in another release run or check/)).toBeNull()
     expect(screen.getByText('1,500')).toBeTruthy()
     expect(screen.getByText(/40 queued · 1,460 sent, awaiting confirmation/)).toBeTruthy()
     expect(screen.getByText('31,000')).toBeTruthy()
@@ -72,6 +74,15 @@ describe('automatic release of unknown-identity punches', () => {
     expect(screen.getByText(/Last batch 10 s ago: 50 punches/)).toBeTruthy()
     // ON: nothing to click, so no one-shot button.
     expect(screen.queryByRole('button', { name: /Release all now/i })).toBeNull()
+  })
+
+  it('says how many held punches another release run or check holds, not counted in Still to release', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => response(status({
+      backlog: { count: 7482, counted_at: '2026-11-05T13:59:20Z', remaining_estimate: 20, held_by_other_approval: 7462 },
+    }))))
+    render(<UnknownIdentityAutoRelease />)
+    const line = await screen.findByText('+ 7,462 in another release run or check (not counted above)')
+    expect(line.closest('dd')?.querySelector('strong')?.textContent).toBe('20')
   })
 
   it('shows a counting state before the worker’s first count', async () => {
@@ -238,6 +249,8 @@ describe('automatic release helpers', () => {
   it('ignores answers that are not a status', () => {
     expect(normalizeAutoReleaseStatus({ rows: [] })).toBeNull()
     expect(normalizeAutoReleaseStatus(null)).toBeNull()
+    // An older ADD without the held count reads as none held.
+    expect(normalizeAutoReleaseStatus(status())?.backlog.held_by_other_approval).toBe(0)
   })
 
   it('formats durations and the Fleet headline', () => {
@@ -254,5 +267,18 @@ describe('automatic release helpers', () => {
     expect(autoReleaseHeadline(off)).toEqual({ value: 'OFF', tone: 'warning', detail: 'Turned off by StateHealthAdmin 1 h ago · 75,000 held' })
     const blocked = normalizeAutoReleaseStatus(status({ allowed: false })) as AutoReleaseStatus
     expect(autoReleaseHeadline(blocked).value).toBe('Blocked')
+  })
+
+  it('never says nothing is left while another release run or check holds punches', () => {
+    const backlog = { count: 7462, counted_at: '2026-11-05T13:59:20Z', remaining_estimate: 0, held_by_other_approval: 7462 }
+    const on = normalizeAutoReleaseStatus(status({ backlog, eta_minutes: 0 })) as AutoReleaseStatus
+    expect(etaText(on)).toBe('nothing left here · 7,462 in another release run or check')
+    expect(autoReleaseHeadline(on).detail).toBe(
+      '0 left here · 7,462 in another release run or check · 1,500 waiting for Oracle · 1,800 confirmed last hour',
+    )
+    const off = normalizeAutoReleaseStatus(status({ backlog, eta_minutes: 0, enabled: false })) as AutoReleaseStatus
+    expect(autoReleaseHeadline(off).detail).toBe('Turned off · 0 held · 7,462 in another release run or check')
+    const none = normalizeAutoReleaseStatus(status({ backlog: { ...backlog, held_by_other_approval: 0 }, eta_minutes: 0 })) as AutoReleaseStatus
+    expect(etaText(none)).toBe('nothing left to release')
   })
 })

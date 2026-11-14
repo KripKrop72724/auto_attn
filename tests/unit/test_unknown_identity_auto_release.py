@@ -26,9 +26,11 @@ import test_attendance_repair
 from test_attendance_force_release import store as store  # noqa: F401 - fixture
 from test_attendance_repair import repair_store as repair_store  # noqa: F401 - fixture
 from zk_add import attendance_direct_ords as direct
+from zk_add import attendance_force_release as force_release
+from zk_add import attendance_safe_repair as safe_repair
 from zk_add import attendance_unknown_auto_release as auto
 from zk_add import worker
-from zk_add.attendance_recovery import RecoveryError
+from zk_add.attendance_recovery import RecoveryError, sign_recovery_preview
 from zk_add.crypto import decrypt_text
 from zk_add.db import Base
 from zk_add.models import (
@@ -193,7 +195,9 @@ def test_missing_row_means_on_and_status_has_the_panel_shape(backend):
         body = client.get("/api/v2/unknown-identity-auto-release").json()
     assert body["allowed"] is True and body["enabled"] is True and body["active"] is True
     assert body["drain_active"] is False and body["changed_by"] is None and body["reason"] is None
-    assert body["backlog"] == {"count": None, "counted_at": None, "remaining_estimate": None}
+    assert body["backlog"] == {
+        "count": None, "counted_at": None, "remaining_estimate": None, "held_by_other_approval": None,
+    }
     assert set(body["progress"]) == {
         "ready", "waiting_oracle", "in_flight", "queued_total", "confirmed_total", "confirmed_last_hour",
         "skipped_total", "skipped_window_hours", "skipped_by_reason", "needs_review", "checked_total",
@@ -615,7 +619,251 @@ def test_skips_are_counted_once_per_punch_with_reasons(backend, monkeypatch):
     assert body["progress"]["skipped_by_reason"] == [{
         "code": "CNIC_CONFLICT", "reason": direct.REASONS["CNIC_CONFLICT"], "count": 1}]
     assert body["progress"]["ready"] == 1
+    assert body["backlog"]["held_by_other_approval"] == 0  # its own queue is not another approval
     assert body["backlog"]["remaining_estimate"] == 1
+
+
+def other_run(sessions, event_ids, *, action, status, preview_expires_at=None) -> int:
+    """An administrator's run (not this releaser's) holding these punches READY."""
+    with sessions() as db:
+        job = Job(
+            action=action, actor="StateHealthAdmin", reason="test", status=status,
+            idempotency_key=f"other-run-{uuid4().hex}", scope={}, candidate_digest="c" * 64,
+            preview_expires_at=preview_expires_at,
+        )
+        db.add(job)
+        db.flush()
+        for event_id in event_ids:
+            db.add(Item(
+                job_id=job.id, source_kind="ATTENDANCE", source_ref=str(event_id),
+                attendance_event_id=event_id, expected_state_digest="e" * 64, lane=action,
+                status="READY", result={},
+            ))
+        db.commit()
+        return job.id
+
+
+# (action, run status, preview expiry from now, whether its READY item still holds the punch)
+OTHER_RUNS = [
+    # Checks never approved: their start refuses an expired preview.
+    (force_release.ACTION, "CHECKED", timedelta(days=-9), False),
+    (force_release.ACTION, "CHECKED", timedelta(minutes=10), True),
+    (force_release.ACTION, "CHECKED", None, True),
+    (safe_repair.ACTION, "CHECKED", timedelta(0), False),
+    (safe_repair.ACTION, "CHECKED", timedelta(minutes=10), True),
+    # Still checking, sending, waiting, paused or stopping: may still act.
+    (force_release.ACTION, "CHECKING", None, True),
+    (force_release.ACTION, "RUNNING", timedelta(days=-9), True),
+    (force_release.ACTION, "WAITING_ORACLE", timedelta(days=-9), True),
+    (force_release.ACTION, "PAUSED", timedelta(days=-9), True),
+    (force_release.ACTION, "STOPPING", timedelta(days=-9), True),
+    (safe_repair.ACTION, "CHECKING", None, True),
+    (safe_repair.ACTION, "RUNNING", timedelta(days=-9), True),
+    (safe_repair.ACTION, "PAUSED", timedelta(days=-9), True),
+    (direct.ACTION, "RUNNING", None, True),
+    (direct.ACTION, "WAITING_ORACLE", None, True),
+    # Unknown to this rule: kept holding.
+    (direct.ACTION, "CHECKED", timedelta(days=-9), True),
+    ("SOME_NEWER_ACTION", "COMPLETED", None, True),
+    # Ended.
+    (force_release.ACTION, "COMPLETED", None, False),
+    (force_release.ACTION, "COMPLETED_WITH_REVIEW", None, False),
+    (force_release.ACTION, "STOPPED", None, False),
+    (force_release.ACTION, "EXPIRED", None, False),
+    (safe_repair.ACTION, "COMPLETED", None, False),
+    (safe_repair.ACTION, "STOPPED", None, False),
+    (direct.ACTION, "COMPLETED", None, False),
+    (direct.ACTION, "COMPLETED_WITH_REVIEW", None, False),
+]
+
+
+def test_only_runs_that_may_still_send_hold_their_ready_punches(backend, monkeypatch):
+    sessions = backend
+    ids = unknown_punches(sessions, len(OTHER_RUNS))
+    now = utc_now()
+    for event_id, (action, status, expires_in, _holds) in zip(ids, OTHER_RUNS):
+        other_run(sessions, [event_id], action=action, status=status,
+                  preview_expires_at=None if expires_in is None else now + expires_in)
+    held = [event_id for event_id, run in zip(ids, OTHER_RUNS) if run[3]]
+    free = [event_id for event_id, run in zip(ids, OTHER_RUNS) if not run[3]]
+    # "Still to release" leaves out what other approvals still hold.
+    with sessions() as db:
+        assert auto.refresh_counts(db, now=now, force=True) is True
+        db.commit()
+        backlog = auto.status(db, now=now)["backlog"]
+    assert backlog["count"] == len(ids)
+    assert backlog["held_by_other_approval"] == len(held)
+    assert backlog["remaining_estimate"] == len(free)
+
+    fake = FakeRelease(monkeypatch)
+    assert step(sessions, now) == "BATCH"
+    assert fake.calls == [sorted(free, reverse=True)]
+    with sessions() as db:
+        auto.refresh_counts(db, now=now, force=True)
+        db.commit()
+        body = auto.status(db, now=now)
+    # This releaser's own READY items are its queue, counted once.
+    assert body["progress"]["ready"] == len(free)
+    assert body["backlog"]["held_by_other_approval"] == len(held)
+    assert body["backlog"]["remaining_estimate"] == len(free)
+
+
+def test_a_punch_held_elsewhere_and_already_counted_here_is_subtracted_once(backend, monkeypatch):
+    """Skipped here, or in this releaser's own queue, and later held READY by an administrator."""
+    sessions = backend
+    monkeypatch.setattr(settings, "unknown_identity_auto_release_batch_size", 10)
+    ids = unknown_punches(sessions, 20)
+    now = utc_now()
+    newest = sorted(ids, reverse=True)[:10]
+    skipped, queued = newest[:6], newest[6:]
+    fake = FakeRelease(monkeypatch, statuses={event_id: "SKIPPED" for event_id in skipped})
+    assert step(sessions, now) == "BATCH"
+    assert fake.calls == [newest]
+    # A paused administrator's run holds the six skipped punches and two of the queued ones.
+    other_run(sessions, skipped + queued[:2], action=force_release.ACTION, status="PAUSED")
+    with sessions() as db:
+        auto.refresh_counts(db, now=now, force=True)
+        db.commit()
+        body = auto.status(db, now=now)
+    assert body["backlog"]["count"] == 20
+    assert body["progress"]["skipped_total"] == 6 and body["progress"]["ready"] == 4
+    assert body["backlog"]["held_by_other_approval"] == 0  # all eight already counted here
+    assert body["backlog"]["remaining_estimate"] == 10 + 4  # never picked, plus its own queue
+
+    # A held punch this releaser never touched still counts as held elsewhere.
+    unpicked = sorted(set(ids) - set(newest))
+    other_run(sessions, unpicked[:3], action=force_release.ACTION, status="PAUSED")
+    with sessions() as db:
+        auto.refresh_counts(db, now=now, force=True)
+        db.commit()
+        backlog = auto.status(db, now=now)["backlog"]
+    assert backlog["held_by_other_approval"] == 3
+    assert backlog["remaining_estimate"] == 7 + 4
+
+
+def test_a_check_left_unapproved_past_its_preview_releases_its_punches(backend, monkeypatch):
+    """13 Nov 2026: 7,462 punches stayed READY in force release checks never started."""
+    sessions = backend
+    stale, fresh = unknown_punches(sessions, 2)
+    now = utc_now()
+    expired = other_run(sessions, [stale], action=force_release.ACTION, status="CHECKED",
+                        preview_expires_at=now - timedelta(days=9))
+    other_run(sessions, [fresh], action=force_release.ACTION, status="CHECKED",
+              preview_expires_at=now + timedelta(minutes=10))
+    repair = other_run(sessions, [], action=safe_repair.ACTION, status="CHECKED",
+                       preview_expires_at=now - timedelta(minutes=1))
+    # The rule rests on these refusals: neither check can be approved any more.
+    with sessions() as db:
+        check = db.get(Job, expired)
+        signature = sign_recovery_preview(digest=check.candidate_digest, expires_at=check.preview_expires_at,
+                                          actor=check.actor, action=check.action)
+        with pytest.raises(RecoveryError) as refused:
+            force_release.start(db, check, actor=check.actor, signature=signature,
+                                reason="late approval", key="late-approval-0001")
+        assert refused.value.code == "PREVIEW_EXPIRED"
+        db.rollback()
+        check = db.get(Job, repair)
+        signature = sign_recovery_preview(digest=check.candidate_digest, expires_at=check.preview_expires_at,
+                                          actor=check.actor, action=check.action)
+        with pytest.raises(RecoveryError) as refused:
+            safe_repair.start_check(db, check, actor=check.actor, signature=signature)
+        assert refused.value.code == "PREVIEW_EXPIRED"
+        db.rollback()
+
+    fake = FakeRelease(monkeypatch)
+    assert step(sessions, now) == "BATCH"
+    assert fake.calls == [[stale]]
+    # The other check holds its punch until its own preview has expired.
+    assert step(sessions, now + timedelta(minutes=20)) == "BATCH"
+    assert fake.calls[-1] == [fresh]
+
+
+def test_a_check_expiring_between_counts_frees_its_punches_in_the_status_at_once(backend, monkeypatch):
+    """The saved held count is dropped once a check it covered expires, and counted again then."""
+    sessions = backend
+    monkeypatch.setattr(settings, "unknown_identity_auto_release_batch_size", 5)
+    ids = unknown_punches(sessions, 20)
+    now = utc_now()
+    other_run(sessions, ids, action=force_release.ACTION, status="CHECKED",
+              preview_expires_at=now + timedelta(seconds=30))
+    with sessions() as db:
+        assert auto.refresh_counts(db, now=now, force=True) is True
+        db.commit()
+        backlog = auto.status(db, now=now)["backlog"]
+        assert auto._held_until(db.get(State, 1).stats) == now + timedelta(seconds=30)
+        assert auto.claim_count(db, now=now + timedelta(seconds=29)) is False
+        db.rollback()
+    assert backlog["held_by_other_approval"] == 20 and backlog["remaining_estimate"] == 0
+
+    later = now + timedelta(seconds=40)  # the check expired; the next count is 20 s off
+    with sessions() as db:
+        backlog = auto.status(db, now=later)["backlog"]
+    assert backlog["held_by_other_approval"] == 0 and backlog["remaining_estimate"] == 20
+    fake = FakeRelease(monkeypatch)
+    assert step(sessions, later) == "BATCH"
+    assert fake.calls == [sorted(ids, reverse=True)[:5]]
+    with sessions() as db:
+        body = auto.status(db, now=later)
+    # The five picked are this releaser's queue, never also subtracted as held elsewhere.
+    assert body["progress"]["ready"] == 5
+    assert body["backlog"]["held_by_other_approval"] == 0 and body["backlog"]["remaining_estimate"] == 20
+
+    # The count is due at once, but only once: a failed recount waits its interval.
+    with sessions() as db:
+        assert auto.claim_count(db, now=later) is True
+        db.commit()
+    with sessions() as db:
+        assert auto.claim_count(db, now=later + timedelta(seconds=5)) is False
+        db.rollback()
+        assert auto.refresh_counts(db, now=later, force=True) is True
+        db.commit()
+        body = auto.status(db, now=later)
+        assert db.get(State, 1).stats["held_until"] is None
+    assert body["backlog"]["held_by_other_approval"] == 0 and body["backlog"]["remaining_estimate"] == 20
+
+
+def test_a_held_count_that_times_out_keeps_the_backlog_count(backend, monkeypatch):
+    """Only the figure for punches other approvals hold is lost, without a COUNT_BUSY back-off."""
+    from sqlalchemy import event
+    from sqlalchemy.exc import OperationalError
+
+    class Canceled(Exception):
+        sqlstate = "57014"
+
+    sessions = backend
+    ids = unknown_punches(sessions, 3)
+    with sessions() as db:
+        auto._ensure(db).enabled = False  # counts run while OFF too; no batch in the way
+        db.commit()
+        engine = db.get_bind()
+    other_run(sessions, ids[:2], action=force_release.ACTION, status="PAUSED")
+    timed_out = []
+
+    def held_count_times_out(_conn, _cursor, statement, _parameters, _context, _executemany):
+        # The held count is the only count that looks at check previews.
+        if "count(" in statement and "preview_expires_at" in statement:
+            timed_out.append(statement)
+            raise OperationalError(statement, {}, Canceled("canceling statement due to statement timeout"))
+
+    event.listen(engine, "before_cursor_execute", held_count_times_out)
+    try:
+        assert auto.tick() == "OFF"
+    finally:
+        event.remove(engine, "before_cursor_execute", held_count_times_out)
+    assert len(timed_out) == 1
+    row = state(sessions)
+    assert row.backlog_count == 3 and row.backlog_counted_at is not None
+    assert row.count_failures == 0 and row.last_error_code is None
+    assert row.stats["held_by_other_approval"] is None and row.stats["held_until"] is None
+    with sessions() as db:
+        backlog = auto.status(db)["backlog"]
+    assert backlog["held_by_other_approval"] == 0 and backlog["remaining_estimate"] == 3
+
+    with sessions() as db:
+        assert auto.refresh_counts(db, force=True) is True
+        db.commit()
+        backlog = auto.status(db)["backlog"]
+    assert backlog["held_by_other_approval"] == 2 and backlog["remaining_estimate"] == 1
 
 
 def test_a_busy_database_is_recorded_not_raised(backend, monkeypatch):
