@@ -19,6 +19,12 @@ gate) and, once the bundle is verified, a chip revision every one of its images
 starts on, both before head office is asked or anything is written. A refused board
 is reported to ADD (BOARD_REFUSED). esptool's XMC startup warning in any later call
 also stops the run: such a board would never start (board.py notes).
+
+A new board or a resume also needs the board's own hardware test (boardtest.py): a
+PASSED report for this board ID, with its eFuses proven unchanged and the test program
+erased, from the last 30 minutes by this installer's clock. Without one the run stops
+right after the mode check (texts.BOARD_TEST_REQUIRED): head office is not asked, no key
+is fetched and nothing is written. The test is never reported to ADD.
 """
 from __future__ import annotations
 
@@ -34,13 +40,15 @@ from pathlib import Path
 from typing import Callable, List, Optional, Protocol, Tuple
 
 from . import texts, validation
-from .api import (Advice, BoardInfo, BootOutcome, BootReport, BundleInfo, CancelToken,
+from .api import (Advice, BoardInfo, BoardTestReport, BootOutcome, BootReport, BundleInfo,
+                  CancelToken,
                   DeviceRecord, EncryptedPackage, Family, HardwareVerdict, InstallConfig,
                   InstallerError, InstallMode, InstallSummary, LocalBundle, PackageRequest,
                   ProgressFn, SecurityState, ServerService, StepId, StepProgress, UsbCandidate)
 from .board import (XMC_STARTUP_FAILED, classify_efuses, classify_sdm,
                     efuse_mac, hardware_advice, key0_locked_hmac, parse_banner,
                     parse_security_info, read_summary_file, refusal_detail, revision_words)
+from .boardtest import check_board_test
 from .bundles import BundleStore, chip_revision_window, flash_ranges
 from .clock import Clock, iso_utc
 from .envelope import EnvelopeError, OneTimeKey, OpenedPackage, open_package
@@ -122,7 +130,8 @@ def cleanup_stale_work(root: Path, now: Optional[float] = None,
     if not root.is_dir():
         return
     moment = time.time() if now is None else now
-    for child in root.glob("sl-install-*"):
+    # Board test work folders (boardtest.py) hold no secrets, only eFuse summaries.
+    for child in [*root.glob("sl-install-*"), *root.glob("sl-boardtest-*")]:
         try:
             if not child.is_dir() or (max_age_s > 0
                                       and moment - child.stat().st_mtime < max_age_s):
@@ -222,14 +231,18 @@ class Installer:
     # ------------------------------------------------------------- run
 
     def run(self, mode: InstallMode, board: BoardInfo, config: InstallConfig,
-            on_step: ProgressFn, cancel: CancelToken) -> InstallSummary:
+            on_step: ProgressFn, cancel: CancelToken,
+            board_test: Optional[BoardTestReport] = None) -> InstallSummary:
         # A PC that sleeps halfway suspends USB under esptool.
         with keep_awake():
-            return self._run(mode, board, config, on_step, cancel)
+            return self._run(mode, board, config, on_step, cancel, board_test)
 
     def _run(self, mode: InstallMode, board: BoardInfo, config: InstallConfig,
-             on_step: ProgressFn, cancel: CancelToken) -> InstallSummary:
+             on_step: ProgressFn, cancel: CancelToken,
+             board_test: Optional[BoardTestReport] = None) -> InstallSummary:
         self._check_mode(mode, board)
+        # Before head office is asked or any key is in memory (module notes).
+        check_board_test(mode, board, board_test, self._clock.now_utc())
         problems = validation.problems(config, mode)
         if problems:
             # Part of preparing the files, so the screen offers to change the details.

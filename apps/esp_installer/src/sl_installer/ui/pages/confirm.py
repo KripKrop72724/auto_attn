@@ -14,12 +14,14 @@ _WORDS = {
     InstallMode.NEW_BOARD: (
         "Start the setup",
         "This prepares the board for State Life for good",
-        "After this, the board can only be used for State Life attendance. It cannot be undone.",
+        "The board passed its hardware test. After this, the board can only be used for State "
+        "Life attendance. It cannot be undone.",
     ),
     InstallMode.RESUME: (
         "Finish the setup",
         "This finishes the setup that stopped earlier",
-        "The board is already locked for State Life. The app copies everything again.",
+        "The board passed its hardware test. It is already locked for State Life. The app "
+        "copies everything again.",
     ),
     InstallMode.CHANGE_SETTINGS: (
         "Write the new settings",

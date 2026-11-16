@@ -40,6 +40,19 @@ class HomePage(BasePage):
             "light",
             picture_size=size,
         )
+        # Neither needs head office: they stay on when board setup is switched off.
+        self.test_card = ChoiceCard(
+            "Test a new board",
+            "Check a board from the shop before it is used. Gives a certificate.",
+            "cable_in",
+            picture_size=size,
+        )
+        self.failed_card = ChoiceCard(
+            "Check a failed board",
+            "For a board that did not start after setup.",
+            "faulty_board",
+            picture_size=size,
+        )
         self.connect_card = ChoiceCard(
             "How to connect a board",
             "See which cable and which socket to use.",
@@ -49,10 +62,19 @@ class HomePage(BasePage):
         for card, name in (
             (self.setup_card, "setup"),
             (self.check_card, "check"),
+            (self.test_card, "board_test"),
+            (self.failed_card, "failed_board"),
             (self.connect_card, "connect_help"),
         ):
             card.clicked.connect(lambda _checked=False, value=name: self.action.emit(value))
-            self.content.addWidget(card)
+        self.content.addWidget(self.setup_card)
+        self.content.addWidget(self.check_card)
+        tests = QHBoxLayout()
+        tests.setSpacing(20)
+        tests.addWidget(self.test_card, 1)
+        tests.addWidget(self.failed_card, 1)
+        self.content.addLayout(tests)
+        self.content.addWidget(self.connect_card)
         links = QHBoxLayout()
         self.lights_link = button("What is the light on the board doing?", "link")
         self.lights_link.clicked.connect(lambda: self.action.emit("lights"))

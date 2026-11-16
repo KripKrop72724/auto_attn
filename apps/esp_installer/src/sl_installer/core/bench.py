@@ -4,6 +4,16 @@
     python -m sl_installer.core.bench watch [--console] [--seconds N]
     python -m sl_installer.core.bench diagnose [--seconds N] [--username U]
     python -m sl_installer.core.bench install --family zkt --zone-id Z --device-id 1 ...
+    python -m sl_installer.core.bench boardtest [--tester NAME]
+    python -m sl_installer.core.bench failedboard [--seconds N] [--tester NAME]
+
+``boardtest`` is the window's "Test a new board": after you type the board ID it writes
+the unsecured State Life test program, runs the memory, flash, CPU and Wi-Fi tests, erases
+the program again and proves the eFuses unchanged (core/boardtest.py), then saves the
+certificate PDF and evidence ZIP in the records folder. ``failedboard`` is "Check a failed
+board": a locked board is only watched while it starts after a replug (nothing is
+written); a board the test program can run on is tested instead. ``install`` runs the
+board test first for a new board or a resume and stops unless it passed.
 
 ``install`` signs in to ADD, inspects the board and shows exactly what it will do.
 It goes on only after you type the board ID (new board or resume) or the ZONE ID
@@ -34,11 +44,13 @@ from typing import List, Optional, Sequence
 
 from ..config import TOOL_PYTHON_ENV, AppConfig, load_config
 from . import texts
-from .api import (STEP_LABELS, Advice, BoardInfo, BootOutcome, BootReport, CancelToken,
-                  ConsoleEvent, Family, HikSettings, InstallConfig, InstallerError, InstallMode,
-                  PhaseFn, PresenceReport, PresenceState, ReplugPhase, SecurityState, Services,
-                  StepProgress, UsbKind, ZktSettings, steps_for)
+from .api import (STEP_LABELS, Advice, BoardInfo, BoardTestProgress, BoardTestReport,
+                  BootOutcome, BootReport, CancelToken, ConsoleEvent, Family, HikSettings,
+                  InstallConfig, InstallerError, InstallMode, PhaseFn, PresenceReport,
+                  PresenceState, ReplugPhase, SecurityState, Services, StepProgress, UsbKind,
+                  ZktSettings, steps_for)
 from .board import hardware_advice, revision_words
+from .boardtest import board_problems, never_started, report_lines
 from .esptool_runner import TOOL_VERSION, SubprocessRunner, tool_version_problems
 from .factory import make_services
 from .installer import report_boot, report_restart
@@ -241,13 +253,23 @@ def cmd_install(services: Services, args: argparse.Namespace) -> int:
     else:
         _confirm(f"This prepares board {board.mac} for State Life for good "
                  "(the security key burn cannot be undone). Type the board ID.", board.mac)
+    board_test: Optional[BoardTestReport] = None
+    if mode is not InstallMode.CHANGE_SETTINGS:
+        # The board's own hardware test comes first; the key is locked only after a pass.
+        print("\nTesting the board's hardware first (the test program is erased again).")
+        board_test = _run_board_test(services, board)
+        _save_board_test(services, board_test, args.tester)
+        if not board_test.passed:
+            print("\nThe board did not pass its hardware test. Nothing was locked.")
+            return 4
 
     def on_step(progress: StepProgress) -> None:
         fraction = "" if progress.fraction is None else f"{progress.fraction * 100:5.1f}%"
         print(f"  {STEP_LABELS[progress.step]:40} {fraction} {progress.detail}", flush=True)
 
     try:
-        summary = services.installer.run(mode, board, config, on_step, CancelToken())
+        summary = services.installer.run(mode, board, config, on_step, CancelToken(),
+                                         board_test=board_test)
     except InstallerError as error:
         print(f"\nInstall stopped (key burned: {error.irreversible_done}).")
         _print_advice([error.advice])
@@ -277,6 +299,81 @@ def cmd_install(services: Services, args: argparse.Namespace) -> int:
         print(texts.SETTINGS_KEPT)
         return 0
     return 4
+
+
+def _test_progress(progress: BoardTestProgress) -> None:
+    fraction = "" if progress.fraction is None else f"{progress.fraction * 100:5.1f}%"
+    print(f"  {progress.stage:8} {fraction:7} {progress.detail}", flush=True)
+
+
+def _run_board_test(services: Services, board: BoardInfo) -> BoardTestReport:
+    report = services.board_test.run_test(
+        board, _test_progress, _phases("The test did not start: unplug the board now",
+                                       "the test program"), _print_event, CancelToken())
+    print()
+    for line in report_lines(report):
+        print(line)
+    if report.advice is not None:
+        _print_advice([report.advice])
+    return report
+
+
+def _save_board_test(services: Services, report: BoardTestReport,
+                     tester: Optional[str]) -> None:
+    try:
+        pdf, evidence = services.records.save_board_test(report, tester or getpass.getuser())
+    except Exception as error:  # the result is printed above; the file is a convenience
+        print(f"\nThe certificate could not be saved: {error}")
+        return
+    print(f"\nCertificate: {pdf}\nEvidence:    {evidence}")
+
+
+def cmd_boardtest(services: Services, args: argparse.Namespace) -> int:
+    report = _one_board(services)
+    board = services.boards.inspect(report.board, CancelToken())
+    _print_board(board)
+    problems = board_problems(board)
+    if problems and board.hardware.value in ("ok", "not_checked"):
+        print("\nThe test program may not run on this board: " + "; ".join(problems) + ".")
+        print("For a locked board use: failedboard")
+        return 2
+    if not problems:
+        _confirm(f"This writes the State Life test program to board {board.mac}, tests the "
+                 "board and erases the program again. eFuses are not changed. Type the "
+                 "board ID.", board.mac)
+    result = _run_board_test(services, board)
+    _save_board_test(services, result, args.tester)
+    return 0 if result.passed else 4
+
+
+def cmd_failedboard(services: Services, args: argparse.Namespace) -> int:
+    report = _one_board(services)
+    board = services.boards.inspect(report.board, CancelToken())
+    _print_board(board)
+    if not board_problems(board):
+        print("\nThis board is unlocked enough for the test program: it is tested instead.")
+        _confirm(f"This writes the State Life test program to board {board.mac}, tests it "
+                 "and erases the program again. eFuses are not changed. Type the board ID.",
+                 board.mac)
+        result = _run_board_test(services, board)
+    elif never_started(board):
+        # Never replugged: its first start could boot a Secure Boot bootloader that burns
+        # eFuses. The test refuses it without touching it and says why.
+        print("\nThis board has never started: it is not replugged. Nothing is written.")
+        result = _run_board_test(services, board)
+    else:
+        print(f"\nNothing is written to this board. Watching its own start for "
+              f"{args.seconds:.0f} s after a replug.")
+        result = services.board_test.check_failed_board(
+            board, _phases("Unplug the board now", "the board's start"), _print_event,
+            CancelToken(), seconds=args.seconds)
+        print()
+        for line in report_lines(result):
+            print(line)
+        if result.advice is not None:
+            _print_advice([result.advice])
+    _save_board_test(services, result, args.tester)
+    return 0 if result.passed else 4
 
 
 def _phases(unplug: str, watching: str) -> PhaseFn:
@@ -328,10 +425,16 @@ def parser() -> argparse.ArgumentParser:
     install.add_argument("--hik-transport", choices=("http_digest",))  # HTTPS needs a CA
     install.add_argument("--hik-model", default="ds-k1t342efwx")
     install.add_argument("--boot-seconds", type=float, default=150.0)
+    install.add_argument("--tester", help="the name on the board test certificate")
+    boardtest = commands.add_parser("boardtest")
+    boardtest.add_argument("--tester", help="the name on the certificate")
+    failedboard = commands.add_parser("failedboard")
+    failedboard.add_argument("--seconds", type=float, default=90.0)
+    failedboard.add_argument("--tester", help="the name on the certificate")
     return main
 
 
-_TOOL_COMMANDS = ("inspect", "install")
+_TOOL_COMMANDS = ("inspect", "install", "boardtest", "failedboard")
 
 
 def tool_check(cfg: AppConfig) -> List[str]:
@@ -362,7 +465,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     try:
         services = make_services(cfg)
         handlers = {"inspect": cmd_inspect, "watch": cmd_watch, "diagnose": cmd_diagnose,
-                    "install": cmd_install}
+                    "install": cmd_install, "boardtest": cmd_boardtest,
+                    "failedboard": cmd_failedboard}
         try:
             return handlers[args.command](services, args)
         except InstallerError as error:

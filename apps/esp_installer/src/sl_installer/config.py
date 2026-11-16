@@ -37,6 +37,8 @@ TOOL_PYTHON_ENV = "SL_INSTALLER_TOOL_PYTHON"
 SIGNING_KEY_NAME = "firmware-signing-key-1.pem"
 STORAGE_IMAGE_NAME = "storage-empty.bin.gz"
 FIELD_DEFAULTS_NAME = "field_defaults.json"
+# The board test program's images and manifest (core/boardtest_images.py pins them).
+BOARD_TEST_DIR_NAME = "boardtest"
 
 
 def resources_dir() -> Path:
@@ -96,6 +98,10 @@ class AppConfig:
     @property
     def storage_image_path(self) -> Path:
         return self.resources_dir / STORAGE_IMAGE_NAME
+
+    @property
+    def board_test_dir(self) -> Path:
+        return self.resources_dir / BOARD_TEST_DIR_NAME
 
     @property
     def field_defaults_path(self) -> Path:

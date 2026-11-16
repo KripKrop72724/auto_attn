@@ -39,7 +39,7 @@ class FailingInstaller:
     def __init__(self, error: InstallerError) -> None:
         self.error = error
 
-    def run(self, mode, board, config, on_step, cancel):
+    def run(self, mode, board, config, on_step, cancel, board_test=None):
         on_step(StepProgress(self.error.step or StepId.PREPARE_FILES, 0.5))
         raise self.error
 

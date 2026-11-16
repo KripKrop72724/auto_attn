@@ -5,6 +5,7 @@ from ..config import AppConfig, load_field_defaults
 from .add_client import AddClient, LoginThrottle
 from .api import FieldDefaults, Services
 from .board import BoardInspector
+from .boardtest import BoardTester
 from .bundles import BundleStore, Verifier, load_public_key
 from .clock import Clock
 from .connectivity import Connectivity
@@ -51,6 +52,10 @@ def make_services(cfg: AppConfig) -> Services:
     server = AddClient(cfg.server_url, app_version=cfg.app_version, store=store, clock=clock,
                        throttle=LoginThrottle(clock, cfg.state_dir / "sign-in-pause.json"))
     usb = UsbWatcher(clock=clock)
+    # The board hardware test: its console lines go to a console log like a setup's.
+    board_test = BoardTester(runner=runner, usb=usb, clock=clock, image_dir=cfg.board_test_dir,
+                             temp_root=cfg.work_dir, console_logs=cfg.logs_dir,
+                             placeholder_ssids=placeholders)
     return Services(
         server=server,
         connectivity=Connectivity(cfg.server_url),
@@ -61,7 +66,9 @@ def make_services(cfg: AppConfig) -> Services:
         # Each watched start's lines go, redacted, to a per-install file next to installer.log.
         boot=BootWatcher(usb, clock, placeholder_ssids=placeholders, console_logs=cfg.logs_dir),
         diagnosis=Diagnoser(placeholders),
-        records=Records(cfg.records_dir, cfg.logs_dir, cfg.app_version),
+        records=Records(cfg.records_dir, cfg.logs_dir, cfg.app_version,
+                        board_test_dir=cfg.board_test_dir),
+        board_test=board_test,
         defaults=defaults,
         app_version=cfg.app_version,
     )

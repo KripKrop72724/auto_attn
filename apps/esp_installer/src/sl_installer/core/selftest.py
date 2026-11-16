@@ -12,6 +12,7 @@ import tempfile
 from typing import List, Optional
 
 from ..config import AppConfig, load_config, load_field_defaults
+from .boardtest_images import image_problems
 from .bundles import STORAGE_EMPTY_SHA256, load_public_key
 from .esptool_runner import SubprocessRunner, ToolRunner, tool_version_problems
 
@@ -38,6 +39,9 @@ def run(cfg: Optional[AppConfig] = None, runner: Optional[ToolRunner] = None) ->
             problems.append("embedded empty storage image does not match its pinned hash")
     except OSError as error:
         problems.append(f"embedded empty storage image unreadable: {error}")
+
+    # The board test program goes onto boards before every key lock: only the pinned bytes.
+    problems.extend(image_problems(config.board_test_dir))
 
     try:
         defaults = load_field_defaults(config.field_defaults_path)

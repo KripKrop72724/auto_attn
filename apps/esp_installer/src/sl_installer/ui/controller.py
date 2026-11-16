@@ -13,17 +13,21 @@ what the board needs to start). After that the window will not close.
 
 from __future__ import annotations
 
+import dataclasses
 import enum
 import functools
 import logging
 import os
+import shutil
 import time
 import uuid
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple
 
-from PySide6.QtCore import QObject, QTimer, QUrl, Signal
+from PySide6.QtCore import QObject, QStandardPaths, QTimer, QUrl, Signal
 from PySide6.QtGui import QDesktopServices
+from PySide6.QtWidgets import QFileDialog
 
 from ..core import api, texts
 from ..core.api import (
@@ -41,6 +45,8 @@ from ..core.api import (
 from ..core.installer import report_board_refused, report_boot, report_restart
 from . import naming, wording
 from .pages import (
+    BOARD_TEST,
+    BOARD_TEST_RESULT,
     CHECK_BOARD,
     CHECKING,
     CONFIRM,
@@ -81,24 +87,35 @@ WIFI_ADVICE = frozenset(
 class Flow(str, enum.Enum):
     SETUP = "setup"
     CHECK = "check"
+    BOARD_TEST = "board_test"  # Test a new board (Home)
+    FAILED_BOARD = "failed_board"  # Check a failed board (Home)
 
 
-SETUP_STEPS = ("Machine", "Details", "Connect", "Check", "Confirm", "Install", "Start", "Done")
+SETUP_STEPS = (
+    "Machine", "Details", "Connect", "Check", "Test", "Confirm", "Install", "Start", "Done"
+)
 _SETUP_INDEX = {
     MACHINE: 0,
     DETAILS: 1,
     CONNECT: 2,
     CHECKING: 3,
-    CONFIRM: 4,
-    INSTALLING: 5,
-    FIRST_START: 6,
-    DONE: 7,
+    BOARD_TEST: 4,
+    BOARD_TEST_RESULT: 4,
+    CONFIRM: 5,
+    INSTALLING: 6,
+    FIRST_START: 7,
+    DONE: 8,
 }
+TEST_STEPS = ("Connect", "Test", "Certificate")
+FAILED_STEPS = ("Connect", "Check", "Result")
+_TEST_INDEX = {CONNECT: 0, BOARD_TEST: 1, BOARD_TEST_RESULT: 2}
 FIX_STEPS = ("Connect", "Check", "Settings", "Confirm", "Write", "Start", "Done")
 _FIX_INDEX = {
     CONNECT: 0,
     CHECKING: 1,
     CHECK_BOARD: 1,
+    BOARD_TEST: 1,
+    BOARD_TEST_RESULT: 1,
     FIX_SETTINGS: 2,
     CONFIRM: 3,
     INSTALLING: 4,
@@ -119,6 +136,14 @@ def cancel_allowed(mode: InstallMode, current: Optional[StepId]) -> bool:
     limit = steps.index(CANCEL_LIMIT[mode])
     index = steps.index(current) if current in steps else 0
     return index < limit
+
+
+# The board test may be stopped until it removes the test program (and nothing may close
+# the window while it writes or removes it: the board would keep the test program).
+TEST_NO_CANCEL_STAGES = frozenset({"cleanup", "done"})
+TEST_NO_CLOSE_STAGES = frozenset({"write", "cleanup"})
+# Certificate kinds (core/certificate.CertificateKind values) and the file each button saves.
+PASSED_CERT, VENDOR_CERT, REPORT_CERT = "passed", "vendor_return", "fault_report"
 
 
 def advice_of(error: BaseException) -> Advice:
@@ -154,6 +179,12 @@ class Session:
     record_path: Optional[str] = None
     light_return: str = HOME
     events: List[api.ConsoleEvent] = field(default_factory=list)
+    # The board test: its report, how far it is, and the saved files by certificate kind.
+    test_report: Optional[object] = None
+    test_stage: str = ""
+    test_cancelled: bool = False
+    test_files: Dict[str, Tuple[str, str]] = field(default_factory=dict)
+    test_saved_by: Optional[str] = None  # the "Tested by" name the files carry
 
 
 @dataclass(frozen=True)
@@ -231,6 +262,11 @@ class Controller(QObject):
                 "The board is being set up. Closing the app now could damage the board. "
                 "Please wait until the app says it is finished."
             )
+        if self.running("board_test") and self.session.test_stage in TEST_NO_CLOSE_STAGES:
+            return (
+                "The app is copying or removing the test program. Please wait until the app "
+                "shows the result."
+            )
         return None
 
     def close_question(self) -> Optional[str]:
@@ -240,6 +276,11 @@ class Controller(QObject):
         person in a hurry from taking it away: closing the app then skips the check that
         shows it keeps its settings. The check can take minutes, so this only asks.
         """
+        if self.running("board_test"):
+            return (
+                "The board is being tested. If you close the app now, the test program may "
+                "stay on the board. Do not use the board until it was tested again."
+            )
         boot = self.session.boot
         if self.running("boot") and boot is not None and boot.outcome is BootOutcome.OK:
             return (
@@ -326,6 +367,11 @@ class Controller(QObject):
                 self._stop("console", "diagnose")
         elif page_id == FIRST_START:
             self._stop("boot")
+        elif page_id == BOARD_TEST:
+            # Stopping the test still removes the test program: the engine cleans up.
+            self._stop("check", "board_test")
+        elif page_id == BOARD_TEST_RESULT:
+            self._stop("certificate", "certificate_copy")
         elif page_id == FIX_SETTINGS:
             self._stop("zones", "lookup")
         elif page_id == DETAILS:
@@ -353,9 +399,19 @@ class Controller(QObject):
         if page == CONFIRM:
             return FIX_SETTINGS if session.fixing else DETAILS
         if page == FIX_SETTINGS:
-            return CHECK_BOARD if session.flow is Flow.CHECK else CHECKING
+            if session.flow is Flow.CHECK:
+                return CHECK_BOARD
+            if session.flow is Flow.FAILED_BOARD:
+                return BOARD_TEST_RESULT if session.test_report is not None else BOARD_TEST
+            return CHECKING
         if page == CHECK_BOARD:
             return HOME
+        if page == BOARD_TEST:
+            if self.running("board_test"):
+                return None  # a test or watch runs (and cleans up): only Stop leaves
+            return CHECKING if session.flow is Flow.SETUP else CONNECT
+        if page == BOARD_TEST_RESULT:
+            return CHECKING if session.flow is Flow.SETUP else HOME
         if page == LIGHT_GUIDE:
             return session.light_return
         return None
@@ -368,11 +424,14 @@ class Controller(QObject):
         elif session.flow is Flow.SETUP and page in _SETUP_INDEX:
             index = len(SETUP_STEPS) if page == DONE else _SETUP_INDEX[page]
             self.window.set_steps(SETUP_STEPS, index)
+        elif session.flow in (Flow.BOARD_TEST, Flow.FAILED_BOARD) and page in _TEST_INDEX:
+            steps = TEST_STEPS if session.flow is Flow.BOARD_TEST else FAILED_STEPS
+            self.window.set_steps(steps, _TEST_INDEX[page])
         else:
             self.window.set_steps(None)
 
     def _update_sign_out(self) -> None:
-        busy = self.session.installing or self.running("boot")
+        busy = self.session.installing or self.running("boot") or self.running("board_test")
         self.window.top_bar.set_sign_out_enabled(not busy)
 
     def _on_action(self, page_id: str, name: str) -> None:
@@ -546,6 +605,9 @@ class Controller(QObject):
         page.set_network(wording.network_words(self._connectivity))
         blocked = notice is not None and notice.code in ("APP_TOO_OLD", "INSTALLER_OFF")
         page.setup_card.setEnabled(not blocked)
+        # The board test needs no head office: it stays on whatever head office says.
+        page.test_card.setEnabled(True)
+        page.failed_card.setEnabled(True)
 
     def _home_recheck(self) -> None:
         self._refresh_capabilities()
@@ -558,6 +620,14 @@ class Controller(QObject):
 
     def _home_check(self) -> None:
         self.session = Session(flow=Flow.CHECK)
+        self.show(CONNECT)
+
+    def _home_board_test(self) -> None:
+        self.session = Session(flow=Flow.BOARD_TEST)
+        self.show(CONNECT)
+
+    def _home_failed_board(self) -> None:
+        self.session = Session(flow=Flow.FAILED_BOARD)
         self.show(CONNECT)
 
     def _home_connect_help(self) -> None:
@@ -685,6 +755,18 @@ class Controller(QObject):
             self._presence_state, self._presence_fast = None, False
             return
         fast = wording.fast_restart_loop(report)
+        if (
+            state is PresenceState.RESTART_LOOP
+            and report.board is not None
+            and self.session.flow is Flow.FAILED_BOARD
+        ):
+            # A failed board that keeps restarting is what Check a failed board is for:
+            # Next reads it, and the check watches it start.
+            self.session.candidate = report.board
+            if self._presence_state is not state:
+                page.show_found(report.board)
+            self._presence_state, self._presence_fast = state, fast
+            return
         if state is PresenceState.RESTART_LOOP and report.board is not None:
             if fast:
                 # Not the faulty-board signature: a cable or power problem first, or a board
@@ -777,6 +859,8 @@ class Controller(QObject):
             return
         if self.session.flow is Flow.CHECK and not self.session.fixing:
             self.show(CHECK_BOARD)
+        elif self.session.flow in (Flow.BOARD_TEST, Flow.FAILED_BOARD):
+            self.show(BOARD_TEST)
         else:
             self.show(CHECKING)
 
@@ -972,10 +1056,23 @@ class Controller(QObject):
 
     def _checking_next(self) -> None:
         self.session.fixing = False
-        self.show(CONFIRM)
+        self._to_test_or_confirm()
 
     def _checking_resume(self) -> None:
         self.session.fixing = False
+        self._to_test_or_confirm()
+
+    def _to_test_or_confirm(self) -> None:
+        """A new board and a resumed setup are tested first: a faulty board is never
+        locked. A test this board passed a moment ago (Check a failed board) counts."""
+        session = self.session
+        if session.mode in (InstallMode.NEW_BOARD, InstallMode.RESUME):
+            if self.fresh_pass(session.test_report, session.board):
+                self.show(CONFIRM)
+            else:
+                session.test_report = None
+                self.show(BOARD_TEST)
+            return
         self.show(CONFIRM)
 
     def _checking_fix(self) -> None:
@@ -1149,9 +1246,17 @@ class Controller(QObject):
         page.set_cancel_allowed(True)
         self._update_sign_out()
 
+        tested = (
+            session.test_report if mode in (InstallMode.NEW_BOARD, InstallMode.RESUME) else None
+        )
+
         def work(operation: Operation) -> object:
             on_step = self.runner.relay(self._on_install_step, operation)
-            return self.services.installer.run(mode, board, config, on_step, operation.token)
+            if tested is None:
+                return self.services.installer.run(mode, board, config, on_step, operation.token)
+            return self.services.installer.run(
+                mode, board, config, on_step, operation.token, board_test=tested
+            )
 
         self._run("install", work, self._installed, self._install_failed)
 
@@ -1237,6 +1342,12 @@ class Controller(QObject):
             actions = [("Change the details", "details", "primary")]
             if advice.can_retry:
                 actions.append(("Try again", "retry", "secondary"))
+        elif advice.code == "BOARD_TEST_REQUIRED":
+            # The engine wants a fresh hardware test first (nothing was written).
+            actions = [
+                ("Test the board", "retest", "primary"),
+                ("Go back to the start", "home", "secondary"),
+            ]
         elif advice.code == "FAMILY_MISMATCH":
             actions = [
                 ("Choose the machine type", "machine", "primary"),
@@ -1257,11 +1368,15 @@ class Controller(QObject):
         # The board now has its key: checking it again offers "Finish the setup".
         self.show(CHECKING)
 
+    def _installing_retest(self) -> None:
+        self.session.test_report = None
+        self.show(BOARD_TEST)
+
     def _installing_details(self) -> None:
         self.show(FIX_SETTINGS if self.session.fixing else DETAILS)
 
     def _installing_machine(self) -> None:
-        if self.session.flow is Flow.CHECK:
+        if self.session.flow in (Flow.CHECK, Flow.FAILED_BOARD):
             self.show(FIX_SETTINGS)  # the machine type is chosen on that page
             return
         self.session.fixing = False
@@ -1729,6 +1844,506 @@ class Controller(QObject):
     def _check_board_recheck(self) -> None:
         self._stop("console", "diagnose", "lookup")
         self._start_check_board()
+
+    # ============================================================= board test
+    #
+    # Three ways in. Setup: after Check, a new board (or a setup to finish) is tested
+    # before Confirm; only a passed test goes on, and its report goes to the installer.
+    # Test a new board (Home): Connect, read the board, test it, certificate. Check a
+    # failed board (Home): Connect, read the board; a board that can still take the test
+    # program is tested, a locked one is watched while it starts (check_failed_board).
+
+    @staticmethod
+    def fresh_pass(report: object, board: Optional[api.BoardInfo]) -> bool:
+        """A passed test of this board, finished a moment ago, that left it as it was."""
+        if report is None or board is None or not getattr(report, "passed", False):
+            return False
+        if str(getattr(report, "mac", "")).lower() != (board.mac or "").lower():
+            return False
+        if getattr(report, "efuses_unchanged", None) is not True:
+            return False
+        if getattr(report, "erased", None) is not True:
+            return False
+        try:
+            finished = datetime.fromisoformat(str(getattr(report, "finished_at", "")))
+        except ValueError:
+            return False
+        now = datetime.now(finished.tzinfo) if finished.tzinfo else datetime.now()
+        age = (now - finished).total_seconds()
+        return -60.0 <= age <= wording.BOARD_TEST_FRESH_S
+
+    def _enter_board_test(self) -> None:
+        session, page = self.session, self.page(BOARD_TEST)
+        session.test_cancelled = False
+        session.test_stage = ""
+        if session.flow is Flow.SETUP:
+            board = session.board
+            if board is None or session.mode not in (InstallMode.NEW_BOARD, InstallMode.RESUME):
+                self.go_home()
+                return
+            page.start("test", board_read=True)
+            page.board_read(board)
+            self._start_board_test(board)
+            return
+        mode = "check" if session.flow is Flow.FAILED_BOARD else "test"
+        page.start(mode)
+        session.board = None
+        session.record = None
+        session.test_report = None
+        session.test_files = {}
+        if session.candidate is None:
+            self.show(CONNECT)
+            return
+
+        def work(operation: Operation) -> _CheckOutcome:
+            return self._inspect_and_look_up(
+                operation, self.runner.relay(page.board_read, operation)
+            )
+
+        self._run("check", work, self._board_test_read, self._board_test_read_failed)
+
+    def _board_test_read_failed(self, error: BaseException) -> None:
+        advice = advice_of(error)
+        actions = [("Try again", "retry", "primary")] if advice.can_retry else []
+        actions.append(("Go back to the start", "home", "secondary"))
+        self.page(BOARD_TEST).show_problem(advice, actions)
+
+    def _board_test_read(self, outcome: object) -> None:
+        if not isinstance(outcome, _CheckOutcome):
+            return
+        session, page = self.session, self.page(BOARD_TEST)
+        board = outcome.board
+        session.board, session.record = board, outcome.record
+        session.candidate = outcome.candidate or session.candidate
+        if session.record is not None and session.record.family is not None:
+            session.family = session.record.family
+        page.board_read(board)
+        self._board_test_decide(board)
+
+    @staticmethod
+    def _testable(board: api.BoardInfo) -> bool:
+        """The test program can go on: a new board, or one whose setup stopped after the
+        key but before the board was locked (no secure download mode)."""
+        if board.secure_download_mode:
+            return False
+        return board.security in (SecurityState.BLANK, SecurityState.KEY_BURNED_NOT_STARTED)
+
+    def _board_test_decide(self, board: api.BoardInfo) -> None:
+        session, page = self.session, self.page(BOARD_TEST)
+        if session.flow is Flow.BOARD_TEST:
+            if self._testable(board):
+                self._start_board_test(board)
+            else:
+                page.show_problem(
+                    wording.board_test_not_possible(board.security),
+                    [
+                        ("Check a failed board", "failed_board", "primary"),
+                        ("Go back to the start", "home", "secondary"),
+                    ],
+                )
+            return
+        # Check a failed board.
+        if board.security is SecurityState.BLANK and not board.secure_download_mode:
+            page.show_problem(
+                wording.board_never_set_up(),
+                [
+                    ("Test this board", "test_now", "primary"),
+                    ("Go back to the start", "home", "secondary"),
+                ],
+            )
+        elif self._testable(board):
+            page.set_mode("test")
+            self._start_board_test(board)
+        else:
+            self._start_failed_check(board)
+
+    def _start_board_test(self, board: api.BoardInfo) -> None:
+        session, page = self.session, self.page(BOARD_TEST)
+        session.test_report = None
+        session.test_files = {}
+        session.test_saved_by = None
+        session.test_stage = "check"
+        page.running()
+        page.set_cancel_allowed(True)
+
+        def work(operation: Operation) -> object:
+            return self.services.board_test.run_test(
+                board,
+                self.runner.relay(self._on_test_progress, operation),
+                self.runner.relay(page.set_phase, operation),
+                self.runner.relay(page.add_event, operation),
+                operation.token,
+            )
+
+        self._run("board_test", work, self._board_tested, self._board_test_failed)
+        self._update_sign_out()
+
+    def _start_failed_check(self, board: api.BoardInfo) -> None:
+        session, page = self.session, self.page(BOARD_TEST)
+        session.test_report = None
+        session.test_files = {}
+        session.test_saved_by = None
+        session.test_stage = "watch"
+        page.set_mode("check")
+        page.running()
+        page.set_cancel_allowed(True)
+
+        def work(operation: Operation) -> object:
+            return self.services.board_test.check_failed_board(
+                board,
+                self.runner.relay(page.set_phase, operation),
+                self.runner.relay(page.add_event, operation),
+                operation.token,
+            )
+
+        self._run("board_test", work, self._board_tested, self._board_test_failed)
+        self._update_sign_out()
+
+    def _on_test_progress(self, progress: object) -> None:
+        session, page = self.session, self.page(BOARD_TEST)
+        session.test_stage = str(getattr(progress, "stage", "") or "")
+        page.update_progress(progress)
+        page.set_cancel_allowed(
+            not session.test_cancelled and session.test_stage not in TEST_NO_CANCEL_STAGES
+        )
+
+    def _board_test_cancel(self) -> None:
+        session = self.session
+        operation = self._ops.get("board_test")
+        if operation is None or session.test_stage in TEST_NO_CANCEL_STAGES:
+            return
+        session.test_cancelled = True
+        operation.token.cancel()  # keep listening: the engine still removes the program
+        self.page(BOARD_TEST).stopping()
+
+    def _board_tested(self, report: object) -> None:
+        session, page = self.session, self.page(BOARD_TEST)
+        self._update_sign_out()
+        board = session.board
+        if (
+            session.flow is Flow.FAILED_BOARD
+            and board is not None
+            and board.security is SecurityState.KEY_BURNED_NOT_STARTED
+            and getattr(report, "kind", "") != "locked_board"
+            and dataclasses.is_dataclass(report)
+        ):
+            # A setup that stopped after the key: the report says the keys were burned.
+            changes: Dict[str, object] = {"kind": "locked_board", "keys_burned": True}
+            if getattr(report, "passed", False) and getattr(report, "recovery", None) is None:
+                changes["recovery"] = "RESUME"
+            report = dataclasses.replace(report, **changes)
+        session.test_report = report
+        page.finish(report)
+        if session.flow is Flow.SETUP and self.fresh_pass(report, board):
+            self._keep_test_record(report)
+            self.show(CONFIRM)
+            return
+        self.show(BOARD_TEST_RESULT)
+
+    def _board_test_failed(self, error: BaseException) -> None:
+        self._update_sign_out()
+        session = self.session
+        advice = advice_of(error)
+        if session.test_cancelled and advice.code == "CANCELLED":
+            advice = Advice(
+                "BOARD_TEST_STOPPED",
+                "The test stopped",
+                "You stopped the test. The board was not locked.",
+                ("Click Try again to test it again.",),
+                Severity.INFO,
+            )
+        actions = [("Try again", "retry", "primary")] if advice.can_retry else []
+        actions.append(("Go back to the start", "home", "secondary"))
+        self.page(BOARD_TEST).show_problem(advice, actions)
+
+    def _board_test_retry(self) -> None:
+        # Outside a setup the board is read again: after a replug it can be on another port.
+        self._enter_board_test()
+
+    def _board_test_test_now(self) -> None:
+        board = self.session.board
+        if board is not None and self._testable(board):
+            self.page(BOARD_TEST).set_mode("test")
+            self._start_board_test(board)
+
+    def _board_test_failed_board(self) -> None:
+        """Test a new board on a locked board: check it as a failed board instead."""
+        session = self.session
+        session.flow = Flow.FAILED_BOARD
+        self._update_steps()
+        board = session.board
+        if board is None:
+            self.show(CONNECT)
+            return
+        self.page(BOARD_TEST).set_mode("check")
+        self._board_test_decide(board)
+
+    def _keep_test_record(self, report: object) -> None:
+        """The passed test before a setup, kept as evidence; best effort, nothing shown."""
+        tester = self.user or ""
+
+        def kept(paths: object) -> None:
+            log.info("board test before setup kept: %s", paths)
+
+        self._run(
+            "test_record",
+            lambda _op: self.services.records.save_board_test(report, tester, PASSED_CERT),
+            kept,
+            lambda error: log.info("board test before setup not kept: %s", error),
+        )
+
+    # ------------------------------------------------------ board test result
+
+    def certificate_kinds(self, report: object) -> List[str]:
+        """The files this report gets: a locked board always gets the fault report, and
+        the vendor claim when its hardware is at fault (owner decision 4)."""
+        verdict = str(getattr(getattr(report, "verdict", ""), "value", "") or "")
+        if getattr(report, "kind", "") == "locked_board":
+            kinds = [REPORT_CERT]
+            if verdict == "failed":
+                kinds.insert(0, VENDOR_CERT)
+            return kinds
+        if verdict == "passed":
+            return [PASSED_CERT]
+        if verdict == "failed":
+            return [VENDOR_CERT]
+        return [REPORT_CERT]
+
+    def _enter_board_test_result(self) -> None:
+        session, page = self.session, self.page(BOARD_TEST_RESULT)
+        report = session.test_report
+        if report is None:
+            self.go_home()
+            return
+        setup = session.flow is Flow.SETUP
+        locked = getattr(report, "kind", "") == "locked_board"
+        kinds = self.certificate_kinds(report)
+        if locked and VENDOR_CERT in kinds:
+            primary = ("Save vendor claim (PDF)", "save_vendor_claim")
+            secondary = ("Save fault report (PDF)", "save_report")
+            extra = [("Save evidence (ZIP)", "save_evidence", "secondary")]
+        elif kinds == [REPORT_CERT]:
+            primary = ("Save fault report (PDF)", "save_report")
+            secondary = ("Save evidence (ZIP)", "save_evidence")
+            extra = []
+        else:
+            primary = ("Save certificate (PDF)", "save_certificate")
+            secondary = ("Save evidence (ZIP)", "save_evidence")
+            extra = []
+        page.show_report(
+            report,
+            wording.board_test_verdict(report, during_setup=setup),
+            session.test_saved_by or self.user or "",
+            primary,
+            secondary,
+            extra,
+            self._recovery_actions(report),
+            retest=getattr(report, "hardware_fault", False),
+            another_words="Use another board" if setup else "Test another board",
+            files_title=(
+                "Certificate and evidence" if kinds[0] != REPORT_CERT else "Report and evidence"
+            ),
+        )
+        if session.test_files and session.test_saved_by is not None:
+            page.show_saved(self._folder_of(session.test_files))
+        else:
+            self._save_test_files(page.tester_name() or self.user or "")
+
+    def _recovery_actions(self, report: object) -> List[Tuple[str, str, str]]:
+        """The way on, on the result card: Test again when the test could not finish, or
+        Finish the setup / Fix the settings when a failed board can be fixed here."""
+        session, board = self.session, self.session.board
+        recovery = getattr(report, "recovery", None)
+        verdict = str(getattr(getattr(report, "verdict", ""), "value", "") or "")
+        if session.flow is Flow.FAILED_BOARD and board is not None:
+            if recovery == "RESUME" and board.security is SecurityState.KEY_BURNED_NOT_STARTED:
+                return [("Finish the setup", "resume", "primary")]
+            if recovery == "FIX_SETTINGS" and board.security is SecurityState.SECURED_STATE_LIFE:
+                return [("Fix the settings", "fix", "primary")]
+        if verdict == "incomplete" and recovery is None:
+            # Not the board's fault, or not proven: the way on is another try.
+            return [("Test again", "retest", "primary")]
+        return []
+
+    @staticmethod
+    def _folder_of(files: Dict[str, Tuple[str, str]]) -> str:
+        for pdf, _zip in files.values():
+            return os.path.dirname(pdf) or pdf
+        return ""
+
+    def _save_test_files(self, tester: str, then: Optional[Callable[[], None]] = None) -> None:
+        """Save every file this report gets (records_dir), for ``tester``; then ``then``."""
+        session, page = self.session, self.page(BOARD_TEST_RESULT)
+        report = session.test_report
+        if report is None:
+            return
+        kinds = self.certificate_kinds(report)
+        records = self.services.records
+        page.set_saving()
+
+        def work(_op: Operation) -> Dict[str, Tuple[str, str]]:
+            shared = getattr(records, "save_board_tests", None)
+            if len(kinds) > 1 and callable(shared):
+                # One evidence ZIP for every PDF: each prints that ZIP's SHA-256.
+                return {kind: (str(pdf), str(archive))
+                        for kind, (pdf, archive) in shared(report, tester, kinds).items()}
+            saved: Dict[str, Tuple[str, str]] = {}
+            for kind in kinds:
+                pdf, archive = records.save_board_test(report, tester, kind)
+                saved[kind] = (str(pdf), str(archive))
+            return saved
+
+        def done(saved: object) -> None:
+            if session is not self.session or not isinstance(saved, dict):
+                return
+            session.test_files = dict(saved)
+            session.test_saved_by = tester
+            page.show_saved(self._folder_of(session.test_files))
+            if then is not None:
+                then()
+
+        def failed(error: BaseException) -> None:
+            if session is self.session:
+                page.show_save_problem(advice_of(error))
+
+        self._run("certificate", work, done, failed)
+
+    def _board_test_result_save_again(self) -> None:
+        page = self.page(BOARD_TEST_RESULT)
+        self._save_test_files(page.tester_name() or self.user or "")
+
+    def _board_test_result_save_certificate(self) -> None:
+        kinds = self.certificate_kinds(self.session.test_report)
+        self._save_copy(kinds[0], pdf=True)
+
+    def _board_test_result_save_vendor_claim(self) -> None:
+        self._save_copy(VENDOR_CERT, pdf=True)
+
+    def _board_test_result_save_report(self) -> None:
+        self._save_copy(REPORT_CERT, pdf=True)
+
+    def _board_test_result_save_evidence(self) -> None:
+        kinds = self.certificate_kinds(self.session.test_report)
+        self._save_copy(kinds[0], pdf=False)
+
+    def _save_copy(self, kind: str, pdf: bool) -> None:
+        """A copy of a saved file where the person chooses (the files are saved already;
+        a changed "Tested by" name saves them again first)."""
+        session, page = self.session, self.page(BOARD_TEST_RESULT)
+        if session.test_report is None or self.running("certificate"):
+            return
+        tester = page.tester_name()
+        if not tester:
+            page.show_save_problem(wording.tested_by_missing())
+            page.tester.setFocus()
+            return
+        if tester != session.test_saved_by or kind not in session.test_files:
+            self._save_test_files(tester, then=lambda: self._save_copy(kind, pdf))
+            return
+        source = session.test_files[kind][0 if pdf else 1]
+        if pdf:
+            target = self.ask_save_path(
+                "Save the certificate", os.path.basename(source), "PDF file (*.pdf)"
+            )
+        else:
+            target = self.ask_save_path(
+                "Save the evidence file", os.path.basename(source), "ZIP file (*.zip)"
+            )
+        if not target:
+            return
+        suffix = ".pdf" if pdf else ".zip"
+        if not target.lower().endswith(suffix):
+            target += suffix
+
+        def copied(path: object) -> None:
+            if session is self.session:
+                page.show_copied(str(path))
+
+        def failed(error: BaseException) -> None:
+            if session is self.session:
+                page.show_save_problem(
+                    Advice(
+                        "COPY_NOT_SAVED",
+                        "The copy was not saved",
+                        f"The app could not write {target}.",
+                        ("Choose another folder, for example Documents.",),
+                        Severity.WARNING,
+                    )
+                )
+
+        self._run(
+            "certificate_copy", lambda _op: shutil.copyfile(source, target), copied, failed
+        )
+
+    def ask_save_path(self, title: str, suggested: str, file_filter: str) -> Optional[str]:
+        """Where to save a copy, from the save dialog on the GUI thread; None if cancelled.
+
+        A method of its own so the tests can answer for the person (a real dialog would
+        wait for a click that never comes)."""
+        folder = QStandardPaths.writableLocation(
+            QStandardPaths.StandardLocation.DocumentsLocation
+        ) or os.path.expanduser("~")
+        path, _chosen = QFileDialog.getSaveFileName(
+            self.window, title, os.path.join(folder, suggested), file_filter
+        )
+        return path or None
+
+    def _board_test_result_open_folder(self) -> None:
+        files = self.session.test_files
+        if files:
+            self._open_folder(next(iter(files.values()))[0])
+
+    def _board_test_result_retest(self) -> None:
+        session = self.session
+        session.test_report = None
+        session.test_files = {}
+        session.test_saved_by = None
+        self.show(BOARD_TEST)  # outside a setup it reads the board again first
+
+    def _board_test_result_another(self) -> None:
+        session = self.session
+        if session.flow is Flow.SETUP:
+            # Another board for the same details: Connect, Check, Test.
+            session.board = session.record = None
+            session.test_report = None
+            session.test_files = {}
+            session.mode = None
+            self.show(CONNECT)
+            return
+        self.session = Session(flow=session.flow)
+        self.show(CONNECT)
+
+    def _board_test_result_resume(self) -> None:
+        """A setup that stopped after the key, on a board that passed its test: set it up
+        again (the details are needed), with this test."""
+        session = self.session
+        report, board = session.test_report, session.board
+        if board is None or board.security is not SecurityState.KEY_BURNED_NOT_STARTED:
+            return
+        family = session.record.family if session.record and session.record.known else None
+        self.session = Session(
+            flow=Flow.SETUP,
+            family=family,
+            test_report=report,
+            test_files=dict(session.test_files),
+            test_saved_by=session.test_saved_by,
+        )
+        if family is not None:
+            self.choose_family(family)
+        else:
+            self.page(MACHINE).set_selected(None)
+            self.show(MACHINE)
+
+    def _board_test_result_fix(self) -> None:
+        session, page = self.session, self.page(BOARD_TEST_RESULT)
+        board = session.board
+        if board is None or board.security is not SecurityState.SECURED_STATE_LIFE:
+            return
+        blocked = wording.install_blocked(session.candidate)
+        if blocked is not None:
+            page.show_problem(blocked)
+            return
+        self.start_fixing()
 
     # ============================================================ light guide
 

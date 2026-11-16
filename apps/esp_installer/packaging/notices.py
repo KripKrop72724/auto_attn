@@ -3,10 +3,12 @@
 The list of components is the runtime lock (requirements.lock), so it matches
 what PyInstaller bundles. Licence texts come from each installed package's
 metadata; ``packaging/licenses`` holds the few texts a package does not ship
-(pyserial's wheel has no licence file, and the Qt wheels carry none at all).
+(pyserial's wheel has no licence file, and the Qt wheels carry none at all)
+and the ESP-IDF texts for the board test program the app writes into boards.
 """
 from __future__ import annotations
 
+import json
 import re
 import sys
 import sysconfig
@@ -32,6 +34,11 @@ VENDORED = {
 STUB_RELEASE = "v1.8.0"
 STUB_SOURCE = ("https://github.com/espressif/esptool-legacy-flasher-stub/releases/tag/"
                + STUB_RELEASE)
+# The board test program the app writes into new boards (and erases again) is
+# built with ESP-IDF; its versions come from the committed image manifest.
+BOARD_TEST_MANIFEST = (PACKAGING.parent / "src" / "sl_installer" / "resources" / "boardtest"
+                       / "manifest.json")
+BOARD_TEST_LICENSES = ["Apache-2.0.txt", "esp-idf-v5.5.3-components.txt"]
 
 
 def locked_names(lock: Path) -> List[str]:
@@ -89,6 +96,21 @@ def _licence_files(dist: metadata.Distribution) -> List[Tuple[str, str]]:
     return found
 
 
+def board_test_versions() -> Tuple[str, str]:
+    """(test program version, ESP-IDF version) of the committed test images."""
+    data = json.loads(BOARD_TEST_MANIFEST.read_text(encoding="utf-8"))
+    return data["version"], data["idf"]
+
+
+def _board_test_section() -> str:
+    version, idf = board_test_versions()
+    texts = [(name, (LICENSES / name).read_text(encoding="utf-8"))
+             for name in BOARD_TEST_LICENSES]
+    return _section(f"ESP-IDF {idf} (in the State Life board test program {version})",
+                    "Apache-2.0 (parts MIT, BSD-3-Clause, BSD-2-Clause, newlib)",
+                    f"https://github.com/espressif/esp-idf/tree/{idf}", texts)
+
+
 def _python_licence() -> str:
     candidates = [Path(sys.base_prefix) / "LICENSE.txt",
                   Path(sysconfig.get_paths()["stdlib"]) / "LICENSE.txt"]
@@ -115,6 +137,7 @@ def _wording(platform: str, esptool: str) -> Dict[str, str]:
                        "does not use, are under the Apache-2.0 or MIT licence; their licence",
                        "files are in that folder."],
             "start_up": ['in "Contents/MacOS"'],
+            "board_test": ['"Contents/Resources/sl_installer/resources/boardtest".'],
         }
     else:
         lines = {
@@ -128,6 +151,7 @@ def _wording(platform: str, esptool: str) -> Dict[str, str]:
                        "use, are under the Apache-2.0 or MIT licence; their licence files are",
                        "in that folder."],
             "start_up": ["inside the app's .exe"],
+            "board_test": ['"_internal\\sl_installer\\resources\\boardtest".'],
         }
     # The body lines of the summary sit 6 spaces in before textwrap.dedent.
     return {key: ("\n" + " " * 6).join(value) for key, value in lines.items()}
@@ -139,6 +163,9 @@ def _summary(app_version: str, versions: Dict[str, str], platform: str = sys.pla
     python = ".".join(str(part) for part in sys.version_info[:3])
     qt_minor = ".".join(qt.split(".")[:2])
     w = _wording(platform, esptool)
+    board_test, idf = versions.get("board-test"), versions.get("esp-idf")
+    if not board_test or not idf:
+        board_test, idf = board_test_versions()
     text = f"""
     State Life Device Installer {app_version}: third-party notices
 
@@ -183,6 +210,15 @@ def _summary(app_version: str, versions: Dict[str, str], platform: str = sys.pla
       and State Life head office can supply a copy on request. The stubs in
       {w['stub_2']}
 
+    State Life board test program {board_test} (built with ESP-IDF {idf})
+      Licence: Apache License 2.0 (Apache-2.0); some parts are under the MIT,
+      BSD and newlib licences, all listed in the "ESP-IDF" section below. To
+      test a new board, the app writes this small program into the board and
+      erases it again afterwards. ESP-IDF is made by Espressif Systems; its
+      source code is at https://github.com/espressif/esp-idf/tree/{idf}.
+      The program's files are in
+      {w['board_test']}
+
     PyInstaller {pyinstaller} (the start-up program {w['start_up']})
       Licence: GPL-2.0-or-later with the PyInstaller bootloader exception,
       which allows it to be used in programs under other licences.
@@ -220,6 +256,7 @@ def write_notices(output: Path, app_version: str, runtime_lock: Path,
             raise RuntimeError(f"no licence text found for {dist.metadata['Name']}")
         parts.append(_section(f"{dist.metadata['Name']} {dist.version}", _licence(dist),
                               _home_page(dist), texts))
+    parts.append(_board_test_section())
     output.parent.mkdir(parents=True, exist_ok=True)
     # Windows line ends, so every text viewer shows it properly.
     output.write_bytes("\n".join(parts).replace("\n", "\r\n").encode("utf-8"))

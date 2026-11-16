@@ -10,14 +10,17 @@ by CI, and by the UI tests.
 from __future__ import annotations
 
 import os
+import threading
 import time
+import zipfile
+from datetime import datetime
 from typing import Callable, List, Optional, Sequence, Tuple
 
 from PySide6.QtCore import QEvent, QSize, Qt
 from PySide6.QtWidgets import QApplication
 
-from ..core import api, fakes
-from ..core.api import Family, ReplugPhase
+from ..core import api, fakes, texts
+from ..core.api import ConsoleKind, Family, ReplugPhase
 from . import pages
 from .app import ensure_app
 from .pages.light_guide import LightGuidePage
@@ -33,6 +36,309 @@ class SceneError(RuntimeError):
     pass
 
 
+# ================================================================ board test
+#
+# A scripted board test (api.BoardTestServiceProto) for the screens: the pictures and the
+# UI tests use it to show every result without a board. Each story is what the engine
+# (core/boardtest.py) reports for that board.
+
+BOARD_TEST_STORIES: Tuple[str, ...] = (
+    "pass",
+    "memory_errors",
+    "memory_start_fault",
+    "flash_chip_refused",
+    "no_start",
+    "locked_memory",
+    "locked_settings",
+    "resume_pass",
+)
+
+_TEST_SCRIPT: Tuple[Tuple[str, float, str], ...] = (
+    ("check", 0.02, "Reading the board's security settings"),
+    ("write", 0.08, "Copying the test program"),
+    ("start", 0.15, "Starting the test program"),
+    ("psram", 0.25, "Testing the extra memory (round 1 of 2)"),
+    ("psram", 0.40, "Testing the extra memory (round 2 of 2)"),
+    ("iram", 0.50, "Testing the chip's own memory"),
+    ("flash", 0.62, "Testing the memory chip"),
+    ("cpu", 0.75, "Testing the processor"),
+    ("wifi", 0.85, "Looking for Wi-Fi networks"),
+    ("cleanup", 0.93, "Removing the test program"),
+    ("done", 1.0, "Finished"),
+)
+_OK_TITLES = {
+    "psram": "The extra memory works",
+    "iram": "The chip's own memory works",
+    "flash": "The memory chip works",
+    "cpu": "The processor works",
+    "wifi": "The Wi-Fi radio works",
+}
+_OK_DETAIL = {
+    "psram": "8 MB found, 7.9 MB tested in 2 rounds of 10 patterns, 0 errors, 41 MB/s",
+    "iram": "312 KB tested, 0 errors",
+    "flash": "chip 20 40 18, 16 MB, read twice and 14 blocks written, 0 errors",
+    "cpu": "both cores gave checksum 0x5a17c3e9, 41 C",
+    "wifi": "6 networks, best -48 dBm",
+}
+
+
+def _sltest(what: str, **fields: object) -> str:
+    """A test program line, as the board prints it (the protocol of SPEC section A)."""
+    return " ".join(["SLTEST", what] + [f"{key}={value}" for key, value in fields.items()])
+
+
+def _finding(code: str, stage: str, result: str, title: str, detail: str,
+             proof: Sequence[str] = ()) -> object:
+    return api.TestFinding(code, stage, result, title, detail, tuple(proof))
+
+
+def _ok(stage: str) -> object:
+    line = _sltest("RESULT", stage=stage, result="ok", code="OK", errors=0, ms=900)
+    return _finding("OK", stage, "ok", _OK_TITLES[stage], _OK_DETAIL[stage], (line,))
+
+
+class ScriptedBoardTest:
+    """``story`` decides the result; ``hold(stage)`` stops the story at that stage (or at
+    "unplug" / "replug" for the replug steps) until ``release``."""
+
+    def __init__(self, story: str = "pass", pace: float = PACE) -> None:
+        if story not in BOARD_TEST_STORIES:
+            raise ValueError(f"unknown board test story {story!r}")
+        self.story = story
+        self.pace = pace
+        self.calls: List[Tuple[str, str]] = []
+        self._held: dict = {}
+        self._lock = threading.Lock()
+
+    def hold(self, name: str) -> None:
+        with self._lock:
+            self._held[name] = threading.Event()
+
+    def release(self, name: str) -> None:
+        with self._lock:
+            event = self._held.pop(name, None)
+        if event is not None:
+            event.set()
+
+    def release_all(self) -> None:
+        for name in list(self._held):
+            self.release(name)
+
+    def _pause(self, name: str, cancel: api.CancelToken) -> bool:
+        with self._lock:
+            event = self._held.get(name)
+        if event is not None:
+            while not event.is_set():
+                if cancel.wait(0.005):
+                    return True
+            return cancel.cancelled
+        return cancel.wait(self.pace)
+
+    # -------------------------------------------------------------- service
+
+    def run_test(self, board, on_progress, on_phase, on_event, cancel) -> object:
+        self.calls.append(("run_test", board.mac))
+        started = _now()
+        if self.story == "flash_chip_refused" or board.hardware not in (
+            api.HardwareVerdict.OK, api.HardwareVerdict.NOT_CHECKED
+        ):
+            finding = _finding(
+                "FLASH_CHIP_UNSUPPORTED", "check", "fail",
+                "The board's memory chip cannot run State Life's software",
+                "Board check refused the board before any test: "
+                f"{board.hardware_detail or 'memory chip 20 70 18'} (XMC flash chips stop the "
+                "start-up program of the secured software)",
+                ("Detected flash chip ID 0x207018",),
+            )
+            return self._report(board, "failed", (finding,), started, erased=True,
+                                advice=texts.FLASH_CHIP_UNSUPPORTED)
+        lines = [_sltest("BEGIN", proto=1, fw="1.0.0", mac=board.mac, chip_rev="v0.2",
+                         cores=2, idf="v5.5.3", flash_id="204018", flash_size=16777216,
+                         psram_size=8388608)]
+        if self.story == "no_start":
+            for stage, fraction, detail in _TEST_SCRIPT[:3]:
+                on_progress(api.BoardTestProgress(stage, fraction, detail))
+                if self._pause(stage, cancel):
+                    return self._cancelled(board, started)
+            for phase, moment in ((ReplugPhase.WAITING_UNPLUG, "unplug"),
+                                  (ReplugPhase.WAITING_REPLUG, "replug"),
+                                  (ReplugPhase.WATCHING, "watch")):
+                on_phase(phase)
+                if self._pause(moment, cancel):
+                    return self._cancelled(board, started)
+            finding = _finding(
+                "NO_START", "startup", "warn", "The test program did not start",
+                "No SLTEST BEGIN and no boot output within 12 s, before and after one replug",
+            )
+            return self._report(board, "incomplete", (finding,), started, erased=True,
+                                advice=texts.NO_START)
+        findings: List[object] = []
+        for stage, fraction, detail in _TEST_SCRIPT:
+            on_progress(api.BoardTestProgress(stage, fraction, detail))
+            if stage == "start":
+                on_event(_self_test_event(lines[0]))
+            if stage in _OK_TITLES and not any(
+                getattr(item, "stage", "") == stage for item in findings
+            ):
+                if stage == "psram" and self.story == "memory_errors":
+                    err = _sltest("ERR", stage="psram", test="pattern_55", addr="0x3c812340",
+                                  want="0x55555555", got="0x55515555")
+                    result = _sltest("RESULT", stage="psram", result="fail",
+                                     code="PSRAM_DATA_ERRORS", detail="pattern_errors",
+                                     errors=1204, ms=5210)
+                    on_event(_self_test_event(err))
+                    on_event(_self_test_event(result))
+                    findings.append(_finding(
+                        "PSRAM_DATA_ERRORS", "psram", "fail",
+                        "The board's extra memory gives wrong data",
+                        "Extra memory pattern test: 1,204 errors, first at 0x3c812340 "
+                        "(wrote 0x55555555, read 0x55515555)",
+                        (err, result),
+                    ))
+                elif fraction >= 0.4 or stage != "psram":
+                    finding = _ok(stage)
+                    on_event(_self_test_event(finding.proof[0]))
+                    findings.append(finding)
+            if stage == "cleanup":
+                failed = [f.stage for f in findings if f.result == "fail"] or ["none"]
+                on_event(_self_test_event(_sltest(
+                    "END", result="fail" if failed != ["none"] else "ok",
+                    failed=",".join(failed), crc="1c291ca3")))
+                on_event(_self_test_event(_sltest("CLEAN", result="ok")))
+            if stage != "done" and self._pause(stage, cancel):
+                return self._cancelled(board, started)
+        if self.story == "resume_pass":
+            return self._report(board, "passed", tuple(findings), started, erased=True,
+                                kind="locked_board", keys_burned=True, recovery="RESUME")
+        verdict = "failed" if any(f.result == "fail" for f in findings) else "passed"
+        advice = texts.PSRAM_DATA_ERRORS if verdict == "failed" else None
+        return self._report(board, verdict, tuple(findings), started, erased=True,
+                            advice=advice)
+
+    def check_failed_board(self, board, on_phase, on_event, cancel, seconds=90.0) -> object:
+        self.calls.append(("check_failed_board", board.mac))
+        started = _now()
+        for phase, moment in ((ReplugPhase.WAITING_UNPLUG, "unplug"),
+                              (ReplugPhase.WAITING_REPLUG, "replug"),
+                              (ReplugPhase.WATCHING, "watch")):
+            on_phase(phase)
+            if self._pause(moment, cancel):
+                return self._cancelled(board, started, kind="locked_board")
+        if self.story == "locked_settings":
+            lines = (
+                ("I (1012) app_init: Project name:     zone_lite", ConsoleKind.BOOT_BANNER),
+                ("E (1490) zone_config: no per-device settings found",
+                 ConsoleKind.SETTINGS_MISSING),
+            )
+            for raw, kind in lines:
+                on_event(api.ConsoleEvent(kind, raw, {}))
+            finding = _finding(
+                "SETTINGS_MISSING", "startup", "fail", "The board has no settings",
+                "Board software started; zone_config found no per-device settings",
+                tuple(raw for raw, _kind in lines),
+            )
+            return self._report(board, "incomplete", (finding,), started, erased=None,
+                                kind="locked_board", keys_burned=True,
+                                recovery="FIX_SETTINGS", sdm=True)
+        lines = (
+            ("I (238) octal_psram: vendor id    : 0x0d (AP)", ConsoleKind.OTHER),
+            ("I (239) octal_psram: density      : 0x03 (64 Mbit)", ConsoleKind.OTHER),
+            ("E (262) esp_psram: PSRAM chip is not connected, or wrong PSRAM line mode",
+             ConsoleKind.PSRAM_FAILED),
+            ("Guru Meditation Error: Core  0 panic'ed (LoadProhibited). Exception was unhandled.",
+             ConsoleKind.PANIC),
+        )
+        for raw, kind in lines:
+            on_event(api.ConsoleEvent(kind, raw, {}))
+        finding = _finding(
+            "PSRAM_STARTUP_FAULT", "startup", "fail",
+            "The board's extra memory fails when it starts",
+            "Extra memory start-up: vendor AP, 64 Mbit, then a crash before the board "
+            "software ran (3 restarts in 40 s)",
+            tuple(raw for raw, _kind in lines),
+        )
+        return self._report(board, "failed", (finding,), started, erased=None,
+                            kind="locked_board", keys_burned=True, sdm=True,
+                            advice=texts.PSRAM_STARTUP_FAULT)
+
+    # -------------------------------------------------------------- reports
+
+    def _cancelled(self, board, started: str, kind: str = "vendor_test") -> object:
+        finding = _finding("CANCELLED", "check", "info", "You stopped the test",
+                           "Cancelled by the person; the test program was removed")
+        return self._report(board, "incomplete", (finding,), started,
+                            erased=None if kind == "locked_board" else True, kind=kind)
+
+    @staticmethod
+    def _report(board, verdict: str, findings, started: str, *, erased,
+                kind: str = "vendor_test", keys_burned: bool = False,
+                recovery: Optional[str] = None, sdm: bool = False, advice=None) -> object:
+        efuses = {} if sdm else {"WR_DIS": {"value": 0}, "SECURE_BOOT_EN": {"value": False}}
+        return api.BoardTestReport(
+            mac=board.mac,
+            verdict=api.BoardTestVerdict(verdict),
+            kind=kind,
+            started_at=started,
+            finished_at=_now(),
+            board=board,
+            findings=tuple(findings),
+            measurements={"psram_size": 8388608, "psram_mb_s": 41, "flash_id": "204018",
+                          "networks": 6, "best_rssi": -48, "temp_c": 41, "chip_rev": "v0.2"},
+            efuse_before=dict(efuses),
+            efuse_after=dict(efuses),
+            efuses_unchanged=None if sdm else True,
+            erased=erased,
+            keys_burned=keys_burned,
+            console_log=None,
+            tool_log=(),
+            image_sha256={"board-test.bin": "0" * 64},
+            end_crc_ok=None if sdm else True,
+            recovery=recovery,
+            advice=advice,
+        )
+
+
+def _now() -> str:
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def _self_test_event(raw: str) -> api.ConsoleEvent:
+    parts = raw.split(" ")
+    data = {"sltest": parts[1]}
+    for part in parts[2:]:
+        name, _sep, value = part.partition("=")
+        data[name] = value
+    return api.ConsoleEvent(ConsoleKind.SELF_TEST, raw, data)
+
+
+def scripted_save_board_test(folder: Callable[[], str]):
+    """records.save_board_test for services whose records cannot write certificates."""
+
+    def save(report, tester: str, kind: Optional[str] = None) -> Tuple[str, str]:
+        mac = str(getattr(report, "mac", "")).replace(":", "")
+        stem = os.path.join(folder(), f"board-test-{mac}-{kind or 'default'}")
+        with open(stem + ".pdf", "wb") as handle:
+            handle.write(b"%PDF-1.4\n% scripted certificate for " + tester.encode() + b"\n")
+        with zipfile.ZipFile(stem + ".zip", "w") as archive:
+            archive.writestr("certificate.txt", f"Scripted certificate, tested by {tester}\n")
+        return stem + ".pdf", stem + ".zip"
+
+    return save
+
+
+def use_scripted_board_test(services: api.Services, story: str = "pass",
+                            pace: float = PACE) -> ScriptedBoardTest:
+    """Put a scripted board test (and, when needed, certificate saving) into ``services``."""
+    tester = ScriptedBoardTest(story, pace)
+    services.board_test = tester
+    records = services.records
+    world = getattr(records, "world", None)
+    if world is not None and not callable(getattr(type(records), "save_board_test", None)):
+        records.save_board_test = scripted_save_board_test(world.folder)
+    return tester
+
+
+
 class Driver:
     """Drives one window through a fake story, the way a person would click."""
 
@@ -45,6 +351,9 @@ class Driver:
         self.window.show()
         self.controller = self.window.controller
         self._held: List[str] = []
+        self.board_tester: Optional[ScriptedBoardTest] = None
+        if getattr(self.services, "board_test", None) is None:
+            self.board_tester = use_scripted_board_test(self.services, "pass")
 
     # ---------------------------------------------------------------- basics
 
@@ -72,9 +381,18 @@ class Driver:
     def act(self, page_id: str, name: str) -> None:
         self.page(page_id).action.emit(name)
 
+    def scripted(self, story: str, *held: str) -> ScriptedBoardTest:
+        """This window's board test tells ``story``, stopping at each of ``held``."""
+        self.board_tester = use_scripted_board_test(self.services, story)
+        for moment in held:
+            self.board_tester.hold(moment)
+        return self.board_tester
+
     def close(self) -> None:
         for moment in self._held:
             self.world.release(moment)
+        if self.board_tester is not None:
+            self.board_tester.release_all()
         self.controller.shutdown()
         self.window.hide()
         if not self.controller.runner.wait(10000):
@@ -171,6 +489,25 @@ class Driver:
         )
         self.act(pages.FIRST_START, "next")
         self.wait(lambda: self.controller.current == pages.DONE, "done")
+
+    def board_test(self, choice: str = "board_test") -> None:
+        """Home's Test a new board (or ``failed_board``), up to the test screen."""
+        self.signed_in()
+        self.act(pages.HOME, choice)
+        self.wait(lambda: self.page(pages.CONNECT).primary_button.isEnabled(), "board found")
+        self.act(pages.CONNECT, "next")
+        self.wait(lambda: self.controller.current == pages.BOARD_TEST, "board test")
+
+    def board_test_result(self, choice: str = "board_test") -> None:
+        self.board_test(choice)
+        self.wait(lambda: self.controller.current == pages.BOARD_TEST_RESULT, "test result")
+        page = self.page(pages.BOARD_TEST_RESULT)
+        self.wait(
+            lambda: page.saved.isVisible() and not self.controller.running("certificate"),
+            "certificate saved",
+        )
+        self.settle()
+        page.scroll_to_top()
 
     def check_board(self) -> None:
         self.signed_in()
@@ -450,6 +787,87 @@ def _light_guide_hotspot(d: Driver) -> None:
     page.scroll.ensureWidgetVisible(page.answer, 20, 20)
 
 
+def _board_test_running(d: Driver) -> None:
+    d.hold("test_flash")
+    d.board_test()
+    page = d.page(pages.BOARD_TEST)
+    d.wait(lambda: page.stage == "flash", "testing the memory chip")
+
+
+def _board_test_replug(d: Driver) -> None:
+    # The test program did not start by itself: the engine asks for one replug.
+    d.scripted("no_start", "replug")
+    d.board_test()
+    page = d.page(pages.BOARD_TEST)
+    d.wait(lambda: page.phase is ReplugPhase.WAITING_REPLUG, "replug steps")
+    page.start_countdown(0)
+    d.settle()
+    page.reveal(page.replug_card)
+
+
+def _board_test_result(choice: str = "board_test") -> Callable[[Driver], None]:
+    def scene(d: Driver) -> None:
+        d.board_test_result(choice)
+
+    return scene
+
+
+def _board_test_not_finished(d: Driver) -> None:
+    d.scripted("no_start")
+    d.board_test_result()
+
+
+def _board_test_details(d: Driver) -> None:
+    # Below the result: the tests one by one, and the board's facts.
+    d.board_test_result()
+    page = d.page(pages.BOARD_TEST_RESULT)
+    page.scroll.verticalScrollBar().setValue(page.scroll.verticalScrollBar().maximum())
+
+
+def _board_test_locked(d: Driver) -> None:
+    d.board_test()
+    d.wait(lambda: d.page(pages.BOARD_TEST).problem.isVisible(), "locked board advice")
+
+
+def _failed_board_never_set_up(d: Driver) -> None:
+    d.board_test("failed_board")
+    d.wait(lambda: d.page(pages.BOARD_TEST).problem.isVisible(), "never set up advice")
+
+
+def _failed_board_replug(d: Driver) -> None:
+    d.hold("test_unplug")
+    d.board_test("failed_board")
+    page = d.page(pages.BOARD_TEST)
+    d.wait(lambda: page.phase is ReplugPhase.WAITING_UNPLUG, "unplug step")
+
+
+def _failed_board_watching(d: Driver) -> None:
+    d.hold("console_line")
+    d.board_test("failed_board")
+    page = d.page(pages.BOARD_TEST)
+    d.wait(lambda: page.phase is ReplugPhase.WATCHING, "watching")
+    d.settle()
+    page.reveal(page.watch)
+
+
+def _setup_board_test(d: Driver) -> None:
+    d.hold("test_wifi")
+    d.checked()
+    d.act(pages.CHECKING, "next")
+    page = d.page(pages.BOARD_TEST)
+    d.wait(lambda: page.stage == "wifi", "testing the Wi-Fi radio")
+
+
+def _setup_board_test_failed(d: Driver) -> None:
+    d.checked()
+    d.act(pages.CHECKING, "next")
+    d.wait(lambda: d.controller.current == pages.BOARD_TEST_RESULT, "test result")
+    page = d.page(pages.BOARD_TEST_RESULT)
+    d.wait(lambda: page.saved.isVisible() and not d.controller.running("certificate"), "saved")
+    d.settle()
+    page.scroll_to_top()
+
+
 def _help(d: Driver) -> None:
     d.connect()
     d.act(pages.CONNECT, "help")
@@ -523,6 +941,26 @@ SCENES: Tuple[Scene, ...] = (
     ("light-guide-answer", "happy_zkt", _light_guide_answer),
     ("light-guide-hotspot", "happy_zkt", _light_guide_hotspot),
     ("help", "happy_zkt", _help),
+    # The board test (1.2.0): Test a new board, Check a failed board, and the test that
+    # comes before every setup.
+    ("board-test-running", "board_test_pass", _board_test_running),
+    ("board-test-replug", "happy_zkt", _board_test_replug),
+    ("board-test-passed", "board_test_pass", _board_test_result()),
+    ("board-test-memory-fault", "board_test_psram_errors", _board_test_result()),
+    ("board-test-memory-fault-details", "board_test_psram_errors", _board_test_details),
+    ("board-test-memory-start-fault", "board_test_psram_hang", _board_test_result()),
+    ("board-test-memory-chip-refused", "board_test_xmc_refused", _board_test_result()),
+    ("board-test-not-finished", "happy_zkt", _board_test_not_finished),
+    ("board-test-locked-board", "secured_board_fix_settings", _board_test_locked),
+    ("failed-board-never-set-up", "happy_zkt", _failed_board_never_set_up),
+    ("failed-board-replug", "failed_board_psram", _failed_board_replug),
+    ("failed-board-watching", "failed_board_psram", _failed_board_watching),
+    ("failed-board-memory-fault", "failed_board_psram", _board_test_result("failed_board")),
+    ("failed-board-settings-missing", "failed_board_settings",
+     _board_test_result("failed_board")),
+    ("failed-board-finish-setup", "failed_board_resume", _board_test_result("failed_board")),
+    ("setup-board-test", "board_test_pass", _setup_board_test),
+    ("setup-board-test-failed", "board_test_psram_errors", _setup_board_test_failed),
 )
 
 

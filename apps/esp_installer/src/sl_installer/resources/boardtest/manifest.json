@@ -1,0 +1,24 @@
+{
+  "version": "1.0.0",
+  "idf": "v5.5.3",
+  "files": [
+    {
+      "name": "bootloader.bin",
+      "offset": 0,
+      "size": 20784,
+      "sha256": "430a7e13bc99db069beda5a77367a439b4db848336696dda6dec4e31ca28b1e1"
+    },
+    {
+      "name": "partition-table.bin",
+      "offset": 32768,
+      "size": 3072,
+      "sha256": "9b046afd65142c07b04513517068a46e2308323c109e4a5a10de70fe3e91fdd7"
+    },
+    {
+      "name": "board-test.bin",
+      "offset": 65536,
+      "size": 735072,
+      "sha256": "279971ab2339378a67ed84284574740cd7b1a063196c86fb86f2c5ba8458c0f4"
+    }
+  ]
+}

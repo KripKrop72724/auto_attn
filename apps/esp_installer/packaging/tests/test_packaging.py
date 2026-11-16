@@ -512,6 +512,176 @@ def test_the_notice_matches_the_stub_esptool_loads():
     assert 'os.environ.get("ESPTOOL_STUB_VERSION", "1")' in source
 
 
+BOARD_TEST_DIR = PACKAGING.parent / "board_test_firmware"
+BOARD_TEST_IMAGES = PACKAGING.parent / "src" / "sl_installer" / "resources" / "boardtest"
+
+
+def _build_images():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("build_images",
+                                                  BOARD_TEST_DIR / "build_images.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.mark.parametrize("platform, folder", [
+    ("win32", '"_internal\\sl_installer\\resources\\boardtest"'),
+    ("darwin", '"Contents/Resources/sl_installer/resources/boardtest"'),
+])
+def test_notices_name_the_board_test_program_and_its_licence(platform, folder):
+    import notices
+
+    version, idf = notices.board_test_versions()
+    assert (version, idf) == ("1.0.0", "v5.5.3")
+    text = notices._summary("1.2.3", NOTICE_VERSIONS, platform=platform)
+    words = " ".join(text.split())
+    part = words[words.index("State Life board test program 1.0.0 (built with ESP-IDF v5.5.3)"):
+                 words.index("PyInstaller")]
+    assert "Licence: Apache License 2.0 (Apache-2.0)" in part
+    assert "writes this small program into the board and erases it again" in part
+    assert "https://github.com/espressif/esp-idf/tree/v5.5.3" in part
+    assert folder in part
+    assert max(len(line) for line in text.splitlines()) <= len(notices.RULE)
+
+
+def test_the_board_test_licence_texts_are_vendored_in_full():
+    import notices
+
+    apache = (notices.LICENSES / "Apache-2.0.txt").read_text(encoding="utf-8")
+    assert "Apache License" in apache and "Version 2.0, January 2004" in apache
+    assert "END OF TERMS AND CONDITIONS" in apache
+    assert "APPENDIX: How to apply the Apache License to your work." in apache
+    parts = (notices.LICENSES / "esp-idf-v5.5.3-components.txt").read_text(encoding="utf-8")
+    for name in ("FreeRTOS kernel", "Amazon.com", "lwIP", "Swedish Institute of Computer Science",
+                 "wpa_supplicant", "Jouni Malinen", "net80211", "TLSF", "Matthew Conte",
+                 "Tensilica", "Newlib", "https://github.com/espressif/esp-idf/tree/v5.5.3"):
+        assert name in parts, name
+    section = notices._board_test_section()
+    assert section.startswith(notices.RULE + "\nESP-IDF v5.5.3 (in the State Life board test "
+                              "program 1.0.0)\nLicence: Apache-2.0")
+    assert "[Apache-2.0.txt]" in section and "[esp-idf-v5.5.3-components.txt]" in section
+    assert apache.strip() in section
+
+
+def test_the_board_test_manifest_describes_the_committed_images():
+    import hashlib
+
+    manifest = json.loads((BOARD_TEST_IMAGES / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["version"] == "1.0.0" and manifest["idf"] == "v5.5.3"
+    assert [(f["name"], f["offset"]) for f in manifest["files"]] == [
+        ("bootloader.bin", 0x0), ("partition-table.bin", 0x8000), ("board-test.bin", 0x10000)]
+    for item in manifest["files"]:
+        data = (BOARD_TEST_IMAGES / item["name"]).read_bytes()
+        assert item["size"] == len(data)
+        assert item["sha256"] == hashlib.sha256(data).hexdigest()
+    assert sorted(p.name for p in BOARD_TEST_IMAGES.iterdir()) == [
+        "board-test.bin", "bootloader.bin", "manifest.json", "partition-table.bin"]
+    tool = _build_images()
+    files = {item["name"]: (BOARD_TEST_IMAGES / item["name"]).read_bytes()
+             for item in manifest["files"]}
+    tool.check_app(files["board-test.bin"])
+    assert tool.manifest(files) == (BOARD_TEST_IMAGES / "manifest.json").read_text(
+        encoding="utf-8")
+
+
+def _board_test_partitions():
+    table = (BOARD_TEST_IMAGES / "partition-table.bin").read_bytes()
+    rows = []
+    for offset in range(0, len(table), 32):
+        magic, kind, subtype, start, size = struct.unpack_from("<HBBII", table, offset)
+        if magic != 0x50AA:
+            break
+        name = table[offset + 12:offset + 28].split(b"\0", 1)[0].decode()
+        rows.append((name, kind, subtype, start, size))
+    return rows
+
+
+def test_the_board_test_partition_table_is_the_specified_one():
+    assert _board_test_partitions() == [
+        ("nvs", 1, 0x02, 0x9000, 0x6000),
+        ("phy_init", 1, 0x01, 0xF000, 0x1000),
+        ("factory", 0, 0x00, 0x10000, 0x100000),
+        ("fltest", 1, 0x99, 0x200000, 0xE00000),
+    ]
+
+
+def _safe_sdkconfig(tool) -> str:
+    return "\n".join(tool.REQUIRED_LINES + (
+        "CONFIG_SECURE_BOOT_V2_RSA_SUPPORTED=y", "CONFIG_SECURE_BOOT_V2_PREFERRED=y",
+        "CONFIG_SECURE_ROM_DL_MODE_ENABLED=y", "CONFIG_EFUSE_MAX_BLK_LEN=256",
+        "# CONFIG_EFUSE_VIRTUAL is not set")) + "\n"
+
+
+@pytest.mark.parametrize("line", [
+    "CONFIG_SECURE_BOOT=y", "CONFIG_SECURE_BOOT_V2_ENABLED=y", "CONFIG_SECURE_BOOT_V1_ENABLED=y",
+    "CONFIG_SECURE_FLASH_ENC_ENABLED=y", "CONFIG_SECURE_FLASH_ENCRYPTION_MODE_RELEASE=y",
+    "CONFIG_NVS_ENCRYPTION=y", "CONFIG_NVS_SEC_KEY_PROTECT_USING_HMAC=y",
+    "CONFIG_NVS_SEC_HMAC_EFUSE_KEY_ID=0",
+    "CONFIG_SECURE_ENABLE_SECURE_ROM_DL_MODE=y", "CONFIG_SECURE_DISABLE_ROM_DL_MODE=y",
+    "CONFIG_SECURE_SIGNED_ON_UPDATE_NO_SECURE_BOOT=y",
+    "CONFIG_SECURE_BOOT_ENABLE_AGGRESSIVE_KEY_REVOKE=y", "CONFIG_BOOTLOADER_APP_ANTI_ROLLBACK=y",
+    "CONFIG_BOOT_ROM_LOG_ALWAYS_OFF=y", "CONFIG_BOOT_ROM_LOG_ON_GPIO_HIGH=y",
+    "CONFIG_EFUSE_VIRTUAL=y",
+])
+def test_the_board_test_build_refuses_anything_that_can_lock_a_board(line):
+    tool = _build_images()
+    tool.check_sdkconfig(_safe_sdkconfig(tool))
+    with pytest.raises(tool.BuildError, match="forbidden option enabled"):
+        tool.check_sdkconfig(_safe_sdkconfig(tool) + line + "\n")
+
+
+@pytest.mark.parametrize("missing", [
+    "CONFIG_SPIRAM_MODE_OCT=y", "CONFIG_SPIRAM_SPEED_80M=y", "CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y",
+    "# CONFIG_SPIRAM_MEMTEST is not set", "CONFIG_ESP_SYSTEM_PANIC_PRINT_HALT=y",
+    "CONFIG_BOOT_ROM_LOG_ALWAYS_ON=y", "CONFIG_APP_REPRODUCIBLE_BUILD=y",
+])
+def test_the_board_test_build_requires_production_hardware_settings(missing):
+    tool = _build_images()
+    text = _safe_sdkconfig(tool).replace(missing + "\n", "")
+    with pytest.raises(tool.BuildError, match="required option missing"):
+        tool.check_sdkconfig(text)
+
+
+def test_the_board_test_sources_never_touch_efuses(tmp_path, monkeypatch):
+    tool = _build_images()
+    tool.check_sources()  # the committed sources are clean
+    defaults = (BOARD_TEST_DIR / "sdkconfig.defaults").read_text(encoding="utf-8")
+    for line in ("CONFIG_SECURE_BOOT=n", "CONFIG_NVS_ENCRYPTION=n", "CONFIG_SPIRAM_MEMTEST=n",
+                 "CONFIG_SPIRAM_IGNORE_NOTFOUND=y", "CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y"):
+        assert line in defaults.splitlines()
+    fake = tmp_path / "fw"
+    (fake / "main").mkdir(parents=True)
+    for name in ("CMakeLists.txt", "main/CMakeLists.txt"):
+        shutil.copy(BOARD_TEST_DIR / name, fake / name)
+    (fake / "main" / "ok.c").write_text("/* never calls esp_efuse_write_field_bit() */\n"
+                                        "int main(void) { return 0; }\n", encoding="utf-8")
+    monkeypatch.setattr(tool, "HERE", fake)
+    tool.check_sources()
+    (fake / "main" / "bad.c").write_text('#include "esp_efuse.h"\nvoid f(void) {\n'
+                                         "    esp_efuse_write_field_bit(0);\n}\n",
+                                         encoding="utf-8")
+    with pytest.raises(tool.BuildError, match=r"bad\.c:3"):
+        tool.check_sources()
+
+
+def test_the_board_test_end_crc_is_zlib_crc32():
+    import zlib
+
+    # The firmware chains esp_rom_crc32_le(0, ...) line by line with "\n" in
+    # between; README.md and sl_out.c give this exact Python equivalent.
+    readme = (BOARD_TEST_DIR / "README.md").read_text(encoding="utf-8")
+    assert 'zlib.crc32("\\n".join(lines).encode("ascii")) & 0xFFFFFFFF' in readme
+    source = (BOARD_TEST_DIR / "main" / "sl_out.c").read_text(encoding="utf-8")
+    assert 'esp_rom_crc32_le(s_crc, (const uint8_t *)"\\n", 1)' in source
+    assert "crc=%08lx" in source
+    lines = ["SLTEST BEGIN proto=1 fw=1.0.0", "SLTEST ALIVE stage=psram step=0 of=20 at=0",
+             "SLTEST RESULT stage=psram result=ok"]
+    # Value from compiling ESP-IDF's reference esp_rom_crc32_le with these lines.
+    assert "%08x" % (zlib.crc32("\n".join(lines).encode("ascii")) & 0xFFFFFFFF) == "08cabfee"
+
+
 def test_modes_cannot_be_combined_and_version_prints(capsys):
     with pytest.raises(SystemExit) as stop:
         entry.main(["--self-test", "--screenshots", "shots"])

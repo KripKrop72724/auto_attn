@@ -46,6 +46,7 @@ from sl_installer.core.records import Records
 from sl_installer.core.usb import UsbWatcher
 from sl_installer.ui import controller as controller_module
 from sl_installer.ui import pages
+from sl_installer.ui.screenshots import ScriptedBoardTest
 from sl_installer.ui.window import MainWindow
 
 
@@ -243,6 +244,8 @@ class Rig:
                 console_logs=self.logs,
             ),
             diagnosis=Diagnoser(("RE7",)),
+            # The hardware test before a setup passes (its own tests: tests/core).
+            board_test=ScriptedBoardTest("pass"),
             records=Records(tmp_path / "records", self.logs, "1.0.0"),
             defaults=FieldDefaults(
                 wifi_password="test-wifi-pass", setup_ap_password="test-hotspot-pass"

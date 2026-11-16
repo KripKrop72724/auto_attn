@@ -137,10 +137,74 @@ _CONSOLE: Dict[ConsoleKind, Tuple[str, str, Severity]] = {
 }
 
 
+# The board test's stages (core/boardtest.py, SLTEST lines) as the screens name them.
+TEST_STAGE_WORDS: Dict[str, str] = {
+    "check": "Board check",
+    "startup": "Start-up",
+    "write": "Copying the test program",
+    "start": "Starting the test program",
+    "psram": "Extra memory",
+    "iram": "Chip's own memory",
+    "flash": "Memory chip",
+    "cpu": "Processor",
+    "wifi": "Wi-Fi radio",
+    "cleanup": "Clean-up",
+}
+
+
+def _sltest_fields(event: ConsoleEvent) -> Dict[str, str]:
+    """The test line's own fields: from the engine's data, else read from the line."""
+    data = {key: str(value) for key, value in (event.data or {}).items()}
+    raw = (event.raw or "").strip()
+    if raw.startswith("SLTEST "):
+        parts = raw.split(" ")
+        data.setdefault("sltest", parts[1] if len(parts) > 1 else "")
+        for part in parts[2:]:
+            name, sep, value = part.partition("=")
+            if sep:
+                data.setdefault(name, value)
+    return data
+
+
+def self_test_words(event: ConsoleEvent) -> Optional[Tuple[str, Severity]]:
+    """A line of the State Life test program in plain words (heartbeats say nothing)."""
+    data = _sltest_fields(event)
+    what = data.get("sltest", "").upper()
+    stage = TEST_STAGE_WORDS.get(data.get("stage", ""), "")
+    result = data.get("result", "")
+    if what == "ALIVE":
+        return None
+    if what == "BEGIN":
+        return "The test program started.", Severity.INFO
+    if what == "ERR":
+        if stage:
+            return f"{stage}: the test found a fault.", Severity.ERROR
+        return "The test found a fault.", Severity.ERROR
+    if what == "RESULT" and stage:
+        if result == "ok":
+            return f"{stage}: passed.", Severity.SUCCESS
+        if result == "fail":
+            return f"{stage}: failed.", Severity.ERROR
+        if data.get("code") == "WIFI_NO_NETWORKS":
+            return f"{stage}: works, but found no Wi-Fi nearby.", Severity.WARNING
+        return f"{stage}: passed with a warning.", Severity.WARNING
+    if what == "END":
+        if result == "ok":
+            return "The test program finished. Every test passed.", Severity.SUCCESS
+        return "The test program finished. Some tests failed.", Severity.ERROR
+    if what == "CLEAN":
+        if result == "ok":
+            return "The test program cleared the storage it used.", Severity.INFO
+        return "The test program could not clear the storage it used.", Severity.WARNING
+    return "The test program is running.", Severity.INFO
+
+
 def console_words(event: ConsoleEvent) -> Optional[Tuple[str, Severity]]:
     """What a console line means in plain words; None for lines people need not see."""
     if event.kind is ConsoleKind.BOOTLOADER_FAILED and event.data.get("reason") == "xmc_flash":
         return "The board's start-up program cannot use its memory chip.", Severity.ERROR
+    if event.kind.value == "self_test":
+        return self_test_words(event)
     entry = _CONSOLE.get(event.kind)
     if entry is None:
         return None
@@ -202,6 +266,18 @@ HELP_TOPICS: Dict[str, HelpTopic] = {
                 "light",
                 "Check or fix a board",
                 "Choose this when a board is not working, or to change its settings.",
+            ),
+            HelpItem(
+                "cable_in",
+                "Test a new board",
+                "Choose this for a board from the shop. The app tests the board and gives a "
+                "certificate. A faulty board can go back to the seller with it.",
+            ),
+            HelpItem(
+                "faulty_board",
+                "Check a failed board",
+                "Choose this for a board that did not start after its setup. The app finds out "
+                "why, and gives a fault report.",
             ),
             HelpItem(
                 "usb_socket", "Connecting a board", "Always use the socket marked USB on the board."
@@ -308,6 +384,12 @@ HELP_TOPICS: Dict[str, HelpTopic] = {
                 "board, "
                 "so that only State Life can use it. This cannot be undone.",
             ),
+            HelpItem(
+                None,
+                "The board was tested first",
+                "The app tested the board before this screen. A board that fails the test is "
+                "never locked.",
+            ),
         ),
     ),
     "installing": HelpTopic(
@@ -379,6 +461,62 @@ HELP_TOPICS: Dict[str, HelpTopic] = {
                 "The board's own Wi-Fi",
                 "Its name and password are on this screen. Use them on a phone to choose the "
                 "site's Wi-Fi.",
+            ),
+        ),
+    ),
+    "board_test": HelpTopic(
+        "Testing a board",
+        (
+            HelpItem(
+                "cable_in",
+                "What the test does",
+                "The app copies a small test program to the board. It tests the board's memory, "
+                "memory chip, processor and Wi-Fi radio. Then the app removes the program "
+                "again.",
+            ),
+            HelpItem(
+                None,
+                "Nothing is locked",
+                "The test does not lock the board and does not change its security. A new "
+                "board stays new.",
+            ),
+            HelpItem(
+                "replug",
+                "If the app asks you to unplug the board",
+                "Unplug the cable, wait 3 seconds and plug it back in. Do not press any button.",
+            ),
+            HelpItem(
+                None,
+                "How long it takes",
+                "About 2 minutes. Keep the cable plugged in until the app shows the result.",
+            ),
+        ),
+    ),
+    "board_test_result": HelpTopic(
+        "The test result",
+        (
+            HelpItem(
+                "success",
+                "Passed",
+                "The board works. You can set it up for an attendance machine.",
+            ),
+            HelpItem(
+                "faulty_board",
+                "Not fit for use",
+                "The board is faulty. Do not set it up. Give the certificate and the evidence "
+                "file to the seller to return the board.",
+            ),
+            HelpItem(
+                "cable",
+                "Could not finish",
+                "Something other than the board stopped the test, for example the cable. Try "
+                "another cable or socket, then click Test again.",
+            ),
+            HelpItem(
+                None,
+                "Where the files are",
+                "The app saves the certificate and the evidence file by itself. Click Open the "
+                "folder to see them.",
             ),
         ),
     ),
@@ -974,4 +1112,200 @@ def boot_fallback(
         "The app stopped watching the board.",
         ("Click Try again.",),
         Severity.INFO,
+    )
+
+
+# ------------------------------------------------------------------ board test
+
+BOARD_TEST_FRESH_S = 25 * 60  # a passed test is used for a setup this long (engine: 30 min)
+
+
+def _verdict_of(report: object) -> str:
+    verdict = getattr(report, "verdict", "")
+    return str(getattr(verdict, "value", verdict) or "")
+
+
+def main_finding(report: object) -> Optional[object]:
+    """The finding that decided the result: the first failure, else the first warning."""
+    findings = tuple(getattr(report, "findings", ()) or ())
+    for wanted in ("fail", "warn"):
+        for finding in findings:
+            if getattr(finding, "result", "") == wanted:
+                return finding
+    return findings[0] if findings else None
+
+
+def test_result_words(result: str) -> str:
+    return {
+        "ok": "Passed",
+        "fail": "Failed",
+        "warn": "Passed, with a warning",
+        "info": "Noted",
+    }.get(result, result.capitalize() or "-")
+
+
+def _setup_stopped(report: object) -> str:
+    """What a setup stopped by its board test left: a board with its key locked already (a
+    RESUME setup) is never said to be "not locked"."""
+    if getattr(report, "keys_burned", False):
+        return " The setup was not finished. Do not use this board."
+    return " The setup stopped. The board was not locked."
+
+
+def board_test_verdict(report: object, during_setup: bool = False) -> Advice:
+    """The result card of a board test: green PASSED, red NOT FIT FOR USE, amber not finished.
+
+    ``during_setup``: the test ran before a setup, which it now stops (the board is not
+    locked). For a locked board (Check a failed board) the card says what can be done:
+    finish the setup, fix the settings, or return the board.
+    """
+    verdict = _verdict_of(report)
+    locked = getattr(report, "kind", "") == "locked_board"
+    recovery = getattr(report, "recovery", None)
+    finding = main_finding(report)
+    reason = str(getattr(finding, "title", "") or "").strip()
+    if reason and not reason.endswith("."):
+        reason += "."
+    advice = getattr(report, "advice", None)
+    if verdict == "passed":
+        if locked and recovery == "RESUME":
+            return Advice(
+                "BOARD_TEST_PASSED",
+                "The board works. Its setup did not finish.",
+                "Every test passed. The board's setup stopped after it got its security keys.",
+                ("Click Finish the setup. You need the board's details again.",),
+                Severity.SUCCESS,
+                "success",
+            )
+        if locked:
+            what = reason or "The board starts normally."
+            steps = tuple(getattr(advice, "what_to_do", ()) or ()) or (
+                "The board is not faulty. The problem is somewhere else.",
+            )
+            return Advice(
+                "BOARD_TEST_PASSED", "The board's hardware works", what, steps,
+                Severity.SUCCESS, "success",
+            )
+        return Advice(
+            "BOARD_TEST_PASSED",
+            "PASSED: this board is fit for State Life use",
+            "Every test passed. The test program was removed and the board's security was "
+            "not changed.",
+            () if during_setup else ("You can set up this board now, or keep it for later.",),
+            Severity.SUCCESS,
+            "success",
+        )
+    if verdict == "failed":
+        what = reason or "The test found a fault in the board's hardware."
+        if during_setup:
+            what += _setup_stopped(report)
+        if locked:
+            steps: Tuple[str, ...] = (
+                "Do not use this board. Put a FAULTY label on it and keep it aside.",
+                "Click Save vendor claim to keep the proof for the seller.",
+                "Give the fault report to head office.",
+            )
+        else:
+            steps = (
+                "Do not set up this board. Put a FAULTY label on it and keep it aside.",
+                "Give the certificate and the evidence file to the seller to return the board.",
+            )
+        return Advice(
+            "BOARD_TEST_FAILED",
+            "NOT FIT FOR USE: this board is faulty",
+            what,
+            steps,
+            Severity.ERROR,
+            "faulty_board",
+            can_retry=False,
+        )
+    if locked and recovery == "FIX_SETTINGS":
+        return Advice(
+            "BOARD_SETTINGS_FIXABLE",
+            "The board is not faulty. Its settings need fixing.",
+            reason or "The board cannot use its settings.",
+            ("Click Fix the settings to write them again.",),
+            Severity.WARNING,
+            "cable_in",
+        )
+    if locked and advice is not None:
+        # The engine's own words: for example the board works but cannot reach head office.
+        return Advice(
+            advice.code,
+            advice.title,
+            advice.what_happened,
+            tuple(advice.what_to_do or ()),
+            Severity.WARNING if advice.severity is Severity.ERROR else advice.severity,
+            advice.illustration,
+        )
+    what = reason or "The test stopped before the end."
+    if during_setup:
+        what += _setup_stopped(report)
+    steps = tuple(getattr(advice, "what_to_do", ()) or ()) or (
+        "Check that the cable is pushed in well, or use another cable or socket.",
+        "Then click Test again.",
+    )
+    picture = getattr(advice, "illustration", None) or "cable"
+    return Advice(
+        str(getattr(advice, "code", "") or "BOARD_TEST_NOT_FINISHED"),
+        "The test could not finish",
+        what,
+        steps,
+        Severity.WARNING,
+        picture,
+    )
+
+
+def board_test_not_possible(security: SecurityState) -> Advice:
+    """Test a new board, on a board that is locked: Check a failed board is the way."""
+    return Advice(
+        "BOARD_LOCKED_NO_TEST",
+        "This board is already locked",
+        " ".join(
+            part
+            for part in (
+                SECURITY_WORDS.get(security, ""),
+                "The app cannot copy the test program to a locked board.",
+            )
+            if part
+        ),
+        ("If the board did not start after its setup, click Check a failed board.",),
+        Severity.INFO,
+        "light",
+    )
+
+
+def board_never_set_up() -> Advice:
+    return Advice(
+        "BOARD_NEVER_SET_UP",
+        "This board was never set up",
+        "It has no State Life security keys. It can be tested like a new board.",
+        ("Click Test this board.",),
+        Severity.INFO,
+        "cable_in",
+    )
+
+
+def board_test_saved(folder: str) -> Advice:
+    return Advice(
+        "BOARD_TEST_SAVED",
+        "Saved",
+        f"The certificate and the evidence file are saved in {folder}",
+        (),
+        Severity.SUCCESS,
+    )
+
+
+def board_test_copied(path: str) -> Advice:
+    return Advice("BOARD_TEST_COPIED", "Copy saved", f"A copy is saved as {path}", (),
+                  Severity.SUCCESS)
+
+
+def tested_by_missing() -> Advice:
+    return Advice(
+        "TESTED_BY_MISSING",
+        "Who tested the board?",
+        "The certificate needs the name of the person who tested the board.",
+        ("Type a name under Tested by, then save again.",),
+        Severity.WARNING,
     )

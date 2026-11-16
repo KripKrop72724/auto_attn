@@ -1092,6 +1092,264 @@ UNEXPECTED = _a(
     _SAVE_HELP)
 
 
+# ------------------------------------------------------------ the board test
+
+# core/boardtest.py: before every key lock, and as "Test a new board", the app puts a small
+# State Life test program on the board, tests its parts and removes the program again. The
+# board's permanent security settings never change. The result screen offers Test again,
+# the certificate buttons and, for a board an earlier setup stopped on, Finish the setup or
+# Fix the settings. "The extra memory" is the board's second memory (the part that failed on
+# the faulty boards of 4 Nov 2026), "the memory chip" the one that holds the software.
+
+_FAULTY_STEPS = (
+    "Do not set this board up. Put a FAULTY label on it and keep it aside.",
+    "Click Save certificate to keep the proof for the seller.",
+    "Use another board.",
+)
+_TEST_AGAIN = "Click Test again."
+
+
+def _fault(code: str, title: str, what: str) -> Advice:
+    return _a(code, title, what + " This is a fault in the board itself.", *_FAULTY_STEPS,
+              illustration="faulty_board", can_retry=False)
+
+
+BOARD_TEST_REQUIRED = _a(
+    "BOARD_TEST_REQUIRED", "The board must pass its test first",
+    "A board is set up only after it passed its hardware test in the last 30 minutes. "
+    "Nothing was changed on the board.",
+    "Go back and let the app test the board.",
+    "When the test has passed, click Next.",
+    severity=Severity.WARNING)
+
+BOARD_TEST_PASSED = _a(
+    "BOARD_TEST_PASSED", "The board passed its test",
+    "The board's memory, extra memory, processor and Wi-Fi work. The test program was "
+    "removed again and nothing permanent on the board was changed.",
+    severity=Severity.SUCCESS)
+
+BOARD_STARTS_NORMALLY = _a(
+    "BOARD_STARTS_NORMALLY", "The board starts normally",
+    "The board started and its software runs. The board itself is not faulty.",
+    "If it does not work at the site, check the site's Wi-Fi and internet.",
+    "Open Help, click Save a help file and send it to head office.",
+    severity=Severity.SUCCESS)
+
+PSRAM_NOT_FOUND = _fault(
+    "PSRAM_NOT_FOUND", "The board's extra memory is missing",
+    "The test could not find the board's extra memory.")
+PSRAM_WRONG_SIZE = _fault(
+    "PSRAM_WRONG_SIZE", "The board's extra memory is the wrong size",
+    "The board's extra memory is not the size this board type must have.")
+PSRAM_TOO_SMALL = _fault(
+    "PSRAM_TOO_SMALL", "Part of the board's extra memory does not work",
+    "The test could use only part of the board's extra memory.")
+PSRAM_DATA_ERRORS = _fault(
+    "PSRAM_DATA_ERRORS", "The board's extra memory gives wrong data",
+    "The test wrote to the board's extra memory and read back something else.")
+PSRAM_CRASH = _fault(
+    "PSRAM_CRASH", "The board crashed while its extra memory was tested",
+    "The board crashed during the extra memory test.")
+PSRAM_STARTUP_FAULT = _fault(
+    "PSRAM_STARTUP_FAULT", "The board's extra memory fails when it starts",
+    "The board stops or crashes while it starts its extra memory, before any program runs.")
+IRAM_DATA_ERRORS = _fault(
+    "IRAM_DATA_ERRORS", "The chip's own memory gives wrong data",
+    "The test wrote to the chip's own memory and read back something else.")
+FLASH_WRONG_SIZE = _fault(
+    "FLASH_WRONG_SIZE", "The board's memory chip is the wrong size",
+    "The memory chip that holds the software is not the size this board type must have.")
+FLASH_ID_CHANGED = _fault(
+    "FLASH_ID_CHANGED", "The board's memory chip answers differently",
+    "The memory chip that holds the software gave another chip ID during the test.")
+FLASH_READ_UNSTABLE = _fault(
+    "FLASH_READ_UNSTABLE", "The board's memory chip gives changing data",
+    "The test read the same part of the memory chip twice and got different data.")
+FLASH_WRITE_ERRORS = _fault(
+    "FLASH_WRITE_ERRORS", "The board's memory chip does not keep what is written",
+    "The test wrote to the memory chip and read back something else.")
+CPU_MISMATCH = _fault(
+    "CPU_MISMATCH", "The board's processor gives wrong results",
+    "The two halves of the board's processor gave different answers to the same sums.")
+WIFI_RADIO_FAILED = _fault(
+    "WIFI_RADIO_FAILED", "The board's Wi-Fi does not work",
+    "The board's Wi-Fi part did not start.")
+TEST_CRASH = _fault(
+    "TEST_CRASH", "The board crashed during the test",
+    "The board crashed while it was tested.")
+TEST_HANG = _fault(
+    "TEST_HANG", "The board stopped during the test",
+    "The board stopped answering in the middle of the test.")
+STARTUP_HANG = _a(
+    "STARTUP_HANG", "This board keeps restarting",
+    "The board restarts again and again without saying anything, before any program runs. "
+    "This is a known fault in the board itself.",
+    *_FAULTY_STEPS, illustration="faulty_board", can_retry=False)
+TEST_FAILED = _fault(
+    "TEST_FAILED", "The board failed its test",
+    "A part of the board did not pass the test.")
+
+WIFI_NO_NETWORKS = _a(
+    "WIFI_NO_NETWORKS", "The board found no Wi-Fi here",
+    "The board's Wi-Fi works, but it found no Wi-Fi networks nearby. This is not a fault "
+    "if there is no Wi-Fi where you are.",
+    severity=Severity.INFO)
+
+EFUSE_CHANGED = _a(
+    "EFUSE_CHANGED", "The board's permanent settings changed",
+    "The board's permanent security settings were different after the test. This must "
+    "never happen. Do not use this board.",
+    "Put the board aside and do not set it up.",
+    "Click Save certificate, then open Help, click Save a help file and send both to head "
+    "office now.",
+    illustration="faulty_board", can_retry=False)
+
+USB_DATA_GARBLED = _a(
+    "USB_DATA_GARBLED", "The test results did not arrive cleanly",
+    "The board's messages were damaged on the way over the cable, so the result cannot be "
+    "trusted.",
+    "Use a short, good cable straight into this computer. Do not use a hub.",
+    _TEST_AGAIN,
+    severity=Severity.WARNING, illustration="cable")
+
+NO_START = _a(
+    "NO_START", "The test did not start",
+    "The app copied the test program, but the board did not start it, even after it was "
+    "plugged in again.",
+    "Unplug the board, wait 5 seconds, and plug it back in. Do not press any button.",
+    _TEST_AGAIN,
+    "If it happens again, the board may be faulty. Put it aside and use another one.",
+    severity=Severity.WARNING, illustration="replug")
+
+TEST_RESTARTED = _a(
+    "TEST_RESTARTED", "The board restarted during the test",
+    "The board restarted in the middle of the test. A loose cable can do this, and so can "
+    "a faulty board.",
+    "Keep the cable plugged in and do not touch it while the test runs.",
+    _TEST_AGAIN,
+    "If it happens again, the board is faulty. Put it aside and use another one.",
+    severity=Severity.WARNING, illustration="cable")
+
+TEST_PROGRAM_REFUSED = _a(
+    "TEST_PROGRAM_REFUSED", "The board did not run the test",
+    "The board's start-up stopped before the test program ran.",
+    _TEST_AGAIN,
+    "If it happens again, open Help, click Save a help file and send it to head office.",
+    severity=Severity.WARNING, illustration="replug")
+
+FLASH_TEST_AREA_MISSING = _a(
+    "FLASH_TEST_AREA_MISSING", "The test could not finish",
+    "The test program could not find the part of the memory chip it tests. This is a "
+    "problem with the app's test program, not with the board.",
+    _TEST_AGAIN,
+    "If it happens again, open Help, click Save a help file and send it to head office.",
+    severity=Severity.WARNING)
+
+TEST_INCOMPLETE = _a(
+    "TEST_INCOMPLETE", "The test did not finish",
+    "The board stopped sending results before the test was complete.",
+    _REPLUG,
+    _TEST_AGAIN,
+    severity=Severity.WARNING, illustration="replug")
+
+ERASE_NOT_FINISHED = _a(
+    "ERASE_NOT_FINISHED", "The test program is still on the board",
+    "The app could not remove the test program from the board. Do not use the board until "
+    "it is removed.",
+    "Hold down the BOOT button on the board.",
+    "While you hold BOOT, unplug the board and plug it back in.",
+    "Let go of BOOT.",
+    "Click Test again to finish removing it.",
+    illustration="boot_button")
+
+BOARD_TEST_IMAGES_DAMAGED = _a(
+    "BOARD_TEST_IMAGES_DAMAGED", "This app is damaged",
+    "The app's board test program is missing or damaged, so the app did not write anything "
+    "to the board.",
+    "Close the app.",
+    "Install it again from the Setup file you were given.",
+    can_retry=False)
+
+BOARD_TEST_NOT_POSSIBLE = _a(
+    "BOARD_TEST_NOT_POSSIBLE", "This board cannot be tested this way",
+    "This board is locked, so the test program cannot run on it. Nothing was changed.",
+    "Go back to the start and click Check a failed board.",
+    severity=Severity.WARNING, can_retry=False)
+
+FAILED_BOARD_FIX_SETTINGS = _a(
+    "FAILED_BOARD_FIX_SETTINGS", "The board works but its settings are missing",
+    "The board starts, but it cannot find or read its settings. The board itself is not "
+    "faulty.",
+    "Click Fix the settings to write them again.",
+    severity=Severity.WARNING)
+
+FAILED_BOARD_RESUME = _a(
+    "FAILED_BOARD_RESUME", "The board's setup was not finished",
+    "An earlier setup locked the board but stopped before the end. The board can still be "
+    "finished.",
+    "Click Finish the setup.",
+    severity=Severity.WARNING)
+
+FAILED_BOARD_NO_HEAD_OFFICE = _a(
+    "FAILED_BOARD_NO_HEAD_OFFICE", "The board works; it could not reach head office",
+    "The board starts and runs, but it could not reach head office from where it was. The "
+    "board is not faulty.",
+    "Check the site's Wi-Fi and internet.",
+    "Ask the local IT person to allow the address autoattn.slichealth.com.",
+    severity=Severity.WARNING)
+
+FAILED_BOARD_SILENT = _a(
+    "FAILED_BOARD_SILENT", "The board did not say anything",
+    "The app watched the board start but it sent no messages, so the app cannot tell what "
+    "is wrong.",
+    "Unplug the board, wait 5 seconds, and plug it back in. Do not press any button.",
+    "Click Check again.",
+    severity=Severity.WARNING, illustration="replug")
+
+# Finding codes that are named per test stage: <STAGE>_HANG, and a crash in a stage other
+# than the extra memory test (TEST_CRASH).
+_STAGE_WORDS = {"psram": "the extra memory test", "iram": "the chip memory test",
+                "flash": "the memory chip test", "cpu": "the processor test",
+                "wifi": "the Wi-Fi test"}
+
+
+def board_test_hang(stage: str) -> Advice:
+    """<STAGE>_HANG: the board went silent in ``stage`` (psram, iram, flash, cpu, wifi)."""
+    words = _STAGE_WORDS.get(stage, "the test")
+    return _fault(f"{stage.upper()}_HANG", "The board stopped during the test",
+                  f"The board stopped answering during {words}.")
+
+
+BOARD_TEST_STATIC: Tuple[Advice, ...] = (
+    BOARD_TEST_REQUIRED, BOARD_TEST_PASSED, BOARD_STARTS_NORMALLY, PSRAM_NOT_FOUND,
+    PSRAM_WRONG_SIZE, PSRAM_TOO_SMALL, PSRAM_DATA_ERRORS, PSRAM_CRASH, PSRAM_STARTUP_FAULT,
+    IRAM_DATA_ERRORS, FLASH_WRONG_SIZE, FLASH_ID_CHANGED, FLASH_READ_UNSTABLE,
+    FLASH_WRITE_ERRORS, CPU_MISMATCH, WIFI_RADIO_FAILED, TEST_CRASH, TEST_HANG, STARTUP_HANG,
+    TEST_FAILED, WIFI_NO_NETWORKS, EFUSE_CHANGED, USB_DATA_GARBLED, NO_START, TEST_RESTARTED,
+    TEST_PROGRAM_REFUSED, FLASH_TEST_AREA_MISSING, TEST_INCOMPLETE, ERASE_NOT_FINISHED,
+    BOARD_TEST_IMAGES_DAMAGED, BOARD_TEST_NOT_POSSIBLE, FAILED_BOARD_FIX_SETTINGS,
+    FAILED_BOARD_RESUME, FAILED_BOARD_NO_HEAD_OFFICE, FAILED_BOARD_SILENT,
+)
+
+
+def board_test_advice(code: str) -> Advice:
+    """What to tell the person about a board test finding ``code``.
+
+    Codes with their own advice elsewhere keep it (STARTUP_CRASH, POWER_PROBLEM, the
+    hardware gate's refusals, cable and tool problems); unknown codes get TEST_FAILED.
+    """
+    own = {advice.code: advice for advice in BOARD_TEST_STATIC}
+    if code in own:
+        return own[code]
+    if code.endswith("_HANG") and code[:-5].lower() in _STAGE_WORDS:
+        return board_test_hang(code[:-5].lower())
+    if code in STATIC:
+        return STATIC[code]
+    shared = {"STARTUP_CRASH": STARTUP_CRASH, "FLASH_CHIP_UNSUPPORTED": FLASH_CHIP_UNSUPPORTED,
+              "RESTART_LOOP_FAULTY": restart_loop_faulty(None)}
+    return shared.get(code, TEST_FAILED)
+
+
 # --------------------------------------------------------------- light guide
 
 @dataclass(frozen=True)
@@ -1230,6 +1488,7 @@ STATIC: Dict[str, Advice] = {
         HEAD_OFFICE_REJECTED, HEAD_OFFICE_CONNECTED, COMM_KEY_WRONG, NEEDS_ZKT_280,
         TERMINAL_NOT_FOUND, TERMINAL_SERIAL_MISMATCH, HIK_PASSWORD_WRONG, HIK_NOT_REACHABLE,
         HIK_SETTINGS_INCOMPLETE, TERMINAL_CONNECTED, BOARD_ONLINE, BOARD_NOT_SEEN, UNEXPECTED,
+        *BOARD_TEST_STATIC,
     )
 }
 

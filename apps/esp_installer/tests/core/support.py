@@ -24,10 +24,10 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
 from sl_installer.core import flashplan
-from sl_installer.core.api import (BundleInfo, Capabilities, CancelToken, DeviceRecord,
-                                   EncryptedPackage, Family, InstallConfig, LocalBundle,
-                                   PackageRequest, UsbCandidate, UsbKind, ZoneSummary,
-                                   ZktSettings)
+from sl_installer.core.api import (BoardInfo, BoardTestReport, BoardTestVerdict, BundleInfo,
+                                   Capabilities, CancelToken, DeviceRecord, EncryptedPackage,
+                                   Family, InstallConfig, LocalBundle, PackageRequest,
+                                   UsbCandidate, UsbKind, ZoneSummary, ZktSettings)
 from sl_installer.core.bundles import STORAGE_EMPTY_SHA256, BundleStore, Verifier
 from sl_installer.core.esptool_runner import ToolCall, ToolResult, ToolRunner, PROGRESS_LINE
 
@@ -236,6 +236,15 @@ class FakeBoard:
         self.reported_mac: Optional[str] = None   # simulate a swapped board in banners
         self.sdm_purposes = (8, 9, 10, 11, 0, 0, 12)
         self.sdm_flags = 0xC5
+        # The board test (core/boardtest.py): register writes, watchdog resets that start
+        # the flash contents, whole-chip erases, and a hook run on every such start.
+        self.mem_writes: List[Tuple[int, int, int]] = []
+        self.started_programs = 0
+        self.chip_erases = 0
+        self.on_start: Optional[Callable[["FakeBoard"], None]] = None
+        # Every eFuse summary the board gave, and a hook that may change the eFuses
+        # (to prove the test notices; a real test program never writes them).
+        self.summaries_read = 0
 
     # -- helpers
     def _xmc(self) -> str:
@@ -268,7 +277,8 @@ class FakeBoard:
         args = list(call.args)
         command = next((a for a in args if a in (
             "get-security-info", "flash-id", "erase-region", "write-flash", "verify-flash",
-            "summary", "burn-key", "version", "--help", "chip-id")), None)
+            "summary", "burn-key", "version", "--help", "chip-id", "write-mem",
+            "erase-flash")), None)
         failure = self.failures.get(command or "") or self.failures.get(call.label)
         if failure is not None:
             failure.times -= 1
@@ -277,7 +287,11 @@ class FakeBoard:
             if failure.then:
                 failure.then(self)
             return failure.returncode, failure.output
-        assert "--after" not in args or args[args.index("--after") + 1] == "no-reset"
+        after = args[args.index("--after") + 1] if "--after" in args else None
+        # Only the board test's start call may boot the board: write-mem (clear the RTC
+        # force-download flag) with --after watchdog-reset. Everything else stays put.
+        assert after in (None, "no-reset") or (command == "write-mem"
+                                                and after == "watchdog-reset"), args
         if command in self.outputs:
             return 0, self.outputs[command]
         if command == "get-security-info":
@@ -321,7 +335,26 @@ class FakeBoard:
                 lines.append("A fatal error occurred: Verification failed.")
                 return 2, "\n".join(lines)
             return 0, "\n".join(lines + ["", "Staying in bootloader."])
+        if command == "write-mem":
+            address, value, mask = (int(item, 16) for item in args[-3:])
+            self.mem_writes.append((address, value, mask))
+            lines = [self._banner(), f"Wrote {value:#010x} with mask {mask:#010x} to "
+                                     f"{address:#010x}."]
+            if after == "watchdog-reset":
+                lines.append("Hard resetting with a watchdog...")
+                self.started_programs += 1
+                if self.on_start is not None:
+                    self.on_start(self)
+            return 0, "\n".join(lines)
+        if command == "erase-flash":
+            assert "--no-stub" not in args  # erase-flash needs the flasher stub
+            self.chip_erases += 1
+            self.flash.clear()
+            self.erased.append((0, self.flash_mb * 0x100000))
+            return 0, self._banner() + "\nErasing flash memory (this may take a while)...\n" \
+                "Flash memory erased successfully in 25.1 seconds."
         if command == "summary":
+            self.summaries_read += 1
             path = Path(args[args.index("--file") + 1])
             path.write_text(json.dumps(self.summary, sort_keys=True, indent=4), encoding="utf-8")
             return 0, "espefuse v5.1.0\nConnecting....\nSaving eFuse values to " + str(path)
@@ -734,3 +767,37 @@ def zkt_config(**changes) -> InstallConfig:
                   zkt=ZktSettings(port=4370, comm_key=1979, preferred_ip="0.0.0.0"))
     values.update(changes)
     return InstallConfig(**values)
+
+
+# ------------------------------------------------------------- board test
+
+def board_test_report(board: BoardInfo, *, verdict: BoardTestVerdict = BoardTestVerdict.PASSED,
+                      finished_at: Optional[str] = None, now=None, efuses_unchanged=True,
+                      erased=True, mac: Optional[str] = None) -> BoardTestReport:
+    """A board test report for ``board``, finished at ``finished_at`` (ISO with zone) or at
+    ``now`` (an aware datetime, e.g. a FakeClock's now_utc())."""
+    if finished_at is None:
+        from datetime import datetime, timezone
+        moment = now if now is not None else datetime.now(timezone.utc)
+        finished_at = moment.astimezone().replace(microsecond=0).isoformat()
+    return BoardTestReport(
+        mac=mac or board.mac, verdict=verdict, kind="vendor_test", started_at=finished_at,
+        finished_at=finished_at, board=board, findings=(), measurements={},
+        efuse_before={}, efuse_after={}, efuses_unchanged=efuses_unchanged, erased=erased,
+        keys_burned=False, console_log=None, tool_log=(), image_sha256={},
+        end_crc_ok=True)
+
+
+def make_test_images(root: Path, sizes: Sequence[int] = (0x5000, 0xC00, 0x40000)):
+    """Three made-up test images in ``root`` and pins that match them: (folder, images)."""
+    from sl_installer.core import boardtest_images
+
+    root.mkdir(parents=True, exist_ok=True)
+    pinned = []
+    for index, (image, size) in enumerate(zip(boardtest_images.IMAGES, sizes)):
+        data = bytes([index + 1]) * size
+        (root / image.name).write_bytes(data)
+        pinned.append(boardtest_images.TestImage(image.name, image.offset, image.max_size,
+                                                 size, hashlib.sha256(data).hexdigest()))
+    return root, tuple(pinned)
+
