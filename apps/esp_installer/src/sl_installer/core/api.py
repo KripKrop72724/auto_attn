@@ -389,6 +389,10 @@ class ConsoleKind(str, enum.Enum):
     # image, chip_revision, secure_boot, other) and fatal ("1" when it always restarts).
     BOOTLOADER_FAILED = "bootloader_failed"
     PANIC = "panic"                          # crash / abort / watchdog
+    # A line of the State Life board test program ("SLTEST <WHAT> key=value ..."). data:
+    # "sltest" (BEGIN, ALIVE, ERR, RESULT, END, CLEAN) and the line's own fields; an END
+    # line also gets "crc_ok" ("1"/"0"): whether its crc matches the lines received.
+    SELF_TEST = "self_test"
     OTHER = "other"
 
 
@@ -432,6 +436,70 @@ class ReplugPhase(str, enum.Enum):
     WAITING_UNPLUG = "waiting_unplug"
     WAITING_REPLUG = "waiting_replug"
     WATCHING = "watching"
+
+
+# --------------------------------------------------------------- board test
+
+class BoardTestVerdict(str, enum.Enum):
+    PASSED = "passed"            # every stage ok/warn, eFuses unchanged, board erased
+    FAILED = "failed"            # hardware fault proven (any stage fail, crash, hang,
+    #                              start-up loop, gate refusal)
+    INCOMPLETE = "incomplete"    # could not finish for a non-board reason (cancelled,
+    #                              cable, no start, tool error)
+
+
+@dataclass(frozen=True)
+class TestFinding:
+    """One thing the board test found (core/boardtest.py)."""
+
+    __test__ = False  # not a pytest test class
+
+    # e.g. PSRAM_DATA_ERRORS, PSRAM_STARTUP_FAULT, STARTUP_CRASH, FLASH_CHIP_UNSUPPORTED,
+    # WIFI_NO_NETWORKS, OK (a stage that passed)
+    code: str
+    stage: str           # psram|iram|flash|cpu|wifi|startup|check|cleanup
+    result: str          # ok|fail|warn|info
+    title: str           # plain words for the person
+    detail: str          # one technical sentence for the vendor
+    proof: Tuple[str, ...] = ()   # exact console / esptool lines that show it (<= 20)
+
+
+@dataclass(frozen=True)
+class BoardTestProgress:
+    stage: str           # check|write|start|psram|iram|flash|cpu|wifi|cleanup|done
+    fraction: Optional[float]   # 0..1 overall, None when unknown
+    detail: str          # plain words ("Testing the extra memory (round 1 of 2)")
+
+
+@dataclass(frozen=True)
+class BoardTestReport:
+    mac: str
+    verdict: BoardTestVerdict
+    kind: str                    # "vendor_test" (blank board) | "locked_board" (failed board)
+    started_at: str              # ISO local time
+    finished_at: str
+    board: BoardInfo             # inspection result
+    findings: Tuple[TestFinding, ...]
+    measurements: Dict[str, object]     # psram_size, psram_mb_s, flash_id, networks, ...
+    efuse_before: Dict[str, object]     # espefuse summary JSON (as read) or {} for SDM boards
+    efuse_after: Dict[str, object]
+    efuses_unchanged: Optional[bool]    # None when not readable (SDM)
+    erased: Optional[bool]              # test program removed (None for locked_board kind)
+    keys_burned: bool                   # the board had our key/secure boot before the test
+    console_log: Optional[str]          # path of the console log file for this run
+    tool_log: Tuple[str, ...]           # esptool/espefuse transcripts (redacted, no keys)
+    image_sha256: Dict[str, str]        # test images used
+    end_crc_ok: Optional[bool]          # END line crc matched the lines received
+    recovery: Optional[str] = None      # locked_board only: "RESUME" | "FIX_SETTINGS" | None
+    advice: Optional[Advice] = None     # what to tell the person
+
+    @property
+    def passed(self) -> bool:
+        return self.verdict is BoardTestVerdict.PASSED
+
+    @property
+    def hardware_fault(self) -> bool:
+        return self.verdict is BoardTestVerdict.FAILED
 
 
 # ----------------------------------------------------------- service protocols
@@ -492,8 +560,14 @@ class BoardServiceProto(Protocol):
 
 
 class InstallService(Protocol):
+    """``board_test``: a NEW_BOARD or RESUME run needs a PASSED board test of this board,
+    finished within the last 30 minutes, with its eFuses unchanged and the test program
+    erased (core/boardtest.py). Without one it stops before head office is asked or
+    anything is written (texts.BOARD_TEST_REQUIRED). CHANGE_SETTINGS needs none."""
+
     def run(self, mode: InstallMode, board: BoardInfo, config: InstallConfig,
-            on_step: ProgressFn, cancel: CancelToken) -> InstallSummary: ...
+            on_step: ProgressFn, cancel: CancelToken,
+            board_test: Optional[BoardTestReport] = None) -> InstallSummary: ...
 
 
 class BootService(Protocol):
@@ -526,11 +600,37 @@ class DiagnosisServiceProto(Protocol):
                  events: Sequence[ConsoleEvent]) -> Sequence[Advice]: ...
 
 
+class BoardTestServiceProto(Protocol):
+    """The board hardware test (core/boardtest.py).
+
+    ``run_test``: a blank board (or one whose earlier setup stopped after the key, without
+    Secure Boot) gets a small unsecured State Life test program, which checks the extra
+    memory, the memory chip, both processor cores and the Wi-Fi radio, and is then erased.
+    eFuses never change; the report proves it (summary before == after).
+    ``check_failed_board``: a locked board is only watched while it starts (after one
+    replug), never written, and its fault classified.
+    Both always return a report; they never raise for a board fault.
+    """
+
+    def run_test(self, board: BoardInfo, on_progress: Callable[[BoardTestProgress], None],
+                 on_phase: PhaseFn, on_event: Callable[[ConsoleEvent], None],
+                 cancel: CancelToken) -> BoardTestReport: ...
+    def check_failed_board(self, board: BoardInfo, on_phase: PhaseFn,
+                           on_event: Callable[[ConsoleEvent], None], cancel: CancelToken,
+                           seconds: float = 90.0) -> BoardTestReport: ...
+
+
 class RecordsService(Protocol):
     # ``restart``: the restart check (BootService.wait_restart), None when not watched.
     def save_install_record(self, summary: InstallSummary, boot: BootReport,
                             restart: Optional[BootReport] = None) -> str: ...
     def save_help_file(self) -> str: ...   # ZIP of redacted logs for head office
+    # A board test's certificate PDF and evidence ZIP: (pdf path, zip path). ``kind``:
+    # certificate.CertificateKind value; None for the one the verdict allows.
+    def save_board_test(self, report: BoardTestReport, tester: str,
+                        kind: Optional[str] = None) -> Tuple[str, str]: ...
+    # Optional (records.Records has it): several kinds of one report sharing ONE evidence
+    # ZIP, {kind: (pdf, zip)}; the screens use it when a report gets more than one PDF.
 
 
 @dataclass
@@ -543,5 +643,6 @@ class Services:
     boot: BootService
     diagnosis: DiagnosisServiceProto
     records: RecordsService
+    board_test: BoardTestServiceProto
     defaults: FieldDefaults
     app_version: str = "0.0.0"

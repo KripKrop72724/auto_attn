@@ -74,6 +74,7 @@ from sl_installer.core.installer import Installer  # noqa: E402
 from sl_installer.core.records import Records  # noqa: E402
 from sl_installer.core.usb import UsbWatcher  # noqa: E402
 from sl_installer.ui import pages  # noqa: E402
+from sl_installer.ui.screenshots import ScriptedBoardTest  # noqa: E402
 from sl_installer.ui.window import MainWindow  # noqa: E402
 
 
@@ -261,6 +262,8 @@ class Rig:
             ),
             boot=BootWatcher(usb, clock, opener=self.console.open, placeholder_ssids=("RE7",)),
             diagnosis=Diagnoser(("RE7",)),
+            # The hardware test before a setup passes (its own tests: tests/core).
+            board_test=ScriptedBoardTest("pass"),
             records=Records(tmp_path / "records", tmp_path / "logs", "1.0.0"),
             defaults=FieldDefaults(
                 wifi_password="test-wifi-pass", setup_ap_password="test-hotspot-pass"

@@ -16,6 +16,8 @@ DONE = "done"
 CHECK_BOARD = "check_board"
 FIX_SETTINGS = "fix_settings"
 LIGHT_GUIDE = "light_guide"
+BOARD_TEST = "board_test"
+BOARD_TEST_RESULT = "board_test_result"
 
 ALL = (
     SIGN_IN,
@@ -31,4 +33,6 @@ ALL = (
     CHECK_BOARD,
     FIX_SETTINGS,
     LIGHT_GUIDE,
+    BOARD_TEST,
+    BOARD_TEST_RESULT,
 )

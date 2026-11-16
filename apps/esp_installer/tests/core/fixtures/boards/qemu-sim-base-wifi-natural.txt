@@ -1,0 +1,125 @@
+# QEMU run of the board test program (ESP-IDF v5.5.3, esp_develop_9.2.2 QEMU), SIM-ONLY build (console on UART0, no fault).
+# nothing forced for Wi-Fi: the radio calibration never returns.
+# Lines: [host seconds] console line. '# tap:' = a gdb workaround (the image is unchanged).
+# Blank eFuses in QEMU: mac=00:00:00:00:00:00, chip_rev v0.0, flash id 9d6018.
+# tap: VM stopped by monitor, backtraces: (gdb, separate timeline)
+# tap: forced tsens_ready (QEMU has no temperature sensor) (gdb, separate timeline)
+[   2.059] ESP-ROM:esp32s3-20210327
+[   2.059] Build:Mar 27 2021
+[   2.060] rst:0x1 (POWERON),boot:0x4 (SPI_FLASH_BOOT)
+[   2.064] SPIWP:0xee
+[   2.065] mode:DIO, clock div:1
+[   2.066] load:0x3fce2820,len:0x14d4
+[   2.067] load:0x403c8700,len:0xd0c
+[   2.067] load:0x403cb700,len:0x2ef0
+[   2.070] entry 0x403c8920
+[   2.074] I (13) boot: ESP-IDF v5.5.3 2nd stage bootloader
+[   2.074] I (14) boot: Multicore bootloader
+[   2.078] I (16) boot: chip revision: v0.0
+[   2.078] I (16) boot: efuse block revision: v0.0
+[   2.079] I (16) boot.esp32s3: Boot SPI Speed : 80MHz
+[   2.080] I (16) boot.esp32s3: SPI Mode       : SLOW READ
+[   2.080] I (17) boot.esp32s3: SPI Flash Size : 16MB
+[   2.082] I (17) boot: Enabling RNG early entropy source...
+[   2.085] I (19) boot: Partition Table:
+[   2.086] I (19) boot: ## Label            Usage          Type ST Offset   Length
+[   2.086] I (20) boot:  0 nvs              WiFi data        01 02 00009000 00006000
+[   2.087] I (20) boot:  1 phy_init         RF data          01 01 0000f000 00001000
+[   2.087] I (20) boot:  2 factory          factory app      00 00 00010000 00100000
+[   2.088] I (20) boot:  3 fltest           Unknown data     01 99 00200000 00e00000
+[   2.088] I (21) boot: End of partition table
+[   2.090] I (21) esp_image: segment 0: paddr=00010020 vaddr=3c090020 size=19278h (103032) map
+[   2.104] I (28) esp_image: segment 1: paddr=000292a0 vaddr=3fc9a700 size=053e0h ( 21472) load
+[   2.107] I (30) esp_image: segment 2: paddr=0002e688 vaddr=40374000 size=01990h (  6544) load
+[   2.109] I (31) esp_image: segment 3: paddr=00030020 vaddr=42000020 size=815e0h (529888) map
+[   2.174] I (64) esp_image: segment 4: paddr=000b1608 vaddr=40375990 size=14cf4h ( 85236) load
+[   2.185] I (69) esp_image: segment 5: paddr=000c6304 vaddr=50000000 size=00020h (    32) load
+[   2.187] I (70) boot: Loaded app from partition at offset 0x10000
+[   2.188] I (70) boot: Disabling RNG early entropy source...
+[   2.205] W (159) rtcinit: o_code calibration fail
+[   2.212] I (82) octal_psram: vendor id    : 0x0d (AP)
+[   2.212] I (83) octal_psram: dev id       : 0x02 (generation 3)
+[   2.212] I (83) octal_psram: density      : 0x03 (64 Mbit)
+[   2.213] I (83) octal_psram: good-die     : 0x01 (Pass)
+[   2.213] I (83) octal_psram: Latency      : 0x01 (Fixed)
+[   2.213] I (83) octal_psram: VCC          : 0x00 (1.8V)
+[   2.213] I (83) octal_psram: SRF          : 0x01 (Fast Refresh)
+[   2.214] I (83) octal_psram: BurstType    : 0x01 (Hybrid Wrap)
+[   2.214] I (84) octal_psram: BurstLen     : 0x01 (32 Byte)
+[   2.214] I (84) octal_psram: Readlatency  : 0x02 (10 cycles@Fixed)
+[   2.215] I (84) octal_psram: DriveStrength: 0x00 (1/1)
+[   2.215] I (84) MSPI Timing: Enter psram timing tuning
+[   2.217] W MSPI Timing: tuning fail, best point is fallen back to index 5
+[   2.218] I (85) esp_psram: Found 8MB PSRAM device
+[   2.218] I (86) esp_psram: Speed: 80MHz
+[   2.219] I (86) cpu_start: Multicore app
+[   2.238] I (95) cpu_start: GPIO 44 and 43 are used as console UART I/O pins
+[   2.243] I (96) cpu_start: Pro cpu start user code
+[   2.243] I (96) cpu_start: cpu freq: 240000000 Hz
+[   2.243] I (96) app_init: Application information:
+[   2.243] I (96) app_init: Project name:     board-test
+[   2.243] I (96) app_init: App version:      1.0.0
+[   2.243] I (96) app_init: ELF file SHA256:  fc2ad031f...
+[   2.243] I (96) app_init: ESP-IDF:          v5.5.3
+[   2.244] I (96) efuse_init: Min chip rev:     v0.0
+[   2.244] I (96) efuse_init: Max chip rev:     v0.99
+[   2.244] I (96) efuse_init: Chip rev:         v0.0
+[   2.245] I (96) heap_init: Initializing. RAM available for dynamic allocation:
+[   2.245] I (96) heap_init: At 3FCA5438 len 000442D8 (272 KiB): RAM
+[   2.245] I (97) heap_init: At 3FCE9710 len 00005724 (21 KiB): RAM
+[   2.245] I (97) heap_init: At 3FCF0000 len 00008000 (32 KiB): DRAM
+[   2.246] I (97) heap_init: At 600FE000 len 00001FE8 (7 KiB): RTCRAM
+[   2.248] I (97) esp_psram: Adding pool of 8192K of PSRAM memory to heap allocator
+[   2.255] I (98) spi_flash: detected chip: issi
+[   2.255] I (98) spi_flash: flash io: dio
+[   2.257] I (98) sleep_gpio: Configure to isolate all GPIO pins in sleep state
+[   2.258] I (99) sleep_gpio: Enable automatic switching of GPIO sleep configuration
+[   2.264] I (99) main_task: Started on CPU0
+[   2.266] I (100) esp_psram: Reserving pool of 32K of internal memory for DMA/internal allocations
+[   2.267] I (101) main_task: Calling app_main()
+[   3.780] SLTEST BEGIN proto=1 fw=1.0.0 mac=00:00:00:00:00:00 chip_rev=v0.0 cores=2 idf=v5.5.3 flash_id=9d6018 flash_size=16777216 psram_size=8388608
+[   3.781] SLTEST ALIVE stage=psram step=0 of=20 at=0
+[   4.280] SLTEST ALIVE stage=psram step=6 of=20 at=0x3c4789c0
+[   4.780] SLTEST ALIVE stage=psram step=12 of=20 at=0x3c4f49c0
+[   5.181] SLTEST ALIVE stage=psram step=16 of=20 at=0x3c4049c0
+[   5.583] SLTEST ALIVE stage=psram step=20 of=20 at=0x3c3549c0
+[   5.596] SLTEST RESULT stage=psram result=ok code=OK detail=all_patterns_ok errors=0 ms=1814 size=8388608 tested=8257472 rounds=2 mb_s=173
+[   5.597] SLTEST ALIVE stage=iram step=0 of=10 at=0
+[   5.617] SLTEST RESULT stage=iram result=ok code=OK detail=all_patterns_ok errors=0 ms=20 tested=196544 mb_s=184
+[   5.618] SLTEST ALIVE stage=flash step=0 of=18 at=0
+[   5.984] SLTEST ALIVE stage=flash step=3 of=18 at=0x00450000
+[   6.484] SLTEST ALIVE stage=flash step=3 of=18 at=0x006f0000
+[   6.885] SLTEST ALIVE stage=flash step=3 of=18 at=0x00960000
+[   7.286] SLTEST ALIVE stage=flash step=3 of=18 at=0x00c00000
+[   7.687] SLTEST ALIVE stage=flash step=3 of=18 at=0x00e90000
+[   8.089] SLTEST ALIVE stage=flash step=4 of=18 at=0x00340000
+[   8.588] SLTEST ALIVE stage=flash step=4 of=18 at=0x00680000
+[   9.021] SLTEST ALIVE stage=flash step=4 of=18 at=0x00920000
+[   9.526] SLTEST ALIVE stage=flash step=4 of=18 at=0x00c90000
+[   9.929] SLTEST ALIVE stage=flash step=4 of=18 at=0x00f40000
+[  10.338] SLTEST ALIVE stage=flash step=6 of=18 at=0x0030d000
+[  10.741] SLTEST ALIVE stage=flash step=9 of=18 at=0x00604000
+[  11.150] SLTEST ALIVE stage=flash step=11 of=18 at=0x00800000
+[  11.568] SLTEST ALIVE stage=flash step=14 of=18 at=0x00b06000
+[  11.982] SLTEST ALIVE stage=flash step=17 of=18 at=0x00e0d000
+[  12.289] SLTEST RESULT stage=flash result=ok code=OK detail=all_blocks_ok errors=0 ms=6671 id=9d6018 size=16777216 blocks=14
+[  12.290] SLTEST ALIVE stage=cpu step=0 of=2 at=0
+[  12.396] SLTEST ALIVE stage=cpu step=1 of=2 at=0
+[  12.492] W (10311) eFuse: calibration efuse version does not match, set default version to 0
+[  12.493] W (10313) temperature_sensor: Calibration failed
+[  12.493] E (10314) temperature_sensor: Exceeding temperature measure range.
+[  12.495] SLTEST RESULT stage=cpu result=ok code=OK detail=cores_agree errors=0 ms=191 temp_c=na sum=cdcb3e9f
+[  12.496] SLTEST ALIVE stage=wifi step=0 of=3 at=0
+[  12.550] W (10369) phy_init: failed to load RF calibration data (0x1102), falling back to full calibration
+[  12.814] SLTEST ALIVE stage=wifi step=1 of=3 at=0
+[  13.218] SLTEST ALIVE stage=wifi step=1 of=3 at=0
+[  13.622] SLTEST ALIVE stage=wifi step=1 of=3 at=0
+[  14.025] SLTEST ALIVE stage=wifi step=1 of=3 at=0
+[  14.429] SLTEST ALIVE stage=wifi step=1 of=3 at=0
+[  14.833] SLTEST ALIVE stage=wifi step=1 of=3 at=0
+[  15.237] SLTEST ALIVE stage=wifi step=1 of=3 at=0
+[  15.640] SLTEST ALIVE stage=wifi step=1 of=3 at=0
+[  16.044] SLTEST ALIVE stage=wifi step=1 of=3 at=0
+[  16.447] SLTEST ALIVE stage=wifi step=1 of=3 at=0
+[  16.851] SLTEST ALIVE stage=wifi step=1 of=3 at=0
+[  17.255] SLTEST ALIVE stage=wifi step=1 of=3 at=0

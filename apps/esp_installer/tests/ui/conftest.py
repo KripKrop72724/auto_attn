@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import os
 import sys
-from typing import Callable, List
+from typing import Callable, List, Optional
 
 import pytest
 
@@ -28,6 +28,7 @@ from PySide6.QtWidgets import QApplication  # noqa: E402
 from sl_installer.core import api, fakes  # noqa: E402
 from sl_installer.ui import pages  # noqa: E402
 from sl_installer.ui.app import ensure_app  # noqa: E402
+from sl_installer.ui.screenshots import ScriptedBoardTest, use_scripted_board_test  # noqa: E402
 from sl_installer.ui.window import MainWindow  # noqa: E402
 
 PACE = 0.002
@@ -51,6 +52,9 @@ class Harness:
         self.window.show()
         self.controller = self.window.controller
         self._held: List[str] = []
+        self.board_tester: Optional[ScriptedBoardTest] = None
+        if getattr(self.services, "board_test", None) is None:
+            self.board_tester = use_scripted_board_test(self.services, "pass", PACE)
 
     # ------------------------------------------------------------ basics
 
@@ -82,9 +86,19 @@ class Harness:
     def release(self, moment: str) -> None:
         self.world.release(moment)
 
+    def scripted(self, story: str, *held: str) -> ScriptedBoardTest:
+        """The board test of this window tells ``story`` (screenshots.BOARD_TEST_STORIES),
+        stopping at each of ``held`` until released."""
+        self.board_tester = use_scripted_board_test(self.services, story, PACE)
+        for moment in held:
+            self.board_tester.hold(moment)
+        return self.board_tester
+
     def close(self) -> None:
         for moment in self._held:
             self.world.release(moment)
+        if self.board_tester is not None:
+            self.board_tester.release_all()
         self.controller.session.installing = False
         self.controller.shutdown()
         self.window.hide()
@@ -175,6 +189,22 @@ class Harness:
         self.wait(lambda: self.page(pages.FIRST_START).primary_button.isVisible(), timeout=8000)
         self.click_primary(pages.FIRST_START)
         self.wait_page(pages.DONE)
+
+    def board_test(self, choice: str = "board_test") -> None:
+        """Home's Test a new board (or ``failed_board``), up to the test screen."""
+        self.signed_in()
+        self.act(pages.HOME, choice)
+        self.wait_page(pages.CONNECT)
+        self.wait(lambda: self.page(pages.CONNECT).primary_button.isEnabled())
+        self.click_primary(pages.CONNECT)
+        self.wait_page(pages.BOARD_TEST)
+
+    def board_test_result(self, choice: str = "board_test") -> None:
+        """As board_test, up to the result with its files saved."""
+        self.board_test(choice)
+        self.wait_page(pages.BOARD_TEST_RESULT)
+        page = self.page(pages.BOARD_TEST_RESULT)
+        self.wait(lambda: page.saved.isVisible() and not self.controller.running("certificate"))
 
     def check_board(self) -> None:
         self.signed_in()

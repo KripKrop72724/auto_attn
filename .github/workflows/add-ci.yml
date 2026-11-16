@@ -711,10 +711,26 @@ jobs:
           SLIC_RESCUE_WIFI_PROFILE: lahore-direct
         run: python3 scripts/build_usb_wifi_rescue.py --output build-ci-usb-rescue
 
+  firmware-board-test:
+    # The installer's unsecured board hardware test program. The committed
+    # images in apps/esp_installer/src/sl_installer/resources/boardtest must be
+    # exactly what this source builds, and the build refuses any option or
+    # call that could burn eFuses or lock a board.
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Rebuild the board test program and compare with the committed images
+        run: python3 apps/esp_installer/board_test_firmware/build_images.py --check
+      - name: Record the ESP-IDF image digest this runner built with
+        run: docker image inspect espressif/idf:v5.5.3 --format '{{json .RepoDigests}}'
+
   firmware:
     # This exact required check (HIL, signing and release gates match it by
     # name) cannot succeed unless every firmware part above succeeded.
-    needs: [firmware-production, firmware-journal, firmware-bridge, firmware-roles]
+    needs: [firmware-production, firmware-journal, firmware-bridge, firmware-roles, firmware-board-test]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -725,11 +741,13 @@ jobs:
           JOURNAL_RESULT: ${{ needs.firmware-journal.result }}
           BRIDGE_RESULT: ${{ needs.firmware-bridge.result }}
           ROLES_RESULT: ${{ needs.firmware-roles.result }}
+          BOARD_TEST_RESULT: ${{ needs.firmware-board-test.result }}
         run: |
           test "$PRODUCTION_RESULT" = success
           test "$JOURNAL_RESULT" = success
           test "$BRIDGE_RESULT" = success
           test "$ROLES_RESULT" = success
+          test "$BOARD_TEST_RESULT" = success
 
   oracle-projection:
     runs-on: ubuntu-latest

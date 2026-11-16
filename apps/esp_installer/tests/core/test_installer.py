@@ -45,9 +45,15 @@ class Rig:
                                    store=store, app_version="1.0.0", clock=self.clock,
                                    temp_root=self.work, today=lambda: date(2026, 11, 1))
 
-    def run(self, mode=InstallMode.NEW_BOARD, board=None, config=None, cancel=None):
-        return self.installer.run(mode, board or blank_board(), config or support.zkt_config(),
-                                  self.steps.append, cancel or CancelToken())
+    def run(self, mode=InstallMode.NEW_BOARD, board=None, config=None, cancel=None,
+            board_test="passed"):
+        """``board_test``: "passed" gives the run a fresh passed board test of the board."""
+        board = board or blank_board()
+        if board_test == "passed":
+            board_test = support.board_test_report(board, now=self.clock.now_utc())
+        return self.installer.run(mode, board, config or support.zkt_config(),
+                                  self.steps.append, cancel or CancelToken(),
+                                  board_test=board_test)
 
     def purposes(self):
         return [c.label for c in self.runner.calls]
@@ -701,7 +707,9 @@ def test_screen_and_audit_failures_never_break_an_install(rig, monkeypatch):
         raise RuntimeError("ADD down")
     monkeypatch.setattr(rig.server, "report", broken_report)
     rig.installer.run(InstallMode.NEW_BOARD, blank_board(), support.zkt_config(),
-                      lambda progress: 1 / 0, CancelToken())
+                      lambda progress: 1 / 0, CancelToken(),
+                      board_test=support.board_test_report(blank_board(),
+                                                           now=rig.clock.now_utc()))
     assert 0x0 in rig.fake.flash
 
 

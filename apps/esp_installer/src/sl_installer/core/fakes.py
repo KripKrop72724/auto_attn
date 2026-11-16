@@ -27,10 +27,11 @@ import tempfile
 import threading
 import zipfile
 from dataclasses import dataclass, replace
-from typing import Dict, List, Optional, Sequence, Tuple
+from datetime import datetime, timezone
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 from .. import __version__
-from . import api
+from . import api, boardtest, boardtest_scripts, texts
 from .api import (
     Advice,
     BootOutcome,
@@ -57,6 +58,7 @@ from .api import (
     UsbKind,
     ZoneSummary,
 )
+from .console import ConsoleParser, ConsoleWatch
 from .naming import hotspot_name
 
 SCENARIOS: Tuple[str, ...] = (
@@ -97,6 +99,19 @@ SCENARIOS: Tuple[str, ...] = (
     "startup_refused",
     # The board opens its own Wi-Fi while the restart check watches it.
     "hotspot_at_start",
+    # The board hardware test (1.2.0): it passes in every other story. A new board whose
+    # extra memory gives wrong data; one that stops in its extra memory start-up (the
+    # ac:27:6e:a4:e5:e8 board); an XMC memory chip the check refuses before any test.
+    "board_test_pass",
+    "board_test_psram_errors",
+    "board_test_psram_hang",
+    "board_test_xmc_refused",
+    # Check a failed board: a locked board with faulty extra memory (ac:27:6e:a4:57:88), a
+    # locked board whose settings are missing (Fix the settings), and a board whose earlier
+    # setup stopped after the key (it is tested, then Finish the setup).
+    "failed_board_psram",
+    "failed_board_settings",
+    "failed_board_resume",
 )
 
 # Boards the board check refuses, by story: (verdict, memory chip ID, what did not fit, as
@@ -117,6 +132,11 @@ _REFUSED_HARDWARE: Dict[str, Tuple[HardwareVerdict, str, str]] = {
         "c8 40 18",
         "extra memory 8 MB, type AP_1v8",
     ),
+    "board_test_xmc_refused": (
+        HardwareVerdict.FLASH_CHIP_UNSUPPORTED,
+        "20 70 18",
+        "memory chip 20 70 18",
+    ),
 }
 CHIP_LINE = "ESP32-S3 (QFN56) (revision v0.2)"
 
@@ -127,6 +147,8 @@ _SECURED_STORIES = (
     "lookup_fails",
     "zone_not_writable",
     "secured_hik_fix_settings",
+    "failed_board_psram",
+    "failed_board_settings",
 )
 
 BOARD_MAC = "ac:27:6e:a4:3d:30"
@@ -268,10 +290,14 @@ class FakeWorld:
         self.inspections = 0
         self.install_runs = 0
         self.lookups = 0
+        self.board_tests = 0
+        # Every board test report the fake service gave, oldest first.
+        self.board_test_reports: List[api.BoardTestReport] = []
         self.signed_in: Optional[str] = None
         self.board_state = {
             "resume_after_key": SecurityState.KEY_BURNED_NOT_STARTED,
             "flash_chip_key_burned": SecurityState.KEY_BURNED_NOT_STARTED,
+            "failed_board_resume": SecurityState.KEY_BURNED_NOT_STARTED,
             "secured_other": SecurityState.SECURED_OTHER,
             **{story: SecurityState.SECURED_STATE_LIFE for story in _SECURED_STORIES},
         }.get(scenario, SecurityState.BLANK)
@@ -760,9 +786,12 @@ class FakeInstaller:
         config: api.InstallConfig,
         on_step: api.ProgressFn,
         cancel: api.CancelToken,
+        board_test: Optional[api.BoardTestReport] = None,
     ) -> api.InstallSummary:
         world = self.world
         world.note("installer.run")
+        # Like the engine: no key lock without a passed board test (boardtest.py).
+        boardtest.check_board_test(mode, board, board_test, datetime.now(timezone.utc))
         world.install_runs += 1
         first_run = world.install_runs == 1
         steps = api.steps_for(mode)
@@ -1367,6 +1396,241 @@ class FakeDiagnosis:
         return sorted(found, key=lambda item: _RANK.get(item.severity, 9))
 
 
+# ================================================================== board test
+
+# Overall progress the fake test reports, as the engine does (boardtest._SPAN).
+_TEST_STEPS: Tuple[Tuple[str, float, str], ...] = (
+    ("check", 0.02, "Checking the board"),
+    ("write", 0.12, "Copying the test program"),
+    ("start", 0.22, "Starting the test"),
+    ("psram", 0.35, "Testing the extra memory (part 6 of 15)"),
+    ("psram", 0.48, "Testing the extra memory (part 14 of 15)"),
+    ("iram", 0.53, "Testing the chip's own memory"),
+    ("flash", 0.64, "Testing the memory chip (part 7 of 12)"),
+    ("cpu", 0.72, "Testing the processor"),
+    ("wifi", 0.8, "Testing the Wi-Fi"),
+    ("cleanup", 0.92, "Removing the test program"),
+    ("done", 1.0, "Finished"),
+)
+_TEST_STAGE_ORDER = tuple(dict.fromkeys(step for step, _fraction, _detail in _TEST_STEPS))
+
+
+def fake_efuses(mac: str, *, key_burned: bool = False) -> Dict[str, object]:
+    """A small eFuse summary as espefuse prints it (JSON), for the fake reports."""
+    block = ("?? " * 32).strip() if key_burned else ("00 " * 32).strip()
+    return {
+        "MAC": {"value": f"{mac} (OK)", "readable": True, "writeable": True},
+        "SECURE_BOOT_EN": {"value": False, "readable": True, "writeable": True},
+        "KEY_PURPOSE_0": {"value": "HMAC_UP" if key_burned else "USER",
+                          "readable": True, "writeable": not key_burned},
+        "BLOCK_KEY0": {"value": block, "readable": not key_burned,
+                       "writeable": not key_burned},
+        "PSRAM_CAP": {"value": "8M", "readable": True, "writeable": True},
+        "FLASH_CAP": {"value": "16M", "readable": True, "writeable": True},
+    }
+
+
+class FakeBoardTest:
+    """BoardTestServiceProto for the stories: the real judge (boardtest.TestJudge) decides
+    on the scripted console of the story (boardtest_scripts), so the findings, words and
+    measurements are the engine's own. Holds: "test_<stage>" stops at that stage of the
+    progress, "test_unplug" / "test_replug" at the replug steps."""
+
+    def __init__(self, world: FakeWorld) -> None:
+        self.world = world
+
+    # ------------------------------------------------------------- run_test
+
+    def run_test(
+        self,
+        board: api.BoardInfo,
+        on_progress: Callable[[api.BoardTestProgress], None],
+        on_phase: api.PhaseFn,
+        on_event: api.EventFn,
+        cancel: api.CancelToken,
+    ) -> api.BoardTestReport:
+        world = self.world
+        world.note("board_test.run_test")
+        world.board_tests += 1
+        started = _local_now()
+        if board.hardware not in (HardwareVerdict.OK, HardwareVerdict.NOT_CHECKED):
+            finding, advice = boardtest.gate_finding(board)
+            return self._keep(self._report(board, api.BoardTestVerdict.FAILED, started,
+                                           (finding,), advice=advice, written=False))
+        if boardtest.board_problems(board):
+            return self._keep(self._report(
+                board, api.BoardTestVerdict.INCOMPLETE, started, (), written=False,
+                advice=texts.BOARD_TEST_NOT_POSSIBLE, code="BOARD_TEST_NOT_POSSIBLE"))
+        mac = board.mac
+        if world.scenario == "board_test_psram_errors":
+            script = boardtest_scripts.psram_errors_run(mac)
+            last_stage = "done"
+        elif world.scenario == "board_test_psram_hang":
+            script = boardtest_scripts.timed(boardtest_scripts.PSRAM_HANG_A4E5E8)
+            last_stage = "start"
+        else:
+            script = boardtest_scripts.passing_run(mac)
+            last_stage = "done"
+        stop_at = _TEST_STAGE_ORDER.index(last_stage)
+        for stage, fraction, detail in _TEST_STEPS:
+            if _TEST_STAGE_ORDER.index(stage) > stop_at and stage not in ("cleanup", "done"):
+                continue
+            on_progress(api.BoardTestProgress(stage, fraction, detail))
+            if world.pause(f"test_{stage}", cancel, 1):
+                return self._keep(self._report(
+                    board, api.BoardTestVerdict.INCOMPLETE, started, (), written=True,
+                    advice=CANCELLED, code="CANCELLED"))
+            if stage == "start":
+                parser = ConsoleParser(mac)
+                for _at, line in script:
+                    event = parser.parse(line)
+                    if event is not None:
+                        on_event(event)
+        judgement = _judge(mac, script, locked=False, board=board)
+        recovery = None
+        if (judgement.verdict is api.BoardTestVerdict.PASSED
+                and board.security is SecurityState.KEY_BURNED_NOT_STARTED):
+            recovery = boardtest.RECOVERY_RESUME
+        return self._keep(self._report(
+            board, judgement.verdict, started, judgement.findings, written=True,
+            measurements=judgement.measurements, crc=judgement.end_crc_ok,
+            advice=judgement.advice, recovery=recovery))
+
+    # ---------------------------------------------------- check_failed_board
+
+    def check_failed_board(
+        self,
+        board: api.BoardInfo,
+        on_phase: api.PhaseFn,
+        on_event: api.EventFn,
+        cancel: api.CancelToken,
+        seconds: float = 90.0,
+    ) -> api.BoardTestReport:
+        world = self.world
+        world.note("board_test.check_failed_board")
+        if not boardtest.board_problems(board):
+            return self.run_test(board, lambda progress: None, on_phase, on_event, cancel)
+        started = _local_now()
+        for phase, hold in ((ReplugPhase.WAITING_UNPLUG, "test_unplug"),
+                            (ReplugPhase.WAITING_REPLUG, "test_replug")):
+            on_phase(phase)
+            if world.pause(hold, cancel, 2):
+                return self._keep(self._report(
+                    board, api.BoardTestVerdict.INCOMPLETE, started, (), written=None,
+                    advice=CANCELLED, code="CANCELLED", kind=boardtest.KIND_LOCKED))
+        on_phase(ReplugPhase.WATCHING)
+        if world.scenario == "failed_board_psram":
+            lines = boardtest_scripts.LOCKED_PSRAM_A45788
+        elif world.scenario == "failed_board_settings":
+            lines = boardtest_scripts.LOCKED_SETTINGS_MISSING
+        else:
+            lines = boardtest_scripts.LOCKED_STARTS_NORMALLY
+        script = boardtest_scripts.timed(lines)
+        parser = ConsoleParser(board.mac)
+        for _at, line in script:
+            if world.pause("console_line", cancel, 0.5):
+                break
+            event = parser.parse(line)
+            if event is not None:
+                on_event(event)
+        judgement = _judge(board.mac, script, locked=True, board=board)
+        return self._keep(self._report(
+            board, judgement.verdict, started, judgement.findings, written=None,
+            measurements=judgement.measurements, advice=judgement.advice,
+            recovery=judgement.recovery, kind=boardtest.KIND_LOCKED))
+
+    # -------------------------------------------------------------- helpers
+
+    def _keep(self, report: api.BoardTestReport) -> api.BoardTestReport:
+        self.world.board_test_reports.append(report)
+        return report
+
+    def _report(
+        self,
+        board: api.BoardInfo,
+        verdict: api.BoardTestVerdict,
+        started: str,
+        findings: Sequence[api.TestFinding],
+        *,
+        written: Optional[bool],
+        measurements: Optional[Dict[str, object]] = None,
+        crc: Optional[bool] = None,
+        advice: Optional[Advice] = None,
+        recovery: Optional[str] = None,
+        code: Optional[str] = None,
+        kind: Optional[str] = None,
+    ) -> api.BoardTestReport:
+        keys = board.security in (SecurityState.KEY_BURNED_NOT_STARTED,
+                                  SecurityState.SECURED_STATE_LIFE)
+        readable = not board.secure_download_mode
+        efuses = fake_efuses(board.mac, key_burned=keys) if readable else {}
+        found = list(findings)
+        if code is not None:
+            found.append(api.TestFinding(code, "check", "info", (advice or CANCELLED).title,
+                                         "fake: " + code))
+        if written:
+            found.append(api.TestFinding("EFUSES_UNCHANGED", "cleanup", "ok",
+                                         "The board's permanent settings did not change",
+                                         "fake: summary before equals after"))
+            found.append(api.TestFinding("ERASED", "cleanup", "ok",
+                                         "The test program was removed", "fake: erased"))
+        if kind is None:
+            kind = (boardtest.KIND_VENDOR if board.security is SecurityState.BLANK
+                    else boardtest.KIND_LOCKED)
+        values = dict(measurements or {})
+        values.setdefault("flash_id", board.flash_id)
+        values.setdefault("chip_revision", board.chip_revision)
+        return api.BoardTestReport(
+            mac=board.mac,
+            verdict=verdict,
+            kind=kind,
+            started_at=started,
+            finished_at=_local_now(),
+            board=board,
+            findings=tuple(found),
+            measurements=values,
+            efuse_before=efuses,
+            efuse_after=dict(efuses),
+            efuses_unchanged=(True if written else None) if readable else None,
+            erased=True if written else None,
+            keys_burned=keys,
+            console_log=None,
+            tool_log=("fake: no tools run",),
+            image_sha256={name: "0" * 64 for name in
+                          ("bootloader.bin", "partition-table.bin", "board-test.bin")},
+            end_crc_ok=crc,
+            recovery=recovery,
+            advice=advice,
+        )
+
+
+def _local_now() -> str:
+    return datetime.now().astimezone().replace(microsecond=0).isoformat()
+
+
+def _judge(mac: str, script: Sequence[Tuple[float, str]], *, locked: bool,
+           board: api.BoardInfo) -> boardtest.Judgement:
+    """The engine's judge on a whole scripted console, as at the end of a real watch."""
+    parser = ConsoleParser(mac)
+    watch = ConsoleWatch(started=0.0, events=[], lines=[], port_open=True)
+    for moment, line in script:
+        event = parser.parse(line, moment)
+        if event is None:
+            continue
+        watch.last_line_at = moment
+        assert watch.lines is not None
+        watch.lines.append((moment, event.raw))
+        if event.kind is ConsoleKind.OTHER and not event.data:
+            watch.other_lines += 1
+        else:
+            watch.events.append(event)
+    end = (script[-1][0] if script else 0.0) + boardtest.SILENCE_S + 1.0
+    judge = boardtest.TestJudge(mac, locked=locked, board=board)
+    judgement = judge.check(watch, end, final=True)
+    assert judgement is not None
+    return judgement
+
+
 # ===================================================================== records
 
 
@@ -1404,6 +1668,37 @@ class FakeRecords:
             archive.writestr("README.txt", "Fake help file: no logs in fake mode.\n")
         return path
 
+    def save_board_test(
+        self, report: api.BoardTestReport, tester: str, kind: Optional[str] = None
+    ) -> Tuple[str, str]:
+        """A small stand-in certificate (not a real PDF) and evidence ZIP."""
+        self.world.note("records.save_board_test")
+        word = kind or ("passed" if report.passed else "fault")
+        stem = os.path.join(
+            self.world.folder(),
+            f"board-test-{report.mac.replace(':', '')}-{self.world.board_tests:04d}-{word}",
+        )
+        with zipfile.ZipFile(stem + ".zip", "w") as archive:
+            archive.writestr("result.txt", f"{report.verdict.value}\n")
+        with open(stem + ".pdf", "wb") as handle:
+            handle.write(b"%PDF-1.4\n% fake certificate\n%%EOF\n")
+        return stem + ".pdf", stem + ".zip"
+
+    def save_board_tests(
+        self, report: api.BoardTestReport, tester: str, kinds: Sequence[str]
+    ) -> Dict[str, Tuple[str, str]]:
+        """As records.Records: one evidence ZIP shared by every kind's PDF."""
+        saved: Dict[str, Tuple[str, str]] = {}
+        archive = ""
+        for kind in kinds:
+            pdf, own = self.save_board_test(report, tester, kind)
+            if archive:
+                os.remove(own)
+            else:
+                archive = own
+            saved[kind] = (pdf, archive)
+        return saved
+
 
 # ===================================================================== factory
 
@@ -1424,6 +1719,7 @@ def make_fake_services(scenario: str, *, pace: float = 0.01) -> api.Services:
         boot=FakeBoot(world),
         diagnosis=FakeDiagnosis(world),
         records=FakeRecords(world),
+        board_test=FakeBoardTest(world),
         defaults=TEST_DEFAULTS,
         app_version=__version__,
     )

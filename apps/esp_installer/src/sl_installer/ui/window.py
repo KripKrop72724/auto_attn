@@ -10,6 +10,8 @@ from PySide6.QtWidgets import QFrame, QMainWindow, QMessageBox, QStackedWidget, 
 
 from ..core import api
 from . import pictures
+from .pages.board_test import BoardTestPage
+from .pages.board_test_result import BoardTestResultPage
 from .pages.check_board import CheckBoardPage
 from .pages.checking import CheckingPage
 from .pages.confirm import ConfirmPage
@@ -77,6 +79,8 @@ class MainWindow(QMainWindow):
             CheckBoardPage(),
             FixSettingsPage(),
             LightGuidePage(),
+            BoardTestPage(),
+            BoardTestResultPage(),
         ):
             self.pages[page.page_id] = page
             self.stack.addWidget(page)

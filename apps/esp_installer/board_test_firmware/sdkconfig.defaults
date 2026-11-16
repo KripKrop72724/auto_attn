@@ -1,0 +1,53 @@
+# State Life board hardware test program.
+#
+# Hardware handling is the same as the production firmware
+# (firmware/zone_lite/sdkconfig.defaults + sdkconfig.zkt.defaults), so the
+# board starts its flash, PSRAM and CPU exactly as it will in the field.
+CONFIG_IDF_TARGET="esp32s3"
+CONFIG_APP_REPRODUCIBLE_BUILD=y
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_ESPTOOLPY_FLASHMODE_DIO=y
+CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_TYPE_AUTO=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_USE_MALLOC=y
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+CONFIG_FREERTOS_HZ=1000
+CONFIG_ESP32S3_REV_MIN_0=y
+CONFIG_BOOTLOADER_FLASH_XMC_SUPPORT=y
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+
+# Differences from production (all required by the board-test spec).
+# We run our own, much stronger PSRAM test in app_main.
+CONFIG_SPIRAM_MEMTEST=n
+# Missing PSRAM becomes a result line instead of an abort at start-up.
+CONFIG_SPIRAM_IGNORE_NOTFOUND=y
+# All output (ROM, bootloader, app) on the USB port the installer reads.
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+# One clean crash dump, then halt (no crash loop hiding the first panic).
+CONFIG_ESP_SYSTEM_PANIC_PRINT_HALT=y
+CONFIG_ESP_TASK_WDT_EN=y
+CONFIG_ESP_TASK_WDT_INIT=y
+CONFIG_ESP_TASK_WDT_PANIC=y
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=10
+CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0=y
+CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU1=y
+# INFO so the octal_psram vendor / density lines print.
+CONFIG_BOOTLOADER_LOG_LEVEL_INFO=y
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_PARTITION_TABLE_OFFSET=0x8000
+# Fast memory loops (production uses size optimisation; this is not hardware).
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+
+# Never anything that burns eFuses or locks the board. build_images.py fails
+# the build if any of these ends up enabled in the final sdkconfig.
+CONFIG_SECURE_BOOT=n
+CONFIG_SECURE_FLASH_ENC_ENABLED=n
+CONFIG_NVS_ENCRYPTION=n
+CONFIG_BOOTLOADER_APP_ANTI_ROLLBACK=n
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=n
+CONFIG_BOOT_ROM_LOG_ALWAYS_ON=y

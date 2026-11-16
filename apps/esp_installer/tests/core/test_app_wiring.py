@@ -11,7 +11,7 @@ import pytest
 from sl_installer import __main__ as entry
 from sl_installer import config as app_config
 from sl_installer.config import AppConfig, load_config, load_field_defaults
-from sl_installer.core import bench, selftest, texts
+from sl_installer.core import bench, boardtest_images, selftest, texts
 from sl_installer.core.api import (BootOutcome, BootReport, FieldDefaults, HardwareVerdict,
                                    PresenceReport, PresenceState, SecurityState, Services)
 from sl_installer.core.esptool_runner import ToolResult, ToolRunner
@@ -46,6 +46,7 @@ def test_resources_are_where_the_engine_expects_them(tmp_path):
     cfg = load_config(data_dir=tmp_path)
     assert cfg.signing_key_path.is_file() and cfg.storage_image_path.is_file()
     assert cfg.work_dir == tmp_path / "work"
+    assert cfg.board_test_dir == cfg.resources_dir / "boardtest"
 
 
 def test_field_defaults_test_build_and_release(tmp_path):
@@ -101,13 +102,27 @@ def test_self_test_reports_missing_resources(tmp_path):
     problems = selftest.run(cfg, ToolsOK())
     assert any("signing key" in p for p in problems)
     assert any("storage image" in p for p in problems)
+    assert any(p.startswith("board test image ") for p in problems)
+
+
+def test_self_test_checks_the_board_test_images_against_their_pins(monkeypatch, tmp_path):
+    resources = tmp_path / "res"
+    folder, pinned = support.make_test_images(resources / "boardtest")
+    monkeypatch.setattr(boardtest_images, "IMAGES", pinned)
+    monkeypatch.setattr(selftest, "image_problems",
+                        lambda directory: boardtest_images.image_problems(directory, pinned))
+    cfg = AppConfig("https://autoattn.slichealth.com", tmp_path / "data", resources, False, "1")
+    assert not [p for p in selftest.run(cfg, ToolsOK()) if "board test" in p]
+    (folder / "board-test.bin").write_bytes(b"changed")
+    problems = [p for p in selftest.run(cfg, ToolsOK()) if "board test" in p]
+    assert problems == ["board test image board-test.bin does not match its pinned hash"]
 
 
 def test_factory_builds_every_service(tmp_path):
     services = make_services(load_config(data_dir=tmp_path))
     assert isinstance(services, Services)
     for name in ("server", "connectivity", "usb", "boards", "installer", "boot", "diagnosis",
-                 "records"):
+                 "records", "board_test"):
         assert getattr(services, name) is not None
     assert services.defaults.is_test_build or services.defaults.wifi_password
     assert (tmp_path / "logs" / "installer.log").exists()
@@ -413,13 +428,17 @@ def test_bench_settings_change_needs_no_bundle(monkeypatch, capsys, allowed):
     assert asked == []  # no board software asked for, nothing run
 
 
-def bench_services(first, restart):
-    """Services for the bench's install path: a new board, then the two watched starts."""
+def bench_services(first, restart, test_verdict=None):
+    """Services for the bench's install path: a new board, its hardware test, then the two
+    watched starts."""
+    from sl_installer.core.api import BoardTestVerdict
+    test_verdict = test_verdict or BoardTestVerdict.PASSED
     from sl_installer.core.api import (BundleInfo, DeviceRecord, Family, InstallSummary,
                                        ReplugPhase)
     bundle = BundleInfo("zkt-2.9.1-e89380a1", Family.ZKT, "ZKT 2.9.1", "2.9.1", True,
                         "AVAILABLE")
-    seen = SimpleNamespace(starts=[], events=[], saved=[], firsts=[])
+    seen = SimpleNamespace(starts=[], events=[], saved=[], firsts=[], tested=[],
+                           board_tests=[], certificates=[])
 
     class Board:
         port, mac, chip, flash_size_mb, psram_mb = support.PORT, support.MAC, "ESP32-S3", 16, 8
@@ -457,9 +476,17 @@ def bench_services(first, restart):
             inspect = staticmethod(lambda candidate, cancel: Board())
 
         class installer:
-            run = staticmethod(lambda mode, board, config, on_step, cancel: InstallSummary(
-                "sli-bench-0001", mode, board.mac, config, bundle, "2026-11-02T09:00:00Z",
-                "2026-11-02T09:03:00Z"))
+            @staticmethod
+            def run(mode, board, config, on_step, cancel, board_test=None):
+                seen.board_tests.append(board_test)
+                return InstallSummary("sli-bench-0001", mode, board.mac, config, bundle,
+                                      "2026-11-02T09:00:00Z", "2026-11-02T09:03:00Z")
+
+        class board_test:
+            @staticmethod
+            def run_test(board, on_progress, on_phase, on_event, cancel):
+                seen.tested.append(board.mac)
+                return support.board_test_report(board, verdict=test_verdict)
 
         class boot:
             wait_first_boot = watched("first start", first)
@@ -469,6 +496,9 @@ def bench_services(first, restart):
             save_install_record = staticmethod(
                 lambda summary, boot, restart=None: seen.saved.append((boot, restart))
                 or "setup-record.txt")
+            save_board_test = staticmethod(
+                lambda report, tester, kind=None: seen.certificates.append(report)
+                or ("board-test.pdf", "board-test.zip"))
 
     return Fake, seen
 
@@ -515,6 +545,26 @@ def test_bench_install_checks_that_the_board_keeps_its_settings(monkeypatch, cap
     assert (texts.SETTINGS_KEPT in out) is (code == 0)
     if code:
         assert texts.SETTINGS_LOST_ON_RESTART.title in out
+
+
+def test_bench_install_tests_the_board_first_and_hands_the_pass_to_the_installer(
+        monkeypatch, capsys):
+    services, seen = bench_services(FIRST_OK, BootReport(
+        BootOutcome.OK, "LF-ZONE-X-01", "1", "2.9.1",
+        advice=texts.settings_kept("LF-ZONE-X-01", "1", "2.9.1")))
+    assert bench_install(monkeypatch, services) == 0
+    assert seen.tested == [support.MAC]
+    assert len(seen.board_tests) == 1 and seen.board_tests[0].passed
+    assert seen.certificates == seen.board_tests  # the certificate is saved as well
+    assert "Certificate: board-test.pdf" in capsys.readouterr().out
+
+
+def test_bench_install_stops_when_the_board_fails_its_test(monkeypatch, capsys):
+    from sl_installer.core.api import BoardTestVerdict
+    services, seen = bench_services(FIRST_OK, None, BoardTestVerdict.FAILED)
+    assert bench_install(monkeypatch, services) == 4
+    assert seen.tested == [support.MAC] and seen.board_tests == [] and seen.starts == []
+    assert "Nothing was locked" in capsys.readouterr().out
 
 
 def test_bench_install_watches_no_restart_after_a_failed_first_start(monkeypatch, capsys):

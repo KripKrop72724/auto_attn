@@ -44,6 +44,7 @@ from __future__ import annotations
 import os
 import re
 import sys
+import zlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import IO, Callable, Dict, List, Optional, Pattern, Sequence, Tuple
@@ -87,6 +88,9 @@ def _rule(tag: Optional[str], pattern: str, kind: ConsoleKind, *keys: str,
 
 
 _HIK_REASON = re.compile(r"^Poll retrying; reason=(\w+); stage=(\w+); http=(\d+)")
+# The board test program's lines (core/boardtest.py): "SLTEST <WHAT> key=value ...".
+_SLTEST = re.compile(r"^SLTEST ([A-Z]+)(?: (.*))?$")
+_SLTEST_FIELD = re.compile(r"^([a-z_][a-z0-9_]*)=(\S*)$")
 
 # Second-stage bootloader tags (ESP-IDF 5.5.3 bootloader_support, bootloader_start.c).
 # The first set logs only in the bootloader; the shared ones also in the running program
@@ -127,7 +131,12 @@ _RULES: Sequence[_Rule] = (
     _rule(r"^(secure_boot\w*|boot)$", r"enabling secure boot v2|Secure boot permanently enabled|"
           r"blowing secure boot efuse|Enabling Security download mode",
           ConsoleKind.SECURE_BOOT_FIRST_BOOT),
-    # PSRAM
+    # PSRAM. ESP-IDF's octal PSRAM driver names the chip it found first (vendor, density):
+    # proof of how far the start got when the board then crashes or goes silent.
+    _rule(r"^octal_psram$", r"^vendor id\s*:\s*(0x[0-9a-fA-F]+(?: \(\w+\))?)", ConsoleKind.OTHER,
+          "vendor", signal="psram_init"),
+    _rule(r"^octal_psram$", r"^density\s*:\s*0x[0-9a-fA-F]+ \((\d+) Mbit\)", ConsoleKind.OTHER,
+          "mbit", signal="psram_density"),
     _rule(r"^esp_psram$", r"^Found (\d+)MB PSRAM device", ConsoleKind.PSRAM_OK, "size_mb"),
     _rule(r"^esp_psram$", r"^SPI SRAM memory test OK", ConsoleKind.PSRAM_OK, test="ok"),
     _rule(None, r"PSRAM chip is not connected|Failed to init external RAM|"
@@ -216,12 +225,27 @@ class ConsoleParser:
         # Who prints now: "bootloader" after a ROM start line, "program" once a line of the
         # running program came, None before either (the port opened halfway).
         self._stage: Optional[str] = None
+        # The board test program: CRC-32 of its lines since BEGIN (None before a BEGIN).
+        self._sltest_crc: Optional[int] = None
 
     def parse(self, line: str, at: float = 0.0) -> Optional[ConsoleEvent]:
         text = _ANSI.sub("", line).strip()
         if not text:
             return None
+        test = _SLTEST.match(text)
+        if test is None:
+            # A partial line left in the USB buffer before the port opened (a cut ROM
+            # banner) can be glued to the front of a test line: read the test line from
+            # "SLTEST ". Its END crc still checks the exact text, so a wrong cut can only
+            # make the run unproven, never a pass.
+            cut = text.find("SLTEST ")
+            if cut > 0:
+                test = _SLTEST.match(text[cut:])
+                if test is not None:
+                    text = text[cut:]
         raw = redact(text)
+        if test:
+            return self._self_test(test, text, raw, at)
         tag = ""
         level = ""
         message = text
@@ -249,6 +273,34 @@ class ConsoleParser:
                 data["ssid"] = self._hotspot
             return ConsoleEvent(rule.kind, raw, data, at)
         return ConsoleEvent(ConsoleKind.OTHER, raw, {}, at)
+
+    def _self_test(self, found: "re.Match[str]", text: str, raw: str,
+                   at: float) -> ConsoleEvent:
+        """A board test program line; END gets crc_ok from the lines since BEGIN.
+
+        The program's END crc is the CRC-32 (esp_rom_crc32_le with 0, the same as zlib's)
+        of every SLTEST line of the run, BEGIN to the line before END, joined with "\\n".
+        It is computed on the exact text, so a redacted copy never spoils it.
+        """
+        what = found.group(1)
+        data: Dict[str, str] = {"sltest": what}
+        for item in (found.group(2) or "").split(" "):
+            pair = _SLTEST_FIELD.match(item)
+            if pair and pair.group(1) != "sltest":
+                data.setdefault(pair.group(1), pair.group(2))
+        encoded = text.encode("utf-8", "replace")
+        if what == "BEGIN":
+            self._sltest_crc = zlib.crc32(encoded)
+        elif what == "END":
+            crc = self._sltest_crc
+            said = data.get("crc", "")
+            data["crc_ok"] = "1" if (crc is not None and re.fullmatch(r"[0-9a-fA-F]{1,8}", said)
+                                     and int(said, 16) == crc) else "0"
+            self._sltest_crc = None
+        elif what != "CLEAN" and self._sltest_crc is not None:
+            self._sltest_crc = zlib.crc32(b"\n" + encoded, self._sltest_crc)
+        self._stage = "program"
+        return ConsoleEvent(ConsoleKind.SELF_TEST, raw, data, at)
 
     def _bootloader(self, level: str, tag: str, message: str, raw: str,
                     at: float) -> Optional[ConsoleEvent]:
@@ -446,7 +498,11 @@ class ConsoleLog:
 
     def end(self, report: BootReport) -> None:
         advice = report.advice.code if report.advice else "-"
-        self._write(f"=== Result: {report.outcome.value} ({advice}) ===", frame=True)
+        self.end_text(f"{report.outcome.value} ({advice})")
+
+    def end_text(self, result: str) -> None:
+        """Close the section with ``result`` (a board test's verdict and code)."""
+        self._write(f"=== Result: {result} ===", frame=True)
         self._write("", frame=True)
         self.close()
 
@@ -504,6 +560,17 @@ class _Watch:
     reset_times: Tuple[float, ...] = ()
     port_busy: bool = False
     last_error: Optional[str] = None  # the newest E line the board printed, redacted
+    # For the board test (core/boardtest.py): when the newest line came (seconds since
+    # ``started``, None before any), whether the port is open now, and, when ``lines``
+    # is a list, every line (redacted) with its time, also those the screen limits drop.
+    last_line_at: Optional[float] = None
+    port_open: bool = False
+    lines: Optional[List[Tuple[float, str]]] = None
+    lines_max: int = 20000
+
+
+# The board test watches with the same loop and the same fields.
+ConsoleWatch = _Watch
 
 
 class BootWatcher:
@@ -637,6 +704,26 @@ class BootWatcher:
                 return False
         return False
 
+    # ------------------------------------------- for the board test (boardtest.py)
+
+    def read(self, mac: str, watch: _Watch, on_event: EventFn, cancel: CancelToken, *,
+             deadline: Optional[float],
+             stop: Optional[Callable[[Optional[ConsoleEvent]], bool]],
+             record: Optional[ConsoleLog] = None) -> None:
+        """Read the console of the board ``mac``, reopening the port after every reset,
+        until ``stop`` says so, ``deadline`` (monotonic) passes or ``cancel``. ``stop`` is
+        called for every event and, with None, in silence about every 20-70 ms."""
+        self._read(mac, watch, on_event, cancel, deadline=deadline, stop=stop, record=record)
+
+    def wait_presence(self, mac: str, *, present: bool, timeout: float,
+                      cancel: CancelToken) -> bool:
+        """Wait until the board ``mac`` is on USB (``present``) or gone; False on time-out."""
+        return self._wait_presence(mac, present=present, timeout=timeout, cancel=cancel)
+
+    def console_log(self, mac: str, transcript: Optional[str]) -> Optional[ConsoleLog]:
+        """The console log file for ``transcript`` of board ``mac`` (None without a folder)."""
+        return self._console_log(mac, transcript)
+
     # -------------------------------------------------------- live console
 
     def watch_console(self, candidate: UsbCandidate, on_event: EventFn,
@@ -682,6 +769,7 @@ class BootWatcher:
                         self._clock.sleep(0.1, cancel)
                         continue
                     _note(record, f"the port {port} is open")
+                    watch.port_open = True
                     if was_open:
                         watch.resets += 1
                         watch.reset_times += (now - watch.started,)
@@ -692,6 +780,7 @@ class BootWatcher:
                 except Exception:  # the chip reset and USB went away
                     _close(handle)
                     handle = None
+                    watch.port_open = False
                     _note(record, "the port closed")
                     for line in reader.flush():
                         self._emit(parser, line, watch, on_event, record)
@@ -708,14 +797,19 @@ class BootWatcher:
                     self._clock.sleep(0.02, cancel)
         finally:
             _close(handle)
+            watch.port_open = False
 
     def _emit(self, parser: ConsoleParser, line: str, watch: _Watch,
               on_event: EventFn, record: Optional[ConsoleLog] = None) -> Optional[ConsoleEvent]:
         if record is not None:
             record.line(line)  # every line, also those past the screen's limits below
-        event = parser.parse(line, self._clock.monotonic() - watch.started)
+        moment = self._clock.monotonic() - watch.started
+        event = parser.parse(line, moment)
         if event is None:
             return None
+        watch.last_line_at = moment
+        if watch.lines is not None and len(watch.lines) < watch.lines_max:
+            watch.lines.append((moment, event.raw[:_LINE_MAX]))
         if _ERROR_LINE.match(event.raw) or event.kind is ConsoleKind.BOOTLOADER_FAILED:
             watch.last_error = event.raw
         if event.kind is ConsoleKind.OTHER and not event.data:
@@ -735,6 +829,15 @@ class BootWatcher:
 
 def _close(handle: object) -> None:
     if handle is not None:
+        if sys.platform != "win32":
+            # macOS holds DTR and RTS high while open (module notes). Drop RTS first, then
+            # DTR: (1,1) -> (1,0) -> (0,0) never passes RTS high with DTR low, which resets
+            # the chip on USB-Serial/JTAG; the close itself then changes nothing.
+            for line in ("rts", "dtr"):
+                try:
+                    setattr(handle, line, False)
+                except Exception:
+                    pass
         try:
             handle.close()  # type: ignore[attr-defined]
         except Exception:

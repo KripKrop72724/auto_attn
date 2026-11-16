@@ -107,7 +107,10 @@ unless head office tells you to.
 1. Open **State Life Device Installer** from the desktop or the Start menu
    (on a Mac: from **Applications** or **Launchpad**).
 2. Sign in with your ADD username and password.
-3. Choose **Set up a new board**, or **Check or fix a board**.
+3. Choose **Set up a new board**, or **Check or fix a board**. To test a
+   board from the shop without setting it up, choose **Test a new board**;
+   for a board that did not start after its setup, choose **Check a failed
+   board** (both are described below).
 4. Choose the attendance machine: **ZKTeco** or **Hikvision**.
 5. Type the **ZONE ID**. The app fills in the zone name. Check the name and
    the group (Life or Health) in the preview.
@@ -118,8 +121,11 @@ unless head office tells you to.
      machine's menu shows it. The board checks it letter for letter.
 6. Connect the board to the computer with a USB cable. Use the socket on the
    board marked **USB**.
-7. Wait while the app checks the board, then click **Next**. Read the
-   summary. Tick **I understand** and click **Start the setup**.
+7. Wait while the app checks the board, then click **Next**. The app now
+   tests the board's hardware by itself (about 2 minutes, see **The board
+   test** below). A board that fails is never locked: the app shows **NOT FIT
+   FOR USE** and saves a certificate for the seller. When the board passes,
+   read the summary. Tick **I understand** and click **Start the setup**.
 8. Wait while the app sets up the board. **Keep the cable plugged in.**
 9. When the app asks, unplug the cable. Wait 3 seconds. Plug it back in.
    When the board has started, the app asks you to do it once more: unplug
@@ -136,6 +142,83 @@ unless head office tells you to.
     computer and choose **Check or fix a board**: the app shows them there too.
 
 Press **Help** on any screen to see pictures of what to do.
+
+### The board test
+
+Since version 1.2.0 the app tests every new board before it locks it, and
+before it finishes a setup that stopped. The app copies a small State Life
+test program to the board. The program tests the board's extra memory, the
+chip's own memory, its memory chip, both cores of its processor and its Wi-Fi
+radio. Then the app removes the program again. The test never locks the board
+and never changes its permanent security settings; the app reads them before
+and after the test and the certificate says they are unchanged. A board whose
+extra memory is faulty fails here, before it is locked. Earlier such boards
+were locked first and then never started.
+
+Keep the cable plugged in during the test. If the test program does not start
+by itself, the app asks you to unplug the board, wait 3 seconds and plug it
+back in. **Stop the test** works until the app removes the program; the app
+still removes it.
+
+The result is one of three:
+
+- **PASSED**: the board is fit for State Life use. In a setup the app goes on
+  to the summary.
+- **NOT FIT FOR USE**: the board is faulty. Do not set it up. Put a FAULTY
+  label on it and give the certificate and the evidence file to the seller.
+- **The test could not finish**: something other than the board stopped the
+  test, for example the cable. Do what the screen says and click **Test
+  again**.
+
+A passed test counts for a setup of the same board for 30 minutes.
+
+### Test a new board
+
+Use this for a board from the shop, before it is used, for example to check a
+delivery. After you sign in it needs nothing from head office, and it works
+when head office has switched board setup off.
+
+1. On the first screen, choose **Test a new board**.
+2. Connect the board (socket marked **USB**) and click **Next**.
+3. The app reads the board and tests it. A locked board cannot be tested this
+   way: the app offers **Check a failed board** instead.
+4. On the result screen, check the name under **Tested by**. It is printed on
+   the certificate.
+
+### Check a failed board
+
+Use this for a board that did not start after its setup and never reached head
+office.
+
+1. On the first screen, choose **Check a failed board**.
+2. Connect the board and click **Next**. A board that keeps restarting is
+   accepted here.
+3. What happens depends on the board:
+   - a board that was never set up: click **Test this board** (the same test
+     as above);
+   - a board whose setup stopped before it was locked: the app tests it. If it
+     passes, click **Finish the setup** and type the board's details again;
+   - a locked board: unplug it, wait 3 seconds and plug it back in when the
+     app asks. The app watches what the board says while it starts.
+4. The result screen says what is wrong. If the fault is in the board's
+   hardware, the app saves a **vendor claim** and a **fault report**. The
+   vendor claim says honestly that the setup gave the board State Life's
+   security keys before the fault showed, and that the keys do not cause the
+   fault. If only the settings are missing or damaged, click **Fix the
+   settings**.
+
+### Certificates and evidence
+
+The app saves every result by itself in the `records` folder (next to the
+setup records): a certificate as a PDF and an evidence file as a ZIP, named
+`board-test-<board ID>-<date>-<time>-passed|fault|report`. The evidence file
+holds what the board printed, the tools' output, the security settings read
+before and after the test and the test program's fingerprints. The PDF prints
+the evidence file's SHA-256, so anyone can check the two belong together. The
+buttons **Save certificate (PDF)**, **Save evidence (ZIP)**, **Save vendor
+claim (PDF)** and **Save fault report (PDF)** save a copy where you choose,
+for example to e-mail it. **Open the folder** shows the saved files. A help
+file carries the newest board test records too.
 
 Keep the computer plugged in to power if you can. On Windows, the app stops it
 from going to sleep while it sets up a board and while it watches the board
@@ -166,6 +249,10 @@ start. On a Mac, keep it plugged in and keep the lid open until the app says
 | "The board's start-up program stopped" | The board printed an error before our software could start; the screen shows the line. Do not use the board. Click **Help**, then **Save a help file**, and send the file to head office. |
 | "The board keeps restarting" | Usually the cable or the USB socket does not give enough power. Use a short cable straight into the computer, not a hub, or another USB socket. Then click **Check again** (or **Try again** after the first start). |
 | "This board is faulty" | Put a FAULTY label on it, keep it aside and tell head office. |
+| "NOT FIT FOR USE" after the board test | The board's hardware is faulty and it was not locked. Put a FAULTY label on it. Give the certificate (PDF) and the evidence file (ZIP) to the seller. Click **Open the folder** to find them. |
+| "The test could not finish" | Push the cable in well, or use another cable or USB socket. Click **Test again**. If it happens again, put the board aside and use another one. |
+| "The board must pass its test first" | The board's test is older than 30 minutes, or was not done. Click **Test the board**. |
+| "This board is already locked" on **Test a new board** | The board was set up before. Click **Check a failed board** instead. |
 | The app cannot start the board's setup mode | Hold down the **BOOT** button. While you hold it, press and release **RST**. Let go of **BOOT**. Click **Try again**. |
 | Setup stopped before the end | Do what the screen says, then click **Finish the setup**. If the app was closed: choose **Set up a new board**, type the same details and connect the same board. The check then offers **Finish the setup**. |
 | The board started with other settings | Click **Fix settings**. The app checks the board again and offers **Change its settings**. |
@@ -429,8 +516,8 @@ python3 -m compileall -q apps/esp_installer/src
 
 ### The bench tool
 
-`python -m sl_installer.core.bench inspect|watch|diagnose|install` drives the
-engine from a terminal with a real board (see its docstring). Every command
+`python -m sl_installer.core.bench inspect|watch|diagnose|install|boardtest|failedboard`
+drives the engine from a terminal with a real board (see its docstring). Every command
 line the engine builds is esptool 5.1.0's, and esptool 5.1.0 needs Python 3.10
 or newer: the Mac's own `python3` (3.9) has esptool 4.7.0, which refuses them.
 From a source checkout the tools run as `<python> -m esptool|espefuse`, so name
@@ -452,6 +539,25 @@ writes no board software, so it needs none. `inspect` and `install` take the
 app's own lock for the same data folder: while the app's window is open they
 stop (exit code 6) before touching the board, and the window does not open
 while they run.
+
+`boardtest [--tester NAME]` runs the board test on a blank board (after a
+typed board ID confirmation) and saves the certificate and evidence ZIP in the
+records folder; `failedboard [--seconds N] [--tester NAME]` checks a board that
+did not start after setup. `install --tester NAME` runs the board test first
+for a new or unfinished board, as the app does, and puts the name on its
+certificate.
+
+### Board test program
+
+The test program the app writes for the board test is built from
+`apps/esp_installer/board_test_firmware` (ESP-IDF v5.5.3, unsecured, no eFuse
+writes). Its `README.md` describes the `SLTEST` line protocol, the END line's
+CRC and how to rebuild the images with `build_images.py`. The built images
+live in `src/sl_installer/resources/boardtest/` with `manifest.json`; their
+sizes and SHA-256 are pinned in `core/boardtest_images.py`, and both the
+`--self-test` and CI (`firmware-board-test` job, `build_images.py --check`)
+fail when the bytes change. A rebuild that changes any byte must update the
+pins in the same change.
 
 ### Runtime behaviour worth knowing
 
@@ -477,6 +583,16 @@ while they run.
   for the same zone. What the board prints in each watched start is kept,
   redacted like the log, in `logs\console-<board ID>-<request>.log` (one file
   per setup, at most 256 KB, the newest 20); a help file carries the newest 10.
+- The board test (`core/boardtest.py`) runs automatically after the check of
+  every NEW_BOARD and RESUME setup; the installer refuses those modes without a
+  PASSED report of the same board from the last 30 minutes, with its eFuses
+  unchanged and the test program erased (`texts.BOARD_TEST_REQUIRED`). Its
+  result screen saves `records/board-test-*.pdf|.zip|.txt`
+  (`records.save_board_test`); copies go where the person chooses through
+  `Controller.ask_save_path`, which the UI tests replace. Test a new board and
+  Check a failed board need no server and stay enabled when head office
+  switches setup off. `--screenshots` draws every board test screen with a
+  scripted test (`ui/screenshots.py`, `ScriptedBoardTest`).
 - While a board is being set up, and while its starts are watched, the app
   asks Windows to keep the computer and the screen awake
   (`SetThreadExecutionState`, `core/keepawake.py`): a laptop that sleeps
