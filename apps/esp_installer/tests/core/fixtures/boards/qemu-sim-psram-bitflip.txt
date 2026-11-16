@@ -1,0 +1,123 @@
+# QEMU run of the board test program (ESP-IDF v5.5.3, esp_develop_9.2.2 QEMU), SIM-ONLY build, SIM_FAULT (a).
+# bit 5 stuck at 1 in one PSRAM word; esp_wifi_init forced to fail.
+# Lines: [host seconds] console line. '# tap:' = a gdb workaround (the image is unchanged).
+# Blank eFuses in QEMU: mac=00:00:00:00:00:00, chip_rev v0.0, flash id 9d6018.
+# tap: esp_restart_noos (chip reset follows); RTC_CNTL_OPTION1_REG = (gdb, separate timeline)
+# tap: forced tsens_ready (QEMU has no temperature sensor) (gdb, separate timeline)
+# tap: forcing esp_wifi_init to return 0x101 (simulated failure, image unchanged) (gdb, separate timeline)
+[   2.061] ESP-ROM:esp32s3-20210327
+[   2.061] Build:Mar 27 2021
+[   2.062] rst:0x1 (POWERON),boot:0x4 (SPI_FLASH_BOOT)
+[   2.066] SPIWP:0xee
+[   2.067] mode:DIO, clock div:1
+[   2.067] load:0x3fce2820,len:0x14d4
+[   2.069] load:0x403c8700,len:0xd0c
+[   2.069] load:0x403cb700,len:0x2ef0
+[   2.072] entry 0x403c8920
+[   2.076] I (13) boot: ESP-IDF v5.5.3 2nd stage bootloader
+[   2.076] I (14) boot: Multicore bootloader
+[   2.080] I (16) boot: chip revision: v0.0
+[   2.080] I (16) boot: efuse block revision: v0.0
+[   2.081] I (16) boot.esp32s3: Boot SPI Speed : 80MHz
+[   2.082] I (17) boot.esp32s3: SPI Mode       : SLOW READ
+[   2.082] I (17) boot.esp32s3: SPI Flash Size : 16MB
+[   2.084] I (18) boot: Enabling RNG early entropy source...
+[   2.088] I (19) boot: Partition Table:
+[   2.088] I (20) boot: ## Label            Usage          Type ST Offset   Length
+[   2.089] I (20) boot:  0 nvs              WiFi data        01 02 00009000 00006000
+[   2.089] I (20) boot:  1 phy_init         RF data          01 01 0000f000 00001000
+[   2.089] I (20) boot:  2 factory          factory app      00 00 00010000 00100000
+[   2.090] I (21) boot:  3 fltest           Unknown data     01 99 00200000 00e00000
+[   2.090] I (21) boot: End of partition table
+[   2.092] I (21) esp_image: segment 0: paddr=00010020 vaddr=3c090020 size=19278h (103032) map
+[   2.106] I (29) esp_image: segment 1: paddr=000292a0 vaddr=3fc9a700 size=053e0h ( 21472) load
+[   2.111] I (31) esp_image: segment 2: paddr=0002e688 vaddr=40374000 size=01990h (  6544) load
+[   2.113] I (32) esp_image: segment 3: paddr=00030020 vaddr=42000020 size=81608h (529928) map
+[   2.181] I (66) esp_image: segment 4: paddr=000b1630 vaddr=40375990 size=14cf4h ( 85236) load
+[   2.193] I (72) esp_image: segment 5: paddr=000c632c vaddr=50000000 size=00020h (    32) load
+[   2.195] I (73) boot: Loaded app from partition at offset 0x10000
+[   2.195] I (73) boot: Disabling RNG early entropy source...
+[   2.213] W (165) rtcinit: o_code calibration fail
+[   2.220] I (86) octal_psram: vendor id    : 0x0d (AP)
+[   2.220] I (86) octal_psram: dev id       : 0x02 (generation 3)
+[   2.220] I (86) octal_psram: density      : 0x03 (64 Mbit)
+[   2.221] I (86) octal_psram: good-die     : 0x01 (Pass)
+[   2.221] I (86) octal_psram: Latency      : 0x01 (Fixed)
+[   2.221] I (86) octal_psram: VCC          : 0x00 (1.8V)
+[   2.222] I (86) octal_psram: SRF          : 0x01 (Fast Refresh)
+[   2.222] I (87) octal_psram: BurstType    : 0x01 (Hybrid Wrap)
+[   2.222] I (87) octal_psram: BurstLen     : 0x01 (32 Byte)
+[   2.223] I (87) octal_psram: Readlatency  : 0x02 (10 cycles@Fixed)
+[   2.223] I (87) octal_psram: DriveStrength: 0x00 (1/1)
+[   2.223] I (87) MSPI Timing: Enter psram timing tuning
+[   2.225] W MSPI Timing: tuning fail, best point is fallen back to index 5
+[   2.226] I (89) esp_psram: Found 8MB PSRAM device
+[   2.226] I (89) esp_psram: Speed: 80MHz
+[   2.227] I (89) cpu_start: Multicore app
+[   2.247] I (99) cpu_start: GPIO 44 and 43 are used as console UART I/O pins
+[   2.251] I (99) cpu_start: Pro cpu start user code
+[   2.251] I (99) cpu_start: cpu freq: 240000000 Hz
+[   2.251] I (99) app_init: Application information:
+[   2.252] I (100) app_init: Project name:     board-test
+[   2.252] I (100) app_init: App version:      1.0.0
+[   2.252] I (100) app_init: ELF file SHA256:  985aa76c5...
+[   2.252] I (100) app_init: ESP-IDF:          v5.5.3
+[   2.252] I (100) efuse_init: Min chip rev:     v0.0
+[   2.252] I (100) efuse_init: Max chip rev:     v0.99
+[   2.252] I (100) efuse_init: Chip rev:         v0.0
+[   2.253] I (100) heap_init: Initializing. RAM available for dynamic allocation:
+[   2.254] I (100) heap_init: At 3FCA5438 len 000442D8 (272 KiB): RAM
+[   2.254] I (100) heap_init: At 3FCE9710 len 00005724 (21 KiB): RAM
+[   2.254] I (100) heap_init: At 3FCF0000 len 00008000 (32 KiB): DRAM
+[   2.254] I (100) heap_init: At 600FE000 len 00001FE8 (7 KiB): RTCRAM
+[   2.256] I (100) esp_psram: Adding pool of 8192K of PSRAM memory to heap allocator
+[   2.263] I (101) spi_flash: detected chip: issi
+[   2.263] I (101) spi_flash: flash io: dio
+[   2.265] I (102) sleep_gpio: Configure to isolate all GPIO pins in sleep state
+[   2.266] I (102) sleep_gpio: Enable automatic switching of GPIO sleep configuration
+[   2.272] I (103) main_task: Started on CPU0
+[   2.273] I (106) esp_psram: Reserving pool of 32K of internal memory for DMA/internal allocations
+[   2.275] I (107) main_task: Calling app_main()
+[   3.788] SLTEST BEGIN proto=1 fw=1.0.0 mac=00:00:00:00:00:00 chip_rev=v0.0 cores=2 idf=v5.5.3 flash_id=9d6018 flash_size=16777216 psram_size=8388608
+[   3.790] SLTEST ALIVE stage=psram step=0 of=20 at=0
+[   3.833] SLTEST ERR stage=psram test=zeros addr=0x3c1b1bf4 want=0x00000000 got=0x00000020
+[   4.027] SLTEST ERR stage=psram test=x55 addr=0x3c1b1bf4 want=0x55555555 got=0x55555575
+[   4.289] SLTEST ALIVE stage=psram step=5 of=20 at=0x3c8089c0
+[   4.320] SLTEST ERR stage=psram test=naddr addr=0x3c1b1bf4 want=0xc3e4e40b got=0xc3e4e42b
+[   4.632] SLTEST ERR stage=psram test=bytes addr=0x3c1b1bf4 want=0x90919293 got=0x909192b3
+[   4.771] SLTEST ERR stage=psram test=dual addr=0x3c1b1bf4 want=0x4fbeee93 got=0x4fbeeeb3
+[   4.789] SLTEST ALIVE stage=psram step=10 of=20 at=0x3c34c9c0
+[   4.825] SLTEST ERR stage=psram test=zeros addr=0x3c1b1bf4 want=0x00000000 got=0x00000020
+[   5.015] SLTEST ERR stage=psram test=x55 addr=0x3c1b1bf4 want=0x55555555 got=0x55555575
+[   5.289] SLTEST ALIVE stage=psram step=16 of=20 at=0x3c4d49c0
+[   5.307] SLTEST ERR stage=psram test=naddr addr=0x3c1b1bf4 want=0xc3e4e40b got=0xc3e4e42b
+[   5.789] SLTEST ALIVE stage=psram step=20 of=20 at=0x3c4249c0
+[   5.794] SLTEST RESULT stage=psram result=fail code=PSRAM_DATA_ERRORS detail=zeros errors=10 ms=2004 size=8388608 tested=8257472 rounds=2
+[   5.795] SLTEST ALIVE stage=iram step=0 of=10 at=0
+[   5.818] SLTEST RESULT stage=iram result=ok code=OK detail=all_patterns_ok errors=0 ms=23 tested=196544 mb_s=163
+[   5.818] SLTEST ALIVE stage=flash step=0 of=18 at=0
+[   6.189] SLTEST ALIVE stage=flash step=3 of=18 at=0x00450000
+[   6.689] SLTEST ALIVE stage=flash step=3 of=18 at=0x00780000
+[   7.189] SLTEST ALIVE stage=flash step=3 of=18 at=0x00ad0000
+[   7.589] SLTEST ALIVE stage=flash step=3 of=18 at=0x00d60000
+[   8.091] SLTEST ALIVE stage=flash step=4 of=18 at=0x002a0000
+[   8.591] SLTEST ALIVE stage=flash step=4 of=18 at=0x005f0000
+[   9.091] SLTEST ALIVE stage=flash step=4 of=18 at=0x00930000
+[   9.491] SLTEST ALIVE stage=flash step=4 of=18 at=0x00bc0000
+[   9.991] SLTEST ALIVE stage=flash step=4 of=18 at=0x00ef0000
+[  10.394] SLTEST ALIVE stage=flash step=6 of=18 at=0x00307000
+[  10.800] SLTEST ALIVE stage=flash step=9 of=18 at=0x0060f000
+[  11.203] SLTEST ALIVE stage=flash step=11 of=18 at=0x0080a000
+[  11.618] SLTEST ALIVE stage=flash step=14 of=18 at=0x00b02000
+[  12.027] SLTEST ALIVE stage=flash step=16 of=18 at=0x00d09000
+[  12.341] SLTEST RESULT stage=flash result=ok code=OK detail=all_blocks_ok errors=0 ms=6521 id=9d6018 size=16777216 blocks=14
+[  12.341] SLTEST ALIVE stage=cpu step=0 of=2 at=0
+[  12.428] SLTEST ALIVE stage=cpu step=1 of=2 at=0
+[  12.544] W (10361) eFuse: calibration efuse version does not match, set default version to 0
+[  12.545] W (10365) temperature_sensor: Calibration failed
+[  12.545] E (10365) temperature_sensor: Exceeding temperature measure range.
+[  12.548] SLTEST RESULT stage=cpu result=ok code=OK detail=cores_agree errors=0 ms=192 temp_c=na sum=cdcb3e9f
+[  12.548] SLTEST ALIVE stage=wifi step=0 of=3 at=0
+[  12.576] SLTEST RESULT stage=wifi result=fail code=WIFI_RADIO_FAILED detail=init_esp_err_no_mem errors=1 ms=22
+[  12.646] SLTEST END result=fail failed=psram,wifi crc=ee9dd987
+[  12.785] SLTEST CLEAN result=ok

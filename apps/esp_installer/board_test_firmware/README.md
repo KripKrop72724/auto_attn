@@ -74,7 +74,7 @@ SLTEST END result=<ok|fail> failed=<stage,stage|none> crc=<8 hex>
 SLTEST CLEAN result=<ok|fail>
 ```
 
-* `BEGIN` is printed 1.5 s after `app_main` starts (time for the installer to
+* `BEGIN` is printed 5 s after `app_main` starts (time for the installer to
   reopen the port). `flash_size` is the chip's own JEDEC size
   (`esp_flash_get_physical_size`), not the image header's.
 * `ALIVE`: one at the start of every stage (`step=0`), then at most every

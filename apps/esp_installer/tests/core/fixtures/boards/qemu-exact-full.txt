@@ -1,0 +1,211 @@
+# QEMU run of the board test program (ESP-IDF v5.5.3, esp_develop_9.2.2 QEMU), exact pinned image.
+# esp_wifi_init forced to return ESP_ERR_NO_MEM; QEMU drops the download-mode request, so the program runs again after CLEAN.
+# Lines: [host seconds] console line. '# tap:' = a gdb workaround (the image is unchanged).
+# Blank eFuses in QEMU: mac=00:00:00:00:00:00, chip_rev v0.0, flash id 9d6018.
+[   1.774] SLTEST BEGIN proto=1 fw=1.0.0 mac=00:00:00:00:00:00 chip_rev=v0.0 cores=2 idf=v5.5.3 flash_id=9d6018 flash_size=16777216 psram_size=8388608
+[   1.791] SLTEST ALIVE stage=psram step=0 of=20 at=0
+[   2.195] SLTEST ALIVE stage=psram step=1 of=20 at=0x3c1b0980
+[   2.703] SLTEST ALIVE stage=psram step=1 of=20 at=0x3c674980
+[   3.210] SLTEST ALIVE stage=psram step=2 of=20 at=0x3c0cc980
+[   3.718] SLTEST ALIVE stage=psram step=2 of=20 at=0x3c59c980
+[   4.127] SLTEST ALIVE stage=psram step=3 of=20 at=0x3c3a8980
+[   4.635] SLTEST ALIVE stage=psram step=3 of=20 at=0x3c548980
+[   5.043] SLTEST ALIVE stage=psram step=4 of=20 at=0x3c65c980
+[   5.551] SLTEST ALIVE stage=psram step=4 of=20 at=0x3c474980
+[   6.059] SLTEST ALIVE stage=psram step=5 of=20 at=0x3c31c980
+[   6.567] SLTEST ALIVE stage=psram step=5 of=20 at=0x3c300980
+[   7.074] SLTEST ALIVE stage=psram step=5 of=20 at=0x3c684980
+[   7.581] SLTEST ALIVE stage=psram step=6 of=20 at=0x3c4d0980
+[   8.088] SLTEST ALIVE stage=psram step=6 of=20 at=0x3c2cc980
+[   8.497] SLTEST ALIVE stage=psram step=6 of=20 at=0x3c5b0980
+[   9.006] SLTEST ALIVE stage=psram step=7 of=20 at=0x3c210980
+[   9.420] SLTEST ALIVE stage=psram step=7 of=20 at=0x3c1c4980
+[   9.927] SLTEST ALIVE stage=psram step=7 of=20 at=0x3c5e8980
+[  10.435] SLTEST ALIVE stage=psram step=8 of=20 at=0x3c5dc980
+[  10.853] SLTEST ALIVE stage=psram step=8 of=20 at=0x3c30c980
+[  11.264] SLTEST ALIVE stage=psram step=8 of=20 at=0x3c64c980
+[  11.674] SLTEST ALIVE stage=psram step=9 of=20 at=0x3c178980
+[  12.182] SLTEST ALIVE stage=psram step=9 of=20 at=0x3c460980
+[  12.691] SLTEST ALIVE stage=psram step=9 of=20 at=0x3c738980
+[  13.201] SLTEST ALIVE stage=psram step=9 of=20 at=0x3c14c980
+[  13.610] SLTEST ALIVE stage=psram step=9 of=20 at=0x3c248980
+[  14.117] SLTEST ALIVE stage=psram step=9 of=20 at=0x3c388980
+[  14.527] SLTEST ALIVE stage=psram step=9 of=20 at=0x3c48c980
+[  15.034] SLTEST ALIVE stage=psram step=9 of=20 at=0x3c5c4980
+[  15.542] SLTEST ALIVE stage=psram step=9 of=20 at=0x3c704980
+[  16.050] SLTEST ALIVE stage=psram step=9 of=20 at=0x3c83c980
+[  16.459] SLTEST ALIVE stage=psram step=10 of=20 at=0x3c5a0940
+[  16.967] SLTEST ALIVE stage=psram step=11 of=20 at=0x3c4dc980
+[  17.475] SLTEST ALIVE stage=psram step=11 of=20 at=0x3c400980
+[  17.982] SLTEST ALIVE stage=psram step=12 of=20 at=0x3c10c980
+[  18.390] SLTEST ALIVE stage=psram step=12 of=20 at=0x3c1e4980
+[  18.799] SLTEST ALIVE stage=psram step=12 of=20 at=0x3c59c980
+[  19.308] SLTEST ALIVE stage=psram step=13 of=20 at=0x3c610980
+[  19.716] SLTEST ALIVE stage=psram step=13 of=20 at=0x3c48c980
+[  20.223] SLTEST ALIVE stage=psram step=14 of=20 at=0x3c668980
+[  20.632] SLTEST ALIVE stage=psram step=14 of=20 at=0x3c3c8980
+[  21.140] SLTEST ALIVE stage=psram step=14 of=20 at=0x3c868980
+[  21.648] SLTEST ALIVE stage=psram step=15 of=20 at=0x3c23c980
+[  22.057] SLTEST ALIVE stage=psram step=15 of=20 at=0x3c4bc980
+[  22.566] SLTEST ALIVE stage=psram step=15 of=20 at=0x3c810980
+[  23.073] SLTEST ALIVE stage=psram step=16 of=20 at=0x3c0b4980
+[  23.580] SLTEST ALIVE stage=psram step=16 of=20 at=0x3c40c980
+[  24.088] SLTEST ALIVE stage=psram step=16 of=20 at=0x3c6e4980
+[  24.596] SLTEST ALIVE stage=psram step=17 of=20 at=0x3c7d4980
+[  25.006] SLTEST ALIVE stage=psram step=17 of=20 at=0x3c3b0980
+[  25.514] SLTEST ALIVE stage=psram step=17 of=20 at=0x3c7d4980
+[  26.021] SLTEST ALIVE stage=psram step=18 of=20 at=0x3c1c8980
+[  26.528] SLTEST ALIVE stage=psram step=18 of=20 at=0x3c5bc980
+[  27.037] SLTEST ALIVE stage=psram step=19 of=20 at=0x3c1a4980
+[  27.446] SLTEST ALIVE stage=psram step=19 of=20 at=0x3c3f4980
+[  27.854] SLTEST ALIVE stage=psram step=19 of=20 at=0x3c644980
+[  28.264] SLTEST ALIVE stage=psram step=19 of=20 at=0x3c0a4980
+[  28.774] SLTEST ALIVE stage=psram step=19 of=20 at=0x3c1dc980
+[  29.282] SLTEST ALIVE stage=psram step=19 of=20 at=0x3c314980
+[  29.790] SLTEST ALIVE stage=psram step=19 of=20 at=0x3c450980
+[  30.298] SLTEST ALIVE stage=psram step=19 of=20 at=0x3c580980
+[  30.805] SLTEST ALIVE stage=psram step=19 of=20 at=0x3c6b4980
+[  31.313] SLTEST ALIVE stage=psram step=19 of=20 at=0x3c7f0980
+[  31.820] SLTEST ALIVE stage=psram step=20 of=20 at=0x3c534940
+[  32.230] SLTEST ALIVE stage=psram step=20 of=20 at=0x3c3ac980
+[  32.355] SLTEST RESULT stage=psram result=ok code=OK detail=all_patterns_ok errors=0 ms=30301 size=8388608 tested=8257472 rounds=2 mb_s=10
+[  32.364] SLTEST ALIVE stage=iram step=0 of=10 at=0
+[  32.649] SLTEST ALIVE stage=iram step=9 of=10 at=0x3fccee00
+[  32.787] SLTEST RESULT stage=iram result=ok code=OK detail=all_patterns_ok errors=0 ms=413 tested=196544 mb_s=9
+[  32.796] SLTEST ALIVE stage=flash step=0 of=18 at=0
+[  33.085] SLTEST ALIVE stage=flash step=3 of=18 at=0x00380000
+[  33.497] SLTEST ALIVE stage=flash step=3 of=18 at=0x00630000
+[  33.906] SLTEST ALIVE stage=flash step=3 of=18 at=0x008b0000
+[  34.343] SLTEST ALIVE stage=flash step=3 of=18 at=0x00b40000
+[  34.758] SLTEST ALIVE stage=flash step=3 of=18 at=0x00dc0000
+[  35.184] SLTEST ALIVE stage=flash step=4 of=18 at=0x00250000
+[  35.605] SLTEST ALIVE stage=flash step=4 of=18 at=0x00500000
+[  36.114] SLTEST ALIVE stage=flash step=4 of=18 at=0x00830000
+[  36.622] SLTEST ALIVE stage=flash step=4 of=18 at=0x00b70000
+[  37.052] SLTEST ALIVE stage=flash step=4 of=18 at=0x00df0000
+[  37.483] SLTEST ALIVE stage=flash step=5 of=18 at=0x00205000
+[  37.897] SLTEST ALIVE stage=flash step=7 of=18 at=0x00401000
+[  38.318] SLTEST ALIVE stage=flash step=10 of=18 at=0x00703000
+[  38.743] SLTEST ALIVE stage=flash step=12 of=18 at=0x0090e000
+[  39.169] SLTEST ALIVE stage=flash step=15 of=18 at=0x00c04000
+[  39.598] SLTEST ALIVE stage=flash step=18 of=18 at=0x00f01000
+[  39.771] SLTEST RESULT stage=flash result=ok code=OK detail=all_blocks_ok errors=0 ms=6907 id=9d6018 size=16777216 blocks=14
+[  39.779] SLTEST ALIVE stage=cpu step=0 of=2 at=0
+[  39.939] # tap: forced tsens_ready (QEMU has no temperature sensor)
+[  39.944] # tap: forced tsens_ready (QEMU has no temperature sensor)
+[  39.958] SLTEST RESULT stage=cpu result=ok code=OK detail=cores_agree errors=0 ms=169 temp_c=na sum=cdcb3e9f
+[  39.966] SLTEST ALIVE stage=wifi step=0 of=3 at=0
+[  39.997] # tap: forcing esp_wifi_init to return 0x101 (simulated failure, image unchanged)
+[  40.005] SLTEST RESULT stage=wifi result=fail code=WIFI_RADIO_FAILED detail=init_esp_err_no_mem errors=1 ms=31
+[  40.043] SLTEST END result=fail failed=wifi crc=7b6553cd
+[  40.204] SLTEST CLEAN result=ok
+[  40.518] # tap: esp_restart_noos (chip reset follows)
+[  42.276] SLTEST BEGIN proto=1 fw=1.0.0 mac=00:00:00:00:00:00 chip_rev=v0.0 cores=2 idf=v5.5.3 flash_id=9d6018 flash_size=16777216 psram_size=8388608
+[  42.291] SLTEST ALIVE stage=psram step=0 of=20 at=0
+[  42.794] SLTEST ALIVE stage=psram step=1 of=20 at=0x3c2b0980
+[  43.203] SLTEST ALIVE stage=psram step=1 of=20 at=0x3c68c980
+[  43.709] SLTEST ALIVE stage=psram step=2 of=20 at=0x3c0dc980
+[  44.216] SLTEST ALIVE stage=psram step=2 of=20 at=0x3c5c0980
+[  44.725] SLTEST ALIVE stage=psram step=3 of=20 at=0x3c670980
+[  45.233] SLTEST ALIVE stage=psram step=3 of=20 at=0x3c614980
+[  45.741] SLTEST ALIVE stage=psram step=4 of=20 at=0x3c100980
+[  46.249] SLTEST ALIVE stage=psram step=4 of=20 at=0x3c5cc980
+[  46.757] SLTEST ALIVE stage=psram step=5 of=20 at=0x3c804980
+[  47.266] SLTEST ALIVE stage=psram step=5 of=20 at=0x3c3f4980
+[  47.775] SLTEST ALIVE stage=psram step=5 of=20 at=0x3c75c980
+[  48.283] SLTEST ALIVE stage=psram step=6 of=20 at=0x3c710980
+[  48.790] SLTEST ALIVE stage=psram step=6 of=20 at=0x3c394980
+[  49.298] SLTEST ALIVE stage=psram step=6 of=20 at=0x3c718980
+[  49.806] SLTEST ALIVE stage=psram step=7 of=20 at=0x3c0d4980
+[  50.215] SLTEST ALIVE stage=psram step=7 of=20 at=0x3c43c980
+[  50.722] SLTEST ALIVE stage=psram step=7 of=20 at=0x3c860980
+[  51.230] SLTEST ALIVE stage=psram step=8 of=20 at=0x3c254980
+[  51.738] SLTEST ALIVE stage=psram step=8 of=20 at=0x3c65c980
+[  52.147] SLTEST ALIVE stage=psram step=9 of=20 at=0x3c164980
+[  52.655] SLTEST ALIVE stage=psram step=9 of=20 at=0x3c44c980
+[  53.164] SLTEST ALIVE stage=psram step=9 of=20 at=0x3c728980
+[  53.574] SLTEST ALIVE stage=psram step=9 of=20 at=0x3c108980
+[  53.984] SLTEST ALIVE stage=psram step=9 of=20 at=0x3c208980
+[  54.492] SLTEST ALIVE stage=psram step=9 of=20 at=0x3c350980
+[  54.999] SLTEST ALIVE stage=psram step=9 of=20 at=0x3c48c980
+[  55.506] SLTEST ALIVE stage=psram step=9 of=20 at=0x3c5c0980
+[  56.015] SLTEST ALIVE stage=psram step=9 of=20 at=0x3c6f8980
+[  56.522] SLTEST ALIVE stage=psram step=9 of=20 at=0x3c830980
+[  56.932] SLTEST ALIVE stage=psram step=10 of=20 at=0x3c0dc980
+[  57.343] SLTEST ALIVE stage=psram step=10 of=20 at=0x3c428980
+[  57.751] SLTEST ALIVE stage=psram step=11 of=20 at=0x3c164980
+[  58.259] SLTEST ALIVE stage=psram step=11 of=20 at=0x3c600980
+[  58.767] SLTEST ALIVE stage=psram step=12 of=20 at=0x3c6e8980
+[  59.274] SLTEST ALIVE stage=psram step=12 of=20 at=0x3c494980
+[  59.782] SLTEST ALIVE stage=psram step=13 of=20 at=0x3c2a0980
+[  60.289] SLTEST ALIVE stage=psram step=13 of=20 at=0x3c450980
+[  60.797] SLTEST ALIVE stage=psram step=14 of=20 at=0x3c5f8980
+[  61.306] SLTEST ALIVE stage=psram step=14 of=20 at=0x3c498980
+[  61.814] SLTEST ALIVE stage=psram step=15 of=20 at=0x3c318980
+[  62.323] SLTEST ALIVE stage=psram step=15 of=20 at=0x3c2d8980
+[  62.830] SLTEST ALIVE stage=psram step=15 of=20 at=0x3c640980
+[  63.240] SLTEST ALIVE stage=psram step=16 of=20 at=0x3c224980
+[  63.749] SLTEST ALIVE stage=psram step=16 of=20 at=0x3c1b8980
+[  64.256] SLTEST ALIVE stage=psram step=16 of=20 at=0x3c510980
+[  64.764] SLTEST ALIVE stage=psram step=16 of=20 at=0x3c878980
+[  65.173] SLTEST ALIVE stage=psram step=17 of=20 at=0x3c19c980
+[  65.582] SLTEST ALIVE stage=psram step=17 of=20 at=0x3c4d8980
+[  65.992] SLTEST ALIVE stage=psram step=17 of=20 at=0x3c7e8980
+[  66.501] SLTEST ALIVE stage=psram step=18 of=20 at=0x3c1b4980
+[  67.009] SLTEST ALIVE stage=psram step=18 of=20 at=0x3c564980
+[  67.416] SLTEST ALIVE stage=psram step=18 of=20 at=0x3c81c980
+[  67.925] SLTEST ALIVE stage=psram step=19 of=20 at=0x3c31c980
+[  68.433] SLTEST ALIVE stage=psram step=19 of=20 at=0x3c5d0980
+[  68.942] SLTEST ALIVE stage=psram step=19 of=20 at=0x3c86c980
+[  69.451] SLTEST ALIVE stage=psram step=19 of=20 at=0x3c194980
+[  69.959] SLTEST ALIVE stage=psram step=19 of=20 at=0x3c2c4980
+[  70.467] SLTEST ALIVE stage=psram step=19 of=20 at=0x3c3dc980
+[  70.976] SLTEST ALIVE stage=psram step=19 of=20 at=0x3c500980
+[  71.485] SLTEST ALIVE stage=psram step=19 of=20 at=0x3c61c980
+[  71.994] SLTEST ALIVE stage=psram step=19 of=20 at=0x3c748980
+[  72.502] SLTEST ALIVE stage=psram step=19 of=20 at=0x3c874980
+[  73.010] SLTEST ALIVE stage=psram step=20 of=20 at=0x3c708940
+[  73.209] SLTEST RESULT stage=psram result=ok code=OK detail=all_patterns_ok errors=0 ms=30662 size=8388608 tested=8257472 rounds=2 mb_s=10
+[  73.217] SLTEST ALIVE stage=iram step=0 of=10 at=0
+[  73.528] SLTEST ALIVE stage=iram step=9 of=10 at=0x3fcc2e00
+[  73.620] SLTEST RESULT stage=iram result=ok code=OK detail=all_patterns_ok errors=0 ms=392 tested=196544 mb_s=9
+[  73.628] SLTEST ALIVE stage=flash step=0 of=18 at=0
+[  73.949] SLTEST ALIVE stage=flash step=3 of=18 at=0x003f0000
+[  74.361] SLTEST ALIVE stage=flash step=3 of=18 at=0x00630000
+[  74.792] SLTEST ALIVE stage=flash step=3 of=18 at=0x00850000
+[  75.307] SLTEST ALIVE stage=flash step=3 of=18 at=0x00b90000
+[  75.821] SLTEST ALIVE stage=flash step=3 of=18 at=0x00ea0000
+[  76.242] SLTEST ALIVE stage=flash step=4 of=18 at=0x00340000
+[  76.652] SLTEST ALIVE stage=flash step=4 of=18 at=0x005c0000
+[  77.065] SLTEST ALIVE stage=flash step=4 of=18 at=0x00810000
+[  77.488] SLTEST ALIVE stage=flash step=4 of=18 at=0x00a50000
+[  77.912] SLTEST ALIVE stage=flash step=4 of=18 at=0x00d10000
+[  78.321] SLTEST ALIVE stage=flash step=4 of=18 at=0x00f90000
+[  78.742] SLTEST ALIVE stage=flash step=7 of=18 at=0x00408000
+[  79.170] SLTEST ALIVE stage=flash step=9 of=18 at=0x00609000
+[  79.612] SLTEST ALIVE stage=flash step=12 of=18 at=0x0090f000
+[  80.028] SLTEST ALIVE stage=flash step=14 of=18 at=0x00b0b000
+[  80.447] SLTEST ALIVE stage=flash step=17 of=18 at=0x00e01000
+[  80.754] SLTEST RESULT stage=flash result=ok code=OK detail=all_blocks_ok errors=0 ms=7061 id=9d6018 size=16777216 blocks=14
+[  80.761] SLTEST ALIVE stage=cpu step=0 of=2 at=0
+[  80.867] SLTEST ALIVE stage=cpu step=1 of=2 at=0
+[  80.975] # tap: forced tsens_ready (QEMU has no temperature sensor)
+[  80.980] # tap: forced tsens_ready (QEMU has no temperature sensor)
+[  80.994] SLTEST RESULT stage=cpu result=ok code=OK detail=cores_agree errors=0 ms=219 temp_c=na sum=cdcb3e9f
+[  81.001] SLTEST ALIVE stage=wifi step=0 of=3 at=0
+[  81.032] # tap: forcing esp_wifi_init to return 0x101 (simulated failure, image unchanged)
+[  81.041] SLTEST RESULT stage=wifi result=fail code=WIFI_RADIO_FAILED detail=init_esp_err_no_mem errors=1 ms=32
+[  81.098] SLTEST END result=fail failed=wifi crc=777ce7d5
+[  81.255] SLTEST CLEAN result=ok
+[  81.566] # tap: esp_restart_noos (chip reset follows)
+[  83.323] SLTEST BEGIN proto=1 fw=1.0.0 mac=00:00:00:00:00:00 chip_rev=v0.0 cores=2 idf=v5.5.3 flash_id=9d6018 flash_size=16777216 psram_size=8388608
+[  83.338] SLTEST ALIVE stage=psram step=0 of=20 at=0
+[  83.840] SLTEST ALIVE stage=psram step=1 of=20 at=0x3c2a4980
+[  84.348] SLTEST ALIVE stage=psram step=1 of=20 at=0x3c778980
+[  84.758] SLTEST ALIVE stage=psram step=2 of=20 at=0x3c0e0980
+[  85.266] SLTEST ALIVE stage=psram step=2 of=20 at=0x3c5bc980
+[  85.774] SLTEST ALIVE stage=psram step=3 of=20 at=0x3c6c8980
+[  86.282] SLTEST ALIVE stage=psram step=3 of=20 at=0x3c6b0980
+[  86.790] SLTEST ALIVE stage=psram step=4 of=20 at=0x3c1dc980
+[  87.201] SLTEST ALIVE stage=psram step=4 of=20 at=0x3c5c8980
+[  87.710] SLTEST ALIVE stage=psram step=5 of=20 at=0x3c79c980

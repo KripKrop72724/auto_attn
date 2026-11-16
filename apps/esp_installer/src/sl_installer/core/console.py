@@ -232,8 +232,18 @@ class ConsoleParser:
         text = _ANSI.sub("", line).strip()
         if not text:
             return None
-        raw = redact(text)
         test = _SLTEST.match(text)
+        if test is None:
+            # A partial line left in the USB buffer before the port opened (a cut ROM
+            # banner) can be glued to the front of a test line: read the test line from
+            # "SLTEST ". Its END crc still checks the exact text, so a wrong cut can only
+            # make the run unproven, never a pass.
+            cut = text.find("SLTEST ")
+            if cut > 0:
+                test = _SLTEST.match(text[cut:])
+                if test is not None:
+                    text = text[cut:]
+        raw = redact(text)
         if test:
             return self._self_test(test, text, raw, at)
         tag = ""
@@ -819,6 +829,15 @@ class BootWatcher:
 
 def _close(handle: object) -> None:
     if handle is not None:
+        if sys.platform != "win32":
+            # macOS holds DTR and RTS high while open (module notes). Drop RTS first, then
+            # DTR: (1,1) -> (1,0) -> (0,0) never passes RTS high with DTR low, which resets
+            # the chip on USB-Serial/JTAG; the close itself then changes nothing.
+            for line in ("rts", "dtr"):
+                try:
+                    setattr(handle, line, False)
+                except Exception:
+                    pass
         try:
             handle.close()  # type: ignore[attr-defined]
         except Exception:

@@ -437,3 +437,11 @@ def test_a_watched_locked_board_prints_no_test_program_hashes(tmp_path):
     assert data.test_program == "Not used (the board was only watched while it started)"
     assert data.image_sha256 == ()
     assert "ab" * 32 not in certificate_text(data)
+
+
+@pytest.mark.parametrize("temp, words", [("na", "not measured (information only)"),
+                                         (38, "38 °C (information only)")])
+def test_a_missing_temperature_reading_is_not_printed_as_degrees(temp, words):
+    # The test program prints temp_c=na when the sensor gives no reading (radio_test.c).
+    rows = dict(certificate._measurement_rows({"temp_c": temp}))
+    assert rows["Chip temperature"] == words

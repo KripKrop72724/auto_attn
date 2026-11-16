@@ -119,8 +119,10 @@ void app_main(void)
     esp_log_level_set("*", ESP_LOG_WARN);
     sl_out_init();
     start_workers();
-    /* Give the installer time to reopen the USB port after the reset. */
-    vTaskDelay(pdMS_TO_TICKS(1500));
+    /* Give the installer time to reopen the USB port after the reset: Windows
+     * can take 1-3 s to bring the COM port back after USB re-enumeration, and a
+     * missed BEGIN breaks the END crc chain. */
+    vTaskDelay(pdMS_TO_TICKS(5000));
 
     uint32_t flash_id = 0;
     print_begin(&flash_id);

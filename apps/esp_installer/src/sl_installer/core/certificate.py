@@ -417,7 +417,9 @@ _MEASUREMENT_LABELS = (
      lambda v: f"{int(v) / (1024 * 1024):g} MB ({v} bytes)"),
     ("chip_rev", "Chip revision read by the test program", str),
     ("cores", "Processor cores", str),
-    ("temp_c", "Chip temperature", lambda v: f"{v} °C (information only)"),
+    # The program prints temp_c=na when the sensor gave no reading (radio_test.c).
+    ("temp_c", "Chip temperature", lambda v: ("not measured" if str(v).lower() == "na"
+                                              else f"{v} °C") + " (information only)"),
     ("networks", "Wi-Fi networks seen", str),
     ("best_rssi", "Strongest Wi-Fi signal", lambda v: f"{v} dBm"),
     ("loop_period_s", "Restart loop period", lambda v: f"{v} s"),

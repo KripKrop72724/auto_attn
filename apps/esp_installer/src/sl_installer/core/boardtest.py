@@ -11,7 +11,9 @@ lock (NEW_BOARD and RESUME) and as the home option "Test a new board", the app
    pinned in boardtest_images.py) with esptool's flasher stub,
 3. starts it: clears the volatile RTC force-download flag (write-mem) and resets the chip
    with esptool's RTC watchdog reset, the way tests/firmware/hardware/wifi_portal/
-   run_spare.py does; if nothing comes it asks for one physical replug,
+   run_spare.py does; if nothing comes it asks for one physical replug; if the program's
+   lines come without their BEGIN (the port came back late) it starts it once more
+   (MAX_STARTS); a watch lasts WATCH_S, up to WATCH_MAX_S while the program shows progress,
 4. reads the program's SLTEST lines (console.py) and judges them (TestJudge, below),
 5. always cleans up: the program forces download mode and restarts after its END and CLEAN
    lines (else esptool's default reset gets there), 0x0-0x110000 is erased (the whole chip
@@ -78,7 +80,8 @@ RECOVERY_FIX_SETTINGS = "FIX_SETTINGS"
 STAGES = ("psram", "iram", "flash", "cpu", "wifi")
 NO_START_S = 12.0          # no line and no USB drop this long after the start: not started
 SILENCE_S = 8.0            # no line this long after BEGIN, port open: the board hangs
-WATCH_S = 150.0            # the whole watch of one start
+WATCH_S = 150.0            # one start's watch, longer only while the program makes progress
+WATCH_MAX_S = 300.0        # one start's watch, at most (slow but working flash chips)
 END_TO_CLEAN_S = 30.0      # the program erases its test sectors after END
 SETTLE_S = 2.0             # after a crash line: the rest of the dump
 LINGER_S = 3.0             # after a decided fault: trailing lines for the proof
@@ -86,6 +89,7 @@ LOOP_DECIDE_S = 45.0       # USB drops but no line: decide by then
 PORT_WAIT_S = 20.0         # the board back on USB (it re-enumerates after every reset)
 AFTER_END_S = 3.0          # the program restarts into download mode right after CLEAN
 TEST_VALID_S = 30 * 60     # a passed test lets the key be locked this long
+MAX_STARTS = 2             # start calls per test: one, and one more when BEGIN was missed
 PROOF_MAX = 20
 RTC_CNTL_OPTION1_REG = 0x6000812C       # ESP32-S3; esptool targets/esp32s3.py
 RTC_CNTL_FORCE_DOWNLOAD_BOOT_MASK = 0x1
@@ -506,6 +510,13 @@ def _panics(events: Sequence[ConsoleEvent]) -> List[ConsoleEvent]:
 # ROM reset reasons that say the supply dipped (the brownout text itself is often lost: the
 # chip resets at once and USB-Serial-JTAG drops with it).
 POWER_RESETS = frozenset({"BROWN_OUT_RST", "GLITCH_RTC_RST"})
+# ROM reset reasons that say the computer reset the chip over USB-Serial/JTAG (its RTS/DTR
+# lines), never the board itself: e.g. a port closed and reopened on macOS.
+HOST_RESETS = frozenset({"USB_UART_CHIP_RESET", "USB_JTAG_CHIP_RESET"})
+
+
+def _host_reset(reason: Optional[str]) -> bool:
+    return bool(reason) and (reason in HOST_RESETS or str(reason).startswith("USB_"))
 
 
 def _brownout(events: Sequence[ConsoleEvent]) -> Optional[ConsoleEvent]:
@@ -637,6 +648,11 @@ class TestJudge:
         self._decided, self._decided_at = verdict, t
         return None
 
+    @property
+    def undecided(self) -> bool:
+        """No fault decided yet (none lingering for its proof)."""
+        return self._decided is None
+
     def decisive(self, watch: ConsoleWatch, now: float, judgement: Judgement) -> bool:
         """A FAILED ``judgement`` that the console proves without the deadline (decided
         already, or reached by evaluate(final=False) too): it stands after a cancel. Any
@@ -693,7 +709,7 @@ class TestJudge:
         silent = last is not None and t - last >= SILENCE_S
         settled = bool(panics) and (final or t - panics[0].at >= SETTLE_S)
         # Evidence only: a crash, two restarts or real silence. A normal start prints the
-        # same PSRAM lines about 1.5 s before BEGIN, so a cancel or the deadline in that
+        # same PSRAM lines about 5 s before BEGIN, so a cancel or the deadline in that
         # window is never a fault by itself.
         if psram and (settled or restarts >= 2 or silent):
             how = ("crashed" if panics else "restarted" if restarts >= 2
@@ -841,6 +857,11 @@ class TestJudge:
             reason = next((event.data.get("reset_reason") for event in restarted
                            if event.data.get("reset_reason")), None)
             proof = _proof([event.raw for event in restarted][:3], _last_proof(lines, 8))
+            if _host_reset(reason):
+                return self._judgement(BoardTestVerdict.INCOMPLETE, "TEST_RESTARTED", results + [
+                    _finding("TEST_RESTARTED", stage, "warn",
+                             f"The computer reset the board over USB ({reason}) during the "
+                             f"{_TECH[stage]} test; this is not a board fault.", proof)], watch)
             if reason and reason != "POWERON":
                 code = "PSRAM_CRASH" if stage == "psram" else "TEST_CRASH"
                 return self._judgement(BoardTestVerdict.FAILED, code, results + [_finding(
@@ -1088,6 +1109,31 @@ class TestJudge:
 
 # ----------------------------------------------------------------- tester
 
+BEGIN_MISSED = "BEGIN_MISSED"   # internal: a start's lines came without BEGIN (restart once)
+
+
+def _log_note(record: Optional[ConsoleLog], text: str) -> None:
+    if record is not None:
+        record.note(text)
+
+
+def _begin_missed(events: Sequence[ConsoleEvent]) -> bool:
+    """The first test program line of this watch is not its BEGIN."""
+    first = next((event for event in events if event.kind is ConsoleKind.SELF_TEST), None)
+    return first is not None and first.data.get("sltest") != "BEGIN"
+
+
+def _progressing(watch: ConsoleWatch, now: float) -> bool:
+    """The program printed a test line lately: within SILENCE_S, or within END_TO_CLEAN_S
+    after its END (it erases its test blocks before CLEAN)."""
+    newest = next((event for event in reversed(watch.events)
+                   if event.kind is ConsoleKind.SELF_TEST), None)
+    if newest is None:
+        return False
+    allowed = END_TO_CLEAN_S if newest.data.get("sltest") == "END" else SILENCE_S
+    return now - watch.started - newest.at < allowed
+
+
 class _Abort(Exception):
     """Stops a test run with a finding; cleanup still runs when something was written."""
 
@@ -1111,6 +1157,8 @@ class _Run:
     efuse_after: Dict[str, object] = field(default_factory=dict)
     written: bool = False
     started: bool = False             # the start call ran: the program may have run
+    starts: int = 0                   # start calls made (at most MAX_STARTS)
+    erase_all: bool = False           # a stopped run may have left test blocks: whole chip
     console_log: Optional[str] = None
     port: str = ""
 
@@ -1421,30 +1469,65 @@ class BoardTester:
         self._call(run, planned, "write", on_line=line)
         self._progress(run, "write", 1.0, "Copying the test program")
 
+    def _start(self, run: _Run, record: Optional[ConsoleLog]) -> None:
+        if run.starts >= MAX_STARTS:  # never reached by the flow below; a guard only
+            raise _Abort(BoardTestVerdict.INCOMPLETE, _finding(
+                "UNEXPECTED", "start", "warn", f"more than {MAX_STARTS} starts refused"),
+                texts.UNEXPECTED)
+        port = self._resolve_port(run, "start")
+        run.started = True  # even a failed start call may have reset the chip
+        run.starts += 1
+        self._call(run, start_call(port), "start")
+        # With the ConsoleLog's times, this note, "the port ... is open" and the BEGIN line
+        # show how long this computer takes to give the port back after the reset.
+        _log_note(record, f"start call {run.starts} finished")
+
+    def _watch_started(self, run: _Run, on_event: Callable[[ConsoleEvent], None],
+                       record: Optional[ConsoleLog]) -> Judgement:
+        """Watch the program just started. When its lines arrive without their BEGIN (the
+        port came back too late after the reset), the END crc can never be proven: stop at
+        once and start it once more (esptool resets it into download mode first) instead
+        of watching a run that can only end USB_DATA_GARBLED."""
+        judgement = self._watch(run, on_event, record,
+                                begin_missed_stops=run.starts < MAX_STARTS)
+        if judgement.code != BEGIN_MISSED or run.cancel.cancelled:
+            return judgement
+        _log_note(record, "the BEGIN line was missed: starting the test program again")
+        if judgement.measurements.get("first_stage") not in ("psram", "iram"):
+            # The stopped run may have reached its flash stage: the next run's CLEAN only
+            # covers the blocks that run touches, so the cleanup erases the whole chip.
+            run.erase_all = True
+        run.findings.append(_finding(
+            BEGIN_MISSED, "start", "info",
+            "The test program's first line (BEGIN) was missed because the USB port came back "
+            "late after the start; the program was started once more.",
+            judgement.findings[0].proof if judgement.findings else (),
+            title="The test was started again"))
+        self._progress(run, "start", 0.0, "Starting the test again")
+        self._start(run, record)
+        return self._watch(run, on_event, record, begin_missed_stops=False)
+
     def _start_and_watch(self, run: _Run, on_phase: PhaseFn,
                          on_event: Callable[[ConsoleEvent], None],
                          record: Optional[ConsoleLog]) -> Judgement:
         self._progress(run, "start", 0.0, "Starting the test")
-        port = self._resolve_port(run, "start")
-        run.started = True  # even a failed start call may have reset the chip
-        self._call(run, start_call(port), "start")
-        judgement = self._watch(run, on_event, record)
+        self._start(run, record)
+        judgement = self._watch_started(run, on_event, record)
         if judgement.code == "NO_START" and not run.cancel.cancelled:
             # Some computers leave a board in download mode after a reset over USB; a power
             # cycle clears that (new-device-firmware-path, 29 Oct 2026). Once.
-            _note = record.note if record is not None else (lambda text: None)
             on_phase(ReplugPhase.WAITING_UNPLUG)
             if not self._watcher.wait_presence(run.board.mac, present=False,
                                                timeout=UNPLUG_TIMEOUT_S, cancel=run.cancel):
                 return self._early(run, judgement)
-            _note("the board was unplugged")
+            _log_note(record, "the board was unplugged")
             on_phase(ReplugPhase.WAITING_REPLUG)
             if not self._watcher.wait_presence(run.board.mac, present=True,
                                                timeout=REPLUG_TIMEOUT_S, cancel=run.cancel):
                 return self._early(run, judgement)
-            _note("the board was plugged in again")
+            _log_note(record, "the board was plugged in again")
             on_phase(ReplugPhase.WATCHING)
-            second = self._watch(run, on_event, record)
+            second = self._watch_started(run, on_event, record)
             if second.code == "NO_START":
                 return replace(second, findings=judgement.findings + second.findings)
             return second
@@ -1461,10 +1544,12 @@ class BoardTester:
             advice=texts.NOT_REPLUGGED)
 
     def _watch(self, run: _Run, on_event: Callable[[ConsoleEvent], None],
-               record: Optional[ConsoleLog]) -> Judgement:
+               record: Optional[ConsoleLog], *, begin_missed_stops: bool = False
+               ) -> Judgement:
         watch = ConsoleWatch(started=self._clock.monotonic(), events=[], lines=[])
         judge = TestJudge(run.board.mac)
         decided: List[Judgement] = []
+        missed: List[bool] = []
         stage_seen = [""]
 
         def listen(event: ConsoleEvent) -> None:
@@ -1476,15 +1561,31 @@ class BoardTester:
                 log.warning("board test console listener failed: %s", error)
 
         def check(_event: Optional[ConsoleEvent]) -> bool:
-            verdict = judge.check(watch, self._clock.monotonic())
+            now = self._clock.monotonic()
+            if begin_missed_stops and judge.undecided and _begin_missed(watch.events):
+                missed.append(True)
+                return True
+            verdict = judge.check(watch, now)
             if verdict is not None:
                 decided.append(verdict)
-            return verdict is not None
+                return True
+            # Past WATCH_S only while the program still shows progress (up to WATCH_MAX_S):
+            # a slow but good flash chip must not end INCOMPLETE; a hang is still caught by
+            # the judge's silence rule.
+            return now - watch.started >= WATCH_S and not _progressing(watch, now)
 
         self._watcher.read(run.board.mac, watch, listen, run.cancel,
-                           deadline=watch.started + WATCH_S, stop=check, record=record)
+                           deadline=watch.started + WATCH_MAX_S, stop=check, record=record)
         if decided:
             return decided[0]
+        if missed:
+            first = next(event for event in watch.events
+                         if event.kind is ConsoleKind.SELF_TEST)
+            stage = first.data.get("stage") if first.data.get("sltest") == "ALIVE" else None
+            return Judgement(BoardTestVerdict.INCOMPLETE, BEGIN_MISSED, (_finding(
+                BEGIN_MISSED, "start", "info", "The test program's lines arrived without "
+                "their BEGIN line.", [first.raw], title="The test was started again"),),
+                {"first_stage": stage}, advice=texts.USB_DATA_GARBLED)
         now = self._clock.monotonic()
         final = judge.check(watch, now, final=True)
         assert final is not None
@@ -1522,7 +1623,8 @@ class BoardTester:
         self._progress(run, "cleanup", 0.1, "Removing the test program")
         # Without its CLEAN line the program may have left test blocks anywhere in its
         # data partition; before it started it wrote nothing there.
-        clean_ok = bool(judgement and judgement.clean_ok) or not run.started
+        clean_ok = (bool(judgement and judgement.clean_ok) or not run.started) \
+            and not run.erase_all
         erased = False
         if judgement is not None and judgement.program_done:
             # After END and CLEAN the program forces download mode and restarts: let it go

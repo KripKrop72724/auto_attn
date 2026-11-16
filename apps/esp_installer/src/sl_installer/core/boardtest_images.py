@@ -48,7 +48,7 @@ PARTITION_TABLE = TestImage(
     sha256="9b046afd65142c07b04513517068a46e2308323c109e4a5a10de70fe3e91fdd7")
 APP = TestImage(
     "board-test.bin", 0x10000, 0x100000, size=735072,
-    sha256="279971ab2339378a67ed84284574740cd7b1a063196c86fb86f2c5ba8458c0f4")
+    sha256="4e75a8a00c6072fbe63590ae83bb16c8f5b67e4ad22bcd8d4fa7c7e16181149b")
 
 IMAGES: Tuple[TestImage, ...] = (BOOTLOADER, PARTITION_TABLE, APP)
 # Everything the images can occupy: erased again after every test (0x0 to the app's end).
