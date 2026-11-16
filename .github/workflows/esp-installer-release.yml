@@ -85,7 +85,7 @@ jobs:
 
   macos-test-build:
     if: github.event_name == 'pull_request'
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 60
     defaults:
       run:
@@ -200,7 +200,7 @@ jobs:
 
   macos-release:
     if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.confirmation == 'BUILD INSTALLER RELEASE'
-    runs-on: macos-14
+    runs-on: macos-15
     environment: firmware-signing
     timeout-minutes: 60
     outputs:
