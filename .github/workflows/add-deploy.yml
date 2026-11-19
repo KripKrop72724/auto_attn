@@ -220,7 +220,13 @@ jobs:
     needs: announce
     runs-on: [self-hosted, Windows, X64]
     environment: add-production
-    timeout-minutes: 40
+    # The pre-deploy backup now outgrows 40 minutes on its own. 19 Nov 2026
+    # (run 44490835512): pg_dump 779 s, copy to host 56 s, sha256 45 s, then
+    # the pg_restore proof into a scratch database ran over 24 min, so the
+    # image build and compose up never started. 14 Nov took 37.7 min in the
+    # deploy step and 16 Nov was cancelled at 40 min. Every backup and restore
+    # check stays; the job just gets room to finish them.
+    timeout-minutes: 120
     defaults:
       run:
         shell: powershell
