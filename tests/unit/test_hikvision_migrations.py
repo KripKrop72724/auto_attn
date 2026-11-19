@@ -28,7 +28,9 @@ def test_hikvision_migrations_handle_bootstrap_and_existing_install(existing_ins
         context = MigrationContext.configure(connection, opts={"compare_type": True})
         migrations = Path(__file__).resolve().parents[2] / "apps/add_backend/migrations/versions"
         with Operations.context(context):
-            for path in sorted(migrations.glob("20260917_*.py")):
+            # 0063 adds the stored-event re-check cursor to add_hikvision_policies.
+            for path in sorted([*migrations.glob("20260917_*.py"),
+                                *migrations.glob("20261119_0063_*.py")]):
                 spec = importlib.util.spec_from_file_location(path.stem, path)
                 module = importlib.util.module_from_spec(spec)
                 spec.loader.exec_module(module)
