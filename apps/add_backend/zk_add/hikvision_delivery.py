@@ -26,6 +26,9 @@ class HikvisionPolicy(Base):
     mapping_revision: Mapped[int] = mapped_column(Integer, default=1)
     success_codes: Mapped[list] = mapped_column(JSON, default=list)
     excluded_codes: Mapped[list] = mapped_column(JSON, default=list)
+    # Stored-event re-check cursor (zk_add.hikvision_recheck); NULL when idle.
+    recheck_after_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    recheck_counts: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
 
 def profile_identity(session, connector, employee_no):
@@ -328,6 +331,10 @@ def configure_policy(
     policy.excluded_codes = request["excluded_codes"]
     policy.enabled = bool(enabled)
     policy.mapping_revision += 1
+    # Held stored events are re-checked against this mapping in the background,
+    # as a rescan would, without contacting the terminal.
+    from zk_add.hikvision_recheck import queue_recheck
+    queue_recheck(policy)
     # An audited ADD approval is required in addition to signed firmware support.
     # A heartbeat cannot grant its own user-write qualification.
     terminal.capability_profile = {
