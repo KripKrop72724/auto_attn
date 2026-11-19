@@ -398,6 +398,7 @@ async def _safe_attendance_repair_loop(stop: asyncio.Event) -> None:
     from zk_add.attendance_direct_ords import tick as direct_tick
     from zk_add.attendance_identity_backlog import tick as backlog_tick
     from zk_add.attendance_unknown_auto_release import tick as unknown_release_tick
+    from zk_add.hikvision_recheck import tick as hikvision_recheck_tick
 
     while not stop.is_set():
         for work, code in (
@@ -406,6 +407,7 @@ async def _safe_attendance_repair_loop(stop: asyncio.Event) -> None:
             (direct_tick, "DIRECT_ORDS_WORKER_ERROR"),
             (backlog_tick, "IDENTITY_BACKLOG_RELEASE_WORKER_ERROR"),
             (unknown_release_tick, "UNKNOWN_IDENTITY_AUTO_RELEASE_WORKER_ERROR"),
+            (hikvision_recheck_tick, "HIKVISION_POLICY_RECHECK_WORKER_ERROR"),
         ):
             try:
                 await asyncio.to_thread(work)
