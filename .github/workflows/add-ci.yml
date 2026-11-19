@@ -455,7 +455,9 @@ jobs:
 
   frontend:
     runs-on: ubuntu-24.04  # Playwright 1.x has no browsers for ubuntu-latest (26.04) yet
-    timeout-minutes: 15
+    # A cold Playwright install (empty cache, slow Ubuntu mirror) has taken up
+    # to 14 minutes on its own; the steps below carry their own limits.
+    timeout-minutes: 30
     defaults:
       run:
         working-directory: apps/add_frontend
@@ -474,9 +476,59 @@ jobs:
         run: pnpm run build
       - name: Enforce frontend bundle budgets
         run: pnpm run budget
+      # The browser downloads take seconds; the slow part of
+      # `playwright install --with-deps` is apt fetching ~126 MB of system
+      # libraries and fonts from the runner's Ubuntu mirror (8 minutes on
+      # 19 Nov 2026). Cache the browsers and the downloaded .deb files, keyed on
+      # the Playwright version, and refresh the cache monthly so security
+      # updates are not served stale for long.
+      - name: Resolve Playwright cache key
+        id: playwright-key
+        run: |
+          version="$(pnpm exec playwright --version | awk '{print $2}')"
+          test -n "$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "month=$(date -u +%Y-%m)" >> "$GITHUB_OUTPUT"
+      - name: Restore Playwright browsers and system packages
+        id: playwright-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cache/ms-playwright
+            ~/.cache/playwright-apt
+          key: playwright-ubuntu-24.04-${{ steps.playwright-key.outputs.version }}-${{ steps.playwright-key.outputs.month }}
+          restore-keys: |
+            playwright-ubuntu-24.04-${{ steps.playwright-key.outputs.version }}-
       - name: Install Playwright browser matrix
-        run: pnpm exec playwright install --with-deps chromium firefox webkit
+        timeout-minutes: 20
+        run: |
+          set -euo pipefail
+          apt_cache="$HOME/.cache/playwright-apt"
+          mkdir -p "$apt_cache/partial"
+          # Playwright runs apt-get itself, so point apt's download cache at
+          # the restored directory and fail over from a stalled mirror sooner.
+          sudo tee /etc/apt/apt.conf.d/99add-playwright-cache > /dev/null <<EOF
+          Dir::Cache::Archives "$apt_cache/";
+          APT::Keep-Downloaded-Packages "true";
+          Binary::apt::APT::Keep-Downloaded-Packages "true";
+          Acquire::Retries "3";
+          Acquire::http::Timeout "15";
+          EOF
+          echo "Restored apt packages: $(find "$apt_cache" -maxdepth 1 -name '*.deb' | wc -l)"
+          pnpm exec playwright install --with-deps chromium firefox webkit
+          sudo rm -rf "$apt_cache/partial" "$apt_cache/lock"
+          sudo chown -R "$(id -u):$(id -g)" "$apt_cache"
+          echo "Cached apt packages: $(find "$apt_cache" -maxdepth 1 -name '*.deb' | wc -l)"
+      - name: Save Playwright browsers and system packages
+        if: steps.playwright-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cache/ms-playwright
+            ~/.cache/playwright-apt
+          key: ${{ steps.playwright-cache.outputs.cache-primary-key }}
       - name: Run responsive and accessibility browser tests
+        timeout-minutes: 10
         run: pnpm test:e2e
       - name: Upload Playwright report on failure
         if: failure()
