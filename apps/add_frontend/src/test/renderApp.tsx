@@ -15,6 +15,8 @@ export const device: Device = {
   zone_name: 'ZONE-SLICTOWER-3FL',
   device_id: '1',
   display_name: 'SLICTOWER · 3rd Floor',
+  division: 'health',
+  friendly_name: 'SLIC Tower · 3rd Floor',
   state: 'ONLINE',
   connected: true,
   firmware_version: '2.1.0',
@@ -105,6 +107,30 @@ export const deliveryAlert = {
   resolved_at: null,
 }
 
+/** Today's attendance totals (GET /api/v1/attendance/summary). */
+export const attendanceSummary = {
+  from_time: '2026-11-19T19:00:00Z',
+  to_time: null,
+  division: null,
+  totals: { received: 1038, sent: 980, waiting: 23, trying_again: 2, not_matched: 35, set_aside: 0, problem: 0, oldest_waiting_at: null },
+  by_division: {
+    life: { received: 312, sent: 298, waiting: 6, trying_again: 0, not_matched: 8, set_aside: 0, problem: 0, oldest_waiting_at: null },
+    health: { received: 726, sent: 682, waiting: 17, trying_again: 2, not_matched: 27, set_aside: 0, problem: 0, oldest_waiting_at: null },
+  },
+  last_sent_at: null,
+}
+
+/** The page has loaded: its title is on screen ("Home" by default). */
+export const appReady = (name = 'Home') => screen.findByRole('heading', { name, level: 1 }, { timeout: 8000 })
+
+/** Click a page in the main menu ("People", "Software updates", …). */
+export const openMenuPage = (name: string) => {
+  const menu = screen.getByRole('navigation', { name: 'Main menu' })
+  const link = Array.from(menu.querySelectorAll<HTMLAnchorElement>('a.nav-link')).find((item) => item.querySelector('.nav-label')?.textContent === name)
+  if (!link) throw new Error(`No menu link named ${name}`)
+  fireEvent.click(link)
+}
+
 export class EventSourceStub {
   onmessage: ((event: MessageEvent) => void) | null = null
   constructor(_url: string, _options?: EventSourceInit) {}
@@ -132,6 +158,7 @@ export const fetchStub = (
     if (path.includes('/api/v1/auth/session')) {
       return response({ username: 'StateHealthAdmin', csrf_token: 'csrf' })
     }
+    if (path.startsWith('/api/v1/attendance/summary')) return response(attendanceSummary)
     if (path.includes('/api/v1/overview')) {
       return response({
         total: 1,

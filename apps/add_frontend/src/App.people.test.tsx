@@ -16,16 +16,16 @@ import App, {
 import { api } from './api'
 import type { Device, DeviceUser, Overview } from './types'
 import {
-  conflictedUser, deliveryAlert, device, fetchStub, fullCnic, maskedCnic, response, selectUserTerminal, useDashboardStubs, user,
+  conflictedUser, deliveryAlert, device, fetchStub, fullCnic, maskedCnic, response, selectUserTerminal, useDashboardStubs, user, appReady, openMenuPage,
 } from './test/renderApp'
 
 describe('State Life ADD interface · People', () => {
-  useDashboardStubs(() => Promise.all([import('./features/Fleet'), import('./features/UsersWorkspace')]))
+  useDashboardStubs(() => Promise.all([import('./features/Home'), import('./features/UsersWorkspace')]))
 
   it('renders only masked CNIC in the selected-terminal users workspace', async () => {
     render(<App />)
-    await screen.findByRole('heading', { name: 'Fleet', level: 1 })
-    fireEvent.click(screen.getByRole('button', { name: 'Users' }))
+    await appReady()
+    openMenuPage('People')
     await selectUserTerminal()
     expect(await screen.findByText(maskedCnic)).toBeTruthy()
     expect(document.body.textContent).not.toContain(fullCnic)
@@ -37,8 +37,8 @@ describe('State Life ADD interface · People', () => {
   it('marks duplicate CNIC identities with text and a non-color-only pattern', async () => {
     vi.stubGlobal('fetch', fetchStub([conflictedUser]))
     render(<App />)
-    await screen.findByRole('heading', { name: 'Fleet', level: 1 })
-    fireEvent.click(screen.getByRole('button', { name: 'Users' }))
+    await appReady()
+    openMenuPage('People')
     await selectUserTerminal()
     const warning = await screen.findByText(/exact cnic also encoded on user 1008 \(uid 8\)/i)
     expect(warning.closest('article')?.classList.contains('identity-conflict')).toBe(true)
@@ -64,8 +64,8 @@ describe('State Life ADD interface · People', () => {
     const fetchMock = fetchStub([user], true)
     vi.stubGlobal('fetch', fetchMock)
     render(<App />)
-    await screen.findByRole('heading', { name: 'Fleet', level: 1 })
-    fireEvent.click(screen.getByRole('button', { name: 'Users' }))
+    await appReady()
+    openMenuPage('People')
     await selectUserTerminal()
     fireEvent.click(screen.getByRole('tab', { name: /historical backlog/i }))
     expect(await screen.findByRole('heading', { name: /historical identity backlog/i })).toBeTruthy()
@@ -111,8 +111,8 @@ describe('State Life ADD interface · People', () => {
     const fetchMock = fetchStub([user], false, true)
     vi.stubGlobal('fetch', fetchMock)
     render(<App />)
-    await screen.findByRole('heading', { name: 'Fleet', level: 1 })
-    fireEvent.click(screen.getByRole('button', { name: 'Users' }))
+    await appReady()
+    openMenuPage('People')
     await selectUserTerminal()
     fireEvent.click(screen.getByRole('tab', { name: /historical backlog/i }))
     expect(await screen.findByText(/exact event cohort/i)).toBeTruthy()
@@ -164,8 +164,8 @@ describe('State Life ADD interface · People', () => {
     const fetchMock = fetchStub([missingIdentityUser], false, false, true)
     vi.stubGlobal('fetch', fetchMock)
     render(<App />)
-    await screen.findByRole('heading', { name: 'Fleet', level: 1 })
-    fireEvent.click(screen.getByRole('button', { name: 'Users' }))
+    await appReady()
+    openMenuPage('People')
     await selectUserTerminal()
     fireEvent.click(screen.getByRole('tab', { name: /historical backlog/i }))
     fireEvent.click(await screen.findByRole('button', { name: /enrich current user/i }))
@@ -183,8 +183,8 @@ describe('State Life ADD interface · People', () => {
     const fetchMock = fetchStub([currentUser], false, false, false, true)
     vi.stubGlobal('fetch', fetchMock)
     render(<App />)
-    await screen.findByRole('heading', { name: 'Fleet', level: 1 })
-    fireEvent.click(screen.getByRole('button', { name: 'Users' }))
+    await appReady()
+    openMenuPage('People')
     await selectUserTerminal()
     fireEvent.click(screen.getByRole('tab', { name: /historical backlog/i }))
     fireEvent.click(

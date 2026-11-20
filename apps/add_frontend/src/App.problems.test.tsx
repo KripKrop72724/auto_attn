@@ -16,16 +16,16 @@ import App, {
 import { api } from './api'
 import type { Device, DeviceUser, Overview } from './types'
 import {
-  conflictedUser, deliveryAlert, device, fetchStub, fullCnic, maskedCnic, response, selectUserTerminal, useDashboardStubs, user,
+  conflictedUser, deliveryAlert, device, fetchStub, fullCnic, maskedCnic, response, selectUserTerminal, useDashboardStubs, user, appReady, openMenuPage,
 } from './test/renderApp'
 
 describe('State Life ADD interface · Problems', () => {
-  useDashboardStubs(() => Promise.all([import('./features/Fleet'), import('./features/Monitoring')]))
+  useDashboardStubs(() => Promise.all([import('./features/Home'), import('./features/Monitoring')]))
 
   it('renders only allowlisted alert diagnostics', async () => {
     render(<App />)
-    await screen.findByRole('heading', { name: 'Fleet', level: 1 })
-    fireEvent.click(screen.getByRole('button', { name: /alerts/i }))
+    await appReady()
+    openMenuPage('Problems')
     expect(await screen.findByText(/Category HTTP_503 · HTTP 503 · Attempt 4/i)).toBeTruthy()
     expect(await screen.findByRole('heading', { name: /attendance quarantine/i })).toBeTruthy()
     expect(screen.getByText(/ATTENDANCE_EVENT_STRING_PATTERN_MISMATCH · event_uid/i)).toBeTruthy()
@@ -63,8 +63,8 @@ describe('State Life ADD interface · Problems', () => {
 
   it('requires audited step-up to reveal and review attendance quarantine', async () => {
     render(<App />)
-    await screen.findByRole('heading', { name: 'Fleet', level: 1 })
-    fireEvent.click(screen.getByRole('button', { name: /alerts/i }))
+    await appReady()
+    openMenuPage('Problems')
     fireEvent.click(await screen.findByRole('button', { name: /^review$/i }))
     expect(await screen.findByRole('heading', { name: /review quarantined attendance/i })).toBeTruthy()
 

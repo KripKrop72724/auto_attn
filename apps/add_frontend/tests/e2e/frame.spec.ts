@@ -1,6 +1,7 @@
 // The app frame: live updates, menu, routes, layout at every size.
 import AxeBuilder from '@axe-core/playwright'
 import { expect, test, device, expectOnlyAllowedStorage, mockDashboard, nationwideDevices, representativeUser } from './fixtures'
+import { reportPlainWords } from './plainWords'
 
 test.beforeEach(async ({ page }) => mockDashboard(page))
 
@@ -21,47 +22,52 @@ test('a permanently closed event stream reconnects while fleet snapshots keep re
   // attempt a few milliseconds past the next 30-second clock boundary.
   await page.clock.pauseAt(new Date('2026-10-04T09:00:01Z'))
   await page.goto('/home')
-  await expect(page.getByRole('heading', { name: 'Fleet', exact: true, level: 1 })).toBeVisible()
+  await expect(page.getByRole('heading', { name: 'Home', exact: true, level: 1 })).toBeVisible()
   await expect.poll(() => streamRequests).toBe(1)
-  await expect(page.locator('.live-sync')).toHaveText('Reconnecting')
+  await expect(page.locator('.live-sync')).toHaveText('Reconnecting…')
   const initialFleetRequests = fleetRequests
   await page.clock.runFor(30_200)
   await expect.poll(() => streamRequests).toBe(2)
   await expect.poll(() => fleetRequests).toBeGreaterThan(initialFleetRequests)
-  await expect(page.getByText('Cached data', { exact: true })).toBeVisible()
+  const phone = (page.viewportSize()?.width || 0) <= 760
+  await expect(page.locator('.live-sync')).toHaveText(phone ? 'Offline' : 'Offline · showing last saved data')
+  await expect(page.locator('.live-banner')).toContainText('Trying again…')
+  await expect(page.getByText('Cached data', { exact: true })).toHaveCount(0)
   await expect(page.getByText('Live transport', { exact: true })).toHaveCount(0)
   await page.clock.runFor(30_000)
   await expect.poll(() => streamRequests).toBe(3)
 })
 
 test('adaptive shell has no horizontal overflow and meets critical accessibility checks', async ({ page }) => {
-  await page.goto('/home')
-  await expect(page.getByRole('heading', { name: 'Fleet', exact: true, level: 1 })).toBeVisible()
-  await expect(page.getByRole('region', { name: 'Pakistan device network map' })).toBeVisible()
-  await expect(page.getByRole('button', { name: 'Map' })).toHaveAttribute('aria-pressed', 'true')
-  const islamabadMarker = page.getByRole('button', { name: /Islamabad, 1 device, All online/i })
-  await islamabadMarker.focus()
-  await page.keyboard.press('Enter')
-  await expect(page.getByRole('button', { name: 'Inspect SLICTOWER · 3rd Floor' })).toBeVisible()
+  const check = async () => {
+    const dimensions = await page.evaluate(() => ({
+      viewport: window.innerWidth,
+      content: document.documentElement.scrollWidth,
+      offenders: Array.from(document.querySelectorAll<HTMLElement>('body *'))
+        .filter((element) => element.getBoundingClientRect().right > window.innerWidth + 1)
+        .slice(0, 8)
+        .map((element) => ({ tag: element.tagName, className: element.className, parent: element.parentElement?.className, right: Math.round(element.getBoundingClientRect().right), scrollWidth: element.scrollWidth })),
+    }))
+    expect(dimensions.content, JSON.stringify(dimensions.offenders)).toBeLessThanOrEqual(dimensions.viewport)
+    const results = await new AxeBuilder({ page }).withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa']).analyze()
+    expect(results.violations.filter((violation) => ['critical', 'serious'].includes(violation.impact || ''))).toEqual([])
+  }
   await page.emulateMedia({ reducedMotion: 'reduce' })
-  await expect(page.locator('.fleet-map-marker-ripple')).toHaveCSS('display', 'none')
-  const dimensions = await page.evaluate(() => ({
-    viewport: window.innerWidth,
-    content: document.documentElement.scrollWidth,
-    offenders: Array.from(document.querySelectorAll<HTMLElement>('body *'))
-      .filter((element) => element.getBoundingClientRect().right > window.innerWidth + 1)
-      .slice(0, 8)
-      .map((element) => ({ tag: element.tagName, className: element.className, parent: element.parentElement?.className, right: Math.round(element.getBoundingClientRect().right), scrollWidth: element.scrollWidth })),
-  }))
-  expect(dimensions.content, JSON.stringify(dimensions.offenders)).toBeLessThanOrEqual(dimensions.viewport)
-  const results = await new AxeBuilder({ page }).withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa']).analyze()
-  expect(results.violations.filter((violation) => ['critical', 'serious'].includes(violation.impact || ''))).toEqual([])
+  await page.goto('/home')
+  await expect(page.getByRole('heading', { name: 'Home', exact: true, level: 1 })).toBeVisible()
+  await expect(page.getByRole('region', { name: 'Summary' }).getByRole('link')).toHaveCount(4)
+  await expect(page.getByRole('region', { name: 'Life' })).toBeVisible()
+  await expect(page.getByRole('region', { name: 'Health' })).toBeVisible()
+  await expect(page.getByRole('region', { name: 'Pakistan device network map' })).toHaveCount(0)
+  await check()
+  await page.goto('/devices')
+  await expect(page.getByRole('link', { name: 'Open SLIC Tower · 3rd Floor, Health, working' })).toBeVisible()
+  await check()
 })
 
 test('primary routes and device deep link remain usable', async ({ page }, testInfo) => {
-  await page.goto('/home')
-  await page.getByRole('button', { name: /Islamabad, 1 device, All online/i }).click()
-  await page.getByRole('button', { name: 'Inspect SLICTOWER · 3rd Floor' }).click()
+  await page.goto('/devices')
+  await page.getByRole('link', { name: 'Open SLIC Tower · 3rd Floor, Health, working' }).click()
   await expect(page).toHaveURL(/\/devices\/connector-one$/)
   await expect(page.getByRole('dialog', { name: 'SLICTOWER · 3rd Floor' })).toBeVisible()
   const custody = page.getByRole('article', { name: 'ZKT ADD custody' })
@@ -77,28 +83,32 @@ test('primary routes and device deep link remain usable', async ({ page }, testI
   if (process.env.ADD_VISUAL_QA === '1') await custody.screenshot({ path: testInfo.outputPath('custody-panel.png') })
   await page.getByRole('button', { name: 'Close', exact: true }).click()
 
-  const primaryNav = page.getByRole('navigation', { name: 'Primary navigation' })
-  await primaryNav.getByRole('button', { name: 'Users', exact: true }).click()
+  const primaryNav = page.getByRole('navigation', { name: 'Main menu' })
+  const phone = (page.viewportSize()?.width || 0) <= 760
+  // On a phone People and the Advanced tools live in the More sheet.
+  const openFromMore = async (name: RegExp) => {
+    await primaryNav.getByRole('button', { name: 'More', exact: true }).click()
+    await page.getByRole('dialog', { name: 'More' }).getByRole('link', { name }).click()
+  }
+  if (phone) await openFromMore(/^People/)
+  else await primaryNav.getByRole('link', { name: 'People', exact: true }).click()
   await expect(page.getByRole('heading', { name: 'Users', exact: true, level: 1 })).toBeVisible()
-  await primaryNav.getByRole('button', { name: 'Attendance', exact: true }).click()
+  await primaryNav.getByRole('link', { name: 'Attendance', exact: true }).click()
   await expect(page.getByRole('heading', { name: 'Live attendance' })).toBeVisible()
-  if ((page.viewportSize()?.width || 0) <= 760) {
-    const moreTrigger = page.getByRole('button', { name: 'More', exact: true })
+  if (phone) {
+    const moreTrigger = primaryNav.getByRole('button', { name: 'More', exact: true })
     await moreTrigger.click()
-    await expect(page.getByRole('dialog', { name: 'More operations' })).toBeVisible()
+    await expect(page.getByRole('dialog', { name: 'More' })).toBeVisible()
     await page.keyboard.press('Escape')
-    await expect(page.getByRole('dialog', { name: 'More operations' })).toHaveCount(0)
+    await expect(page.getByRole('dialog', { name: 'More' })).toHaveCount(0)
     await expect(moreTrigger).toBeFocused()
-    await moreTrigger.click()
-    const moreNavigation = page.getByRole('dialog', { name: 'More operations' })
-    await moreNavigation.getByRole('button', { name: /Reconciliation/ }).click()
+    await openFromMore(/^Recover attendance/)
     await expect(page.getByRole('heading', { name: 'Reconciliation', exact: true, level: 1 })).toBeVisible()
-    await page.getByRole('button', { name: 'More', exact: true }).click()
-    await page.getByRole('dialog', { name: 'More operations' }).getByRole('button', { name: /Firmware/ }).click()
+    await openFromMore(/^Software updates/)
   } else {
-    await primaryNav.getByRole('button', { name: 'Reconciliation', exact: true }).click()
+    await primaryNav.getByRole('link', { name: 'Recover attendance', exact: true }).click()
     await expect(page.getByRole('heading', { name: 'Reconciliation', exact: true, level: 1 })).toBeVisible()
-    await primaryNav.getByRole('button', { name: 'Firmware', exact: true }).click()
+    await primaryNav.getByRole('link', { name: 'Software updates', exact: true }).click()
   }
   await expect(page.getByRole('heading', { name: 'Firmware', exact: true, level: 1 })).toBeVisible()
   const channelBadgeGeometry = await page.locator('.firmware-channel-strip .status-badge').first().evaluate((badge) => {
@@ -121,7 +131,7 @@ test('primary routes and device deep link remain usable', async ({ page }, testI
   await expect(page.getByRole('heading', { name: 'Zone Lite 2.2.30' })).toBeVisible()
   await page.getByRole('tab', { name: /Campaigns/ }).click()
   await expect(page.getByRole('heading', { name: 'Campaign operations' })).toBeVisible()
-  await primaryNav.getByRole('button', { name: /Alerts/ }).click()
+  await primaryNav.getByRole('link', { name: /^Problems/ }).click()
   await expect(page.getByRole('heading', { name: 'Alerts', exact: true, level: 1 })).toBeVisible()
   expect(page.url()).not.toMatch(/cnic|password|reason|confirmation/i)
   await expectOnlyAllowedStorage(page)
@@ -166,7 +176,7 @@ test('reported viewport thresholds, route scroll reset, and collision layers rem
   await workspace.evaluate((node) => { node.scrollTop = Math.min(360, node.scrollHeight - node.clientHeight) })
   const savedScroll = await workspace.evaluate((node) => node.scrollTop)
   expect(savedScroll).toBeGreaterThan(0)
-  await page.getByRole('navigation', { name: 'Primary navigation' }).getByRole('button', { name: 'Firmware', exact: true }).click()
+  await page.getByRole('navigation', { name: 'Main menu' }).getByRole('link', { name: 'Software updates', exact: true }).click()
   await expect(page.getByRole('heading', { name: 'Firmware', exact: true, level: 1 })).toBeVisible()
   await expect.poll(() => workspace.evaluate((node) => node.scrollTop)).toBe(0)
   await page.goBack()
@@ -212,7 +222,7 @@ test('reported viewport thresholds, route scroll reset, and collision layers rem
   await expect(userDialog).toBeVisible()
   const overlayOrder = await page.evaluate(() => {
     const overlayRoot = document.querySelector<HTMLElement>('#overlay-root')
-    const stickyLayers = ['.app-header', '.users-section-tabs', '.user-directory-head']
+    const stickyLayers = ['.app-header', '.live-banner', '.app-sidebar', '.users-section-tabs', '.user-directory-head']
       .map((selector) => document.querySelector<HTMLElement>(selector))
       .filter((node): node is HTMLElement => Boolean(node))
     const overlayZ = Number.parseInt(getComputedStyle(overlayRoot as HTMLElement).zIndex, 10)
@@ -249,4 +259,25 @@ test('old addresses and bookmarks open the new pages with their filters kept', a
     expect(page.url()).not.toMatch(/\d{6,}/)
   }
   await expectOnlyAllowedStorage(page)
+})
+
+test('frame controls are at least 44 px on touch screens and use plain words', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'phone-390-touch', 'Touch sizes are checked on the phone project.')
+  await page.goto('/home')
+  await expect(page.getByRole('heading', { name: 'Home', exact: true, level: 1 })).toBeVisible()
+  const small = async (selector: string) => page.evaluate((root) => Array.from(document.querySelectorAll<HTMLElement>(`${root} :is(a[href], button, [role="radio"])`))
+    .filter((element) => {
+      if (element.closest('.skip-link') || element.classList.contains('skip-link')) return false
+      const box = element.getBoundingClientRect()
+      const style = getComputedStyle(element)
+      return box.width > 0 && box.height > 0 && style.visibility !== 'hidden' && (box.width < 44 || box.height < 44)
+    })
+    .map((element) => `${element.tagName} "${(element.getAttribute('aria-label') || element.textContent || '').trim().slice(0, 30)}" ${Math.round(element.getBoundingClientRect().width)}x${Math.round(element.getBoundingClientRect().height)}`), selector)
+  expect(await small('.app-header')).toEqual([])
+  expect(await small('.app-sidebar')).toEqual([])
+  await page.getByRole('navigation', { name: 'Main menu' }).getByRole('button', { name: 'More', exact: true }).click()
+  await expect(page.getByRole('dialog', { name: 'More' })).toBeVisible()
+  expect(await small('.more-sheet')).toEqual([])
+  const words = await reportPlainWords(page, testInfo, 'more-sheet')
+  expect(words).toEqual([])
 })
