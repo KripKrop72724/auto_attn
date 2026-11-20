@@ -1,0 +1,77 @@
+/* ADD component kit (src/ui). Tokens live in styles.css :root. Every animation is finite
+   except the spinner; the reduced-motion block at the end turns motion off. Breakpoints:
+   phone <=760 px, tablet 761-1023 px, desktop >=1024 px.
+   Core parts (buttons, tones, dialog, toast) ship in the entry stylesheet; every other part
+   imports its own file (chips.css, content.css, tabs.css, sheet.css, filterbar.css,
+   datalist.css, steps.css), so it ships with the page that uses it. */
+
+/* Buttons ---------------------------------------------------------------- */
+.ui-button.is-busy { cursor: progress; }
+.ui-button.is-busy:disabled { color: var(--text-secondary); }
+.ui-button.primary.is-busy:disabled, .ui-button.destructive.is-busy:disabled { color: #fff; border-color: var(--accent); background: var(--accent); opacity: .85; }
+.ui-button.destructive.is-busy:disabled { border-color: var(--critical); background: var(--critical); }
+.ui-button-ghost { color: var(--text); border-color: transparent; background: transparent; }
+.ui-button-ghost:hover:not(:disabled) { background: var(--surface-hover); }
+.ui-button-link { min-height: auto; text-decoration: underline; text-underline-offset: 2px; }
+.ui-icon-button { position: relative; }
+.ui-icon-button::after { content: ""; position: absolute; inset: 50% auto auto 50%; width: max(100%, var(--touch-min)); height: max(100%, var(--touch-min)); transform: translate(-50%, -50%); }
+.ui-button > svg { width: var(--icon-sm); height: var(--icon-sm); }
+
+.ui-spinner { width: 16px; height: 16px; display: inline-block; flex: none; border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%; opacity: .8; animation: ui-spin 700ms linear infinite; }
+.ui-spinner-md { width: 20px; height: 20px; }
+.ui-spinner-wrap { display: inline-flex; align-items: center; }
+@keyframes ui-spin { to { transform: rotate(360deg); } }
+
+
+/* Tones shared by chips, cards, tiles and timelines. */
+.tone-working { --chip-fg: var(--tone-working-fg); --chip-bg: var(--tone-working-bg); --chip-border: var(--tone-working-border); --tone-edge: var(--tone-working-solid); }
+.tone-attention { --chip-fg: var(--tone-attention-fg); --chip-bg: var(--tone-attention-bg); --chip-border: var(--tone-attention-border); --tone-edge: var(--tone-attention-solid); }
+.tone-offline { --chip-fg: var(--tone-offline-fg); --chip-bg: var(--tone-offline-bg); --chip-border: var(--tone-offline-border); --tone-edge: var(--tone-offline-solid); }
+.tone-neutral { --chip-fg: var(--tone-neutral-fg); --chip-bg: var(--tone-neutral-bg); --chip-border: var(--tone-neutral-border); --tone-edge: var(--tone-neutral-solid); }
+.tone-info { --chip-fg: var(--tone-info-fg); --chip-bg: var(--tone-info-bg); --chip-border: var(--tone-info-border); --tone-edge: var(--tone-info-solid); }
+
+/* Shared layer pieces ----------------------------------------------------- */
+.ui-layer-content { display: contents; }
+.is-exiting { pointer-events: none; }
+.dialog-size-sm { width: min(440px, 100%); }
+.dialog-size-lg { width: min(840px, 100%); }
+.ui-discard-backdrop { position: absolute; inset: 0; z-index: 5; display: grid; place-items: center; padding: var(--space-4); border-radius: inherit; background: var(--overlay); }
+.ui-discard { width: min(400px, 100%); padding: var(--space-5); border-radius: var(--radius-lg); background: var(--surface); box-shadow: var(--shadow-xl); animation: ui-rise var(--motion-sheet) var(--ease-out) both; }
+.ui-discard h2 { margin: 0 0 var(--space-1); font-size: var(--text-xl); }
+.ui-discard p { margin: 0; color: var(--text-secondary); }
+.ui-discard-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: var(--space-2); margin-top: var(--space-5); }
+@keyframes ui-rise { from { opacity: 0; transform: translateY(8px); } }
+
+/* clip-path, not transform: an edge-anchored layer never reaches past the screen, even mid-animation. */
+@keyframes ui-sheet-up { from { clip-path: inset(100% 0 0 0); } to { clip-path: inset(0); } }
+
+/* Toasts ------------------------------------------------------------------ */
+.ui-toast-stack { position: fixed; right: var(--space-6); bottom: var(--space-6); z-index: var(--z-toast); width: min(440px, calc(100vw - 32px)); display: grid; gap: var(--space-2); pointer-events: none; }
+.ui-toast { display: flex; align-items: flex-start; gap: var(--space-2); padding: var(--space-3) var(--space-1) var(--space-3) var(--space-4); border: 1px solid var(--border); border-radius: var(--radius-lg); color: var(--text); background: var(--surface); box-shadow: var(--shadow-lg); font-size: var(--text-md); font-weight: 500; line-height: var(--leading-body); pointer-events: auto; animation: ui-rise var(--motion-sheet) var(--ease-out) both; }
+.ui-toast-icon { width: 18px; height: 18px; margin-top: 2px; color: var(--positive); }
+.ui-toast.tone-info .ui-toast-icon { color: var(--accent); }
+.ui-toast.tone-error { border-color: var(--critical-border); }
+.ui-toast.tone-error .ui-toast-icon { color: var(--critical); }
+.ui-toast-text { min-width: 0; flex: 1; padding-top: 1px; overflow-wrap: anywhere; }
+.ui-toast-action { min-height: 32px; flex: none; margin-top: -5px; font-weight: 600; }
+.ui-toast-close { width: 32px; min-height: 32px; height: 32px; margin: -5px 0; }
+
+
+/* Phones ------------------------------------------------------------------ */
+@media (max-width: 760px) {
+  .ui-toast-stack { right: var(--space-3); left: var(--space-3); bottom: calc(var(--app-bottom-nav-height) + env(safe-area-inset-bottom) + var(--space-3)); width: auto; }
+  #overlay-root:has(.dialog-backdrop:not(.is-exiting), .ui-sheet-backdrop:not(.is-exiting)) .ui-toast-stack { top: max(var(--space-3), env(safe-area-inset-top)); bottom: auto; }
+  .dialog-backdrop { padding: 0; }
+  .dialog-panel, .dialog-size-sm, .dialog-size-lg { width: 100%; min-height: 100vh; min-height: 100dvh; max-height: 100vh; max-height: 100dvh; border-radius: 0; animation: ui-sheet-up var(--motion-sheet) var(--ease-out) both; }
+  .dialog-panel .dialog-body > .dialog-actions:last-child { padding-bottom: calc(max(12px, env(safe-area-inset-bottom)) + var(--keyboard-inset)); }
+  .ui-discard-actions { flex-direction: column-reverse; }
+  .ui-discard-actions .button { width: 100%; }
+}
+
+@media (max-width: 760px), (pointer: coarse) {
+  .ui-toast-close { width: 44px; min-height: 44px; height: 44px; margin: -11px 0; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ui-spinner { animation: none; border-right-color: currentColor; opacity: .5; }
+}

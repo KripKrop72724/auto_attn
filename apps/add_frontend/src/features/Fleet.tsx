@@ -9,7 +9,7 @@ import { firmwareLabel, humanizeStatus, isOnlineState, statusPattern, terminalLi
 import type { Device, Overview } from '../types'
 import { Metric, availabilityTone, metricsTime } from '../ui/Metric'
 import { PageHeader } from '../ui/PageHeader'
-import { StatusBadge, TerminalLinkBadge, showsTerminalLinkBadge } from '../ui/StatusChip'
+import { StatusBadge, TerminalLinkBadge, showsTerminalLinkBadge } from '../ui/StatusBadge'
 import { autoReleaseHeadline, useUnknownAutoReleaseStatus } from './unknownAutoRelease'
 import { healthReasonLine, healthTierPattern, primaryHealthReason } from '../words/health'
 

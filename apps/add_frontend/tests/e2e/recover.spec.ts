@@ -20,7 +20,7 @@ test('source exception inspector is responsive, keyboard-operable, and fail-clos
   await drawer.getByLabel('Administrator password').fill('not-recorded-by-test')
   await drawer.getByRole('button', { name: 'Reveal protected bytes' }).click()
   await expect(drawer.getByText('ffffffffffffffff')).toBeVisible()
-  await drawer.getByRole('button', { name: 'Close dialog' }).click()
+  await drawer.getByRole('button', { name: 'Close', exact: true }).click()
   await page.getByRole('button', { name: /SLICTOWER · 3rd Floor · ordinal 5,130/ }).click()
   const divergenceDrawer = page.getByRole('dialog', { name: 'Terminal-history change' })
   await expect(divergenceDrawer.getByText('Independent fresh-buffer verification')).toBeVisible()
@@ -136,7 +136,7 @@ test('large reconciliation evidence stays viewport-bound and progressively revea
 
   await drawer.getByRole('button', { name: 'Load 25 older events' }).click()
   await expect(drawer.locator('.reconciliation-event-summary')).toHaveCount(50)
-  await drawer.getByRole('button', { name: 'Close dialog' }).click()
+  await drawer.getByRole('button', { name: 'Close', exact: true }).click()
   await expect(inspect).toBeFocused()
   await expect(page.locator('#root')).not.toHaveAttribute('inert', '')
 })

@@ -1,46 +1,66 @@
-// Status pills: text, icon and border pattern, never colour alone (moved from App.tsx).
-import { Icon } from '../Icon'
-import { humanizeStatus, normalizedStatus, statusPattern, terminalLinkPattern } from '../status'
-import { terminalLinkLabel } from '../words/health'
-import type { TerminalLink } from '../types'
+import { Icon, type IconName } from '../Icon'
+import type { StatusPattern } from '../status'
+import { cx } from './cx'
+import './chips.css'
 
-export const statusIcon = {
-  confirmed: 'check',
-  blocked: 'alert',
-  waiting: 'clock',
-  notice: 'info',
-} as const
+/** One meaning per tone; the label always says it in words. */
+export type Tone = 'working' | 'attention' | 'offline' | 'neutral' | 'info'
 
-export function StatusBadge({
-  state,
-  live = false,
-}: {
-  state?: string | null
-  live?: boolean
-}) {
-  const status = normalizedStatus(state)
-  const label = status.replaceAll('_', ' ')
-  const pattern = statusPattern(status)
-  return (
-    <span className={`status-badge pattern-${pattern}`} data-pattern={pattern} aria-label={`Status: ${label}`} title={label}>
-      <Icon name={statusIcon[pattern]} />
-      <span>{humanizeStatus(status)}</span>
-      {live && <i aria-hidden="true" />}
-    </span>
-  )
+const toneIcon: Record<Tone, IconName> = {
+  working: 'check',
+  attention: 'alert',
+  offline: 'power',
+  neutral: 'info',
+  info: 'info',
 }
 
-// The ESP lifecycle badge and this terminal-link badge are deliberately separate.
-export function TerminalLinkBadge({ link }: { link: TerminalLink }) {
-  const pattern = terminalLinkPattern(link.state)
-  const label = terminalLinkLabel(link.state)
+// data-pattern keeps the non-colour contract of the old StatusBadge
+// (confirmed / waiting / blocked / notice) so existing checks still apply.
+const tonePattern: Record<Tone, StatusPattern> = {
+  working: 'confirmed',
+  attention: 'waiting',
+  offline: 'blocked',
+  neutral: 'notice',
+  info: 'notice',
+}
+
+const patternTone: Record<StatusPattern, Tone> = {
+  confirmed: 'working',
+  waiting: 'attention',
+  blocked: 'offline',
+  notice: 'neutral',
+}
+
+export const toneForPattern = (pattern: StatusPattern): Tone => patternTone[pattern]
+export const patternForTone = (tone: Tone): StatusPattern => tonePattern[tone]
+
+export type StatusChipProps = {
+  tone: Tone
+  /** Plain words from fe/words (the caller looks them up); never a code. */
+  label: string
+  /** The raw code, kept on data-status-code for tests and engineers; never shown. */
+  code?: string
+  /** Override the tone's icon; null hides it. */
+  icon?: IconName | null
+  /** Prefix for the spoken name, "Status: {label}". null speaks the label alone. */
+  labelPrefix?: string | null
+  size?: 'sm' | 'md'
+  className?: string
+}
+
+// Icon + text, one row, never truncated, no pulse, no hover title.
+export function StatusChip({ tone, label, code, icon, labelPrefix = 'Status', size = 'md', className }: StatusChipProps) {
+  const iconName = icon === undefined ? toneIcon[tone] : icon
   return (
-    <span className={`status-badge terminal-link-badge pattern-${pattern}`} data-pattern={pattern} aria-label={`Terminal link: ${humanizeStatus(link.state)}`} title={link.message || label}>
-      <Icon name={statusIcon[pattern]} />
+    <span
+      className={cx('ui-chip', `tone-${tone}`, size === 'sm' && 'ui-chip-sm', className)}
+      data-tone={tone}
+      data-pattern={tonePattern[tone]}
+      data-status-code={code || undefined}
+      aria-label={labelPrefix ? `${labelPrefix}: ${label}` : undefined}
+    >
+      {iconName && <Icon name={iconName} size="sm" />}
       <span>{label}</span>
     </span>
   )
 }
-
-export const showsTerminalLinkBadge = (link?: TerminalLink | null): link is TerminalLink =>
-  Boolean(link && !['CONNECTED', 'UNKNOWN'].includes(normalizedStatus(link.state).toUpperCase()))

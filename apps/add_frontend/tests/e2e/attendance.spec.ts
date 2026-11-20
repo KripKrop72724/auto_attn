@@ -80,7 +80,7 @@ test('manual force release remains clear, accessible and resumable', async ({ pa
   await expect(page.getByRole('button', { name: 'Force release 300 punches', exact: true })).toBeEnabled()
   await page.getByRole('button', { name: 'Force release 300 punches', exact: true }).click()
   const dialog = page.getByRole('dialog')
-  await expect(dialog.getByRole('button', { name: 'Close dialog' })).toBeFocused()
+  await expect(dialog.getByRole('button', { name: 'Close', exact: true })).toBeFocused()
   await page.keyboard.press('Tab')
   await expect(dialog.getByLabel('Reason for release')).toBeFocused()
   await dialog.getByLabel('Reason for release').fill('Current terminal identity checked')

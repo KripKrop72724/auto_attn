@@ -52,7 +52,7 @@ describe('State Life ADD interface · People', () => {
     expect(screen.getByText(/no zkt user, fingerprint template, uid, or attendance event is merged/i)).toBeTruthy()
     expect(screen.getByLabelText(/type “same employee”/i)).toBeTruthy()
     expect(screen.getByLabelText(/confirm administrator password/i)).toBeTruthy()
-    fireEvent.click(screen.getByRole('button', { name: /close dialog/i }))
+    fireEvent.click(screen.getByRole('button', { name: 'Close' }))
     fireEvent.click(screen.getByRole('tab', { name: /directory/i }))
     fireEvent.click(screen.getByRole('button', { name: /edit ayesha fatima/i }))
     expect(

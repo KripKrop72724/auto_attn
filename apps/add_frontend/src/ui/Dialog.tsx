@@ -1,49 +1,38 @@
-import { useEffect, useRef, type ReactNode, type RefObject } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, type ReactNode, type RefObject } from 'react'
 import { createPortal } from 'react-dom'
 import { Icon } from '../Icon'
+import { DiscardConfirm } from './DiscardConfirm'
+import { lockApplicationForModal, overlayRoot, playExitGhost } from './modalLock'
+import { useDismiss } from './useDismiss'
+import { useFocusTrap, type InitialFocus } from './useFocusTrap'
+import { useKeyboardInset } from './useKeyboardInset'
+import { UI_TEXT } from './uiText'
+import { cx } from './cx'
 
-let modalLockDepth = 0
-let lockedWorkspace: HTMLElement | null = null
-let lockedWorkspaceOverflow = ''
-let lockedWorkspaceScrollTop = 0
-let rootAriaHidden: string | null = null
-let rootWasInert = false
+export type DialogSize = 'sm' | 'md' | 'lg'
 
-function lockApplicationForModal() {
-  const root = document.getElementById('root')
-  if (modalLockDepth === 0) {
-    lockedWorkspace = document.querySelector<HTMLElement>('.app-workspace')
-    lockedWorkspaceOverflow = lockedWorkspace?.style.overflow || ''
-    lockedWorkspaceScrollTop = lockedWorkspace?.scrollTop || 0
-    if (lockedWorkspace) lockedWorkspace.style.overflow = 'hidden'
-    if (root) {
-      rootAriaHidden = root.getAttribute('aria-hidden')
-      rootWasInert = root.hasAttribute('inert')
-      root.setAttribute('aria-hidden', 'true')
-      root.setAttribute('inert', '')
-    }
-  }
-  modalLockDepth += 1
-  return () => {
-    modalLockDepth = Math.max(0, modalLockDepth - 1)
-    if (modalLockDepth > 0) return
-    if (lockedWorkspace) {
-      lockedWorkspace.style.overflow = lockedWorkspaceOverflow
-      lockedWorkspace.scrollTop = lockedWorkspaceScrollTop
-    }
-    if (root) {
-      if (rootAriaHidden === null) root.removeAttribute('aria-hidden')
-      else root.setAttribute('aria-hidden', rootAriaHidden)
-      if (!rootWasInert) root.removeAttribute('inert')
-    }
-    lockedWorkspace = null
-  }
+export type DialogProps = {
+  titleId: string
+  title: string
+  description?: string
+  onClose: () => void
+  children: ReactNode
+  className?: string
+  returnFocusRef?: RefObject<HTMLElement | null>
+  /** 440 / 640 / 840 px. Default md (today's width). */
+  size?: DialogSize
+  /** Default false: a click outside does nothing; Escape and Close still work. */
+  dismissOnBackdrop?: boolean
+  /** When true, Escape and Close ask "Discard your changes?" first. */
+  dirty?: boolean
+  /** Default 'close' (the header Close button), 'first-field', or a ref. */
+  initialFocus?: InitialFocus
 }
 
-// Open dialogs, innermost last: a dialog opened from another one (for example
-// an operator action inside the device drawer) owns Escape and the focus trap.
-const openDialogs: symbol[] = []
-
+// The one modal dialog. Portals into #overlay-root, makes #root inert and
+// hidden, locks the workspace scroll and puts it back, and lets only the
+// innermost layer handle Escape and Tab. It never adds an "Are you sure?" of
+// its own: the only question it asks is about losing typed text (`dirty`).
 export function Dialog({
   titleId,
   title,
@@ -52,83 +41,70 @@ export function Dialog({
   children,
   className = '',
   returnFocusRef,
-}: {
-  titleId: string
-  title: string
-  description?: string
-  onClose: () => void
-  children: ReactNode
-  className?: string
-  returnFocusRef?: RefObject<HTMLElement | null>
-}) {
-  const panel = useRef<HTMLDivElement>(null)
+  size = 'md',
+  dismissOnBackdrop = false,
+  dirty = false,
+  initialFocus = 'close',
+}: DialogProps) {
+  const backdropRef = useRef<HTMLDivElement>(null)
+  const panelRef = useRef<HTMLDivElement>(null)
+  const [confirming, setConfirming] = useState(false)
   const closeRef = useRef(onClose)
   closeRef.current = onClose
-  useEffect(() => {
-    const previous = document.activeElement as HTMLElement | null
-    const releaseModalLock = lockApplicationForModal()
-    const token = Symbol('dialog')
-    openDialogs.push(token)
-    const node = panel.current
-    const focusable = () =>
-      Array.from(
-        node?.querySelectorAll<HTMLElement>(
-          'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [href], [tabindex]:not([tabindex="-1"])',
-        ) || [],
-      )
-    const focusFrame = window.requestAnimationFrame(() => focusable()[0]?.focus())
-    const handle = (event: KeyboardEvent) => {
-      if (openDialogs[openDialogs.length - 1] !== token) return
-      if (event.key === 'Escape') {
-        event.preventDefault()
-        closeRef.current()
-      }
-      if (event.key === 'Tab') {
-        const items = focusable()
-        if (!items.length) return
-        const first = items[0]
-        const last = items[items.length - 1]
-        if (event.shiftKey && document.activeElement === first) {
-          event.preventDefault()
-          last.focus()
-        } else if (!event.shiftKey && document.activeElement === last) {
-          event.preventDefault()
-          first.focus()
-        }
-      }
-    }
-    document.addEventListener('keydown', handle)
-    return () => {
-      const position = openDialogs.indexOf(token)
-      if (position >= 0) openDialogs.splice(position, 1)
-      window.cancelAnimationFrame(focusFrame)
-      document.removeEventListener('keydown', handle)
-      releaseModalLock()
-      ;(returnFocusRef?.current || previous)?.focus()
-    }
-  }, [returnFocusRef])
+  const dirtyRef = useRef(dirty)
+  dirtyRef.current = dirty
+
+  const requestClose = useCallback(() => {
+    if (dirtyRef.current) setConfirming(true)
+    else closeRef.current()
+  }, [])
+  const isTop = useDismiss(() => {
+    if (confirming) setConfirming(false)
+    else requestClose()
+  })
+  useFocusTrap(panelRef, { initialFocus, returnFocusRef, isTop })
+  useKeyboardInset()
+  useEffect(() => lockApplicationForModal(), [])
+  useLayoutEffect(() => {
+    const backdrop = backdropRef.current
+    return () => playExitGhost(backdrop, '.dialog-panel', [
+      { opacity: 1, transform: 'translateY(0)' },
+      { opacity: 0, transform: 'translateY(8px)' },
+    ])
+  }, [])
+
   return createPortal(
-    <div className="dialog-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose() }}>
+    <div
+      ref={backdropRef}
+      className="dialog-backdrop"
+      role="presentation"
+      onMouseDown={(event) => {
+        if (event.target === event.currentTarget && dismissOnBackdrop && !dirtyRef.current) requestClose()
+      }}
+    >
       <div
-        ref={panel}
-        className={`dialog-panel ${className}`}
+        ref={panelRef}
+        className={cx('dialog-panel', `dialog-size-${size}`, className)}
         role="dialog"
         aria-modal="true"
         aria-labelledby={titleId}
         aria-describedby={description ? `${titleId}-description` : undefined}
       >
-        <header className="dialog-header">
-          <div>
-            <h2 id={titleId}>{title}</h2>
-            {description && <p id={`${titleId}-description`}>{description}</p>}
-          </div>
-          <button className="icon-button" type="button" onClick={onClose} aria-label="Close dialog">
-            <Icon name="x" />
-          </button>
-        </header>
-        {children}
+        <div className="ui-layer-content" inert={confirming || undefined}>
+          <header className="dialog-header">
+            <div>
+              <h2 id={titleId}>{title}</h2>
+              {description && <p id={`${titleId}-description`}>{description}</p>}
+            </div>
+            <button className="icon-button ui-icon-button" type="button" onClick={requestClose} aria-label={UI_TEXT.close}>
+              <Icon name="x" />
+            </button>
+          </header>
+          {children}
+        </div>
+        {confirming && <DiscardConfirm onKeep={() => setConfirming(false)} onDiscard={() => { setConfirming(false); closeRef.current() }} />}
       </div>
     </div>,
-    document.getElementById('overlay-root') || document.body,
+    overlayRoot(),
   )
 }

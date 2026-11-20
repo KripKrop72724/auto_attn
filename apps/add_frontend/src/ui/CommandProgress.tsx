@@ -1,7 +1,7 @@
 import { Icon } from '../Icon'
 import { humanizeStatus, normalizedStatus, statusPattern } from '../status'
 import type { Command } from '../types'
-import { statusIcon } from './StatusChip'
+import { statusIcon } from './StatusBadge'
 
 export function CommandProgress({
   command,

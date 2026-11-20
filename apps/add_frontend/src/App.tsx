@@ -11,7 +11,6 @@ import {
   useRef,
   useState,
 } from 'react'
-import { createPortal } from 'react-dom'
 import { createBrowserRouter, RouterProvider, useLocation, useNavigate, useNavigationType } from 'react-router-dom'
 import { api, ApiError, setCsrfToken } from './api'
 import { AppDataProvider, type AppData, type Revisions } from './AppData'
@@ -28,7 +27,7 @@ import { documentTitle, routeTable } from './routeTable'
 import type { DashboardRoute, Device, Overview } from './types'
 import { NewVersionNotice } from './ui/NewVersionNotice'
 import { PageErrorBoundary, RouteErrorBoundary } from './ui/PageError'
-import { useToast } from './ui/Toast'
+import { ToastProvider, useToast as useKitToast, type Toast } from './ui/Toast'
 
 // Moved modules, re-exported so the pages that import from '../App' keep working.
 export * from './lib/dashboardTypes'
@@ -39,10 +38,18 @@ export * from './ui/CommandProgress'
 export * from './ui/Dialog'
 export * from './ui/Metric'
 export * from './ui/PageHeader'
+export * from './ui/StatusBadge'
 export * from './ui/StatusChip'
 export * from './ui/Toast'
 export * from './words/health'
 export { statusPattern } from './status'
+
+// The feature files type their toast prop as ReturnType<typeof useToast> from
+// '../App', so this keeps the old return shape ({ toast, notice, error, dismiss })
+// and their test doubles still fit. Import useToast from './ui' for show()/Undo.
+export function useToast(): Toast {
+  return useKitToast()
+}
 
 // Realtime refresh bounds. Device events with a whole row update the list in
 // place; partial device events and command updates re-read it at most every
@@ -444,20 +451,7 @@ function DashboardApp() {
         </PageErrorBoundary>
       </AppShell>
       {drawer && <PageErrorBoundary key={drawer.connector_id}><Suspense fallback={null}><DeviceDrawer key={drawer.connector_id} seed={drawer} revision={deviceRevision(drawer.connector_id)} custodyRevision={deviceCustodyRevision(drawer.connector_id)} onClose={closeDevice} onManageUsers={manageUsers} onInventoryChanged={refreshFleet} toast={toast} /></Suspense></PageErrorBoundary>}
-      {toast.toast && <ToastBanner toast={toast} />}
     </AppDataProvider>
-  )
-}
-
-function ToastBanner({ toast }: { toast: ReturnType<typeof useToast> }) {
-  if (!toast.toast) return null
-  return createPortal(
-    <div className={`toast pattern-${toast.toast.kind === 'error' ? 'blocked' : 'confirmed'}`} role={toast.toast.kind === 'error' ? 'alert' : 'status'} aria-live={toast.toast.kind === 'error' ? 'assertive' : 'polite'}>
-      <Icon name={toast.toast.kind === 'error' ? 'alert' : 'check'} />
-      <span>{toast.toast.text}</span>
-      <button type="button" className="icon-button" onClick={toast.dismiss} aria-label="Dismiss notification"><Icon name="x" /></button>
-    </div>,
-    document.getElementById('overlay-root') || document.body,
   )
 }
 
@@ -478,5 +472,6 @@ export default function App() {
     element: <DashboardApp />,
     errorElement: <RouteErrorBoundary />,
   }]), [])
-  return <RouterProvider router={router} />
+  // ToastProvider shows messages in #overlay-root for the whole app (FND-6).
+  return <ToastProvider><RouterProvider router={router} /></ToastProvider>
 }

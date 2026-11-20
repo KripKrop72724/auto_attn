@@ -75,7 +75,7 @@ test('primary routes and device deep link remain usable', async ({ page }, testI
   const bounds = await custody.evaluate(element => ({ width: element.clientWidth, scroll: element.scrollWidth }))
   expect(bounds.scroll).toBeLessThanOrEqual(bounds.width + 1)
   if (process.env.ADD_VISUAL_QA === '1') await custody.screenshot({ path: testInfo.outputPath('custody-panel.png') })
-  await page.getByRole('button', { name: 'Close dialog' }).click()
+  await page.getByRole('button', { name: 'Close', exact: true }).click()
 
   const primaryNav = page.getByRole('navigation', { name: 'Primary navigation' })
   await primaryNav.getByRole('button', { name: 'Users', exact: true }).click()
@@ -225,7 +225,7 @@ test('reported viewport thresholds, route scroll reset, and collision layers rem
   expect(overlayOrder.dialogInsideOverlay).toBe(true)
   expect(overlayOrder.overlayZ).toBeGreaterThan(overlayOrder.highestStickyZ)
   await expect(page.locator('#root')).toHaveAttribute('inert', '')
-  await page.getByRole('button', { name: 'Close dialog' }).click()
+  await page.getByRole('button', { name: 'Close', exact: true }).click()
 })
 
 test('old addresses and bookmarks open the new pages with their filters kept', async ({ page }) => {

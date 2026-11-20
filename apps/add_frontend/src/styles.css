@@ -1,5 +1,7 @@
 /* State Life ADD design foundation: tokens, base elements, application shell, shared components.
-   Feature stylesheets consume these tokens; the legacy names at the end of :root keep them in step. */
+   Feature stylesheets consume these tokens; the legacy names at the end of :root keep them in step.
+   The component kit (src/ui) styles live in ui/ui.css, pulled into this entry stylesheet here. */
+@import './ui/ui.css';
 
 :root {
   color-scheme: light;
@@ -38,6 +40,78 @@
   --critical-solid: #f04438;
   --neutral-solid: #98a2b3;
 
+  /* New neutrals (replace repeated literals). */
+  --border-hover: #a9b2bf;
+  --border-hover-strong: #b3bcc8;
+  --critical-hover: #912018;
+  --overlay: rgba(16, 24, 40, .42);
+
+  /* Status tones: one meaning each, always shown with words and an icon, never colour alone. */
+  --tone-working-fg: var(--positive);
+  --tone-working-bg: var(--positive-subtle);
+  --tone-working-border: var(--positive-border);
+  --tone-working-solid: var(--positive-solid);
+  --tone-attention-fg: var(--warning);
+  --tone-attention-bg: var(--warning-subtle);
+  --tone-attention-border: var(--warning-border);
+  --tone-attention-solid: var(--warning-solid);
+  --tone-offline-fg: var(--critical);
+  --tone-offline-bg: var(--critical-subtle);
+  --tone-offline-border: var(--critical-border);
+  --tone-offline-solid: var(--critical-solid);
+  --tone-neutral-fg: var(--text-secondary);
+  --tone-neutral-bg: var(--surface-sunken);
+  --tone-neutral-border: var(--border);
+  --tone-neutral-solid: var(--neutral-solid);
+  --tone-info-fg: var(--accent);
+  --tone-info-bg: var(--accent-subtle);
+  --tone-info-border: var(--accent-border);
+  --tone-info-solid: var(--brand);
+
+  /* Division (owner decision D-11): Life indigo, Health violet; always shown with the word. */
+  --life-fg: #3538cd;
+  --life-bg: #eef4ff;
+  --life-border: #c7d7fe;
+  --health-fg: #6927da;
+  --health-bg: #f5f3ff;
+  --health-border: #ddd6fe;
+
+  /* Code and technical boxes. */
+  --code-bg: #0b1220;
+  --code-fg: #e5e7eb;
+  --code-muted: #8b95a7;
+  --code-accent: #7cc8ef;
+  --code-warn: #fdb022;
+  --code-error: #f97066;
+  --tech-bg: var(--surface-sunken);
+  --tech-fg: var(--text);
+
+  --skeleton-base: var(--surface-sunken);
+  --skeleton-shine: #f9fafb;
+
+  /* Type scale: nothing under 12 px; weights 400 / 500 / 600 only. */
+  --text-xs: 12px;
+  --text-sm: 13px;
+  --text-md: 14px;
+  --text-lg: 16px;
+  --text-xl: 18px;
+  --text-2xl: 22px;
+  --text-3xl: 26px;
+  --leading-tight: 1.3;
+  --leading-body: 1.5;
+  --tracking-heading: -.01em;
+  --tracking-eyebrow: .06em;
+
+  /* Spacing, 4-pt steps. */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-8: 32px;
+  --space-10: 40px;
+
   --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI Variable Text", "Segoe UI", Inter, Roboto, "Helvetica Neue", Arial, sans-serif;
   --font-mono: ui-monospace, "SF Mono", SFMono-Regular, "Cascadia Mono", "Segoe UI Mono", Menlo, Consolas, monospace;
 
@@ -47,32 +121,51 @@
   --radius-lg: 12px;
   --radius-xl: 16px;
   --radius-full: 999px;
+  --radius-sheet: 20px;
 
   --shadow-xs: 0 1px 2px rgba(16, 24, 40, .05);
   --shadow-sm: 0 1px 3px rgba(16, 24, 40, .07), 0 1px 2px rgba(16, 24, 40, .04);
   --shadow-md: 0 12px 16px -4px rgba(16, 24, 40, .09), 0 4px 6px -2px rgba(16, 24, 40, .04);
   --shadow-lg: 0 20px 24px -4px rgba(16, 24, 40, .1), 0 8px 8px -4px rgba(16, 24, 40, .04);
   --shadow-xl: 0 24px 48px -12px rgba(16, 24, 40, .2);
+  --shadow-up: 0 -6px 16px rgba(16, 24, 40, .06);
   --focus-ring: 0 0 0 3px rgba(0, 148, 218, .22);
   --chevron-right: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23667085' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m9 18 6-6-6-6'/%3E%3C/svg%3E");
 
   --control-height: 40px;
   --control-height-sm: 32px;
+  --touch-min: 44px;
+  --icon-sm: 16px;
+  --icon-md: 20px;
+  --icon-lg: 24px;
+  --keyboard-inset: 0px;
 
-  --motion-control: 120ms;
+  /* Motion: every content animation is finite; one reduced-motion block below turns it all off. */
+  --motion-fade: 120ms;
   --motion-content: 180ms;
-  --motion-surface: 240ms;
-  --ease-corporate: cubic-bezier(.2, .8, .2, 1);
+  --motion-sheet: 200ms;
+  --motion-panel: 250ms;
+  --motion-exit: 150ms;
+  --motion-highlight: 1200ms;
+  --ease-out: cubic-bezier(.2, .8, .2, 1);
+  --ease-exit: cubic-bezier(.4, 0, 1, 1);
+  --motion-control: var(--motion-fade);
+  --motion-surface: var(--motion-panel);
+  --ease-corporate: var(--ease-out);
 
   --app-header-height: 56px;
   --app-sidebar-width: 240px;
   --app-sidebar-compact-width: 68px;
+  --app-rail-width: 84px;
   --app-bottom-nav-height: 64px;
   --app-content-max: 1440px;
   --app-gutter: clamp(16px, 3vw, 40px);
+  /* Layers. */
+  --z-sticky: 20;
   --z-app-header: 35;
   --z-app-sidebar: 45;
   --z-popover: 76;
+  --z-sheet: 90;
   --z-modal: 100;
   --z-toast: 120;
 
@@ -87,7 +180,9 @@
   -moz-osx-font-smoothing: grayscale;
 }
 
-@media (pointer: coarse) {
+/* Breakpoints (media queries cannot read variables): small phone <=520 px, phone <=760 px,
+   tablet 761-1023 px (labelled rail), desktop >=1024 px (full sidebar), wide content grids >=1200 px. */
+@media (pointer: coarse), (max-width: 760px) {
   :root { --control-height: 44px; --control-height-sm: 40px; }
 }
 
@@ -100,10 +195,10 @@ button, a, input, select, textarea, summary { -webkit-tap-highlight-color: trans
 button { cursor: pointer; }
 button:disabled { cursor: not-allowed; }
 :focus-visible { outline: 2px solid var(--brand); outline-offset: 2px; }
-svg { width: 20px; height: 20px; flex-shrink: 0; }
+svg { flex-shrink: 0; }
 h1, h2, h3, h4, p { margin-top: 0; }
-h1, h2, h3, h4 { color: var(--text); font-weight: 600; line-height: 1.3; letter-spacing: -.01em; }
-strong, b { color: var(--text); font-weight: 600; }
+h1, h2, h3, h4 { color: var(--text); font-weight: 600; line-height: var(--leading-tight); letter-spacing: var(--tracking-heading); }
+strong, b { font-weight: 600; }
 small { font-size: 12px; line-height: 1.45; }
 code, pre, kbd, samp { font-family: var(--font-mono); font-size: .92em; }
 a { color: var(--accent); text-decoration: none; text-underline-offset: 2px; }
@@ -160,7 +255,7 @@ details > summary { cursor: pointer; }
   text-overflow: ellipsis;
 }
 :where(textarea) { min-height: 88px; padding: 9px 12px; line-height: 1.5; resize: vertical; }
-:where(input, select, textarea):hover:not(:disabled) { border-color: #a9b2bf; }
+:where(input, select, textarea):hover:not(:disabled) { border-color: var(--border-hover); }
 :where(input, select, textarea):focus { border-color: var(--brand); outline: none; box-shadow: var(--focus-ring); }
 :where(input, select, textarea):disabled { color: var(--text-disabled); background-color: var(--surface-sunken); box-shadow: none; cursor: not-allowed; }
 :where(input, select, textarea)[aria-invalid="true"] { border-color: var(--critical); }
@@ -216,10 +311,10 @@ details > summary { cursor: pointer; }
 .button.primary:hover:not(:disabled) { border-color: var(--accent-hover); background: var(--accent-hover); }
 .button.primary strong, .button.destructive strong { color: inherit; }
 .button.secondary { color: var(--text); border-color: var(--border-strong); background: var(--surface); box-shadow: var(--shadow-xs); }
-.button.secondary:hover:not(:disabled) { border-color: #b3bcc8; background: var(--surface-hover); }
+.button.secondary:hover:not(:disabled) { border-color: var(--border-hover-strong); background: var(--surface-hover); }
 .button.secondary[aria-expanded="true"] { border-color: var(--accent-border); color: var(--accent); background: var(--accent-subtle); }
 .button.destructive { color: #fff; border-color: var(--critical); background: var(--critical); box-shadow: var(--shadow-xs); }
-.button.destructive:hover:not(:disabled) { border-color: #912018; background: #912018; }
+.button.destructive:hover:not(:disabled) { border-color: var(--critical-hover); background: var(--critical-hover); }
 .button.destructive-outline { color: var(--critical); border-color: var(--critical-border); background: var(--surface); box-shadow: var(--shadow-xs); }
 .button.destructive-outline:hover:not(:disabled) { border-color: var(--critical); background: var(--critical-subtle); }
 .button:disabled, .button[aria-disabled="true"] { color: var(--text-disabled); border-color: var(--border); background: var(--surface-sunken); box-shadow: none; }
@@ -667,7 +762,7 @@ details > summary { cursor: pointer; }
   place-items: center;
   padding: max(24px, env(safe-area-inset-top)) max(24px, env(safe-area-inset-right)) max(24px, env(safe-area-inset-bottom)) max(24px, env(safe-area-inset-left));
   overflow: hidden;
-  background: rgba(16, 24, 40, .42);
+  background: var(--overlay);
   animation: backdrop-enter var(--motion-content) var(--ease-corporate) both;
 }
 .dialog-panel {
@@ -826,7 +921,7 @@ dd { margin: 3px 0 0; overflow-wrap: anywhere; font-size: 13px; font-weight: 500
 .toast > button svg { width: 16px; height: 16px; }
 @keyframes toast-enter { from { opacity: 0; transform: translateY(8px); } }
 
-.mobile-more-backdrop { position: fixed; inset: 0; z-index: var(--z-modal); display: none; align-items: flex-end; background: rgba(16, 24, 40, .42); animation: backdrop-enter var(--motion-content) var(--ease-corporate) both; }
+.mobile-more-backdrop { position: fixed; inset: 0; z-index: var(--z-modal); display: none; align-items: flex-end; background: var(--overlay); animation: backdrop-enter var(--motion-content) var(--ease-corporate) both; }
 .mobile-more-sheet { width: 100%; padding: 8px max(16px, env(safe-area-inset-right)) calc(16px + env(safe-area-inset-bottom)) max(16px, env(safe-area-inset-left)); border-radius: 20px 20px 0 0; background: var(--surface); box-shadow: var(--shadow-xl); animation: sheet-enter var(--motion-surface) var(--ease-corporate) both; }
 .mobile-more-sheet::before { content: ""; width: 36px; height: 4px; display: block; margin: 0 auto 12px; border-radius: 2px; background: var(--border-strong); }
 .mobile-more-sheet header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 4px; }
@@ -996,6 +1091,11 @@ dd { margin: 3px 0 0; overflow-wrap: anywhere; font-size: 13px; font-weight: 500
   .login-card { padding: 24px 20px; border-radius: var(--radius-lg); }
 }
 
+/* Phones: 16 px fields so iOS never zooms into them. */
+@media (max-width: 760px) {
+  :where(input:not([type="checkbox"], [type="radio"], [type="range"], [type="file"], [type="color"])), :where(select), :where(textarea) { font-size: var(--text-lg); }
+}
+
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: .001ms !important; animation-iteration-count: 1 !important; transition-duration: .001ms !important; scroll-behavior: auto !important; }
 }
@@ -1004,5 +1104,8 @@ dd { margin: 3px 0 0; overflow-wrap: anywhere; font-size: 13px; font-weight: 500
   .status-badge, .alert-card, .device-card, .metric-card, .panel, .detail-card, .control-card, .pattern-blocked, .pattern-waiting, .pattern-confirmed { border: 2px solid CanvasText !important; }
   .live-sync i, .alert-card > .alert-icon { forced-color-adjust: none; }
   .section-tabs button.active, .section-tabs button[aria-selected="true"], .tabs button.active { border-bottom-color: Highlight; }
+  .ui-chip, .ui-division-tag, .ui-badge, .ui-card, .ui-stat-tile, .ui-callout, .ui-filter-chip, .ui-toast { border: 1px solid CanvasText !important; }
+  .ui-division-tag::before, .ui-chip-dot, .ui-steps-marker { forced-color-adjust: none; }
+  .ui-tab[aria-selected="true"], .ui-segment[aria-checked="true"], .ui-filter-chip[aria-pressed="true"] { outline: 2px solid Highlight; }
 }
 
