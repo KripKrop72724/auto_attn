@@ -2,17 +2,22 @@ import { useEffect, useRef, useState, type ReactNode, type RefObject } from 'rea
 import { Icon } from './Icon'
 import type { DashboardRoute } from './types'
 import type { RealtimeState } from './realtime'
+import { clock } from './lib/time'
 
 const navigation = [
-  { id: 'fleet', label: 'Fleet', icon: 'grid', description: 'Live device health across the national fleet' },
-  { id: 'users', label: 'Users', icon: 'users', description: 'Terminal identities for one selected device' },
+  { id: 'home', label: 'Fleet', icon: 'grid', description: 'Live device health across the national fleet' },
+  { id: 'people', label: 'Users', icon: 'users', description: 'Terminal identities for one selected device' },
   { id: 'attendance', label: 'Attendance', icon: 'clock', description: 'Punches, Oracle delivery, and release reviews' },
-  { id: 'reconciliation', label: 'Reconciliation', icon: 'refresh', description: 'Terminal history, recovery, and source evidence' },
-  { id: 'firmware', label: 'Firmware', icon: 'terminal', description: 'Signed releases, device preparation, and campaigns' },
-  { id: 'alerts', label: 'Alerts', icon: 'alert', description: 'Open device conditions and their history' },
+  { id: 'recover', label: 'Reconciliation', icon: 'refresh', description: 'Terminal history, recovery, and source evidence' },
+  { id: 'updates', label: 'Firmware', icon: 'terminal', description: 'Signed releases, device preparation, and campaigns' },
+  { id: 'problems', label: 'Alerts', icon: 'alert', description: 'Open device conditions and their history' },
 ] as const
 
-const mobilePrimary = new Set<DashboardRoute>(['fleet', 'users', 'attendance', 'alerts'])
+const mobilePrimary = new Set<DashboardRoute>(['home', 'people', 'attendance', 'problems'])
+
+// Pages without their own menu item yet light up the item they belong to. The
+// app frame rebuild (FND-9) gives every page its own item.
+const menuItemFor: Partial<Record<DashboardRoute, DashboardRoute>> = { devices: 'home', setup: 'updates' }
 
 const connectionLabels: Record<RealtimeState, string> = {
   connecting: 'Connecting',
@@ -20,8 +25,6 @@ const connectionLabels: Record<RealtimeState, string> = {
   reconnecting: 'Reconnecting',
   stale: 'Cached data',
 }
-
-const pktTime = (value: Date) => value.toLocaleTimeString('en-PK', { timeZone: 'Asia/Karachi', hour: 'numeric', minute: '2-digit', second: '2-digit' })
 
 export function operatorInitials(name: string) {
   const words = name.replace(/([a-z])([A-Z])/g, '$1 $2').split(/[\s._@-]+/).filter(Boolean)
@@ -33,7 +36,7 @@ export function operatorInitials(name: string) {
 export function AppShell({
   children,
   username,
-  route,
+  route: currentRoute,
   openAlertCount,
   onNavigate,
   onLogout,
@@ -44,13 +47,15 @@ export function AppShell({
   children: ReactNode
   username: string
   route: DashboardRoute
-  openAlertCount: number
+  /** Null until the first overview: the badge stays hidden instead of showing 0. */
+  openAlertCount: number | null
   onNavigate: (route: DashboardRoute) => void
   onLogout: () => void
   realtimeState: RealtimeState
   lastSyncAt: Date | null
   workspaceRef: RefObject<HTMLElement | null>
 }) {
+  const route = menuItemFor[currentRoute] || currentRoute
   const [moreOpen, setMoreOpen] = useState(false)
   const [scrolled, setScrolled] = useState(false)
   const moreTriggerRef = useRef<HTMLButtonElement>(null)
@@ -97,16 +102,16 @@ export function AppShell({
   const connectionLabel = connectionLabels[realtimeState]
   const current = navigation.find((item) => item.id === route) || navigation[0]
   const secondaryActive = !mobilePrimary.has(route)
-  const syncDetail = lastSyncAt ? `Last stream activity ${pktTime(lastSyncAt)} PKT. Each panel shows its own evidence age.` : 'Connecting to live operations'
+  const syncDetail = lastSyncAt ? `Last stream activity ${clock(lastSyncAt)} PKT. Each panel shows its own evidence age.` : 'Connecting to live operations'
   return (
     <div className="app-shell">
       <aside className="app-sidebar">
         <a
           className="app-brand"
-          href="/fleet"
+          href="/home"
           onClick={(event) => {
             event.preventDefault()
-            onNavigate('fleet')
+            onNavigate('home')
           }}
         >
           <img src="/state-life-logo.png" alt="State Life Insurance Corporation" />
@@ -123,7 +128,7 @@ export function AppShell({
             >
               <Icon name={item.icon} />
               <span>{item.label}</span>
-              {item.id === 'alerts' && openAlertCount > 0 && (
+              {item.id === 'problems' && openAlertCount !== null && openAlertCount > 0 && (
                 <span className="nav-count" aria-label={`${openAlertCount} alert${openAlertCount === 1 ? '' : 's'} need${openAlertCount === 1 ? 's' : ''} action`}>{openAlertCount > 99 ? '99+' : openAlertCount}</span>
               )}
             </button>

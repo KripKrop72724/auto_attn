@@ -508,7 +508,7 @@ const selectUserTerminal = async () => {
 
 describe('State Life ADD interface', () => {
   beforeEach(() => {
-    window.history.replaceState({}, '', '/fleet')
+    window.history.replaceState({}, '', '/home')
     vi.stubGlobal('EventSource', EventSourceStub)
     vi.stubGlobal('fetch', fetchStub())
   })
@@ -568,7 +568,8 @@ describe('State Life ADD interface', () => {
     fireEvent.click(screen.getByRole('button', { name: 'List' }))
     expect(await screen.findByRole('button', { name: `Inspect ${device.display_name}` })).toBeTruthy()
     expect(screen.queryByRole('region', { name: 'Pakistan device network map' })).toBeNull()
-    expect(window.localStorage.length).toBe(0)
+    // The browser keeps at most one key, add.prefs, and only after a change (D-25).
+    expect(Object.keys(window.localStorage).every((key) => key === 'add.prefs')).toBe(true)
     expect(window.sessionStorage.length).toBe(0)
   })
 
@@ -1223,7 +1224,7 @@ describe('realtime refresh budget', () => {
     // A request still in flight from an earlier test must not satisfy this one.
     queryClient.clear()
     vi.useFakeTimers({ shouldAdvanceTime: true })
-    window.history.replaceState({}, '', '/fleet')
+    window.history.replaceState({}, '', '/home')
     vi.stubGlobal('EventSource', CapturingEventSource)
   })
 
@@ -1234,7 +1235,7 @@ describe('realtime refresh budget', () => {
     CapturingEventSource.latest = null
   })
 
-  it('refreshes devices on device events at most every 3 s and never refetches the overview for punches', async () => {
+  it('refreshes devices on device events at most every 5 s and never refetches the overview for punches', async () => {
     const fetchMock = fetchStub()
     vi.stubGlobal('fetch', fetchMock)
     render(<App />)
@@ -1262,16 +1263,16 @@ describe('realtime refresh budget', () => {
       await vi.advanceTimersByTimeAsync(150)
     }
     expect(calls(fetchMock, '/api/v1/devices')).toBe(2)
-    await vi.advanceTimersByTimeAsync(3000)
+    await vi.advanceTimersByTimeAsync(5000)
     await waitFor(() => expect(calls(fetchMock, '/api/v1/devices')).toBe(3))
-    await vi.advanceTimersByTimeAsync(6000)
+    await vi.advanceTimersByTimeAsync(10_000)
     expect(calls(fetchMock, '/api/v1/devices')).toBe(3)
     expect(calls(fetchMock, '/api/v1/overview')).toBe(1)
     // The list never falls back to its loading state during a background refresh.
     expect(screen.queryByText(/loading live fleet/i)).toBeNull()
   })
 
-  it('refreshes the overview for alerts at most every 15 s on the Fleet page', async () => {
+  it('refreshes the overview for alerts at most every 15 s on the Home page', async () => {
     const fetchMock = fetchStub()
     vi.stubGlobal('fetch', fetchMock)
     render(<App />)

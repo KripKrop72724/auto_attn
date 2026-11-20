@@ -1902,7 +1902,7 @@ export default function FirmwareProvisioning({
                 {current.state === 'VERIFIED_ONLINE' && (
                   <a
                     className="button primary"
-                    href={`/fleet/${current.result.connector_id || ''}`}
+                    href={`/devices/${current.result.connector_id || ''}`}
                   >
                     View device
                   </a>

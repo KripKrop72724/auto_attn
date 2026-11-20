@@ -253,7 +253,9 @@ export function AlertsView({ devices, toast, revision }: { devices: Device[]; to
         {error && <div className="panel message pattern-blocked operational-error" role="alert"><Icon name="alert" /><span>{error}</span><button className="button secondary" onClick={() => void load()}>Retry queue</button></div>}
         {loading && !rows.length && <div className="panel empty-state is-loading" role="status"><Icon name="refresh" /><h2>Loading alerts…</h2></div>}
         {rows.map((row) => {
-          const inspectorPath = typeof row.details.inspector_path === 'string' && /^\/reconciliation\?tab=source-exceptions&device_id=[A-Za-z0-9-]{1,100}$/.test(row.details.inspector_path) ? row.details.inspector_path : null
+          // Stored alerts name the old address; link straight to Recover attendance › Unreadable records.
+          const inspectorMatch = typeof row.details.inspector_path === 'string' ? /^\/(?:reconciliation\?tab=source-exceptions|recover\?tab=unreadable)&device_id=([A-Za-z0-9-]{1,100})$/.exec(row.details.inspector_path) : null
+          const inspectorPath = inspectorMatch ? `/recover?tab=unreadable&device_id=${inspectorMatch[1]}` : null
           return <AlertCard key={`${row.device.connector_id}-${row.id}`} alert={row} device={row.device} busy={actionBusy} onAcknowledge={(item) => void acknowledge(item)} onResolve={() => setResolving(row)}>
             {inspectorPath && <a className="button primary" href={inspectorPath}><Icon name="search" /> Inspect source rows</a>}
           </AlertCard>
