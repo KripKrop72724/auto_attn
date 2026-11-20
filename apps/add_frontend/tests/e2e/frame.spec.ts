@@ -92,12 +92,12 @@ test('primary routes and device deep link remain usable', async ({ page }, testI
     await moreTrigger.click()
     const moreNavigation = page.getByRole('dialog', { name: 'More operations' })
     await moreNavigation.getByRole('button', { name: /Reconciliation/ }).click()
-    await expect(page.getByRole('heading', { name: 'Reconciliation', exact: true, level: 1 })).toBeVisible()
+    await expect(page.getByRole('heading', { name: 'Recover attendance', exact: true, level: 1 })).toBeVisible()
     await page.getByRole('button', { name: 'More', exact: true }).click()
     await page.getByRole('dialog', { name: 'More operations' }).getByRole('button', { name: /Firmware/ }).click()
   } else {
     await primaryNav.getByRole('button', { name: 'Reconciliation', exact: true }).click()
-    await expect(page.getByRole('heading', { name: 'Reconciliation', exact: true, level: 1 })).toBeVisible()
+    await expect(page.getByRole('heading', { name: 'Recover attendance', exact: true, level: 1 })).toBeVisible()
     await primaryNav.getByRole('button', { name: 'Firmware', exact: true }).click()
   }
   await expect(page.getByRole('heading', { name: 'Firmware', exact: true, level: 1 })).toBeVisible()
