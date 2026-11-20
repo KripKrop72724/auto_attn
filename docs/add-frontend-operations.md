@@ -1,25 +1,35 @@
 # ADD frontend operations
 
-The Attendance Device Dashboard is the single administrator interface for the national ADD fleet. Fleet inventory is the home workspace; Users, Attendance, Reconciliation, Firmware, and Alerts preserve the same safety and audit boundaries on desktop and mobile.
+The Attendance Device Dashboard is the single administrator interface for State Life's attendance devices. **Home** is the first page; **Devices**, **Attendance**, **Problems** and **People** are the everyday pages, and **Advanced tools** holds **Recover attendance**, **Software updates**, **Set up a device** and **Settings**. Old addresses (`/fleet`, `/users`, `/alerts`, `/reconciliation`, `/firmware`) redirect to the new pages with their filters kept. The same safety and audit boundaries apply on desktop and mobile.
 
 ## Navigation and live state
 
-Desktop keeps the permanent State Life navigation rail. Mobile presents Fleet, Users, Attendance, and Alerts in the primary bottom navigation; Reconciliation and Firmware remain available from **More**. Device details open as a full-screen mobile sheet.
+From 1024 px the menu is a sidebar with the five everyday pages, an "Advanced tools" group and, at the bottom, "All times are Pakistan time" and a link to the public status page. Between 761 and 1023 px it is a labelled rail (icon over the name). On phones (760 px and less) the bottom bar is **Home · Devices · Attendance · Problems · More**; **More** opens a sheet with People, the Advanced tools, Settings, who is signed in, Sign out and "Show technical details". "Set up a device" shows a grey "Switched off" tag while provisioning is switched off. The Problems item shows how many problems nobody has looked at yet.
 
-The header reports one of four realtime states:
+The header is opaque. On the left is the **All · Life · Health** switch (on phones a full-width row at the top of the page); the choice is kept in the page address (`?division=life`) and, once changed, in the one browser key `add.prefs`. When Life or Health is chosen, "Showing Life only · Show all" sits above the page title. On the right are the Live indicator and the account menu (Settings, the public status page, "Show technical details", Sign out).
 
-- **Connecting**: the browser is establishing the authenticated SSE stream.
-- **Live sync**: named events are being received and the last successful synchronization is current.
-- **Reconnecting**: cached data remains visible while the browser reconnects.
-- **Cached data**: the stream has been unavailable for more than 30 seconds. Affected summaries are refreshed every 30 seconds until a complete resynchronization succeeds.
+The Live indicator says in words whether the page is live:
 
-Attendance, alerts, users, commands, reconciliation, identity, logs, firmware, backend errors, and device events invalidate only their affected views. Event bursts are coalesced to prevent duplicate requests.
+- **Connecting…**: the browser is opening the live stream.
+- **Live**: changes show up as they happen.
+- **Reconnecting…**: the last data stays on screen while the browser reconnects.
+- **Offline · showing last saved data** (phone: **Offline**): the stream has been down for 30 seconds or a background refresh failed after its retries. A slim banner under the header says since when and offers **Try now**. Background failures never pop up a message.
+
+Attendance, problems, people, requests, recoveries, logs, software updates and device events refresh only the views they affect. Event bursts are coalesced to prevent duplicate requests. Motion is short (fades of 120 ms, sheets 200 ms, panels 250 ms maximum) and off under reduced motion.
 
 ## Workspace behavior
 
-### Fleet
+### Home
 
-Fleet is the operational home and authoritative inventory. Status includes text, icon, and border pattern. Last-contact time and connectivity reasons remain visible in the device inspector. A pending command can be cancelled through the real command-cancellation endpoint before execution.
+Four numbers (Devices, Working, Needs attention, Offline) counted from the same device rows the Devices list shows; then a Life panel and a Health panel that list only the devices that are not working, worst first, with the reason and since when; today's attendance per division (received, sent to the HR system, waiting, not matched to an employee) with the automatic-sending line; the newest problems nobody has looked at; spare devices and temporary admin access. The map is gone. A device whose machine is not responding counts as Offline, as on the public status page.
+
+### Devices
+
+Every device, the ones that need attention first, then by name with numbers in order. Filters: status, city, machine brand, spare devices, software version and one search box for name, city, code or serial. Every filter is in the page address, so a filtered view can be shared; opening a device and closing it brings the same filtered list back. Codes, MAC, IP and serial are in the device's "Technical details".
+
+### Settings
+
+"Show technical details" (opens every Technical details box), check-in phone messages (the settings dialog and its password step are unchanged), contact IT, and **Use the old screens for now** (`/classic/`).
 
 ### Users
 
@@ -31,21 +41,21 @@ The preferred enrollment path is a ten-minute administrator lease. Permanent ele
 
 All visible and entered times are Pakistan Standard Time (`Asia/Karachi`). Browser `datetime-local` values are converted from PKT to UTC before requests, so **Today** produces identical bounds in every browser timezone. CNIC queries run only with exactly 13 digits. Searches debounce, abort superseded requests, retain prior rows during refresh, paginate, and distinguish failure from a genuine empty result.
 
-### Reconciliation
+### Recover attendance
 
 Preflight belongs strictly to the currently selected connector and is cleared before every device switch. Complete scans remain resumable and immutable. Protected raw evidence automatically hides after 60 seconds, when the page is backgrounded, or when its drawer closes.
 
-### Firmware
+### Software updates
 
 Campaign creation requires `POST /api/v1/firmware/campaigns/preflight`. The response lists exact eligible and excluded devices, exclusion reasons, offline count, expiration, and a signed five-minute scope token. Campaign creation sends that token plus a fresh idempotency key; changed or expired scope must be previewed again. Releases can be revoked from the protected release inventory with a reason and password.
 
-### Alerts
+### Problems
 
 Alerts use the global cursor-paginated `GET /api/v1/alerts` queue. Filters are server-authoritative, severity ordering is explicit, safe device identity is embedded, and a request failure never renders as “No alerts.” Device names link to the exact Fleet inspector; source exceptions link to their immutable evidence view.
 
 ## Motion and accessibility
 
-Corporate motion uses 120 ms control feedback, 180 ms content transitions, and a 240 ms maximum for dialogs, drawers, and sheets. Motion never delays data or critical actions. `prefers-reduced-motion` removes spatial movement, and forced-colors mode retains explicit boundaries. Keyboard focus, dialog semantics, 44 px touch targets, safe-area padding, screen-reader live regions, and status redundancy are required release checks.
+Motion uses 120 ms fades, 200 ms sheets and a 250 ms maximum for panels and dialogs. Motion never delays data or critical actions. `prefers-reduced-motion` removes spatial movement, and forced-colors mode retains explicit boundaries. Keyboard focus, dialog semantics, 44 px touch targets, safe-area padding, screen-reader live regions, and status redundancy are required release checks.
 
 ## Release and rollback
 

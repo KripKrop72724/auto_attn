@@ -1,92 +1,70 @@
-// The device list and map.
-import { expect, test, device, mockDashboard, nationwideDevices } from './fixtures'
+// Home and the Devices list (03-home-devices): Life and Health, tiles that
+// equal the list, filters in the address, phone cards that never cut a name.
+import AxeBuilder from '@axe-core/playwright'
+import { expect, test, mockDashboard, nationwideDevices } from './fixtures'
+import { reportPlainWords } from './plainWords'
 
-test.beforeEach(async ({ page }) => mockDashboard(page))
-
-test('nationwide fleet keeps clustered city beacons stable and location details contextual', async ({ page }, testInfo) => {
+test.beforeEach(async ({ page }) => {
+  await mockDashboard(page)
   await page.route('**/api/v1/devices*', (route) => route.fulfill({
     status: 200,
     contentType: 'application/json',
     body: JSON.stringify({ rows: nationwideDevices }),
   }))
-  await page.route('**/api/v1/overview*', (route) => route.fulfill({
-    status: 200,
-    contentType: 'application/json',
-    body: JSON.stringify({ total: 11, online: 10, offline: 0, degraded: 1, flapping: 0, quarantined_duplicate_serial: 0, open_alerts: 1, active_leases: 0, ords_delivery: { backlog: 0, retrying: 0, blocked_identity: 0, quarantined: 0 } }),
-  }))
+})
 
+test('Home splits Life and Health and Devices filters by the page address', async ({ page }, testInfo) => {
   await page.goto('/home')
-  await expect(page.getByRole('heading', { name: 'Fleet', exact: true, level: 1 })).toBeVisible()
-  const markers = page.locator('.fleet-map-marker')
-  await expect(markers).toHaveCount(7, { timeout: 10_000 })
-  const projectedCoordinates = await markers.evaluateAll((nodes) => Object.fromEntries(nodes.map((node) => {
-    const location = Array.from(node.classList).find((name) => name.startsWith('location-'))?.replace('location-', '') || ''
-    const style = (node as HTMLElement).style
-    return [location, {
-      x: Number.parseFloat(style.getPropertyValue('--marker-x')),
-      y: Number.parseFloat(style.getPropertyValue('--marker-y')),
-    }]
-  })))
-  const expectedCoordinates = {
-    swat: { x: 69.21, y: 20.98 },
-    peshawar: { x: 64.50, y: 25.91 },
-    islamabad: { x: 73.09, y: 28.07 },
-    faisalabad: { x: 73.58, y: 42.65 },
-    quetta: { x: 38.85, y: 50.95 },
-    multan: { x: 64.50, y: 51.09 },
-    karachi: { x: 39.00, y: 85.67 },
-  }
-  for (const [location, expected] of Object.entries(expectedCoordinates)) {
-    expect(projectedCoordinates[location].x).toBeCloseTo(expected.x, 1)
-    expect(projectedCoordinates[location].y).toBeCloseTo(expected.y, 1)
-  }
+  await expect(page.getByRole('heading', { name: 'Home', exact: true, level: 1 })).toBeVisible()
+  const summary = page.getByRole('region', { name: 'Summary' })
+  await expect(summary.getByRole('link').first()).toContainText('13')
+  await expect(summary.getByRole('link').nth(2)).toContainText('2')
+  await expect(summary.getByRole('link').nth(3)).toContainText('1')
+  const life = page.getByRole('region', { name: 'Life' })
+  const health = page.getByRole('region', { name: 'Health' })
+  await expect(life.getByRole('link', { name: 'Open Building 9 · Device 3' })).toBeVisible()
+  await expect(health.getByRole('link', { name: 'Open Multan · Device 2' })).toBeVisible()
+  await expect(health.getByRole('link', { name: 'Open Peshawar · Device 2' })).toBeVisible()
+  await expect(health.getByRole('link', { name: 'Open Swat' })).toHaveCount(0)
+  await expect(page.getByRole('region', { name: 'Attendance today' })).toContainText('1,038')
+  await reportPlainWords(page, testInfo, '/home')
 
-  const markerCores = await page.locator('.fleet-map-marker-core').evaluateAll((nodes) => nodes.map((node) => {
-    const box = node.getBoundingClientRect()
-    return { x: box.x + box.width / 2, y: box.y + box.height / 2, radius: box.width / 2 }
-  }))
-  const closestVisibleGap = Math.min(...markerCores.flatMap((left, index) => markerCores.slice(index + 1).map((right) => (
-    Math.hypot(left.x - right.x, left.y - right.y) - left.radius - right.radius
-  ))))
-  expect(closestVisibleGap).toBeGreaterThanOrEqual(-1)
+  // Needs attention tile → the filtered list, in the address.
+  await summary.getByRole('link').nth(2).click()
+  await expect(page).toHaveURL(/\/devices\?status=attention$/)
+  await expect(page.getByRole('link', { name: /^Open .*needs attention$/ })).toHaveCount(2)
+  await expect(page.getByText('Showing 2 of 13')).toBeVisible()
 
-  const peshawar = page.getByRole('button', { name: /Peshawar, 2 devices, Needs attention/i })
-  await page.locator('.page-content > section.panel').evaluate(async (node) => {
-    await Promise.all(node.getAnimations().map((animation) => animation.finished.catch(() => undefined)))
-  })
-  const beforeSelection = await peshawar.evaluate((node) => {
-    const box = node.getBoundingClientRect()
-    const stage = node.closest('.fleet-map-stage')?.getBoundingClientRect()
-    return { x: box.x - (stage?.x || 0), y: box.y - (stage?.y || 0) }
-  })
-  await peshawar.click()
-  await expect(page.getByRole('heading', { name: 'Peshawar' })).toBeVisible()
-  await expect(page.getByRole('button', { name: /Inspect Peshawar/ })).toHaveCount(2)
-  const afterSelection = await peshawar.evaluate((node) => {
-    const box = node.getBoundingClientRect()
-    const stage = node.closest('.fleet-map-stage')?.getBoundingClientRect()
-    return { x: box.x - (stage?.x || 0), y: box.y - (stage?.y || 0) }
-  })
-  expect(Math.abs(afterSelection.x - beforeSelection.x)).toBeLessThan(1)
-  expect(Math.abs(afterSelection.y - beforeSelection.y)).toBeLessThan(1)
+  // The Division switch narrows every count and keeps the filter.
+  const phone = (page.viewportSize()?.width || 0) <= 760
+  await page.locator(phone ? '.phone-division-row' : '.header-division').getByRole('radio', { name: 'Life' }).click()
+  await expect(page).toHaveURL(/status=attention/)
+  await expect(page).toHaveURL(/division=life/)
+  await expect(page.getByRole('link', { name: /^Open / })).toHaveCount(1)
+  await expect(page.getByText('Showing Life only')).toBeVisible()
 
-  await page.getByRole('button', { name: /Islamabad, 2 devices, All online/i }).click()
-  await expect(page.getByRole('heading', { name: 'Islamabad' })).toBeVisible()
-  await expect(page.getByRole('button', { name: /Inspect SLICTOWER/ })).toHaveCount(2)
-  await page.getByRole('button', { name: /Multan, 2 devices, All online/i }).click()
-  await expect(page.getByRole('heading', { name: 'Multan' })).toBeVisible()
-  await expect(page.getByRole('button', { name: /Inspect ZONE-MULTAN/ })).toHaveCount(2)
-  await page.getByRole('button', { name: /Faisalabad, 2 devices, All online/i }).click()
-  await expect(page.getByRole('heading', { name: 'Faisalabad' })).toBeVisible()
-  await expect(page.getByRole('button', { name: /Inspect ZONE-FAISALABAD/ })).toHaveCount(2)
-  await page.getByRole('button', { name: /Quetta, 1 device, All online/i }).click()
-  await expect(page.getByRole('heading', { name: 'Quetta' })).toBeVisible()
-  await expect(page.getByRole('button', { name: 'Inspect ZONE-QUETTA-01' })).toBeVisible()
-  if ((page.viewportSize()?.width || 0) > 920) {
-    const canvasBox = await page.locator('.fleet-map-canvas').boundingBox()
-    const sheetBox = await page.locator('.fleet-location-sheet').boundingBox()
-    expect((sheetBox?.width || 0)).toBeLessThanOrEqual(400)
-    expect((sheetBox?.height || 0)).toBeLessThan(canvasBox?.height || 0)
+  // A shared address opens the same view.
+  await page.goto('/devices?q=karachi')
+  await expect(page.getByRole('link', { name: /^Open Building 9 · Device [13]/ })).toHaveCount(2)
+  await page.goto('/devices?status=offline')
+  await expect(page.getByRole('link', { name: /^Open / })).toHaveCount(1)
+  await expect(page.getByRole('link', { name: 'Open Multan · Device 2, Health, offline' })).toBeVisible()
+  await reportPlainWords(page, testInfo, '/devices')
+  if (process.env.ADD_VISUAL_QA === '1') await page.screenshot({ path: testInfo.outputPath('devices-filtered.png'), fullPage: true })
+})
+
+test('device names and status chips are never cut, and the pages pass axe', async ({ page }) => {
+  for (const route of ['/home', '/devices']) {
+    await page.goto(route)
+    await expect(page.locator('.app-header')).toBeVisible()
+    await expect(page.getByRole('link', { name: /^Open Multan · Device 2/ }).first()).toBeVisible()
+    const clipped = await page.evaluate(() => Array.from(document.querySelectorAll<HTMLElement>('.ui-chip, .device-name, .home-device-name'))
+      .filter((element) => element.scrollWidth > element.clientWidth + 1 || getComputedStyle(element).textOverflow === 'ellipsis')
+      .map((element) => element.textContent))
+    expect(clipped).toEqual([])
+    const width = await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth)
+    expect(width).toBeLessThanOrEqual(0)
+    const results = await new AxeBuilder({ page }).withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa']).analyze()
+    expect(results.violations.filter((violation) => ['critical', 'serious'].includes(violation.impact || ''))).toEqual([])
   }
-  if (process.env.ADD_VISUAL_QA === '1') await page.screenshot({ path: testInfo.outputPath('nationwide-map.png'), fullPage: true })
 })

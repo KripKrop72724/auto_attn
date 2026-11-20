@@ -29,6 +29,11 @@ export const device = {
   zone_name: 'SLICTOWER',
   device_id: '1',
   display_name: 'SLICTOWER · 3rd Floor',
+  division: 'health',
+  friendly_name: 'SLIC Tower · 3rd Floor',
+  place: 'SLIC Tower',
+  unit: '3rd Floor',
+  city: 'Islamabad',
   state: 'ONLINE',
   connected: true,
   firmware_version: 'zone-lite-2.2.30',
@@ -54,6 +59,17 @@ export const device = {
   },
 }
 
+/** Today's attendance totals (GET /api/v1/attendance/summary, Home). */
+export const attendanceSummary = {
+  from_time: '2026-08-01T19:00:00Z', to_time: null, division: null,
+  totals: { received: 1038, sent: 980, waiting: 23, trying_again: 2, not_matched: 35, set_aside: 0, problem: 0, oldest_waiting_at: null },
+  by_division: {
+    life: { received: 312, sent: 298, waiting: 6, trying_again: 0, not_matched: 8, set_aside: 0, problem: 0, oldest_waiting_at: null },
+    health: { received: 726, sent: 682, waiting: 17, trying_again: 2, not_matched: 27, set_aside: 0, problem: 0, oldest_waiting_at: null },
+  },
+  last_sent_at: '2026-08-01T17:56:00Z',
+}
+
 export const representativeUser = {
   id: 1, user_key: 'user-one', uid: '7', user_id: '1007', display_name: 'Ayesha Khan',
   cnic_masked: '*****-****567-1', cnic_available: true, identity_complete: true,
@@ -73,17 +89,19 @@ export const representativeAttendance = {
 }
 
 export const nationwideDevices = [
-  { ...device, connector_id: 'karachi-one', zone_id: 'ZONE-KARACHI-01', zone_name: 'Karachi', display_name: 'Karachi · Main Office', zkt: { ...device.zkt, id: 11, serial: 'KHI-0001' } },
-  { ...device, connector_id: 'peshawar-one', zone_id: 'ZONE-PESHAWAR-01', zone_name: 'Peshawar', display_name: 'Peshawar · Ground Floor', zkt: { ...device.zkt, id: 21, serial: 'PEW-0001' } },
-  { ...device, connector_id: 'peshawar-two', zone_id: 'ZONE-PESH-02', zone_name: 'Peshawar', display_name: 'Peshawar · First Floor', state: 'DEGRADED', zkt: { ...device.zkt, id: 22, serial: 'PEW-0002' } },
-  { ...device, connector_id: 'swat-one', zone_id: 'ZONE-SWAT-01', zone_name: 'Swat', display_name: 'Swat · Regional Office', zkt: { ...device.zkt, id: 31, serial: 'SWT-0001' } },
-  { ...device, connector_id: 'multan-one', zone_id: 'ZONE-MULTAN-01', zone_name: 'Multan', display_name: 'ZONE-MULTAN-01', zkt: { ...device.zkt, id: 35, serial: 'AF4C211861133' } },
-  { ...device, connector_id: 'multan-two', zone_id: 'ZONE-MULTAN-02', zone_name: 'Multan', display_name: 'ZONE-MULTAN-02', zkt: { ...device.zkt, id: 36, serial: 'RKQ4245100152' } },
-  { ...device, connector_id: 'faisalabad-one', zone_id: 'ZONE-FAISALABAD-01', zone_name: 'Faisalabad', display_name: 'ZONE-FAISALABAD-01', zkt: { ...device.zkt, id: 37, serial: 'FSD-0001' } },
-  { ...device, connector_id: 'faisalabad-two', zone_id: 'ZONE-FAISALABAD-02', zone_name: 'Faisalabad', display_name: 'ZONE-FAISALABAD-02', zkt: { ...device.zkt, id: 38, serial: 'FSD-0002' } },
-  { ...device, connector_id: 'quetta-one', zone_id: 'ZONE-QUETTA-01', zone_name: 'Quetta', display_name: 'ZONE-QUETTA-01', zkt: { ...device.zkt, id: 39, serial: 'UET-0001' } },
+  { ...device, connector_id: 'karachi-one', zone_id: 'ZONE-KARACHI-01', zone_name: 'Karachi', display_name: 'Karachi · Main Office', friendly_name: 'Karachi', city: 'Karachi', zkt: { ...device.zkt, id: 11, serial: 'KHI-0001' } },
+  { ...device, connector_id: 'peshawar-one', zone_id: 'ZONE-PESHAWAR-01', zone_name: 'Peshawar', display_name: 'Peshawar · Ground Floor', friendly_name: 'Peshawar · Device 1', city: 'Peshawar', zkt: { ...device.zkt, id: 21, serial: 'PEW-0001' } },
+  { ...device, connector_id: 'peshawar-two', zone_id: 'ZONE-PESH-02', zone_name: 'Peshawar', display_name: 'Peshawar · First Floor', friendly_name: 'Peshawar · Device 2', city: 'Peshawar', state: 'DEGRADED', zkt: { ...device.zkt, id: 22, serial: 'PEW-0002' } },
+  { ...device, connector_id: 'swat-one', zone_id: 'ZONE-SWAT-01', zone_name: 'Swat', display_name: 'Swat · Regional Office', friendly_name: 'Swat', city: 'Swat', zkt: { ...device.zkt, id: 31, serial: 'SWT-0001' } },
+  { ...device, connector_id: 'multan-one', zone_id: 'ZONE-MULTAN-01', zone_name: 'Multan', display_name: 'ZONE-MULTAN-01', friendly_name: 'Multan · Device 1', city: 'Multan', zkt: { ...device.zkt, id: 35, serial: 'AF4C211861133' } },
+  { ...device, connector_id: 'multan-two', zone_id: 'ZONE-MULTAN-02', zone_name: 'Multan', display_name: 'ZONE-MULTAN-02', friendly_name: 'Multan · Device 2', city: 'Multan', state: 'OFFLINE', connected: false, zkt: { ...device.zkt, id: 36, serial: 'RKQ4245100152' } },
+  { ...device, connector_id: 'faisalabad-one', zone_id: 'ZONE-FAISALABAD-01', zone_name: 'Faisalabad', display_name: 'ZONE-FAISALABAD-01', friendly_name: 'Faisalabad · Device 1', city: 'Faisalabad', zkt: { ...device.zkt, id: 37, serial: 'FSD-0001' } },
+  { ...device, connector_id: 'faisalabad-two', zone_id: 'ZONE-FAISALABAD-02', zone_name: 'Faisalabad', display_name: 'ZONE-FAISALABAD-02', friendly_name: 'Faisalabad · Device 2', city: 'Faisalabad', zkt: { ...device.zkt, id: 38, serial: 'FSD-0002' } },
+  { ...device, connector_id: 'quetta-one', zone_id: 'ZONE-QUETTA-01', zone_name: 'Quetta', display_name: 'ZONE-QUETTA-01', friendly_name: 'Quetta', city: 'Quetta', zkt: { ...device.zkt, id: 39, serial: 'UET-0001' } },
   { ...device, connector_id: 'tower-three', zone_id: 'ZONE-SLICTOWER-3FL', zone_name: 'SLICTOWER', display_name: 'SLICTOWER · 3rd Floor', zkt: { ...device.zkt, id: 41, serial: 'ISB-0003' } },
-  { ...device, connector_id: 'tower-thirteen', zone_id: 'ZONE-SLICTOWER-13FL', zone_name: 'SLIC-TOWER', display_name: 'SLICTOWER · 13th Floor', zkt: { ...device.zkt, id: 42, serial: 'ISB-0013' } },
+  { ...device, connector_id: 'tower-thirteen', zone_id: 'ZONE-SLICTOWER-13FL', zone_name: 'SLIC-TOWER', display_name: 'SLICTOWER · 13th Floor', friendly_name: 'SLIC Tower · 13th Floor', unit: '13th Floor', zkt: { ...device.zkt, id: 42, serial: 'ISB-0013' } },
+  { ...device, connector_id: 'bld9-three', zone_id: 'LF-ZONE-BLD9-03', zone_name: 'LF-ZONE-BLD9-03', display_name: 'LF-ZONE-BLD9-03', division: 'life', friendly_name: 'Building 9 · Device 3', place: 'Building 9', unit: 'Device 3', city: 'Karachi', state: 'DEGRADED', zkt: { ...device.zkt, id: 51, serial: 'KHI-0903' } },
+  { ...device, connector_id: 'bld9-one', zone_id: 'LF-ZONE-BLD9-01', zone_name: 'LF-ZONE-BLD9-01', display_name: 'LF-ZONE-BLD9-01', division: 'life', friendly_name: 'Building 9 · Device 1', place: 'Building 9', unit: 'Device 1', city: 'Karachi', zkt: { ...device.zkt, id: 52, serial: 'KHI-0901' } },
 ]
 
 export const sourceException = {
@@ -325,6 +343,7 @@ export async function mockDashboard(page: Page) {
     if (url.pathname === '/api/v1/auth/session') json = { username: 'StateHealthAdmin', csrf_token: 'test-token' }
     else if (url.pathname === '/api/v1/overview') json = { total: 1, online: 1, offline: 0, degraded: 0, flapping: 0, open_alerts: 1, active_leases: 0, ords_delivery: { backlog: 12, retrying: 0, blocked_identity: 2, quarantined: 1 } }
     else if (url.pathname === '/api/v1/devices') json = { rows: [device] }
+    else if (url.pathname === '/api/v1/attendance/summary') json = attendanceSummary
     else if (url.pathname === `/api/v1/devices/${device.connector_id}`) json = device
     else if (url.pathname.endsWith('/zkt-custody')) json = {
       connector_id: device.connector_id, enabled: true, sampled_at: new Date().toISOString(),

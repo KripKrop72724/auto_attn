@@ -10,7 +10,7 @@ export const STRICT_ROUTES: readonly string[] = []
 /** Collects the text a person can read on the page (marked IT parts left out). */
 export async function pageVisibleText(page: Page): Promise<string> {
   return page.evaluate(() => {
-    const skip = '[data-technical], [data-device-code], [data-brand], [data-user-text], script, style, noscript, [hidden], [aria-hidden="true"]'
+    const skip = '[data-technical], [data-device-code], [data-brand], [data-user-text], [data-old-name], script, style, noscript, [hidden], [aria-hidden="true"]'
     const parts: string[] = []
     const walk = (node: Node) => {
       if (node.nodeType === Node.TEXT_NODE) {
