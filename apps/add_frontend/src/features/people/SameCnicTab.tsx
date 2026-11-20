@@ -60,7 +60,7 @@ export function SameCnicTab({ report, loading, error, onRetry, decision, onDecis
                   const evidence = member.punch_evidence
                   return (
                     <li key={member.user_key}>
-                      <span className="avatar" aria-hidden="true">{personInitials(member.display_name)}</span>
+                      <span className="avatar" aria-hidden="true" data-user-text>{personInitials(member.display_name)}</span>
                       <span>
                         <strong data-user-text>{SAME_CNIC.member(member.display_name, member.user_id)}</strong>
                         <small>{evidence?.captured_count ? `${SAME_CNIC.checkins(evidence.captured_count)}${evidence.last_captured_at ? `, ${SAME_CNIC.last(day(evidence.last_captured_at))}` : ''}` : SAME_CNIC.noCheckins}</small>

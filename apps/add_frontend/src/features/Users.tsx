@@ -36,7 +36,7 @@ export function DeviceLine({ device }: { device: Device }) {
   return (
     <p className="people-dialog-device">
       <Icon name="server" size="sm" />
-      <span>{friendlyName(device)}</span>
+      <span data-user-text>{friendlyName(device)}</span>
       <DivisionTag division={divisionOf(device)} />
     </p>
   )

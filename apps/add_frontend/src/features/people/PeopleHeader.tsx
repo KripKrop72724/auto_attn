@@ -32,7 +32,7 @@ export function PeopleDeviceHeader({ device, otherDivision, canCreate, onAdd, on
   return (
     <section className="people-device-header" aria-labelledby="people-device-title">
       <div className="people-device-header-text">
-        <h2 id="people-device-title">{friendlyName(device)}</h2>
+        <h2 id="people-device-title" data-user-text>{friendlyName(device)}</h2>
         <p className="people-device-header-facts">
           <DivisionTag division={division} />
           <StatusChip tone={toneForPattern(toneToPattern(status.tone))} label={status.chip} code={status.code} size="sm" />

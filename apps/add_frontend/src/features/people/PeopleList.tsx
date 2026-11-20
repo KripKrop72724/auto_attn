@@ -124,7 +124,7 @@ export function PeopleList({
           </label>
         )}
         <div className="people-cell people-cell-person">
-          <span className="avatar" aria-hidden="true">{personInitials(name)}</span>
+          <span className="avatar" aria-hidden="true" data-user-text>{personInitials(name)}</span>
           <span className="people-person-text">
             <button type="button" className="people-person-open" onClick={() => onOpen(user)}>
               <strong data-user-text title={name.length > 40 ? name : undefined}>{name}</strong>

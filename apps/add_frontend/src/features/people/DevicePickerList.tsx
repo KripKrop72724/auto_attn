@@ -96,7 +96,7 @@ export function DevicePickerList({
       id: 'device', header: PICKER.columns.device, primary: true,
       cell: (row) => (
         <span className="people-device-name">
-          <strong>{row.name}</strong>
+          <strong data-user-text>{row.name}</strong>
           <DivisionTag division={row.division} />
           <small className="people-device-code" data-device-code>{row.device.display_name}</small>
         </span>
