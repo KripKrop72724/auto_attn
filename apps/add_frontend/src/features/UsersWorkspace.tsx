@@ -2,7 +2,7 @@
 // people on one machine. Every write keeps today's safeguards (password,
 // typed confirmations, reasons, re-checked selections); only the words, the
 // layout and the progress feedback changed.
-import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent } from 'react'
+import { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState, type MouseEvent } from 'react'
 import { useLocation, useNavigate } from 'react-router-dom'
 import './UsersWorkspace.css'
 import './people/people.css'
@@ -19,7 +19,8 @@ import { isFinalCommand, type CommandStep } from '../lib/useCommandTracker'
 import {
   CAPABILITY_OFF, CHANGES, DAMAGED_ENTRY, HEADER, LIST, PICKER, REMOVE_MANY, changeDone, changeLabel, writesOff,
 } from '../words/people'
-import { BulkDeletionDialog, BulkDeletionProgress, HistoricalIdentityResolutionDialog, IdentityResolutionDialog, UserOperationDialog, isActiveRemoval, type CommandMeta } from './Users'
+import type { CommandMeta } from './Users'
+import { BulkDeletionProgress, isActiveRemoval } from './people/BulkRemovalCard'
 import { AdminAccessBanner, EndAdminAccessDialog } from './people/AdminAccessBanner'
 import { ChangesTray, changeFailure } from './people/ChangesTray'
 import { DevicePickerList, type PickerShow } from './people/DevicePickerList'
@@ -36,6 +37,12 @@ import {
   baseWritable, cnicDigits, divisionOf, friendlyName, isBulkSelectionEligible, isCnicSearch, mergeDevice,
   type PeopleDevice, type PeopleIntegrity, type PeopleListResponse, type PeopleUser,
 } from './people/model'
+
+// The dialogs load when first opened, so the People list itself stays small.
+const UserOperationDialog = lazy(() => import('./Users').then((module) => ({ default: module.UserOperationDialog })))
+const BulkDeletionDialog = lazy(() => import('./Users').then((module) => ({ default: module.BulkDeletionDialog })))
+const IdentityResolutionDialog = lazy(() => import('./Users').then((module) => ({ default: module.IdentityResolutionDialog })))
+const HistoricalIdentityResolutionDialog = lazy(() => import('./Users').then((module) => ({ default: module.HistoricalIdentityResolutionDialog })))
 
 type ToastLike = {
   notice: (text: string) => void
@@ -857,6 +864,7 @@ function PeopleWorkspace({ devices, devicesLoaded, devicesError, deviceId, switc
         />
       )}
       {changeDeviceSheet}
+      <Suspense fallback={null}>
       {dialog && <UserOperationDialog key={JSON.stringify([dialog.state.mode, 'user' in dialog.state ? dialog.state.user.user_key : ''])} state={dialog.state} draft={dialog.draft} device={selected} onClose={() => setDialog(null)} onCommand={trackCommand} toast={toast} />}
       {bulkDialogOpen && selectedUsers.length > 0 && (
         <BulkDeletionDialog
@@ -876,6 +884,7 @@ function PeopleWorkspace({ devices, devicesLoaded, devicesError, deviceId, switc
       )}
       {resolutionDialog && <IdentityResolutionDialog state={resolutionDialog} device={selected} onClose={() => setResolutionDialog(null)} onComplete={(report) => { setConflictReport(report); void refreshWorkspace() }} toast={toast} />}
       {historicalDialog && <HistoricalIdentityResolutionDialog state={historicalDialog} device={selected} onClose={() => setHistoricalDialog(null)} onComplete={async () => { await Promise.all([refreshWorkspace(), refreshFleet()]) }} toast={toast} />}
+      </Suspense>
       {endLeaseOpen && selected.active_lease && <EndAdminAccessDialog lease={selected.active_lease} deviceName={place} onClose={() => setEndLeaseOpen(false)} onCommand={(command) => trackCommand(command, { name: selected.active_lease?.user_display_name || undefined })} toast={toast} />}
       {machineDialogOpen && <MachineCheckDialog device={selected} place={place} onClose={() => setMachineDialogOpen(false)} onAccepted={(updated, command) => { setDetail((current) => mergeDevice(current, updated)); setMachineCommand(command); trackCommand(command) }} toast={toast} />}
     </div>

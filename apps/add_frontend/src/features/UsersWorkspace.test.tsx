@@ -561,7 +561,7 @@ describe('People on one machine', () => {
     fireEvent.click(screen.getByRole('tab', { name: /Same CNIC/ }))
     fireEvent.click(screen.getByRole('tab', { name: /People/ }))
     fireEvent.click(await screen.findByRole('button', { name: /Edit Ayesha/i }))
-    expect(screen.getByRole('heading', { name: /Edit Ayesha Khan/i })).toBeTruthy()
+    expect(await screen.findByRole('heading', { name: /Edit Ayesha Khan/i })).toBeTruthy()
 
     view.rerender(<UsersHarness selectedDevice={secondDevice} />)
     await waitFor(() => expect((screen.getByLabelText('Search name, Employee ID or CNIC') as HTMLInputElement).value).toBe(''))
@@ -673,7 +673,7 @@ describe('People on one machine', () => {
     expect(screen.queryByRole('article', { name: /Stale Result/i })).toBeNull()
 
     fireEvent.click(screen.getByRole('button', { name: /Edit Fast Result/i }))
-    fireEvent.change(screen.getByLabelText('Your password'), { target: { value: 'password' } })
+    fireEvent.change(await screen.findByLabelText('Your password'), { target: { value: 'password' } })
     const save = screen.getByRole('button', { name: 'Save changes' }) as HTMLButtonElement
     expect(save.disabled).toBe(false)
     fireEvent.click(save)

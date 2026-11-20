@@ -49,7 +49,7 @@ describe('State Life ADD interface · People', () => {
     expect(personProblems(conflictedUser).map((chip) => chip.label)).toContain('Same CNIC as 1008')
     fireEvent.click(screen.getByRole('tab', { name: /same cnic/i }))
     fireEvent.click(await screen.findByRole('button', { name: /yes, same person/i }))
-    expect(screen.getByRole('heading', { name: /are these the same person/i })).toBeTruthy()
+    expect(await screen.findByRole('heading', { name: /are these the same person/i })).toBeTruthy()
     expect(screen.getByText(/nothing on the machine changes/i)).toBeTruthy()
     expect(screen.getByLabelText(/to confirm, type exactly: same employee/i)).toBeTruthy()
     expect(screen.getByLabelText(/your password/i)).toBeTruthy()
@@ -57,7 +57,7 @@ describe('State Life ADD interface · People', () => {
     fireEvent.click(screen.getByRole('tab', { name: /people/i }))
     fireEvent.click(await screen.findByRole('button', { name: /edit ayesha fatima/i }))
     expect(
-      screen.getByLabelText(/correct cnic \(needed — same cnic as someone else\)/i),
+      await screen.findByLabelText(/correct cnic \(needed — same cnic as someone else\)/i),
     ).toBeTruthy()
   })
 
@@ -71,7 +71,7 @@ describe('State Life ADD interface · People', () => {
     fireEvent.click(screen.getByRole('tab', { name: /old check-ins/i }))
     expect(await screen.findByRole('heading', { name: /old check-ins without a cnic/i })).toBeTruthy()
     fireEvent.click(screen.getByRole('button', { name: /enter hr details/i }))
-    fireEvent.change(screen.getByLabelText(/cnic \(from hr\)/i), {
+    fireEvent.change(await screen.findByLabelText(/cnic \(from hr\)/i), {
       target: { value: fullCnic },
     })
     fireEvent.change(screen.getByLabelText(/employee id in hr's records/i), {
@@ -118,7 +118,7 @@ describe('State Life ADD interface · People', () => {
     fireEvent.click(screen.getByRole('tab', { name: /old check-ins/i }))
     expect((await screen.findAllByText(/no longer on this machine/i)).length).toBeGreaterThan(0)
     fireEvent.click(screen.getByRole('button', { name: /enter hr details/i }))
-    fireEvent.change(screen.getByLabelText(/cnic \(from hr\)/i), {
+    fireEvent.change(await screen.findByLabelText(/cnic \(from hr\)/i), {
       target: { value: fullCnic },
     })
     fireEvent.change(screen.getByLabelText(/employee id in hr's records/i), {
@@ -192,7 +192,7 @@ describe('State Life ADD interface · People', () => {
       await screen.findByRole('button', { name: /confirm same person/i }),
     )
     expect(
-      screen.getByRole('heading', {
+      await screen.findByRole('heading', {
         name: /confirm it is the same person/i,
       }),
     ).toBeTruthy()
