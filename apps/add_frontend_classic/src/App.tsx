@@ -1,0 +1,1112 @@
+import { deviceActivity } from './hikvisionHealth'
+import {
+  FormEvent,
+  KeyboardEvent as ReactKeyboardEvent,
+  ReactNode,
+  Suspense,
+  lazy,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type RefObject,
+} from 'react'
+import { createPortal } from 'react-dom'
+import { createBrowserRouter, RouterProvider, useLocation, useNavigate, useNavigationType, useRouteError } from 'react-router-dom'
+import { api, ApiError, queryString, setCsrfToken } from './api'
+import { queryClient } from './data'
+import { deviceSnapshots, useDevices } from './deviceData'
+import { AppShell } from './AppShell'
+import { Icon } from './Icon'
+import { dashboardRoute, firmwareSection, routeDeviceId, routePath } from './routing'
+import { useRealtime, type RealtimeTopic } from './realtime'
+import { useThrottledRunner } from './lib/throttle'
+import { formatMetricsTime } from './lib/metricsTime'
+import { autoReleaseHeadline, useUnknownAutoReleaseStatus } from './features/unknownAutoRelease'
+import {
+  firmwareLabel, humanizeStatus, isOnlineState, normalizedStatus, statusPattern, terminalLinkNeedsAttention,
+  terminalLinkPattern, type StatusPattern,
+} from './status'
+import type {
+  Alert,
+  AlertQueueResponse,
+  AttendanceEvent,
+  Command,
+  ConnectionEvent,
+  Device,
+  DeviceHealth,
+  DeviceLog,
+  DeviceUser,
+  FirmwareCampaign,
+  FirmwareRelease,
+  FirmwareScopePreview,
+  HistoricalIdentityCandidate,
+  HistoricalIdentityReport,
+  IdentityConflictGroup,
+  IdentityConflictReport,
+  IdentityIntegrity,
+  Overview,
+  ReconciliationJob,
+  ReconciliationDivergenceDetail,
+  ReconciliationDivergenceReveal,
+  ReconciliationPreflight,
+  ReconciliationScheduler,
+  SourceException,
+  SourceExceptionList,
+  SourceExceptionReveal,
+  SourceExceptionTotals,
+  TerminalLink,
+  UserCommandResponse,
+  UserDeletionJob,
+  DashboardRoute,
+} from './types'
+import { CLASSIC_BASE, LOGO_SRC, withBase } from './classic'
+
+type View = DashboardRoute
+export type DrawerTab = 'overview' | 'logs' | 'alerts' | 'control'
+type ToastState = { kind: 'notice' | 'error'; text: string } | null
+export type UserDialogState =
+  | { mode: 'create' }
+  | { mode: 'edit'; user: DeviceUser }
+  | { mode: 'delete'; user: DeviceUser }
+  | { mode: 'lease'; user: DeviceUser }
+  | null
+export type IdentityResolutionDialogState = {
+  mode: 'resolve' | 'revoke'
+  group: IdentityConflictGroup
+} | null
+export type HistoricalIdentityDialogState = {
+  candidate: HistoricalIdentityCandidate
+} | null
+export type ReconciliationDialogState =
+  | { mode: 'start' }
+  | { mode: 'control'; job: ReconciliationJob; action: 'pause' | 'resume' | 'cancel' | 'retry' }
+  | null
+
+export const terminalCommandStates = new Set(['SUCCEEDED', 'FAILED', 'CANCELLED', 'EXPIRED'])
+export const drawerTabs: DrawerTab[] = ['overview', 'logs', 'alerts', 'control']
+export { statusPattern } from './status'
+
+export const dateTime = (value?: string | null) =>
+  value
+    ? new Intl.DateTimeFormat('en-PK', {
+        dateStyle: 'medium',
+        timeStyle: 'medium',
+        timeZone: 'Asia/Karachi',
+      }).format(new Date(value))
+    : '—'
+
+export const relativeTime = (value?: string | null) => {
+  if (!value) return 'Never seen'
+  const seconds = Math.round((new Date(value).getTime() - Date.now()) / 1000)
+  const formatter = new Intl.RelativeTimeFormat('en', { numeric: 'auto' })
+  if (Math.abs(seconds) < 60) return formatter.format(seconds, 'second')
+  const minutes = Math.round(seconds / 60)
+  if (Math.abs(minutes) < 60) return formatter.format(minutes, 'minute')
+  const hours = Math.round(minutes / 60)
+  if (Math.abs(hours) < 48) return formatter.format(hours, 'hour')
+  return formatter.format(Math.round(hours / 24), 'day')
+}
+
+export const pktInputToUtc = (value: string) => value ? new Date(`${value}:00+05:00`).toISOString() : ''
+
+export const pktTodayBounds = (now = new Date()) => {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Karachi', year: 'numeric', month: '2-digit', day: '2-digit',
+  }).formatToParts(now)
+  const value = (type: Intl.DateTimeFormatPartTypes) => parts.find((part) => part.type === type)?.value || ''
+  const day = `${value('year')}-${value('month')}-${value('day')}`
+  return { from: `${day}T00:00`, to: `${day}T23:59` }
+}
+
+export const idempotency = (prefix: string) => {
+  const id = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random()}`
+  return `${prefix}:${id}`
+}
+
+export const utf8Length = (value: string) => new TextEncoder().encode(value).length
+
+const utf8Prefix = (value: string, maxBytes: number) => {
+  let output = ''
+  for (const character of value) {
+    if (utf8Length(output + character) > maxBytes) break
+    output += character
+  }
+  return output
+}
+
+export function identityConflictText(user: DeviceUser) {
+  const matches = user.identity_conflict_members
+    .map((member) => `${member.user_id} (UID ${member.uid})`)
+    .join(', ')
+  if (user.identity_conflict_resolved) {
+    return matches
+      ? `${user.cnic_masked || 'Masked CNIC'} · Verified same employee across user ${matches}`
+      : `${user.cnic_masked || 'Masked CNIC'} · Verified same-employee terminal alias`
+  }
+  return matches
+    ? `${user.cnic_masked || 'Masked CNIC'} · Exact CNIC also encoded on user ${matches} · correction required`
+    : `${user.cnic_masked || 'Masked CNIC'} · Exact duplicate reported by terminal · correction required`
+}
+
+export function buildMachinePreview(
+  displayName: string,
+  cnic: string,
+  shiftWorker: boolean,
+  byteLimit = 24,
+) {
+  const canonical = displayName.trim().replace(/\s+/g, ' ')
+  const suffix = `-${shiftWorker ? 'S-' : ''}${cnic}`
+  return `${utf8Prefix(canonical, Math.max(0, byteLimit - utf8Length(suffix)))}${suffix}`
+}
+
+export function validateUserDraft(values: {
+  displayName: string
+  cnic: string
+  password: string
+  userIdOverride?: string
+}) {
+  if (!values.displayName.trim()) return 'Full name is required.'
+  if (!/^\d{13}$/.test(values.cnic)) return 'CNIC must contain exactly 13 digits.'
+  if (values.userIdOverride && !/^\d+$/.test(values.userIdOverride)) {
+    return 'The optional employee/user ID must be numeric.'
+  }
+  if (!values.password) return 'Password confirmation is required.'
+  return null
+}
+
+export const confirmationMatches = (value: string, user: DeviceUser) =>
+  value === user.display_name || value === user.user_id
+
+export const bulkDeletionConfirmation = (count: number, deviceId: string) =>
+  `DELETE ${count} USERS FROM ${deviceId}`
+
+export const statusIcon = {
+  confirmed: 'check',
+  blocked: 'alert',
+  waiting: 'clock',
+  notice: 'info',
+} as const
+
+export function StatusBadge({
+  state,
+  live = false,
+}: {
+  state?: string | null
+  live?: boolean
+}) {
+  const status = normalizedStatus(state)
+  const label = status.replaceAll('_', ' ')
+  const pattern = statusPattern(status)
+  return (
+    <span className={`status-badge pattern-${pattern}`} data-pattern={pattern} aria-label={`Status: ${label}`} title={label}>
+      <Icon name={statusIcon[pattern]} />
+      <span>{humanizeStatus(status)}</span>
+      {live && <i aria-hidden="true" />}
+    </span>
+  )
+}
+
+const terminalLinkLabels: Record<string, string> = {
+  CONNECTED: 'Terminal connected',
+  STABILIZING: 'Terminal stabilizing',
+  MAINTENANCE: 'Terminal maintenance',
+  STARTING: 'Terminal starting',
+  RECONNECTING: 'Terminal reconnecting',
+  DISCONNECTED: 'Terminal disconnected',
+  FLAPPING: 'Terminal flapping',
+  ERROR: 'Terminal error',
+  UNKNOWN: 'Terminal unknown',
+}
+
+export const terminalLinkLabel = (state: unknown) => {
+  const status = normalizedStatus(state).toUpperCase()
+  return terminalLinkLabels[status] || `Terminal ${humanizeStatus(status).toLowerCase()}`
+}
+
+// The ESP lifecycle badge and this terminal-link badge are deliberately separate.
+export function TerminalLinkBadge({ link }: { link: TerminalLink }) {
+  const pattern = terminalLinkPattern(link.state)
+  const label = terminalLinkLabel(link.state)
+  return (
+    <span className={`status-badge terminal-link-badge pattern-${pattern}`} data-pattern={pattern} aria-label={`Terminal link: ${humanizeStatus(link.state)}`} title={link.message || label}>
+      <Icon name={statusIcon[pattern]} />
+      <span>{label}</span>
+    </span>
+  )
+}
+
+export const showsTerminalLinkBadge = (link?: TerminalLink | null): link is TerminalLink =>
+  Boolean(link && !['CONNECTED', 'UNKNOWN'].includes(normalizedStatus(link.state).toUpperCase()))
+
+// Compact elapsed time for reason lines: '37 min', '5 h 12 min', '3 d'.
+export function elapsedSince(value?: string | null, now = Date.now()) {
+  const started = value ? Date.parse(value) : NaN
+  if (!Number.isFinite(started)) return ''
+  const minutes = Math.floor(Math.max(0, now - started) / 60_000)
+  if (minutes < 1) return 'under 1 min'
+  if (minutes < 60) return `${minutes} min`
+  const hours = Math.floor(minutes / 60)
+  if (hours < 48) return minutes % 60 ? `${hours} h ${minutes % 60} min` : `${hours} h`
+  return `${Math.floor(hours / 24)} d`
+}
+
+export const healthTierPattern = (tier: unknown): StatusPattern => {
+  const value = normalizedStatus(tier).toUpperCase()
+  return value === 'DEGRADED' ? 'waiting' : value === 'WARNING' ? 'notice' : statusPattern(value)
+}
+
+const tierWords: Record<string, string> = { DEGRADED: 'Degraded', WARNING: 'Warning' }
+
+// The list carries a compact primary reason; the detail response carries the
+// ordered reasons, so fall back to the first one with the worst tier.
+export function primaryHealthReason(health?: DeviceHealth | null) {
+  if (!health) return null
+  if (health.primary) return health.primary
+  const reasons = health.reasons || []
+  return reasons.find((reason) => normalizedStatus(reason.tier).toUpperCase() === 'DEGRADED')
+    || reasons.find((reason) => normalizedStatus(reason.tier).toUpperCase() === 'WARNING')
+    || null
+}
+
+export function healthReasonLine(
+  reason: { code: string; tier: string | null; message: string; since: string | null },
+  now = Date.now(),
+) {
+  const tier = normalizedStatus(reason.tier).toUpperCase()
+  const prefix = tierWords[tier] || (reason.tier ? humanizeStatus(reason.tier) : '')
+  const elapsed = elapsedSince(reason.since, now)
+  return `${prefix ? `${prefix}: ` : ''}${reason.message || humanizeStatus(reason.code)}${elapsed ? ` · ${elapsed}` : ''}`
+}
+
+export function useToast() {
+  const [toast, setToast] = useState<ToastState>(null)
+  useEffect(() => {
+    if (!toast) return
+    const timeout = window.setTimeout(() => setToast(null), toast.kind === 'error' ? 8000 : 5000)
+    return () => window.clearTimeout(timeout)
+  }, [toast])
+  const notice = useCallback((text: string) => setToast({ kind: 'notice', text }), [])
+  const error = useCallback((text: string) => setToast({ kind: 'error', text }), [])
+  const dismiss = useCallback(() => setToast(null), [])
+  return useMemo(() => ({ toast, notice, error, dismiss }), [dismiss, error, notice, toast])
+}
+
+let modalLockDepth = 0
+let lockedWorkspace: HTMLElement | null = null
+let lockedWorkspaceOverflow = ''
+let lockedWorkspaceScrollTop = 0
+let rootAriaHidden: string | null = null
+let rootWasInert = false
+
+function lockApplicationForModal() {
+  const root = document.getElementById('root')
+  if (modalLockDepth === 0) {
+    lockedWorkspace = document.querySelector<HTMLElement>('.app-workspace')
+    lockedWorkspaceOverflow = lockedWorkspace?.style.overflow || ''
+    lockedWorkspaceScrollTop = lockedWorkspace?.scrollTop || 0
+    if (lockedWorkspace) lockedWorkspace.style.overflow = 'hidden'
+    if (root) {
+      rootAriaHidden = root.getAttribute('aria-hidden')
+      rootWasInert = root.hasAttribute('inert')
+      root.setAttribute('aria-hidden', 'true')
+      root.setAttribute('inert', '')
+    }
+  }
+  modalLockDepth += 1
+  return () => {
+    modalLockDepth = Math.max(0, modalLockDepth - 1)
+    if (modalLockDepth > 0) return
+    if (lockedWorkspace) {
+      lockedWorkspace.style.overflow = lockedWorkspaceOverflow
+      lockedWorkspace.scrollTop = lockedWorkspaceScrollTop
+    }
+    if (root) {
+      if (rootAriaHidden === null) root.removeAttribute('aria-hidden')
+      else root.setAttribute('aria-hidden', rootAriaHidden)
+      if (!rootWasInert) root.removeAttribute('inert')
+    }
+    lockedWorkspace = null
+  }
+}
+
+// Open dialogs, innermost last: a dialog opened from another one (for example
+// an operator action inside the device drawer) owns Escape and the focus trap.
+const openDialogs: symbol[] = []
+
+export function Dialog({
+  titleId,
+  title,
+  description,
+  onClose,
+  children,
+  className = '',
+  returnFocusRef,
+}: {
+  titleId: string
+  title: string
+  description?: string
+  onClose: () => void
+  children: ReactNode
+  className?: string
+  returnFocusRef?: RefObject<HTMLElement | null>
+}) {
+  const panel = useRef<HTMLDivElement>(null)
+  const closeRef = useRef(onClose)
+  closeRef.current = onClose
+  useEffect(() => {
+    const previous = document.activeElement as HTMLElement | null
+    const releaseModalLock = lockApplicationForModal()
+    const token = Symbol('dialog')
+    openDialogs.push(token)
+    const node = panel.current
+    const focusable = () =>
+      Array.from(
+        node?.querySelectorAll<HTMLElement>(
+          'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [href], [tabindex]:not([tabindex="-1"])',
+        ) || [],
+      )
+    const focusFrame = window.requestAnimationFrame(() => focusable()[0]?.focus())
+    const handle = (event: KeyboardEvent) => {
+      if (openDialogs[openDialogs.length - 1] !== token) return
+      if (event.key === 'Escape') {
+        event.preventDefault()
+        closeRef.current()
+      }
+      if (event.key === 'Tab') {
+        const items = focusable()
+        if (!items.length) return
+        const first = items[0]
+        const last = items[items.length - 1]
+        if (event.shiftKey && document.activeElement === first) {
+          event.preventDefault()
+          last.focus()
+        } else if (!event.shiftKey && document.activeElement === last) {
+          event.preventDefault()
+          first.focus()
+        }
+      }
+    }
+    document.addEventListener('keydown', handle)
+    return () => {
+      const position = openDialogs.indexOf(token)
+      if (position >= 0) openDialogs.splice(position, 1)
+      window.cancelAnimationFrame(focusFrame)
+      document.removeEventListener('keydown', handle)
+      releaseModalLock()
+      ;(returnFocusRef?.current || previous)?.focus()
+    }
+  }, [returnFocusRef])
+  return createPortal(
+    <div className="dialog-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose() }}>
+      <div
+        ref={panel}
+        className={`dialog-panel ${className}`}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={titleId}
+        aria-describedby={description ? `${titleId}-description` : undefined}
+      >
+        <header className="dialog-header">
+          <div>
+            <h2 id={titleId}>{title}</h2>
+            {description && <p id={`${titleId}-description`}>{description}</p>}
+          </div>
+          <button className="icon-button" type="button" onClick={onClose} aria-label="Close dialog">
+            <Icon name="x" />
+          </button>
+        </header>
+        {children}
+      </div>
+    </div>,
+    document.getElementById('overlay-root') || document.body,
+  )
+}
+
+const Login = lazy(() => import('./features/Login'))
+const FleetMap = lazy(() => import('./features/FleetMap').then((module) => ({ default: module.FleetMap })))
+
+export function PageHeader({
+  title,
+  description,
+  action,
+}: {
+  title: string
+  description?: string
+  action?: ReactNode
+}) {
+  return (
+    <header className="page-header">
+      <div>
+        <h1>{title}</h1>
+        {description && <p>{description}</p>}
+      </div>
+      {action}
+    </header>
+  )
+}
+
+export type MetricTone = 'neutral' | 'positive' | 'warning' | 'critical'
+
+export function Metric({ label, value, detail, icon, tone = 'neutral', onClick }: { label: string; value: string | number; detail: string; icon: Parameters<typeof Icon>[0]['name']; tone?: MetricTone; onClick?: () => void }) {
+  const content = <div>
+      <p><Icon name={icon} />{label}</p>
+      <strong>{typeof value === 'number' ? value.toLocaleString() : value}</strong>
+      <small>{detail}</small>
+    </div>
+  return onClick
+    ? <button type="button" className={`metric-card metric-${tone} metric-link`} onClick={onClick} aria-label={`${label}: ${value}. ${detail}`}>{content}</button>
+    : <article className={`metric-card metric-${tone}`}>{content}</article>
+}
+
+// The server may serve cached overview metrics; say how old they are. Older
+// backends omit the field and nothing is shown.
+export function metricsTime(overview: Overview) {
+  return formatMetricsTime(overview.metrics_computed_at)
+}
+
+// Availability is only calm when nearly every connector is online.
+export const availabilityTone = (percent: number, total: number): MetricTone =>
+  !total ? 'neutral' : percent >= 95 ? 'positive' : percent >= 80 ? 'warning' : 'critical'
+
+// The owner's automatic release of unknown-identity punches, at a glance. It
+// polls its own small status (saved counts only) and hides for non-admins.
+function UnknownReleaseMetric({ onOpen }: { onOpen: () => void }) {
+  const { data } = useUnknownAutoReleaseStatus(true)
+  if (!data) return null
+  const headline = autoReleaseHeadline(data)
+  return <Metric label="Unknown-identity release" value={headline.value} detail={headline.detail} icon="refresh" tone={headline.tone} onClick={onOpen} />
+}
+
+function FleetView({
+  devices,
+  overview,
+  loading,
+  onInspect,
+  onManageUsers,
+  onNavigateAlerts,
+  onNavigateReconciliation,
+  onNavigateUnknownRelease,
+}: {
+  devices: Device[]
+  overview: Overview
+  loading: boolean
+  onInspect: (device: Device) => void
+  onManageUsers: (device: Device) => void
+  onNavigateAlerts: () => void
+  onNavigateReconciliation: () => void
+  onNavigateUnknownRelease: () => void
+}) {
+  const [query, setQuery] = useState('')
+  const [filter, setFilter] = useState('ALL')
+  const [sort, setSort] = useState<'name' | 'last-contact' | 'state'>('last-contact')
+  const [mode, setMode] = useState<'map' | 'list'>('map')
+  const [inventory, setInventory] = useState<'fleet' | 'spares'>('fleet')
+  const activeDevices = devices.filter((device) => !device.is_spare)
+  const spareDevices = devices.filter((device) => device.is_spare)
+  const inventoryDevices = inventory === 'fleet' ? activeDevices : spareDevices
+  const needle = query.trim().toLowerCase()
+  // Online with warnings is still online. A terminal link that is down needs
+  // attention even while the ESP itself is online.
+  const terminalDown = (device: Device) => terminalLinkNeedsAttention(device.terminal_link?.state)
+  const matchesState = (device: Device) => inventory === 'spares' || filter === 'ALL'
+    || (filter === 'ATTENTION' ? !isOnlineState(device.state) || terminalDown(device)
+      : filter === 'TERMINAL_LINK_DOWN' ? terminalDown(device)
+        : device.state === filter)
+  const shown = inventoryDevices.filter(
+    (device) =>
+      matchesState(device) &&
+      `${device.display_name} ${device.zone_name} ${device.zone_id} ${device.hardware_id} ${device.zkt?.serial || ''}`
+        .toLowerCase()
+        .includes(needle),
+  ).sort((left, right) => sort === 'name'
+    ? left.display_name.localeCompare(right.display_name)
+    : sort === 'state'
+      ? left.state.localeCompare(right.state) || left.display_name.localeCompare(right.display_name)
+      : +new Date(right.last_seen_at || 0) - +new Date(left.last_seen_at || 0))
+  const withWarnings = overview.online_with_warnings || 0
+  const online = (overview.online || 0) + withWarnings
+  const availability = overview.total ? Math.round((online / overview.total) * 100) : 0
+  const attention =
+    (overview.offline || 0) +
+    (overview.degraded || 0) +
+    (overview.flapping || 0) +
+    (overview.quarantined_duplicate_serial || 0)
+  const terminalAttention = overview.terminal_attention || 0
+  // Acknowledged alerts stay OPEN; the queue counts only those still needing action.
+  const needsAction = overview.open_unacknowledged_alerts ?? overview.open_alerts
+  const delivery = overview.ords_delivery
+  const recovery = overview.attendance_recovery?.delivery
+  const backlogStale = Boolean(delivery?.oldest_backlog_at && Date.now() - +new Date(delivery.oldest_backlog_at) > 15 * 60_000)
+  const metricsAsOf = metricsTime(overview)
+  const filtered = Boolean(needle) || (inventory === 'fleet' && filter !== 'ALL')
+  const clearFilters = () => { setQuery(''); setFilter('ALL') }
+  const showAttention = () => { setInventory('fleet'); setFilter('ATTENTION'); setMode('list') }
+  return (
+    <>
+      <PageHeader
+        title={inventory === 'fleet' ? 'Fleet' : 'Spare device inventory'}
+        description={inventory === 'fleet'
+          ? 'Live health of every Zone Lite connector and its attendance terminal.'
+          : 'Backup devices, kept apart from fleet health, outages, and the operations queue.'}
+        action={inventory === 'fleet' && metricsAsOf
+          ? <span className="fleet-toolbar-note" title="Time the server computed these fleet metrics"><Icon name="clock" /> Metrics as of {metricsAsOf}</span>
+          : undefined}
+      />
+      <div className="section-tabs fleet-inventory-tabs" role="tablist" aria-label="Device inventory">
+        <button role="tab" aria-selected={inventory === 'fleet'} className={inventory === 'fleet' ? 'active' : ''} onClick={() => setInventory('fleet')}><Icon name="grid" /> Active fleet <span className="tab-count">{activeDevices.length}</span></button>
+        <button role="tab" aria-selected={inventory === 'spares'} className={inventory === 'spares' ? 'active' : ''} onClick={() => setInventory('spares')}><Icon name="server" /> Spares <span className="tab-count">{spareDevices.length}</span></button>
+      </div>
+      {inventory === 'fleet' ? <section className="metric-grid" aria-label="Fleet key indicators">
+        <Metric label="Fleet availability" value={`${availability}%`} detail={`${online} of ${overview.total} online${withWarnings ? ` (${withWarnings} with warnings)` : ''}`} icon="pulse" tone={availabilityTone(availability, overview.total)} onClick={attention || terminalAttention || online < overview.total ? showAttention : undefined} />
+        <Metric label="Operations queue" value={needsAction} detail={`${attention} device${attention === 1 ? '' : 's'} degraded or offline${terminalAttention ? ` · ${terminalAttention} terminal link${terminalAttention === 1 ? '' : 's'} down` : ''}`} icon="alert" tone={needsAction ? 'warning' : 'neutral'} onClick={onNavigateAlerts} />
+        <Metric
+          label="ORDS delivery queue"
+          value={delivery?.backlog ?? 0}
+          detail={`${delivery?.retrying ?? 0} retrying · ${delivery?.blocked_identity ?? 0} identity blocked · ${delivery?.quarantined ?? 0} quarantined`}
+          icon="clock"
+          tone={(delivery?.retrying ?? 0) > 0 ? 'critical' : (delivery?.backlog ?? 0) > 0 && backlogStale ? 'warning' : 'neutral'}
+        />
+        <Metric
+          label="Attendance recovery"
+          value={recovery?.safe_retryable ?? 0}
+          detail={`${recovery?.identity_held ?? 0} held for identity · ${recovery?.permanent_review ?? 0} for review`}
+          icon="refresh"
+          tone={(recovery?.safe_retryable ?? 0) > 0 ? 'warning' : 'neutral'}
+          onClick={onNavigateReconciliation}
+        />
+        <UnknownReleaseMetric onOpen={onNavigateUnknownRelease} />
+        <Metric label="Enrollment leases" value={overview.active_leases} detail="Temporary administrator access" icon="shield" />
+      </section> : <section className="spare-inventory-banner" aria-label="Spare inventory monitoring policy">
+        <span className="spare-inventory-icon"><Icon name="shield" /></span>
+        <div><h2>Ready when the active fleet needs a replacement</h2><p>Spare devices keep their telemetry and management access, but their offline state and alerts do not affect fleet availability or the operations queue.</p></div>
+        <div className="spare-inventory-count"><strong>{spareDevices.length}</strong><span>Spare device{spareDevices.length === 1 ? '' : 's'}</span></div>
+      </section>}
+      <section className="panel">
+        <header className="panel-header">
+          <div>
+            <h2>{inventory === 'fleet' ? 'Devices' : 'Spare devices'}</h2>
+            <p>{filtered ? `${shown.length} of ${inventoryDevices.length} shown` : inventory === 'fleet' ? `${inventoryDevices.length} connector${inventoryDevices.length === 1 ? '' : 's'} · open a device for live logs and controls` : 'Open a device to return it to active service.'}</p>
+          </div>
+          <div className="fleet-panel-actions">
+            {inventory === 'fleet' && <span className="fleet-toolbar-note"><Icon name="shield" /> Secure auto-onboarding enabled</span>}
+            {inventory === 'fleet' && <div className="segmented-control fleet-view-toggle" role="group" aria-label="Fleet view">
+              <button type="button" className={mode === 'map' ? 'active' : ''} aria-pressed={mode === 'map'} onClick={() => setMode('map')}><Icon name="map" /> Map</button>
+              <button type="button" className={mode === 'list' ? 'active' : ''} aria-pressed={mode === 'list'} onClick={() => setMode('list')}><Icon name="list" /> List</button>
+            </div>}
+          </div>
+        </header>
+        <div className="toolbar">
+          <label className="search-field">
+            <span className="sr-only">{inventory === 'fleet' ? 'Search active fleet' : 'Search spare devices'}</span>
+            <Icon name="search" />
+            <input
+              type="search"
+              placeholder={inventory === 'fleet' ? 'Search name, zone, MAC, or serial' : 'Search spare devices'}
+              value={query}
+              onChange={(event) => setQuery(event.target.value)}
+            />
+          </label>
+          {inventory === 'fleet' && <label>
+            <span className="sr-only">Filter by state</span>
+            <select value={filter} onChange={(event) => setFilter(event.target.value)}>
+              <option value="ALL">All states</option>
+              <option value="ATTENTION">Needs attention</option>
+              <option value="ONLINE">Online</option>
+              <option value="ONLINE_WITH_WARNINGS">Online with warnings</option>
+              <option value="DEGRADED">Degraded</option>
+              <option value="OFFLINE">Offline</option>
+              <option value="ONBOARDING">Onboarding</option>
+              <option value="QUARANTINED_DUPLICATE_SERIAL">Quarantined</option>
+              <option value="TERMINAL_LINK_DOWN">Terminal link down</option>
+            </select>
+          </label>}
+          <label><span className="sr-only">Sort fleet</span><select value={sort} onChange={(event) => setSort(event.target.value as typeof sort)}><option value="last-contact">Newest contact first</option><option value="name">Device name</option><option value="state">Operational state</option></select></label>
+        </div>
+        {inventory === 'fleet' && mode === 'map' ? (
+          <Suspense fallback={<div className="fleet-map-fallback" role="status"><Icon name="refresh" /> Preparing national map…</div>}>
+            <FleetMap
+              devices={shown}
+              loading={loading && !devices.length}
+              onInspect={onInspect}
+              onManageUsers={onManageUsers}
+              formatRelativeTime={relativeTime}
+            />
+          </Suspense>
+        ) : (
+          <div className="device-list" aria-busy={loading}>
+            {loading && !shown.length && <div className="empty-state is-loading" role="status"><Icon name="refresh" /><h3>Loading live fleet…</h3></div>}
+            {shown.length > 0 && <div className="device-list-head" aria-hidden="true"><span>Device</span><span>Terminal</span><span>Activity</span><span>Firmware</span><span>Status</span></div>}
+            {shown.map((device) => {
+              const primary = !device.is_spare && device.health?.mode === 'ENFORCED' ? primaryHealthReason(device.health) : null
+              return <article className={`device-card ${device.is_spare ? 'spare-device-card pattern-notice' : `pattern-${statusPattern(device.state)}`}`} key={device.connector_id}>
+                <button className="device-card-main" onClick={() => onInspect(device)} aria-label={`Inspect ${device.display_name}`}>
+                  <span className="device-identity"><strong>{device.display_name}</strong><small>{device.zone_id} · {device.hardware_id}</small></span>
+                  <span className="device-terminal"><strong>{device.zkt?.model || (device.firmware_family === 'hikvision' ? 'Hikvision terminal' : 'Awaiting terminal')}</strong><small>{[device.zkt?.ip_address, device.zkt?.serial].filter(Boolean).join(' · ') || 'Identity pending'}</small></span>
+                  <span className="device-activity"><strong>{device.is_spare ? 'Reserve inventory' : deviceActivity(device)}</strong><small>{relativeTime(device.last_seen_at)}</small></span>
+                  <span className="device-firmware"><strong>{device.firmware_version ? firmwareLabel(device.firmware_version) : 'Firmware unknown'}</strong><small>{device.ota_capable ? humanizeStatus(device.ota_state || 'OTA_READY') : 'Manual updates'}</small></span>
+                  <span className="device-status-stack">
+                    <StatusBadge state={device.is_spare ? 'SPARE' : device.state} live={!device.is_spare && device.connected} />
+                    {!device.is_spare && showsTerminalLinkBadge(device.terminal_link) && <TerminalLinkBadge link={device.terminal_link} />}
+                  </span>
+                  <Icon name="chevron" />
+                  {primary && <span className={`device-health-line pattern-${healthTierPattern(primary.tier)}`}>{healthReasonLine(primary)}</span>}
+                </button>
+                <div className="device-card-actions">
+                  <button className="icon-button" onClick={() => onManageUsers(device)} aria-label={`Manage users on ${device.display_name}`} title="Manage users"><Icon name="users" /></button>
+                </div>
+              </article>
+            })}
+            {!loading && !shown.length && (
+              <div className="empty-state">
+                <Icon name={filtered ? 'search' : 'server'} />
+                <h3>{inventoryDevices.length ? 'No devices match these filters' : inventory === 'spares' ? 'No spare devices yet' : 'Waiting for the first device'}</h3>
+                <p>{inventoryDevices.length ? 'Try a different search or state.' : inventory === 'spares' ? 'Open any active device and move it to spare inventory when it is taken out of service.' : 'A securely flashed Zone Lite ESP appears here automatically after signed onboarding.'}</p>
+                {filtered && inventoryDevices.length > 0 && <button type="button" className="button secondary small" onClick={clearFilters}>Clear filters</button>}
+              </div>
+            )}
+          </div>
+        )}
+      </section>
+    </>
+  )
+}
+
+export function CommandProgress({
+  command,
+  onCancel,
+}: {
+  command: Command
+  onCancel: (command: Command) => Promise<void>
+}) {
+  const status = normalizedStatus(command.status)
+  const commandType = normalizedStatus(command.type)
+  const canCancel = !['RUNNING', 'CANCEL_REQUESTED', 'SUCCEEDED', 'FAILED', 'CANCELLED', 'EXPIRED'].includes(status)
+  const pattern = statusPattern(status)
+  return (
+    <section className={`command-progress pattern-${pattern}`} aria-live="polite">
+      <span className="command-symbol"><Icon name={status === 'SUCCEEDED' ? 'check' : status === 'FAILED' ? 'alert' : statusIcon[pattern]} /></span>
+      <div>
+        <p className="eyebrow">{commandType.replaceAll('_', ' ')}</p>
+        <h3>{humanizeStatus(status)}</h3>
+        <p>{command.error_message || (command.error_code ? humanizeStatus(command.error_code) : `Command ${command.command_id.slice(0, 8)} is durably tracked.`)}</p>
+      </div>
+      {canCancel && <button className="button secondary" onClick={() => void onCancel(command)}>Cancel before execution</button>}
+    </section>
+  )
+}
+
+const UsersView = lazy(() => import('./features/UsersWorkspace').then((module) => ({ default: module.UsersView })))
+
+const ReconciliationView = lazy(() => import('./features/Reconciliation').then((module) => ({ default: module.ReconciliationView })))
+const FirmwareView = lazy(() => import('./features/Firmware').then((module) => ({ default: module.FirmwareView })))
+const FirmwareProvisioning = lazy(() => import('./features/FirmwareProvisioning'))
+
+const AttendanceView = lazy(() => import('./features/Attendance').then((module) => ({ default: module.AttendanceView })))
+const AlertsView = lazy(() => import('./features/Monitoring').then((module) => ({ default: module.AlertsView })))
+
+export function formatAlertDiagnostics(details: Record<string, unknown>): string {
+  const facts: string[] = []
+  const category = details.failure_category
+  if (typeof category === 'string' && /^[A-Z0-9_]{1,80}$/.test(category)) {
+    facts.push(`Category ${category}`)
+  }
+  const httpStatus = details.http_status
+  if (typeof httpStatus === 'number' && Number.isInteger(httpStatus) && httpStatus >= 100 && httpStatus <= 599) {
+    facts.push(`HTTP ${httpStatus}`)
+  }
+  const attemptCount = details.attempt_count
+  if (typeof attemptCount === 'number' && Number.isInteger(attemptCount) && attemptCount >= 0) {
+    facts.push(`Attempt ${attemptCount}`)
+  }
+  const affectedUsers = details.affected_users
+  if (typeof affectedUsers === 'number' && Number.isInteger(affectedUsers) && affectedUsers >= 0) {
+    facts.push(`${affectedUsers} affected users`)
+  }
+  const evidence = record(details.evidence)
+  if (typeof evidence?.summary === 'string' && evidence.summary.trim()) {
+    facts.push(`Evidence: ${evidence.summary.trim().slice(0, 300)}`)
+  }
+  const firmware = token(details.firmware_version, /^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$/)
+  const boot = token(details.boot_id, /^[A-Za-z0-9-]{1,64}$/)
+  if (firmware || boot) facts.push([firmware && `Firmware ${firmware}`, boot && `boot ${boot.slice(0, 8)}`].filter(Boolean).join(' · '))
+  const binding = token(details.binding, /^[A-Z_]{1,40}$/)
+  if (binding) facts.push(bindingLabels[binding] || `Binding ${binding}`)
+  const latch = token(record(details.latch)?.kind, /^[A-Z_]{1,60}$/)
+  if (latch) facts.push(latchLabels[latch] || `Latch ${latch}`)
+  // Rejection alerts keep one entry per message type; legacy rows carry one type.
+  const types = record(details.types)
+  const legacyRejection = typeof details.error_category === 'string' || typeof details.error_type === 'string'
+  const candidates: unknown[] = types ? Object.keys(types) : legacyRejection ? [details.message_type] : []
+  const messageTypes = candidates
+    .filter((value): value is string => typeof value === 'string' && /^[a-z][a-z0-9_]{0,63}$/.test(value))
+    .slice(0, 16)
+  if (messageTypes.length) facts.push(`Rejected ${messageTypes.join(', ')}`)
+  const resolution = record(details.resolution)
+  const kind = token(resolution?.kind, /^[A-Z_]{1,40}$/)
+  if (kind) facts.push(resolutionSummary(kind, token(resolution?.actor, /^[\w.@-]{1,80}$/)))
+  return facts.join(' · ')
+}
+
+const record = (value: unknown) =>
+  value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null
+const token = (value: unknown, pattern: RegExp) => typeof value === 'string' && pattern.test(value) ? value : null
+const bindingLabels: Record<string, string> = {
+  OBSERVED: 'Observed on its boot',
+  INFERRED_CURRENT: 'Inferred on the current boot',
+  INFERRED_PREVIOUS: 'Inferred on an earlier boot',
+}
+const latchLabels: Record<string, string> = {
+  LED_LATCH_NO_IO_ERRORS: 'LED latch: no I/O errors this boot',
+  LED_LATCH_STORAGE_VERIFIED: 'LED latch: storage verified this boot',
+}
+const resolutionLabels: Record<string, string> = {
+  VERIFIED: 'Resolved on verified evidence',
+  CONDITION_CLEARED: 'Resolved: condition cleared',
+  MESSAGE_ACCEPTED: 'Resolved: message accepted',
+  DEPLOYMENT_SUCCEEDED: 'Resolved: later deployment succeeded',
+  BOOT_ENDED: 'Resolved: its boot ended',
+  OPERATOR: 'Resolved by an operator',
+  CLEANUP: 'Resolved by stranded-alert cleanup',
+}
+
+// Resolution kinds come from alert details.resolution.kind.
+export function resolutionSummary(kind: string, actor?: string | null) {
+  if (kind === 'OPERATOR' && actor) return `Resolved by ${actor}`
+  const label = resolutionLabels[kind] || `Resolved: ${humanizeStatus(kind).toLowerCase()}`
+  return actor ? `${label} (${actor})` : label
+}
+
+// Realtime refresh bounds. Heartbeats and command updates refresh the device
+// list; alerts and the periodic resync refresh the heavier overview.
+export const DEVICE_REFRESH_MS = 3_000
+export const FLEET_OVERVIEW_REFRESH_MS = 15_000
+export const BACKGROUND_OVERVIEW_REFRESH_MS = 60_000
+
+const DeviceDrawer = lazy(() => import('./features/DeviceDrawer').then((module) => ({ default: module.DeviceDrawer })))
+
+function DashboardApp() {
+  const location = useLocation()
+  const navigate = useNavigate()
+  const navigationType = useNavigationType()
+  const workspaceRef = useRef<HTMLElement>(null)
+  const workspaceScrollPositions = useRef(new Map<string, number>())
+  const previousScrollContext = useRef<{ key: string; context: string } | null>(null)
+  const [authState, setAuthState] = useState<'loading' | 'anonymous' | 'authenticated'>('loading')
+  const [username, setUsername] = useState('')
+  const devices = useDevices()
+  const deviceRequest = useRef(0)
+  const overviewRequest = useRef(0)
+  const [overview, setOverview] = useState<Overview>({ total: 0, open_alerts: 0, active_leases: 0 })
+  const [loading, setLoading] = useState(true)
+  const [revisions, setRevisions] = useState<Record<RealtimeTopic, number>>({
+    attendance: 0, alert: 0, users: 0, reconciliation: 0, command: 0, log: 0,
+    identity: 0, firmware: 0, provisioning: 0, device: 0, backend_error: 0, resync: 0,
+  })
+  const [selectedDeviceId, setSelectedDeviceId] = useState('')
+  const [drawer, setDrawer] = useState<Device | null>(null)
+  const toast = useToast()
+  const view = dashboardRoute(location.pathname)
+  const rememberWorkspaceScroll = useCallback(() => {
+    const workspace = workspaceRef.current
+    if (workspace) workspaceScrollPositions.current.set(location.key, workspace.scrollTop)
+  }, [location.key])
+  const setView = useCallback((next: View) => {
+    rememberWorkspaceScroll()
+    navigate(routePath(next))
+  }, [navigate, rememberWorkspaceScroll])
+  const scrollContext = useMemo(() => {
+    if (view === 'fleet') return 'fleet'
+    if (view === 'users') return `users:${routeDeviceId(location.pathname, 'users') || 'picker'}`
+    if (view === 'firmware') return `firmware:${firmwareSection(location.search)}`
+    if (view === 'reconciliation') {
+      return `reconciliation:${new URLSearchParams(location.search).get('tab') || 'jobs'}`
+    }
+    return view
+  }, [location.pathname, location.search, view])
+
+  useLayoutEffect(() => {
+    const workspace = workspaceRef.current
+    if (!workspace) return
+    const previous = previousScrollContext.current
+    const sameFleetCanvas = previous?.context === 'fleet' && scrollContext === 'fleet'
+    const contextChanged = previous !== null && previous.context !== scrollContext
+    let target = workspace.scrollTop
+    let shouldRestore = false
+    if (!sameFleetCanvas && navigationType === 'POP') {
+      target = workspaceScrollPositions.current.get(location.key) || 0
+      shouldRestore = true
+    } else if (!sameFleetCanvas && (previous === null || contextChanged)) {
+      target = 0
+      shouldRestore = true
+    }
+
+    let restorationComplete = !shouldRestore
+    let resizeObserver: ResizeObserver | null = null
+    const delayed: number[] = []
+    const applyTarget = (finalAttempt = false) => {
+      if (restorationComplete) return
+      const maximum = Math.max(0, workspace.scrollHeight - workspace.clientHeight)
+      workspace.scrollTop = Math.min(target, maximum)
+      if (maximum >= target || finalAttempt) {
+        restorationComplete = true
+        resizeObserver?.disconnect()
+      }
+    }
+    applyTarget()
+    const frame = window.requestAnimationFrame(() => applyTarget())
+    if (!restorationComplete) {
+      ;[80, 250, 600].forEach((delay, index) => {
+        delayed.push(window.setTimeout(() => applyTarget(index === 2), delay))
+      })
+    }
+    const content = workspace.querySelector<HTMLElement>('.page-content')
+    resizeObserver = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(() => applyTarget())
+    if (!restorationComplete && content) resizeObserver?.observe(content)
+    previousScrollContext.current = { key: location.key, context: scrollContext }
+
+    const remember = () => workspaceScrollPositions.current.set(location.key, workspace.scrollTop)
+    workspace.addEventListener('scroll', remember, { passive: true })
+    return () => {
+      window.cancelAnimationFrame(frame)
+      delayed.forEach((timer) => window.clearTimeout(timer))
+      resizeObserver?.disconnect()
+      remember()
+      workspace.removeEventListener('scroll', remember)
+    }
+  }, [location.key, navigationType, scrollContext])
+
+  useEffect(() => {
+    const legacy = window.location.hash.replace(/^#/, '') as View
+    if (legacy && ['fleet', 'users', 'attendance', 'reconciliation', 'firmware', 'alerts'].includes(legacy)) {
+      navigate(routePath(legacy), { replace: true })
+      window.history.replaceState(null, '', withBase(routePath(legacy)))
+      return
+    }
+    if (location.pathname === '/' || dashboardRoute(location.pathname) !== location.pathname.split('/').filter(Boolean)[0]) {
+      navigate('/fleet', { replace: true })
+    }
+  }, [location.pathname, navigate])
+
+  useEffect(() => {
+    const userDevice = routeDeviceId(location.pathname, 'users')
+    if (userDevice && userDevice !== selectedDeviceId) setSelectedDeviceId(userDevice)
+    else if (location.pathname === '/users' && selectedDeviceId) setSelectedDeviceId('')
+  }, [location.pathname, selectedDeviceId])
+
+  useEffect(() => {
+    const fleetDevice = routeDeviceId(location.pathname, 'fleet')
+    if (!fleetDevice) {
+      if (drawer) setDrawer(null)
+      return
+    }
+    const match = devices.find((device) => device.connector_id === fleetDevice)
+    if (match && drawer?.connector_id !== match.connector_id) setDrawer(match)
+  }, [devices, drawer, location.pathname])
+
+  // Devices and overview refresh apart: heartbeats and commands only change the
+  // device list, while the overview aggregates the whole attendance and ORDS
+  // backlog and is far heavier on a busy server. Background refreshes never
+  // touch the loading state, so a live page does not flicker.
+  const reportFleetError = useCallback((reason: unknown) => {
+    if (reason instanceof ApiError && reason.status === 401) setAuthState('anonymous')
+    else toast.error(reason instanceof Error ? reason.message : 'Unable to refresh fleet.')
+  }, [toast.error])
+
+  const refreshDevices = useCallback(async () => {
+    const request = ++deviceRequest.current
+    try {
+      const fleet = await queryClient.fetchQuery({ queryKey: ['devices'], queryFn: ({ signal }) => api<{ rows: Device[] }>('/api/v1/devices', { signal }), staleTime: 0 })
+      if (request !== deviceRequest.current) return
+      deviceSnapshots.replaceFleet(fleet.rows)
+    } catch (reason) {
+      if (request === deviceRequest.current) reportFleetError(reason)
+    } finally {
+      if (request === deviceRequest.current) setLoading(false)
+    }
+  }, [reportFleetError])
+
+  const refreshOverview = useCallback(async () => {
+    const request = ++overviewRequest.current
+    try {
+      const counts = await queryClient.fetchQuery({ queryKey: ['overview'], queryFn: ({ signal }) => api<Overview>('/api/v1/overview', { signal }), staleTime: 0 })
+      if (request !== overviewRequest.current) return
+      setOverview(counts)
+    } catch (reason) {
+      if (request === overviewRequest.current) reportFleetError(reason)
+    }
+  }, [reportFleetError])
+
+  // Only the Fleet page shows the overview metrics; elsewhere the shell needs
+  // just the alert count, so the overview refreshes at most once a minute.
+  const viewRef = useRef(view)
+  viewRef.current = view
+  const deviceRefresh = useThrottledRunner(refreshDevices, DEVICE_REFRESH_MS)
+  const overviewRefresh = useThrottledRunner(
+    refreshOverview,
+    () => viewRef.current === 'fleet' ? FLEET_OVERVIEW_REFRESH_MS : BACKGROUND_OVERVIEW_REFRESH_MS,
+  )
+
+  const invalidateFleetRequests = useCallback(() => {
+    ++deviceRequest.current
+    ++overviewRequest.current
+    deviceRefresh.cancel()
+    overviewRefresh.cancel()
+  }, [deviceRefresh, overviewRefresh])
+
+  // Explicit refresh after an operator action: both at once, never overlapping
+  // a request already in flight.
+  const refreshFleet = useCallback(async () => {
+    await Promise.all([deviceRefresh.runNow(), overviewRefresh.runNow()])
+  }, [deviceRefresh, overviewRefresh])
+
+  const handleRealtimeTopics = useCallback((topics: ReadonlySet<RealtimeTopic>) => {
+    setRevisions((current) => {
+      const next = { ...current }
+      topics.forEach((topic) => {
+        next[topic] += 1
+        if (topic === 'resync') {
+          ;(['attendance', 'alert', 'users', 'reconciliation', 'command', 'log', 'identity', 'firmware', 'provisioning', 'device'] as RealtimeTopic[])
+            .forEach((name) => { next[name] += 1 })
+        }
+      })
+      return next
+    })
+    // Attendance never refreshes the overview directly: a punch release emits
+    // thousands of batches, and the periodic resync picks the backlog up.
+    if (topics.has('device') || topics.has('command') || topics.has('resync')) deviceRefresh.schedule()
+    if (topics.has('alert') || topics.has('resync')) overviewRefresh.schedule()
+  }, [deviceRefresh, overviewRefresh])
+  const realtime = useRealtime(authState === 'authenticated', handleRealtimeTopics)
+
+  useEffect(() => {
+    api<{ username: string; csrf_token: string }>('/api/v1/auth/session')
+      .then((session) => {
+        setCsrfToken(session.csrf_token)
+        setUsername(session.username)
+        setAuthState('authenticated')
+      })
+      .catch(() => setAuthState('anonymous'))
+  }, [])
+
+  useEffect(() => {
+    const handleSessionExpired = () => {
+      setCsrfToken('')
+      setAuthState('anonymous')
+      invalidateFleetRequests()
+      deviceSnapshots.clear()
+      queryClient.clear()
+      setDrawer(null)
+    }
+    window.addEventListener('add:session-expired', handleSessionExpired)
+    return () => window.removeEventListener('add:session-expired', handleSessionExpired)
+  }, [invalidateFleetRequests])
+
+  useEffect(() => {
+    if (authState !== 'authenticated') return
+    setLoading(true)
+    void refreshFleet()
+  }, [authState, refreshFleet])
+
+  // Returning to the Fleet page brings its metrics up to date (immediately when
+  // the last overview is older than the Fleet interval).
+  const previousView = useRef(view)
+  useEffect(() => {
+    if (previousView.current === view) return
+    previousView.current = view
+    if (authState === 'authenticated' && view === 'fleet') overviewRefresh.schedule()
+  }, [authState, overviewRefresh, view])
+
+  const login = async (loginUsername: string, password: string) => {
+    const response = await api<{ username: string; csrf_token: string }>('/api/v1/auth/login', {
+      method: 'POST',
+      body: JSON.stringify({ username: loginUsername, password }),
+    })
+    setCsrfToken(response.csrf_token)
+    setUsername(response.username)
+    setAuthState('authenticated')
+  }
+
+  const logout = async () => {
+    try { await api('/api/v1/auth/logout', { method: 'POST', body: '{}' }) } finally {
+      setCsrfToken('')
+      setAuthState('anonymous')
+      invalidateFleetRequests()
+      deviceSnapshots.clear()
+      queryClient.clear()
+    }
+  }
+
+  const manageUsers = (device: Device) => {
+    setSelectedDeviceId(device.connector_id)
+    setDrawer(null)
+    navigate(routePath('users', device.connector_id))
+  }
+
+  const inspectDevice = (device: Device) => {
+    setDrawer(device)
+    navigate(routePath('fleet', device.connector_id))
+  }
+
+  const closeDevice = () => {
+    setDrawer(null)
+    navigate('/fleet')
+  }
+
+  const selectUserDevice = (id: string) => {
+    setSelectedDeviceId(id)
+    navigate(id ? routePath('users', id) : '/users')
+  }
+
+  if (authState === 'loading') return <main className="boot-screen"><img src={LOGO_SRC} alt="State Life Insurance Corporation" /><p>Opening Attendance Device Dashboard…</p></main>
+  if (authState === 'anonymous') return <Suspense fallback={<main className="boot-screen"><img src={LOGO_SRC} alt="State Life Insurance Corporation" /><p>Opening secure sign in…</p></main>}><Login onLogin={login} /></Suspense>
+
+  return (
+    <>
+      <AppShell workspaceRef={workspaceRef} username={username} route={view} openAlertCount={overview.open_unacknowledged_alerts ?? overview.open_alerts} onNavigate={setView} onLogout={() => void logout()} realtimeState={realtime.state} lastSyncAt={realtime.lastSyncAt}>
+        {view === 'fleet' && <FleetView devices={devices} overview={overview} loading={loading} onInspect={inspectDevice} onManageUsers={manageUsers} onNavigateAlerts={() => navigate('/alerts')} onNavigateReconciliation={() => navigate('/reconciliation?tab=recovery')} onNavigateUnknownRelease={() => navigate('/attendance')} />}
+        {view === 'users' && <Suspense fallback={<WorkspaceLoading label="Opening users" />}><UsersView devices={devices} selectedDeviceId={selectedDeviceId} onSelectDevice={selectUserDevice} revision={revisions.users + revisions.identity + revisions.command} toast={toast} refreshFleet={refreshFleet} /></Suspense>}
+        {view === 'attendance' && <Suspense fallback={<WorkspaceLoading label="Opening attendance" />}><AttendanceView devices={devices} revision={revisions.attendance} realtimeState={realtime.state} realtimeLastSyncAt={realtime.lastSyncAt} toast={toast} /></Suspense>}
+        {view === 'reconciliation' && <Suspense fallback={<WorkspaceLoading label="Opening reconciliation" />}><ReconciliationView devices={devices} revision={revisions.reconciliation + revisions.attendance} toast={toast} /></Suspense>}
+        {view === 'firmware' && <Suspense fallback={<WorkspaceLoading label="Opening firmware" />}>{firmwareSection(location.search) === 'prepare' ? <FirmwareProvisioning revision={revisions.provisioning} toast={toast} username={username} onSection={(section) => navigate(`/firmware?tab=${section}`)} /> : <FirmwareView devices={devices} revision={revisions.firmware} toast={toast} section={firmwareSection(location.search)} onSection={(section) => navigate(`/firmware?tab=${section}`)} />}</Suspense>}
+        {view === 'alerts' && <Suspense fallback={<WorkspaceLoading label="Opening alerts" />}><AlertsView devices={devices.filter((device) => !device.is_spare)} toast={toast} revision={revisions.alert} /></Suspense>}
+      </AppShell>
+      {drawer && <Suspense fallback={null}><DeviceDrawer key={drawer.connector_id} seed={drawer} revision={revisions.device + revisions.command + revisions.log + revisions.alert} custodyRevision={revisions.attendance + revisions.reconciliation} onClose={closeDevice} onManageUsers={manageUsers} onInventoryChanged={refreshFleet} toast={toast} /></Suspense>}
+      {toast.toast && createPortal(
+        <div className={`toast pattern-${toast.toast.kind === 'error' ? 'blocked' : 'confirmed'}`} role={toast.toast.kind === 'error' ? 'alert' : 'status'} aria-live={toast.toast.kind === 'error' ? 'assertive' : 'polite'}>
+          <Icon name={toast.toast.kind === 'error' ? 'alert' : 'check'} />
+          <span>{toast.toast.text}</span>
+          <button type="button" className="icon-button" onClick={toast.dismiss} aria-label="Dismiss notification"><Icon name="x" /></button>
+        </div>,
+        document.getElementById('overlay-root') || document.body,
+      )}
+    </>
+  )
+}
+
+// Waits briefly so a fast lazy chunk never flashes a loading state.
+function WorkspaceLoading({ label }: { label: string }) {
+  const [visible, setVisible] = useState(false)
+  useEffect(() => {
+    const timer = window.setTimeout(() => setVisible(true), 180)
+    return () => window.clearTimeout(timer)
+  }, [])
+  if (!visible) return null
+  return <div className="panel empty-state is-loading" role="status"><Icon name="refresh" /><h3>{label}…</h3></div>
+}
+
+function RouteErrorBoundary() {
+  const error = useRouteError()
+  return <main className="boot-screen route-error" role="alert"><img src={LOGO_SRC} alt="State Life Insurance Corporation" /><h1>This workspace could not be opened</h1><p>{error instanceof Error ? error.message : 'The requested route is unavailable.'}</p><a className="button primary" href={withBase('/fleet')}>Return to Fleet</a></main>
+}
+
+export default function App() {
+  const router = useMemo(() => createBrowserRouter([{
+    path: '*',
+    element: <DashboardApp />,
+    errorElement: <RouteErrorBoundary />,
+  }], { basename: CLASSIC_BASE }), [])
+  return <RouterProvider router={router} />
+}

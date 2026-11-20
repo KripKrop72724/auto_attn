@@ -114,6 +114,8 @@ def main() -> int:
     expected_apps = {
         "add_backend",
         "add_frontend",
+        # Old screens, one week after the revamp release (docs/add-classic-screens.md).
+        "add_frontend_classic",
         "add_provisioner",
         "esp_installer",
         "provisioning_companion",

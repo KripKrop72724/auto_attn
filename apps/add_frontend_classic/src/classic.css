@@ -1,0 +1,23 @@
+/* Old screens only: a slim banner above the frozen dashboard. */
+.classic-frame {
+  height: 100vh;
+  height: 100dvh;
+  display: flex;
+  flex-direction: column;
+  overflow: auto;
+}
+.classic-banner {
+  flex: 0 0 auto;
+  padding: 8px 16px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text);
+  font-size: 13px;
+  line-height: 1.4;
+  text-align: center;
+}
+.classic-banner a { color: var(--brand); font-weight: 600; }
+/* The dashboard shell normally fills the whole window; here it fills what the banner leaves. */
+.classic-frame > .app-shell { flex: 1 1 0; height: auto; min-height: 0; }
+.classic-frame > .boot-screen,
+.classic-frame > .login-shell { flex: 1 0 auto; min-height: 0; }

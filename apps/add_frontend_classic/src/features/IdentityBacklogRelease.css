@@ -1,0 +1,10 @@
+.identity-backlog { margin-bottom: 20px; }
+.identity-backlog-controls { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 12px; margin: 12px 0; }
+.identity-backlog-controls label { display: grid; gap: 6px; font-size: 13px; color: var(--text-secondary); }
+.identity-backlog-table { width: 100%; border-collapse: collapse; margin: 12px 0 16px; font-size: 13px; }
+.identity-backlog-table caption { text-align: left; color: var(--text-secondary); padding-bottom: 8px; }
+.identity-backlog-table th, .identity-backlog-table td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); }
+.identity-backlog-table th { color: var(--text-tertiary); font-weight: 600; }
+@media (max-width: 640px) {
+  .identity-backlog-table { display: block; overflow-x: auto; }
+}
