@@ -72,13 +72,13 @@ describe('firmware preservation evidence', () => {
     const diagnostics = { ...healthy, storage: { ...healthy.storage!, legacy_read_recoveries: 42,
       legacy_error_queue: 'ords_pending', legacy_error_operation: 'legacy_read', [field]: 1 } }
     const { rerender } = render(<FirmwareHealth bootId="current" diagnostics={diagnostics} observedAt={new Date().toISOString()} />)
-    expect(screen.getByRole('heading', { name: 'Local storage needs attention' })).toBeTruthy()
-    expect(screen.queryByText('Local storage verified')).toBeNull()
+    expect(screen.getByRole('heading', { name: 'Saving check-ins needs attention' })).toBeTruthy()
+    expect(screen.queryByText('Check-ins are being saved safely')).toBeNull()
     expect(screen.getByText('42')).toBeTruthy()
     if (field === 'legacy_error_code') expect(screen.getByText(/Retained Oracle pending · reading preserved records · 1/)).toBeTruthy()
     rerender(<FirmwareHealth bootId="current" diagnostics={{ ...diagnostics,
       storage: { ...diagnostics.storage, [field]: 0 } }} observedAt={new Date().toISOString()} />)
-    expect(screen.getByRole('heading', { name: 'Local storage verified' })).toBeTruthy()
+    expect(screen.getByRole('heading', { name: 'Check-ins are being saved safely' })).toBeTruthy()
     expect(screen.getByText('42')).toBeTruthy()
   })
   it.each(['missing', 'stale', 'full', 'recovering', 'append-failed'])('does not promote legacy storage proof over %s journal evidence', failure => {
@@ -91,7 +91,7 @@ describe('firmware preservation evidence', () => {
     if (failure === 'recovering') diagnostics.journal_storage!.checkpoint_recovery_pending = true
     if (failure === 'append-failed') diagnostics.journal_storage!.last_append_result = 'UNCERTAIN'
     render(<FirmwareHealth bootId="current" diagnostics={diagnostics} observedAt={new Date().toISOString()} />)
-    expect(screen.queryByText('Local storage verified')).toBeNull()
+    expect(screen.queryByText('Check-ins are being saved safely')).toBeNull()
   })
   it('keeps historical errors and unverified migration visible without inventing a pending count', () => {
     render(<FirmwareHealth bootId="current" observedAt={new Date().toISOString()} diagnostics={{ ...healthy,
@@ -102,7 +102,7 @@ describe('firmware preservation evidence', () => {
       queues: [{ name: 'legacy_migration', count_known: false, records: 0, count_reason: 'UNVERIFIED_MIGRATION' }],
       workers: [{ name: 'capture', state: 'RUNNING', completed_operations: 20, failures: 2, timeouts: 1 }],
     }} />)
-    expect(screen.getByText('Local storage verified')).toBeTruthy()
+    expect(screen.getByText('Check-ins are being saved safely')).toBeTruthy()
     expect(screen.getByText(/old_sync · filesystem 5/)).toBeTruthy()
     expect(screen.getByText(/Legacy custody verification pending/)).toBeTruthy()
     expect(screen.queryByText(/0 pending/)).toBeNull()
@@ -163,38 +163,38 @@ describe('firmware preservation evidence', () => {
       persistence_probe_operation: 'persistence_sync', persistence_probe_failures: 3,
       persistence_probe_total_failures: 12 } }
     const { rerender } = render(<FirmwareHealth bootId="current" diagnostics={diagnostics} observedAt={new Date().toISOString()} />)
-    expect(screen.getByRole('heading', { name: 'Local storage needs attention' })).toBeTruthy()
+    expect(screen.getByRole('heading', { name: 'Saving check-ins needs attention' })).toBeTruthy()
     expect(screen.getByText('persistence_sync · 5')).toBeTruthy()
     rerender(<FirmwareHealth bootId="current" diagnostics={{ ...diagnostics, storage: {
       ...diagnostics.storage, persistence_probe_error: 0, persistence_probe_failures: 0,
     } }} observedAt={new Date().toISOString()} />)
-    expect(screen.getByRole('heading', { name: 'Local storage verified' })).toBeTruthy()
+    expect(screen.getByRole('heading', { name: 'Check-ins are being saved safely' })).toBeTruthy()
     expect(screen.getByText('12')).toBeTruthy()
     expect(screen.queryByText('Active persistence probe error')).toBeNull()
   })
   it('does not turn absent legacy diagnostics into healthy zero values', () => {
     render(<FirmwareHealth />)
-    expect(screen.getByRole('heading', { name: 'Local durability not reported' })).toBeTruthy()
-    expect(screen.queryByText('Local storage verified')).toBeNull()
+    expect(screen.getByRole('heading', { name: 'Not reported by this link box' })).toBeTruthy()
+    expect(screen.queryByText('Check-ins are being saved safely')).toBeNull()
   })
   it('requires both persistence and recovery evidence', () => {
     render(<FirmwareHealth bootId="current" diagnostics={{ ...healthy, storage: { ...healthy.storage!, recovery_complete: false } }} observedAt={new Date().toISOString()} />)
-    expect(screen.getByRole('heading', { name: 'Local recovery checks pending' })).toBeTruthy()
+    expect(screen.getByRole('heading', { name: 'Still checking after a restart' })).toBeTruthy()
   })
   it('does not present stale healthy reports as current health', () => {
     render(<FirmwareHealth bootId="current" diagnostics={healthy} observedAt={new Date(Date.now() - 60_000).toISOString()} />)
-    expect(screen.getByRole('heading', { name: 'Durability telemetry is stale' })).toBeTruthy()
-    expect(screen.queryByText('Local storage verified')).toBeNull()
+    expect(screen.getByRole('heading', { name: 'Last report is old' })).toBeTruthy()
+    expect(screen.queryByText('Check-ins are being saved safely')).toBeNull()
   })
   it('keeps unknown queue counts distinct from an empty queue', () => {
     render(<FirmwareHealth bootId="current" diagnostics={{ ...healthy, queues: [{ name: 'live', count_known: false, records: 0 }] }} observedAt={new Date().toISOString()} />)
-    expect(screen.getByRole('heading', { name: 'Local storage verified' })).toBeTruthy()
+    expect(screen.getByRole('heading', { name: 'Check-ins are being saved safely' })).toBeTruthy()
     expect(screen.getByText(/Pending count not reported/)).toBeTruthy()
     expect(screen.queryByText(/0 pending/)).toBeNull()
   })
   it.each([undefined, 'old-boot'])('withholds health for missing or mismatched boot evidence: %s', boot => {
     render(<FirmwareHealth bootId="current" diagnostics={{ ...healthy, boot_id: boot }} observedAt={new Date().toISOString()} />)
-    expect(screen.queryByText('Local storage verified')).toBeNull()
+    expect(screen.queryByText('Check-ins are being saved safely')).toBeNull()
     expect(screen.getByText(/Boot identity is unverified/)).toBeTruthy()
   })
   it('puts a plain three-line summary on the same verdicts (ADV-18, "Link box memory")', () => {
@@ -212,5 +212,29 @@ describe('firmware preservation evidence', () => {
     expect(screen.getByRole('heading', { name: 'Saving check-ins needs attention' })).toBeTruthy()
     rerender(<FirmwareHealth />)
     expect(screen.getByRole('heading', { name: 'Not reported by this link box' })).toBeTruthy()
+  })
+})
+
+describe('Link box memory: plain summary (ADV-18)', () => {
+  it('names the card, keeps three plain lines and puts the rows under Technical details', () => {
+    const { container } = render(<FirmwareHealth bootId="current" observedAt={new Date().toISOString()} diagnostics={{
+      ...healthy,
+      storage: { durability: 'HEALTHY', persistence_verified: true, recovery_complete: true, used_bytes: 310, total_bytes: 1000 },
+      workers: [{ name: 'capture', state: 'RUNNING', completed_operations: 1, failures: 3, timeouts: 1 }],
+      queues: [{ name: 'add_delivery', records: 1, count_known: true, bytes: 40 }],
+    }} />)
+    expect(screen.getByRole('article', { name: 'Link box memory' })).toBeTruthy()
+    expect(screen.getByRole('heading', { name: 'Check-ins are being saved safely' })).toBeTruthy()
+    expect(screen.getByText(/^Last report: .* · (just now|\d+ s ago)$/)).toBeTruthy()
+    expect(screen.getByText('Storage used: 31% · Waiting to send: 1 check-in')).toBeTruthy()
+    expect(screen.getByText(/3 failures since boot · 1 timeout since boot/).closest('[data-technical]')).toBeTruthy()
+    expect(screen.getByText('Telemetry received').closest('[data-technical]')).toBeTruthy()
+    expect(container.textContent).not.toMatch(/ATTENDANCE PRESERVATION/)
+  })
+
+  it('never says saved safely without a report', () => {
+    render(<FirmwareHealth />)
+    expect(screen.getByRole('heading', { name: 'Not reported by this link box' })).toBeTruthy()
+    expect(screen.getByText("This link box's software doesn't report this.")).toBeTruthy()
   })
 })

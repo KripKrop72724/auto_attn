@@ -99,6 +99,7 @@ const dialog = (onClose = vi.fn(), notice = vi.fn(), onChanged = vi.fn(async () 
     <RetryTargetDialog
       campaign={campaign}
       deployment={deployment}
+      deviceName="Multan · Device 2"
       onClose={onClose}
       onChanged={onChanged}
       toast={{ notice }}
@@ -132,13 +133,19 @@ describe('interrupted target boot', () => {
     expect(await screen.findByText(/up 12 min/)).toBeTruthy()
     const [review] = fetchMock.mock.calls[0] as unknown as [string, RequestInit?]
     expect(review).toBe('/api/v1/firmware/campaigns/campaign-multan-02/retry-target?deployment_id=deployment-multan-02')
-    expect(screen.getByText(/DEGRADED · no I\/O faults reported/)).toBeTruthy()
-    expect(screen.getByText(/^0 queued at/)).toBeTruthy()
+    // The plain three-line summary; the raw values stay under Technical details.
+    expect(screen.getByText('Online · version 2.6.15')).toBeTruthy()
+    expect(screen.getByText('Saved data: Needs attention')).toBeTruthy()
+    expect(screen.getByText('Check-ins waiting to send: 0')).toBeTruthy()
+    expect(screen.getByText(/DEGRADED · no I\/O faults reported/).closest('[data-technical]')).toBeTruthy()
+    expect(screen.getByText(/^0 queued at/).closest('[data-technical]')).toBeTruthy()
+    expect(screen.getByText('This device has been restarting a lot')).toBeTruthy()
     expect(screen.queryByLabelText('Administrator password')).toBeNull()
     expect(screen.queryByLabelText('Audited reason')).toBeNull()
     expect(screen.queryByLabelText(/Type exact version/)).toBeNull()
     expect(screen.queryByLabelText(/Override the stability warnings/)).toBeNull()
-    const retry = screen.getByRole('button', { name: 'Retry same target' }) as HTMLButtonElement
+    expect(screen.getByRole('dialog', { name: 'Try the update again' })).toBeTruthy()
+    const retry = screen.getByRole('button', { name: 'Try again' }) as HTMLButtonElement
     expect(retry.disabled).toBe(false)
     fireEvent.click(retry)
     await waitFor(() => expect(onClose).toHaveBeenCalled())
@@ -151,7 +158,7 @@ describe('interrupted target boot', () => {
       resume_pending_deployments: 0,
     })
     expect(onChanged).toHaveBeenCalled()
-    expect(notice).toHaveBeenCalledWith(expect.stringMatching(/2\.7\.5 attempt for Multan 02 is queued/))
+    expect(notice).toHaveBeenCalledWith('Trying again on Multan · Device 2.')
   })
 
   it('sends the pending deployments the retry also resumes and says so', async () => {
@@ -160,8 +167,8 @@ describe('interrupted target boot', () => {
     const onClose = vi.fn()
     const notice = vi.fn()
     dialog(onClose, notice)
-    expect(await screen.findByText(/also offers its 2 other pending deployments/)).toBeTruthy()
-    const retry = screen.getByRole('button', { name: 'Retry same target' }) as HTMLButtonElement
+    expect(await screen.findByText(/also restarts the update for 2 other waiting devices here/)).toBeTruthy()
+    const retry = screen.getByRole('button', { name: 'Try again' }) as HTMLButtonElement
     expect(retry.disabled).toBe(false)
     fireEvent.click(retry)
     await waitFor(() => expect(onClose).toHaveBeenCalled())
@@ -169,7 +176,7 @@ describe('interrupted target boot', () => {
     expect(body.resume_pending_deployments).toBe(2)
     expect(body.override_stability_warnings).toBe(false)
     expect(body).not.toHaveProperty('stability_warnings_digest')
-    expect(notice).toHaveBeenCalledWith(expect.stringMatching(/also offers its 2 other pending deployments/))
+    expect(notice).toHaveBeenCalledWith('Trying again on Multan · Device 2.')
   })
 
   it('shows the server refusal from the review and never offers the retry', async () => {
@@ -179,9 +186,9 @@ describe('interrupted target boot', () => {
     }))
     vi.stubGlobal('fetch', fetchMock)
     dialog()
-    expect((await screen.findByRole('alert')).textContent).toContain('storage I/O faults')
-    expect(screen.getByText('I/O faults: write_failures=3')).toBeTruthy()
-    expect((screen.getByRole('button', { name: 'Retry same target' }) as HTMLButtonElement).disabled).toBe(true)
+    expect((await screen.findByRole('alert')).textContent).toContain("Can't try again yet: This device has a storage problem; fix that first.")
+    expect(screen.getByText('I/O faults: write_failures=3').closest('[data-technical]')).toBeTruthy()
+    expect((screen.getByRole('button', { name: 'Try again' }) as HTMLButtonElement).disabled).toBe(true)
     expect(posts(fetchMock)).toHaveLength(0)
   })
 
@@ -198,9 +205,9 @@ describe('interrupted target boot', () => {
       () => response({ detail: 'The ESP is offline.' }, 409)))
     const onClose = vi.fn()
     dialog(onClose)
-    await screen.findByText(/Current ESP state/)
-    fireEvent.click(screen.getByRole('button', { name: 'Retry same target' }))
-    expect((await screen.findByRole('alert')).textContent).toContain('The ESP is offline.')
+    await screen.findByText('Link box now')
+    fireEvent.click(screen.getByRole('button', { name: 'Try again' }))
+    expect((await screen.findByRole('alert')).textContent).toContain("Can't try again yet: This device is offline; try when it is back.")
     expect(onClose).not.toHaveBeenCalled()
   })
 })
@@ -223,9 +230,9 @@ describe('downloaded image that did not verify (ZKT 2.7.7)', () => {
         toast={{ notice: vi.fn() }}
       />,
     )
-    expect(screen.getByText(/did not verify on the ESP/)).toBeTruthy()
-    expect(screen.getByText(/downloads it again from\s+the start/)).toBeTruthy()
-    expect(document.body.textContent).not.toMatch(/reset before it confirmed/)
-    await waitFor(() => expect(screen.queryByText(/Checking the ESP/)).toBeNull())
+    expect(screen.getByText(/The downloaded file was damaged, so it was not installed/)).toBeTruthy()
+    expect(screen.getByText(/Trying again downloads it fresh/)).toBeTruthy()
+    expect(document.body.textContent).not.toMatch(/restarted before it finished installing/)
+    await waitFor(() => expect(screen.queryByText(/Checking the device/)).toBeNull())
   })
 })

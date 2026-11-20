@@ -105,7 +105,9 @@ bytes belonging to a different bundle.
 
 ## Operator flow and recovery
 
-The UI is **Firmware → Prepare device**. It guides environment/pairing, automatic
+The UI is **Advanced tools › Set up a device** (`/setup`; the old
+`/firmware?tab=prepare` link redirects). The browser steps below show only when the server says a
+setup can start (`can_start`); otherwise the page leads with the State Life Device Installer. It guides environment/pairing, automatic
 USB inspection, configuration, review, password step-up, exact-MAC confirmation
 for irreversible paths, package preparation, eFuse verification, range write and
 readback, boot evidence, signed onboarding and terminal validation.

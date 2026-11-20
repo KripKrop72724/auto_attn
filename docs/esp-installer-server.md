@@ -208,10 +208,13 @@ withdraw a bundle, move its directory out of the store.
 
 ## App store
 
-The Prepare page ("Prepare an ESP32" on the Firmware page) shows a **State Life Device
-Installer** card. It reads `GET /apps` and offers the newest app for the visitor's computer:
-Windows or Mac, with a smaller link for the other one. It shows the version, the size and the
-SHA-256, how to open the app the first time, and an empty state when nothing is published.
+The **Set up a device** page (Advanced tools › Set up a device, `/setup`; old
+`/firmware?tab=prepare` links redirect there) shows a **State Life Device Installer** card first.
+It reads `GET /apps` and offers the newest app for the visitor's computer: Windows or Mac, with a
+smaller link for the other one. It shows the version, the size and how to open the app the first
+time; the file name, exact size and SHA-256 sit under Technical details. Phones and tablets see a
+note instead of the downloads. While the installer is switched off the page shows one plain
+"Switched off for now" card instead.
 Both routes use the dashboard's admin session and the installer kill switch, like every other
 installer route.
 

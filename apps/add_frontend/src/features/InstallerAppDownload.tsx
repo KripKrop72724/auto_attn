@@ -1,14 +1,15 @@
 import { useEffect, useMemo, useState } from 'react'
 import { z } from 'zod'
 import { api, ApiError } from '../api'
-import { dateTime, type useToast } from '../App'
+import { dayTime } from '../lib/time'
 import { Icon } from '../Icon'
+import { TechnicalDetails } from '../ui'
+import type { Toast } from '../ui/Toast'
+import { INSTALLER_CARD, SETUP_OFF_CARD, SETUP_PAGE } from '../words/setup'
 
-// The State Life Device Installer download card on the Prepare page
+// The State Life Device Installer download card on Set up a device
 // (GET /api/v1/installer/apps, docs/esp-installer-server.md "App store").
-// It is its own lazy chunk, so the Prepare page's bundle budget is unchanged.
-
-type Toast = ReturnType<typeof useToast>
+// It is its own lazy chunk. The page may pass the apps it already read.
 
 const appFileSchema = z.object({
   platform: z.string(),
@@ -30,7 +31,7 @@ export const installerAppsSchema = z.object({
     .nullable(),
   min_app_version: z.string(),
 })
-type InstallerApps = z.infer<typeof installerAppsSchema>
+export type InstallerApps = z.infer<typeof installerAppsSchema>
 export type DesktopPlatform = 'windows' | 'macos'
 type AppFile = z.infer<typeof appFileSchema> & { platform: DesktopPlatform }
 
@@ -49,6 +50,11 @@ const firstRunSteps: Record<DesktopPlatform, string[]> = {
     'Open the app. If the Mac says it was not opened, click Done.',
     'Go to System Settings > Privacy & Security. Scroll down, click Open Anyway and confirm.',
   ],
+}
+
+/** A phone or tablet: the app downloads are replaced by a note. */
+export function touchDevice(userAgent: string, maxTouchPoints = 0) {
+  return /iPhone|iPad|iPod|Android/i.test(userAgent) || (/Macintosh|Mac OS X/i.test(userAgent) && maxTouchPoints > 1)
 }
 
 export function visitorPlatform(
@@ -77,44 +83,49 @@ type LoadState =
 function FileFacts({
   file,
   onCopy,
+  copied,
 }: {
   file: AppFile
   onCopy: (value: string) => void
+  copied: boolean
 }) {
   return (
-    <dl className="installer-app-facts">
-      <div>
-        <dt>File</dt>
-        <dd>{file.filename}</dd>
-      </div>
-      <div>
-        <dt>Size</dt>
-        <dd>
-          {fileSize(file.size)} ({file.size.toLocaleString('en-US')} bytes)
-        </dd>
-      </div>
-      <div>
-        <dt>SHA-256</dt>
-        <dd className="installer-app-hash">
-          <code>{file.sha256}</code>
-          <button
-            type="button"
-            className="icon-button"
-            aria-label={`Copy the SHA-256 of the ${platformNames[file.platform]} file`}
-            onClick={() => onCopy(file.sha256)}
-          >
-            <Icon name="copy" />
-          </button>
-        </dd>
-      </div>
-    </dl>
+    <TechnicalDetails summary={`Technical details (${platformNames[file.platform]} file)`} copyText={file.sha256}>
+      <dl className="installer-app-facts">
+        <div>
+          <dt>File</dt>
+          <dd>{file.filename}</dd>
+        </div>
+        <div>
+          <dt>Size</dt>
+          <dd>
+            {fileSize(file.size)} ({file.size.toLocaleString('en-US')} bytes)
+          </dd>
+        </div>
+        <div>
+          <dt>SHA-256</dt>
+          <dd className="installer-app-hash">
+            <code>{file.sha256}</code>
+            <button
+              type="button"
+              className="icon-button"
+              aria-label={`Copy the SHA-256 of the ${platformNames[file.platform]} file`}
+              onClick={() => onCopy(file.sha256)}
+            >
+              <Icon name={copied ? 'check' : 'copy'} />
+            </button>
+          </dd>
+        </div>
+      </dl>
+      <p>{INSTALLER_CARD.compare}</p>
+    </TechnicalDetails>
   )
 }
 
 function FirstRun({ platform }: { platform: DesktopPlatform }) {
   return (
     <div className="installer-app-first-run">
-      <strong>First run on {platform === 'windows' ? 'Windows' : 'a Mac'}</strong>
+      <strong>{INSTALLER_CARD.firstTime(platform)}</strong>
       <ol>
         {firstRunSteps[platform].map((step) => (
           <li key={step}>{step}</li>
@@ -127,18 +138,27 @@ function FirstRun({ platform }: { platform: DesktopPlatform }) {
 export default function InstallerAppDownload({
   toast,
   refreshKey = 0,
+  apps,
 }: {
-  toast: Toast
+  toast: Pick<Toast, 'notice' | 'error'>
   refreshKey?: number
+  /** The apps the page already read; the card then makes no request of its own. */
+  apps?: InstallerApps | null
 }) {
-  const [state, setState] = useState<LoadState>({ kind: 'loading' })
+  const [state, setState] = useState<LoadState>(apps ? { kind: 'ready', apps } : { kind: 'loading' })
   const [attempt, setAttempt] = useState(0)
+  const [copied, setCopied] = useState('')
   const platform = useMemo(
     () => visitorPlatform(navigator.userAgent, navigator.maxTouchPoints || 0),
     [],
   )
+  const touch = useMemo(() => touchDevice(navigator.userAgent, navigator.maxTouchPoints || 0), [])
 
   useEffect(() => {
+    if (apps) {
+      setState({ kind: 'ready', apps })
+      return
+    }
     let current = true
     api<unknown>('/api/v1/installer/apps')
       .then((raw) => {
@@ -156,14 +176,20 @@ export default function InstallerAppDownload({
     return () => {
       current = false
     }
-  }, [refreshKey, attempt])
+  }, [refreshKey, attempt, apps])
+  useEffect(() => {
+    if (!copied) return
+    const timer = window.setTimeout(() => setCopied(''), 1500)
+    return () => window.clearTimeout(timer)
+  }, [copied])
 
   const copy = async (value: string) => {
     try {
       await navigator.clipboard.writeText(value)
-      toast.notice('SHA-256 copied.')
+      setCopied(value)
+      toast.notice(INSTALLER_CARD.copied)
     } catch {
-      toast.error('The SHA-256 could not be copied. Select it and copy it instead.')
+      toast.error(INSTALLER_CARD.copyFailed)
     }
   }
 
@@ -185,12 +211,8 @@ export default function InstallerAppDownload({
       <div className="installer-app-heading">
         <Icon name="download" />
         <div>
-          <p className="eyebrow">APP FOR SITE STAFF</p>
-          <h2 id="installer-app-title">State Life Device Installer</h2>
-          <p>
-            Sets up a board for a ZKTeco or Hikvision attendance machine. Staff
-            sign in with the dashboard's username and password.
-          </p>
+          <h2 id="installer-app-title">{INSTALLER_CARD.title}</h2>
+          <p>{INSTALLER_CARD.intro.split(/(ZKTeco|Hikvision)/).map((part, index) => (index % 2 ? <span key={part} data-brand>{part}</span> : part))}</p>
         </div>
         {latest && primary && (
           <span className="installer-app-version">Version {latest.version}</span>
@@ -198,18 +220,17 @@ export default function InstallerAppDownload({
       </div>
       {state.kind === 'loading' && (
         <p className="installer-app-message" role="status">
-          Looking for the latest app…
+          {INSTALLER_CARD.loading}
         </p>
       )}
       {state.kind === 'disabled' && (
         <p className="installer-app-message" role="status">
-          The installer is switched off on this server, so the app cannot be
-          downloaded here.
+          {SETUP_OFF_CARD.sentence} {SETUP_OFF_CARD.ask}
         </p>
       )}
       {state.kind === 'failed' && (
         <div className="installer-app-message" role="alert">
-          <p>The app downloads could not be loaded.</p>
+          <p>{INSTALLER_CARD.failed}</p>
           <button
             type="button"
             className="button secondary small"
@@ -221,14 +242,17 @@ export default function InstallerAppDownload({
       )}
       {state.kind === 'ready' && !primary && (
         <div className="installer-app-message" role="status">
-          <strong>No version of the app is published yet.</strong>
-          <p>
-            The Windows and Mac downloads appear here once a release build is
-            published to this server.
-          </p>
+          <strong>{INSTALLER_CARD.none}</strong>
+          <p>{INSTALLER_CARD.noneHelp}</p>
         </div>
       )}
-      {latest && primary && (
+      {latest && primary && touch && (
+        <p className="installer-app-note">
+          {SETUP_PAGE.phoneNote}{' '}
+          {files.map((file) => `${platformNames[file.platform]}: ${fileSize(file.size)}`).join(' · ')}
+        </p>
+      )}
+      {latest && primary && !touch && (
         <>
           <div className="installer-app-primary">
             <a
@@ -239,7 +263,7 @@ export default function InstallerAppDownload({
               <Icon name="download" /> Download for {platformNames[primary.platform]}
             </a>
             <span>
-              {fileSize(primary.size)} · published {dateTime(latest.published_at)}
+              {fileSize(primary.size)} · published {dayTime(latest.published_at)}
             </span>
           </div>
           {platform && primary.platform !== platform && (
@@ -257,20 +281,18 @@ export default function InstallerAppDownload({
               ({fileSize(file.size)})
             </p>
           ))}
-          <FileFacts file={primary} onCopy={(value) => void copy(value)} />
           <FirstRun platform={primary.platform} />
           {others.map((file) => (
             <details className="installer-app-details" key={file.filename}>
-              <summary>{platformNames[file.platform]} file and first run</summary>
-              <FileFacts file={file} onCopy={(value) => void copy(value)} />
+              <summary>{platformNames[file.platform]}: first time</summary>
               <FirstRun platform={file.platform} />
+              <FileFacts file={file} copied={copied === file.sha256} onCopy={(value) => void copy(value)} />
             </details>
           ))}
-          <p className="installer-app-note">
-            Compare the SHA-256 to check that a copy is unchanged.
-            {minVersion &&
-              ` Copies older than version ${minVersion} cannot set up boards.`}
-          </p>
+          {minVersion && (
+            <p className="installer-app-note">{INSTALLER_CARD.tooOld(minVersion)}</p>
+          )}
+          <FileFacts file={primary} copied={copied === primary.sha256} onCopy={(value) => void copy(value)} />
         </>
       )}
     </section>

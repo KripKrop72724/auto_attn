@@ -94,7 +94,6 @@ test('primary routes and device deep link remain usable', async ({ page }, testI
   await panel.getByRole('button', { name: phone ? 'Back' : 'Close', exact: true }).click()
 
   const primaryNav = page.getByRole('navigation', { name: 'Main menu' })
-  const phone = (page.viewportSize()?.width || 0) <= 760
   // On a phone People and the Advanced tools live in the More sheet.
   const openFromMore = async (name: RegExp) => {
     await primaryNav.getByRole('button', { name: 'More', exact: true }).click()
@@ -120,27 +119,21 @@ test('primary routes and device deep link remain usable', async ({ page }, testI
     await expect(page.getByRole('heading', { name: 'Recover attendance', exact: true, level: 1 })).toBeVisible()
     await primaryNav.getByRole('link', { name: 'Software updates', exact: true }).click()
   }
-  await expect(page.getByRole('heading', { name: 'Firmware', exact: true, level: 1 })).toBeVisible()
-  const channelBadgeGeometry = await page.locator('.firmware-channel-strip .status-badge').first().evaluate((badge) => {
-    const icon = badge.querySelector('svg')?.getBoundingClientRect()
-    const text = badge.querySelector('span')?.getBoundingClientRect()
-    const box = badge.getBoundingClientRect()
-    return {
-      display: getComputedStyle(badge).display,
-      flexDirection: getComputedStyle(badge).flexDirection,
-      height: box.height,
-      horizontal: Boolean(icon && text && icon.right <= text.left && Math.abs((icon.top + icon.height / 2) - (text.top + text.height / 2)) <= 2),
-    }
-  })
-  expect(['flex', 'inline-flex']).toContain(channelBadgeGeometry.display)
-  expect(channelBadgeGeometry.flexDirection).toBe('row')
-  expect(channelBadgeGeometry.height).toBeLessThanOrEqual(32)
-  expect(channelBadgeGeometry.horizontal).toBe(true)
-  await page.getByRole('tab', { name: /Signed releases/ }).click()
-  await expect(page.getByRole('heading', { name: 'Signed release inventory' })).toBeVisible()
-  await expect(page.getByRole('heading', { name: 'Zone Lite 2.2.30' })).toBeVisible()
-  await page.getByRole('tab', { name: /Campaigns/ }).click()
-  await expect(page.getByRole('heading', { name: 'Campaign operations' })).toBeVisible()
+  await expect(page.getByRole('heading', { name: 'Software updates', exact: true, level: 1 })).toBeVisible()
+  // The OTA channel strip is gone (ADV-12): the status line says it in words and
+  // its links stay one row high.
+  const status = page.getByRole('region', { name: 'Software status' })
+  await expect(status).toContainText(/devices? (are|is) up to date/)
+  const statusLink = status.locator('.updates-status-link').first()
+  if (await statusLink.count()) {
+    const box = await statusLink.boundingBox()
+    expect(box?.height || 0).toBeGreaterThanOrEqual(44)
+  }
+  await page.getByRole('tab', { name: /Versions/ }).click()
+  await expect(page.getByRole('heading', { name: 'Software versions' })).toBeVisible()
+  await expect(page.getByText('2.2.30', { exact: true })).toBeVisible()
+  await page.getByRole('tab', { name: /Updates/ }).click()
+  await expect(page.getByRole('heading', { name: 'Updates', exact: true })).toBeVisible()
   await primaryNav.getByRole('link', { name: /^Problems/ }).click()
   await expect(page.getByRole('heading', { name: 'Problems', exact: true, level: 1 })).toBeVisible()
   expect(page.url()).not.toMatch(/cnic|password|reason|confirmation/i)
@@ -187,7 +180,7 @@ test('reported viewport thresholds, route scroll reset, and collision layers rem
   const savedScroll = await workspace.evaluate((node) => node.scrollTop)
   expect(savedScroll).toBeGreaterThan(0)
   await page.getByRole('navigation', { name: 'Main menu' }).getByRole('link', { name: 'Software updates', exact: true }).click()
-  await expect(page.getByRole('heading', { name: 'Firmware', exact: true, level: 1 })).toBeVisible()
+  await expect(page.getByRole('heading', { name: 'Software updates', exact: true, level: 1 })).toBeVisible()
   await expect.poll(() => workspace.evaluate((node) => node.scrollTop)).toBe(0)
   await page.goBack()
   await expect(page.getByRole('heading', { name: 'People', exact: true, level: 1 })).toBeVisible()

@@ -1,7 +1,16 @@
 import type { FirmwareDiagnostics } from '../types'
 import { useEffect, useState } from 'react'
+import { ago, clock } from '../lib/time'
+import { TechnicalDetails } from '../ui'
 import { captureLatencyLabel } from './captureLatency'
-import { ago, dayTime } from '../lib/time'
+
+// "Link box memory" (08-advanced 2.7, ADV-18): a plain three-line summary on
+// the same verdict variables as before (verified, fresh, sameBoot,
+// journalNeedsAttention); every engineering row moves unchanged into
+// Technical details. Placed in the device detail by chapter 04.
+const many = (count: number, one: string, other = `${one}s`) => `${count} ${count === 1 ? one : other}`
+// Queues of check-ins still to be sent to the dashboard.
+const SEND_QUEUES = new Set(['add_delivery', 'journal_add_delivery', 'legacy_add_delivery', 'live', 'bulk'])
 
 const bytes = (value?: number | null) => value == null ? 'Not reported' : `${(value / 1024).toLocaleString(undefined, { maximumFractionDigits: 1 })} KiB`
 const labels: Record<string, string> = {
@@ -110,34 +119,27 @@ export function FirmwareHealth({ diagnostics, observedAt, bootId, imageDigest }:
   const journalNeedsAttention = ownerFresh && journalStorage &&
     (['DEGRADED', 'FULL'].includes(journalStorage.durability) || !journalStorage.ready ||
       journalStorage.checkpoint_recovery_pending || (journalStorage.last_append_result && journalStorage.last_append_result !== 'OK'))
-  const heading = !diagnostics ? 'Local durability not reported'
-    : !sameBoot ? 'Durability boot identity is unverified'
-      : !fresh ? 'Durability telemetry is stale'
-      : verified ? 'Local storage verified'
-        : storage?.durability === 'DEGRADED' || storage?.durability === 'FULL' || storage?.persistence_probe_error || legacyNeedsAttention || journalNeedsAttention ? 'Local storage needs attention'
-          : 'Local recovery checks pending'
-  // ADV-18 plain summary on exactly the same verdict variables.
-  const plainHeading = !diagnostics ? 'Not reported by this link box'
+  const heading = !diagnostics ? 'Not reported by this link box'
     : !sameBoot ? 'Waiting for a fresh report after a restart'
       : !fresh ? 'Last report is old'
-        : verified ? 'Check-ins are being saved safely'
-          : heading === 'Local storage needs attention' ? 'Saving check-ins needs attention'
-            : 'Still checking after a restart'
-  const used = storage?.used_bytes != null && storage?.total_bytes ? Math.round((storage.used_bytes / storage.total_bytes) * 100) : null
-  const knownQueues = diagnostics?.queues.filter(queue => queue.count_known && queue.records != null) ?? []
-  const waiting = knownQueues.length ? knownQueues.reduce((sum, queue) => sum + (queue.records || 0), 0) : null
-  return <article className="detail-card wide" aria-label="Link box memory">
-    <div className="firmware-health-plain">
-      <h3>{plainHeading}</h3>
-      {observedAt && Number.isFinite(observed) && <p>Last report: {dayTime(observedAt, now)} · {ago(observedAt, now)}</p>}
-      {(used !== null || waiting !== null) && <p>{[used !== null ? `Storage used: ${used}%` : '', waiting !== null ? `Waiting to send: ${waiting.toLocaleString('en-PK')} ${waiting === 1 ? 'check-in' : 'check-ins'}` : ''].filter(Boolean).join(' · ')}</p>}
-    </div>
-    <h4>{heading}</h4>
-    <p>Connection status, local preservation and Oracle delivery are checked separately.</p>
-    {!diagnostics ? <p>This firmware has not reported preservation diagnostics.</p> : <>
-      {!fresh && <p>Values below are the last report and do not confirm current health.</p>}
-      <dl>
-        <div><dt>Telemetry received</dt><dd>{observedAt ? new Date(observedAt).toLocaleString() : 'Not reported'}{Number.isFinite(observed) ? ` · ${Math.max(0, Math.floor((now - observed) / 1000))} seconds ago` : ''}</dd></div>
+      : verified ? 'Check-ins are being saved safely'
+        : storage?.durability === 'DEGRADED' || storage?.durability === 'FULL' || storage?.persistence_probe_error || legacyNeedsAttention || journalNeedsAttention ? 'Saving check-ins needs attention'
+          : 'Still checking after a restart'
+  const usedPercent = typeof storage?.used_bytes === 'number' && typeof storage?.total_bytes === 'number' && storage.total_bytes > 0
+    ? Math.round((storage.used_bytes / storage.total_bytes) * 100) : null
+  const sendQueues = (diagnostics?.queues ?? []).filter(queue => SEND_QUEUES.has(queue.name))
+  const waiting = sendQueues.length && sendQueues.every(queue => queue.count_known && queue.records != null)
+    ? sendQueues.reduce((total, queue) => total + (queue.records ?? 0), 0) : null
+  return <article className="detail-card wide link-box-memory" aria-label="Link box memory">
+    <h3>{heading}</h3>
+    {!diagnostics ? <p>This link box's software doesn't report this.</p> : <>
+      <p>Last report: {Number.isFinite(observed) ? `${clock(observed)} · ${ago(observed, now)}` : 'not received yet'}</p>
+      <p>Storage used: {usedPercent === null ? 'not reported' : `${usedPercent}%`} · Waiting to send: {waiting === null ? 'not counted yet' : many(waiting, 'check-in')}</p>
+      {!fresh && <p>These are from the last report and may be out of date.</p>}
+      <TechnicalDetails>
+      <p>This only shows whether check-ins are saved safely on the link box. Sending to the HR system is shown elsewhere.</p>
+      <dl className="link-box-memory-facts">
+        <div><dt>Telemetry received</dt><dd>{observedAt ? `${clock(observedAt)} PKT` : 'Not reported'}{Number.isFinite(observed) ? ` · ${many(Math.max(0, Math.floor((now - observed) / 1000)), 'second')} ago` : ''}</dd></div>
         <div><dt>Telemetry sampled</dt><dd>{diagnostics.sampled_at || 'Not reported'}</dd></div>
         <div><dt>Boot identity</dt><dd>{diagnostics.boot_id || bootId || 'Not reported'}{!sameBoot ? ' · Boot identity is unverified' : ''}</dd></div>
         <div><dt>Current boot evidence</dt><dd>{currentBootReported ? 'Fresh report from this boot' : 'Unverified'}</dd></div>
@@ -199,18 +201,19 @@ export function FirmwareHealth({ diagnostics, observedAt, bootId, imageDigest }:
       {diagnostics.workers.map(worker => <p key={worker.name}>
         {labels[worker.name] || worker.name}: {worker.state === 'UNKNOWN' ? 'Not reported' : worker.state.replaceAll('_', ' ').toLowerCase()}
         {worker.operation ? ` · ${worker.operation}` : ''}
-        {worker.restart_count != null ? ` · ${worker.restart_count} successful restarts` : ''}
-        {worker.restart_attempts != null ? ` · ${worker.restart_attempts} restart attempts` : ''}
-        {worker.pending_requests != null ? ` · ${worker.pending_requests} pending requests` : ''}
-        {worker.failures != null ? ` · ${worker.failures} failures since boot` : ''}
-        {worker.timeouts != null ? ` · ${worker.timeouts} timeouts since boot` : ''}
-        {worker.refusals != null ? ` · ${worker.refusals} admission refusals since boot` : ''}
+        {worker.restart_count != null ? ` · ${many(worker.restart_count, 'successful restart')}` : ''}
+        {worker.restart_attempts != null ? ` · ${many(worker.restart_attempts, 'restart attempt')}` : ''}
+        {worker.pending_requests != null ? ` · ${many(worker.pending_requests, 'pending request')}` : ''}
+        {worker.failures != null ? ` · ${many(worker.failures, 'failure')} since boot` : ''}
+        {worker.timeouts != null ? ` · ${many(worker.timeouts, 'timeout')} since boot` : ''}
+        {worker.refusals != null ? ` · ${many(worker.refusals, 'admission refusal')} since boot` : ''}
       </p>)}
       {!diagnostics.workers.length && <p>Delivery workers: Not reported</p>}
       {diagnostics.queues.map(queue => <p key={queue.name}>
         {labels[queue.name] || queue.name}: {queue.count_known && queue.records != null ? `${queue.records.toLocaleString()} pending` : 'Pending count not reported'} · {bytes(queue.bytes)}
         {queue.count_reason && countReasons[queue.count_reason] ? ` · ${countReasons[queue.count_reason]}` : ''}
       </p>)}
+      </TechnicalDetails>
     </>}
   </article>
 }

@@ -271,11 +271,14 @@ export default function FirmwareProvisioning({
   toast,
   username,
   onSection,
+  embedded = false,
 }: {
   revision: number
   toast: Toast
   username: string
   onSection: (section: FirmwareSection) => void
+  /** Inside Set up a device (ADV-19): the page owns the header, the installer card, the switched-off card and past setups. */
+  embedded?: boolean
 }) {
   const [capabilities, setCapabilities] = useState<z.infer<
     typeof capabilitiesSchema
@@ -805,6 +808,7 @@ export default function FirmwareProvisioning({
 
   return (
     <div className="firmware-workspace firmware-provisioning-workspace">
+      {!embedded && <>
       <PageHeader
         title="Firmware"
         description="Signed releases, device preparation, and audited rollouts to exact device scopes."
@@ -924,6 +928,7 @@ export default function FirmwareProvisioning({
           <StatusBadge state={online ? 'READY' : 'NOT READY'} />
         </article>
       </section>
+      </>}
       <p className="sr-only" aria-live="polite">
         {current
           ? `Provisioning state ${humanizeProvisioningState(current.state)}, ${current.progress} percent complete.`
@@ -979,7 +984,7 @@ export default function FirmwareProvisioning({
           ))}
         </ol>
         <main className="provisioning-main">
-          {!capabilities?.enabled && (
+          {!embedded && !capabilities?.enabled && (
             <section className="provisioning-state pattern-blocked">
               <Icon name="shield" />
               <div>
@@ -1976,7 +1981,7 @@ export default function FirmwareProvisioning({
           </dl>
         </aside>
       </div>
-      {sessions.length > 0 && (
+      {!embedded && sessions.length > 0 && (
         <section className="panel provisioning-history">
           <div className="panel-header">
             <div>

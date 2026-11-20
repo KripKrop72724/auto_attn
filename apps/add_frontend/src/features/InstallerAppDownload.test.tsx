@@ -52,12 +52,17 @@ describe('State Life Device Installer download card', () => {
     expect(other.getAttribute('href')).toBe(macFile.download_path)
     expect(other.className).not.toContain('button')
     expect(screen.getByText('Version 1.1.0')).toBeTruthy()
+    // The file name, exact size and SHA-256 sit under Technical details.
     expect(screen.getAllByText('a'.repeat(64))).toHaveLength(1)
-    expect(screen.getByText('82.1 MB (86,123,456 bytes)')).toBeTruthy()
+    expect(screen.getByText('a'.repeat(64)).closest('[data-technical]')).toBeTruthy()
+    expect(screen.getByText('82.1 MB (86,123,456 bytes)').closest('[data-technical]')).toBeTruthy()
     expect(screen.getByText(/Windows protected your PC/)).toBeTruthy()
-    expect(screen.getByText(/Copies older than version 1\.0\.0 cannot set up boards/)).toBeTruthy()
+    expect(screen.getByText('First time on Windows')).toBeTruthy()
+    expect(screen.getByText("Copies older than version 1.0.0 can't set up link boxes.")).toBeTruthy()
+    expect(screen.queryByText('APP FOR SITE STAFF')).toBeNull()
+    expect(document.querySelector('.installer-app-heading')?.textContent).toMatch(/new link box for a ZKTeco or Hikvision machine/)
     // The Mac file's checksum and first-run steps wait behind a disclosure.
-    const details = screen.getByText('Mac file and first run').closest('details') as HTMLElement
+    const details = screen.getByText('Mac: first time').closest('details') as HTMLElement
     expect(within(details).getByText('b'.repeat(64))).toBeTruthy()
     expect(within(details).getByText(/Privacy & Security/)).toBeTruthy()
     expect(within(details).getByText(/Apple silicon \(M1 or newer\) only/)).toBeTruthy()
@@ -74,7 +79,7 @@ describe('State Life Device Installer download card', () => {
   it('copies the SHA-256', async () => {
     renderAs(WINDOWS, published([windowsFile, macFile]))
     fireEvent.click(await screen.findByRole('button', { name: 'Copy the SHA-256 of the Windows file' }))
-    await vi.waitFor(() => expect(toast.notice).toHaveBeenCalledWith('SHA-256 copied.'))
+    await vi.waitFor(() => expect(toast.notice).toHaveBeenCalledWith('Copied.'))
     expect(navigator.clipboard.writeText).toHaveBeenCalledWith('a'.repeat(64))
   })
 
@@ -95,24 +100,49 @@ describe('State Life Device Installer download card', () => {
 
   it('shows an empty state when nothing is published', async () => {
     renderAs(WINDOWS, { latest: null, min_app_version: '1.0.0' })
-    expect(await screen.findByText('No version of the app is published yet.')).toBeTruthy()
+    expect(await screen.findByText("The app isn't available yet.")).toBeTruthy()
+    expect(screen.getByText('Ask IT for the Setup file.')).toBeTruthy()
     expect(screen.queryByRole('link')).toBeNull()
   })
 
   it('says when the installer is switched off', async () => {
     renderAs(WINDOWS, { code: 'INSTALLER_DISABLED', message: 'Off.', detail: { code: 'INSTALLER_DISABLED', message: 'Off.' } }, 409)
-    expect(await screen.findByText(/switched off on this server/)).toBeTruthy()
+    expect(await screen.findByText(/Setting up new devices from the dashboard is switched off/)).toBeTruthy()
     expect(screen.queryByRole('link')).toBeNull()
   })
 
   it('offers to try again when the list cannot be loaded', async () => {
     const fetch = renderAs(WINDOWS, { rows: [] })
     const retry = await screen.findByRole('button', { name: 'Try again' })
-    expect(screen.getByRole('alert').textContent).toContain('could not be loaded')
+    expect(screen.getByRole('alert').textContent).toContain("Couldn't load the app downloads.")
     fetch.mockImplementation(async () => response(published([windowsFile])))
     fireEvent.click(retry)
     expect(await screen.findByRole('link', { name: 'Download for Windows' })).toBeTruthy()
     expect(fetch).toHaveBeenCalledTimes(2)
+  })
+})
+
+describe('on a phone or tablet', () => {
+  afterEach(() => {
+    cleanup()
+    vi.unstubAllGlobals()
+  })
+
+  it('replaces the downloads with a note and the file sizes', async () => {
+    renderAs('Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X)', published([windowsFile, macFile]))
+    expect(await screen.findByText(/Open this page on a Windows computer or a Mac with an Apple chip to download the app/)).toBeTruthy()
+    expect(screen.getByText(/Windows: 82\.1 MB · Mac: 95\.0 MB/)).toBeTruthy()
+    expect(screen.queryByRole('link')).toBeNull()
+    expect(screen.queryByText('First time on Windows')).toBeNull()
+  })
+
+  it('uses the apps the page already read, with no request of its own', async () => {
+    vi.stubGlobal('navigator', { ...navigator, userAgent: WINDOWS, maxTouchPoints: 0 })
+    const fetch = vi.fn()
+    vi.stubGlobal('fetch', fetch)
+    render(<InstallerAppDownload toast={toast} apps={published([windowsFile]) as never} />)
+    expect(await screen.findByRole('link', { name: 'Download for Windows' })).toBeTruthy()
+    expect(fetch).not.toHaveBeenCalled()
   })
 })
 

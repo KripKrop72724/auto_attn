@@ -1,23 +1,24 @@
 import { lazy } from 'react'
 import { useLocation } from 'react-router-dom'
 import { useAppData } from '../AppData'
-import { firmwareSectionForUpdates, updatesSection, updatesSectionForFirmware } from '../routing'
+import { updatesSection } from '../routing'
 
 const FirmwareView = lazy(() => import('../features/Firmware').then((module) => ({ default: module.FirmwareView })))
 
-// Software updates (`/updates?tab=overview | updates | versions`). Today's
-// firmware page keeps its own tab names; this module translates them.
+// Software updates (`/updates?tab=overview | updates | versions`). The page
+// moves between its own tabs; old tab names are read by routing.ts.
 export default function UpdatesRoute() {
   const app = useAppData()
   const location = useLocation()
-  const section = firmwareSectionForUpdates(updatesSection(location.search))
   return (
     <FirmwareView
       devices={app.devices}
+      devicesLoaded={app.devicesLoaded}
+      devicesError={app.devicesError}
       revision={app.revisions.firmware}
       toast={app.toast}
-      section={section}
-      onSection={(next) => app.navigate(next === 'prepare' ? '/setup' : `/updates?tab=${updatesSectionForFirmware(next)}`)}
+      section={updatesSection(location.search)}
+      onRefreshDevices={app.refreshFleet}
     />
   )
 }
