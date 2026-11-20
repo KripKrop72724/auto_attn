@@ -113,11 +113,11 @@ test('primary routes and device deep link remain usable', async ({ page }, testI
     await expect(page.getByRole('dialog', { name: 'More' })).toHaveCount(0)
     await expect(moreTrigger).toBeFocused()
     await openFromMore(/^Recover attendance/)
-    await expect(page.getByRole('heading', { name: 'Reconciliation', exact: true, level: 1 })).toBeVisible()
+    await expect(page.getByRole('heading', { name: 'Recover attendance', exact: true, level: 1 })).toBeVisible()
     await openFromMore(/^Software updates/)
   } else {
     await primaryNav.getByRole('link', { name: 'Recover attendance', exact: true }).click()
-    await expect(page.getByRole('heading', { name: 'Reconciliation', exact: true, level: 1 })).toBeVisible()
+    await expect(page.getByRole('heading', { name: 'Recover attendance', exact: true, level: 1 })).toBeVisible()
     await primaryNav.getByRole('link', { name: 'Software updates', exact: true }).click()
   }
   await expect(page.getByRole('heading', { name: 'Firmware', exact: true, level: 1 })).toBeVisible()

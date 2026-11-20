@@ -90,9 +90,11 @@ search with HTTP 200 (`poll_stage=events`), which firmware reports as `OFFLINE`
 while its anchor mismatches. A full terminal audit or active-user history still
 waits until the terminal is `ONLINE`.
 
-Start it from **Reconciliation → Reconcile attendance → History scope → Recent
-tail**. It needs an audited reason, the administrator password, and the typed
-confirmation `RECONCILE <device_id> RECENT TAIL`.
+Start it from **Advanced tools → Recover attendance**: choose the device, pick
+**What to read → Only the newest check-ins (catch up)** and press **Start
+recovery**. It starts with one click, like every recovery (no reason, password
+or typed phrase). The card then reads "Watching for new check-ins" until you
+press **Stop**.
 
 ## LF-ZONE-BLD1-01, October 2026
 
