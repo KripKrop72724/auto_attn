@@ -1,7 +1,12 @@
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { AttendanceEvent, CheckinNotification, CheckinNotificationOverview, Device } from '../types'
+import { BrowserRouter } from 'react-router-dom'
 import { AttendanceView } from './Attendance'
+import { CheckinNotifySettingsCard } from './CheckinNotification'
+import { queryClient } from '../data'
+import { autoReleaseQueryKey } from './unknownAutoRelease'
+import { expectPlainText } from '../words/testing'
 
 const device: Device = {
   connector_id: 'connector-one', hardware_id: 'hw-one', zone_id: 'ZONE-ONE', zone_name: 'Islamabad',
@@ -50,9 +55,26 @@ const response = (body: unknown, status = 200) => new Response(JSON.stringify(bo
 
 const props = { devices: [device], revision: 0, realtimeState: 'live' as const, realtimeLastSyncAt: null }
 const wait = { timeout: 5000 }
+const renderView = (extra: Partial<Parameters<typeof AttendanceView>[0]> = {}) =>
+  render(<AttendanceView {...props} {...extra} />, { wrapper: BrowserRouter })
+/** The list answers with `rows`; the totals and journey calls get shapes of their own. */
+const stub = (handler?: (input: RequestInfo | URL, init?: RequestInit) => Response | undefined) => vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+  const handled = handler?.(input, init)
+  if (handled) return handled
+  const url = new URL(String(input), 'https://add.test')
+  if (url.pathname === '/api/v1/attendance/summary') return response({ totals: { received: 6 }, by_division: {}, computed_at: new Date().toISOString() })
+  if (url.pathname.endsWith('/journey')) return response({ detail: 'Not found' }, 404)
+  return response({ rows, next_cursor: null })
+})
+const openSheet = async (name: RegExp) => {
+  const row = await screen.findByRole('article', { name }, wait)
+  fireEvent.click(within(row).getByRole('button', { name: /^Open check-in/ }))
+  return screen.findByRole('dialog', {}, wait)
+}
 
-describe('Phone notification pills on the Attendance page', () => {
+describe('Phone messages on the Attendance page', () => {
   beforeEach(() => {
+    queryClient.setQueryData(autoReleaseQueryKey, null)
     window.history.replaceState(null, '', '/attendance')
     vi.stubGlobal('IntersectionObserver', class { observe() {} unobserve() {} disconnect() {} takeRecords() { return [] } })
     Object.defineProperty(Element.prototype, 'scrollIntoView', { configurable: true, value: vi.fn() })
@@ -61,80 +83,68 @@ describe('Phone notification pills on the Attendance page', () => {
   afterEach(() => {
     cleanup()
     vi.unstubAllGlobals()
+    queryClient.clear()
   })
 
-  it('shows one pill per punch, including old punches that were never notified', async () => {
-    vi.stubGlobal('fetch', vi.fn(async () => response({ rows, next_cursor: null, checkin_notifications: summary })))
-    render(<AttendanceView {...props} />)
-    const pillFor = async (name: RegExp) => within(await screen.findByRole('article', { name }, wait)).getByRole('button', { name: /Phone notification:/ })
-    expect((await pillFor(/Ayesha Khan/)).textContent).toMatch(/^Notified \d{1,2}:\d{2}/)
-    expect((await pillFor(/Ayesha Khan/)).getAttribute('data-notify-status')).toBe('NOTIFIED')
-    expect((await pillFor(/Bilal Ahmed/)).textContent).toBe('Retrying')
-    expect((await pillFor(/Chand Bibi/)).textContent).toBe('Failed')
-    expect((await pillFor(/Danish Ali/)).textContent).toBe('Not sent · before feature')
-    expect((await pillFor(/Erum Shah/)).textContent).toBe('Not sent · grouped')
-    expect((await pillFor(/Faisal Raza/)).textContent).toBe('Pending')
-    expect((await pillFor(/Chand Bibi/)).className).toContain('pattern-blocked')
-    expect((await pillFor(/Ayesha Khan/)).className).toContain('pattern-confirmed')
+  it('marks only a failed message on the list and shows each state in the sheet', async () => {
+    vi.stubGlobal('fetch', stub())
+    renderView()
+    const chand = await screen.findByRole('article', { name: /Chand Bibi/ }, wait)
+    expect(within(chand).getByText('Phone message failed')).toBeTruthy()
+    expect(within(await screen.findByRole('article', { name: /Ayesha Khan/ })).queryByText(/Phone message/)).toBeNull()
+    expect(screen.queryByRole('region', { name: /phone messages/i })).toBeNull()
+    const ayesha = await openSheet(/Ayesha Khan/)
+    expect(within(ayesha).getByLabelText(/^Phone message: Delivered \d{1,2}:\d{2} (am|pm)$/)).toBeTruthy()
+    fireEvent.click(within(ayesha).getByRole('button', { name: 'Close' }))
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
+    const danish = await openSheet(/Danish Ali/)
+    expect(within(danish).getByText('Not sent: older check-in')).toBeTruthy()
+    expect(within(danish).queryByRole('button', { name: /Send the message again/ })).toBeNull()
+    fireEvent.click(within(danish).getByRole('button', { name: 'Close' }))
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
+    const erum = await openSheet(/Erum Shah/)
+    expect(within(erum).getByText('Not sent: combined with an earlier one')).toBeTruthy()
   }, 20000)
 
-  it('omits the pill when the API predates the feature', async () => {
-    vi.stubGlobal('fetch', vi.fn(async () => response({ rows: [{ ...rows[0], checkin_notification: undefined }], next_cursor: null })))
-    render(<AttendanceView {...props} />)
-    const row = await screen.findByRole('article', { name: /Ayesha Khan/ }, wait)
-    expect(within(row).queryByRole('button', { name: /Phone notification:/ })).toBeNull()
-    expect(screen.queryByRole('region', { name: 'Employee phone notifications' })).toBeNull()
+  it('shows nothing about phone messages when the server predates them', async () => {
+    vi.stubGlobal('fetch', stub(() => response({ rows: [{ ...rows[0], checkin_notification: undefined }], next_cursor: null })))
+    renderView()
+    const sheet = await openSheet(/Ayesha Khan/)
+    expect(within(sheet).queryByText('Phone message')).toBeNull()
   }, 20000)
 
-  it('summarizes the last 24 hours with the current mode', async () => {
-    vi.stubGlobal('fetch', vi.fn(async () => response({ rows, next_cursor: null, checkin_notifications: summary })))
-    render(<AttendanceView {...props} />)
-    const region = await screen.findByRole('region', { name: 'Employee phone notifications' }, wait)
-    expect(region.textContent).toContain('Mode: All zones')
-    expect(region.textContent).toContain('Working')
-    expect(within(region).getByRole('list', { name: 'Last 24 hours' }).textContent).toMatch(/12 notified.*3 waiting.*1 failed.*30 not sent/)
-  }, 20000)
-
-  it('filters by phone notification status and removes the filter from its chip', async () => {
-    const fetchMock = vi.fn(async (_input: RequestInfo | URL) => response({ rows, next_cursor: null, checkin_notifications: summary }))
+  it('filters by phone message state and removes the filter from its chip', async () => {
+    const fetchMock = stub()
     vi.stubGlobal('fetch', fetchMock)
-    render(<AttendanceView {...props} />)
+    renderView()
     await screen.findByRole('article', { name: /Ayesha Khan/ }, wait)
-    fireEvent.click(screen.getByText(/^Filters$/i))
-    const fieldset = screen.getByRole('group', { name: 'Phone notification' })
+    fireEvent.click(screen.getByRole('button', { name: /More filters/ }))
+    const fieldset = await screen.findByRole('group', { name: 'Phone message' })
     fireEvent.click(within(fieldset).getByLabelText('Failed'))
     fireEvent.click(within(fieldset).getByLabelText('Not sent'))
-    await waitFor(() => {
-      const sent = new URL(String(fetchMock.mock.calls.at(-1)?.[0]), 'https://add.test')
-      expect(sent.searchParams.getAll('notify_status')).toEqual(['FAILED', 'NOT_SENT'])
-    }, wait)
-    fireEvent.click(screen.getByRole('button', { name: /Phone: Failed/ }))
-    await waitFor(() => {
-      const sent = new URL(String(fetchMock.mock.calls.at(-1)?.[0]), 'https://add.test')
-      expect(sent.searchParams.getAll('notify_status')).toEqual(['NOT_SENT'])
-    }, wait)
+    const lastList = () => fetchMock.mock.calls.map(([input]) => new URL(String(input), 'https://add.test')).filter((url) => url.pathname === '/api/v1/attendance').at(-1)!
+    await waitFor(() => expect(lastList().searchParams.getAll('notify_status')).toEqual(['FAILED', 'NOT_SENT']), wait)
+    expect(window.location.search).toContain('phone=failed%2Cnot_sent')
+    fireEvent.click(screen.getByRole('button', { name: 'Remove filter: Phone message: failed' }))
+    await waitFor(() => expect(lastList().searchParams.getAll('notify_status')).toEqual(['NOT_SENT']), wait)
   }, 20000)
 
-  it('retries a failed notification with an audited reason and password', async () => {
-    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-      if (String(input).includes('/checkin-notification/retry')) {
-        return response({ checkin_notification: pill({ status: 'PENDING', reason: null, manual_retry: true }) })
-      }
-      void init
-      return response({ rows, next_cursor: null, checkin_notifications: summary })
-    })
+  it('sends a failed message again with a reason and password (unchanged)', async () => {
+    const fetchMock = stub((input) => (String(input).includes('/checkin-notification/retry')
+      ? response({ checkin_notification: pill({ status: 'PENDING', reason: null, manual_retry: true }) })
+      : undefined))
     vi.stubGlobal('fetch', fetchMock)
     const notice = vi.fn()
-    render(<AttendanceView {...props} toast={{ notice, error: vi.fn() }} />)
-    const row = await screen.findByRole('article', { name: /Chand Bibi/ }, wait)
-    fireEvent.click(within(row).getByRole('button', { name: /Phone notification: Failed/ }))
-    const dialog = await screen.findByRole('dialog', { name: 'Phone notification' }, wait)
-    expect(dialog.textContent).toContain('The HRM service answered HTTP 404')
-    expect(dialog.textContent).toContain('No employee #####')
-    const submit = within(dialog).getByRole('button', { name: /Retry notification/ })
+    renderView({ toast: { notice, error: vi.fn() } })
+    const sheet = await openSheet(/Chand Bibi/)
+    expect(within(sheet).getByText(/^Failed: the phone message service refused it/)).toBeTruthy()
+    expect(within(sheet).getByText('No employee #####').closest('[data-technical]')).toBeTruthy()
+    fireEvent.click(within(sheet).getByRole('button', { name: /Send the message again/ }))
+    const dialog = await screen.findByRole('dialog', { name: 'Send the message again' }, wait)
+    const submit = within(dialog).getByRole('button', { name: /Send the message again/ })
     expect(submit.hasAttribute('disabled')).toBe(true)
-    fireEvent.change(within(dialog).getByLabelText('Audited reason'), { target: { value: 'HRM fixed the employee record' } })
-    fireEvent.change(within(dialog).getByLabelText('Administrator password'), { target: { value: 'secret-password' } })
+    fireEvent.change(within(dialog).getByLabelText('Why? (saved in the records)'), { target: { value: 'HRM fixed the employee record' } })
+    fireEvent.change(within(dialog).getByLabelText('Your password'), { target: { value: 'secret-password' } })
     fireEvent.click(submit)
     await waitFor(() => expect(notice).toHaveBeenCalled(), wait)
     const call = fetchMock.mock.calls.find(([input]) => String(input).includes('/checkin-notification/retry'))!
@@ -143,58 +153,76 @@ describe('Phone notification pills on the Attendance page', () => {
     expect(JSON.parse(String(call[1]?.body))).toEqual({ reason: 'HRM fixed the employee record', password: 'secret-password' })
   }, 20000)
 
-  it('warns that a retry after an unclear answer can send the message twice', async () => {
+  it('warns that sending again after an unclear answer can send the message twice', async () => {
     const uncertain = event(7, 'Gul Nawaz', pill({ status: 'FAILED', reason: 'DELIVERY_UNCERTAIN', detail: 'TRANSPORT_TIMEOUT', attempts: 1, host: 'PRIMARY', can_retry: true }))
-    vi.stubGlobal('fetch', vi.fn(async () => response({ rows: [...rows, uncertain], next_cursor: null, checkin_notifications: summary })))
-    render(<AttendanceView {...props} />)
-    const row = await screen.findByRole('article', { name: /Gul Nawaz/ }, wait)
-    fireEvent.click(within(row).getByRole('button', { name: /Phone notification: Failed/ }))
-    const dialog = await screen.findByRole('dialog', { name: 'Phone notification' }, wait)
+    vi.stubGlobal('fetch', stub(() => response({ rows: [...rows, uncertain], next_cursor: null })))
+    renderView()
+    const sheet = await openSheet(/Gul Nawaz/)
+    fireEvent.click(within(sheet).getByRole('button', { name: /Send the message again/ }))
+    const dialog = await screen.findByRole('dialog', { name: 'Send the message again' }, wait)
     expect(dialog.textContent).toContain('may already have the message; it is not repeated automatically')
-    expect(within(dialog).getByRole('note').textContent).toContain('Retrying can send it a second time')
-    expect(within(dialog).getByRole('button', { name: /Retry notification/ })).toBeTruthy()
+    expect(within(dialog).getByRole('note').textContent).toContain('Sending again can send it a second time')
   }, 20000)
+})
 
-  it('offers no retry for a notification that was not sent', async () => {
-    vi.stubGlobal('fetch', vi.fn(async () => response({ rows, next_cursor: null, checkin_notifications: summary })))
-    render(<AttendanceView {...props} />)
-    const row = await screen.findByRole('article', { name: /Danish Ali/ }, wait)
-    fireEvent.click(within(row).getByRole('button', { name: /Phone notification:/ }))
-    const dialog = await screen.findByRole('dialog', { name: 'Phone notification' }, wait)
-    expect(dialog.textContent).toContain('Punch is from before phone notifications started')
-    expect(within(dialog).queryByRole('button', { name: /Retry notification/ })).toBeNull()
-  }, 20000)
+describe('Settings › Check-in phone messages', () => {
+  const settings = {
+    ...summary, mode: 'PILOT', revision: 4, pilot_zone_ids: ['ZONE-ONE'],
+    pilot_cnics: [{ id: 'abcd1234abcd1234', masked: '*****-****567-1' }], updated_by: 'StateHealthAdmin',
+    updated_at: null, endpoint_host: 'local.slichealth.com', fallback_host: 'eclaim2.slichealth.com',
+    cnic_json_type: 'number', stale_window_hours: 12, coalesce_seconds: 120, retry_window_hours: 6,
+    modes: ['OFF', 'PILOT', 'ALL'], punch_policies: ['ALL_PUNCHES', 'FIRST_PER_DAY'],
+  }
+  afterEach(() => { cleanup(); vi.unstubAllGlobals() })
 
-  it('switches the mode at runtime with an audited, password-confirmed change', async () => {
-    const settings = {
-      ...summary, mode: 'PILOT', revision: 4, pilot_zone_ids: ['ZONE-ONE'],
-      pilot_cnics: [{ id: 'abcd1234abcd1234', masked: '*****-****567-1' }], updated_by: 'StateHealthAdmin',
-      updated_at: null, endpoint_host: 'local.slichealth.com', fallback_host: 'eclaim2.slichealth.com',
-      cnic_json_type: 'number', stale_window_hours: 12, coalesce_seconds: 120, retry_window_hours: 6,
-      modes: ['OFF', 'PILOT', 'ALL'], punch_policies: ['ALL_PUNCHES', 'FIRST_PER_DAY'],
-    }
-    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+  it('reads its own figures and shows the last 24 hours as a 2×2 grid', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => response({ ...settings, mode: 'ALL' })))
+    const { container } = render(<CheckinNotifySettingsCard toast={{ notice: vi.fn(), error: vi.fn() }} />)
+    const region = await screen.findByRole('region', { name: 'Check-in phone messages' })
+    expect(await within(region).findByText('Sending to: everyone · every check-in')).toBeTruthy()
+    expect(within(region).getByLabelText('Status: Working')).toBeTruthy()
+    const counts = within(region).getByLabelText('Last 24 hours')
+    // A definition grid, not a wrapping list whose flex basis became a tall empty block on phones.
+    expect(counts.tagName).toBe('DL')
+    expect(counts.className).toBe('notify-card-counts')
+    expect(counts.textContent).toMatch(/Delivered12.*Waiting3.*Failed1.*Not needed30/)
+    expect(within(region).getByText(/local\.slichealth\.com/).closest('[data-technical]')).toBeTruthy()
+    expectPlainText(container)
+  })
+
+  it('says when phone messages are not set up and when it could not load', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => response({ detail: 'no' }, 503)))
+    render(<CheckinNotifySettingsCard toast={{ notice: vi.fn(), error: vi.fn() }} />)
+    expect(await screen.findByText(/Couldn't load phone message settings/)).toBeTruthy()
+    cleanup()
+    vi.stubGlobal('fetch', vi.fn(async () => response({ ...settings, configured: false, state: 'NOT_CONFIGURED' })))
+    render(<CheckinNotifySettingsCard toast={{ notice: vi.fn(), error: vi.fn() }} />)
+    expect(await screen.findByText("Phone messages aren't set up yet, so nothing is sent.")).toBeTruthy()
+  })
+
+  it('changes who gets messages with a reason and password (unchanged request)', async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       if (String(input) === '/api/v1/checkin-notifications') return response(settings)
       if (String(input) === '/api/v1/checkin-notifications/settings') return response({ ...settings, mode: 'ALL', revision: 5 })
-      void init
-      return response({ rows, next_cursor: null, checkin_notifications: summary })
+      return response({})
     })
     vi.stubGlobal('fetch', fetchMock)
     const notice = vi.fn()
-    render(<AttendanceView {...props} toast={{ notice, error: vi.fn() }} />)
-    const region = await screen.findByRole('region', { name: 'Employee phone notifications' }, wait)
-    fireEvent.click(within(region).getByRole('button', { name: /Settings/ }))
-    const dialog = await screen.findByRole('dialog', { name: 'Phone notification settings' }, wait)
-    await within(dialog).findByRole('radio', { name: /^All zones/ }, wait)
-    expect((within(dialog).getByRole('radio', { name: /^Pilot/ }) as HTMLInputElement).checked).toBe(true)
-    expect((within(dialog).getByLabelText('Pilot zone IDs') as HTMLInputElement).value).toBe('ZONE-ONE')
-    fireEvent.click(within(dialog).getByRole('radio', { name: /^All zones/ }))
+    render(<CheckinNotifySettingsCard toast={{ notice, error: vi.fn() }} />)
+    const region = await screen.findByRole('region', { name: 'Check-in phone messages' })
+    expect(await within(region).findByText(/Sending to: trial \(0 areas, 0 people\)/)).toBeTruthy()
+    fireEvent.click(within(region).getByRole('button', { name: /Change settings/ }))
+    const dialog = await screen.findByRole('dialog', { name: 'Phone message settings' }, wait)
+    await within(dialog).findByRole('radio', { name: /^Everyone/ }, wait)
+    expect((within(dialog).getByRole('radio', { name: /^Trial/ }) as HTMLInputElement).checked).toBe(true)
+    expect((within(dialog).getByLabelText('Trial areas') as HTMLInputElement).value).toBe('ZONE-ONE')
+    fireEvent.click(within(dialog).getByRole('radio', { name: /^Everyone/ }))
     fireEvent.click(within(dialog).getByLabelText('Remove *****-****567-1'))
-    fireEvent.change(within(dialog).getByLabelText('Add employee CNIC'), { target: { value: '35202-1234567-1' } })
-    fireEvent.change(within(dialog).getByLabelText('Audited reason'), { target: { value: 'Owner approved rollout to every zone' } })
-    fireEvent.change(within(dialog).getByLabelText('Administrator password'), { target: { value: 'secret-password' } })
+    fireEvent.change(within(dialog).getByLabelText("Add a person's CNIC"), { target: { value: '35202-1234567-1' } })
+    fireEvent.change(within(dialog).getByLabelText('Why? (saved in the records)'), { target: { value: 'Owner approved rollout to every zone' } })
+    fireEvent.change(within(dialog).getByLabelText('Your password'), { target: { value: 'secret-password' } })
     fireEvent.click(within(dialog).getByRole('button', { name: /Save settings/ }))
-    await waitFor(() => expect(notice).toHaveBeenCalledWith(expect.stringContaining('all zones')), wait)
+    await waitFor(() => expect(notice).toHaveBeenCalledWith('Phone messages: now Everyone.'), wait)
     const call = fetchMock.mock.calls.find(([input]) => String(input) === '/api/v1/checkin-notifications/settings')!
     expect(call[1]?.method).toBe('PUT')
     expect(JSON.parse(String(call[1]?.body))).toEqual({
@@ -202,5 +230,20 @@ describe('Phone notification pills on the Attendance page', () => {
       add_pilot_cnics: ['3520212345671'], remove_pilot_cnic_ids: ['abcd1234abcd1234'],
       expected_revision: 4, reason: 'Owner approved rollout to every zone', password: 'secret-password',
     })
-  }, 20000)
+  })
+
+  it('offers the trial areas grouped Life and Health and keeps the same area codes', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => response(settings)))
+    const devices = [
+      { ...device, connector_id: 'life', zone_id: 'LF-ZONE-BLD9', zone_name: 'LF-ZONE-BLD9', division: 'life' },
+      { ...device, connector_id: 'health', zone_id: 'ZONE-ONE', zone_name: 'Islamabad', division: 'health' },
+    ] as Device[]
+    render(<CheckinNotifySettingsCard toast={{ notice: vi.fn(), error: vi.fn() }} devices={devices} />)
+    fireEvent.click(await screen.findByRole('button', { name: /Change settings/ }))
+    const dialog = await screen.findByRole('dialog', { name: 'Phone message settings' }, wait)
+    const areas = await within(dialog).findByRole('group', { name: 'Trial areas' })
+    expect((within(areas).getByLabelText('Islamabad') as HTMLInputElement).checked).toBe(true)
+    expect((within(areas).getByLabelText('Building 9') as HTMLInputElement).checked).toBe(false)
+    expect(areas.textContent).toMatch(/Life.*Building 9.*Health.*Islamabad/)
+  })
 })

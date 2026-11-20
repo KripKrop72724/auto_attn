@@ -67,7 +67,7 @@ export function IdentityBacklogRelease({ devices, toast }: { devices: Device[]; 
     devices.filter((device) => device.firmware_family !== 'hikvision' && !device.is_spare)
       .map((device) => [device.zone_id, { id: device.zone_id, name: areaName(device.zone_id, device.zone_name), division: deviceDivision(device) }] as const),
   ).values()].sort((a, b) => a.name.localeCompare(b.name, 'en', { numeric: true })), [devices])
-  const placeNames = useMemo(() => new Map(devices.map((device) => [device.connector_id, placeOf(device)])), [devices])
+  const byId = useMemo(() => new Map(devices.map((device) => [device.connector_id, device])), [devices])
   const [zone, setZone] = useState('')
   const [checking, setChecking] = useState(false)
   const [progress, setProgress] = useState({ scanned: 0, total: 0 })
@@ -192,7 +192,14 @@ export function IdentityBacklogRelease({ devices, toast }: { devices: Device[]; 
   }
 
   const zoneLabel = zones.find((item) => item.id === zone)?.name || ''
-  const placeLabel = (connectorId: string) => placeNames.get(connectorId) || result?.names[connectorId] || 'Place not known'
+  // The friendly name, else the server's saved device name read as a place.
+  const placeLabel = (connectorId: string) => {
+    const known = byId.get(connectorId)
+    if (known?.friendly_name) return known.friendly_name
+    const saved = result?.names[connectorId]
+    if (saved && saved !== connectorId) return placeOf({ friendly_name: null, display_name: saved, zone_id: saved })
+    return known ? placeOf(known) : 'Place not known'
+  }
   return <section className="panel safe-repair identity-backlog" aria-label="Send older not-matched check-ins (one area)">
     <header className="safe-repair-header"><div>
       <h2>Send older not-matched check-ins (one area)</h2>
