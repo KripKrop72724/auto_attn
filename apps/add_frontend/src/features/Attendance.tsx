@@ -2,12 +2,12 @@
 // one status per check-in, the check-in sheet) and Fix tools. Live check-ins
 // slide in at the top, or wait behind an "N new check-ins" pill while the
 // reader is scrolled down. Every safeguard inside the tools is unchanged.
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import './Attendance.css'
 import { api } from '../api'
 import { Icon } from '../Icon'
-import { PageHeader, TabPanel, Tabs } from '../ui'
+import { ActionMenu, PageHeader, TabPanel, Tabs, useIsPhone } from '../ui'
 import { useThrottledRunner } from '../lib/throttle'
 import { useDivision } from '../lib/useDivision'
 import type { DivisionChoice } from '../lib/prefs'
@@ -21,7 +21,6 @@ import { AttendanceFilters } from './attendance/AttendanceFilters'
 import { AttendanceListSkeleton, AttendanceRowItem, canSelect } from './attendance/AttendanceList'
 import { AttendanceSheet } from './attendance/AttendanceSheet'
 import { AttendanceToday, updatedLine } from './attendance/AttendanceToday'
-import { FixTools } from './attendance/FixTools'
 import type { HistoryKind } from './attendance/AttendanceHistory'
 import { checkins, rowGroup } from './attendance/attendanceWords'
 import { msUntilNextPktMidnight, pktPresetRange, todayKey } from './attendance/pktDates'
@@ -32,6 +31,9 @@ import {
 import type { AttendanceAllTime, AttendanceListResponse, AttendanceRow } from './attendance/types'
 
 type Toast = { notice: (message: string) => void; error: (message: string) => void }
+
+// Fix tools load only when the tab opens (keeps the Check-ins page within its size budget).
+const FixTools = lazy(() => import('./attendance/FixTools').then((module) => ({ default: module.FixTools })))
 
 const LIVE_REFRESH_MS = 3_000
 const FILTER_DELAY_MS = 300
@@ -80,6 +82,7 @@ function CheckinsTab({
   const [rows, setRows] = useState<AttendanceRow[]>([])
   const rowsRef = useRef(rows)
   rowsRef.current = rows
+  const phone = useIsPhone()
   const [pendingRows, setPendingRows] = useState<AttendanceRow[]>([])
   const [nextCursor, setNextCursor] = useState<number | null>(null)
   const [loaded, setLoaded] = useState(false)
@@ -319,8 +322,15 @@ function CheckinsTab({
           </div>
           <div className="attendance-feed-actions">
             <button type="button" className={`button secondary ${selectMode ? 'is-active' : ''}`} aria-pressed={selectMode} onClick={() => setSelectMode(!selectMode)}>{selectMode ? 'Done' : 'Select'}</button>
-            <button type="button" className="button secondary" onClick={toggleFrozen}><Icon name={frozen ? 'pulse' : 'pause'} /> {frozen ? 'Unfreeze list' : 'Freeze list'}</button>
-            <button type="button" className="button secondary" disabled={refreshing} aria-busy={refreshing} onClick={() => void refreshFeed(true, true)}><Icon name="refresh" /> {refreshing ? 'Refreshing…' : upToDate || 'Refresh'}</button>
+            {phone
+              ? <ActionMenu label="More list actions" items={[
+                { id: 'freeze', label: frozen ? 'Unfreeze list' : 'Freeze list', onSelect: toggleFrozen },
+                { id: 'refresh', label: refreshing ? 'Refreshing…' : 'Refresh', disabled: refreshing, onSelect: () => void refreshFeed(true, true) },
+              ]} />
+              : <>
+                <button type="button" className="button secondary" onClick={toggleFrozen}><Icon name={frozen ? 'pulse' : 'pause'} /> {frozen ? 'Unfreeze list' : 'Freeze list'}</button>
+                <button type="button" className="button secondary" disabled={refreshing} aria-busy={refreshing} onClick={() => void refreshFeed(true, true)}><Icon name="refresh" /> {refreshing ? 'Refreshing…' : upToDate || 'Refresh'}</button>
+              </>}
           </div>
         </header>
         {frozen && <p className="attendance-frozen" role="status">List frozen · new check-ins show when you unfreeze. Sending to the HR system goes on as normal. <button type="button" className="text-button" onClick={toggleFrozen}>Unfreeze list</button></p>}
@@ -504,7 +514,7 @@ export function AttendanceView({
           />
         </>}
         {view === 'fix-tools' && (
-          <FixTools
+          <Suspense fallback={<p className="attendance-history-note" role="status">Loading…</p>}><FixTools
             tool={tool}
             onTool={(next) => go({ tool: next })}
             onShowMachineMatch={() => go({ view: 'checkins', extra: { machine_match: '1' } })}
@@ -518,7 +528,7 @@ export function AttendanceView({
             historyKind={historyKind}
             onHistoryKind={(kind) => go({ tool: 'history', extra: { kind: kind === 'all' ? null : kind } })}
             releaseJobId={params.get('release_job')}
-          />
+          /></Suspense>
         )}
       </TabPanel>
     </div>

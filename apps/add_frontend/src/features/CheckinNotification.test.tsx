@@ -201,7 +201,7 @@ describe('Settings › Check-in phone messages', () => {
   })
 
   it('changes who gets messages with a reason and password (unchanged request)', async () => {
-    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, _init?: RequestInit) => {
       if (String(input) === '/api/v1/checkin-notifications') return response(settings)
       if (String(input) === '/api/v1/checkin-notifications/settings') return response({ ...settings, mode: 'ALL', revision: 5 })
       return response({})

@@ -4,10 +4,12 @@ import { msUntilNextPktMidnight, pktPresetRange } from './pktDates'
 import { FILTER_SCHEMA, listParams, readView, rewriteLegacySearch, summaryParams, type FilterValues } from './useAttendanceFilters'
 
 const base = readUrlValues(FILTER_SCHEMA, '') as FilterValues
-const originalTz = process.env.TZ
+// Node's TZ (no @types/node in this project): changing it changes the zone for new Dates.
+const env = (globalThis as unknown as { process: { env: Record<string, string | undefined> } }).process.env
+const originalTz = env.TZ
 
 describe('attendance filters in the address', () => {
-  afterEach(() => { process.env.TZ = originalTz })
+  afterEach(() => { env.TZ = originalTz })
 
   it('round-trips every filter through the URL and keeps other keys', () => {
     const filters: FilterValues = {
@@ -65,7 +67,7 @@ describe('attendance filters in the address', () => {
   })
 
   it.each(['UTC', 'America/New_York', 'Asia/Karachi'])('moves Today at Pakistan midnight whatever the browser time zone (%s)', (zone) => {
-    process.env.TZ = zone
+    env.TZ = zone
     // 23:59 in Pakistan on 6 Nov is 18:59 UTC.
     const beforeMidnight = Date.parse('2026-11-06T18:59:00Z')
     expect(pktPresetRange('today', beforeMidnight).from_time).toBe('2026-11-05T19:00:00.000Z')

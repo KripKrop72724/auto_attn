@@ -248,8 +248,10 @@
   .attendance-feed { border-radius: var(--radius-md); }
   .attendance-feed-title h2 { display: none; }
   .attendance-feed-header { padding: 8px 12px; }
-  .attendance-feed-actions { width: 100%; }
-  .attendance-feed-actions .button { flex: 1 1 auto; }
+  .attendance-feed-header { flex-wrap: nowrap; }
+  .attendance-feed-actions { flex: none; flex-wrap: nowrap; }
+  .attendance-date-line { margin: 0 0 8px; }
+  .attendance-tabs { margin-bottom: 8px; }
   .attendance-history-row { grid-template-columns: minmax(0, 1fr) auto; }
   .attendance-history-count { grid-column: 1; }
   /* Phone selection bar: a status line and full-width buttons above the bottom bar. */

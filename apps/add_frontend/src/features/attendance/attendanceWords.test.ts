@@ -18,8 +18,8 @@ const plain = (text: string) => expect(findPlainWordProblems(text), text).toEqua
 
 describe('attendance words', () => {
   it('maps every stored status to the same group as the server (shared fixture)', () => {
-    for (const item of groupsFixture.rows) {
-      expect(rowGroup({ ords_status: item.ords_status, delivery_group: null }), item.ords_status).toBe(item.delivery_group)
+    for (const item of groupsFixture.rows as Array<{ ords_status: string | null; delivery_group: string }>) {
+      expect(rowGroup({ ords_status: item.ords_status ?? '', delivery_group: null }), String(item.ords_status)).toBe(item.delivery_group)
     }
     expect(rowGroup({ ords_status: 'SOMETHING_NEW', delivery_group: null })).toBe('problem')
     // The server's own group wins when it is sent.

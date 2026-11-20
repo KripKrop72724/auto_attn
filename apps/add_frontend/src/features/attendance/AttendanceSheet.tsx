@@ -5,7 +5,7 @@ import { useCallback, useEffect, useState, type RefObject } from 'react'
 import { api } from '../../api'
 import { DivisionTag, Sheet, StatusChip, TechnicalDetails, Timeline, type TimelineItem } from '../../ui'
 import type { AttendanceEvent } from '../../types'
-import { AdminSendFacts } from '../ManualForceRelease'
+import { AdminSendFacts } from './AdminSendFacts'
 import { CheckinNotifyRow } from '../CheckinNotification'
 import {
   arrivalWords, checkinKind, clockWords, explainReleaseLock, GROUP_CHIP, journeyTime, longTime, neverSentSentence,
