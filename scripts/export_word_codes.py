@@ -489,21 +489,29 @@ def firmware_domains() -> dict[str, set[str]]:
     return out
 
 
-def _log_classes() -> dict | None:
-    """LOG_CLASS from be/activity_words.py (04-device DEV-1), when it exists."""
-    path = BACKEND / "activity_words.py"
+def _log_classes(codes: set[str]) -> dict[str, dict]:
+    """Group, kind and act for each log code, from be/activity_words_data.py WORDS (04-device DEV-1)."""
+    path = BACKEND / "activity_words_data.py"
     if not path.exists():
-        return None
-    for node in _nodes(path):
+        return {}
+    words = None
+    for node in _tree(path).body:
         if isinstance(node, (ast.Assign, ast.AnnAssign)):
             targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-            if any(isinstance(t, ast.Name) and t.id == "LOG_CLASS" for t in targets):
-                try:
-                    value = ast.literal_eval(node.value)
-                except ValueError:
-                    return None
-                return {code: list(entry) for code, entry in sorted(value.items())}
-    return None
+            if any(isinstance(t, ast.Name) and t.id == "WORDS" for t in targets) and node.value is not None:
+                words = ast.literal_eval(node.value)
+    if not words:
+        return {}
+    classes = {}
+    for code in sorted(codes):
+        entry = words.get(code)
+        if entry is None:
+            continue
+        value = {"group": entry["group"], "kind": entry["kind"], "act": entry["act"]}
+        if entry.get("kind_by_level"):
+            value["kind_by_level"] = dict(sorted(entry["kind_by_level"].items()))
+        classes[code] = value
+    return classes
 
 
 def build() -> dict:
@@ -519,9 +527,8 @@ def build() -> dict:
         "note": "Generated file. Run `python scripts/export_word_codes.py` after adding a code, then add its words.",
         "domains": domains,
     }
-    classes = _log_classes()
-    if classes is not None:
-        result["log_classes"] = classes
+    log = domains["log"]
+    result["log_classes"] = _log_classes(set(log["backend"]) | set(log["firmware"]))
     return result
 
 

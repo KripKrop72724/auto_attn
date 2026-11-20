@@ -919,5 +919,998 @@
         "ZKT_TIME_SYNC_READBACK_FAILED"
       ]
     }
+  },
+  "log_classes": {
+    "ADD_DIRECT_ACK_FALLBACK_FAILED": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "if_repeats"
+    },
+    "ADD_DIRECT_ACK_FALLBACK_SUCCEEDED": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no"
+    },
+    "ADD_MESSAGE_PROCESSING_FAILED": {
+      "group": "link_box",
+      "kind": "routine",
+      "act": "if_repeats"
+    },
+    "ADD_RECONNECTED": {
+      "group": "link_box",
+      "kind": "routine",
+      "act": "no"
+    },
+    "ADD_SOURCE_CHECKPOINT_REPLAY": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "no"
+    },
+    "ADD_SOURCE_CHECKPOINT_RETRY": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "no"
+    },
+    "ADD_SOURCE_COVERAGE_APPLIED": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "no"
+    },
+    "ADD_SOURCE_COVERAGE_CERTIFIED": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "no"
+    },
+    "ADD_SOURCE_COVERAGE_DEFERRED": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "if_repeats"
+    },
+    "ADD_SOURCE_COVERAGE_INVALIDATED": {
+      "group": "machine",
+      "kind": "problem",
+      "act": "yes"
+    },
+    "ADD_SOURCE_COVERAGE_TERMINAL_MISMATCH": {
+      "group": "machine",
+      "kind": "problem",
+      "act": "yes"
+    },
+    "ADD_TRUTH_QUEUE_SATURATED": {
+      "group": "link_box",
+      "kind": "routine",
+      "act": "if_repeats"
+    },
+    "ASSIGNMENT_RELEASED_FOR_COMMAND": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "no"
+    },
+    "ATTENDANCE_TIMESTAMP_QUARANTINED": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "list"
+    },
+    "ATTENDANCE_TIMESTAMP_QUARANTINE_SUMMARY": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "list"
+    },
+    "AUTHENTICATED_IP_NOT_PERSISTED": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no"
+    },
+    "BLOCKED_IDENTITY_RECOVERY_DEFERRED": {
+      "group": "software",
+      "kind": "problem",
+      "act": "yes"
+    },
+    "COMM_KEY_APPLIED": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "no"
+    },
+    "CURRENT_TAIL_AUDIT_RETRY": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "no"
+    },
+    "CURRENT_TAIL_CHECKPOINT_RETRY": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "no"
+    },
+    "CURRENT_TAIL_SOURCE_COMMITTED": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "no"
+    },
+    "CURRENT_TAIL_SOURCE_EXCEPTIONS_COMMITTED": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "list"
+    },
+    "DEVICE_MESSAGE_REJECTED": {
+      "group": "link_box",
+      "kind": "problem",
+      "act": "yes"
+    },
+    "FULL_RECONCILE": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "no"
+    },
+    "FULL_RECONCILE_DEFERRED_ORDS_GATE": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "no"
+    },
+    "FULL_RECONCILE_DEFERRED_OUTBOX": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "no"
+    },
+    "FULL_RECONCILE_FAILED": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "if_repeats"
+    },
+    "HIK_ANCHOR_MISMATCH": {
+      "group": "machine",
+      "kind": "problem",
+      "act": "yes"
+    },
+    "HIK_CLOCK_SAMPLE": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "no"
+    },
+    "HIK_HISTORY_PAGE_ACCEPTED": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "no"
+    },
+    "HIK_HISTORY_RECEIPT_PENDING": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "no"
+    },
+    "HIK_HISTORY_RETRY": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "if_repeats"
+    },
+    "HIK_IP_REDISCOVERED": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "no"
+    },
+    "HIK_IP_SAVE_PENDING": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "if_repeats"
+    },
+    "HIK_LIGHT_RECONCILE": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "no"
+    },
+    "HIK_LIVE_STREAM_CONNECTED": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "no"
+    },
+    "HIK_LIVE_STREAM_RETRY": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "if_repeats"
+    },
+    "HIK_POLL_STATUS": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "no"
+    },
+    "HIK_WORKER_START_PENDING": {
+      "group": "link_box",
+      "kind": "routine",
+      "act": "if_repeats"
+    },
+    "HISTORY_BACKFILL_BLOCKED": {
+      "group": "machine",
+      "kind": "problem",
+      "act": "yes"
+    },
+    "HISTORY_BACKFILL_COMPLETE": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "no"
+    },
+    "HISTORY_DUMP_CACHE_REUSED": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "no"
+    },
+    "HISTORY_DUMP_CACHE_VERIFIED": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "no"
+    },
+    "HISTORY_EMPTY_MONTHS_SKIPPED": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "no"
+    },
+    "IDENTITY_CATALOG_APPLIED": {
+      "group": "people",
+      "kind": "routine",
+      "act": "no"
+    },
+    "IDENTITY_CATALOG_CHUNK_REJECTED": {
+      "group": "people",
+      "kind": "routine",
+      "act": "if_repeats"
+    },
+    "IDENTITY_CATALOG_COMMIT_REJECTED": {
+      "group": "people",
+      "kind": "routine",
+      "act": "if_repeats"
+    },
+    "IDENTITY_CATALOG_MEMORY_FALLBACK": {
+      "group": "people",
+      "kind": "routine",
+      "act": "no"
+    },
+    "IDENTITY_CATALOG_PERSIST_FAILED": {
+      "group": "people",
+      "kind": "problem",
+      "act": "yes"
+    },
+    "IDENTITY_CATALOG_STAGE_FAILED": {
+      "group": "people",
+      "kind": "routine",
+      "act": "if_repeats"
+    },
+    "LEASE_EVIDENCE_REQUIRED": {
+      "group": "people",
+      "kind": "problem",
+      "act": "yes"
+    },
+    "LEASE_IDENTITY_CHANGED": {
+      "group": "people",
+      "kind": "problem",
+      "act": "yes"
+    },
+    "LEASE_REVOKED_LOCAL": {
+      "group": "people",
+      "kind": "routine",
+      "act": "no"
+    },
+    "LEASE_REVOKE_FAILED": {
+      "group": "people",
+      "kind": "problem",
+      "act": "yes"
+    },
+    "LEASE_USER_MISSING": {
+      "group": "people",
+      "kind": "problem",
+      "act": "yes"
+    },
+    "LEGACY_QUEUE_READ_FAILED": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "if_repeats"
+    },
+    "LIGHT_RECONCILE_OK": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "no"
+    },
+    "LIVE_DIRECT_ACK_FALLBACK_FAILED": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "if_repeats"
+    },
+    "LIVE_DIRECT_ACK_FALLBACK_SUCCEEDED": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no"
+    },
+    "LIVE_EVENT_DURABILITY_DEFERRED": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "if_repeats"
+    },
+    "LIVE_LOCAL_STORAGE_RECOVERED": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no"
+    },
+    "LIVE_OUTBOX_LOCK_RECOVERED": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no"
+    },
+    "LIVE_PACKET_FORMAT_REJECTED": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "if_repeats"
+    },
+    "LOCAL_RECONCILE_STORAGE_RECOVERED": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no"
+    },
+    "NVS_CHECKPOINT_FAILED": {
+      "group": "storage",
+      "kind": "problem",
+      "act": "yes"
+    },
+    "ORACLE_RECONCILE_ACCEPTED": {
+      "group": "hr_system",
+      "kind": "routine",
+      "act": "no"
+    },
+    "ORACLE_RECONCILE_DELEGATED_TO_ADD": {
+      "group": "hr_system",
+      "kind": "routine",
+      "act": "no"
+    },
+    "ORDS_DRAIN_STORAGE_BACKPRESSURE": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "if_repeats"
+    },
+    "ORDS_LEGACY_LOCK_SLOW": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no"
+    },
+    "ORDS_RECONCILE_AUTH_FAILED": {
+      "group": "hr_system",
+      "kind": "problem",
+      "act": "yes"
+    },
+    "ORDS_RECONCILE_BACKOFF": {
+      "group": "hr_system",
+      "kind": "routine",
+      "act": "if_repeats"
+    },
+    "ORDS_RECONCILE_ENDPOINT_MISSING": {
+      "group": "hr_system",
+      "kind": "problem",
+      "act": "yes"
+    },
+    "ORDS_RECONCILE_HTTP_FAILED": {
+      "group": "hr_system",
+      "kind": "routine",
+      "act": "if_repeats"
+    },
+    "ORDS_RECONCILE_PAYLOAD_FAILED": {
+      "group": "hr_system",
+      "kind": "problem",
+      "act": "yes"
+    },
+    "ORDS_RECONCILE_REJECTED": {
+      "group": "hr_system",
+      "kind": "problem",
+      "act": "yes"
+    },
+    "ORDS_RECONCILE_RESPONSE_INVALID": {
+      "group": "hr_system",
+      "kind": "routine",
+      "act": "if_repeats"
+    },
+    "ORDS_RECONCILE_TRANSPORT_RECOVERED": {
+      "group": "hr_system",
+      "kind": "routine",
+      "act": "no"
+    },
+    "ORDS_RECONCILE_TRANSPORT_RETRY": {
+      "group": "hr_system",
+      "kind": "routine",
+      "act": "if_repeats"
+    },
+    "ORDS_RECONCILE_WINDOW_LIMIT": {
+      "group": "hr_system",
+      "kind": "problem",
+      "act": "yes"
+    },
+    "OTA_IMAGE_UNVERIFIED": {
+      "group": "software",
+      "kind": "routine",
+      "act": "if_repeats"
+    },
+    "RECONCILE_TERMINAL_SERIAL_MISMATCH": {
+      "group": "machine",
+      "kind": "problem",
+      "act": "yes"
+    },
+    "SCHEDULED_RESTART": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "no"
+    },
+    "SOURCE_COMMITTED_BOUNDARY_DIVERGED": {
+      "group": "machine",
+      "kind": "problem",
+      "act": "yes"
+    },
+    "SOURCE_FIRST_ANCHOR_DIVERGED": {
+      "group": "machine",
+      "kind": "problem",
+      "act": "yes"
+    },
+    "SOURCE_INVALIDATION_NOT_PERSISTED": {
+      "group": "storage",
+      "kind": "problem",
+      "act": "yes"
+    },
+    "SOURCE_PROBE_ORDINAL_UNAVAILABLE": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "if_repeats"
+    },
+    "SOURCE_RANGE_COUNT_REGRESSION": {
+      "group": "machine",
+      "kind": "problem",
+      "act": "yes"
+    },
+    "SOURCE_RANGE_LAYOUT_INVALID": {
+      "group": "machine",
+      "kind": "problem",
+      "act": "yes"
+    },
+    "SOURCE_RANGE_PREPARE_FAILED": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "if_repeats"
+    },
+    "SOURCE_RANGE_READ_RETRY": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "no"
+    },
+    "SOURCE_RANGE_RELEASE_RETRY": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "no"
+    },
+    "SOURCE_RANGE_SNAPSHOT_RETRY": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "no"
+    },
+    "SOURCE_TAIL_COVERAGE_INACTIVE": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "if_repeats"
+    },
+    "SOURCE_TAIL_EPOCH_STALE": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "no"
+    },
+    "STORAGE_FILE_UNREADABLE": {
+      "group": "storage",
+      "kind": "problem",
+      "act": "yes"
+    },
+    "STORAGE_INVENTORY": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no",
+      "kind_by_level": {
+        "INFO": "routine",
+        "WARN": "problem"
+      }
+    },
+    "STORAGE_RECOVERY_CUSTODY_COMPLETE": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no"
+    },
+    "STORAGE_RECOVERY_PROGRESS": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no"
+    },
+    "STORAGE_RECOVERY_SCAN": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no"
+    },
+    "STORAGE_RECOVERY_UNREADABLE_LIMIT": {
+      "group": "storage",
+      "kind": "problem",
+      "act": "yes"
+    },
+    "STORAGE_RECOVERY_UNREADABLE_REGION": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no"
+    },
+    "STORAGE_REPAIR_BLOCKED": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no"
+    },
+    "STORAGE_REPAIR_CATALOG_DEFERRED": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no"
+    },
+    "STORAGE_REPAIR_CATALOG_DROPPED": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no"
+    },
+    "STORAGE_REPAIR_CHECKED": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no"
+    },
+    "STORAGE_REPAIR_CHECK_DELETED": {
+      "group": "storage",
+      "kind": "problem",
+      "act": "yes"
+    },
+    "STORAGE_REPAIR_COMMANDS_FAILED": {
+      "group": "storage",
+      "kind": "problem",
+      "act": "yes"
+    },
+    "STORAGE_REPAIR_COMMANDS_MERGED": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no"
+    },
+    "STORAGE_REPAIR_COMPACTED": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no"
+    },
+    "STORAGE_REPAIR_COMPACT_STOPPED": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no"
+    },
+    "STORAGE_REPAIR_CURSOR_RESET": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no"
+    },
+    "STORAGE_REPAIR_DEFERRED": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no"
+    },
+    "STORAGE_REPAIR_DISABLED": {
+      "group": "storage",
+      "kind": "problem",
+      "act": "yes"
+    },
+    "STORAGE_REPAIR_DONE": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no",
+      "kind_by_level": {
+        "ERROR": "problem",
+        "INFO": "routine",
+        "WARN": "routine"
+      }
+    },
+    "STORAGE_REPAIR_EXCEPTION_AREA_TEST": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no",
+      "kind_by_level": {
+        "ERROR": "problem",
+        "WARN": "routine"
+      }
+    },
+    "STORAGE_REPAIR_EXCEPTION_CONFIRMED": {
+      "group": "software",
+      "kind": "routine",
+      "act": "no"
+    },
+    "STORAGE_REPAIR_EXCEPTION_DEPLOYMENT_ENDED": {
+      "group": "software",
+      "kind": "routine",
+      "act": "no"
+    },
+    "STORAGE_REPAIR_EXCEPTION_ELIGIBLE": {
+      "group": "software",
+      "kind": "routine",
+      "act": "no"
+    },
+    "STORAGE_REPAIR_EXCEPTION_EVIDENCE": {
+      "group": "software",
+      "kind": "routine",
+      "act": "no"
+    },
+    "STORAGE_REPAIR_EXCEPTION_RECORD": {
+      "group": "software",
+      "kind": "problem",
+      "act": "yes"
+    },
+    "STORAGE_REPAIR_EXCEPTION_REFUSED": {
+      "group": "software",
+      "kind": "routine",
+      "act": "no"
+    },
+    "STORAGE_REPAIR_EXCEPTION_RESTART": {
+      "group": "software",
+      "kind": "routine",
+      "act": "no"
+    },
+    "STORAGE_REPAIR_EXCEPTION_ROUND": {
+      "group": "software",
+      "kind": "routine",
+      "act": "no",
+      "kind_by_level": {
+        "ERROR": "problem",
+        "WARN": "routine"
+      }
+    },
+    "STORAGE_REPAIR_EXCEPTION_UNHEALTHY": {
+      "group": "software",
+      "kind": "problem",
+      "act": "yes"
+    },
+    "STORAGE_REPAIR_EXCEPTION_UNREPAIRED": {
+      "group": "software",
+      "kind": "problem",
+      "act": "yes"
+    },
+    "STORAGE_REPAIR_EXCEPTION_WAITING": {
+      "group": "software",
+      "kind": "problem",
+      "act": "if_repeats"
+    },
+    "STORAGE_REPAIR_FULL": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "if_repeats"
+    },
+    "STORAGE_REPAIR_GAP": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no"
+    },
+    "STORAGE_REPAIR_GC_UNSAFE": {
+      "group": "storage",
+      "kind": "problem",
+      "act": "yes"
+    },
+    "STORAGE_REPAIR_JOURNAL_FAILED": {
+      "group": "storage",
+      "kind": "problem",
+      "act": "yes"
+    },
+    "STORAGE_REPAIR_LEVEL2_SKIPPED": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no"
+    },
+    "STORAGE_REPAIR_MANIFEST_FULL": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no"
+    },
+    "STORAGE_REPAIR_MANIFEST_UNREADABLE": {
+      "group": "storage",
+      "kind": "problem",
+      "act": "yes"
+    },
+    "STORAGE_REPAIR_MERGED": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no"
+    },
+    "STORAGE_REPAIR_MERGE_DEFERRED": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no"
+    },
+    "STORAGE_REPAIR_MOUNT_FAILED": {
+      "group": "storage",
+      "kind": "problem",
+      "act": "yes"
+    },
+    "STORAGE_REPAIR_NOT_READY": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no"
+    },
+    "STORAGE_REPAIR_NO_TIME": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no"
+    },
+    "STORAGE_REPAIR_NVS_FULL": {
+      "group": "storage",
+      "kind": "problem",
+      "act": "yes"
+    },
+    "STORAGE_REPAIR_PROBE_ALTERNATE": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no"
+    },
+    "STORAGE_REPAIR_REBUILT": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no"
+    },
+    "STORAGE_REPAIR_RECLAIM": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no"
+    },
+    "STORAGE_REPAIR_RECLAIM_EXPOSURE": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no"
+    },
+    "STORAGE_REPAIR_RECLAIM_FAILED": {
+      "group": "storage",
+      "kind": "problem",
+      "act": "yes"
+    },
+    "STORAGE_REPAIR_RECLAIM_MISMATCH": {
+      "group": "storage",
+      "kind": "problem",
+      "act": "yes"
+    },
+    "STORAGE_REPAIR_RECLAIM_REDONE": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no"
+    },
+    "STORAGE_REPAIR_RECLAIM_SETTLED": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no",
+      "kind_by_level": {
+        "ERROR": "problem"
+      }
+    },
+    "STORAGE_REPAIR_RECLAIM_SHORT": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no"
+    },
+    "STORAGE_REPAIR_RECLAIM_SOURCES": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no",
+      "kind_by_level": {
+        "ERROR": "problem"
+      }
+    },
+    "STORAGE_REPAIR_RECLAIM_UNAVAILABLE": {
+      "group": "storage",
+      "kind": "problem",
+      "act": "yes"
+    },
+    "STORAGE_REPAIR_RECORDS_FULL": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no"
+    },
+    "STORAGE_REPAIR_RESERVE": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no"
+    },
+    "STORAGE_REPAIR_RESTORE_DEFERRED": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no"
+    },
+    "STORAGE_REPAIR_RESTORE_RETRIED": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no",
+      "kind_by_level": {
+        "ERROR": "problem"
+      }
+    },
+    "STORAGE_REPAIR_RESTORE_WAITING": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no"
+    },
+    "STORAGE_REPAIR_RESUME_BLOCKED": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no"
+    },
+    "STORAGE_REPAIR_SIZE_RECOVERED": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no"
+    },
+    "STORAGE_REPAIR_SIZE_TORN": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no"
+    },
+    "STORAGE_REPAIR_SPAN": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no"
+    },
+    "STORAGE_REPAIR_STARTED": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no"
+    },
+    "STORAGE_REPAIR_SUPERSEDED": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no"
+    },
+    "STORAGE_REPAIR_TAIL_TERMINATED": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no"
+    },
+    "STORAGE_REPAIR_UNHIDDEN": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no"
+    },
+    "TRUTH_IDENTITY_INCOMPLETE": {
+      "group": "people",
+      "kind": "routine",
+      "act": "list"
+    },
+    "TRUTH_READ_RETRY_EXHAUSTED": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "if_repeats"
+    },
+    "TRUTH_READ_RETRY_SESSION": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "no"
+    },
+    "TRUTH_RETRY_COOLDOWN": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "if_repeats"
+    },
+    "TRUTH_SNAPSHOT_IMPLAUSIBLE": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "if_repeats"
+    },
+    "TRUTH_WINDOW_ALLOCATION_FAILED": {
+      "group": "link_box",
+      "kind": "routine",
+      "act": "if_repeats"
+    },
+    "TRUTH_WINDOW_MEMORY_BOUNDED": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "no"
+    },
+    "USER_SNAPSHOT_TRUNCATED": {
+      "group": "people",
+      "kind": "problem",
+      "act": "yes"
+    },
+    "USER_SNAPSHOT_UNSTABLE": {
+      "group": "people",
+      "kind": "routine",
+      "act": "no"
+    },
+    "ZKT_CONNECTION_LOST": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "if_repeats"
+    },
+    "ZKT_CREDENTIAL_IDENTITY_DEFERRED": {
+      "group": "people",
+      "kind": "routine",
+      "act": "no"
+    },
+    "ZKT_CREDENTIAL_POLICY_FAILED": {
+      "group": "people",
+      "kind": "routine",
+      "act": "if_repeats"
+    },
+    "ZKT_CREDENTIAL_POLICY_OK": {
+      "group": "people",
+      "kind": "routine",
+      "act": "no"
+    },
+    "ZKT_FRAME_OVERSIZE": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "no"
+    },
+    "ZKT_FRAME_SESSION_MISMATCH": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "no"
+    },
+    "ZKT_PREPARED_READ_FAILED": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "if_repeats"
+    },
+    "ZKT_RECORD_SIZE_FALLBACK": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "no"
+    },
+    "ZKT_SECURE_HANDSHAKE_FAILED": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "if_repeats"
+    },
+    "ZKT_SECURE_KEY_FAILED": {
+      "group": "machine",
+      "kind": "problem",
+      "act": "if_repeats"
+    },
+    "ZKT_SECURE_KEY_READY": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "no"
+    },
+    "ZKT_SECURE_SESSION": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "no"
+    },
+    "ZKT_SERIAL_CHANGED": {
+      "group": "machine",
+      "kind": "problem",
+      "act": "yes"
+    },
+    "ZKT_SERIAL_MISMATCH": {
+      "group": "machine",
+      "kind": "problem",
+      "act": "yes"
+    },
+    "ZKT_SERIAL_UNREADABLE": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "if_repeats"
+    },
+    "ZKT_SESSION_REFRESHED": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "no"
+    },
+    "ZKT_STABLE": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "no"
+    },
+    "ZKT_TIME_SYNC_DEFERRED": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "no"
+    },
+    "ZKT_TIME_SYNC_FAILED": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "if_repeats"
+    },
+    "ZKT_TIME_SYNC_OK": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "no"
+    },
+    "ZKT_TIME_SYNC_READBACK_FAILED": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "if_repeats"
+    }
   }
 }

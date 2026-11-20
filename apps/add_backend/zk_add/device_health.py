@@ -1123,10 +1123,22 @@ def coverage(connector: Connector) -> list[dict]:
     return rows
 
 
+def _plain_words(reason: Reason, details: dict) -> dict:
+    """plain_title, plain_detail and next_step (problem_words) for a reason."""
+    from zk_add.problem_words import plain
+
+    minutes = None
+    if reason.alert is None and reason.since is not None:
+        minutes = max(1, int((utc_now() - ensure_utc(reason.since)).total_seconds() // 60))
+    words = plain(reason.code, details, minutes=minutes, severity=reason.severity)
+    return {key: words[key] for key in ("plain_title", "plain_detail", "next_step")}
+
+
 def reason_payload(reason: Reason) -> dict:
     alert = reason.alert
     details = (alert.details or {}) if alert is not None else {}
     return {
+        **_plain_words(reason, details),
         "code": reason.code, "error_code": reason.error_code, "tier": reason.tier,
         "currency": reason.currency, "gating": reason.gating, "severity": reason.severity,
         "message": reason.message, "since": reason.since, "last_seen_at": reason.last_seen_at,
@@ -1144,7 +1156,8 @@ def _primary_payload(health: Health) -> dict | None:
     primary = health.primary
     return None if primary is None else {
         "code": primary.code, "error_code": primary.error_code, "tier": primary.tier,
-        "message": primary.message, "since": primary.since}
+        "message": primary.message, "since": primary.since,
+        **_plain_words(primary, (primary.alert.details or {}) if primary.alert is not None else {})}
 
 
 def health_summary(health: Health) -> dict:

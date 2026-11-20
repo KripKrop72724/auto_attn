@@ -94,3 +94,25 @@ def test_device_status_offline_words_match_public_status():
         assert found, f"deviceStatus.ts has no OFFLINE_REASONS entry for {code}"
         assert found.group(2) == heading, code
         assert found.group(4).replace("\\'", "'") == sentence, code
+
+
+GROUPS = {"machine", "link_box", "hr_system", "people", "software", "storage"}
+
+
+def test_every_log_code_has_a_class():
+    """Every log code has activity words (group, kind, act) in be/activity_words_data.py (04-device DEV-1)."""
+    data = exporter.build()
+    log = data["domains"]["log"]
+    missing = sorted((set(log["backend"]) | set(log["firmware"])) - set(data["log_classes"]))
+    assert missing == [], f"add plain words in apps/add_backend/zk_add/activity_words_data.py for: {missing}"
+    for code, value in data["log_classes"].items():
+        assert value["group"] in GROUPS, code
+        assert value["kind"] in {"routine", "problem"}, code
+        assert value["act"] in {"no", "if_repeats", "yes", "list"}, code
+
+
+def test_sanity_floors_for_backend_domains():
+    domains = exporter.build()["domains"]
+    count = {name: len(d["backend"]) + len(d["firmware"]) for name, d in domains.items()}
+    for name in ("delivery", "identity", "request", "requestType", "update"):
+        assert count[name] >= 5, name
