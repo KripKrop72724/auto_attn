@@ -4,6 +4,7 @@ import { Button } from './Button'
 import { TechnicalDetails } from './TechnicalDetails'
 import { UI_TEXT } from './uiText'
 import { cx } from './cx'
+import './content.css'
 
 type ErrorLike = { status?: unknown; requestId?: unknown; plainMessage?: unknown; message?: unknown }
 

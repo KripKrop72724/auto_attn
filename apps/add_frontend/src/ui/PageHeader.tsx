@@ -1,6 +1,7 @@
 import type { ReactNode, Ref } from 'react'
 import { ActionMenu, type ActionMenuItem } from './ActionMenu'
 import { cx } from './cx'
+import './content.css'
 
 export type PageHeaderProps = {
   title: string

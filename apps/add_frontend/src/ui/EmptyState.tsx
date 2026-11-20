@@ -2,6 +2,7 @@ import type { ReactNode } from 'react'
 import { Icon, type IconName } from '../Icon'
 import { UI_TEXT } from './uiText'
 import { cx } from './cx'
+import './content.css'
 
 export function EmptyState({ icon = 'list', title = UI_TEXT.emptyTitle, children, action, headingLevel = 3, className }: { icon?: IconName | null; title?: ReactNode; children?: ReactNode; action?: ReactNode; headingLevel?: 2 | 3 | 4; className?: string }) {
   const Heading = `h${headingLevel}` as 'h2' | 'h3' | 'h4'

@@ -1,5 +1,6 @@
 import { UI_TEXT } from './uiText'
 import { cx } from './cx'
+import './chips.css'
 
 export type Division = 'life' | 'health'
 

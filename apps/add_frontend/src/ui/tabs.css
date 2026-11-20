@@ -1,0 +1,36 @@
+/* ADD kit: tabs, segmented control, division switch and scope chip. Imported by the component itself, so it ships with the page that uses it. */
+.ui-tab::after { content: ""; position: absolute; inset: 50% auto auto 50%; width: max(100%, var(--touch-min)); height: max(100%, var(--touch-min)); transform: translate(-50%, -50%); }
+.ui-segment::after { content: ""; position: absolute; inset: 50% auto auto 50%; width: max(100%, var(--touch-min)); height: max(100%, var(--touch-min)); transform: translate(-50%, -50%); }
+/* Tabs and segmented control --------------------------------------------- */
+.ui-tabs { position: relative; min-width: 0; border-bottom: 1px solid var(--border); }
+.ui-tabs.fade-end { mask-image: linear-gradient(90deg, #000 calc(100% - 32px), transparent); }
+.ui-tabs.fade-start { mask-image: linear-gradient(90deg, transparent, #000 32px); }
+.ui-tabs.fade-start.fade-end { mask-image: linear-gradient(90deg, transparent, #000 32px, #000 calc(100% - 32px), transparent); }
+.ui-tablist { position: relative; display: flex; gap: var(--space-1); overflow-x: auto; scrollbar-width: none; overscroll-behavior-x: contain; }
+.ui-tablist::-webkit-scrollbar { display: none; }
+.ui-tab { position: relative; min-height: 44px; display: inline-flex; flex: none; align-items: center; gap: 6px; padding: 0 var(--space-3); border: 0; color: var(--text-secondary); background: transparent; font-size: var(--text-md); font-weight: 500; white-space: nowrap; }
+.ui-tab:hover { color: var(--text); }
+.ui-tab[aria-selected="true"] { color: var(--text); font-weight: 600; }
+.ui-tab:focus-visible { outline-offset: -2px; }
+.ui-tab-count { min-width: 20px; padding: 1px 6px; border-radius: var(--radius-full); color: var(--text-secondary); background: var(--surface-sunken); font-size: var(--text-xs); font-weight: 600; text-align: center; font-variant-numeric: tabular-nums; }
+.ui-tab[aria-selected="true"] .ui-tab-count { color: var(--accent); background: var(--accent-muted); }
+.ui-tab-indicator { position: absolute; bottom: 0; left: 0; height: 2px; border-radius: 2px; background: var(--accent); transition: transform var(--motion-content) var(--ease-out), width var(--motion-content) var(--ease-out); }
+.ui-tabpanel:focus-visible { outline-offset: 4px; }
+
+.ui-segmented { --segment-count: 3; --segment-index: 0; position: relative; display: inline-grid; grid-auto-columns: minmax(0, 1fr); grid-auto-flow: column; padding: 2px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface-sunken); isolation: isolate; }
+.ui-segmented.is-full { display: grid; width: 100%; }
+.ui-segmented::before { content: ""; position: absolute; z-index: -1; top: 2px; bottom: 2px; left: 2px; width: calc((100% - 4px) / var(--segment-count)); border-radius: var(--radius-xs); background: var(--surface); box-shadow: var(--shadow-xs); transform: translateX(calc(100% * var(--segment-index))); transition: transform var(--motion-content) var(--ease-out); }
+.ui-segment { position: relative; min-width: 64px; min-height: 32px; padding: 0 var(--space-3); border: 0; border-radius: var(--radius-xs); color: var(--text-secondary); background: transparent; font-size: var(--text-md); font-weight: 500; white-space: nowrap; }
+.ui-segment[aria-checked="true"] { color: var(--text); font-weight: 600; }
+.ui-segment:focus-visible { outline-offset: -2px; }
+.ui-division-scope { display: flex; flex-wrap: wrap; align-items: center; gap: 0 2px; margin: var(--space-1) 0 0; color: var(--text-secondary); font-size: var(--text-sm); }
+.ui-division-scope-all { min-height: 32px; font-size: var(--text-sm); }
+
+
+@media (max-width: 760px) {
+  .ui-segment { min-height: 40px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ui-segmented::before, .ui-tab-indicator { transition: none; }
+}

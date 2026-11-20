@@ -4,6 +4,7 @@ import { Icon, type IconName } from '../Icon'
 import { IconButton } from './Button'
 import { UI_TEXT } from './uiText'
 import { cx } from './cx'
+import './content.css'
 
 export type ActionMenuItem = {
   id: string

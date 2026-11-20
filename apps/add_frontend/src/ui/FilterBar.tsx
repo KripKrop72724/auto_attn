@@ -5,6 +5,7 @@ import { Sheet } from './Sheet'
 import { useIsPhone } from './useMediaQuery'
 import { UI_TEXT, formatCount } from './uiText'
 import { cx } from './cx'
+import './filterbar.css'
 
 export type FilterChip = {
   id: string

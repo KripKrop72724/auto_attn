@@ -2,6 +2,7 @@ import { createContext, useContext, useEffect, useRef, useState, type ReactNode 
 import { Icon } from '../Icon'
 import { UI_TEXT } from './uiText'
 import { cx } from './cx'
+import './content.css'
 
 // The "Show technical details" preference. The preferences module (FND-8)
 // provides the value; without a provider every box starts closed.

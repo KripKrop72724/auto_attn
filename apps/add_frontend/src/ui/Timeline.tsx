@@ -3,6 +3,7 @@ import { Icon, type IconName } from '../Icon'
 import type { Tone } from './StatusChip'
 import { TechnicalDetails } from './TechnicalDetails'
 import { cx } from './cx'
+import './steps.css'
 
 export type TimelineItem = {
   id: string

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState, type CSSProperties, type KeyboardEvent, type ReactNode } from 'react'
 import { formatCount } from './uiText'
 import { cx } from './cx'
+import './tabs.css'
 
 export type TabItem<T extends string = string> = {
   id: T

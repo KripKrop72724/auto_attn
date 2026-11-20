@@ -1,5 +1,6 @@
 import { cx } from './cx'
 import { UI_TEXT } from './uiText'
+import './content.css'
 
 export type SkeletonVariant = 'line' | 'block' | 'tile' | 'row'
 

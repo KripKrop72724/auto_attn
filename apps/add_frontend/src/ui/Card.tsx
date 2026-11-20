@@ -1,6 +1,7 @@
 import { useId, type ReactNode } from 'react'
 import type { Tone } from './StatusChip'
 import { cx } from './cx'
+import './content.css'
 
 export type CardProps = {
   title?: ReactNode

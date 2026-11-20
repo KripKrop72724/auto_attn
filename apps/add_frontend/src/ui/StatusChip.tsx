@@ -1,6 +1,7 @@
 import { Icon, type IconName } from '../Icon'
 import type { StatusPattern } from '../status'
 import { cx } from './cx'
+import './chips.css'
 
 /** One meaning per tone; the label always says it in words. */
 export type Tone = 'working' | 'attention' | 'offline' | 'neutral' | 'info'

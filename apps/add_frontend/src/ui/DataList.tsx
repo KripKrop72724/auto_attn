@@ -2,6 +2,7 @@ import { Fragment, type MouseEvent, type ReactNode } from 'react'
 import { Icon } from '../Icon'
 import { useIsPhone } from './useMediaQuery'
 import { cx } from './cx'
+import './datalist.css'
 
 export type DataColumn<T> = {
   id: string

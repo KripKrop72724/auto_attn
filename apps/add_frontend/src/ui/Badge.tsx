@@ -1,5 +1,6 @@
 import type { ReactNode } from 'react'
 import { cx } from './cx'
+import './chips.css'
 
 export type BadgeTone = 'neutral' | 'info' | 'danger'
 

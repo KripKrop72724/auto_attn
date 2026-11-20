@@ -1,0 +1,29 @@
+/* ADD kit: timeline and steps. Imported by the component itself, so it ships with the page that uses it. */
+/* Timeline and steps ------------------------------------------------------ */
+.ui-timeline { margin: 0; padding: 0; list-style: none; }
+.ui-timeline-item { position: relative; display: grid; grid-template-columns: 28px minmax(0, 1fr); gap: var(--space-3); padding-bottom: var(--space-4); }
+.ui-timeline-item:not(:last-child)::before { content: ""; position: absolute; top: 28px; bottom: 0; left: 13px; width: 2px; background: var(--border); }
+.ui-timeline-marker { width: 28px; height: 28px; display: grid; place-items: center; border-radius: var(--radius-full); color: var(--chip-fg, var(--text-secondary)); background: var(--chip-bg, var(--surface-sunken)); }
+.ui-timeline-dot { width: 8px; height: 8px; border-radius: 50%; background: currentColor; }
+.ui-timeline-content { min-width: 0; padding-top: 3px; }
+.ui-timeline-content time { color: var(--text-tertiary); font-size: var(--text-xs); font-variant-numeric: tabular-nums; }
+.ui-timeline-title { margin: 2px 0 0; font-weight: 500; overflow-wrap: anywhere; }
+.ui-timeline-text { margin: 2px 0 0; color: var(--text-secondary); font-size: var(--text-sm); }
+
+.ui-steps { display: flex; flex-wrap: wrap; gap: var(--space-2) var(--space-4); margin: 0; padding: 0; list-style: none; }
+.ui-step { display: flex; align-items: center; gap: var(--space-2); color: var(--text-tertiary); font-size: var(--text-md); }
+.ui-step:not(:last-child)::after { content: ""; width: 24px; height: 2px; margin-left: var(--space-2); border-radius: 1px; background: var(--border-strong); }
+.ui-steps-marker { width: 24px; height: 24px; display: grid; flex: none; place-items: center; border: 2px solid var(--border-strong); border-radius: 50%; background: var(--surface); }
+.ui-steps-marker > span { width: 8px; height: 8px; border-radius: 50%; }
+.ui-step.is-done { color: var(--text); }
+.ui-step.is-done .ui-steps-marker { border-color: var(--positive); color: #fff; background: var(--positive); }
+.ui-step.is-done:not(:last-child)::after { background: var(--positive); }
+.ui-step.is-current { color: var(--text); font-weight: 600; }
+.ui-step.is-current .ui-steps-marker { border-color: var(--accent); }
+.ui-step.is-current .ui-steps-marker > span { background: var(--accent); }
+.ui-step.is-ended { color: var(--text); font-weight: 600; }
+.ui-step.is-ended .ui-steps-marker { border-color: var(--text-secondary); color: var(--text-secondary); }
+.ui-step.is-failed { color: var(--critical); }
+.ui-step.is-failed .ui-steps-marker { border-color: var(--critical); color: #fff; background: var(--critical); }
+.ui-steps-note { margin: var(--space-2) 0 0; color: var(--text-secondary); font-size: var(--text-sm); }
+

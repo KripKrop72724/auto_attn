@@ -3,6 +3,7 @@ import { Icon, type IconName } from '../Icon'
 import type { Tone } from './StatusChip'
 import { formatCount } from './uiText'
 import { cx } from './cx'
+import './content.css'
 
 export type StatTileProps = {
   label: string

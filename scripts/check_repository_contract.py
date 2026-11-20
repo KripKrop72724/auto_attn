@@ -159,8 +159,8 @@ def main() -> int:
 
     ui_sources = [
         ROOT / "apps/add_frontend/src/styles.css",
-        ROOT / "apps/add_frontend/src/ui/ui.css",
         ROOT / "apps/add_frontend/index.html",
+        *sorted((ROOT / "apps/add_frontend/src/ui").glob("*.css")),
     ]
     found_colors: set[str] = set()
     for source in ui_sources:

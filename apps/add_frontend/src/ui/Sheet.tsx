@@ -9,6 +9,7 @@ import { useKeyboardInset } from './useKeyboardInset'
 import { useIsPhone } from './useMediaQuery'
 import { UI_TEXT } from './uiText'
 import { cx } from './cx'
+import './sheet.css'
 
 export type SheetProps = {
   title: string

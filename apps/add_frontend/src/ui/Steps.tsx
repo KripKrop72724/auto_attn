@@ -1,6 +1,7 @@
 import { Icon } from '../Icon'
 import { UI_TEXT } from './uiText'
 import { cx } from './cx'
+import './steps.css'
 
 export type StepsState = 'waiting' | 'sent' | 'confirmed' | 'failed' | 'cancelling' | 'cancelled' | 'timed-out'
 

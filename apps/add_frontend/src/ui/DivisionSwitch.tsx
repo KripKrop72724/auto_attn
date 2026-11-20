@@ -1,6 +1,7 @@
 import { SegmentedControl } from './Tabs'
 import { UI_TEXT } from './uiText'
 import { cx } from './cx'
+import './tabs.css'
 
 export type DivisionChoice = 'all' | 'life' | 'health'
 
