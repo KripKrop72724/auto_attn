@@ -88,7 +88,7 @@ export function RecoverTabs({ value, onChange, counts, phone }: {
               role="tab"
               className="ui-tab"
               aria-selected={value === id}
-              aria-controls={`recover-panel-${id}`}
+              aria-controls={value === id ? `recover-panel-${id}` : undefined}
               tabIndex={value === id ? 0 : -1}
               onKeyDown={(event) => move(event, index)}
               onClick={() => onChange(id)}
