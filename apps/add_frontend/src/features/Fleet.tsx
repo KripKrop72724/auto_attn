@@ -1,6 +1,7 @@
 // The fleet page: key figures and the device list or map (moved from App.tsx).
 // Home and Devices both show it until their own pages replace it.
 import { Suspense, lazy, useState } from 'react'
+import './Devices.css'
 import { Icon } from '../Icon'
 import { deviceActivity } from '../hikvisionHealth'
 import { relativeTime } from '../lib/time'

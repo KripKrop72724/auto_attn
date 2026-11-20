@@ -146,7 +146,7 @@ describe('recovery summary refresh budget', () => {
       await waitFor(() => expect(summaryCalls).toBe(1))
       expect(screen.queryByText(/Figures as of/)).toBeNull()
       await releaseAll()
-      const expected = new Date('2026-11-04T09:15:42Z').toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+      const expected = '2:15 pm' // Pakistan time, no seconds
       await waitFor(() => expect(screen.getByText(`Figures as of ${expected}`, { exact: false })).toBeTruthy())
     } finally {
       delete summary.metrics_computed_at

@@ -1,5 +1,7 @@
+import { lazy } from 'react'
 import { useAppData } from '../AppData'
-import { FleetView } from '../features/Fleet'
+
+const FleetView = lazy(() => import('../features/Fleet').then((module) => ({ default: module.FleetView })))
 import { FleetRefreshBar } from './FleetRefreshBar'
 
 // Home (`/home`, the default page). Placeholder: shows today's fleet page until

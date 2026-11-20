@@ -1,5 +1,7 @@
 import { defineConfig, devices } from '@playwright/test'
 
+const sweeps = /(guards|visual-tour)\.spec\.ts$/
+
 export default defineConfig({
   testDir: './tests/e2e',
   timeout: 30_000,
@@ -18,14 +20,18 @@ export default defineConfig({
     reuseExistingServer: !process.env.CI,
     timeout: 30_000,
   },
+  // The page sweeps and the screenshot tour run on one phone and one desktop
+  // size only (DLV-3); every other project runs the page specs.
   projects: [
-    { name: 'mobile-320', use: { ...devices['Desktop Chrome'], viewport: { width: 320, height: 720 } } },
-    { name: 'mobile-390', use: { ...devices['Desktop Chrome'], viewport: { width: 390, height: 844 } } },
-    { name: 'tablet-768', use: { ...devices['Desktop Chrome'], viewport: { width: 768, height: 1024 } } },
-    { name: 'desktop-1280', use: { ...devices['Desktop Chrome'], viewport: { width: 1280, height: 900 } } },
+    { name: 'mobile-320', testIgnore: sweeps, use: { ...devices['Desktop Chrome'], viewport: { width: 320, height: 720 } } },
+    { name: 'mobile-390', testIgnore: sweeps, use: { ...devices['Desktop Chrome'], viewport: { width: 390, height: 844 } } },
+    // A real phone: touch, mobile viewport rules (FND-1). Runs the frame specs and the sweeps.
+    { name: 'phone-390-touch', testMatch: /(frame|guards|visual-tour)\.spec\.ts$/, use: { ...devices['Pixel 5'], viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true } },
+    { name: 'tablet-768', testIgnore: sweeps, use: { ...devices['Desktop Chrome'], viewport: { width: 768, height: 1024 } } },
+    { name: 'desktop-1280', testIgnore: sweeps, use: { ...devices['Desktop Chrome'], viewport: { width: 1280, height: 900 } } },
     { name: 'desktop-1440', use: { ...devices['Desktop Chrome'], viewport: { width: 1440, height: 1000 } } },
-    { name: 'wide-1600', use: { ...devices['Desktop Chrome'], viewport: { width: 1600, height: 1000 } } },
-    { name: 'firefox-1280', use: { ...devices['Desktop Firefox'], viewport: { width: 1280, height: 900 } } },
-    { name: 'webkit-1280', use: { ...devices['Desktop Safari'], viewport: { width: 1280, height: 900 } } },
+    { name: 'wide-1600', testIgnore: sweeps, use: { ...devices['Desktop Chrome'], viewport: { width: 1600, height: 1000 } } },
+    { name: 'firefox-1280', testIgnore: sweeps, use: { ...devices['Desktop Firefox'], viewport: { width: 1280, height: 900 } } },
+    { name: 'webkit-1280', testIgnore: sweeps, use: { ...devices['Desktop Safari'], viewport: { width: 1280, height: 900 } } },
   ],
 })

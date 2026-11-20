@@ -254,3 +254,6 @@
 @media (forced-colors: active) {
   .user-directory-row.identity-missing, .user-directory-row.identity-conflict, .user-directory-row.identity-resolved { border-left: 4px solid CanvasText; }
 }
+
+/* Bulk removal progress. Moved from styles.css (FND-2). */
+.bulk-deletion-progress small { display: block; margin-top: 4px; color: var(--text-secondary); }

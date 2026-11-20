@@ -1,4 +1,5 @@
 import { Suspense, lazy, useCallback, useEffect, useRef, useState } from 'react'
+import './Monitoring.css'
 import { api, queryString } from '../api'
 import {
   Dialog, PageHeader, StatusBadge, idempotency,
