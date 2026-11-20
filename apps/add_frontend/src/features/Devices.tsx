@@ -5,7 +5,6 @@ import { useMemo, type MouseEvent } from 'react'
 import { useLocation } from 'react-router-dom'
 import { useAppData } from '../AppData'
 import { flag, oneOf, text, useUrlState } from '../lib/urlState'
-import { useDivision } from '../lib/useDivision'
 import { routePath } from '../routing'
 import type { Device } from '../types'
 import { DataList, type DataColumn } from '../ui/DataList'
@@ -22,6 +21,7 @@ import {
   BRAND_WORD, applyFilters, cityOptions, deviceViews, sortViews, spareCount, statusCounts, versionOptions,
   type Brand, type DeviceFilters, type DeviceView, type SortKey, type StatusFilter,
 } from './devices/deviceList'
+import { usePageDivision } from './devices/usePageDivision'
 import { useStatusChange } from './devices/useStatusChange'
 import './Devices.css'
 
@@ -48,7 +48,7 @@ export function DevicesView() {
   const location = useLocation()
   const phone = useIsPhone()
   const now = useNow()
-  const [division] = useDivision()
+  const division = usePageDivision()
   const [values, setValues] = useUrlState(schema)
   const views = useMemo(() => deviceViews(app.devices), [app.devices])
   const filters: DeviceFilters = useMemo(() => ({

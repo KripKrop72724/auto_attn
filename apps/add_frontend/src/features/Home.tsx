@@ -10,7 +10,6 @@ import { queryClient } from '../data'
 import { Icon } from '../Icon'
 import type { DivisionChoice, DivisionKey } from '../lib/division'
 import { ago, clock, dayTime, pakistanDay } from '../lib/time'
-import { useDivision } from '../lib/useDivision'
 import type { Alert, Device } from '../types'
 import { DivisionTag } from '../ui/DivisionTag'
 import { EmptyState } from '../ui/EmptyState'
@@ -26,6 +25,7 @@ import {
 import { problemWords } from '../words/problems'
 import { DeviceStatusChip, UpdatedAgo, sinceText, useNow } from './devices/DeviceBits'
 import { deviceViews, fleetCounts, notWorking, type DeviceView } from './devices/deviceList'
+import { usePageDivision } from './devices/usePageDivision'
 import { useStatusChange } from './devices/useStatusChange'
 import { autoSendingLine } from './home/autoSendingLine'
 import { MenuChangeNote } from './home/MenuChangeNote'
@@ -55,7 +55,7 @@ export function HomeView() {
   const app = useAppData()
   const phone = useIsPhone()
   const now = useNow()
-  const [division] = useDivision()
+  const division = usePageDivision()
   const link = useLink()
   const views = useMemo(() => deviceViews(app.devices), [app.devices])
   const { changed, announcement } = useStatusChange(views, app.devicesLoaded)
