@@ -2155,12 +2155,22 @@ def list_reconciliations(
     cursor: int | None = Query(default=None, ge=1),
     limit: int = Query(default=100, ge=1, le=500),
     include_archived: bool = False,
+    division: str | None = None,
     auth: tuple[Session, AdminContext] = Depends(require_admin),
 ):
     db, _context = auth
+    try:
+        chosen_division = connector_naming.parse_division(division)
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
     # Archived jobs leave the dashboard and its totals; their evidence stays
     # readable by job ID and by every check that uses it.
     visible = [] if include_archived else [ReconciliationJob.archived_at.is_(None)]
+    if chosen_division is not None:
+        # Life / Health narrows the rows and the totals alike.
+        visible.append(ReconciliationJob.connector_id.in_(
+            connector_naming.connector_ids_for_division(db, chosen_division)
+        ))
     clauses = [*visible]
     if connector_id:
         connector = connector_or_404(db, connector_id)
@@ -2179,6 +2189,7 @@ def list_reconciliations(
                 Connector.display_name.ilike(term),
                 Connector.zone_id.ilike(term),
                 Connector.hardware_id.ilike(term),
+                ReconciliationJob.terminal_serial.ilike(term),
             )
         )
     status_groups = {
@@ -2265,10 +2276,23 @@ def list_reconciliations(
             or 0
         ),
     }
+    row_connectors = {
+        connector.id: connector
+        for connector in db.scalars(
+            select(Connector).where(Connector.id.in_({row.connector_id for row in rows}))
+        ).all()
+    } if rows else {}
     return {
         "enabled": settings.reconciliation_enabled,
         "scheduler": reconciliation_scheduler_state(db),
-        "rows": [serialize_job(db, row) for row in rows],
+        "rows": [
+            {
+                **serialize_job(db, row),
+                **(connector_naming.naming(row_connectors[row.connector_id])
+                   if row.connector_id in row_connectors else {}),
+            }
+            for row in rows
+        ],
         "next_cursor": next_cursor,
         "filtered_total": int(filtered_total),
         "totals": totals,
@@ -2309,9 +2333,14 @@ def source_exceptions(
     corrected: bool | None = None,
     cursor: int | None = Query(default=None, ge=1),
     limit: int = Query(default=100, ge=1, le=500),
+    division: str | None = None,
     auth: tuple[Session, AdminContext] = Depends(require_admin),
 ):
     db, _context = auth
+    try:
+        chosen_division = connector_naming.parse_division(division)
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
     job = reconciliation_or_404(db, job_id) if job_id else None
     connector_pk = None
     if device_id:
@@ -2336,6 +2365,10 @@ def source_exceptions(
         corrected=corrected,
         cursor=cursor,
         limit=limit,
+        connector_ids=(
+            connector_naming.connector_ids_for_division(db, chosen_division)
+            if chosen_division is not None else None
+        ),
     )
     if job is not None:
         assurance = source_exception_assurance(db, job)
@@ -2354,6 +2387,8 @@ def source_exceptions(
                     "open",
                     "invalid_time",
                     "malformed",
+                    "identity_unresolved",
+                    "identity_unresolved_open",
                     "state",
                     "cohort_digest",
                     "correction_ids",

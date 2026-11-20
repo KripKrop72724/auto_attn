@@ -134,8 +134,13 @@ def list_source_exceptions(
     corrected: bool | None = None,
     cursor: int | None = None,
     limit: int = 100,
+    connector_ids: list[int] | None = None,
 ) -> dict:
-    statement = select(TerminalRecordManifest).where(
+    """``connector_ids`` (the Life / Health filter) narrows the rows and the totals."""
+    division_scope = (
+        [TerminalRecordManifest.connector_id.in_(connector_ids)] if connector_ids is not None else []
+    )
+    statement = select(TerminalRecordManifest).where(*division_scope).where(
         TerminalRecordManifest.canonical_source == True,  # noqa: E712
         TerminalRecordManifest.disposition.in_(EXCEPTION_DISPOSITIONS)
     )
@@ -203,6 +208,7 @@ def list_source_exceptions(
     ).where(
         TerminalRecordManifest.canonical_source == True,  # noqa: E712
         TerminalRecordManifest.disposition.in_(EXCEPTION_DISPOSITIONS),
+        *division_scope,
     )
     total, invalid_time, malformed, identity_unresolved, affected_terminals = session.execute(totals_statement).one()
     # Reviews stay with the bytes they reviewed; a settled row's review is
@@ -213,6 +219,7 @@ def list_source_exceptions(
         .where(
             TerminalRecordManifest.canonical_source == True,  # noqa: E712
             TerminalRecordManifest.disposition.in_(EXCEPTION_DISPOSITIONS),
+            *division_scope,
         )
     ) or 0
     return {
