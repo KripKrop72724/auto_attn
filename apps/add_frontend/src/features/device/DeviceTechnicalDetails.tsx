@@ -5,6 +5,7 @@ import type { ReactNode } from 'react'
 import { ago, dayTime } from '../../lib/time'
 import { TechnicalDetails } from '../../ui'
 import { plainActivity, plainConnectionRow } from '../../words/machine'
+import { plainStatus } from '../../words/states'
 import { SUMMARY_WORDS, softwareVersion, type DeviceDetail } from '../../words/device'
 import { HealthEvidence } from '../DeviceHealthPanel'
 import { FirmwareHealth } from '../FirmwareHealth'
@@ -143,7 +144,7 @@ export function DeviceTechnicalDetails({ device }: { device: DeviceDetail }) {
           ['Version', softwareVersion(device.firmware_version) || '—'],
           ['Running copy', device.ota_running_partition || '—'],
           ['Software fingerprint', device.ota_image_sha256 || '—'],
-          ['Update state', device.ota_state || '—'],
+          ['Update state', device.ota_state ? `${plainStatus('softwareDevice', device.ota_state).label} (${device.ota_state})` : '—'],
         ]} />
       </Section>
       {!device.is_spare && <Section id="health" title={SUMMARY_WORDS.healthSection}>

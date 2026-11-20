@@ -77,10 +77,9 @@ export interface HeaderStatus {
 }
 
 const healthAge = (device: DeviceDetail, now: Date) => {
-  const at = device.health?.evaluated_at ?? device.snapshot_at ?? null
-  if (!at) return null
-  const time = Date.parse(at)
-  return Number.isFinite(time) ? now.getTime() - time : null
+  // The newest of the detail's evaluation and the live row's snapshot time.
+  const times = [device.health?.evaluated_at, device.snapshot_at].map((value) => (value ? Date.parse(value) : NaN)).filter(Number.isFinite)
+  return times.length ? now.getTime() - Math.max(...times) : null
 }
 
 /**

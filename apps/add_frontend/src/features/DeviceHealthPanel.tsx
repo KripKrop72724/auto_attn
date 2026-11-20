@@ -54,7 +54,7 @@ function coverageText(item: Coverage, firmware?: string | null) {
 function ReasonRow({ reason }: { reason: HealthReason }) {
   const key = reason.alert_id == null ? `derived-${reason.code}` : `alert-${reason.alert_id}`
   const titleId = `device-health-${key}-title`
-  const words = problemWords({ code: reason.code })
+  const words = problemWords(reason)
   const tier = reason.tier ? plainTier(reason.tier).label : 'Does not change the status'
   const extra = healthDetailWords(reason)
   return (

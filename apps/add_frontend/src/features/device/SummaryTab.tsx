@@ -12,10 +12,18 @@ import {
   type DeviceDetail, type DeviceTab,
 } from '../../words/device'
 import { problemWords } from '../../words/problems'
+import { plainStatus } from '../../words/states'
 import { deviceDivision, devicePlace, isHikvision } from './deviceNaming'
 import { DeviceTechnicalDetails } from './DeviceTechnicalDetails'
 import { fetchActivity, itemKey, itemTime, type ActivityItem } from './activityData'
 import { useSpareToggle } from './SpareTool'
+
+/** " · Update undone" when the link box's update state needs a word (WORDS-9 device part). */
+const updateNote = (state: string | null | undefined) => {
+  if (!state || state === 'OTA_READY') return ''
+  const word = plainStatus('softwareDevice', state)
+  return word.unknown ? '' : ` · ${word.label}`
+}
 
 const KIND_ICON = { problem: 'x', review: 'list', retried: 'refresh', good: 'check', routine: 'info', action: 'users' } as const
 
@@ -49,7 +57,7 @@ function WhatsHappeningCard({ device, onOpenTab, onInventoryChanged }: {
       {words.clearsWhen && <p>{SUMMARY_WORDS.clearsWhen(words.clearsWhen)}</p>}
       {other && total > 1 && (
         <p className="dv-also-open">
-          {SUMMARY_WORDS.alsoOpen(problemWords({ code: other.code }).title)} ·{' '}
+          {SUMMARY_WORDS.alsoOpen(problemWords(other).title)} ·{' '}
           <button type="button" className="text-button" onClick={() => onOpenTab('problems')}>{SUMMARY_WORDS.seeAll(total)}</button>
         </p>
       )}
@@ -97,7 +105,7 @@ function KeyFacts({ device, detailQuery }: { device: DeviceDetail; detailQuery: 
         <Fact label={SUMMARY_WORDS.place}>{devicePlace(device)}</Fact>
         <Fact label={SUMMARY_WORDS.division}><DivisionTag division={deviceDivision(device)} /></Fact>
         <Fact label={SUMMARY_WORDS.machine}>{machine}</Fact>
-        <Fact label={SUMMARY_WORDS.software}>{softwareVersion(device.firmware_version) || SUMMARY_WORDS.notReported}</Fact>
+        <Fact label={SUMMARY_WORDS.software}>{softwareVersion(device.firmware_version) || SUMMARY_WORDS.notReported}{updateNote(device.ota_state)}</Fact>
         <Fact label={SUMMARY_WORDS.lastCheckin}>{todayValue(lastCheckin)}</Fact>
         <Fact label={SUMMARY_WORDS.checkinsToday}>{todayValue((value) => formatNumber(value.checkins_today))}</Fact>
         <Fact label={SUMMARY_WORDS.sentToHr} wide>{todayValue((value) => (

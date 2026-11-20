@@ -30,7 +30,7 @@ function ProblemCard({ alert, operator, reason, busy, onSeen, onFix }: {
   onSeen?: () => void
   onFix?: () => void
 }) {
-  const words = problemWords({ code: alert.code, ...(alert.details || {}) } as Parameters<typeof problemWords>[0])
+  const words = problemWords({ ...(reason as object | undefined), ...(alert.details || {}), ...(alert as object), code: alert.code } as Parameters<typeof problemWords>[0])
   const resolved = Boolean(alert.resolved_at)
   const isNew = !resolved && alertNeedsAction(alert)
   const seenBy = text(alert.acknowledged_by) || text(alert.details?.acknowledged_by)
@@ -74,7 +74,7 @@ function ProblemCard({ alert, operator, reason, busy, onSeen, onFix }: {
 }
 
 function HappeningNow({ reason }: { reason: HealthReason }) {
-  const words = problemWords({ code: reason.code })
+  const words = problemWords(reason)
   return (
     <article className="dv-problem-card is-derived" aria-label={words.title} data-status-code={reason.code}>
       <div className="dv-problem-head"><Icon name="alert" size="sm" /><h4>{words.title}</h4></div>
