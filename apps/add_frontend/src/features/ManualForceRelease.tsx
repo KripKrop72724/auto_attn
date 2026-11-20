@@ -1,8 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { api, queryString } from '../api'
-import { dateTime, Dialog, idempotency, Metric, pktInputToUtc } from '../App'
+import { Dialog, idempotency, Metric, pktInputToUtc } from '../App'
 import { Icon } from '../Icon'
+import { DivisionTag, TechnicalDetails } from '../ui'
+import { deviceDivision } from '../lib/division'
+import { deviceName } from '../lib/deviceNames'
+import { FORCE_RUN_ERROR } from '../words/attendanceReasons'
 import type { AttendanceEvent, Device } from '../types'
+import { longTime, rowTime } from './attendance/attendanceWords'
 import './SafeAttendanceRepair.css'
 import './ManualForceRelease.css'
 
@@ -15,28 +20,39 @@ export type ForceRun = {
 }
 type Item = { id: number; status: string; needs_attention?: boolean; reason: string; name: string | null; user_id: string; device_name: string; device_serial: string; time: string }
 type Page = { rows: Item[]; next_cursor: number | null }
-const punchCount = (count: number) => `${count.toLocaleString()} ${count === 1 ? 'punch' : 'punches'}`
+type Scope = 'SELECTED' | 'LIFE' | 'HEALTH' | 'ALL_PAKISTAN'
+const checkinCount = (count: number) => `${count.toLocaleString()} ${count === 1 ? 'check-in' : 'check-ins'}`
+const machines = (count: number) => `${count.toLocaleString()} ${count === 1 ? 'machine' : 'machines'}`
 const root = '/api/v2/attendance-force-releases'
 const finished = new Set(['COMPLETED', 'COMPLETED_WITH_REVIEW', 'STOPPED', 'EXPIRED'])
-const label: Record<string, string> = {
-  CHECKING: 'Checking punches', CHECKED: 'Ready to review', RUNNING: 'Preparing delivery', WAITING_ORACLE: 'Waiting for Oracle',
-  PAUSED: 'Paused', STOPPING: 'Stopping — accounting for queued deliveries', STOPPED: 'Stopped', EXPIRED: 'Check expired',
-  COMPLETED: 'Finished', COMPLETED_WITH_REVIEW: 'Finished — some punches need attention', BASELINE: 'Waiting',
-  SYNC_PENDING: 'Waiting', SYNCING: 'Syncing', RELEASING: 'Preparing delivery', DONE: 'Prepared', UNAVAILABLE: 'Couldn’t sync',
-  SKIPPED: 'Skipped after recheck', READY: 'Ready to release', NEEDS_REVIEW: 'Cannot release', CONFIRMED: 'Confirmed by Oracle', EXCLUDED: 'Excluded',
+export const FORCE_RUN_WORDS: Record<string, string> = {
+  CHECKING: 'Checking check-ins', CHECKED: 'Ready to send', RUNNING: 'Getting ready', WAITING_ORACLE: 'Waiting for the HR system',
+  PAUSED: 'Paused', STOPPING: 'Stopping · counting the check-ins already on the way', STOPPED: 'Stopped', EXPIRED: 'Check expired',
+  COMPLETED: 'Done', COMPLETED_WITH_REVIEW: 'Done · some check-ins need checking', BASELINE: 'Waiting',
+  SYNC_PENDING: 'Waiting', SYNCING: 'Refreshing the list of people', RELEASING: 'Getting ready', DONE: 'Ready', UNAVAILABLE: "Couldn't refresh",
+  SKIPPED: 'Not sent after the second check', READY: 'Can be sent', NEEDS_REVIEW: "Can't be sent", CONFIRMED: 'Sent', EXCLUDED: 'Left out',
 }
-const message = (error: unknown) => error instanceof Error ? error.message : 'Could not reach ADD. Please try again.'
+const label = FORCE_RUN_WORDS
+const message = (error: unknown) => error instanceof Error ? error.message : "Couldn't reach the dashboard. Try again."
+const placeOf = (device: Pick<Device, 'friendly_name' | 'display_name' | 'zone_id'>) => {
+  if (device.friendly_name) return device.friendly_name
+  const name = deviceName(device.display_name || device.zone_id)
+  return name.unit ? `${name.location} · ${name.unit}` : name.location
+}
+/** The place name for a machine in a saved check (by its id, else its saved name). */
+const runPlace = (devices: Device[], connectorId: string, fallback: string) => {
+  const known = devices.find((device) => device.connector_id === connectorId)
+  return known ? placeOf(known) : placeOf({ friendly_name: null, display_name: fallback, zone_id: fallback })
+}
 
 export function ManualForceRelease({ devices, toast, initialConnectorId }: { devices: Device[]; toast: Toast; initialConnectorId?: string | null }) {
   const [enabled, setEnabled] = useState(false)
-  const [scope, setScope] = useState<'SELECTED' | 'ALL_PAKISTAN'>('SELECTED')
+  const [scope, setScope] = useState<Scope>('SELECTED')
   const [selected, setSelected] = useState<string[]>(initialConnectorId ? [initialConnectorId] : [])
   const [deviceSearch, setDeviceSearch] = useState('')
   const [allDates, setAllDates] = useState(true)
   const [from, setFrom] = useState(''); const [to, setTo] = useState('')
   const [run, setRun] = useState<ForceRun | null>(null)
-  const [history, setHistory] = useState<ForceRun[]>([])
-  const [historyCursor, setHistoryCursor] = useState<number | null>(null)
   const [items, setItems] = useState<Page>({ rows: [], next_cursor: null })
   const [filter, setFilter] = useState(''); const [search, setSearch] = useState('')
   const [cursor, setCursor] = useState(0); const [back, setBack] = useState<number[]>([])
@@ -49,12 +65,13 @@ export function ManualForceRelease({ devices, toast, initialConnectorId }: { dev
   const open = useCallback((value: ForceRun) => {
     active.current = value.job_id; setRun(value); setCursor(0); setBack([])
     const url = new URL(window.location.href)
-    url.searchParams.set('force_run', value.job_id); url.searchParams.set('view', 'needs-review')
+    url.searchParams.set('force_run', value.job_id); url.searchParams.set('view', 'fix-tools'); url.searchParams.set('tool', 'held-staff')
     window.history.replaceState({}, '', url)
   }, [])
-  const loadHistory = useCallback(async (before?: number) => {
-    const result = await api<{ enabled: boolean; rows: ForceRun[]; next_cursor: number | null }>(root + queryString({ before }))
-    setEnabled(result.enabled); setHistory(old => before ? [...old, ...result.rows] : result.rows); setHistoryCursor(result.next_cursor)
+  // The list of saved checks is under Fix tools › History; here it only says whether the tool is on.
+  const loadHistory = useCallback(async () => {
+    const result = await api<{ enabled: boolean; rows: ForceRun[]; next_cursor: number | null }>(root)
+    setEnabled(result.enabled)
   }, [])
   useEffect(() => {
     void loadHistory().catch(err => setError(message(err)))
@@ -85,7 +102,9 @@ export function ManualForceRelease({ devices, toast, initialConnectorId }: { dev
 
   const check = async () => {
     setBusy(true); setError('')
-    const content = JSON.stringify({ scope, connector_ids: scope === 'ALL_PAKISTAN' ? [] : selected,
+    // "All Life" / "All Health" are the chosen machines of that division: the API is unchanged.
+    const ids = scope === 'ALL_PAKISTAN' ? [] : scope === 'SELECTED' ? selected : divisionIds(scope === 'LIFE' ? 'life' : 'health')
+    const content = JSON.stringify({ scope: scope === 'ALL_PAKISTAN' ? 'ALL_PAKISTAN' : 'SELECTED', connector_ids: ids,
       from_time: allDates ? null : pktInputToUtc(from) || null, to_time: allDates ? null : pktInputToUtc(to) || null })
     if (request.current?.content !== content) request.current = { content, key: idempotency('force-check') }
     try {
@@ -102,53 +121,86 @@ export function ManualForceRelease({ devices, toast, initialConnectorId }: { dev
         : { action: confirm, password, idempotency_key: approvalKey.current }
       const value = await api<ForceRun>(`${root}/${run.job_id}/${confirm === 'START' ? 'start' : 'control'}`, { method: 'POST', body: JSON.stringify(body) })
       setRun(value); setConfirm(null); setPassword(''); setReason(''); approvalKey.current = idempotency('force-approval')
-      toast.notice(confirm === 'START' ? 'Approval saved. ADD is refreshing terminals before delivery.' : 'Your action is saved.')
+      toast.notice(confirm === 'START' ? 'Approval saved. The machines are refreshed before sending.' : 'Saved.')
     } catch (err) { setError(message(err)) } finally { setBusy(false) }
   }
   const showConfirm = (action: typeof confirm) => { setConfirm(action); setError(''); setPassword(''); approvalKey.current = idempotency('force-approval') }
+  const inUse = devices.filter(d => !d.is_spare)
+  const divisionIds = (division: 'life' | 'health') => inUse.filter(d => deviceDivision(d) === division).map(d => d.connector_id)
   const readyDevices = run?.devices.filter(d => d.ready > 0) ?? []
   const syncInProgress = run?.devices.some(d => ['SYNCING', 'SYNC_PENDING'].includes(d.status))
   const groups = new Map<string, Item[]>()
   items.rows.forEach(item => { const key = `${item.device_serial} · ${item.user_id}`; groups.set(key, [...(groups.get(key) || []), item]) })
-  return <section className="panel safe-repair manual-force" aria-label="Force release attendance">
-    <header className="safe-repair-header"><div><h2>Force release attendance</h2><p>Sync current terminal users, review matching punches, then approve their release.</p></div><span className="badge"><Icon name="shield" /> Manual approval only</span></header>
+  const found = inUse.filter(d => `${placeOf(d)} ${d.display_name}`.toLowerCase().includes(deviceSearch.toLowerCase()))
+  const scopeCount = scope === 'LIFE' ? divisionIds('life').length : scope === 'HEALTH' ? divisionIds('health').length : selected.length
+  const step = run ? (run.status === 'CHECKING' ? 0 : run.status === 'CHECKED' ? 1 : run.status === 'RUNNING' ? syncInProgress ? 2 : 3 : run.status === 'WAITING_ORACLE' ? 4 : run.status.startsWith('COMPLETED') ? 5 : -1) : -1
+  const dialogTitle = confirm === 'START' ? `Send ${checkinCount(run?.counts.ready || 0)}` : confirm === 'PAUSE' ? 'Pause this task' : confirm === 'RESUME' ? 'Resume this task' : 'Stop this task'
+  return <section className="panel safe-repair manual-force" aria-label="Re-check not-matched check-ins">
+    <header className="safe-repair-header"><div><h2>Re-check not-matched check-ins</h2><p>Refresh the machines' people lists, see which not-matched check-ins now match a person with a CNIC, and send them after your approval.</p></div><span className="badge"><Icon name="shield" /> Needs your approval</span></header>
     <div className="safe-repair-body">
-      <h3>1. Select and sync</h3>
-      <fieldset className="force-scope"><legend>Devices to check</legend><label><input type="radio" name="force-scope" checked={scope === 'SELECTED'} onChange={() => setScope('SELECTED')} /> Selected devices</label><label><input type="radio" name="force-scope" checked={scope === 'ALL_PAKISTAN'} onChange={() => setScope('ALL_PAKISTAN')} /> All Pakistan</label></fieldset>
-      {scope === 'SELECTED' ? <><label className="force-device-search">Find a device<input type="search" value={deviceSearch} onChange={e => setDeviceSearch(e.target.value)} placeholder="Name or terminal serial" /></label><div className="force-device-picker" role="group" aria-label="Select devices">{devices.filter(d => !d.is_spare && `${d.display_name} ${d.zkt?.serial}`.toLowerCase().includes(deviceSearch.toLowerCase())).map(d => <label key={d.connector_id}><input type="checkbox" checked={selected.includes(d.connector_id)} onChange={e => setSelected(old => e.target.checked ? [...old, d.connector_id] : old.filter(id => id !== d.connector_id))} /><span><strong>{d.display_name}</strong><small>{d.zkt?.serial || 'Serial not reported'} · {d.hardware_id} · {d.connected ? 'Online' : 'Unavailable'}</small></span></label>)}</div><p className="force-selection-count">{selected.length} {selected.length === 1 ? 'device' : 'devices'} selected</p></> : <p>Checks all active devices across Pakistan. Spares are excluded. Unavailable devices will be listed separately.</p>}
-      <label className="force-inline"><input type="checkbox" checked={allDates} onChange={e => setAllDates(e.target.checked)} /> All saved dates</label>
-      {!allDates && <div className="safe-repair-scope"><label>From (PKT)<input type="datetime-local" value={from} onChange={e => setFrom(e.target.value)} /></label><label>Before (PKT)<input type="datetime-local" value={to} onChange={e => setTo(e.target.value)} /></label></div>}
-      <button className="button primary" disabled={!enabled || busy || (scope === 'SELECTED' && !selected.length) || (!allDates && (!from || !to || from >= to))} onClick={() => void check()}>{busy && !confirm ? 'Saving check…' : 'Sync and check'}</button>
-      {!enabled && <p role="status">Manual force release is awaiting production qualification.</p>}
-      {disconnected && <p role="status" className="message pattern-waiting">Connection lost. Your run is saved and continues on ADD. Reconnecting…</p>}
+      <h3>1. Choose machines</h3>
+      <fieldset className="force-scope"><legend>Machines</legend>
+        <label><input type="radio" name="force-scope" checked={scope === 'SELECTED'} onChange={() => setScope('SELECTED')} /> Chosen machines</label>
+        <label><input type="radio" name="force-scope" checked={scope === 'LIFE'} onChange={() => setScope('LIFE')} /> All Life</label>
+        <label><input type="radio" name="force-scope" checked={scope === 'HEALTH'} onChange={() => setScope('HEALTH')} /> All Health</label>
+        <label><input type="radio" name="force-scope" checked={scope === 'ALL_PAKISTAN'} onChange={() => setScope('ALL_PAKISTAN')} /> All machines</label>
+      </fieldset>
+      {scope === 'SELECTED' ? <><label className="force-device-search">Find a place<input type="search" value={deviceSearch} onChange={e => setDeviceSearch(e.target.value)} placeholder="Place name" /></label>
+        <div className="force-device-picker" role="group" aria-label="Choose machines">{(['life', 'health'] as const).map(division => {
+          const rows = found.filter(d => deviceDivision(d) === division).sort((a, b) => placeOf(a).localeCompare(placeOf(b), 'en', { numeric: true }))
+          if (!rows.length) return null
+          return <div key={division} className="force-device-group"><p className="force-device-group-title"><DivisionTag division={division} /></p>{rows.map(d => <label key={d.connector_id}><input type="checkbox" checked={selected.includes(d.connector_id)} onChange={e => setSelected(old => e.target.checked ? [...old, d.connector_id] : old.filter(id => id !== d.connector_id))} /><span><strong>{placeOf(d)}</strong><small><i className={`force-online-dot ${d.connected ? 'is-online' : ''}`} aria-hidden="true" />{d.connected ? 'Online' : 'Offline'}</small></span></label>)}</div>
+        })}</div>
+        <p className="force-selection-count">{machines(selected.length)} chosen</p></>
+        : scope === 'ALL_PAKISTAN' ? <p>Checks every machine in use. Spares are left out. Machines that are offline are listed separately.</p>
+          : <p>Checks {machines(scopeCount)} in use in {scope === 'LIFE' ? 'Life' : 'Health'}. Spares are left out.</p>}
+      <label className="force-inline"><input type="checkbox" checked={allDates} onChange={e => setAllDates(e.target.checked)} /> All dates</label>
+      {!allDates && <div className="safe-repair-scope"><label>From<input type="datetime-local" value={from} onChange={e => setFrom(e.target.value)} /></label><label>Up to<input type="datetime-local" value={to} onChange={e => setTo(e.target.value)} /></label><small>Pakistan time</small></div>}
+      <button className="button primary" disabled={!enabled || busy || (scope !== 'ALL_PAKISTAN' && !scopeCount) || (!allDates && (!from || !to || from >= to))} onClick={() => void check()}>{busy && !confirm ? 'Checking…' : 'Re-check not-matched check-ins'}</button>
+      {!enabled && <p role="status">This tool isn't switched on yet.</p>}
+      {disconnected && <p role="status" className="message pattern-waiting">Connection lost. Sending continues; reconnecting…</p>}
       {error && !confirm && <p className="message pattern-blocked" role="alert">{error}</p>}
       {run && <div className="safe-repair-run">
-        <div className="safe-repair-heading"><h3 aria-live="polite">{run.status === 'RUNNING' && syncInProgress ? 'Refreshing terminals' : label[run.status]}</h3><a href={`/attendance?view=needs-review&force_run=${run.job_id}`}>Saved run link</a></div>
-        <ol className="safe-repair-steps" aria-label="Release progress">{['Sync and check', 'Review', 'Refreshing terminals', 'Preparing delivery', 'Waiting for Oracle', 'Finished'].map((step, i) => <li key={step} aria-current={(run.status === 'CHECKING' ? 0 : run.status === 'CHECKED' ? 1 : run.status === 'RUNNING' ? syncInProgress ? 2 : 3 : run.status === 'WAITING_ORACLE' ? 4 : run.status.startsWith('COMPLETED') ? 5 : -1) === i ? 'step' : undefined}>{step}</li>)}</ol>
-        <div className="safe-repair-counts"><Metric label="Ready to release" value={run.counts.ready} icon="shield" detail="Matching current user and CNIC" /><Metric label="Cannot release" value={run.counts.review} icon="alert" detail="Saved safely for review" tone={run.counts.review ? 'warning' : 'neutral'} /><Metric label="Already confirmed" value={run.counts.already_confirmed} icon="check" detail="Excluded from this release" /><Metric label="Devices unavailable" value={run.counts.unavailable_devices} icon="server" detail="Ready devices can proceed" /></div>
-        {!['CHECKING', 'CHECKED'].includes(run.status) && <p role="status">{run.counts.confirmed.toLocaleString()} confirmed · {(run.counts.waiting - ((run.counts.attention ?? run.counts.review) - run.counts.review)).toLocaleString()} waiting · {run.counts.skipped.toLocaleString()} skipped · {run.counts.stopped.toLocaleString()} stopped · {(run.counts.attention ?? run.counts.review).toLocaleString()} need attention</p>}
-        {run.counts.already_delivering > 0 && <p>{run.counts.already_delivering} punches already have a delivery in progress and will not be sent again.</p>}
-        <ul className="safe-repair-devices">{run.devices.map(d => <li key={d.connector_id}><strong>{d.name} · {d.serial || 'Serial not reported'}</strong><span>{d.status === 'CHECKED' ? 'Ready' : label[d.status]} · {d.checked.toLocaleString()} checked{d.synced_at ? ` · Last terminal sync ${dateTime(d.synced_at)}` : ''}</span>{d.error && <span>{d.error}</span>}</li>)}</ul>
-        {run.status === 'CHECKED' && <div className="safe-repair-next"><h3>2. Review and approve</h3><p>Only the ready punches listed in this saved check can be released. Later punches need another manual run.</p><button className="button primary" disabled={!run.signature || !run.execution_enabled || !run.counts.ready} onClick={() => showConfirm('START')}>Force release {punchCount(run.counts.ready)}</button>{!run.signature && <p>This review expired or belongs to another administrator. Sync and check again.</p>}{!run.execution_enabled && run.counts.ready > 0 && <p>Release is not enabled for every ready device in this selection yet.</p>}<small>Review expires {dateTime(run.expires_at)}</small></div>}
-        {run.last_error && <p role="status">{run.last_error}</p>}
-        {['RUNNING', 'WAITING_ORACLE', 'PAUSED'].includes(run.status) && <div className="safe-repair-actions"><button className="button secondary" onClick={() => showConfirm(run.status === 'PAUSED' ? 'RESUME' : 'PAUSE')}>{run.status === 'PAUSED' ? 'Resume' : 'Pause'}</button><button className="button secondary" onClick={() => showConfirm('STOP')}>Stop</button><span>You can close this page. Your run is saved.</span></div>}
-        <div className="safe-repair-filter"><label>Show punches<select value={filter} onChange={e => { setFilter(e.target.value); setCursor(0); setBack([]) }}><option value="">All results</option>{['READY', 'NEEDS_REVIEW', 'SKIPPED', 'EXCLUDED', 'WAITING_ORACLE', 'CONFIRMED'].map(s => <option key={s} value={s}>{label[s]}</option>)}</select></label><label>Find an employee<input value={search} onChange={e => { setSearch(e.target.value); setCursor(0); setBack([]) }} placeholder="Name or user ID" /></label></div>
-        {[...groups].map(([key, rows]) => <div className="force-employee-group" key={key}><h4>{rows[0].device_name} · {rows[0].name || `User ${rows[0].user_id}`}</h4><small>{rows[0].device_serial} · User {rows[0].user_id}</small><ul className="safe-repair-items">{rows.map(item => <li key={item.id}><span>{dateTime(item.time)}</span><div><strong>{item.needs_attention ? 'Needs attention' : label[item.status] || item.status}</strong><span>{item.reason}</span></div></li>)}</ul></div>)}
-        {!items.rows.length && <p>No punches in this view yet.</p>}
+        <div className="safe-repair-heading"><h3 aria-live="polite">{run.status === 'RUNNING' && syncInProgress ? 'Refreshing machines' : label[run.status] || 'In progress'}</h3><a href={`/attendance?view=fix-tools&tool=held-staff&force_run=${run.job_id}`}>Link to this check</a></div>
+        <ol className="safe-repair-steps" aria-label="Progress">{['Check', 'Review', 'Refresh machines', 'Get ready', 'Waiting for HR system', 'Done'].map((name, i) => <li key={name} aria-current={step === i ? 'step' : undefined}>{name}</li>)}</ol>
+        <div className="safe-repair-counts"><Metric label="Can be sent" value={run.counts.ready} icon="shield" detail="Same person and CNIC on the machine now" /><Metric label="Can't be sent" value={run.counts.review} icon="alert" detail="Kept safely for checking" tone={run.counts.review ? 'warning' : 'neutral'} /><Metric label="Already sent" value={run.counts.already_confirmed} icon="check" detail="Left out of this one" /><Metric label="Machines offline" value={run.counts.unavailable_devices} icon="server" detail="The others can go ahead" /></div>
+        {!['CHECKING', 'CHECKED'].includes(run.status) && <p role="status">{run.counts.confirmed.toLocaleString()} sent · {(run.counts.waiting - ((run.counts.attention ?? run.counts.review) - run.counts.review)).toLocaleString()} waiting · {run.counts.skipped.toLocaleString()} not sent · {run.counts.stopped.toLocaleString()} stopped · {(run.counts.attention ?? run.counts.review).toLocaleString()} need checking</p>}
+        {run.counts.already_delivering > 0 && <p>{checkinCount(run.counts.already_delivering)} are already on the way and won't be sent again.</p>}
+        <ul className="safe-repair-devices">{run.devices.map(d => <li key={d.connector_id}><strong>{runPlace(devices, d.connector_id, d.name)}</strong><span>{d.status === 'CHECKED' ? 'Ready' : label[d.status] || 'In progress'} · {d.checked.toLocaleString()} checked{d.synced_at ? ` · List of people read ${rowTime(d.synced_at)}` : ''}</span>{d.error && <span data-technical className="force-device-error">{d.error}</span>}</li>)}</ul>
+        {run.status === 'CHECKED' && <div className="safe-repair-next"><h3>2. Send</h3><p>Only the check-ins that can be sent in this saved check are sent. Later check-ins need another check.</p><button className="button primary" disabled={!run.signature || !run.execution_enabled || !run.counts.ready} onClick={() => showConfirm('START')}>Send {checkinCount(run.counts.ready)}</button>{!run.signature && <p>This check expired or belongs to another admin. Check again.</p>}{!run.execution_enabled && run.counts.ready > 0 && <p>Sending isn't switched on yet for every chosen machine.</p>}<small>This check expires {longTime(run.expires_at)}</small></div>}
+        {run.last_error && <p role="status">{FORCE_RUN_ERROR}</p>}
+        {['RUNNING', 'WAITING_ORACLE', 'PAUSED'].includes(run.status) && <div className="safe-repair-actions"><button className="button secondary" onClick={() => showConfirm(run.status === 'PAUSED' ? 'RESUME' : 'PAUSE')}>{run.status === 'PAUSED' ? 'Resume' : 'Pause'}</button><button className="button secondary" onClick={() => showConfirm('STOP')}>Stop</button><span>You can close this page. The task is saved.</span></div>}
+        <div className="safe-repair-filter"><label>Show<select value={filter} onChange={e => { setFilter(e.target.value); setCursor(0); setBack([]) }}><option value="">All results</option>{['READY', 'NEEDS_REVIEW', 'SKIPPED', 'EXCLUDED', 'WAITING_ORACLE', 'CONFIRMED'].map(s => <option key={s} value={s}>{label[s]}</option>)}</select></label><label>Find a person<input value={search} onChange={e => { setSearch(e.target.value); setCursor(0); setBack([]) }} placeholder="Name or Employee ID" /></label></div>
+        {[...groups].map(([key, rows]) => <div className="force-employee-group" key={key}><h4>{runPlace(devices, '', rows[0].device_name)} · {rows[0].name || 'Name not known'}</h4><small>Employee ID {rows[0].user_id}</small><ul className="safe-repair-items">{rows.map(item => <li key={item.id}><span>{rowTime(item.time)}</span><div><strong>{item.needs_attention ? 'Needs checking' : label[item.status] || 'In progress'}</strong><span>{item.reason}</span></div></li>)}</ul></div>)}
+        {!items.rows.length && <p>No check-ins in this view yet.</p>}
         <div className="safe-repair-actions"><button className="button secondary" disabled={!back.length} onClick={() => { setCursor(back.at(-1) || 0); setBack(old => old.slice(0, -1)) }}>Previous</button><button className="button secondary" disabled={!items.next_cursor} onClick={() => { setBack(old => [...old, cursor]); setCursor(items.next_cursor || 0) }}>Next</button></div>
       </div>}
-      <details><summary>Saved checks and release runs</summary><ul className="safe-repair-history">{history.map(row => <li key={row.job_id}><button className="button secondary" onClick={() => open(row)}>{dateTime(row.created_at)} · {label[row.status]} · {row.devices.length} devices</button></li>)}</ul>{historyCursor && <button className="button secondary" onClick={() => void loadHistory(historyCursor).catch(err => setError(message(err)))}>Older runs</button>}</details>
     </div>
-    {confirm && run && <Dialog titleId="force-approve-title" title={confirm === 'START' ? `Force release ${punchCount(run.counts.ready)}` : `${confirm[0]}${confirm.slice(1).toLowerCase()} this run`} description={confirm === 'START' ? `${readyDevices.length} ready devices. ${run.counts.review} punches cannot be released; ${run.counts.unavailable_devices} devices are unavailable.` : confirm === 'RESUME' ? 'ADD will refresh terminals before preparing the remaining approved punches.' : 'New records will stop entering delivery. Records already queued continue to be accounted for. Attendance is never deleted.'} onClose={() => { if (!busy) { setConfirm(null); setPassword(''); setError('') } }}><form className="dialog-body" onSubmit={approve}>
-      {confirm === 'START' && <><p>You approve using the current matching terminal user and CNIC for these older punches. This records your decision; it does not create historical identity proof. ADD will refresh terminals again and skip changed matches.</p><label>Reason for release<textarea required minLength={3} maxLength={500} value={reason} onChange={e => setReason(e.target.value)} /></label></>}
-      {confirm === 'RESUME' && <p>ADD will sync terminals again before preparing any remaining punches.</p>}
-      <label>Administrator password<input type="password" required autoComplete="current-password" value={password} onChange={e => setPassword(e.target.value)} /></label>{error && <p role="alert" className="message pattern-blocked">{error}</p>}
-      <footer className="dialog-actions"><button className="button secondary" type="button" disabled={busy} onClick={() => { setConfirm(null); setPassword(''); setError('') }}>Cancel</button><button className="button primary" disabled={busy || !password || (confirm === 'START' && reason.trim().length < 3)}>{busy ? 'Saving…' : confirm === 'START' ? `Approve ${punchCount(run.counts.ready)}` : 'Confirm'}</button></footer></form></Dialog>}
+    {confirm && run && <Dialog titleId="force-approve-title" title={dialogTitle} description={confirm === 'START' ? `${machines(readyDevices.length)} ready. ${checkinCount(run.counts.review)} can't be sent; ${machines(run.counts.unavailable_devices)} offline.` : confirm === 'RESUME' ? "The machines' people lists are read again before the rest are sent." : 'No more check-ins start sending. Check-ins already on the way are still counted. Attendance is never deleted.'} onClose={() => { if (!busy) { setConfirm(null); setPassword(''); setError('') } }}><form className="dialog-body" onSubmit={approve}>
+      {confirm === 'START' && <><p>You approve using the person and CNIC on the machine now for these older check-ins. This saves your decision in the records. The machines are read again first, and any match that changed is not sent.</p><label>Why? (saved in the records)<textarea required minLength={3} maxLength={500} value={reason} onChange={e => setReason(e.target.value)} /></label></>}
+      {confirm === 'RESUME' && <p>The machines' people lists are read again before any more check-ins are sent.</p>}
+      <label>Your password<input type="password" required autoComplete="current-password" value={password} onChange={e => setPassword(e.target.value)} /></label>{error && <p role="alert" className="message pattern-blocked">{error}</p>}
+      <footer className="dialog-actions"><button className="button secondary" type="button" disabled={busy} onClick={() => { setConfirm(null); setPassword(''); setError('') }}>Cancel</button><button className="button primary" disabled={busy || !password || (confirm === 'START' && reason.trim().length < 3)}>{busy ? 'Saving…' : confirm === 'START' ? `Send ${checkinCount(run.counts.ready)}` : 'Confirm'}</button></footer></form></Dialog>}
   </section>
 }
 
-export function ForcedPill({ evidence }: { evidence: NonNullable<AttendanceEvent['force_release']> }) {
-  const [open, setOpen] = useState(false)
+/** The sheet block for a check-in an admin sent (replaces the old "Forced" pill). */
+export function AdminSendFacts({ evidence }: { evidence: NonNullable<AttendanceEvent['force_release']> }) {
   const direct = evidence.policy === 'manual-direct-ords-v1'
-  return <><button type="button" className="force-pill" onClick={() => setOpen(true)} aria-label="Forced attendance — view administrator decision">Forced</button>{open && <Dialog titleId="forced-evidence-title" title={direct ? 'Administrator Oracle send' : 'Manual force release'} onClose={() => setOpen(false)}><div className="dialog-body"><p>Approved by {evidence.administrator} · {dateTime(evidence.approved_at)}</p><p>{evidence.reason}</p>{!direct && <p>Terminal sync command {evidence.sync_command_id} · Saved user list {evidence.snapshot_id}</p>}<p>Audit {evidence.audit_id}</p><a href={direct ? `/attendance?view=all-events&direct_run=${evidence.run_id}` : `/attendance?view=needs-review&force_run=${evidence.run_id}`}>Open saved run</a><p>This label records the administrator’s decision. Oracle delivery status is shown separately.</p></div></Dialog>}</>
+  const href = direct ? `/attendance?direct_run=${encodeURIComponent(evidence.run_id)}` : `/attendance?view=fix-tools&tool=held-staff&force_run=${encodeURIComponent(evidence.run_id)}`
+  return <section className="attendance-sheet-block" aria-labelledby={`admin-send-${evidence.run_id}`}>
+    <h3 id={`admin-send-${evidence.run_id}`}>Sent by an admin</h3>
+    <p>Sent by <span data-user-text>{evidence.administrator}</span> on {longTime(evidence.approved_at)}</p>
+    {evidence.reason && <p>Reason: <span data-user-text>{evidence.reason}</span></p>}
+    <a href={href}>Open the sending task</a>
+    <TechnicalDetails summary="Technical details">
+      <dl className="attendance-tech-list">
+        {evidence.audit_id != null && <div><dt>Record no.</dt><dd>{evidence.audit_id}</dd></div>}
+        <div><dt>Task</dt><dd>{evidence.run_id}</dd></div>
+        {evidence.policy && <div><dt>Policy</dt><dd>{evidence.policy}</dd></div>}
+        {evidence.snapshot_id != null && <div><dt>Saved people list</dt><dd>{evidence.snapshot_id}</dd></div>}
+        {evidence.sync_command_id != null && <div><dt>Machine request</dt><dd>{evidence.sync_command_id}</dd></div>}
+      </dl>
+    </TechnicalDetails>
+  </section>
 }
