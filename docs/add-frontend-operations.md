@@ -35,9 +35,11 @@ All visible and entered times are Pakistan Standard Time (`Asia/Karachi`). Brows
 
 Preflight belongs strictly to the currently selected connector and is cleared before every device switch. Complete scans remain resumable and immutable. Protected raw evidence automatically hides after 60 seconds, when the page is backgrounded, or when its drawer closes.
 
-### Firmware
+### Software updates and Set up a device
 
-Campaign creation requires `POST /api/v1/firmware/campaigns/preflight`. The response lists exact eligible and excluded devices, exclusion reasons, offline count, expiration, and a signed five-minute scope token. Campaign creation sends that token plus a fresh idempotency key; changed or expired scope must be previewed again. Releases can be revoked from the protected release inventory with a reason and password.
+**Software updates** (`/updates`) opens with one status line ("18 of 20 devices are up to date · 1 updating · 1 update failed"), built with `softwareStatus()` in `src/words/software.ts`, the one rule the Devices list and the device panel also use. Spares are not counted; the line shows a skeleton until the device list arrives. Tabs: **Overview** (Life and Health panels with the devices that are not up to date, updates running now, newest version per machine brand), **Updates** (one card per update with a step strip and the pause reason in plain words; Pause, Continue, Stop update, Hide from list, Try again on this device and Clear history stay one click) and **Versions** (Withdraw version… sits in each row's ⋯ menu and keeps its note and password). **Update software** starts one update per place in one click (groups of 30). Running updates refresh every 15 s while the tab is visible. Signing keys, fingerprints, test-device plans and raw codes are under Technical details.
+
+**Set up a device** (`/setup`) shows one "Switched off for now" card while the server's installer or setup switch is off, the State Life Device Installer card first when it is on, and the older browser setup only when the server says it can start. Past setups list by place with search and Mine · Everyone.
 
 ### Alerts
 
