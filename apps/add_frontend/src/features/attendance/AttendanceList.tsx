@@ -52,7 +52,8 @@ export const AttendanceRowItem = memo(function AttendanceRowItem({ row, now, aut
           </span>
           <span className="attendance-cell attendance-time"><strong>{time}</strong><small>{kind}</small></span>
           <span className="attendance-cell attendance-place">
-            <span>{placeLine(row)}</span>
+            {/* Place names come from the device list ("SLIC Tower"), like a person's name. */}
+            <span data-user-text>{placeLine(row)}</span>
             {division && <DivisionTag division={division} />}
           </span>
           <span className="attendance-cell attendance-status">

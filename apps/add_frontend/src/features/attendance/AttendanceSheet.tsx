@@ -125,7 +125,7 @@ export function AttendanceSheet({ row, missing, onClose, onSend, onChanged, toas
       className="attendance-sheet"
       headerExtra={<div className="attendance-sheet-facts">
         <p>{checkinKind(row.punch)} · {longTime(row.device_event_time, now)}</p>
-        <p className="attendance-sheet-place"><span>{placeLine(row)}</span>{division && <DivisionTag division={division} />}</p>
+        <p className="attendance-sheet-place"><span data-user-text>{placeLine(row)}</span>{division && <DivisionTag division={division} />}</p>
         <p className="attendance-sheet-status"><StatusChip tone={chip.tone} label={chip.label} icon={chip.icon} code={row.ords_status} /><span>{group === 'sent' ? SENT_SENTENCE : note}</span></p>
       </div>}
     >

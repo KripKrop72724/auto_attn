@@ -387,7 +387,7 @@ function CheckinsTab({
           row={rows.find((row) => row.id === filters.event) || null}
           missing={loaded && !loading && !rows.some((row) => row.id === filters.event)}
           onClose={closeEvent}
-          onSend={(row) => { setSelected(new Map([[row.id, row]])); setSingleSendRequest((value) => value + 1) }}
+          onSend={(row) => { closeEvent(); setSelected(new Map([[row.id, row]])); setSingleSendRequest((value) => value + 1) }}
           onChanged={() => void refreshFeed(true)}
           toast={toast}
           autoSending={autoSending}
@@ -441,18 +441,9 @@ export function AttendanceView({
   const params = new URLSearchParams(typeof window === 'undefined' ? '' : window.location.search)
   const extended = overview as (Overview & { attendance_all_time?: AttendanceAllTime; checkin_notifications?: CheckinNotificationOverview }) | null | undefined
   const historyKind = (['all', 'hand', 'not-matched', 'old-release', 'old-repair'].includes(params.get('kind') || '') ? params.get('kind') : 'all') as HistoryKind
-  const openedHere = useRef(false)
-
-  const openEvent = useCallback((row: AttendanceRow) => {
-    openedHere.current = true
-    setFilters({ event: row.id })
-  }, [setFilters])
-  const closeEvent = useCallback(() => {
-    if (openedHere.current) {
-      openedHere.current = false
-      navigate(-1)
-    } else setFilters({ event: 0 }, { history: 'replace' })
-  }, [navigate, setFilters])
+  // Opening pushes `event=<id>` (Back closes the sheet); closing replaces it.
+  const openEvent = useCallback((row: AttendanceRow) => setFilters({ event: row.id }), [setFilters])
+  const closeEvent = useCallback(() => setFilters({ event: 0 }, { history: 'replace' }), [setFilters])
 
   return (
     <div className="attendance-workspace">
