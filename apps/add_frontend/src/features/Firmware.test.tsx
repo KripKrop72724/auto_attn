@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { Device, FirmwareCampaign, FirmwareRelease } from '../types'
 import { FirmwareView } from './Firmware'
@@ -225,7 +225,7 @@ describe('signed release inventory hides superseded releases without revoking th
 
     fireEvent.click(update)
     expect(offered()).toEqual(['zone-lite-2.7.8', 'zone-lite-2.5.2'])
-    fireEvent.click(screen.getByRole('button', { name: 'Close' }))
+    fireEvent.click(within(screen.getByRole('dialog')).getAllByRole('button', { name: 'Close' })[0])
 
     fireEvent.click(screen.getByRole('checkbox', { name: 'Show older releases' }))
     fireEvent.click(update)
