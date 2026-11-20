@@ -506,3 +506,109 @@ export function activitySummary(problems: number, routine: number, fixedThemselv
   if (fixedThemselves > 0) return `${countText(problems, 'problem needs', 'problems need')} attention · ${new Intl.NumberFormat('en-PK').format(fixedThemselves)} fixed themselves`
   return `${countText(problems, 'problem', 'problems')} · ${countText(routine, 'routine update', 'routine updates')} today`
 }
+
+// ---------------------------------------------------------------- Activity tab (DEV-11)
+
+/** Display kinds of the /activity items (04-device §3 Row anatomy). */
+export type ActivityDisplayKind = 'problem' | 'review' | 'retried' | 'good' | 'routine' | 'action'
+
+export const ACTIVITY_KIND_LABELS: Record<ActivityDisplayKind, string> = {
+  problem: 'Problem',
+  review: 'Needs checking',
+  retried: 'Trying again',
+  good: 'Good',
+  routine: 'Routine',
+  action: 'Done from the dashboard',
+}
+export const SERIOUS_PROBLEM = 'Serious problem'
+
+/** Problem event labels (the flag rows). */
+export const PROBLEM_EVENT_LABELS: Record<string, string> = {
+  opened: 'Problem opened',
+  seen: 'Marked as seen',
+  fixed: 'Marked as fixed',
+  cleared: 'Fixed by itself',
+}
+
+/** The API's `topic` values (be/activity_words.py TOPICS) and their chip words (Appendix B Group). */
+export const ACTIVITY_TOPICS = ['machine', 'link_box', 'storage', 'hr_system', 'people', 'software'] as const
+export type ActivityTopic = typeof ACTIVITY_TOPICS[number]
+export const TOPIC_LABELS: Record<ActivityTopic, string> = {
+  machine: 'Machine',
+  link_box: 'Link box',
+  storage: 'Link box memory',
+  hr_system: 'HR system',
+  people: 'People and CNIC',
+  software: 'Software update',
+}
+export const topicLabel = (topic: string | null | undefined) =>
+  TOPIC_LABELS[(topic ?? '') as ActivityTopic] ?? (topic === 'memory' ? TOPIC_LABELS.storage : TOPIC_LABELS.link_box)
+
+/** Fallback rows (client dictionary): its group → the API topic. */
+export const groupTopic = (group: ActivityGroup): ActivityTopic => (group === 'memory' ? 'storage' : group)
+
+/** Display kind of a raw log row in the simpler (fallback) view. */
+export function fallbackKind(described: Pick<DescribedLog, 'kind' | 'act'>, level: string | null | undefined): ActivityDisplayKind {
+  if (described.kind === 'problem') return 'problem'
+  if (described.act === 'list') return 'review'
+  const upper = (level ?? '').toUpperCase()
+  if (described.act === 'if_repeats' || upper === 'WARN' || upper === 'ERROR') return 'retried'
+  return 'routine'
+}
+
+export const ACTIVITY_WORDS_TAB = {
+  all: 'All',
+  problemsOnly: 'Problems only',
+  topicsLabel: 'Show',
+  dayLabel: 'Day',
+  today: 'Today',
+  yesterday: 'Yesterday',
+  last7: 'Last 7 days',
+  pickDay: 'Pick a day…',
+  live: 'Live',
+  reconnecting: 'Reconnecting…',
+  offline: 'Offline · showing last saved data',
+  updated: (ago: string) => `Updated ${ago}`,
+  newRows: (count: number) => `${count} new · Show`,
+  show: 'Show',
+  hide: 'Hide',
+  showAll: (count: number) => `Show all ${count}`,
+  loading: 'Loading…',
+  copyDetails: 'Copy details',
+  copied: 'Copied',
+  whatToDo: 'What to do:',
+  when: 'When:',
+  received: 'received',
+  emptyProblems: (period: string) => `No problems ${period}.`,
+  emptyKind: (period: string) => `No events of this kind ${period}.`,
+  periodToday: 'today',
+  periodDay: 'on this day',
+  periodWeek: 'in the last 7 days',
+  summaryNone: (period: string, routine: string) => `Nothing needs a look ${period}. ${routine} routine checks.`,
+  summarySome: (period: string, problems: string, retried: string) => `${period}: ${problems}. ${retried} retried automatically.`,
+  summaryPeriodToday: 'Today',
+  summaryPeriodDay: 'That day',
+  summaryPeriodWeek: 'Last 7 days',
+  fixedAt: (time: string) => `Fixed at ${time}`,
+  levelLabel: 'Level',
+  levelAny: 'Any',
+  levelWarn: 'Warnings and worse',
+  levelError: 'Errors and worse',
+  areaLabel: 'Area',
+  areaAny: 'Any',
+  // Event sheet
+  sheetCode: 'Code',
+  sheetLevel: 'Level',
+  sheetArea: 'Area',
+  sheetLinkBoxTime: 'Link box time',
+  sheetReceived: 'Received',
+  sheetRestart: 'Restart id',
+  sheetNumber: 'Number',
+  sheetMessage: 'Message',
+  sheetContext: 'Context',
+  sheetFirst: 'First',
+  sheetLast: 'Last',
+  sheetCount: 'Times',
+  sheetActor: 'By',
+  sheetStatus: 'Status',
+} as const
