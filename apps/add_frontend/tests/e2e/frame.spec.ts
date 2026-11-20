@@ -1,6 +1,7 @@
 // The app frame: live updates, menu, routes, layout at every size.
 import AxeBuilder from '@axe-core/playwright'
 import { expect, test, device, expectOnlyAllowedStorage, mockDashboard, nationwideDevices, representativeUser } from './fixtures'
+import { reportPlainWords } from './plainWords'
 
 test.beforeEach(async ({ page }) => mockDashboard(page))
 
@@ -258,4 +259,25 @@ test('old addresses and bookmarks open the new pages with their filters kept', a
     expect(page.url()).not.toMatch(/\d{6,}/)
   }
   await expectOnlyAllowedStorage(page)
+})
+
+test('frame controls are at least 44 px on touch screens and use plain words', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'phone-390-touch', 'Touch sizes are checked on the phone project.')
+  await page.goto('/home')
+  await expect(page.getByRole('heading', { name: 'Home', exact: true, level: 1 })).toBeVisible()
+  const small = async (selector: string) => page.evaluate((root) => Array.from(document.querySelectorAll<HTMLElement>(`${root} :is(a[href], button, [role="radio"])`))
+    .filter((element) => {
+      if (element.closest('.skip-link') || element.classList.contains('skip-link')) return false
+      const box = element.getBoundingClientRect()
+      const style = getComputedStyle(element)
+      return box.width > 0 && box.height > 0 && style.visibility !== 'hidden' && (box.width < 44 || box.height < 44)
+    })
+    .map((element) => `${element.tagName} "${(element.getAttribute('aria-label') || element.textContent || '').trim().slice(0, 30)}" ${Math.round(element.getBoundingClientRect().width)}x${Math.round(element.getBoundingClientRect().height)}`), selector)
+  expect(await small('.app-header')).toEqual([])
+  expect(await small('.app-sidebar')).toEqual([])
+  await page.getByRole('navigation', { name: 'Main menu' }).getByRole('button', { name: 'More', exact: true }).click()
+  await expect(page.getByRole('dialog', { name: 'More' })).toBeVisible()
+  expect(await small('.more-sheet')).toEqual([])
+  const words = await reportPlainWords(page, testInfo, 'more-sheet')
+  expect(words).toEqual([])
 })

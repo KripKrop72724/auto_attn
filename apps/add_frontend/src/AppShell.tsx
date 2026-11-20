@@ -257,7 +257,7 @@ export function AppShell({
           <div className="more-account">
             <span className="operator-avatar" aria-hidden="true" data-user-text>{operatorInitials(username)}</span>
             <span className="more-who">{FRAME_WORDS.signedInAs(username)}</span>
-            <SignOutButton onLogout={onLogout} className="button secondary small" />
+            <SignOutButton onLogout={onLogout} className="button secondary" />
           </div>
           <nav className="more-links" aria-label={FRAME_WORDS.more}>
             {moreLink(everyday[4])}
