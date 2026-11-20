@@ -3,7 +3,9 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import App from '../App'
 import { deviceSnapshots } from '../deviceData'
 import { resetPrefs } from '../lib/prefs'
-import { appReady, device, fetchStub, response, useDashboardStubs, user } from '../test/renderApp'
+import { appReady, attendanceSummary, device, fetchStub, response, useDashboardStubs, user } from '../test/renderApp'
+import { readUrlValues } from '../lib/urlState'
+import { FILTER_SCHEMA } from './attendance/useAttendanceFilters'
 import type { Device } from '../types'
 import { homeHeadline } from '../words/home'
 import { plainTextProblems } from '../words/testing'
@@ -72,6 +74,35 @@ describe('Home', () => {
     expect(screen.getByRole('region', { name: 'Life' })).toBeTruthy()
     expect(screen.getByText('Health also has 1 offline device.')).toBeTruthy()
     expect(screen.getByText('Showing Life only')).toBeTruthy()
+  })
+
+  it("links the refused line to both groups it counts, and shows the chosen division's own last check-in", async () => {
+    const base = fetchStub([user], false, false, false, false, fleet)
+    const summary = {
+      ...attendanceSummary,
+      totals: { ...attendanceSummary.totals, problem: 2, set_aside: 3 },
+      // The newest confirmation overall is a Health check-in.
+      last_sent_at: '2026-11-20T06:30:00Z',
+      by_division: {
+        life: { ...attendanceSummary.by_division.life, problem: 1, set_aside: 3, last_sent_at: '2026-11-20T05:10:00Z' },
+        health: { ...attendanceSummary.by_division.health, problem: 1, last_sent_at: '2026-11-20T06:30:00Z' },
+      },
+    }
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) =>
+      String(input).startsWith('/api/v1/attendance/summary') ? response(summary) : base(input, init)))
+    window.history.replaceState({}, '', '/home?division=life')
+    render(<App />)
+    await appReady()
+    const today = await screen.findByRole('region', { name: 'Attendance today' })
+    const refused = await within(today).findByRole('link', { name: /Refused by the HR system: 1 · Set aside: 3/ })
+    const href = refused.getAttribute('href') || ''
+    expect(href.startsWith('/attendance?')).toBe(true)
+    const filters = readUrlValues(FILTER_SCHEMA, href.slice(href.indexOf('?')))
+    expect(filters.status).toEqual(['problem', 'set_aside'])
+    expect(new URLSearchParams(href.slice(href.indexOf('?'))).get('division')).toBe('life')
+    const lastSent = within(today).getByText(/^Last check-in reached the HR system at /).textContent || ''
+    expect(lastSent).toContain('10:10')
+    expect(lastSent).not.toContain('11:30')
   })
 
   it('says it is counting while the attendance totals are being prepared, and when there are no new problems', async () => {

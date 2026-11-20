@@ -131,20 +131,30 @@ def compute_summary(
         ).all()
     } if rows else {}
     totals = _empty_division_totals()
-    by_division = {name: _empty_division_totals() for name in DIVISIONS}
+    # Each division also carries its own latest HR confirmation, so a page
+    # showing one division never shows the other division's check-in.
+    by_division = {name: {**_empty_division_totals(), "last_sent_at": None} for name in DIVISIONS}
     last_sent_at: datetime | None = None
+
+    def later(current: datetime | None, value: datetime) -> datetime:
+        return value if current is None or value > current else current
+
     for connector_pk, status, count, oldest, confirmed in rows:
         row_division = divisions.get(connector_pk, "health")
         _fold(by_division[row_division], status, int(count), oldest)
+        if confirmed is not None:
+            confirmed = ensure_utc(confirmed)
+            by_division[row_division]["last_sent_at"] = later(by_division[row_division]["last_sent_at"], confirmed)
         if division is not None and row_division != division:
             continue
         _fold(totals, status, int(count), oldest)
         if confirmed is not None:
-            confirmed = ensure_utc(confirmed)
-            last_sent_at = confirmed if last_sent_at is None or confirmed > last_sent_at else last_sent_at
+            last_sent_at = later(last_sent_at, confirmed)
     for bucket in (totals, *by_division.values()):
         if bucket["oldest_waiting_at"] is not None:
             bucket["oldest_waiting_at"] = iso_utc(bucket["oldest_waiting_at"])
+        if bucket.get("last_sent_at") is not None:
+            bucket["last_sent_at"] = iso_utc(bucket["last_sent_at"])
     return {
         "from_time": iso_utc(from_time),
         "to_time": iso_utc(to_time) if to_time is not None else None,

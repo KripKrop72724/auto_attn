@@ -19,7 +19,7 @@ import { MARK_SEEN, PROBLEMS_PAGE, PROBLEM_CARD, PROBLEM_GROUP, PROBLEM_TYPE_LAB
 import { divisionLabel } from '../lib/division'
 import type { AlertResolveResponse, AttendanceQuarantineResponse, Device } from '../types'
 import {
-  CLEARED, PROBLEM_TYPES, PROBLEM_URL_SCHEMA, SERIOUS, SORTS, effectiveWhen, hasFilters, seriousOf, severityRank, toApiParams,
+  CLEARED, PROBLEM_TYPES, PROBLEM_URL_SCHEMA, SERIOUS, SORTS, effectiveWhen, hasFilters, pageSize, seriousOf, severityRank, toApiParams,
   type EffectiveWhen, type ProblemFilters, type ProblemTab, type Serious,
 } from './problems/problemFilters'
 import { useProblems, type ProblemsData } from './problems/useProblems'
@@ -601,13 +601,13 @@ function ListBody({
     ))
   }
 
-  const capped = tab !== 'fixed' && Boolean(data.nextCursor)
+  // Every tab pages the same way: New and Seen hold up to 500 a page, Fixed 50.
+  const paged = tab === 'fixed' || Boolean(data.nextCursor) || data.rows.length > pageSize(tab)
   const total = counts ? (tab === 'new' ? counts.open : tab === 'seen' ? (filters.old ? counts.legacy_seen : counts.seen) : counts.fixed) : data.rows.length
   return (
     <>
       {body}
-      {capped && <p className="problems-more-note">{PROBLEMS_PAGE.capped(formatCount(data.rows.length), formatCount(total))}</p>}
-      {tab === 'fixed' && (
+      {paged && (
         <div className="problems-more">
           {data.nextCursor && <Button variant="secondary" busy={data.loadingMore} busyLabel={PROBLEMS_PAGE.loadingMore} onClick={() => data.loadMore()}>{PROBLEMS_PAGE.showMore}</Button>}
           <small>{PROBLEMS_PAGE.showing(formatCount(data.rows.length), formatCount(Math.max(total, data.rows.length)))}</small>

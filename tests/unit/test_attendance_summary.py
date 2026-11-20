@@ -83,6 +83,9 @@ def test_today_totals_per_group_and_division(db, seeded):
     assert body["by_division"]["life"]["received"] == 4
     assert body["by_division"]["health"]["received"] == 4
     assert body["by_division"]["life"]["problem"] == 1
+    # Each division has its own latest HR confirmation (Home's Life / Health view).
+    assert body["by_division"]["health"]["last_sent_at"] == body["last_sent_at"]
+    assert body["by_division"]["life"]["last_sent_at"] is None
 
     life_only = client.get("/api/v1/attendance/summary", params={
         "from_time": seeded["today"].isoformat(), "division": "life"}).json()
@@ -90,6 +93,8 @@ def test_today_totals_per_group_and_division(db, seeded):
     assert life_only["totals"]["set_aside"] == 1
     # by_division always covers both divisions.
     assert life_only["by_division"]["health"]["received"] == 4
+    assert life_only["last_sent_at"] is None
+    assert life_only["by_division"]["health"]["last_sent_at"] == body["last_sent_at"]
 
     one_place = client.get("/api/v1/attendance/summary", params={
         "from_time": seeded["today"].isoformat(), "device_id": seeded["health"].connector_id}).json()

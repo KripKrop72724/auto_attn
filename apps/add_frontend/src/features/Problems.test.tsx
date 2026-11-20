@@ -96,6 +96,8 @@ const baseCounts: ProblemCounts = {
 }
 let counts: ProblemCounts | undefined = baseCounts
 let queues: Record<string, ProblemRow[]> = {}
+// Rows a queue returns for cursor 'page-2'; when set, its first page carries that cursor.
+let secondPages: Record<string, ProblemRow[]> = {}
 let resolveResponses: Response[] = []
 let failAlerts = false
 
@@ -132,14 +134,17 @@ describe('Problems page', () => {
     counts = baseCounts
     failAlerts = false
     resolveResponses = []
+    secondPages = {}
     queues = { NEEDS_ACTION: [needsAction, workflow], SEEN: [acknowledged], RESOLVED: [resolved], LEGACY_SEEN: [legacy] }
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = new URL(String(input), 'http://localhost')
       if (url.pathname === '/api/v1/alerts') {
         if (failAlerts) return json({ detail: 'down' }, 503)
+        const queue = url.searchParams.get('queue') || 'NEEDS_ACTION'
+        const second = url.searchParams.get('cursor') === 'page-2'
         const body: ProblemsResponse = {
-          rows: queues[url.searchParams.get('queue') || 'NEEDS_ACTION'] || [],
-          next_cursor: null,
+          rows: second ? secondPages[queue] || [] : queues[queue] || [],
+          next_cursor: !second && secondPages[queue] ? 'page-2' : null,
           totals: { all: 6, open: 2, acknowledged: 0, resolved: 4 },
           queue_totals: { needs_action: 2, acknowledged: 1, resolved: 4, all: 7 },
           ...(counts ? { counts } : {}),
@@ -367,6 +372,24 @@ describe('Problems page', () => {
     expect(await screen.findByRole('article', { name: 'No internet' })).toBeTruthy()
     expect(alertRequests().at(-1)?.searchParams.get('queue')).toBe('LEGACY_SEEN')
     expect(currentLocation).toBe('/problems?tab=seen&old=1')
+  })
+
+  it.each([
+    ['New', '/problems', 'NEEDS_ACTION'],
+    ['Seen', '/problems?tab=seen', 'SEEN'],
+  ])('lets %s load the next page with Show more', async (_tab, path, queue) => {
+    secondPages[queue] = [alert({ id: 90, code: 'ZKT_CLOCK_DRIFT', severity: 'WARNING', plain_title: 'Machine clock is 9 min slow', acknowledged_at: queue === 'SEEN' ? '2026-10-10T07:30:00Z' : null, device: ref(lifeDevice) })]
+    const { container } = renderPage(path)
+    const more = await screen.findByRole('button', { name: 'Show more' })
+    expect(screen.queryByRole('heading', { name: 'Machine clock is 9 min slow' })).toBeNull()
+    expect(screen.queryByText(/Narrow the filters/)).toBeNull()
+    fireEvent.click(more)
+    expect(await screen.findByRole('heading', { name: 'Machine clock is 9 min slow' })).toBeTruthy()
+    const last = alertRequests().at(-1)
+    expect(last?.searchParams.get('queue')).toBe(queue)
+    expect(last?.searchParams.get('cursor')).toBe('page-2')
+    await waitFor(() => expect(screen.queryByRole('button', { name: 'Show more' })).toBeNull())
+    expectPlainText(container)
   })
 
   it('falls back to the older totals and the group title on an older backend', async () => {

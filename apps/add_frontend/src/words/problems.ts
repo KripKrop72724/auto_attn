@@ -306,7 +306,6 @@ export const PROBLEMS_PAGE = {
   showMore: 'Show more',
   loadingMore: 'Loading…',
   showing: (shown: string, total: string) => `Showing ${shown} of ${total}`,
-  capped: (shown: string, total: string) => `Showing ${shown} of ${total}. Narrow the filters to see the rest.`,
   newPill: (count: string) => `${count} ↑`,
   announce: (place: string, title: string) => `New problem at ${place}: ${title}`,
   setAsideLink: (count: string) => `Set-aside check-ins: ${count}`,

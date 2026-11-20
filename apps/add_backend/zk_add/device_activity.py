@@ -226,6 +226,32 @@ def fold(rows: list[_Row], serialize_log: Callable[[DeviceLog], dict]) -> list[d
     return result
 
 
+def _align_to_bursts(rows: list[_Row], cut: int) -> int:
+    """A page cut that never splits an escalation burst.
+
+    ``rows`` is newest first and an escalation shows at its newest member, so a
+    prefix that holds a burst's newest row must also hold its oldest one, or
+    the next page would show the older members again. Move the cut back to
+    before the burst; when that leaves nothing, move it on past the burst.
+    """
+    index = {id(item): position for position, item in enumerate(rows)}
+    spans = [(position, max(index[id(member)] for member in item.burst))
+             for position, item in enumerate(rows) if item.burst]
+
+    def inside(value: int) -> bool:
+        return any(head < value <= oldest for head, oldest in spans)
+
+    back = cut
+    while back > 0 and inside(back):
+        back -= 1
+    if back > 0:
+        return back
+    forward = cut
+    while forward < len(rows) and inside(forward):
+        forward += 1
+    return forward
+
+
 def _counts(db: Session, connector: Connector, since: datetime, until: datetime) -> dict:
     rows = db.execute(
         select(DeviceLog.code, DeviceLog.level, DeviceLog.subsystem, func.count(DeviceLog.id))
@@ -360,7 +386,7 @@ def build_activity(
                 low = middle
             else:
                 high = middle - 1
-        consumed = max(low, 1)
+        consumed = _align_to_bursts(classified, max(low, 1))
         items = fold(classified[:consumed], serialize_log)
     has_more = more_raw or consumed < len(classified)
     next_cursor = _cursor(classified[consumed - 1].log) if has_more and consumed else None

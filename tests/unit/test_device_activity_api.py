@@ -147,6 +147,42 @@ def test_since_until_and_paging_have_no_gaps_or_repeats(db):
                    if NOW - timedelta(minutes=30) <= ensure_utc(row.received_at) < NOW - timedelta(minutes=10)}
 
 
+# limit 3: the burst's newest row starts a page, so the cut moves on past it;
+# limit 4: the cut would fall just after it, so the cut moves back before it.
+@pytest.mark.parametrize("limit", [3, 4])
+def test_a_page_cut_never_splits_an_escalation_burst(db, limit):
+    connector, logs = _setup(db)
+    lost, other = [], []
+    for minute in (29, 23, 17, 11, 5):  # five lost connections in 30 minutes, each followed by two problems
+        lost.append(logs.add("ZKT_CONNECTION_LOST", "WARN", minutes_ago=minute))
+        other.append(logs.add("ZKT_SERIAL_MISMATCH", "CRITICAL", minutes_ago=minute - 1))
+        other.append(logs.add("ZKT_SERIAL_MISMATCH", "CRITICAL", minutes_ago=minute - 2))
+    other.append(logs.add("ZKT_SERIAL_MISMATCH", "CRITICAL", minutes_ago=1))
+    db.commit()
+    client, _headers = admin_client(db)
+    lost_ids = {row.id for row in lost}
+    shown_lost: list[int] = []
+    shown_other: list[int] = []
+    cursor, pages = None, 0
+    while True:
+        body = _activity(client, connector, f"?limit={limit}" + (f"&before={cursor}" if cursor else ""))
+        for item in body["items"]:
+            if item["type"] == "escalation":
+                shown_lost.extend(i for i in range(item["first_id"], item["last_id"] + 1) if i in lost_ids)
+                assert item["count"] == 5
+            elif item["type"] == "event" and item["id"] in lost_ids:
+                shown_lost.append(item["id"])
+            elif item["type"] == "event":
+                shown_other.append(item["id"])
+        pages += 1
+        cursor = body["next_cursor"]
+        if cursor is None:
+            break
+    assert pages > 1
+    assert sorted(shown_lost) == sorted(lost_ids)  # each lost connection once, none twice, none lost
+    assert sorted(shown_other) == sorted(row.id for row in other)
+
+
 def test_after_returns_only_newer_rows(db):
     connector, logs = _setup(db)
     old = logs.add("ZKT_SERIAL_MISMATCH", "CRITICAL", minutes_ago=10)

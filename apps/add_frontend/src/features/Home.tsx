@@ -292,6 +292,8 @@ interface SummaryBucket {
   set_aside?: number
   problem?: number
   oldest_waiting_at?: string | null
+  /** by_division buckets only: that division's latest HR confirmation. */
+  last_sent_at?: string | null
 }
 
 interface AttendanceSummary {
@@ -381,6 +383,10 @@ function AttendanceToday({ division }: { division: DivisionChoice }) {
   }
 
   const refused = scopedBucket && ((scopedBucket.problem || 0) > 0 || (scopedBucket.set_aside || 0) > 0)
+  // The refused line counts both groups, so its link opens both.
+  const refusedHref = withQuery('/attendance', { when: 'today', division: division === 'all' ? undefined : division, status: 'problem,set_aside' })
+  // One division: its own latest check-in, never the other division's.
+  const lastSentAt = data ? (division === 'all' ? data.last_sent_at : data.by_division[division]?.last_sent_at ?? null) : null
   return (
     <section className="panel home-attendance" aria-labelledby="home-attendance-title">
       <header className="home-block-header">
@@ -390,10 +396,10 @@ function AttendanceToday({ division }: { division: DivisionChoice }) {
       {body}
       {data && (
         <div className="home-attendance-lines">
-          {data.last_sent_at && <p>{AT.lastSent(clock(data.last_sent_at), ago(data.last_sent_at, now))}</p>}
+          {lastSentAt && <p>{AT.lastSent(clock(lastSentAt), ago(lastSentAt, now))}</p>}
           {refused && (
             <p>
-              <a className="home-line-link" href={withQuery('/attendance', { when: 'today', division: division === 'all' ? undefined : division, status: 'problem' })} onClick={link(withQuery('/attendance', { when: 'today', division: division === 'all' ? undefined : division, status: 'problem' }))}>
+              <a className="home-line-link" href={refusedHref} onClick={link(refusedHref)}>
                 {AT.refused(scopedBucket?.problem || 0, scopedBucket?.set_aside || 0)} <Icon name="chevron" size="sm" />
               </a>
             </p>

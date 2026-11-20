@@ -101,8 +101,7 @@
 
 .problems-old-marks .problems-old-actions { display: inline-flex; flex-wrap: wrap; gap: var(--space-2); }
 .problems-more { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-3); }
-.problems-more small, .problems-more-note { color: var(--text-secondary); font-size: var(--text-sm); }
-.problems-more-note { margin: 0; }
+.problems-more small { color: var(--text-secondary); font-size: var(--text-sm); }
 
 /* Mark as fixed and the shared field look */
 .mark-fixed-form { display: grid; gap: var(--space-3); }
