@@ -19,12 +19,12 @@ export function StatusBadge({
   live?: boolean
 }) {
   const status = normalizedStatus(state)
-  const label = status.replaceAll('_', ' ')
+  const label = humanizeStatus(status)
   const pattern = statusPattern(status)
   return (
     <span className={`status-badge pattern-${pattern}`} data-pattern={pattern} aria-label={`Status: ${label}`} title={label}>
       <Icon name={statusIcon[pattern]} />
-      <span>{humanizeStatus(status)}</span>
+      <span>{label}</span>
       {live && <i aria-hidden="true" />}
     </span>
   )

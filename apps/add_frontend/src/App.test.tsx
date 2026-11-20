@@ -3,7 +3,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import App, {
   buildMachinePreview,
   bulkDeletionConfirmation,
-  CommandProgress,
   confirmationMatches,
   formatAlertDiagnostics,
   identityConflictText,
@@ -200,14 +199,14 @@ describe('State Life ADD interface', () => {
     rerender(<StatusBadge state="WAITING_FOR_ZKT" />)
     expect(container.querySelector('[data-pattern="waiting"]')).toBeTruthy()
     expect(screen.getByText('Waiting for ZKT')).toBeTruthy()
-    const badge = screen.getByLabelText('Status: WAITING FOR ZKT')
-    expect(badge.getAttribute('title')).toBe('WAITING FOR ZKT')
+    const badge = screen.getByLabelText('Status: Waiting for ZKT')
+    expect(badge.getAttribute('title')).toBe('Waiting for ZKT')
   })
 
   it('keeps the full accessible status when a long pill label must be visually truncated', () => {
     render(<StatusBadge state="SOURCE_RECOVERY_EPOCH_ACTIVATED" />)
-    const badge = screen.getByLabelText('Status: SOURCE RECOVERY EPOCH ACTIVATED')
-    expect(badge.getAttribute('title')).toBe('SOURCE RECOVERY EPOCH ACTIVATED')
+    const badge = screen.getByLabelText('Status: Source recovery epoch activated')
+    expect(badge.getAttribute('title')).toBe('Source recovery epoch activated')
     expect(badge.textContent).toContain('Source recovery epoch activated')
   })
 
@@ -244,43 +243,6 @@ describe('State Life ADD interface', () => {
     expect(await screen.findByText("Sign in to look after State Life's attendance machines.")).toBeTruthy()
     expect(screen.getByText('You were signed out. Sign in again to continue where you left off.')).toBeTruthy()
     expect((screen.getByLabelText('Username') as HTMLInputElement).value).toBe('')
-  })
-
-  it('keeps command progress visible when a legacy command envelope has no status', () => {
-    render(
-      <CommandProgress
-        command={{
-          command_id: 'restart-command',
-          type: 'command',
-          status: undefined,
-          created_at: '2026-07-23T12:00:00Z',
-          expires_at: null,
-        } as unknown as Parameters<typeof CommandProgress>[0]['command']}
-        onCancel={async () => undefined}
-      />,
-    )
-    expect(screen.getByRole('heading', { name: 'Unknown' })).toBeTruthy()
-    expect(screen.getByText(/durably tracked/i)).toBeTruthy()
-  })
-
-
-  it('shows durable command progress without relying on hue', () => {
-    const { container } = render(
-      <CommandProgress
-        command={{
-          command_id: 'command-one',
-          type: 'UPDATE_USER',
-          status: 'WAITING_FOR_ZKT',
-          created_at: '2026-07-13T12:00:00Z',
-          expires_at: '2026-07-13T12:30:00Z',
-        }}
-        onCancel={async () => undefined}
-      />,
-    )
-    expect(screen.getByRole('heading', { name: 'Waiting for ZKT' })).toBeTruthy()
-    expect(screen.getByText(/durably tracked/i)).toBeTruthy()
-    expect(container.querySelector('.pattern-waiting')).toBeTruthy()
-    expect(screen.getByRole('button', { name: /cancel before execution/i })).toBeTruthy()
   })
 
   it('supports semantic keyboard tabs, Escape close, and focus restoration', async () => {

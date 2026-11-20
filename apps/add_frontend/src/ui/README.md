@@ -42,7 +42,7 @@ Breakpoints: phone ≤760 px, tablet 761–1023 px, desktop ≥1024 px. `useIsPh
 |---|---|
 | `PageHeader` | `title` (h1, `tabIndex={-1}`); `description?` (one sentence, hidden on phones, class `.page-header-description`); `primaryAction?` (one button; `action` is accepted as the old name); `moreActions?: ActionMenuItem[]` (the ⋯ menu); `children` (under the title, e.g. `DivisionScopeChip`); `headingRef` (the frame focuses it after navigation). |
 | `Card` | `title?`, `subtitle?`, `actions?`, `tone?` (coloured left edge; say the state in words too), `headingLevel` 2–4 (default 2), `as` `'section' \| 'article' \| 'div'`. |
-| `StatTile` | `label`; `value: number \| string \| null` (numbers "158,560" en-PK, `null` → "–"); `subtitle?`; `tone?`; `icon?`; `href?` and/or `onClick?` (a link; the chevron always shows; call `event.preventDefault()` in `onClick` to route in-app); `loading` (skeleton, never a fake 0). Value change = 600 ms tint. |
+| `StatTile` | `label`; `value: number \| string \| null` (numbers "158,560" en-PK, `null` → "–"); `subtitle?`; `tone?`; `icon?`; `href?` and/or `onClick?` (a link; the chevron always shows; call `event.preventDefault()` in `onClick` to route in-app); `loading` (skeleton, never a fake 0); `pressed?` (a button tile that filters a list: sets `aria-pressed`). Value change = 600 ms tint. |
 | `Tabs` | `tabs: { id, label, count?, disabled? }[]`; `value`; `onChange`; `label` (accessible name); `idPrefix` (pairs with `TabPanel`). WAI-ARIA tabs (arrows, Home/End, roving tabindex), counts, sliding underline, edge fades when they scroll on a phone, selected tab scrolled into view. Keep the value in the URL (`?tab=`) with `useUrlState`. |
 | `TabPanel` | `idPrefix`, `id`, `children`. |
 | `SegmentedControl` | `options: { id, label }[]`, `value`, `onChange`, `label`, `fullWidth?`. `role="radiogroup"`, arrows move and choose, sliding thumb. |
@@ -104,7 +104,6 @@ copies.** New pages use the kit parts above instead.
 |---|---|---|
 | `StatusBadge.tsx` | `StatusBadge`, `TerminalLinkBadge`, `showsTerminalLinkBadge`, `statusIcon` (old code-based pills) | `StatusChip tone={toneForPattern(statusPattern(code))} label={plainStatus(domain, code).label} code={code}` |
 | `Metric.tsx` | `Metric` (has `loading`), `metricsTime`, `availabilityTone` | `StatTile` |
-| `CommandProgress.tsx` | old command progress line | `Steps` + `commandStepState()`, or `useCommandTracker` (lib) |
 | `PageError.tsx` | `PageErrorBoundary`, `RouteErrorBoundary`, `PageErrorCard` (each page has its own boundary) | keep; `ErrorState` for in-page load errors |
 | `NewVersionNotice.tsx` | "A new version is ready" bar (lib/newVersion) | keep |
 

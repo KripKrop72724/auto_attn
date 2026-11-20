@@ -14,6 +14,7 @@ import { plainStatus } from '../../words/states'
 import { PROBLEM_CARD, problemWords, refusalWords, resolutionWords } from '../../words/problems'
 import { devicePath, problemLink, type ProblemLink } from './problemLinks'
 import type { RowBusy, RowPhase } from './useProblems'
+import { problemIsFixed, problemIsNew, problemIsSeen } from './state'
 import type { ProblemDevice, ProblemRow } from './types'
 import './problems.css'
 
@@ -28,11 +29,7 @@ const NEVER_BY_HAND = new Set([
 
 const upper = (value: string | null | undefined) => (value || '').toUpperCase()
 
-export const problemIsFixed = (row: Pick<ProblemRow, 'state'>) => upper(row.state) === 'RESOLVED'
-export const problemIsSeen = (row: Pick<ProblemRow, 'state' | 'acknowledged_at'>) =>
-  !problemIsFixed(row) && (upper(row.state) === 'ACKNOWLEDGED' || Boolean(row.acknowledged_at))
-export const problemIsNew = (row: Pick<ProblemRow, 'state' | 'acknowledged_at'>) =>
-  upper(row.state) === 'OPEN' && !row.acknowledged_at
+export { problemIsFixed, problemIsNew, problemIsSeen }
 
 /** Can this problem be marked as fixed by hand? From `operator`, else from the code alone. */
 export function canMarkFixed(row: ProblemRow) {

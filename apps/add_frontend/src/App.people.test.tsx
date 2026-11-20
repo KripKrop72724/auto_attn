@@ -3,7 +3,6 @@ import { describe, expect, it, vi } from 'vitest'
 import App, {
   buildMachinePreview,
   bulkDeletionConfirmation,
-  CommandProgress,
   confirmationMatches,
   formatAlertDiagnostics,
   metricsTime,

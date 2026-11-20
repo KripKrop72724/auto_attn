@@ -13,7 +13,7 @@ import { Badge, Button, Disclosure, EmptyState, ErrorState, Skeleton, TechnicalD
 import type { Toast } from '../../ui/Toast'
 import { PROBLEMS_WORDS, type DeviceDetail } from '../../words/device'
 import { problemWords, refusalWords, resolutionWords } from '../../words/problems'
-import { alertNeedsAction } from '../AlertCard'
+import { problemIsNew as alertNeedsAction } from '../problems/state'
 import { AlertResolveDialog } from '../AlertResolveDialog'
 import type { HealthAlertTarget } from '../DeviceHealthPanel'
 import { friendlyName } from './deviceNaming'

@@ -10,7 +10,7 @@ import { Skeleton, TabPanel, Tabs, useDismiss, useFocusTrap, useIsPhone, useToas
 import { lockApplicationForModal, overlayRoot } from '../../ui/modalLock'
 import type { Toast } from '../../ui/Toast'
 import { DEVICE_FRAME, DEVICE_TAB_LABELS, DEVICE_TABS, PROBLEMS_WORDS, headerStatus, type DeviceTab } from '../../words/device'
-import { alertNeedsAction } from '../AlertCard'
+import { problemIsNew as alertNeedsAction } from '../problems/state'
 import { DeviceHeader } from './DeviceHeader'
 import { deviceDivision, friendlyName } from './deviceNaming'
 import { PeopleTab } from './PeopleTab'

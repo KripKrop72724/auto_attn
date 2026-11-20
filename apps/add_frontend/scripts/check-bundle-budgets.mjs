@@ -8,7 +8,7 @@ import { readdirSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 const assets = join(process.cwd(), 'dist', 'assets')
-const LAZY_PAGE = /^(Login|UsersWorkspace|Attendance|Monitoring|Home|Problems|Devices|DeviceView|ActivityTab|TechnicalLog|AdvancedTools|Firmware|Reconciliation|DeviceDrawer|PublicStatus|HealthCleanupDialog|Settings|InstallerAppDownload)-/
+const LAZY_PAGE = /^(Login|UsersWorkspace|Attendance|FixTools|Home|Problems|Devices|DeviceView|ActivityTab|TechnicalLog|AdvancedTools|Firmware|Reconciliation|DeviceDrawer|PublicStatus|HealthCleanupDialog|Settings|InstallerAppDownload)-/
 const PROVISIONING = /^FirmwareProvisioning-/
 const CORE = /^(index|router|query|forms|react-core|vendor)-/
 const LIMITS = { css: 14, provisioning: 12, lazy: 45, core: 85, other: 45 }
