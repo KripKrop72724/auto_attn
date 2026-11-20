@@ -3,7 +3,7 @@ import { api, ApiError } from '../api'
 import { Dialog, idempotency, type useToast } from '../App'
 import { Icon } from '../Icon'
 import { humanizeStatus } from '../status'
-import type { Alert, AlertResolveResponse, DeviceErrorClearResponse, DeviceErrorState } from '../types'
+import type { DeviceErrorClearResponse, DeviceErrorState } from '../types'
 import './DeviceHealth.css'
 
 type Toast = Pick<ReturnType<typeof useToast>, 'notice' | 'error'>
@@ -138,55 +138,9 @@ function StepUpReasonDialog({
   )
 }
 
-export function AlertResolveDialog({
-  alert,
-  deviceName,
-  toast,
-  onClose,
-  onResolved,
-}: {
-  alert: Pick<Alert, 'id' | 'code' | 'message'>
-  deviceName?: string | null
-  toast: Toast
-  onClose: () => void
-  onResolved?: (response: AlertResolveResponse) => Promise<void> | void
-}) {
-  const submit = async (body: StepUpBody) => {
-    const response = await api<AlertResolveResponse>(`/api/v1/alerts/${alert.id}/resolve`, {
-      method: 'POST',
-      body: JSON.stringify(body),
-    })
-    const parts = ['Alert resolved with an audit entry.']
-    if (response.device_state) parts.push(`Device is now ${humanizeStatus(response.device_state).toLowerCase()}.`)
-    if (response.residual_alert_id) {
-      parts.push(`Preservation unverified (alert #${response.residual_alert_id}) stays open until storage is verified.`)
-    }
-    toast.notice(parts.join(' '))
-    onClose()
-    void Promise.resolve(onResolved?.(response)).catch(() => undefined)
-  }
-  return (
-    <StepUpReasonDialog
-      titleId="alert-resolve-title"
-      title="Resolve alert with reason"
-      description={`${humanizeStatus(alert.code)}${deviceName ? ` · ${deviceName}` : ''}`}
-      keyPrefix="alert-resolve"
-      submitLabel="Resolve alert"
-      busyLabel="Resolving…"
-      onSubmit={submit}
-      onClose={onClose}
-    >
-      <article className="info-copy pattern-waiting">
-        <Icon name="shield" />
-        <div>
-          <h3>{alert.message}</h3>
-          <p>Your reason is recorded in the audit log. Resolving never moves the alert’s last-seen time; if the device reports the condition again, ADD opens a new alert.</p>
-          {alert.code === 'ESP_DURABILITY_FAULT' && <p>Storage evidence: resolving leaves Preservation unverified open as a gating warning until firmware that reports storage diagnostics verifies storage.</p>}
-        </div>
-      </article>
-    </StepUpReasonDialog>
-  )
-}
+// "Mark this problem as fixed" lives in problems/MarkFixedDialog.tsx (PRB-6);
+// this name stays for the device page until it switches (04-device DEV-7).
+export { MarkFixedDialog, MarkFixedDialog as AlertResolveDialog, markFixedFailure } from './problems/MarkFixedDialog'
 
 export function DeviceErrorClearDialog({
   connectorId,

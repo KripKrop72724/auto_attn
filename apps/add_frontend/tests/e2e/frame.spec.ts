@@ -142,7 +142,7 @@ test('primary routes and device deep link remain usable', async ({ page }, testI
   await page.getByRole('tab', { name: /Campaigns/ }).click()
   await expect(page.getByRole('heading', { name: 'Campaign operations' })).toBeVisible()
   await primaryNav.getByRole('link', { name: /^Problems/ }).click()
-  await expect(page.getByRole('heading', { name: 'Alerts', exact: true, level: 1 })).toBeVisible()
+  await expect(page.getByRole('heading', { name: 'Problems', exact: true, level: 1 })).toBeVisible()
   expect(page.url()).not.toMatch(/cnic|password|reason|confirmation/i)
   await expectOnlyAllowedStorage(page)
 })

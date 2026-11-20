@@ -2,17 +2,21 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-li
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { useToast } from '../App'
 import type { CleanupPreview, Device } from '../types'
-import { HealthCleanupDialog, PESHAWAR_FIRST_SCOPE, cleanupConfirmation } from './HealthCleanupDialog'
+import { expectPlainText } from '../words/testing'
+import { HealthCleanupDialog, cleanupConfirmation } from './HealthCleanupDialog'
 
-const [P02, P06] = PESHAWAR_FIRST_SCOPE
+const P02 = 'bf4badc7-5f9c-42aa-8b3a-8a43f8daeb5e'
+const P06 = '233dac02-eb1b-4598-a876-e3a7b1ecfd54'
 
 const device = (connectorId: string, name: string): Device => ({
   connector_id: connectorId,
   hardware_id: connectorId === P02 ? 'e0:72:a1:d7:05:c4' : 'e0:72:a1:d5:08:a0',
-  zone_id: name.toUpperCase().replace(' ', '-'),
+  zone_id: `ZONE-${name.toUpperCase().replace(' ', '-')}`,
   zone_name: 'Peshawar',
   device_id: connectorId.slice(0, 4),
-  display_name: name,
+  display_name: `ZONE-${name.toUpperCase().replace(' ', '-')}`,
+  division: 'health',
+  friendly_name: name.replace(/ 0?(\d+)$/, ' · Device $1'),
   state: 'ONLINE_WITH_WARNINGS',
   connected: true,
   firmware_version: '2.5.2',
@@ -87,18 +91,19 @@ const requests = (suffix: string) => vi.mocked(fetch).mock.calls
   .map(([, init]) => JSON.parse(String(init?.body)))
 
 async function openPreview(notices = toast()) {
-  render(<HealthCleanupDialog devices={devices} toast={notices} onClose={vi.fn()} onApplied={vi.fn()} />)
-  const dialog = screen.getByRole('dialog', { name: 'Stranded alert review' })
-  expect((within(dialog).getByRole('radio', { name: /Peshawar 02 \+ 06/ }) as HTMLInputElement).checked).toBe(true)
-  fireEvent.click(within(dialog).getByRole('button', { name: /Preview stranded alerts/ }))
-  await within(dialog).findByRole('heading', { name: '2. Review the preview' })
+  render(<HealthCleanupDialog devices={devices} toast={notices} onClose={vi.fn()} onApplied={vi.fn()} initialChosen={[P02, P06]} />)
+  const dialog = screen.getByRole('dialog', { name: 'Clean up old problems' })
+  expect((within(dialog).getByRole('radio', { name: /Pick devices/ }) as HTMLInputElement).checked).toBe(true)
+  expect(within(dialog).getByText('Up to 50 · 2 picked')).toBeTruthy()
+  fireEvent.click(within(dialog).getByRole('button', { name: 'Find old problems' }))
+  await within(dialog).findByRole('heading', { name: '2. Check the list' })
   return { dialog, notices }
 }
 
 const fillApply = (dialog: HTMLElement, typed: string) => {
-  fireEvent.change(within(dialog).getByLabelText('Audited reason'), { target: { value: 'Peshawar 02 and 06 recovery cleanup, reviewed with the owner.' } })
-  fireEvent.change(within(dialog).getByLabelText(/^Type RESOLVE/), { target: { value: typed } })
-  fireEvent.change(within(dialog).getByLabelText('Administrator password'), { target: { value: 'local-step-up' } })
+  fireEvent.change(within(dialog).getByLabelText('What did you do?'), { target: { value: 'Peshawar 02 and 06 recovery cleanup, reviewed with the owner.' } })
+  fireEvent.change(within(dialog).getByLabelText(/^Type .* to confirm$/), { target: { value: typed } })
+  fireEvent.change(within(dialog).getByLabelText('Enter your password to confirm'), { target: { value: 'local-step-up' } })
 }
 
 describe('HealthCleanupDialog', () => {
@@ -119,45 +124,56 @@ describe('HealthCleanupDialog', () => {
     vi.unstubAllGlobals()
   })
 
-  it('previews the Peshawar 02 + 06 preset with durability and review rows unchecked', async () => {
+  it('previews the picked devices with memory and check-first rows unticked, in plain words', async () => {
     const { dialog } = await openPreview()
     expect(requests('/cleanup/preview')).toEqual([{ connector_ids: [P02, P06] }])
-    const worker = within(dialog).getByRole('checkbox', { name: 'Resolve alert 501 ESP delivery worker fault' }) as HTMLInputElement
-    const durability = within(dialog).getByRole('checkbox', { name: 'Resolve alert 502 ESP durability fault' }) as HTMLInputElement
-    const rejection = within(dialog).getByRole('checkbox', { name: 'Resolve alert 601 Device message rejected' }) as HTMLInputElement
-    const review = within(dialog).getByRole('checkbox', { name: 'Resolve alert 602 OTA device rolled back' }) as HTMLInputElement
+    const worker = within(dialog).getByRole('checkbox', { name: 'Close Link box is stuck sending attendance' }) as HTMLInputElement
+    const durability = within(dialog).getByRole('checkbox', { name: 'Close Link box cannot save attendance safely' }) as HTMLInputElement
+    const rejection = within(dialog).getByRole('checkbox', { name: 'Close Some information from this device was refused' }) as HTMLInputElement
+    const review = within(dialog).getByRole('checkbox', { name: 'Close Software update undone' }) as HTMLInputElement
     expect([worker.checked, durability.checked, rejection.checked, review.checked]).toEqual([true, false, true, false])
-    expect(within(dialog).getByText('storage evidence: leaves Preservation unverified')).toBeTruthy()
-    expect(within(dialog).getByText('Review before selecting')).toBeTruthy()
-    const p02 = within(dialog).getByRole('article', { name: 'Peshawar 02' })
-    expect(within(p02).getByText('HIL CONNECTOR_ERROR_REQUIRES_REVIEW lifted')).toBeTruthy()
-    expect(within(p02).getByText('Firmware 2.6.27 · boot aaaaaaaa')).toBeTruthy()
-    expect(within(p02).getByText(/Device error ESP delivery worker fault → none/)).toBeTruthy()
-    const p06 = within(dialog).getByRole('article', { name: 'Peshawar 06' })
-    expect(within(p06).getByText('HIL: kept · Factory: kept')).toBeTruthy()
-    expect((within(p06).getByRole('checkbox', { name: /Set the stored device error on Peshawar 06/ }) as HTMLInputElement).checked).toBe(true)
-    expect(within(dialog).getByText(/device offline/)).toBeTruthy()
-    expect(within(dialog).getByText('RESOLVE 2 ALERTS ON 2 DEVICES')).toBeTruthy()
+    expect(within(dialog).getByText('Leaves a memory reminder open')).toBeTruthy()
+    expect(within(dialog).getByText('Check before picking')).toBeTruthy()
+    const p02 = within(dialog).getByRole('article', { name: /Peshawar · Device 2/ })
+    expect(within(p02).getByText(/HIL CONNECTOR_ERROR_REQUIRES_REVIEW lifted/).closest('[data-technical]')).toBeTruthy()
+    expect(within(p02).getByText(/2\.6\.27 · Restart aaaaaaaa/).closest('[data-technical]')).toBeTruthy()
+    expect(within(p02).getByText('Saved device problem: Link box is stuck sending attendance → No problem')).toBeTruthy()
+    const p06 = within(dialog).getByRole('article', { name: /Peshawar · Device 6/ })
+    expect(within(p06).getByText(/hil: KEPT · factory: KEPT/).closest('[data-technical]')).toBeTruthy()
+    expect((within(p06).getByRole('checkbox', { name: /^Update Peshawar · Device 6's saved problem/ }) as HTMLInputElement).checked).toBe(true)
+    expect(within(dialog).getByText(/The device is offline, so we can't check it\./)).toBeTruthy()
+    expect(within(dialog).getByText('RESOLVE 2 ALERTS ON 2 DEVICES').hasAttribute('data-typed-phrase')).toBe(true)
+    expectPlainText(dialog, { skip: '[data-typed-phrase]' })
   })
 
-  it('keeps Apply disabled until the typed confirmation matches and posts the signed selection', async () => {
+  it('filters the list by kind without changing the ticks', async () => {
+    const { dialog } = await openPreview()
+    const kinds = within(dialog).getByRole('group', { name: 'Kinds of old problems' })
+    fireEvent.click(within(kinds).getByRole('button', { name: /Check before closing/ }))
+    expect(within(dialog).queryByRole('checkbox', { name: 'Close Link box is stuck sending attendance' })).toBeNull()
+    expect(within(dialog).getByRole('checkbox', { name: 'Close Software update undone' })).toBeTruthy()
+    fireEvent.click(within(kinds).getByRole('button', { name: /Check before closing/ }))
+    expect((within(dialog).getByRole('checkbox', { name: 'Close Link box is stuck sending attendance' }) as HTMLInputElement).checked).toBe(true)
+  })
+
+  it('keeps Close problems disabled until the typed phrase matches and posts the signed selection', async () => {
     const { dialog, notices } = await openPreview()
-    const apply = within(dialog).getByRole('button', { name: 'Apply cleanup' }) as HTMLButtonElement
+    const apply = within(dialog).getByRole('button', { name: 'Close problems' }) as HTMLButtonElement
     fillApply(dialog, 'RESOLVE 2 ALERTS')
     expect(apply.disabled).toBe(true)
-    fireEvent.change(within(dialog).getByLabelText(/^Type RESOLVE/), { target: { value: 'RESOLVE 2 ALERTS ON 2 DEVICES' } })
+    fireEvent.change(within(dialog).getByLabelText(/^Type .* to confirm$/), { target: { value: 'RESOLVE 2 ALERTS ON 2 DEVICES' } })
     expect(apply.disabled).toBe(false)
 
-    // Opting in to the durability row changes the phrase and disables Apply again.
-    fireEvent.click(within(dialog).getByRole('checkbox', { name: 'Resolve alert 502 ESP durability fault' }))
-    expect(within(dialog).getByLabelText('Type RESOLVE 3 ALERTS ON 2 DEVICES')).toBeTruthy()
+    // Opting in to the memory row changes the phrase and disables the button again.
+    fireEvent.click(within(dialog).getByRole('checkbox', { name: 'Close Link box cannot save attendance safely' }))
+    expect(within(dialog).getByLabelText('Type RESOLVE 3 ALERTS ON 2 DEVICES to confirm')).toBeTruthy()
     expect(apply.disabled).toBe(true)
-    fireEvent.change(within(dialog).getByLabelText(/^Type RESOLVE/), { target: { value: cleanupConfirmation(3, 2) } })
+    fireEvent.change(within(dialog).getByLabelText(/^Type .* to confirm$/), { target: { value: cleanupConfirmation(3, 2) } })
     expect(apply.disabled).toBe(false)
     fireEvent.click(apply)
 
-    expect(await within(dialog).findByText(/Cleanup applied/)).toBeTruthy()
-    expect(within(dialog).getByText('device-health-cleanup:applied')).toBeTruthy()
+    expect(await within(dialog).findByText(/^Done\. 3 problems closed · 1 reminder left open\./)).toBeTruthy()
+    expect(within(dialog).getByText(/device-health-cleanup:applied/).closest('[data-technical]')).toBeTruthy()
     const [body] = requests('/cleanup/apply')
     expect(body).toEqual({
       connector_ids: [P02, P06],
@@ -171,41 +187,44 @@ describe('HealthCleanupDialog', () => {
       password: 'local-step-up',
       idempotency_key: expect.stringMatching(/^device-health-cleanup:/),
     })
-    expect(notices.notice).toHaveBeenCalledWith(expect.stringMatching(/audit request device-health-cleanup:applied/))
+    expect(notices.notice).toHaveBeenCalledWith('Old problems closed.')
   })
 
-  it('explains scope changes and a disabled apply without changing anything', async () => {
+  it('explains an out-of-date list and a switched-off clean-up without changing anything', async () => {
     applyResponses = [
       json({ detail: { code: 'SCOPE_CHANGED', message: 'Device evidence changed since the preview.' } }, 409),
       json({ detail: { code: 'CLEANUP_DISABLED', message: 'Device health cleanup apply is disabled.' } }, 409),
     ]
     const { dialog } = await openPreview()
     fillApply(dialog, 'RESOLVE 2 ALERTS ON 2 DEVICES')
-    fireEvent.click(within(dialog).getByRole('button', { name: 'Apply cleanup' }))
-    expect(await within(dialog).findByText(/Device evidence changed after the preview/)).toBeTruthy()
-    expect(within(dialog).getByText('Device evidence changed since the preview.')).toBeTruthy()
-    expect((within(dialog).getByLabelText('Administrator password') as HTMLInputElement).value).toBe('')
-    expect(within(dialog).getAllByRole('button', { name: /Run the preview again/ }).length).toBeGreaterThan(0)
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Close problems' }))
+    expect(await within(dialog).findByText('This list is out of date. Nothing was changed. Press Look again.')).toBeTruthy()
+    expect(within(dialog).getByText('Device evidence changed since the preview.').closest('[data-technical]')).toBeTruthy()
+    expect((within(dialog).getByLabelText('Enter your password to confirm') as HTMLInputElement).value).toBe('')
+    expect(within(dialog).getAllByRole('button', { name: /Look again/ }).length).toBeGreaterThan(0)
 
-    fireEvent.change(within(dialog).getByLabelText('Administrator password'), { target: { value: 'local-step-up' } })
-    fireEvent.click(within(dialog).getByRole('button', { name: 'Apply cleanup' }))
-    expect(await within(dialog).findByText(/switched off on this server/)).toBeTruthy()
+    fireEvent.change(within(dialog).getByLabelText('Enter your password to confirm'), { target: { value: 'local-step-up' } })
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Close problems' }))
+    expect(await within(dialog).findByText(/Closing old problems is switched off right now\./)).toBeTruthy()
     const [first, second] = requests('/cleanup/apply')
     expect(second.idempotency_key).toBe(first.idempotency_key)
   })
 
-  it('previews chosen devices or the whole fleet', async () => {
+  it('starts with Pick devices and none picked, or checks every device', async () => {
     render(<HealthCleanupDialog devices={devices} toast={toast()} onClose={vi.fn()} />)
-    const dialog = screen.getByRole('dialog', { name: 'Stranded alert review' })
-    fireEvent.click(within(dialog).getByRole('radio', { name: /Chosen devices/ }))
-    const preview = within(dialog).getByRole('button', { name: /Preview stranded alerts/ }) as HTMLButtonElement
-    expect(preview.disabled).toBe(true)
-    fireEvent.click(within(dialog).getByRole('checkbox', { name: /Swat 01/ }))
-    fireEvent.click(preview)
+    const dialog = screen.getByRole('dialog', { name: 'Clean up old problems' })
+    expect((within(dialog).getByRole('radio', { name: /Pick devices/ }) as HTMLInputElement).checked).toBe(true)
+    expect(within(dialog).queryByText(/Peshawar 02 \+ 06/)).toBeNull()
+    const find = within(dialog).getByRole('button', { name: 'Find old problems' }) as HTMLButtonElement
+    expect(find.disabled).toBe(true)
+    const picker = within(dialog).getByRole('group', { name: 'Devices to pick from' })
+    expect(within(picker).getByText('Health (3)')).toBeTruthy()
+    fireEvent.click(within(picker).getByRole('checkbox', { name: /Swat · Device 1/ }))
+    fireEvent.click(find)
     await waitFor(() => expect(requests('/cleanup/preview')).toEqual([{ connector_ids: ['connector-swat-01'] }]))
-    await within(dialog).findByRole('heading', { name: '2. Review the preview' })
+    await within(dialog).findByRole('heading', { name: '2. Check the list' })
     fireEvent.click(within(dialog).getByRole('radio', { name: /All devices/ }))
-    fireEvent.click(within(dialog).getByRole('button', { name: /Run the preview again/ }))
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Look again' }))
     await waitFor(() => expect(requests('/cleanup/preview').at(-1)).toEqual({ connector_ids: null }))
   })
 })
