@@ -12,6 +12,7 @@ const utf8Prefix = (value: string, maxBytes: number) => {
   return output
 }
 
+/** Old engineer wording; kept for older callers. People shows personProblems() from words/people. */
 export function identityConflictText(user: DeviceUser) {
   const matches = user.identity_conflict_members
     .map((member) => `${member.user_id} (UID ${member.uid})`)
@@ -43,12 +44,12 @@ export function validateUserDraft(values: {
   password: string
   userIdOverride?: string
 }) {
-  if (!values.displayName.trim()) return 'Full name is required.'
-  if (!/^\d{13}$/.test(values.cnic)) return 'CNIC must contain exactly 13 digits.'
+  if (!values.displayName.trim()) return 'Type the full name.'
+  if (!/^\d{13}$/.test(values.cnic)) return `CNIC must be 13 digits (${values.cnic.replace(/\D/g, '').length} typed).`
   if (values.userIdOverride && !/^\d+$/.test(values.userIdOverride)) {
-    return 'The optional employee/user ID must be numeric.'
+    return 'Employee ID can only have digits.'
   }
-  if (!values.password) return 'Password confirmation is required.'
+  if (!values.password) return 'Type your password.'
   return null
 }
 
