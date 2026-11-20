@@ -494,17 +494,18 @@ describe('DeviceDrawer device health', () => {
     expect(within(resolved).getByText(/Reason: Stranded by the 2\.6\.27 recovery image\./)).toBeTruthy()
 
     fireEvent.click(within(needsAction).getByRole('button', { name: /Resolve/ }))
-    let dialog = await screen.findByRole('dialog', { name: 'Resolve alert with reason' })
+    let dialog = await screen.findByRole('dialog', { name: 'Mark this problem as fixed' })
     fireEvent.keyDown(document, { key: 'Escape' })
-    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Resolve alert with reason' })).toBeNull())
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Mark this problem as fixed' })).toBeNull())
     expect(onClose).not.toHaveBeenCalled()
 
     fireEvent.click(within(screen.getByRole('region', { name: /Needs action/ })).getByRole('button', { name: /Resolve/ }))
-    dialog = await screen.findByRole('dialog', { name: 'Resolve alert with reason' })
-    fireEvent.change(within(dialog).getByLabelText('Audited reason'), { target: { value: 'Stranded by the 2.6.27 storage-recovery image.' } })
-    fireEvent.change(within(dialog).getByLabelText('Administrator password'), { target: { value: 'local-step-up' } })
-    fireEvent.click(within(dialog).getByRole('button', { name: 'Resolve alert' }))
-    await waitFor(() => expect(toast.notice).toHaveBeenCalledWith(expect.stringMatching(/Alert resolved with an audit entry/)))
+    // The Mark as fixed dialog is the Problems page's (05-problems PRB-6); its reason and password stay.
+    dialog = await screen.findByRole('dialog', { name: 'Mark this problem as fixed' })
+    fireEvent.change(within(dialog).getByLabelText('What did you do?'), { target: { value: 'Stranded by the 2.6.27 storage-recovery image.' } })
+    fireEvent.change(within(dialog).getByLabelText('Enter your password to confirm'), { target: { value: 'local-step-up' } })
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Mark as fixed' }))
+    await waitFor(() => expect(toast.notice).toHaveBeenCalledWith(expect.stringMatching(/^Marked as fixed\./)))
     const request = vi.mocked(fetch).mock.calls.find(([input]) => String(input).endsWith('/api/v1/alerts/41/resolve'))
     expect(JSON.parse(String(request?.[1]?.body))).toEqual({
       reason: 'Stranded by the 2.6.27 storage-recovery image.',
