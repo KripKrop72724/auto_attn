@@ -9,11 +9,16 @@ RUN pnpm run build
 # The old screens, served under /classic/ for one week after the revamp release.
 # Remove this stage, its COPY below and the /classic/ blocks in nginx.conf
 # together with apps/add_frontend_classic (docs/add-classic-screens.md).
-FROM node:22-alpine AS build-classic
+#
+# It starts from the build stage so it reuses pnpm and the package store that
+# stage already has, and installs offline: the production server's build
+# cache covers the main app, but the server cannot always reach npm (the
+# 20 Nov deploy failed fetching pnpm here). Its lockfile must therefore stay
+# identical to apps/add_frontend/pnpm-lock.yaml (checked in CI).
+FROM build AS build-classic
 WORKDIR /classic
-RUN corepack enable && corepack prepare pnpm@11.7.0 --activate
 COPY apps/add_frontend_classic/package.json apps/add_frontend_classic/pnpm-lock.yaml ./
-RUN pnpm install --frozen-lockfile
+RUN pnpm install --frozen-lockfile --offline
 COPY apps/add_frontend_classic ./
 RUN pnpm run build
 
