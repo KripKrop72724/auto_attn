@@ -54,7 +54,7 @@ from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from zk_add import public_status
+from zk_add import device_names, public_status
 from zk_add.audit import append_audit
 from zk_add.device_health import evaluate_health
 from zk_add.hikvision_delivery import HikvisionPolicy
@@ -1057,27 +1057,23 @@ def _pakistan_time(value: datetime, now: datetime) -> str:
 
 
 def _public_identity(db: Session, connector: Connector) -> tuple[str, str]:
-    """The /status page's name and Life/Health group (public_status.build_snapshot)."""
-    name = public_status.device_name(connector.display_name or connector.zone_id)
-    group = dict(public_status.ZONES)[name.zone]
-    if not name.unit:
-        return name.location, group
-    if name.number is not None:
+    """The /status page's name and Life/Health group (device_names, as public_status uses it)."""
+    name = device_names.device_name(device_names.device_code(connector))
+    group = dict(device_names.ZONES)[name.zone]
+    numbered = None
+    listed = True
+    if name.unit and name.number is not None:
         # A numbered unit is named only where its place has several numbered
-        # devices among the listed (active, non-spare) connectors.
-        numbered, listed = 0, False
-        for row in db.execute(
+        # devices among the listed (active, non-spare) connectors; a board
+        # being installed that is not listed yet counts itself.
+        rows = db.execute(
             select(Connector.id, Connector.display_name, Connector.zone_id).where(
                 Connector.active.is_(True), Connector.is_spare.is_(False)
             )
-        ):
-            other = public_status.device_name(row.display_name or row.zone_id)
-            if other.number is not None and (other.zone, other.location) == (name.zone, name.location):
-                numbered += 1
-                listed = listed or row.id == connector.id
-        if numbered + (0 if listed else 1) <= 1:
-            return name.location, group
-    return f"{name.location} · {name.unit}", group
+        ).all()
+        numbered = device_names.numbered_places(row.display_name or row.zone_id for row in rows)
+        listed = any(row.id == connector.id for row in rows)
+    return device_names.friendly_name(name, numbered, listed=listed), group
 
 
 def _hik_source_epoch(db: Session, connector: Connector) -> str | None:

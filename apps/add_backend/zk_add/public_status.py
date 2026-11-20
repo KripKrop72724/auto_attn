@@ -36,9 +36,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import re
 import threading
-from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import AsyncIterator
 
@@ -46,7 +44,15 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
 from zk_add.db import session_scope
+from zk_add import device_names
 from zk_add.device_health import _epoch, evaluate_health_batch
+from zk_add.device_names import (  # noqa: F401  (re-exported: /status names live in device_names)
+    LOCATIONS,
+    ZONES,
+    DeviceName,
+    device_name,
+)
+from zk_add.device_names import natural as _natural
 from zk_add.models import Connector, PublicDeviceStatus
 from zk_add.settings import settings
 from zk_add.time_utils import ensure_utc, iso_utc, utc_now
@@ -54,9 +60,7 @@ from zk_add.time_utils import ensure_utc, iso_utc, utc_now
 logger = logging.getLogger(__name__)
 
 ONLINE, OFFLINE = "online", "offline"
-ZONES = (("life", "Life"), ("health", "Health"))
 TERMINAL_DOWN = frozenset({"DISCONNECTED", "ERROR"})
-LOCATIONS = {"SLICTOWER": "SLIC Tower"}
 HEARTBEAT_SECONDS = 30
 
 # Why a device is Offline: (heading, one plain sentence). The keys are the
@@ -82,49 +86,6 @@ TERMINAL_ERROR_REASONS = {
     "HIK_AUTH": "machine_settings_wrong",
     "HIK_CONFIGURATION": "machine_settings_wrong",
 }
-
-
-@dataclass(frozen=True)
-class DeviceName:
-    zone: str
-    location: str
-    unit: str | None  # "Device 3" or "13th Floor"
-    number: int | None  # a numbered unit is named only when its location has several
-
-
-def _ordinal(value: int) -> str:
-    suffix = "th" if 10 <= value % 100 <= 20 else {1: "st", 2: "nd", 3: "rd"}.get(value % 10, "th")
-    return f"{value}{suffix}"
-
-
-def _location(code: str) -> str:
-    compact = re.sub(r"[\s_-]+", "", code)
-    if compact in LOCATIONS:
-        return LOCATIONS[compact]
-    building = re.fullmatch(r"(G&?P)?BLD(\d+)", compact)
-    if building:
-        name = f"Building {int(building.group(2))}"
-        return f"Group & Pension {name}" if building.group(1) else name
-    return " ".join(word.capitalize() for word in re.split(r"[\s_-]+", code) if word)
-
-
-def device_name(code: str) -> DeviceName:
-    value = (code or "").strip().upper()
-    life = re.match(r"LF[\s_-]+", value)
-    zone = "life" if life else "health"
-    rest = re.sub(r"^ZONE[\s_-]+", "", value[life.end():] if life else value)
-    floor = re.fullmatch(r"(.+?)[\s_-]+(\d{1,3})\s*FL", rest)
-    if floor:
-        return DeviceName(zone, _location(floor.group(1)), f"{_ordinal(int(floor.group(2)))} Floor", None)
-    numbered = re.fullmatch(r"(.+?)[\s_-]+(\d{1,3})", rest)
-    if numbered:
-        number = int(numbered.group(2))
-        return DeviceName(zone, _location(numbered.group(1)), f"Device {number}", number)
-    return DeviceName(zone, _location(rest) or (code or "").strip(), None, None)
-
-
-def _natural(text: str) -> list:
-    return [int(part) if part.isdigit() else part.lower() for part in re.split(r"(\d+)", text)]
 
 
 def last_hikvision_delivery(connector: Connector, now: datetime) -> datetime | None:
@@ -202,6 +163,7 @@ class StatusTracker:
             .options(selectinload(Connector.zkt_device))
             .order_by(Connector.id)
         ).all()
+        device_names.remember_fleet(connectors)
         healths = evaluate_health_batch(session, connectors, now=now)
         stored = {row.connector_id: row for row in session.scalars(select(PublicDeviceStatus))}
         grace = {OFFLINE: timedelta(seconds=settings.public_status_offline_grace_seconds),
@@ -250,25 +212,49 @@ class StatusTracker:
         for tracked in (self._pending, self._online_seen, self._reason):
             for connector_id in set(tracked) - current:
                 del tracked[connector_id]
+        remember_statuses(rows)
         return build_snapshot(rows, now)
+
+
+# The latest /status answer per listed connector (primary key), so signed-in
+# device rows read exactly the Online/Offline, "since" and reason the public
+# page shows, without a query. Spares and unlisted connectors have none.
+_latest: dict[int, dict] = {}
+
+
+def remember_statuses(rows) -> None:
+    global _latest
+    _latest = {
+        connector.id: {
+            "status": status,
+            "since": iso_utc(since),
+            "reason_code": reason if reason in REASONS else None,
+        }
+        for connector, status, since, reason in rows
+    }
+
+
+def status_for(connector) -> dict | None:
+    """The device's /status Online/Offline, since and reason_code; None when not listed."""
+    if connector.is_spare or not connector.active:
+        return None
+    value = _latest.get(connector.id)
+    return dict(value) if value is not None else None
 
 
 def build_snapshot(rows, now: datetime) -> dict:
     named = [(device_name(connector.display_name or connector.zone_id), connector, status, since, reason)
              for connector, status, since, reason in rows]
-    numbered: dict[tuple[str, str], int] = {}
-    for name, *_ in named:
-        if name.number is not None:
-            numbered[(name.zone, name.location)] = numbered.get((name.zone, name.location), 0) + 1
+    numbered = device_names.numbered_places(name for name, *_ in named)
     zone_rank = {key: rank for rank, (key, _title) in enumerate(ZONES)}
     devices = []
     for name, connector, status, since, reason in sorted(named, key=lambda item: (
             zone_rank[item[0].zone], _natural(item[0].location), _natural(item[0].unit or ""),
             item[1].display_name or "")):
         heading, detail = REASONS.get(reason, (None, None))
-        shown = name.unit and (name.number is None or numbered[(name.zone, name.location)] > 1)
+        shown = device_names.unit_shown(name, numbered)
         devices.append({
-            "name": f"{name.location} · {name.unit}" if shown else name.location,
+            "name": device_names.friendly_name(name, numbered),
             "location": name.location,
             "unit": name.unit if shown else None,
             "zone": name.zone,
