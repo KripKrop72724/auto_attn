@@ -272,18 +272,20 @@ export function CheckinNotifySettingsCard({ toast, devices = [] }: { toast: Toas
         <>
           {!summary.configured && <p className="notify-copy">Phone messages aren't set up yet, so nothing is sent.</p>}
           <p className="notify-card-mode">{sendingTo(summary)}</p>
-          <p className="notify-card-caption">Last {summary.last_24h.window_hours === 24 ? '24 hours' : `${summary.last_24h.window_hours} hours`}</p>
-          <dl className="notify-card-counts" aria-label="Last 24 hours">
-            <div><dt>Delivered</dt><dd>{summary.last_24h.notified.toLocaleString()}</dd></div>
-            <div><dt>Waiting</dt><dd>{(summary.last_24h.pending + summary.last_24h.retrying).toLocaleString()}</dd></div>
-            <div><dt>Failed</dt><dd>{summary.last_24h.failed.toLocaleString()}</dd></div>
-            <div><dt>Not needed</dt><dd>{summary.last_24h.not_sent.toLocaleString()}</dd></div>
-          </dl>
-          {summary.last_24h.not_sent > 0 && Object.keys(summary.last_24h.not_sent_reasons || {}).length > 0 && (
-            <Disclosure summary="See why some were not needed">
-              <ul className="notify-card-reasons">{Object.entries(summary.last_24h.not_sent_reasons).map(([code, count]) => <li key={code}><strong>{count.toLocaleString()}</strong> {shortReasons[code] || explainNotifyReason(code).toLowerCase()}</li>)}</ul>
-            </Disclosure>
-          )}
+          {summary.last_24h && <>
+            <p className="notify-card-caption">Last {summary.last_24h.window_hours === 24 ? '24 hours' : `${summary.last_24h.window_hours} hours`}</p>
+            <dl className="notify-card-counts" aria-label="Last 24 hours">
+              <div><dt>Delivered</dt><dd>{summary.last_24h.notified.toLocaleString()}</dd></div>
+              <div><dt>Waiting</dt><dd>{(summary.last_24h.pending + summary.last_24h.retrying).toLocaleString()}</dd></div>
+              <div><dt>Failed</dt><dd>{summary.last_24h.failed.toLocaleString()}</dd></div>
+              <div><dt>Not needed</dt><dd>{summary.last_24h.not_sent.toLocaleString()}</dd></div>
+            </dl>
+            {summary.last_24h.not_sent > 0 && Object.keys(summary.last_24h.not_sent_reasons || {}).length > 0 && (
+              <Disclosure summary="See why some were not needed">
+                <ul className="notify-card-reasons">{Object.entries(summary.last_24h.not_sent_reasons).map(([code, count]) => <li key={code}><strong>{count.toLocaleString()}</strong> {shortReasons[code] || explainNotifyReason(code).toLowerCase()}</li>)}</ul>
+              </Disclosure>
+            )}
+          </>}
           <p className="notify-card-caption">Last message {summary.last_success_at ? ago(summary.last_success_at) : 'not sent yet'}{summary.oldest_pending_age_seconds > 60 ? ` · Oldest waiting ${Math.round(summary.oldest_pending_age_seconds / 60)} min` : ''}</p>
           <TechnicalDetails>
             <dl className="attendance-tech-list">

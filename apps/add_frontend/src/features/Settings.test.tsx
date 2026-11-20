@@ -40,7 +40,9 @@ describe('Settings', () => {
   it('holds the phone messages, contact IT, the old screens link and the account, with no Division switch', async () => {
     await open()
     expect(await screen.findByRole('heading', { name: 'Check-in phone messages' })).toBeTruthy()
-    await waitFor(() => expect(screen.getByRole('region', { name: 'Employee phone notifications' })).toBeTruthy())
+    const card = screen.getByRole('region', { name: 'Check-in phone messages' })
+    await waitFor(() => expect(card.querySelector('.notify-card-counts')).toBeTruthy())
+    expect(screen.getByRole('button', { name: 'Change settings' })).toBeTruthy()
     expect(screen.getByRole('heading', { name: 'Contact IT' })).toBeTruthy()
     expect(screen.getByRole('link', { name: /Open the old screens/ }).getAttribute('href')).toBe('/classic/')
     expect(screen.getByText('Signed in as StateHealthAdmin')).toBeTruthy()
