@@ -6,7 +6,6 @@ import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } fro
 import { useLocation, useNavigate } from 'react-router-dom'
 import { api, queryString } from '../../api'
 import { ago, clock } from '../../lib/time'
-import { parseDivision } from '../../lib/division'
 import { useDivision } from '../../lib/useDivision'
 import type { Device, FirmwareDeployment, FirmwareRelease, FirmwareSection, UpdatesSection } from '../../types'
 import { Button, Callout, ErrorState, PageHeader, Skeleton, TabPanel, Tabs, TechnicalDetails } from '../../ui'
@@ -155,8 +154,6 @@ export function FirmwareView({
     for (const key of PAGE_KEYS) params.delete(key)
     params.set('tab', next)
     for (const [key, value] of Object.entries(extra)) params.set(key, value)
-    const divisionChoice = parseDivision(location.search)
-    if (divisionChoice === 'all') params.delete('division')
     navigate(`/updates?${params.toString()}`)
   }, [location.search, navigate])
 
@@ -252,7 +249,7 @@ export function FirmwareView({
       <TabPanel idPrefix="updates" id={tab}>
         {tab === 'overview' && (
           liveError && live === null ? (
-            <ErrorState title={SOFTWARE_PAGE.updatesFailed} onRetry={() => loadLive()} />
+            <ErrorState title="Couldn't load the running updates." onRetry={() => loadLive()} />
           ) : (
             <OverviewTab
               devices={devices}

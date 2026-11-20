@@ -6,7 +6,7 @@ import { deviceDivision, type DivisionKey } from '../../lib/division'
 import { flag, oneOf, useUrlState } from '../../lib/urlState'
 import type { DivisionChoice } from '../../lib/prefs'
 import type { Device, UpdatesSection } from '../../types'
-import { Button, Callout, DivisionTag, ErrorState, FilterBar, Skeleton, StatusChip, TechnicalDetails } from '../../ui'
+import { Button, DivisionTag, ErrorState, FilterBar, Skeleton, StatusChip, TechnicalDetails } from '../../ui'
 import { Icon } from '../../Icon'
 import {
   FAMILY_NAMES, SOFTWARE_PAGE, plainVersion, SOFTWARE_RANK, SOFTWARE_SHOW, newestVersion, softwareShowFor, softwareStatus,
@@ -210,9 +210,6 @@ export function OverviewTab({
           <Button variant="link" icon="plus" onClick={onSetup}>{SOFTWARE_PAGE.setupLink}</Button>
         </div>
       </section>
-      {catalog && !catalog.enabled && !catalog.hilEnabled && (
-        <Callout tone="info">Starting new updates is switched off. Devices keep their current version.</Callout>
-      )}
       <TechnicalDetails>
         <ul className="updates-technical-list">
           <li>Updates for all devices: {catalog ? (catalog.enabled ? 'On' : 'Off') : 'not known yet'}</li>
