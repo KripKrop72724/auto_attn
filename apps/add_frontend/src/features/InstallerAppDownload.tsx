@@ -212,7 +212,7 @@ export default function InstallerAppDownload({
         <Icon name="download" />
         <div>
           <h2 id="installer-app-title">{INSTALLER_CARD.title}</h2>
-          <p>{INSTALLER_CARD.intro}</p>
+          <p>{INSTALLER_CARD.intro.split(/(ZKTeco|Hikvision)/).map((part, index) => (index % 2 ? <span key={part} data-brand>{part}</span> : part))}</p>
         </div>
         {latest && primary && (
           <span className="installer-app-version">Version {latest.version}</span>
