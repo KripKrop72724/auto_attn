@@ -180,6 +180,28 @@ def test_requests_and_problem_events_are_merged_without_payloads(db):
     assert [item["type"] for item in items] == ["problem_event", "action", "event"]
 
 
+def test_after_only_adds_requests_and_problem_events_newer_than_the_shown_row(db):
+    connector, logs = _setup(db)
+    db.add(DeviceCommand(command_id="activity-cmd-old", connector_id=connector.id, command_type="REFRESH_USERS",
+                         payload_encrypted="p", expected_state_encrypted="x", desired_state_encrypted="y",
+                         idempotency_key="activity-old", status="SUCCEEDED", actor="StateHealthAdmin",
+                         created_at=NOW - timedelta(minutes=30)))
+    shown = logs.add("ZKT_TIME_SYNC_OK", minutes_ago=10)
+    db.add(DeviceCommand(command_id="activity-cmd-new", connector_id=connector.id, command_type="REFRESH_USERS",
+                         payload_encrypted="p", expected_state_encrypted="x", desired_state_encrypted="y",
+                         idempotency_key="activity-new", status="SUCCEEDED", actor="StateHealthAdmin",
+                         created_at=NOW - timedelta(minutes=5)))
+    db.commit()
+    client, _headers = admin_client(db)
+    everything = _activity(client, connector)["items"]
+    assert {item["command_id"] for item in everything if item["type"] == "action"} == {
+        "activity-cmd-old", "activity-cmd-new"}
+    live = _activity(client, connector, f"?after={shown.id}")["items"]
+    assert [item["command_id"] for item in live if item["type"] == "action"] == ["activity-cmd-new"]
+    # An unknown row adds no requests at all (nothing to anchor them to).
+    assert not [item for item in _activity(client, connector, "?after=999999999")["items"] if item["type"] == "action"]
+
+
 def test_activity_needs_a_known_device_and_a_valid_cursor(db):
     connector, _logs = _setup(db)
     client, _headers = admin_client(db)

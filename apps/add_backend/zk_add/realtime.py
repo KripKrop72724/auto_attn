@@ -4,7 +4,7 @@ import asyncio
 import json
 from collections import deque
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from typing import AsyncIterator
 from uuid import uuid4
 
@@ -181,8 +181,15 @@ browser_events = BrowserEventHub()
 connector_hub = ConnectorHub()
 
 
+def _json_default(value: object) -> str:
+    """Dates as ISO 8601 ("2026-11-20T10:00:00+00:00"), the same as the REST answers."""
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    return str(value)
+
+
 def sse_encode(event: LiveEvent) -> str:
-    data = json.dumps(event.data, separators=(",", ":"), default=str)
+    data = json.dumps(event.data, separators=(",", ":"), default=_json_default)
     cursor = f"{event.generation}:{event.event_id}" if event.generation else str(event.event_id)
     id_line = f"id: {cursor}\n" if event.event_id else ""
     return f"{id_line}event: {event.event_type}\ndata: {data}\n\n"

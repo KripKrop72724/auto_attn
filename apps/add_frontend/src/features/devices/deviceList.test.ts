@@ -88,4 +88,13 @@ describe('device rows for Home and Devices', () => {
     expect(fleetCounts(views)).toMatchObject({ total: 6, working: 4, attention: 1, offline: 1, spares: 1 })
     expect(notWorking(views).map((view) => view.id)).toEqual(['multan-2', 'bld9-3'])
   })
+
+  it('D-1: counts Offline only once /status does (inside its wait it needs attention)', () => {
+    const waiting = deviceViews([
+      ...fleet,
+      row('lahore-1', 'ZONE-LAHORE-01', { state: 'OFFLINE', connected: false, public_status: { status: 'online' } } as Partial<Device>),
+      row('lahore-2', 'ZONE-LAHORE-02', { state: 'OFFLINE', connected: false, public_status: { status: 'offline', since: '2026-11-20T06:00:00Z', reason_code: 'no_internet' } } as Partial<Device>),
+    ])
+    expect(fleetCounts(waiting)).toMatchObject({ total: 8, offline: 2, attention: 2 })
+  })
 })

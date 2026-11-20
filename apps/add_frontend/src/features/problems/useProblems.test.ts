@@ -105,6 +105,26 @@ describe('useProblems', () => {
     expect(result.current.phases[2]).toBe('fixed-now')
   })
 
+  it('never calls rows loaded with "Show more" fixed on New or Seen', async () => {
+    responses = [() => page([row(1), row(2)], 'next')]
+    const params = { queue: 'LEGACY_SEEN', limit: 2 }
+    const { result } = renderHook(() => useProblems(params, { tab: 'seen' }))
+    await waitFor(() => expect(result.current.rows.map((item) => item.id)).toEqual([1, 2]))
+    responses = [() => page([row(3), row(4)])]
+    await act(async () => { await result.current.loadMore() })
+    expect(result.current.rows.map((item) => item.id)).toEqual([1, 2, 3, 4])
+    responses = [() => page([row(1), row(2)], 'next')]
+    await act(async () => { await result.current.refresh() })
+    expect(result.current.rows.map((item) => item.id)).toEqual([1, 2, 3, 4])
+    expect(result.current.phases[3]).toBeUndefined()
+    expect(result.current.phases[4]).toBeUndefined()
+    // A row on the first page that left is still fixed just now.
+    responses = [() => page([row(1)], null)]
+    await act(async () => { await result.current.refresh() })
+    expect(result.current.phases[2]).toBe('fixed-now')
+    expect(result.current.phases[3]).toBeUndefined()
+  })
+
   it('turns ten live changes in 2 s into one request now and one 10 s later', async () => {
     responses = [() => page([row(1)])]
     const params = { queue: 'NEEDS_ACTION', limit: 500 }

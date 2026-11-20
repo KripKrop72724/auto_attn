@@ -3,7 +3,7 @@ import type { ReactNode } from 'react'
 import { MemoryRouter, useLocation, useNavigationType } from 'react-router-dom'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
-  assertAllowedKeys, flag, integer, oneOf, pktDate, readUrlValues, text, useUrlState, writeUrlValues,
+  assertAllowedKeys, flag, integer, oneOf, panelOrigin, pktDate, readUrlValues, text, useUrlState, writeUrlValues,
 } from './urlState'
 
 const schema = {
@@ -70,6 +70,23 @@ describe('useUrlState', () => {
     act(() => { vi.advanceTimersByTime(260) })
     expect(result.current.location.search).toBe('?q=multan')
     expect(result.current.type).toBe('REPLACE')
+  })
+
+  it('keeps reading the list filters behind an open device panel and never writes onto the panel address', () => {
+    vi.useFakeTimers()
+    const entry = { pathname: '/devices/c-1', search: '?division=life', state: { from: '/devices?status=offline&q=mul' } }
+    const { result } = renderHook(() => ({ state: useUrlState(schema), location: useLocation() }), {
+      wrapper: ({ children }: { children: ReactNode }) => <MemoryRouter initialEntries={[entry]}>{children}</MemoryRouter>,
+    })
+    expect(result.current.state[0].status).toBe('offline')
+    expect(result.current.state[0].q).toBe('mul')
+    act(() => result.current.state[1]({ q: 'multan' }))
+    act(() => { vi.advanceTimersByTime(260) })
+    expect(result.current.location.pathname).toBe('/devices/c-1')
+    expect(result.current.location.search).toBe('?division=life')
+    expect(panelOrigin('/devices', { from: '/x?a=1' })).toBeNull()
+    expect(panelOrigin('/devices/c-1', null)).toBeNull()
+    expect(panelOrigin('/devices/c-1', { from: '/' })).toBe('')
   })
 
   it('throws in tests when a page declares a private key', () => {

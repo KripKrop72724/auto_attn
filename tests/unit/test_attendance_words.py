@@ -44,11 +44,13 @@ def test_lane_reason_codes_cover_every_event_lane_sentence():
 
 
 def test_direct_send_reason_fallback_is_plain_and_never_a_title_cased_code():
-    text = attendance_direct_ords._reason("SOMETHING_NEW")
+    text = attendance_direct_ords._shown_reason("SOMETHING_NEW")
     assert text == attendance_words.UNKNOWN_REASON
     assert "_" not in text and "Something New" not in text
-    assert attendance_direct_ords._reason("CLOCK_INVALID") == attendance_direct_ords.REASONS["CLOCK_INVALID"]
-    assert attendance_direct_ords._reason(None) == "Approved; waiting to prepare delivery."
+    assert attendance_direct_ords._shown_reason("CLOCK_INVALID") == attendance_direct_ords.REASONS["CLOCK_INVALID"]
+    assert attendance_direct_ords._shown_reason(None) == "Approved; waiting to prepare delivery."
+    # The text stored on direct-send items is unchanged (custody module stays read-side only).
+    assert attendance_direct_ords._reason("SOMETHING_NEW") == "Something New"
 
 
 def test_force_release_items_and_devices_carry_their_codes(store):

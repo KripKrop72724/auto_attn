@@ -79,6 +79,23 @@ describe('Activity tab', () => {
     expect(within(sheet).getByRole('button', { name: 'Copy details' })).toBeTruthy()
   })
 
+  it('never marks a row already shown as new on a live update', async () => {
+    const newer = { type: 'event', id: 18250, at: at(1), kind: 'routine', serious: false, topic: 'machine', title: 'A brand new line.', action: null, link: null, fixed_at: null, code: 'ZKT_TIME_SYNC_OK', raw: raw({ id: 18250, level: 'INFO', code: 'ZKT_TIME_SYNC_OK', received_at: at(1) }) }
+    activity = (path) => {
+      if (!path.includes('/activity?')) return undefined
+      if (path.includes('after=')) return json({ ...page, items: [newer, page.items[3]], next_cursor: null, newest_id: 18250 })
+      return json(page)
+    }
+    const view = openActivity()
+    const region = await screen.findByRole('region', { name: 'Device activity' })
+    await within(region).findByText('StateHealthAdmin refreshed the people list. Confirmed.')
+    view.rerenderRevision(1)
+    const fresh = await within(region).findByText('A brand new line.')
+    expect(fresh.closest('li')?.className).toContain('is-new')
+    expect(within(region).getAllByText('StateHealthAdmin refreshed the people list. Confirmed.')).toHaveLength(1)
+    expect(within(region).getByText('StateHealthAdmin refreshed the people list. Confirmed.').closest('li')?.className).not.toContain('is-new')
+  })
+
   it('asks the server for today in Pakistan time, problems only and a group', async () => {
     openActivity()
     await screen.findByText('Problem started: Link box cannot save attendance safely.')

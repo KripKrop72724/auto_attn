@@ -119,8 +119,9 @@ def test_rows_carry_group_place_and_division_and_filters_work(db):
 
     assert ids(delivery_group="problem") == {refused.id, unknown.id}
     assert ids(delivery_group="sent,waiting") == {sent.id, waiting.id, life_live.id, edge.id}
-    # OR-ed with the old stored-code filter.
-    assert ids(delivery_group="problem", ords_status="ACKED") == {refused.id, unknown.id, sent.id, edge.id}
+    # The status groups narrow the old stored-code filter (AND), never widen it.
+    assert ids(delivery_group="problem", ords_status="ACKED") == set()
+    assert ids(delivery_group="sent", ords_status="ACKED") == {sent.id, edge.id}
     assert ids(division="life") == {life_held.id, life_live.id}
     assert ids(division="health") == {sent.id, waiting.id, refused.id, unknown.id, edge.id}
     assert ids(source_group="live") == {life_live.id}
@@ -136,6 +137,28 @@ def test_rows_carry_group_place_and_division_and_filters_work(db):
     assert edge.id not in ids(to_time=upper, to_exclusive="true")
     assert client.get("/api/v1/attendance", params={"delivery_group": "finished"}).status_code == 422
     assert client.get("/api/v1/attendance", params={"division": "both"}).status_code == 422
+
+
+def test_status_group_and_no_cnic_filter_narrow_together(db):
+    health = connector_fixture(db)
+    waiting_linked = _make_recovery_event(db, health, event_number=9301, ords_status="FAILED_RETRYABLE")
+    waiting_no_id = _make_recovery_event(
+        db, health, event_number=9302, ords_status="FAILED_RETRYABLE", cnic_lookup_hash=None)
+    refused_no_id = _make_recovery_event(
+        db, health, event_number=9303, ords_status="QUARANTINED_ORDS_REJECTED", cnic_lookup_hash=None)
+    db.commit()
+    client = _client(db)
+
+    def ids(**params):
+        response = client.get("/api/v1/attendance", params=params)
+        assert response.status_code == 200, response.text
+        return {row["id"] for row in response.json()["rows"]}
+
+    assert waiting_no_id.id in ids(ords_status="CNIC_NOT_LINKED")
+    assert refused_no_id.id in ids(ords_status="CNIC_NOT_LINKED")
+    assert waiting_linked.id not in ids(ords_status="CNIC_NOT_LINKED")
+    # "Waiting" plus "No CNIC": waiting check-ins that have no CNIC, nothing more.
+    assert ids(delivery_group="waiting", ords_status="CNIC_NOT_LINKED") == {waiting_no_id.id}
 
 
 def test_notify_summary_false_skips_the_phone_message_summary(db):

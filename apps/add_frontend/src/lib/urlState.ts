@@ -126,6 +126,19 @@ export interface SetUrlOptions {
  * Typed URL filters for one page. The values update at once; the URL follows
  * (pushed for chips, replaced 250 ms after typing stops).
  */
+/**
+ * The search of the page an open device panel sits over, or null when no panel
+ * is open. The panel lives at /devices/:id and keeps that page's address in
+ * history state (`from`).
+ */
+export function panelOrigin(pathname: string, state: unknown): string | null {
+  if (!/^\/devices\/[^/]+\/?$/.test(pathname)) return null
+  const from = (state as { from?: unknown } | null)?.from
+  if (typeof from !== 'string' || !from) return null
+  const query = from.split('#')[0].split('?')[1]
+  return query ? `?${query}` : ''
+}
+
 export function useUrlState<S extends UrlSchema>(schema: S): [UrlValues<S>, (change: Partial<UrlValues<S>>, options?: SetUrlOptions) => void] {
   const location = useLocation()
   const navigate = useNavigate()
@@ -135,11 +148,18 @@ export function useUrlState<S extends UrlSchema>(schema: S): [UrlValues<S>, (cha
   // A programming mistake, caught by the tests; production just never writes the key.
   useMemo(() => { if (import.meta.env.DEV || import.meta.env.MODE === 'test') assertAllowedKeys(keys.split('\u0000').filter(Boolean)) }, [keys])
 
-  const fromUrl = useMemo(() => readUrlValues(schemaRef.current, location.search), [location.search, keys])
+  // Behind an open device panel (/devices/:id with the page it came from in
+  // history state) the page keeps reading its own filters from that saved
+  // address, and never writes onto the panel's address.
+  const behind = panelOrigin(location.pathname, location.state)
+  const search = behind === null ? location.search : behind
+  const behindRef = useRef(behind !== null)
+  behindRef.current = behind !== null
+  const fromUrl = useMemo(() => readUrlValues(schemaRef.current, search), [search, keys])
   const [overlay, setOverlay] = useState<Partial<UrlValues<S>>>({})
   const pending = useRef<{ timer: number; change: Partial<UrlValues<S>> } | null>(null)
-  const searchRef = useRef(location.search)
-  searchRef.current = location.search
+  const searchRef = useRef(search)
+  searchRef.current = search
   const pathRef = useRef(location.pathname)
   pathRef.current = location.pathname
 
@@ -147,13 +167,14 @@ export function useUrlState<S extends UrlSchema>(schema: S): [UrlValues<S>, (cha
   useEffect(() => {
     if (pending.current) return
     setOverlay({})
-  }, [location.search])
+  }, [search])
 
   const flush = useCallback(() => {
     const queued = pending.current
     if (!queued) return
     window.clearTimeout(queued.timer)
     pending.current = null
+    if (behindRef.current) return
     const next = writeUrlValues(schemaRef.current, searchRef.current, queued.change)
     if (next !== (searchRef.current || '')) navigate(`${pathRef.current}${next}${window.location.hash}`, { replace: true, preventScrollReset: true })
     setOverlay({})
@@ -164,6 +185,7 @@ export function useUrlState<S extends UrlSchema>(schema: S): [UrlValues<S>, (cha
   }, [])
 
   const set = useCallback((change: Partial<UrlValues<S>>, options: SetUrlOptions = {}) => {
+    if (behindRef.current) return
     const typing = Object.keys(change).some((key) => schemaRef.current[key]?.typing)
     const mode = options.history || (typing ? 'replace' : 'push')
     if (mode === 'replace' && typing && !options.history) {

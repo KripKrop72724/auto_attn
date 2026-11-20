@@ -790,9 +790,16 @@ def _reason(error: str | None) -> str:
         return "Oracle cannot accept this older punch ID. The punch remains saved for ID repair."
     if error in REASONS:
         return REASONS[error]
-    # An unknown code gets one plain sentence; the code itself stays in the
-    # item's error_code (never a title-cased code such as "Sync Expired").
-    return attendance_words.UNKNOWN_REASON if error else "Approved; waiting to prepare delivery."
+    # Stored item text stays as before (custody module); previews use _shown_reason.
+    return error.replace("_", " ").title() if error else "Approved; waiting to prepare delivery."
+
+
+def _shown_reason(error: str | None) -> str:
+    """The sentence a preview answer shows: an unknown code gets one plain sentence
+    (never a title-cased code); the code itself stays in ``exclusion``."""
+    if error and error not in REASONS and error != "INVALID_EVENT_UID":
+        return attendance_words.UNKNOWN_REASON
+    return _reason(error)
 
 
 def _group_key(kind: str, row: dict, *facts) -> str:
@@ -856,7 +863,7 @@ def preview(session, event_ids) -> dict:
             "display_name": user.display_name if user else event.display_name,
             "device_event_time": event.device_event_time,
             "exclusion": None if check.error in hidden else check.error,
-            "exclusion_reason": None if check.error in hidden else _reason(check.error),
+            "exclusion_reason": None if check.error in hidden else _shown_reason(check.error),
             "cnic_source": resolution.source,
             "punch_time_cnic": punch.state if punch else None,
             "punch_time_cnic_masked": mask_cnic(punch.cnic) if other_cnic else None,

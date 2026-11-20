@@ -53,6 +53,13 @@ describe('deviceStatus (HOME-7, D-1)', () => {
     // /status hasn't counted it yet: Needs attention meanwhile, same words.
     expect(deviceStatus(row({ public_status: { status: 'online' }, terminal_link: link('DISCONNECTED') })))
       .toMatchObject({ group: 'attention', heading: 'Machine not responding' })
+    // Same for no internet: /status still says Online, so it is never Offline here yet.
+    expect(deviceStatus(row({ public_status: { status: 'online' }, connected: false })))
+      .toMatchObject({ group: 'attention', heading: 'No internet' })
+    expect(deviceStatus(row({ public_status: { status: 'online' }, state: 'OFFLINE' })))
+      .toMatchObject({ group: 'attention', heading: 'No internet' })
+    expect(deviceStatus(row({ public_status: { status: 'offline', since: '2026-11-19T12:00:00Z', reason_code: 'no_internet' }, connected: false })))
+      .toMatchObject({ group: 'offline', since: '2026-11-19T12:00:00Z', heading: 'No internet' })
   })
 
   it('keeps FLAPPING and DEGRADED in Needs attention', () => {

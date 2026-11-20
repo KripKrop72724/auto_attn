@@ -4374,17 +4374,16 @@ def attendance(
             AttendanceCheckinNotification,
             AttendanceCheckinNotification.attendance_event_id == AttendanceEvent.id,
         ).where(checkin_notify.filter_condition(sorted(set(notify_status))))
-    if ords_status or groups:
-        selected_states = []
-        if ords_status:
-            stored_statuses = set(ords_status) - {"CNIC_NOT_LINKED"}
-            selected_states.append(AttendanceEvent.ords_status.in_(stored_statuses))
-            if "CNIC_NOT_LINKED" in ords_status:
-                selected_states.append(cnic_not_linked)
-        if groups:
-            # The plain status groups are OR-ed with the stored codes above.
-            selected_states.append(attendance_groups.group_condition(groups))
+    if ords_status:
+        stored_statuses = set(ords_status) - {"CNIC_NOT_LINKED"}
+        selected_states = [AttendanceEvent.ords_status.in_(stored_statuses)]
+        if "CNIC_NOT_LINKED" in ords_status:
+            selected_states.append(cnic_not_linked)
         statement = statement.where(or_(*selected_states))
+    if groups:
+        # The plain status groups narrow the list further (AND), so "Waiting"
+        # plus "No CNIC" means waiting check-ins that have no CNIC.
+        statement = statement.where(attendance_groups.group_condition(groups))
     if punch:
         statement = statement.where(AttendanceEvent.punch == punch)
     if source:

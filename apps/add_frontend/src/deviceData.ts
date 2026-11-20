@@ -56,7 +56,8 @@ export class DeviceSnapshots {
     for (const row of incoming) {
       if (!row || typeof row.connector_id !== 'string') continue
       const prior = this.rows.get(row.connector_id)
-      const revision = (value: Device) => Date.parse(value.snapshot_at || value.firmware_diagnostics_at || value.last_seen_at || '')
+      // Older live payloads wrote dates with a space ("2026-11-20 10:00:00+00:00"); Safari needs the T.
+      const revision = (value: Device) => Date.parse((value.snapshot_at || value.firmware_diagnostics_at || value.last_seen_at || '').replace(/^(\d{4}-\d{2}-\d{2}) /, '$1T'))
       if (prior && Number.isFinite(revision(prior)) && (!Number.isFinite(revision(row)) || revision(row) < revision(prior))) continue
       this.rows.set(row.connector_id, mergeDevice(prior, row))
       changed = true

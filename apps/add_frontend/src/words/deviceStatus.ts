@@ -143,7 +143,10 @@ export function deviceStatus(row: DeviceStatusInput): DeviceStatus {
     return offline(pub.reason_code && OFFLINE_REASONS[pub.reason_code] ? pub.reason_code : offlineReasonCode(row), pub.since ?? null)
   }
   if (row.health?.tier === 'OFFLINE' || row.state === 'OFFLINE' || !row.connected) {
-    return offline('no_internet', row.last_seen_at)
+    if (!pub) return offline('no_internet', row.last_seen_at)
+    // D-1: /status still says Online (its wait has not passed): needs attention meanwhile.
+    const reason = OFFLINE_REASONS.no_internet
+    return { group: 'attention', chip: STATE_WORDS.device.DEGRADED.label, tone: 'warning', heading: reason.heading, sentence: reason.sentence, since: row.last_seen_at ?? null, note: null, rank: RANK.attention, code: 'NO_INTERNET' }
   }
   if (row.state === 'ONBOARDING') {
     return { group: 'setup', chip: STATE_WORDS.device.ONBOARDING.label, tone: 'neutral', heading: 'Being set up', sentence: 'It will show as working once its machine is linked.', since: null, note: null, rank: RANK.setup, code: 'ONBOARDING' }

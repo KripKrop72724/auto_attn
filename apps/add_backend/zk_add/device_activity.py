@@ -371,10 +371,19 @@ def build_activity(
     # Requests and problem events for the time this page covers.
     # A later page starts where the previous one stopped, so nothing is skipped.
     page_high = cursor[0] if cursor is not None and cursor[0] is not None else until
-    page_low = ensure_utc(classified[consumed - 1].log.received_at) if has_more and consumed else since
-    extra = _alert_items(db, connector, page_low, page_high, topics)
-    if show != "problems":
-        extra += _command_items(db, connector, page_low, page_high, topics)
+    page_low: datetime | None = (
+        ensure_utc(classified[consumed - 1].log.received_at) if has_more and consumed else since)
+    if after is not None:
+        # A live poll only adds requests and problem events newer than the log
+        # row the page already shows; without that row there is nothing to add.
+        anchor = db.scalar(select(DeviceLog.received_at).where(
+            DeviceLog.connector_id == connector.id, DeviceLog.id == after))
+        page_low = max(page_low, ensure_utc(anchor)) if anchor is not None and page_low is not None else None
+    extra = []
+    if page_low is not None:
+        extra = _alert_items(db, connector, page_low, page_high, topics)
+        if show != "problems":
+            extra += _command_items(db, connector, page_low, page_high, topics)
     items.extend(extra)
     items.sort(key=lambda item: ensure_utc(item.get("at") or item.get("last_at")), reverse=True)
 

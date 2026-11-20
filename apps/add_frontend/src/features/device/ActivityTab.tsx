@@ -72,6 +72,9 @@ export function ActivityTab({ device, revision }: { device: DeviceDetail; revisi
   const [fresh, setFresh] = useState<ActivityItem[]>([])
   const [waiting, setWaiting] = useState<ActivityItem[]>([])
   const [newKeys, setNewKeys] = useState<Set<string>>(new Set())
+  // Newer copies of rows already on screen (a request that finished): patched in place, never "new".
+  const [patched, setPatched] = useState<Map<string, ActivityItem>>(new Map())
+  const shownKeys = useRef<Set<string>>(new Set())
   const [open, setOpen] = useState<ActivityItem | null>(null)
   const [updatedAt, setUpdatedAt] = useState<number | null>(null)
   const listRef = useRef<HTMLDivElement>(null)
@@ -98,6 +101,7 @@ export function ActivityTab({ device, revision }: { device: DeviceDetail; revisi
     setFresh([])
     setWaiting([])
     setNewKeys(new Set())
+    setPatched(new Map())
     setOlderError(false)
   }, [filterKey])
   useEffect(() => { if (first.data) setUpdatedAt(Date.now()) }, [first.data])
@@ -114,14 +118,28 @@ export function ActivityTab({ device, revision }: { device: DeviceDetail; revisi
     try {
       const answer = await fetchActivity(id, { show: url.show, topics: url.topic, after: newestId.current, since: range.since, until: new Date(Date.now() + 60_000).toISOString(), limit: 50 })
       if (answer.newest_id != null) newestId.current = answer.newest_id
-      if (!answer.items.length) return
+      // Rows already shown (or already waiting) are never new again.
+      const known = answer.items.filter((item) => shownKeys.current.has(itemKey(item)))
+      const unseen = answer.items.filter((item) => !shownKeys.current.has(itemKey(item)))
+      if (known.length) {
+        setPatched((current) => {
+          const next = new Map(current)
+          known.forEach((item) => next.set(itemKey(item), item))
+          return next
+        })
+      }
+      if (!unseen.length) {
+        if (known.length) setUpdatedAt(Date.now())
+        return
+      }
+      unseen.forEach((item) => shownKeys.current.add(itemKey(item)))
       const scroller = listRef.current?.closest('.dv-panel-body, .dv-page') as HTMLElement | null
       const atTop = !scroller || scroller.scrollTop < 80
       if (atTop) {
-        setFresh((current) => mergeItems(answer.items, current))
-        setNewKeys(new Set(answer.items.map(itemKey)))
+        setFresh((current) => mergeItems(unseen, current))
+        setNewKeys(new Set(unseen.map(itemKey)))
       } else {
-        setWaiting((current) => mergeItems(answer.items, current))
+        setWaiting((current) => mergeItems(unseen, current))
       }
       setUpdatedAt(Date.now())
     } catch {
@@ -135,7 +153,11 @@ export function ActivityTab({ device, revision }: { device: DeviceDetail; revisi
     live.schedule()
   }, [live, revision])
 
-  const items = useMemo(() => mergeItems(fresh, mergeItems(page?.items || [], older)), [fresh, older, page?.items])
+  const items = useMemo(() => {
+    const merged = mergeItems(fresh, mergeItems(page?.items || [], older))
+    return patched.size ? merged.map((item) => patched.get(itemKey(item)) ?? item) : merged
+  }, [fresh, older, page?.items, patched])
+  useEffect(() => { shownKeys.current = new Set([...items, ...waiting].map(itemKey)) }, [items, waiting])
 
   const loadOlder = async () => {
     if (!nextCursor) return
@@ -156,6 +178,7 @@ export function ActivityTab({ device, revision }: { device: DeviceDetail; revisi
 
   const refresh = async () => {
     setFresh([])
+    setPatched(new Map())
     setWaiting([])
     setOlder([])
     setCursor(undefined)

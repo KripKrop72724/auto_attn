@@ -144,18 +144,30 @@ function CheckinsTab({
     }), CHANGED_MS)
   }, [])
 
+  // A live refresh never pre-empts a replace: it has its own request, waits
+  // while a replace is in flight, and drops its answer if the filters changed.
+  const refreshRequest = useRef<AbortController | null>(null)
+  const replacing = useRef(false)
+  // The query the rows on screen were loaded for.
+  const rowsQuery = useRef<string | null>(null)
+
   const replaceFeed = useCallback(async () => {
     latestRequest.current?.abort()
+    refreshRequest.current?.abort()
     pageRequest.current?.abort()
     const controller = new AbortController()
+    const startedFor = queryRef.current
     latestRequest.current = controller
+    replacing.current = true
     setLoading(true)
+    setRefreshing(false)
     setError('')
     setPendingRows([])
     try {
-      const response = await api<AttendanceListResponse>(`/api/v1/attendance?${queryRef.current}`, { signal: controller.signal })
+      const response = await api<AttendanceListResponse>(`/api/v1/attendance?${startedFor}`, { signal: controller.signal })
       if (controller.signal.aborted || latestRequest.current !== controller) return
       const fresh = safeRows(response)
+      rowsQuery.current = startedFor
       setRows(fresh)
       setNextCursor(response.next_cursor ?? null)
       setLoaded(true)
@@ -164,19 +176,31 @@ function CheckinsTab({
       if (reason instanceof DOMException && reason.name === 'AbortError') return
       setError("Couldn't load check-ins. Check your connection, then try again.")
     } finally {
-      if (latestRequest.current === controller) setLoading(false)
+      if (latestRequest.current === controller) {
+        replacing.current = false
+        setLoading(false)
+      }
     }
   }, [])
 
   // `user`: the person pressed Refresh (the only time the button is busy).
   const refreshFeed = useCallback(async (reveal = false, user = false) => {
-    latestRequest.current?.abort()
+    if (replacing.current) return
+    const startedFor = queryRef.current
+    if (rowsQuery.current !== startedFor) {
+      // The rows belong to other filters (changed while paused, or the filter
+      // wait has not run yet): load the list for the current filters instead.
+      void replaceFeed()
+      return
+    }
+    refreshRequest.current?.abort()
     const controller = new AbortController()
-    latestRequest.current = controller
+    refreshRequest.current = controller
     if (user) setRefreshing(true)
     try {
-      const response = await api<AttendanceListResponse>(`/api/v1/attendance?${queryRef.current}`, { signal: controller.signal })
-      if (controller.signal.aborted || latestRequest.current !== controller) return
+      const response = await api<AttendanceListResponse>(`/api/v1/attendance?${startedFor}`, { signal: controller.signal })
+      if (controller.signal.aborted || refreshRequest.current !== controller) return
+      if (replacing.current || queryRef.current !== startedFor || rowsQuery.current !== startedFor) return
       const fresh = safeRows(response)
       const current = rowsRef.current
       const currentById = new Map(current.map((row) => [row.event_uid, row]))
@@ -205,22 +229,25 @@ function CheckinsTab({
       }
     } catch (reason) {
       if (reason instanceof DOMException && reason.name === 'AbortError') return
+      if (queryRef.current !== startedFor) return
       setError("Couldn't update. Showing the last saved list.")
     } finally {
-      if (latestRequest.current === controller && user) setRefreshing(false)
+      if (refreshRequest.current === controller && user) setRefreshing(false)
     }
-  }, [markChanged, markNew, topVisible])
+  }, [markChanged, markNew, replaceFeed, topVisible])
 
   const loadOlder = async () => {
     if (!nextCursor) return
     pageRequest.current?.abort()
     const controller = new AbortController()
     pageRequest.current = controller
+    // Older pages follow the filters the rows on screen were loaded for.
+    const startedFor = rowsQuery.current ?? queryRef.current
     setLoadingMore(true)
     setError('')
     try {
-      const response = await api<AttendanceListResponse>(`/api/v1/attendance?${queryRef.current}&cursor=${nextCursor}`, { signal: controller.signal })
-      if (controller.signal.aborted || pageRequest.current !== controller) return
+      const response = await api<AttendanceListResponse>(`/api/v1/attendance?${startedFor}&cursor=${nextCursor}`, { signal: controller.signal })
+      if (controller.signal.aborted || pageRequest.current !== controller || rowsQuery.current !== startedFor) return
       const older = safeRows(response)
       setRows((current) => mergeByEventUid(current, older))
       setNextCursor(response.next_cursor ?? null)
@@ -241,6 +268,7 @@ function CheckinsTab({
 
   useEffect(() => () => {
     latestRequest.current?.abort()
+    refreshRequest.current?.abort()
     pageRequest.current?.abort()
   }, [])
 
@@ -272,6 +300,9 @@ function CheckinsTab({
       frozenRef.current = true
       liveRefresh.cancel()
       latestRequest.current?.abort()
+      latestRequest.current = null
+      replacing.current = false
+      refreshRequest.current?.abort()
       pageRequest.current?.abort()
       setLoading(false)
       setRefreshing(false)

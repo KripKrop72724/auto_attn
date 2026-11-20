@@ -90,6 +90,10 @@ export function useProblems(params: ProblemApiParams, { tab, revision = 0, devic
     setRows(value)
   }, [])
   const pagesRef = useRef(1)
+  // Ids of the last first-page answer, in order: only a row that was in that
+  // window can be "fixed just now" when it leaves (rows loaded with "Show more"
+  // are never on the first page).
+  const firstPageRef = useRef<number[]>([])
   const removedRef = useRef(new Set<number>())
   const phasesRef = useRef(phases)
   const mainRequest = useRef<AbortController | null>(null)
@@ -157,7 +161,9 @@ export function useProblems(params: ProblemApiParams, { tab, revision = 0, devic
     setError(null)
     void fetchPage(null, controller.signal).then((response) => {
       if (controller.signal.aborted || keyRef.current !== key) return
-      updateRows(Array.isArray(response.rows) ? response.rows : [])
+      const firstRows = Array.isArray(response.rows) ? response.rows : []
+      firstPageRef.current = firstRows.map((row) => row.id)
+      updateRows(firstRows)
       setCounts(countsFrom(response))
       setNextCursor(response.next_cursor ?? null)
       phasesRef.current = {}
@@ -190,6 +196,13 @@ export function useProblems(params: ProblemApiParams, { tab, revision = 0, devic
       const incoming = Array.isArray(response.rows) ? response.rows : []
       const watchingOpen = tabRef.current !== 'fixed'
       const merged = mergeRows(rowsRef.current, incoming, watchingOpen ? removedRef.current : new Set())
+      const previousFirst = firstPageRef.current
+      firstPageRef.current = incoming.map((row) => row.id)
+      // A row can only have been fixed if the earlier first page held it. When
+      // more pages exist, the last few rows of that page may just have been
+      // pushed to page 2 by the rows that arrived, so they are not counted.
+      const pushed = response.next_cursor ? Math.max(0, merged.arrived.length) : 0
+      const firstWindow = new Set(previousFirst.slice(0, Math.max(0, previousFirst.length - pushed)))
       updateRows(merged.rows)
       setCounts(countsFrom(response))
       if (pagesRef.current <= 1) setNextCursor(response.next_cursor ?? null)
@@ -205,6 +218,7 @@ export function useProblems(params: ProblemApiParams, { tab, revision = 0, devic
       // Open and Seen hold every open problem: one that left was fixed (or seen elsewhere).
       if (watchingOpen) {
         for (const row of merged.missing) {
+          if (!firstWindow.has(row.id)) continue
           if (phasesRef.current[row.id] || removedRef.current.has(row.id)) continue
           leave(row.id, 'fixed-now', FIXED_NOW_MS)
         }

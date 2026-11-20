@@ -328,6 +328,34 @@ describe('Attendance check-ins', () => {
     expect(screen.queryByRole('button', { name: /Show older check-ins/i })).toBeNull()
   })
 
+  it('never lets a live refresh break into a filter change', async () => {
+    const waiting = event({ id: 4, event_uid: 'event-waiting', display_name: 'Waiting Person', user_id: '901', uid: '10' })
+    let release: () => void = () => undefined
+    const fetchMock = stub(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input), 'https://add.test')
+      if (url.searchParams.getAll('delivery_group').includes('waiting')) {
+        await new Promise<void>((resolve) => { release = resolve })
+        if (init?.signal?.aborted) throw new DOMException('Aborted', 'AbortError')
+        return response({ rows: [waiting], next_cursor: null })
+      }
+      return response({ rows: [event()], next_cursor: 10 })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const view = renderView()
+    await screen.findByRole('article', { name: /Ayesha Khan/i })
+    await screen.findByText('3,412')
+    fireEvent.click(screen.getByRole('button', { name: /^Waiting\s*80/ }))
+    await waitFor(() => expect(listCalls(fetchMock).some((url) => url.searchParams.getAll('delivery_group').includes('waiting'))).toBe(true))
+    const before = listCalls(fetchMock).length
+    view.rerender(<AttendanceView {...attendanceProps} revision={1} />)
+    await new Promise((resolve) => window.setTimeout(resolve, 50))
+    expect(listCalls(fetchMock).length).toBe(before)
+    await act(async () => { release() })
+    expect(await screen.findByRole('article', { name: /Waiting Person/i })).toBeTruthy()
+    expect(screen.queryByRole('article', { name: /Ayesha Khan/i })).toBeNull()
+    expect(screen.queryByRole('button', { name: /Show older check-ins/i })).toBeNull()
+  })
+
   it('reads nothing while the list is frozen and catches up when unfrozen', async () => {
     const fetchMock = stub(async () => response({ rows: [event()], next_cursor: null }))
     vi.stubGlobal('fetch', fetchMock)
