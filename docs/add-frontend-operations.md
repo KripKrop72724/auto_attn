@@ -31,9 +31,9 @@ The preferred enrollment path is a ten-minute administrator lease. Permanent ele
 
 All visible and entered times are Pakistan Standard Time (`Asia/Karachi`). Browser `datetime-local` values are converted from PKT to UTC before requests, so **Today** produces identical bounds in every browser timezone. CNIC queries run only with exactly 13 digits. Searches debounce, abort superseded requests, retain prior rows during refresh, paginate, and distinguish failure from a genuine empty result.
 
-### Reconciliation
+### Recover attendance (`/recover`)
 
-Preflight belongs strictly to the currently selected connector and is cleared before every device switch. Complete scans remain resumable and immutable. Protected raw evidence automatically hides after 60 seconds, when the page is backgrounded, or when its drawer closes.
+The page opens with one status line ("1 recovery is waiting for you · 2 running · …") and three tabs: **Recoveries**, **Unreadable records** (opens on "Not seen yet") and **Not in HR system yet**. Each recovery is one card with a stage strip (Waiting to start → Reading the machine → Checking with the HR system → Done), two progress bars and one main button; Stop is beside it and Details, Stop and hide and Hide are in ⋯. Start, pause, resume, try again, stop, hide, Recover several devices and Clear history stay one click. Marking an unreadable record as seen still needs a note and your password, and showing a raw record (under Technical details) needs its own note and password; the raw record hides after 60 seconds, when the page is backgrounded, or when its sheet closes. The readiness answer belongs strictly to the chosen device and is cleared before every device switch. The retired bulk resend form is no longer shown; Fix impossible times appears only when the server switches it on and keeps its note, password and typed phrase.
 
 ### Firmware
 
