@@ -20,7 +20,7 @@
   z-index: var(--z-toast);
   padding: 10px 16px;
   border-radius: var(--radius-md);
-  color: #fff;
+  color: var(--on-solid);
   background: var(--accent);
   font-weight: 600;
   transform: translateY(-200%);
@@ -66,7 +66,7 @@
 .nav-link.active { color: var(--accent); background: var(--accent-subtle); font-weight: 600; }
 .nav-link.active svg { color: var(--accent); }
 .nav-label { min-width: 0; }
-.nav-count { min-width: 20px; height: 20px; display: inline-grid; place-items: center; margin-left: auto; padding: 0 6px; border-radius: var(--radius-full); color: #fff; background: var(--critical); font-size: 12px; font-weight: 600; line-height: 1; font-variant-numeric: tabular-nums; }
+.nav-count { min-width: 20px; height: 20px; display: inline-grid; place-items: center; margin-left: auto; padding: 0 6px; border-radius: var(--radius-full); color: var(--on-solid); background: var(--critical); font-size: 12px; font-weight: 600; line-height: 1; font-variant-numeric: tabular-nums; }
 .nav-off { margin-left: auto; padding: 1px 6px; border: 1px solid var(--border); border-radius: var(--radius-sm); color: var(--text-secondary); background: var(--surface-sunken); font-size: 11px; font-weight: 500; white-space: nowrap; }
 .more-link .nav-off { margin-left: 8px; vertical-align: 1px; }
 .sidebar-footer { display: grid; gap: 4px; margin: 12px; padding: 12px 10px 0; border-top: 1px solid var(--border); color: var(--text-tertiary); font-size: 12px; }
@@ -251,7 +251,7 @@
     border-top: 1px solid var(--border);
     border-right: 0;
     background: var(--surface);
-    box-shadow: var(--shadow-up, 0 -2px 8px rgba(16, 24, 40, .06));
+    box-shadow: var(--shadow-up);
   }
   .app-brand, .sidebar-footer, .nav-heading, .nav-link.mobile-secondary { display: none; }
   .app-sidebar nav { height: 100%; display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 0; padding: 0; overflow: visible; }

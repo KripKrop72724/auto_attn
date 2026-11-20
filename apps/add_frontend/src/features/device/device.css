@@ -121,7 +121,7 @@
 .dv-chip-count { font-variant-numeric: tabular-nums; }
 .dv-activity-day { display: flex; align-items: center; gap: var(--space-2); }
 .dv-activity-list { display: grid; gap: var(--space-3); min-width: 0; }
-.dv-new-pill { justify-self: center; min-height: 36px; padding: 0 14px; border: 0; border-radius: var(--radius-full); background: var(--accent); color: #fff; font: inherit; font-weight: 600; cursor: pointer; position: sticky; top: 56px; z-index: 3; }
+.dv-new-pill { justify-self: center; min-height: 36px; padding: 0 14px; border: 0; border-radius: var(--radius-full); background: var(--accent); color: var(--on-solid); font: inherit; font-weight: 600; cursor: pointer; position: sticky; top: 56px; z-index: 3; }
 .dv-day-header { position: sticky; top: 52px; z-index: 2; margin: 0; padding: var(--space-2) 0; background: var(--canvas); color: var(--text-secondary); font-size: 12px; font-weight: 600; letter-spacing: var(--tracking-eyebrow, .04em); text-transform: uppercase; }
 .dv-activity-row { border-left: 3px solid var(--border); background: var(--surface); border-radius: var(--radius-sm); margin-bottom: 4px; }
 .dv-activity-row.kind-problem { border-left-color: var(--tone-offline-solid); }
@@ -152,7 +152,7 @@
   .dv-run-rows { padding-left: calc(64px + 24px + var(--space-2) * 2); }
   .dv-activity-line { grid-template-columns: 64px 24px minmax(0, 1fr); }
   .dv-day-header { top: 96px; }
-  .dv-chip-row { flex-wrap: nowrap; -webkit-mask-image: linear-gradient(90deg, #000 90%, transparent); mask-image: linear-gradient(90deg, #000 90%, transparent); }
+  .dv-chip-row { flex-wrap: nowrap; -webkit-mask-image: linear-gradient(90deg, var(--mask-opaque) 90%, transparent); mask-image: linear-gradient(90deg, var(--mask-opaque) 90%, transparent); }
 }
 
 /* ------------------------------------------------------- technical log */

@@ -16,7 +16,7 @@
 .ui-steps-marker { width: 24px; height: 24px; display: grid; flex: none; place-items: center; border: 2px solid var(--border-strong); border-radius: 50%; background: var(--surface); }
 .ui-steps-marker > span { width: 8px; height: 8px; border-radius: 50%; }
 .ui-step.is-done { color: var(--text); }
-.ui-step.is-done .ui-steps-marker { border-color: var(--positive); color: #fff; background: var(--positive); }
+.ui-step.is-done .ui-steps-marker { border-color: var(--positive); color: var(--on-solid); background: var(--positive); }
 .ui-step.is-done:not(:last-child)::after { background: var(--positive); }
 .ui-step.is-current { color: var(--text); font-weight: 600; }
 .ui-step.is-current .ui-steps-marker { border-color: var(--accent); }
@@ -24,6 +24,6 @@
 .ui-step.is-ended { color: var(--text); font-weight: 600; }
 .ui-step.is-ended .ui-steps-marker { border-color: var(--text-secondary); color: var(--text-secondary); }
 .ui-step.is-failed { color: var(--critical); }
-.ui-step.is-failed .ui-steps-marker { border-color: var(--critical); color: #fff; background: var(--critical); }
+.ui-step.is-failed .ui-steps-marker { border-color: var(--critical); color: var(--on-solid); background: var(--critical); }
 .ui-steps-note { margin: var(--space-2) 0 0; color: var(--text-secondary); font-size: var(--text-sm); }
 

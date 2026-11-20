@@ -3,9 +3,9 @@
 .ui-segment::after { content: ""; position: absolute; inset: 50% auto auto 50%; width: max(100%, var(--touch-min)); height: max(100%, var(--touch-min)); transform: translate(-50%, -50%); }
 /* Tabs and segmented control --------------------------------------------- */
 .ui-tabs { position: relative; min-width: 0; border-bottom: 1px solid var(--border); }
-.ui-tabs.fade-end { mask-image: linear-gradient(90deg, #000 calc(100% - 32px), transparent); }
-.ui-tabs.fade-start { mask-image: linear-gradient(90deg, transparent, #000 32px); }
-.ui-tabs.fade-start.fade-end { mask-image: linear-gradient(90deg, transparent, #000 32px, #000 calc(100% - 32px), transparent); }
+.ui-tabs.fade-end { mask-image: linear-gradient(90deg, var(--mask-opaque) calc(100% - 32px), transparent); }
+.ui-tabs.fade-start { mask-image: linear-gradient(90deg, transparent, var(--mask-opaque) 32px); }
+.ui-tabs.fade-start.fade-end { mask-image: linear-gradient(90deg, transparent, var(--mask-opaque) 32px, var(--mask-opaque) calc(100% - 32px), transparent); }
 .ui-tablist { position: relative; display: flex; gap: var(--space-1); overflow-x: auto; scrollbar-width: none; overscroll-behavior-x: contain; }
 .ui-tablist::-webkit-scrollbar { display: none; }
 .ui-tab { position: relative; min-height: 44px; display: inline-flex; flex: none; align-items: center; gap: 6px; padding: 0 var(--space-3); border: 0; color: var(--text-secondary); background: transparent; font-size: var(--text-md); font-weight: 500; white-space: nowrap; }

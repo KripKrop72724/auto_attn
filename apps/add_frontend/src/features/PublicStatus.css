@@ -224,7 +224,7 @@
 }
 
 .ps-device:first-child { border-top-color: transparent; }
-.ps-device.is-offline { background: #fffbfa; }
+.ps-device.is-offline { background: var(--status-offline-row); }
 
 .ps-dot {
   width: 10px;

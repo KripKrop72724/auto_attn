@@ -11,7 +11,7 @@
 .ui-filter-sort { position: relative; display: flex; align-items: center; }
 .ui-filter-sort > svg { position: absolute; left: 12px; color: var(--text-tertiary); pointer-events: none; }
 .ui-filter-sort select { width: auto; padding-left: 34px; }
-.ui-filter-more-count { min-width: 20px; height: 20px; display: inline-grid; place-items: center; padding: 0 6px; border-radius: var(--radius-full); color: #fff; background: var(--accent); font-size: var(--text-xs); font-weight: 600; }
+.ui-filter-more-count { min-width: 20px; height: 20px; display: inline-grid; place-items: center; padding: 0 6px; border-radius: var(--radius-full); color: var(--on-solid); background: var(--accent); font-size: var(--text-xs); font-weight: 600; }
 .ui-filter-actions { display: flex; gap: var(--space-2); margin-left: auto; }
 .ui-filter-chips { display: flex; flex-wrap: wrap; gap: var(--space-2); }
 .ui-filter-chip { position: relative; min-height: 32px; display: inline-flex; align-items: center; gap: 6px; padding: 0 var(--space-3); border: 1px solid var(--border-strong); border-radius: var(--radius-full); color: var(--text); background: var(--surface); font-size: var(--text-sm); font-weight: 500; white-space: nowrap; transition: background-color var(--motion-fade) var(--ease-out), border-color var(--motion-fade) var(--ease-out); }

@@ -59,6 +59,9 @@ ALLOWED_UI_COLORS = {
     "#fbfcfd", "#ffd987", "#fff0f1", "#fff4d6",
     # Division tags (owner decision D-11): Life indigo, Health violet.
     "#3538cd", "#eef4ff", "#c7d7fe", "#6927da", "#f5f3ff", "#ddd6fe",
+    # Tokens named in PR-9: --mask-opaque (fade masks, never painted) and
+    # --status-offline-row (the public status page's existing offline row).
+    "#000000", "#fffbfa",
     "#111111",
     "#171717",
     "#1c1c1c",
@@ -174,6 +177,21 @@ def main() -> int:
         problems.append(f"UI contains colors outside State Life blue/white/neutrals: {unexpected_colors}")
     if "#0094da" not in found_colors or "#ffffff" not in found_colors:
         problems.append("UI must use State Life blue #0094DA and white")
+
+    # Colour contract (PR-9, verify.md G9): colours are tokens defined once in
+    # styles.css; every other stylesheet and component uses var(--...) only.
+    frontend_src = ROOT / "apps/add_frontend/src"
+    literal_color = re.compile(r"(?<![\w&])#[0-9a-fA-F]{3,8}(?![0-9a-zA-Z_-])|\b(?:rgba?|hsla?)\(")
+    color_offenders = []
+    for source in sorted([*frontend_src.rglob("*.css"), *frontend_src.rglob("*.tsx")]):
+        if source.name == "styles.css" or ".test." in source.name:
+            continue
+        for number, line in enumerate(source.read_text().splitlines(), start=1):
+            code = line.split("//", 1)[0] if source.suffix == ".tsx" else line
+            if literal_color.search(code):
+                color_offenders.append(f"{source.relative_to(ROOT)}:{number}")
+    if color_offenders:
+        problems.append(f"UI colours must be styles.css tokens (var(--...)): {color_offenders[:20]}")
 
     frontend = (ROOT / "apps/add_frontend/src/App.tsx").read_text().lower()
     backend = (ROOT / "apps/add_backend/zk_add/web.py").read_text().lower()

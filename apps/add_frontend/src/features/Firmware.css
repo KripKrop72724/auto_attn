@@ -87,7 +87,7 @@
 .firmware-inline-error > div { display: grid; gap: 2px; }
 .firmware-inline-error p { margin: 0; color: var(--text-secondary); font-size: 13px; }
 .firmware-skeleton { display: grid; gap: 12px; padding: 20px; background: var(--surface); }
-.firmware-skeleton i { height: 60px; border-radius: var(--radius-md); background: linear-gradient(90deg, var(--surface-sunken) 25%, #f7f8fa 50%, var(--surface-sunken) 75%); background-size: 200% 100%; animation: firmware-shimmer 1.3s linear infinite; }
+.firmware-skeleton i { height: 60px; border-radius: var(--radius-md); background: linear-gradient(90deg, var(--surface-sunken) 25%, var(--skeleton-shine) 50%, var(--surface-sunken) 75%); background-size: 200% 100%; animation: firmware-shimmer 1.3s linear infinite; }
 @keyframes firmware-shimmer { to { background-position: -200% 0; } }
 
 
@@ -126,7 +126,7 @@
 .firmware-deployment li { min-height: 40px; display: grid; grid-template-columns: minmax(150px, .6fr) minmax(130px, .4fr) minmax(0, 1fr); align-items: center; gap: 10px; border-top: 1px solid var(--border); font-size: 13px; }
 .firmware-deployment time { color: var(--text-tertiary); font-size: 12px; font-variant-numeric: tabular-nums; }
 .firmware-deployment code { font-size: 12px; }
-.firmware-drawer-actions { position: sticky; bottom: -20px; display: flex; justify-content: flex-end; gap: 8px; padding: 12px; border: 1px solid var(--border); border-radius: var(--radius-lg) var(--radius-lg) 0 0; background: rgba(255, 255, 255, .96); box-shadow: 0 -6px 16px rgba(16, 24, 40, .08); backdrop-filter: blur(12px); }
+.firmware-drawer-actions { position: sticky; bottom: -20px; display: flex; justify-content: flex-end; gap: 8px; padding: 12px; border: 1px solid var(--border); border-radius: var(--radius-lg) var(--radius-lg) 0 0; background: var(--surface); box-shadow: var(--shadow-up); backdrop-filter: blur(12px); }
 
 .firmware-provisioning-readiness { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin-bottom: 16px; }
 .firmware-provisioning-readiness article { min-width: 0; min-height: 76px; display: grid; grid-template-columns: 32px minmax(0, 1fr); align-items: start; gap: 4px 12px; padding: 12px 14px; border: 1px solid var(--border); border-radius: var(--radius-lg); background: var(--surface); box-shadow: var(--shadow-xs); }
