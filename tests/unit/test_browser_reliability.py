@@ -38,3 +38,16 @@ def test_reconnect_overflow_and_server_restart_require_resynchronization():
 def test_error_category_never_contains_private_exception_input():
     assert rejection_category(ValueError("private attendance or roster bytes")) == "EVIDENCE_INVALID"
     assert rejection_category(RuntimeError("private queue evidence")) == "INTERNAL_ERROR"
+
+
+def test_sse_dates_are_iso_8601_like_the_rest_answers():
+    import json
+    from datetime import datetime, timezone
+
+    async def run():
+        hub = BrowserEventHub()
+        moment = datetime(2026, 11, 20, 10, 0, 0, 123456, tzinfo=timezone.utc)
+        event = await hub.publish("heartbeat", {"snapshot_at": moment, "last_seen_at": moment})
+        data = sse_encode(event).split("data: ", 1)[1].strip()
+        assert json.loads(data)["snapshot_at"] == "2026-11-20T10:00:00.123456+00:00"
+    asyncio.run(run())

@@ -528,7 +528,13 @@ jobs:
             ~/.cache/playwright-apt
           key: ${{ steps.playwright-cache.outputs.cache-primary-key }}
       - name: Run responsive and accessibility browser tests
-        timeout-minutes: 10
+        # The page sweeps and the screenshot tour run on phone-390-touch and
+        # desktop-1440 only (playwright.config.ts). Nine projects take about
+        # 12 minutes on 4 workers locally; the runner uses 2 workers, so allow
+        # 25 minutes inside the job's 30.
+        timeout-minutes: 25
+        env:
+          ADD_VISUAL_QA: "1"
         run: pnpm test:e2e
       - name: Upload Playwright report on failure
         if: failure()
@@ -538,6 +544,42 @@ jobs:
           path: apps/add_frontend/playwright-report/
           if-no-files-found: ignore
           retention-days: 7
+      # Full-page screenshots of every page at 390 px (touch) and 1440 px, for
+      # the PR review (DLV-3). Uploaded whether the tests passed or not.
+      - name: Upload dashboard screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: add-ui-screenshots
+          path: apps/add_frontend/screenshots/
+          if-no-files-found: ignore
+          retention-days: 14
+
+  frontend-classic:
+    # The old screens (apps/add_frontend_classic) are a frozen copy served
+    # under /classic/ for one week after the revamp release. They are only
+    # built here: no unit tests, browser tests or bundle budgets, because the
+    # frontend job above covers the live app only. Delete this job with the
+    # folder (docs/add-classic-screens.md).
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: apps/add_frontend_classic
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install exact old-screens dependencies
+        run: corepack enable && corepack prepare pnpm@11.7.0 --activate && pnpm install --frozen-lockfile
+      - name: Build the old screens under /classic/
+        run: |
+          pnpm run build
+          grep -q '<title>ADD (old screens)</title>' dist/index.html
+          grep -q 'src="/classic/assets/' dist/index.html
 
   firmware-production:
     # The firmware parts run in parallel on separate runners. Each original
@@ -858,4 +900,11 @@ jobs:
           curl --fail --silent --show-error http://127.0.0.1:8096/health/ready
           curl --fail --silent --show-error http://127.0.0.1:8095/health/ui
           curl --fail --silent --show-error http://127.0.0.1:8095/ | grep -q 'Attendance Device Dashboard'
+          curl --fail --silent --show-error http://127.0.0.1:8095/status | grep -q 'Attendance Device Dashboard'
+          # Old screens for one week (docs/add-classic-screens.md): served under
+          # /classic/ with the SPA fallback and the same security headers.
+          curl --fail --silent --show-error http://127.0.0.1:8095/classic/ | grep -q 'ADD (old screens)'
+          curl --fail --silent --show-error http://127.0.0.1:8095/classic/fleet | grep -q 'ADD (old screens)'
+          curl --silent --show-error --head http://127.0.0.1:8095/classic | tr -d '\r' | grep -qi '^location: /classic/$'
+          curl --fail --silent --show-error --head http://127.0.0.1:8095/classic/fleet | grep -qi '^content-security-policy:'
           docker compose --env-file .env.add -f docker-compose.add.yml exec -T add-api alembic -c apps/add_backend/alembic.ini current

@@ -6,6 +6,7 @@ import binascii
 import hashlib
 import json
 import logging
+import re
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -42,9 +43,18 @@ from zk_add import attendance_force_release as force_release
 from zk_add import attendance_direct_ords as direct_ords
 from zk_add import checkin_notify
 from zk_add import dashboard_cache
+from zk_add import device_names
+from zk_add import people_read
 from zk_add import public_status
 from zk_add import source_newest_slot as newest_slot
 from zk_add.attendance_cnic_link import cnic_not_linked_expression, unknown_synced_cnic_expression
+# Read-side page helpers (UI/UX revamp): status groups, totals, plain words, names.
+from zk_add import attendance_groups
+from zk_add import attendance_summary
+from zk_add import connector_naming
+from zk_add import alert_list
+from zk_add import problem_words
+from zk_add import firmware_list
 from zk_add.attendance_force_schemas import ForceCheckRequest, ForceStartRequest, ForceControlRequest, UserRefreshRequest
 from zk_add.attendance_direct_ords_schemas import (
     DirectOrdsPreviewRequest,
@@ -640,6 +650,8 @@ def _dashboard_metrics(session: Session) -> dict:
             session, outbox_coverage=coverage, event_status_counts=status_counts
         ),
         "checkin_notifications": checkin_notify.overview(session),
+        # Plain status groups over every retained check-in, from the same counts.
+        "attendance_all_time": attendance_summary.all_time_totals(status_counts),
     }
 
 
@@ -711,16 +723,28 @@ def invalidate_dashboard_metrics_after_commit(db: Session) -> None:
         dashboard_cache.mark_stale(
             DASHBOARD_METRICS_KEY, DASHBOARD_METRICS_MARK_MIN_AGE_SECONDS
         )
+        attendance_summary.mark_summaries_stale(DASHBOARD_METRICS_MARK_MIN_AGE_SECONDS)
 
     sa_event.listen(db, "after_commit", _invalidate, once=True)
 
 
 @app.get("/api/v1/overview")
-def overview(auth: tuple[Session, AdminContext] = Depends(require_admin)):
+def overview(
+    sections: Literal["fleet"] | None = None,
+    auth: tuple[Session, AdminContext] = Depends(require_admin),
+):
+    """The dashboard overview.
+
+    sections=fleet returns only the live device and alert counts: it never
+    waits for the cached delivery figures and never answers 503.
+    """
     db, _context = auth
     # Device and alert counts stay live: they are cheap and change with
     # operator actions such as marking a spare.
     result = fleet_counts(db)
+    if sections == "fleet":
+        result["sections"] = ["fleet"]
+        return result
     metrics, computed_at, max_age = dashboard_metrics(db)
     # Shallow copies: the cached sections are shared between requests.
     result.update({key: dict(value) for key, value in metrics.items()})
@@ -1484,8 +1508,10 @@ async def onboard(
 def list_devices(
     state: str | None = None,
     q: str | None = None,
+    view: Literal["full", "list"] = "full",
     auth: tuple[Session, AdminContext] = Depends(require_admin),
 ):
+    """Every device. view=list returns the slim rows (serialize_connector)."""
     db, _context = auth
     # serialize_connector reads connector.zkt_device: load them in one query.
     statement = (
@@ -1504,8 +1530,11 @@ def list_devices(
             )
         )
     rows = db.scalars(statement).all()
+    if not state and not q:
+        # Every connector is loaded: refresh the remembered fleet for names.
+        device_names.remember_fleet(rows)
     healths = evaluate_health_batch(db, rows)
-    return {"rows": [serialize_connector(row, health=healths[row.id]) for row in rows]}
+    return {"rows": [serialize_connector(row, health=healths[row.id], view=view) for row in rows]}
 
 
 def connector_or_404(db: Session, connector_id: str) -> Connector:
@@ -1534,12 +1563,31 @@ def get_device(connector_id: str, auth: tuple[Session, AdminContext] = Depends(r
             ).order_by(TemporaryAdminLease.requested_at.desc()).limit(1)
         )
     health = evaluate_health(db, connector)
+    row = serialize_connector(connector)
+    status = row["public_status"] or {}
     return {
-        **serialize_connector(connector),
+        **row,
         "health": health_detail(db, connector, health),
         "active_command": command_response(active_command) if active_command else None,
-        "active_lease": serialize_lease(active_lease) if active_lease else None,
+        "active_lease": (
+            serialize_lease(active_lease, db.get(DeviceUser, active_lease.device_user_id))
+            if active_lease else None
+        ),
+        # Read-side figures for the device page; the /status answer's since
+        # and reason, so the page and /status never disagree.
+        "attendance_today": device_attendance_today(db, connector),
+        "status_since": status.get("since"),
+        "offline_reason": status.get("reason_code"),
     }
+
+
+def device_attendance_today(db: Session, connector: Connector) -> dict | None:
+    from zk_add.device_detail import attendance_today
+
+    try:
+        return attendance_today(db, connector, cached=_dashboard_cache_applies(db))
+    except dashboard_cache.DashboardCacheUnavailable:
+        return None
 
 
 @app.get("/api/v1/device-health/shadow")
@@ -2146,12 +2194,22 @@ def list_reconciliations(
     cursor: int | None = Query(default=None, ge=1),
     limit: int = Query(default=100, ge=1, le=500),
     include_archived: bool = False,
+    division: str | None = None,
     auth: tuple[Session, AdminContext] = Depends(require_admin),
 ):
     db, _context = auth
+    try:
+        chosen_division = connector_naming.parse_division(division)
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
     # Archived jobs leave the dashboard and its totals; their evidence stays
     # readable by job ID and by every check that uses it.
     visible = [] if include_archived else [ReconciliationJob.archived_at.is_(None)]
+    if chosen_division is not None:
+        # Life / Health narrows the rows and the totals alike.
+        visible.append(ReconciliationJob.connector_id.in_(
+            connector_naming.connector_ids_for_division(db, chosen_division)
+        ))
     clauses = [*visible]
     if connector_id:
         connector = connector_or_404(db, connector_id)
@@ -2170,6 +2228,7 @@ def list_reconciliations(
                 Connector.display_name.ilike(term),
                 Connector.zone_id.ilike(term),
                 Connector.hardware_id.ilike(term),
+                ReconciliationJob.terminal_serial.ilike(term),
             )
         )
     status_groups = {
@@ -2256,10 +2315,23 @@ def list_reconciliations(
             or 0
         ),
     }
+    row_connectors = {
+        connector.id: connector
+        for connector in db.scalars(
+            select(Connector).where(Connector.id.in_({row.connector_id for row in rows}))
+        ).all()
+    } if rows else {}
     return {
         "enabled": settings.reconciliation_enabled,
         "scheduler": reconciliation_scheduler_state(db),
-        "rows": [serialize_job(db, row) for row in rows],
+        "rows": [
+            {
+                **serialize_job(db, row),
+                **(connector_naming.naming(row_connectors[row.connector_id])
+                   if row.connector_id in row_connectors else {}),
+            }
+            for row in rows
+        ],
         "next_cursor": next_cursor,
         "filtered_total": int(filtered_total),
         "totals": totals,
@@ -2300,9 +2372,14 @@ def source_exceptions(
     corrected: bool | None = None,
     cursor: int | None = Query(default=None, ge=1),
     limit: int = Query(default=100, ge=1, le=500),
+    division: str | None = None,
     auth: tuple[Session, AdminContext] = Depends(require_admin),
 ):
     db, _context = auth
+    try:
+        chosen_division = connector_naming.parse_division(division)
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
     job = reconciliation_or_404(db, job_id) if job_id else None
     connector_pk = None
     if device_id:
@@ -2327,6 +2404,10 @@ def source_exceptions(
         corrected=corrected,
         cursor=cursor,
         limit=limit,
+        connector_ids=(
+            connector_naming.connector_ids_for_division(db, chosen_division)
+            if chosen_division is not None else None
+        ),
     )
     if job is not None:
         assurance = source_exception_assurance(db, job)
@@ -2345,6 +2426,8 @@ def source_exceptions(
                     "open",
                     "invalid_time",
                     "malformed",
+                    "identity_unresolved",
+                    "identity_unresolved_open",
                     "state",
                     "cohort_digest",
                     "correction_ids",
@@ -2934,8 +3017,19 @@ def list_device_users_v2(
     present: bool = True,
     limit: int = Query(default=200, ge=1, le=500),
     cursor: int | None = None,
+    sort: Literal["problems", "name", "employee_id", "newest"] | None = None,
+    offset: int = Query(default=0, ge=0),
+    shift_worker: bool | None = None,
+    changing: bool | None = None,
+    added_within_days: int | None = Query(default=None, ge=1, le=90),
     auth: tuple[Session, AdminContext] = Depends(require_admin),
 ):
+    """People on one machine.
+
+    Without sort the rows keep today's id order and cursor paging. With sort
+    they page by offset (next_offset). total counts everyone on the machine,
+    filtered_total the rows that match every filter.
+    """
     db, _context = auth
     connector = connector_or_404(db, connector_id)
     zkt = connector.zkt_device
@@ -2964,10 +3058,21 @@ def list_device_users_v2(
         statement = statement.where(DeviceUser.cnic_lookup_hash == cnic_lookup(normalized))
     if privilege is not None:
         statement = statement.where(DeviceUser.privilege == privilege)
+    if shift_worker is not None:
+        statement = statement.where(DeviceUser.shift_worker.is_(shift_worker))
+    if changing is not None:
+        statement = statement.where(
+            DeviceUser.current_command_id.is_not(None) if changing else DeviceUser.current_command_id.is_(None)
+        )
     rows = list(db.scalars(statement.order_by(DeviceUser.id.asc())).all())
     integrity, conflict_members, resolutions_by_user = device_user_identity_integrity(
         db, zkt=zkt
     )
+    first_read = people_read.first_list_read_at(db, zkt)
+    added_recently = people_read.added_since(first_read, people_read.ADDED_RECENTLY_DAYS)
+    if added_within_days is not None:
+        added = people_read.added_since(first_read, added_within_days)
+        rows = [row for row in rows if added(row)]
     if identity == "COMPLETE":
         rows = [
             row
@@ -2990,7 +3095,34 @@ def list_device_users_v2(
         ]
     elif identity == "RESOLVED_ALIAS":
         rows = [row for row in rows if row.id in resolutions_by_user]
-    next_cursor = rows[limit - 1].id if len(rows) > limit else None
+    elif identity in {"NO_CNIC", "TYPED_WRONG"}:
+        from zk_add.identity import suspect_cnic_name
+
+        typed_wrong = {
+            row.id for row in rows
+            if not row.cnic_lookup_hash and suspect_cnic_name(decrypt_text(row.machine_name_encrypted))
+        }
+        rows = [
+            row for row in rows
+            if not row.cnic_lookup_hash and ((row.id in typed_wrong) == (identity == "TYPED_WRONG"))
+        ]
+
+    def needs_fixing(row: DeviceUser) -> bool:
+        return not row.cnic_lookup_hash or (
+            row.identity_conflict_code is not None and row.id not in resolutions_by_user
+        )
+
+    filtered_total = len(rows)
+    next_cursor = None
+    next_offset = None
+    if sort is None:
+        page = rows[:limit]
+        next_cursor = rows[limit - 1].id if len(rows) > limit else None
+    else:
+        ordered = people_read.sort_users(rows, sort, needs_fixing=needs_fixing)
+        page = ordered[offset:offset + limit]
+        next_offset = offset + limit if len(ordered) > offset + limit else None
+    commands = people_read.command_ids(db, page)
     return {
         "rows": [
             serialize_user(
@@ -2998,13 +3130,73 @@ def list_device_users_v2(
                 zkt=zkt,
                 identity_conflict_members=conflict_members.get(row.id, []),
                 identity_resolution=resolutions_by_user.get(row.id),
+                added_recently=added_recently(row),
+                current_command_id=commands.get(row.current_command_id),
             )
-            for row in rows[:limit]
+            for row in page
         ],
         "next_cursor": next_cursor,
+        "next_offset": next_offset,
+        "total": integrity["total_users"] if present else filtered_total,
+        "filtered_total": filtered_total,
         "device": serialize_connector(connector),
         "identity_integrity": integrity,
     }
+
+
+PEOPLE_SUMMARY_KEY = "people_summary"
+
+
+@app.get("/api/v2/people/summary")
+def people_summary(auth: tuple[Session, AdminContext] = Depends(require_admin)):
+    """Per device: people, CNIC totals, admins and who has admin access. No CNICs."""
+    db, _context = auth
+    if not _dashboard_cache_applies(db):
+        return people_read.people_summary(db, device_user_identity_integrity)
+    db.commit()
+    try:
+        return dashboard_cache.get_or_compute(
+            PEOPLE_SUMMARY_KEY, 60, lambda: _compute_people_summary(), stale_s=300, wait_s=20
+        )
+    except dashboard_cache.DashboardCacheUnavailable as error:
+        raise HTTPException(
+            status_code=503, detail="People totals are being counted. Try again shortly.",
+            headers={"Retry-After": "5"},
+        ) from error
+
+
+def _compute_people_summary() -> dict:
+    session = SessionLocal()
+    try:
+        return people_read.people_summary(session, device_user_identity_integrity)
+    finally:
+        session.close()
+
+
+class PeopleSearchRequest(BaseModel):
+    """A name or Employee ID, or a 13-digit CNIC. Kept out of the URL on purpose."""
+
+    q: str = Field(min_length=2, max_length=100)
+
+
+@app.post("/api/v2/people/search")
+def search_people(
+    body: PeopleSearchRequest,
+    auth: tuple[Session, AdminContext] = Depends(require_admin_mutation),
+):
+    """Find a person on any device. A CNIC is matched by its lookup hash and never returned."""
+    db, _context = auth
+    text = body.q.strip()
+    digits = re.sub(r"[\s-]", "", text)
+    cnic_hash = None
+    if digits.isdigit() and len(digits) == 13:
+        try:
+            cnic_hash = cnic_lookup(normalize_cnic(digits))
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+    elif len(text) < 2:
+        raise HTTPException(status_code=422, detail="Type at least 2 letters or numbers.")
+    return {"rows": people_read.search_people(db, q=text, cnic_hash=cnic_hash), "limit": people_read.SEARCH_LIMIT}
 
 
 @app.post("/api/v2/devices/{connector_id}/users/validate-selection")
@@ -3659,7 +3851,7 @@ async def grant_admin_lease(
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     db.commit()
     await dispatch_command(connector, command)
-    return {"lease": serialize_lease(lease), "command": command_response(command)}
+    return {"lease": serialize_lease(lease, user), "command": command_response(command)}
 
 
 @app.post("/api/v1/admin-leases/{lease_id}/revoke", status_code=202)
@@ -3698,7 +3890,7 @@ async def revoke_admin_lease(
     lease.updated_at = utc_now()
     db.commit()
     await dispatch_command(connector, command)
-    return {"lease": serialize_lease(lease), "command": command_response(command)}
+    return {"lease": serialize_lease(lease, user), "command": command_response(command)}
 
 
 @app.post("/api/v1/devices/{connector_id}/restart", status_code=202)
@@ -4090,12 +4282,12 @@ def _identity_release_safety(
 
 @app.get("/api/v1/attendance")
 def attendance(
-    device_id: str | None = None,
+    device_id: list[str] = Query(default=[]),
     q: str | None = None,
     cnic: str | None = None,
     punch: str | None = None,
     source: str | None = None,
-    clock_quality: str | None = None,
+    clock_quality: list[str] = Query(default=[]),
     forced: bool = False,
     ords_status: list[str] = Query(default=[]),
     notify_status: list[str] = Query(default=[]),
@@ -4105,6 +4297,11 @@ def attendance(
     to_time: str | None = None,
     cursor: int | None = None,
     limit: int = Query(default=100, ge=1, le=500),
+    division: str | None = None,
+    delivery_group: list[str] = Query(default=[]),
+    source_group: Literal["live", "later"] | None = None,
+    to_exclusive: bool = False,
+    notify_summary: bool = True,
     auth: tuple[Session, AdminContext] = Depends(require_admin),
 ):
     db, _context = auth
@@ -4114,12 +4311,30 @@ def attendance(
     statement = select(AttendanceEvent, cnic_not_linked.label("cnic_not_linked"))
     if len(ords_status) > 30 or any(not value or len(value) > 40 for value in ords_status):
         raise HTTPException(status_code=422, detail="Select at most 30 valid Oracle delivery statuses.")
+    try:
+        groups = attendance_groups.parse_groups(delivery_group)
+        chosen_division = connector_naming.parse_division(division)
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
     if forced:
         from zk_add.models import AttendanceForceReleaseDecision
         statement = statement.where(AttendanceEvent.id.in_(select(AttendanceForceReleaseDecision.attendance_event_id)))
-    if device_id:
-        connector = connector_or_404(db, device_id)
-        statement = statement.where(AttendanceEvent.connector_id == connector.id)
+    device_ids = [value for value in device_id if value]
+    if len(device_ids) > 50:
+        raise HTTPException(status_code=422, detail="Choose 50 places or fewer.")
+    if device_ids:
+        # Repeated device_id values are OR-ed; one value keeps its old meaning.
+        statement = statement.where(AttendanceEvent.connector_id.in_(
+            [connector_or_404(db, value).id for value in dict.fromkeys(device_ids)]
+        ))
+    if chosen_division is not None:
+        statement = statement.where(AttendanceEvent.connector_id.in_(
+            connector_naming.connector_ids_for_division(db, chosen_division)
+        ))
+    if source_group == "live":
+        statement = statement.where(AttendanceEvent.source.in_(attendance_summary.LIVE_SOURCES))
+    elif source_group == "later":
+        statement = statement.where(AttendanceEvent.source.not_in(attendance_summary.LIVE_SOURCES))
     if cursor:
         statement = statement.where(AttendanceEvent.id < cursor)
     if q:
@@ -4165,16 +4380,29 @@ def attendance(
         if "CNIC_NOT_LINKED" in ords_status:
             selected_states.append(cnic_not_linked)
         statement = statement.where(or_(*selected_states))
+    if groups:
+        # The plain status groups narrow the list further (AND), so "Waiting"
+        # plus "No CNIC" means waiting check-ins that have no CNIC.
+        statement = statement.where(attendance_groups.group_condition(groups))
     if punch:
         statement = statement.where(AttendanceEvent.punch == punch)
     if source:
         statement = statement.where(AttendanceEvent.source == source)
-    if clock_quality:
-        statement = statement.where(AttendanceEvent.clock_quality == clock_quality)
+    clock_qualities = [value for value in clock_quality if value]
+    if len(clock_qualities) > 10:
+        raise HTTPException(status_code=422, detail="Select at most 10 clock states.")
+    if clock_qualities:
+        statement = statement.where(AttendanceEvent.clock_quality.in_(clock_qualities))
     if from_time:
         statement = statement.where(AttendanceEvent.device_event_time >= parse_datetime(from_time))
     if to_time:
-        statement = statement.where(AttendanceEvent.device_event_time <= parse_datetime(to_time))
+        upper = parse_datetime(to_time)
+        # to_exclusive=true is for whole-day windows ending at the next
+        # midnight; older callers keep the inclusive bound.
+        statement = statement.where(
+            AttendanceEvent.device_event_time < upper if to_exclusive
+            else AttendanceEvent.device_event_time <= upper
+        )
     results = db.execute(statement.order_by(AttendanceEvent.id.desc()).limit(limit + 1)).all()
     rows = [event for event, _cnic_not_linked in results]
     next_cursor = rows[limit - 1].id if len(rows) > limit else None
@@ -4208,11 +4436,70 @@ def attendance(
         ],
         "next_cursor": next_cursor,
         # A compact summary for the first page; older pages do not repeat it.
-        "checkin_notifications": None if cursor else checkin_notify.overview(db),
-        "status_options": db.scalars(
-            select(AttendanceEvent.ords_status).distinct().order_by(AttendanceEvent.ords_status).limit(100)
-        ).all() + ["CNIC_NOT_LINKED"],
+        # notify_summary=false (live list refreshes) skips it entirely.
+        "checkin_notifications": None if cursor or not notify_summary else checkin_notify.overview(db),
+        # A fixed list: no DISTINCT scan of the whole table on every refresh.
+        "status_options": [*attendance_groups.STATUS_OPTIONS, "CNIC_NOT_LINKED"],
     }
+
+
+@app.get("/api/v1/attendance/summary")
+def attendance_summary_totals(
+    from_time: str,
+    to_time: str | None = None,
+    division: str | None = None,
+    device_id: list[str] = Query(default=[]),
+    auth: tuple[Session, AdminContext] = Depends(require_admin),
+):
+    """Totals per plain status group for one window (Home and Attendance tiles).
+
+    ``to_time`` is exclusive. ``totals`` follow ``division`` and ``device_id``;
+    ``by_division`` always covers both divisions for the chosen places.
+    """
+    db, _context = auth
+    try:
+        chosen_division = connector_naming.parse_division(division)
+        lower = parse_datetime(from_time)
+        upper = parse_datetime(to_time) if to_time else None
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail={
+            "code": "INVALID_FILTER", "message": "Choose a valid date range and division."}) from error
+    device_ids = list(dict.fromkeys(value for value in device_id if value))
+    if len(device_ids) > 50:
+        raise HTTPException(status_code=422, detail={
+            "code": "TOO_MANY_PLACES", "message": "Choose 50 places or fewer."})
+    connector_ids = [connector_or_404(db, value).id for value in device_ids] or None
+    use_cache = _dashboard_cache_applies(db)
+    if use_cache:
+        # End the request's transaction before a possible wait on the cache.
+        db.commit()
+    try:
+        return attendance_summary.summary(
+            db, from_time=lower, to_time=upper, division=chosen_division,
+            connector_ids=connector_ids, use_cache=use_cache,
+            compute_session=SessionLocal if use_cache else None,
+        )
+    except attendance_summary.SummaryRangeError as error:
+        raise HTTPException(status_code=422, detail={"code": error.code, "message": error.message}) from error
+    except dashboard_cache.DashboardCacheUnavailable as error:
+        raise HTTPException(
+            status_code=503,
+            detail="Attendance totals are being refreshed. Try again shortly.",
+            headers={"Retry-After": "5"},
+        ) from error
+
+
+@app.get("/api/v1/attendance/{event_id}/journey")
+def attendance_journey(
+    event_id: int,
+    auth: tuple[Session, AdminContext] = Depends(require_admin),
+):
+    """One check-in's times from the machine to the HR system (no CNIC, no payload)."""
+    db, _context = auth
+    event = db.get(AttendanceEvent, event_id)
+    if event is None:
+        raise HTTPException(status_code=404, detail="Check-in not found.")
+    return attendance_summary.journey(db, event)
 
 
 @app.get("/api/v1/checkin-notifications")
@@ -4267,19 +4554,37 @@ def retry_checkin_notification(
 @app.get("/api/v1/devices/{connector_id}/logs")
 def logs(
     connector_id: str,
-    level: str | None = None,
+    level: list[str] | None = Query(default=None),
+    code: list[str] | None = Query(default=None),
+    since: datetime | None = None,
+    until: datetime | None = None,
     subsystem: str | None = None,
     cursor: int | None = None,
     limit: int = Query(default=200, ge=1, le=1000),
     auth: tuple[Session, AdminContext] = Depends(require_admin),
 ):
+    """The device's stored log rows, newest first.
+
+    level and code are repeatable (or comma separated); since/until bound
+    received_at (until is exclusive). Without them the answer is unchanged.
+    """
     db, _context = auth
     connector = connector_or_404(db, connector_id)
     statement = select(DeviceLog).where(DeviceLog.connector_id == connector.id)
     if cursor:
         statement = statement.where(DeviceLog.id < cursor)
-    if level:
-        statement = statement.where(DeviceLog.level == level.upper())
+    levels = _query_values(level, upper=True)
+    if levels:
+        statement = statement.where(
+            DeviceLog.level == levels[0] if len(levels) == 1 else DeviceLog.level.in_(levels)
+        )
+    codes = _query_values(code)
+    if codes:
+        statement = statement.where(DeviceLog.code.in_(codes))
+    if since is not None:
+        statement = statement.where(DeviceLog.received_at >= ensure_utc(since))
+    if until is not None:
+        statement = statement.where(DeviceLog.received_at < ensure_utc(until))
     if subsystem:
         statement = statement.where(DeviceLog.subsystem == subsystem)
     rows = db.scalars(statement.order_by(DeviceLog.id.desc()).limit(limit + 1)).all()
@@ -4287,6 +4592,49 @@ def logs(
         "rows": [serialize_log(row) for row in rows[:limit]],
         "next_cursor": rows[limit - 1].id if len(rows) > limit else None,
     }
+
+
+@app.get("/api/v1/devices/{connector_id}/activity")
+def device_activity(
+    connector_id: str,
+    show: Literal["all", "problems"] = "all",
+    topic: list[str] | None = Query(default=None),
+    since: datetime | None = None,
+    until: datetime | None = None,
+    before: str | None = Query(default=None, max_length=80),
+    after: int | None = Query(default=None, ge=0),
+    limit: int = Query(default=50, ge=1, le=100),
+    auth: tuple[Session, AdminContext] = Depends(require_admin),
+):
+    """The device's activity in plain words (device_activity), newest first.
+
+    since/until bound received_at (default: the last 24 hours); before is the
+    previous page's next_cursor; after returns only rows newer than a log id.
+    """
+    from zk_add.device_activity import ActivityCursorError, build_activity
+
+    db, _context = auth
+    connector = connector_or_404(db, connector_id)
+    try:
+        return build_activity(
+            db, connector, serialize_log=serialize_log, show=show, topics=_query_values(topic),
+            since=since, until=until, before=before, after=after, limit=limit,
+        )
+    except ActivityCursorError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+
+
+def _query_values(values: list[str] | None, *, upper: bool = False) -> list[str]:
+    """Repeatable query values, also accepting "a,b"; blanks dropped, order kept."""
+    result: list[str] = []
+    for value in values or []:
+        for part in value.split(","):
+            part = part.strip()
+            if part:
+                part = part.upper() if upper else part
+                if part not in result:
+                    result.append(part)
+    return result
 
 
 @app.get("/api/v1/devices/{connector_id}/connectivity")
@@ -4320,7 +4668,7 @@ def connectivity_history(
     }
 
 
-ALERT_QUEUE_PATTERN = "^(NEEDS_ACTION|ACKNOWLEDGED|ACTIVE|RESOLVED|ALL)$"
+ALERT_QUEUE_PATTERN = "^(NEEDS_ACTION|ACKNOWLEDGED|SEEN|LEGACY_SEEN|ACTIVE|RESOLVED|ALL)$"
 
 
 def alert_queue_filters(queue: str | None) -> list:
@@ -4338,6 +4686,11 @@ def alert_queue_filters(queue: str | None) -> list:
             and_(DeviceAlert.state == "OPEN", DeviceAlert.acknowledged_at.is_not(None)),
             DeviceAlert.state == "ACKNOWLEDGED",
         )]
+    if queue == "SEEN":
+        # Seen and still open; the legacy ACKNOWLEDGED rows are kept apart.
+        return alert_list.seen_filters()
+    if queue == "LEGACY_SEEN":
+        return alert_list.legacy_seen_filters()
     if queue == "ACTIVE":
         return [DeviceAlert.state.in_(["OPEN", "ACKNOWLEDGED"])]
     return [DeviceAlert.state == "RESOLVED"]
@@ -4358,7 +4711,11 @@ def alerts(
         .order_by(DeviceAlert.last_seen_at.desc(), DeviceAlert.id.desc())
         .limit(limit)
     ).all()
-    return {"rows": [serialize_alert(row) for row in rows]}
+    operators = alert_list.operators_for_page(db, [(row, connector) for row in rows])
+    return {"rows": [
+        {**serialize_alert(row), **({"operator": operators[row.id]} if row.id in operators else {})}
+        for row in rows
+    ]}
 
 
 @app.get("/api/v1/alerts")
@@ -4370,19 +4727,55 @@ def global_alerts(
     queue: str | None = Query(default=None, pattern=ALERT_QUEUE_PATTERN),
     limit: int = Query(default=100, ge=1, le=500),
     cursor: str | None = None,
+    division: str | None = None,
+    type: list[str] = Query(default=[]),
+    affects_attendance: bool = False,
+    q: str | None = Query(default=None, max_length=100),
+    from_time: str | None = None,
+    to_time: str | None = None,
+    order: Literal["serious", "newest", "oldest", "fixed_newest"] = "serious",
     auth: tuple[Session, AdminContext] = Depends(require_admin),
 ):
     db, _context = auth
+    try:
+        chosen_division = connector_naming.parse_division(division)
+        codes_of_type = alert_list.type_codes(alert_list.parse_list(type))
+        first_seen_window = alert_list.date_condition(DeviceAlert.first_seen_at, from_time, to_time)
+        resolved_window = alert_list.date_condition(DeviceAlert.resolved_at, from_time, to_time)
+    except (ValueError, alert_list.AlertFilterError) as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
     scope_filters = [Connector.is_spare.is_(False)]
     state_filter = alert_queue_filters(queue)
+    state_only: list = []
     if state:
-        state_filter.append(DeviceAlert.state == state.strip().upper())
-    if severity:
-        scope_filters.append(DeviceAlert.severity == severity.strip().upper())
+        state_only.append(DeviceAlert.state == state.strip().upper())
+        state_filter.append(state_only[0])
+    severity_filter: list = []
+    severities = alert_list.severity_values(severity)
+    if severities:
+        # One value keeps its old meaning; a comma list matches any of them.
+        severity_filter.append(
+            DeviceAlert.severity == severities[0] if len(severities) == 1
+            else DeviceAlert.severity.in_(severities)
+        )
     if connector_id:
         scope_filters.append(Connector.connector_id == connector_id)
     if zone_id:
         scope_filters.append(Connector.zone_id == zone_id)
+    # counts.by_division covers both divisions; counts() applies the division itself.
+    count_scope = [*scope_filters]
+    if chosen_division is not None:
+        scope_filters.append(Connector.id.in_(
+            connector_naming.connector_ids_for_division(db, chosen_division, include_spares=False)
+        ))
+    type_filter = [DeviceAlert.code.in_(codes_of_type)] if type else []
+    attention_filter = (
+        [DeviceAlert.code.in_(sorted(problem_words.AFFECTS_ATTENDANCE))] if affects_attendance else []
+    )
+    search_filter = [alert_list.search_condition(db, q)] if q and q.strip() else []
+    # Dates apply to when a problem started, or for the Fixed list when it was fixed.
+    page_window = resolved_window if queue == "RESOLVED" or order == "fixed_newest" else first_seen_window
+    scope_filters.extend([*severity_filter, *type_filter, *attention_filter, *search_filter])
     severity_order = case(
         (DeviceAlert.severity == "CRITICAL", 0),
         (DeviceAlert.severity == "HIGH", 1),
@@ -4391,8 +4784,18 @@ def global_alerts(
         (DeviceAlert.severity == "INFO", 4),
         else_=5,
     )
-    page_filters = [*scope_filters, *state_filter]
-    if cursor:
+    page_filters = [*scope_filters, *state_filter, *page_window]
+    if order != "serious":
+        if order == "fixed_newest":
+            page_filters.append(DeviceAlert.resolved_at.is_not(None))
+        if cursor:
+            try:
+                page_filters.append(alert_list.time_page_filter(order, cursor))
+            except alert_list.AlertFilterError as error:
+                raise HTTPException(status_code=422, detail=str(error)) from error
+        column, descending = alert_list.time_order(order)
+        ordering = (column.desc(), DeviceAlert.id.desc()) if descending else (column.asc(), DeviceAlert.id.asc())
+    elif cursor:
         try:
             raw = base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4))
             cursor_payload = json.loads(raw)
@@ -4412,11 +4815,13 @@ def global_alerts(
                 ),
             )
         )
+    if order == "serious":
+        ordering = (severity_order.asc(), DeviceAlert.last_seen_at.desc(), DeviceAlert.id.desc())
     rows = db.execute(
         select(DeviceAlert, Connector)
         .join(Connector, Connector.id == DeviceAlert.connector_id)
         .where(*page_filters)
-        .order_by(severity_order.asc(), DeviceAlert.last_seen_at.desc(), DeviceAlert.id.desc())
+        .order_by(*ordering)
         .limit(limit + 1)
     ).all()
     page = rows[:limit]
@@ -4435,7 +4840,9 @@ def global_alerts(
         return count_where([DeviceAlert.state == alert_state] if alert_state else [])
 
     next_cursor = None
-    if len(rows) > limit and page:
+    if len(rows) > limit and page and order != "serious":
+        next_cursor = alert_list.time_next_cursor(order, page[-1][0])
+    elif len(rows) > limit and page:
         last_row = page[-1][0]
         rank = {"CRITICAL": 0, "HIGH": 1, "WARNING": 2, "MEDIUM": 3, "INFO": 4}.get(
             last_row.severity,
@@ -4452,15 +4859,18 @@ def global_alerts(
             ).encode()
         ).rstrip(b"=").decode()
 
+    operators = alert_list.operators_for_page(db, list(page))
     return {
         "rows": [
             {
                 **serialize_alert(row),
+                **({"operator": operators[row.id]} if row.id in operators else {}),
                 "device": {
                     "connector_id": connector.connector_id,
                     "display_name": connector.display_name,
                     "zone_id": connector.zone_id,
                     "hardware_id": connector.hardware_id,
+                    **alert_list.device_fields(connector),
                 },
             }
             for row, connector in page
@@ -4478,6 +4888,18 @@ def global_alerts(
             "resolved": count_where(alert_queue_filters("RESOLVED")),
             "all": count_for(),
         },
+        # Tab and chip counts; each ignores only the filter it counts.
+        "counts": alert_list.counts(
+            db,
+            base={
+                "scope": count_scope, "severity": severity_filter, "type": type_filter,
+                "attention": attention_filter, "search": search_filter, "state": state_only,
+            },
+            division=chosen_division,
+            first_seen_window=first_seen_window,
+            resolved_window=resolved_window,
+            page_window=[*state_filter, *page_window],
+        ),
     }
 
 
@@ -4984,6 +5406,11 @@ async def device_logs(
     return response
 
 
+def log_event(connector: Connector, level: str | None, code: str | None) -> dict:
+    """The browser "log" event: which device, how serious, which code. No text."""
+    return {"connector_id": connector.connector_id, "level": level, "code": code}
+
+
 def persist_device_logs(
     body: LogBatchRequest,
     auth: tuple[Session, Connector],
@@ -4993,14 +5420,9 @@ def persist_device_logs(
     count = ingest_logs(db, connector=connector, logs=body.logs)
     db.commit()
     for item in body.logs[-min(count, 50):]:
-        events.append(("log", {
-                "connector_id": connector.connector_id,
-                "level": item.level,
-                "subsystem": item.subsystem,
-                "code": item.code,
-                "message": item.message,
-                "device_time": item.device_time,
-            }))
+        # Browsers only learn that a device logged something; they read the
+        # stored, redacted row through /logs or /activity.
+        events.append(("log", log_event(connector, item.level, item.code)))
     response = {"ok": True, "accepted": count}
 
     return response, events
@@ -5575,7 +5997,8 @@ def persist_envelope(connector_pk: int, envelope: Envelope) -> EnvelopeOutcome |
                 device_time=envelope.sent_at,
             )
             ingest_logs(db, connector=connector, logs=[log])
-            event_payload = {"connector_id": connector.connector_id, **envelope.payload}
+            # Never republish the device's unredacted message or context.
+            event_payload = log_event(connector, log.level, log.code)
         elif envelope.type == "user_snapshot":
             snapshot = UserSnapshotRequest.model_validate(envelope.payload)
             count = replace_user_snapshot(db, connector=connector, snapshot=snapshot)
@@ -6131,6 +6554,10 @@ def device_user_identity_integrity(
             "resolved_duplicate_groups": len(duplicate_groups) - len(unresolved_groups),
             "unresolved_duplicate_groups": len(unresolved_groups),
             "unresolved_duplicate_users": sum(len(group) for group in unresolved_groups),
+            "admins": sum(user.privilege == people_read.ADMIN_PRIVILEGE for user in active),
+            "added_recently": sum(map(people_read.added_since(
+                people_read.first_list_read_at(db, zkt), people_read.ADDED_RECENTLY_DAYS), active)),
+            "shift_workers": sum(bool(user.shift_worker) for user in active),
         },
         conflict_members,
         resolutions_by_user,
@@ -6143,7 +6570,11 @@ def serialize_user(
     zkt: ZKTDevice | None = None,
     identity_conflict_members: list[dict[str, str]] | None = None,
     identity_resolution: IdentityConflictResolution | None = None,
+    added_recently: bool = False,
+    current_command_id: str | None = None,
 ) -> dict:
+    """One person on a machine. added_recently and current_command_id are
+    filled by the People list (people_read); other callers leave them unset."""
     from zk_add.service import user_profile_is_writable
 
     from zk_add.identity import suspect_cnic_name
@@ -6187,6 +6618,12 @@ def serialize_user(
         "suggested_display_name": suspect.display_name if suspect and suspect.display_name else None,
         # The unparsed name's "-S" marker; the edit dialog keeps it as the flag.
         "suggested_shift_worker": bool(suspect and suspect.shift_worker),
+        "created_at": row.created_at,
+        "added_recently": added_recently,
+        "current_command_id": current_command_id,
+        "looks_damaged": people_read.looks_damaged(
+            row, hikvision=bool(zkt and zkt.connector and zkt.connector.firmware_family == "hikvision")
+        ),
     }
 
 
@@ -6242,6 +6679,8 @@ def serialize_attendance(
             "display_name": source_connector.display_name,
             "zone_id": source_connector.zone_id,
             "zone_name": source_connector.zone_name,
+            # Plain place name and Life/Health tag, so the page never parses codes.
+            **connector_naming.naming(source_connector),
         } if source_connector is not None and source_connector.id == row.connector_id else None,
         "terminal_provenance": {
             "state": provenance_state,
@@ -6264,6 +6703,8 @@ def serialize_attendance(
         "clock_quality": row.clock_quality,
         "clock_drift_seconds": row.clock_drift_seconds,
         "ords_status": row.ords_status,
+        # One of sent / waiting / not_matched / set_aside / problem (read side only).
+        "delivery_group": attendance_groups.delivery_group(row.ords_status),
         "oracle_confirmed_at": row.oracle_confirmed_at,
         "oracle_confirmation_path": row.oracle_confirmation_path,
         "identity_resolution_id": row.identity_resolution_id,
@@ -6319,13 +6760,18 @@ def serialize_alert(row: DeviceAlert) -> dict:
         "acknowledged_by": (row.details or {}).get("acknowledged_by"),
         "resolved_at": row.resolved_at,
         "resolution": (row.details or {}).get("resolution"),
+        # Plain words, type and attendance flag (the stored message stays above).
+        **problem_words.alert_fields(row.code, row.details, severity=row.severity, message=row.message),
     }
 
 
-def serialize_lease(row: TemporaryAdminLease | None) -> dict | None:
+def serialize_lease(row: TemporaryAdminLease | None, user: DeviceUser | None = None) -> dict | None:
+    """A temporary admin access; with ``user``, who it was given to (no CNIC)."""
     if row is None:
         return None
     return {
+        "user_id": user.user_id if user is not None else None,
+        "user_display_name": user.display_name if user is not None else None,
         "lease_id": row.lease_id,
         "state": row.state,
         "requested_at": row.requested_at,
@@ -6849,10 +7295,14 @@ def list_firmware_releases(
     # "current" hides superseded releases from the view; it never changes a
     # release's state. "all" stays the default for existing scripts.
     scope: _Literal["current", "all"] = "all",
+    family: _Literal["zkt", "hikvision"] | None = None,
     auth: tuple[Session, AdminContext] = Depends(require_admin),
 ):
     db, _ = auth
-    result = _release_page(db, query=q, state=state, cursor=cursor, limit=limit, scope=scope)
+    result = _release_page(
+        db, query=q, state=state, cursor=cursor, limit=limit, scope=scope,
+        release_ids=firmware_list.release_ids_for_family(db, family) if family else None,
+    )
     return {
         **result,
         "enabled": settings.firmware_ota_enabled,
@@ -6870,9 +7320,33 @@ def list_firmware_campaigns(
     cursor: int | None = Query(default=None, ge=1),
     limit: int | None = Query(default=None, ge=1, le=200),
     include_archived: bool = False,
+    division: str | None = None,
+    attention: bool = False,
+    waiting: bool = False,
+    created_from: str | None = None,
+    created_to: str | None = None,
+    sort: _Literal["newest", "attention"] = "newest",
     auth: tuple[Session, AdminContext] = Depends(require_admin),
 ):
     db, _ = auth
+    try:
+        chosen_division = connector_naming.parse_division(division)
+        created = firmware_list.created_window(
+            parse_datetime(created_from) if created_from else None,
+            parse_datetime(created_to) if created_to else None,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    scope_clauses = []
+    if chosen_division is not None:
+        scope_clauses.append(_FirmwareCampaign.zone_id.in_(
+            connector_naming.zone_ids_for_division(db, chosen_division)
+        ))
+    extra_clauses = [*created]
+    if attention:
+        extra_clauses.append(firmware_list.attention_condition())
+    if waiting:
+        extra_clauses.append(firmware_list.waiting_condition())
     result = _campaign_page(
         db,
         query=q,
@@ -6883,7 +7357,13 @@ def list_firmware_campaigns(
         limit=limit,
         include_deployments=view == "full",
         include_archived=include_archived,
+        scope_clauses=tuple(scope_clauses),
+        extra_clauses=tuple(extra_clauses),
+        extra_search=(firmware_list.zone_name_search,),
+        # With sort=attention the cursor is a row offset (next_cursor gives it).
+        order_by=firmware_list.attention_order() if sort == "attention" else None,
     )
+    result["rows"] = firmware_list.decorate_rows(db, result["rows"])
     return {
         **result,
         "enabled": settings.firmware_ota_enabled,

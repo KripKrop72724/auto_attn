@@ -1,0 +1,1916 @@
+{
+  "generated_by": "scripts/export_word_codes.py",
+  "note": "Generated file. Run `python scripts/export_word_codes.py` after adding a code, then add its words.",
+  "domains": {
+    "device": {
+      "description": "Device status (Connector.lifecycle_state)",
+      "backend": [
+        "DEGRADED",
+        "FLAPPING",
+        "OFFLINE",
+        "ONBOARDING",
+        "ONLINE",
+        "ONLINE_WITH_WARNINGS",
+        "QUARANTINED_DUPLICATE_SERIAL"
+      ],
+      "firmware": []
+    },
+    "tier": {
+      "description": "Health tier of one reason",
+      "backend": [
+        "DEGRADED",
+        "WARNING"
+      ],
+      "firmware": []
+    },
+    "machineLink": {
+      "description": "Machine connection state (terminal_link.state)",
+      "backend": [
+        "CONNECTED",
+        "DISCONNECTED",
+        "ERROR",
+        "FLAPPING",
+        "MAINTENANCE",
+        "RECONNECTING",
+        "STABILIZING",
+        "STARTING",
+        "UNKNOWN"
+      ],
+      "firmware": []
+    },
+    "machineLinkReason": {
+      "description": "Machine connection reason (terminal_link.reason)",
+      "backend": [
+        "ESP_DISCONNECTED",
+        "FLAPPING",
+        "HIK_AUTH",
+        "HIK_CONFIGURATION",
+        "HIK_HTTP_STATUS",
+        "HIK_INVALID_RESPONSE",
+        "HIK_LIVE_CAPTURE",
+        "HIK_NETWORK",
+        "HIK_OVERSIZED",
+        "HIK_SOURCE_CHANGED",
+        "HIK_STORAGE",
+        "HIK_WAITING",
+        "LINK_UP",
+        "MAINTENANCE_OVERRAN",
+        "NO_TERMINAL",
+        "STABILIZING",
+        "STABILIZING_STALLED"
+      ],
+      "firmware": []
+    },
+    "machineRaw": {
+      "description": "Machine connection history state (connection_state)",
+      "backend": [],
+      "firmware": [
+        "BOOTING",
+        "CONNECTING",
+        "DISCOVERING",
+        "FLAPPING",
+        "ONLINE",
+        "RECOVERING",
+        "RESTARTING",
+        "RETRY_WAIT",
+        "SESSION_REFRESH",
+        "SUSPECT"
+      ]
+    },
+    "activity": {
+      "description": "What the device is doing now (current_activity)",
+      "backend": [],
+      "firmware": [
+        "APPLYING_CONFIG",
+        "BOOTING",
+        "CONNECTING",
+        "DISCOVERING",
+        "FLAPPING",
+        "FULL_RECONCILE",
+        "HIKVISION_POLL_2S",
+        "HISTORICAL_RECONCILE",
+        "LIGHT_RECONCILE",
+        "LIVE_CAPTURE",
+        "ONLINE",
+        "OTA_RESTART",
+        "PROCESSING_COMMAND",
+        "RECOVERING",
+        "RESTARTING",
+        "RETRY_WAIT",
+        "SESSION_REFRESH",
+        "SUSPECT"
+      ]
+    },
+    "problem": {
+      "description": "Problem kinds (POLICY codes)",
+      "backend": [
+        "ADD_MESSAGE_PROCESSING_FAILED",
+        "ADD_SOURCE_COVERAGE_INVALIDATED",
+        "ADD_SOURCE_COVERAGE_UNVERIFIED",
+        "ADD_SOURCE_GENERATION_LINEAGE_DIVERGED",
+        "ADD_SOURCE_TAIL_STALE_GENERATION",
+        "ADMIN_REVOKE_OVERDUE",
+        "ATTENDANCE_EVENT_QUARANTINED",
+        "ATTENDANCE_REPAIR_NEEDS_ATTENTION",
+        "ATTENDANCE_REPAIR_STALLED",
+        "ATTENDANCE_TIMESTAMP_QUARANTINED",
+        "CHECKIN_NOTIFY_DEGRADED",
+        "DELIVERY_AUTHORITY_UNKNOWN",
+        "DEVICE_MESSAGE_REJECTED",
+        "DUPLICATE_USER_CNIC",
+        "ESP_CLOCK_SKEW",
+        "ESP_DELIVERY_WORKER_FAULT",
+        "ESP_DURABILITY_FAULT",
+        "ESP_FATAL",
+        "ESP_LOCAL_FAILURE",
+        "ESP_OFFLINE",
+        "ESP_PRESERVATION_UNVERIFIED",
+        "ESP_RESTART_LOOP",
+        "HEARTBEAT_STALE",
+        "HIK_CAPTURE_UNHEALTHY",
+        "HIK_CLOCK_DRIFT",
+        "HIK_LIGHT_RECONCILE_BLOCKED",
+        "HISTORY_BACKFILL_BLOCKED",
+        "ORACLE_RECEIPT_CONNECTOR_MISMATCH",
+        "ORDS_DELIVERY_FAILED",
+        "ORDS_EVENT_REJECTED",
+        "OTA_DEVICE_REPORTED_FAILURE",
+        "OTA_DEVICE_ROLLED_BACK",
+        "QUARANTINED_DUPLICATE_SERIAL",
+        "TERMINAL_DISCONNECTED",
+        "TERMINAL_LINK_DOWN",
+        "TERMINAL_NEWEST_RECORD_CHANGED",
+        "TERMINAL_NEWEST_RECORD_CORRECTED",
+        "TERMINAL_NEWEST_RECORD_PUNCH_UNRECEIVED",
+        "TERMINAL_NEWEST_RECORD_RELEASE_HELD",
+        "TERMINAL_SOURCE_EXCEPTION",
+        "TERMINAL_STABILIZING_STALLED",
+        "USER_CNIC_FORMAT_SUSPECT",
+        "USER_DELETION_JOB_INCOMPLETE",
+        "USER_SNAPSHOT_TRUNCATED",
+        "ZKT_CLOCK_DRIFT",
+        "ZKT_CONNECTION_FLAPPING",
+        "ZKT_SERIAL_MISMATCH"
+      ],
+      "firmware": []
+    },
+    "severity": {
+      "description": "How urgent a problem is",
+      "backend": [
+        "CRITICAL",
+        "HIGH",
+        "INFO",
+        "MEDIUM",
+        "WARNING"
+      ],
+      "firmware": []
+    },
+    "refusal": {
+      "description": "Why a problem can't be marked as fixed by hand",
+      "backend": [
+        "ALERT_CONDITION_CURRENT",
+        "ALERT_WORKFLOW_OWNED",
+        "DERIVED_REASON"
+      ],
+      "firmware": []
+    },
+    "delivery": {
+      "description": "Sending a check-in to the HR system (ords_status)",
+      "backend": [
+        "ACKED",
+        "ACKED_CHECK",
+        "ACKED_FIRMWARE",
+        "BLOCKED_IDENTITY",
+        "FAILED_RETRYABLE",
+        "FIRMWARE_RECEIPT_UNVERIFIED",
+        "FIRMWARE_RECEIPT_VERIFYING",
+        "IN_FLIGHT",
+        "MEMBERSHIP_REVERIFYING",
+        "MEMBERSHIP_REVERIFY_RETRY",
+        "PENDING",
+        "QUARANTINED_IDENTITY_CONFLICT",
+        "QUARANTINED_IDENTITY_REUSE",
+        "QUARANTINED_INVALID_DEVICE_TIME",
+        "QUARANTINED_INVALID_EVENT_UID",
+        "QUARANTINED_MISSING_TERMINAL_PROVENANCE",
+        "QUARANTINED_ORDS_REJECTED",
+        "RETRYING"
+      ],
+      "firmware": []
+    },
+    "identity": {
+      "description": "Matching a check-in to an employee",
+      "backend": [
+        "BLOCKED_CONFLICT",
+        "BLOCKED_IDENTITY",
+        "BLOCKED_INVALID_EVENT_UID",
+        "BLOCKED_MALFORMED_IDENTITY",
+        "BLOCKED_PROVENANCE",
+        "BLOCKED_SOURCE_CONFLICT",
+        "MANUALLY_APPROVED_CURRENT_TERMINAL",
+        "QUARANTINED_REUSE",
+        "RESOLVED",
+        "RESOLVED_ATTENDANCE_REPAIR",
+        "RESOLVED_CURRENT_IDENTITY_EVIDENCE",
+        "RESOLVED_CURRENT_SNAPSHOT",
+        "RESOLVED_DIRECTORY_EVENT_GROUP",
+        "RESOLVED_DIRECTORY_EVIDENCE",
+        "RESOLVED_HIKVISION_NAME",
+        "RESOLVED_HISTORICAL_ALIAS",
+        "RESOLVED_RETAINED_IDENTITY",
+        "RESOLVED_SYNCED_CNIC",
+        "RESOLVED_TOMBSTONE",
+        "WAITING_FOR_SNAPSHOT"
+      ],
+      "firmware": []
+    },
+    "requestType": {
+      "description": "Request sent to a device (command_type)",
+      "backend": [
+        "APPLY_CONFIG",
+        "CREATE_USER",
+        "DELETE_USER",
+        "ESP_REBOOT",
+        "GRANT_TEMP_ADMIN",
+        "PIN_TERMINAL_SERIAL",
+        "REFRESH_USERS",
+        "RESTART_ZKT",
+        "REVOKE_TEMP_ADMIN",
+        "UPDATE_USER"
+      ],
+      "firmware": []
+    },
+    "request": {
+      "description": "Request status (command status)",
+      "backend": [
+        "ACKNOWLEDGED",
+        "CANCELLED",
+        "CANCEL_REQUESTED",
+        "DISPATCHED",
+        "EXPIRED",
+        "FAILED",
+        "QUEUED",
+        "RETRYING",
+        "RUNNING",
+        "SUCCEEDED",
+        "WAITING_FOR_DEVICE",
+        "WAITING_FOR_ZKT"
+      ],
+      "firmware": []
+    },
+    "requestFailure": {
+      "description": "Why a request failed (command error_code)",
+      "backend": [],
+      "firmware": [
+        "ACTIVE_ADMIN_LEASE",
+        "ADD_SNAPSHOT_SEND_FAILED",
+        "ADMIN_LEASE_IDENTITY_REQUIRED",
+        "ADMIN_LEASE_REVOCATION_REQUIRED",
+        "COMMAND_EXECUTOR_BUSY",
+        "COMMAND_EXPIRED",
+        "COMMAND_RECEIPT_PERSIST_FAILED",
+        "COMMAND_RECEIPT_READ_FAILED",
+        "COMMAND_UNSUPPORTED",
+        "COMM_KEY_CANDIDATE_AUTH_FAILED",
+        "COMM_KEY_ENVELOPE_INVALID",
+        "COMM_KEY_PERSIST_FAILED",
+        "COMM_KEY_REVISION_CONFLICT",
+        "COMM_KEY_SERIAL_PIN_FAILED",
+        "COMM_KEY_TERMINAL_SERIAL_MISMATCH",
+        "COMM_KEY_TERMINAL_WRITE_UNSUPPORTED",
+        "ESP_REBOOT_NOT_SAFE",
+        "ESP_REBOOT_SCOPE_OR_DEADLINE",
+        "ESP_REBOOT_UNSUPPORTED",
+        "HIK_COMMAND_UNAVAILABLE",
+        "HIK_PROFILE_PRECONDITION_FAILED",
+        "HIK_PROFILE_REFRESH_PENDING",
+        "HIK_PROFILE_VERIFICATION_PENDING",
+        "IDENTITY_TOMBSTONE_PERSIST_FAILED",
+        "IDENTITY_TOMBSTONE_REQUIRED",
+        "LEASE_CHECKPOINT_FAILED",
+        "LEASE_EVIDENCE_REQUIRED",
+        "LEGACY_USER_RECORD_READ_ONLY",
+        "REBOOT_INBOX_NOT_DURABLE",
+        "STORAGE_RECOVERY_ACTIVE",
+        "STORAGE_UPGRADE_NOT_CHECKED",
+        "TRUSTED_TIME_UNAVAILABLE",
+        "USER_IDENTIFIER_CONFLICT",
+        "USER_NOT_FOUND",
+        "USER_PRECONDITION_FAILED",
+        "USER_SNAPSHOT_TRUNCATED",
+        "ZKT_RESTART_FAILED",
+        "ZKT_SERIAL_PERSIST_FAILED",
+        "ZKT_SERIAL_PRECONDITION_FAILED",
+        "ZKT_USER_CREATE_FAILED",
+        "ZKT_USER_DELETE_VERIFY_FAILED",
+        "ZKT_USER_POSTCONDITION_FAILED",
+        "ZKT_USER_READ_FAILED",
+        "ZKT_USER_REREAD_FAILED",
+        "ZKT_USER_WRITE_FAILED"
+      ]
+    },
+    "peopleRemoval": {
+      "description": "Removing several people (deletion job status)",
+      "backend": [
+        "CANCEL_REQUESTED",
+        "QUEUED",
+        "RUNNING"
+      ],
+      "firmware": []
+    },
+    "writesOff": {
+      "description": "Why adding or changing people is off (writes_disabled_reason)",
+      "backend": [
+        "DUPLICATE_SERIAL",
+        "FULL_USER_SNAPSHOT_REQUIRED",
+        "HIKVISION_WRITE_QUALIFICATION_PENDING",
+        "LEGACY_28_BYTE_RECORD",
+        "SERIAL_MISMATCH",
+        "STABILITY_CERTIFICATION_PENDING",
+        "TERMINAL_SERIAL_CONFIRMATION_REQUIRED",
+        "TERMINAL_SERIAL_PIN_FAILED",
+        "USER_SNAPSHOT_TRUNCATED"
+      ],
+      "firmware": []
+    },
+    "lease": {
+      "description": "Temporary admin access state",
+      "backend": [
+        "ACTIVE",
+        "FAILED",
+        "GRANTING",
+        "OVERDUE",
+        "REQUESTED",
+        "REVOKED",
+        "REVOKING"
+      ],
+      "firmware": []
+    },
+    "commKey": {
+      "description": "Machine password (COMM Key) state",
+      "backend": [
+        "APPLIED",
+        "EXPIRED",
+        "RECONCILIATION_REQUIRED",
+        "UNKNOWN"
+      ],
+      "firmware": []
+    },
+    "commKeyError": {
+      "description": "Why a machine password change failed",
+      "backend": [
+        "COMM_KEY_OPERATION_EXPIRED",
+        "COMM_KEY_REVISION_DRIFT"
+      ],
+      "firmware": [
+        "AUTH_NOT_REQUIRED",
+        "AUTH_NO_RESPONSE",
+        "AUTH_REJECTED",
+        "COMM_KEY_CANDIDATE_AUTH_FAILED",
+        "COMM_KEY_DIAGNOSTIC_VERIFIED_NO_COMMIT",
+        "COMM_KEY_ENVELOPE_INVALID",
+        "COMM_KEY_PERSIST_FAILED",
+        "COMM_KEY_REVISION_CONFLICT",
+        "COMM_KEY_SERIAL_PIN_FAILED",
+        "COMM_KEY_TERMINAL_SERIAL_MISMATCH",
+        "COMM_KEY_TERMINAL_WRITE_UNSUPPORTED",
+        "CONNECT_NO_RESPONSE",
+        "CONNECT_REJECTED",
+        "SERIAL_EMPTY",
+        "SERIAL_MISMATCH",
+        "SERIAL_READ_FAILED",
+        "TCP_4370_UNREACHABLE"
+      ]
+    },
+    "softwareDevice": {
+      "description": "Device update state (ota_state)",
+      "backend": [
+        "OTA_BLOCKED",
+        "OTA_READY",
+        "ROLLBACK_REQUIRED",
+        "UPDATING"
+      ],
+      "firmware": []
+    },
+    "update": {
+      "description": "Update to one device (deployment status)",
+      "backend": [
+        "BOOTED_PENDING",
+        "CANCELLED",
+        "DOWNLOADING",
+        "FAILED",
+        "OFFERED",
+        "PENDING",
+        "READY_TO_BOOT",
+        "RECONCILING",
+        "RELEASE_REVOKED",
+        "ROLLED_BACK",
+        "SUCCEEDED",
+        "SUPERSEDED",
+        "VERIFYING"
+      ],
+      "firmware": []
+    },
+    "updateEvent": {
+      "description": "Update timeline event (FirmwareEvent.state)",
+      "backend": [
+        "BRIDGE_FAILED",
+        "BRIDGE_INCOMPLETE",
+        "BRIDGE_READY",
+        "DOWNLOAD_INTERRUPTED",
+        "DOWNLOAD_RETRIES_EXHAUSTED",
+        "DOWNLOAD_RETRY_NOT_TAKEN",
+        "DOWNLOAD_RETRY_OFFERED",
+        "DOWNLOAD_RETRY_WITHDRAWN",
+        "HIL_INCOMPLETE",
+        "OFFERED",
+        "RETRY_REQUESTED",
+        "STABILITY_WARNINGS_OVERRIDDEN"
+      ],
+      "firmware": []
+    },
+    "rollout": {
+      "description": "Update rollout state (campaign status)",
+      "backend": [
+        "ACTIVE",
+        "CANCELLED",
+        "COMPLETED",
+        "PAUSED"
+      ],
+      "firmware": []
+    },
+    "updateCode": {
+      "description": "Codes the link box reports during an update",
+      "backend": [
+        "BOOT_LOCAL_JOURNAL_RECOVERY",
+        "BOOT_LOCAL_LEGACY_WORKERS",
+        "BOOT_LOCAL_STORAGE_UNVERIFIED",
+        "BOOT_LOCAL_STORAGE_UPGRADE",
+        "BOOT_LOCAL_TELEMETRY_LOCK",
+        "BOOT_LOCAL_TERMINAL_COUNTS",
+        "BOOT_LOCAL_TERMINAL_SESSION",
+        "DOWNLOAD_BEGIN_FAILED",
+        "DOWNLOAD_OR_SIGNATURE_FAILED",
+        "IMAGE_DESCRIPTOR_MISMATCH",
+        "IMAGE_HASH_MISMATCH",
+        "IMAGE_TOO_LARGE",
+        "PARTITION_HASH_FAILED",
+        "STORAGE_REDO_FLOOR",
+        "STORAGE_REPAIR_EXCEPTION"
+      ],
+      "firmware": [
+        "BOOTLOADER_ROLLBACK",
+        "BOOT_CONFIRM_CAP",
+        "BOOT_HEALTH_TIMEOUT",
+        "BOOT_LOCAL_IMAGE_UNSUPPORTED",
+        "BOOT_LOCAL_MARK_VALID_FAILED",
+        "BOOT_LOCAL_UNSUPPORTED_FAMILY",
+        "BOOT_ROLLBACK_PREDECESSOR_UNQUALIFIED",
+        "BOOT_ROLLBACK_READER_RECOVERY",
+        "BOOT_ROLLBACK_SELECTION_HELD",
+        "BOOT_ROLLBACK_SELECTION_PENDING",
+        "BOOT_ROLLBACK_SELECTION_UNAVAILABLE",
+        "BOOT_ROLLBACK_SESSION_CLEANUP",
+        "BOOT_ROLLBACK_STORAGE_DRAIN",
+        "BOOT_ROLLBACK_WRITER_IDENTITY",
+        "DOWNLOAD_INCOMPLETE",
+        "FACTORY_TRIAL_CHECKPOINT_BINDING",
+        "FACTORY_TRIAL_CHECKPOINT_INVALID",
+        "FACTORY_TRIAL_EXACT_TARGET_REQUIRED",
+        "FACTORY_TRIAL_FACTORY_NOT_VERIFIED",
+        "FACTORY_TRIAL_FACTORY_SELECTED",
+        "FACTORY_TRIAL_FALLBACK_CHANGED",
+        "FACTORY_TRIAL_FALLBACK_NOT_AUTHORIZED",
+        "FACTORY_TRIAL_INTENT_UNCERTAIN",
+        "FACTORY_TRIAL_JOURNAL_EVIDENCE_PRESENT",
+        "FACTORY_TRIAL_NOT_OBSERVED",
+        "FACTORY_TRIAL_PREDECESSOR_OR_AUTHORITY",
+        "FACTORY_TRIAL_PROOF_COMMIT_UNCERTAIN",
+        "FACTORY_TRIAL_RETAINED_ATTEMPT_REQUIRES_REVIEW",
+        "FACTORY_TRIAL_REVOCATION_HELD",
+        "FACTORY_TRIAL_REVOCATION_UNCERTAIN",
+        "FACTORY_TRIAL_SECURITY_OR_IDENTITY",
+        "FACTORY_TRIAL_SELECTION_UNCERTAIN",
+        "FACTORY_TRIAL_SESSION_CLEANUP",
+        "FACTORY_TRIAL_STORAGE_DRAIN",
+        "FACTORY_TRIAL_STORAGE_NOT_CHECKED",
+        "FACTORY_TRIAL_STORAGE_UNAVAILABLE",
+        "IMAGE_LENGTH_MISMATCH",
+        "IMAGE_SIZE_ALIGNMENT",
+        "JOURNAL_BRIDGE_CAPTURE_DISABLED",
+        "JOURNAL_OTA_TARGET_UNSUPPORTED",
+        "JOURNAL_READER_ANTI_ROLLBACK_UNQUALIFIED",
+        "JOURNAL_READER_BINDING_MISMATCH",
+        "JOURNAL_READER_BOOT_IMAGE_MISMATCH",
+        "JOURNAL_READER_COMMIT_UNCERTAIN",
+        "JOURNAL_READER_GENERATION_EXHAUSTED",
+        "JOURNAL_READER_INPUT_INVALID",
+        "JOURNAL_READER_INTENT_IMAGE_MISMATCH",
+        "JOURNAL_READER_INTENT_INVALID",
+        "JOURNAL_READER_PROOF_CORRUPT",
+        "JOURNAL_READER_PROOF_MISSING",
+        "JOURNAL_READER_PROOF_UNAVAILABLE",
+        "JOURNAL_READER_RUNTIME_NOT_READY",
+        "JOURNAL_READER_SECURITY_REQUIRED",
+        "JOURNAL_READER_SELECTION_EXPIRED",
+        "JOURNAL_READER_SELECTION_PENDING",
+        "JOURNAL_READER_SELECTION_UNAVAILABLE",
+        "JOURNAL_READER_SELECTION_UNCERTAIN",
+        "JOURNAL_READER_VERSION_MISMATCH",
+        "JOURNAL_ROLLBACK_IMAGE_MISMATCH",
+        "JOURNAL_ROLLBACK_SLOT_PROTECTED",
+        "LOCAL_RUNTIME_HEALTHY",
+        "OTA_ASSIGNMENT_ALREADY_RUNNING",
+        "OTA_RESUME_OFFSET_INVALID",
+        "PARTITION_ERASE_ALIGNMENT",
+        "PREVIOUS_FIRMWARE_OBSERVED",
+        "RUNNING_VERSION_MISMATCH",
+        "RUNTIME_HEALTHY",
+        "STORAGE_RECOVERY_ADD_UNAVAILABLE",
+        "STORAGE_RECOVERY_BUILD_MISMATCH",
+        "STORAGE_RECOVERY_CURSOR_UNCHANGED",
+        "STORAGE_RECOVERY_IDENTITY",
+        "STORAGE_RECOVERY_INVENTORY_AFTER",
+        "STORAGE_RECOVERY_INVENTORY_BEFORE",
+        "STORAGE_RECOVERY_MOUNT",
+        "STORAGE_RECOVERY_NOT_AUTHORIZED",
+        "STORAGE_RECOVERY_NOT_PENDING_VERIFY",
+        "STORAGE_RECOVERY_NOT_STARTED",
+        "STORAGE_RECOVERY_ORPHAN_COMPLETE",
+        "STORAGE_RECOVERY_ORPHAN_SEEN",
+        "STORAGE_RECOVERY_ORPHAN_SEEN_PARTIAL",
+        "STORAGE_RECOVERY_ROLLBACK_FAILED",
+        "STORAGE_RECOVERY_ROLLBACK_IMAGE",
+        "STORAGE_RECOVERY_ROLLBACK_STATE",
+        "STORAGE_RECOVERY_RUNNING",
+        "STORAGE_RECOVERY_SLOT_LAYOUT",
+        "STORAGE_RECOVERY_STARTED",
+        "STORAGE_RECOVERY_TARGET_MISMATCH",
+        "WAITING_FOR_HIK_SAFEPOINT",
+        "WAITING_FOR_JOURNAL_QUIESCE",
+        "WAITING_FOR_RUNTIME_HEALTH",
+        "WAITING_FOR_ZKT_SAFEPOINT"
+      ]
+    },
+    "recoverJob": {
+      "description": "Recover attendance job status",
+      "backend": [
+        "CANCELLED",
+        "CANCEL_REQUESTED",
+        "COMPLETED",
+        "FAILED",
+        "INVALIDATED",
+        "NEEDS_ATTENTION",
+        "PAUSED",
+        "PAUSE_REQUESTED",
+        "QUEUED",
+        "RUNNING"
+      ],
+      "firmware": []
+    },
+    "recoverPhase": {
+      "description": "Recover attendance stage",
+      "backend": [
+        "ANCHORING",
+        "DRAINING_ORDS",
+        "FINAL_ASSURANCE",
+        "RECOVERING_AFTER_INTERRUPTION",
+        "RECOVERING_AFTER_SOURCE_CHANGE",
+        "SCANNING_TERMINAL",
+        "VERIFYING_SOURCE_CHANGE",
+        "WAITING_FOR_CAPACITY",
+        "WAITING_FOR_DEVICE",
+        "WAITING_FOR_IDENTITY",
+        "WAITING_FOR_SAFE_WINDOW"
+      ],
+      "firmware": []
+    },
+    "recoverStep": {
+      "description": "What a Recover attendance job is doing",
+      "backend": [
+        "CANCELLED",
+        "CAPTURING_SOURCE",
+        "COMPLETED",
+        "COMPLETED_WITH_CORRECTIONS",
+        "COMPLETED_WITH_IDENTITY_HOLDS",
+        "COMPLETED_WITH_REVIEW",
+        "PAUSED",
+        "RECOVERING",
+        "REVIEW_REQUIRED",
+        "VERIFYING_ORACLE",
+        "VERIFYING_SOURCE_CHANGE",
+        "WAITING_FOR_DEVICE",
+        "WAITING_FOR_ORACLE_CAPACITY"
+      ],
+      "firmware": []
+    },
+    "forceReason": {
+      "description": "Force release reasons",
+      "backend": [
+        "ALREADY_CONFIRMED",
+        "ALREADY_DELIVERING",
+        "CNIC_CONFLICT",
+        "CNIC_MISSING",
+        "DEVICE_BUSY",
+        "DEVICE_OFFLINE",
+        "EVENT_ID_INVALID",
+        "EVIDENCE_CHANGED",
+        "IDENTITY_CONFLICT",
+        "NOT_HELD",
+        "ORACLE_CONFLICT",
+        "ORACLE_UNAVAILABLE",
+        "PERMANENT_REVIEW",
+        "READY",
+        "ROLLOUT_RESTRICTED",
+        "SNAPSHOT_CHANGED",
+        "SOURCE_INVALID",
+        "STOPPED",
+        "SYNC_EXPIRED",
+        "SYNC_FAILED",
+        "TERMINAL_CHANGED",
+        "TERMINAL_NEWEST_RECORD_UNCONFIRMED",
+        "TIME_INVALID",
+        "UID_INVALID",
+        "UID_UNPROVEN",
+        "USER_ID_INVALID",
+        "USER_MISSING"
+      ],
+      "firmware": []
+    },
+    "directReason": {
+      "description": "Send saved check-ins reasons",
+      "backend": [
+        "AUTO_RELEASED",
+        "AUTO_RELEASE_PENDING",
+        "CLOCK_INVALID",
+        "CNIC_CHOICE_REQUIRED",
+        "CNIC_CHOICE_STALE",
+        "CNIC_CONFLICT",
+        "IDENTITY_CONFLICT_UNRESOLVED",
+        "PREVIOUS_POST_UNCERTAIN",
+        "PUNCH_TIME_CNIC_DIFFERS",
+        "PUNCH_TIME_CNIC_HELD_BY_OTHER",
+        "PUNCH_TIME_CNIC_UNREADABLE",
+        "PUNCH_TIME_NAME_MISSING",
+        "PUNCH_TIME_RECORDS_TOO_MANY",
+        "SUPERSEDED",
+        "TIME_IMPOSSIBLE"
+      ],
+      "firmware": []
+    },
+    "error": {
+      "description": "Refusals (HTTP 409 code)",
+      "backend": [
+        "ACTION_NOT_ALLOWED",
+        "ACTOR_MISMATCH",
+        "APPROVED_COUNT_INVALID",
+        "CHECK_ACTOR_MISMATCH",
+        "CHECK_INCOMPLETE",
+        "CONFIRMATION_MISMATCH",
+        "CONTROL_CONFLICT",
+        "CONTROL_STATE_CONFLICT",
+        "CORRECTED_TIME_INVALID",
+        "CORRECTED_TIME_REQUIRED",
+        "CORRECTION_DISABLED",
+        "DUPLICATE_SOURCE",
+        "EXECUTION_DISABLED",
+        "FORCE_DISABLED",
+        "GROUPS_REQUIRED",
+        "HISTORICAL_IDENTITY_EVIDENCE_REQUIRED",
+        "IDEMPOTENCY_CONFLICT",
+        "IDENTITY_HELD",
+        "NOTHING_TO_RELEASE",
+        "NO_ELIGIBLE_CORRECTIONS",
+        "NO_ELIGIBLE_EVENTS",
+        "NO_ELIGIBLE_RECORDS",
+        "PREVIEW_BUSY",
+        "PREVIEW_DISABLED",
+        "PREVIEW_DRIFT",
+        "PREVIEW_EXPIRED",
+        "PREVIEW_INVALID",
+        "REASON_REQUIRED",
+        "RECHECK_UNAVAILABLE",
+        "RECOVERY_INVALID",
+        "RECOVERY_NOT_RETRYABLE",
+        "RELEASE_ALREADY_RUNNING",
+        "RELEASE_PROOF_DISABLED",
+        "REPAIR_ALREADY_RUNNING",
+        "REPAIR_DISABLED",
+        "REPAIR_RETIRED",
+        "ROLLOUT_RESTRICTED",
+        "RUN_MISMATCH",
+        "SCOPE_CHANGED",
+        "SCOPE_TOO_LARGE",
+        "SIGNING_UNAVAILABLE",
+        "SOURCE_EVIDENCE_INVALID",
+        "SOURCE_FACT_CONFLICT",
+        "SOURCE_IDENTITY_DRIFT",
+        "SOURCE_IDENTITY_INVALID",
+        "SOURCE_MISSING",
+        "SOURCE_NOT_CORRECTABLE",
+        "SOURCE_NOT_PARSEABLE",
+        "SOURCE_REFERENCE_INVALID",
+        "SOURCE_SCOPE_MISMATCH",
+        "STATE_DRIFT",
+        "WORKFLOW_MISMATCH",
+        "ZONE_CHANGED",
+        "ZONE_NOT_ENABLED",
+        "ZONE_NOT_FOUND"
+      ],
+      "firmware": []
+    },
+    "log": {
+      "description": "Device activity log codes",
+      "backend": [
+        "ADD_MESSAGE_PROCESSING_FAILED",
+        "DEVICE_MESSAGE_REJECTED",
+        "SOURCE_TAIL_COVERAGE_INACTIVE",
+        "SOURCE_TAIL_EPOCH_STALE"
+      ],
+      "firmware": [
+        "ADD_DIRECT_ACK_FALLBACK_FAILED",
+        "ADD_DIRECT_ACK_FALLBACK_SUCCEEDED",
+        "ADD_RECONNECTED",
+        "ADD_SOURCE_CHECKPOINT_REPLAY",
+        "ADD_SOURCE_CHECKPOINT_RETRY",
+        "ADD_SOURCE_COVERAGE_APPLIED",
+        "ADD_SOURCE_COVERAGE_CERTIFIED",
+        "ADD_SOURCE_COVERAGE_DEFERRED",
+        "ADD_SOURCE_COVERAGE_INVALIDATED",
+        "ADD_SOURCE_COVERAGE_TERMINAL_MISMATCH",
+        "ADD_TRUTH_QUEUE_SATURATED",
+        "ASSIGNMENT_RELEASED_FOR_COMMAND",
+        "ATTENDANCE_TIMESTAMP_QUARANTINED",
+        "ATTENDANCE_TIMESTAMP_QUARANTINE_SUMMARY",
+        "AUTHENTICATED_IP_NOT_PERSISTED",
+        "BLOCKED_IDENTITY_RECOVERY_DEFERRED",
+        "COMM_KEY_APPLIED",
+        "CURRENT_TAIL_AUDIT_RETRY",
+        "CURRENT_TAIL_CHECKPOINT_RETRY",
+        "CURRENT_TAIL_SOURCE_COMMITTED",
+        "CURRENT_TAIL_SOURCE_EXCEPTIONS_COMMITTED",
+        "FULL_RECONCILE",
+        "FULL_RECONCILE_DEFERRED_ORDS_GATE",
+        "FULL_RECONCILE_DEFERRED_OUTBOX",
+        "FULL_RECONCILE_FAILED",
+        "HIK_ANCHOR_MISMATCH",
+        "HIK_CLOCK_SAMPLE",
+        "HIK_HISTORY_PAGE_ACCEPTED",
+        "HIK_HISTORY_RECEIPT_PENDING",
+        "HIK_HISTORY_RETRY",
+        "HIK_IP_REDISCOVERED",
+        "HIK_IP_SAVE_PENDING",
+        "HIK_LIGHT_RECONCILE",
+        "HIK_LIVE_STREAM_CONNECTED",
+        "HIK_LIVE_STREAM_RETRY",
+        "HIK_POLL_STATUS",
+        "HIK_WORKER_START_PENDING",
+        "HISTORY_BACKFILL_BLOCKED",
+        "HISTORY_BACKFILL_COMPLETE",
+        "HISTORY_DUMP_CACHE_REUSED",
+        "HISTORY_DUMP_CACHE_VERIFIED",
+        "HISTORY_EMPTY_MONTHS_SKIPPED",
+        "IDENTITY_CATALOG_APPLIED",
+        "IDENTITY_CATALOG_CHUNK_REJECTED",
+        "IDENTITY_CATALOG_COMMIT_REJECTED",
+        "IDENTITY_CATALOG_MEMORY_FALLBACK",
+        "IDENTITY_CATALOG_PERSIST_FAILED",
+        "IDENTITY_CATALOG_STAGE_FAILED",
+        "LEASE_EVIDENCE_REQUIRED",
+        "LEASE_IDENTITY_CHANGED",
+        "LEASE_REVOKED_LOCAL",
+        "LEASE_REVOKE_FAILED",
+        "LEASE_USER_MISSING",
+        "LEGACY_QUEUE_READ_FAILED",
+        "LIGHT_RECONCILE_OK",
+        "LIVE_DIRECT_ACK_FALLBACK_FAILED",
+        "LIVE_DIRECT_ACK_FALLBACK_SUCCEEDED",
+        "LIVE_EVENT_DURABILITY_DEFERRED",
+        "LIVE_LOCAL_STORAGE_RECOVERED",
+        "LIVE_OUTBOX_LOCK_RECOVERED",
+        "LIVE_PACKET_FORMAT_REJECTED",
+        "LOCAL_RECONCILE_STORAGE_RECOVERED",
+        "NVS_CHECKPOINT_FAILED",
+        "ORACLE_RECONCILE_ACCEPTED",
+        "ORACLE_RECONCILE_DELEGATED_TO_ADD",
+        "ORDS_DRAIN_STORAGE_BACKPRESSURE",
+        "ORDS_LEGACY_LOCK_SLOW",
+        "ORDS_RECONCILE_AUTH_FAILED",
+        "ORDS_RECONCILE_BACKOFF",
+        "ORDS_RECONCILE_ENDPOINT_MISSING",
+        "ORDS_RECONCILE_HTTP_FAILED",
+        "ORDS_RECONCILE_PAYLOAD_FAILED",
+        "ORDS_RECONCILE_REJECTED",
+        "ORDS_RECONCILE_RESPONSE_INVALID",
+        "ORDS_RECONCILE_TRANSPORT_RECOVERED",
+        "ORDS_RECONCILE_TRANSPORT_RETRY",
+        "ORDS_RECONCILE_WINDOW_LIMIT",
+        "OTA_IMAGE_UNVERIFIED",
+        "RECONCILE_TERMINAL_SERIAL_MISMATCH",
+        "SCHEDULED_RESTART",
+        "SOURCE_COMMITTED_BOUNDARY_DIVERGED",
+        "SOURCE_FIRST_ANCHOR_DIVERGED",
+        "SOURCE_INVALIDATION_NOT_PERSISTED",
+        "SOURCE_PROBE_ORDINAL_UNAVAILABLE",
+        "SOURCE_RANGE_COUNT_REGRESSION",
+        "SOURCE_RANGE_LAYOUT_INVALID",
+        "SOURCE_RANGE_PREPARE_FAILED",
+        "SOURCE_RANGE_READ_RETRY",
+        "SOURCE_RANGE_RELEASE_RETRY",
+        "SOURCE_RANGE_SNAPSHOT_RETRY",
+        "STORAGE_FILE_UNREADABLE",
+        "STORAGE_INVENTORY",
+        "STORAGE_RECOVERY_CUSTODY_COMPLETE",
+        "STORAGE_RECOVERY_PROGRESS",
+        "STORAGE_RECOVERY_SCAN",
+        "STORAGE_RECOVERY_UNREADABLE_LIMIT",
+        "STORAGE_RECOVERY_UNREADABLE_REGION",
+        "STORAGE_REPAIR_BLOCKED",
+        "STORAGE_REPAIR_CATALOG_DEFERRED",
+        "STORAGE_REPAIR_CATALOG_DROPPED",
+        "STORAGE_REPAIR_CHECKED",
+        "STORAGE_REPAIR_CHECK_DELETED",
+        "STORAGE_REPAIR_COMMANDS_FAILED",
+        "STORAGE_REPAIR_COMMANDS_MERGED",
+        "STORAGE_REPAIR_COMPACTED",
+        "STORAGE_REPAIR_COMPACT_STOPPED",
+        "STORAGE_REPAIR_CURSOR_RESET",
+        "STORAGE_REPAIR_DEFERRED",
+        "STORAGE_REPAIR_DISABLED",
+        "STORAGE_REPAIR_DONE",
+        "STORAGE_REPAIR_EXCEPTION_AREA_TEST",
+        "STORAGE_REPAIR_EXCEPTION_CONFIRMED",
+        "STORAGE_REPAIR_EXCEPTION_DEPLOYMENT_ENDED",
+        "STORAGE_REPAIR_EXCEPTION_ELIGIBLE",
+        "STORAGE_REPAIR_EXCEPTION_EVIDENCE",
+        "STORAGE_REPAIR_EXCEPTION_RECORD",
+        "STORAGE_REPAIR_EXCEPTION_REFUSED",
+        "STORAGE_REPAIR_EXCEPTION_RESTART",
+        "STORAGE_REPAIR_EXCEPTION_ROUND",
+        "STORAGE_REPAIR_EXCEPTION_UNHEALTHY",
+        "STORAGE_REPAIR_EXCEPTION_UNREPAIRED",
+        "STORAGE_REPAIR_EXCEPTION_WAITING",
+        "STORAGE_REPAIR_FULL",
+        "STORAGE_REPAIR_GAP",
+        "STORAGE_REPAIR_GC_UNSAFE",
+        "STORAGE_REPAIR_JOURNAL_FAILED",
+        "STORAGE_REPAIR_LEVEL2_SKIPPED",
+        "STORAGE_REPAIR_MANIFEST_FULL",
+        "STORAGE_REPAIR_MANIFEST_UNREADABLE",
+        "STORAGE_REPAIR_MERGED",
+        "STORAGE_REPAIR_MERGE_DEFERRED",
+        "STORAGE_REPAIR_MOUNT_FAILED",
+        "STORAGE_REPAIR_NOT_READY",
+        "STORAGE_REPAIR_NO_TIME",
+        "STORAGE_REPAIR_NVS_FULL",
+        "STORAGE_REPAIR_PROBE_ALTERNATE",
+        "STORAGE_REPAIR_REBUILT",
+        "STORAGE_REPAIR_RECLAIM",
+        "STORAGE_REPAIR_RECLAIM_EXPOSURE",
+        "STORAGE_REPAIR_RECLAIM_FAILED",
+        "STORAGE_REPAIR_RECLAIM_MISMATCH",
+        "STORAGE_REPAIR_RECLAIM_REDONE",
+        "STORAGE_REPAIR_RECLAIM_SETTLED",
+        "STORAGE_REPAIR_RECLAIM_SHORT",
+        "STORAGE_REPAIR_RECLAIM_SOURCES",
+        "STORAGE_REPAIR_RECLAIM_UNAVAILABLE",
+        "STORAGE_REPAIR_RECORDS_FULL",
+        "STORAGE_REPAIR_RESERVE",
+        "STORAGE_REPAIR_RESTORE_DEFERRED",
+        "STORAGE_REPAIR_RESTORE_RETRIED",
+        "STORAGE_REPAIR_RESTORE_WAITING",
+        "STORAGE_REPAIR_RESUME_BLOCKED",
+        "STORAGE_REPAIR_SIZE_RECOVERED",
+        "STORAGE_REPAIR_SIZE_TORN",
+        "STORAGE_REPAIR_SPAN",
+        "STORAGE_REPAIR_STARTED",
+        "STORAGE_REPAIR_SUPERSEDED",
+        "STORAGE_REPAIR_TAIL_TERMINATED",
+        "STORAGE_REPAIR_UNHIDDEN",
+        "TRUTH_IDENTITY_INCOMPLETE",
+        "TRUTH_READ_RETRY_EXHAUSTED",
+        "TRUTH_READ_RETRY_SESSION",
+        "TRUTH_RETRY_COOLDOWN",
+        "TRUTH_SNAPSHOT_IMPLAUSIBLE",
+        "TRUTH_WINDOW_ALLOCATION_FAILED",
+        "TRUTH_WINDOW_MEMORY_BOUNDED",
+        "USER_SNAPSHOT_TRUNCATED",
+        "USER_SNAPSHOT_UNSTABLE",
+        "ZKT_CONNECTION_LOST",
+        "ZKT_CREDENTIAL_IDENTITY_DEFERRED",
+        "ZKT_CREDENTIAL_POLICY_FAILED",
+        "ZKT_CREDENTIAL_POLICY_OK",
+        "ZKT_FRAME_OVERSIZE",
+        "ZKT_FRAME_SESSION_MISMATCH",
+        "ZKT_PREPARED_READ_FAILED",
+        "ZKT_RECORD_SIZE_FALLBACK",
+        "ZKT_SECURE_HANDSHAKE_FAILED",
+        "ZKT_SECURE_KEY_FAILED",
+        "ZKT_SECURE_KEY_READY",
+        "ZKT_SECURE_SESSION",
+        "ZKT_SERIAL_CHANGED",
+        "ZKT_SERIAL_MISMATCH",
+        "ZKT_SERIAL_UNREADABLE",
+        "ZKT_SESSION_REFRESHED",
+        "ZKT_STABLE",
+        "ZKT_TIME_SYNC_DEFERRED",
+        "ZKT_TIME_SYNC_FAILED",
+        "ZKT_TIME_SYNC_OK",
+        "ZKT_TIME_SYNC_READBACK_FAILED"
+      ]
+    }
+  },
+  "log_classes": {
+    "ADD_DIRECT_ACK_FALLBACK_FAILED": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "if_repeats"
+    },
+    "ADD_DIRECT_ACK_FALLBACK_SUCCEEDED": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no"
+    },
+    "ADD_MESSAGE_PROCESSING_FAILED": {
+      "group": "link_box",
+      "kind": "routine",
+      "act": "if_repeats"
+    },
+    "ADD_RECONNECTED": {
+      "group": "link_box",
+      "kind": "routine",
+      "act": "no"
+    },
+    "ADD_SOURCE_CHECKPOINT_REPLAY": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "no"
+    },
+    "ADD_SOURCE_CHECKPOINT_RETRY": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "no"
+    },
+    "ADD_SOURCE_COVERAGE_APPLIED": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "no"
+    },
+    "ADD_SOURCE_COVERAGE_CERTIFIED": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "no"
+    },
+    "ADD_SOURCE_COVERAGE_DEFERRED": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "if_repeats"
+    },
+    "ADD_SOURCE_COVERAGE_INVALIDATED": {
+      "group": "machine",
+      "kind": "problem",
+      "act": "yes"
+    },
+    "ADD_SOURCE_COVERAGE_TERMINAL_MISMATCH": {
+      "group": "machine",
+      "kind": "problem",
+      "act": "yes"
+    },
+    "ADD_TRUTH_QUEUE_SATURATED": {
+      "group": "link_box",
+      "kind": "routine",
+      "act": "if_repeats"
+    },
+    "ASSIGNMENT_RELEASED_FOR_COMMAND": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "no"
+    },
+    "ATTENDANCE_TIMESTAMP_QUARANTINED": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "list"
+    },
+    "ATTENDANCE_TIMESTAMP_QUARANTINE_SUMMARY": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "list"
+    },
+    "AUTHENTICATED_IP_NOT_PERSISTED": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no"
+    },
+    "BLOCKED_IDENTITY_RECOVERY_DEFERRED": {
+      "group": "software",
+      "kind": "problem",
+      "act": "yes"
+    },
+    "COMM_KEY_APPLIED": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "no"
+    },
+    "CURRENT_TAIL_AUDIT_RETRY": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "no"
+    },
+    "CURRENT_TAIL_CHECKPOINT_RETRY": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "no"
+    },
+    "CURRENT_TAIL_SOURCE_COMMITTED": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "no"
+    },
+    "CURRENT_TAIL_SOURCE_EXCEPTIONS_COMMITTED": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "list"
+    },
+    "DEVICE_MESSAGE_REJECTED": {
+      "group": "link_box",
+      "kind": "problem",
+      "act": "yes"
+    },
+    "FULL_RECONCILE": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "no"
+    },
+    "FULL_RECONCILE_DEFERRED_ORDS_GATE": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "no"
+    },
+    "FULL_RECONCILE_DEFERRED_OUTBOX": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "no"
+    },
+    "FULL_RECONCILE_FAILED": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "if_repeats"
+    },
+    "HIK_ANCHOR_MISMATCH": {
+      "group": "machine",
+      "kind": "problem",
+      "act": "yes"
+    },
+    "HIK_CLOCK_SAMPLE": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "no"
+    },
+    "HIK_HISTORY_PAGE_ACCEPTED": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "no"
+    },
+    "HIK_HISTORY_RECEIPT_PENDING": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "no"
+    },
+    "HIK_HISTORY_RETRY": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "if_repeats"
+    },
+    "HIK_IP_REDISCOVERED": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "no"
+    },
+    "HIK_IP_SAVE_PENDING": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "if_repeats"
+    },
+    "HIK_LIGHT_RECONCILE": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "no"
+    },
+    "HIK_LIVE_STREAM_CONNECTED": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "no"
+    },
+    "HIK_LIVE_STREAM_RETRY": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "if_repeats"
+    },
+    "HIK_POLL_STATUS": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "no"
+    },
+    "HIK_WORKER_START_PENDING": {
+      "group": "link_box",
+      "kind": "routine",
+      "act": "if_repeats"
+    },
+    "HISTORY_BACKFILL_BLOCKED": {
+      "group": "machine",
+      "kind": "problem",
+      "act": "yes"
+    },
+    "HISTORY_BACKFILL_COMPLETE": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "no"
+    },
+    "HISTORY_DUMP_CACHE_REUSED": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "no"
+    },
+    "HISTORY_DUMP_CACHE_VERIFIED": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "no"
+    },
+    "HISTORY_EMPTY_MONTHS_SKIPPED": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "no"
+    },
+    "IDENTITY_CATALOG_APPLIED": {
+      "group": "people",
+      "kind": "routine",
+      "act": "no"
+    },
+    "IDENTITY_CATALOG_CHUNK_REJECTED": {
+      "group": "people",
+      "kind": "routine",
+      "act": "if_repeats"
+    },
+    "IDENTITY_CATALOG_COMMIT_REJECTED": {
+      "group": "people",
+      "kind": "routine",
+      "act": "if_repeats"
+    },
+    "IDENTITY_CATALOG_MEMORY_FALLBACK": {
+      "group": "people",
+      "kind": "routine",
+      "act": "no"
+    },
+    "IDENTITY_CATALOG_PERSIST_FAILED": {
+      "group": "people",
+      "kind": "problem",
+      "act": "yes"
+    },
+    "IDENTITY_CATALOG_STAGE_FAILED": {
+      "group": "people",
+      "kind": "routine",
+      "act": "if_repeats"
+    },
+    "LEASE_EVIDENCE_REQUIRED": {
+      "group": "people",
+      "kind": "problem",
+      "act": "yes"
+    },
+    "LEASE_IDENTITY_CHANGED": {
+      "group": "people",
+      "kind": "problem",
+      "act": "yes"
+    },
+    "LEASE_REVOKED_LOCAL": {
+      "group": "people",
+      "kind": "routine",
+      "act": "no"
+    },
+    "LEASE_REVOKE_FAILED": {
+      "group": "people",
+      "kind": "problem",
+      "act": "yes"
+    },
+    "LEASE_USER_MISSING": {
+      "group": "people",
+      "kind": "problem",
+      "act": "yes"
+    },
+    "LEGACY_QUEUE_READ_FAILED": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "if_repeats"
+    },
+    "LIGHT_RECONCILE_OK": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "no"
+    },
+    "LIVE_DIRECT_ACK_FALLBACK_FAILED": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "if_repeats"
+    },
+    "LIVE_DIRECT_ACK_FALLBACK_SUCCEEDED": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no"
+    },
+    "LIVE_EVENT_DURABILITY_DEFERRED": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "if_repeats"
+    },
+    "LIVE_LOCAL_STORAGE_RECOVERED": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no"
+    },
+    "LIVE_OUTBOX_LOCK_RECOVERED": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no"
+    },
+    "LIVE_PACKET_FORMAT_REJECTED": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "if_repeats"
+    },
+    "LOCAL_RECONCILE_STORAGE_RECOVERED": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no"
+    },
+    "NVS_CHECKPOINT_FAILED": {
+      "group": "storage",
+      "kind": "problem",
+      "act": "yes"
+    },
+    "ORACLE_RECONCILE_ACCEPTED": {
+      "group": "hr_system",
+      "kind": "routine",
+      "act": "no"
+    },
+    "ORACLE_RECONCILE_DELEGATED_TO_ADD": {
+      "group": "hr_system",
+      "kind": "routine",
+      "act": "no"
+    },
+    "ORDS_DRAIN_STORAGE_BACKPRESSURE": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "if_repeats"
+    },
+    "ORDS_LEGACY_LOCK_SLOW": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no"
+    },
+    "ORDS_RECONCILE_AUTH_FAILED": {
+      "group": "hr_system",
+      "kind": "problem",
+      "act": "yes"
+    },
+    "ORDS_RECONCILE_BACKOFF": {
+      "group": "hr_system",
+      "kind": "routine",
+      "act": "if_repeats"
+    },
+    "ORDS_RECONCILE_ENDPOINT_MISSING": {
+      "group": "hr_system",
+      "kind": "problem",
+      "act": "yes"
+    },
+    "ORDS_RECONCILE_HTTP_FAILED": {
+      "group": "hr_system",
+      "kind": "routine",
+      "act": "if_repeats"
+    },
+    "ORDS_RECONCILE_PAYLOAD_FAILED": {
+      "group": "hr_system",
+      "kind": "problem",
+      "act": "yes"
+    },
+    "ORDS_RECONCILE_REJECTED": {
+      "group": "hr_system",
+      "kind": "problem",
+      "act": "yes"
+    },
+    "ORDS_RECONCILE_RESPONSE_INVALID": {
+      "group": "hr_system",
+      "kind": "routine",
+      "act": "if_repeats"
+    },
+    "ORDS_RECONCILE_TRANSPORT_RECOVERED": {
+      "group": "hr_system",
+      "kind": "routine",
+      "act": "no"
+    },
+    "ORDS_RECONCILE_TRANSPORT_RETRY": {
+      "group": "hr_system",
+      "kind": "routine",
+      "act": "if_repeats"
+    },
+    "ORDS_RECONCILE_WINDOW_LIMIT": {
+      "group": "hr_system",
+      "kind": "problem",
+      "act": "yes"
+    },
+    "OTA_IMAGE_UNVERIFIED": {
+      "group": "software",
+      "kind": "routine",
+      "act": "if_repeats"
+    },
+    "RECONCILE_TERMINAL_SERIAL_MISMATCH": {
+      "group": "machine",
+      "kind": "problem",
+      "act": "yes"
+    },
+    "SCHEDULED_RESTART": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "no"
+    },
+    "SOURCE_COMMITTED_BOUNDARY_DIVERGED": {
+      "group": "machine",
+      "kind": "problem",
+      "act": "yes"
+    },
+    "SOURCE_FIRST_ANCHOR_DIVERGED": {
+      "group": "machine",
+      "kind": "problem",
+      "act": "yes"
+    },
+    "SOURCE_INVALIDATION_NOT_PERSISTED": {
+      "group": "storage",
+      "kind": "problem",
+      "act": "yes"
+    },
+    "SOURCE_PROBE_ORDINAL_UNAVAILABLE": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "if_repeats"
+    },
+    "SOURCE_RANGE_COUNT_REGRESSION": {
+      "group": "machine",
+      "kind": "problem",
+      "act": "yes"
+    },
+    "SOURCE_RANGE_LAYOUT_INVALID": {
+      "group": "machine",
+      "kind": "problem",
+      "act": "yes"
+    },
+    "SOURCE_RANGE_PREPARE_FAILED": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "if_repeats"
+    },
+    "SOURCE_RANGE_READ_RETRY": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "no"
+    },
+    "SOURCE_RANGE_RELEASE_RETRY": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "no"
+    },
+    "SOURCE_RANGE_SNAPSHOT_RETRY": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "no"
+    },
+    "SOURCE_TAIL_COVERAGE_INACTIVE": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "if_repeats"
+    },
+    "SOURCE_TAIL_EPOCH_STALE": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "no"
+    },
+    "STORAGE_FILE_UNREADABLE": {
+      "group": "storage",
+      "kind": "problem",
+      "act": "yes"
+    },
+    "STORAGE_INVENTORY": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no",
+      "kind_by_level": {
+        "INFO": "routine",
+        "WARN": "problem"
+      }
+    },
+    "STORAGE_RECOVERY_CUSTODY_COMPLETE": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no"
+    },
+    "STORAGE_RECOVERY_PROGRESS": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no"
+    },
+    "STORAGE_RECOVERY_SCAN": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no"
+    },
+    "STORAGE_RECOVERY_UNREADABLE_LIMIT": {
+      "group": "storage",
+      "kind": "problem",
+      "act": "yes"
+    },
+    "STORAGE_RECOVERY_UNREADABLE_REGION": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no"
+    },
+    "STORAGE_REPAIR_BLOCKED": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no"
+    },
+    "STORAGE_REPAIR_CATALOG_DEFERRED": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no"
+    },
+    "STORAGE_REPAIR_CATALOG_DROPPED": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no"
+    },
+    "STORAGE_REPAIR_CHECKED": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no"
+    },
+    "STORAGE_REPAIR_CHECK_DELETED": {
+      "group": "storage",
+      "kind": "problem",
+      "act": "yes"
+    },
+    "STORAGE_REPAIR_COMMANDS_FAILED": {
+      "group": "storage",
+      "kind": "problem",
+      "act": "yes"
+    },
+    "STORAGE_REPAIR_COMMANDS_MERGED": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no"
+    },
+    "STORAGE_REPAIR_COMPACTED": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no"
+    },
+    "STORAGE_REPAIR_COMPACT_STOPPED": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no"
+    },
+    "STORAGE_REPAIR_CURSOR_RESET": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no"
+    },
+    "STORAGE_REPAIR_DEFERRED": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no"
+    },
+    "STORAGE_REPAIR_DISABLED": {
+      "group": "storage",
+      "kind": "problem",
+      "act": "yes"
+    },
+    "STORAGE_REPAIR_DONE": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no",
+      "kind_by_level": {
+        "ERROR": "problem",
+        "INFO": "routine",
+        "WARN": "routine"
+      }
+    },
+    "STORAGE_REPAIR_EXCEPTION_AREA_TEST": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no",
+      "kind_by_level": {
+        "ERROR": "problem",
+        "WARN": "routine"
+      }
+    },
+    "STORAGE_REPAIR_EXCEPTION_CONFIRMED": {
+      "group": "software",
+      "kind": "routine",
+      "act": "no"
+    },
+    "STORAGE_REPAIR_EXCEPTION_DEPLOYMENT_ENDED": {
+      "group": "software",
+      "kind": "routine",
+      "act": "no"
+    },
+    "STORAGE_REPAIR_EXCEPTION_ELIGIBLE": {
+      "group": "software",
+      "kind": "routine",
+      "act": "no"
+    },
+    "STORAGE_REPAIR_EXCEPTION_EVIDENCE": {
+      "group": "software",
+      "kind": "routine",
+      "act": "no"
+    },
+    "STORAGE_REPAIR_EXCEPTION_RECORD": {
+      "group": "software",
+      "kind": "problem",
+      "act": "yes"
+    },
+    "STORAGE_REPAIR_EXCEPTION_REFUSED": {
+      "group": "software",
+      "kind": "routine",
+      "act": "no"
+    },
+    "STORAGE_REPAIR_EXCEPTION_RESTART": {
+      "group": "software",
+      "kind": "routine",
+      "act": "no"
+    },
+    "STORAGE_REPAIR_EXCEPTION_ROUND": {
+      "group": "software",
+      "kind": "routine",
+      "act": "no",
+      "kind_by_level": {
+        "ERROR": "problem",
+        "WARN": "routine"
+      }
+    },
+    "STORAGE_REPAIR_EXCEPTION_UNHEALTHY": {
+      "group": "software",
+      "kind": "problem",
+      "act": "yes"
+    },
+    "STORAGE_REPAIR_EXCEPTION_UNREPAIRED": {
+      "group": "software",
+      "kind": "problem",
+      "act": "yes"
+    },
+    "STORAGE_REPAIR_EXCEPTION_WAITING": {
+      "group": "software",
+      "kind": "problem",
+      "act": "if_repeats"
+    },
+    "STORAGE_REPAIR_FULL": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "if_repeats"
+    },
+    "STORAGE_REPAIR_GAP": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no"
+    },
+    "STORAGE_REPAIR_GC_UNSAFE": {
+      "group": "storage",
+      "kind": "problem",
+      "act": "yes"
+    },
+    "STORAGE_REPAIR_JOURNAL_FAILED": {
+      "group": "storage",
+      "kind": "problem",
+      "act": "yes"
+    },
+    "STORAGE_REPAIR_LEVEL2_SKIPPED": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no"
+    },
+    "STORAGE_REPAIR_MANIFEST_FULL": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no"
+    },
+    "STORAGE_REPAIR_MANIFEST_UNREADABLE": {
+      "group": "storage",
+      "kind": "problem",
+      "act": "yes"
+    },
+    "STORAGE_REPAIR_MERGED": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no"
+    },
+    "STORAGE_REPAIR_MERGE_DEFERRED": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no"
+    },
+    "STORAGE_REPAIR_MOUNT_FAILED": {
+      "group": "storage",
+      "kind": "problem",
+      "act": "yes"
+    },
+    "STORAGE_REPAIR_NOT_READY": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no"
+    },
+    "STORAGE_REPAIR_NO_TIME": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no"
+    },
+    "STORAGE_REPAIR_NVS_FULL": {
+      "group": "storage",
+      "kind": "problem",
+      "act": "yes"
+    },
+    "STORAGE_REPAIR_PROBE_ALTERNATE": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no"
+    },
+    "STORAGE_REPAIR_REBUILT": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no"
+    },
+    "STORAGE_REPAIR_RECLAIM": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no"
+    },
+    "STORAGE_REPAIR_RECLAIM_EXPOSURE": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no"
+    },
+    "STORAGE_REPAIR_RECLAIM_FAILED": {
+      "group": "storage",
+      "kind": "problem",
+      "act": "yes"
+    },
+    "STORAGE_REPAIR_RECLAIM_MISMATCH": {
+      "group": "storage",
+      "kind": "problem",
+      "act": "yes"
+    },
+    "STORAGE_REPAIR_RECLAIM_REDONE": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no"
+    },
+    "STORAGE_REPAIR_RECLAIM_SETTLED": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no",
+      "kind_by_level": {
+        "ERROR": "problem"
+      }
+    },
+    "STORAGE_REPAIR_RECLAIM_SHORT": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no"
+    },
+    "STORAGE_REPAIR_RECLAIM_SOURCES": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no",
+      "kind_by_level": {
+        "ERROR": "problem"
+      }
+    },
+    "STORAGE_REPAIR_RECLAIM_UNAVAILABLE": {
+      "group": "storage",
+      "kind": "problem",
+      "act": "yes"
+    },
+    "STORAGE_REPAIR_RECORDS_FULL": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no"
+    },
+    "STORAGE_REPAIR_RESERVE": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no"
+    },
+    "STORAGE_REPAIR_RESTORE_DEFERRED": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no"
+    },
+    "STORAGE_REPAIR_RESTORE_RETRIED": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no",
+      "kind_by_level": {
+        "ERROR": "problem"
+      }
+    },
+    "STORAGE_REPAIR_RESTORE_WAITING": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no"
+    },
+    "STORAGE_REPAIR_RESUME_BLOCKED": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no"
+    },
+    "STORAGE_REPAIR_SIZE_RECOVERED": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no"
+    },
+    "STORAGE_REPAIR_SIZE_TORN": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no"
+    },
+    "STORAGE_REPAIR_SPAN": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no"
+    },
+    "STORAGE_REPAIR_STARTED": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no"
+    },
+    "STORAGE_REPAIR_SUPERSEDED": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no"
+    },
+    "STORAGE_REPAIR_TAIL_TERMINATED": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no"
+    },
+    "STORAGE_REPAIR_UNHIDDEN": {
+      "group": "storage",
+      "kind": "routine",
+      "act": "no"
+    },
+    "TRUTH_IDENTITY_INCOMPLETE": {
+      "group": "people",
+      "kind": "routine",
+      "act": "list"
+    },
+    "TRUTH_READ_RETRY_EXHAUSTED": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "if_repeats"
+    },
+    "TRUTH_READ_RETRY_SESSION": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "no"
+    },
+    "TRUTH_RETRY_COOLDOWN": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "if_repeats"
+    },
+    "TRUTH_SNAPSHOT_IMPLAUSIBLE": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "if_repeats"
+    },
+    "TRUTH_WINDOW_ALLOCATION_FAILED": {
+      "group": "link_box",
+      "kind": "routine",
+      "act": "if_repeats"
+    },
+    "TRUTH_WINDOW_MEMORY_BOUNDED": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "no"
+    },
+    "USER_SNAPSHOT_TRUNCATED": {
+      "group": "people",
+      "kind": "problem",
+      "act": "yes"
+    },
+    "USER_SNAPSHOT_UNSTABLE": {
+      "group": "people",
+      "kind": "routine",
+      "act": "no"
+    },
+    "ZKT_CONNECTION_LOST": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "if_repeats"
+    },
+    "ZKT_CREDENTIAL_IDENTITY_DEFERRED": {
+      "group": "people",
+      "kind": "routine",
+      "act": "no"
+    },
+    "ZKT_CREDENTIAL_POLICY_FAILED": {
+      "group": "people",
+      "kind": "routine",
+      "act": "if_repeats"
+    },
+    "ZKT_CREDENTIAL_POLICY_OK": {
+      "group": "people",
+      "kind": "routine",
+      "act": "no"
+    },
+    "ZKT_FRAME_OVERSIZE": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "no"
+    },
+    "ZKT_FRAME_SESSION_MISMATCH": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "no"
+    },
+    "ZKT_PREPARED_READ_FAILED": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "if_repeats"
+    },
+    "ZKT_RECORD_SIZE_FALLBACK": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "no"
+    },
+    "ZKT_SECURE_HANDSHAKE_FAILED": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "if_repeats"
+    },
+    "ZKT_SECURE_KEY_FAILED": {
+      "group": "machine",
+      "kind": "problem",
+      "act": "if_repeats"
+    },
+    "ZKT_SECURE_KEY_READY": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "no"
+    },
+    "ZKT_SECURE_SESSION": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "no"
+    },
+    "ZKT_SERIAL_CHANGED": {
+      "group": "machine",
+      "kind": "problem",
+      "act": "yes"
+    },
+    "ZKT_SERIAL_MISMATCH": {
+      "group": "machine",
+      "kind": "problem",
+      "act": "yes"
+    },
+    "ZKT_SERIAL_UNREADABLE": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "if_repeats"
+    },
+    "ZKT_SESSION_REFRESHED": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "no"
+    },
+    "ZKT_STABLE": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "no"
+    },
+    "ZKT_TIME_SYNC_DEFERRED": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "no"
+    },
+    "ZKT_TIME_SYNC_FAILED": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "if_repeats"
+    },
+    "ZKT_TIME_SYNC_OK": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "no"
+    },
+    "ZKT_TIME_SYNC_READBACK_FAILED": {
+      "group": "machine",
+      "kind": "routine",
+      "act": "if_repeats"
+    }
+  }
+}

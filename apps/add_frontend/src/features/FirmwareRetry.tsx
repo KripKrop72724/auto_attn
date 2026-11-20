@@ -1,7 +1,11 @@
 import { useEffect, useState } from 'react'
 import { api, queryString } from '../api'
-import { Dialog, dateTime, type useToast } from '../App'
+import { dateTime } from '../lib/time'
 import { Icon } from '../Icon'
+import { Button, Callout, Dialog, TechnicalDetails } from '../ui'
+import type { Toast as FullToast } from '../ui/Toast'
+import { RETRY_REFUSAL_FALLBACK, plainVersion, retryRefusalSentence, stabilityWarningLine, updateActionError, updateToast } from '../words/software'
+import { technicalCode } from '../words/technical'
 import type {
   FirmwareCampaign,
   FirmwareDeployment,
@@ -11,24 +15,27 @@ import type {
   FirmwareStabilityWarning,
 } from '../types'
 
-type Toast = Pick<ReturnType<typeof useToast>, 'notice'>
+type Toast = Pick<FullToast, 'notice'>
 
 // Information only: a one-click update or retry overrides exactly these
-// warnings (by the server's digest) and records them with the attempt.
-export function StabilityWarnings({ warnings }: { warnings: FirmwareStabilityWarning[] }) {
+// warnings (by the server's digest) and records them with the attempt. The
+// plain line is built from the structured fields; the server text stays under
+// Technical details.
+export function StabilityWarnings({ warnings, nameFor }: { warnings: FirmwareStabilityWarning[]; nameFor?: (connectorId: string) => string | null | undefined }) {
   if (!warnings.length) return null
   return (
-    <div className="message pattern-waiting firmware-stability-warnings" role="status">
-      <Icon name="alert" />
-      <div>
-        <strong>ESP stability warnings (recorded with the attempt)</strong>
+    <Callout tone="warning" role="status" title="This device has been restarting a lot" className="firmware-stability-warnings">
+      <ul>
+        {warnings.map((warning) => (
+          <li key={`${warning.connector_id}-${warning.code}`}>{stabilityWarningLine(warning, nameFor?.(warning.connector_id) || 'This device')}</li>
+        ))}
+      </ul>
+      <TechnicalDetails>
         <ul>
-          {warnings.map((warning) => (
-            <li key={`${warning.connector_id}-${warning.code}`}>{warning.message}</li>
-          ))}
+          {warnings.map((warning) => <li key={`${warning.connector_id}-${warning.code}-raw`}>{warning.code}: {warning.message}</li>)}
         </ul>
-      </div>
-    </div>
+      </TechnicalDetails>
+    </Callout>
   )
 }
 
@@ -43,12 +50,12 @@ export function RollbackEvidence({ diagnosis }: { diagnosis: FirmwareRollbackDia
   const reconcile = diagnosis.reconcile_at_reset?.running
   const interrupted = diagnosis.classification === 'TARGET_BOOT_INTERRUPTED'
   return (
-    <section className="firmware-rollback-evidence" aria-label="Rollback evidence">
+    <section className="firmware-rollback-evidence" aria-label="Rollback evidence" data-technical="">
       <h4>{interrupted ? 'Target boot interrupted' : 'Return to the previous firmware'}</h4>
       <p>
         {interrupted
           ? 'The ESP left the new image before confirming it and sent no failure report. ADD cannot tell a crash from a power or reset event; the facts below are evidence, not a cause.'
-          : `Not classified as an interrupted boot (${(diagnosis.unclassified_reasons || []).join(', ').toLowerCase().replaceAll('_', ' ') || 'no reason recorded'}).`}
+          : `Not classified as an interrupted boot (${(diagnosis.unclassified_reasons || []).map(technicalCode).join(', ') || 'no reason recorded'}).`}
       </p>
       {target && (
         <dl>
@@ -119,37 +126,30 @@ export function RollbackEvidence({ diagnosis }: { diagnosis: FirmwareRollbackDia
   )
 }
 
-function EspState({ state }: { state: FirmwareRetryEspState }) {
+const storageWord = (state: FirmwareRetryEspState) =>
+  !state.storage_reported ? 'Not reported'
+    : state.storage_io_faults && Object.keys(state.storage_io_faults).length ? 'Needs attention'
+      : state.storage_durability === 'HEALTHY' || state.storage_durability === null ? 'OK' : 'Needs attention'
+
+// "Link box now": three plain lines; the raw values go to Technical details.
+function LinkBoxNow({ state }: { state: FirmwareRetryEspState }) {
   const faults = state.storage_io_faults ? Object.entries(state.storage_io_faults) : []
   return (
-    <section className="firmware-rollback-evidence" aria-label="Current ESP state">
-      <h4>Current ESP state</h4>
-      <dl>
-        <div>
-          <dt>Connection</dt>
-          <dd>
-            {state.connected ? 'Online' : 'Offline'} · {state.firmware_version || 'unknown firmware'}
-          </dd>
-        </div>
-        <div>
-          <dt>Storage</dt>
-          <dd>
-            {!state.storage_reported
-              ? 'Not reported'
-              : faults.length
-                ? `I/O faults: ${faults.map(([name, value]) => `${name}=${String(value)}`).join(', ')}`
-                : `${state.storage_durability || 'Unknown'} · no I/O faults reported`}
-          </dd>
-        </div>
-        <div>
-          <dt>Queue</dt>
-          <dd>
-            {state.outbox_depth === null
-              ? 'No heartbeat on this boot'
-              : `${state.outbox_depth} queued at ${state.last_heartbeat_at ? dateTime(state.last_heartbeat_at) : 'the last heartbeat'}`}
-          </dd>
-        </div>
-      </dl>
+    <section className="firmware-retry-now" aria-label="Link box now">
+      <h4>Link box now</h4>
+      <ul>
+        <li>{state.connected ? 'Online' : 'Offline'} · version {plainVersion(state.firmware_version) ?? 'not known'}</li>
+        <li>Saved data: {storageWord(state)}</li>
+        <li>Check-ins waiting to send: {state.outbox_depth === null ? 'not reported since the last restart' : state.outbox_depth}</li>
+      </ul>
+      <TechnicalDetails>
+        <dl>
+          <div><dt>Connection</dt><dd>{state.connected ? 'Online' : 'Offline'} · {state.firmware_version || 'unknown firmware'}</dd></div>
+          <div><dt>Storage</dt><dd>{!state.storage_reported ? 'Not reported' : faults.length ? `I/O faults: ${faults.map(([name, value]) => `${name}=${String(value)}`).join(', ')}` : `${state.storage_durability || 'Unknown'} · no I/O faults reported`}</dd></div>
+          <div><dt>Queue</dt><dd>{state.outbox_depth === null ? 'No heartbeat on this boot' : `${state.outbox_depth} queued at ${state.last_heartbeat_at ? dateTime(state.last_heartbeat_at) : 'the last heartbeat'}`}</dd></div>
+          <div><dt>Boot</dt><dd>{state.boot_id || 'Not reported'}</dd></div>
+        </dl>
+      </TechnicalDetails>
     </section>
   )
 }
@@ -157,12 +157,15 @@ function EspState({ state }: { state: FirmwareRetryEspState }) {
 export function RetryTargetDialog({
   campaign,
   deployment,
+  deviceName,
   onClose,
   onChanged,
   toast,
 }: {
   campaign: FirmwareCampaign
   deployment: FirmwareDeployment
+  /** The device's friendly name ("Multan · Device 2"). */
+  deviceName?: string
   onClose: () => void
   onChanged: () => Promise<void>
   toast: Toast
@@ -171,6 +174,7 @@ export function RetryTargetDialog({
   const [preflightError, setPreflightError] = useState('')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
+  const name = deviceName || deployment.display_name || 'this device'
   useEffect(() => {
     let active = true
     // The 7-day stability scan runs only when the owner opens this dialog.
@@ -206,83 +210,61 @@ export function RetryTargetDialog({
           resume_pending_deployments: pending,
         }),
       })
-      toast.notice(
-        `One new ${deployment.target_version} attempt for ${deployment.display_name || deployment.connector_id} is queued; the campaign is active again${
-          pending ? ` and also offers its ${pending} other pending deployment${pending === 1 ? '' : 's'}` : ''
-        }.`,
-      )
+      toast.notice(updateToast.retried(name))
       await onChanged()
       onClose()
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : 'The retry was refused.')
+      const message = reason instanceof Error ? reason.message : ''
+      const refused = retryRefusalSentence(message)
+      setError(refused !== RETRY_REFUSAL_FALLBACK ? `Can't try again yet: ${refused}` : updateActionError(message))
     } finally {
       setBusy(false)
     }
   }
+  const kind = preflight?.kind ?? deployment.retry?.kind
+  const refusal = preflightError || (preflight && !preflight.available ? preflight.refusal || '' : null)
   return (
     <Dialog
       titleId="firmware-retry-target-title"
-      title="Retry same target"
-      description={`${deployment.display_name || deployment.connector_id} · ${deployment.previous_version || 'unknown'} → ${deployment.target_version}`}
+      title="Try the update again"
+      description={`${name} · ${plainVersion(deployment.previous_version) ?? 'unknown'} → ${plainVersion(deployment.target_version) ?? deployment.target_version}`}
       onClose={onClose}
     >
       <div className="dialog-body">
-        <div className="info-copy pattern-waiting">
-          <Icon name="shield" />
-          <div>
-            <h3>One new attempt, through every admission check.</h3>
-            {(preflight?.kind ?? deployment.retry?.kind) === 'PARTITION_HASH_FAILED' ? (
-              <p>
-                The downloaded image did not verify on the ESP. The new attempt downloads it again from
-                the start; {preflight?.limit ?? deployment.retry?.limit ?? 2} failed verifications of one
-                release stop retries until the power and flash of the ESP are checked.
-              </p>
-            ) : (
-              <p>
-                The ESP reset before it confirmed the new image. Retry only after checking its power,
-                its reset history and its current storage and queue state below;{' '}
-                {preflight?.limit ?? deployment.retry?.limit ?? 2} interrupted boots of one release stop
-                retries until a UART capture is taken.
-              </p>
-            )}
-          </div>
-        </div>
+        <Callout tone="info" title="One more try, with all the usual safety checks.">
+          {kind === 'PARTITION_HASH_FAILED'
+            ? 'The downloaded file was damaged, so it was not installed. Trying again downloads it fresh.'
+            : 'The link box restarted before it finished installing. Make sure it has steady power before trying again.'}
+        </Callout>
         {!preflight && !preflightError && (
-          <div className="message pattern-waiting" role="status">
-            <Icon name="info" />
-            Checking the ESP and its reset history…
-          </div>
+          <p className="firmware-retry-checking" role="status"><Icon name="clock" /> Checking the device…</p>
         )}
-        {(preflightError || (preflight && !preflight.available)) && (
-          <div className="message pattern-blocked" role="alert">
-            <Icon name="alert" />
-            {preflightError || preflight?.refusal || 'Retry is not available.'}
-          </div>
+        {refusal !== null && (
+          <Callout tone="danger" role="alert">
+            Can't try again yet: {retryRefusalSentence(refusal)}
+            <TechnicalDetails><p>{refusal || 'No reason given.'}</p></TechnicalDetails>
+          </Callout>
         )}
-        {preflight?.esp_state && <EspState state={preflight.esp_state} />}
+        {preflight?.esp_state && <LinkBoxNow state={preflight.esp_state} />}
         {pending > 0 && (
-          <div className="message pattern-waiting" role="status">
-            <Icon name="info" />
-            <div>
-              Retrying resumes the campaign, which also offers its {pending} other pending
-              deployment{pending === 1 ? '' : 's'}, one at a time before this retry.
-            </div>
-          </div>
+          <p className="firmware-retry-pending" role="status">
+            Trying again also restarts the update for {pending} other waiting device{pending === 1 ? '' : 's'} here, one at a time.
+          </p>
         )}
-        <StabilityWarnings warnings={warnings} />
-        {error && (
-          <div className="message pattern-blocked" role="alert">
-            <Icon name="alert" />
-            {error}
-          </div>
-        )}
+        <StabilityWarnings warnings={warnings} nameFor={() => name} />
+        {error && <Callout tone="danger" role="alert">{error}</Callout>}
+        <TechnicalDetails>
+          <dl>
+            <div><dt>Update</dt><dd>{campaign.campaign_id}</dd></div>
+            <div><dt>Deployment</dt><dd>{deployment.deployment_id}</dd></div>
+            <div><dt>Kind</dt><dd>{kind || 'TARGET_BOOT_INTERRUPTED'} · {preflight?.interrupted_boots ?? deployment.retry?.interrupted_boots ?? 0} of {preflight?.limit ?? deployment.retry?.limit ?? 2} tries used</dd></div>
+            {deployment.error_message && <div><dt>Device message</dt><dd>{deployment.error_code} · {deployment.error_message}</dd></div>}
+          </dl>
+          {deployment.rollback_diagnosis && <RollbackEvidence diagnosis={deployment.rollback_diagnosis} />}
+        </TechnicalDetails>
         <div className="dialog-actions">
-          <button className="button secondary" onClick={onClose}>
-            Keep paused
-          </button>
-          <button className="button primary" disabled={!valid} onClick={() => void retry()}>
-            {busy ? 'Verifying…' : 'Retry same target'}
-          </button>
+          <Button onClick={onClose}>Keep paused</Button>
+          <Button variant="primary" busy={busy} busyLabel="Starting…" disabled={!valid} onClick={() => retry()}>Try again</Button>
         </div>
       </div>
     </Dialog>

@@ -1,10 +1,8 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { BrowserRouter } from 'react-router-dom'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type {
   AttendanceEvent,
-  AttendanceReleaseCandidate,
-  AttendanceReleaseCandidates,
-  AttendanceReleaseQueueRow,
   AttendanceRepairJob,
   Device,
 } from '../types'
@@ -13,10 +11,14 @@ import { queryClient } from '../data'
 import { autoReleaseQueryKey } from './unknownAutoRelease'
 import { directSendDecisions } from './DirectOrdsSend'
 import type { DirectOrdsPreviewRow } from '../types'
+import type { AttendanceRow } from './attendance/types'
+import { expectPlainText } from '../words/testing'
+import { resetPrefs } from '../lib/prefs'
 
 const device: Device = {
   connector_id: 'connector-one', hardware_id: 'hw-one', zone_id: 'ZONE-ONE', zone_name: 'Islamabad',
-  device_id: '1', display_name: 'SLICTOWER · 3rd Floor', state: 'ONLINE', connected: true,
+  device_id: '1', display_name: 'SLICTOWER · 3rd Floor', friendly_name: 'SLIC Tower · 3rd Floor', division: 'health',
+  state: 'ONLINE', connected: true,
   firmware_version: '2.4.5', onboarding_generation: 2, last_onboarded_at: null,
   last_seen_at: '2026-08-12T10:00:00Z', current_activity: 'Live capture', last_error_code: null,
   zkt: {
@@ -30,18 +32,54 @@ const device: Device = {
   },
 }
 
-const event = (overrides: Partial<AttendanceEvent> = {}): AttendanceEvent => ({
+const connector = {
+  connector_id: 'connector-one', display_name: 'SLICTOWER-3FL', zone_id: 'ZONE-SLICTOWER-3FL', zone_name: 'SLICTOWER-3FL',
+  friendly_name: 'SLIC Tower · 3rd Floor', division: 'health' as const,
+}
+
+const event = (overrides: Partial<AttendanceRow> = {}): AttendanceEvent => ({
   id: 1, event_uid: 'event-one', device_serial: 'ADZV211860253', uid: '7', user_id: '1007',
   display_name: 'Ayesha Khan', cnic_masked: '*****-****567-1', device_event_time: '2026-08-12T08:00:00Z',
   captured_at: '2026-08-12T08:00:01Z', received_at: '2026-08-12T08:00:02Z', source: 'LIVE',
   status: 'CAPTURED', punch: '0', clock_quality: 'OK', clock_drift_seconds: 2, ords_status: 'PENDING',
   oracle_confirmed_at: null, oracle_confirmation_path: null, identity_resolution_id: null,
+  source_connector: connector,
   ...overrides,
-})
+} as unknown as AttendanceEvent)
 
 const response = (body: unknown, status = 200) => new Response(JSON.stringify(body), {
   status, headers: { 'Content-Type': 'application/json' },
 })
+
+const summary = {
+  from_time: '2026-08-11T19:00:00Z', to_time: null, computed_at: new Date().toISOString(), max_age_seconds: 15,
+  totals: { received: 3412, sent: 3300, waiting: 80, trying_again: 12, not_matched: 28, set_aside: 3, problem: 1, oldest_waiting_at: null },
+  last_sent_at: null,
+  by_division: {
+    life: { received: 1234, sent: 1200, waiting: 20, trying_again: 0, not_matched: 10, set_aside: 4, problem: 0, oldest_waiting_at: null },
+    health: { received: 2178, sent: 2100, waiting: 60, trying_again: 12, not_matched: 18, set_aside: 0, problem: 1, oldest_waiting_at: null },
+  },
+}
+
+const journey = {
+  id: 1, delivery_group: 'sent', ords_status: 'ACKED', source: 'LIVE', live: true,
+  device_event_time: '2026-08-12T08:00:00Z', captured_at: '2026-08-12T08:00:01Z', received_at: '2026-08-12T08:00:02Z',
+  oracle_confirmed_at: '2026-08-12T08:00:05Z',
+  outbox: { status: 'ACKED', delivery_type: 'LIVE', created_at: '2026-08-12T08:00:03Z', last_attempt_at: '2026-08-12T08:00:04Z', attempt_count: 1, next_attempt_at: null, acknowledged_at: '2026-08-12T08:00:05Z' },
+  steps: [],
+}
+
+/** Wraps a page fetch stub so the totals and journey calls answer with their own shapes. */
+const stub = (handler: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>) => vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+  const url = new URL(String(input), 'https://add.test')
+  if (url.pathname === '/api/v1/attendance/summary') return response(summary)
+  if (/^\/api\/v1\/attendance\/\d+\/journey$/.test(url.pathname)) return response(journey)
+  return handler(input, init)
+})
+
+const listCalls = (fetchMock: ReturnType<typeof vi.fn>) => fetchMock.mock.calls
+  .map(([input]) => new URL(String(input), 'https://add.test'))
+  .filter((url) => url.pathname === '/api/v1/attendance')
 
 class IntersectionObserverStub {
   static instance: IntersectionObserverStub | null = null
@@ -62,93 +100,21 @@ const attendanceProps = {
   devices: [device], revision: 0, realtimeState: 'live' as const, realtimeLastSyncAt: null,
 }
 
-const queueRow = (
-  overrides: Partial<AttendanceReleaseQueueRow> = {},
-): AttendanceReleaseQueueRow => ({
-  connector_id: device.connector_id,
-  device_id: device.device_id,
-  device_name: device.display_name,
-  user_key: '11111111-1111-4111-8111-111111111111',
-  row_version: 3,
-  display_name: 'Dr Farzana',
-  user_id: '1007',
-  uid: '7',
-  cnic_masked: '*****-****567-1',
-  eligible: true,
-  lock_reason: null,
-  lock_reasons: [],
-  source_current: true,
-  active_release_job_id: null,
-  counts: {
-    ordinary_blocked: 1,
-    identity_reuse: 1,
-    eligible: 2,
-    locked: 0,
-    in_progress: 0,
-  },
-  first_event_at: '2026-08-12T08:00:00Z',
-  last_event_at: '2026-08-12T09:00:00Z',
-  ...overrides,
-})
+const renderView = (props: Partial<Parameters<typeof AttendanceView>[0]> = {}) =>
+  render(<AttendanceView {...attendanceProps} {...props} />, { wrapper: BrowserRouter })
 
-const releaseCandidate = (
-  overrides: Partial<AttendanceReleaseCandidate> = {},
-): AttendanceReleaseCandidate => ({
-  event_token: 'event-token-one',
-  event_uid: 'release-event-one',
-  device_event_time: '2026-08-12T08:00:00Z',
-  punch: '0',
-  status: '0',
-  source: 'FULL_HISTORY',
-  device_serial: 'ADZV211860253',
-  uid: '**',
-  user_id: '10**07',
-  display_name: 'Dr Farzana',
-  clock_quality: 'OK',
-  source_ords_status: 'BLOCKED_IDENTITY',
-  risk_class: 'ORDINARY_BLOCKED',
-  evidence_classification: 'CURRENT_USER_LINEAGE',
-  eligible: true,
-  lock_reason: null,
-  ...overrides,
-})
+const openRow = async (name: RegExp) => {
+  const row = await screen.findByRole('article', { name })
+  fireEvent.click(within(row).getByRole('button', { name: /^Open check-in/ }))
+  return screen.findByRole('dialog')
+}
 
-const releaseCandidates = (
-  rows: AttendanceReleaseCandidate[],
-  overrides: Partial<AttendanceReleaseCandidates> = {},
-): AttendanceReleaseCandidates => ({
-  candidate_set_token: 'candidate-set-token',
-  expires_at: '2026-08-12T10:15:00Z',
-  source_current: true,
-  source_certificate: { certificate_digest: 'c'.repeat(64) },
-  target: {
-    user_key: '11111111-1111-4111-8111-111111111111',
-    row_version: 3,
-    display_name: 'Dr Farzana',
-    user_id: '1007',
-    uid: '7',
-    cnic_masked: '*****-****567-1',
-    eligible: true,
-    lock_reason: null,
-  },
-  filters: {
-    date_from: null,
-    date_to: null,
-    hold_statuses: ['BLOCKED_IDENTITY', 'QUARANTINED_IDENTITY_REUSE'],
-    punch: null,
-    source: null,
-  },
-  totals: {
-    all: rows.length,
-    eligible: rows.filter((row) => row.eligible).length,
-    locked: rows.filter((row) => !row.eligible).length,
-    ordinary_blocked: rows.filter((row) => row.risk_class === 'ORDINARY_BLOCKED').length,
-    identity_reuse: rows.filter((row) => row.risk_class === 'IDENTITY_REUSE').length,
-  },
-  rows,
-  next_cursor: null,
-  ...overrides,
-})
+const selectAllShown = async () => {
+  fireEvent.click(screen.getByRole('button', { name: 'Select' }))
+  fireEvent.click(await screen.findByLabelText('Select all shown'))
+}
+
+const sendChosen = () => fireEvent.click(within(screen.getByRole('region', { name: 'Chosen check-ins' })).getByRole('button', { name: 'Send to HR system' }))
 
 const releaseJob = (
   overrides: Partial<AttendanceRepairJob> = {},
@@ -207,11 +173,11 @@ const releaseJob = (
   ...overrides,
 })
 
-describe('Live attendance workspace', () => {
+describe('Attendance check-ins', () => {
   beforeEach(() => {
-    // The automatic-release panel always shows on this page and has its own
-    // tests; a saved "no status" keeps these fetch counts about the ledger.
+    // The automatic sending switch has its own tests; a saved "no status" keeps these fetch counts about the list.
     queryClient.setQueryData(autoReleaseQueryKey, null)
+    resetPrefs()
     window.history.replaceState(null, '', '/attendance')
     IntersectionObserverStub.instance = null
     vi.stubGlobal('IntersectionObserver', IntersectionObserverStub)
@@ -224,34 +190,51 @@ describe('Live attendance workspace', () => {
     queryClient.clear()
   })
 
-  it('defaults to an all-source live chronology with loaded-result metrics and human labels', async () => {
-    const fetchMock = vi.fn(async (_input: RequestInfo | URL) => response({ rows: [event({
-      ords_status: 'ACKNOWLEDGED', oracle_confirmed_at: '2026-08-12T08:00:05Z',
+  it('opens on today with server totals, one status per check-in and the journey in the sheet', async () => {
+    const fetchMock = stub(async () => response({ rows: [event({
+      ords_status: 'ACKED', delivery_group: 'sent', oracle_confirmed_at: '2026-08-12T08:00:05Z',
       oracle_confirmation_path: 'ADD_EVENT_UID',
     })], next_cursor: null }))
     vi.stubGlobal('fetch', fetchMock)
-    render(<AttendanceView {...attendanceProps} />)
+    const { container } = renderView()
 
-    const row = await screen.findByRole('article', { name: /Ayesha Khan, Check in/i })
-    expect(within(row).getByText('SLICTOWER · 3rd Floor')).toBeTruthy()
-    expect(within(row).getByText('Live capture')).toBeTruthy()
-    expect(within(row).getByText('Clock verified')).toBeTruthy()
-    expect(within(row).getByLabelText('Status: ACKNOWLEDGED')).toBeTruthy()
-    expect(screen.getByText('Events loaded').closest('article')?.textContent).toContain('1')
-    expect(screen.getByText('Oracle confirmed').closest('article')?.textContent).toContain('1')
-    expect(screen.getByText('Data-quality attention').closest('article')?.textContent).toContain('0')
-    expect(String(fetchMock.mock.calls[0][0])).not.toContain('source=')
+    const row = await screen.findByRole('article', { name: /Ayesha Khan, Check-in, .*, Sent/i })
+    expect(within(row).getByText('SLIC Tower · 3rd Floor')).toBeTruthy()
+    expect(within(row).getByText('Health')).toBeTruthy()
+    expect(within(row).getByLabelText('Status: Sent')).toBeTruthy()
+    expect(within(row).getByText(/^Sent /)).toBeTruthy()
+    // How it arrived and the clock are only in the sheet now.
+    expect(within(row).queryByText('Live capture')).toBeNull()
+    expect(within(row).queryByText('Clock verified')).toBeNull()
+    expect(row.textContent).not.toMatch(/retained event includes a terminal serial/)
+    // Real totals for the day, never the loaded rows.
+    expect(await screen.findByText('3,412')).toBeTruthy()
+    expect(screen.getByText('Life 1,234 · Health 2,178')).toBeTruthy()
+    const list = listCalls(fetchMock)
+    expect(list).toHaveLength(1)
+    // Today sends only the start of the Pakistan day, so the live list keeps moving.
+    expect(list[0].searchParams.get('from_time')).toMatch(/T19:00:00\.000Z$/)
+    expect(list[0].searchParams.get('to_time')).toBeNull()
+    expect(list[0].searchParams.get('notify_summary')).toBe('false')
+    expect(list[0].searchParams.get('source')).toBeNull()
+    expectPlainText(container)
 
-    fireEvent.click(within(row).getByLabelText(/view event details/i))
-    expect(within(row).getByText('event-one')).toBeTruthy()
+    const sheet = await openRow(/Ayesha Khan/)
+    expect(window.location.search).toContain('event=1')
+    expect(await within(sheet).findByText('Machine time correct')).toBeTruthy()
+    expect(within(sheet).getByText('Live')).toBeTruthy()
+    expect(within(sheet).getByText('Confirmed by HR system')).toBeTruthy()
+    expect(within(sheet).getByText('event-one')).toBeTruthy()
+    expect(within(sheet).getByText('event-one').closest('[data-technical]')).toBeTruthy()
+    expect((sheet.querySelector('details[data-technical]') as HTMLDetailsElement).open).toBe(false)
   })
 
-  it('shows retained connector and zone custody without inventing a terminal serial', async () => {
-    vi.stubGlobal('fetch', vi.fn(async () => response({ rows: [event({
+  it('names the place by the link box that delivered it without inventing a machine serial', async () => {
+    vi.stubGlobal('fetch', stub(async () => response({ rows: [event({
       device_serial: null,
       source_connector: {
         connector_id: 'karachi-connector', display_name: 'ZONE-KARACHI-01',
-        zone_id: 'ZONE-KARACHI', zone_name: 'Karachi',
+        zone_id: 'ZONE-KARACHI', zone_name: 'Karachi', friendly_name: 'Karachi · Device 1', division: 'health',
       },
       terminal_provenance: {
         state: 'MISSING_TERMINAL_PROVENANCE', serial: null, confidence: 'REVIEW_REQUIRED',
@@ -259,174 +242,226 @@ describe('Live attendance workspace', () => {
       },
       source: 'DUMP_RECONNECT', ords_status: 'BLOCKED_IDENTITY',
     })], next_cursor: null })))
-    render(<AttendanceView {...attendanceProps} />)
+    renderView()
 
-    const row = await screen.findByRole('article', { name: /Ayesha Khan, Check in/i })
-    expect(within(row).getByText('Source connector: ZONE-KARACHI-01')).toBeTruthy()
-    expect(within(row).getByText('Current connector zone: Karachi')).toBeTruthy()
-    expect(within(row).queryByText('Zone: Karachi')).toBeNull()
-    const warning = within(row).getByText('Terminal provenance unavailable')
-    expect(warning.getAttribute('title')).toBe('The saved punch has no verified terminal serial.')
-    expect(warning.classList.contains('attention-copy')).toBe(true)
+    const row = await screen.findByRole('article', { name: /Ayesha Khan, Check-in/i })
+    expect(within(row).getByText('Came through Karachi · Device 1')).toBeTruthy()
+    expect(within(row).getByText('Machine not confirmed')).toBeTruthy()
+    expect(within(row).getByLabelText('Status: Not matched')).toBeTruthy()
     expect(within(row).queryByText(device.display_name)).toBeNull()
     expect(within(row).queryByText(device.zkt!.serial!)).toBeNull()
-    expect(within(row).getByLabelText('Status: BLOCKED IDENTITY')).toBeTruthy()
+    expect(within(row).queryByText('SLIC Tower · 3rd Floor')).toBeNull()
+    const sheet = await openRow(/Ayesha Khan/)
+    // The backend sentence is only under Technical details.
+    expect(within(sheet).getByText(/The saved punch has no verified terminal serial/).closest('[data-technical]')).toBeTruthy()
+    expect(await within(sheet).findByText('Collected later, after the machine came back online')).toBeTruthy()
   })
 
-  it('keeps the provenance warning when connector custody is unavailable', async () => {
-    vi.stubGlobal('fetch', vi.fn(async () => response({
+  it('says the place is not known when the link box is unavailable', async () => {
+    vi.stubGlobal('fetch', stub(async () => response({
       rows: [event({ device_serial: null, source_connector: null })], next_cursor: null,
     })))
-    render(<AttendanceView {...attendanceProps} />)
-
-    const row = await screen.findByRole('article', { name: /Ayesha Khan, Check in/i })
-    expect(within(row).getByText('Source connector unavailable')).toBeTruthy()
-    expect(within(row).getByText('Terminal provenance unavailable')).toBeTruthy()
+    renderView()
+    const row = await screen.findByRole('article', { name: /Ayesha Khan, Check-in/i })
+    expect(within(row).getByText('Place not known')).toBeTruthy()
     expect(within(row).queryByText(device.display_name)).toBeNull()
   })
 
-  it('updates delivery state in place and queues unseen events when the reader is away from the top', async () => {
+  it('updates the status in place and queues new check-ins while the reader is scrolled down', async () => {
     const first = event()
     const second = event({ id: 2, event_uid: 'event-two', display_name: 'Bilal Ahmed', user_id: '1008', uid: '8', punch: '1' })
     let request = 0
-    vi.stubGlobal('fetch', vi.fn(async (_input: RequestInfo | URL) => response({
-      rows: request++ === 0 ? [first] : [second, { ...first, ords_status: 'ACKNOWLEDGED', oracle_confirmed_at: '2026-08-12T08:01:00Z' }],
+    vi.stubGlobal('fetch', stub(async () => response({
+      rows: request++ === 0 ? [first] : [second, { ...first, ords_status: 'ACKED', oracle_confirmed_at: '2026-08-12T08:01:00Z' }],
       next_cursor: null,
     })))
-    const view = render(<AttendanceView {...attendanceProps} />)
-    const ayesha = await screen.findByRole('article', { name: /Ayesha Khan, Check in/i })
+    const view = renderView()
+    const ayesha = await screen.findByRole('article', { name: /Ayesha Khan, Check-in/i })
+    expect(within(ayesha).getByLabelText('Status: Waiting')).toBeTruthy()
 
     act(() => IntersectionObserverStub.instance?.emit(false))
     view.rerender(<AttendanceView {...attendanceProps} revision={1} />)
 
-    expect(await screen.findByRole('button', { name: /1 new event · show newest/i })).toBeTruthy()
-    expect(within(ayesha).getByLabelText('Status: ACKNOWLEDGED')).toBeTruthy()
+    expect(await screen.findByRole('button', { name: /1 new check-in · Show/i })).toBeTruthy()
+    expect(within(screen.getByRole('article', { name: /Ayesha Khan/i })).getByLabelText('Status: Sent')).toBeTruthy()
     expect(screen.queryByRole('article', { name: /Bilal Ahmed/i })).toBeNull()
-    fireEvent.click(screen.getByRole('button', { name: /1 new event · show newest/i }))
-    expect(await screen.findByRole('article', { name: /Bilal Ahmed, Check out/i })).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: /1 new check-in · Show/i }))
+    expect(await screen.findByRole('article', { name: /Bilal Ahmed, Check-out/i })).toBeTruthy()
     expect(screen.getAllByRole('article', { name: /Ayesha Khan|Bilal Ahmed/i })).toHaveLength(2)
   })
 
-  it('preserves loaded older rows and an exhausted pagination cursor during live reconciliation', async () => {
+  it('reads the list at most once for a burst of live check-ins', async () => {
+    const fetchMock = stub(async () => response({ rows: [event()], next_cursor: null }))
+    vi.stubGlobal('fetch', fetchMock)
+    const view = renderView()
+    await screen.findByRole('article', { name: /Ayesha Khan/i })
+    for (let revision = 1; revision <= 20; revision += 1) view.rerender(<AttendanceView {...attendanceProps} revision={revision} />)
+    await new Promise((resolve) => window.setTimeout(resolve, 400))
+    // The first live refresh starts at once; the rest of the burst waits for the 3 s throttle.
+    expect(listCalls(fetchMock).length).toBeLessThanOrEqual(2)
+  })
+
+  it('keeps older pages and an exhausted cursor during a live refresh', async () => {
     const first = event()
     const older = event({ id: 3, event_uid: 'event-old', display_name: 'Older Event', user_id: '900', uid: '9' })
     let newestRequests = 0
-    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+    const fetchMock = stub(async (input: RequestInfo | URL) => {
       const url = new URL(String(input), 'https://add.test')
       if (url.searchParams.get('cursor') === '10') return response({ rows: [older], next_cursor: null })
       newestRequests += 1
       return response({
-        rows: newestRequests === 1 ? [first] : [{ ...first, ords_status: 'ACKNOWLEDGED', oracle_confirmed_at: '2026-08-12T08:01:00Z' }],
+        rows: newestRequests === 1 ? [first] : [{ ...first, ords_status: 'ACKED', oracle_confirmed_at: '2026-08-12T08:01:00Z' }],
         next_cursor: 10,
       })
     })
     vi.stubGlobal('fetch', fetchMock)
-    const view = render(<AttendanceView {...attendanceProps} />)
+    const view = renderView()
     await screen.findByRole('article', { name: /Ayesha Khan/i })
 
-    fireEvent.click(screen.getByRole('button', { name: /Load older events/i }))
+    fireEvent.click(screen.getByRole('button', { name: /Show older check-ins/i }))
     expect(await screen.findByRole('article', { name: /Older Event/i })).toBeTruthy()
-    expect(screen.queryByRole('button', { name: /Load older events/i })).toBeNull()
+    expect(screen.queryByRole('button', { name: /Show older check-ins/i })).toBeNull()
 
     view.rerender(<AttendanceView {...attendanceProps} revision={1} />)
-    await waitFor(() => expect(screen.getByLabelText('Status: ACKNOWLEDGED')).toBeTruthy())
+    await waitFor(() => expect(screen.getByLabelText('Status: Sent')).toBeTruthy())
     expect(screen.getByRole('article', { name: /Older Event/i })).toBeTruthy()
-    expect(screen.queryByRole('button', { name: /Load older events/i })).toBeNull()
+    expect(screen.queryByRole('button', { name: /Show older check-ins/i })).toBeNull()
   })
 
-  it('performs no revision fetch while paused and reconciles immediately on resume', async () => {
-    const fetchMock = vi.fn(async (_input: RequestInfo | URL) => response({ rows: [event()], next_cursor: null }))
+  it('never lets a live refresh break into a filter change', async () => {
+    const waiting = event({ id: 4, event_uid: 'event-waiting', display_name: 'Waiting Person', user_id: '901', uid: '10' })
+    let release: () => void = () => undefined
+    const fetchMock = stub(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input), 'https://add.test')
+      if (url.searchParams.getAll('delivery_group').includes('waiting')) {
+        await new Promise<void>((resolve) => { release = resolve })
+        if (init?.signal?.aborted) throw new DOMException('Aborted', 'AbortError')
+        return response({ rows: [waiting], next_cursor: null })
+      }
+      return response({ rows: [event()], next_cursor: 10 })
+    })
     vi.stubGlobal('fetch', fetchMock)
-    const view = render(<AttendanceView {...attendanceProps} />)
+    const view = renderView()
     await screen.findByRole('article', { name: /Ayesha Khan/i })
-    expect(fetchMock).toHaveBeenCalledTimes(1)
+    await screen.findByText('3,412')
+    fireEvent.click(screen.getByRole('button', { name: /^Waiting\s*80/ }))
+    await waitFor(() => expect(listCalls(fetchMock).some((url) => url.searchParams.getAll('delivery_group').includes('waiting'))).toBe(true))
+    const before = listCalls(fetchMock).length
+    view.rerender(<AttendanceView {...attendanceProps} revision={1} />)
+    await new Promise((resolve) => window.setTimeout(resolve, 50))
+    expect(listCalls(fetchMock).length).toBe(before)
+    await act(async () => { release() })
+    expect(await screen.findByRole('article', { name: /Waiting Person/i })).toBeTruthy()
+    expect(screen.queryByRole('article', { name: /Ayesha Khan/i })).toBeNull()
+    expect(screen.queryByRole('button', { name: /Show older check-ins/i })).toBeNull()
+  })
 
-    fireEvent.click(screen.getByRole('button', { name: 'Pause' }))
+  it('reads nothing while the list is frozen and catches up when unfrozen', async () => {
+    const fetchMock = stub(async () => response({ rows: [event()], next_cursor: null }))
+    vi.stubGlobal('fetch', fetchMock)
+    const view = renderView()
+    await screen.findByRole('article', { name: /Ayesha Khan/i })
+    expect(listCalls(fetchMock)).toHaveLength(1)
+    expect(screen.getByText(/Newest first · Live/)).toBeTruthy()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Freeze list' }))
     view.rerender(<AttendanceView {...attendanceProps} revision={1} />)
     await new Promise((resolve) => window.setTimeout(resolve, 350))
-    expect(fetchMock).toHaveBeenCalledTimes(1)
-    expect(screen.getByText('Updates paused')).toBeTruthy()
+    expect(listCalls(fetchMock)).toHaveLength(1)
+    expect(screen.getByText(/Sending to the HR system goes on as normal/)).toBeTruthy()
 
-    fireEvent.click(screen.getByRole('button', { name: 'Resume' }))
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
-    expect(screen.getByText('Realtime connected')).toBeTruthy()
+    fireEvent.click(screen.getAllByRole('button', { name: 'Unfreeze list' })[0])
+    await waitFor(() => expect(listCalls(fetchMock)).toHaveLength(2))
   })
 
-  it('validates exact CNIC and PKT ranges before sending advanced filters', async () => {
-    const fetchMock = vi.fn(async (_input: RequestInfo | URL) => response({ rows: [event()], next_cursor: null }))
+  it('searches a 13-digit CNIC on the server but never writes it into the page address', async () => {
+    const fetchMock = stub(async () => response({ rows: [event()], next_cursor: null }))
     vi.stubGlobal('fetch', fetchMock)
-    render(<AttendanceView {...attendanceProps} />)
+    renderView()
     await screen.findByRole('article', { name: /Ayesha Khan/i })
-    fireEvent.click(screen.getByText(/^Filters$/i))
+    fireEvent.change(screen.getByLabelText('Search check-ins'), { target: { value: '35202-1234567-1' } })
+    await waitFor(() => expect(listCalls(fetchMock).at(-1)?.searchParams.get('cnic')).toBe('3520212345671'))
+    expect(listCalls(fetchMock).at(-1)?.searchParams.get('q')).toBeNull()
+    expect(screen.getByText('Searching by CNIC')).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Remove filter: CNIC ending …671' })).toBeTruthy()
+    await new Promise((resolve) => window.setTimeout(resolve, 300))
+    expect(window.location.search).not.toMatch(/3520|cnic/i)
 
-    fireEvent.change(screen.getByLabelText('Exact CNIC'), { target: { value: '35202' } })
-    expect((await screen.findByRole('alert')).textContent).toMatch(/exact 13-digit cnic/i)
-    expect(fetchMock).toHaveBeenCalledTimes(1)
-
-    fireEvent.change(screen.getByLabelText('Exact CNIC'), { target: { value: '3520212345671' } })
-    fireEvent.change(screen.getByLabelText('Capture source'), { target: { value: 'FULL_HISTORY' } })
-    fireEvent.change(screen.getByLabelText('From (PKT)'), { target: { value: '2026-08-12T10:00' } })
-    fireEvent.change(screen.getByLabelText('To (PKT)'), { target: { value: '2026-08-12T11:00' } })
-    await waitFor(() => expect(fetchMock.mock.calls.length).toBeGreaterThan(1))
-    const sent = new URL(String(fetchMock.mock.calls.at(-1)?.[0]), 'https://add.test')
-    expect(sent.searchParams.get('cnic')).toBe('3520212345671')
-    expect(sent.searchParams.get('source')).toBe('FULL_HISTORY')
-    expect(sent.searchParams.get('from_time')).toBe('2026-08-12T05:00:00.000Z')
-    expect(sent.searchParams.get('to_time')).toBe('2026-08-12T06:00:00.000Z')
-
-    fireEvent.change(screen.getByLabelText('From (PKT)'), { target: { value: '2026-08-12T12:00' } })
-    expect((await screen.findByRole('alert')).textContent).toMatch(/from time must be earlier/i)
+    fireEvent.change(screen.getByLabelText('Search check-ins'), { target: { value: 'Ayesha' } })
+    await waitFor(() => expect(listCalls(fetchMock).at(-1)?.searchParams.get('q')).toBe('Ayesha'))
+    await waitFor(() => expect(window.location.search).toContain('q=Ayesha'))
   })
 
-  it('combines Oracle status choices, missing CNIC, and a chosen page size', async () => {
-    const fetchMock = vi.fn(async (_input: RequestInfo | URL) => response({
-      rows: [event()], next_cursor: null,
-      status_options: ['BLOCKED_IDENTITY', 'FAILED_RETRYABLE', 'ACKED'],
-    }))
+  it('keeps the status, place and More filters in the address and sends them as list filters', async () => {
+    const fetchMock = stub(async () => response({ rows: [event()], next_cursor: null }))
     vi.stubGlobal('fetch', fetchMock)
-    render(<AttendanceView {...attendanceProps} />)
+    renderView()
     await screen.findByRole('article', { name: /Ayesha Khan/i })
-    fireEvent.click(screen.getByText(/^Filters$/i))
-    fireEvent.click(screen.getByLabelText('Blocked identity'))
-    fireEvent.click(screen.getByLabelText('Failed retryable'))
-    fireEvent.change(screen.getByLabelText('CNIC availability'), { target: { value: 'missing' } })
-    fireEvent.change(screen.getByLabelText('Rows per load'), { target: { value: '250' } })
+    fireEvent.click(screen.getByRole('button', { name: /^Status: Status/ }))
+    fireEvent.click(await screen.findByLabelText(/^Not matched/))
+    await waitFor(() => expect(listCalls(fetchMock).at(-1)?.searchParams.getAll('delivery_group')).toEqual(['not_matched']))
+    expect(window.location.search).toContain('status=not_matched')
+
+    fireEvent.click(screen.getByRole('button', { name: /More filters/ }))
+    fireEvent.click(await screen.findByRole('switch', { name: 'No CNIC' }))
+    fireEvent.click(screen.getByRole('switch', { name: 'Machine time was wrong' }))
     await waitFor(() => {
-      const sent = new URL(String(fetchMock.mock.calls.at(-1)?.[0]), 'https://add.test')
-      expect(sent.searchParams.getAll('ords_status')).toEqual(['BLOCKED_IDENTITY', 'FAILED_RETRYABLE'])
-      expect(sent.searchParams.get('cnic_present')).toBe('false')
-      expect(sent.searchParams.get('limit')).toBe('250')
+      const sent = listCalls(fetchMock).at(-1)!
+      expect(sent.searchParams.getAll('ords_status')).toEqual(['CNIC_NOT_LINKED'])
+      expect(sent.searchParams.getAll('clock_quality')).toEqual(['DRIFTED', 'INVALID'])
     })
-    fireEvent.click(screen.getByRole('button', { name: /Oracle: BLOCKED IDENTITY/i }))
-    await waitFor(() => {
-      const sent = new URL(String(fetchMock.mock.calls.at(-1)?.[0]), 'https://add.test')
-      expect(sent.searchParams.getAll('ords_status')).toEqual(['FAILED_RETRYABLE'])
-    })
+    expect(window.location.search).toMatch(/no_id=1/)
+    expect(window.location.search).not.toMatch(/cnic|password|reason|confirmation/i)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Remove filter: Not matched' }))
+    await waitFor(() => expect(listCalls(fetchMock).at(-1)?.searchParams.getAll('delivery_group')).toEqual([]))
   })
 
-  it('lets an administrator select a held punch when the synced user has a CNIC', async () => {
+  it('sends a tile choice as the status filter', async () => {
+    const fetchMock = stub(async () => response({ rows: [event()], next_cursor: null }))
+    vi.stubGlobal('fetch', fetchMock)
+    renderView()
+    await screen.findByText('3,412')
+    fireEvent.click(screen.getByRole('button', { name: /^Waiting\s*80/ }))
+    await waitFor(() => expect(listCalls(fetchMock).at(-1)?.searchParams.getAll('delivery_group')).toEqual(['waiting']))
+    expect(window.location.search).toContain('status=waiting')
+  })
+
+  it('sends Yesterday with an exclusive end at Pakistan midnight', async () => {
+    window.history.replaceState(null, '', '/attendance?when=yesterday')
+    const fetchMock = stub(async () => response({ rows: [], next_cursor: null }))
+    vi.stubGlobal('fetch', fetchMock)
+    renderView()
+    await waitFor(() => expect(listCalls(fetchMock)).toHaveLength(1))
+    const sent = listCalls(fetchMock)[0]
+    expect(sent.searchParams.get('to_exclusive')).toBe('true')
+    expect(Date.parse(sent.searchParams.get('to_time')!) - Date.parse(sent.searchParams.get('from_time')!)).toBe(86_400_000)
+    expect(await screen.findByText('No check-ins on these dates')).toBeTruthy()
+  })
+
+  it('lets an admin send a not-matched check-in when the machine has the CNIC', async () => {
     const held = event({
       cnic_masked: null, ords_status: 'BLOCKED_IDENTITY',
       direct_ords_identity: { eligible: true, cnic_source: 'SYNCED_USER', exclusion: null },
     })
-    vi.stubGlobal('fetch', vi.fn(async () => response({ rows: [held], next_cursor: null })))
-    render(<AttendanceView {...attendanceProps} />)
+    vi.stubGlobal('fetch', stub(async () => response({ rows: [held], next_cursor: null })))
+    renderView()
     const row = await screen.findByRole('article', { name: /Ayesha Khan/i })
-    expect(within(row).getByText(/CNIC on synced user/i)).toBeTruthy()
-    expect(within(row).queryByLabelText('Status: CNIC NOT LINKED')).toBeNull()
-    fireEvent.click(within(row).getByRole('button', { name: 'Send to ORDS' }))
-    const dialog = screen.getByRole('dialog')
-    expect(dialog.textContent).toMatch(/compares the CNIC the terminal held for this user ID at punch time/i)
-    expect(dialog.textContent).toMatch(/does not prove who owned the terminal user ID/i)
+    expect(within(row).queryByText('No CNIC for this person')).toBeNull()
+    const sheet = await openRow(/Ayesha Khan/)
+    fireEvent.click(within(sheet).getByRole('button', { name: 'Send to HR system' }))
+    const dialog = await screen.findByRole('dialog', { name: /Send 1 check-in to the HR system \(Oracle\)/ })
+    expect(dialog.textContent).toMatch(/compares the CNIC the machine had for this Employee ID at the check-in time/i)
+    expect(dialog.textContent).toMatch(/does not prove who had the Employee ID/i)
   })
 
-  it('lists unknown identities with a synced CNIC, shows the server-side automatic release and releases a selection without a reason or password', async () => {
+  it('shows not-matched check-ins with a CNIC on the machine and sends a selection in one click', async () => {
     queryClient.removeQueries({ queryKey: autoReleaseQueryKey })
     const unknown = (id: number) => event({
       id, event_uid: `unknown-${id}`, display_name: null, cnic_masked: null, ords_status: 'BLOCKED_IDENTITY',
       direct_ords_identity: { eligible: true, cnic_source: 'SYNCED_USER', exclusion: null, punch_time_cnic: 'NONE', cnic_choice_required: true },
     })
-    const fetchMock = vi.fn(async (path: RequestInfo | URL, init?: RequestInit) => {
+    const fetchMock = stub(async (path: RequestInfo | URL, init?: RequestInit) => {
       const url = String(path)
       if (url === '/api/v2/attendance-direct-ords/unknown-synced') {
         return response({ count: 3, devices: [{ connector_id: device.connector_id, display_name: device.display_name, zone_id: 'ZONE-ONE', count: 3 }], event_ids: [], truncated: false })
@@ -440,6 +475,7 @@ describe('Live attendance workspace', () => {
           server_time: '2026-08-12T10:00:30Z',
         })
       }
+      if (url === '/api/v2/attendance-force-releases') return response({ enabled: true, rows: [], next_cursor: null })
       if (url === '/api/v2/attendance-direct-ords/quick-release' && init?.method === 'POST') {
         const ids = JSON.parse(String(init.body)).event_ids as number[]
         return response({ job_id: 'quick-one', selected: ids.length, ready: ids.length - 1, skipped: 1, not_matching: 0, skipped_by_reason: { CNIC_CONFLICT: 1 } }, 202)
@@ -447,46 +483,48 @@ describe('Live attendance workspace', () => {
       return response({ rows: url.includes('unknown_synced_cnic=true') ? [unknown(12), unknown(11), unknown(10)] : [event()], next_cursor: null })
     })
     vi.stubGlobal('fetch', fetchMock)
-    render(<AttendanceView {...attendanceProps} />)
+    renderView()
     await screen.findByRole('article', { name: /Ayesha Khan/i })
-    // Releasing all of them is server-side now: the switch and its progress
-    // show without the heavy filter (they read the worker's saved counts).
-    const control = await screen.findByRole('switch', { name: /Automatic release/i })
-    expect(control.getAttribute('aria-checked')).toBe('true')
+    fireEvent.click(screen.getByRole('tab', { name: /Fix tools/ }))
+    const card = await screen.findByRole('article', { name: 'Send not-matched check-ins automatically' })
+    await waitFor(() => expect(card.textContent).toMatch(/On · 3 still to send/))
     expect(fetchMock.mock.calls.some(([path]) => String(path).includes('unknown-synced'))).toBe(false)
-    expect(fetchMock.mock.calls.some(([path]) => String(path).includes('unknown_synced_cnic=true'))).toBe(false)
-    fireEvent.click(screen.getByRole('button', { name: /Unknown identity · CNIC on synced user/i }))
-    expect(screen.queryByRole('button', { name: /Release all \d/ })).toBeNull()
+    fireEvent.click(within(card).getByRole('button', { name: /^Open/ }))
+    const control = await screen.findByRole('switch', { name: /Send automatically/i })
+    expect(control.getAttribute('aria-checked')).toBe('true')
+    fireEvent.click(screen.getByRole('button', { name: 'Show these check-ins' }))
     await waitFor(() => expect(fetchMock.mock.calls.some(([path]) => String(path).includes('unknown_synced_cnic=true'))).toBe(true))
-    const rows = await screen.findAllByRole('article', { name: /Unknown identity/i })
+    expect(window.location.search).toContain('machine_match=1')
+    const rows = await screen.findAllByRole('article', { name: /Name not known/i })
     expect(rows).toHaveLength(3)
-    expect(screen.getByText(/SLICTOWER · 3rd Floor: 3/)).toBeTruthy()
+    expect(within(rows[0]).getByText('Not matched · CNIC found on the machine, sending by itself')).toBeTruthy()
+    expect(await screen.findByText(/SLIC Tower · 3rd Floor \(3\)/)).toBeTruthy()
     expect(fetchMock.mock.calls.some(([path]) => String(path) === '/api/v2/attendance-direct-ords/quick-release')).toBe(false)
 
+    fireEvent.click(screen.getByRole('button', { name: 'Select' }))
     fireEvent.click(within(rows[0]).getByRole('checkbox'))
     fireEvent.click(within(rows[1]).getByRole('checkbox'))
-    fireEvent.click(await screen.findByRole('button', { name: 'Release 2 punches selected' }))
-    expect(await screen.findByText(/queued for Oracle/i)).toBeTruthy()
+    fireEvent.click(await screen.findByRole('button', { name: 'Send 2 now' }))
+    expect(await screen.findByText(/on the way to the HR system/i)).toBeTruthy()
     const post = fetchMock.mock.calls.find(([path, init]) => String(path) === '/api/v2/attendance-direct-ords/quick-release' && init?.method === 'POST')
     const body = JSON.parse(String(post?.[1]?.body))
     expect(body.event_ids).toEqual([12, 11])
     expect(body.idempotency_key).toMatch(/^quick-release/)
     expect(Object.keys(body).sort()).toEqual(['event_ids', 'idempotency_key'])
-    expect(screen.getByText(/1 punch another CNIC or person on record/)).toBeTruthy()
-    expect(screen.queryByLabelText(/Administrator password/i)).toBeNull()
+    expect(screen.getByText(/1 check-in someone else had this Employee ID/)).toBeTruthy()
+    expect(screen.queryByLabelText(/password/i)).toBeNull()
   })
 
-  it('retries a busy one-click release of a selection with the same key', async () => {
+  it('retries a busy one-click send of a selection with the same key', async () => {
+    window.history.replaceState(null, '', '/attendance?machine_match=1')
     const unknown = event({
       id: 21, event_uid: 'unknown-21', display_name: null, cnic_masked: null, ords_status: 'BLOCKED_IDENTITY',
       direct_ords_identity: { eligible: true, cnic_source: 'SYNCED_USER', exclusion: null, punch_time_cnic: 'NONE', cnic_choice_required: true },
     })
     let attempts = 0
-    const fetchMock = vi.fn(async (path: RequestInfo | URL, init?: RequestInit) => {
+    const fetchMock = stub(async (path: RequestInfo | URL, init?: RequestInit) => {
       const url = String(path)
-      if (url === '/api/v2/attendance-direct-ords/unknown-synced') {
-        return response({ count: 1, devices: [], event_ids: [21], truncated: false })
-      }
+      if (url === '/api/v2/attendance-direct-ords/unknown-synced') return response({ count: 1, devices: [], event_ids: [21], truncated: false })
       if (url === '/api/v2/attendance-direct-ords/quick-release' && init?.method === 'POST') {
         attempts += 1
         if (attempts === 1) return response({ detail: { code: 'ADD_BUSY', message: 'ADD is busy delivering earlier punches. Retrying shortly.' } }, 503)
@@ -495,13 +533,12 @@ describe('Live attendance workspace', () => {
       return response({ rows: [unknown], next_cursor: null })
     })
     vi.stubGlobal('fetch', fetchMock)
-    render(<AttendanceView {...attendanceProps} />)
-    fireEvent.click(await screen.findByRole('button', { name: /Unknown identity · CNIC on synced user/i }))
-    await waitFor(() => expect(fetchMock.mock.calls.some(([path]) => String(path).includes('unknown_synced_cnic=true'))).toBe(true))
-    const [row] = await screen.findAllByRole('article', { name: /Unknown identity/i })
+    renderView()
+    const [row] = await screen.findAllByRole('article', { name: /Name not known/i })
+    fireEvent.click(screen.getByRole('button', { name: 'Select' }))
     fireEvent.click(within(row).getByRole('checkbox'))
-    fireEvent.click(await screen.findByRole('button', { name: 'Release 1 punch selected' }))
-    expect(await screen.findByText(/queued for Oracle/i, undefined, { timeout: 8000 })).toBeTruthy()
+    fireEvent.click(await screen.findByRole('button', { name: 'Send 1 now' }))
+    expect(await screen.findByText(/on the way to the HR system/i, undefined, { timeout: 8000 })).toBeTruthy()
     const posts = fetchMock.mock.calls.filter(([path, init]) => String(path) === '/api/v2/attendance-direct-ords/quick-release' && init?.method === 'POST')
     expect(posts).toHaveLength(2)
     const keys = posts.map(([, init]) => JSON.parse(String(init?.body)).idempotency_key)
@@ -509,7 +546,7 @@ describe('Live attendance workspace', () => {
     expect(screen.queryByText(/Stopped:/)).toBeNull()
   }, 15000)
 
-  it('marks impossible punch times and CNIC changes on held ledger rows', async () => {
+  it('marks wrong machine times and CNIC changes with one short note', async () => {
     const invalid = event({
       ords_status: 'BLOCKED_IDENTITY', clock_quality: 'INVALID',
       direct_ords_identity: { eligible: false, cnic_source: 'SAVED_PUNCH', exclusion: 'CLOCK_INVALID', punch_time_cnic: null, cnic_choice_required: false },
@@ -519,18 +556,21 @@ describe('Live attendance workspace', () => {
       ords_status: 'BLOCKED_IDENTITY',
       direct_ords_identity: { eligible: true, cnic_source: 'SYNCED_USER', exclusion: null, punch_time_cnic: 'DIFFERS', cnic_choice_required: true },
     })
-    vi.stubGlobal('fetch', vi.fn(async () => response({ rows: [invalid, changed], next_cursor: null })))
-    render(<AttendanceView {...attendanceProps} />)
+    vi.stubGlobal('fetch', stub(async () => response({ rows: [invalid, changed], next_cursor: null })))
+    renderView()
     const invalidRow = await screen.findByRole('article', { name: /Ayesha Khan/i })
-    expect(within(invalidRow).getByText(/Invalid punch time; it is never sent to Oracle/)).toBeTruthy()
-    expect(within(invalidRow).getByRole('checkbox').hasAttribute('disabled')).toBe(true)
-    expect(within(invalidRow).queryByRole('button', { name: 'Send to ORDS' })).toBeNull()
+    expect(within(invalidRow).getByText('Wrong time on the machine · not sent until the time is fixed')).toBeTruthy()
     const changedRow = screen.getByRole('article', { name: /Toheed/i })
-    expect(within(changedRow).getByText(/CNIC changed since this punch/)).toBeTruthy()
-    expect(within(changedRow).getByRole('button', { name: 'Send to ORDS' })).toBeTruthy()
+    expect(within(changedRow).getByText('CNIC changed · you choose which one to send')).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: 'Select' }))
+    expect(within(invalidRow).getByRole('checkbox').hasAttribute('disabled')).toBe(true)
+    expect(within(changedRow).getByRole('checkbox').hasAttribute('disabled')).toBe(false)
+    const sheet = await openRow(/Ayesha Khan/)
+    expect(within(sheet).queryByRole('button', { name: 'Send to HR system' })).toBeNull()
+    expect(within(sheet).getByRole('link', { name: 'Fix the time in Recover attendance' }).getAttribute('href')).toBe('/recover?tab=held')
   })
 
-  it('asks which CNIC to send, defaults to the punch-time CNIC and confirms imminent automatic releases', async () => {
+  it('asks which CNIC to send, defaults to the check-in time CNIC and confirms imminent automatic sends', async () => {
     const rows = [
       event({ id: 11, event_uid: 'refused', display_name: 'Dr Farzana', user_id: '48384' }),
       event({ id: 12, event_uid: 'toheed-9', display_name: 'Toheed', user_id: '3980', cnic_masked: null, ords_status: 'BLOCKED_IDENTITY', direct_ords_identity: { eligible: true, cnic_source: 'SYNCED_USER' as const, exclusion: null, punch_time_cnic: 'DIFFERS' as const, cnic_choice_required: true } }),
@@ -551,7 +591,7 @@ describe('Live attendance workspace', () => {
       check({ event_id: 13, user_id: '04048', display_name: 'A.Saleem', cnic_source: null, punch_time_cnic: 'NONE', record_position: 'NO_RECORDS', cnic_choice_required: true, cnic_choices: ['CURRENT'], decision_kind: 'CONFIRM_TODAY', decision_group: 'today|5be1', evidence_digest: '2'.repeat(64) }),
       check({ event_id: 14, user_id: '1008', display_name: 'Bilal', auto_release_at_next_snapshot: true, database_guard: 'ACCEPTED' }),
     ], missing_event_ids: [], counts: { selected: 4, refused: 1, cnic_choice_required: 2, auto_release_soon: 1 } }
-    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    const fetchMock = stub(async (input: RequestInfo | URL, init?: RequestInit) => {
       const path = String(input)
       if (path === '/api/v2/attendance-direct-ords/preview') return response(preview)
       if (path === '/api/v2/attendance-direct-ords' && init?.method === 'POST') return response({
@@ -562,33 +602,30 @@ describe('Live attendance workspace', () => {
       return response({ rows, next_cursor: null })
     })
     vi.stubGlobal('fetch', fetchMock)
-    render(<AttendanceView {...attendanceProps} />)
+    renderView()
     await screen.findByRole('article', { name: /Toheed/i })
-    fireEvent.click(screen.getByLabelText('Select loaded punches'))
-    fireEvent.click(screen.getByRole('button', { name: 'Send 4 punches' }))
+    await selectAllShown()
+    sendChosen()
     const dialog = screen.getByRole('dialog')
-    expect((screen.getByRole('button', { name: 'Approve and send 4 punches' }) as HTMLButtonElement).disabled).toBe(true)
-    const refused = await within(dialog).findByRole('region', { name: 'Punches that cannot be sent' })
+    expect((screen.getByRole('button', { name: 'Send 4 check-ins' }) as HTMLButtonElement).disabled).toBe(true)
+    const refused = await within(dialog).findByRole('region', { name: "Check-ins that can't be sent" })
     expect(refused.textContent).toMatch(/Dr Farzana.*impossible/)
-    const changed = within(dialog).getByRole('region', { name: 'CNIC changed since the punch' })
-    const punchTime = within(changed).getByLabelText(/CNIC at punch time \*{5}-\*{4}609-0/) as HTMLInputElement
+    const changed = within(dialog).getByRole('region', { name: 'CNIC changed since the check-in' })
+    const punchTime = within(changed).getByLabelText(/CNIC at check-in time \*{5}-\*{4}609-0/) as HTMLInputElement
     const today = within(changed).getByLabelText(/Today's CNIC \*{5}-\*{4}609-2/) as HTMLInputElement
     expect(punchTime.checked).toBe(true)
     expect(today.checked).toBe(false)
-    expect(dialog.textContent).toMatch(/3 punches will be skipped; 1 punch will be approved/)
-    fireEvent.change(screen.getByLabelText('Reason for sending'), { target: { value: 'HR confirmed identities' } })
-    fireEvent.change(screen.getByLabelText('Administrator password'), { target: { value: 'test-password' } })
+    expect(dialog.textContent).toMatch(/3 check-ins will not be sent; 1 check-in will be sent/)
+    fireEvent.change(screen.getByLabelText('Why?'), { target: { value: 'HR confirmed identities' } })
+    fireEvent.change(screen.getByLabelText('Your password'), { target: { value: 'test-password' } })
 
-    const submitted = async () => {
-      fireEvent.click(screen.getByRole('button', { name: 'Approve and send 4 punches' }))
-      await waitFor(() => expect(fetchMock.mock.calls.some(([path, init]) => String(path) === '/api/v2/attendance-direct-ords' && init?.method === 'POST')).toBe(true))
-      const call = fetchMock.mock.calls.find(([path, init]) => String(path) === '/api/v2/attendance-direct-ords' && init?.method === 'POST')
-      return JSON.parse(String(call?.[1]?.body))
-    }
-    fireEvent.click(within(dialog).getByLabelText(/Use today's CNIC \*{5}-\*{4}609-2 for A\.Saleem · user 04048 · 1 punch/))
-    fireEvent.click(within(dialog).getByLabelText(/Send 1 punch now anyway/))
+    fireEvent.click(within(dialog).getByLabelText(/Use today's CNIC \*{5}-\*{4}609-2 for A\.Saleem · Employee ID 04048 · 1 check-in/))
+    fireEvent.click(within(dialog).getByLabelText(/Send 1 check-in now anyway/))
     fireEvent.click(today)
-    const body = await submitted()
+    fireEvent.click(screen.getByRole('button', { name: 'Send 4 check-ins' }))
+    await waitFor(() => expect(fetchMock.mock.calls.some(([path, init]) => String(path) === '/api/v2/attendance-direct-ords' && init?.method === 'POST')).toBe(true))
+    const call = fetchMock.mock.calls.find(([path, init]) => String(path) === '/api/v2/attendance-direct-ords' && init?.method === 'POST')
+    const body = JSON.parse(String(call?.[1]?.body))
     expect(body.event_ids).toEqual([11, 12, 13, 14])
     // Each choice echoes the evidence the dialog showed.
     expect(body.cnic_choices).toEqual([
@@ -598,7 +635,7 @@ describe('Live attendance workspace', () => {
     expect(body.send_now_event_ids).toEqual([14])
   })
 
-  it('sends the punch-time CNIC by default and leaves unconfirmed punches for ADD to skip', async () => {
+  it('sends the check-in time CNIC by default from the sheet and leaves unconfirmed check-ins unsent', async () => {
     const rows = [event({ id: 12, event_uid: 'toheed-9', display_name: 'Toheed', user_id: '3980', cnic_masked: null, ords_status: 'BLOCKED_IDENTITY', direct_ords_identity: { eligible: true, cnic_source: 'SYNCED_USER' as const, exclusion: null, punch_time_cnic: 'DIFFERS' as const, cnic_choice_required: true } })]
     const preview = { rows: [{
       event_id: 12, user_id: '3980', display_name: 'Toheed', device_event_time: '2026-10-09T04:00:00Z',
@@ -608,7 +645,7 @@ describe('Live attendance workspace', () => {
       auto_release_at_next_snapshot: false, awaiting_next_snapshot: false, database_guard: 'NOT_CHECKED',
       evidence_digest: '1'.repeat(64),
     }], missing_event_ids: [], counts: { selected: 1, refused: 0, cnic_choice_required: 1, auto_release_soon: 0 } }
-    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    const fetchMock = stub(async (input: RequestInfo | URL, init?: RequestInit) => {
       const path = String(input)
       if (path === '/api/v2/attendance-direct-ords/preview') return response(preview)
       if (path === '/api/v2/attendance-direct-ords' && init?.method === 'POST') return response({
@@ -619,16 +656,16 @@ describe('Live attendance workspace', () => {
       return response({ rows, next_cursor: null })
     })
     vi.stubGlobal('fetch', fetchMock)
-    render(<AttendanceView {...attendanceProps} />)
-    const row = await screen.findByRole('article', { name: /Toheed/i })
-    fireEvent.click(within(row).getByRole('button', { name: 'Send to ORDS' }))
-    const approve = screen.getByRole('button', { name: 'Approve and send 1 punch' }) as HTMLButtonElement
-    await screen.findByRole('region', { name: 'CNIC changed since the punch' })
-    fireEvent.change(screen.getByLabelText('Reason for sending'), { target: { value: 'Punch-time identity' } })
-    fireEvent.change(screen.getByLabelText('Administrator password'), { target: { value: 'test-password' } })
+    renderView()
+    const sheet = await openRow(/Toheed/)
+    fireEvent.click(within(sheet).getByRole('button', { name: 'Send to HR system' }))
+    const approve = await screen.findByRole('button', { name: 'Send 1 check-in' }) as HTMLButtonElement
+    await screen.findByRole('region', { name: 'CNIC changed since the check-in' })
+    fireEvent.change(screen.getByLabelText('Why?'), { target: { value: 'Punch-time identity' } })
+    fireEvent.change(screen.getByLabelText('Your password'), { target: { value: 'test-password' } })
     expect(approve.disabled).toBe(false)
     fireEvent.click(approve)
-    await screen.findByText('Preparing delivery')
+    await screen.findByText('Getting ready')
     const call = fetchMock.mock.calls.find(([path, init]) => String(path) === '/api/v2/attendance-direct-ords' && init?.method === 'POST')
     const body = JSON.parse(String(call?.[1]?.body))
     expect(body.cnic_choices).toEqual([{ event_id: 12, choice: 'PUNCH_TIME', evidence_digest: '1'.repeat(64), held_by_other_confirmed: false }])
@@ -679,8 +716,7 @@ describe('Live attendance workspace', () => {
     expect(result.skipped).toBe(2)
   })
 
-  it('shows refused identities with the other CNIC and asks before using a CNIC another user holds', async () => {
-    // The ledger's hints were loaded earlier; the dialog's checks are current.
+  it('shows refused check-ins with the other CNIC and asks before using a CNIC someone else has', async () => {
     const hint = { eligible: true, cnic_source: 'SYNCED_USER' as const, exclusion: null, punch_time_cnic: 'NONE' as const, cnic_choice_required: true }
     const rows = [
       event({ id: 21, event_uid: 'conflict', display_name: 'Babar', user_id: '100', cnic_masked: null, ords_status: 'BLOCKED_IDENTITY', direct_ords_identity: hint }),
@@ -688,11 +724,11 @@ describe('Live attendance workspace', () => {
       event({ id: 23, event_uid: 'gap', display_name: 'Toheed', user_id: '3980', cnic_masked: null, ords_status: 'BLOCKED_IDENTITY', direct_ords_identity: hint }),
     ]
     const preview = { rows: [
-      previewRow({ event_id: 21, user_id: '100', display_name: 'Babar', punch_time_cnic: 'CONFLICT', exclusion: 'CNIC_CONFLICT', exclusion_reason: "ADD's records show another CNIC or another person for this terminal user ID at punch time.", other_cnics_masked: ['*****-****777-1'], evidence_signals: ['OTHER_UID_RECORD'] }),
+      previewRow({ event_id: 21, user_id: '100', display_name: 'Babar', punch_time_cnic: 'CONFLICT', exclusion: 'CNIC_CONFLICT', exclusion_reason: "ADD's records show another CNIC.", other_cnics_masked: ['*****-****777-1'], evidence_signals: ['OTHER_UID_RECORD'] }),
       previewRow({ event_id: 22, user_id: '3980', display_name: 'Toheed', punch_time_cnic: 'DIFFERS', punch_time_cnic_masked: '*****-****609-0', punch_time_cnic_held_by_other: true, evidence_signals: ['PUNCH_TIME_CNIC_HELD_BY_OTHER'], cnic_choice_required: true, cnic_choices: ['PUNCH_TIME', 'CURRENT'], default_cnic_choice: null, decision_kind: 'CHOOSE_CNIC', decision_group: 'choose|1|3980|aaaa|1' }),
       previewRow({ event_id: 23, user_id: '3980', display_name: 'Toheed', punch_time_cnic: 'CHANGED_NEAR_PUNCH', other_cnics_masked: ['*****-****609-0'], evidence_signals: ['CNIC_CHANGED_NEAR_PUNCH'], record_before_ended_at: '2026-09-25T09:00:00Z', record_after_started_at: '2026-10-19T08:01:00Z', cnic_choice_required: true, cnic_choices: ['CURRENT'], decision_kind: 'CONFIRM_TODAY', decision_group: 'row|23' }),
     ], missing_event_ids: [], counts: { selected: 3, refused: 1, cnic_choice_required: 2, auto_release_soon: 0 } }
-    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    const fetchMock = stub(async (input: RequestInfo | URL, init?: RequestInit) => {
       const path = String(input)
       if (path === '/api/v2/attendance-direct-ords/preview') return response(preview)
       if (path === '/api/v2/attendance-direct-ords' && init?.method === 'POST') return response({
@@ -703,30 +739,30 @@ describe('Live attendance workspace', () => {
       return response({ rows, next_cursor: null })
     })
     vi.stubGlobal('fetch', fetchMock)
-    render(<AttendanceView {...attendanceProps} />)
+    renderView()
     await screen.findByRole('article', { name: /Babar/i })
-    fireEvent.click(screen.getByLabelText('Select loaded punches'))
-    fireEvent.click(screen.getByRole('button', { name: 'Send 3 punches' }))
+    await selectAllShown()
+    sendChosen()
     const dialog = screen.getByRole('dialog')
-    const refused = await within(dialog).findByRole('region', { name: 'Punches that cannot be sent' })
-    expect(refused.textContent).toMatch(/Babar.*another CNIC or another person.*\*{5}-\*{4}777-1/)
-    const changed = within(dialog).getByRole('region', { name: 'CNIC changed since the punch' })
-    expect(changed.textContent).toMatch(/Another active terminal user has the punch-time CNIC today/)
-    expect((within(changed).getByLabelText(/CNIC at punch time/) as HTMLInputElement).checked).toBe(false)
+    const refused = await within(dialog).findByRole('region', { name: "Check-ins that can't be sent" })
+    expect(refused.textContent).toMatch(/Babar.*Another CNIC or person used this Employee ID.*\*{5}-\*{4}777-1/)
+    const changed = within(dialog).getByRole('region', { name: 'CNIC changed since the check-in' })
+    expect(changed.textContent).toMatch(/Another person on the machine has the old CNIC today/)
+    expect((within(changed).getByLabelText(/CNIC at check-in time/) as HTMLInputElement).checked).toBe(false)
     expect((within(changed).getByLabelText(/Today's CNIC/) as HTMLInputElement).checked).toBe(false)
-    const confirm = within(dialog).getByRole('region', { name: "Confirm today's CNIC" })
-    // The old record ended weeks before the punch: only today's CNIC is offered, with both edges shown.
-    expect(confirm.textContent).toMatch(/CNIC changed around it \(the old CNIC's record ended .+; today's CNIC was first recorded .+\)\. Only a record within 30 minutes of the punch is offered\..*other CNIC on record: \*{5}-\*{4}609-0/)
+    const confirm = within(dialog).getByRole('region', { name: 'Use the current CNIC?' })
+    // The old record ended weeks before the check-in: only today's CNIC is offered, with both edges shown.
+    expect(confirm.textContent).toMatch(/CNIC changed around it \(the old CNIC's record ended .+; today's CNIC was first recorded .+\)\. Only a record within 30 minutes of the check-in is offered\..*other CNIC on record: \*{5}-\*{4}609-0/)
     expect(dialog.textContent).not.toMatch(/nearest/i)
-    expect(dialog.textContent).toMatch(/3 punches will be skipped; 0 punches will be approved/)
-    fireEvent.click(within(changed).getByLabelText(/CNIC at punch time/))
-    fireEvent.change(screen.getByLabelText('Reason for sending'), { target: { value: 'HR confirmed Toheed punched' } })
-    fireEvent.change(screen.getByLabelText('Administrator password'), { target: { value: 'test-password' } })
-    fireEvent.click(screen.getByRole('button', { name: 'Approve and send 3 punches' }))
-    await screen.findByText('Preparing delivery')
+    expect(dialog.textContent).toMatch(/3 check-ins will not be sent; 0 check-ins will be sent/)
+    fireEvent.click(within(changed).getByLabelText(/CNIC at check-in time/))
+    fireEvent.change(screen.getByLabelText('Why?'), { target: { value: 'HR confirmed Toheed punched' } })
+    fireEvent.change(screen.getByLabelText('Your password'), { target: { value: 'test-password' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Send 3 check-ins' }))
+    await screen.findByText('Getting ready')
     const call = fetchMock.mock.calls.find(([path, init]) => String(path) === '/api/v2/attendance-direct-ords' && init?.method === 'POST')
     const body = JSON.parse(String(call?.[1]?.body))
-    // Choosing the punch-time CNIC another user holds is the explicit confirmation ADD requires.
+    // Choosing the check-in time CNIC another person has is the explicit confirmation the server requires.
     expect(body.cnic_choices).toEqual([{ event_id: 22, choice: 'PUNCH_TIME', evidence_digest: 'e'.repeat(64), held_by_other_confirmed: true }])
   })
 
@@ -745,7 +781,7 @@ describe('Live attendance workspace', () => {
     expect(result.cnicChoices).toEqual([{ event_id: 600, choice: 'PUNCH_TIME', evidence_digest: '6'.repeat(64), held_by_other_confirmed: false }])
   })
 
-  it('labels a CNIC change around a punch by when each record ended and started, with nothing selected', async () => {
+  it('labels a CNIC change around a check-in by when each record ended and started, with nothing selected', async () => {
     const hint = { eligible: true, cnic_source: 'SYNCED_USER' as const, exclusion: null, punch_time_cnic: 'CHANGED_NEAR_PUNCH' as const, cnic_choice_required: true }
     const rows = [event({ id: 41, event_uid: 'edited', display_name: 'Toheed', user_id: '3980', cnic_masked: null, ords_status: 'BLOCKED_IDENTITY', direct_ords_identity: hint })]
     const preview = { rows: [previewRow({
@@ -755,22 +791,22 @@ describe('Live attendance workspace', () => {
       current_cnic_masked: '*****-****609-2', cnic_choice_required: true, cnic_choices: ['PUNCH_TIME', 'CURRENT'], default_cnic_choice: null,
       decision_kind: 'CHOOSE_CNIC', decision_group: 'row|41',
     })], missing_event_ids: [], counts: { selected: 1, refused: 0, cnic_choice_required: 1, auto_release_soon: 0 } }
-    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+    vi.stubGlobal('fetch', stub(async (input: RequestInfo | URL) => {
       const path = String(input)
       if (path === '/api/v2/attendance-direct-ords/preview') return response(preview)
       if (path.includes('/api/v2/attendance-direct-ords')) return response({ rows: [], next_cursor: null })
       return response({ rows, next_cursor: null })
     }))
-    render(<AttendanceView {...attendanceProps} />)
+    renderView()
     await screen.findByRole('article', { name: /Toheed/i })
-    fireEvent.click(screen.getByLabelText('Select loaded punches'))
-    fireEvent.click(screen.getByRole('button', { name: 'Send 1 punch' }))
-    const changed = await within(screen.getByRole('dialog')).findByRole('region', { name: 'CNIC changed since the punch' })
-    const old = within(changed).getByLabelText(/CNIC on today's terminal user record until/) as HTMLInputElement
+    await selectAllShown()
+    sendChosen()
+    const changed = await within(screen.getByRole('dialog')).findByRole('region', { name: 'CNIC changed since the check-in' })
+    const old = within(changed).getByLabelText(/CNIC on today's person's record until/) as HTMLInputElement
     const today = within(changed).getByLabelText(/Today's CNIC \*{5}-\*{4}609-2 \(recorded from /) as HTMLInputElement
     expect(old.checked).toBe(false)
     expect(today.checked).toBe(false)
-    expect(changed.textContent).toMatch(/the old CNIC's record ended .+; today's CNIC was first recorded .+, punch /)
+    expect(changed.textContent).toMatch(/the old CNIC's record ended .+; today's CNIC was first recorded .+, check-in /)
     expect(changed.textContent).not.toMatch(/nearest/i)
   })
 
@@ -784,7 +820,7 @@ describe('Live attendance workspace', () => {
     expect(result.skipped).toBe(1)
   })
 
-  it('explains punches older than ADD\'s first record and confirms them apart', async () => {
+  it("explains check-ins older than the dashboard's first record and confirms them apart", async () => {
     const hint = { eligible: true, cnic_source: 'SYNCED_USER' as const, exclusion: null, punch_time_cnic: 'NONE' as const, cnic_choice_required: true }
     const rows = [
       event({ id: 31, event_uid: 'early', display_name: 'A.Saleem', user_id: '04048', cnic_masked: null, ords_status: 'BLOCKED_IDENTITY', direct_ords_identity: hint }),
@@ -794,39 +830,42 @@ describe('Live attendance workspace', () => {
       previewRow({ event_id: 31, user_id: '04048', display_name: 'A.Saleem', punch_time_cnic: 'NONE', record_position: 'BEFORE_FIRST_RECORD', first_observed_at: '2026-10-21T06:00:00Z', evidence_signals: ['PUNCH_BEFORE_FIRST_OBSERVATION'], cnic_choice_required: true, cnic_choices: ['CURRENT'], decision_kind: 'CONFIRM_TODAY', decision_group: 'today|early' }),
       previewRow({ event_id: 32, user_id: '04048', display_name: 'A.Saleem', punch_time_cnic: 'NONE', record_position: 'BETWEEN_RECORDS', evidence_signals: ['NAME_DIFFERS'], punch_display_name: 'Someone Else', cnic_choice_required: true, cnic_choices: ['CURRENT'], decision_kind: 'CONFIRM_TODAY', decision_group: 'row|32' }),
     ], missing_event_ids: [], counts: { selected: 2, refused: 0, cnic_choice_required: 2, auto_release_soon: 0 } }
-    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+    vi.stubGlobal('fetch', stub(async (input: RequestInfo | URL) => {
       const path = String(input)
       if (path === '/api/v2/attendance-direct-ords/preview') return response(preview)
       if (path.includes('/api/v2/attendance-direct-ords')) return response({ rows: [], next_cursor: null })
       return response({ rows, next_cursor: null })
     }))
-    render(<AttendanceView {...attendanceProps} />)
+    renderView()
     await screen.findAllByRole('article', { name: /A\.Saleem/i })
-    fireEvent.click(screen.getByLabelText('Select loaded punches'))
-    fireEvent.click(screen.getByRole('button', { name: 'Send 2 punches' }))
-    const confirm = await within(screen.getByRole('dialog')).findByRole('region', { name: "Confirm today's CNIC" })
+    await selectAllShown()
+    sendChosen()
+    const confirm = await within(screen.getByRole('dialog')).findByRole('region', { name: 'Use the current CNIC?' })
     expect(within(confirm).getAllByRole('checkbox')).toHaveLength(2)
-    expect(confirm.textContent).toMatch(/older than ADD's first record of this user ID/)
-    expect(confirm.textContent).toMatch(/name saved with the punch: Someone Else/)
+    expect(confirm.textContent).toMatch(/older than the dashboard's first record of this Employee ID/)
+    expect(confirm.textContent).toMatch(/name saved with the check-in: Someone Else/)
   })
 
-  it('keeps a punch without a usable current user CNIC out of manual selection', async () => {
+  it('keeps a check-in without a usable CNIC out of Send by hand', async () => {
     const held = event({
       cnic_masked: null, ords_status: 'BLOCKED_IDENTITY',
       direct_ords_identity: { eligible: false, cnic_source: null, exclusion: 'CNIC_MISSING' },
     })
-    vi.stubGlobal('fetch', vi.fn(async () => response({ rows: [held], next_cursor: null })))
-    render(<AttendanceView {...attendanceProps} />)
+    vi.stubGlobal('fetch', stub(async () => response({ rows: [held], next_cursor: null })))
+    renderView()
     const row = await screen.findByRole('article', { name: /Ayesha Khan/i })
-    const delivery = row.querySelector('[data-label="Oracle delivery"]') as HTMLElement
-    expect(within(delivery).getByLabelText('Status: BLOCKED IDENTITY')).toBeTruthy()
-    expect(within(delivery).getByLabelText('Status: CNIC NOT LINKED').getAttribute('data-pattern')).toBe('blocked')
-    expect(within(delivery).getByText('CNIC not linked')).toBeTruthy()
-    expect(within(row).queryByRole('button', { name: 'Send to ORDS' })).toBeNull()
+    expect(within(row).getByLabelText('Status: Not matched')).toBeTruthy()
+    expect(within(row).getByText('No CNIC for this person')).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: 'Select' }))
     expect(within(row).getByRole('checkbox').hasAttribute('disabled')).toBe(true)
+    const sheet = await openRow(/Ayesha Khan/)
+    expect(within(sheet).queryByRole('button', { name: 'Send to HR system' })).toBeNull()
+    const people = within(sheet).getByRole('link', { name: 'Open on People page' })
+    // Only the Employee ID goes in the link, never a CNIC.
+    expect(people.getAttribute('href')).toBe('/people/connector-one?q=1007')
   })
 
-  it('uses server CNIC linkage for delivery pills and filters it with other Oracle states', async () => {
+  it("uses the server's CNIC link for the note", async () => {
     const missing = event({
       display_name: 'Unlinked Employee', user_id: '14', cnic_masked: null,
       cnic_not_linked: true, ords_status: 'BLOCKED_IDENTITY',
@@ -837,44 +876,15 @@ describe('Live attendance workspace', () => {
       cnic_masked: null, cnic_not_linked: false, ords_status: 'BLOCKED_IDENTITY',
       direct_ords_identity: { eligible: true, cnic_source: 'SYNCED_USER', exclusion: null },
     })
-    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
-      const url = new URL(String(input), 'https://add.test')
-      const statuses = url.searchParams.getAll('ords_status')
-      return response({
-        rows: statuses.includes('CNIC_NOT_LINKED') && !statuses.includes('BLOCKED_IDENTITY') ? [missing] : [missing, synced],
-        next_cursor: null,
-        status_options: ['ACKED', 'BLOCKED_IDENTITY', 'CNIC_NOT_LINKED'],
-      })
-    })
-    vi.stubGlobal('fetch', fetchMock)
-    render(<AttendanceView {...attendanceProps} />)
+    vi.stubGlobal('fetch', stub(async () => response({ rows: [missing, synced], next_cursor: null })))
+    renderView()
     const missingRow = await screen.findByRole('article', { name: /Unlinked Employee/i })
     const syncedRow = screen.getByRole('article', { name: /Synced Employee/i })
-    expect(within(missingRow).getByLabelText('Status: CNIC NOT LINKED')).toBeTruthy()
-    expect(within(syncedRow).queryByLabelText('Status: CNIC NOT LINKED')).toBeNull()
-
-    fireEvent.click(screen.getByText(/^Filters$/i))
-    fireEvent.click(screen.getByLabelText('CNIC not linked'))
-    await waitFor(() => {
-      const sent = new URL(String(fetchMock.mock.calls.at(-1)?.[0]), 'https://add.test')
-      expect(sent.searchParams.getAll('ords_status')).toEqual(['CNIC_NOT_LINKED'])
-      expect(screen.queryByRole('article', { name: /Synced Employee/i })).toBeNull()
-    })
-    expect(screen.getByRole('article', { name: /Unlinked Employee/i })).toBeTruthy()
-    fireEvent.click(screen.getByLabelText('Blocked identity'))
-    await waitFor(() => {
-      const sent = new URL(String(fetchMock.mock.calls.at(-1)?.[0]), 'https://add.test')
-      expect(sent.searchParams.getAll('ords_status')).toEqual(['CNIC_NOT_LINKED', 'BLOCKED_IDENTITY'])
-      expect(screen.getByRole('article', { name: /Synced Employee/i })).toBeTruthy()
-    })
-    fireEvent.click(screen.getByRole('button', { name: /Oracle: CNIC not linked/i }))
-    await waitFor(() => {
-      const sent = new URL(String(fetchMock.mock.calls.at(-1)?.[0]), 'https://add.test')
-      expect(sent.searchParams.getAll('ords_status')).toEqual(['BLOCKED_IDENTITY'])
-    })
+    expect(within(missingRow).getByText('No CNIC for this person')).toBeTruthy()
+    expect(within(syncedRow).queryByText('No CNIC for this person')).toBeNull()
   })
 
-  it('shows audited approved identity for an unnamed punch without inventing identity for unapproved punches', async () => {
+  it('shows the approved name for an unnamed check-in an admin sent, and nothing invented for others', async () => {
     const approvedIdentity = { display_name: 'Approved Employee', cnic_masked: '*****-****123-1' }
     const approval: NonNullable<AttendanceEvent['force_release']> = {
       run_id: 'approved-send', policy: 'manual-direct-ords-v1', administrator: 'StateHealthAdmin',
@@ -886,54 +896,29 @@ describe('Live attendance workspace', () => {
       ords_status: 'ACKED', oracle_confirmed_at: '2026-08-12T09:01:00Z',
     })
     const unapproved = event({
-      id: 2, event_uid: 'unapproved-punch', display_name: null, cnic_masked: null,
+      id: 2, event_uid: 'unapproved-punch', display_name: null, cnic_masked: null, ords_status: 'BLOCKED_IDENTITY',
       direct_ords_identity: { eligible: true, cnic_source: 'SYNCED_USER', exclusion: null },
     })
-    const captured = event({ id: 3, event_uid: 'captured-identity', force_release: approval })
-    vi.stubGlobal('fetch', vi.fn(async () => response({ rows: [approved, unapproved, captured], next_cursor: null })))
-    render(<AttendanceView {...attendanceProps} />)
-    const approvedRow = await screen.findByRole('article', { name: /Approved Employee, Check in/i })
-    expect(within(approvedRow).getByText(approvedIdentity.cnic_masked)).toBeTruthy()
-    expect(within(approvedRow).queryByLabelText('Status: CNIC NOT LINKED')).toBeNull()
-    expect(within(approvedRow).getByLabelText('Status: ACKED')).toBeTruthy()
-    const unknownRow = screen.getByRole('article', { name: /Unknown identity, Check in/i })
-    expect(within(unknownRow).getByText('User 1007 · CNIC on synced user')).toBeTruthy()
+    vi.stubGlobal('fetch', stub(async () => response({ rows: [approved, unapproved], next_cursor: null })))
+    renderView()
+    const approvedRow = await screen.findByRole('article', { name: /Approved Employee, Check-in/i })
+    expect(within(approvedRow).getByLabelText('Status: Sent')).toBeTruthy()
+    expect(within(approvedRow).getByText(/^Sent by an admin/)).toBeTruthy()
+    const unknownRow = screen.getByRole('article', { name: /Name not known, Check-in/i })
+    expect(within(unknownRow).getByText('Employee ID 1007 · Check-in')).toBeTruthy()
     expect(within(unknownRow).queryByText('Approved Employee')).toBeNull()
-    const capturedRow = screen.getByRole('article', { name: /Ayesha Khan, Check in/i })
-    expect(within(capturedRow).getByText('*****-****567-1')).toBeTruthy()
-    expect(within(capturedRow).queryByText(approvedIdentity.cnic_masked)).toBeNull()
-    expect(screen.getByText('Data-quality attention').closest('article')?.textContent).toContain('1')
-    fireEvent.click(within(approvedRow).getByRole('button', { name: /Forced attendance/i }))
-    const dialog = screen.getByRole('dialog')
-    expect(within(dialog).getByText('Administrator Oracle send')).toBeTruthy()
-    expect(within(dialog).getByText('Audit 17')).toBeTruthy()
+    const sheet = await openRow(/Approved Employee/)
+    const facts = within(sheet).getByRole('region', { name: 'Sent by an admin' })
+    expect(facts.textContent).toMatch(/Sent by StateHealthAdmin on/)
+    expect(facts.textContent).toMatch(/Reason: Identified this punch/)
+    expect(within(facts).getByRole('link', { name: 'Open the sending task' }).getAttribute('href')).toBe('/attendance?direct_run=approved-send')
     expect(approved.display_name).toBeNull()
     expect(approved.cnic_masked).toBeNull()
   })
 
-  it.each([true, false, undefined])('keeps server CNIC linkage classification authoritative after approval (%s)', async (cnicNotLinked) => {
-    const approved = event({
-      display_name: null, cnic_masked: null, cnic_not_linked: cnicNotLinked,
-      ords_status: 'ACKED', oracle_confirmed_at: '2026-08-12T09:01:00Z',
-      force_release: {
-        run_id: 'approved-send', policy: 'manual-direct-ords-v1', administrator: 'StateHealthAdmin',
-        approved_at: '2026-08-12T09:00:00Z', reason: 'Identified this punch', audit_id: 17,
-        snapshot_id: null, sync_command_id: null,
-        approved_identity: { display_name: 'Approved employee', cnic_masked: '*****-****123-1' },
-      },
-    })
-    vi.stubGlobal('fetch', vi.fn(async () => response({ rows: [approved], next_cursor: null })))
-    render(<AttendanceView {...attendanceProps} />)
-    const row = await screen.findByRole('article', { name: /Approved employee, Check in/i })
-    expect(within(row).getByText('*****-****123-1')).toBeTruthy()
-    const missingCnicBadge = within(row).queryByLabelText('Status: CNIC NOT LINKED')
-    if (cnicNotLinked) expect(missingCnicBadge).toBeTruthy()
-    else expect(missingCnicBadge).toBeNull()
-  })
-
-  it('saves one administrator approval for a multi-punch Oracle send and shows durable progress', async () => {
+  it('saves one approval for a hand send of several check-ins and shows its progress', async () => {
     const second = event({ id: 2, event_uid: 'event-two', user_id: '1008', display_name: 'Bilal Ahmed' })
-    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    const fetchMock = stub(async (input: RequestInfo | URL, init?: RequestInit) => {
       const path = String(input)
       if (path === '/api/v2/attendance-direct-ords' && init?.method === 'POST') return response({
         job_id: 'saved-direct-run', status: 'RUNNING', created_at: '2026-08-12T09:00:00Z', actor: 'operator',
@@ -944,18 +929,19 @@ describe('Live attendance workspace', () => {
       return response({ rows: [event(), second], next_cursor: null })
     })
     vi.stubGlobal('fetch', fetchMock)
-    render(<AttendanceView {...attendanceProps} />)
+    renderView()
     await screen.findByRole('article', { name: /Bilal Ahmed/i })
-    fireEvent.click(screen.getByLabelText('Select loaded punches'))
-    fireEvent.click(screen.getByRole('button', { name: 'Send 2 punches' }))
-    expect(screen.getByRole('dialog').textContent).toMatch(/older damaged punch IDs are checked against records already in Oracle/i)
-    fireEvent.change(screen.getByLabelText('Reason for sending'), { target: { value: 'Verified by administrator' } })
-    fireEvent.change(screen.getByLabelText('Administrator password'), { target: { value: 'test-password' } })
-    // Approval waits until ADD has returned its read-only punch checks.
-    const approve = screen.getByRole('button', { name: 'Approve and send 2 punches' }) as HTMLButtonElement
+    await selectAllShown()
+    expect(screen.getByText('2 selected')).toBeTruthy()
+    sendChosen()
+    expect(screen.getByRole('dialog').textContent).toMatch(/Older damaged record numbers are checked against the HR system records/i)
+    fireEvent.change(screen.getByLabelText('Why?'), { target: { value: 'Verified by administrator' } })
+    fireEvent.change(screen.getByLabelText('Your password'), { target: { value: 'test-password' } })
+    // Sending waits until the server has returned its read-only checks.
+    const approve = screen.getByRole('button', { name: 'Send 2 check-ins' }) as HTMLButtonElement
     await waitFor(() => expect(approve.disabled).toBe(false))
     fireEvent.click(approve)
-    await screen.findByText('Preparing delivery')
+    await screen.findByText('Getting ready')
     const call = fetchMock.mock.calls.find(([path, init]) => String(path) === '/api/v2/attendance-direct-ords' && init?.method === 'POST')
     const body = JSON.parse(String(call?.[1]?.body))
     expect(body.event_ids).toEqual([1, 2])
@@ -965,14 +951,14 @@ describe('Live attendance workspace', () => {
     expect(window.location.search).toContain('direct_run=saved-direct-run')
   })
 
-  it('rechecks a saved damaged-ID run without offering another Oracle insert', async () => {
+  it('rechecks a saved damaged-record task without sending anything new', async () => {
     window.history.replaceState(null, '', '/attendance?direct_run=saved-direct-run')
     const finished = {
       job_id: 'saved-direct-run', status: 'COMPLETED_WITH_REVIEW', created_at: '2026-08-12T09:00:00Z',
       actor: 'operator', selected: 5, ready: 0, waiting: 0, confirmed: 0, skipped: 0,
       attention: 5, legacy_recheckable: 5,
     }
-    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    const fetchMock = stub(async (input: RequestInfo | URL, init?: RequestInit) => {
       const path = String(input)
       if (path.endsWith('/saved-direct-run/recheck') && init?.method === 'POST') {
         return response({ ...finished, status: 'WAITING_ORACLE', waiting: 5, attention: 0, legacy_recheckable: 0 }, 202)
@@ -982,19 +968,19 @@ describe('Live attendance workspace', () => {
       return response({ rows: [event()], next_cursor: null })
     })
     vi.stubGlobal('fetch', fetchMock)
-    render(<AttendanceView {...attendanceProps} />)
-    fireEvent.click(await screen.findByRole('button', { name: 'Check 5 punches already in Oracle' }))
+    renderView()
+    fireEvent.click(await screen.findByRole('button', { name: 'Check 5 check-ins in HR records' }))
     const dialog = screen.getByRole('dialog')
-    expect(dialog.textContent).toMatch(/will not insert another Oracle punch/i)
-    fireEvent.change(screen.getByLabelText('Administrator password'), { target: { value: 'test-password' } })
-    fireEvent.click(screen.getByRole('button', { name: 'Check Oracle records' }))
-    await screen.findByText('Waiting for Oracle')
+    expect(dialog.textContent).toMatch(/Nothing new is sent/i)
+    fireEvent.change(screen.getByLabelText('Your password'), { target: { value: 'test-password' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Check now' }))
+    await screen.findByText('Waiting for the HR system')
     const call = fetchMock.mock.calls.find(([path, init]) => String(path).endsWith('/saved-direct-run/recheck') && init?.method === 'POST')
     expect(JSON.parse(String(call?.[1]?.body))).toEqual({ password: 'test-password' })
   })
 
-  it('keeps the original hold visible beside the downstream-verified release state', async () => {
-    vi.stubGlobal('fetch', vi.fn(async () => response({
+  it('keeps the old release facts in Technical details only', async () => {
+    vi.stubGlobal('fetch', stub(async () => response({
       rows: [event({
         ords_status: 'BLOCKED_IDENTITY',
         release_state: 'RELEASED',
@@ -1005,15 +991,13 @@ describe('Live attendance workspace', () => {
       })],
       next_cursor: null,
     })))
-    render(<AttendanceView {...attendanceProps} />)
-
-    const row = await screen.findByRole('article', { name: /Ayesha Khan, Check in/i })
-    expect(within(row).getByLabelText('Status: BLOCKED IDENTITY')).toBeTruthy()
-    expect(within(row).getByText('Released · Oracle verified')).toBeTruthy()
-    expect(within(row).getByText(/Oracle and downstream verified/i)).toBeTruthy()
-    fireEvent.click(within(row).getByLabelText(/view event details/i))
-    expect(within(row).getAllByText(/blocked identity/i).length).toBeGreaterThan(1)
-    expect(within(row).getByText(/job 22222222/i)).toBeTruthy()
+    renderView()
+    const row = await screen.findByRole('article', { name: /Ayesha Khan, Check-in/i })
+    expect(within(row).getByLabelText('Status: Not matched')).toBeTruthy()
+    expect(within(row).queryByText('Released · Oracle verified')).toBeNull()
+    const sheet = await openRow(/Ayesha Khan/)
+    const old = within(sheet).getByText(/Released · Oracle verified · job 22222222/)
+    expect(old.closest('[data-technical]')).toBeTruthy()
   })
 
   it('describes completed release-history punches as verified rather than unsafe', async () => {
@@ -1081,68 +1065,40 @@ describe('Live attendance workspace', () => {
       throw new Error(`Unexpected request ${url.pathname}`)
     }))
 
-    render(<AttendanceView {...attendanceProps} />)
+    renderView()
 
-    expect(await screen.findByText('Oracle content and downstream attendance are verified.')).toBeTruthy()
-    expect(screen.queryByText('This punch cannot be released safely.')).toBeNull()
+    expect(await screen.findByText('The HR system has it.')).toBeTruthy()
+    expect(screen.queryByText("Can't be sent (see code)")).toBeNull()
+    expectPlainText(document.querySelector('.release-history-workspace') as HTMLElement)
   })
 
-  it('supports keyboard navigation across all three Attendance views and URL restoration', async () => {
-    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+  it('has two tabs, keeps them in the address and rewrites old links', async () => {
+    const fetchMock = stub(async (input: RequestInfo | URL) => {
       const url = new URL(String(input), 'https://add.test')
-      if (url.pathname === '/api/v1/attendance')
-        return response({ rows: [], next_cursor: null })
-      if (['/api/v2/attendance-force-releases', '/api/v2/attendance-recovery/checks'].includes(url.pathname)) return response({ enabled: true, rows: [], next_cursor: null })
-      if (url.pathname === '/api/v2/attendance-release-queue')
-        return response({
-          preview_enabled: true,
-          execution_enabled: true,
-          totals: { employees: 0, events: 0, eligible: 0, locked: 0 },
-          rows: [],
-          next_cursor: null,
-        })
-      if (url.pathname === '/api/v2/attendance-releases')
-        return response({
-          preview_enabled: true,
-          execution_enabled: true,
-          rows: [],
-          next_cursor: null,
-          totals: { all: 0, active: 0, attention: 0 },
-          worker: {},
-        })
-      throw new Error(`Unexpected request ${url.pathname}`)
+      if (url.pathname === '/api/v1/attendance') return response({ rows: [], next_cursor: null })
+      if (['/api/v2/attendance-force-releases', '/api/v2/attendance-recovery/checks', '/api/v2/attendance-direct-ords'].includes(url.pathname)) return response({ enabled: true, rows: [], next_cursor: null })
+      if (url.pathname === '/api/v2/attendance-repairs') return response({ rows: [], next_cursor: null })
+      return response({})
     })
     vi.stubGlobal('fetch', fetchMock)
-    render(<AttendanceView {...attendanceProps} />)
-
-    const allTab = screen.getByRole('tab', { name: /All events/i })
-    const reviewTab = screen.getByRole('tab', { name: /Needs review/i })
-    const historyTab = screen.getByRole('tab', { name: /Release history/i })
-    expect(allTab.getAttribute('aria-selected')).toBe('true')
-
-    fireEvent.keyDown(allTab, { key: 'ArrowRight' })
-    expect(reviewTab.getAttribute('aria-selected')).toBe('true')
-    expect(document.activeElement).toBe(reviewTab)
-    expect(window.location.search).toBe('?view=needs-review')
-    expect(await screen.findByRole('heading', { name: 'Force release attendance' })).toBeTruthy()
-
-    fireEvent.keyDown(reviewTab, { key: 'End' })
-    expect(historyTab.getAttribute('aria-selected')).toBe('true')
-    expect(document.activeElement).toBe(historyTab)
-    expect(window.location.search).toBe('?view=release-history')
-    expect(await screen.findByRole('heading', { name: 'Previous repair history' })).toBeTruthy()
-
-    window.history.replaceState(null, '', '/attendance?view=needs-review')
-    window.dispatchEvent(new PopStateEvent('popstate'))
-    await waitFor(() => expect(reviewTab.getAttribute('aria-selected')).toBe('true'))
-  })
-
-  it('opens the manual workflow instead of the retired release controls', async () => {
-    window.history.replaceState(null, '', '/attendance?view=needs-review')
-    vi.stubGlobal('fetch', vi.fn(async () => response({ enabled: true, rows: [], next_cursor: null })))
-    render(<AttendanceView {...attendanceProps} />)
-    await screen.findByRole('heading', { name: 'Force release attendance' })
+    window.history.replaceState(null, '', '/attendance?view=needs-review&device_id=connector-one&user_key=abc')
+    renderView()
+    await waitFor(() => expect(Object.fromEntries(new URLSearchParams(window.location.search))).toEqual({ view: 'fix-tools', tool: 'held-staff', device_id: 'connector-one' }))
+    expect(screen.getByRole('tab', { name: /Fix tools/ }).getAttribute('aria-selected')).toBe('true')
+    expect(await screen.findByRole('heading', { name: 'Re-check not-matched check-ins' })).toBeTruthy()
+    expect(screen.getByText('Needs your approval')).toBeTruthy()
     expect(screen.queryByRole('button', { name: /Prepare.*punches|Start repair/ })).toBeNull()
-    expect((screen.getByRole('button', { name: 'Sync and check' }) as HTMLButtonElement).disabled).toBe(true)
+
+    fireEvent.click(screen.getByRole('button', { name: /Fix tools/, hidden: false }))
+    expect(await screen.findByRole('article', { name: 'History' })).toBeTruthy()
+    fireEvent.click(within(screen.getByRole('article', { name: 'History' })).getByRole('button', { name: /Open/ }))
+    expect(window.location.search).toContain('tool=history')
+    fireEvent.change(await screen.findByLabelText('Type'), { target: { value: 'old-repair' } })
+    expect(await screen.findByText('Old repair tasks (no longer used)', { selector: 'option' })).toBeTruthy()
+    expect(window.location.search).toContain('kind=old-repair')
+
+    fireEvent.click(screen.getByRole('tab', { name: 'Check-ins' }))
+    expect(window.location.search).not.toContain('view=')
+    expect(await screen.findByText('No check-ins yet today')).toBeTruthy()
   })
 })

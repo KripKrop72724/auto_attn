@@ -1,9 +1,15 @@
-import { useEffect, useState, type FormEvent } from 'react'
+import { useCallback, useEffect, useState, type FormEvent } from 'react'
 import { api } from '../api'
-import { Dialog, dateTime, relativeTime } from '../App'
+import { Dialog } from '../App'
 import { Icon } from '../Icon'
+import { Disclosure, Skeleton, StatusChip, TechnicalDetails } from '../ui'
+import { ago, clock } from '../lib/time'
+import { deviceDivision } from '../lib/division'
+import { deviceName } from '../lib/deviceNames'
+import { rowTime } from './attendance/attendanceWords'
 import type {
   AttendanceEvent,
+  Device,
   CheckinNotification,
   CheckinNotificationOverview,
   CheckinNotificationSettings,
@@ -11,93 +17,85 @@ import type {
 } from '../types'
 import { explainOperatorError, OperatorFailureMessage, type OperatorFailure } from './AlertResolveDialog'
 import './CheckinNotification.css'
+import { STEP_UP } from '../words/glossary'
 
 type Toast = { notice: (message: string) => void; error: (message: string) => void }
 
-// The employee phone notification ("attendance punched") for each punch.
+// The employee phone message ("attendance punched") for each check-in.
 export const notifyStatusLabels: Record<CheckinNotificationStatus, string> = {
-  NOTIFIED: 'Notified',
-  PENDING: 'Pending',
-  RETRYING: 'Retrying',
+  NOTIFIED: 'Delivered',
+  PENDING: 'Waiting',
+  RETRYING: 'Trying again',
   FAILED: 'Failed',
   NOT_SENT: 'Not sent',
 }
 
-const statusPatterns: Record<CheckinNotificationStatus, string> = {
-  NOTIFIED: 'confirmed',
-  PENDING: 'waiting',
-  RETRYING: 'waiting',
-  FAILED: 'blocked',
-  NOT_SENT: 'notice',
-}
-
-const statusIcons: Record<CheckinNotificationStatus, Parameters<typeof Icon>[0]['name']> = {
-  NOTIFIED: 'check',
-  PENDING: 'clock',
-  RETRYING: 'refresh',
-  FAILED: 'alert',
-  NOT_SENT: 'info',
-}
-
 const reasonLabels: Record<string, string> = {
-  BEFORE_FEATURE: 'Punch is from before phone notifications started',
-  OLD_PUNCH: 'Old punch: Oracle confirmed it too long after the punch time',
-  NO_CNIC: 'No CNIC on the punch',
-  CNIC_UNCERTAIN: 'The CNIC Oracle received could not be confirmed',
-  DISABLED: 'Phone notifications were switched off',
-  NOT_CONFIGURED: 'The notification service key is not configured',
-  GROUPED: 'Grouped with an earlier punch by the same employee',
-  NOT_FIRST_OF_DAY: 'Only the first punch of the day is notified',
-  NOT_IN_PILOT: 'Outside the pilot zones and employees',
-  INVALID_CLOCK: 'The punch time is invalid or in the future',
-  AWAITING_ORACLE: 'Waiting for Oracle to confirm the punch',
-  CONFIRMATION_WITHDRAWN: 'Oracle withdrew its confirmation of this punch',
-  EVENT_MISSING: 'The punch is no longer available',
-  NOT_RECORDED: 'No notification was recorded for this punch',
-  RETRY_WINDOW_EXHAUSTED: 'Gave up after retrying for the whole retry period',
-  DELIVERY_UNCERTAIN: 'The HRM service gave no clear answer, so the employee may already have the message; it is not repeated automatically',
-  API_REPORTED_FAILURE: 'The HRM service reported that it could not send it',
-  TRANSPORT_ALL_HOSTS_UNREACHABLE: 'Neither notification host could be reached',
-  TRANSPORT_TIMEOUT: 'The HRM service did not answer in time',
-  TRANSPORT_CONNECT_ERROR: 'The HRM service could not be reached',
-  TRANSPORT_CONNECT_TIMEOUT: 'Connecting to the HRM service timed out',
+  BEFORE_FEATURE: 'This check-in is from before phone messages started',
+  OLD_PUNCH: 'The HR system confirmed this check-in too long after it happened',
+  NO_CNIC: 'No CNIC on this check-in',
+  CNIC_UNCERTAIN: "The CNIC the HR system received couldn't be confirmed",
+  DISABLED: 'Phone messages were switched off',
+  NOT_CONFIGURED: "Phone messages aren't set up",
+  GROUPED: 'Combined with an earlier check-in by the same person',
+  NOT_FIRST_OF_DAY: 'Only the first check-in of the day gets a message',
+  NOT_IN_PILOT: 'This person or area is not in the trial',
+  INVALID_CLOCK: 'The check-in time is wrong or in the future',
+  AWAITING_ORACLE: 'Waiting for the HR system to confirm the check-in',
+  CONFIRMATION_WITHDRAWN: 'The HR system took back its confirmation of this check-in',
+  EVENT_MISSING: 'The check-in is no longer available',
+  NOT_RECORDED: 'No phone message was recorded for this check-in',
+  RETRY_WINDOW_EXHAUSTED: 'Stopped trying after the whole retry period',
+  DELIVERY_UNCERTAIN: "The phone message service gave no clear answer, so the person may already have the message; it is not repeated automatically",
+  API_REPORTED_FAILURE: "The phone message service said it couldn't send it",
+  TRANSPORT_ALL_HOSTS_UNREACHABLE: "The phone message service couldn't be reached",
+  TRANSPORT_TIMEOUT: "The phone message service didn't answer in time",
+  TRANSPORT_CONNECT_ERROR: "The phone message service couldn't be reached",
+  TRANSPORT_CONNECT_TIMEOUT: 'Connecting to the phone message service took too long',
 }
 
 const shortReasons: Record<string, string> = {
-  BEFORE_FEATURE: 'before feature',
-  OLD_PUNCH: 'old punch',
+  BEFORE_FEATURE: 'older check-in',
+  OLD_PUNCH: 'confirmed too late',
   NO_CNIC: 'no CNIC',
-  CNIC_UNCERTAIN: 'CNIC uncertain',
-  DISABLED: 'disabled',
-  NOT_CONFIGURED: 'not configured',
-  GROUPED: 'grouped',
-  NOT_FIRST_OF_DAY: 'not first of day',
-  NOT_IN_PILOT: 'outside pilot',
-  INVALID_CLOCK: 'invalid time',
-  AWAITING_ORACLE: 'awaiting Oracle',
-  CONFIRMATION_WITHDRAWN: 'confirmation withdrawn',
+  CNIC_UNCERTAIN: 'CNIC not confirmed',
+  DISABLED: 'switched off',
+  NOT_CONFIGURED: 'not set up',
+  GROUPED: 'combined with an earlier one',
+  NOT_FIRST_OF_DAY: 'not the first of the day',
+  NOT_IN_PILOT: 'not in the trial',
+  INVALID_CLOCK: 'wrong time',
+  AWAITING_ORACLE: 'waiting for the HR system',
+  CONFIRMATION_WITHDRAWN: 'the HR system took it back',
 }
 
 export const explainNotifyReason = (reason: string | null) => {
   if (!reason) return ''
   if (reasonLabels[reason]) return reasonLabels[reason]
-  const http = /^HTTP_(\d{3})$/.exec(reason)
-  if (http) return `The HRM service answered HTTP ${http[1]}`
-  return reason.replaceAll('_', ' ').toLowerCase().replace(/^./, (value) => value.toUpperCase())
+  if (/^HTTP_(\d{3})$/.test(reason)) return 'The phone message service refused it'
+  return "The phone message couldn't be sent"
 }
 
-const pktTime = (value: string) =>
-  new Date(value).toLocaleTimeString('en-PK', { timeZone: 'Asia/Karachi', hour: 'numeric', minute: '2-digit' })
+const pktTime = (value: string) => clock(value)
 
+/** "Delivered 8:03 am", "Not sent: older check-in", "Failed: …", "Trying again". */
 export const notifyPillText = (value: CheckinNotification) => {
-  if (value.status === 'NOTIFIED' && value.sent_at) return `Notified ${pktTime(value.sent_at)}`
+  if (value.status === 'NOTIFIED' && value.sent_at) return `Delivered ${pktTime(value.sent_at)}`
   if (value.status === 'NOT_SENT' && value.reason) {
-    return `Not sent · ${shortReasons[value.reason] || explainNotifyReason(value.reason).toLowerCase()}`
+    return `Not sent: ${shortReasons[value.reason] || explainNotifyReason(value.reason).toLowerCase()}`
   }
+  if (value.status === 'FAILED' && value.reason) return `Failed: ${explainNotifyReason(value.reason).toLowerCase()}`
   return notifyStatusLabels[value.status]
 }
 
-export function CheckinNotifyPill({
+/** The only phone-message mark on a list row: shown when the message failed. */
+export function CheckinNotifyFailedMark({ row }: { row: AttendanceEvent }) {
+  if (row.checkin_notification?.status !== 'FAILED') return null
+  return <span className="notify-failed-mark" data-notify-status="FAILED"><Icon name="alert" /> Phone message failed</span>
+}
+
+/** The "Phone message" block in the check-in sheet, with "Send the message again" when allowed. */
+export function CheckinNotifyRow({
   row,
   toast,
   onChanged,
@@ -111,18 +109,23 @@ export function CheckinNotifyPill({
   if (!value) return null
   const text = notifyPillText(value)
   return (
-    <>
-      <button
-        type="button"
-        className={`status-badge notify-pill pattern-${statusPatterns[value.status]}`}
-        data-notify-status={value.status}
-        aria-label={`Phone notification: ${text}. View details`}
-        title={explainNotifyReason(value.reason) || notifyStatusLabels[value.status]}
-        onClick={() => setOpen(true)}
-      >
-        <Icon name={statusIcons[value.status]} />
-        <span>{text}</span>
-      </button>
+    <section className="attendance-sheet-block notify-row" aria-labelledby={`notify-${row.id}-heading`} data-notify-status={value.status}>
+      <h3 id={`notify-${row.id}-heading`}>Phone message</h3>
+      <p aria-label={`Phone message: ${text}`}>{text}</p>
+      {value.can_retry && <button className="button secondary" type="button" onClick={() => setOpen(true)}><Icon name="refresh" /> Send the message again</button>}
+      {(value.reason || value.attempts || value.last_http_status || value.host || value.detail) && (
+        <TechnicalDetails summary="Phone message service detail">
+          <dl className="attendance-tech-list">
+            {value.reason && <div><dt>Reason code</dt><dd>{value.reason}</dd></div>}
+            {value.detail && <div><dt>Service detail</dt><dd>{value.detail}</dd></div>}
+            {value.attempts > 0 && <div><dt>Attempts</dt><dd>{value.attempts}</dd></div>}
+            {value.next_attempt_at && <div><dt>Next try</dt><dd>{rowTime(value.next_attempt_at)}</dd></div>}
+            {value.last_http_status && <div><dt>Last answer</dt><dd>{value.last_http_status}</dd></div>}
+            {value.host && <div><dt>Host</dt><dd>{value.host}</dd></div>}
+            {value.manual_retry && <div><dt>Sent again by an admin</dt><dd>Yes</dd></div>}
+          </dl>
+        </TechnicalDetails>
+      )}
       {open && (
         <CheckinNotifyDetails
           row={row}
@@ -132,7 +135,7 @@ export function CheckinNotifyPill({
           onChanged={() => { setOpen(false); onChanged() }}
         />
       )}
-    </>
+    </section>
   )
 }
 
@@ -167,110 +170,154 @@ function CheckinNotifyDetails({
         method: 'POST',
         body: JSON.stringify({ reason: trimmed, password: secret }),
       })
-      toast.notice('The phone notification was queued again with an audit entry.')
+      toast.notice('The phone message will be sent again.')
       onChanged()
     } catch (error) {
-      setFailure(explainOperatorError(error, 'The notification could not be queued again.'))
+      setFailure(explainOperatorError(error, "Couldn't send the phone message again."))
     } finally {
       setBusy(false)
     }
   }
-  const facts: Array<[string, string]> = [
-    ['Status', notifyStatusLabels[value.status]],
-  ]
-  if (value.reason) facts.push(['Reason', explainNotifyReason(value.reason)])
-  if (value.detail) facts.push(['Service detail', value.detail])
-  if (value.sent_at) facts.push(['Sent', dateTime(value.sent_at)])
-  if (value.next_attempt_at) facts.push(['Next attempt', `${dateTime(value.next_attempt_at)} (${relativeTime(value.next_attempt_at)})`])
-  if (value.attempts) facts.push(['Attempts', String(value.attempts)])
-  if (value.last_http_status) facts.push(['Last HTTP status', String(value.last_http_status)])
-  if (value.host) facts.push(['Host', value.host === 'FALLBACK' ? 'Public fallback host' : 'Internal ORDS host'])
-  if (value.manual_retry) facts.push(['Administrator retry', 'Yes'])
   return (
     <Dialog
       titleId={`notify-${row.id}-title`}
-      title="Phone notification"
-      description={`${row.display_name || `User ${row.user_id}`} · punch ${dateTime(row.device_event_time)}`}
+      title="Send the message again"
+      description={`${row.display_name || 'Name not known'} · ${rowTime(row.device_event_time)}`}
       onClose={() => { if (!busy) onClose() }}
       className="operator-action-dialog"
     >
       <form className="dialog-body notify-details" onSubmit={(event) => void retry(event)}>
-        <dl className="notify-facts">
-          {facts.map(([label, text]) => <div key={label}><dt>{label}</dt><dd>{text}</dd></div>)}
-        </dl>
-        <p className="notify-copy">ADD asks the HRM service to send the employee an “attendance punched” message only after Oracle confirms the punch. Punch delivery to Oracle is never affected by this notification.</p>
+        <p className="notify-copy">{notifyPillText(value)}{value.reason && value.status !== 'NOT_SENT' && value.status !== 'FAILED' ? ` · ${explainNotifyReason(value.reason)}` : ''}.</p>
+        {value.reason && <p className="notify-copy">{explainNotifyReason(value.reason)}.</p>}
+        <p className="notify-copy">The person gets a phone message only after the HR system confirms the check-in. Sending to the HR system is never affected by this message.</p>
         {value.can_retry && value.reason === 'DELIVERY_UNCERTAIN' && (
-          <p className="notify-copy notify-warning" role="note">The employee may already have received this message. Retrying can send it a second time.</p>
+          <p className="notify-copy notify-warning" role="note">The person may already have this message. Sending again can send it a second time.</p>
         )}
         {value.can_retry && (
           <>
-            <label>Audited reason<textarea value={reason} maxLength={300} placeholder="At least 10 characters" onChange={(event) => setReason(event.target.value)} /></label>
-            <label>Administrator password<input type="password" autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} /></label>
+            <label>{STEP_UP.why}<textarea value={reason} maxLength={300} onChange={(event) => setReason(event.target.value)} /></label><small className="step-up-help">{STEP_UP.whyHelp(10)}</small>
+            <label>{STEP_UP.password}<input type="password" autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} /></label><small className="step-up-help">{STEP_UP.passwordHelp}</small>
           </>
         )}
+        {value.detail && <TechnicalDetails><p>{value.detail}</p></TechnicalDetails>}
         {failure && <OperatorFailureMessage failure={failure} />}
         <div className="dialog-actions">
           <button type="button" className="button secondary" disabled={busy} onClick={onClose}>Close</button>
-          {value.can_retry && <button type="submit" className="button primary" disabled={!canRetry}><Icon name="refresh" /> {busy ? 'Queuing…' : 'Retry notification'}</button>}
+          {value.can_retry && <button type="submit" className="button primary" disabled={!canRetry}><Icon name="refresh" /> {busy ? 'Sending…' : 'Send the message again'}</button>}
         </div>
       </form>
     </Dialog>
   )
 }
 
-const stateLabels: Record<CheckinNotificationOverview['state'], string> = {
+export const notifyStateLabels: Record<CheckinNotificationOverview['state'], string> = {
   OK: 'Working',
-  DEGRADED: 'Delayed',
+  DEGRADED: 'Slow',
   PAUSED: 'Paused after failures',
   OFF: 'Switched off',
-  NOT_CONFIGURED: 'Not configured',
+  NOT_CONFIGURED: 'Not set up',
 }
 
-const statePatterns: Record<CheckinNotificationOverview['state'], string> = {
-  OK: 'confirmed', DEGRADED: 'waiting', PAUSED: 'blocked', OFF: 'notice', NOT_CONFIGURED: 'notice',
+const stateTones: Record<CheckinNotificationOverview['state'], 'working' | 'attention' | 'offline' | 'neutral'> = {
+  OK: 'working', DEGRADED: 'attention', PAUSED: 'offline', OFF: 'neutral', NOT_CONFIGURED: 'neutral',
 }
 
 const modeLabels: Record<CheckinNotificationOverview['mode'], string> = {
-  OFF: 'Off', PILOT: 'Pilot', ALL: 'All zones',
+  OFF: 'Off', PILOT: 'Trial', ALL: 'Everyone',
 }
 
-export function CheckinNotifySummary({
-  summary,
-  toast,
-  onChanged,
-}: {
-  summary: CheckinNotificationOverview
-  toast: Toast
-  onChanged: () => void
-}) {
+const sendingTo = (summary: CheckinNotificationOverview) => {
+  const who = summary.mode === 'OFF' ? 'nobody'
+    : summary.mode === 'PILOT' ? `trial (${summary.pilot_zone_count} ${summary.pilot_zone_count === 1 ? 'area' : 'areas'}, ${summary.pilot_cnic_count} ${summary.pilot_cnic_count === 1 ? 'person' : 'people'})`
+      : 'everyone'
+  if (summary.mode === 'OFF') return `Sending to: ${who}`
+  return `Sending to: ${who} · ${summary.punch_policy === 'FIRST_PER_DAY' ? 'first check-in of the day only' : 'every check-in'}`
+}
+
+/**
+ * Settings › "Check-in phone messages" (ATT-13). Reads its own figures from
+ * `GET /api/v1/checkin-notifications`, so it no longer depends on the
+ * attendance list. The counts are a 2×2 grid, never a stretched wrapping list.
+ */
+export function CheckinNotifySettingsCard({ toast, devices = [] }: { toast: Toast; devices?: Device[] }) {
+  const [summary, setSummary] = useState<CheckinNotificationSettings | null>(null)
+  const [failed, setFailed] = useState(false)
   const [settingsOpen, setSettingsOpen] = useState(false)
-  const counts = summary.last_24h
+  const load = useCallback(async (signal?: AbortSignal) => {
+    try {
+      const value = await api<CheckinNotificationSettings>('/api/v1/checkin-notifications', { signal })
+      if (signal?.aborted) return
+      setSummary(value)
+      setFailed(false)
+    } catch (error) {
+      if (error instanceof DOMException && error.name === 'AbortError') return
+      setFailed(true)
+    }
+  }, [])
+  useEffect(() => {
+    const controller = new AbortController()
+    void load(controller.signal)
+    return () => controller.abort()
+  }, [load])
+
   return (
-    <section className="notify-summary" aria-label="Employee phone notifications">
-      <div className="notify-summary-title">
-        <Icon name="pulse" />
-        <span><strong>Phone notifications</strong><small>Mode: {modeLabels[summary.mode]}{summary.mode === 'PILOT' ? ` (${summary.pilot_zone_count} zones, ${summary.pilot_cnic_count} employees)` : ''}{summary.punch_policy === 'FIRST_PER_DAY' ? ' · first punch per day' : ''}</small></span>
-        <span className={`status-badge pattern-${statePatterns[summary.state]}`}>{stateLabels[summary.state]}</span>
-      </div>
-      <ul className="notify-summary-counts" aria-label="Last 24 hours">
-        <li><strong>{counts.notified.toLocaleString()}</strong> notified</li>
-        <li><strong>{(counts.pending + counts.retrying).toLocaleString()}</strong> waiting</li>
-        <li><strong>{counts.failed.toLocaleString()}</strong> failed</li>
-        <li><strong>{counts.not_sent.toLocaleString()}</strong> not sent</li>
-        <li><small>Last 24 h · last sent {summary.last_success_at ? relativeTime(summary.last_success_at) : 'never'}{summary.oldest_pending_age_seconds > 60 ? ` · oldest waiting ${Math.round(summary.oldest_pending_age_seconds / 60)} min` : ''}{summary.preferred_host === 'FALLBACK' ? ' · using public fallback host' : ''}</small></li>
-      </ul>
-      <button className="button secondary" type="button" onClick={() => setSettingsOpen(true)}><Icon name="edit" /> Settings</button>
-      {settingsOpen && <CheckinNotifySettingsDialog toast={toast} onClose={() => setSettingsOpen(false)} onSaved={() => { setSettingsOpen(false); onChanged() }} />}
+    <section className="panel notify-card" aria-labelledby="notify-card-title">
+      <header className="notify-card-head">
+        <h2 id="notify-card-title">Check-in phone messages</h2>
+        {summary && <StatusChip tone={stateTones[summary.state]} label={notifyStateLabels[summary.state]} code={summary.state} />}
+      </header>
+      <p className="notify-copy">People get a phone message after the HR system confirms their check-in.</p>
+      {!summary && !failed && <Skeleton variant="line" count={3} label="Loading phone message settings" />}
+      {failed && !summary && <p className="message pattern-blocked" role="alert">Couldn't load phone message settings. <button className="text-button" type="button" onClick={() => void load()}>Try again</button></p>}
+      {summary && (
+        <>
+          {!summary.configured && <p className="notify-copy">Phone messages aren't set up yet, so nothing is sent.</p>}
+          <p className="notify-card-mode">{sendingTo(summary)}</p>
+          {summary.last_24h && <>
+            <p className="notify-card-caption">Last {summary.last_24h.window_hours === 24 ? '24 hours' : `${summary.last_24h.window_hours} hours`}</p>
+            <dl className="notify-card-counts" aria-label="Last 24 hours">
+              <div><dt>Delivered</dt><dd>{summary.last_24h.notified.toLocaleString()}</dd></div>
+              <div><dt>Waiting</dt><dd>{(summary.last_24h.pending + summary.last_24h.retrying).toLocaleString()}</dd></div>
+              <div><dt>Failed</dt><dd>{summary.last_24h.failed.toLocaleString()}</dd></div>
+              <div><dt>Not needed</dt><dd>{summary.last_24h.not_sent.toLocaleString()}</dd></div>
+            </dl>
+            {summary.last_24h.not_sent > 0 && Object.keys(summary.last_24h.not_sent_reasons || {}).length > 0 && (
+              <Disclosure summary="See why some were not needed">
+                <ul className="notify-card-reasons">{Object.entries(summary.last_24h.not_sent_reasons).map(([code, count]) => <li key={code}><strong>{count.toLocaleString()}</strong> {shortReasons[code] || explainNotifyReason(code).toLowerCase()}</li>)}</ul>
+              </Disclosure>
+            )}
+          </>}
+          <p className="notify-card-caption">Last message {summary.last_success_at ? ago(summary.last_success_at) : 'not sent yet'}{summary.oldest_pending_age_seconds > 60 ? ` · Oldest waiting ${Math.round(summary.oldest_pending_age_seconds / 60)} min` : ''}</p>
+          <TechnicalDetails>
+            <dl className="attendance-tech-list">
+              <div><dt>State</dt><dd>{summary.state}</dd></div>
+              <div><dt>Host in use</dt><dd>{summary.preferred_host}{summary.endpoint_host ? ` · ${summary.endpoint_host}` : ''}{summary.fallback_host ? ` · fallback ${summary.fallback_host}` : ''}</dd></div>
+              {summary.last_failure_category && <div><dt>Last failure</dt><dd>{summary.last_failure_category}</dd></div>}
+            </dl>
+          </TechnicalDetails>
+          <button className="button secondary" type="button" onClick={() => setSettingsOpen(true)}><Icon name="edit" /> Change settings</button>
+        </>
+      )}
+      {settingsOpen && <CheckinNotifySettingsDialog toast={toast} devices={devices} onClose={() => setSettingsOpen(false)} onSaved={() => { setSettingsOpen(false); void load() }} />}
     </section>
   )
 }
 
+/** One line for the Check-ins tab when phone messages are paused after failures. */
+export function checkinNotifyBanner(summary: Pick<CheckinNotificationOverview, 'state'> | null | undefined): string | null {
+  if (!summary) return null
+  if (summary.state === 'PAUSED') return 'Phone messages are paused after failures.'
+  return null
+}
+
 export function CheckinNotifySettingsDialog({
   toast,
+  devices = [],
   onClose,
   onSaved,
 }: {
   toast: Toast
+  devices?: Device[]
   onClose: () => void
   onSaved: () => void
 }) {
@@ -297,11 +344,17 @@ export function CheckinNotifySettingsDialog({
       })
       .catch((error) => {
         if (error instanceof DOMException && error.name === 'AbortError') return
-        setLoadError(error instanceof Error ? error.message : 'Notification settings could not be loaded.')
+        setLoadError("Couldn't load phone message settings.")
       })
     return () => controller.abort()
   }, [])
 
+  const zoneList = zones.split(',').map((item) => item.trim()).filter(Boolean)
+  const areas = [...new Map(devices.filter((device) => !device.is_spare).map((device) => [device.zone_id, {
+    id: device.zone_id,
+    name: deviceName(device.zone_name || device.zone_id).location || device.zone_name || device.zone_id,
+    division: deviceDivision(device),
+  }] as const)).values()].sort((a, b) => a.name.localeCompare(b.name, 'en', { numeric: true }))
   const trimmed = reason.trim()
   const cnicValid = !addCnic || /^\d{13}$/.test(addCnic)
   const canSave = Boolean(current) && trimmed.length >= 10 && Boolean(password) && cnicValid && !busy
@@ -326,10 +379,10 @@ export function CheckinNotifySettingsDialog({
           password: secret,
         }),
       })
-      toast.notice(`Phone notifications are now ${modeLabels[mode].toLowerCase()}. The change was audited.`)
+      toast.notice(`Phone messages: now ${modeLabels[mode]}.`)
       onSaved()
     } catch (error) {
-      setFailure(explainOperatorError(error, 'The notification settings could not be saved.'))
+      setFailure(explainOperatorError(error, "Couldn't save the settings."))
     } finally {
       setBusy(false)
     }
@@ -338,37 +391,42 @@ export function CheckinNotifySettingsDialog({
   return (
     <Dialog
       titleId="notify-settings-title"
-      title="Phone notification settings"
-      description="Choose who receives the “attendance punched” phone message. Changes apply within seconds and are audited."
+      title="Phone message settings"
+      description="Choose who gets the phone message. Changes apply in seconds."
       onClose={() => { if (!busy) onClose() }}
       className="operator-action-dialog"
     >
       <form className="dialog-body notify-settings" onSubmit={(event) => void save(event)}>
         {loadError && <div className="message pattern-blocked" role="alert"><Icon name="alert" /><span>{loadError}</span></div>}
-        {!current && !loadError && <p role="status">Loading notification settings…</p>}
+        {!current && !loadError && <p role="status">Loading…</p>}
         {current && (
           <>
-            {!current.configured && <div className="message pattern-waiting" role="status"><Icon name="alert" /><span>The notification service key is not configured, so nothing is sent whatever the mode.</span></div>}
+            {!current.configured && <div className="message pattern-waiting" role="status"><Icon name="alert" /><span>Phone messages aren't set up yet, so nothing is sent whatever you choose.</span></div>}
             <fieldset className="notify-mode">
-              <legend>Mode</legend>
+              <legend>Send to</legend>
               {current.modes.map((value) => (
-                <label key={value}><input type="radio" name="notify-mode" value={value} checked={mode === value} onChange={() => setMode(value)} />{modeLabels[value]}<small>{value === 'OFF' ? 'Send nothing' : value === 'PILOT' ? 'Only the zones and employees listed below' : 'Every zone'}</small></label>
+                <label key={value}><input type="radio" name="notify-mode" value={value} checked={mode === value} onChange={() => setMode(value)} />{modeLabels[value]}<small>{value === 'OFF' ? 'Send nothing' : value === 'PILOT' ? 'Only the areas and people chosen below' : 'Every area'}</small></label>
               ))}
             </fieldset>
-            <label>Which punches<select value={policy} onChange={(event) => setPolicy(event.target.value as CheckinNotificationSettings['punch_policy'])}><option value="ALL_PUNCHES">Every punch</option><option value="FIRST_PER_DAY">First punch of the day only</option></select></label>
-            <label>Pilot zone IDs<input value={zones} placeholder="Comma separated, for example ZONE-ISB-01" onChange={(event) => setZones(event.target.value)} /></label>
+            <label>Which check-ins<select value={policy} onChange={(event) => setPolicy(event.target.value as CheckinNotificationSettings['punch_policy'])}><option value="ALL_PUNCHES">Every check-in</option><option value="FIRST_PER_DAY">First check-in of the day only</option></select></label>
+            {areas.length > 0
+              ? <fieldset className="notify-areas"><legend>Trial areas</legend>{(['life', 'health'] as const).map((division) => {
+                const items = areas.filter((area) => area.division === division)
+                return items.length ? <div key={division} className="notify-area-group"><strong>{division === 'life' ? 'Life' : 'Health'}</strong>{items.map((area) => <label key={area.id}><input type="checkbox" checked={zoneList.includes(area.id)} onChange={(event) => setZones((event.target.checked ? [...zoneList, area.id] : zoneList.filter((id) => id !== area.id)).join(', '))} />{area.name}</label>)}</div> : null
+              })}{zoneList.filter((id) => !areas.some((area) => area.id === id)).length > 0 && <small>Also kept: {zoneList.filter((id) => !areas.some((area) => area.id === id)).length} more areas.</small>}</fieldset>
+              : <label>Trial areas<input value={zones} placeholder="Area codes, separated by commas" onChange={(event) => setZones(event.target.value)} /></label>}
             <div className="notify-pilot-cnics">
-              <span>Pilot employees</span>
-              {current.pilot_cnics.length === 0 && <small>No employees listed.</small>}
+              <span>Trial people</span>
+              {current.pilot_cnics.length === 0 && <small>Nobody listed.</small>}
               {current.pilot_cnics.map((item) => (
-                <label key={item.id}><input type="checkbox" checked={removeIds.includes(item.id)} onChange={(event) => setRemoveIds(event.target.checked ? [...removeIds, item.id] : removeIds.filter((id) => id !== item.id))} />Remove {item.masked || 'employee'}</label>
+                <label key={item.id}><input type="checkbox" checked={removeIds.includes(item.id)} onChange={(event) => setRemoveIds(event.target.checked ? [...removeIds, item.id] : removeIds.filter((id) => id !== item.id))} />Remove {item.masked || 'person'}</label>
               ))}
-              <label>Add employee CNIC<input inputMode="numeric" autoComplete="off" value={addCnic} placeholder="13 digits" onChange={(event) => setAddCnic(event.target.value.replace(/\D/g, '').slice(0, 13))} /></label>
+              <label>Add a person's CNIC<input inputMode="numeric" autoComplete="off" value={addCnic} placeholder="13 digits" onChange={(event) => setAddCnic(event.target.value.replace(/\D/g, '').slice(0, 13))} /></label>
               {!cnicValid && <small className="attention-copy">Enter all 13 digits of the CNIC.</small>}
             </div>
-            <p className="notify-copy">Old punches are never notified: a punch confirmed by Oracle more than {current.stale_window_hours} hours after it happened is marked “Not sent · old punch”. Repeat punches within {Math.round(current.coalesce_seconds / 60)} minutes are grouped into one message. Host: {current.endpoint_host || 'not set'}{current.fallback_host ? `, fallback ${current.fallback_host}` : ''}.</p>
-            <label>Audited reason<textarea value={reason} maxLength={300} placeholder="At least 10 characters" onChange={(event) => setReason(event.target.value)} /></label>
-            <label>Administrator password<input type="password" autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} /></label>
+            <p className="notify-copy">Old check-ins never get a message: one the HR system confirms more than {current.stale_window_hours} hours after it happened shows "Not sent: confirmed too late". Check-ins within {Math.round(current.coalesce_seconds / 60)} minutes of each other get one message.</p>
+            <label>{STEP_UP.why}<textarea value={reason} maxLength={300} onChange={(event) => setReason(event.target.value)} /></label><small className="step-up-help">{STEP_UP.whyHelp(10)}</small>
+            <label>{STEP_UP.password}<input type="password" autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} /></label><small className="step-up-help">{STEP_UP.passwordHelp}</small>
           </>
         )}
         {failure && <OperatorFailureMessage failure={failure} />}

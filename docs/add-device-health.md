@@ -215,9 +215,11 @@ and the end of the boot for a worker fault.
 
 ## Alerts and acknowledgement
 
-Acknowledging an alert annotates it. The alert stays OPEN, keeps driving tier
-and holds, and later evidence refreshes or resolves the same row. The alerts
-page has queues: Needs action (default), Acknowledged, Resolved and All.
+Acknowledging an alert ("Mark as seen") annotates it. The alert stays OPEN,
+keeps driving tier and holds, and later evidence refreshes or resolves the same
+row. The Problems page has tabs New (`NEEDS_ACTION`, default), Seen (`SEEN`:
+OPEN and acknowledged) and Fixed (`RESOLVED`). Legacy `ACKNOWLEDGED` rows from
+before 10 Oct are listed apart (`LEGACY_SEEN`) behind one note on the Seen tab.
 
 ## Operator actions
 
@@ -237,10 +239,13 @@ characters and an idempotency key. Both are audited with before and after.
 
 ## Stranded-alert cleanup
 
-In ADD, open **Alerts → Stranded alert review**.
+In ADD, open **Problems → ⋯ → Clean up old problems…** (or the device page,
+which starts with that device picked). The tool was called "Stranded alert
+review"; its safeguards are unchanged.
 
-1. Choose **Peshawar 02 + 06** first, then **Preview**. The preview is
-   read-only and signed for 15 minutes. Rows are grouped by device:
+1. Choose **Pick devices** (none are picked at the start) or **All devices**,
+   then **Find old problems**. The preview is read-only and signed for 15
+   minutes. Rows are grouped by device, with class chips to narrow the list:
    - **Stranded diagnostics**: a fault from a boot that has ended. The raising
      firmware and boot are shown, inferred from telemetry for older rows.
      Worker rows are preselected. Durability rows are not, because resolving
@@ -260,7 +265,7 @@ In ADD, open **Alerts → Stranded alert review**.
    effect of each device. Keep a P02 durability row unless the recovery
    receipts prove preservation.
 3. Enter a reason, the typed confirmation `RESOLVE n ALERTS ON m DEVICES` and
-   the password, then **Apply**. Apply locks the devices and their alerts,
+   the password, then **Close problems**. Apply locks the devices and their alerts,
    recomputes the plan, and refuses with `SCOPE_CHANGED` if anything moved.
 4. Verify:
    - the next heartbeat shows no stranded reason;

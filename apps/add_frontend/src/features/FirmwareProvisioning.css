@@ -9,7 +9,7 @@
 .provisioning-stepper li strong { color: inherit; font-size: 13px; font-weight: 500; }
 .provisioning-stepper li.active { color: var(--text); }
 .provisioning-stepper li.active strong { font-weight: 600; }
-.provisioning-stepper li.active > span { color: #fff; border-color: var(--accent); background: var(--accent); box-shadow: 0 0 0 4px var(--accent-muted); }
+.provisioning-stepper li.active > span { color: var(--on-solid); border-color: var(--accent); background: var(--accent); box-shadow: 0 0 0 4px var(--accent-muted); }
 .provisioning-stepper li.done { color: var(--text-secondary); }
 .provisioning-stepper li.done > span { color: var(--positive); border-color: var(--positive-border); background: var(--positive-subtle); }
 .provisioning-stepper li.done::after { background: var(--positive-border); }
@@ -54,6 +54,8 @@
 .installer-app-facts > div { display: grid; grid-template-columns: 90px minmax(0, 1fr); align-items: center; gap: 12px; min-width: 0; padding: 8px 12px; border-top: 0; }
 .installer-app-facts > div + div { border-top: 1px solid var(--border); }
 .installer-app-facts dt { color: var(--text-tertiary); font-size: 12px; }
+/* Under Technical details the sunken background needs the darker label colour (AA contrast). */
+.ui-technical-body .installer-app-facts dt { color: var(--text-secondary); }
 .installer-app-facts dd { min-width: 0; margin: 0; font-size: 13px; overflow-wrap: anywhere; }
 .installer-app-hash { display: flex; align-items: center; gap: 6px; }
 .installer-app-hash code { min-width: 0; font-size: 12px; line-height: 1.5; word-break: break-all; user-select: all; }
@@ -109,7 +111,7 @@
 .event-timeline li.active { color: var(--text); border-color: var(--accent-border); background: var(--accent-subtle); }
 .event-timeline li span { display: grid; }
 .event-timeline li small { color: var(--text-tertiary); }
-.flashing-card pre { max-height: 220px; overflow: auto; padding: 12px; border-radius: var(--radius-sm); color: #e5e7eb; background: #0b1220; font-size: 12px; }
+.flashing-card pre { max-height: 220px; overflow: auto; padding: 12px; border-radius: var(--radius-sm); color: var(--code-fg); background: var(--code-bg); font-size: 12px; }
 .completion-card { border-top: 3px solid var(--tone-solid, var(--positive-solid)); text-align: center; }
 .completion-card > svg { width: 44px; height: 44px; color: var(--tone-fg, var(--positive)); }
 .completion-card .provisioning-actions { justify-content: center; }

@@ -1,8 +1,12 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from 'react'
 import { api, queryString } from '../api'
-import { dateTime, Dialog, idempotency } from '../App'
-import { humanizeStatus } from '../status'
+import { Dialog, idempotency } from '../App'
+import { Disclosure } from '../ui'
+import { plainReason } from '../words/attendanceReasons'
+import { GROUP_CHIP, rowGroup, rowTime } from './attendance/attendanceWords'
 import type { AttendanceEvent, DirectOrdsCnicChoice, DirectOrdsCnicDecision, DirectOrdsPreview, DirectOrdsPreviewRow } from '../types'
+import { plainErrorText } from '../lib/plainApiError'
+import { STEP_UP } from '../words/glossary'
 
 export type DirectRun = {
   job_id: string; status: string; created_at: string; actor: string; selected: number;
@@ -12,34 +16,35 @@ type DirectItem = { item_id: string; attendance_event_id: number; status: string
 type ItemPage = { rows: DirectItem[]; next_cursor: number | null }
 const root = '/api/v2/attendance-direct-ords'
 const finished = new Set(['COMPLETED', 'COMPLETED_WITH_REVIEW'])
-const count = (value: number) => `${value.toLocaleString()} ${value === 1 ? 'punch' : 'punches'}`
-const message = (error: unknown) => error instanceof Error ? error.message : 'ADD could not save this request.'
+const count = (value: number) => `${value.toLocaleString()} ${value === 1 ? 'check-in' : 'check-ins'}`
+// A plain sentence only; the backend text never shows (writing rule 6).
+const message = (error: unknown) => plainErrorText(error, "Couldn't save this. Try again.")
 const previewRows = (value: Partial<DirectOrdsPreview> | null | undefined): DirectOrdsPreviewRow[] =>
   Array.isArray(value?.rows) ? value.rows.filter((row) => typeof row?.event_id === 'number') : []
-const rowLabel = (row: DirectOrdsPreviewRow) =>
-  `${row.display_name || `User ${row.user_id}`} · user ${row.user_id}${row.device_serial ? ` · ${row.device_serial}` : ''} · ${dateTime(row.device_event_time)}`
+const who = (row: { display_name: string | null; user_id: string }) => `${row.display_name || 'Name not known'} · Employee ID ${row.user_id}`
+const rowLabel = (row: DirectOrdsPreviewRow) => `${who(row)} · ${rowTime(row.device_event_time)}`
 const SIGNAL_TEXT: Record<string, string> = {
-  REVOKED_RECORD: 'the identity record at punch time was revoked',
-  OTHER_UID_RECORD: 'a record at punch time belongs to another terminal UID',
-  CAPTURED_CNIC_DIFFERS: 'the terminal captured another CNIC with the punch',
-  PREVIOUS_HOLDER_DELETED: 'a deleted terminal user held this user ID',
-  PUNCH_LINKED_TO_OTHER_USER: 'the punch was linked to another terminal user',
-  UID_DIFFERS: "the punch's terminal UID is not today's user's UID",
-  IDENTITY_CONFLICT_UNRESOLVED: 'this user has an unresolved identity conflict',
-  CNIC_CHANGED_NEAR_PUNCH: 'a record just before or after the punch holds another CNIC',
-  RECORDS_TRUNCATED: 'too many identity records to check',
-  PUNCH_TIME_CNIC_HELD_BY_OTHER: 'another active terminal user has the punch-time CNIC today',
-  PUNCH_BEFORE_FIRST_OBSERVATION: "the punch is older than ADD's first record of this user ID",
-  GAP_BRIDGED_SAME_CNIC: 'no record covers the punch; the records just before and after it are one terminal user with the same CNIC',
-  NAME_DIFFERS: "the name saved with the punch is not today's user's name",
-  RECORD_HOLDER_DELETED_BEFORE_PUNCH: 'the terminal user on the record before the punch was deleted before it',
+  REVOKED_RECORD: "the person's record at that time was removed",
+  OTHER_UID_RECORD: 'a record at that time belongs to another person on the machine',
+  CAPTURED_CNIC_DIFFERS: 'the machine saved another CNIC with the check-in',
+  PREVIOUS_HOLDER_DELETED: 'someone deleted from the machine had this Employee ID',
+  PUNCH_LINKED_TO_OTHER_USER: 'the check-in was linked to another person on the machine',
+  UID_DIFFERS: "the check-in's machine record isn't today's person's record",
+  IDENTITY_CONFLICT_UNRESOLVED: "this person has a conflict that isn't sorted out",
+  CNIC_CHANGED_NEAR_PUNCH: 'a record just before or after the check-in has another CNIC',
+  RECORDS_TRUNCATED: 'too many records to check them all',
+  PUNCH_TIME_CNIC_HELD_BY_OTHER: 'another person on the machine has the old CNIC today',
+  PUNCH_BEFORE_FIRST_OBSERVATION: "the check-in is older than the dashboard's first record of this Employee ID",
+  GAP_BRIDGED_SAME_CNIC: 'no record covers the check-in; the records just before and after it are the same person with the same CNIC',
+  NAME_DIFFERS: "the name saved with the check-in isn't today's person's name",
+  RECORD_HOLDER_DELETED_BEFORE_PUNCH: 'the person on the record before the check-in was deleted before it',
 }
 /** Plain-language evidence for one punch; masked CNICs only. */
 export function evidenceText(row: DirectOrdsPreviewRow) {
   const notes = (row.evidence_signals || []).filter((signal) => SIGNAL_TEXT[signal]).map((signal) => SIGNAL_TEXT[signal])
-  if (row.identity_conflict_code) notes.push(`conflict: ${humanizeStatus(row.identity_conflict_code)}`)
+  if (row.identity_conflict_code) notes.push('a conflict is recorded for this person')
   if (row.other_cnics_masked?.length) notes.push(`other CNIC on record: ${row.other_cnics_masked.join(', ')}`)
-  if (row.punch_display_name) notes.push(`name saved with the punch: ${row.punch_display_name}`)
+  if (row.punch_display_name) notes.push(`name saved with the check-in: ${row.punch_display_name}`)
   return notes.join('; ')
 }
 const groupOf = (row: DirectOrdsPreviewRow): [string, 'CHOOSE_CNIC' | 'CONFIRM_TODAY'] => {
@@ -94,40 +99,47 @@ export function directSendDecisions(rows: DirectOrdsPreviewRow[], choices: Recor
 }
 const span = (rows: DirectOrdsPreviewRow[]) => {
   const times = rows.map((row) => row.device_event_time).sort()
-  return times.length === 1 ? dateTime(times[0]) : `${dateTime(times[0])} – ${dateTime(times[times.length - 1])}`
+  return times.length === 1 ? rowTime(times[0]) : `${rowTime(times[0])} – ${rowTime(times[times.length - 1])}`
 }
-const groupLabel = (group: DirectSendGroup) => {
-  const row = group.rows[0]
-  return `${row.display_name || `User ${row.user_id}`} · user ${row.user_id}${row.device_serial ? ` · ${row.device_serial}` : ''} · ${count(group.rows.length)} · ${span(group.rows)}`
-}
-/** When the records around an uncovered punch end and start; never which one is "nearest". */
+const groupLabel = (group: DirectSendGroup) => `${who(group.rows[0])} · ${count(group.rows.length)} · ${span(group.rows)}`
+/** When the records around an uncovered check-in end and start; never which one is "nearest". */
 const recordEdges = (row: DirectOrdsPreviewRow) => [
-  row.record_before_ended_at ? `the old CNIC's record ended ${dateTime(row.record_before_ended_at)}` : '',
-  row.record_after_started_at ? `today's CNIC was first recorded ${dateTime(row.record_after_started_at)}` : '',
+  row.record_before_ended_at ? `the old CNIC's record ended ${rowTime(row.record_before_ended_at)}` : '',
+  row.record_after_started_at ? `today's CNIC was first recorded ${rowTime(row.record_after_started_at)}` : '',
 ].filter(Boolean).join('; ')
 const confirmReason = (row: DirectOrdsPreviewRow) => {
   if (row.punch_time_cnic === 'CHANGED_NEAR_PUNCH') {
     const edges = recordEdges(row)
-    return `No record covers the punch time; the CNIC changed around it${edges ? ` (${edges}, punch ${dateTime(row.device_event_time)})` : ''}. Only a record within 30 minutes of the punch is offered.`
+    return `No record covers the check-in time; the CNIC changed around it${edges ? ` (${edges}, check-in ${rowTime(row.device_event_time)})` : ''}. Only a record within 30 minutes of the check-in is offered.`
   }
-  if (row.punch_time_cnic !== 'NONE') return "ADD's records at the punch time do not prove today's CNIC."
+  if (row.punch_time_cnic !== 'NONE') return "The records at the check-in time don't prove today's CNIC."
   if (row.record_position === 'BEFORE_FIRST_RECORD') {
-    return `These punches are older than ADD's first record of this user ID${row.first_observed_at ? ` (${dateTime(row.first_observed_at)})` : ''}; a user ID reused before then cannot be detected.`
+    return `These check-ins are older than the dashboard's first record of this Employee ID${row.first_observed_at ? ` (${rowTime(row.first_observed_at)})` : ''}; an Employee ID used by someone else before then can't be seen.`
   }
-  if (row.record_position === 'BETWEEN_RECORDS') return "No record covers the punch time, and the records around it are not one terminal user record holding today's CNIC throughout."
-  if (row.record_position === 'AFTER_LAST_RECORD') return "The punch is after ADD's last record of this user ID."
-  return 'ADD has no identity record for this user ID.'
+  if (row.record_position === 'BETWEEN_RECORDS') return "No record covers the check-in time, and the records around it don't show the same person with today's CNIC all along."
+  if (row.record_position === 'AFTER_LAST_RECORD') return "The check-in is after the dashboard's last record of this Employee ID."
+  return 'The dashboard has no record of this Employee ID.'
 }
 const otherCnicLabel = (row: DirectOrdsPreviewRow) => row.punch_time_cnic_basis === 'RECORD_BEFORE_PUNCH'
-  ? `CNIC on today's terminal user record until ${row.record_before_ended_at ? dateTime(row.record_before_ended_at) : 'just before the punch'}`
+  ? `CNIC on today's person's record until ${row.record_before_ended_at ? rowTime(row.record_before_ended_at) : 'just before the check-in'}`
   : row.punch_time_cnic_basis === 'BRIDGED_GAP'
-    ? 'CNIC at punch time (records before and after it)' : 'CNIC at punch time'
+    ? 'CNIC at check-in time (records before and after it)' : 'CNIC at check-in time'
 const todayLabel = (row: DirectOrdsPreviewRow) => row.punch_time_cnic === 'CHANGED_NEAR_PUNCH' && row.record_after_started_at
-  ? `Today's CNIC ${row.current_cnic_masked} (recorded from ${dateTime(row.record_after_started_at)})`
+  ? `Today's CNIC ${row.current_cnic_masked} (recorded from ${rowTime(row.record_after_started_at)})`
   : `Today's CNIC ${row.current_cnic_masked}`
+const ITEM_WORDS: Record<string, string> = {
+  CONFIRMED: 'Sent', SKIPPED: 'Not sent', WAITING_ORACLE: 'Waiting for the HR system', READY: 'Getting ready',
+  NEEDS_REVIEW: 'Needs checking', ATTENTION: 'Needs checking', CHECKING_COPY: 'Checking HR records', SUPERSEDED: 'Replaced',
+}
+const itemWords = (status: string) => ITEM_WORDS[status] || 'In progress'
 
-export function DirectOrdsSend({ selected, clearSelection, refresh, openRequest, selectControl }: {
-  selected: AttendanceEvent[]; clearSelection: () => void; refresh: () => void; openRequest: number; selectControl?: ReactNode;
+/**
+ * "Send by hand": the dialog that sends chosen check-ins to the HR system and
+ * the progress of the last sending task. The selection bar that opens it is
+ * on the Check-ins list (`openRequest`). Reason and password stay (owner).
+ */
+export function DirectOrdsSend({ selected, clearSelection, refresh, openRequest, onCopied }: {
+  selected: AttendanceEvent[]; clearSelection: () => void; refresh: () => void; openRequest: number; onCopied?: (text: string) => void;
 }) {
   const [open, setOpen] = useState(false)
   const [reason, setReason] = useState('')
@@ -135,7 +147,6 @@ export function DirectOrdsSend({ selected, clearSelection, refresh, openRequest,
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
   const [run, setRun] = useState<DirectRun | null>(null)
-  const [history, setHistory] = useState<DirectRun[]>([])
   const [items, setItems] = useState<ItemPage>({ rows: [], next_cursor: null })
   const [cursor, setCursor] = useState(0)
   const [disconnected, setDisconnected] = useState(false)
@@ -167,16 +178,13 @@ export function DirectOrdsSend({ selected, clearSelection, refresh, openRequest,
     return () => controller.abort()
   }, [open, selectionKey])
 
-  const loadHistory = useCallback(async () => {
-    const response = await api<{ rows: DirectRun[] }>(root)
-    setHistory(Array.isArray(response.rows) ? response.rows.filter((row) => row.job_id && typeof row.selected === 'number') : [])
-  }, [])
   const openRun = useCallback((value: DirectRun) => {
     activeId.current = value.job_id
     setRun(value); setCursor(0); setItems({ rows: [], next_cursor: null })
     const url = new URL(window.location.href)
     url.searchParams.set('direct_run', value.job_id)
-    url.searchParams.set('view', 'all-events')
+    url.searchParams.delete('view')
+    url.searchParams.delete('tool')
     window.history.replaceState({}, '', url)
   }, [])
   useEffect(() => {
@@ -230,7 +238,7 @@ export function DirectOrdsSend({ selected, clearSelection, refresh, openRequest,
       }) })
       openRun(saved); setOpen(false); setPassword(''); setReason(''); clearSelection()
       approvalKey.current = idempotency('direct-ords'); requestSignature.current = ''
-      await loadHistory(); refresh()
+      refresh()
     } catch (failure) { setError(message(failure)) }
     finally { setBusy(false) }
   }
@@ -247,43 +255,46 @@ export function DirectOrdsSend({ selected, clearSelection, refresh, openRequest,
     } catch (failure) { setError(message(failure)) }
     finally { setRechecking(false) }
   }
-  return <section className={`attendance-direct-send ${selected.length ? 'has-selection' : ''}`} aria-label="Send selected punches to Oracle">
-    <div className="attendance-direct-toolbar">
-      {selectControl}
-      <div className="attendance-direct-summary"><strong>{selected.length ? `${count(selected.length)} selected` : 'Send saved punches to Oracle'}</strong><small>{selected.length ? 'ADD saves one audited run; Oracle confirmation decides the final status.' : 'Select up to 500 punches. Unknown users are checked by ADD before delivery.'}</small></div>
-      <div className="attendance-direct-actions">{selected.length > 0 && <button className="button secondary" type="button" onClick={clearSelection}>Clear selection</button>}<button className="button primary" type="button" disabled={!selected.length} onClick={() => { setOpen(true); setError('') }}>Send {selected.length ? count(selected.length) : 'selected punches'}</button></div>
-    </div>
+  const runLink = run ? `${window.location.origin}/attendance?direct_run=${encodeURIComponent(run.job_id)}` : ''
+  const copyLink = async () => {
+    try { await navigator.clipboard?.writeText(runLink); onCopied?.('Link copied') } catch { onCopied?.('Copy the link from the address bar.') }
+  }
+  return <section className="attendance-direct-send" aria-label="Send by hand">
     {run && <div className="attendance-direct-progress" role="status" aria-live="polite">
-      <div className="attendance-direct-heading"><strong>{run.status === 'RUNNING' ? 'Preparing delivery' : run.status === 'WAITING_ORACLE' ? 'Waiting for Oracle' : run.attention || run.skipped ? 'Finished with items to review' : 'Finished'}</strong><a href={`/attendance?view=all-events&direct_run=${encodeURIComponent(run.job_id)}`}>Saved run link</a></div>
-      <div className="attendance-direct-counts"><span><strong>{run.ready}</strong> preparing</span><span><strong>{run.waiting}</strong> waiting</span><span><strong>{run.confirmed}</strong> confirmed</span><span><strong>{run.skipped}</strong> skipped</span><span><strong>{run.attention}</strong> need attention</span></div>
-      {disconnected && <p>Connection lost. Your run is saved and continues on ADD. Reconnecting…</p>}
-      {finished.has(run.status) && !!run.legacy_recheckable && <button className="button secondary" type="button" onClick={() => { setRecheckOpen(true); setError('') }}>Check {count(run.legacy_recheckable)} already in Oracle</button>}
-      {run.skipped > 0 && <p>Unknown users, missing CNICs, invalid punch times, CNIC choices not made or made on records that changed since, punches ADD releases automatically, older IDs Oracle cannot accept, already confirmed punches and deliveries already in progress are shown as skipped.</p>}
-      {items.rows.length > 0 && <details><summary>See punch results</summary><ul>{items.rows.map((item) => <li key={item.item_id}>Punch {item.attendance_event_id}: <strong>{humanizeStatus(item.status)}</strong>{item.reason ? ` · ${item.reason}` : ''}</li>)}</ul><div className="attendance-direct-pages"><button className="button secondary" type="button" disabled={!cursor} onClick={() => setCursor(0)}>First</button><button className="button secondary" type="button" disabled={!items.next_cursor} onClick={() => setCursor(items.next_cursor || 0)}>Next</button></div></details>}
+      <div className="attendance-direct-heading"><strong>{run.status === 'RUNNING' ? 'Getting ready' : run.status === 'WAITING_ORACLE' ? 'Waiting for the HR system' : run.attention || run.skipped ? 'Done · some need checking' : 'Done'}</strong><button className="text-button" type="button" onClick={() => void copyLink()}>Copy link</button></div>
+      <div className="attendance-direct-counts"><span><strong>{run.ready}</strong> getting ready</span><span><strong>{run.waiting}</strong> waiting</span><span><strong>{run.confirmed}</strong> sent</span><span><strong>{run.skipped}</strong> not sent</span><span><strong>{run.attention}</strong> need checking</span></div>
+      {disconnected && <p>Connection lost. Sending continues; reconnecting…</p>}
+      {finished.has(run.status) && !!run.legacy_recheckable && <button className="button secondary" type="button" onClick={() => { setRecheckOpen(true); setError('') }}>Check {count(run.legacy_recheckable)} in HR records</button>}
+      {run.skipped > 0 && <p>Some check-ins were not sent. Open the list to see why.</p>}
+      {items.rows.length > 0 && <details><summary>See each check-in</summary><ul>{items.rows.map((item) => <li key={item.item_id}><strong>{itemWords(item.status)}</strong>{item.error_code ? ` · ${plainReason('direct', item.error_code).sentence}` : ''} <span className="attendance-direct-ref" data-technical>record {item.attendance_event_id} · {item.status}{item.error_code ? ` · ${item.error_code}` : ''}</span></li>)}</ul><div className="attendance-direct-pages"><button className="button secondary" type="button" disabled={!cursor} onClick={() => setCursor(0)}>First</button><button className="button secondary" type="button" disabled={!items.next_cursor} onClick={() => setCursor(items.next_cursor || 0)}>Next</button></div></details>}
     </div>}
     {error && !open && <p className="message pattern-blocked" role="alert">{error}</p>}
-    <details className="attendance-direct-history" onToggle={(event) => { if (event.currentTarget.open) void loadHistory().catch((failure) => setError(message(failure))) }}><summary>Saved Oracle send runs</summary><ul>{history.map((item) => <li key={item.job_id}><button className="text-button" type="button" onClick={() => openRun(item)}>{dateTime(item.created_at)} · {count(item.selected)} · {item.confirmed} confirmed</button></li>)}</ul>{!history.length && <p>No saved runs yet.</p>}</details>
-    {open && <Dialog titleId="direct-ords-title" title={`Send ${count(selected.length)} to Oracle`} description="ADD will submit these saved punches under your administrator decision and show actual Oracle results." onClose={close}><form className="dialog-body" onSubmit={approve}>
-      <p>ADD uses a CNIC saved with the punch when available. Otherwise it compares the CNIC the terminal held for this user ID at punch time with today's CNIC, and asks you when they differ or when it has no record: today's CNIC alone does not prove who owned the terminal user ID when an older punch happened. A punch whose records show another CNIC or person is never sent by hand. Punches with an invalid clock or impossible date are never sent. Unknown current users and missing CNICs are skipped. Older damaged punch IDs are checked against records already in Oracle; they are never sent as new punches. Other ADD delivery holds are overridden. Oracle may still reject or flag a conflicting record; confirmed and in-progress punches are not sent twice.</p>
-      {checks === null && <p className="message pattern-waiting" role="status">Checking punch times, CNICs and automatic releases…</p>}
-      {checksError && <p className="message pattern-blocked" role="alert">ADD could not load the punch checks ({checksError}). If you approve, ADD still skips every punch that needs a decision.</p>}
-      {decisions.refused.length > 0 && <section className="attendance-direct-check pattern-blocked" aria-label="Punches that cannot be sent"><strong>{count(decisions.refused.length)} cannot be sent</strong><ul>{decisions.refused.slice(0, 50).map((row) => <li key={row.event_id}>{rowLabel(row)} · {row.exclusion_reason || humanizeStatus(row.exclusion || '')}{row.exclusion === 'CNIC_CONFLICT' && evidenceText(row) ? ` (${evidenceText(row)})` : ''}</li>)}</ul>{decisions.refused.length > 50 && <small>And {count(decisions.refused.length - 50)} more that cannot be sent.</small>}</section>}
-      {decisions.choose.length > 0 && <section className="attendance-direct-check pattern-waiting" aria-label="CNIC changed since the punch"><strong>CNIC changed since {decisions.choose.reduce((total, group) => total + group.rows.length, 0) === 1 ? 'this punch' : 'these punches'}</strong><small>The terminal held a different CNIC for this user ID at or near punch time. ADD sends the punch-time CNIC unless you choose today's. Today's CNIC is offered only for the same terminal user record. Where no record covers the punch, only a record within 30 minutes of it is offered and nothing is preselected.</small>{decisions.choose.map((group) => { const row = group.rows[0]; const choice = decisions.chosen(group); const notes = evidenceText(row); return <fieldset key={group.key}><legend>{groupLabel(group)}</legend>{row.punch_time_cnic_held_by_other && <small className="attention-copy">Another active terminal user has the punch-time CNIC today. Choosing it confirms that HR verified this employee, not that user, punched.</small>}{row.punch_time_cnic === 'CHANGED_NEAR_PUNCH' && <small>{confirmReason(row)}{notes ? ` Evidence: ${notes}.` : ''}</small>}{row.cnic_choices.includes('PUNCH_TIME') && <label><input type="radio" name={`cnic-${group.key}`} checked={choice === 'PUNCH_TIME'} onChange={() => setChoices((current) => ({ ...current, [group.key]: 'PUNCH_TIME' }))} /> {otherCnicLabel(row)} {row.punch_time_cnic_masked}{row.punch_time_display_name ? ` (${row.punch_time_display_name})` : ''}{row.default_cnic_choice === 'PUNCH_TIME' ? ' · recommended' : ''}</label>}{row.cnic_choices.includes('CURRENT') && <label><input type="radio" name={`cnic-${group.key}`} checked={choice === 'CURRENT'} onChange={() => setChoices((current) => ({ ...current, [group.key]: 'CURRENT' }))} /> {todayLabel(row)}</label>}{!choice && <small>No CNIC chosen; {group.rows.length === 1 ? 'this punch is' : 'these punches are'} skipped.</small>}</fieldset> })}</section>}
-      {decisions.confirm.length > 0 && <section className="attendance-direct-check pattern-waiting" aria-label="Confirm today's CNIC"><strong>Confirm today's CNIC</strong><small>Tick only after HR confirmed the same employee held the terminal user ID at the punch time. Unticked punches are skipped.</small>{decisions.confirm.map((group) => { const row = group.rows[0]; const notes = evidenceText(row); return <label key={group.key} className="check-field"><input type="checkbox" checked={Boolean(confirmed[group.key])} onChange={(event) => { const checked = event.target.checked; setConfirmed((current) => ({ ...current, [group.key]: checked })) }} /><span><strong>Use today's CNIC {row.current_cnic_masked} for {groupLabel(group)}</strong><small>{confirmReason(row)}{notes ? ` Evidence: ${notes}.` : ''}</small></span></label> })}</section>}
-      {decisions.autoSoon.length > 0 && <label className="check-field attendance-direct-check"><input type="checkbox" checked={sendNow} onChange={(event) => setSendNow(event.target.checked)} /><span><strong>Send {count(decisions.autoSoon.length)} now anyway</strong><small>ADD's own identity proof releases {decisions.autoSoon.filter((row) => row.auto_release_at_next_snapshot).length} at the next user snapshot and re-checks {decisions.autoSoon.filter((row) => !row.auto_release_at_next_snapshot).length} then (normally within 15 minutes). Unticked punches are skipped and keep waiting for that release.</small></span></label>}
-      {decisions.replacing > 0 && <p className="message pattern-waiting">{count(decisions.replacing)} replace an earlier approval that stopped before anything was sent to Oracle.</p>}
-      {checks !== null && decisions.skipped > 0 && <p className="message pattern-waiting">{count(decisions.skipped)} will be skipped; {count(Math.max(0, selected.length - decisions.skipped))} will be approved.</p>}
-      <details className="attendance-direct-review"><summary>Review selected punches</summary><ul>{selected.slice(0, 20).map((row) => <li key={row.id}>{row.display_name || `User ${row.user_id}`} · {row.device_serial || 'Terminal unknown'} · {dateTime(row.device_event_time)} · {humanizeStatus(row.ords_status)}</li>)}</ul>{selected.length > 20 && <p>And {selected.length - 20} more selected punches.</p>}</details>
-      <label>Reason for sending<textarea required minLength={3} maxLength={500} value={reason} onChange={(event) => setReason(event.target.value)} /></label>
-      <label>Administrator password<input type="password" required autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} /></label>
+    {open && <Dialog titleId="direct-ords-title" title={`Send ${count(selected.length)} to the HR system (Oracle)`} description="You are approving these check-ins. You'll see what the HR system says." onClose={close}><form className="dialog-body" onSubmit={approve}>
+      <ul className="attendance-direct-rules">
+        <li>We use the CNIC saved with the check-in.</li>
+        <li>If the CNIC changed, you choose which one to send.</li>
+        <li>Check-ins with a wrong time, or someone else's Employee ID, are never sent.</li>
+      </ul>
+      <Disclosure summary="More about these checks"><p>When no CNIC was saved with the check-in, the dashboard compares the CNIC the machine had for this Employee ID at the check-in time with today's CNIC, and asks you when they differ or when it has no record: today's CNIC alone does not prove who had the Employee ID when an older check-in happened. A check-in whose records show another CNIC or person is never sent by hand. Check-ins with a wrong machine time or an impossible date are never sent. People not on the machine any more and missing CNICs are not sent. Older damaged record numbers are checked against the HR system records; they are never sent as new check-ins. The HR system may still refuse or flag a record that conflicts; check-ins already sent or on the way are not sent twice.</p></Disclosure>
+      {checks === null && <p className="message pattern-waiting" role="status">Checking times, CNICs and automatic sending…</p>}
+      {checksError && <p className="message pattern-blocked" role="alert">Couldn't load the checks. If you send, every check-in that needs a decision is still not sent.</p>}
+      {decisions.refused.length > 0 && <section className="attendance-direct-check pattern-blocked" aria-label="Check-ins that can't be sent"><strong>{count(decisions.refused.length)} can't be sent</strong><ul>{decisions.refused.slice(0, 50).map((row) => <li key={row.event_id}>{rowLabel(row)} · {plainReason('direct', row.exclusion).sentence}{row.exclusion === 'CNIC_CONFLICT' && evidenceText(row) ? ` (${evidenceText(row)})` : ''}</li>)}</ul>{decisions.refused.length > 50 && <small>And {count(decisions.refused.length - 50)} more that can't be sent.</small>}</section>}
+      {decisions.choose.length > 0 && <section className="attendance-direct-check pattern-waiting" aria-label="CNIC changed since the check-in"><strong>The CNIC changed for {count(decisions.choose.reduce((total, group) => total + group.rows.length, 0))}</strong><small>The machine had a different CNIC for this Employee ID at or near the check-in time. The CNIC from the check-in time is sent unless you choose today's. Today's CNIC is offered only for the same person's record. Where no record covers the check-in, only a record within 30 minutes of it is offered and nothing is chosen for you.</small>{decisions.choose.map((group) => { const row = group.rows[0]; const choice = decisions.chosen(group); const notes = evidenceText(row); return <fieldset key={group.key}><legend>{groupLabel(group)}</legend>{row.punch_time_cnic_held_by_other && <small className="attention-copy">Another person on the machine has the old CNIC today. Choosing it means HR confirmed this person, not that one, checked in.</small>}{row.punch_time_cnic === 'CHANGED_NEAR_PUNCH' && <small>{confirmReason(row)}{notes ? ` Records: ${notes}.` : ''}</small>}{row.cnic_choices.includes('PUNCH_TIME') && <label><input type="radio" name={`cnic-${group.key}`} checked={choice === 'PUNCH_TIME'} onChange={() => setChoices((current) => ({ ...current, [group.key]: 'PUNCH_TIME' }))} /> {otherCnicLabel(row)} {row.punch_time_cnic_masked}{row.punch_time_display_name ? ` (${row.punch_time_display_name})` : ''}{row.default_cnic_choice === 'PUNCH_TIME' ? ' · recommended' : ''}</label>}{row.cnic_choices.includes('CURRENT') && <label><input type="radio" name={`cnic-${group.key}`} checked={choice === 'CURRENT'} onChange={() => setChoices((current) => ({ ...current, [group.key]: 'CURRENT' }))} /> {todayLabel(row)}</label>}{!choice && <small>No CNIC chosen, so {group.rows.length === 1 ? 'this check-in is' : 'these check-ins are'} not sent.</small>}</fieldset> })}</section>}
+      {decisions.confirm.length > 0 && <section className="attendance-direct-check pattern-waiting" aria-label="Use the current CNIC?"><strong>Use the current CNIC?</strong><small>Tick only if HR confirmed this person checked in. Unticked check-ins are not sent.</small>{decisions.confirm.map((group) => { const row = group.rows[0]; const notes = evidenceText(row); return <label key={group.key} className="check-field"><input type="checkbox" checked={Boolean(confirmed[group.key])} onChange={(event) => { const checked = event.target.checked; setConfirmed((current) => ({ ...current, [group.key]: checked })) }} /><span><strong>Use today's CNIC {row.current_cnic_masked} for {groupLabel(group)}</strong><small>{confirmReason(row)}{notes ? ` Records: ${notes}.` : ''}</small></span></label> })}</section>}
+      {decisions.autoSoon.length > 0 && <label className="check-field attendance-direct-check"><input type="checkbox" checked={sendNow} onChange={(event) => setSendNow(event.target.checked)} /><span><strong>Send {count(decisions.autoSoon.length)} now anyway</strong><small>The dashboard sends {decisions.autoSoon.filter((row) => row.auto_release_at_next_snapshot).length} by itself at the next read of the machine's list of people, and checks {decisions.autoSoon.filter((row) => !row.auto_release_at_next_snapshot).length} again then (normally within 15 minutes). Unticked check-ins are not sent now and keep waiting for that.</small></span></label>}
+      {decisions.replacing > 0 && <p className="message pattern-waiting">{count(decisions.replacing)} replace an earlier approval that stopped before anything was sent.</p>}
+      {checks !== null && decisions.skipped > 0 && <p className="message pattern-waiting">{count(decisions.skipped)} will not be sent; {count(Math.max(0, selected.length - decisions.skipped))} will be sent.</p>}
+      <details className="attendance-direct-review"><summary>Review the chosen check-ins</summary><ul>{selected.slice(0, 20).map((row) => <li key={row.id}>{row.display_name || 'Name not known'} · Employee ID {row.user_id} · {rowTime(row.device_event_time)} · {GROUP_CHIP[rowGroup(row as Parameters<typeof rowGroup>[0])].label}</li>)}</ul>{selected.length > 20 && <p>And {count(selected.length - 20)} more.</p>}</details>
+      <label>{STEP_UP.why}<textarea required minLength={3} maxLength={500} value={reason} onChange={(event) => setReason(event.target.value)} /></label><small className="step-up-help">{STEP_UP.whyHelp(3)}</small>
+      <label>{STEP_UP.password}<input type="password" required autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} /></label><small className="step-up-help">{STEP_UP.passwordHelp}</small>
       {error && <p className="message pattern-blocked" role="alert">{error}</p>}
-      <footer className="dialog-actions"><button className="button secondary" type="button" disabled={busy} onClick={close}>Cancel</button><button className="button primary" disabled={busy || checks === null || !password || reason.trim().length < 3}>{busy ? 'Saving approval…' : `Approve and send ${count(selected.length)}`}</button></footer>
+      <footer className="dialog-actions"><button className="button secondary" type="button" disabled={busy} onClick={close}>Cancel</button><button className="button primary" disabled={busy || checks === null || !password || reason.trim().length < 3}>{busy ? 'Sending…' : `Send ${count(selected.length)}`}</button></footer>
     </form></Dialog>}
-    {recheckOpen && run && <Dialog titleId="direct-ords-recheck-title" title="Check saved Oracle punches" description="ADD will compare the approved punches with rows already in Oracle. It will not insert another Oracle punch." onClose={() => { if (!rechecking) { setRecheckOpen(false); setRecheckPassword('') } }}><form className="dialog-body" onSubmit={recheck}>
-      <p>Check {count(run.legacy_recheckable || 0)} from this saved run. Only an exact match of terminal, employee, time, CNIC, punch and original ID can become confirmed. Anything else stays for review.</p>
-      <label>Administrator password<input type="password" required autoComplete="current-password" value={recheckPassword} onChange={(event) => setRecheckPassword(event.target.value)} /></label>
+    {recheckOpen && run && <Dialog titleId="direct-ords-recheck-title" title="Check HR records" description="We'll look for these check-ins in the HR system. Nothing new is sent." onClose={() => { if (!rechecking) { setRecheckOpen(false); setRecheckPassword('') } }}><form className="dialog-body" onSubmit={recheck}>
+      <p>Check {count(run.legacy_recheckable || 0)} from this sending task. Only an exact match of machine, person, time, CNIC, type and record number counts as sent. Anything else stays for checking.</p>
+      <label>{STEP_UP.password}<input type="password" required autoComplete="current-password" value={recheckPassword} onChange={(event) => setRecheckPassword(event.target.value)} /></label><small className="step-up-help">{STEP_UP.passwordHelp}</small>
       {error && <p className="message pattern-blocked" role="alert">{error}</p>}
-      <footer className="dialog-actions"><button className="button secondary" type="button" disabled={rechecking} onClick={() => { setRecheckOpen(false); setRecheckPassword('') }}>Cancel</button><button className="button primary" disabled={rechecking || !recheckPassword}>{rechecking ? 'Saving check…' : 'Check Oracle records'}</button></footer>
+      <footer className="dialog-actions"><button className="button secondary" type="button" disabled={rechecking} onClick={() => { setRecheckOpen(false); setRecheckPassword('') }}>Cancel</button><button className="button primary" disabled={rechecking || !recheckPassword}>{rechecking ? 'Checking…' : 'Check now'}</button></footer>
     </form></Dialog>}
   </section>
 }

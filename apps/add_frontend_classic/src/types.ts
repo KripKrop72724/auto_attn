@@ -1,0 +1,2190 @@
+export type DeviceState =
+  | 'ONLINE'
+  | 'ONLINE_WITH_WARNINGS'
+  | 'OFFLINE'
+  | 'DEGRADED'
+  | 'FLAPPING'
+  | 'ONBOARDING'
+  | 'QUARANTINED_DUPLICATE_SERIAL'
+  | string
+
+export type HealthMode = 'SHADOW' | 'ENFORCED' | string
+export type HealthCurrency = 'CURRENT' | 'HELD' | 'PREVIOUS_BOOT' | 'LATCHED' | string
+export type TerminalLinkState =
+  | 'CONNECTED'
+  | 'STABILIZING'
+  | 'MAINTENANCE'
+  | 'STARTING'
+  | 'RECONNECTING'
+  | 'DISCONNECTED'
+  | 'FLAPPING'
+  | 'ERROR'
+  | 'UNKNOWN'
+  | string
+
+// Terminal link status is derived separately from the ESP lifecycle tier.
+// reason is a short code (LINK_UP, STABILIZING_STALLED, ESP_DISCONNECTED, ... or
+// the raw firmware state); message is operator text.
+export interface TerminalLink {
+  state: TerminalLinkState
+  raw_state: string | null
+  since: string | null
+  reason: string | null
+  message: string | null
+}
+
+export interface HealthOperatorPolicy {
+  resolvable: boolean
+  refusal_code: 'DERIVED_REASON' | 'ALERT_WORKFLOW_OWNED' | 'ALERT_CONDITION_CURRENT' | string | null
+  refusal: string | null
+}
+
+export interface HealthLatch {
+  kind: 'LED_LATCH_NO_IO_ERRORS' | 'LED_LATCH_STORAGE_VERIFIED' | string
+  source: string | null
+  firmware_version: string | null
+}
+
+// One reason behind the derived tier: an OPEN alert mapped through the health
+// policy, or a derived condition (HEARTBEAT_STALE, TERMINAL_DISCONNECTED,
+// TERMINAL_STABILIZING_STALLED) without an alert_id. other_active_alerts use
+// the same shape with a null tier.
+export interface HealthReason {
+  code: string
+  error_code: string | null
+  tier: 'DEGRADED' | 'WARNING' | string | null
+  currency: HealthCurrency
+  gating: boolean
+  severity: string | null
+  message: string
+  since: string | null
+  last_seen_at: string | null
+  alert_id: number | null
+  alert_state: string | null
+  acknowledged_at: string | null
+  acknowledged_by: string | null
+  boot_id: string | null
+  firmware_version: string | null
+  binding: 'OBSERVED' | 'INFERRED_CURRENT' | 'INFERRED_PREVIOUS' | string | null
+  latch: HealthLatch | null
+  evidence_summary: string | null
+  // A full sentence, for example "Clears when the terminal link reconnects."
+  clear_condition: string | null
+  operator: HealthOperatorPolicy
+}
+
+// "What ADD can verify on this firmware".
+export interface Coverage {
+  key: 'storage' | 'workers' | 'preservation' | 'led' | string
+  label: string
+  status: 'REPORTED' | 'NOT_REPORTED_BY_FIRMWARE' | 'MISSING' | 'ACTIVE' | string
+  detail: string | null
+}
+
+// code is the stored last_error_code; derived_code is what the health model derives.
+export interface DeviceErrorState {
+  code: string | null
+  message: string | null
+  derived_code: string | null
+  backed: boolean
+  backing_alert_ids: number[]
+}
+
+export interface HealthPrimaryReason {
+  code: string
+  error_code: string | null
+  tier: string | null
+  message: string
+  since: string | null
+}
+
+// GET /api/v1/devices rows carry the summary; GET /api/v1/devices/{id} adds the
+// detail fields. Older backends omit health entirely.
+export interface DeviceHealth {
+  mode: HealthMode
+  tier: 'ONLINE' | 'ONLINE_WITH_WARNINGS' | 'DEGRADED' | 'OFFLINE' | string
+  derived_lifecycle: string
+  last_error_code: string | null
+  primary: HealthPrimaryReason | null
+  degraded_count: number
+  warning_count: number
+  evaluated_at?: string
+  lifecycle_state?: string
+  reasons?: HealthReason[]
+  other_active_alerts?: HealthReason[]
+  terminal_link?: TerminalLink | null
+  coverage?: Coverage[]
+  device_error?: DeviceErrorState | null
+}
+
+export interface AlertResolution {
+  kind: 'VERIFIED' | 'CONDITION_CLEARED' | 'MESSAGE_ACCEPTED' | 'DEPLOYMENT_SUCCEEDED' | 'BOOT_ENDED' | 'OPERATOR' | 'CLEANUP' | string
+  actor?: string | null
+  reason?: string | null
+  at?: string | null
+  [key: string]: unknown
+}
+
+export type AlertQueue = 'NEEDS_ACTION' | 'ACKNOWLEDGED' | 'ACTIVE' | 'RESOLVED' | 'ALL'
+
+export interface AlertQueueTotals {
+  needs_action: number
+  acknowledged: number
+  resolved: number
+  all: number
+}
+
+export interface AlertResolveResponse {
+  alert: Alert
+  device_state: string | null
+  device_error: Partial<DeviceErrorState> | null
+  residual_alert_id: number | null
+}
+
+export interface DeviceErrorClearResponse {
+  device_state: string | null
+  device_error: Partial<DeviceErrorState> | null
+}
+
+export type CleanupClass = 'STRANDED_DIAGNOSTICS' | 'CONDITION_CLEARED' | 'SUPERSEDED_ACK' | 'STALE_ERROR_CODE' | 'REVIEW' | string
+
+// One OPEN or legacy-ACKNOWLEDGED alert classified by the stranded-alert plan.
+// A STALE_ERROR_CODE row without an alert_id is a per-device error fix.
+export interface CleanupPreviewRow {
+  alert_id: number | null
+  connector_id: string
+  code: string
+  state: string
+  severity?: string | null
+  message?: string | null
+  class: CleanupClass
+  review?: boolean
+  default_selected: boolean
+  rationale: string | null
+  evidence: string | Record<string, unknown> | null
+  raising_firmware?: string | null
+  raising_boot_id?: string | null
+  current_firmware?: string | null
+  current_boot_id?: string | null
+  first_seen_at?: string | null
+  last_seen_at?: string | null
+  residual_code?: string | null
+}
+
+export interface CleanupConnectorEffect {
+  connector_id: string
+  display_name?: string | null
+  zone_id?: string | null
+  lifecycle_state?: string | null
+  derived_lifecycle_before?: string | null
+  derived_lifecycle_after?: string | null
+  last_error_before?: string | null
+  last_error_after?: string | null
+  // Class D (STALE_ERROR_CODE): a preselected SET_LAST_ERROR_CODE to the
+  // derived value, applied through error_fix_connector_ids.
+  error_fix?: boolean
+  hold_effects?: string[] | Array<Record<string, unknown>> | Record<string, unknown> | null
+  residuals?: string[] | null
+}
+
+export interface CleanupBlockedConnector {
+  connector_id: string
+  display_name?: string | null
+  reason: string
+}
+
+export interface CleanupSkippedRow {
+  alert_id?: number | null
+  connector_id: string
+  code?: string | null
+  reason: string
+}
+
+export interface CleanupScopeTarget {
+  connector_id: string
+  mac?: string | null
+  terminal_serial?: string | null
+}
+
+export interface CleanupPreview {
+  digest: string
+  expires_at: string
+  signature: string
+  typed_confirmation: string
+  suggested_first_scope: Array<string | CleanupScopeTarget>
+  rows: CleanupPreviewRow[]
+  connectors: CleanupConnectorEffect[]
+  blocked: CleanupBlockedConnector[]
+  skipped: CleanupSkippedRow[]
+  counts: Record<string, number>
+}
+
+// The stored DEVICE_HEALTH_CLEANUP_APPLIED summary; a replay returns the same body.
+export interface CleanupApply {
+  request_id?: string | null
+  digest?: string | null
+  counts?: Record<string, number>
+  resolved_alert_ids?: number[]
+  residual_alert_ids?: number[]
+  error_fix_connector_ids?: string[]
+  replayed?: boolean
+}
+
+export interface PaginatedResponse<T> {
+  rows: T[]
+  next_cursor: number | null
+}
+
+export type DashboardRoute =
+  | 'fleet'
+  | 'users'
+  | 'attendance'
+  | 'reconciliation'
+  | 'firmware'
+  | 'alerts'
+
+export type FirmwareSection = 'overview' | 'prepare' | 'releases' | 'campaigns'
+export type ReconciliationSection = 'jobs' | 'exceptions' | 'recovery'
+export type ReconciliationStatusGroup = '' | 'ACTIVE' | 'QUEUED_WAITING' | 'PAUSED' | 'ATTENTION' | 'COMPLETED' | 'CANCELLED'
+
+export interface FirmwareScopePreview {
+  scope_token: string
+  expires_at: string
+  release: { release_id: string; version: string; state: string }
+  zone_id: string
+  counts: { candidates: number; eligible: number; excluded: number; offline: number }
+  eligible: Array<Pick<Device, 'connector_id' | 'display_name' | 'zone_id' | 'hardware_id' | 'connected' | 'firmware_version' | 'ota_state'>>
+  excluded: Array<Pick<Device, 'connector_id' | 'display_name' | 'zone_id' | 'hardware_id' | 'connected' | 'firmware_version' | 'ota_state'> & { reason: string }>
+  // Owner-overridable ESP reset-rate and uptime warnings; never part of the signed scope.
+  stability_warnings?: FirmwareStabilityWarning[]
+  // An override must name this digest, so it covers exactly the warnings shown.
+  stability_warnings_digest?: string
+}
+
+export interface FirmwareStabilityWarning {
+  code: 'ESP_RESET_RATE_HIGH' | 'ESP_UPTIME_SHORT' | 'TARGET_BOOT_INTERRUPTED_REPEATEDLY' | string
+  connector_id: string
+  display_name?: string | null
+  message: string
+  [key: string]: unknown
+}
+
+export interface AlertQueueResponse {
+  rows: Array<Alert & { device: Pick<Device, 'connector_id' | 'display_name' | 'zone_id' | 'hardware_id'> }>
+  next_cursor: string | null
+  totals: { all: number; open: number; acknowledged: number; resolved: number }
+  queue_totals?: AlertQueueTotals
+}
+
+export interface AttendanceQuarantineItem {
+  id: number
+  receipt_id: string
+  connector_id: string
+  device_id: string
+  display_name: string
+  zone_id: string
+  item_index: number
+  error_code: string | null
+  error_path: string | null
+  payload_digest: string
+  review_state: 'OPEN' | 'REVIEWED'
+  reviewed_by: string | null
+  review_reason: string | null
+  reviewed_at: string | null
+  observed_at: string
+  evidence_available: boolean
+  handling: 'QUARANTINED_NON_BLOCKING'
+}
+
+export interface AttendanceQuarantineResponse {
+  totals: { all: number; open: number }
+  filtered_total: number
+  rows: AttendanceQuarantineItem[]
+  next_cursor: number | null
+}
+
+export interface AttendanceQuarantineReveal {
+  id: number
+  payload_digest: string
+  error_code: string | null
+  error_path: string | null
+  payload: unknown
+}
+
+export interface ZktDevice {
+  id: number
+  serial: string | null
+  expected_serial: string | null
+  confirmed_serial?: string | null
+  terminal_binding_state?: string
+  serial_confirmed_by?: string | null
+  serial_confirmed_at?: string | null
+  ip_address: string | null
+  model: string | null
+  platform: string | null
+  online: boolean
+  connection_state: string
+  consecutive_failures: number
+  consecutive_successes: number
+  flap_count_15m: number
+  last_transition_at: string | null
+  last_online_at: string | null
+  offline_since: string | null
+  stability_since: string | null
+  backoff_until: string | null
+  probe_latency_ms: number | null
+  certification_state: string
+  certification_observations: number
+  capabilities: Record<string, boolean | number | string | null>
+  snapshot_complete: boolean
+  identity_snapshot_revision?: number
+  identity_snapshot_state_hash?: string | null
+  identity_snapshot_observed_at?: string | null
+  identity_snapshot_received_at?: string | null
+  identity_snapshot_stable?: boolean
+  last_identity_change_at?: string | null
+  writes_disabled_reason: string | null
+  user_count: number | null
+  attendance_count: number | null
+  device_time: string | null
+  device_time_sampled_at: string | null
+  drift_seconds: number | null
+  last_reconcile_at: string | null
+  next_restart_at: string | null
+}
+
+export interface CaptureLatencyHistogram {
+  schema_version: 1
+  buckets: number[]
+  samples: number
+  max_ms: number
+  saturated: boolean
+}
+
+export interface FirmwareDiagnostics {
+  schema_version: 1 | 2
+  runtime_profile?: 'ZKT_LEGACY' | 'HIKVISION_V1' | 'ZKT_JOURNAL_V1' | null
+  boot_id?: string | null
+  sample_sequence?: number | null
+  sampled_at?: string | null
+  sampled_uptime_ms?: number | null
+  ota_runtime?: {
+    running_version?: string | null
+    running_partition?: 'factory' | 'ota_0' | 'ota_1' | null
+    image_sha256?: string | null
+    state?: string
+    last_error?: string
+    boot_health_checks?: number
+    boot_health_last_ready?: boolean
+    // ZKT 2.7.7 and later: the confirm-first storage exception. 2.7.8 adds
+    // every failing term (named by ADD) and the inventory's condition.
+    storage_exception?: {
+      state?: string | null
+      reason?: string | null
+      since_seconds?: number | null
+      detail?: string | null
+      detail_file?: string | null
+      failing_terms?: string[]
+    } | null
+  } | null
+  delivery_authority?: 'LEGACY_DUAL' | 'ADD' | 'UNKNOWN' | null
+  journal_runtime?: {
+    observed: boolean
+    phase: string
+    reader_ready: boolean
+    writer_ready: boolean
+    delivery_authority?: 'UNKNOWN' | 'LEGACY' | 'ADD' | null
+    start_attempts: number
+    storage_starts: number
+    delivery_starts: number
+    capture_starts: number
+    proof_attempts: number
+    failures: number
+    sampled_uptime_ms?: number | null
+    last_progress_uptime_ms?: number | null
+    compatibility?: string | null
+  } | null
+  journal_storage?: {
+    observed: boolean
+    fresh: boolean
+    ready: boolean
+    durability: 'HEALTHY' | 'DEGRADED' | 'FULL' | 'UNKNOWN'
+    checkpoint_recovery_pending: boolean
+    mailbox_capacity: number
+    mailbox_high_watermark: number
+    pending_appends: number
+    sampled_uptime_ms?: number | null
+    segments?: number | null
+    last_append_result?: string | null
+    last_append_uptime_ms?: number | null
+    last_failure_operation?: string | null
+    last_filesystem_error?: number | null
+    last_nvs_error?: number | null
+  } | null
+  storage?: {
+    upgrade_contract?: string | null
+    upgrade_error?: string | null
+    upgrade_ready?: boolean | null
+    // ZKT 2.8.1 and later, direct role: how the boot judged the other OTA
+    // slot (PREDECESSOR, NONE_* or UNQUALIFIED) and that slot's otadata state.
+    rollback_slot?: string | null
+    rollback_slot_state?: string | null
+    total_bytes?: number | null
+    used_bytes?: number | null
+    admission_reserve_bytes?: number | null
+    write_failures?: number | null
+    read_failures?: number | null
+    legacy_read_faults?: number | null
+    legacy_append_faults?: number | null
+    legacy_retire_faults?: number | null
+    legacy_read_recoveries?: number | null
+    legacy_error_queue?: string | null
+    legacy_error_operation?: string | null
+    legacy_error_code?: number | null
+    persistence_probe_failures?: number | null
+    persistence_probe_total_failures?: number | null
+    persistence_probe_error?: number | null
+    persistence_probe_operation?: string | null
+    fault_class?: string | null
+    durability: 'HEALTHY' | 'DEGRADED' | 'FULL' | 'UNKNOWN'
+    persistence_verified: boolean
+    recovery_complete: boolean
+    error_operation?: string | null
+    error_code?: number | null
+  } | null
+  queues: Array<{
+    name: string
+    bytes?: number | null
+    records?: number | null
+    count_known: boolean
+    count_reason?: string | null
+    oldest_pending_age_seconds?: number | null
+    last_progress_uptime_ms?: number | null
+  }>
+  workers: Array<{
+    name: string
+    state: 'RUNNING' | 'WAITING_NETWORK' | 'WAITING_RESOURCE' | 'STOPPED' | 'FAULT' | 'UNKNOWN'
+    last_activity_uptime_ms?: number | null
+    operation?: string | null
+    restart_count?: number | null
+    restart_attempts?: number | null
+    execution_model?: 'TASK' | 'ON_DEMAND'
+    sampled_uptime_ms?: number | null
+    last_progress_uptime_ms?: number | null
+    operation_started_uptime_ms?: number | null
+    pending_requests?: number | null
+    completed_operations?: number | null
+    failures?: number | null
+    consecutive_failures?: number | null
+    timeouts?: number | null
+    refusals?: number | null
+    max_operation_ms?: number | null
+    packet_commit_latency_ms?: CaptureLatencyHistogram | null
+    fragment_commit_latency_ms?: CaptureLatencyHistogram | null
+  }>
+  reconciliation_mode?: string | null
+  last_light_check_uptime_ms?: number | null
+  last_tail_audit_uptime_ms?: number | null
+  source_generation?: number | null
+  committed_source_cursor?: number | null
+}
+
+export interface HikvisionHealth {
+  light_reconcile?: {
+    state: string
+    policy: string
+    scanned: number
+    cursor: number
+    last_completed_epoch: number
+    error: number
+  }
+
+  capture_mode: 'stream' | 'poll'
+  poll_interval_seconds?: number
+  last_poll_interval_ms?: number
+  poll_count?: number
+  history_page_count?: number
+  last_successful_poll_epoch?: number
+  poll_error?: number
+  poll_stage?: string
+  poll_http_status?: number
+  poll_duration_ms?: number
+  consecutive_poll_failures?: number
+  durable_poll_cursor?: number
+  source_queue_depth?: number
+  full_history_required?: boolean
+  qualification_state: string
+}
+
+export interface Device {
+  snapshot_at?: string
+  boot_id?: string | null
+  firmware_family?: 'zkt' | 'hikvision'
+  terminal_vendor?: 'zkt' | 'hikvision'
+  hikvision?: HikvisionHealth | null
+  connector_id: string
+  hardware_id: string
+  zone_id: string
+  zone_name: string
+  device_id: string
+  display_name: string
+  state: DeviceState
+  connected: boolean
+  firmware_version: string | null
+  firmware_diagnostics?: FirmwareDiagnostics | null
+  firmware_diagnostics_at?: string | null
+  comm_key_capable?: boolean
+  comm_key_revision?: number
+  ota_capable?: boolean
+  ota_state?: 'LEGACY_MANUAL_UPDATE' | 'OTA_READY' | 'UPDATING' | 'ROLLBACK_REQUIRED' | 'OTA_BLOCKED'
+  ota_partition_layout?: string | null
+  ota_running_partition?: string | null
+  ota_image_sha256?: string | null
+  ota_signing_key_id?: string | null
+  onboarding_generation: number
+  last_onboarded_at: string | null
+  last_seen_at: string | null
+  current_activity: string | null
+  last_error_message?: string | null
+  last_error_code: string | null
+  is_spare?: boolean
+  zkt: ZktDevice | null
+  active_command?: Command | null
+  active_lease?: Lease | null
+  terminal_link?: TerminalLink | null
+  health?: DeviceHealth | null
+}
+
+export interface CommKeyOperation {
+  operation_id: string
+  mode: 'ESP_ONLY' | 'ESP_AND_TERMINAL'
+  requested_revision: number
+  expected_terminal_serial: string
+  status: string
+  error_code: string | null
+  created_at: string
+  updated_at: string
+  expires_at: string
+  completed_at: string | null
+}
+
+export interface CommKeyState {
+  enabled: boolean
+  reveal_enabled: boolean
+  management_state: string
+  applied_revision: number
+  desired_revision: number
+  last_verified_at: string | null
+  verified_terminal_serial: string | null
+  last_error_message?: string | null
+  last_error_code: string | null
+  managed: boolean
+  capabilities: {
+    esp_only: boolean
+    esp_and_terminal: boolean
+    esp_and_terminal_block_reason: string | null
+    recovery_staging: boolean
+  }
+  active_operation: CommKeyOperation | null
+}
+
+export interface CommKeyReveal {
+  comm_key: string
+  applied_revision: number
+  verified_terminal_serial: string | null
+  last_verified_at: string | null
+}
+
+export interface Overview {
+  /** When the server computed the cached delivery/recovery sections (ISO). */
+  metrics_computed_at?: string | null
+  /** How long those sections may be reused (0 when computed for this request). */
+  metrics_max_age_seconds?: number
+  total: number
+  spares?: number
+  online?: number
+  online_with_warnings?: number
+  offline?: number
+  degraded?: number
+  flapping?: number
+  onboarding?: number
+  quarantined_duplicate_serial?: number
+  open_alerts: number
+  open_unacknowledged_alerts?: number
+  terminal_attention?: number
+  active_leases: number
+  ords_delivery?: {
+    backlog: number
+    pending: number
+    retrying: number
+    in_flight: number
+    blocked_identity: number
+    quarantined: number
+    acknowledged: number
+    acknowledged_add: number
+    acknowledged_check: number
+    acknowledged_firmware: number
+    firmware_unverified: number
+    membership_reverify: number
+    oldest_backlog_at: string | null
+    last_attempt_at: string | null
+    missing_outbox?: number
+    held_without_outbox?: number
+    review_without_outbox?: number
+    decided_held_without_outbox?: number
+    without_outbox_total?: number
+    without_outbox_by_status?: Record<string, number>
+  }
+  attendance_recovery?: AttendanceRecoverySummary
+}
+
+export interface ReconciliationPreflight {
+  active_user_history?: { eligible: boolean; user_count: number | null; reason: string | null }
+  recent_tail?: {
+    eligible: boolean
+    ready_now?: boolean
+    anchor_serial: number | null
+    begin_serial: number | null
+    earlier_breaks?: number[]
+    reason: string | null
+  }
+  source_protocol?: string
+  eligible: boolean
+  ready_now: boolean
+  hard_blockers: Array<{ code: string; message: string }>
+  waitable_blockers: Array<{ code: string; message: string }>
+  terminal: null | {
+    serial: string | null
+    model: string | null
+    attendance_count: number | null
+    user_count: number | null
+    connection_state: string
+    range_resume_verified: boolean
+    serial_search_enabled?: boolean
+  }
+  coverage: ReconciliationCoverage | null
+}
+
+export interface ReconciliationCoverage {
+  coverage_id: string
+  certified_source_cursor: number
+  source_committed_cursor: number
+  source_committed_chain_digest: string
+  tail_exception_count: number
+  raw_preserved_count?: number
+  tail_last_committed_at: string | null
+  capture_state: string
+  oracle_state: string
+  active: boolean
+  captured_at: string
+  oracle_certified_at: string | null
+  invalidated_reason: string | null
+  source_ledger_count?: number
+  source_ledger_complete?: boolean
+  terminal_source_parity?: boolean
+  chain_continuous?: boolean
+}
+
+export interface SourceExceptionReview {
+  review_id: string
+  state: 'REVIEWED'
+  reason: string
+  actor: string
+  created_at: string
+}
+
+export interface SourceException {
+  id: number
+  connector_id: string | null
+  device_id: string | null
+  display_name: string | null
+  zone_id: string | null
+  terminal_serial: string
+  terminal_generation: number
+  ordinal: number
+  source_kind: 'BASELINE' | 'TAIL'
+  record_size: number | null
+  disposition: 'INVALID_TIME' | 'MALFORMED' | 'IDENTITY_UNRESOLVED'
+  error_code: string | null
+  raw_timestamp: number | null
+  observed_uid: string | null
+  observed_user_id: string | null
+  raw_record_digest: string
+  evidence_available: boolean
+  terminal_record_key: string
+  attendance_event_id: number | null
+  observed_at: string
+  review_state: 'OPEN' | 'REVIEWED'
+  reviewed_at: string | null
+  reviewed_by: string | null
+  review_reason: string | null
+  source_committed_cursor: number
+  cursor_advanced: boolean
+  oracle_action: 'EXCLUDED_FAIL_CLOSED' | 'HELD_IDENTITY_EVIDENCE_REQUIRED'
+  // Derived from the receipt that read the row; older backends omit it.
+  source_condition?:
+    | 'TERMINAL_NEWEST_RECORD_UNSETTLED'
+    | 'TERMINAL_NEWEST_RECORD_UNCONFIRMED'
+    | 'TERMINAL_NEWEST_RECORD_CORRECTED'
+    | 'TERMINAL_NEWEST_RECORD_OUT_OF_ORDER'
+    | null
+  operator_reason?: string | null
+  source_correction_ids?: string[]
+  // Detail only: later reads of this slot kept as receipts.
+  slot_receipts?: SourceSlotReceipt[]
+  reviews?: SourceExceptionReview[]
+}
+
+export interface SourceSlotReceipt {
+  manifest_id: number
+  source_kind: string
+  job_id: string | null
+  raw_record_digest: string
+  disposition: string
+  decodes_as_punch: boolean
+  punch_received: boolean | null
+  observed_at: string
+}
+
+export interface SourceExceptionTotals {
+  all: number
+  open: number
+  reviewed: number
+  invalid_time: number
+  malformed: number
+  identity_unresolved?: number
+  affected_terminals: number
+}
+
+export interface SourceExceptionList {
+  totals: SourceExceptionTotals
+  filtered_total: number
+  rows: SourceException[]
+  next_cursor: number | null
+  scope?: {
+    job_id: string
+    device_id: string | null
+    terminal_serial: string | null
+    cutoff_count: number | null
+    source_exception_assurance: SourceExceptionAssurance
+  }
+}
+
+export interface SourceExceptionAssurance {
+  total: number
+  reviewed: number
+  corrected?: number
+  open: number
+  invalid_time: number
+  malformed: number
+  identity_unresolved?: number
+  identity_unresolved_open?: number
+  raw_preserved?: number
+  raw_interpretation_open?: number
+  newest_held?: number
+  newest_punch_unreceived?: number
+  state: 'NONE' | 'REVIEW_REQUIRED' | 'IDENTITY_EVIDENCE_REQUIRED' | 'INTERPRETATION_REQUIRED' | 'NEWEST_PUNCH_UNRECEIVED' | 'REVIEWED_EXCLUSIONS' | 'CORRECTED_DERIVED_EVENTS' | 'SCOPE_MISMATCH'
+
+  cohort_digest: string | null
+  correction_ids?: string[]
+}
+
+export type AttendanceRecoveryAction =
+  | 'RETRY_DELIVERY'
+  | 'REBUILD_OUTBOX'
+  | 'RECOVER_STALE_IN_FLIGHT'
+
+export interface AttendanceRecoverySummary {
+  schema_version: string
+  /** When the server computed these figures (ISO); they are shared for a few seconds. */
+  metrics_computed_at?: string | null
+  metrics_max_age_seconds?: number
+  preview_enabled: boolean
+  execution_enabled: boolean
+  correction_enabled?: boolean
+  allowed_zones?: string[]
+  delivery: {
+    safe_retryable: number
+    missing_outbox: number
+    held_without_outbox?: number
+    review_without_outbox?: number
+    stale_in_flight: number
+    active_in_flight?: number
+    identity_held: number
+    permanent_review: number
+    status_counts: Record<string, number>
+  }
+  source: {
+    zkt_invalid_time: number
+    zkt_malformed: number
+    hikvision: Record<string, number>
+  }
+}
+
+export interface AttendanceRecoveryCandidate {
+  source_kind: string
+  source_ref: string
+  attendance_event_id: number
+  event_uid: string
+  connector_id: string | null
+  display_name: string | null
+  zone_id: string | null
+  firmware_family: string | null
+  terminal_serial: string | null
+  source: string
+  source_epoch?: string | null
+  generation?: number | null
+  source_digest?: string | null
+  source_event_id?: string | null
+  device_event_time: string | null
+  received_at: string | null
+  event_status: string | null
+  outbox_status: string | null
+  lane: string
+  reason: string
+  stale_in_flight: boolean
+  state_digest: string
+  uid?: string | null
+  user_id?: string | null
+  identity_snapshot_id?: number | null
+  clock_quality?: string | null
+  clock_drift_seconds?: number | null
+  terminal_provenance?: 'VERIFIED' | 'MISSING'
+}
+
+export interface AttendanceRecoveryPreview {
+  schema_version: string
+  action: AttendanceRecoveryAction
+  filters: Record<string, unknown>
+  candidate_digest: string
+  preview_expires_at: string
+  confirmation: string
+  counts: {
+    matching: number
+    eligible: number
+    excluded: number
+    safe_delivery: number
+    identity_held: number
+    source_correction: number
+    permanent_review: number
+    confirmed: number
+  }
+  rows: AttendanceRecoveryCandidate[]
+  excluded_rows: AttendanceRecoveryCandidate[]
+  preview_signature: string
+}
+
+export interface SourceCorrectionCandidate {
+  id: number
+  source_kind: 'HIKVISION_EVIDENCE'
+  source_ref: string
+  connector_id: string
+  display_name: string
+  zone_id: string
+  terminal_serial: string
+  source_epoch: string
+  event_uid: string | null
+  source_event_id: string | null
+  observation_sha256: string
+  original_digest: string | null
+  captured_epoch: number
+  disposition: string
+  identity_available: boolean
+  eligible: boolean
+}
+
+export interface AttendanceRecoveryItem {
+  item_id: string
+  source_kind: string
+  source_ref: string
+  attendance_event_id: number | null
+  manifest_id: number | null
+  hikvision_evidence_id: number | null
+  lane: string
+  status: string
+  outcome: string | null
+  error_code: string | null
+  error_message: string | null
+  attempt_count: number
+  corrected_device_time: string | null
+  result: Record<string, unknown>
+  created_at: string
+  completed_at: string | null
+  updated_at: string
+}
+
+export interface AttendanceRecoveryJob {
+  job_id: string
+  action: string
+  status: string
+  actor: string
+  reason: string
+  scope: Record<string, unknown>
+  candidate_digest: string
+  preview_expires_at: string | null
+  progress: {
+    requested: number
+    eligible: number
+    excluded: number
+    identity_held: number
+    review: number
+    succeeded: number
+    failed: number
+    skipped: number
+    cursor: number
+  }
+  lease: { owner: string | null; until: string | null }
+  last_error: string | null
+  items?: AttendanceRecoveryItem[]
+  created_at: string
+  started_at: string | null
+  completed_at: string | null
+  updated_at: string
+}
+
+export interface SourceExceptionReveal {
+  id: number
+  raw_record_b64: string
+  raw_record_hex: string
+  raw_record_digest: string
+  record_size: number | null
+}
+
+export interface ReconciliationDivergenceDetail {
+  divergence_id: string
+  job_id: string | null
+  ordinal: number
+  state: string
+  old_raw_digest: string
+  new_raw_digest: string
+  old_disposition: string | null
+  new_disposition: string | null
+  observations: Array<{
+    raw_record_digest: string
+    disposition: string
+    observed_at: string
+    kind: string
+  }>
+  evidence_available: boolean
+  created_at: string
+  resolved_at: string | null
+}
+
+export interface ReconciliationDivergenceReveal {
+  divergence_id: string
+  raw_record_b64: string
+  raw_record_hex: string
+  new_raw_digest: string
+}
+
+export type HikvisionHistoryScope = 'ACTIVE_USERS' | 'ALL_RECORDS' | 'RECENT_TAIL'
+
+export interface ReconciliationJob {
+  scope?: HikvisionHistoryScope
+  recent_tail?: {
+    anchor_serial: number
+    begin_serial: number
+    boundary_serial: number | null
+    earlier_breaks: number[]
+    last_serial: number | null
+    anchor_returned: boolean | null
+    pages: number
+    records: number
+    overlap_records: number
+    fact_conflicts: number
+    confirmed_conflicts: number
+    continuity_conflicts: number
+    caught_up: boolean
+    caught_up_at: string | null
+    last_page_at: string | null
+    coverage_certified: false
+  }
+  active_user_scope?: {
+    user_count: number
+    completed_users: number
+    snapshot_id: string
+    snapshot_received_at: string
+    cutoff_serial: number | null
+    all_terminal_records: false
+  }
+  job_id: string
+  mode: string
+  status: string
+  phase: string
+  wait_reason: string | null
+  error_code: string | null
+  error_message: string | null
+  operator_state?: string
+  operator_message?: string
+  completion_outcome?: string | null
+  assurance_outcome?: 'ALL_CONFIRMED' | 'COMPLETED_WITH_IDENTITY_HOLDS' | 'COMPLETED_WITH_CORRECTIONS' | 'COMPLETED_WITH_REVIEW' | 'REVIEW_REQUIRED' | 'NOT_CERTIFIED' | null
+  review_required?: boolean
+  source_exception_assurance: SourceExceptionAssurance
+  connector: null | {
+    connector_id: string
+    device_id: string
+    display_name: string
+    zone_id: string
+    connected: boolean
+  }
+  terminal: {
+    serial: string | null
+    generation: number
+    cutoff_count: number | null
+    latest_count: number | null
+    record_size: number | null
+    source_total_bytes: number | null
+  }
+  progress: {
+    scanned: number
+    remaining: number | null
+    add_durable: number
+    already_present: number
+    terminal_duplicates: number
+    blocked_identity: number
+    quarantined: number
+    raw_preserved?: number
+    oracle_target: number
+    oracle_confirmed: number
+    oracle_pending: number
+    oracle_review_required?: number
+    retry_count: number
+    auto_retry_count?: number
+  }
+  checkpoint?: {
+    next_ordinal: number | null
+    source_serial?: number | null
+    source_pass?: string
+    chain_digest: string | null
+    last_progress_at: string | null
+  }
+  assignment: {
+    assignment_id: string | null
+    credit_start_ordinal: number | null
+    credit_end_ordinal: number | null
+    credit_committed_through: number | null
+    granted_at: string | null
+    expires_at: string | null
+    accepted_at: string | null
+    heartbeat_at: string | null
+  }
+  eta: {
+    low_seconds: number | null
+    high_seconds: number | null
+    confidence: string
+    unavailable_reason: string | null
+  }
+  recovery?: {
+    operation_id: string
+    source_epoch: number
+    source_epoch_id: string | null
+    divergence: null | {
+      divergence_id: string
+      ordinal: number
+      state: string
+      old_raw_digest: string
+      new_raw_digest: string
+      observation_count: number
+      next_probe_at: string | null
+    }
+  }
+  capture_certificate?: Record<string, unknown> | null
+  oracle_certificate?: Record<string, unknown> | null
+  events?: Array<{
+    state: string
+    details: Record<string, unknown>
+    created_at: string
+  }>
+  requested_at: string
+  started_at: string | null
+  capture_certified_at: string | null
+  oracle_certified_at: string | null
+  completed_at: string | null
+  updated_at: string
+  archived_at?: string | null
+  archived_by?: string | null
+}
+
+export type ReconciliationBulkOutcome = 'CREATED' | 'ALREADY_ACTIVE' | 'BLOCKED'
+
+export interface ReconciliationBulkResult {
+  connector_id: string
+  display_name: string | null
+  zone_id: string | null
+  outcome: ReconciliationBulkOutcome
+  job_id: string | null
+  status: string | null
+  message: string | null
+}
+
+export interface ReconciliationBulkResponse {
+  results: ReconciliationBulkResult[]
+  created: number
+}
+
+export interface ReconciliationClearHistoryResult {
+  cancelled: number
+  deleted: number
+  archived: number
+  kept_reasons: Record<string, number>
+  // Open jobs left running: Hikvision recent-tail capture, or an open attendance repair's source.
+  kept_running?: Record<string, number>
+  // Jobs a busy database row held past the lock timeout; the next press finishes them.
+  busy?: number
+}
+
+export interface ReconciliationScheduler {
+  policy: 'BOUNDED_PARALLEL_PER_DEVICE' | string
+  device_concurrency: number
+  active_scan_jobs: number
+  waiting_scan_jobs: number
+  available_scan_slots: number
+  history_backlog?: number
+  history_backlog_limit?: number
+  reserved_credit?: number
+  available_credit?: number
+}
+
+export interface ReconciliationJobTotals {
+  all: number
+  active: number
+  queued_waiting: number
+  paused: number
+  attention: number
+  completed: number
+  cancelled: number
+}
+
+export interface ReconciliationListResponse {
+  enabled: boolean
+  scheduler: ReconciliationScheduler
+  rows: ReconciliationJob[]
+  next_cursor: number | null
+  filtered_total: number
+  totals: ReconciliationJobTotals
+}
+
+export interface HilTarget {
+  connector_id: string
+  mac: string
+  terminal_serial: string
+}
+
+export interface FirmwareRelease {
+  firmware_family?: 'zkt' | 'hikvision'
+  display_name?: string
+  release_id: string
+  version: string
+  git_sha: string
+  image_sha256: string
+  application_sha256: string | null
+  image_size: number
+  state: 'AVAILABLE' | 'HIL_ONLY' | 'REVOKED' | string
+  partition_layout: string
+  signing_key_id: string
+  published_at: string
+  revoked_at?: string | null
+  revoked_by?: string | null
+  /** Active devices of this family that report this version. */
+  devices_running?: number
+  /** Still needed: not revoked, and running, in a live campaign, newest production or a newer HIL candidate. */
+  current?: boolean
+  hil_target_mac: string | null
+  hil_targets?: HilTarget[] | null
+  hil_next_target?: HilTarget | null
+  hil_allowed_targets?: HilTarget[] | null
+  hil_scope_message?: string | null
+  hil_schedule?: {
+    policy: string
+    denominator: number
+    trial_target_count?: number
+    counts: Record<'PASSED' | 'PENDING' | 'DEFERRED_OFFLINE' | 'BLOCKED', number> &
+      Partial<Record<'NOT_APPLICABLE_TO_THIS_BRIDGE', number>>
+    hold: string | null
+    rows: {
+      target: HilTarget
+      name: string
+      wave: string
+      exposed: boolean
+      status: 'PASSED' | 'PENDING' | 'DEFERRED_OFFLINE' | 'BLOCKED' | 'NOT_APPLICABLE_TO_THIS_BRIDGE'
+      reason: string
+      prerequisites: string[]
+      current_hold: string | null
+    }[]
+  } | null
+}
+
+export interface FirmwareCampaign {
+  campaign_id: string
+  release_id: string | null
+  release_state: string | null
+  zone_id: string
+  zone_name: string | null
+  version: string | null
+  status: 'ACTIVE' | 'PAUSED' | 'COMPLETED' | 'CANCELLED' | string
+  eligible: number
+  legacy_skipped: number
+  counts: Record<string, number>
+  pause_reason: string | null
+  actor: string
+  reason: string
+  deployments: FirmwareDeployment[]
+  // A live campaign whose next device is held (for example while it is
+  // offline) is waiting, not stuck.
+  waiting?: { connector_id: string | null; display_name: string | null; code: string; message: string | null } | null
+  created_at: string
+  updated_at: string
+  archived_at?: string | null
+  archived_by?: string | null
+}
+
+// POST /api/v1/firmware/campaigns/bulk: one campaign per zone, in one click.
+export interface FirmwareBulkZoneResult {
+  zone_id: string
+  outcome: 'CREATED' | 'BUSY' | 'BLOCKED'
+  campaign_id: string | null
+  status: string | null
+  message: string | null
+  stability_warnings: FirmwareStabilityWarning[]
+  eligible: number
+  // Why the zone's first device would wait for now (e.g. NATIONWIDE_TWO_UPGRADE_RESERVATIONS).
+  fleet_hold: string | null
+  closed: Array<{ campaign_id: string; status: string }>
+}
+
+export interface FirmwareBulkResult {
+  release_id: string
+  results: FirmwareBulkZoneResult[]
+  created: number
+}
+
+// POST /api/v1/firmware/campaigns/clear-history
+export interface FirmwareHistoryCleared {
+  completed: number
+  cancelled: number
+  kept_running: Array<{ campaign_id: string; zone_id: string; connector: string | null; connector_id: string | null; state: string }>
+  // Campaigns a device's own transaction held past the lock timeout; counted in more.
+  busy?: number
+  deleted: number
+  archived: number
+  more: boolean
+}
+
+export interface FirmwareDeploymentEvent {
+  state: string
+  details: {
+    bytes_written?: number
+    error_code?: string | null
+    [key: string]: unknown
+  }
+  created_at: string
+}
+
+export interface FirmwareTransportDiagnostics {
+  download_grants: {
+    issued_count: number
+    reached_count: number
+    endpoint_reached: boolean
+    first_issued_at: string | null
+    latest_issued_at: string | null
+    latest_expires_at: string | null
+    last_reached_at: string | null
+  }
+  telemetry: {
+    window_started_at: string
+    window_ended_at: string
+    sample_count: number
+    minimum_free_heap: number | null
+    weakest_rssi: number | null
+    latest: {
+      free_heap: number | null
+      rssi: number | null
+      uptime_seconds: number | null
+      outbox_depth: number
+      current_activity: string | null
+      created_at: string
+    } | null
+  }
+}
+
+export interface FirmwareRollbackDiagnosis {
+  classification: 'TARGET_BOOT_INTERRUPTED' | 'UNCLASSIFIED' | string | null
+  unclassified_reasons?: string[]
+  summary?: string
+  target_version?: string
+  previous_version?: string
+  classified_at?: string | null
+  target_boot?: {
+    estimated_lifetime_seconds: { min: number | null; max: number | null }
+    last_progress_at: string | null
+    last_progress_state: string | null
+    last_progress_code: string | null
+    progress_reports: number
+    failure_reports: Array<{ state: string; error_code: string | null; at: string | null }>
+    logs_received: number
+    telemetry_received: number
+  }
+  previous_firmware_resets?: {
+    resets: number
+    boot_ids: number
+    online_hours: number
+    reset_rate_per_online_hour: number
+    days: number
+  }
+  // ADD's receipt of the terminal's time sync: an upper bound on when it answered.
+  terminal?: {
+    time_sync_after_new_boot_seconds: number | null
+    answered_within_30_seconds: boolean | null
+    bound?: 'upper' | null
+    source?: 'received_at' | 'inconsistent' | null
+  }
+  location_resets?: {
+    location: string | null
+    peers_checked: number
+    window_seconds: number
+    complete: boolean
+    resets: Array<{ connector_id: string; display_name: string; offset_seconds: number }>
+  }
+  reconcile_at_reset?: { running: boolean | null; last_target_activity: string | null }
+}
+
+// Campaign detail's hint only; the owner's dialog reads FirmwareRetryPreflight.
+export interface FirmwareRetryView {
+  available: boolean
+  refusal: string | null
+  // TARGET_BOOT_INTERRUPTED, or (ZKT 2.7.7) PARTITION_HASH_FAILED: the
+  // downloaded image did not verify on the ESP. interrupted_boots counts
+  // attempts of that kind on this ESP and release.
+  kind?: string
+  interrupted_boots: number
+  limit: number
+  // Other PENDING deployments that resuming the campaign also offers.
+  pending_deployments?: number
+}
+
+// The ESP's current storage and queue state, shown with the retry.
+export interface FirmwareRetryEspState {
+  connected: boolean
+  firmware_version: string | null
+  boot_id: string | null
+  storage_reported: boolean
+  storage_durability: string | null
+  storage_io_faults: Record<string, unknown> | null
+  diagnostics_at: string | null
+  outbox_depth: number | null
+  last_heartbeat_at: string | null
+}
+
+export interface FirmwareRetryPreflight extends FirmwareRetryView {
+  campaign_id: string
+  deployment_id: string
+  target_version: string
+  stability_warnings: FirmwareStabilityWarning[]
+  stability_warnings_digest: string
+  esp_state: FirmwareRetryEspState | null
+}
+
+export interface FirmwareDeployment {
+  deployment_id: string
+  connector_id: string | null
+  display_name: string | null
+  hardware_id: string | null
+  zone_id: string | null
+  status: string
+  previous_version: string | null
+  target_version: string
+  bytes_written: number
+  attempt_count: number
+  error_code: string | null
+  error_message: string | null
+  offered_at: string | null
+  completed_at: string | null
+  updated_at: string
+  transport_diagnostics: FirmwareTransportDiagnostics | null
+  // Campaign detail only: re-read rollback evidence and the owner's retry hint.
+  rollback_diagnosis?: FirmwareRollbackDiagnosis | null
+  retry?: FirmwareRetryView | null
+  events: FirmwareDeploymentEvent[]
+}
+
+export interface FirmwareReleaseTotals {
+  all: number
+  available: number
+  hil_only: number
+  revoked: number
+  /** Releases still needed, and the superseded ones the default view hides. */
+  current?: number
+  hidden?: number
+  [state: string]: number | undefined
+}
+
+export interface FirmwareCampaignTotals {
+  campaigns: Record<string, number>
+  deployments: Record<string, number>
+  archived_campaigns?: number
+}
+
+export interface FirmwareListResponse<T, TTotals> {
+  rows: T[]
+  enabled: boolean
+  hil_enabled: boolean
+  next_cursor: number | null
+  filtered_total: number
+  totals: TTotals
+}
+
+export interface DeviceUser {
+  id: number
+  user_key: string
+  uid: string
+  user_id: string
+  display_name: string
+  cnic_masked: string | null
+  cnic_available: boolean
+  identity_complete: boolean
+  identity_conflict_code: string | null
+  identity_conflict_members: Array<{ user_id: string; uid: string }>
+  identity_conflict_resolved: boolean
+  identity_resolution_id: string | null
+  shift_worker: boolean
+  privilege: 0 | 14
+  present: boolean
+  lifecycle_state: string
+  row_version: number
+  observed_at: string
+  machine_name_preview: string | null
+  current_command_state: string | null
+  read_only: boolean
+  /** The terminal name holds a CNIC ADD cannot parse (e.g. a letter before the digits). Never used. */
+  cnic_format_suspect?: boolean
+  cnic_format_suspect_reason?: 'LETTER_BEFORE_DIGITS' | 'SEPARATED_DIGITS' | 'UNSUPPORTED_SEPARATOR' | null
+  suggested_display_name?: string | null
+  /** The unparsed name carried the "-S" shift-worker marker; the edit dialog keeps it. */
+  suggested_shift_worker?: boolean
+}
+
+export interface AttendanceRepairCohortCandidate {
+  cohort_token: string
+  evidence_classification: 'CURRENT_USER_LINEAGE' | 'EXACT_TOMBSTONE' | string
+  selectable: boolean
+  exclusion_code: string | null
+  source_device_user_key: string
+  source_uid: string | null
+  source_user_id: string | null
+  first_event_at: string
+  last_event_at: string
+  event_count: number
+  membership_digest: string
+  masked_identity: {
+    variants: Array<{
+      display_name_masked: string | null
+      cnic_masked: string | null
+    }>
+    variant_count: number
+    truncated: boolean
+  }
+  source_evidence: {
+    terminal_manifest_events: number
+    exact_tombstone: boolean
+    source_types: string[]
+  }
+}
+
+export interface AttendanceRepairCandidateTarget {
+  user_key: string
+  row_version: number
+  display_name: string
+  cnic_masked: string | null
+  eligible: boolean
+  exclusion_code: string | null
+  cohorts: AttendanceRepairCohortCandidate[]
+}
+
+export interface AttendanceRepairCandidates {
+  connector_id: string
+  device_id: string
+  source_current: boolean
+  source_certificate: Record<string, unknown>
+  date_scope: {
+    timezone: 'Asia/Karachi'
+    start_utc: string | null
+    end_utc_exclusive: string | null
+  }
+  targets: AttendanceRepairCandidateTarget[]
+}
+
+export interface AttendanceRepairPreflight {
+  preview_enabled: boolean
+  execution_enabled: boolean
+  eligible: boolean
+  ready_now: boolean
+  requires_source_reconciliation: boolean
+  hard_blockers: Array<{ code: string; message: string }>
+  waitable_blockers: Array<{ code: string; message: string }>
+  limits: { employees: number; events: number; oracle_batch: number }
+  source_certificate: Record<string, unknown>
+  terminal: {
+    serial: string | null
+    snapshot_complete: boolean
+    snapshot_stable: boolean
+    snapshot_revision: number
+    attendance_count: number | null
+  } | null
+  oracle: {
+    available: boolean
+    capabilities?: Record<string, unknown>
+    error_code?: string
+    message?: string
+  }
+  worker: {
+    active_jobs: number
+    review_items: number
+    stale_leases: number
+    oldest_job_age_seconds: number
+    retrying_items?: number
+    unknown_outcome_items?: number
+    waiting_downstream_items?: number
+    oldest_downstream_lag_seconds?: number
+    leased_oracle_slots?: number
+    active_worker_count?: number
+    heartbeat?: {
+      state: string
+      updated_at: string
+      last_started_at: string | null
+      last_completed_at: string | null
+      last_error_at: string | null
+      last_error_message?: string | null
+  last_error_code: string | null
+    } | null
+    release_v2?: {
+      queue_oldest_age_seconds: number
+      preparing_oldest_age_seconds: number
+      awaiting_approval_oldest_age_seconds: number
+      execution_oldest_age_seconds: number
+      exclusions_by_code: Record<string, number>
+      retry_exhausted_jobs: number
+      reuse_attribution_failures: Record<string, number>
+    }
+  }
+}
+
+export interface AttendanceRepairTargetOutcome {
+  user_key: string
+  display_name: string
+  cnic_masked: string | null
+  expected_row_version: number
+  desired_identity_digest: string
+  status: string
+  event_count: number
+  completed_event_count: number
+  attention_event_count: number
+}
+
+export interface AttendanceRepairItemOutcome {
+  event_uid: string
+  user_key: string | null
+  event_time: string | null
+  punch?: string | null
+  capture_source?: string | null
+  source_ords_status?: string | null
+  risk_class?: string
+  selection_origin?: string
+  state: string
+  oracle_classification: string
+  outcome: string | null
+  attempt_count: number
+  oracle_attempt_count: number
+  downstream_attempt_count: number
+  next_attempt_at: string | null
+  error_code: string | null
+  error_message?: string | null
+  operation_id?: string
+  oracle_receipt_id?: string | null
+  oracle_verified_at?: string | null
+  downstream_status?: string | null
+  downstream_verified_at?: string | null
+  effective_identity_activated_at?: string | null
+}
+
+export interface AttendanceRepairJob {
+  job_id: string
+  connector_id: string
+  device_id: string
+  actor: string
+  status: string
+  release_state?: string
+  phase: string
+  workflow_version?: string
+  selection_mode?: string
+  selection_manifest_digest?: string | null
+  selection_filters?: {
+    date_from: string | null
+    date_to: string | null
+    hold_statuses: string[]
+    punch: string | null
+    source: string | null
+  } | null
+  selection_exclusion_manifest_digest?: string | null
+  candidate_membership_digest?: string | null
+  release_target_user_id?: string | null
+  date_scope: {
+    timezone: 'Asia/Karachi'
+    start_utc: string | null
+    end_utc_exclusive: string | null
+  }
+  request_digest: string
+  preview_digest: string | null
+  preview_expires_at: string | null
+  source_dependency_job_id: string | null
+  totals: {
+    employees: number
+    events: number
+    selected?: number
+    safe?: number
+    ordinary?: number
+    reuse?: number
+    safe_reuse?: number
+    operator_excluded?: number
+    excluded: number
+    completed_employees: number
+    completed_events: number
+    attention_events: number
+  }
+  wait_reason: string | null
+  error_code: string | null
+  error_message: string | null
+  cancellation_requested: boolean
+  preparation_attempt_count: number
+  next_attempt_at: string | null
+  created_at: string
+  approved_at: string | null
+  started_at: string | null
+  completed_at: string | null
+  reason?: string | null
+  typed_confirmation?: string
+  reuse_attestation?: {
+    attestation_id: string
+    evidence_type: string
+    event_count: number
+    event_membership_digest: string
+    actor: string
+    created_at: string
+  } | null
+  downstream_impact?: {
+    timezone: 'Asia/Karachi'
+    calendar_days: number
+    employee_days: number
+    before_identity_day_groups: number
+    desired_identity_day_groups: number
+    first_date: string | null
+    last_date: string | null
+  }
+  targets: AttendanceRepairTargetOutcome[]
+  items?: AttendanceRepairItemOutcome[]
+  items_next_cursor?: number | null
+}
+
+export interface AttendanceRepairListResponse {
+  preview_enabled: boolean
+  execution_enabled: boolean
+  rows: AttendanceRepairJob[]
+  next_cursor: number | null
+  totals: { all: number; active: number; attention: number }
+  worker: AttendanceRepairPreflight['worker']
+}
+
+export interface AttendanceReleaseQueueRow {
+  connector_id: string | null
+  device_id: string | null
+  device_name: string
+  user_key: string | null
+  row_version: number | null
+  display_name: string
+  user_id: string
+  uid: string | null
+  cnic_masked: string | null
+  eligible: boolean
+  lock_reason: string | null
+  lock_reasons: string[]
+  source_current: boolean
+  active_release_job_id: string | null
+  counts: {
+    ordinary_blocked: number
+    identity_reuse: number
+    eligible: number
+    locked: number
+    in_progress: number
+  }
+  first_event_at: string
+  last_event_at: string
+}
+
+export interface AttendanceReleaseQueueResponse {
+  preview_enabled: boolean
+  execution_enabled: boolean
+  totals: {
+    employees: number
+    events: number
+    eligible: number
+    locked: number
+  }
+  rows: AttendanceReleaseQueueRow[]
+  next_cursor: number | null
+}
+
+export interface AttendanceReleaseCandidate {
+  event_token: string | null
+  event_uid: string
+  device_event_time: string
+  punch: string | null
+  status: string | null
+  source: string
+  device_serial: string | null
+  uid: string | null
+  user_id: string | null
+  display_name: string | null
+  clock_quality: string
+  source_ords_status: 'BLOCKED_IDENTITY' | 'QUARANTINED_IDENTITY_REUSE'
+  risk_class: 'ORDINARY_BLOCKED' | 'IDENTITY_REUSE'
+  evidence_classification: string | null
+  eligible: boolean
+  lock_reason: string | null
+}
+
+export interface AttendanceReleaseCandidates {
+  candidate_set_token: string
+  expires_at: string
+  source_current: boolean
+  source_certificate: Record<string, unknown>
+  target: {
+    user_key: string
+    row_version: number
+    display_name: string
+    user_id: string
+    uid: string | null
+    cnic_masked: string | null
+    eligible: boolean
+    lock_reason: string | null
+  }
+  filters: {
+    date_from: string | null
+    date_to: string | null
+    hold_statuses: string[]
+    punch: string | null
+    source: string | null
+  }
+  totals: {
+    all: number
+    eligible: number
+    locked: number
+    ordinary_blocked: number
+    identity_reuse: number
+  }
+  rows: AttendanceReleaseCandidate[]
+  next_cursor: number | null
+}
+
+export interface UserDeletionJobItem {
+  user_key: string
+  uid: string
+  user_id: string
+  display_name: string
+  status: string
+  error_code: string | null
+  error_message: string | null
+  result: Record<string, unknown>
+}
+
+export interface UserDeletionJob {
+  job_id: string
+  connector_id: string
+  status: string
+  reason: string
+  counts: {
+    requested: number
+    succeeded: number
+    failed: number
+    canceled: number
+    expired: number
+    pending: number
+  }
+  created_at: string
+  expires_at: string
+  started_at: string | null
+  completed_at: string | null
+  items: UserDeletionJobItem[]
+}
+
+export interface IdentityIntegrity {
+  source: 'CURRENT_COMPLETE_ZKT_SNAPSHOT' | 'PARTIAL_ZKT_SNAPSHOT'
+  total_users: number
+  with_cnic: number
+  missing_cnic: number
+  cnic_format_suspect_users?: number
+  duplicate_groups: number
+  duplicate_users: number
+  resolved_duplicate_groups: number
+  unresolved_duplicate_groups: number
+  unresolved_duplicate_users: number
+}
+
+export interface IdentityConflictPunchEvidence {
+  captured_count: number
+  first_captured_at: string | null
+  last_captured_at: string | null
+  blocked_identity_count: number
+}
+
+export interface IdentityConflictMember {
+  user_key: string
+  uid: string
+  user_id: string
+  display_name: string
+  row_version: number
+  privilege: number
+  observed_at: string
+  punch_evidence: IdentityConflictPunchEvidence
+}
+
+export interface IdentityConflictGroup {
+  group_token: string
+  cnic_masked: string | null
+  classification: 'EXACT_NAME_MATCH' | 'POSSIBLE_NAME_VARIANT' | 'MIXED_NAMES_HIGH_RISK'
+  status: 'UNRESOLVED' | 'RESOLVED_SAME_EMPLOYEE'
+  resolution_id: string | null
+  resolution_created_at: string | null
+  resolution_reason: string | null
+  recommended_action: 'CONFIRM_SAME_EMPLOYEE' | 'HR_IDENTITY_REVIEW'
+  members: IdentityConflictMember[]
+}
+
+export interface IdentityConflictReport {
+  evidence_scope: {
+    snapshot_source: 'CURRENT_COMPLETE_ZKT_SNAPSHOT' | 'PARTIAL_ZKT_SNAPSHOT'
+    terminal_attendance_count: number
+    add_attendance_count: number
+    attendance_coverage_percent: number | null
+    attendance_is_immutable: boolean
+    terminal_users_are_unchanged: boolean
+  }
+  raw_duplicate_groups: number
+  resolved_groups: number
+  unresolved_groups: number
+  groups: IdentityConflictGroup[]
+}
+
+export interface HistoricalIdentityCandidate {
+  source_user_key: string | null
+  source_kind?: 'DELETED_USER' | 'EVENT_GROUP'
+  group_token?: string
+  active_user_key?: string | null
+  active_user_row_version?: number | null
+  uid: string
+  user_id: string
+  display_name: string
+  row_version: number | null
+  observed_at: string | null
+  deleted_at: string | null
+  cnic_available: boolean
+  identity_conflict_code: string | null
+  event_count: number
+  blocked_count: number
+  quarantined_count: number
+  first_event_at: string | null
+  last_event_at: string | null
+  resolution_path:
+    | 'HR_DIRECTORY_EVIDENCE'
+    | 'HR_DIRECTORY_EVENT_GROUP'
+    | 'ACTIVE_USER_ENRICHMENT'
+    | 'CURRENT_IDENTITY_EVIDENCE'
+    | 'VERIFIED_TOMBSTONE_REPAIR'
+    | 'IDENTITY_CONFLICT_REVIEW'
+    | 'IDENTITY_REUSE_REVIEW'
+  operator_actionable: boolean
+}
+
+export interface HistoricalIdentityReport {
+  device_serial: string | null
+  snapshot_revision: number
+  totals: {
+    unresolved_events: number
+    blocked_identity: number
+    quarantined_identity_reuse: number
+    attributed_to_deleted_users: number
+    unassigned_events: number
+    actionable_event_groups?: number
+    candidate_users: number
+  }
+  rows: HistoricalIdentityCandidate[]
+  unassigned_groups?: HistoricalIdentityCandidate[]
+}
+
+export type PunchTimeCnicState = 'MATCHES_CURRENT' | 'DIFFERS' | 'CONFLICT' | 'CHANGED_NEAR_PUNCH' | 'AMBIGUOUS' | 'NONE'
+export type DirectOrdsCnicChoice = 'PUNCH_TIME' | 'CURRENT'
+/** One administrator CNIC decision, bound to the evidence the dialog showed. */
+export interface DirectOrdsCnicDecision {
+  event_id: number
+  choice: DirectOrdsCnicChoice
+  /** The preview's evidence_digest; ADD skips the choice if the evidence changed. */
+  evidence_digest: string
+  /** Required to send a punch-time CNIC another active terminal user holds today. */
+  held_by_other_confirmed: boolean
+}
+/** Evidence notes about who held the terminal user ID at punch time; they never carry a CNIC. */
+export type PunchTimeEvidenceSignal =
+  | 'REVOKED_RECORD' | 'OTHER_UID_RECORD' | 'CAPTURED_CNIC_DIFFERS' | 'CAPTURED_CNIC_MATCHES'
+  | 'PREVIOUS_HOLDER_DELETED' | 'PUNCH_LINKED_TO_OTHER_USER' | 'UID_DIFFERS' | 'IDENTITY_CONFLICT_UNRESOLVED'
+  | 'CNIC_CHANGED_NEAR_PUNCH' | 'RECORDS_TRUNCATED' | 'PUNCH_TIME_CNIC_HELD_BY_OTHER'
+  | 'PUNCH_BEFORE_FIRST_OBSERVATION' | 'GAP_BRIDGED_SAME_CNIC' | 'NAME_DIFFERS'
+  | 'RECORD_HOLDER_DELETED_BEFORE_PUNCH'
+/** Where a punch that no identity record covers sits in ADD's records of the user ID. */
+export type PunchTimeRecordPosition = 'NO_RECORDS' | 'BEFORE_FIRST_RECORD' | 'BETWEEN_RECORDS' | 'AFTER_LAST_RECORD'
+
+/** Read-only checks shown before an administrator approves a direct Oracle send. */
+export interface DirectOrdsPreviewRow {
+  event_id: number
+  zkt_device_id?: number | null
+  device_serial?: string | null
+  user_id: string
+  display_name: string | null
+  device_event_time: string
+  exclusion: string | null
+  exclusion_reason: string | null
+  cnic_source: 'SAVED_PUNCH' | 'SYNCED_USER' | 'PUNCH_TIME_HISTORY' | null
+  punch_time_cnic: PunchTimeCnicState | null
+  punch_time_cnic_masked: string | null
+  punch_time_display_name: string | null
+  /**
+   * How the other CNIC is known: a record covering the punch, records on both sides of a break,
+   * or today's own terminal user record that ended at most 30 minutes before an uncovered punch.
+   */
+  punch_time_cnic_basis?: 'COVERING_RECORD' | 'BRIDGED_GAP' | 'RECORD_BEFORE_PUNCH' | null
+  record_position?: PunchTimeRecordPosition | null
+  /** BEFORE_FIRST_RECORD: when ADD first recorded this terminal user ID. */
+  first_observed_at?: string | null
+  /** An uncovered punch: when the record before it ended and the record after it started. */
+  record_before_ended_at?: string | null
+  record_after_started_at?: string | null
+  /** NAME_DIFFERS: the name saved with the punch. */
+  punch_display_name?: string | null
+  /** Masked CNICs of anyone else ADD's records show at or near the punch time. */
+  other_cnics_masked?: string[]
+  evidence_signals?: PunchTimeEvidenceSignal[]
+  current_cnic_masked: string | null
+  uid_matches_current: boolean
+  identity_conflict_code?: string | null
+  punch_time_cnic_held_by_other?: boolean
+  cnic_choice_required: boolean
+  cnic_choices: DirectOrdsCnicChoice[]
+  default_cnic_choice: DirectOrdsCnicChoice | null
+  /** CHOOSE_CNIC: radio per group; CONFIRM_TODAY: an explicit tick per group. */
+  decision_kind?: 'CHOOSE_CNIC' | 'CONFIRM_TODAY' | null
+  /** Rows with identical evidence share one decision; mixed evidence is one row per group. */
+  decision_group?: string | null
+  auto_release_at_next_snapshot: boolean
+  awaiting_next_snapshot: boolean
+  database_guard: string
+  replaces_stopped_approval?: boolean
+  /** Echoed with a CNIC choice so ADD can refuse a choice made on older evidence. */
+  evidence_digest?: string | null
+}
+
+export interface DirectOrdsPreview {
+  rows: DirectOrdsPreviewRow[]
+  missing_event_ids: number[]
+  counts: { selected: number; refused: number; cnic_choice_required: number; auto_release_soon: number }
+}
+
+export type CheckinNotificationStatus = 'NOTIFIED' | 'PENDING' | 'RETRYING' | 'FAILED' | 'NOT_SENT'
+
+// The employee "attendance punched" phone notification for one punch. Punches
+// from before the feature have no stored row and arrive as NOT_SENT.
+export interface CheckinNotification {
+  status: CheckinNotificationStatus
+  reason: string | null
+  detail: string | null
+  sent_at: string | null
+  attempts: number
+  next_attempt_at: string | null
+  last_http_status: number | null
+  host: 'PRIMARY' | 'FALLBACK' | null
+  updated_at: string | null
+  can_retry: boolean
+  manual_retry: boolean
+}
+
+export interface CheckinNotificationOverview {
+  state: 'OK' | 'DEGRADED' | 'PAUSED' | 'OFF' | 'NOT_CONFIGURED'
+  configured: boolean
+  mode: 'OFF' | 'PILOT' | 'ALL'
+  punch_policy: 'ALL_PUNCHES' | 'FIRST_PER_DAY'
+  pilot_zone_count: number
+  pilot_cnic_count: number
+  last_success_at: string | null
+  last_failure_at: string | null
+  last_failure_category: string | null
+  consecutive_failures: number
+  preferred_host: 'PRIMARY' | 'FALLBACK'
+  primary_reprobe_at: string | null
+  paused_until: string | null
+  oldest_pending_at: string | null
+  oldest_pending_age_seconds: number
+  started_at: string | null
+  last_24h: {
+    notified: number
+    pending: number
+    retrying: number
+    failed: number
+    not_sent: number
+    not_sent_reasons: Record<string, number>
+    window_hours: number
+  }
+}
+
+export interface CheckinNotificationSettings extends CheckinNotificationOverview {
+  revision: number
+  pilot_zone_ids: string[]
+  pilot_cnics: Array<{ id: string; masked: string | null }>
+  updated_by: string | null
+  updated_at: string | null
+  endpoint_host: string | null
+  fallback_host: string | null
+  cnic_json_type: 'number' | 'string'
+  stale_window_hours: number
+  coalesce_seconds: number
+  retry_window_hours: number
+  modes: Array<'OFF' | 'PILOT' | 'ALL'>
+  punch_policies: Array<'ALL_PUNCHES' | 'FIRST_PER_DAY'>
+}
+
+export interface AttendanceEvent {
+  checkin_notification?: CheckinNotification | null
+  cnic_not_linked?: boolean
+  force_release?: { run_id: string; policy?: string | null; administrator: string; approved_at: string; reason: string; audit_id: number | null; snapshot_id: number | null; sync_command_id: number | null; needs_attention?: boolean; approved_identity?: { display_name: string | null; cnic_masked: string | null } | null } | null
+  direct_ords_identity?: {
+    eligible: boolean
+    cnic_source: 'SAVED_PUNCH' | 'SYNCED_USER' | null
+    exclusion:
+      | 'UNKNOWN_USER' | 'CNIC_MISSING' | 'INVALID_EVENT_UID' | 'CLOCK_INVALID' | 'TIME_IMPOSSIBLE' | 'CNIC_CONFLICT'
+      | 'IDENTITY_CONFLICT_UNRESOLVED' | 'PUNCH_TIME_RECORDS_TOO_MANY' | 'ALREADY_CONFIRMED' | null
+    /** Which CNIC the terminal held for this user ID at the punch time. */
+    punch_time_cnic?: PunchTimeCnicState | null
+    /** The send dialog must ask which CNIC to use; ADD never picks today's by user ID alone. */
+    cnic_choice_required?: boolean
+  } | null
+  id: number
+  event_uid: string
+  device_serial: string | null
+  source_connector?: {
+    connector_id: string
+    display_name: string
+    zone_id: string
+    zone_name: string
+  } | null
+  terminal_provenance?: {
+    state: string
+    serial: string | null
+    confidence: string
+    explanation: string
+  }
+  uid: string | null
+  user_id: string
+  display_name: string | null
+  cnic_masked: string | null
+  device_event_time: string
+  captured_at: string
+  received_at: string
+  source: string
+  status: string | null
+  punch: string | null
+  clock_quality: string
+  clock_drift_seconds: number | null
+  ords_status: string
+  oracle_confirmed_at: string | null
+  oracle_confirmation_path: string | null
+  identity_resolution_id: number | null
+  identity_resolution_status?: string
+  identity_snapshot_id?: number | null
+  identity_repaired_at?: string | null
+  identity_content_status?: string
+  identity_content_confirmed_at?: string | null
+  identity_downstream_confirmed_at?: string | null
+  release_state?: string
+  release_state_label?: string
+  effective_identity_confirmed_at?: string | null
+  effective_identity_downstream_confirmed_at?: string | null
+  active_release_job_id?: string | null
+  latest_release_job_id?: string | null
+  release_target_user_key?: string | null
+  release_connector_id?: string | null
+  release_lock_reason?: string | null
+}
+
+export interface DeviceLog {
+  id: number
+  boot_id: string
+  sequence: number
+  level: string
+  subsystem: string
+  code: string | null
+  message: string
+  context: Record<string, unknown>
+  device_time: string | null
+  received_at: string
+}
+
+export interface Alert {
+  id: number
+  code: string
+  severity: string
+  state: string
+  message: string
+  details: Record<string, unknown>
+  first_seen_at: string
+  last_seen_at: string
+  acknowledged_at: string | null
+  acknowledged_by?: string | null
+  resolved_at: string | null
+  resolution?: AlertResolution | null
+}
+
+export interface Lease {
+  lease_id: string
+  state: string
+  requested_at: string
+  granted_at: string | null
+  expires_at: string | null
+  revoked_at: string | null
+  last_error: string | null
+}
+
+export interface Command {
+  command_id: string
+  type: string
+  status: string
+  created_at: string
+  expires_at: string | null
+  dispatched_at?: string | null
+  acknowledged_at?: string | null
+  started_at?: string | null
+  completed_at?: string | null
+  result?: Record<string, unknown>
+  error_code?: string | null
+  error_message?: string | null
+}
+
+export interface ConnectionEvent {
+  id: number
+  from_state: string | null
+  to_state: string
+  reason: string | null
+  consecutive_failures: number
+  consecutive_successes: number
+  flap_count_15m: number
+  observed_at: string
+}
+
+export interface UserCommandResponse {
+  user: DeviceUser
+  command: Command
+}

@@ -1,7 +1,8 @@
-import { cleanup, fireEvent, render, screen, within } from '@testing-library/react'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { cleanup, render, screen, within } from '@testing-library/react'
+import { afterEach, describe, expect, it } from 'vitest'
 import type { Device, DeviceHealth, HealthReason } from '../types'
-import { DeviceHealthPanel, currencyLabel } from './DeviceHealthPanel'
+import { HealthEvidence, currencyLabel } from './DeviceHealthPanel'
+import { problemWords } from '../words/problems'
 
 const device: Device = {
   connector_id: 'connector-peshawar-02',
@@ -70,144 +71,87 @@ const health = (overrides: Partial<DeviceHealth> = {}): DeviceHealth => ({
 
 afterEach(cleanup)
 
-describe('DeviceHealthPanel', () => {
-  it('shows what 2.5.2 firmware cannot report and keeps the LED channel visible', () => {
-    render(<DeviceHealthPanel device={device} health={health()} />)
-    expect(screen.getByRole('heading', { name: 'Why this device is online with warnings' })).toBeTruthy()
-    const coverage = screen.getByRole('region', { name: 'What ADD can verify on this firmware' })
+// Health evidence lives in Summary › Technical details (04-device §2); the
+// headline and the Mark as seen / fixed buttons moved to the card and the
+// Problems tab, so this checks the evidence parts only.
+describe('HealthEvidence', () => {
+  it('shows what 2.5.2 software cannot report and keeps the LED channel visible', () => {
+    render(<HealthEvidence device={device} health={health()} />)
+    const coverage = screen.getByRole('heading', { name: 'What this link box software can report' }).closest('section') as HTMLElement
     expect(within(coverage).getAllByText(/not reported by firmware 2\.5\.2/i)).toHaveLength(3)
     expect(within(coverage).getByText('Storage durability:')).toBeTruthy()
     expect(within(coverage).getByText(/reported through the LED state/)).toBeTruthy()
   })
 
   it('composes the coverage text when the backend sends no detail', () => {
-    render(<DeviceHealthPanel device={device} health={health({ coverage: [{ key: 'storage', label: 'Storage durability', status: 'NOT_REPORTED_BY_FIRMWARE', detail: null }] })} />)
-    expect(screen.getByText('Not reported by firmware 2.5.2.')).toBeTruthy()
+    render(<HealthEvidence device={device} health={health({ coverage: [{ key: 'storage', label: 'Storage durability', status: 'NOT_REPORTED_BY_FIRMWARE', detail: null }] })} />)
+    expect(screen.getByText('Not reported by link box software 2.5.2.')).toBeTruthy()
   })
 
-  it('explains a latched LED fault and refuses manual resolution', () => {
+  it('explains a latched fault, its clear condition and why it cannot be marked as fixed, with no buttons', () => {
     const latched = reason({
       code: 'ESP_LOCAL_FAILURE',
       error_code: 'ESP_LOCAL_FAILURE',
       tier: 'DEGRADED',
       currency: 'CURRENT',
       alert_id: 77,
-      boot_id: '5e6f7a8b-0000-4000-8000-000000000003',
-      firmware_version: '2.6.15',
-      binding: null,
       latch: { kind: 'LED_LATCH_NO_IO_ERRORS', source: 'add_connector.c:3764', firmware_version: '2.6.15' },
       message: 'The ESP LED reports LOCAL_FAILURE.',
       clear_condition: 'Clears when the ESP reports a healthy LED state, or at the next reboot.',
       operator: { resolvable: false, refusal_code: 'ALERT_CONDITION_CURRENT', refusal: 'The latest evidence still asserts this condition.' },
     })
-    const onResolve = vi.fn()
-    render(<DeviceHealthPanel device={{ ...device, state: 'DEGRADED', firmware_version: '2.6.15' }} health={health({ tier: 'DEGRADED', derived_lifecycle: 'DEGRADED', reasons: [latched] })} onResolve={onResolve} onAcknowledge={vi.fn()} />)
-    const row = screen.getByRole('listitem', { name: 'ESP local failure' })
-    expect(within(row).getByText('Latched until reboot — no I/O errors this boot')).toBeTruthy()
+    render(<HealthEvidence device={{ ...device, state: 'DEGRADED' }} health={health({ tier: 'DEGRADED', reasons: [latched] })} />)
+    const row = screen.getByRole('listitem', { name: problemWords({ code: 'ESP_LOCAL_FAILURE' }).title })
+    expect(within(row).getByText('Kept until the next restart: no memory errors since this restart')).toBeTruthy()
     expect(within(row).getByText('Clears when the ESP reports a healthy LED state, or at the next reboot.')).toBeTruthy()
-    const resolve = within(row).getByRole('button', { name: 'Resolve with reason' }) as HTMLButtonElement
-    expect(resolve.disabled).toBe(true)
     expect(within(row).getByText('The latest evidence still asserts this condition.')).toBeTruthy()
-    fireEvent.click(resolve)
-    expect(onResolve).not.toHaveBeenCalled()
+    expect(within(row).getByText('Needs attention')).toBeTruthy()
+    expect(screen.queryByRole('button')).toBeNull()
   })
 
-  it('maps every currency to operator language', () => {
+  it('maps every currency to plain words', () => {
     const base = reason({})
-    expect(currencyLabel({ ...base, currency: 'CURRENT' })).toBe('Current')
-    expect(currencyLabel({ ...base, currency: 'HELD' })).toBe('Held: waiting for verified evidence')
-    expect(currencyLabel({ ...base, currency: 'PREVIOUS_BOOT' })).toBe('From an earlier boot (firmware 2.6.27, boot 1a2b3c4d…)')
-    expect(currencyLabel({ ...base, currency: 'PREVIOUS_BOOT', firmware_version: null, boot_id: null })).toBe('From an earlier boot')
-    expect(currencyLabel({ ...base, currency: 'LATCHED' })).toBe('Latched: heartbeats do not re-check it')
+    expect(currencyLabel({ ...base, currency: 'CURRENT' })).toBe('Reported now')
+    expect(currencyLabel({ ...base, currency: 'HELD' })).toBe('Waiting for the link box to confirm it')
+    expect(currencyLabel({ ...base, currency: 'PREVIOUS_BOOT' })).toBe('From before the last restart (software 2.6.27, restart 1a2b3c4d…)')
+    expect(currencyLabel({ ...base, currency: 'PREVIOUS_BOOT', firmware_version: null, boot_id: null })).toBe('From before the last restart')
+    expect(currencyLabel({ ...base, currency: 'LATCHED' })).toBe('Kept until it is checked again')
     expect(currencyLabel({ ...base, currency: 'CURRENT', latch: { kind: 'LED_LATCH_STORAGE_VERIFIED', source: null, firmware_version: '2.7.0' } }))
-      .toBe('Latched until reboot — storage verified this boot')
+      .toBe('Kept until the next restart: memory checked since this restart')
   })
 
-  it('offers acknowledgement and resolution for eligible alert reasons only', () => {
-    const onAcknowledge = vi.fn()
-    const onResolve = vi.fn()
-    const derived = reason({
-      code: 'TERMINAL_DISCONNECTED',
-      error_code: null,
-      tier: 'WARNING',
-      currency: 'CURRENT',
-      gating: false,
-      severity: null,
-      alert_id: null,
-      alert_state: null,
-      last_seen_at: null,
-      boot_id: null,
-      firmware_version: null,
-      binding: null,
-      evidence_summary: null,
-      message: 'The terminal has been unreachable for 7 minutes (RETRY_WAIT).',
-      clear_condition: 'Clears when the terminal link reconnects.',
-      operator: { resolvable: false, refusal_code: 'DERIVED_REASON', refusal: 'Derived from live state; it clears on its own.' },
-    })
-    render(<DeviceHealthPanel device={device} health={health({ reasons: [reason({}), derived] })} onAcknowledge={onAcknowledge} onResolve={onResolve} />)
-    const worker = screen.getByRole('listitem', { name: 'ESP delivery worker fault' })
-    fireEvent.click(within(worker).getByRole('button', { name: 'Acknowledge' }))
-    expect(onAcknowledge).toHaveBeenCalledWith(41)
-    fireEvent.click(within(worker).getByRole('button', { name: 'Resolve with reason' }))
-    expect(onResolve).toHaveBeenCalledWith({ id: 41, code: 'ESP_DELIVERY_WORKER_FAULT', message: 'Delivery worker add_delivery reported STOPPED.' })
-    expect(within(worker).getByText('Holds HIL and factory work while active.')).toBeTruthy()
-
-    const terminal = screen.getByRole('listitem', { name: 'Terminal disconnected' })
-    expect(within(terminal).queryByRole('button')).toBeNull()
-    expect(within(terminal).getByText('Live condition')).toBeTruthy()
-    expect(within(terminal).queryByText('Holds HIL and factory work while active.')).toBeNull()
+  it('says a gating reason pauses test-device work and a derived one is happening now', () => {
+    const derived = reason({ code: 'ZKT_LINK_DOWN', error_code: null, alert_id: null, alert_state: null, last_seen_at: null, gating: false, tier: 'DEGRADED' })
+    render(<HealthEvidence device={device} health={health({ reasons: [reason({}), derived] })} />)
+    const worker = screen.getByRole('listitem', { name: problemWords({ code: 'ESP_DELIVERY_WORKER_FAULT' }).title })
+    expect(within(worker).getByText('While open, test-device updates wait.')).toBeTruthy()
+    expect(within(worker).getByText('#41')).toBeTruthy()
+    const link = screen.getByRole('listitem', { name: problemWords({ code: 'ZKT_LINK_DOWN' }).title })
+    expect(within(link).getByText('Happening now')).toBeTruthy()
+    expect(within(link).queryByText('While open, test-device updates wait.')).toBeNull()
   })
 
-  it('shows acknowledgements, other open items and the re-evaluate action for an unbacked error', () => {
-    const onClearError = vi.fn()
-    const acknowledged = reason({ acknowledged_at: '2026-10-10T07:00:00Z', acknowledged_by: 'StateHealthAdmin' })
-    const clockDrift = reason({
-      code: 'ZKT_CLOCK_DRIFT',
-      error_code: null,
-      tier: null,
-      currency: 'CURRENT',
-      gating: false,
-      severity: 'WARNING',
-      alert_id: 55,
-      message: 'Terminal clock drift exceeds two minutes.',
-      clear_condition: 'Clears when the terminal clock is within two minutes of trusted time.',
-    })
-    render(<DeviceHealthPanel
-      device={device}
-      health={health({
-        reasons: [acknowledged],
-        other_active_alerts: [clockDrift],
-        device_error: { code: 'ZKT_CONNECTION_FLAPPING', message: null, derived_code: 'ESP_DELIVERY_WORKER_FAULT', backed: false, backing_alert_ids: [] },
-      })}
-      onAcknowledge={vi.fn()}
-      onResolve={vi.fn()}
-      onClearError={onClearError}
-    />)
-    const worker = screen.getByRole('listitem', { name: 'ESP delivery worker fault' })
-    expect(within(worker).getByText(/Acknowledged by StateHealthAdmin/)).toBeTruthy()
-    expect(within(worker).queryByRole('button', { name: 'Acknowledge' })).toBeNull()
-    const others = screen.getByRole('region', { name: 'Other open items (no health effect)' })
-    const drift = within(others).getByRole('listitem', { name: 'ZKT clock drift' })
-    expect(within(drift).getByText('No health effect')).toBeTruthy()
-    expect(screen.getByText(/ADD derives ESP delivery worker fault from the active alerts/)).toBeTruthy()
-    fireEvent.click(screen.getByRole('button', { name: 'Re-evaluate device error' }))
-    expect(onClearError).toHaveBeenCalledTimes(1)
+  it('says whether an open problem keeps the saved error, and shows other open items', () => {
+    const drift = reason({ code: 'ZKT_CLOCK_DRIFT', error_code: 'ZKT_CLOCK_DRIFT', tier: null, alert_id: 43, gating: false })
+    const { rerender } = render(<HealthEvidence device={device} health={health({ other_active_alerts: [drift] })} />)
+    expect(screen.getByText('Kept by open problem #41. It clears with that problem.')).toBeTruthy()
+    const others = screen.getByRole('heading', { name: 'Also open (does not change the status)' }).closest('section') as HTMLElement
+    expect(within(others).getByText('Does not change the status')).toBeTruthy()
+    rerender(<HealthEvidence device={device} health={health({ device_error: { code: 'ZKT_CONNECTION_FLAPPING', message: null, derived_code: null, backed: false, backing_alert_ids: [] } })} />)
+    expect(screen.getByText('No open problem keeps this saved error. It is out of date.')).toBeTruthy()
   })
 
-  it('renders the list summary until the detail arrives', () => {
-    const summary = health()
-    delete summary.reasons
-    delete summary.coverage
-    render(<DeviceHealthPanel device={device} health={summary} />)
-    expect(screen.getByText(/Warning: Delivery worker add_delivery reported STOPPED\./)).toBeTruthy()
+  it('labels the shadow model as a preview and shows the machine connection', () => {
+    render(<HealthEvidence device={device} health={health({ mode: 'SHADOW' })} />)
+    expect(screen.getByRole('heading', { name: /^Preview of the new status rules: / })).toBeTruthy()
+    expect(screen.getByText('Preview only. The status at the top still decides the totals and problems.')).toBeTruthy()
+    expect(screen.getByRole('heading', { name: 'Machine connection' })).toBeTruthy()
   })
 
   it('keeps older backends readable without a health object', () => {
-    const { container, rerender } = render(<DeviceHealthPanel device={{ ...device, state: 'DEGRADED', last_error_code: 'ZKT_SERIAL_MISMATCH' }} />)
-    expect(screen.getByRole('heading', { name: 'Why this device is degraded' })).toBeTruthy()
-    expect(screen.getByText(/Stored device error: ZKT serial mismatch/)).toBeTruthy()
-    expect(screen.queryByText('ACTIVE PROBLEM')).toBeNull()
-    rerender(<DeviceHealthPanel device={{ ...device, state: 'ONLINE', last_error_code: null }} />)
-    expect(container.textContent).toBe('')
+    const { container, rerender } = render(<HealthEvidence device={{ ...device, last_error_code: 'ZKT_SERIAL_MISMATCH' }} health={null} />)
+    expect(screen.getByText(/Saved error: .*\(ZKT_SERIAL_MISMATCH\)/)).toBeTruthy()
+    rerender(<HealthEvidence device={{ ...device, last_error_code: null }} health={null} />)
+    expect(container.textContent).toBe('No health details reported.')
   })
 })

@@ -1,7 +1,8 @@
 import { useEffect, useState } from 'react'
 import { api, queryString } from '../api'
 import { dateTime } from '../App'
-import { humanizeStatus } from '../status'
+import { plainErrorText } from '../lib/plainApiError'
+import { plainStatus } from '../words/states'
 import type { Device } from '../types'
 import './SafeAttendanceRepair.css'
 
@@ -12,6 +13,8 @@ export type RepairRun = {
   last_error: string | null; execution_enabled: boolean; eligible_at_check: number
   devices: Array<{ connector_id: string; name: string; serial: string | null; checked: number; status: string }>
 }
+
+const failed = (error: unknown) => plainErrorText(error, "Couldn't load the old repair tasks. Try again.")
 
 /** Previous policy remains readable, without admission or approval controls. */
 export function SafeAttendanceRepair(_props: { devices: Device[]; toast: { notice: (text: string) => void; error: (text: string) => void } }) {
@@ -25,13 +28,13 @@ export function SafeAttendanceRepair(_props: { devices: Device[]; toast: { notic
     const page = await api<{ rows: RepairRun[]; next_cursor: number | null }>('/api/v2/attendance-recovery/checks' + queryString({ before }))
     setRows(old => before ? [...old, ...page.rows] : page.rows); setCursor(page.next_cursor)
   }
-  useEffect(() => { void load().catch(err => setError(String(err))) }, [])
+  useEffect(() => { void load().catch(err => setError(failed(err))) }, [])
   const show = async (value: RepairRun, after?: number) => {
     setRun(value)
     try {
       const page = await api<{ rows: typeof items; next_cursor: number | null }>(`/api/v2/attendance-recovery/jobs/${value.job_id}/items` + queryString({ cursor: after, limit: 25 }))
       setItems(old => after ? [...old, ...page.rows] : page.rows); setItemCursor(page.next_cursor)
-    } catch (err) { setError(String(err)) }
+    } catch (err) { setError(failed(err)) }
   }
-  return <section className="panel safe-repair" aria-label="Previous repair history"><header className="safe-repair-header"><div><h2>Previous repair history</h2><p>This policy is retired. New releases use Force release attendance.</p></div></header><div className="safe-repair-body">{error && <p role="alert">{error}</p>}{!rows.length && !error && <p className="safe-repair-empty">No earlier repair runs were recorded.</p>}<ul className="safe-repair-history">{rows.map(row => <li key={row.job_id}><button className="button secondary" onClick={() => void show(row)}>{dateTime(row.created_at)} · {humanizeStatus(row.status)} · {row.counts.confirmed} confirmed</button></li>)}</ul>{cursor && <button className="button secondary" onClick={() => void load(cursor).catch(err => setError(String(err)))}>Older history</button>}{run && <div><h3>{dateTime(run.created_at)} · {run.actor}</h3><p>{run.counts.confirmed} confirmed · {run.counts.waiting} waiting · {run.counts.review} need review</p><ul className="safe-repair-items">{items.map(item => <li key={item.id}><span>{item.name} · {dateTime(item.time)}</span><span>{item.reason}</span></li>)}</ul>{itemCursor && <button className="button secondary" onClick={() => void show(run, itemCursor)}>More records</button>}</div>}</div></section>
+  return <section className="panel safe-repair" aria-label="Old repair tasks (no longer used)"><header className="safe-repair-header"><div><h2>Old repair tasks (no longer used)</h2></div></header><div className="safe-repair-body">{error && <p role="alert">{error}</p>}{!rows.length && !error && <p className="safe-repair-empty">No earlier repair runs were recorded.</p>}<ul className="safe-repair-history">{rows.map(row => <li key={row.job_id}><button className="button secondary" onClick={() => void show(row)}>{dateTime(row.created_at)} · {plainStatus('recoveryJob', row.status).label} · {row.counts.confirmed} confirmed</button></li>)}</ul>{cursor && <button className="button secondary" onClick={() => void load(cursor).catch(err => setError(failed(err)))}>Older history</button>}{run && <div><h3>{dateTime(run.created_at)} · {run.actor}</h3><p>{run.counts.confirmed} confirmed · {run.counts.waiting} waiting · {run.counts.review} waiting for you</p><ul className="safe-repair-items">{items.map(item => <li key={item.id}><span>{item.name} · {dateTime(item.time)}</span><span data-technical>{item.reason}</span></li>)}</ul>{itemCursor && <button className="button secondary" onClick={() => void show(run, itemCursor)}>More records</button>}</div>}</div></section>
 }

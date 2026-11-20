@@ -15,7 +15,7 @@
 .auto-release-switch strong { min-width: 26px; color: var(--text-secondary); font-size: 12px; font-weight: 600; }
 .auto-release-switch[aria-checked="true"] strong { color: var(--positive); }
 .auto-release-switch-track { position: relative; width: 34px; height: 20px; flex: 0 0 34px; border-radius: 999px; background: var(--neutral-solid, var(--text-tertiary)); transition: background-color var(--motion-control, .15s) var(--ease-corporate, ease); }
-.auto-release-switch-track > span { position: absolute; top: 2px; left: 2px; width: 16px; height: 16px; border-radius: 50%; background: #fff; box-shadow: var(--shadow-xs); transition: transform var(--motion-control, .15s) var(--ease-corporate, ease); }
+.auto-release-switch-track > span { position: absolute; top: 2px; left: 2px; width: 16px; height: 16px; border-radius: 50%; background: var(--on-solid); box-shadow: var(--shadow-xs); transition: transform var(--motion-control, .15s) var(--ease-corporate, ease); }
 .auto-release-switch[aria-checked="true"] .auto-release-switch-track { background: var(--positive-solid); }
 .auto-release-switch[aria-checked="true"] .auto-release-switch-track > span { transform: translateX(14px); }
 

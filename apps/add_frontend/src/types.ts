@@ -236,12 +236,20 @@ export interface PaginatedResponse<T> {
 }
 
 export type DashboardRoute =
-  | 'fleet'
-  | 'users'
+  | 'home'
+  | 'devices'
   | 'attendance'
-  | 'reconciliation'
-  | 'firmware'
-  | 'alerts'
+  | 'problems'
+  | 'people'
+  | 'recover'
+  | 'updates'
+  | 'setup'
+  | 'settings'
+
+// Tabs of the Software updates page (08-advanced 2.1) and of Recover
+// attendance (08-advanced 1.1), as they appear in the URL.
+export type UpdatesSection = 'overview' | 'updates' | 'versions'
+export type RecoverSection = 'recoveries' | 'unreadable' | 'held'
 
 export type FirmwareSection = 'overview' | 'prepare' | 'releases' | 'campaigns'
 export type ReconciliationSection = 'jobs' | 'exceptions' | 'recovery'
@@ -518,6 +526,12 @@ export interface HikvisionHealth {
 
 export interface Device {
   snapshot_at?: string
+  // 'list' marks a slim row from /api/v1/devices?view=list (PR-1a); it leaves
+  // out the heavy detail fields, so a slim row never replaces them.
+  payload?: 'list' | 'detail'
+  // Life or Health and the friendly name, when the backend sends them (HOME-2).
+  division?: 'life' | 'health' | null
+  friendly_name?: string | null
   boot_id?: string | null
   firmware_family?: 'zkt' | 'hikvision'
   terminal_vendor?: 'zkt' | 'hikvision'

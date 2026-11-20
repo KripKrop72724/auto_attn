@@ -1624,7 +1624,8 @@ def update_heartbeat(
             # pending operation remains durable and is retried on the next heartbeat;
             # an unavailable wrapping key never triggers an unsealed fallback.
             pass
-    return serialize_connector(connector, health=health)
+    # Published to browsers as the heartbeat event: the slim list row.
+    return serialize_connector(connector, health=health, view="list")
 
 
 def replace_user_snapshot(
@@ -6347,8 +6348,23 @@ def serialize_user_deletion_job(session: Session, job: UserDeletionJob) -> dict:
     }
 
 
-def serialize_connector(connector: Connector, *, health: Health | None = None) -> dict:
-    """Runs at the end of every heartbeat, so it must never query."""
+# Capability keys the slim list drops: top-level "hikvision" already carries them.
+LIST_VIEW_DROPPED_CAPABILITIES = frozenset({"hikvision_health"})
+
+
+def serialize_connector(
+    connector: Connector, *, health: Health | None = None, view: str = "full"
+) -> dict:
+    """Runs at the end of every heartbeat, so it must never query.
+
+    view="list" is the slim row of the device list and of heartbeat browser
+    events: firmware_diagnostics is null (only the device page reads it) and
+    zkt.capabilities leaves out what top-level "hikvision" repeats. Every
+    other field is kept, and the row says "payload": "list" so a browser
+    keeps the full fields it already has.
+    """
+    from zk_add import device_names, public_status
+
     zkt = connector.zkt_device
     now = utc_now()
     row = {
@@ -6429,9 +6445,21 @@ def serialize_connector(connector: Connector, *, health: Health | None = None) -
             "next_restart_at": zkt.next_restart_at,
         },
         "terminal_link": terminal_link(connector, now),
+        # Plain naming (device_names) and the /status answer for this device,
+        # both read from memory.
+        **device_names.naming_for(connector),
+        "public_status": public_status.status_for(connector),
     }
     if health is not None:
         row["health"] = health_summary(health)
+    if view == "list":
+        row["payload"] = "list"
+        row["firmware_diagnostics"] = None
+        if row["zkt"] is not None and isinstance(row["zkt"]["capabilities"], dict):
+            row["zkt"]["capabilities"] = {
+                key: value for key, value in row["zkt"]["capabilities"].items()
+                if key not in LIST_VIEW_DROPPED_CAPABILITIES
+            }
     return row
 
 

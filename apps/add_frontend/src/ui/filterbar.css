@@ -1,0 +1,42 @@
+/* ADD kit: filter bar. Imported by the component itself, so it ships with the page that uses it. */
+.ui-filter-chip::after { content: ""; position: absolute; inset: 50% auto auto 50%; width: max(100%, var(--touch-min)); height: max(100%, var(--touch-min)); transform: translate(-50%, -50%); }
+/* Filter bar -------------------------------------------------------------- */
+.ui-filter-bar { display: grid; gap: var(--space-3); margin-bottom: var(--space-4); }
+.ui-filter-row { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); }
+.ui-filter-search { position: relative; min-width: min(100%, 240px); flex: 1 1 280px; max-width: 480px; }
+.ui-filter-search input { padding-right: 44px; padding-left: 36px; }
+.ui-filter-search input::-webkit-search-cancel-button { appearance: none; }
+.ui-filter-search-icon { position: absolute; top: 50%; left: 12px; color: var(--text-tertiary); transform: translateY(-50%); pointer-events: none; }
+.ui-filter-search-clear { position: absolute; top: 50%; right: 4px; width: 32px; min-height: 32px; height: 32px; transform: translateY(-50%); }
+.ui-filter-sort { position: relative; display: flex; align-items: center; }
+.ui-filter-sort > svg { position: absolute; left: 12px; color: var(--text-tertiary); pointer-events: none; }
+.ui-filter-sort select { width: auto; padding-left: 34px; }
+.ui-filter-more-count { min-width: 20px; height: 20px; display: inline-grid; place-items: center; padding: 0 6px; border-radius: var(--radius-full); color: var(--on-solid); background: var(--accent); font-size: var(--text-xs); font-weight: 600; }
+.ui-filter-actions { display: flex; gap: var(--space-2); margin-left: auto; }
+.ui-filter-chips { display: flex; flex-wrap: wrap; gap: var(--space-2); }
+.ui-filter-chip { position: relative; min-height: 32px; display: inline-flex; align-items: center; gap: 6px; padding: 0 var(--space-3); border: 1px solid var(--border-strong); border-radius: var(--radius-full); color: var(--text); background: var(--surface); font-size: var(--text-sm); font-weight: 500; white-space: nowrap; transition: background-color var(--motion-fade) var(--ease-out), border-color var(--motion-fade) var(--ease-out); }
+.ui-filter-chip:hover { border-color: var(--border-hover-strong); background: var(--surface-hover); }
+.ui-filter-chip[aria-pressed="true"] { border-color: var(--accent); color: var(--accent-hover); background: var(--accent-subtle); }
+.ui-filter-chip-count { color: var(--text-secondary); font-variant-numeric: tabular-nums; }
+.ui-filter-chip[aria-pressed="true"] .ui-filter-chip-count { color: inherit; }
+.ui-filter-status { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2) var(--space-3); }
+.ui-filter-result { margin: 0; color: var(--text-secondary); font-size: var(--text-sm); }
+.ui-filter-active { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); margin: 0; padding: 0; list-style: none; }
+.ui-filter-active-chip { min-height: 32px; display: inline-flex; align-items: center; gap: 4px; padding: 0 var(--space-2) 0 var(--space-3); border: 1px solid var(--accent-border); border-radius: var(--radius-full); color: var(--accent-hover); background: var(--accent-subtle); font-size: var(--text-sm); font-weight: 500; }
+.ui-filter-clear { min-height: 32px; font-size: var(--text-sm); }
+.ui-filter-popover { max-height: inherit; overflow: auto; padding: var(--space-4); border: 1px solid var(--border); border-radius: var(--radius-md); background: var(--surface); box-shadow: var(--shadow-lg); }
+
+
+@media (max-width: 760px) {
+  /* Search and Filters share one row; sort lives in the Filters sheet. */
+  .ui-filter-search { max-width: none; flex: 1 1 0; min-width: 0; }
+  .ui-filter-sheet-sort { margin-bottom: var(--space-4); }
+  .ui-filter-sheet-sort .ui-filter-sort, .ui-filter-sheet-sort select { width: 100%; }
+  .ui-filter-chips { flex-wrap: nowrap; overflow-x: auto; scrollbar-width: none; }
+  .ui-filter-chips::-webkit-scrollbar { display: none; }
+  .ui-filter-chip { flex: none; }
+}
+
+@media (pointer: coarse) {
+  .ui-filter-search-clear { width: 40px; min-height: 40px; height: 40px; }
+}

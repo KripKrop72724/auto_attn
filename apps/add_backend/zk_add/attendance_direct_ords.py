@@ -29,6 +29,7 @@ from sqlalchemy import func, select, tuple_
 
 from zk_add import source_newest_slot as newest_slot
 from zk_add.attendance_cnic_link import unknown_synced_cnic_expression
+from zk_add import attendance_words
 from zk_add.attendance_direct_ords_schemas import DirectOrdsCnicChoice
 from zk_add.attendance_force_release import _lock_scheduler
 from zk_add.attendance_legacy_uid import potentially_recoverable
@@ -789,7 +790,16 @@ def _reason(error: str | None) -> str:
         return "Oracle cannot accept this older punch ID. The punch remains saved for ID repair."
     if error in REASONS:
         return REASONS[error]
+    # Stored item text stays as before (custody module); previews use _shown_reason.
     return error.replace("_", " ").title() if error else "Approved; waiting to prepare delivery."
+
+
+def _shown_reason(error: str | None) -> str:
+    """The sentence a preview answer shows: an unknown code gets one plain sentence
+    (never a title-cased code); the code itself stays in ``exclusion``."""
+    if error and error not in REASONS and error != "INVALID_EVENT_UID":
+        return attendance_words.UNKNOWN_REASON
+    return _reason(error)
 
 
 def _group_key(kind: str, row: dict, *facts) -> str:
@@ -853,7 +863,7 @@ def preview(session, event_ids) -> dict:
             "display_name": user.display_name if user else event.display_name,
             "device_event_time": event.device_event_time,
             "exclusion": None if check.error in hidden else check.error,
-            "exclusion_reason": None if check.error in hidden else _reason(check.error),
+            "exclusion_reason": None if check.error in hidden else _shown_reason(check.error),
             "cnic_source": resolution.source,
             "punch_time_cnic": punch.state if punch else None,
             "punch_time_cnic_masked": mask_cnic(punch.cnic) if other_cnic else None,

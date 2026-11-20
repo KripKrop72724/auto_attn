@@ -12,6 +12,7 @@ from uuid import uuid4
 from sqlalchemy import func, or_, select
 
 from zk_add.attendance_manual_guard import decision_for
+from zk_add import attendance_words
 from zk_add.attendance_recovery import (
     RecoveryError,
     _digest,
@@ -1392,6 +1393,8 @@ def serialize(session, job, actor):
                 "ready": ready_by_device.get(c.id, 0),
                 "synced_at": t.synced_at,
                 "error": explain(t.error_code) if t.error_code else None,
+                # The code behind "error", for the page's own plain words.
+                "error_code": t.error_code,
             }
             for t, c in devices
         ],
@@ -1424,6 +1427,8 @@ def items_page(session, job, *, cursor=0, limit=50, state=None, search=None):
                 "status": i.status,
                 "needs_attention": bool(i.result.get("needs_attention")),
                 "reason": i.result.get("reason", explain(i.error_code)),
+                "reason_code": attendance_words.force_item_reason_code(
+                    i.error_code, i.result.get("reason", explain(i.error_code))),
                 "name": e.display_name,
                 "user_id": e.user_id,
                 "device_name": c.display_name,

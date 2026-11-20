@@ -317,7 +317,7 @@ start. On a Mac, keep it plugged in and keep the lid open until the app says
    builds (it never rebuilds, so ADD offers exactly the tested files) and runs
    `deploy/add/publish-installer-app.ps1`, which checks each file against its
    build's `SHA256SUMS.txt` and puts both into ADD's installer app store
-   (below). ADD then offers them on the **Prepare an ESP32** page. The run's
+   (below). ADD then offers them on the **Set up a device** page (Advanced tools › Set up a device). The run's
    summary names the published version.
 
 Pull requests that touch `apps/esp_installer/**` run the same build and smoke
@@ -374,7 +374,7 @@ The smoke-test logs are in `esp-installer-smoke-logs-<commit>` (Windows) and
 
 ### ADD's installer app store
 
-The **Prepare an ESP32** page offers the newest published version for each
+The **Set up a device** page offers the newest published version for each
 platform from a store on the ADD host:
 
 - **Host directory:** `ADD_INSTALLER_APP_STORE_HOST_PATH`. When it is unset,
@@ -421,7 +421,7 @@ artifacts:
 ### Share it
 
 - **The dashboard:** once published, anyone with an ADD sign-in downloads the
-  right file from **Prepare an ESP32**.
+  right file from **Set up a device** (Advanced tools › Set up a device).
 - **WhatsApp:** send the `.exe` or `.dmg` as a **Document**, not as a photo or
   video.
 - **Email:** Gmail and many other mail systems block `.exe` and `.dmg` files,

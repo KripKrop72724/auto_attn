@@ -1,0 +1,306 @@
+// The app frame: live updates, menu, routes, layout at every size.
+import AxeBuilder from '@axe-core/playwright'
+import { expect, test, device, expectOnlyAllowedStorage, mockDashboard, nationwideDevices, representativeUser } from './fixtures'
+import { reportPlainWords } from './plainWords'
+
+test.beforeEach(async ({ page }) => mockDashboard(page))
+
+test('a permanently closed event stream reconnects while fleet snapshots keep refreshing', async ({ page }) => {
+  let streamRequests = 0
+  let fleetRequests = 0
+  page.on('request', request => {
+    if (new URL(request.url()).pathname === '/api/v1/devices') fleetRequests += 1
+  })
+  await page.route('**/events/v1/stream', async route => {
+    streamRequests += 1
+    // HTTP 204 puts the browser's real EventSource in CLOSED; its native
+    // transient-error retry cannot recover this connection.
+    await route.fulfill({ status: 204 })
+  })
+  await page.clock.install({ time: new Date('2026-10-04T09:00:00Z') })
+  // Freeze before app startup so real network scheduling cannot move an
+  // attempt a few milliseconds past the next 30-second clock boundary.
+  await page.clock.pauseAt(new Date('2026-10-04T09:00:01Z'))
+  await page.goto('/home')
+  // React reveals a lazy page on its own short timer, which the paused clock
+  // holds back. Step the clock a little at a time (far below the 30 s check)
+  // until the page shows.
+  const homeHeading = page.getByRole('heading', { name: 'Home', exact: true, level: 1 })
+  await expect(async () => {
+    await page.clock.runFor(100)
+    await expect(homeHeading).toBeVisible({ timeout: 100 })
+  }).toPass({ timeout: 10_000 })
+  await expect.poll(() => streamRequests).toBe(1)
+  await expect(page.locator('.live-sync')).toHaveText('Reconnecting…')
+  const initialFleetRequests = fleetRequests
+  await page.clock.runFor(30_200)
+  await expect.poll(() => streamRequests).toBe(2)
+  await expect.poll(() => fleetRequests).toBeGreaterThan(initialFleetRequests)
+  const phone = (page.viewportSize()?.width || 0) <= 760
+  await expect(page.locator('.live-sync')).toHaveText(phone ? 'Offline' : 'Offline · showing last saved data')
+  await expect(page.locator('.live-banner')).toContainText('Trying again…')
+  await expect(page.getByText('Cached data', { exact: true })).toHaveCount(0)
+  await expect(page.getByText('Live transport', { exact: true })).toHaveCount(0)
+  await page.clock.runFor(30_000)
+  await expect.poll(() => streamRequests).toBe(3)
+})
+
+test('adaptive shell has no horizontal overflow and meets critical accessibility checks', async ({ page }) => {
+  const check = async () => {
+    const dimensions = await page.evaluate(() => ({
+      viewport: window.innerWidth,
+      content: document.documentElement.scrollWidth,
+      offenders: Array.from(document.querySelectorAll<HTMLElement>('body *'))
+        .filter((element) => element.getBoundingClientRect().right > window.innerWidth + 1)
+        .slice(0, 8)
+        .map((element) => ({ tag: element.tagName, className: element.className, parent: element.parentElement?.className, right: Math.round(element.getBoundingClientRect().right), scrollWidth: element.scrollWidth })),
+    }))
+    expect(dimensions.content, JSON.stringify(dimensions.offenders)).toBeLessThanOrEqual(dimensions.viewport)
+    const results = await new AxeBuilder({ page }).withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa']).analyze()
+    expect(results.violations.filter((violation) => ['critical', 'serious'].includes(violation.impact || ''))).toEqual([])
+  }
+  await page.emulateMedia({ reducedMotion: 'reduce' })
+  await page.goto('/home')
+  await expect(page.getByRole('heading', { name: 'Home', exact: true, level: 1 })).toBeVisible()
+  await expect(page.getByRole('region', { name: 'Summary' }).getByRole('link')).toHaveCount(4)
+  await expect(page.getByRole('region', { name: 'Life' })).toBeVisible()
+  await expect(page.getByRole('region', { name: 'Health' })).toBeVisible()
+  await expect(page.getByRole('region', { name: 'Pakistan device network map' })).toHaveCount(0)
+  await check()
+  await page.goto('/devices')
+  await expect(page.getByRole('link', { name: 'Open SLIC Tower · 3rd Floor, Health, working' })).toBeVisible()
+  await check()
+})
+
+test('primary routes and device deep link remain usable', async ({ page }, testInfo) => {
+  await page.goto('/devices')
+  await page.getByRole('link', { name: 'Open SLIC Tower · 3rd Floor, Health, working' }).click()
+  await expect(page).toHaveURL(/\/devices\/connector-one$/)
+  const phone = (page.viewportSize()?.width || 0) <= 760
+  const panel = page.getByRole('dialog', { name: /3rd Floor/i })
+  await expect(panel).toBeVisible()
+  if (phone) {
+    await expect(panel.getByRole('heading', { level: 1, name: /3rd Floor/i })).toBeVisible()
+    await expect(panel.getByRole('button', { name: 'Back' })).toBeVisible()
+  }
+  // The engineer custody card moved to Tools › Advanced tools (04-device §6).
+  await panel.getByRole('tab', { name: 'Tools' }).click()
+  await panel.getByRole('button', { name: 'Advanced tools · for IT' }).click()
+  await panel.getByRole('button', { name: 'Show the IT view' }).click()
+  const custody = page.getByRole('article', { name: 'ZKT ADD custody' })
+  await expect(custody.getByRole('heading', { name: 'Preserved records need processing repair' })).toBeVisible()
+  await custody.locator('summary').click()
+  await expect(custody.getByText('Protocol review', { exact: true })).toBeVisible()
+  await expect(custody.getByText('Not established by custody')).toBeVisible()
+  await expect(custody.getByText('Proposed facts · qualification required')).toBeVisible()
+  await expect(custody.getByRole('heading', { name: 'ADD worker · all ZKT connectors' })).toBeVisible()
+  await expect(custody.getByText('Stalled', { exact: true })).toBeVisible()
+  const bounds = await custody.evaluate(element => ({ width: element.clientWidth, scroll: element.scrollWidth }))
+  expect(bounds.scroll).toBeLessThanOrEqual(bounds.width + 1)
+  if (process.env.ADD_VISUAL_QA === '1') await custody.screenshot({ path: testInfo.outputPath('custody-panel.png') })
+  await panel.getByRole('button', { name: phone ? 'Back' : 'Close', exact: true }).click()
+
+  const primaryNav = page.getByRole('navigation', { name: 'Main menu' })
+  // On a phone People and the Advanced tools live in the More sheet.
+  const openFromMore = async (name: RegExp) => {
+    await primaryNav.getByRole('button', { name: 'More', exact: true }).click()
+    await page.getByRole('dialog', { name: 'More' }).getByRole('link', { name }).click()
+  }
+  if (phone) await openFromMore(/^People/)
+  else await primaryNav.getByRole('link', { name: 'People', exact: true }).click()
+  await expect(page.getByRole('heading', { name: 'People', exact: true, level: 1 })).toBeVisible()
+  await primaryNav.getByRole('link', { name: 'Attendance', exact: true }).click()
+  await expect(page.getByRole('heading', { name: 'Attendance', exact: true, level: 1 })).toBeVisible()
+  if (phone) {
+    const moreTrigger = primaryNav.getByRole('button', { name: 'More', exact: true })
+    await moreTrigger.click()
+    await expect(page.getByRole('dialog', { name: 'More' })).toBeVisible()
+    await page.keyboard.press('Escape')
+    await expect(page.getByRole('dialog', { name: 'More' })).toHaveCount(0)
+    await expect(moreTrigger).toBeFocused()
+    await openFromMore(/^Recover attendance/)
+    await expect(page.getByRole('heading', { name: 'Recover attendance', exact: true, level: 1 })).toBeVisible()
+    await openFromMore(/^Software updates/)
+  } else {
+    await primaryNav.getByRole('link', { name: 'Recover attendance', exact: true }).click()
+    await expect(page.getByRole('heading', { name: 'Recover attendance', exact: true, level: 1 })).toBeVisible()
+    await primaryNav.getByRole('link', { name: 'Software updates', exact: true }).click()
+  }
+  await expect(page.getByRole('heading', { name: 'Software updates', exact: true, level: 1 })).toBeVisible()
+  // The OTA channel strip is gone (ADV-12): the status line says it in words and
+  // its links stay one row high.
+  const status = page.getByRole('region', { name: 'Software status' })
+  await expect(status).toContainText(/devices? (are|is) up to date/)
+  const statusLink = status.locator('.updates-status-link').first()
+  if (await statusLink.count()) {
+    const box = await statusLink.boundingBox()
+    expect(box?.height || 0).toBeGreaterThanOrEqual(44)
+  }
+  await page.getByRole('tab', { name: /Versions/ }).click()
+  await expect(page.getByRole('heading', { name: 'Software versions' })).toBeVisible()
+  await expect(page.getByText('2.2.30', { exact: true })).toBeVisible()
+  await page.getByRole('tab', { name: /Updates/ }).click()
+  await expect(page.getByRole('heading', { name: 'Updates', exact: true })).toBeVisible()
+  await primaryNav.getByRole('link', { name: /^Problems/ }).click()
+  await expect(page.getByRole('heading', { name: 'Problems', exact: true, level: 1 })).toBeVisible()
+  expect(page.url()).not.toMatch(/cnic|password|reason|confirmation/i)
+  await expectOnlyAllowedStorage(page)
+})
+
+test('reported viewport thresholds, route scroll reset, and collision layers remain bounded', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop-1280', 'Threshold matrix runs once in Chromium; Firefox and WebKit retain their dedicated projects.')
+  // Thirteen screen sizes, a scroll round trip and three layered sheets: about
+  // 17 s alone, so it needs more than the default 30 s when workers share CPUs.
+  test.slow()
+  const sizes = [
+    { width: 320, height: 720 }, { width: 390, height: 844 },
+    { width: 759, height: 800 }, { width: 760, height: 800 }, { width: 761, height: 800 },
+    { width: 768, height: 1024 }, { width: 1024, height: 600 }, { width: 1224, height: 697 },
+    { width: 1279, height: 720 }, { width: 1280, height: 720 }, { width: 1281, height: 720 },
+    { width: 1440, height: 900 }, { width: 1600, height: 1000 },
+  ]
+  const routes = ['/home', '/people/connector-one', '/attendance', '/recover', '/updates', '/setup', '/problems', '/devices', '/settings']
+  for (let index = 0; index < sizes.length; index += 1) {
+    await page.setViewportSize(sizes[index])
+    await page.goto(routes[index % routes.length])
+    await expect(page.locator('.app-header')).toBeVisible()
+    await page.waitForTimeout(200)
+    const bounds = await page.evaluate(() => ({
+      width: window.innerWidth,
+      documentWidth: document.documentElement.scrollWidth,
+      shell: document.querySelector<HTMLElement>('.app-shell')?.getBoundingClientRect().height || 0,
+      workspace: document.querySelector<HTMLElement>('.app-workspace')?.getBoundingClientRect().height || 0,
+      viewportHeight: window.innerHeight,
+      offenders: Array.from(document.querySelectorAll<HTMLElement>('body *')).filter((element) => {
+        const rect = element.getBoundingClientRect()
+        return rect.right > window.innerWidth + 1 || rect.left < -1
+      }).slice(0, 8).map((element) => ({ tag: element.tagName, text: element.textContent?.trim().slice(0, 30), className: element.className, parent: element.parentElement?.className, right: Math.round(element.getBoundingClientRect().right), scrollWidth: element.scrollWidth })),
+    }))
+    expect(bounds.documentWidth, `${sizes[index].width}x${sizes[index].height} on ${routes[index % routes.length]} offenders=${JSON.stringify(bounds.offenders)}`).toBeLessThanOrEqual(bounds.width)
+    expect(Math.abs(bounds.shell - bounds.viewportHeight)).toBeLessThanOrEqual(1)
+    expect(Math.abs(bounds.workspace - bounds.viewportHeight)).toBeLessThanOrEqual(1)
+  }
+
+  await page.setViewportSize({ width: 1224, height: 697 })
+  await page.goto('/people/connector-one')
+  const workspace = page.locator('.app-workspace')
+  await expect(page.getByRole('article', { name: /Ayesha Khan, Employee ID 1007/i })).toBeVisible()
+  await page.waitForTimeout(120)
+  await workspace.evaluate((node) => { node.scrollTop = Math.min(360, node.scrollHeight - node.clientHeight) })
+  const savedScroll = await workspace.evaluate((node) => node.scrollTop)
+  expect(savedScroll).toBeGreaterThan(0)
+  await page.getByRole('navigation', { name: 'Main menu' }).getByRole('link', { name: 'Software updates', exact: true }).click()
+  await expect(page.getByRole('heading', { name: 'Software updates', exact: true, level: 1 })).toBeVisible()
+  await expect.poll(() => workspace.evaluate((node) => node.scrollTop)).toBe(0)
+  await page.goBack()
+  await expect(page.getByRole('heading', { name: 'People', exact: true, level: 1 })).toBeVisible()
+  await expect.poll(() => workspace.evaluate((node) => node.scrollTop)).toBe(savedScroll)
+
+  await page.route('**/api/v1/devices*', (route) => route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ rows: nationwideDevices }) }))
+  await page.goto('/people')
+  // The device list is the page now (no popover); pick the fixture by its link, not its position.
+  const deviceList = page.locator('.people-device-list')
+  await expect(deviceList).toBeVisible()
+  await expect(page.getByText(/No device matches/)).toHaveCount(0)
+  const towerLink = deviceList.locator('a.ui-row-link[href*="/people/tower-thirteen"]')
+  await towerLink.scrollIntoViewIfNeeded()
+  await towerLink.click()
+  await expect(page).toHaveURL(/\/people\/tower-thirteen$/)
+  await page.getByRole('button', { name: 'Change device' }).click()
+  const sheet = page.locator('.ui-sheet').last()
+  await expect(sheet).toBeVisible()
+  const sheetBox = await sheet.boundingBox()
+  expect(sheetBox?.x || 0).toBeGreaterThanOrEqual(0)
+  expect((sheetBox?.x || 0) + (sheetBox?.width || 0)).toBeLessThanOrEqual(1224 + 1)
+  expect((sheetBox?.y || 0) + (sheetBox?.height || 0)).toBeLessThanOrEqual(697 + 1)
+  await expect(sheet.locator('.people-device-list a.ui-row-link').last()).toBeVisible()
+  await page.keyboard.press('Escape')
+  await expect(sheet).toHaveCount(0)
+
+  const directoryUsers = Array.from({ length: 43 }, (_, index) => ({ ...representativeUser, id: index + 1, user_key: `operator-${index + 1}`, uid: `${index + 1}`, user_id: `${40_000 + index}`, display_name: `Operator ${index + 1}` }))
+  // The People page reads the device's own record too; serve tower-three's,
+  // not the shared stub's empty answer, so its people can be changed.
+  const towerThree = nationwideDevices.find((row) => row.connector_id === 'tower-three')
+  await page.route('**/api/v1/devices/tower-three', (route) => route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(towerThree) }))
+  await page.route('**/api/v2/devices/*/users*', (route) => route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ rows: directoryUsers, next_cursor: null, device: towerThree, identity_integrity: { source: 'CURRENT_COMPLETE_ZKT_SNAPSHOT', total_users: 43, with_cnic: 43, missing_cnic: 0, duplicate_groups: 0, duplicate_users: 0, resolved_duplicate_groups: 0, unresolved_duplicate_groups: 0, unresolved_duplicate_users: 0 } }) }))
+  await page.goto('/people/tower-three')
+  const finalRow = page.getByRole('article', { name: /Operator 43, Employee ID 40042/i })
+  await finalRow.scrollIntoViewIfNeeded()
+  const finalMore = finalRow.getByLabel('More for Operator 43')
+  await finalMore.click()
+  const actionLayer = page.locator('.user-action-layer')
+  await expect(actionLayer.getByRole('group', { name: 'Options for Operator 43' })).toBeVisible()
+  const actionBox = await actionLayer.boundingBox()
+  expect(actionBox?.y || 0).toBeGreaterThanOrEqual(11)
+  expect((actionBox?.y || 0) + (actionBox?.height || 0)).toBeLessThanOrEqual(697 - 11)
+  await page.keyboard.press('Escape')
+  await expect(finalMore).toBeFocused()
+
+  const firstRow = page.getByRole('article', { name: /Operator 1, Employee ID 40000/i })
+  await firstRow.getByRole('button', { name: 'Edit Operator 1' }).click()
+  const userDialog = page.getByRole('dialog', { name: 'Edit Operator 1' })
+  await expect(userDialog).toBeVisible()
+  const overlayOrder = await page.evaluate(() => {
+    const overlayRoot = document.querySelector<HTMLElement>('#overlay-root')
+    const stickyLayers = ['.app-header', '.live-banner', '.app-sidebar', '.users-section-tabs', '.user-directory-head']
+      .map((selector) => document.querySelector<HTMLElement>(selector))
+      .filter((node): node is HTMLElement => Boolean(node))
+    const overlayZ = Number.parseInt(getComputedStyle(overlayRoot as HTMLElement).zIndex, 10)
+    return {
+      overlayZ,
+      highestStickyZ: Math.max(...stickyLayers.map((node) => Number.parseInt(getComputedStyle(node).zIndex, 10) || 0)),
+      dialogInsideOverlay: Boolean(document.querySelector('.dialog-backdrop')?.closest('#overlay-root')),
+    }
+  })
+  expect(overlayOrder.dialogInsideOverlay).toBe(true)
+  expect(overlayOrder.overlayZ).toBeGreaterThan(overlayOrder.highestStickyZ)
+  await expect(page.locator('#root')).toHaveAttribute('inert', '')
+  await page.getByRole('button', { name: 'Close', exact: true }).click()
+})
+
+test('old addresses and bookmarks open the new pages with their filters kept', async ({ page }) => {
+  // Ten full page loads (each starts the whole app): about 3 s each in Firefox
+  // and WebKit when workers share CPUs, so it needs more than the default 30 s.
+  test.slow()
+  const redirects: Array<[string, RegExp]> = [
+    ['/fleet', /\/home$/],
+    ['/fleet/connector-one', /\/devices\/connector-one$/],
+    ['/users/connector-one', /\/people\/connector-one$/],
+    ['/alerts?division=life', /\/problems\?division=life$/],
+    ['/reconciliation?tab=exceptions', /\/recover\?tab=unreadable$/],
+    ['/reconciliation?tab=source-exceptions&device_id=connector-one', /\/recover\?tab=unreadable&device_id=connector-one$/],
+    ['/firmware?tab=prepare', /\/setup$/],
+    ['/firmware?tab=campaigns', /\/updates\?tab=updates$/],
+    ['/#users', /\/people$/],
+    ['/no-such-page', /\/home$/],
+  ]
+  for (const [from, to] of redirects) {
+    await page.goto(from)
+    await expect(page).toHaveURL(to)
+    await expect(page.locator('.app-header')).toBeVisible()
+    expect(page.url()).not.toMatch(/cnic|password|reason|confirmation/i)
+    expect(page.url()).not.toMatch(/\d{6,}/)
+  }
+  await expectOnlyAllowedStorage(page)
+})
+
+test('frame controls are at least 44 px on touch screens and use plain words', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'phone-390-touch', 'Touch sizes are checked on the phone project.')
+  await page.goto('/home')
+  await expect(page.getByRole('heading', { name: 'Home', exact: true, level: 1 })).toBeVisible()
+  const small = async (selector: string) => page.evaluate((root) => Array.from(document.querySelectorAll<HTMLElement>(`${root} :is(a[href], button, [role="radio"])`))
+    .filter((element) => {
+      if (element.closest('.skip-link') || element.classList.contains('skip-link')) return false
+      const box = element.getBoundingClientRect()
+      const style = getComputedStyle(element)
+      return box.width > 0 && box.height > 0 && style.visibility !== 'hidden' && (box.width < 44 || box.height < 44)
+    })
+    .map((element) => `${element.tagName} "${(element.getAttribute('aria-label') || element.textContent || '').trim().slice(0, 30)}" ${Math.round(element.getBoundingClientRect().width)}x${Math.round(element.getBoundingClientRect().height)}`), selector)
+  expect(await small('.app-header')).toEqual([])
+  expect(await small('.app-sidebar')).toEqual([])
+  await page.getByRole('navigation', { name: 'Main menu' }).getByRole('button', { name: 'More', exact: true }).click()
+  await expect(page.getByRole('dialog', { name: 'More' })).toBeVisible()
+  expect(await small('.more-sheet')).toEqual([])
+  const words = await reportPlainWords(page, testInfo, 'more-sheet')
+  expect(words).toEqual([])
+})

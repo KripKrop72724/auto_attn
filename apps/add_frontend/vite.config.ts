@@ -26,6 +26,18 @@ export default defineConfig({
     fileParallelism: false,
     exclude: ['tests/e2e/**', 'node_modules/**', 'dist/**'],
   },
+  // `vite preview` (the e2e server) sends the production security headers
+  // from security-headers.conf, so a Content Security Policy break fails the
+  // browser tests instead of the live site (FND-1). The dev server stays open.
+  preview: {
+    headers: {
+      'X-Content-Type-Options': 'nosniff',
+      'X-Frame-Options': 'DENY',
+      'Referrer-Policy': 'same-origin',
+      'Permissions-Policy': 'camera=(), microphone=(), geolocation=()',
+      'Content-Security-Policy': "default-src 'self'; connect-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'",
+    },
+  },
   server: {
     proxy: {
       '/api': 'http://localhost:8096',

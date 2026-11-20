@@ -1,15 +1,18 @@
 import {
   useCallback,
+  useEffect,
   useLayoutEffect,
   useRef,
   useState,
   type CSSProperties,
+  type KeyboardEvent as ReactKeyboardEvent,
   type ReactNode,
   type RefObject,
 } from 'react'
 import { createPortal } from 'react-dom'
+import { focusableIn } from './ui/useFocusTrap'
 
-export type AnchoredLayerDismissReason = 'escape' | 'outside'
+export type AnchoredLayerDismissReason = 'escape' | 'outside' | 'tab'
 
 type LayerPosition = {
   ready: boolean
@@ -40,6 +43,7 @@ export function AnchoredLayer({
   matchAnchor = false,
   mobileSheet = false,
   preferredWidth = 320,
+  manageFocus = false,
   onDismiss,
 }: {
   anchorRef: RefObject<HTMLElement | null>
@@ -48,6 +52,8 @@ export function AnchoredLayer({
   matchAnchor?: boolean
   mobileSheet?: boolean
   preferredWidth?: number
+  /** A popover with fields: focus moves in on open, and Tab past either end closes it and goes back to the anchor. */
+  manageFocus?: boolean
   onDismiss: (reason: AnchoredLayerDismissReason) => void
 }) {
   const layerRef = useRef<HTMLDivElement>(null)
@@ -154,6 +160,25 @@ export function AnchoredLayer({
     }
   }, [anchorRef, onDismiss, updatePosition])
 
+  // Focus moves into the layer once it is placed (it is the last thing in the
+  // page order, so Tab alone would never reach it).
+  useEffect(() => {
+    if (!manageFocus || !position.ready) return
+    const layer = layerRef.current
+    if (layer && !layer.contains(document.activeElement)) focusableIn(layer)[0]?.focus()
+  }, [manageFocus, position.ready])
+
+  const onLayerKeyDown = (event: ReactKeyboardEvent<HTMLDivElement>) => {
+    if (!manageFocus || event.key !== 'Tab') return
+    const items = focusableIn(layerRef.current)
+    if (!items.length) return
+    const leaving = event.shiftKey ? document.activeElement === items[0] : document.activeElement === items[items.length - 1]
+    if (!leaving) return
+    event.preventDefault()
+    anchorRef.current?.focus()
+    onDismiss('tab')
+  }
+
   const style = {
     top: position.mobile ? undefined : position.top,
     left: position.mobile ? undefined : position.left,
@@ -168,6 +193,7 @@ export function AnchoredLayer({
       className={`anchored-layer ${position.mobile ? 'is-mobile-sheet' : ''} ${className}`.trim()}
       data-placement={position.placement}
       style={style}
+      onKeyDown={manageFocus ? onLayerKeyDown : undefined}
     >
       {children}
     </div>,

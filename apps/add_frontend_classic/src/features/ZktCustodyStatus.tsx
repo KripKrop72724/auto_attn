@@ -1,0 +1,192 @@
+import { useEffect, useState } from 'react'
+import { api } from '../api'
+import { humanizeStatus } from '../status'
+
+type Work = {
+  id: number; state: string; reason_code: string; owner: string;
+  updated_at: string; next_attempt_at: string | null;
+  decoding?: {
+    version: string; result: string; step_index: number; sampled_at: string;
+    authority: 'UNQUALIFIED'; current_input: boolean; current_decoder: boolean;
+  } | null;
+}
+type Processor = {
+  schema_version: 1; instance_id: string; sampled_at: string;
+  state: 'NOT_STARTED' | 'STARTING' | 'RUNNING' | 'IDLE' | 'WAITING_FOR_LOCK' | 'RETRYING' | 'STALLED' | 'STOPPED';
+  last_completed_at: string | null; last_progress_at: string | null;
+  inspected_groups_total: number; successful_ticks: number; failed_ticks: number;
+  last_tick_ms: number | null;
+}
+type SourceBoundary = {
+  state: 'HELD' | 'VERIFIED_SOURCE_ANCHOR'; reason: string;
+  migration_certified: false; delivery_permission: 'NOT_EVALUATED';
+  source_epoch?: string; next_ordinal?: number; record_size?: number;
+  writer_digest?: string; capture_epoch?: string; sampled_at?: string;
+}
+type LegacyHandoff = { state: 'NOT_COMMITTED' } | { state: 'HELD'; reason: string } | {
+  state: 'COMMITTED'; receipt_id: string; evidence_digest: string; created_at: string;
+  scope: 'LOCAL_LEGACY_ABSENCE_AND_SOURCE_BOUNDARY_V1';
+  oracle_delivery: 'NOT_ASSERTED'; historical_completeness: 'NOT_ASSERTED';
+}
+export type CustodySnapshot = {
+  connector_id: string; enabled: boolean; sampled_at: string;
+  oracle_completion: 'NOT_ASSERTED'; missing_processing_obligation: boolean;
+  counts: { state: string; owner: string; count: number }[];
+  rows: Work[]; next_cursor: number | null;
+  processor?: Processor;
+  source_boundary?: SourceBoundary;
+  legacy_handoff?: LegacyHandoff;
+}
+const states: Record<string, string> = {
+  PENDING: 'Awaiting inspection', INTERPRETING: 'Interpretation in progress', WAIT_FRAGMENTS: 'Waiting for packet fragments',
+  WAIT_PROFILE: 'Waiting for profile qualification', WAIT_SOURCE: 'Waiting for source evidence',
+  HELD_EXCEPTION: 'Preserved for review', RETRY_SYSTEM: 'System retry pending',
+  SOURCE_ASSOCIATED: 'Source linked', HELD_OCCURRENCE: 'Occurrence link needs review',
+  ATTENDANCE_CREATED: 'Attendance created from source', HELD_SOURCE: 'Source handoff needs review',
+}
+const owners: Record<string, string> = {
+  ADD_PROTOCOL: 'Protocol review', ADD_EVIDENCE_REVIEW: 'Evidence review',
+  ADD_OPERATIONS: 'ADD operations', ADD_RECONCILIATION: 'Reconciliation',
+  ADD_DELIVERY: 'Attendance delivery',
+}
+const label = (state: string) => states[state] || humanizeStatus(state)
+const owner = (value: string) => owners[value] || humanizeStatus(value)
+const date = (value: string) => new Date(value).toLocaleString('en-GB', { timeZone: 'Asia/Karachi' })
+const timestamp = (value: unknown): value is string => typeof value === 'string' && Number.isFinite(Date.parse(value))
+const counter = (value: unknown): value is number => Number.isSafeInteger(value) && (value as number) >= 0
+function handoffLabel(value: LegacyHandoff | undefined, fresh: boolean, now: number) {
+  if (!value || value.state === 'NOT_COMMITTED') return 'No committed local handoff receipt'
+  if (value.state === 'HELD') return 'Retained handoff evidence needs review'
+  if (value.state !== 'COMMITTED' || value.scope !== 'LOCAL_LEGACY_ABSENCE_AND_SOURCE_BOUNDARY_V1'
+    || value.oracle_delivery !== 'NOT_ASSERTED' || value.historical_completeness !== 'NOT_ASSERTED'
+    || !/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(value.receipt_id)
+    || !/^[a-f0-9]{64}$/.test(value.evidence_digest) || !timestamp(value.created_at)
+    || Date.parse(value.created_at) > now + 1000) return 'Handoff receipt unavailable'
+  return `${fresh ? '' : 'Previous report: '}Local legacy handoff committed · ${date(value.created_at)} (Pakistan)`
+}
+function boundaryLabel(value: SourceBoundary | undefined, fresh: boolean, now: number) {
+  if (!value || value.migration_certified !== false || value.delivery_permission !== 'NOT_EVALUATED'
+    || typeof value.reason !== 'string' || !/^SOURCE_BOUNDARY_[A-Z_]{1,70}$/.test(value.reason)) return 'Source boundary evidence unavailable'
+  if (value.state === 'HELD') return `${fresh ? '' : 'Previous report: '}${humanizeStatus(value.reason)}`
+  if (value.state !== 'VERIFIED_SOURCE_ANCHOR' || value.reason !== 'SOURCE_BOUNDARY_MATCHES_ADD_CUSTODY'
+    || !counter(value.next_ordinal) || value.next_ordinal > 0x7fffffff
+    || !(value.next_ordinal === 0 ? value.record_size === 0 : [8, 16, 40, 49].includes(value.record_size || 0))
+    || !timestamp(value.sampled_at) || Date.parse(value.sampled_at) > now + 1000
+    || typeof value.writer_digest !== 'string' || typeof value.capture_epoch !== 'string' || typeof value.source_epoch !== 'string'
+    || !/^[a-f0-9]{64}$/.test(value.writer_digest || '') || !/^[a-f0-9]{32}$/.test(value.capture_epoch || '')
+    || !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(value.source_epoch || '')) return 'Source boundary evidence unavailable'
+  return fresh && now - Date.parse(value.sampled_at) <= 45_000
+    ? 'Boundary matches preserved source bytes in ADD' : 'Previous report: boundary matched preserved source bytes in ADD'
+}
+const interpretations: Record<string, string> = {
+  PENDING: 'Interpretation in progress', UNQUALIFIED_FACTS: 'Proposed facts · qualification required',
+  AMBIGUOUS_LAYOUT: 'Ambiguous record layout', DECODE_REJECTED: 'No valid interpretation',
+}
+function decodingStatus(value: Work['decoding'], sampledAt: string) {
+  if (!value) return 'No decoding evidence recorded'
+  if (value.authority !== 'UNQUALIFIED' || !interpretations[value.result] || !counter(value.step_index)
+    || typeof value.version !== 'string' || !value.version || value.version.length > 80
+    || typeof value.current_input !== 'boolean' || typeof value.current_decoder !== 'boolean'
+    || !timestamp(value.sampled_at) || Date.parse(value.sampled_at) > Date.parse(sampledAt) + 1000) return 'Decoding evidence unavailable'
+  if (!value.current_input) return 'Earlier capture evidence · inspection required'
+  if (!value.current_decoder) return 'Earlier decoder version · inspection required'
+  return interpretations[value.result]
+}
+function validProcessor(value: Processor | undefined): value is Processor {
+  return value?.schema_version === 1 && typeof value.instance_id === 'string' && /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(value.instance_id)
+    && timestamp(value.sampled_at) && Date.parse(value.sampled_at) <= Date.now() + 1000
+    && ['NOT_STARTED', 'STARTING', 'RUNNING', 'IDLE', 'WAITING_FOR_LOCK', 'RETRYING', 'STALLED', 'STOPPED'].includes(value.state)
+    && [value.last_completed_at, value.last_progress_at].every(time => time === null ||
+      (timestamp(time) && Date.parse(time) <= Date.parse(value.sampled_at) + 1000))
+    && [value.inspected_groups_total, value.successful_ticks, value.failed_ticks].every(counter)
+    && (value.last_tick_ms === null || counter(value.last_tick_ms))
+}
+function valid(value: CustodySnapshot, connector: string) {
+  return value?.connector_id === connector && typeof value.enabled === 'boolean' && timestamp(value.sampled_at)
+    && Date.parse(value.sampled_at) <= Date.now() + 1000
+    && value.oracle_completion === 'NOT_ASSERTED' && typeof value.missing_processing_obligation === 'boolean'
+    && Array.isArray(value.counts) && value.counts.length <= 100 && value.counts.every(row =>
+      typeof row.state === 'string' && typeof row.owner === 'string' && Number.isSafeInteger(row.count) && row.count >= 0)
+    && Array.isArray(value.rows) && value.rows.length <= 10 && value.rows.every(row =>
+      Number.isSafeInteger(row.id) && typeof row.state === 'string' && typeof row.reason_code === 'string'
+      && typeof row.owner === 'string' && timestamp(row.updated_at)
+      && (row.next_attempt_at === null || timestamp(row.next_attempt_at)))
+}
+
+export function ZktCustodyStatus({ connectorId, revision }: { connectorId: string; revision: number }) {
+  const [snapshot, setSnapshot] = useState<CustodySnapshot | null>(null)
+  const [failureFor, setFailureFor] = useState<string | null>(null)
+  const [refresh, setRefresh] = useState(0)
+  const [now, setNow] = useState(Date.now)
+  useEffect(() => {
+    const poll = window.setInterval(() => setRefresh(value => value + 1), 30_000)
+    const clock = window.setInterval(() => setNow(Date.now()), 1000)
+    return () => { window.clearInterval(poll); window.clearInterval(clock) }
+  }, [])
+  useEffect(() => {
+    let active = true
+    const controller = new AbortController()
+    const deadline = window.setTimeout(() => controller.abort(), 10_000)
+    void api<CustodySnapshot>(`/api/v1/devices/${encodeURIComponent(connectorId)}/zkt-custody?limit=10`, { signal: controller.signal })
+      .then(value => {
+        if (!active || controller.signal.aborted) return
+        if (!valid(value, connectorId)) throw new Error('Custody snapshot is unverified')
+        setSnapshot(prior => prior?.connector_id === connectorId && Date.parse(prior.sampled_at) > Date.parse(value.sampled_at) ? prior : value)
+        setFailureFor(null)
+      })
+      .catch(() => { if (active) setFailureFor(connectorId) })
+      .finally(() => window.clearTimeout(deadline))
+    return () => { active = false; window.clearTimeout(deadline); controller.abort() }
+  }, [connectorId, revision, refresh])
+  const data = snapshot?.connector_id === connectorId ? snapshot : null
+  const failed = failureFor === connectorId
+  const age = data ? now - Date.parse(data.sampled_at) : NaN
+  const fresh = !failed && age >= -1000 && age <= 45_000
+  const processor = validProcessor(data?.processor) ? data.processor : null
+  const processorFresh = fresh && processor && now - Date.parse(processor.sampled_at) <= 45_000
+  const heading = failed ? 'Custody status unavailable' : !data ? 'Loading custody status'
+    : !fresh ? 'Custody evidence is stale' : !data.enabled ? 'Journal custody is not enabled'
+      : data.missing_processing_obligation ? 'Preserved records need processing repair' : 'ADD custody processing'
+  return <article className="detail-card wide" aria-label="ZKT ADD custody">
+    <div className="detail-title"><div><p className="eyebrow">ADD CUSTODY</p><h3>{heading}</h3></div>
+      <button className="text-button" onClick={() => setRefresh(value => value + 1)}>Refresh custody</button></div>
+    <p>Custody confirms preservation in ADD. Identity resolution, source coverage and Oracle completion require their own evidence.</p>
+    {!data ? <p>Processing counts are unknown until ADD returns a verified snapshot.</p> : <>
+      {!fresh && <p>Values below are the last report and do not confirm current processing status.</p>}
+      <dl>
+        <div><dt>Evidence sampled (Pakistan)</dt><dd>{date(data.sampled_at)} · {Math.max(0, Math.floor(age / 1000))} seconds ago</dd></div>
+        <div><dt>Journal receipt path</dt><dd>{data.enabled ? 'Enabled' : 'Not enabled'}</dd></div>
+        <div><dt>Missing processing obligations</dt><dd>{data.missing_processing_obligation ? 'Detected — needs ADD operations review' : 'None detected in this snapshot'}</dd></div>
+        <div><dt>Oracle completion</dt><dd>Not established by custody</dd></div>
+        <div><dt>Source handoff boundary</dt><dd>{boundaryLabel(data.source_boundary, fresh, now)}</dd></div>
+        <div><dt>Local legacy handoff</dt><dd>{handoffLabel(data.legacy_handoff, fresh, now)}</dd></div>
+      </dl>
+      <p>A local handoff receipt records the source boundary and empty legacy queues at cutover. Historical completeness, current device health and Oracle completion have separate checks.</p>
+      <h4>ADD worker · all ZKT connectors</h4>
+      {!processor ? <p>Worker progress evidence is unavailable.</p> : <dl>
+        <div><dt>{processorFresh ? 'Worker state' : 'Last reported worker state'}</dt><dd>{humanizeStatus(processor.state)}</dd></div>
+        <div><dt>Last completed inspection (Pakistan)</dt><dd>{processor.last_completed_at ? date(processor.last_completed_at) : 'Not recorded'}</dd></div>
+        <div><dt>Last group progress (Pakistan)</dt><dd>{processor.last_progress_at ? date(processor.last_progress_at) : 'Not recorded'}</dd></div>
+        <div><dt>Last batch duration</dt><dd>{processor.last_tick_ms === null ? 'Unknown' : `${processor.last_tick_ms.toLocaleString()} ms`}</dd></div>
+        <div><dt>Inspected groups · this worker instance</dt><dd>{processor.inspected_groups_total.toLocaleString()}</dd></div>
+        <div><dt>Completed / failed batches</dt><dd>{processor.successful_ticks.toLocaleString()} / {processor.failed_ticks.toLocaleString()}</dd></div>
+      </dl>}
+      <p>Worker activity measures inspection progress. It does not establish identity resolution or Oracle delivery.</p>
+      <h4>Processing groups</h4>
+      <p>A group can contain several observations. These counts are not punch totals.</p>
+      <dl>{data.counts.map(row => <div key={`${row.state}:${row.owner}`}>
+        <dt>{label(row.state)} · {owner(row.owner)}</dt><dd>{row.count.toLocaleString()}</dd>
+      </div>)}</dl>
+      {!data.counts.length && <p>No journal processing groups recorded.</p>}
+      {!!data.rows.length && <><h4>Latest {data.rows.length} processing {data.rows.length === 1 ? 'group' : 'groups'}</h4>
+        {data.rows.map(row => <details className="custody-work-group" key={row.id}>
+          <summary>{label(row.state)} · {humanizeStatus(row.reason_code)}</summary>
+          <dl><div><dt>Responsible team</dt><dd>{owner(row.owner)}</dd></div>
+            <div><dt>Last updated (Pakistan)</dt><dd>{date(row.updated_at)}</dd></div>
+            <div><dt>Decoding result</dt><dd>{decodingStatus(row.decoding, data.sampled_at)}</dd></div>
+            <div><dt>Next inspection</dt><dd>{row.next_attempt_at ? date(row.next_attempt_at) : row.state === 'SOURCE_ASSOCIATED' ? 'Source association complete' : row.state === 'ATTENDANCE_CREATED' ? 'Attendance created; delivery has separate evidence' : 'Waiting for relevant evidence or review'}</dd></div></dl>
+          <p>Decoding evidence does not establish terminal profile qualification or employee identity.</p>
+        </details>)}</>}
+    </>}
+  </article>
+}

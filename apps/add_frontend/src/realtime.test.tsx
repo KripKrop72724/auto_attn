@@ -218,4 +218,51 @@ describe('device refresh and stream recovery', () => {
     act(() => { vi.advanceTimersByTime(30_120) })
     expect(topics).toHaveBeenCalledWith(new Set(['resync']))
   })
+  it("passes each event's data to the event callback before the topics", () => {
+    vi.useFakeTimers()
+    vi.stubGlobal('EventSource', Stream)
+    const order: string[] = []
+    const topics = vi.fn(() => order.push('topics'))
+    const events = vi.fn(() => order.push('events'))
+    renderHook(() => useRealtime(true, topics, events))
+    act(() => {
+      Stream.latest.onopen?.()
+      Stream.latest.dispatchEvent(new MessageEvent('heartbeat', { data: JSON.stringify({ connector_id: 'one', state: 'ONLINE' }) }))
+      Stream.latest.dispatchEvent(new MessageEvent('log', { data: 'not json' }))
+      vi.advanceTimersByTime(120)
+    })
+    expect(order).toEqual(['events', 'topics'])
+    expect(events).toHaveBeenCalledExactlyOnceWith([
+      { topic: 'device', name: 'heartbeat', data: { connector_id: 'one', state: 'ONLINE' } },
+      { topic: 'log', name: 'log', data: null },
+    ])
+    expect(topics).toHaveBeenLastCalledWith(new Set(['resync', 'device', 'log']))
+  })
+  it('re-reads everything from the timer only once a minute while the stream is healthy', () => {
+    vi.useFakeTimers()
+    vi.stubGlobal('EventSource', Stream)
+    const topics = vi.fn()
+    renderHook(() => useRealtime(true, topics))
+    act(() => { Stream.latest.onopen?.(); vi.advanceTimersByTime(120) })
+    topics.mockClear()
+    // Keepalives every 10 s keep the stream healthy for two minutes.
+    for (let second = 10; second <= 120; second += 10) {
+      act(() => {
+        vi.advanceTimersByTime(10_000)
+        Stream.latest.dispatchEvent(new Event('keepalive'))
+      })
+    }
+    act(() => { vi.advanceTimersByTime(120) })
+    const resyncs = topics.mock.calls.filter(([set]) => (set as Set<string>).has('resync')).length
+    expect(resyncs).toBe(2)
+  })
+  it('counts connections so a reconnect can check for a new version', () => {
+    vi.useFakeTimers()
+    vi.stubGlobal('EventSource', Stream)
+    const { result } = renderHook(() => useRealtime(true, vi.fn()))
+    expect(result.current.connections).toBe(0)
+    act(() => { Stream.latest.onopen?.() })
+    act(() => { Stream.latest.onopen?.() })
+    expect(result.current.connections).toBe(2)
+  })
 })

@@ -37,6 +37,8 @@ def test_attendance_exposes_retained_owner_without_backfilling_terminal_serial(d
         "display_name": "ZONE-KARACHI-01",
         "zone_id": "ZONE-KARACHI",
         "zone_name": "Karachi",
+        "division": "health",
+        "friendly_name": "Karachi · Device 1",
     }
     assert saved["device_serial"] == missing_serial
     assert saved["terminal_provenance"]["state"] == "MISSING_TERMINAL_PROVENANCE"

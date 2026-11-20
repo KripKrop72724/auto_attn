@@ -1,6 +1,17 @@
 import type { FirmwareDiagnostics } from '../types'
 import { useEffect, useState } from 'react'
+import { ago, clock } from '../lib/time'
+import { TechnicalDetails } from '../ui'
+import { spacedCode, technicalCode } from '../words/technical'
 import { captureLatencyLabel } from './captureLatency'
+
+// "Link box memory" (08-advanced 2.7, ADV-18): a plain three-line summary on
+// the same verdict variables as before (verified, fresh, sameBoot,
+// journalNeedsAttention); every engineering row moves unchanged into
+// Technical details. Placed in the device detail by chapter 04.
+const many = (count: number, one: string, other = `${one}s`) => `${count} ${count === 1 ? one : other}`
+// Queues of check-ins still to be sent to the dashboard.
+const SEND_QUEUES = new Set(['add_delivery', 'journal_add_delivery', 'legacy_add_delivery', 'live', 'bulk'])
 
 const bytes = (value?: number | null) => value == null ? 'Not reported' : `${(value / 1024).toLocaleString(undefined, { maximumFractionDigits: 1 })} KiB`
 const labels: Record<string, string> = {
@@ -53,7 +64,7 @@ const exceptionDetails: Record<string, string> = {
   BYTES: 'unreadable bytes outside the held pages', UNMATCHED: 'unreadable files the report does not list',
   HELD_READABLE: 'a file the repair holds now reads whole or is missing',
 }
-const code = (value?: string | null) => value ? value.replaceAll('_', ' ').toLowerCase() : ''
+const code = technicalCode
 
 export function FirmwareHealth({ diagnostics, observedAt, bootId, imageDigest }: {
   diagnostics?: FirmwareDiagnostics | null
@@ -109,30 +120,37 @@ export function FirmwareHealth({ diagnostics, observedAt, bootId, imageDigest }:
   const journalNeedsAttention = ownerFresh && journalStorage &&
     (['DEGRADED', 'FULL'].includes(journalStorage.durability) || !journalStorage.ready ||
       journalStorage.checkpoint_recovery_pending || (journalStorage.last_append_result && journalStorage.last_append_result !== 'OK'))
-  const heading = !diagnostics ? 'Local durability not reported'
-    : !sameBoot ? 'Durability boot identity is unverified'
-      : !fresh ? 'Durability telemetry is stale'
-      : verified ? 'Local storage verified'
-        : storage?.durability === 'DEGRADED' || storage?.durability === 'FULL' || storage?.persistence_probe_error || legacyNeedsAttention || journalNeedsAttention ? 'Local storage needs attention'
-          : 'Local recovery checks pending'
-  return <article className="detail-card wide" aria-label="Firmware preservation health">
-    <p className="eyebrow">ATTENDANCE PRESERVATION</p>
+  const heading = !diagnostics ? 'Not reported by this link box'
+    : !sameBoot ? 'Waiting for a fresh report after a restart'
+      : !fresh ? 'Last report is old'
+      : verified ? 'Check-ins are being saved safely'
+        : storage?.durability === 'DEGRADED' || storage?.durability === 'FULL' || storage?.persistence_probe_error || legacyNeedsAttention || journalNeedsAttention ? 'Saving check-ins needs attention'
+          : 'Still checking after a restart'
+  const usedPercent = typeof storage?.used_bytes === 'number' && typeof storage?.total_bytes === 'number' && storage.total_bytes > 0
+    ? Math.round((storage.used_bytes / storage.total_bytes) * 100) : null
+  const sendQueues = (diagnostics?.queues ?? []).filter(queue => SEND_QUEUES.has(queue.name))
+  const waiting = sendQueues.length && sendQueues.every(queue => queue.count_known && queue.records != null)
+    ? sendQueues.reduce((total, queue) => total + (queue.records ?? 0), 0) : null
+  return <article className="detail-card wide link-box-memory" aria-label="Link box memory">
     <h3>{heading}</h3>
-    <p>Connection status, local preservation and Oracle delivery are checked separately.</p>
-    {!diagnostics ? <p>This firmware has not reported preservation diagnostics.</p> : <>
-      {!fresh && <p>Values below are the last report and do not confirm current health.</p>}
-      <dl>
-        <div><dt>Telemetry received</dt><dd>{observedAt ? new Date(observedAt).toLocaleString() : 'Not reported'}{Number.isFinite(observed) ? ` · ${Math.max(0, Math.floor((now - observed) / 1000))} seconds ago` : ''}</dd></div>
+    {!diagnostics ? <p>This link box's software doesn't report this.</p> : <>
+      <p>Last report: {Number.isFinite(observed) ? `${clock(observed)} · ${ago(observed, now)}` : 'not received yet'}</p>
+      <p>Storage used: {usedPercent === null ? 'not reported' : `${usedPercent}%`} · Waiting to send: {waiting === null ? 'not counted yet' : many(waiting, 'check-in')}</p>
+      {!fresh && <p>These are from the last report and may be out of date.</p>}
+      <TechnicalDetails>
+      <p>This only shows whether check-ins are saved safely on the link box. Sending to the HR system is shown elsewhere.</p>
+      <dl className="link-box-memory-facts">
+        <div><dt>Telemetry received</dt><dd>{observedAt ? `${clock(observedAt)} PKT` : 'Not reported'}{Number.isFinite(observed) ? ` · ${many(Math.max(0, Math.floor((now - observed) / 1000)), 'second')} ago` : ''}</dd></div>
         <div><dt>Telemetry sampled</dt><dd>{diagnostics.sampled_at || 'Not reported'}</dd></div>
         <div><dt>Boot identity</dt><dd>{diagnostics.boot_id || bootId || 'Not reported'}{!sameBoot ? ' · Boot identity is unverified' : ''}</dd></div>
         <div><dt>Current boot evidence</dt><dd>{currentBootReported ? 'Fresh report from this boot' : 'Unverified'}</dd></div>
         <div><dt>Reported running image</dt><dd>{ota?.running_version || 'Not reported'}{ota?.running_partition ? ` · ${ota.running_partition}` : ''}</dd></div>
         <div><dt>Reported running application digest</dt><dd style={{ overflowWrap: 'anywhere' }}>{ota?.image_sha256 || 'Not reported'}</dd></div>
         <div><dt>Last OTA capability digest</dt><dd style={{ overflowWrap: 'anywhere' }}>{imageDigest || 'Not reported'}</dd></div>
-        <div><dt>Reported OTA state</dt><dd>{ota?.state?.replaceAll('_', ' ') || 'Not reported'}</dd></div>
+        <div><dt>Reported OTA state</dt><dd>{spacedCode(ota?.state) || 'Not reported'}</dd></div>
         {!!ota?.last_error && <div><dt>Reported OTA error</dt><dd>{ota.last_error === 'BOOT_ROLLBACK_PREDECESSOR_UNQUALIFIED'
           ? 'Previous image is not qualified to read the preserved data; connector rollback is held.'
-          : ota.last_error.replaceAll('_', ' ')}</dd></div>}
+          : spacedCode(ota.last_error)}</dd></div>}
         {exception?.state && <div><dt>Storage exception</dt><dd>{code(exception.state)}{exception.reason
           ? ` · ${exceptionReasons[exception.reason] || code(exception.reason)}` : ''}{exception.detail
           ? ` · ${exceptionDetails[exception.detail] || code(exception.detail)}` : ''}{exception.detail_file
@@ -154,7 +172,7 @@ export function FirmwareHealth({ diagnostics, observedAt, bootId, imageDigest }:
         <div><dt>Persistence probe failures</dt><dd>{storage?.persistence_probe_failures ?? 'Not reported'}</dd></div>
         <div><dt>Probe failures since boot</dt><dd>{storage?.persistence_probe_total_failures ?? 'Not reported'}</dd></div>
         {!!storage?.persistence_probe_error && <div><dt>Active persistence probe error</dt><dd>{storage.persistence_probe_operation || 'Operation not reported'} · {storage.persistence_probe_error}</dd></div>}
-        <div><dt>Active reconciliation mode</dt><dd>{diagnostics.reconciliation_mode?.replaceAll('_', ' ') || 'Not reported'}</dd></div>
+        <div><dt>Active reconciliation mode</dt><dd>{spacedCode(diagnostics.reconciliation_mode) || 'Not reported'}</dd></div>
         <div><dt>Committed source cursor</dt><dd>{diagnostics.committed_source_cursor ?? 'Not reported'}</dd></div>
         {capture && <>
           <div><dt>Complete packet preservation time</dt><dd>{captureFresh ? captureLatencyLabel(capture.packet_commit_latency_ms) : 'Current capture timing unverified'}</dd></div>
@@ -182,20 +200,21 @@ export function FirmwareHealth({ diagnostics, observedAt, bootId, imageDigest }:
       </dl>
       {capture?.packet_commit_latency_ms && <p>Timing covers successful preservation in this capture session. Failed or incomplete packets remain separate; this does not certify attendance delivery latency.</p>}
       {diagnostics.workers.map(worker => <p key={worker.name}>
-        {labels[worker.name] || worker.name}: {worker.state === 'UNKNOWN' ? 'Not reported' : worker.state.replaceAll('_', ' ').toLowerCase()}
+        {labels[worker.name] || worker.name}: {worker.state === 'UNKNOWN' ? 'Not reported' : technicalCode(worker.state)}
         {worker.operation ? ` · ${worker.operation}` : ''}
-        {worker.restart_count != null ? ` · ${worker.restart_count} successful restarts` : ''}
-        {worker.restart_attempts != null ? ` · ${worker.restart_attempts} restart attempts` : ''}
-        {worker.pending_requests != null ? ` · ${worker.pending_requests} pending requests` : ''}
-        {worker.failures != null ? ` · ${worker.failures} failures since boot` : ''}
-        {worker.timeouts != null ? ` · ${worker.timeouts} timeouts since boot` : ''}
-        {worker.refusals != null ? ` · ${worker.refusals} admission refusals since boot` : ''}
+        {worker.restart_count != null ? ` · ${many(worker.restart_count, 'successful restart')}` : ''}
+        {worker.restart_attempts != null ? ` · ${many(worker.restart_attempts, 'restart attempt')}` : ''}
+        {worker.pending_requests != null ? ` · ${many(worker.pending_requests, 'pending request')}` : ''}
+        {worker.failures != null ? ` · ${many(worker.failures, 'failure')} since boot` : ''}
+        {worker.timeouts != null ? ` · ${many(worker.timeouts, 'timeout')} since boot` : ''}
+        {worker.refusals != null ? ` · ${many(worker.refusals, 'admission refusal')} since boot` : ''}
       </p>)}
       {!diagnostics.workers.length && <p>Delivery workers: Not reported</p>}
       {diagnostics.queues.map(queue => <p key={queue.name}>
         {labels[queue.name] || queue.name}: {queue.count_known && queue.records != null ? `${queue.records.toLocaleString()} pending` : 'Pending count not reported'} · {bytes(queue.bytes)}
         {queue.count_reason && countReasons[queue.count_reason] ? ` · ${countReasons[queue.count_reason]}` : ''}
       </p>)}
+      </TechnicalDetails>
     </>}
   </article>
 }

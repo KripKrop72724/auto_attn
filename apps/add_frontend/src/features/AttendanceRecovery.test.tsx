@@ -1,7 +1,9 @@
-import { act, cleanup, render, screen, waitFor } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { AttendanceRecoverySummary } from '../types'
-import { AttendanceRecovery, withoutOutboxDetail, withoutOutboxTone } from './AttendanceRecovery'
+import { AttendanceRecovery, notLinedUpTone } from './AttendanceRecovery'
+import { notLinedUpText } from '../words/recover'
+import { expectPlainText } from '../words/testing'
 
 const delivery = (overrides: Partial<AttendanceRecoverySummary['delivery']>): AttendanceRecoverySummary['delivery'] => ({
   safe_retryable: 0,
@@ -13,39 +15,37 @@ const delivery = (overrides: Partial<AttendanceRecoverySummary['delivery']>): At
   ...overrides,
 })
 
-describe('missing outbox detail', () => {
-  it('names held and review rows apart and keeps both out of the missing count', () => {
-    expect(withoutOutboxDetail(delivery({ held_without_outbox: 74838, review_without_outbox: 307 })))
-      .toBe(`Deliverable rows to rebuild · ${(74838).toLocaleString()} held · ${(307).toLocaleString()} for review`)
+describe('not lined up for sending yet', () => {
+  it('names held and set-aside rows apart and keeps both out of the number', () => {
+    expect(notLinedUpText(delivery({ held_without_outbox: 74838, review_without_outbox: 307 })))
+      .toBe(`If this stays above 0 for a day, tell IT. · 74,838 waiting to be matched to an employee · 307 set aside because something looks wrong`)
   })
 
-  it('never calls review rows held', () => {
-    expect(withoutOutboxDetail(delivery({ held_without_outbox: 0, review_without_outbox: 3 })))
-      .toBe('Deliverable rows to rebuild · 3 for review')
-    expect(withoutOutboxDetail(delivery({ held_without_outbox: 5, review_without_outbox: 0 })))
-      .toBe('Deliverable rows to rebuild · 5 held')
-    expect(withoutOutboxDetail(delivery({ held_without_outbox: 0, review_without_outbox: 0 })))
-      .toBe('Deliverable rows to rebuild')
+  it('never calls set-aside rows unmatched', () => {
+    expect(notLinedUpText(delivery({ held_without_outbox: 0, review_without_outbox: 3 })))
+      .toBe('If this stays above 0 for a day, tell IT. · 3 set aside because something looks wrong')
+    expect(notLinedUpText(delivery({ held_without_outbox: 5, review_without_outbox: 0 })))
+      .toBe('If this stays above 0 for a day, tell IT. · 5 waiting to be matched to an employee')
+    expect(notLinedUpText(delivery({ held_without_outbox: 0, review_without_outbox: 0 })))
+      .toBe('If this stays above 0 for a day, tell IT.')
   })
 
-  it('keeps the original label when an older backend still counts held rows as missing', () => {
-    expect(withoutOutboxDetail(delivery({ missing_outbox: 75145 }))).toBe('Durable rows to rebuild')
-    expect(withoutOutboxDetail(undefined)).toBe('Durable rows to rebuild')
-  })
-})
-
-describe('missing outbox tone', () => {
-  it('stays positive when only held or review rows lack an outbox', () => {
-    expect(withoutOutboxTone(delivery({ held_without_outbox: 74838, review_without_outbox: 0 }))).toBe('positive')
-    // ZKT invalid-time quarantines never get an outbox; the Source review tile
-    // already flags them, so they must not keep this tile amber for good.
-    expect(withoutOutboxTone(delivery({ held_without_outbox: 74838, review_without_outbox: 143 }))).toBe('positive')
-    expect(withoutOutboxTone(undefined)).toBe('positive')
+  it('keeps the plain sentence when an older backend still counts held rows inside the number', () => {
+    expect(notLinedUpText(delivery({ missing_outbox: 75145 }))).toBe('If this stays above 0 for a day, tell IT.')
+    expect(notLinedUpText(undefined)).toBe('If this stays above 0 for a day, tell IT.')
   })
 
-  it('turns amber for a real gap, whatever else lacks an outbox', () => {
-    expect(withoutOutboxTone(delivery({ missing_outbox: 1 }))).toBe('warning')
-    expect(withoutOutboxTone(delivery({ missing_outbox: 1, held_without_outbox: 74838, review_without_outbox: 143 }))).toBe('warning')
+  it('stays calm when only held or set-aside rows have no sending slot', () => {
+    expect(notLinedUpTone(delivery({ held_without_outbox: 74838, review_without_outbox: 0 }))).toBe('neutral')
+    // ZKT invalid-time records never get a sending slot; the set-aside row
+    // already flags them, so they must not keep this row amber for good.
+    expect(notLinedUpTone(delivery({ held_without_outbox: 74838, review_without_outbox: 143 }))).toBe('neutral')
+    expect(notLinedUpTone(undefined)).toBe('neutral')
+  })
+
+  it('turns amber for a real gap, whatever else has no sending slot', () => {
+    expect(notLinedUpTone(delivery({ missing_outbox: 1 }))).toBe('warning')
+    expect(notLinedUpTone(delivery({ missing_outbox: 1, held_without_outbox: 74838, review_without_outbox: 143 }))).toBe('warning')
   })
 })
 
@@ -136,7 +136,7 @@ describe('recovery summary refresh budget', () => {
     await releaseAll()
     await waitFor(() => expect(summaryCalls).toBe(3))
     await releaseAll()
-    expect(screen.getByRole('region', { name: 'Recovery health' })).toBeTruthy()
+    expect(screen.getByRole('list', { name: 'Where the check-ins are' })).toBeTruthy()
   })
 
   it('shows when the server computed the shared recovery figures', async () => {
@@ -144,12 +144,56 @@ describe('recovery summary refresh budget', () => {
     try {
       render(<AttendanceRecovery revision={0} toast={toast} />)
       await waitFor(() => expect(summaryCalls).toBe(1))
-      expect(screen.queryByText(/Figures as of/)).toBeNull()
+      expect(screen.queryByText(/Figures from/)).toBeNull()
       await releaseAll()
-      const expected = new Date('2026-11-04T09:15:42Z').toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
-      await waitFor(() => expect(screen.getByText(`Figures as of ${expected}`, { exact: false })).toBeTruthy())
+      const expected = '2:15 pm' // Pakistan time, no seconds
+      await waitFor(() => expect(screen.getByText(`Figures from ${expected}`, { exact: false })).toBeTruthy())
     } finally {
       delete summary.metrics_computed_at
     }
+  })
+
+  it('shows plain rows, no retired resend form and no system words', async () => {
+    const view = render(<AttendanceRecovery revision={0} toast={toast} />)
+    await waitFor(() => expect(summaryCalls).toBe(1))
+    await releaseAll()
+    await screen.findByText('Waiting to be sent again')
+    expect(screen.getByText('Not matched to an employee')).toBeTruthy()
+    expect(screen.getByRole('link', { name: /Send not-matched check-ins automatically/ }).getAttribute('href')).toBe('/attendance?view=fix-tools&tool=auto-send')
+    expect(screen.queryByText(/Preview filtered rows|Approve and queue batch|Audit reason/)).toBeNull()
+    expect(screen.getByText('Fixing impossible times is switched off for now. Ask IT to switch it on.')).toBeTruthy()
+    const calls = (fetch as unknown as ReturnType<typeof vi.fn>).mock.calls.map(([input]) => String(input))
+    expect(calls.some((url) => /attendance-recovery\/(preview|jobs)/.test(url))).toBe(false)
+    expectPlainText(view.container)
+  })
+})
+
+describe('Fix impossible times', () => {
+  const toast = { toast: null, notice: vi.fn(), error: vi.fn(), dismiss: vi.fn() }
+  const respond = (body: unknown) => new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
+  afterEach(() => { cleanup(); vi.unstubAllGlobals() })
+
+  it('sends corrected times typed in Pakistan time as UTC and never calls the retired endpoints', async () => {
+    const posts: Array<{ path: string; body: Record<string, unknown> }> = []
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = new URL(String(input), 'https://add.test').pathname
+      if (init?.method === 'POST') posts.push({ path, body: JSON.parse(String(init.body)) })
+      if (path === '/api/v2/attendance-recovery/summary') return respond({ schema_version: '1', preview_enabled: true, execution_enabled: true, correction_enabled: true, delivery: delivery({}), source: { zkt_invalid_time: 1, zkt_malformed: 0, hikvision: {} } })
+      if (path === '/api/v1/source-exceptions') return respond({ rows: [{ id: 7, display_name: 'ZONE-MULTAN-01', terminal_serial: 'RKQ1', ordinal: 11842, error_code: 'IMPLAUSIBLE_TERMINAL_TIME', observed_uid: '5', raw_record_digest: 'c'.repeat(64) }], totals: { open: 1 }, filtered_total: 1, next_cursor: null })
+      if (path === '/api/v2/source-corrections/candidates') return respond({ rows: [] })
+      if (path === '/api/v2/source-corrections/preview') return respond({ counts: { eligible: 1, rejected: 0 }, confirmation: 'CORRECT 1', candidate_digest: 'd', preview_expires_at: '2026-11-04T10:00:00Z', preview_signature: 's' })
+      return respond({})
+    }))
+    render(<AttendanceRecovery revision={0} toast={toast} />)
+    fireEvent.click(await screen.findByRole('checkbox'))
+    fireEvent.change(screen.getByLabelText('Corrected time for record 11,842 (Pakistan time)'), { target: { value: '2026-11-04T09:00' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Show the fixes' }))
+    await waitFor(() => expect(posts.some((post) => post.path === '/api/v2/source-corrections/preview')).toBe(true))
+    const preview = posts.find((post) => post.path === '/api/v2/source-corrections/preview')!
+    expect(preview.body.corrections).toEqual([{ source_kind: 'ZKT_MANIFEST', source_ref: '7', corrected_device_time: '2026-11-04T04:00:00.000Z' }])
+    // The safeguard stays: password and the typed phrase are still required to apply.
+    const apply = await screen.findByRole('button', { name: 'Fix 1 time' }) as HTMLButtonElement
+    expect(apply.disabled).toBe(true)
+    expect(posts.some((post) => /attendance-recovery\/(preview|jobs)$/.test(post.path))).toBe(false)
   })
 })

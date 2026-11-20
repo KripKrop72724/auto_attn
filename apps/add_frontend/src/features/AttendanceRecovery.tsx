@@ -1,102 +1,100 @@
+// "Not in HR system yet" (08-advanced 1.7, ADV-8; today the "Recovery" tab).
+// Plain rows say what is waiting to reach the HR system and why. The bulk
+// resend form is gone: its server endpoints were retired in #188 and answer
+// 410, so it could only ever fail. The identity panel is now one link row.
+// "Fix impossible times" keeps its preview → approve flow and its safeguard
+// (note, your password and the typed phrase) exactly; only its words, labels
+// and the Pakistan-time dates change.
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { api, queryString } from '../api'
-import { Metric, StatusBadge, idempotency, relativeTime, useToast } from '../App'
-import { Icon } from '../Icon'
-import { humanizeStatus } from '../status'
+import { Button, Callout, ErrorState, Skeleton, StatusChip, TechnicalDetails } from '../ui'
+import { idempotency } from '../lib/idempotency'
+import { plainApiError, type PlainApiError } from '../lib/plainApiError'
+import { ago, dayTime, pktInputToUtc } from '../lib/time'
 import { useThrottledRunner } from '../lib/throttle'
 import { formatMetricsTime } from '../lib/metricsTime'
+import { formatCount } from '../words/glossary'
+import { FIX_TIMES, HELD_TAB, notLinedUpText, recoveryJob, setAsideText } from '../words/recover'
+import type { Toast } from '../ui/Toast'
 import type {
-  AttendanceRecoveryAction,
   AttendanceRecoveryJob,
-  AttendanceRecoveryPreview,
   AttendanceRecoverySummary,
   SourceCorrectionCandidate,
   SourceExceptionList,
 } from '../types'
+import { chipTone } from './recover/tones'
 
-type Toast = ReturnType<typeof useToast>
-
-const actions: Array<{ value: AttendanceRecoveryAction; label: string; description: string }> = [
-  { value: 'RETRY_DELIVERY', label: 'Retry safe delivery', description: 'Queue eligible events through the existing idempotent ORDS outbox.' },
-  { value: 'REBUILD_OUTBOX', label: 'Rebuild missing outbox', description: 'Create only missing durable delivery rows.' },
-  { value: 'RECOVER_STALE_IN_FLIGHT', label: 'Recover stale in-flight', description: 'Requeue deliveries whose worker lease has expired.' },
-]
-
-function formatDate(value: string | null) {
-  if (!value) return '—'
-  return new Date(value).toLocaleString()
-}
-
-// Identity-held and review-quarantined punches get no Oracle work item until
-// they are released, so they are named beside the missing count, never inside
-// it. Review rows (non-identity quarantines and unknown states) are never
-// called held. Only a real gap colours this tile: every review row is also
-// counted by the Source review tile, which turns critical, and ZKT invalid-time
-// quarantines never get an outbox, so colouring this tile for them would keep
-// it amber for good and hide a new gap.
 type RecoveryDelivery = AttendanceRecoverySummary['delivery']
 
-export function withoutOutboxDetail(delivery?: RecoveryDelivery) {
-  if (!delivery || (delivery.held_without_outbox === undefined && delivery.review_without_outbox === undefined)) {
-    // An older backend counted held rows inside missing_outbox.
-    return 'Durable rows to rebuild'
-  }
-  const parts = ['Deliverable rows to rebuild']
-  if (delivery.held_without_outbox) parts.push(`${delivery.held_without_outbox.toLocaleString()} held`)
-  if (delivery.review_without_outbox) parts.push(`${delivery.review_without_outbox.toLocaleString()} for review`)
-  return parts.join(' · ')
+/**
+ * Only a real gap colours the "Not lined up for sending yet" row: held and
+ * set-aside rows never get a sending slot until they are released, so they are
+ * named beside the number, never inside it.
+ */
+export function notLinedUpTone(delivery?: RecoveryDelivery): 'warning' | 'neutral' {
+  return delivery?.missing_outbox ? 'warning' : 'neutral'
 }
 
-export function withoutOutboxTone(delivery?: RecoveryDelivery): 'positive' | 'warning' {
-  return delivery?.missing_outbox ? 'warning' : 'positive'
-}
-
-// Automatic (realtime) refreshes of the recovery summary and the source
-// correction lists start at most this often and never overlap. The summary
-// counts the whole attendance and ORDS backlog, which is heavy during a large
-// release or reconcile.
+// Automatic (realtime) refreshes of the summary and the time-fix lists start at
+// most this often and never overlap. The summary counts the whole attendance
+// and HR system backlog, which is heavy during a large release or recovery.
 export const RECOVERY_SUMMARY_REFRESH_MS = 15_000
+
+type CorrectionPreview = {
+  counts: { eligible: number; rejected: number }
+  confirmation: string
+  candidate_digest: string
+  preview_expires_at: string
+  preview_signature: string
+  rejected?: Array<{ source_ref: string; reason: string }>
+}
+
+function SummaryRow({ label, value, sentence, tone = 'neutral', link }: { label: string; value: number | null; sentence?: string; tone?: 'warning' | 'neutral'; link?: { label: string; href?: string; onClick?: () => void } }) {
+  return (
+    <li className="recover-held-row" data-tone={tone}>
+      <span className="recover-held-label">{label}</span>
+      <strong className="recover-held-value">{value === null ? <Skeleton variant="line" width="56px" /> : formatCount(value)}</strong>
+      <span className="recover-held-text">
+        {sentence}
+        {link && (link.href
+          ? <a className="text-button" href={link.href}>{link.label} ›</a>
+          : <button type="button" className="text-button" onClick={link.onClick}>{link.label} ›</button>)}
+      </span>
+    </li>
+  )
+}
 
 export function AttendanceRecovery({
   revision,
   toast,
   refreshToken = 0,
   onSummary,
+  onShowUnreadable,
 }: {
   revision: number
   toast: Toast
-  /** Changes when the operator presses the page Refresh button. */
+  /** Changes when the person presses the page Refresh. */
   refreshToken?: number
   onSummary?: (summary: AttendanceRecoverySummary) => void
+  onShowUnreadable?: () => void
 }) {
   const [summary, setSummary] = useState<AttendanceRecoverySummary | null>(null)
-  const [summaryError, setSummaryError] = useState('')
-  const [action, setAction] = useState<AttendanceRecoveryAction>('RETRY_DELIVERY')
-  const [zone, setZone] = useState('')
-  const [terminal, setTerminal] = useState('')
-  const [family, setFamily] = useState('')
-  const [status, setStatus] = useState('')
-  const [sourceEpoch, setSourceEpoch] = useState('')
-  const [fromAt, setFromAt] = useState('')
-  const [toAt, setToAt] = useState('')
-  const [staleOnly, setStaleOnly] = useState(false)
-  const [errorCategory, setErrorCategory] = useState('')
-  const [provenance, setProvenance] = useState('')
-  const [reason, setReason] = useState('')
-  const [password, setPassword] = useState('')
-  const [confirmation, setConfirmation] = useState('')
-  const [preview, setPreview] = useState<AttendanceRecoveryPreview | null>(null)
-  const [previewError, setPreviewError] = useState('')
-  const [busy, setBusy] = useState(false)
-  const [job, setJob] = useState<AttendanceRecoveryJob | null>(null)
+  const [summaryError, setSummaryError] = useState<unknown>(null)
   const [sourceExceptions, setSourceExceptions] = useState<SourceExceptionList | null>(null)
   const [hikvisionCandidates, setHikvisionCandidates] = useState<SourceCorrectionCandidate[]>([])
-  const [sourceError, setSourceError] = useState('')
+  const [sourceError, setSourceError] = useState<unknown>(null)
   const [selectedExceptions, setSelectedExceptions] = useState<Set<number>>(new Set())
   const [selectedHikvision, setSelectedHikvision] = useState<Set<number>>(new Set())
   const [correctionTimes, setCorrectionTimes] = useState<Record<number, string>>({})
   const [hikvisionCorrectionTimes, setHikvisionCorrectionTimes] = useState<Record<number, string>>({})
-  const [correctionPreview, setCorrectionPreview] = useState<any>(null)
+  const [correctionPreview, setCorrectionPreview] = useState<CorrectionPreview | null>(null)
+  const [reason, setReason] = useState('')
+  const [password, setPassword] = useState('')
+  const [confirmation, setConfirmation] = useState('')
+  const [actionError, setActionErrorState] = useState<PlainApiError | null>(null)
+  const showActionError = (error: unknown, fallback: string) => setActionErrorState(plainApiError(error, fallback))
+  const [busy, setBusy] = useState(false)
+  const [job, setJob] = useState<AttendanceRecoveryJob | null>(null)
   const [controlBusy, setControlBusy] = useState(false)
   const [controlConfirmation, setControlConfirmation] = useState('')
 
@@ -104,26 +102,26 @@ export function AttendanceRecovery({
   onSummaryRef.current = onSummary
   const loadSummary = useCallback(async () => {
     try {
-      setSummaryError('')
+      setSummaryError(null)
       const result = await api<AttendanceRecoverySummary>('/api/v2/attendance-recovery/summary')
       setSummary(result)
       onSummaryRef.current?.(result)
     } catch (error) {
-      setSummaryError(error instanceof Error ? error.message : 'Recovery summary could not be loaded.')
+      setSummaryError(error)
     }
   }, [])
 
   const loadSourceExceptions = useCallback(async () => {
     try {
-      setSourceError('')
+      setSourceError(null)
       const [zkt, hik] = await Promise.all([
         api<SourceExceptionList>('/api/v1/source-exceptions' + queryString({ review_state: 'OPEN', limit: 50 })),
         api<{ rows: SourceCorrectionCandidate[] }>('/api/v2/source-corrections/candidates?limit=50'),
       ])
       setSourceExceptions(zkt)
-      setHikvisionCandidates(hik.rows)
+      setHikvisionCandidates(hik.rows || [])
     } catch (error) {
-      setSourceError(error instanceof Error ? error.message : 'Source corrections could not be loaded.')
+      setSourceError(error)
     }
   }, [])
 
@@ -155,84 +153,28 @@ export function AttendanceRecovery({
     return () => window.clearInterval(timer)
   }, [job])
 
-  const filters = useMemo(() => ({
-    zone_id: zone || undefined,
-    terminal_serial: terminal || undefined,
-    firmware_family: family || undefined,
-    lane: 'SAFE_DELIVERY',
-    statuses: status ? [status] : [],
-    source_epoch: sourceEpoch || undefined,
-    from_at: fromAt ? new Date(fromAt).toISOString() : undefined,
-    to_at: toAt ? new Date(toAt).toISOString() : undefined,
-    stale_only: staleOnly,
-    ords_error_category: errorCategory || undefined,
-    provenance: provenance || undefined,
-  }), [errorCategory, family, fromAt, provenance, sourceEpoch, staleOnly, status, terminal, toAt, zone])
-
-  const runPreview = async () => {
-    setBusy(true)
-    setPreviewError('')
-    try {
-      const result = await api<AttendanceRecoveryPreview>('/api/v2/attendance-recovery/preview', {
-        method: 'POST',
-        body: JSON.stringify({ action, filters, reason: reason.trim() || 'Preview safe attendance delivery recovery.' }),
-      })
-      setPreview(result)
-      setConfirmation(result.confirmation)
-    } catch (error) {
-      setPreviewError(error instanceof Error ? error.message : 'The recovery preview could not be generated.')
-    } finally {
-      setBusy(false)
-    }
-  }
-
-  const createJob = async () => {
-    if (!preview) return
-    setBusy(true)
-    setPreviewError('')
-    try {
-      const result = await api<AttendanceRecoveryJob>('/api/v2/attendance-recovery/jobs', {
-        method: 'POST',
-        body: JSON.stringify({ action, filters, reason, password, typed_confirmation: confirmation, candidate_digest: preview.candidate_digest, preview_expires_at: preview.preview_expires_at, preview_signature: preview.preview_signature, idempotency_key: idempotency('attendance-recovery') }),
-      })
-      setJob(result)
-      toast.notice('Recovery batch queued. No source rows were changed.')
-    } catch (error) {
-      setPreviewError(error instanceof Error ? error.message : 'The recovery batch could not be queued.')
-    } finally {
-      setBusy(false)
-    }
-  }
-
-  const correctionInputs = [...selectedExceptions]
+  // Corrected times are typed in Pakistan time and sent as UTC.
+  const correctionInputs = useMemo(() => [...selectedExceptions]
     .filter((id) => correctionTimes[id])
-    .map((id) => ({
-      source_kind: 'ZKT_MANIFEST',
-      source_ref: String(id),
-      corrected_device_time: new Date(correctionTimes[id]).toISOString(),
-    }))
-    .concat(
-      [...selectedHikvision]
-        .filter((id) => hikvisionCorrectionTimes[id])
-        .map((id) => ({
-          source_kind: 'HIKVISION_EVIDENCE',
-          source_ref: String(id),
-          corrected_device_time: new Date(hikvisionCorrectionTimes[id]).toISOString(),
-        })),
-    )
+    .map((id) => ({ source_kind: 'ZKT_MANIFEST', source_ref: String(id), corrected_device_time: pktInputToUtc(correctionTimes[id]) }))
+    .concat([...selectedHikvision]
+      .filter((id) => hikvisionCorrectionTimes[id])
+      .map((id) => ({ source_kind: 'HIKVISION_EVIDENCE', source_ref: String(id), corrected_device_time: pktInputToUtc(hikvisionCorrectionTimes[id]) }))),
+  [correctionTimes, hikvisionCorrectionTimes, selectedExceptions, selectedHikvision])
 
   const previewCorrections = async () => {
     if (!correctionInputs.length) return
     setBusy(true)
+    setActionErrorState(null)
     try {
-      const result = await api<any>('/api/v2/source-corrections/preview', {
+      const result = await api<CorrectionPreview>('/api/v2/source-corrections/preview', {
         method: 'POST',
         body: JSON.stringify({ corrections: correctionInputs, reason: reason.trim() || 'Preview timestamp correction.' }),
       })
       setCorrectionPreview(result)
       setConfirmation(result.confirmation)
     } catch (error) {
-      setPreviewError(error instanceof Error ? error.message : 'The correction preview could not be generated.')
+      showActionError(error, "Couldn't show the fixes. Try again.")
     } finally {
       setBusy(false)
     }
@@ -241,27 +183,22 @@ export function AttendanceRecovery({
   const createCorrections = async () => {
     if (!correctionPreview) return
     setBusy(true)
+    setActionErrorState(null)
     try {
       const result = await api<AttendanceRecoveryJob>('/api/v2/source-corrections/jobs', {
         method: 'POST',
         body: JSON.stringify({ corrections: correctionInputs, reason, password, typed_confirmation: confirmation, candidate_digest: correctionPreview.candidate_digest, preview_expires_at: correctionPreview.preview_expires_at, preview_signature: correctionPreview.preview_signature, idempotency_key: idempotency('attendance-source-correction') }),
       })
       setJob(result)
-      toast.notice('Timestamp correction batch queued. Original source evidence remains immutable.')
+      toast.notice(FIX_TIMES.queued)
     } catch (error) {
-      setPreviewError(error instanceof Error ? error.message : 'The correction batch could not be queued.')
+      showActionError(error, "Couldn't fix the times. Try again.")
     } finally {
       setBusy(false)
     }
   }
 
-  const toggleException = (id: number) => setSelectedExceptions((current) => {
-    const next = new Set(current)
-    if (next.has(id)) next.delete(id)
-    else next.add(id)
-    return next
-  })
-  const toggleHikvision = (id: number) => setSelectedHikvision((current) => {
+  const toggle = (setter: typeof setSelectedExceptions, id: number) => setter((current) => {
     const next = new Set(current)
     if (next.has(id)) next.delete(id)
     else next.add(id)
@@ -272,7 +209,7 @@ export function AttendanceRecovery({
     if (!job || !password || reason.trim().length < 10) return
     const expectedConfirmation = `${control.toUpperCase()} ${job.job_id}`
     if (controlConfirmation.trim() !== expectedConfirmation) {
-      setPreviewError(`Type ${expectedConfirmation} to confirm this job control action.`)
+      setActionErrorState({ sentence: `Type ${expectedConfirmation} to confirm.`, raw: '', code: null })
       return
     }
     setControlBusy(true)
@@ -283,9 +220,9 @@ export function AttendanceRecovery({
       })
       setJob(updated)
       setControlConfirmation('')
-      toast.notice(`Recovery job ${control} request accepted.`)
+      toast.notice(FIX_TIMES.controlDone[control])
     } catch (error) {
-      setPreviewError(error instanceof Error ? error.message : 'The recovery job control request failed.')
+      showActionError(error, "That didn't work. Try again.")
     } finally {
       setControlBusy(false)
     }
@@ -293,40 +230,141 @@ export function AttendanceRecovery({
 
   const delivery = summary?.delivery
   const summaryAsOf = formatMetricsTime(summary?.metrics_computed_at)
+  const number = (value: number | undefined) => (summary ? value ?? 0 : null)
+  const correctionEnabled = Boolean(summary?.correction_enabled)
+  const toFix = (sourceExceptions?.totals?.open ?? 0) + hikvisionCandidates.length
+  const jobWords = job ? recoveryJob(job.status) : null
+  const controlPhrase = job ? `${['QUEUED', 'RUNNING', 'PAUSE_REQUESTED'].includes(job.status) ? 'PAUSE' : job.status === 'PAUSED' ? 'RESUME' : 'CANCEL'} ${job.job_id}` : ''
+
   return (
-    <div className="reconciliation-recovery">
-      <section className="metric-grid reconciliation-metrics" aria-label="Recovery health">
-        <Metric label="Safe delivery" value={(delivery?.safe_retryable ?? 0).toLocaleString()} detail="Eligible for preview and bulk retry" icon="refresh" tone={delivery?.safe_retryable ? 'warning' : 'positive'} />
-        <Metric label="Missing outbox" value={(delivery?.missing_outbox ?? 0).toLocaleString()} detail={withoutOutboxDetail(delivery)} icon="server" tone={withoutOutboxTone(delivery)} />
-        <Metric label="Active in-flight" value={(delivery?.active_in_flight ?? 0).toLocaleString()} detail="Owned by a live worker lease" icon="pulse" tone="neutral" />
-        <Metric label="Identity held" value={(delivery?.identity_held ?? 0).toLocaleString()} detail="Read-only evidence lane" icon="shield" tone={delivery?.identity_held ? 'warning' : 'positive'} />
-        <Metric label="Source review" value={(delivery?.permanent_review ?? 0).toLocaleString()} detail={`${summary?.source.zkt_invalid_time ?? 0} invalid ZKT timestamps`} icon="alert" tone={delivery?.permanent_review ? 'critical' : 'positive'} />
+    <div className="recover-held">
+      <section className="recover-section-head" aria-labelledby="recover-held-title">
+        <h2 id="recover-held-title">{HELD_TAB.title}</h2>
+        <p>{HELD_TAB.intro}</p>
+        <p className="recover-muted">
+          {HELD_TAB.introMore}{summaryAsOf ? ` ${HELD_TAB.figuresFrom(summaryAsOf)}.` : ''} {HELD_TAB.national}
+        </p>
       </section>
-      {summaryAsOf && <p className="fleet-toolbar-note recovery-metrics-note" title="Time the server computed these recovery figures"><Icon name="clock" /> Figures as of {summaryAsOf}</p>}
-      {(summaryError || previewError) && <div className="inline-retry pattern-blocked" role="alert"><Icon name="alert" /><span>{summaryError || previewError}</span><button className="button secondary" onClick={() => void summaryRefresh.runNow()}>Retry</button></div>}
-      <section className="panel recovery-action-panel">
-        <div className="panel-header"><div><p className="eyebrow">SAFE DELIVERY LANE</p><h2>Recover preserved attendance in bulk</h2><p>Identity-held and unsafe rows are automatically excluded. Preview freezes the exact rows before approval.</p></div><StatusBadge state={summary?.execution_enabled ? 'READY' : 'PREVIEW ONLY'} /></div>
-        <div className="recovery-filters">
-          <label className="recovery-action-field"><span>Action</span><select value={action} onChange={(event) => { setAction(event.target.value as AttendanceRecoveryAction); setPreview(null) }}>{actions.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}</select></label>
-          <label><span>Vendor</span><select value={family} onChange={(event) => setFamily(event.target.value)}><option value="">ZKT and HIK</option><option value="zkt">ZKT</option><option value="hikvision">Hikvision</option></select></label>
-          <label><span>Zone</span><input value={zone} onChange={(event) => setZone(event.target.value)} placeholder="Optional zone ID" /></label>
-          <label><span>Terminal serial</span><input value={terminal} onChange={(event) => setTerminal(event.target.value)} placeholder="Optional exact serial" /></label>
-          <label><span>Status</span><select value={status} onChange={(event) => setStatus(event.target.value)}><option value="">All active statuses</option><option value="PENDING">Pending</option><option value="FAILED_RETRYABLE">Retryable failure</option><option value="BLOCKED_IDENTITY">Identity-held</option><option value="IN_FLIGHT">In-flight</option></select></label>
-          <label><span>Source epoch</span><input value={sourceEpoch} onChange={(event) => setSourceEpoch(event.target.value)} placeholder="Optional epoch" /></label>
-          <label><span>ORDS error</span><input value={errorCategory} onChange={(event) => setErrorCategory(event.target.value)} placeholder="Optional category" /></label>
-          <label><span>From</span><input type="datetime-local" value={fromAt} onChange={(event) => setFromAt(event.target.value)} /></label>
-          <label><span>To</span><input type="datetime-local" value={toAt} onChange={(event) => setToAt(event.target.value)} /></label>
-          <label><span>Provenance</span><select value={provenance} onChange={(event) => setProvenance(event.target.value)}><option value="">All</option><option value="VERIFIED">Verified</option><option value="MISSING">Missing</option></select></label>
-          <label className="recovery-inline-check"><input type="checkbox" checked={staleOnly} onChange={(event) => setStaleOnly(event.target.checked)} /><span>Only expired in-flight</span></label>
-        </div>
-        <p className="recovery-action-description">{actions.find((item) => item.value === action)?.description}</p>
-        <div className="recovery-confirm-fields"><label><span>Audit reason</span><textarea value={reason} onChange={(event) => setReason(event.target.value)} minLength={10} placeholder="Why is this recovery batch being run?" /></label><label><span>Administrator password</span><input type="password" value={password} onChange={(event) => setPassword(event.target.value)} autoComplete="current-password" /></label></div>
-        <div className="dialog-actions"><button className="button primary" disabled={busy || reason.trim().length < 10} onClick={() => void runPreview()}><Icon name="search" /> {busy ? 'Preparing…' : 'Preview filtered rows'}</button></div>
-        {preview && <div className="recovery-preview" aria-live="polite"><div className="recovery-preview-counts"><strong>{preview.counts.eligible.toLocaleString()} eligible</strong><span>{preview.counts.excluded.toLocaleString()} excluded</span><span>{preview.counts.identity_held.toLocaleString()} identity-held</span><span>{preview.counts.permanent_review.toLocaleString()} review-only</span></div><p>Candidate digest <code>{preview.candidate_digest.slice(0, 16)}…</code> · expires {relativeTime(preview.preview_expires_at)}</p><label><span>Type confirmation: <strong>{preview.confirmation}</strong></span><input value={confirmation} onChange={(event) => setConfirmation(event.target.value)} autoComplete="off" /></label><button className="button primary" disabled={busy || !password || confirmation !== preview.confirmation || !summary?.execution_enabled} onClick={() => void createJob()}>Approve and queue batch</button><div className="recovery-candidate-table">{preview.rows.slice(0, 25).map((row) => <div className="recovery-candidate-row" key={row.source_ref}><StatusBadge state={row.event_status || 'PENDING'} /><span>{row.display_name} · {row.zone_id}</span><small>{row.terminal_serial || 'Terminal provenance pending'} · {formatDate(row.device_event_time)}</small></div>)}{preview.counts.eligible > 25 && <small>Showing first 25 rows; the approved digest covers all matching eligible rows.</small>}</div></div>}
-      </section>
-      <section className="panel recovery-identity-panel"><div className="panel-header"><div><p className="eyebrow">MANUAL APPROVAL REQUIRED</p><h2>Identity-held events stay protected</h2><p>Use Force release attendance to sync current terminal users and review eligible punches. An administrator must approve their release with a password and reason. Syncing users alone does not release held attendance.</p></div><StatusBadge state="READ ONLY" /></div><div className="info-copy pattern-waiting"><Icon name="shield" /><span>{(delivery?.identity_held ?? 0).toLocaleString()} identity-held event(s) remain saved for review.</span></div><div className="dialog-actions"><a className="button secondary" href="/attendance?view=needs-review"><Icon name="users" /> Open force release</a></div></section>
-      <section className="panel recovery-correction-panel"><div className="panel-header"><div><p className="eyebrow">SOURCE CORRECTION LANE</p><h2>Correct eligible terminal timestamps</h2><p>Only parseable identity plus timestamp-only errors may be corrected. Original source bytes remain immutable.</p></div><StatusBadge state={`${(sourceExceptions?.totals.open ?? 0) + hikvisionCandidates.length} OPEN`} /></div>{sourceError && <div className="inline-retry pattern-blocked" role="alert"><Icon name="alert" /><span>{sourceError}</span></div>}<p className="recovery-correction-heading">ZKT source manifests</p>{sourceExceptions?.rows.map((row) => <div className="recovery-correction-row" key={`zkt-${row.id}`}><label className="recovery-checkbox"><input type="checkbox" checked={selectedExceptions.has(row.id)} onChange={() => toggleException(row.id)} /><span>{row.display_name || row.terminal_serial} · ordinal {row.ordinal}</span></label><small>{row.error_code || 'INVALID_TIME'} · UID {row.observed_uid || 'unparsed'} · source {row.raw_record_digest.slice(0, 12)}…</small><input type="datetime-local" disabled={!selectedExceptions.has(row.id)} value={correctionTimes[row.id] || ''} onChange={(event) => setCorrectionTimes((current) => ({ ...current, [row.id]: event.target.value }))} /></div>)}<p className="recovery-correction-heading">Hikvision evidence</p>{hikvisionCandidates.map((row) => <div className="recovery-correction-row" key={`hik-${row.id}`}><label className="recovery-checkbox"><input type="checkbox" disabled={!row.eligible} checked={selectedHikvision.has(row.id)} onChange={() => toggleHikvision(row.id)} /><span>{row.display_name} · {row.terminal_serial} · epoch {row.source_epoch}</span></label><small>{row.eligible ? 'Identity verified; timestamp-only correction is eligible' : `${humanizeStatus(row.disposition)} · inspect evidence; no correction permitted`} · digest {row.observation_sha256.slice(0, 12)}…</small><input type="datetime-local" disabled={!row.eligible || !selectedHikvision.has(row.id)} value={hikvisionCorrectionTimes[row.id] || ''} onChange={(event) => setHikvisionCorrectionTimes((current) => ({ ...current, [row.id]: event.target.value }))} /></div>)}{sourceExceptions && !sourceExceptions.rows.length && !hikvisionCandidates.length && <div className="empty-state compact"><Icon name="check" /><p>No open source evidence rows are loaded for correction or review.</p></div>}<div className="dialog-actions"><button className="button secondary" disabled={busy || !correctionInputs.length} onClick={() => void previewCorrections()}><Icon name="search" /> Preview timestamp corrections</button></div>{correctionPreview && <div className="recovery-preview"><div className="recovery-preview-counts"><strong>{correctionPreview.counts.eligible} eligible</strong><span>{correctionPreview.counts.rejected} rejected</span></div><p>Type confirmation: <strong>{correctionPreview.confirmation}</strong></p><input value={confirmation} onChange={(event) => setConfirmation(event.target.value)} /><button className="button primary" disabled={busy || !password || confirmation !== correctionPreview.confirmation || !summary?.execution_enabled || !summary?.correction_enabled} onClick={() => void createCorrections()}>Approve timestamp corrections</button>{!summary?.correction_enabled && <small className="recovery-disabled-reason">Timestamp correction remains disabled until the canary proves its lineage.</small>}{correctionPreview.rejected?.map((item: { source_ref: string; reason: string }) => <p className="recovery-rejected" key={item.source_ref}>{item.source_ref}: {item.reason}</p>)}</div>}</section>
-      {job && <section className="panel recovery-job-panel"><div className="panel-header"><div><p className="eyebrow">DURABLE RECOVERY JOB</p><h2>{humanizeStatus(job.action)}</h2><p>{job.job_id} · updated {relativeTime(job.updated_at)}</p></div><StatusBadge state={job.status} live={job.status === 'RUNNING'} /></div><div className="recovery-progress"><strong>{job.progress.succeeded.toLocaleString()} succeeded</strong><span>{job.progress.failed.toLocaleString()} failed</span><span>{job.progress.skipped.toLocaleString()} skipped</span><span>{job.progress.requested.toLocaleString()} requested</span></div><div className="recovery-control-confirm"><label><span>Type the exact phrase for the control action you choose</span><input value={controlConfirmation} onChange={(event) => setControlConfirmation(event.target.value)} placeholder={`${job.status === 'PAUSED' ? 'RESUME' : 'PAUSE'} ${job.job_id}`} autoComplete="off" /></label><small>Use the action word followed by the full job ID.</small></div><div className="dialog-actions recovery-job-controls">{['QUEUED', 'RUNNING', 'PAUSE_REQUESTED'].includes(job.status) && <button className="button secondary" disabled={controlBusy || controlConfirmation.trim() !== `PAUSE ${job.job_id}`} onClick={() => void controlJob('pause')}>Pause</button>}{job.status === 'PAUSED' && <button className="button secondary" disabled={controlBusy || controlConfirmation.trim() !== `RESUME ${job.job_id}`} onClick={() => void controlJob('resume')}>Resume</button>}{job.status === 'COMPLETED_WITH_ATTENTION' && <button className="button secondary" disabled={controlBusy || controlConfirmation.trim() !== `RETRY ${job.job_id}`} onClick={() => void controlJob('retry')}>Retry failed safe items</button>}{!['COMPLETED', 'CANCELLED'].includes(job.status) && <button className="button destructive" disabled={controlBusy || controlConfirmation.trim() !== `CANCEL ${job.job_id}`} onClick={() => void controlJob('cancel')}>Cancel pending items</button>}</div>{job.items && job.items.filter((item) => item.status !== 'SUCCEEDED').slice(0, 50).map((item) => <div className="recovery-candidate-row" key={item.item_id}><StatusBadge state={item.status} /><span>{item.source_ref} · {item.outcome || 'pending'}</span><small>{item.error_code || 'Awaiting worker'} {item.error_message || ''}</small></div>)}</section>}
+      {Boolean(summaryError) && (
+        <ErrorState compact title={HELD_TAB.loadFailed} message={summary ? 'Showing the last figures we had.' : undefined} error={summaryError} onRetry={() => summaryRefresh.runNow()} />
+      )}
+      <ul className="recover-held-rows" aria-label="Where the check-ins are">
+        <SummaryRow label={HELD_TAB.retry} value={number(delivery?.safe_retryable)} sentence={HELD_TAB.retryText} />
+        <SummaryRow label={HELD_TAB.sending} value={number(delivery?.active_in_flight)} />
+        <SummaryRow label={HELD_TAB.missing} value={number(delivery?.missing_outbox)} sentence={notLinedUpText(delivery)} tone={notLinedUpTone(delivery)} />
+        <SummaryRow label={HELD_TAB.unmatched} value={number(delivery?.identity_held)} link={{ label: HELD_TAB.unmatchedLink, href: '/attendance?view=fix-tools&tool=auto-send' }} />
+        <SummaryRow label={HELD_TAB.setAside} value={number(delivery?.permanent_review)} sentence={setAsideText(summary?.source?.zkt_invalid_time ?? 0)} tone={delivery?.permanent_review ? 'warning' : 'neutral'} link={onShowUnreadable ? { label: HELD_TAB.setAsideLink, onClick: onShowUnreadable } : { label: HELD_TAB.setAsideLink, href: '/recover?tab=unreadable' }} />
+      </ul>
+
+      {!summary && !summaryError && <Skeleton variant="block" label="Loading" />}
+      {summary && !correctionEnabled && !job && (
+        <p className="recover-muted recover-fix-off">{FIX_TIMES.off}</p>
+      )}
+      {summary && (correctionEnabled || job) && (
+        <section className="recover-fix panel" aria-labelledby="recover-fix-title">
+          <div className="recover-section-head">
+            <h2 id="recover-fix-title">{FIX_TIMES.title}</h2>
+            <p>{FIX_TIMES.intro}</p>
+            <p className="recover-muted">{FIX_TIMES.toFix(toFix)}</p>
+          </div>
+          {Boolean(sourceError) && <ErrorState compact title="Couldn't load the records to fix." error={sourceError} onRetry={() => sourceRefresh.runNow()} />}
+          {actionError && <Callout tone="danger" role="alert" title="That didn't work.">{actionError.sentence}{actionError.raw && <TechnicalDetails>{actionError.raw}</TechnicalDetails>}</Callout>}
+          <h3 className="recover-fix-heading" data-brand>{FIX_TIMES.zkt}</h3>
+          <ul className="recover-fix-list">
+            {sourceExceptions?.rows?.map((row) => {
+              const record = row.ordinal.toLocaleString()
+              return (
+                <li key={`zkt-${row.id}`}>
+                  <label className="recover-bulk-check">
+                    <input type="checkbox" checked={selectedExceptions.has(row.id)} onChange={() => toggle(setSelectedExceptions, row.id)} />
+                    <span><strong data-device-code>{row.display_name || 'Device'}</strong><small>{`Record ${record}`}</small></span>
+                  </label>
+                  <label className="recover-fix-time">
+                    <span>{FIX_TIMES.timeLabel(record)}</span>
+                    <input type="datetime-local" disabled={!selectedExceptions.has(row.id)} value={correctionTimes[row.id] || ''} onChange={(event) => setCorrectionTimes((current) => ({ ...current, [row.id]: event.target.value }))} />
+                  </label>
+                  <TechnicalDetails><p>{row.error_code || 'INVALID_TIME'} · UID {row.observed_uid || 'unparsed'} · source {row.raw_record_digest.slice(0, 12)}… · {row.terminal_serial}</p></TechnicalDetails>
+                </li>
+              )
+            })}
+          </ul>
+          <h3 className="recover-fix-heading" data-brand>{FIX_TIMES.hik}</h3>
+          <ul className="recover-fix-list">
+            {hikvisionCandidates.map((row) => (
+              <li key={`hik-${row.id}`}>
+                <label className="recover-bulk-check">
+                  <input type="checkbox" disabled={!row.eligible} checked={selectedHikvision.has(row.id)} onChange={() => toggle(setSelectedHikvision, row.id)} />
+                  <span><strong data-device-code>{row.display_name || 'Device'}</strong><small>{row.eligible ? FIX_TIMES.allowed : FIX_TIMES.notAllowed}</small></span>
+                </label>
+                <label className="recover-fix-time">
+                  <span>{FIX_TIMES.timeLabel(String(row.id))}</span>
+                  <input type="datetime-local" disabled={!row.eligible || !selectedHikvision.has(row.id)} value={hikvisionCorrectionTimes[row.id] || ''} onChange={(event) => setHikvisionCorrectionTimes((current) => ({ ...current, [row.id]: event.target.value }))} />
+                </label>
+                <TechnicalDetails><p>{row.terminal_serial} · epoch {row.source_epoch} · {row.disposition} · digest {row.observation_sha256.slice(0, 12)}…</p></TechnicalDetails>
+              </li>
+            ))}
+          </ul>
+          {sourceExceptions && !sourceExceptions.rows?.length && !hikvisionCandidates.length && <p className="recover-muted">{FIX_TIMES.none}</p>}
+          <div className="recover-form">
+            <label>
+              <span>{FIX_TIMES.note}</span>
+              <textarea value={reason} onChange={(event) => setReason(event.target.value)} minLength={10} placeholder="At least 10 letters" />
+            </label>
+            <label>
+              <span>{FIX_TIMES.password}</span>
+              <input type="password" value={password} onChange={(event) => setPassword(event.target.value)} autoComplete="current-password" />
+            </label>
+          </div>
+          <div className="recover-fix-actions">
+            <Button busy={busy && !correctionPreview} busyLabel="Checking…" disabled={busy || !correctionInputs.length} onClick={() => previewCorrections()}>{FIX_TIMES.show}</Button>
+          </div>
+          {correctionPreview && (
+            <div className="recover-fix-preview" aria-live="polite">
+              <p><strong>{`${formatCount(correctionPreview.counts.eligible)} can be fixed`}</strong> · {`${formatCount(correctionPreview.counts.rejected)} can't`}</p>
+              <label>
+                <span>{FIX_TIMES.typePhrase(correctionPreview.confirmation)}</span>
+                <input value={confirmation} onChange={(event) => setConfirmation(event.target.value)} autoComplete="off" data-technical />
+              </label>
+              <Button variant="primary" busy={busy} busyLabel="Saving…" disabled={busy || !password || confirmation !== correctionPreview.confirmation || !summary?.execution_enabled || !summary?.correction_enabled} onClick={() => createCorrections()}>
+                {FIX_TIMES.apply(correctionPreview.counts.eligible)}
+              </Button>
+              {!summary?.correction_enabled && <p className="recover-muted">{FIX_TIMES.off}</p>}
+              {!!correctionPreview.rejected?.length && (
+                <TechnicalDetails>
+                  {correctionPreview.rejected.map((item) => <p key={item.source_ref}>{item.source_ref}: {item.reason}</p>)}
+                </TechnicalDetails>
+              )}
+            </div>
+          )}
+          {job && jobWords && (
+            <article className="recover-fix-job" aria-label={FIX_TIMES.batch}>
+              <header>
+                <h3>{FIX_TIMES.batch}</h3>
+                <StatusChip tone={chipTone(jobWords.tone)} label={jobWords.label} code={job.status} />
+              </header>
+              <p>{FIX_TIMES.progress(job.progress.succeeded, job.progress.failed, job.progress.skipped, job.progress.requested)}</p>
+              <p className="recover-muted">{`Updated ${ago(job.updated_at)}`}</p>
+              <label className="recover-fix-phrase">
+                <span>{FIX_TIMES.typePhrase(controlPhrase)}</span>
+                <input value={controlConfirmation} onChange={(event) => setControlConfirmation(event.target.value)} autoComplete="off" data-technical />
+                <small>Type the words shown above exactly. The note and your password are needed too.</small>
+              </label>
+              <div className="recover-fix-actions">
+                {['QUEUED', 'RUNNING', 'PAUSE_REQUESTED'].includes(job.status) && <Button busy={controlBusy} busyLabel="Pausing…" disabled={controlBusy || controlConfirmation.trim() !== `PAUSE ${job.job_id}`} onClick={() => controlJob('pause')}>Pause</Button>}
+                {job.status === 'PAUSED' && <Button busy={controlBusy} busyLabel="Resuming…" disabled={controlBusy || controlConfirmation.trim() !== `RESUME ${job.job_id}`} onClick={() => controlJob('resume')}>Resume</Button>}
+                {job.status === 'COMPLETED_WITH_ATTENTION' && <Button busy={controlBusy} busyLabel="Trying again…" disabled={controlBusy || controlConfirmation.trim() !== `RETRY ${job.job_id}`} onClick={() => controlJob('retry')}>Try the failed ones again</Button>}
+                {!['COMPLETED', 'CANCELLED'].includes(job.status) && <Button variant="danger" busy={controlBusy} busyLabel="Stopping…" disabled={controlBusy || controlConfirmation.trim() !== `CANCEL ${job.job_id}`} onClick={() => controlJob('cancel')}>Stop the rest</Button>}
+              </div>
+              <TechnicalDetails>
+                <p>{job.job_id} · {job.action} · {job.status} · started {job.started_at ? dayTime(job.started_at) : 'not yet'}</p>
+                {job.items?.filter((item) => item.status !== 'SUCCEEDED').slice(0, 50).map((item) => (
+                  <p key={item.item_id}>{item.source_ref} · {item.status} · {item.outcome || 'pending'} · {item.error_code || 'Awaiting worker'} {item.error_message || ''}</p>
+                ))}
+              </TechnicalDetails>
+            </article>
+          )}
+        </section>
+      )}
     </div>
   )
 }
