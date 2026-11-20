@@ -528,7 +528,12 @@ jobs:
             ~/.cache/playwright-apt
           key: ${{ steps.playwright-cache.outputs.cache-primary-key }}
       - name: Run responsive and accessibility browser tests
-        timeout-minutes: 10
+        # The page sweeps and the screenshot tour run on phone-390-touch and
+        # desktop-1440 only (playwright.config.ts), so this stays well inside
+        # the job's limit.
+        timeout-minutes: 15
+        env:
+          ADD_VISUAL_QA: "1"
         run: pnpm test:e2e
       - name: Upload Playwright report on failure
         if: failure()
@@ -538,6 +543,16 @@ jobs:
           path: apps/add_frontend/playwright-report/
           if-no-files-found: ignore
           retention-days: 7
+      # Full-page screenshots of every page at 390 px (touch) and 1440 px, for
+      # the PR review (DLV-3). Uploaded whether the tests passed or not.
+      - name: Upload dashboard screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: add-ui-screenshots
+          path: apps/add_frontend/screenshots/
+          if-no-files-found: ignore
+          retention-days: 14
 
   frontend-classic:
     # The old screens (apps/add_frontend_classic) are a frozen copy served

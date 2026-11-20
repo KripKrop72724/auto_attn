@@ -14,510 +14,15 @@ import App, {
   validateUserDraft,
 } from './App'
 import { api } from './api'
-import { queryClient } from './data'
 import type { Device, DeviceUser, Overview } from './types'
-
-const maskedCnic = '*****-****567-1'
-const fullCnic = '3520212345671'
-
-const device: Device = {
-  connector_id: 'connector-one',
-  hardware_id: 'e0:72:a1:d6:f3:28',
-  zone_id: 'ZONE-SLICTOWER-3FL',
-  zone_name: 'ZONE-SLICTOWER-3FL',
-  device_id: '1',
-  display_name: 'SLICTOWER · 3rd Floor',
-  state: 'ONLINE',
-  connected: true,
-  firmware_version: '2.1.0',
-  onboarding_generation: 2,
-  last_onboarded_at: '2026-07-13T12:00:00Z',
-  last_seen_at: '2026-07-13T12:01:00Z',
-  current_activity: 'Live capture',
-  last_error_code: null,
-  zkt: {
-    id: 1,
-    serial: 'ADZV211860253',
-    expected_serial: 'ADZV211860253',
-    ip_address: '192.168.110.137',
-    model: 'MB20/ID',
-    platform: 'ZLM60_TFT',
-    online: true,
-    connection_state: 'ONLINE',
-    consecutive_failures: 0,
-    consecutive_successes: 4,
-    flap_count_15m: 0,
-    last_transition_at: null,
-    last_online_at: null,
-    offline_since: null,
-    stability_since: null,
-    backoff_until: null,
-    probe_latency_ms: 12,
-    certification_state: 'CERTIFIED',
-    certification_observations: 2,
-    capabilities: { user_write: true, create_user: true, delete_user: true },
-    snapshot_complete: true,
-    writes_disabled_reason: null,
-    user_count: 1,
-    attendance_count: 42,
-    device_time: '2026-07-13T12:01:00Z',
-    device_time_sampled_at: '2026-07-13T12:01:00Z',
-    drift_seconds: 0,
-    last_reconcile_at: '2026-07-13T12:00:00Z',
-    next_restart_at: '2026-07-13T22:00:00Z',
-  },
-}
-
-const user: DeviceUser = {
-  id: 1,
-  user_key: 'test-user-key',
-  uid: '7',
-  user_id: '1007',
-  display_name: 'Ayesha Fatima',
-  cnic_masked: maskedCnic,
-  cnic_available: true,
-  identity_complete: true,
-  identity_conflict_code: null,
-  identity_conflict_members: [],
-  identity_conflict_resolved: false,
-  identity_resolution_id: null,
-  shift_worker: false,
-  privilege: 0,
-  present: true,
-  lifecycle_state: 'ACTIVE',
-  row_version: 3,
-  observed_at: '2026-07-13T12:00:00Z',
-  machine_name_preview: 'Ayesha-*****-****567-1',
-  current_command_state: null,
-  read_only: false,
-}
-
-const conflictedUser: DeviceUser = {
-  ...user,
-  identity_complete: false,
-  identity_conflict_code: 'DUPLICATE_CNIC',
-  identity_conflict_members: [{ user_id: '1008', uid: '8' }],
-}
-
-const deliveryAlert = {
-  id: 9,
-  code: 'ORDS_DELIVERY_FAILED',
-  severity: 'WARNING',
-  state: 'OPEN',
-  message: 'Oracle attendance delivery is retrying; preserved events remain queued.',
-  details: {
-    failure_category: 'HTTP_503',
-    http_status: 503,
-    attempt_count: 4,
-    response_body: `must-not-render-${fullCnic}`,
-  },
-  first_seen_at: '2026-07-13T12:00:00Z',
-  last_seen_at: '2026-07-13T12:05:00Z',
-  acknowledged_at: null,
-  resolved_at: null,
-}
-
-class EventSourceStub {
-  onmessage: ((event: MessageEvent) => void) | null = null
-  constructor(_url: string, _options?: EventSourceInit) {}
-  addEventListener() {}
-  close() {}
-}
-
-const response = (body: unknown, status = 200) =>
-  new Response(JSON.stringify(body), {
-    status,
-    headers: { 'Content-Type': 'application/json' },
-  })
-
-const fetchStub = (
-  users: DeviceUser[] = [user],
-  includeHistorical = false,
-  includeEventGroup = false,
-  includeActiveEnrichment = false,
-  includeCurrentIdentity = false,
-  fleetDevices: Device[] = [device],
-  overviewOverrides: Partial<Overview> = {},
-) =>
-  vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-    const path = String(input)
-    if (path.includes('/api/v1/auth/session')) {
-      return response({ username: 'StateHealthAdmin', csrf_token: 'csrf' })
-    }
-    if (path.includes('/api/v1/overview')) {
-      return response({
-        total: 1,
-        online: 1,
-        spares: fleetDevices.filter((row) => row.is_spare).length,
-        open_alerts: 1,
-        active_leases: 0,
-        ords_delivery: {
-          backlog: 12,
-          pending: 9,
-          retrying: 3,
-          in_flight: 0,
-          blocked_identity: 2,
-          quarantined: 1,
-          acknowledged: 24,
-          acknowledged_add: 24,
-          acknowledged_check: 0,
-          acknowledged_firmware: 0,
-          firmware_unverified: 0,
-          membership_reverify: 0,
-          oldest_backlog_at: '2026-07-13T12:00:00Z',
-          last_attempt_at: '2026-07-13T12:05:00Z',
-        },
-        ...overviewOverrides,
-      })
-    }
-    if (path.startsWith('/api/v1/firmware/releases')) {
-      return response({
-        enabled: false,
-        hil_enabled: true,
-        filtered_total: 1,
-        next_cursor: null,
-        totals: { all: 1, available: 0, hil_only: 1, revoked: 0 },
-        rows: [{
-          release_id: 'release-2-2-4',
-          version: '2.2.4',
-          git_sha: 'f11f9306d7c0f01df19123dda9bea6157a68119d',
-          image_sha256: 'a'.repeat(64),
-          application_sha256: 'b'.repeat(64),
-          image_size: 1_048_576,
-          state: 'HIL_ONLY',
-          partition_layout: 'ota_0/ota_1',
-          signing_key_id: 'zone-lite-production',
-          published_at: '2026-07-27T12:00:00Z',
-          hil_target_mac: device.hardware_id,
-        }],
-      })
-    }
-    if (path.endsWith('/api/v1/firmware/campaigns/bulk') && init?.method === 'POST') {
-      const body = JSON.parse(String(init.body))
-      return response({
-        release_id: body.release_id,
-        created: body.zone_ids.length,
-        results: body.zone_ids.map((zone_id: string) => ({
-          zone_id,
-          outcome: 'CREATED',
-          campaign_id: 'campaign-one',
-          status: 'ACTIVE',
-          message: null,
-          stability_warnings: [],
-          eligible: 1,
-          fleet_hold: null,
-          closed: [],
-        })),
-      })
-    }
-    if (path.startsWith('/api/v1/firmware/campaigns') && (init?.method ?? 'GET') === 'GET') {
-      return response({
-        enabled: false,
-        hil_enabled: true,
-        rows: [],
-        filtered_total: 0,
-        next_cursor: null,
-        totals: { campaigns: { all: 0 }, deployments: { all: 0 } },
-      })
-    }
-    if (/\/api\/v1\/firmware\/campaigns\/[^/]+\/(pause|resume|cancel)$/.test(path)) {
-      return response({ campaign_id: 'campaign-one', status: 'PAUSED' })
-    }
-    if (path.includes('/logs?')) return response({ rows: [] })
-    if (path.includes('/connectivity?')) return response({ rows: [] })
-    if (/\/api\/v1\/attendance-quarantine\/\d+\/review$/.test(path) && init?.method === 'POST') {
-      return response({
-        id: 91,
-        review_state: 'REVIEWED',
-        reviewed_by: 'StateHealthAdmin',
-        review_reason: 'Confirmed malformed source evidence.',
-        reviewed_at: '2026-07-13T12:06:00Z',
-      })
-    }
-    if (/\/api\/v1\/attendance-quarantine\/\d+\/reveal$/.test(path) && init?.method === 'POST') {
-      return response({
-        id: 91,
-        payload_digest: 'a'.repeat(64),
-        error_code: 'ATTENDANCE_EVENT_STRING_PATTERN_MISMATCH',
-        error_path: 'event_uid',
-        payload: { terminal_value: 'protected-attendance-evidence' },
-      })
-    }
-    if (path.startsWith('/api/v1/attendance-quarantine')) return response({
-      totals: { all: 1, open: 1 },
-      filtered_total: 1,
-      next_cursor: null,
-      rows: [{
-        id: 91,
-        receipt_id: '11111111-2222-3333-4444-555555555555',
-        connector_id: device.connector_id,
-        device_id: device.device_id,
-        display_name: device.display_name,
-        zone_id: device.zone_id,
-        batch_id: 'safe-batch-id',
-        item_index: 1,
-        error_code: 'ATTENDANCE_EVENT_STRING_PATTERN_MISMATCH',
-        error_path: 'event_uid',
-        payload_digest: 'a'.repeat(64),
-        review_state: 'OPEN',
-        reviewed_by: null,
-        review_reason: null,
-        reviewed_at: null,
-        observed_at: '2026-07-13T12:05:00Z',
-        evidence_available: true,
-        handling: 'QUARANTINED_NON_BLOCKING',
-      }],
-    })
-    if (path.startsWith('/api/v1/alerts') && init?.method !== 'POST') return response({
-      rows: [{ ...deliveryAlert, device: {
-        connector_id: device.connector_id,
-        display_name: device.display_name,
-        zone_id: device.zone_id,
-        hardware_id: device.hardware_id,
-      } }],
-      next_cursor: null,
-      totals: { all: 1, open: 1, acknowledged: 0, resolved: 0 },
-    })
-    if (path.includes('/alerts')) return response({ rows: [deliveryAlert] })
-    if (path.endsWith('/api/v1/devices/connector-one')) return response(device)
-    if (path.includes('/api/v1/devices') && !path.includes('/users')) {
-      return response({ rows: fleetDevices })
-    }
-    if (path.includes('/api/v2/devices/connector-one/identity-conflicts')) {
-      const hasConflict = users.some((row) => row.identity_conflict_code)
-      return response({
-        evidence_scope: {
-          snapshot_source: 'CURRENT_COMPLETE_ZKT_SNAPSHOT',
-          terminal_attendance_count: 42,
-          add_attendance_count: 4,
-          attendance_coverage_percent: 9.52,
-          attendance_is_immutable: true,
-          terminal_users_are_unchanged: true,
-        },
-        raw_duplicate_groups: hasConflict ? 1 : 0,
-        resolved_groups: 0,
-        unresolved_groups: hasConflict ? 1 : 0,
-        groups: hasConflict
-          ? [{
-              group_token: 'a'.repeat(64),
-              cnic_masked: maskedCnic,
-              classification: 'POSSIBLE_NAME_VARIANT',
-              status: 'UNRESOLVED',
-              resolution_id: null,
-              resolution_created_at: null,
-              resolution_reason: null,
-              recommended_action: 'HR_IDENTITY_REVIEW',
-              members: [
-                {
-                  user_key: conflictedUser.user_key,
-                  uid: conflictedUser.uid,
-                  user_id: conflictedUser.user_id,
-                  display_name: conflictedUser.display_name,
-                  row_version: conflictedUser.row_version,
-                  privilege: conflictedUser.privilege,
-                  observed_at: conflictedUser.observed_at,
-                  punch_evidence: { captured_count: 4, first_captured_at: null, last_captured_at: null, blocked_identity_count: 1 },
-                },
-                {
-                  user_key: 'other-user-key',
-                  uid: '8',
-                  user_id: '1008',
-                  display_name: 'Ayesha F.',
-                  row_version: 2,
-                  privilege: 0,
-                  observed_at: conflictedUser.observed_at,
-                  punch_evidence: { captured_count: 0, first_captured_at: null, last_captured_at: null, blocked_identity_count: 0 },
-                },
-              ],
-            }]
-          : [],
-      })
-    }
-    if (
-      path.includes('/api/v2/devices/connector-one/historical-identities/resolve-current-identity') &&
-      init?.method === 'POST'
-    ) {
-      return response({ ok: true, repaired_events: 1 }, 201)
-    }
-    if (
-      path.includes('/api/v2/devices/connector-one/historical-identities/resolve-event-group') &&
-      init?.method === 'POST'
-    ) {
-      return response({ ok: true, repaired_events: 2 }, 201)
-    }
-    if (
-      path.includes('/api/v2/devices/connector-one/historical-identities/resolve') &&
-      init?.method === 'POST'
-    ) {
-      return response({ ok: true, repaired_events: 3 }, 201)
-    }
-    if (path.includes('/api/v2/devices/connector-one/historical-identities')) {
-      return response({
-        device_serial: device.zkt?.serial,
-        snapshot_revision: 8,
-        totals: {
-          unresolved_events:
-            (includeHistorical ? 3 : 0) +
-            (includeEventGroup ? 2 : 0) +
-            (includeActiveEnrichment ? 1 : 0) +
-            (includeCurrentIdentity ? 1 : 0),
-          blocked_identity:
-            (includeHistorical ? 3 : 0) +
-            (includeEventGroup ? 2 : 0) +
-            (includeActiveEnrichment ? 1 : 0) +
-            (includeCurrentIdentity ? 1 : 0),
-          quarantined_identity_reuse: 0,
-          attributed_to_deleted_users: includeHistorical ? 3 : 0,
-          unassigned_events:
-            (includeEventGroup ? 2 : 0) +
-            (includeActiveEnrichment ? 1 : 0) +
-            (includeCurrentIdentity ? 1 : 0),
-          actionable_event_groups:
-            includeEventGroup || includeActiveEnrichment || includeCurrentIdentity ? 1 : 0,
-          candidate_users: includeHistorical ? 1 : 0,
-        },
-        rows: includeHistorical
-          ? [{
-              source_user_key: 'historical-user-key',
-              uid: '33',
-              user_id: 'CL04196',
-              display_name: 'Dr Mehtab',
-              row_version: 366,
-              observed_at: '2026-07-13T12:00:00Z',
-              deleted_at: '2026-07-14T12:00:00Z',
-              cnic_available: false,
-              identity_conflict_code: null,
-              event_count: 3,
-              blocked_count: 3,
-              quarantined_count: 0,
-              first_event_at: '2026-06-01T08:00:00Z',
-              last_event_at: '2026-07-01T08:00:00Z',
-              resolution_path: 'HR_DIRECTORY_EVIDENCE',
-              operator_actionable: true,
-            }]
-          : [],
-        unassigned_groups: includeCurrentIdentity
-          ? [{
-              source_user_key: null,
-              source_kind: 'EVENT_GROUP',
-              group_token: 'c'.repeat(64),
-              active_user_key: user.user_key,
-              active_user_row_version: user.row_version,
-              uid: '',
-              user_id: '03752',
-              display_name: 'Ubaidullah',
-              row_version: null,
-              observed_at: '2026-07-01T08:00:00Z',
-              deleted_at: '2026-07-01T08:00:00Z',
-              cnic_available: false,
-              identity_conflict_code: null,
-              event_count: 1,
-              blocked_count: 1,
-              quarantined_count: 0,
-              first_event_at: '2026-07-01T08:00:00Z',
-              last_event_at: '2026-07-01T08:00:00Z',
-              resolution_path: 'CURRENT_IDENTITY_EVIDENCE',
-              operator_actionable: true,
-            }]
-          : includeActiveEnrichment
-          ? [{
-              source_user_key: null,
-              source_kind: 'EVENT_GROUP',
-              group_token: 'b'.repeat(64),
-              active_user_key: user.user_key,
-              uid: user.uid,
-              user_id: user.user_id,
-              display_name: user.display_name,
-              row_version: null,
-              observed_at: '2026-07-01T08:00:00Z',
-              deleted_at: '2026-07-01T08:00:00Z',
-              cnic_available: false,
-              identity_conflict_code: null,
-              event_count: 1,
-              blocked_count: 1,
-              quarantined_count: 0,
-              first_event_at: '2026-07-01T08:00:00Z',
-              last_event_at: '2026-07-01T08:00:00Z',
-              resolution_path: 'ACTIVE_USER_ENRICHMENT',
-              operator_actionable: true,
-            }]
-          : includeEventGroup
-          ? [{
-              source_user_key: null,
-              source_kind: 'EVENT_GROUP',
-              group_token: 'a'.repeat(64),
-              uid: '77',
-              user_id: 'CL04999',
-              display_name: 'Former Employee',
-              row_version: null,
-              observed_at: '2026-06-01T08:00:00Z',
-              deleted_at: '2026-07-01T08:00:00Z',
-              cnic_available: false,
-              identity_conflict_code: null,
-              event_count: 2,
-              blocked_count: 2,
-              quarantined_count: 0,
-              first_event_at: '2026-06-01T08:00:00Z',
-              last_event_at: '2026-07-01T08:00:00Z',
-              resolution_path: 'HR_DIRECTORY_EVENT_GROUP',
-              operator_actionable: true,
-            }]
-          : [],
-      })
-    }
-    if (path.includes('/api/v2/devices/connector-one/user-deletion-jobs/latest')) {
-      return response({ job: null })
-    }
-    if (path.includes('/api/v2/devices/connector-one/users')) {
-      const hasConflict = users.some((row) => row.identity_conflict_code)
-      return response({
-        rows: users,
-        next_cursor: null,
-        device,
-        identity_integrity: {
-          source: 'CURRENT_COMPLETE_ZKT_SNAPSHOT',
-          total_users: hasConflict ? 2 : users.length,
-          with_cnic: hasConflict ? 2 : users.length,
-          missing_cnic: 0,
-          duplicate_groups: hasConflict ? 1 : 0,
-          duplicate_users: hasConflict ? 2 : 0,
-          resolved_duplicate_groups: 0,
-          unresolved_duplicate_groups: hasConflict ? 1 : 0,
-          unresolved_duplicate_users: hasConflict ? 2 : 0,
-        },
-      })
-    }
-    return response({ rows: [] })
-  })
-
-const selectUserTerminal = async () => {
-  let option = document.querySelector<HTMLButtonElement>('.terminal-picker-results [role="option"]')
-  if (!option) {
-    const trigger = await screen.findByRole('button', { name: /select terminal/i })
-    if (trigger.getAttribute('aria-expanded') !== 'true') fireEvent.click(trigger)
-    option = await waitFor(() => {
-      const found = document.querySelector<HTMLButtonElement>('.terminal-picker-results [role="option"]')
-      expect(found).toBeTruthy()
-      return found
-    })
-  }
-  fireEvent.click(option as HTMLButtonElement)
-  await screen.findByRole('heading', { name: /terminal directory/i })
-  await screen.findByRole('button', { name: /^edit /i })
-}
+import {
+  conflictedUser, deliveryAlert, device, fetchStub, fullCnic, maskedCnic, response, selectUserTerminal, useDashboardStubs, user,
+  CapturingEventSource,
+} from './test/renderApp'
+import { queryClient } from './data'
 
 describe('State Life ADD interface', () => {
-  beforeEach(() => {
-    window.history.replaceState({}, '', '/fleet')
-    vi.stubGlobal('EventSource', EventSourceStub)
-    vi.stubGlobal('fetch', fetchStub())
-  })
-
-  afterEach(() => {
-    cleanup()
-    vi.unstubAllGlobals()
-    queryClient.clear()
-  })
+  useDashboardStubs(() => Promise.all([import('./features/Fleet'), import('./features/Login'), import('./features/DeviceDrawer'), import('./features/FleetMap'), import('./features/Attendance')]))
 
   it('builds an exact device-scoped bulk deletion confirmation', () => {
     expect(bulkDeletionConfirmation(12, 'ZONE-SWAT-01')).toBe(
@@ -568,7 +73,8 @@ describe('State Life ADD interface', () => {
     fireEvent.click(screen.getByRole('button', { name: 'List' }))
     expect(await screen.findByRole('button', { name: `Inspect ${device.display_name}` })).toBeTruthy()
     expect(screen.queryByRole('region', { name: 'Pakistan device network map' })).toBeNull()
-    expect(window.localStorage.length).toBe(0)
+    // The browser keeps at most one key, add.prefs, and only after a change (D-25).
+    expect(Object.keys(window.localStorage).every((key) => key === 'add.prefs')).toBe(true)
     expect(window.sessionStorage.length).toBe(0)
   })
 
@@ -698,218 +204,6 @@ describe('State Life ADD interface', () => {
     expect(screen.queryByRole('button', { name: 'Inspect Multan 01' })).toBeNull()
   })
 
-  it('renders only masked CNIC in the selected-terminal users workspace', async () => {
-    render(<App />)
-    await screen.findByRole('heading', { name: 'Fleet', level: 1 })
-    fireEvent.click(screen.getByRole('button', { name: 'Users' }))
-    await selectUserTerminal()
-    expect(await screen.findByText(maskedCnic)).toBeTruthy()
-    expect(document.body.textContent).not.toContain(fullCnic)
-    expect(screen.getByRole('button', { name: /edit ayesha fatima/i })).toBeTruthy()
-    fireEvent.click(screen.getByLabelText(/more actions for ayesha fatima/i))
-    expect(screen.getByRole('button', { name: /delete ayesha fatima/i })).toBeTruthy()
-  })
-
-  it('marks duplicate CNIC identities with text and a non-color-only pattern', async () => {
-    vi.stubGlobal('fetch', fetchStub([conflictedUser]))
-    render(<App />)
-    await screen.findByRole('heading', { name: 'Fleet', level: 1 })
-    fireEvent.click(screen.getByRole('button', { name: 'Users' }))
-    await selectUserTerminal()
-    const warning = await screen.findByText(/exact cnic also encoded on user 1008 \(uid 8\)/i)
-    expect(warning.closest('article')?.classList.contains('identity-conflict')).toBe(true)
-    expect(screen.getByRole('tab', { name: /identity review/i })).toBeTruthy()
-    expect(screen.getByRole('option', { name: 'CNIC conflict' })).toBeTruthy()
-    expect(document.body.textContent).not.toContain(fullCnic)
-    expect(identityConflictText(conflictedUser)).toContain('1008 (UID 8)')
-    fireEvent.click(screen.getByRole('tab', { name: /identity review/i }))
-    fireEvent.click(screen.getByRole('button', { name: /review same-employee alias/i }))
-    expect(screen.getByRole('heading', { name: /verify same employee/i })).toBeTruthy()
-    expect(screen.getByText(/no zkt user, fingerprint template, uid, or attendance event is merged/i)).toBeTruthy()
-    expect(screen.getByLabelText(/type “same employee”/i)).toBeTruthy()
-    expect(screen.getByLabelText(/confirm administrator password/i)).toBeTruthy()
-    fireEvent.click(screen.getByRole('button', { name: /close dialog/i }))
-    fireEvent.click(screen.getByRole('tab', { name: /directory/i }))
-    fireEvent.click(screen.getByRole('button', { name: /edit ayesha fatima/i }))
-    expect(
-      screen.getByLabelText(/replacement cnic \(required to resolve conflict\)/i),
-    ).toBeTruthy()
-  })
-
-  it('saves exact HR evidence while retaining the manual attendance hold', async () => {
-    const fetchMock = fetchStub([user], true)
-    vi.stubGlobal('fetch', fetchMock)
-    render(<App />)
-    await screen.findByRole('heading', { name: 'Fleet', level: 1 })
-    fireEvent.click(screen.getByRole('button', { name: 'Users' }))
-    await selectUserTerminal()
-    fireEvent.click(screen.getByRole('tab', { name: /historical backlog/i }))
-    expect(await screen.findByRole('heading', { name: /historical identity backlog/i })).toBeTruthy()
-    fireEvent.click(screen.getByRole('button', { name: /enter verified hr evidence/i }))
-    fireEvent.change(screen.getByLabelText(/authoritative cnic/i), {
-      target: { value: fullCnic },
-    })
-    fireEvent.change(screen.getByLabelText(/hr employee id/i), {
-      target: { value: '5294' },
-    })
-    fireEvent.change(screen.getByLabelText(/audit reason/i), {
-      target: { value: 'Verified against the authoritative HR directory.' },
-    })
-    fireEvent.change(screen.getByLabelText(/type “cl04196 -> hr 5294”/i), {
-      target: { value: 'CL04196 -> HR 5294' },
-    })
-    fireEvent.change(screen.getByLabelText(/confirm administrator password/i), {
-      target: { value: 'test-password' },
-    })
-    fireEvent.click(screen.getByRole('button', { name: /save verified hr evidence/i }))
-
-    expect(await screen.findByText(/Identity evidence saved. Held attendance still requires manual approval/i)).toBeTruthy()
-    const resolutionCall = fetchMock.mock.calls.find(([input, init]) =>
-      String(input).includes('/historical-identities/resolve') &&
-      (init as RequestInit | undefined)?.method === 'POST',
-    )
-    expect(resolutionCall).toBeTruthy()
-    const requestBody = JSON.parse(
-      String((resolutionCall?.[1] as RequestInit | undefined)?.body),
-    )
-    expect(requestBody).toMatchObject({
-      source_user_key: 'historical-user-key',
-      expected_version: 366,
-      source_cnic: fullCnic,
-      directory_employee_id: '5294',
-      directory_service_number: 'CL04196',
-      directory_employee_name: 'Dr Mehtab',
-      typed_confirmation: 'CL04196 -> HR 5294',
-    })
-  })
-
-  it('routes exact orphaned event cohorts through the versioned HR evidence endpoint', async () => {
-    const fetchMock = fetchStub([user], false, true)
-    vi.stubGlobal('fetch', fetchMock)
-    render(<App />)
-    await screen.findByRole('heading', { name: 'Fleet', level: 1 })
-    fireEvent.click(screen.getByRole('button', { name: 'Users' }))
-    await selectUserTerminal()
-    fireEvent.click(screen.getByRole('tab', { name: /historical backlog/i }))
-    expect(await screen.findByText(/exact event cohort/i)).toBeTruthy()
-    fireEvent.click(screen.getByRole('button', { name: /enter verified hr evidence/i }))
-    fireEvent.change(screen.getByLabelText(/authoritative cnic/i), {
-      target: { value: fullCnic },
-    })
-    fireEvent.change(screen.getByLabelText(/hr employee id/i), {
-      target: { value: '5294' },
-    })
-    fireEvent.change(screen.getByLabelText(/audit reason/i), {
-      target: { value: 'Verified exact event cohort against the HR directory.' },
-    })
-    fireEvent.change(screen.getByLabelText(/type “cl04999 -> hr 5294”/i), {
-      target: { value: 'CL04999 -> HR 5294' },
-    })
-    fireEvent.change(screen.getByLabelText(/confirm administrator password/i), {
-      target: { value: 'test-password' },
-    })
-    fireEvent.click(screen.getByRole('button', { name: /save verified hr evidence/i }))
-
-    expect(await screen.findByText(/Identity evidence saved. Held attendance still requires manual approval/i)).toBeTruthy()
-    const resolutionCall = fetchMock.mock.calls.find(([input, init]) =>
-      String(input).includes('/historical-identities/resolve-event-group') &&
-      (init as RequestInit | undefined)?.method === 'POST',
-    )
-    expect(resolutionCall).toBeTruthy()
-    const requestBody = JSON.parse(
-      String((resolutionCall?.[1] as RequestInit | undefined)?.body),
-    )
-    expect(requestBody).toMatchObject({
-      group_token: 'a'.repeat(64),
-      source_user_id: 'CL04999',
-      source_uid: '77',
-      directory_employee_id: '5294',
-      directory_service_number: 'CL04999',
-      directory_employee_name: 'Former Employee',
-    })
-  })
-
-  it('routes linked historical cohorts to the certified current-user enrichment dialog', async () => {
-    const missingIdentityUser: DeviceUser = {
-      ...user,
-      cnic_masked: null,
-      cnic_available: false,
-      identity_complete: false,
-      machine_name_preview: user.display_name,
-    }
-    const fetchMock = fetchStub([missingIdentityUser], false, false, true)
-    vi.stubGlobal('fetch', fetchMock)
-    render(<App />)
-    await screen.findByRole('heading', { name: 'Fleet', level: 1 })
-    fireEvent.click(screen.getByRole('button', { name: 'Users' }))
-    await selectUserTerminal()
-    fireEvent.click(screen.getByRole('tab', { name: /historical backlog/i }))
-    fireEvent.click(await screen.findByRole('button', { name: /enrich current user/i }))
-    expect(await screen.findByRole('heading', { name: /edit device user/i })).toBeTruthy()
-    expect(screen.getByLabelText(/replacement cnic/i)).toBeTruthy()
-  })
-
-  it('resolves one exact legacy cohort against the unchanged current identity without an employee id', async () => {
-    const currentUser: DeviceUser = {
-      ...user,
-      user_id: '03752',
-      uid: '11',
-      display_name: 'Ubaidullah',
-    }
-    const fetchMock = fetchStub([currentUser], false, false, false, true)
-    vi.stubGlobal('fetch', fetchMock)
-    render(<App />)
-    await screen.findByRole('heading', { name: 'Fleet', level: 1 })
-    fireEvent.click(screen.getByRole('button', { name: 'Users' }))
-    await selectUserTerminal()
-    fireEvent.click(screen.getByRole('tab', { name: /historical backlog/i }))
-    fireEvent.click(
-      await screen.findByRole('button', { name: /verify against current identity/i }),
-    )
-    expect(
-      screen.getByRole('heading', {
-        name: /verify preserved cohort against current identity/i,
-      }),
-    ).toBeTruthy()
-    expect(screen.queryByLabelText(/hr employee id/i)).toBeNull()
-    fireEvent.change(screen.getByLabelText(/authoritative cnic/i), {
-      target: { value: fullCnic },
-    })
-    fireEvent.change(screen.getByLabelText(/audit reason/i), {
-      target: { value: 'Oracle raw capture exactly matches the current identity.' },
-    })
-    fireEvent.change(screen.getByLabelText(/type “03752 -> current 03752”/i), {
-      target: { value: '03752 -> CURRENT 03752' },
-    })
-    fireEvent.change(screen.getByLabelText(/confirm administrator password/i), {
-      target: { value: 'test-password' },
-    })
-    fireEvent.click(
-      screen.getByRole('button', { name: /verify and save identity evidence/i }),
-    )
-
-    expect(await screen.findByText(/Identity evidence saved. Held attendance still requires manual approval/i)).toBeTruthy()
-    const resolutionCall = fetchMock.mock.calls.find(([input, init]) =>
-      String(input).includes('/historical-identities/resolve-current-identity') &&
-      (init as RequestInit | undefined)?.method === 'POST',
-    )
-    expect(resolutionCall).toBeTruthy()
-    const requestBody = JSON.parse(
-      String((resolutionCall?.[1] as RequestInit | undefined)?.body),
-    )
-    expect(requestBody).toMatchObject({
-      group_token: 'c'.repeat(64),
-      source_user_id: '03752',
-      source_uid: '',
-      target_user_key: user.user_key,
-      expected_version: user.row_version,
-      source_cnic: fullCnic,
-      verified_employee_name: 'Ubaidullah',
-      typed_confirmation: '03752 -> CURRENT 03752',
-    })
-    expect(requestBody).not.toHaveProperty('directory_employee_id')
-  })
-
   it('communicates every state with text, icon, and border pattern', () => {
     const { container, rerender } = render(<StatusBadge state="ONLINE" />)
     expect(container.querySelector('[data-pattern="confirmed"]')).toBeTruthy()
@@ -953,82 +247,6 @@ describe('State Life ADD interface', () => {
     })
   })
 
-  it('updates firmware in the selected zones with one click and no password, reason or typed version', async () => {
-    // Finish the lazy module's test-time transform before timing interactions.
-    // The browser suite exercises route loading from the production bundle.
-    await import('./features/Firmware')
-    const fetchMock = fetchStub()
-    vi.stubGlobal('fetch', fetchMock)
-    render(<App />)
-    await screen.findByRole('heading', { name: 'Fleet', level: 1 })
-    fireEvent.click(screen.getByRole('button', { name: 'Firmware' }))
-    expect(await screen.findByRole('heading', { name: 'Firmware', level: 1 })).toBeTruthy()
-    const update = screen.getByRole('button', { name: 'Update firmware' }) as HTMLButtonElement
-    await waitFor(() => expect(update.disabled).toBe(false))
-    fireEvent.click(update)
-
-    // The newest publishable release is preselected; only its HIL target's zone is offered.
-    expect((screen.getByLabelText('Release') as HTMLSelectElement).value).toBe('release-2-2-4')
-    expect(screen.queryByLabelText('Administrator password')).toBeNull()
-    expect(screen.queryByLabelText('Audited reason')).toBeNull()
-    expect(screen.queryByLabelText(/Type exact version/)).toBeNull()
-    const start = screen.getByRole('button', { name: 'Update 0 zones' }) as HTMLButtonElement
-    expect(start.disabled).toBe(true)
-    fireEvent.click(screen.getByRole('button', { name: 'Select all eligible' }))
-    expect((screen.getByRole('checkbox', { name: new RegExp(device.zone_id) }) as HTMLInputElement).checked).toBe(true)
-    fireEvent.click(screen.getByRole('button', { name: 'Update 1 zone' }))
-
-    expect(await screen.findByText(/1 device queued/)).toBeTruthy()
-    const bulkCalls = fetchMock.mock.calls.filter(
-      ([input, init]) => String(input).endsWith('/api/v1/firmware/campaigns/bulk') && init?.method === 'POST',
-    )
-    expect(bulkCalls).toHaveLength(1)
-    const body = JSON.parse(String(bulkCalls[0]?.[1]?.body))
-    expect(body).toEqual({
-      release_id: 'release-2-2-4',
-      zone_ids: [device.zone_id],
-      idempotency_key: expect.stringMatching(/^firmware-bulk:/),
-    })
-    // The old single-zone flow (preflight, then create) is not used.
-    expect(fetchMock.mock.calls.some(([input]) => String(input).endsWith('/campaigns/preflight'))).toBe(false)
-  })
-
-  it('shows stability warnings and a waiting offline device as information after a one-click update', async () => {
-    await import('./features/Firmware')
-    const base = fetchStub()
-    const warning = {
-      code: 'ESP_RESET_RATE_HIGH',
-      connector_id: device.connector_id,
-      display_name: device.display_name,
-      message: `${device.display_name}: 46 ESP resets in 30 online hours on 2.6.15 over 7 days (1.53/h; the warning threshold is 0.5/h).`,
-    }
-    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-      if (String(input).endsWith('/api/v1/firmware/campaigns/bulk')) {
-        return response({
-          release_id: 'release-2-2-4',
-          created: 1,
-          results: [{
-            zone_id: device.zone_id, outcome: 'CREATED', campaign_id: 'campaign-one', status: 'ACTIVE', message: null,
-            stability_warnings: [warning], eligible: 1, fleet_hold: 'NATIONWIDE_TARGET_OFFLINE', closed: [],
-          }],
-        })
-      }
-      return base(input, init)
-    })
-    vi.stubGlobal('fetch', fetchMock)
-    render(<App />)
-    await screen.findByRole('heading', { name: 'Fleet', level: 1 })
-    fireEvent.click(screen.getByRole('button', { name: 'Firmware' }))
-    expect(await screen.findByRole('heading', { name: 'Firmware', level: 1 })).toBeTruthy()
-    const update = screen.getByRole('button', { name: 'Update firmware' }) as HTMLButtonElement
-    await waitFor(() => expect(update.disabled).toBe(false))
-    fireEvent.click(update)
-    fireEvent.click(screen.getByRole('checkbox', { name: new RegExp(device.zone_id) }))
-    fireEvent.click(screen.getByRole('button', { name: 'Update 1 zone' }))
-    expect(await screen.findByText(/46 ESP resets in 30 online hours/)).toBeTruthy()
-    expect(screen.getByText(/Created; waiting for the device to come online/)).toBeTruthy()
-    expect(screen.queryByLabelText(/Override the stability warnings/)).toBeNull()
-  })
 
   it('returns to the login screen when any request reports an expired session', async () => {
     render(<App />)
@@ -1055,76 +273,6 @@ describe('State Life ADD interface', () => {
     expect(screen.getByText(/durably tracked/i)).toBeTruthy()
   })
 
-  it('renders only allowlisted alert diagnostics', async () => {
-    render(<App />)
-    await screen.findByRole('heading', { name: 'Fleet', level: 1 })
-    fireEvent.click(screen.getByRole('button', { name: /alerts/i }))
-    expect(await screen.findByText(/Category HTTP_503 · HTTP 503 · Attempt 4/i)).toBeTruthy()
-    expect(await screen.findByRole('heading', { name: /attendance quarantine/i })).toBeTruthy()
-    expect(screen.getByText(/ATTENDANCE_EVENT_STRING_PATTERN_MISMATCH · event_uid/i)).toBeTruthy()
-    expect(screen.getByText(/valid and newer punches continue/i)).toBeTruthy()
-    expect(document.body.textContent).not.toContain('must-not-render')
-    expect(document.body.textContent).not.toContain(fullCnic)
-    expect(formatAlertDiagnostics({ failure_category: 'unsafe detail!', secret: 'x' })).toBe('')
-  })
-
-  it('renders bounded device-health evidence, binding, latch, rejection types, and resolution', () => {
-    expect(formatAlertDiagnostics({
-      diagnostics_schema_version: 2,
-      boot_id: '1a2b3c4d-5e6f-4a1b-8c2d-0123456789ab',
-      firmware_version: '2.5.2',
-      binding: 'INFERRED_PREVIOUS',
-      evidence: { summary: 'add_delivery STOPPED · restarts 3', workers: [{ name: 'add_delivery', state: 'STOPPED' }] },
-      latch: { kind: 'LED_LATCH_NO_IO_ERRORS', source: 'add_connector.c:3764', firmware_version: '2.6.15' },
-      resolution: { kind: 'OPERATOR', actor: 'StateHealthAdmin', reason: 'Stranded by the recovery image.', at: '2026-10-10T08:00:00Z' },
-    })).toBe(
-      'Evidence: add_delivery STOPPED · restarts 3 · Firmware 2.5.2 · boot 1a2b3c4d · Inferred on an earlier boot · '
-      + 'LED latch: no I/O errors this boot · Resolved by StateHealthAdmin',
-    )
-    expect(formatAlertDiagnostics({
-      message_type: 'log',
-      error_type: 'ValidationError',
-      error_category: 'SCHEMA_INVALID',
-      types: { heartbeat: { count: 2 }, queue_evidence: { count: 1 }, 'not a type!': {} },
-      resolution: { kind: 'MESSAGE_ACCEPTED', at: '2026-10-10T08:00:00Z' },
-    })).toBe('Rejected heartbeat, queue_evidence · Resolved: message accepted')
-    expect(formatAlertDiagnostics({ message_type: 'heartbeat', error_category: 'DATABASE_UNAVAILABLE' })).toBe('Rejected heartbeat')
-    expect(formatAlertDiagnostics({ message_type: 'heartbeat' })).toBe('')
-    expect(formatAlertDiagnostics({ evidence: { summary: 'x'.repeat(400) } })).toBe(`Evidence: ${'x'.repeat(300)}`)
-    expect(formatAlertDiagnostics({ firmware_version: '<script>', boot_id: 'bad boot', binding: 'lower', latch: 'LED' })).toBe('')
-  })
-
-  it('requires audited step-up to reveal and review attendance quarantine', async () => {
-    render(<App />)
-    await screen.findByRole('heading', { name: 'Fleet', level: 1 })
-    fireEvent.click(screen.getByRole('button', { name: /alerts/i }))
-    fireEvent.click(await screen.findByRole('button', { name: /^review$/i }))
-    expect(await screen.findByRole('heading', { name: /review quarantined attendance/i })).toBeTruthy()
-
-    const reason = screen.getByLabelText(/audited reason/i)
-    const password = screen.getByLabelText(/administrator password/i)
-    fireEvent.change(reason, { target: { value: 'Inspect retained malformed source evidence.' } })
-    fireEvent.change(password, { target: { value: 'local-quarantine-step-up' } })
-    fireEvent.click(screen.getByRole('button', { name: /reveal evidence/i }))
-    expect(await screen.findByText(/protected-attendance-evidence/i)).toBeTruthy()
-    const revealCall = vi.mocked(fetch).mock.calls.find(([path, init]) =>
-      String(path).endsWith('/api/v1/attendance-quarantine/91/reveal') && init?.method === 'POST')
-    expect(revealCall).toBeTruthy()
-    expect(JSON.parse(String(revealCall?.[1]?.body)).idempotency_key).toMatch(/^attendance-quarantine-reveal:/)
-    expect(document.body.textContent).not.toContain('local-quarantine-step-up')
-    fireEvent.click(screen.getByRole('button', { name: /hide now/i }))
-    expect(screen.queryByText(/protected-attendance-evidence/i)).toBeNull()
-
-    fireEvent.change(reason, { target: { value: 'Confirmed malformed source evidence.' } })
-    fireEvent.change(password, { target: { value: 'local-quarantine-step-up' } })
-    fireEvent.click(screen.getByRole('button', { name: /mark reviewed/i }))
-    await waitFor(() => expect(vi.mocked(fetch).mock.calls.some(([path, init]) =>
-      String(path).endsWith('/api/v1/attendance-quarantine/91/review') && init?.method === 'POST')).toBe(true))
-    const reviewCall = vi.mocked(fetch).mock.calls.find(([path, init]) =>
-      String(path).endsWith('/api/v1/attendance-quarantine/91/review') && init?.method === 'POST')
-    expect(JSON.parse(String(reviewCall?.[1]?.body)).idempotency_key).toMatch(/^attendance-quarantine-review:/)
-    expect(screen.queryByRole('heading', { name: /review quarantined attendance/i })).toBeNull()
-  })
 
   it('shows durable command progress without relying on hue', () => {
     const { container } = render(
@@ -1165,56 +313,6 @@ describe('State Life ADD interface', () => {
   })
 })
 
-describe('user-operation safety rules', () => {
-  it('builds a valid UTF-8 24-byte machine-name projection', () => {
-    const preview = buildMachinePreview('زارا State Life Employee', fullCnic, true)
-    expect(new TextEncoder().encode(preview).length).toBeLessThanOrEqual(24)
-    expect(preview.endsWith(`-S-${fullCnic}`)).toBe(true)
-  })
-
-  it('validates CNIC, numeric override, password, and typed deletion confirmation', () => {
-    expect(
-      validateUserDraft({
-        displayName: 'Ayesha',
-        cnic: '123',
-        password: 'secret',
-      }),
-    ).toMatch(/13 digits/)
-    expect(
-      validateUserDraft({
-        displayName: 'Ayesha',
-        cnic: fullCnic,
-        password: 'secret',
-        userIdOverride: 'employee-seven',
-      }),
-    ).toMatch(/numeric/)
-    expect(confirmationMatches('Ayesha Fatima', user)).toBe(true)
-    expect(confirmationMatches('1007', user)).toBe(true)
-    expect(confirmationMatches('Ayesha', user)).toBe(false)
-  })
-})
-
-// Captures realtime listeners so a test can emit topics like the server does.
-class CapturingEventSource {
-  static latest: CapturingEventSource | null = null
-  static CLOSED = 2
-  readyState = 1
-  onopen: (() => void) | null = null
-  onmessage: ((event: MessageEvent) => void) | null = null
-  onerror: (() => void) | null = null
-  listeners = new Map<string, Array<() => void>>()
-  constructor(_url: string, _options?: EventSourceInit) {
-    CapturingEventSource.latest = this
-  }
-  addEventListener(name: string, listener: () => void) {
-    this.listeners.set(name, [...(this.listeners.get(name) || []), listener])
-  }
-  close() {}
-  emit(name: string) {
-    this.listeners.get(name)?.forEach((listener) => listener())
-  }
-}
-
 describe('realtime refresh budget', () => {
   const calls = (fetchMock: ReturnType<typeof fetchStub>, pathname: string) =>
     fetchMock.mock.calls.filter(([input]) => new URL(String(input), 'https://add.test').pathname === pathname).length
@@ -1223,7 +321,7 @@ describe('realtime refresh budget', () => {
     // A request still in flight from an earlier test must not satisfy this one.
     queryClient.clear()
     vi.useFakeTimers({ shouldAdvanceTime: true })
-    window.history.replaceState({}, '', '/fleet')
+    window.history.replaceState({}, '', '/home')
     vi.stubGlobal('EventSource', CapturingEventSource)
   })
 
@@ -1234,7 +332,7 @@ describe('realtime refresh budget', () => {
     CapturingEventSource.latest = null
   })
 
-  it('refreshes devices on device events at most every 3 s and never refetches the overview for punches', async () => {
+  it('refreshes devices on device events at most every 5 s and never refetches the overview for punches', async () => {
     const fetchMock = fetchStub()
     vi.stubGlobal('fetch', fetchMock)
     render(<App />)
@@ -1262,16 +360,16 @@ describe('realtime refresh budget', () => {
       await vi.advanceTimersByTimeAsync(150)
     }
     expect(calls(fetchMock, '/api/v1/devices')).toBe(2)
-    await vi.advanceTimersByTimeAsync(3000)
+    await vi.advanceTimersByTimeAsync(5000)
     await waitFor(() => expect(calls(fetchMock, '/api/v1/devices')).toBe(3))
-    await vi.advanceTimersByTimeAsync(6000)
+    await vi.advanceTimersByTimeAsync(10_000)
     expect(calls(fetchMock, '/api/v1/devices')).toBe(3)
     expect(calls(fetchMock, '/api/v1/overview')).toBe(1)
     // The list never falls back to its loading state during a background refresh.
     expect(screen.queryByText(/loading live fleet/i)).toBeNull()
   })
 
-  it('refreshes the overview for alerts at most every 15 s on the Fleet page', async () => {
+  it('refreshes the overview for alerts at most every 15 s on the Home page', async () => {
     const fetchMock = fetchStub()
     vi.stubGlobal('fetch', fetchMock)
     render(<App />)
@@ -1298,6 +396,94 @@ describe('overview metrics time', () => {
     expect(metricsTime(base)).toBeNull()
     expect(metricsTime({ ...base, metrics_computed_at: 'not-a-date' } as Overview)).toBeNull()
     expect(metricsTime({ ...base, metrics_computed_at: '2026-11-04T09:15:42Z' } as Overview))
-      .toBe(new Date('2026-11-04T09:15:42Z').toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }))
+      .toBe('2:15 pm') // Pakistan time without seconds, whatever the browser zone
+  })
+})
+
+describe('first paint, quiet errors and live rows', () => {
+  const pending = () => new Promise<Response>(() => undefined)
+  const path = (input: RequestInfo | URL) => String(input)
+
+  beforeEach(() => {
+    queryClient.clear()
+    window.history.replaceState({}, '', '/home')
+    vi.stubGlobal('EventSource', CapturingEventSource)
+  })
+
+  afterEach(() => {
+    cleanup()
+    vi.useRealTimers()
+    vi.unstubAllGlobals()
+    CapturingEventSource.latest = null
+    queryClient.clear()
+  })
+
+  it('shows loading tiles and no problem badge before the overview arrives, never a false 0', async () => {
+    const base = fetchStub()
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) =>
+      path(input).includes('/api/v1/overview') ? pending() : base(input, init)))
+    render(<App />)
+    await screen.findByRole('heading', { name: 'Fleet', level: 1 })
+    expect(screen.getByLabelText('Fleet availability: loading')).toBeTruthy()
+    expect(screen.getByLabelText('ORDS delivery queue: loading')).toBeTruthy()
+    expect(screen.queryByText('0%')).toBeNull()
+    expect(screen.queryByText(/0 of 0 online/)).toBeNull()
+    expect(document.querySelector('.nav-count')).toBeNull()
+  })
+
+  it('never pops up a message when a background refresh fails', { timeout: 15_000 }, async () => {
+    const base = fetchStub()
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) =>
+      path(input).startsWith('/api/v1/devices?') ? response({ detail: 'Bad gateway' }, 502) : base(input, init)))
+    render(<App />)
+    await screen.findByRole('heading', { name: 'Fleet', level: 1 })
+    // The request is retried twice before the page says so.
+    expect(await screen.findByText('Could not load the devices. Trying again…', undefined, { timeout: 8000 })).toBeTruthy()
+    expect(screen.queryByText(/bad gateway|request failed/i)).toBeNull()
+    expect(document.querySelector('.toast')).toBeNull()
+  })
+
+  it('asks for the slim list, the quick overview off Home, and moves old addresses', async () => {
+    const fetchMock = fetchStub()
+    vi.stubGlobal('fetch', fetchMock)
+    window.history.replaceState({}, '', '/alerts?division=life')
+    render(<App />)
+    await waitFor(() => expect(window.location.pathname).toBe('/problems'))
+    expect(window.location.search).toBe('?division=life')
+    await waitFor(() => expect(fetchMock.mock.calls.some(([input]) => path(input) === '/api/v1/overview?sections=fleet')).toBe(true))
+    expect(fetchMock.mock.calls.some(([input]) => path(input) === '/api/v1/devices?view=list')).toBe(true)
+    expect(fetchMock.mock.calls.some(([input]) => path(input) === '/api/v1/overview')).toBe(false)
+    expect(document.title).toBe('Problems · State Life Attendance')
+  })
+
+  it('opens an old device link on the Devices page', async () => {
+    vi.stubGlobal('fetch', fetchStub())
+    window.history.replaceState({}, '', '/fleet/connector-one')
+    render(<App />)
+    await waitFor(() => expect(window.location.pathname).toBe('/devices/connector-one'))
+    expect(await screen.findByRole('dialog')).toBeTruthy()
+  })
+
+  it('applies a heartbeat row in place without re-reading the device list', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    const fetchMock = fetchStub()
+    vi.stubGlobal('fetch', fetchMock)
+    render(<App />)
+    await screen.findByRole('heading', { name: 'Fleet', level: 1 })
+    fireEvent.click(screen.getByRole('button', { name: 'List' }))
+    await screen.findByRole('button', { name: `Inspect ${device.display_name}` })
+    const listReads = () => fetchMock.mock.calls.filter(([input]) => path(input).startsWith('/api/v1/devices?')).length
+    await waitFor(() => expect(listReads()).toBe(1))
+    const stream = CapturingEventSource.latest as CapturingEventSource
+    const row = { ...device, display_name: 'Swat · renamed live', snapshot_at: new Date(Date.now() + 1000).toISOString(), health: { mode: 'ENFORCED', tier: 'ONLINE' } }
+    stream.emit('heartbeat', JSON.stringify(row))
+    await vi.advanceTimersByTimeAsync(200)
+    expect(await screen.findByRole('button', { name: 'Inspect Swat · renamed live' })).toBeTruthy()
+    await vi.advanceTimersByTimeAsync(6000)
+    expect(listReads()).toBe(1)
+    // A partial device event (no row) still re-reads the list.
+    stream.emit('device', JSON.stringify({ connector_id: device.connector_id, connected: false }))
+    await vi.advanceTimersByTimeAsync(200)
+    await waitFor(() => expect(listReads()).toBe(2))
   })
 })

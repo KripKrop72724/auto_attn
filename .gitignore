@@ -41,3 +41,4 @@ apps/add_frontend_classic/vite.config.d.ts
 
 apps/add_frontend/test-results/
 apps/add_frontend/playwright-report/
+apps/add_frontend/screenshots/

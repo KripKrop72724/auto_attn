@@ -23,6 +23,7 @@ import {
 import { Icon } from '../Icon'
 import { AnchoredLayer } from '../AnchoredLayer'
 import { AttendanceRecovery } from './AttendanceRecovery'
+import { recoverSection } from '../routing'
 import type {
   AttendanceRecoverySummary,
   Device,
@@ -154,6 +155,15 @@ function useThrottledValue<T>(value: T, intervalMs: number): T {
 }
 
 const REVISION_REFRESH_MS = 5000
+// Check-ins arrive in thousands during a release; they move the "Reached the HR
+// system" figures only slowly, so they refresh this page at most every 15 s.
+const ATTENDANCE_REVISION_REFRESH_MS = 15_000
+
+// URL tab (`/recover?tab=recoveries | unreadable | held`, old names read too) ⇄ this page's sections.
+const sectionFromUrl = (search: string): ReconciliationSection => {
+  const tab = recoverSection(search)
+  return tab === 'unreadable' ? 'exceptions' : tab === 'held' ? 'recovery' : 'jobs'
+}
 const RECOVERY_COUNT_REFRESH_MS = 60_000
 const JOB_PAGE = 40
 const BULK_REQUEST_LIMIT = 100
@@ -1470,20 +1480,18 @@ function ReconciliationDivergenceDrawer({
 export function ReconciliationView({
   devices,
   revision,
+  attendanceRevision = 0,
   toast,
 }: {
   devices: Device[]
+  /** Recovery (reconciliation) live events. */
   revision: number
+  /** Check-in live events, throttled apart (ADV-24). */
+  attendanceRevision?: number
   toast: Toast
 }) {
   const initial = useMemo(() => new URLSearchParams(window.location.search), [])
-  const [section, setSection] = useState<ReconciliationSection>(
-    initial.get('tab') === 'source-exceptions'
-      ? 'exceptions'
-      : initial.get('tab') === 'recovery'
-        ? 'recovery'
-      : 'jobs',
-  )
+  const [section, setSection] = useState<ReconciliationSection>(() => sectionFromUrl(window.location.search))
   const [rows, setRows] = useState<ReconciliationJob[]>([])
   const [scheduler, setScheduler] =
     useState<ReconciliationScheduler>(emptyScheduler)
@@ -1553,6 +1561,7 @@ export function ReconciliationView({
     jobCursorRef.current = jobCursor
   }, [rows, jobCursor])
   const refreshRevision = useThrottledValue(revision, REVISION_REFRESH_MS)
+    + useThrottledValue(attendanceRevision, ATTENDANCE_REVISION_REFRESH_MS)
   const selected =
     devices.find((device) => device.connector_id === selectedId) || null
   const zones = useMemo(
@@ -1575,8 +1584,8 @@ export function ReconciliationView({
   const setWorkspaceSection = (next: ReconciliationSection) => {
     setSection(next)
     const params = new URLSearchParams()
-    if (next === 'exceptions') params.set('tab', 'source-exceptions')
-    if (next === 'recovery') params.set('tab', 'recovery')
+    if (next === 'exceptions') params.set('tab', 'unreadable')
+    if (next === 'recovery') params.set('tab', 'held')
     const deviceId = next === 'exceptions' ? exceptionFilters.device_id : ''
     const jobId = next === 'exceptions' ? exceptionFilters.job_id : ''
     if (deviceId) params.set('device_id', deviceId)
@@ -1598,7 +1607,7 @@ export function ReconciliationView({
     setExceptionFilters(next)
     setSection('exceptions')
     const params = new URLSearchParams({
-      tab: 'source-exceptions',
+      tab: 'unreadable',
       job_id: job.job_id,
     })
     if (job.connector?.connector_id)
@@ -1612,12 +1621,7 @@ export function ReconciliationView({
   useEffect(() => {
     const onPopState = () => {
       const params = new URLSearchParams(window.location.search)
-      const next =
-        params.get('tab') === 'source-exceptions'
-          ? 'exceptions'
-          : params.get('tab') === 'recovery'
-            ? 'recovery'
-            : 'jobs'
+      const next = sectionFromUrl(window.location.search)
       setSection(next)
       if (next === 'exceptions') {
         const deviceId = params.get('device_id') || ''
@@ -2982,7 +2986,7 @@ export function ReconciliationView({
                 event.preventDefault()
                 setExceptionFilters(exceptionDraft)
                 const params = new URLSearchParams({
-                  tab: 'source-exceptions',
+                  tab: 'unreadable',
                 })
                 if (exceptionDraft.job_id)
                   params.set('job_id', exceptionDraft.job_id)
@@ -3106,7 +3110,7 @@ export function ReconciliationView({
                     window.history.pushState(
                       null,
                       '',
-                      `${window.location.pathname}?tab=source-exceptions`,
+                      `${window.location.pathname}?tab=unreadable`,
                     )
                   }}
                 >

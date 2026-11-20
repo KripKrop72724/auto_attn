@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import './ZktCustodyStatus.css'
 import { api } from '../api'
 import { humanizeStatus } from '../status'
 

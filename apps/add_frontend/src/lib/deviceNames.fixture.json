@@ -1,5 +1,5 @@
 {
-  "_comment": "One naming rule for Life/Health and friendly names, shared by the backend (be/device_names.py, tests/unit/test_device_names.py) and the frontend fallback (fe/lib/deviceNames.test.ts). friendly_name uses the numbered places of `fleet` (the active, non-spare devices, the /status set): a device number is shown only where a place has several numbered devices; a device that is not listed counts itself; a spare never counts and ends in ' · Spare'.",
+  "_comment": "One naming rule for Life/Health and friendly names, shared by the backend (be/device_names.py, tests/unit/test_device_names.py) and the frontend fallback (fe/lib/deviceNames.test.ts). friendly_name uses the numbered places of `fleet` (the active, non-spare devices, the /status set): a device number is shown only where a place has several numbered devices; a device that is not listed counts itself; a spare never counts and ends in ' · Spare'. `name_cases` and `live` are the /status vectors (zone, location, unit, number; the /status order and names of the live active devices), read by tests/unit/test_device_names_fixture.py and src/lib/deviceNames.test.ts.",
   "fleet": [
     "LF-ZONE-BLD1-01",
     "LF-ZONE-BLD5-01",
@@ -342,5 +342,403 @@
       "friendly_name": "Lfzone Bld2",
       "city": "Lfzone Bld2"
     }
-  ]
+  ],
+  "name_cases": [
+    {
+      "code": "LF-ZONE-BLD1-01",
+      "zone": "life",
+      "location": "Building 1",
+      "unit": "Device 1",
+      "number": 1
+    },
+    {
+      "code": "LF-ZONE-BLD5-01",
+      "zone": "life",
+      "location": "Building 5",
+      "unit": "Device 1",
+      "number": 1
+    },
+    {
+      "code": "LF-ZONE-BLD9-01",
+      "zone": "life",
+      "location": "Building 9",
+      "unit": "Device 1",
+      "number": 1
+    },
+    {
+      "code": "LF-ZONE-BLD9-02",
+      "zone": "life",
+      "location": "Building 9",
+      "unit": "Device 2",
+      "number": 2
+    },
+    {
+      "code": "LF-ZONE-BLD9-03",
+      "zone": "life",
+      "location": "Building 9",
+      "unit": "Device 3",
+      "number": 3
+    },
+    {
+      "code": "LF-ZONE-G&PBLD8-01",
+      "zone": "life",
+      "location": "Group & Pension Building 8",
+      "unit": "Device 1",
+      "number": 1
+    },
+    {
+      "code": "ZONE-BLD9-01",
+      "zone": "health",
+      "location": "Building 9",
+      "unit": "Device 1",
+      "number": 1
+    },
+    {
+      "code": "ZONE-FAISALABAD-01",
+      "zone": "health",
+      "location": "Faisalabad",
+      "unit": "Device 1",
+      "number": 1
+    },
+    {
+      "code": "ZONE-FAISALABAD-02",
+      "zone": "health",
+      "location": "Faisalabad",
+      "unit": "Device 2",
+      "number": 2
+    },
+    {
+      "code": "ZONE-KARACHI-01",
+      "zone": "health",
+      "location": "Karachi",
+      "unit": "Device 1",
+      "number": 1
+    },
+    {
+      "code": "ZONE-LAHORE-01",
+      "zone": "health",
+      "location": "Lahore",
+      "unit": "Device 1",
+      "number": 1
+    },
+    {
+      "code": "ZONE-LAHORE-02",
+      "zone": "health",
+      "location": "Lahore",
+      "unit": "Device 2",
+      "number": 2
+    },
+    {
+      "code": "ZONE-MULTAN-01",
+      "zone": "health",
+      "location": "Multan",
+      "unit": "Device 1",
+      "number": 1
+    },
+    {
+      "code": "ZONE-MULTAN-02",
+      "zone": "health",
+      "location": "Multan",
+      "unit": "Device 2",
+      "number": 2
+    },
+    {
+      "code": "ZONE-PESHAWAR-02",
+      "zone": "health",
+      "location": "Peshawar",
+      "unit": "Device 2",
+      "number": 2
+    },
+    {
+      "code": "ZONE-PESHAWAR-06",
+      "zone": "health",
+      "location": "Peshawar",
+      "unit": "Device 6",
+      "number": 6
+    },
+    {
+      "code": "ZONE-QUETTA-01",
+      "zone": "health",
+      "location": "Quetta",
+      "unit": "Device 1",
+      "number": 1
+    },
+    {
+      "code": "ZONE-SLICTOWER-13FL",
+      "zone": "health",
+      "location": "SLIC Tower",
+      "unit": "13th Floor",
+      "number": null
+    },
+    {
+      "code": "ZONE-SLICTOWER-3FL",
+      "zone": "health",
+      "location": "SLIC Tower",
+      "unit": "3rd Floor",
+      "number": null
+    },
+    {
+      "code": "ZONE-SWAT-01",
+      "zone": "health",
+      "location": "Swat",
+      "unit": "Device 1",
+      "number": 1
+    },
+    {
+      "code": "ZONE-LAHORE-03",
+      "zone": "health",
+      "location": "Lahore",
+      "unit": "Device 3",
+      "number": 3
+    },
+    {
+      "code": "LF ZONE BLD1",
+      "zone": "life",
+      "location": "Building 1",
+      "unit": null,
+      "number": null
+    },
+    {
+      "code": "lf-zone-x",
+      "zone": "life",
+      "location": "X",
+      "unit": null,
+      "number": null
+    },
+    {
+      "code": "LF_ZONE_BLD2-04",
+      "zone": "life",
+      "location": "Building 2",
+      "unit": "Device 4",
+      "number": 4
+    },
+    {
+      "code": "LFZONE-1",
+      "zone": "health",
+      "location": "Lfzone",
+      "unit": "Device 1",
+      "number": 1
+    },
+    {
+      "code": "zone-faisalabad-02",
+      "zone": "health",
+      "location": "Faisalabad",
+      "unit": "Device 2",
+      "number": 2
+    },
+    {
+      "code": "ZONE-KARACHI",
+      "zone": "health",
+      "location": "Karachi",
+      "unit": null,
+      "number": null
+    },
+    {
+      "code": "",
+      "zone": "health",
+      "location": "",
+      "unit": null,
+      "number": null
+    },
+    {
+      "code": "  ZONE-SLICTOWER-3FL  ",
+      "zone": "health",
+      "location": "SLIC Tower",
+      "unit": "3rd Floor",
+      "number": null
+    },
+    {
+      "code": "LF-ZONE-SLICTOWER-2FL",
+      "zone": "life",
+      "location": "SLIC Tower",
+      "unit": "2nd Floor",
+      "number": null
+    },
+    {
+      "code": "ZONE GBLD3 01",
+      "zone": "health",
+      "location": "Gbld3",
+      "unit": "Device 1",
+      "number": 1
+    },
+    {
+      "code": "SOMETHING ELSE",
+      "zone": "health",
+      "location": "Something Else",
+      "unit": null,
+      "number": null
+    }
+  ],
+  "live": {
+    "active": [
+      "LF-ZONE-BLD1-01",
+      "LF-ZONE-BLD5-01",
+      "LF-ZONE-BLD9-01",
+      "LF-ZONE-BLD9-02",
+      "LF-ZONE-BLD9-03",
+      "LF-ZONE-G&PBLD8-01",
+      "ZONE-BLD9-01",
+      "ZONE-FAISALABAD-01",
+      "ZONE-FAISALABAD-02",
+      "ZONE-KARACHI-01",
+      "ZONE-LAHORE-01",
+      "ZONE-LAHORE-02",
+      "ZONE-MULTAN-01",
+      "ZONE-MULTAN-02",
+      "ZONE-PESHAWAR-02",
+      "ZONE-PESHAWAR-06",
+      "ZONE-QUETTA-01",
+      "ZONE-SLICTOWER-13FL",
+      "ZONE-SLICTOWER-3FL",
+      "ZONE-SWAT-01"
+    ],
+    "spare": [
+      "LF-ZONE-BLD1-01",
+      "LF-ZONE-BLD5-01",
+      "LF-ZONE-G&PBLD8-01",
+      "ZONE-LAHORE-03"
+    ],
+    "names": [
+      {
+        "code": "LF-ZONE-BLD1-01",
+        "zone": "life",
+        "name": "Building 1",
+        "location": "Building 1",
+        "unit": null
+      },
+      {
+        "code": "LF-ZONE-BLD5-01",
+        "zone": "life",
+        "name": "Building 5",
+        "location": "Building 5",
+        "unit": null
+      },
+      {
+        "code": "LF-ZONE-BLD9-01",
+        "zone": "life",
+        "name": "Building 9 · Device 1",
+        "location": "Building 9",
+        "unit": "Device 1"
+      },
+      {
+        "code": "LF-ZONE-BLD9-02",
+        "zone": "life",
+        "name": "Building 9 · Device 2",
+        "location": "Building 9",
+        "unit": "Device 2"
+      },
+      {
+        "code": "LF-ZONE-BLD9-03",
+        "zone": "life",
+        "name": "Building 9 · Device 3",
+        "location": "Building 9",
+        "unit": "Device 3"
+      },
+      {
+        "code": "LF-ZONE-G&PBLD8-01",
+        "zone": "life",
+        "name": "Group & Pension Building 8",
+        "location": "Group & Pension Building 8",
+        "unit": null
+      },
+      {
+        "code": "ZONE-BLD9-01",
+        "zone": "health",
+        "name": "Building 9",
+        "location": "Building 9",
+        "unit": null
+      },
+      {
+        "code": "ZONE-FAISALABAD-01",
+        "zone": "health",
+        "name": "Faisalabad · Device 1",
+        "location": "Faisalabad",
+        "unit": "Device 1"
+      },
+      {
+        "code": "ZONE-FAISALABAD-02",
+        "zone": "health",
+        "name": "Faisalabad · Device 2",
+        "location": "Faisalabad",
+        "unit": "Device 2"
+      },
+      {
+        "code": "ZONE-KARACHI-01",
+        "zone": "health",
+        "name": "Karachi",
+        "location": "Karachi",
+        "unit": null
+      },
+      {
+        "code": "ZONE-LAHORE-01",
+        "zone": "health",
+        "name": "Lahore · Device 1",
+        "location": "Lahore",
+        "unit": "Device 1"
+      },
+      {
+        "code": "ZONE-LAHORE-02",
+        "zone": "health",
+        "name": "Lahore · Device 2",
+        "location": "Lahore",
+        "unit": "Device 2"
+      },
+      {
+        "code": "ZONE-MULTAN-01",
+        "zone": "health",
+        "name": "Multan · Device 1",
+        "location": "Multan",
+        "unit": "Device 1"
+      },
+      {
+        "code": "ZONE-MULTAN-02",
+        "zone": "health",
+        "name": "Multan · Device 2",
+        "location": "Multan",
+        "unit": "Device 2"
+      },
+      {
+        "code": "ZONE-PESHAWAR-02",
+        "zone": "health",
+        "name": "Peshawar · Device 2",
+        "location": "Peshawar",
+        "unit": "Device 2"
+      },
+      {
+        "code": "ZONE-PESHAWAR-06",
+        "zone": "health",
+        "name": "Peshawar · Device 6",
+        "location": "Peshawar",
+        "unit": "Device 6"
+      },
+      {
+        "code": "ZONE-QUETTA-01",
+        "zone": "health",
+        "name": "Quetta",
+        "location": "Quetta",
+        "unit": null
+      },
+      {
+        "code": "ZONE-SLICTOWER-3FL",
+        "zone": "health",
+        "name": "SLIC Tower · 3rd Floor",
+        "location": "SLIC Tower",
+        "unit": "3rd Floor"
+      },
+      {
+        "code": "ZONE-SLICTOWER-13FL",
+        "zone": "health",
+        "name": "SLIC Tower · 13th Floor",
+        "location": "SLIC Tower",
+        "unit": "13th Floor"
+      },
+      {
+        "code": "ZONE-SWAT-01",
+        "zone": "health",
+        "name": "Swat",
+        "location": "Swat",
+        "unit": null
+      }
+    ]
+  }
 }

@@ -16,6 +16,7 @@ import {
 } from '../App'
 import { Icon } from '../Icon'
 import { humanizeStatus } from '../status'
+import { useThrottledRunner } from '../lib/throttle'
 import type { RealtimeState } from '../realtime'
 import type { AttendanceEvent, CheckinNotificationOverview, CheckinNotificationStatus, Device } from '../types'
 import { AttendanceReleaseHistory } from './AttendanceRelease'
@@ -57,6 +58,8 @@ const emptyFilters: AttendanceFilters = {
 
 const notifyFilterOptions: CheckinNotificationStatus[] = ['NOTIFIED', 'PENDING', 'RETRYING', 'FAILED', 'NOT_SENT']
 type Toast = { notice: (message: string) => void; error: (message: string) => void }
+
+const LIVE_REFRESH_MS = 3_000
 
 const sourceLabels: Record<string, string> = {
   LIVE: 'Live capture',
@@ -207,7 +210,9 @@ function AllAttendanceEvents({
     }
   }, [requestPath, validationError])
 
-  const refreshFeed = useCallback(async (reveal = false) => {
+  // `background`: a live check-in started it. It shows no busy state and skips
+  // the phone-message figures (the Refresh button and actions still read them).
+  const refreshFeed = useCallback(async (reveal = false, background = false) => {
     if (validationError) {
       setError(validationError)
       return
@@ -215,10 +220,11 @@ function AllAttendanceEvents({
     latestRequest.current?.abort()
     const controller = new AbortController()
     latestRequest.current = controller
-    setRefreshing(true)
+    if (!background) setRefreshing(true)
     setError('')
     try {
-      const response = await api<AttendanceResponse>(requestPath(), { signal: controller.signal })
+      const path = background ? `${requestPath()}&notify_summary=false` : requestPath()
+      const response = await api<AttendanceResponse>(path, { signal: controller.signal })
       if (controller.signal.aborted || latestRequest.current !== controller) return
       const current = rowsRef.current
       const currentIds = new Set(current.map((row) => row.event_uid))
@@ -277,11 +283,14 @@ function AllAttendanceEvents({
     pageRequest.current?.abort()
   }, [])
 
+  // Live check-ins arrive in bursts (a release sends thousands): re-read the
+  // list at most every 3 s, the last change always included (ATT-1).
+  const liveRefresh = useThrottledRunner(() => (liveRef.current ? refreshFeed(false, true) : undefined), LIVE_REFRESH_MS)
   useEffect(() => {
     if (revision === initialRevision.current) return
     initialRevision.current = revision
-    if (live) void refreshFeed(false)
-  }, [live, refreshFeed, revision])
+    if (live) liveRefresh.schedule()
+  }, [live, liveRefresh, revision])
 
   useEffect(() => {
     if (!topSentinel.current || typeof IntersectionObserver === 'undefined') return
@@ -331,6 +340,7 @@ function AllAttendanceEvents({
   const toggleLive = () => {
     if (live) {
       liveRef.current = false
+      liveRefresh.cancel()
       latestRequest.current?.abort()
       pageRequest.current?.abort()
       setLoading(false)
