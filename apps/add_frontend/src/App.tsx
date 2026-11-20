@@ -17,7 +17,8 @@ import { AppDataProvider, type AppData, type Revisions } from './AppData'
 import { queryClient } from './data'
 import { deviceSnapshots, isFullDeviceRow, useDevices, useDevicesLoaded } from './deviceData'
 import { AppShell } from './AppShell'
-import { Icon } from './Icon'
+import { PageSkeleton } from './shell/PageSkeleton'
+import { ErrorState } from './ui/ErrorState'
 import { parseDivision } from './lib/division'
 import { useNewVersion } from './lib/newVersion'
 import { useThrottledRunner } from './lib/throttle'
@@ -70,6 +71,10 @@ const ALL_TOPICS: RealtimeTopic[] = [
 ]
 
 const Login = lazy(() => import('./features/Login'))
+const SESSION_TIMEOUT_MS = 15_000
+const SESSION_SLOW_MS = 8_000
+/** Shown on the sign-in card after a session ended (01-foundation F). */
+const LOGIN_NOTICE = 'You were signed out. Sign in again to continue where you left off.'
 const DeviceDrawer = lazy(() => import('./features/DeviceDrawer').then((module) => ({ default: module.DeviceDrawer })))
 
 const eventConnector = (event: RealtimeEvent): string => {
@@ -86,7 +91,11 @@ function DashboardApp() {
   const workspaceRef = useRef<HTMLElement>(null)
   const workspaceScrollPositions = useRef(new Map<string, number>())
   const previousScrollContext = useRef<{ key: string; context: string } | null>(null)
-  const [authState, setAuthState] = useState<'loading' | 'anonymous' | 'authenticated'>('loading')
+  const [authState, setAuthState] = useState<'loading' | 'unreachable' | 'anonymous' | 'authenticated'>('loading')
+  // The sign-in check: retried by "Try again", given up after 15 s.
+  const [sessionAttempt, setSessionAttempt] = useState(0)
+  const [bootSlow, setBootSlow] = useState(false)
+  const [sessionEnded, setSessionEnded] = useState(false)
   const [username, setUsername] = useState('')
   const devices = useDevices()
   const devicesLoaded = useDevicesLoaded()
@@ -320,18 +329,39 @@ function DashboardApp() {
   const newVersion = useNewVersion(realtime.connections > 1 ? realtime.connections : 0, authState === 'authenticated')
 
   useEffect(() => {
-    api<{ username: string; csrf_token: string }>('/api/v1/auth/session')
+    let cancelled = false
+    const controller = new AbortController()
+    const timeout = window.setTimeout(() => controller.abort(), SESSION_TIMEOUT_MS)
+    const slow = window.setTimeout(() => { if (!cancelled) setBootSlow(true) }, SESSION_SLOW_MS)
+    setBootSlow(false)
+    api<{ username: string; csrf_token: string }>('/api/v1/auth/session', { signal: controller.signal })
       .then((session) => {
+        if (cancelled) return
         setCsrfToken(session.csrf_token)
         setUsername(session.username)
         setAuthState('authenticated')
       })
-      .catch(() => setAuthState('anonymous'))
-  }, [])
+      .catch((reason) => {
+        if (cancelled) return
+        // Not signed in → the sign-in card; no answer at all → "Couldn't connect".
+        setAuthState(reason instanceof ApiError && reason.status < 500 ? 'anonymous' : 'unreachable')
+      })
+      .finally(() => {
+        window.clearTimeout(timeout)
+        window.clearTimeout(slow)
+      })
+    return () => {
+      cancelled = true
+      controller.abort()
+      window.clearTimeout(timeout)
+      window.clearTimeout(slow)
+    }
+  }, [sessionAttempt])
 
   useEffect(() => {
     const handleSessionExpired = () => {
       setCsrfToken('')
+      setSessionEnded(true)
       setAuthState('anonymous')
       invalidateFleetRequests()
       deviceSnapshots.clear()
@@ -365,6 +395,7 @@ function DashboardApp() {
     })
     setCsrfToken(response.csrf_token)
     setUsername(response.username)
+    setSessionEnded(false)
     setAuthState('authenticated')
   }
 
@@ -440,8 +471,26 @@ function DashboardApp() {
     selectedDeviceId, toast, username,
   ])
 
-  if (authState === 'loading') return <main className="boot-screen"><img src="/state-life-logo.png" alt="State Life Insurance Corporation" /><p>Opening Attendance Device Dashboard…</p></main>
-  if (authState === 'anonymous') return <Suspense fallback={<main className="boot-screen"><img src="/state-life-logo.png" alt="State Life Insurance Corporation" /><p>Opening secure sign in…</p></main>}><Login onLogin={login} /></Suspense>
+  const retrySession = () => { setAuthState('loading'); setSessionAttempt((value) => value + 1) }
+  if (authState === 'loading') {
+    return (
+      <main className="boot-screen">
+        <img src="/state-life-logo.png" alt="State Life Insurance Corporation" />
+        <span className="boot-spinner" aria-hidden="true" />
+        <p role="status">Opening…</p>
+        {bootSlow && <><p>Still connecting… Check the internet connection.</p><button type="button" className="button secondary" onClick={retrySession}>Try again</button></>}
+      </main>
+    )
+  }
+  if (authState === 'unreachable') {
+    return (
+      <main className="boot-screen">
+        <img src="/state-life-logo.png" alt="State Life Insurance Corporation" />
+        <ErrorState title="Couldn't connect" message="Check the internet and try again." onRetry={retrySession} headingLevel={2} />
+      </main>
+    )
+  }
+  if (authState === 'anonymous') return <Suspense fallback={<main className="boot-screen"><img src="/state-life-logo.png" alt="State Life Insurance Corporation" /><span className="boot-spinner" aria-hidden="true" /><p role="status">Opening sign-in…</p></main>}><Login onLogin={login} notice={sessionEnded ? LOGIN_NOTICE : null} /></Suspense>
 
   const entry = routeTable[pageRoute]
   const Page = entry.Page
@@ -452,23 +501,12 @@ function DashboardApp() {
       <AppShell workspaceRef={workspaceRef} username={username} route={pageRoute} openAlertCount={openAlertCount} onNavigate={setView} onLogout={logout} realtimeState={realtime.state} lastSyncAt={realtime.lastSyncAt} fetchFailed={Boolean(devicesError) && devicesLoaded} onTryNow={refreshFleet}>
         <NewVersionNotice available={newVersion} />
         <PageErrorBoundary key={pageRoute}>
-          <Suspense fallback={<WorkspaceLoading label={entry.loadingLabel} />}><Page /></Suspense>
+          <Suspense fallback={<PageSkeleton title={entry.title} />}><Page /></Suspense>
         </PageErrorBoundary>
       </AppShell>
       {drawer && <PageErrorBoundary key={drawer.connector_id}><Suspense fallback={null}><DeviceDrawer key={drawer.connector_id} seed={drawer} revision={deviceRevision(drawer.connector_id)} custodyRevision={deviceCustodyRevision(drawer.connector_id)} onClose={closeDevice} onManageUsers={manageUsers} onInventoryChanged={refreshFleet} toast={toast} /></Suspense></PageErrorBoundary>}
     </AppDataProvider>
   )
-}
-
-// Waits briefly so a fast lazy chunk never flashes a loading state.
-function WorkspaceLoading({ label }: { label: string }) {
-  const [visible, setVisible] = useState(false)
-  useEffect(() => {
-    const timer = window.setTimeout(() => setVisible(true), 180)
-    return () => window.clearTimeout(timer)
-  }, [])
-  if (!visible) return null
-  return <div className="panel empty-state is-loading" role="status"><Icon name="refresh" /><h3>{label}…</h3></div>
 }
 
 export default function App() {

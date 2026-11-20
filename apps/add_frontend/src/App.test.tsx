@@ -241,7 +241,9 @@ describe('State Life ADD interface', () => {
     await appReady()
     vi.stubGlobal('fetch', vi.fn(async () => response({ detail: 'Session expired.' }, 401)))
     await api('/api/v1/protected-test').catch(() => undefined)
-    expect(await screen.findByText(/sign in to the national device operations console/i)).toBeTruthy()
+    expect(await screen.findByText("Sign in to look after State Life's attendance machines.")).toBeTruthy()
+    expect(screen.getByText('You were signed out. Sign in again to continue where you left off.')).toBeTruthy()
+    expect((screen.getByLabelText('Username') as HTMLInputElement).value).toBe('')
   })
 
   it('keeps command progress visible when a legacy command envelope has no status', () => {

@@ -415,7 +415,9 @@ details > summary { cursor: pointer; }
   min-height: 100vh;
   min-height: 100dvh;
   display: grid;
-  place-items: center;
+  place-content: center;
+  justify-items: center;
+  gap: 16px;
   padding: 40px 16px;
   background:
     radial-gradient(1100px 520px at 50% -180px, rgba(0, 148, 218, .1), transparent 70%),
@@ -438,7 +440,12 @@ details > summary { cursor: pointer; }
 .login-field > label { color: var(--text); font-size: 13px; font-weight: 500; }
 .login-password { position: relative; display: block; }
 .login-password input { padding-right: 64px; }
-.login-password .text-button { position: absolute; top: 50%; right: 4px; min-height: 32px; padding: 0 10px; font-size: 13px; transform: translateY(-50%); }
+.login-password .text-button { position: absolute; top: 50%; right: 2px; min-width: 44px; min-height: 44px; padding: 0 10px; font-size: 13px; transform: translateY(-50%); }
+.login-card.is-shaking { animation: login-shake 300ms var(--ease-corporate); }
+@keyframes login-shake { 20%, 60% { transform: translateX(-8px); } 40%, 80% { transform: translateX(8px); } }
+.login-spinner { width: 16px; height: 16px; display: inline-block; margin-right: 8px; border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%; vertical-align: -3px; animation: spin .8s linear infinite; }
+.login-status-link { min-height: 44px; display: inline-flex; align-items: center; gap: 6px; font-size: 14px; }
+.boot-spinner { width: 24px; height: 24px; border: 3px solid var(--accent-muted); border-top-color: var(--accent); border-radius: 50%; animation: spin .8s linear infinite; }
 .login-footnote { display: flex; align-items: center; justify-content: center; gap: 6px; margin: 20px 0 0; color: var(--text-tertiary); font-size: 12px; text-align: center; }
 .login-footnote svg { width: 14px; height: 14px; }
 
