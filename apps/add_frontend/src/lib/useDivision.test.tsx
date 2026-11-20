@@ -40,4 +40,14 @@ describe('Division in the URL', () => {
     expect(withDivision('?a=1', 'life')).toBe('?a=1&division=life')
     expect(withDivision('?division=life', 'all')).toBe('')
   })
+
+  it('keeps the list choice from the address under an open device, and never adds the saved one there', () => {
+    window.localStorage.setItem(PREFS_KEY, JSON.stringify({ division: 'health', technical: false, menuNoteSeen: false }))
+    reloadPrefsForTests()
+    const open = renderHook(() => ({ division: useDivision(), location: useLocation() }), { wrapper: wrapper('/devices/connector-one?division=life') })
+    expect(open.result.current.division[0]).toBe('life')
+    const bare = renderHook(() => ({ division: useDivision(), location: useLocation() }), { wrapper: wrapper('/people/connector-one') })
+    expect(bare.result.current.division[0]).toBe('all')
+    expect(bare.result.current.location.search).toBe('')
+  })
 })

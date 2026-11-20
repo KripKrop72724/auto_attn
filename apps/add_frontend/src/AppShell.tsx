@@ -8,7 +8,6 @@ import { useLocation, useNavigationType } from 'react-router-dom'
 import { api } from './api'
 import { queryClient } from './data'
 import { Icon, type IconName } from './Icon'
-import { parseDivision } from './lib/division'
 import { routesWithoutDivision, useDivision } from './lib/useDivision'
 import type { RealtimeState } from './realtime'
 import { routePath } from './routing'
@@ -94,10 +93,7 @@ export function AppShell({
   const location = useLocation()
   const navigationType = useNavigationType()
   const phone = useIsPhone()
-  const [chosenDivision, setDivision] = useDivision()
-  // useDivision reads "All" on a single device; the device panel opens over a
-  // list page, so keep showing that list's choice from the address.
-  const division = /^\/devices\/[^/]+/.test(location.pathname) ? parseDivision(location.search) : chosenDivision
+  const [division, setDivision] = useDivision()
   const [moreOpen, setMoreOpen] = useState(false)
   const [scrolled, setScrolled] = useState(false)
   const moreTriggerRef = useRef<HTMLButtonElement>(null)

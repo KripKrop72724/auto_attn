@@ -21,7 +21,7 @@ import {
   BRAND_WORD, applyFilters, cityOptions, deviceViews, sortViews, spareCount, statusCounts, versionOptions,
   type Brand, type DeviceFilters, type DeviceView, type SortKey, type StatusFilter,
 } from './devices/deviceList'
-import { usePageDivision } from './devices/usePageDivision'
+import { useDivision } from '../lib/useDivision'
 import { useStatusChange } from './devices/useStatusChange'
 import './Devices.css'
 
@@ -48,7 +48,7 @@ export function DevicesView() {
   const location = useLocation()
   const phone = useIsPhone()
   const now = useNow()
-  const division = usePageDivision()
+  const [division] = useDivision()
   const [values, setValues] = useUrlState(schema)
   const views = useMemo(() => deviceViews(app.devices), [app.devices])
   const filters: DeviceFilters = useMemo(() => ({
@@ -97,7 +97,7 @@ export function DevicesView() {
   const openRow = (row: DeviceView, event: MouseEvent<HTMLElement>) => {
     if (event.metaKey || event.ctrlKey || event.shiftKey || event.button === 1) return
     event.preventDefault()
-    app.inspectDevice(row.device)
+    app.inspectDevice(row.device, shown.map((item) => item.id))
   }
   const openPeople = (device: Device, event: MouseEvent<HTMLAnchorElement>) => {
     if (event.metaKey || event.ctrlKey || event.shiftKey || event.button === 1) return

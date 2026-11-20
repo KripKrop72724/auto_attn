@@ -37,7 +37,6 @@ export * from './lib/dashboardTypes'
 export * from './lib/idempotency'
 export * from './lib/people'
 export * from './lib/time'
-export * from './ui/CommandProgress'
 export * from './ui/Dialog'
 export * from './ui/Metric'
 export * from './ui/PageHeader'
@@ -420,10 +419,10 @@ function DashboardApp() {
   // was opened from (kept in history state), or the Devices list.
   // From the Devices list the filters (?status=…) are kept, so closing the panel
   // brings the same filtered list back.
-  const inspectDevice = useCallback((device: Device) => {
+  const inspectDevice = useCallback((device: Device, list?: readonly string[]) => {
     setDrawer(device)
     const from = panelFrom || `${location.pathname}${location.search}`
-    navigate(routePath('devices', device.connector_id, { division }), { state: { from } })
+    navigate(routePath('devices', device.connector_id, { division }), { state: list?.length ? { from, list: [...list] } : { from } })
   }, [division, location.pathname, location.search, navigate, panelFrom])
 
   const closeDevice = useCallback(() => {

@@ -39,7 +39,8 @@ export interface AppData {
   /** People page: the machine picked in `/people/:deviceId`. */
   selectedDeviceId: string
   selectUserDevice: (id: string) => void
-  inspectDevice: (device: Device) => void
+  /** Opens one device; `list` (connector ids in the order shown) turns on Previous / Next. */
+  inspectDevice: (device: Device, list?: readonly string[]) => void
   manageUsers: (device: Device) => void
   navigate: (to: string) => void
   /** Sign out (Settings, account menu); resolves when the session has ended. */

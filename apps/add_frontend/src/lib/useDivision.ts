@@ -39,6 +39,9 @@ export function useDivision(): [DivisionChoice, (next: DivisionChoice) => void] 
   }, [fromUrl, location.hash, location.pathname, location.search, location.state, navigate, setPrefs])
 
   // An explicit "All" in the URL is not possible (All has no key), so a stored
-  // Life/Health wins until the person picks All again.
-  return [applies ? (fromUrl !== 'all' ? fromUrl : prefs.division) : 'all', setDivision]
+  // Life/Health wins until the person picks All again. On a page where the
+  // switch does not apply (one device, Set up a device, Settings) only the
+  // address counts: the device panel opens over the list with the list's
+  // `?division=` kept, and that list must keep its choice while it is open.
+  return [applies ? (fromUrl !== 'all' ? fromUrl : prefs.division) : fromUrl, setDivision]
 }

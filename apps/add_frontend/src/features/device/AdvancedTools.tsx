@@ -130,6 +130,7 @@ export function AdvancedTools({ device, custodyRevision, toast, hasOpenProblems,
       />}
       {cleanupOpen && <HealthCleanupDialog
         devices={[device]}
+        initialChosen={[device.connector_id]}
         toast={toast}
         onClose={() => setCleanupOpen(false)}
         onApplied={afterAction}
