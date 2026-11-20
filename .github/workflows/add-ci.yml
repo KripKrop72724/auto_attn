@@ -529,9 +529,10 @@ jobs:
           key: ${{ steps.playwright-cache.outputs.cache-primary-key }}
       - name: Run responsive and accessibility browser tests
         # The page sweeps and the screenshot tour run on phone-390-touch and
-        # desktop-1440 only (playwright.config.ts), so this stays well inside
-        # the job's limit.
-        timeout-minutes: 15
+        # desktop-1440 only (playwright.config.ts). Nine projects take about
+        # 12 minutes on 4 workers locally; the runner uses 2 workers, so allow
+        # 25 minutes inside the job's 30.
+        timeout-minutes: 25
         env:
           ADD_VISUAL_QA: "1"
         run: pnpm test:e2e

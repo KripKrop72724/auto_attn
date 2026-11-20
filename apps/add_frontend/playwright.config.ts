@@ -23,6 +23,11 @@ export default defineConfig({
   // The page sweeps and the screenshot tour run on one phone and one desktop
   // size only (DLV-3); every other project runs the page specs.
   projects: [
+    // WebKit on a CPU-only runner draws slowly; several WebKit browsers at once
+    // stall each other for seconds and time out. Run its tests one at a time,
+    // first, so they overlap the Chromium projects instead of ending the run
+    // with every worker on WebKit.
+    { name: 'webkit-1280', workers: 1, testIgnore: sweeps, use: { ...devices['Desktop Safari'], viewport: { width: 1280, height: 900 } } },
     { name: 'mobile-320', testIgnore: sweeps, use: { ...devices['Desktop Chrome'], viewport: { width: 320, height: 720 } } },
     { name: 'mobile-390', testIgnore: sweeps, use: { ...devices['Desktop Chrome'], viewport: { width: 390, height: 844 } } },
     // A real phone: touch, mobile viewport rules (FND-1). Runs the frame specs and the sweeps.
@@ -32,6 +37,5 @@ export default defineConfig({
     { name: 'desktop-1440', use: { ...devices['Desktop Chrome'], viewport: { width: 1440, height: 1000 } } },
     { name: 'wide-1600', testIgnore: sweeps, use: { ...devices['Desktop Chrome'], viewport: { width: 1600, height: 1000 } } },
     { name: 'firefox-1280', testIgnore: sweeps, use: { ...devices['Desktop Firefox'], viewport: { width: 1280, height: 900 } } },
-    { name: 'webkit-1280', testIgnore: sweeps, use: { ...devices['Desktop Safari'], viewport: { width: 1280, height: 900 } } },
   ],
 })

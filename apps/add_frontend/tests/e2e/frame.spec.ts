@@ -22,7 +22,14 @@ test('a permanently closed event stream reconnects while fleet snapshots keep re
   // attempt a few milliseconds past the next 30-second clock boundary.
   await page.clock.pauseAt(new Date('2026-10-04T09:00:01Z'))
   await page.goto('/home')
-  await expect(page.getByRole('heading', { name: 'Home', exact: true, level: 1 })).toBeVisible()
+  // React reveals a lazy page on its own short timer, which the paused clock
+  // holds back. Step the clock a little at a time (far below the 30 s check)
+  // until the page shows.
+  const homeHeading = page.getByRole('heading', { name: 'Home', exact: true, level: 1 })
+  await expect(async () => {
+    await page.clock.runFor(100)
+    await expect(homeHeading).toBeVisible({ timeout: 100 })
+  }).toPass({ timeout: 10_000 })
   await expect.poll(() => streamRequests).toBe(1)
   await expect(page.locator('.live-sync')).toHaveText('Reconnecting…')
   const initialFleetRequests = fleetRequests
@@ -142,6 +149,9 @@ test('primary routes and device deep link remain usable', async ({ page }, testI
 
 test('reported viewport thresholds, route scroll reset, and collision layers remain bounded', async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== 'desktop-1280', 'Threshold matrix runs once in Chromium; Firefox and WebKit retain their dedicated projects.')
+  // Thirteen screen sizes, a scroll round trip and three layered sheets: about
+  // 17 s alone, so it needs more than the default 30 s when workers share CPUs.
+  test.slow()
   const sizes = [
     { width: 320, height: 720 }, { width: 390, height: 844 },
     { width: 759, height: 800 }, { width: 760, height: 800 }, { width: 761, height: 800 },
@@ -208,7 +218,11 @@ test('reported viewport thresholds, route scroll reset, and collision layers rem
   await expect(sheet).toHaveCount(0)
 
   const directoryUsers = Array.from({ length: 43 }, (_, index) => ({ ...representativeUser, id: index + 1, user_key: `operator-${index + 1}`, uid: `${index + 1}`, user_id: `${40_000 + index}`, display_name: `Operator ${index + 1}` }))
-  await page.route('**/api/v2/devices/*/users*', (route) => route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ rows: directoryUsers, next_cursor: null, device: nationwideDevices[4], identity_integrity: { source: 'CURRENT_COMPLETE_ZKT_SNAPSHOT', total_users: 43, with_cnic: 43, missing_cnic: 0, duplicate_groups: 0, duplicate_users: 0, resolved_duplicate_groups: 0, unresolved_duplicate_groups: 0, unresolved_duplicate_users: 0 } }) }))
+  // The People page reads the device's own record too; serve tower-three's,
+  // not the shared stub's empty answer, so its people can be changed.
+  const towerThree = nationwideDevices.find((row) => row.connector_id === 'tower-three')
+  await page.route('**/api/v1/devices/tower-three', (route) => route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(towerThree) }))
+  await page.route('**/api/v2/devices/*/users*', (route) => route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ rows: directoryUsers, next_cursor: null, device: towerThree, identity_integrity: { source: 'CURRENT_COMPLETE_ZKT_SNAPSHOT', total_users: 43, with_cnic: 43, missing_cnic: 0, duplicate_groups: 0, duplicate_users: 0, resolved_duplicate_groups: 0, unresolved_duplicate_groups: 0, unresolved_duplicate_users: 0 } }) }))
   await page.goto('/people/tower-three')
   const finalRow = page.getByRole('article', { name: /Operator 43, Employee ID 40042/i })
   await finalRow.scrollIntoViewIfNeeded()
@@ -245,6 +259,9 @@ test('reported viewport thresholds, route scroll reset, and collision layers rem
 })
 
 test('old addresses and bookmarks open the new pages with their filters kept', async ({ page }) => {
+  // Ten full page loads (each starts the whole app): about 3 s each in Firefox
+  // and WebKit when workers share CPUs, so it needs more than the default 30 s.
+  test.slow()
   const redirects: Array<[string, RegExp]> = [
     ['/fleet', /\/home$/],
     ['/fleet/connector-one', /\/devices\/connector-one$/],

@@ -54,6 +54,8 @@
 .installer-app-facts > div { display: grid; grid-template-columns: 90px minmax(0, 1fr); align-items: center; gap: 12px; min-width: 0; padding: 8px 12px; border-top: 0; }
 .installer-app-facts > div + div { border-top: 1px solid var(--border); }
 .installer-app-facts dt { color: var(--text-tertiary); font-size: 12px; }
+/* Under Technical details the sunken background needs the darker label colour (AA contrast). */
+.ui-technical-body .installer-app-facts dt { color: var(--text-secondary); }
 .installer-app-facts dd { min-width: 0; margin: 0; font-size: 13px; overflow-wrap: anywhere; }
 .installer-app-hash { display: flex; align-items: center; gap: 6px; }
 .installer-app-hash code { min-width: 0; font-size: 12px; line-height: 1.5; word-break: break-all; user-select: all; }

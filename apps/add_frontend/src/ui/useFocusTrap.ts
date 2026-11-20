@@ -73,7 +73,16 @@ export function useFocusTrap(
     return () => {
       window.cancelAnimationFrame(focusFrame)
       document.removeEventListener('keydown', handle)
-      ;(returnFocusRef?.current || previous)?.focus?.()
+      const target = returnFocusRef?.current || previous
+      target?.focus?.()
+      // The app root is still inert while the layer's other cleanups (the modal
+      // lock) have not run yet, so the first focus() is ignored. Try again once
+      // the whole close has finished.
+      if (target && document.activeElement !== target) {
+        queueMicrotask(() => {
+          if (target.isConnected && document.activeElement !== target) target.focus?.()
+        })
+      }
     }
   }, [containerRef, returnFocusRef])
 }

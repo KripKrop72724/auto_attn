@@ -4,7 +4,7 @@
 // data-user-text is skipped. The banned words default to the one list in
 // fe/words/glossary.ts (BANNED_WORDS); fe/words/testing.ts (expectPlainText) is
 // the strict page-test version with the full PLAIN_RULES.
-import { BANNED_WORDS } from '../words/glossary'
+import { BANNED_WORDS, ORACLE_PHRASE } from '../words/glossary'
 
 export interface PlainWordsProblem {
   rule: string
@@ -23,8 +23,10 @@ const RULES: ReadonlyArray<{ rule: string; pattern: RegExp }> = [
 ]
 
 /** Problems in one piece of visible text. `banned` adds whole words (case-insensitive). */
-export function findPlainWordsProblems(text: string, banned: readonly string[] = BANNED_WORDS): PlainWordsProblem[] {
+export function findPlainWordsProblems(input: string, banned: readonly string[] = BANNED_WORDS): PlainWordsProblem[] {
   const problems: PlainWordsProblem[] = []
+  // "HR system (Oracle)" is the one allowed use of the word Oracle (glossary rule).
+  const text = input.split(ORACLE_PHRASE).join('HR system')
   for (const { rule, pattern } of RULES) {
     for (const match of text.matchAll(pattern)) problems.push({ rule, text: match[0] })
   }

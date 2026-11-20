@@ -62,7 +62,13 @@
 .dv-tabs.is-phone { position: static; padding: 0 16px; }
 /* Five tabs spread across the width; a count ("Problems 2") widens its own tab, and the list scrolls sideways when they don't fit, never overlapping. */
 .dv-tabs.is-phone .ui-tablist { display: grid; grid-template-columns: repeat(5, auto); justify-content: space-between; column-gap: 2px; }
-.dv-tabs.is-phone .ui-tab { padding: 0 6px; font-size: 13px; justify-content: center; text-align: center; }
+.dv-tabs.is-phone .ui-tab { min-width: var(--touch-min, 44px); padding: 0 6px; font-size: 13px; justify-content: center; text-align: center; }
+/* The smallest phones (320 px): all five labels, and a count, still fit without sideways scroll.
+   Each tab is at least 44 px wide, so its touch area never reaches past the list edge. */
+@media (max-width: 359px) {
+  .dv-tabs.is-phone .ui-tablist { column-gap: 0; }
+  .dv-tabs.is-phone .ui-tab { padding: 0 4px; font-size: 12px; }
+}
 .dv-tabpanel:focus-visible { outline: 2px solid var(--brand); outline-offset: -2px; }
 .dv-tab-content { display: grid; gap: var(--space-4); padding-top: var(--space-4); animation: dv-fade var(--motion-fade, 120ms) var(--ease-out) both; }
 .dv-page .dv-tab-content { padding: var(--space-4) 16px 0; }

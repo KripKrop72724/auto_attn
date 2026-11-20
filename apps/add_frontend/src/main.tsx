@@ -1,10 +1,15 @@
 import React, { Component, lazy, Suspense, type ReactNode } from 'react'
 import ReactDOM from 'react-dom/client'
 import { QueryClientProvider } from '@tanstack/react-query'
+import { config as zodConfig } from 'zod/v4/core'
 import App from './App'
 import { queryClient } from './data'
 import { isPublicStatusPath } from './publicStatus'
 import './styles.css'
+
+// zod's fast path probes `new Function`, which the production Content Security
+// Policy (no 'unsafe-eval') blocks and reports. Plain parsing works the same.
+zodConfig({ jitless: true })
 
 // The public status page needs no sign-in, so it never mounts the dashboard.
 const PublicStatus = lazy(() => import('./features/PublicStatus'))

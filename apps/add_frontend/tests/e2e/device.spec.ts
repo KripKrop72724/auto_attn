@@ -115,18 +115,23 @@ test('device header, five tabs and Activity fit every screen without sideways sc
 
 // A sheet opened from inside the device view is drawn above it (review #29).
 test('the restart sheet opens above the device view', async ({ page }) => {
+  // A machine model the dashboard can restart, so the button is offered.
+  const restartable = { ...device, zkt: { ...device.zkt, capabilities: { ...device.zkt.capabilities, protocol_restart: true } } }
+  await page.route(/\/api\/v1\/devices(?:\/connector-one)?(?:\?.*)?$/, async route => {
+    await route.fulfill({ json: new URL(route.request().url()).pathname.endsWith('/connector-one') ? restartable : { rows: [restartable] } })
+  })
   await page.goto('/devices/connector-one?tab=tools')
   const panel = page.getByRole('dialog', { name: /3rd Floor/i })
   await expect(panel).toBeVisible()
   const open = panel.getByRole('button', { name: 'Restart machine…' })
-  test.skip(!(await open.isEnabled().catch(() => false)), 'Restart is not offered for the fixture machine')
+  await expect(open).toBeEnabled()
   await open.click()
   const sheet = page.getByRole('dialog', { name: /Restart the machine at/ })
   await expect(sheet).toBeVisible()
-  const onTop = await sheet.evaluate((element) => {
+  // The sheet slides in (clip-path), so wait for its opening motion to end before hit-testing.
+  await expect.poll(() => sheet.evaluate((element) => {
     const box = element.getBoundingClientRect()
     const hit = document.elementFromPoint(box.left + box.width / 2, box.top + Math.min(40, box.height / 2))
     return Boolean(hit && element.contains(hit))
-  })
-  expect(onTop).toBe(true)
+  })).toBe(true)
 })

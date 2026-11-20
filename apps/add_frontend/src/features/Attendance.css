@@ -121,7 +121,8 @@
 .attendance-journey-skeleton { display: grid; gap: 14px; }
 .attendance-tech-list { display: grid; gap: 6px; margin: 0; font-size: 12px; }
 .attendance-tech-list > div { display: grid; grid-template-columns: minmax(120px, 38%) minmax(0, 1fr); gap: 8px; }
-.attendance-tech-list dt { color: var(--text-tertiary); }
+/* Tertiary grey is under 4.5:1 on the sunken technical background. */
+.attendance-tech-list dt { color: var(--text-secondary); }
 .attendance-tech-list dd { margin: 0; overflow-wrap: anywhere; font-family: var(--font-mono, ui-monospace, monospace); }
 .attendance-direct-rules { margin: 0 0 8px; padding-left: 20px; font-size: 14px; }
 .attendance-direct-ref { color: var(--text-tertiary); font-size: 11px; }

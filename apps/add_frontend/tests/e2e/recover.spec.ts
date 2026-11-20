@@ -9,7 +9,8 @@ const records = (page: import('@playwright/test').Page) => page.getByRole('list'
 test('unreadable record sheet is responsive, keyboard-operable, and keeps its safeguard', async ({ page }) => {
   await page.goto('/recover')
   await expect(page.getByRole('heading', { name: 'Recover attendance', exact: true, level: 1 })).toBeVisible()
-  await page.getByRole('tab', { name: /Unreadable records/ }).click()
+  // Phones show the short tab label "Unreadable" (plan: shorter tab names on phone).
+  await page.getByRole('tab', { name: /^Unreadable( records)?\b/ }).click()
   await expect(page.getByRole('heading', { name: 'Unreadable records', level: 2 })).toBeVisible()
   const row = records(page).getByRole('listitem').filter({ hasText: 'Impossible time' })
   await expect(row).toBeVisible()
@@ -69,7 +70,7 @@ test('records not matched to an employee stay explicit and readable after they a
   // The old address still lands on the tab.
   await page.goto('/reconciliation?tab=source-exceptions')
   await expect(page).toHaveURL(/\/recover\?tab=unreadable/)
-  await expect(page.getByRole('tab', { name: 'Unreadable records 1', exact: true })).toBeVisible()
+  await expect(page.getByRole('tab', { name: /^Unreadable( records)? 1$/ })).toBeVisible()
   await expect(records(page).getByText('Not sent: not matched to an employee')).toBeVisible()
   const viewport = await page.evaluate(() => ({ width: innerWidth, scroll: document.documentElement.scrollWidth }))
   expect(viewport.scroll).toBeLessThanOrEqual(viewport.width)

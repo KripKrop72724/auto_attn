@@ -57,7 +57,8 @@ test('problems page fits, shows tabs with counts and keeps filters in the link',
   expect(tabsFit).toBe(true)
   const card = page.getByRole('article', { name: 'Link box cannot save attendance safely' })
   await expect(card).toBeVisible()
-  await expect(page.getByRole('button', { name: /Important/ })).toHaveAttribute('aria-pressed', 'true')
+  await expect(page.getByRole('group', { name: 'How serious' }).getByRole('button', { name: /^Important/ })).toHaveAttribute('aria-pressed', 'true')
+  await expect(page.getByRole('button', { name: 'Remove filter: Important' })).toBeVisible()
   await noSidewaysScroll(page)
   // Touch targets on the phone.
   if (testInfo.project.name === 'mobile-390') {

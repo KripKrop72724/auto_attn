@@ -6,8 +6,14 @@ import { expect, test as base, type Page } from '@playwright/test'
 export const test = base.extend<{ cspViolations: string[] }>({
   cspViolations: [async ({ page }, use) => {
     const violations: string[] = []
+    // Playwright's own screenshot step in WebKit adds and removes an inline
+    // `<style>body {}</style>` to line up animations; the policy (rightly)
+    // refuses it. That is the test tool, not the dashboard, so each such step
+    // excuses exactly one inline-style refusal; any other one still fails.
+    let screenshotStyles = 0
     page.on('console', (message) => {
-      if (message.type() === 'error' && /Content Security Policy|Refused to (load|execute|apply|connect|frame)/i.test(message.text())) {
+      if (message.type() === 'info' && message.text() === 'add-e2e: screenshot sync style') screenshotStyles += 1
+      else if (message.type() === 'error' && /Content Security Policy|Refused to (load|execute|apply|connect|frame)/i.test(message.text())) {
         violations.push(message.text())
       }
     })
@@ -15,8 +21,23 @@ export const test = base.extend<{ cspViolations: string[] }>({
       document.addEventListener('securitypolicyviolation', (event) => {
         console.error(`Content Security Policy violation: ${event.violatedDirective} ${event.blockedURI}`)
       })
+      new MutationObserver((records) => {
+        for (const record of records) {
+          for (const node of Array.from(record.addedNodes)) {
+            if (node instanceof HTMLStyleElement && node.textContent === 'body {}' && record.target === document.head) console.info('add-e2e: screenshot sync style')
+          }
+        }
+      }).observe(document, { childList: true, subtree: true })
     })
     await use(violations)
+    const refused = "Refused to apply a stylesheet because its hash, its nonce, or 'unsafe-inline' does not appear in the style-src directive of the Content Security Policy."
+    const reported = 'Content Security Policy violation: style-src-elem inline'
+    for (let step = 0; step < screenshotStyles; step += 1) {
+      for (const text of [refused, reported]) {
+        const at = violations.indexOf(text)
+        if (at >= 0) violations.splice(at, 1)
+      }
+    }
     expect(violations, 'Content Security Policy violations').toEqual([])
   }, { auto: true }],
 })

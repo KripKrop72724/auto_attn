@@ -43,7 +43,8 @@ test('Home splits Life and Health and Devices filters by the page address', asyn
   await expect(page.getByRole('link', { name: /^Open / })).toHaveCount(1)
   await expect(page.getByText('Showing Life only')).toBeVisible()
 
-  // A shared address opens the same view.
+  // A shared address opens the same view for someone who has not picked Life or Health.
+  await page.evaluate(() => window.localStorage.removeItem('add.prefs'))
   await page.goto('/devices?q=karachi')
   await expect(page.getByRole('link', { name: /^Open Building 9 · Device [13]/ })).toHaveCount(2)
   await page.goto('/devices?status=offline')

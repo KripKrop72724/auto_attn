@@ -23,14 +23,17 @@ test('Attendance filters by status, keeps them in the address and offers an acce
   const phone = (page.viewportSize()?.width || 0) <= 760
   if (phone) {
     await page.getByRole('button', { name: /More filters/ }).click()
-    await page.getByRole('checkbox', { name: /^Not matched/ }).check()
-    await page.getByRole('checkbox', { name: /^Waiting/ }).check()
+    // The sheet also has a "Phone message › Waiting" box, so pick from the Status group.
+    const status = page.getByRole('group', { name: 'Status' })
+    await status.getByRole('checkbox', { name: /^Not matched/ }).check()
+    await status.getByRole('checkbox', { name: /^Waiting/ }).check()
     await page.getByRole('switch', { name: 'No CNIC' }).check()
     await page.getByRole('button', { name: 'Show results' }).click()
   } else {
     await page.getByRole('button', { name: /^Status:/ }).click()
-    await page.getByRole('checkbox', { name: /^Not matched/ }).check()
-    await page.getByRole('checkbox', { name: /^Waiting/ }).check()
+    const status = page.getByRole('group', { name: 'Status' })
+    await status.getByRole('checkbox', { name: /^Not matched/ }).check()
+    await status.getByRole('checkbox', { name: /^Waiting/ }).check()
     await page.keyboard.press('Escape')
     await page.getByRole('button', { name: /More filters/ }).click()
     await page.getByRole('switch', { name: 'No CNIC' }).check()

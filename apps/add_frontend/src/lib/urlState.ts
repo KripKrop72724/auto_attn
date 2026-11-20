@@ -163,9 +163,15 @@ export function useUrlState<S extends UrlSchema>(schema: S): [UrlValues<S>, (cha
   const pathRef = useRef(location.pathname)
   pathRef.current = location.pathname
 
-  // The URL changed from outside (Back, a link): it wins over typed values not yet written.
+  // Values already sent to the URL but not yet shown there: the router commits
+  // its navigation in a transition, so a checkbox would otherwise spring back
+  // for a moment after a click.
+  const unsaved = useRef<Partial<UrlValues<S>>>({})
+
+  // The URL changed (Back, a link, or our own write landed): it wins over typed values not yet written.
   useEffect(() => {
     if (pending.current) return
+    unsaved.current = {}
     setOverlay({})
   }, [search])
 
@@ -175,9 +181,16 @@ export function useUrlState<S extends UrlSchema>(schema: S): [UrlValues<S>, (cha
     window.clearTimeout(queued.timer)
     pending.current = null
     if (behindRef.current) return
-    const next = writeUrlValues(schemaRef.current, searchRef.current, queued.change)
-    if (next !== (searchRef.current || '')) navigate(`${pathRef.current}${next}${window.location.hash}`, { replace: true, preventScrollReset: true })
-    setOverlay({})
+    const change = { ...unsaved.current, ...queued.change }
+    const next = writeUrlValues(schemaRef.current, searchRef.current, change)
+    if (next === (searchRef.current || '')) {
+      unsaved.current = {}
+      setOverlay({})
+      return
+    }
+    // The overlay stays until the new address lands (the effect above clears it).
+    unsaved.current = change
+    navigate(`${pathRef.current}${next}${window.location.hash}`, { replace: true, preventScrollReset: true })
   }, [navigate])
 
   useEffect(() => () => {
@@ -195,14 +208,20 @@ export function useUrlState<S extends UrlSchema>(schema: S): [UrlValues<S>, (cha
       pending.current = { change: merged, timer: window.setTimeout(flush, TYPING_DEBOUNCE_MS) }
       return
     }
-    const merged = { ...(pending.current?.change || {}), ...change }
+    const merged = { ...unsaved.current, ...(pending.current?.change || {}), ...change }
     if (pending.current) {
       window.clearTimeout(pending.current.timer)
       pending.current = null
     }
-    setOverlay({})
     const next = writeUrlValues(schemaRef.current, searchRef.current, merged)
-    if (next === (searchRef.current || '')) return
+    if (next === (searchRef.current || '')) {
+      unsaved.current = {}
+      setOverlay({})
+      return
+    }
+    // Show the new values at once; the URL follows when the router commits.
+    unsaved.current = merged
+    setOverlay(merged)
     navigate(`${pathRef.current}${next}${window.location.hash}`, { replace: mode === 'replace', preventScrollReset: true })
   }, [flush, navigate])
 
