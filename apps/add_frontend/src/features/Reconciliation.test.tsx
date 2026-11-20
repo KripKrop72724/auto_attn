@@ -951,7 +951,8 @@ describe('One-click reconcile', () => {
     expect(screen.getByText('ESP connection')).toBeTruthy()
     expect(screen.getByRole('heading', { name: 'Terminal 44' })).toBeTruthy()
     expect(screen.getAllByRole('heading', { name: /^Terminal \d+$/ })).toHaveLength(45)
-  })
+    // 45 rendered jobs plus a refresh: about 5 s on a busy machine, so the 5 s default flakes.
+  }, 15_000)
 })
 
 describe('Recovery tab count', () => {
