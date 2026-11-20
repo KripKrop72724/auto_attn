@@ -573,6 +573,10 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
+      - name: Old screens use the live app's exact lockfile
+        # The image builds them offline from the main build stage's package
+        # store (apps/add_frontend/Dockerfile), so the two lockfiles must match.
+        run: cmp pnpm-lock.yaml ../add_frontend/pnpm-lock.yaml
       - name: Install exact old-screens dependencies
         run: corepack enable && corepack prepare pnpm@11.7.0 --activate && pnpm install --frozen-lockfile
       - name: Build the old screens under /classic/
