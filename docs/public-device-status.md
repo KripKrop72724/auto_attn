@@ -45,7 +45,9 @@ Devices whose name starts with `LF` are State Life **Life** zone devices. All ot
 **Health**. Names are shown in plain words: `LF-ZONE-BLD9-03` is "Building 9 · Device 3",
 `LF-ZONE-G&PBLD8-01` is "Group & Pension Building 8", `ZONE-SLICTOWER-13FL` is
 "SLIC Tower · 13th Floor" and `ZONE-SWAT-01` is "Swat". A device number shows only where a place
-has several devices. Spare connectors are not listed.
+has several devices. Spare connectors are not listed. The naming rule lives in
+`apps/add_backend/zk_add/device_names.py` (unchanged), so the signed-in dashboard's device names
+and Life/Health tags are the same as this page's.
 
 ## API
 

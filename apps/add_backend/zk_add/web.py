@@ -4454,6 +4454,36 @@ def logs(
     }
 
 
+@app.get("/api/v1/devices/{connector_id}/activity")
+def device_activity(
+    connector_id: str,
+    show: Literal["all", "problems"] = "all",
+    topic: list[str] | None = Query(default=None),
+    since: datetime | None = None,
+    until: datetime | None = None,
+    before: str | None = Query(default=None, max_length=80),
+    after: int | None = Query(default=None, ge=0),
+    limit: int = Query(default=50, ge=1, le=100),
+    auth: tuple[Session, AdminContext] = Depends(require_admin),
+):
+    """The device's activity in plain words (device_activity), newest first.
+
+    since/until bound received_at (default: the last 24 hours); before is the
+    previous page's next_cursor; after returns only rows newer than a log id.
+    """
+    from zk_add.device_activity import ActivityCursorError, build_activity
+
+    db, _context = auth
+    connector = connector_or_404(db, connector_id)
+    try:
+        return build_activity(
+            db, connector, serialize_log=serialize_log, show=show, topics=_query_values(topic),
+            since=since, until=until, before=before, after=after, limit=limit,
+        )
+    except ActivityCursorError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+
+
 def _query_values(values: list[str] | None, *, upper: bool = False) -> list[str]:
     """Repeatable query values, also accepting "a,b"; blanks dropped, order kept."""
     result: list[str] = []
