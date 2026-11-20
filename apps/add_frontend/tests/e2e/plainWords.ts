@@ -5,12 +5,17 @@ import type { Page, TestInfo } from '@playwright/test'
 import { findPlainWordsProblems, type PlainWordsProblem } from '../../src/test/plainWords'
 import { BANNED_WORDS } from '../../src/words/glossary'
 
-export const STRICT_ROUTES: readonly string[] = []
+// Every page except Set up a device, whose browser wizard keeps its engineer
+// words until ADV-20 (the e2e fixture has can_start=true, so the wizard shows).
+export const STRICT_ROUTES: readonly string[] = [
+  '/home', '/devices', '/devices/connector-one', '/attendance', '/problems', '/people', '/people/connector-one',
+  '/recover', '/updates', '/settings',
+]
 
 /** Collects the text a person can read on the page (marked IT parts left out). */
 export async function pageVisibleText(page: Page): Promise<string> {
   return page.evaluate(() => {
-    const skip = '[data-technical], [data-device-code], [data-brand], [data-user-text], [data-old-name], script, style, noscript, [hidden], [aria-hidden="true"]'
+    const skip = '[data-technical], [data-device-code], [data-brand], [data-user-text], [data-typed-phrase], [data-old-name], script, style, noscript, [hidden], [aria-hidden="true"]'
     const parts: string[] = []
     const walk = (node: Node) => {
       if (node.nodeType === Node.TEXT_NODE) {

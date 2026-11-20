@@ -126,6 +126,8 @@ export const BRAND_WORDS: readonly string[] = ['ZKTeco', 'Hikvision']
 /** Capital words allowed in plain text. "ADD" is allowed only inside `data-brand`. */
 export const ALLOWED_CAPS: readonly string[] = [
   'CNIC', 'PKT', 'ID', 'HR', 'OK', 'AM', 'PM', 'IT', 'PIN', 'KB', 'MB', 'USB', 'COMM',
+  // Part of real place names ("SLIC Tower"), not a system word.
+  'SLIC',
 ]
 
 /** The one allowed way to name Oracle: "HR system (Oracle)". */

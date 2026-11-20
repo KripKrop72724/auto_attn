@@ -12,7 +12,7 @@
 
 import { findPlainWordProblems, type PlainWordProblem } from './glossary'
 
-export const SKIP_SELECTOR = '[data-technical], [data-brand], [data-device-code], [data-user-text]'
+export const SKIP_SELECTOR = '[data-technical], [data-brand], [data-device-code], [data-user-text], [data-typed-phrase], [data-old-name]'
 const ATTRIBUTES = ['aria-label', 'title', 'placeholder', 'alt'] as const
 const IGNORED_TAGS = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'TEMPLATE'])
 

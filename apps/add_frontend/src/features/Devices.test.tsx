@@ -6,7 +6,7 @@ import type { Device } from '../types'
 import { plainTextProblems } from '../words/testing'
 
 // "SLIC Tower" is a place name (State Life Insurance Corporation), not a code.
-const expectPlain = (root: Element) => expect(plainTextProblems(root).filter((problem) => problem.match !== 'SLIC')).toEqual([])
+const expectPlain = (root: Element) => expect(plainTextProblems(root)).toEqual([])
 
 const fleet: Device[] = [
   { ...device, connector_id: 'tower-13', display_name: 'ZONE-SLICTOWER-13FL', friendly_name: 'SLIC Tower · 13th Floor', division: 'health', zkt: { ...device.zkt!, serial: 'ISB-0013' } },

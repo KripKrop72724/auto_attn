@@ -87,7 +87,7 @@ function KeyFacts({ device, detailQuery }: { device: DeviceDetail; detailQuery: 
   const failed = !today && detailQuery.isError
   const brand = machineBrand(device)
   const machine = device.zkt?.model
-    ? <><span data-brand>{brand}</span> {device.zkt.model}</>
+    ? <><span data-brand>{brand}</span> <span data-device-code>{device.zkt.model}</span></>
     : isHikvision(device) ? <span data-brand>{brand}</span> : SUMMARY_WORDS.noMachine
   const skeleton = <Skeleton width="7rem" />
   const todayValue = (render: (value: NonNullable<DeviceDetail['attendance_today']>) => React.ReactNode) =>

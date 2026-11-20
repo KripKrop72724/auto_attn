@@ -85,7 +85,20 @@ export const representativeAttendance = {
   captured_at: '2026-08-12T08:00:01Z', received_at: '2026-08-12T08:00:02Z', source: 'LIVE',
   status: 'CAPTURED', punch: '0', clock_quality: 'OK', clock_drift_seconds: 2, ords_status: 'ACKNOWLEDGED',
   oracle_confirmed_at: '2026-08-12T08:00:05Z', oracle_confirmation_path: 'ADD_EVENT_UID',
-  identity_resolution_id: null,
+  identity_resolution_id: null, delivery_group: 'sent',
+}
+
+/** One check-in's journey (GET /api/v1/attendance/{id}/journey, the check-in sheet). */
+export const attendanceJourney = {
+  id: 1, delivery_group: 'sent', ords_status: 'ACKNOWLEDGED', source: 'LIVE', live: true,
+  device_event_time: '2026-08-12T08:00:00Z', captured_at: '2026-08-12T08:00:01Z', received_at: '2026-08-12T08:00:02Z',
+  oracle_confirmed_at: '2026-08-12T08:00:05Z', outbox: null,
+  steps: [
+    { step: 'checked_in', at: '2026-08-12T08:00:00Z', done: true },
+    { step: 'reached_dashboard', at: '2026-08-12T08:00:02Z', done: true },
+    { step: 'queued_for_hr', at: '2026-08-12T08:00:03Z', done: true },
+    { step: 'sent_to_hr', at: '2026-08-12T08:00:05Z', done: true },
+  ],
 }
 
 export const nationwideDevices = [
@@ -344,6 +357,7 @@ export async function mockDashboard(page: Page) {
     else if (url.pathname === '/api/v1/overview') json = { total: 1, online: 1, offline: 0, degraded: 0, flapping: 0, open_alerts: 1, active_leases: 0, ords_delivery: { backlog: 12, retrying: 0, blocked_identity: 2, quarantined: 1 } }
     else if (url.pathname === '/api/v1/devices') json = { rows: [device] }
     else if (url.pathname === '/api/v1/attendance/summary') json = attendanceSummary
+    else if (/^\/api\/v1\/attendance\/\d+\/journey$/.test(url.pathname)) json = attendanceJourney
     else if (url.pathname === `/api/v1/devices/${device.connector_id}`) json = device
     else if (url.pathname.endsWith('/zkt-custody')) json = {
       connector_id: device.connector_id, enabled: true, sampled_at: new Date().toISOString(),

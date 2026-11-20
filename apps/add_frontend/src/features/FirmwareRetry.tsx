@@ -5,6 +5,7 @@ import { Icon } from '../Icon'
 import { Button, Callout, Dialog, TechnicalDetails } from '../ui'
 import type { Toast as FullToast } from '../ui/Toast'
 import { RETRY_REFUSAL_FALLBACK, plainVersion, retryRefusalSentence, stabilityWarningLine, updateActionError, updateToast } from '../words/software'
+import { technicalCode } from '../words/technical'
 import type {
   FirmwareCampaign,
   FirmwareDeployment,
@@ -54,7 +55,7 @@ export function RollbackEvidence({ diagnosis }: { diagnosis: FirmwareRollbackDia
       <p>
         {interrupted
           ? 'The ESP left the new image before confirming it and sent no failure report. ADD cannot tell a crash from a power or reset event; the facts below are evidence, not a cause.'
-          : `Not classified as an interrupted boot (${(diagnosis.unclassified_reasons || []).join(', ').toLowerCase().replaceAll('_', ' ') || 'no reason recorded'}).`}
+          : `Not classified as an interrupted boot (${(diagnosis.unclassified_reasons || []).map(technicalCode).join(', ') || 'no reason recorded'}).`}
       </p>
       {target && (
         <dl>

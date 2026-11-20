@@ -28,6 +28,7 @@ from lazy feature chunks. App code must never import `codes.generated.json` (tes
 | `software.ts`, `recover.ts`, `setup.ts` | Software updates, Recover attendance and Set up a device words. |
 | `errors.ts` | `errorWords(code)` for 409 refusal codes (sentence + "Try again" / "Check again"). |
 | `glossary.ts` | `GLOSSARY`, `BANNED_WORDS` (one entry per line: the backend tests read it with a regex), `PLAIN_RULES`, `findPlainWordProblems`, `isPlainText`, `plural` / `pluralWord`, `formatCount`, `BUSY`. |
+| `technical.ts` | `technicalCode` / `spacedCode`: a code with its underscores read as spaces, for Technical details only (`data-technical`). Plain text never uses them. `source.test.ts` (WORDS-12) fails on `humanizeStatus(`, `replaceAll('_'` or `.replace(/_/g` outside `src/words/`, apart from the old screens it lists. |
 | `time.ts` | Small Pakistan-time helpers used inside sentences (`clockText`, `dayTimeText`, `durationText`, `agoText`). Pages use `lib/time.ts`. |
 
 ## Tests for a page

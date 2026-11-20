@@ -59,7 +59,7 @@ describe('Home', () => {
     expect(await within(today).findByText('1,038')).toBeTruthy()
     expect(within(today).getByRole('link', { name: 'Life: 298 sent to the HR system' }).getAttribute('href')).toBe('/attendance?when=today&division=life&status=sent')
     // "SLIC Tower" is a place name, not a code.
-    expect(plainTextProblems(document.querySelector('.home-page') as HTMLElement, { skip: '[data-old-name]' }).filter((problem) => problem.match !== 'SLIC')).toEqual([])
+    expect(plainTextProblems(document.querySelector('.home-page') as HTMLElement)).toEqual([])
   })
 
   it('shows Life only when the Division switch says so', async () => {
