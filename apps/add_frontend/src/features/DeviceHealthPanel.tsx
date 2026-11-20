@@ -1,11 +1,16 @@
-import type { ReactNode } from 'react'
-import {
-  StatusBadge, TerminalLinkBadge, dateTime, healthReasonLine, healthTierPattern, primaryHealthReason,
-  relativeTime, statusIcon,
-} from '../App'
-import { Icon } from '../Icon'
-import { humanizeStatus, normalizedStatus, statusPattern, type StatusPattern } from '../status'
+// Health evidence of one device (04-device §2 Technical details › Health
+// evidence). The plain headline and the Mark as seen / Mark as fixed buttons
+// moved out: the "What's happening" card says what is wrong, the Problems tab
+// owns the buttons. What stays here is for IT: how current each reason is,
+// what the link box software can report, the machine connection and the saved
+// error. It is shown only inside a Technical details box.
+import { dayTime, ago } from '../lib/time'
+import { normalizedStatus } from '../status'
 import type { Coverage, Device, DeviceHealth, HealthReason } from '../types'
+import { healthDetailWords, plainTier } from '../words/health'
+import { plainMachineLink } from '../words/machine'
+import { problemWords, TEST_UPDATES_WAIT } from '../words/problems'
+import { plainStatus } from '../words/states'
 import './DeviceHealth.css'
 
 export interface HealthAlertTarget {
@@ -14,216 +19,121 @@ export interface HealthAlertTarget {
   message: string
 }
 
-const headlinePhrases: Record<string, string> = {
-  ONLINE: 'online',
-  ONLINE_WITH_WARNINGS: 'online with warnings',
-  DEGRADED: 'degraded',
-  OFFLINE: 'offline',
-  QUARANTINED_DUPLICATE_SERIAL: 'quarantined',
-  ONBOARDING: 'onboarding',
-}
-
-const phrase = (state: string) => headlinePhrases[state] || humanizeStatus(state).toLowerCase()
-const sentenceCase = (value: string) => value.charAt(0).toUpperCase() + value.slice(1)
-
-// Quarantine and onboarding override the reason-derived tier.
-export function healthHeadline(health: Pick<DeviceHealth, 'tier' | 'derived_lifecycle'>) {
-  const derived = normalizedStatus(health.derived_lifecycle).toUpperCase()
-  return ['QUARANTINED_DUPLICATE_SERIAL', 'ONBOARDING'].includes(derived) ? derived : normalizedStatus(health.tier).toUpperCase()
-}
-
-const shortBoot = (value?: string | null) => value ? `${value.slice(0, 8)}…` : null
 const firmwareVersion = (value?: string | null) => value ? value.replace(/^zone-lite-/i, '') : null
+const shortRestart = (value?: string | null) => value ? `${value.slice(0, 8)}…` : null
 
+/** How current a reason is, in the words of 02-words A3 (raw facts kept for IT). */
 export function currencyLabel(reason: Pick<HealthReason, 'currency' | 'firmware_version' | 'boot_id' | 'latch' | 'code'>) {
   const latch = normalizedStatus(reason.latch?.kind).toUpperCase()
-  if (latch === 'LED_LATCH_NO_IO_ERRORS') return 'Latched until reboot — no I/O errors this boot'
-  if (latch === 'LED_LATCH_STORAGE_VERIFIED') return 'Latched until reboot — storage verified this boot'
+  if (latch === 'LED_LATCH_NO_IO_ERRORS') return 'Kept until the next restart: no memory errors since this restart'
+  if (latch === 'LED_LATCH_STORAGE_VERIFIED') return 'Kept until the next restart: memory checked since this restart'
   switch (normalizedStatus(reason.currency).toUpperCase()) {
-    case 'CURRENT': return 'Current'
-    case 'HELD': return 'Held: waiting for verified evidence'
+    case 'CURRENT': return 'Reported now'
+    case 'HELD': return 'Waiting for the link box to confirm it'
     case 'PREVIOUS_BOOT': {
       const facts = [
-        firmwareVersion(reason.firmware_version) && `firmware ${firmwareVersion(reason.firmware_version)}`,
-        shortBoot(reason.boot_id) && `boot ${shortBoot(reason.boot_id)}`,
+        firmwareVersion(reason.firmware_version) && `software ${firmwareVersion(reason.firmware_version)}`,
+        shortRestart(reason.boot_id) && `restart ${shortRestart(reason.boot_id)}`,
       ].filter(Boolean)
-      return `From an earlier boot${facts.length ? ` (${facts.join(', ')})` : ''}`
+      return `From before the last restart${facts.length ? ` (${facts.join(', ')})` : ''}`
     }
-    case 'LATCHED': return 'Latched: heartbeats do not re-check it'
-    default: return humanizeStatus(reason.currency)
+    case 'LATCHED': return 'Kept until it is checked again'
+    default: return plainStatus('currency', reason.currency).label
   }
-}
-
-const currencyIcon = (reason: Pick<HealthReason, 'currency' | 'latch'>) => {
-  if (reason.latch?.kind) return 'shield' as const
-  const currency = normalizedStatus(reason.currency).toUpperCase()
-  return currency === 'CURRENT' ? 'pulse' as const : currency === 'HELD' ? 'pause' as const : currency === 'PREVIOUS_BOOT' ? 'clock' as const : 'shield' as const
-}
-
-const tierLabels: Record<string, string> = { DEGRADED: 'Degraded', WARNING: 'Warning' }
-
-function Pill({ pattern, icon, children }: { pattern: StatusPattern; icon?: Parameters<typeof Icon>[0]['name']; children: ReactNode }) {
-  return (
-    <span className={`status-badge device-health-pill pattern-${pattern}`} data-pattern={pattern}>
-      <Icon name={icon || statusIcon[pattern]} />
-      <span>{children}</span>
-    </span>
-  )
 }
 
 function coverageText(item: Coverage, firmware?: string | null) {
   if (item.detail) return item.detail
   const status = normalizedStatus(item.status).toUpperCase()
-  if (status === 'NOT_REPORTED_BY_FIRMWARE') return `Not reported by firmware ${firmwareVersion(firmware) || 'in use'}.`
-  if (status === 'MISSING') return 'The latest heartbeat carried no diagnostics.'
-  return humanizeStatus(status)
+  if (status === 'NOT_REPORTED_BY_FIRMWARE') return `Not reported by link box software ${firmwareVersion(firmware) || 'in use'}.`
+  if (status === 'MISSING') return 'The last status report carried no details.'
+  if (status === 'REPORTED' || status === 'ACTIVE') return 'Reported.'
+  return 'Not known.'
 }
 
-function ReasonRow({
-  reason,
-  busy,
-  onAcknowledge,
-  onResolve,
-}: {
-  reason: HealthReason
-  busy: boolean
-  onAcknowledge?: (alertId: number) => void
-  onResolve?: (target: HealthAlertTarget) => void
-}) {
+function ReasonRow({ reason }: { reason: HealthReason }) {
   const key = reason.alert_id == null ? `derived-${reason.code}` : `alert-${reason.alert_id}`
   const titleId = `device-health-${key}-title`
-  const refusalId = `device-health-${key}-refusal`
-  const tier = normalizedStatus(reason.tier).toUpperCase()
-  const resolvable = reason.operator?.resolvable === true
-  const acknowledged = Boolean(reason.acknowledged_at || reason.acknowledged_by)
-  const canAcknowledge = reason.alert_id != null && normalizedStatus(reason.alert_state).toUpperCase() === 'OPEN' && !acknowledged
-  const alertId = reason.alert_id
+  const words = problemWords(reason)
+  const tier = reason.tier ? plainTier(reason.tier).label : 'Does not change the status'
+  const extra = healthDetailWords(reason)
   return (
-    <li className={`device-health-reason pattern-${reason.tier ? healthTierPattern(reason.tier) : 'notice'}`} aria-labelledby={titleId}>
-      <div className="device-health-reason-head">
-        <div>
-          <h4 id={titleId}>{humanizeStatus(reason.code)}</h4>
-          <p>{reason.message}</p>
-        </div>
-        <div className="device-health-pills">
-          <Pill pattern={reason.tier ? healthTierPattern(reason.tier) : 'notice'}>{tierLabels[tier] || (reason.tier ? humanizeStatus(reason.tier) : 'No health effect')}</Pill>
-          <Pill pattern="notice" icon={currencyIcon(reason)}>{currencyLabel(reason)}</Pill>
-        </div>
-      </div>
+    <li className="device-health-reason" aria-labelledby={titleId}>
+      <h5 id={titleId}>{words.title}</h5>
       <dl className="device-health-facts">
-        <div><dt>Since</dt><dd>{reason.since ? <time dateTime={reason.since}>{dateTime(reason.since)} · {relativeTime(reason.since)}</time> : 'Not recorded'}</dd></div>
-        <div><dt>Last seen</dt><dd>{reason.last_seen_at ? <time dateTime={reason.last_seen_at}>{relativeTime(reason.last_seen_at)}</time> : 'Live condition'}</dd></div>
-        {reason.evidence_summary && <div className="wide"><dt>Evidence</dt><dd>{reason.evidence_summary}</dd></div>}
+        <div><dt>Code</dt><dd>{reason.code}</dd></div>
+        <div><dt>Effect</dt><dd>{tier}</dd></div>
+        <div><dt>How current</dt><dd>{currencyLabel(reason)}</dd></div>
+        <div><dt>Since</dt><dd>{reason.since ? <time dateTime={reason.since}>{dayTime(reason.since)} · {ago(reason.since)}</time> : 'Not recorded'}</dd></div>
+        <div><dt>Last reported</dt><dd>{reason.last_seen_at ? <time dateTime={reason.last_seen_at}>{ago(reason.last_seen_at)}</time> : 'Happening now'}</dd></div>
+        {reason.alert_id != null && <div><dt>Problem number</dt><dd>#{reason.alert_id}</dd></div>}
+        <div className="wide"><dt>Message</dt><dd>{reason.message}</dd></div>
+        {reason.evidence_summary && <div className="wide"><dt>Details</dt><dd>{reason.evidence_summary}</dd></div>}
+        {reason.clear_condition && <div className="wide"><dt>Clears when</dt><dd>{reason.clear_condition}</dd></div>}
+        {reason.operator && !reason.operator.resolvable && reason.operator.refusal && <div className="wide"><dt>Why it can't be marked as fixed</dt><dd>{reason.operator.refusal}</dd></div>}
       </dl>
-      {reason.clear_condition && <p className="device-health-clears">{reason.clear_condition}</p>}
-      {acknowledged && <p>Acknowledged{reason.acknowledged_by ? ` by ${reason.acknowledged_by}` : ''}{reason.acknowledged_at ? ` · ${dateTime(reason.acknowledged_at)}` : ''}. It stays active until it clears.</p>}
-      {reason.gating && reason.tier && <p>Holds HIL and factory work while active.</p>}
-      {alertId != null && (onAcknowledge || onResolve) && <div className="device-health-actions">
-        {canAcknowledge && onAcknowledge && <button type="button" className="button secondary small" disabled={busy} onClick={() => onAcknowledge(alertId)}><Icon name="check" /> Acknowledge</button>}
-        {onResolve && <button
-          type="button"
-          className="button secondary small"
-          disabled={busy || !resolvable}
-          aria-describedby={resolvable ? undefined : refusalId}
-          onClick={() => onResolve({ id: alertId, code: reason.code, message: reason.message })}
-        ><Icon name="shield" /> Resolve with reason</button>}
-        {!resolvable && <p className="device-health-refusal" id={refusalId}>{reason.operator?.refusal || 'ADD does not allow resolving this alert by hand.'}</p>}
-      </div>}
+      {extra.map((line) => <p key={line}>{line}</p>)}
+      {reason.gating && reason.tier && <p>{TEST_UPDATES_WAIT}</p>}
     </li>
   )
 }
 
-export function DeviceHealthPanel({
-  device,
-  health,
-  busy = false,
-  onAcknowledge,
-  onResolve,
-  onClearError,
-}: {
-  device: Device
-  // The full object from GET /api/v1/devices/{id}; a list summary renders its primary reason.
-  health?: DeviceHealth | null
-  busy?: boolean
-  onAcknowledge?: (alertId: number) => void
-  onResolve?: (target: HealthAlertTarget) => void
-  onClearError?: () => void
-}) {
+export function HealthEvidence({ device, health }: { device: Device; health?: DeviceHealth | null }) {
   if (!health) {
-    // Older backends report only the stored error.
-    if (!device.last_error_code) return null
+    if (!device.last_error_code) return <p>No health details reported.</p>
     return (
-      <article className="detail-card wide device-health-panel pattern-blocked" aria-labelledby="device-health-title">
-        <div>
-          <p className="eyebrow">DEVICE HEALTH</p>
-          <h3 id="device-health-title">Why this device is {phrase(normalizedStatus(device.state).toUpperCase())}</h3>
-        </div>
-        <p>Stored device error: {humanizeStatus(device.last_error_code)}. {device.last_error_message || device.zkt?.writes_disabled_reason || 'Review live logs and connectivity history.'}</p>
-      </article>
+      <div className="device-health-evidence">
+        <p>Saved error: {problemWords({ code: device.last_error_code }).title} ({device.last_error_code}).</p>
+        {device.last_error_message && <p>{device.last_error_message}</p>}
+      </div>
     )
   }
-  const headline = healthHeadline(health)
   const shadow = normalizedStatus(health.mode).toUpperCase() === 'SHADOW'
-  const title = shadow ? `New health model (preview): ${sentenceCase(phrase(headline))}` : `Why this device is ${phrase(headline)}`
-  const reasons = health.reasons
-  const primary = primaryHealthReason(health)
+  const reasons = health.reasons || []
   const others = health.other_active_alerts || []
   const coverage = health.coverage || []
   const link = health.terminal_link ?? device.terminal_link
   const deviceError = health.device_error
+  const machine = link ? plainMachineLink(link) : null
   return (
-    <article className={`detail-card wide device-health-panel pattern-${statusPattern(headline)}`} aria-labelledby="device-health-title">
-      <div className="detail-title">
-        <div>
-          <p className="eyebrow">{shadow ? 'DEVICE HEALTH · PREVIEW' : 'DEVICE HEALTH'}</p>
-          <h3 id="device-health-title">{title}</h3>
-        </div>
-        <div className="device-health-headline">
-          {shadow && <span className="device-health-legacy">Current status <StatusBadge state={device.state} /></span>}
-          <StatusBadge state={headline} />
-        </div>
-      </div>
-      {shadow && <p>Preview only. The current status above still drives fleet counts, holds and alerts until the derived model is enforced.</p>}
-      {headline === 'OFFLINE' && <p>ADD marks a connector offline when it accepts no heartbeat for 45 seconds; the next accepted heartbeat brings it back.</p>}
-      {health.evaluated_at && <p>Evaluated {relativeTime(health.evaluated_at)}.</p>}
-      {reasons ? (
-        reasons.length
-          ? <ul className="device-health-reasons" aria-label="Health reasons">
-            {reasons.map((reason) => <ReasonRow key={reason.alert_id ?? reason.code} reason={reason} busy={busy} onAcknowledge={onAcknowledge} onResolve={onResolve} />)}
-          </ul>
-          : <p>No active health reasons.</p>
-      ) : primary ? <p>{healthReasonLine(primary)}{health.degraded_count + health.warning_count > 1 ? ` · ${health.degraded_count + health.warning_count} reasons in total` : ''}</p> : <p>No active health reasons.</p>}
-      {deviceError?.code && <section className="device-health-section" aria-labelledby="device-health-error-title">
-        <h4 id="device-health-error-title">Stored device error: {humanizeStatus(deviceError.code)}</h4>
-        {deviceError.message && <p>{deviceError.message}</p>}
-        <p>{deviceError.backed
-          ? `Backed by active alert${deviceError.backing_alert_ids.length === 1 ? '' : 's'} ${deviceError.backing_alert_ids.map((id) => `#${id}`).join(', ')}; it clears with ${deviceError.backing_alert_ids.length === 1 ? 'that alert' : 'those alerts'}.`
-          : `No active alert backs this error. ADD derives ${deviceError.derived_code ? humanizeStatus(deviceError.derived_code) : 'no device error'} from the active alerts.`}</p>
-        {!deviceError.backed && onClearError && <div className="device-health-actions"><button type="button" className="button secondary small" disabled={busy} onClick={onClearError}><Icon name="refresh" /> Re-evaluate device error</button></div>}
+    <div className="device-health-evidence">
+      {shadow && <section aria-labelledby="device-health-preview-title">
+        <h5 id="device-health-preview-title">Preview of the new status rules: {plainStatus('device', health.tier).label}</h5>
+        <p>Preview only. The status at the top still decides the totals and problems.</p>
       </section>}
-      {coverage.length > 0 && <section className="device-health-section" aria-labelledby="device-health-coverage-title">
-        <h4 id="device-health-coverage-title">What ADD can verify on this firmware</h4>
+      {normalizedStatus(health.tier).toUpperCase() === 'OFFLINE' && <p>We show a device as offline when we haven't heard from it for 45 seconds. It comes back by itself when it reconnects.</p>}
+      {health.evaluated_at && <p className="device-muted">Checked {ago(health.evaluated_at)}</p>}
+      {reasons.length > 0 && <ul className="device-health-reasons" aria-label="Health reasons">
+        {reasons.map((reason) => <ReasonRow key={reason.alert_id ?? reason.code} reason={reason} />)}
+      </ul>}
+      {deviceError?.code && <section aria-labelledby="device-health-error-title">
+        <h5 id="device-health-error-title">Saved error: {problemWords({ code: deviceError.code }).title}</h5>
+        <p>{deviceError.code}{deviceError.message ? ` · ${deviceError.message}` : ''}</p>
+        <p>{deviceError.backed
+          ? `Kept by open problem ${deviceError.backing_alert_ids.map((id) => `#${id}`).join(', ')}. It clears with ${deviceError.backing_alert_ids.length === 1 ? 'that problem' : 'those problems'}.`
+          : 'No open problem keeps this saved error. It is out of date.'}</p>
+      </section>}
+      {coverage.length > 0 && <section aria-labelledby="device-health-coverage-title">
+        <h5 id="device-health-coverage-title">What this link box software can report</h5>
         <ul className="device-health-coverage">
-          {coverage.map((item) => <li key={item.key}><strong>{item.label || humanizeStatus(item.key)}:</strong> <span>{coverageText(item, device.firmware_version)}</span></li>)}
+          {coverage.map((item) => <li key={item.key}><strong>{item.label || item.key}:</strong> <span>{coverageText(item, device.firmware_version)}</span></li>)}
         </ul>
       </section>}
-      {link && <section className="device-health-section" aria-labelledby="device-health-terminal-title">
-        <div className="detail-title">
-          <h4 id="device-health-terminal-title">Terminal link</h4>
-          <TerminalLinkBadge link={link} />
-        </div>
-        {link.message && <p>{link.message}</p>}
-        <dl>
-          <div><dt>Reported state</dt><dd>{link.raw_state ? humanizeStatus(link.raw_state) : 'Not reported'}</dd></div>
-          <div><dt>Since</dt><dd>{link.since ? `${dateTime(link.since)} · ${relativeTime(link.since)}` : 'Not recorded'}</dd></div>
+      {link && machine && <section aria-labelledby="device-health-terminal-title">
+        <h5 id="device-health-terminal-title">Machine connection</h5>
+        <p aria-label={`Machine connection: ${machine.label.toLowerCase()}`}>{machine.label}. {machine.sentence}</p>
+        <dl className="device-health-facts">
+          <div><dt>Reported by the link box</dt><dd>{link.raw_state || 'Not reported'}</dd></div>
+          <div><dt>Since</dt><dd>{link.since ? `${dayTime(link.since)} · ${ago(link.since)}` : 'Not recorded'}</dd></div>
+          {link.message && <div className="wide"><dt>Message</dt><dd>{link.message}</dd></div>}
         </dl>
       </section>}
-      {others.length > 0 && <section className="device-health-section" aria-labelledby="device-health-other-title">
-        <h4 id="device-health-other-title">Other open items (no health effect)</h4>
+      {others.length > 0 && <section aria-labelledby="device-health-other-title">
+        <h5 id="device-health-other-title">Also open (does not change the status)</h5>
         <ul className="device-health-reasons">
-          {others.map((reason) => <ReasonRow key={reason.alert_id ?? reason.code} reason={reason} busy={busy} onAcknowledge={onAcknowledge} onResolve={onResolve} />)}
+          {others.map((reason) => <ReasonRow key={reason.alert_id ?? reason.code} reason={reason} />)}
         </ul>
       </section>}
-    </article>
+    </div>
   )
 }

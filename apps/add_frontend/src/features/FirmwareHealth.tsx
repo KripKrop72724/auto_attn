@@ -1,6 +1,7 @@
 import type { FirmwareDiagnostics } from '../types'
 import { useEffect, useState } from 'react'
 import { captureLatencyLabel } from './captureLatency'
+import { ago, dayTime } from '../lib/time'
 
 const bytes = (value?: number | null) => value == null ? 'Not reported' : `${(value / 1024).toLocaleString(undefined, { maximumFractionDigits: 1 })} KiB`
 const labels: Record<string, string> = {
@@ -115,9 +116,23 @@ export function FirmwareHealth({ diagnostics, observedAt, bootId, imageDigest }:
       : verified ? 'Local storage verified'
         : storage?.durability === 'DEGRADED' || storage?.durability === 'FULL' || storage?.persistence_probe_error || legacyNeedsAttention || journalNeedsAttention ? 'Local storage needs attention'
           : 'Local recovery checks pending'
-  return <article className="detail-card wide" aria-label="Firmware preservation health">
-    <p className="eyebrow">ATTENDANCE PRESERVATION</p>
-    <h3>{heading}</h3>
+  // ADV-18 plain summary on exactly the same verdict variables.
+  const plainHeading = !diagnostics ? 'Not reported by this link box'
+    : !sameBoot ? 'Waiting for a fresh report after a restart'
+      : !fresh ? 'Last report is old'
+        : verified ? 'Check-ins are being saved safely'
+          : heading === 'Local storage needs attention' ? 'Saving check-ins needs attention'
+            : 'Still checking after a restart'
+  const used = storage?.used_bytes != null && storage?.total_bytes ? Math.round((storage.used_bytes / storage.total_bytes) * 100) : null
+  const knownQueues = diagnostics?.queues.filter(queue => queue.count_known && queue.records != null) ?? []
+  const waiting = knownQueues.length ? knownQueues.reduce((sum, queue) => sum + (queue.records || 0), 0) : null
+  return <article className="detail-card wide" aria-label="Link box memory">
+    <div className="firmware-health-plain">
+      <h3>{plainHeading}</h3>
+      {observedAt && Number.isFinite(observed) && <p>Last report: {dayTime(observedAt, now)} · {ago(observedAt, now)}</p>}
+      {(used !== null || waiting !== null) && <p>{[used !== null ? `Storage used: ${used}%` : '', waiting !== null ? `Waiting to send: ${waiting.toLocaleString('en-PK')} ${waiting === 1 ? 'check-in' : 'check-ins'}` : ''].filter(Boolean).join(' · ')}</p>}
+    </div>
+    <h4>{heading}</h4>
     <p>Connection status, local preservation and Oracle delivery are checked separately.</p>
     {!diagnostics ? <p>This firmware has not reported preservation diagnostics.</p> : <>
       {!fresh && <p>Values below are the last report and do not confirm current health.</p>}
