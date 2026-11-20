@@ -1,0 +1,18 @@
+/* Settings (FND-13). */
+.settings-page { display: grid; gap: var(--space-4); max-width: 880px; }
+.settings-page .ui-page-header { margin-bottom: 0; }
+.settings-section { display: grid; gap: var(--space-3); padding: var(--space-5); }
+.settings-section h2 { margin: 0; font-size: var(--text-lg); }
+.settings-help { margin: 0; max-width: 640px; color: var(--text-secondary); font-size: var(--text-sm); line-height: 1.5; }
+.settings-switch { min-height: 44px; display: flex; align-items: flex-start; gap: 12px; cursor: pointer; }
+.settings-switch input { width: 20px; height: 20px; flex: none; margin-top: 2px; accent-color: var(--accent); }
+.settings-switch span { display: grid; gap: 2px; }
+.settings-switch small { color: var(--text-secondary); font-size: var(--text-sm); }
+.settings-classic-link { justify-self: start; min-height: 44px; display: inline-flex; align-items: center; gap: 6px; }
+.settings-account-row { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: var(--space-3); }
+.settings-account-row p { margin: 0; overflow-wrap: anywhere; }
+.settings-account-row .button { min-height: 44px; display: inline-flex; align-items: center; gap: 6px; }
+@media (max-width: 760px) {
+  .settings-section { padding: var(--space-4); }
+  .settings-account-row .button, .settings-classic-link { width: 100%; justify-content: center; }
+}

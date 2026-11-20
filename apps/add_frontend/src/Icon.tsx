@@ -1,6 +1,6 @@
 import type { ReactElement, SVGProps } from 'react'
 
-export type IconName = 'grid' | 'map' | 'list' | 'pulse' | 'users' | 'terminal' | 'shield' | 'alert' | 'clock' | 'refresh' | 'power' | 'search' | 'x' | 'chevron' | 'wifi' | 'server' | 'logout' | 'plus' | 'edit' | 'check' | 'trash' | 'userPlus' | 'menu' | 'info' | 'pause' | 'more' | 'download' | 'copy'
+export type IconName = 'grid' | 'list' | 'pulse' | 'users' | 'terminal' | 'shield' | 'alert' | 'clock' | 'refresh' | 'power' | 'search' | 'x' | 'chevron' | 'wifi' | 'server' | 'logout' | 'plus' | 'edit' | 'check' | 'trash' | 'userPlus' | 'menu' | 'info' | 'pause' | 'more' | 'download' | 'copy'
   | 'home' | 'settings' | 'update' | 'tool' | 'chevronDown' | 'chevronLeft' | 'external' | 'filter' | 'eye' | 'eyeOff' | 'calendar' | 'sort'
 type Name = IconName
 
@@ -9,7 +9,6 @@ const iconPixels: Record<IconSize, number> = { sm: 16, md: 20, lg: 24 }
 
 const paths: Record<Name, ReactElement> = {
   grid: <><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></>,
-  map: <><path d="m3 6 5-3 8 3 5-3v15l-5 3-8-3-5 3Z"/><path d="M8 3v15M16 6v15"/></>,
   list: <><path d="M8 6h13M8 12h13M8 18h13"/><circle cx="3.5" cy="6" r=".5" fill="currentColor"/><circle cx="3.5" cy="12" r=".5" fill="currentColor"/><circle cx="3.5" cy="18" r=".5" fill="currentColor"/></>,
   pulse: <path d="M3 12h4l2-7 4 14 2-7h6"/>,
   users: <><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></>,

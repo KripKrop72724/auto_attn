@@ -16,11 +16,11 @@ import App, {
 import { api } from './api'
 import type { Device, DeviceUser, Overview } from './types'
 import {
-  conflictedUser, deliveryAlert, device, fetchStub, fullCnic, maskedCnic, response, selectUserTerminal, useDashboardStubs, user,
+  conflictedUser, deliveryAlert, device, fetchStub, fullCnic, maskedCnic, response, selectUserTerminal, useDashboardStubs, user, appReady, openMenuPage,
 } from './test/renderApp'
 
 describe('State Life ADD interface · Software updates', () => {
-  useDashboardStubs(() => Promise.all([import('./features/Fleet'), import('./features/Firmware')]))
+  useDashboardStubs(() => Promise.all([import('./features/Home'), import('./features/Firmware')]))
 
   it('updates firmware in the selected zones with one click and no password, reason or typed version', async () => {
     // Finish the lazy module's test-time transform before timing interactions.
@@ -29,8 +29,8 @@ describe('State Life ADD interface · Software updates', () => {
     const fetchMock = fetchStub()
     vi.stubGlobal('fetch', fetchMock)
     render(<App />)
-    await screen.findByRole('heading', { name: 'Fleet', level: 1 })
-    fireEvent.click(screen.getByRole('button', { name: 'Firmware' }))
+    await appReady()
+    openMenuPage('Software updates')
     expect(await screen.findByRole('heading', { name: 'Firmware', level: 1 })).toBeTruthy()
     const update = screen.getByRole('button', { name: 'Update firmware' }) as HTMLButtonElement
     await waitFor(() => expect(update.disabled).toBe(false))
@@ -86,8 +86,8 @@ describe('State Life ADD interface · Software updates', () => {
     })
     vi.stubGlobal('fetch', fetchMock)
     render(<App />)
-    await screen.findByRole('heading', { name: 'Fleet', level: 1 })
-    fireEvent.click(screen.getByRole('button', { name: 'Firmware' }))
+    await appReady()
+    openMenuPage('Software updates')
     expect(await screen.findByRole('heading', { name: 'Firmware', level: 1 })).toBeTruthy()
     const update = screen.getByRole('button', { name: 'Update firmware' }) as HTMLButtonElement
     await waitFor(() => expect(update.disabled).toBe(false))

@@ -1,47 +1,79 @@
-import { useEffect, useRef, useState, type ReactNode, type RefObject } from 'react'
-import { Icon } from './Icon'
-import type { DashboardRoute } from './types'
+// The app frame (01-foundation A-E, FND-9): the menu (sidebar ≥1024 px, a
+// labelled rail 761-1023 px, a bottom bar on phones), the opaque header with
+// the Division switch, the Live indicator and the account menu, the "not live"
+// banner, the skip link, and focus on the page title after every page change.
+import { useEffect, useRef, useState, type MouseEvent, type ReactNode, type RefObject } from 'react'
+import { useQuery } from '@tanstack/react-query'
+import { useLocation, useNavigationType } from 'react-router-dom'
+import { api } from './api'
+import { queryClient } from './data'
+import { Icon, type IconName } from './Icon'
+import { parseDivision } from './lib/division'
+import { routesWithoutDivision, useDivision } from './lib/useDivision'
 import type { RealtimeState } from './realtime'
-import { clock } from './lib/time'
+import { routePath } from './routing'
+import { AccountMenu, SignOutButton, TechnicalSwitch, operatorInitials } from './shell/AccountMenu'
+import { LiveBanner, LiveStatus, useConnectionHealth } from './shell/LiveStatus'
+import type { DashboardRoute } from './types'
+import { capCount } from './ui/Badge'
+import { DivisionScopeChip, DivisionSwitch } from './ui/DivisionSwitch'
+import { Sheet } from './ui/Sheet'
+import { useIsPhone } from './ui/useMediaQuery'
+import { FRAME_WORDS, MENU_WORDS } from './words/home'
+import './shell/shell.css'
 
-const navigation = [
-  { id: 'home', label: 'Fleet', icon: 'grid', description: 'Live device health across the national fleet' },
-  { id: 'people', label: 'Users', icon: 'users', description: 'Terminal identities for one selected device' },
-  { id: 'attendance', label: 'Attendance', icon: 'clock', description: 'Punches, Oracle delivery, and release reviews' },
-  { id: 'recover', label: 'Reconciliation', icon: 'refresh', description: 'Terminal history, recovery, and source evidence' },
-  { id: 'updates', label: 'Firmware', icon: 'terminal', description: 'Signed releases, device preparation, and campaigns' },
-  { id: 'problems', label: 'Alerts', icon: 'alert', description: 'Open device conditions and their history' },
-] as const
+export { operatorInitials }
 
-const mobilePrimary = new Set<DashboardRoute>(['home', 'people', 'attendance', 'problems'])
+type MenuItem = { id: DashboardRoute; icon: IconName }
 
-// Pages without their own menu item yet light up the item they belong to. The
-// app frame rebuild (FND-9) gives every page its own item.
-const menuItemFor: Partial<Record<DashboardRoute, DashboardRoute>> = { devices: 'home', setup: 'updates' }
+const everyday: MenuItem[] = [
+  { id: 'home', icon: 'home' },
+  { id: 'devices', icon: 'grid' },
+  { id: 'attendance', icon: 'clock' },
+  { id: 'problems', icon: 'alert' },
+  { id: 'people', icon: 'users' },
+]
+const advanced: MenuItem[] = [
+  { id: 'recover', icon: 'refresh' },
+  { id: 'updates', icon: 'update' },
+  { id: 'setup', icon: 'tool' },
+  { id: 'settings', icon: 'settings' },
+]
+/** Phone bottom bar: four everyday pages and More (People and Advanced tools live in More). */
+const phoneBar = new Set<DashboardRoute>(['home', 'devices', 'attendance', 'problems'])
 
-const connectionLabels: Record<RealtimeState, string> = {
-  connecting: 'Connecting',
-  live: 'Live transport',
-  reconnecting: 'Reconnecting',
-  stale: 'Cached data',
+/** Set up a device is switched off in production until the new-box software ships (D-17/18). */
+function useSetupSwitchedOff() {
+  const capabilities = useQuery({
+    queryKey: ['provisioning-capabilities', 'menu'],
+    queryFn: ({ signal }) => api<{ enabled?: boolean }>('/api/v1/provisioning/capabilities', { signal }),
+    staleTime: 5 * 60_000,
+    retry: false,
+  }, queryClient)
+  return capabilities.data ? capabilities.data.enabled === false : false
 }
 
-export function operatorInitials(name: string) {
-  const words = name.replace(/([a-z])([A-Z])/g, '$1 $2').split(/[\s._@-]+/).filter(Boolean)
-  if (!words.length) return '?'
-  const letters = words.length === 1 ? words[0].slice(0, 2) : `${words[0][0]}${words[words.length - 1][0]}`
-  return letters.toUpperCase()
+function ProblemsBadge({ count }: { count: number | null }) {
+  if (count === null || count <= 0) return null
+  return (
+    <span className="nav-count">
+      <span aria-hidden="true">{capCount(count, 99)}</span>
+      <span className="sr-only">{FRAME_WORDS.problemsBadge(count)}</span>
+    </span>
+  )
 }
 
 export function AppShell({
   children,
   username,
-  route: currentRoute,
+  route,
   openAlertCount,
   onNavigate,
   onLogout,
   realtimeState,
   lastSyncAt,
+  fetchFailed,
+  onTryNow,
   workspaceRef,
 }: {
   children: ReactNode
@@ -50,16 +82,30 @@ export function AppShell({
   /** Null until the first overview: the badge stays hidden instead of showing 0. */
   openAlertCount: number | null
   onNavigate: (route: DashboardRoute) => void
-  onLogout: () => void
+  onLogout: () => Promise<void>
   realtimeState: RealtimeState
   lastSyncAt: Date | null
+  /** A background refresh failed (after its retries): the page shows what it knew. */
+  fetchFailed?: boolean
+  /** "Try now": re-read the devices and the overview. */
+  onTryNow?: () => Promise<void>
   workspaceRef: RefObject<HTMLElement | null>
 }) {
-  const route = menuItemFor[currentRoute] || currentRoute
+  const location = useLocation()
+  const navigationType = useNavigationType()
+  const phone = useIsPhone()
+  const [chosenDivision, setDivision] = useDivision()
+  // useDivision reads "All" on a single device; the device panel opens over a
+  // list page, so keep showing that list's choice from the address.
+  const division = /^\/devices\/[^/]+/.test(location.pathname) ? parseDivision(location.search) : chosenDivision
   const [moreOpen, setMoreOpen] = useState(false)
   const [scrolled, setScrolled] = useState(false)
   const moreTriggerRef = useRef<HTMLButtonElement>(null)
-  const moreSheetRef = useRef<HTMLElement>(null)
+  const setupOff = useSetupSwitchedOff()
+  const health = useConnectionHealth(realtimeState, lastSyncAt, Boolean(fetchFailed))
+  const tryNow = onTryNow || (async () => undefined)
+  const showDivision = !routesWithoutDivision(location.pathname) || /^\/devices\/[^/]+/.test(location.pathname)
+
   useEffect(() => {
     const workspace = workspaceRef.current
     if (!workspace) return
@@ -68,98 +114,163 @@ export function AppShell({
     workspace.addEventListener('scroll', update, { passive: true })
     return () => workspace.removeEventListener('scroll', update)
   }, [workspaceRef])
+
+  // The More sheet belongs to phones: close it when the window widens.
   useEffect(() => {
-    if (!moreOpen) return
-    const previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null
-    const focusableSelector = 'button:not([disabled]), a[href], input:not([disabled]), [tabindex]:not([tabindex="-1"])'
-    const focusable = () => Array.from(moreSheetRef.current?.querySelectorAll<HTMLElement>(focusableSelector) || [])
-    focusable()[0]?.focus()
-    const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') {
-        event.preventDefault()
-        setMoreOpen(false)
-        return
-      }
-      if (event.key !== 'Tab') return
-      const controls = focusable()
-      if (!controls.length) return
-      const first = controls[0]
-      const last = controls[controls.length - 1]
-      if (event.shiftKey && document.activeElement === first) {
-        event.preventDefault()
-        last.focus()
-      } else if (!event.shiftKey && document.activeElement === last) {
-        event.preventDefault()
-        first.focus()
-      }
+    if (!phone && moreOpen) setMoreOpen(false)
+  }, [moreOpen, phone])
+
+  // After an in-app page change (not the first load, not Back/Forward), move
+  // focus to the new page's title so keyboard and screen-reader users start there.
+  const firstRoute = useRef(true)
+  useEffect(() => {
+    if (firstRoute.current) {
+      firstRoute.current = false
+      return
     }
-    document.addEventListener('keydown', handleKeyDown)
-    return () => {
-      document.removeEventListener('keydown', handleKeyDown)
-      ;(previousFocus || moreTriggerRef.current)?.focus()
-    }
-  }, [moreOpen])
-  const connectionLabel = connectionLabels[realtimeState]
-  const current = navigation.find((item) => item.id === route) || navigation[0]
-  const secondaryActive = !mobilePrimary.has(route)
-  const syncDetail = lastSyncAt ? `Last stream activity ${clock(lastSyncAt)} PKT. Each panel shows its own evidence age.` : 'Connecting to live operations'
+    if (navigationType === 'POP') return
+    let tries = 0
+    // Pages load their code lazily: look for the title for up to 5 s.
+    const timer = window.setInterval(() => {
+      const heading = workspaceRef.current?.querySelector<HTMLElement>('.page-content h1')
+      if (heading) {
+        if (!heading.hasAttribute('tabindex')) heading.setAttribute('tabindex', '-1')
+        heading.focus({ preventScroll: true })
+      }
+      if (heading || ++tries > 100) window.clearInterval(timer)
+    }, 50)
+    return () => window.clearInterval(timer)
+    // Only a change of page counts; filters (?status=…) and the device panel do not.
+  }, [route]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  const go = (id: DashboardRoute) => (event: MouseEvent<HTMLAnchorElement>) => {
+    if (event.metaKey || event.ctrlKey || event.shiftKey || event.button === 1) return
+    event.preventDefault()
+    setMoreOpen(false)
+    onNavigate(id)
+  }
+  const href = (id: DashboardRoute) => routePath(id, undefined, { division })
+  const label = (id: DashboardRoute) => MENU_WORDS[id].label
+  const current = MENU_WORDS[route]
+  const moreActive = !phoneBar.has(route)
+
+  const menuLink = (item: MenuItem, extra = '') => (
+    <a
+      key={item.id}
+      href={href(item.id)}
+      className={`nav-link ${route === item.id ? 'active' : ''} ${extra}`}
+      aria-current={route === item.id ? 'page' : undefined}
+      onClick={go(item.id)}
+    >
+      <Icon name={item.icon} />
+      <span className="nav-label">{label(item.id)}</span>
+      {item.id === 'problems' && <ProblemsBadge count={openAlertCount} />}
+      {item.id === 'setup' && setupOff && <span className="nav-off">{FRAME_WORDS.switchedOff}</span>}
+    </a>
+  )
+
+  const moreLink = (item: MenuItem) => (
+    <a
+      key={item.id}
+      href={href(item.id)}
+      className={`more-link ${route === item.id ? 'active' : ''}`}
+      aria-current={route === item.id ? 'page' : undefined}
+      onClick={go(item.id)}
+    >
+      <Icon name={item.icon} />
+      <span>
+        <strong>{label(item.id)}{item.id === 'setup' && setupOff && <span className="nav-off">{FRAME_WORDS.switchedOff}</span>}</strong>
+        <small>{MENU_WORDS[item.id].description}</small>
+      </span>
+      <Icon name="chevron" size="sm" />
+    </a>
+  )
+
   return (
     <div className="app-shell">
+      <a className="skip-link" href="#main" onClick={(event) => { event.preventDefault(); document.getElementById('main')?.focus() }}>{FRAME_WORDS.skipLink}</a>
       <aside className="app-sidebar">
-        <a
-          className="app-brand"
-          href="/home"
-          onClick={(event) => {
-            event.preventDefault()
-            onNavigate('home')
-          }}
-        >
+        <a className="app-brand" href={href('home')} onClick={go('home')}>
           <img src="/state-life-logo.png" alt="State Life Insurance Corporation" />
-          <span><strong>State Life</strong><small>Attendance devices</small></span>
+          <span><strong>{FRAME_WORDS.brandName}</strong><small>{FRAME_WORDS.brandSub}</small></span>
         </a>
-        <nav aria-label="Primary navigation">
-          {navigation.map((item) => (
-            <button
-              key={item.id}
-              className={`${route === item.id ? 'active' : ''} ${mobilePrimary.has(item.id) ? 'mobile-primary' : 'mobile-secondary'}`}
-              aria-current={route === item.id ? 'page' : undefined}
-              title={item.label}
-              onClick={() => onNavigate(item.id)}
-            >
-              <Icon name={item.icon} />
-              <span>{item.label}</span>
-              {item.id === 'problems' && openAlertCount !== null && openAlertCount > 0 && (
-                <span className="nav-count" aria-label={`${openAlertCount} alert${openAlertCount === 1 ? '' : 's'} need${openAlertCount === 1 ? 's' : ''} action`}>{openAlertCount > 99 ? '99+' : openAlertCount}</span>
-              )}
-            </button>
-          ))}
+        <nav aria-label={FRAME_WORDS.mainMenu}>
+          <div className="nav-group">
+            {everyday.map((item) => menuLink(item, phoneBar.has(item.id) ? 'mobile-primary' : 'mobile-secondary'))}
+          </div>
+          <div className="nav-group nav-advanced" role="group" aria-labelledby="nav-advanced-title">
+            <p id="nav-advanced-title" className="nav-heading">{FRAME_WORDS.advancedTools}</p>
+            {advanced.map((item) => menuLink(item, 'mobile-secondary'))}
+          </div>
+          <button
+            ref={moreTriggerRef}
+            type="button"
+            className={`mobile-more-trigger ${moreOpen || moreActive ? 'active' : ''}`}
+            onClick={() => setMoreOpen(true)}
+            aria-haspopup="dialog"
+            aria-expanded={moreOpen}
+          >
+            <Icon name="more" /><span>{FRAME_WORDS.more}</span>
+          </button>
         </nav>
-        <div className="sidebar-footer"><strong>Pakistan Standard Time</strong><span>All times are shown in PKT</span></div>
-        <button ref={moreTriggerRef} className={`mobile-more-trigger ${moreOpen || secondaryActive ? 'active' : ''}`} onClick={() => setMoreOpen(true)} aria-haspopup="dialog" aria-expanded={moreOpen}><Icon name="menu" /><span>More</span></button>
+        <div className="sidebar-footer">
+          <span>{FRAME_WORDS.pakistanTime}</span>
+          <a href="/status" target="_blank" rel="noopener">{FRAME_WORDS.publicStatus} <Icon name="external" size="sm" /><span className="sr-only"> {FRAME_WORDS.opensInNewTab}</span></a>
+        </div>
       </aside>
       <section ref={workspaceRef} className="app-workspace">
         <header className={`app-header ${scrolled ? 'is-scrolled' : ''}`}>
-          <div className="app-header-context">
-            <img src="/state-life-logo.png" alt="" />
-            <strong>{current.label}</strong>
+          <div className="app-header-start">
+            <img className="app-header-logo" src="/state-life-logo.png" alt="" />
+            {showDivision && !phone && <DivisionSwitch value={division} onChange={setDivision} className="header-division" />}
+            <strong className="app-header-title" aria-hidden={!scrolled || undefined}>{current.label}</strong>
           </div>
           <div className="operator-area">
-            <span className={`live-sync connection-${realtimeState}`} role="status" title={syncDetail}><i aria-hidden="true" /><span>{connectionLabel}</span></span>
-            <span className="operator">
-              <span className="operator-avatar" aria-hidden="true">{operatorInitials(username)}</span>
-              <span><strong>{username}</strong><small>State Life operator</small></span>
-            </span>
-            <button className="icon-button" onClick={onLogout} aria-label="Sign out" title="Sign out"><Icon name="logout" /></button>
+            {showDivision && phone && division !== 'all' && (
+              <button type="button" className="header-division-chip" onClick={() => workspaceRef.current?.scrollTo({ top: 0, behavior: 'smooth' })}>
+                {division === 'life' ? 'Life' : 'Health'}
+              </button>
+            )}
+            <LiveStatus health={health} lastSyncAt={lastSyncAt} phone={phone} onTryNow={tryNow} />
+            {!phone && <AccountMenu username={username} onLogout={onLogout} onSettings={go('settings')} />}
           </div>
         </header>
-        <main className="page-content">{children}</main>
+        <LiveBanner health={health} onTryNow={tryNow} />
+        <main id="main" tabIndex={-1} className="page-content">
+          {showDivision && phone && (
+            <div className="phone-division-row">
+              <DivisionSwitch value={division} onChange={setDivision} fullWidth />
+            </div>
+          )}
+          {showDivision && <DivisionScopeChip division={division} onShowAll={() => setDivision('all')} className="frame-division-chip" />}
+          <div className="page-enter" key={route}>{children}</div>
+        </main>
       </section>
-      {moreOpen && <div className="mobile-more-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setMoreOpen(false) }}>
-        <section ref={moreSheetRef} className="mobile-more-sheet" role="dialog" aria-modal="true" aria-labelledby="mobile-more-title">
-          <header><h2 id="mobile-more-title">More operations</h2><button className="icon-button" aria-label="Close more navigation" onClick={() => setMoreOpen(false)}><Icon name="x" /></button></header>
-          {navigation.filter((item) => !mobilePrimary.has(item.id)).map((item) => <button key={item.id} className={route === item.id ? 'active' : ''} aria-current={route === item.id ? 'page' : undefined} onClick={() => { onNavigate(item.id); setMoreOpen(false) }}><Icon name={item.icon} /><span><strong>{item.label}</strong><small>{item.description}</small></span><Icon name="chevron" /></button>)}
-        </section>
-      </div>}
+      {moreOpen && (
+        <Sheet
+          title={FRAME_WORDS.moreTitle}
+          onClose={() => setMoreOpen(false)}
+          returnFocusRef={moreTriggerRef}
+          placement="bottom"
+          className="more-sheet"
+        >
+          <div className="more-account">
+            <span className="operator-avatar" aria-hidden="true" data-user-text>{operatorInitials(username)}</span>
+            <span className="more-who">{FRAME_WORDS.signedInAs(username)}</span>
+            <SignOutButton onLogout={onLogout} className="button secondary small" />
+          </div>
+          <nav className="more-links" aria-label={FRAME_WORDS.more}>
+            {moreLink(everyday[4])}
+            <p className="nav-heading">{FRAME_WORDS.advancedTools}</p>
+            {advanced.map(moreLink)}
+          </nav>
+          <div className="more-footer">
+            <TechnicalSwitch id="more-technical" />
+            <p>{FRAME_WORDS.pakistanTime}</p>
+            <a href="/status" target="_blank" rel="noopener">{FRAME_WORDS.publicStatus} <Icon name="external" size="sm" /><span className="sr-only"> {FRAME_WORDS.opensInNewTab}</span></a>
+          </div>
+        </Sheet>
+      )}
     </div>
   )
 }

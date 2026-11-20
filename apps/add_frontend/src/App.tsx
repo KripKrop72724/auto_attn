@@ -368,7 +368,7 @@ function DashboardApp() {
     setAuthState('authenticated')
   }
 
-  const logout = async () => {
+  const logout = useCallback(async () => {
     try { await api('/api/v1/auth/logout', { method: 'POST', body: '{}' }) } finally {
       setCsrfToken('')
       setAuthState('anonymous')
@@ -377,7 +377,7 @@ function DashboardApp() {
       queryClient.clear()
       setOverview(null)
     }
-  }
+  }, [invalidateFleetRequests])
 
   const manageUsers = useCallback((device: Device) => {
     setSelectedDeviceId(device.connector_id)
@@ -387,11 +387,13 @@ function DashboardApp() {
 
   // The device panel opens at /devices/:id; closing it returns to the page it
   // was opened from (kept in history state), or the Devices list.
+  // From the Devices list the filters (?status=…) are kept, so closing the panel
+  // brings the same filtered list back.
   const inspectDevice = useCallback((device: Device) => {
     setDrawer(device)
-    const from = panelFrom || (view === 'devices' ? '' : `${location.pathname}${location.search}`)
-    navigate(routePath('devices', device.connector_id, { division }), { state: from ? { from } : null })
-  }, [division, location.pathname, location.search, navigate, panelFrom, view])
+    const from = panelFrom || `${location.pathname}${location.search}`
+    navigate(routePath('devices', device.connector_id, { division }), { state: { from } })
+  }, [division, location.pathname, location.search, navigate, panelFrom])
 
   const closeDevice = useCallback(() => {
     setDrawer(null)
@@ -431,9 +433,10 @@ function DashboardApp() {
     inspectDevice,
     manageUsers,
     navigate: (to: string) => navigate(to),
+    logout,
   }), [
     deviceCustodyRevision, deviceRevision, devices, devicesError, devicesLoaded, devicesUpdatedAt, inspectDevice,
-    manageUsers, navigate, overview, realtime.lastSyncAt, realtime.state, refreshFleet, revisions, selectUserDevice,
+    logout, manageUsers, navigate, overview, realtime.lastSyncAt, realtime.state, refreshFleet, revisions, selectUserDevice,
     selectedDeviceId, toast, username,
   ])
 
@@ -446,7 +449,7 @@ function DashboardApp() {
   const openAlertCount = overview ? overview.open_unacknowledged_alerts ?? overview.open_alerts : null
   return (
     <AppDataProvider value={appData}>
-      <AppShell workspaceRef={workspaceRef} username={username} route={pageRoute} openAlertCount={openAlertCount} onNavigate={setView} onLogout={() => void logout()} realtimeState={realtime.state} lastSyncAt={realtime.lastSyncAt}>
+      <AppShell workspaceRef={workspaceRef} username={username} route={pageRoute} openAlertCount={openAlertCount} onNavigate={setView} onLogout={logout} realtimeState={realtime.state} lastSyncAt={realtime.lastSyncAt} fetchFailed={Boolean(devicesError) && devicesLoaded} onTryNow={refreshFleet}>
         <NewVersionNotice available={newVersion} />
         <PageErrorBoundary key={pageRoute}>
           <Suspense fallback={<WorkspaceLoading label={entry.loadingLabel} />}><Page /></Suspense>

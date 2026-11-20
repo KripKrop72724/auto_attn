@@ -42,6 +42,8 @@ export interface AppData {
   inspectDevice: (device: Device) => void
   manageUsers: (device: Device) => void
   navigate: (to: string) => void
+  /** Sign out (Settings, account menu); resolves when the session has ended. */
+  logout: () => Promise<void>
 }
 
 const AppDataContext = createContext<AppData | null>(null)

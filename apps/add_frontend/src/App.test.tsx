@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import App, {
   buildMachinePreview,
@@ -7,22 +7,22 @@ import App, {
   confirmationMatches,
   formatAlertDiagnostics,
   identityConflictText,
-  metricsTime,
   pktInputToUtc,
   pktTodayBounds,
   StatusBadge,
   validateUserDraft,
 } from './App'
 import { api } from './api'
-import type { Device, DeviceUser, Overview } from './types'
+import type { Device, DeviceUser } from './types'
 import {
-  conflictedUser, deliveryAlert, device, fetchStub, fullCnic, maskedCnic, response, selectUserTerminal, useDashboardStubs, user,
+  appReady, conflictedUser, deliveryAlert, device, fetchStub, fullCnic, maskedCnic, response, selectUserTerminal, useDashboardStubs, user,
   CapturingEventSource,
 } from './test/renderApp'
 import { queryClient } from './data'
+import { deviceSnapshots } from './deviceData'
 
 describe('State Life ADD interface', () => {
-  useDashboardStubs(() => Promise.all([import('./features/Fleet'), import('./features/Login'), import('./features/DeviceDrawer'), import('./features/FleetMap'), import('./features/Attendance')]))
+  useDashboardStubs(() => Promise.all([import('./features/Home'), import('./features/Devices'), import('./features/Login'), import('./features/DeviceDrawer'), import('./features/Attendance')]))
 
   it('builds an exact device-scoped bulk deletion confirmation', () => {
     expect(bulkDeletionConfirmation(12, 'ZONE-SWAT-01')).toBe(
@@ -30,18 +30,24 @@ describe('State Life ADD interface', () => {
     )
   })
 
-  it('uses secure automatic onboarding language and exposes no registration control', async () => {
+  it('Home shows the four tiles and no registration control', async () => {
     render(<App />)
-    expect(await screen.findByRole('heading', { name: 'Fleet', level: 1 })).toBeTruthy()
-    expect(screen.getByAltText('State Life Insurance Corporation')).toBeTruthy()
+    await appReady()
+    expect(screen.getAllByAltText('State Life Insurance Corporation').length).toBeGreaterThan(0)
     expect(screen.queryByText(/register connector/i)).toBeNull()
-    expect(screen.getByText(/secure auto-onboarding enabled/i)).toBeTruthy()
-    expect(screen.getByText('ORDS delivery queue')).toBeTruthy()
-    expect(await screen.findByText('12')).toBeTruthy()
-    expect(await screen.findByText(/3 retrying · 2 identity blocked · 1 quarantined/i)).toBeTruthy()
+    const summary = await screen.findByRole('region', { name: 'Summary' })
+    await waitFor(() => expect(within(summary).getAllByRole('link')).toHaveLength(4))
+    const tiles = within(summary).getAllByRole('link').map((tile) => tile.textContent)
+    expect(tiles[0]).toMatch(/^Devices1/)
+    expect(tiles[1]).toMatch(/^Working1/)
+    expect(tiles[2]).toMatch(/^Needs attention0/)
+    expect(tiles[3]).toMatch(/^Offline0/)
+    // The old delivery tiles are gone from Home.
+    expect(screen.queryByText('ORDS delivery queue')).toBeNull()
+    expect(await screen.findByText('The device is working.')).toBeTruthy()
   })
 
-  it('shows the unknown-identity automatic release on Fleet and opens it on Attendance', async () => {
+  it('shows the automatic sending line in Attendance today and opens Attendance', async () => {
     const base = fetchStub()
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       if (String(input) === '/api/v2/unknown-identity-auto-release') {
@@ -56,53 +62,49 @@ describe('State Life ADD interface', () => {
       return base(input, init)
     }))
     render(<App />)
-    const tile = await screen.findByRole('button', { name: /Unknown-identity release: OFF\. Turned off by StateHealthAdmin 2 h ago · 108,000 held/ })
-    fireEvent.click(tile)
+    const today = await screen.findByRole('region', { name: 'Attendance today' })
+    const line = await within(today).findByRole('link', { name: 'Sending not-matched check-ins automatically: Off (turned off by StateHealthAdmin 2 h ago) · 108,000 waiting.' })
+    fireEvent.click(line)
     await waitFor(() => expect(window.location.pathname).toBe('/attendance'))
     // Plain Attendance: the panel shows there without turning on the heavy filter.
     expect(window.location.search).toBe('')
   })
 
-  it('opens on the Pakistan map and preserves the complete list behind an in-memory toggle', async () => {
+  it('opens on Home with no map and keeps only the division choice in browser storage', async () => {
     render(<App />)
-    await screen.findByRole('heading', { name: 'Fleet', level: 1 })
-    expect(await screen.findByRole('region', { name: 'Pakistan device network map' })).toBeTruthy()
-    expect(screen.getByRole('button', { name: 'Map' }).getAttribute('aria-pressed')).toBe('true')
-    expect(screen.getByRole('button', { name: /Islamabad, 1 device, All online/i })).toBeTruthy()
-
-    fireEvent.click(screen.getByRole('button', { name: 'List' }))
-    expect(await screen.findByRole('button', { name: `Inspect ${device.display_name}` })).toBeTruthy()
+    await appReady()
     expect(screen.queryByRole('region', { name: 'Pakistan device network map' })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Map' })).toBeNull()
+    expect(await screen.findByRole('region', { name: 'Health' })).toBeTruthy()
     // The browser keeps at most one key, add.prefs, and only after a change (D-25).
     expect(Object.keys(window.localStorage).every((key) => key === 'add.prefs')).toBe(true)
     expect(window.sessionStorage.length).toBe(0)
   })
 
-  it('keeps spare devices in a separate inventory view', async () => {
+  it('shows spare devices only under the Spare filter on Devices', async () => {
     const spareDevice: Device = {
       ...device,
       connector_id: 'connector-spare',
       hardware_id: 'e0:72:a1:d6:f3:29',
       display_name: 'Islamabad reserve device',
+      friendly_name: 'Islamabad Reserve Device · Spare',
+      division: 'health',
       state: 'OFFLINE',
       connected: false,
       is_spare: true,
     }
     vi.stubGlobal('fetch', fetchStub([user], false, false, false, false, [device, spareDevice]))
+    window.history.replaceState({}, '', '/devices?spare=1')
     render(<App />)
 
-    await screen.findByRole('heading', { name: 'Fleet', level: 1 })
-    expect(await screen.findByRole('tab', { name: /active fleet 1/i })).toBeTruthy()
-    fireEvent.click(await screen.findByRole('tab', { name: /spares 1/i }))
-
-    expect(await screen.findByRole('heading', { name: /spare device inventory/i })).toBeTruthy()
-    expect(screen.getByText(/offline state and alerts do not affect fleet availability/i)).toBeTruthy()
-    expect(screen.getByRole('button', { name: 'Inspect Islamabad reserve device' })).toBeTruthy()
-    expect(screen.queryByRole('button', { name: `Inspect ${device.display_name}` })).toBeNull()
-    expect(screen.getByText('Spare')).toBeTruthy()
+    await appReady('Devices')
+    expect(await screen.findByRole('button', { name: /^Spare\s*1$/ })).toBeTruthy()
+    expect(await screen.findByRole('link', { name: 'Open Islamabad Reserve Device · Spare, Health, spare (not in use)' })).toBeTruthy()
+    expect(screen.queryByRole('link', { name: /^Open SLIC Tower · 3rd Floor/ })).toBeNull()
+    expect(screen.getAllByText('Not counted in any totals.').length).toBeGreaterThan(0)
   })
 
-  it('counts warnings as online and keeps terminal outages in the attention filter', async () => {
+  it('counts a machine that is not responding as offline and keeps a note on a working device', async () => {
     const minutesAgo = (minutes: number) => new Date(Date.now() - minutes * 60_000 - 5_000).toISOString()
     const warningDevice: Device = {
       ...device,
@@ -110,7 +112,8 @@ describe('State Life ADD interface', () => {
       hardware_id: 'e0:72:a1:d7:05:c4',
       zone_id: 'ZONE-PESHAWAR-02',
       zone_name: 'Peshawar',
-      display_name: 'Peshawar 02',
+      display_name: 'ZONE-PESHAWAR-02',
+      friendly_name: 'Peshawar · Device 2',
       state: 'ONLINE_WITH_WARNINGS',
       terminal_link: { state: 'CONNECTED', raw_state: 'ONLINE', since: minutesAgo(90), reason: 'LINK_UP', message: 'The terminal link is up.' },
       health: {
@@ -135,7 +138,8 @@ describe('State Life ADD interface', () => {
       hardware_id: 'e0:72:a1:d5:08:a0',
       zone_id: 'ZONE-MULTAN-01',
       zone_name: 'Multan',
-      display_name: 'Multan 01',
+      display_name: 'ZONE-MULTAN-01',
+      friendly_name: 'Multan',
       state: 'ONLINE',
       terminal_link: { state: 'DISCONNECTED', raw_state: 'RETRY_WAIT', since: minutesAgo(6), reason: 'RETRY_WAIT', message: 'The terminal has been unreachable for 6 minutes (RETRY_WAIT).' },
     }
@@ -145,7 +149,8 @@ describe('State Life ADD interface', () => {
       hardware_id: 'e0:72:a1:d6:f3:31',
       zone_id: 'ZONE-SWAT-01',
       zone_name: 'Swat',
-      display_name: 'Swat 01',
+      display_name: 'ZONE-SWAT-01',
+      friendly_name: 'Swat',
       state: 'DEGRADED',
       terminal_link: { state: 'CONNECTED', raw_state: 'ONLINE', since: minutesAgo(90), reason: 'LINK_UP', message: 'The terminal link is up.' },
     }
@@ -159,49 +164,32 @@ describe('State Life ADD interface', () => {
       terminal_attention: 1,
     }))
     render(<App />)
-    await screen.findByRole('heading', { name: 'Fleet', level: 1 })
+    await appReady()
+    const summary = await screen.findByRole('region', { name: 'Summary' })
+    await waitFor(() => expect(within(summary).getAllByRole('link')[1].textContent).toMatch(/^Working2/))
+    const tiles = within(summary).getAllByRole('link').map((tile) => tile.textContent)
+    expect(tiles[1]).toContain('1 with a note')
+    expect(tiles[2]).toMatch(/^Needs attention1/)
+    expect(tiles[3]).toMatch(/^Offline1/)
+    expect(screen.getByText('2 problems to look at')).toBeTruthy()
 
-    expect(await screen.findByText('3 of 4 online (1 with warnings)')).toBeTruthy()
-    expect(screen.getByText('75%')).toBeTruthy()
-    expect(screen.getByRole('button', { name: 'Operations queue: 2. 1 device degraded or offline · 1 terminal link down' })).toBeTruthy()
-    expect(screen.getByLabelText('2 alerts need action')).toBeTruthy()
+    fireEvent.click(within(summary).getAllByRole('link')[2])
+    await appReady('Devices')
+    expect(window.location.pathname).toBe('/devices')
+    expect(window.location.search).toBe('?status=attention')
+    expect(await screen.findByRole('link', { name: 'Open Swat, Health, needs attention' })).toBeTruthy()
+    expect(screen.queryByRole('link', { name: /^Open Multan,/ })).toBeNull()
 
-    const filter = screen.getByRole('combobox', { name: 'Filter by state' }) as HTMLSelectElement
-    expect(Array.from(filter.options).map((option) => [option.value, option.textContent])).toEqual([
-      ['ALL', 'All states'],
-      ['ATTENTION', 'Needs attention'],
-      ['ONLINE', 'Online'],
-      ['ONLINE_WITH_WARNINGS', 'Online with warnings'],
-      ['DEGRADED', 'Degraded'],
-      ['OFFLINE', 'Offline'],
-      ['ONBOARDING', 'Onboarding'],
-      ['QUARANTINED_DUPLICATE_SERIAL', 'Quarantined'],
-      ['TERMINAL_LINK_DOWN', 'Terminal link down'],
-    ])
-
-    fireEvent.click(screen.getByRole('button', { name: 'List' }))
-    expect(await screen.findByRole('button', { name: 'Inspect Peshawar 02' })).toBeTruthy()
-    expect(screen.getByText('Warning: add_delivery STOPPED · 37 min')).toBeTruthy()
-    const terminalBadge = screen.getByLabelText('Terminal link: Disconnected')
-    expect(terminalBadge.getAttribute('data-pattern')).toBe('blocked')
-    expect(terminalBadge.textContent).toBe('Terminal disconnected')
-    expect(terminalBadge.closest('button')?.getAttribute('aria-label')).toBe('Inspect Multan 01')
-    expect(screen.queryByLabelText('Terminal link: Connected')).toBeNull()
-    expect(screen.getByLabelText('Status: ONLINE WITH WARNINGS').getAttribute('data-pattern')).toBe('notice')
-
-    fireEvent.change(filter, { target: { value: 'ATTENTION' } })
-    expect(screen.getByRole('button', { name: 'Inspect Multan 01' })).toBeTruthy()
-    expect(screen.getByRole('button', { name: 'Inspect Swat 01' })).toBeTruthy()
-    expect(screen.queryByRole('button', { name: 'Inspect Peshawar 02' })).toBeNull()
-    expect(screen.queryByRole('button', { name: `Inspect ${device.display_name}` })).toBeNull()
-
-    fireEvent.change(filter, { target: { value: 'TERMINAL_LINK_DOWN' } })
-    expect(screen.getByRole('button', { name: 'Inspect Multan 01' })).toBeTruthy()
-    expect(screen.queryByRole('button', { name: 'Inspect Swat 01' })).toBeNull()
-
-    fireEvent.change(filter, { target: { value: 'ONLINE_WITH_WARNINGS' } })
-    expect(screen.getByRole('button', { name: 'Inspect Peshawar 02' })).toBeTruthy()
-    expect(screen.queryByRole('button', { name: 'Inspect Multan 01' })).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: /^All\s*4$/ }))
+    const peshawar = await screen.findByRole('link', { name: 'Open Peshawar · Device 2, Health, working' })
+    expect(peshawar.closest('tr')?.textContent).toContain('Note: Link box is stuck sending attendance.')
+    expect(document.body.textContent).not.toContain('add_delivery STOPPED')
+    const multan = screen.getByRole('link', { name: 'Open Multan, Health, offline' })
+    expect(multan.closest('tr')?.textContent).toContain('Machine not responding.')
+    expect(screen.getByRole('link', { name: 'People on Multan' })).toBeTruthy()
+    // The status chip is never clipped.
+    const chip = within(multan.closest('tr') as HTMLElement).getByLabelText('Status: Offline')
+    expect(getComputedStyle(chip).textOverflow).not.toBe('ellipsis')
   })
 
   it('communicates every state with text, icon, and border pattern', () => {
@@ -250,7 +238,7 @@ describe('State Life ADD interface', () => {
 
   it('returns to the login screen when any request reports an expired session', async () => {
     render(<App />)
-    await screen.findByRole('heading', { name: 'Fleet', level: 1 })
+    await appReady()
     vi.stubGlobal('fetch', vi.fn(async () => response({ detail: 'Session expired.' }, 401)))
     await api('/api/v1/protected-test').catch(() => undefined)
     expect(await screen.findByText(/sign in to the national device operations console/i)).toBeTruthy()
@@ -294,12 +282,12 @@ describe('State Life ADD interface', () => {
   })
 
   it('supports semantic keyboard tabs, Escape close, and focus restoration', async () => {
+    window.history.replaceState({}, '', '/devices')
     render(<App />)
-    await screen.findByRole('heading', { name: 'Fleet', level: 1 })
-    fireEvent.click(await screen.findByRole('button', { name: /Islamabad, 1 device, All online/i }))
-    const inspect = await screen.findByRole('button', { name: `Inspect ${device.display_name}` })
-    inspect.focus()
-    fireEvent.click(inspect)
+    await appReady('Devices')
+    const open = await screen.findByRole('link', { name: 'Open SLIC Tower · 3rd Floor, Health, working' })
+    open.focus()
+    fireEvent.click(open)
     expect(await screen.findByRole('dialog')).toBeTruthy()
     const overview = screen.getByRole('tab', { name: 'Overview' })
     expect(overview.getAttribute('aria-controls')).toBe('device-tabpanel')
@@ -309,7 +297,8 @@ describe('State Life ADD interface', () => {
     expect(screen.getByRole('tabpanel').getAttribute('aria-labelledby')).toBe('device-tab-logs')
     fireEvent.keyDown(document, { key: 'Escape' })
     await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
-    expect(document.activeElement).toBe(inspect)
+    expect(window.location.pathname).toBe('/devices')
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByRole('link', { name: 'Open SLIC Tower · 3rd Floor, Health, working' })))
   })
 })
 
@@ -336,7 +325,7 @@ describe('realtime refresh budget', () => {
     const fetchMock = fetchStub()
     vi.stubGlobal('fetch', fetchMock)
     render(<App />)
-    await screen.findByRole('heading', { name: 'Fleet', level: 1 })
+    await appReady()
     await waitFor(() => expect(calls(fetchMock, '/api/v1/devices')).toBe(1))
     expect(calls(fetchMock, '/api/v1/overview')).toBe(1)
     const stream = await waitFor(() => {
@@ -365,15 +354,15 @@ describe('realtime refresh budget', () => {
     await vi.advanceTimersByTimeAsync(10_000)
     expect(calls(fetchMock, '/api/v1/devices')).toBe(3)
     expect(calls(fetchMock, '/api/v1/overview')).toBe(1)
-    // The list never falls back to its loading state during a background refresh.
-    expect(screen.queryByText(/loading live fleet/i)).toBeNull()
+    // The page never falls back to its loading state during a background refresh.
+    expect(screen.queryByText('Loading devices…')).toBeNull()
   })
 
   it('refreshes the overview for alerts at most every 15 s on the Home page', async () => {
     const fetchMock = fetchStub()
     vi.stubGlobal('fetch', fetchMock)
     render(<App />)
-    await screen.findByRole('heading', { name: 'Fleet', level: 1 })
+    await appReady()
     await waitFor(() => expect(calls(fetchMock, '/api/v1/overview')).toBe(1))
     const stream = CapturingEventSource.latest as CapturingEventSource
     const start = Date.now()
@@ -390,22 +379,14 @@ describe('realtime refresh budget', () => {
   })
 })
 
-describe('overview metrics time', () => {
-  it('formats the server computation time and stays silent when the backend omits it', () => {
-    const base: Overview = { total: 1, open_alerts: 0, active_leases: 0 }
-    expect(metricsTime(base)).toBeNull()
-    expect(metricsTime({ ...base, metrics_computed_at: 'not-a-date' } as Overview)).toBeNull()
-    expect(metricsTime({ ...base, metrics_computed_at: '2026-11-04T09:15:42Z' } as Overview))
-      .toBe('2:15 pm') // Pakistan time without seconds, whatever the browser zone
-  })
-})
-
 describe('first paint, quiet errors and live rows', () => {
   const pending = () => new Promise<Response>(() => undefined)
   const path = (input: RequestInfo | URL) => String(input)
 
   beforeEach(() => {
     queryClient.clear()
+    // The device store outlives a test; a first load must start empty.
+    deviceSnapshots.clear()
     window.history.replaceState({}, '', '/home')
     vi.stubGlobal('EventSource', CapturingEventSource)
   })
@@ -423,22 +404,22 @@ describe('first paint, quiet errors and live rows', () => {
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) =>
       path(input).includes('/api/v1/overview') ? pending() : base(input, init)))
     render(<App />)
-    await screen.findByRole('heading', { name: 'Fleet', level: 1 })
-    expect(screen.getByLabelText('Fleet availability: loading')).toBeTruthy()
-    expect(screen.getByLabelText('ORDS delivery queue: loading')).toBeTruthy()
+    await appReady()
+    // The tiles count the device list; the problem badge waits for the overview.
+    await waitFor(() => expect(document.querySelector('.ui-stat-tile:not(.is-loading)')).toBeTruthy())
     expect(screen.queryByText('0%')).toBeNull()
     expect(screen.queryByText(/0 of 0 online/)).toBeNull()
     expect(document.querySelector('.nav-count')).toBeNull()
   })
 
-  it('never pops up a message when a background refresh fails', { timeout: 15_000 }, async () => {
+  it('never pops up a message when a background refresh fails', { timeout: 20_000 }, async () => {
     const base = fetchStub()
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) =>
       path(input).startsWith('/api/v1/devices?') ? response({ detail: 'Bad gateway' }, 502) : base(input, init)))
     render(<App />)
-    await screen.findByRole('heading', { name: 'Fleet', level: 1 })
-    // The request is retried twice before the page says so.
-    expect(await screen.findByText('Could not load the devices. Trying again…', undefined, { timeout: 8000 })).toBeTruthy()
+    await appReady()
+    // The request is retried twice before the page says so, in place.
+    expect(await screen.findByText('Could not load devices', undefined, { timeout: 12_000 })).toBeTruthy()
     expect(screen.queryByText(/bad gateway|request failed/i)).toBeNull()
     expect(document.querySelector('.toast')).toBeNull()
   })
@@ -468,17 +449,17 @@ describe('first paint, quiet errors and live rows', () => {
     vi.useFakeTimers({ shouldAdvanceTime: true })
     const fetchMock = fetchStub()
     vi.stubGlobal('fetch', fetchMock)
+    window.history.replaceState({}, '', '/devices')
     render(<App />)
-    await screen.findByRole('heading', { name: 'Fleet', level: 1 })
-    fireEvent.click(screen.getByRole('button', { name: 'List' }))
-    await screen.findByRole('button', { name: `Inspect ${device.display_name}` })
+    await appReady('Devices')
+    await screen.findByRole('link', { name: 'Open SLIC Tower · 3rd Floor, Health, working' })
     const listReads = () => fetchMock.mock.calls.filter(([input]) => path(input).startsWith('/api/v1/devices?')).length
     await waitFor(() => expect(listReads()).toBe(1))
     const stream = CapturingEventSource.latest as CapturingEventSource
-    const row = { ...device, display_name: 'Swat · renamed live', snapshot_at: new Date(Date.now() + 1000).toISOString(), health: { mode: 'ENFORCED', tier: 'ONLINE' } }
+    const row = { ...device, friendly_name: 'Swat · renamed live', snapshot_at: new Date(Date.now() + 1000).toISOString(), health: { mode: 'ENFORCED', tier: 'ONLINE' } }
     stream.emit('heartbeat', JSON.stringify(row))
     await vi.advanceTimersByTimeAsync(200)
-    expect(await screen.findByRole('button', { name: 'Inspect Swat · renamed live' })).toBeTruthy()
+    expect(await screen.findByRole('link', { name: 'Open Swat · renamed live, Health, working' })).toBeTruthy()
     await vi.advanceTimersByTimeAsync(6000)
     expect(listReads()).toBe(1)
     // A partial device event (no row) still re-reads the list.
