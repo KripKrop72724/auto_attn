@@ -29,6 +29,7 @@ from sqlalchemy import func, select, tuple_
 
 from zk_add import source_newest_slot as newest_slot
 from zk_add.attendance_cnic_link import unknown_synced_cnic_expression
+from zk_add import attendance_words
 from zk_add.attendance_direct_ords_schemas import DirectOrdsCnicChoice
 from zk_add.attendance_force_release import _lock_scheduler
 from zk_add.attendance_legacy_uid import potentially_recoverable
@@ -789,7 +790,9 @@ def _reason(error: str | None) -> str:
         return "Oracle cannot accept this older punch ID. The punch remains saved for ID repair."
     if error in REASONS:
         return REASONS[error]
-    return error.replace("_", " ").title() if error else "Approved; waiting to prepare delivery."
+    # An unknown code gets one plain sentence; the code itself stays in the
+    # item's error_code (never a title-cased code such as "Sync Expired").
+    return attendance_words.UNKNOWN_REASON if error else "Approved; waiting to prepare delivery."
 
 
 def _group_key(kind: str, row: dict, *facts) -> str:

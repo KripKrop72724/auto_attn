@@ -1,0 +1,100 @@
+{
+  "_comment": "Shared by pytest (tests/unit/test_attendance_delivery_groups.py) and Vitest: every stored ords_status and its plain status group. Regenerate from zk_add.attendance_groups.fixture_rows().",
+  "groups": [
+    "sent",
+    "waiting",
+    "not_matched",
+    "set_aside",
+    "problem"
+  ],
+  "trying_again": [
+    "FAILED_RETRYABLE",
+    "RETRYING"
+  ],
+  "rows": [
+    {
+      "ords_status": "ACKED",
+      "delivery_group": "sent"
+    },
+    {
+      "ords_status": "ACKED_CHECK",
+      "delivery_group": "sent"
+    },
+    {
+      "ords_status": "ACKED_FIRMWARE",
+      "delivery_group": "waiting"
+    },
+    {
+      "ords_status": "BLOCKED_IDENTITY",
+      "delivery_group": "not_matched"
+    },
+    {
+      "ords_status": "FAILED_RETRYABLE",
+      "delivery_group": "waiting"
+    },
+    {
+      "ords_status": "FIRMWARE_RECEIPT_UNVERIFIED",
+      "delivery_group": "waiting"
+    },
+    {
+      "ords_status": "FIRMWARE_RECEIPT_VERIFYING",
+      "delivery_group": "waiting"
+    },
+    {
+      "ords_status": "IN_FLIGHT",
+      "delivery_group": "waiting"
+    },
+    {
+      "ords_status": "MEMBERSHIP_REVERIFYING",
+      "delivery_group": "waiting"
+    },
+    {
+      "ords_status": "MEMBERSHIP_REVERIFY_RETRY",
+      "delivery_group": "waiting"
+    },
+    {
+      "ords_status": "PENDING",
+      "delivery_group": "waiting"
+    },
+    {
+      "ords_status": "QUARANTINED_IDENTITY_CONFLICT",
+      "delivery_group": "set_aside"
+    },
+    {
+      "ords_status": "QUARANTINED_IDENTITY_REUSE",
+      "delivery_group": "not_matched"
+    },
+    {
+      "ords_status": "QUARANTINED_INVALID_DEVICE_TIME",
+      "delivery_group": "set_aside"
+    },
+    {
+      "ords_status": "QUARANTINED_INVALID_EVENT_UID",
+      "delivery_group": "set_aside"
+    },
+    {
+      "ords_status": "QUARANTINED_MISSING_TERMINAL_PROVENANCE",
+      "delivery_group": "set_aside"
+    },
+    {
+      "ords_status": "QUARANTINED_ORDS_REJECTED",
+      "delivery_group": "problem"
+    },
+    {
+      "ords_status": "RETRYING",
+      "delivery_group": "waiting"
+    },
+    {
+      "ords_status": null,
+      "delivery_group": "problem"
+    },
+    {
+      "ords_status": "MISSING_STATUS",
+      "delivery_group": "problem"
+    },
+    {
+      "ords_status": "SOME_FUTURE_STATUS",
+      "delivery_group": "problem"
+    }
+  ]
+}

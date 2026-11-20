@@ -22,6 +22,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from zk_add.audit import append_audit
+from zk_add import attendance_words
 from zk_add.crypto import cnic_lookup, decrypt_text, decrypt_cnic
 from zk_add.models import (
     AttendanceEvent,
@@ -510,6 +511,8 @@ def _candidate_row(
         "outbox_status": outbox.status if outbox else None,
         "lane": lane,
         "reason": reason,
+        # The code behind "reason", for the page's own plain words.
+        "reason_code": attendance_words.lane_reason_code(reason),
         "stale_in_flight": stale,
         "state_digest": _event_state_digest(event, outbox),
     }

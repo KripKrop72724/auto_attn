@@ -4,12 +4,24 @@ From 02-words Appendix C1. The backend fields plain_title, plain_detail and
 next_step are built here from the code and the alert's details (numbers
 only); the stored message and clear_condition stay unchanged and are shown
 only under Technical details.
+
+The Problems page parts (PRB-2) live here too:
+
+* ``GROUP`` is each code's group with "Link box memory" spelled
+  ``link_box_memory``; ``PROBLEM_TYPE`` is the Problems page "Type" filter
+  (eight values); ``AFFECTS_ATTENDANCE`` lists the codes whose problem can stop
+  or pause check-ins.
+* ``codes_matching(q)`` finds codes whose plain title or type label contains
+  the search text, for ``GET /api/v1/alerts?q=``.
+* ``alert_fields()`` is every plain field one alert row carries.
+
+Unknown codes get the group fallback ("Link box problem"), never the code.
 """
 from __future__ import annotations
 
 import math
 from datetime import datetime, timedelta, timezone
-from typing import Mapping
+from typing import Any, Mapping
 
 from zk_add.activity_words import MESSAGE_TYPE_OTHER, MESSAGE_TYPES
 
@@ -338,14 +350,14 @@ def _minutes(seconds) -> int | None:
     return None if value is None else max(1, round(value / 60))
 
 
-def plain(code: str, details: Mapping | None = None, *, minutes: int | None = None,
-          severity: str | None = None) -> dict:
+def plain(code: str | None, details: Any = None, *, minutes: int | None = None,
+          severity: str | None = None, message: str | None = None) -> dict:
     """{"plain_title", "plain_detail", "next_step", "group"} for a problem code.
 
     details is the alert's details (numbers and names only are read);
     minutes is how long a derived reason (no alert) has lasted.
     """
-    details = details or {}
+    details = details if isinstance(details, Mapping) else {}
     code = code or ""
     group = group_for(code)
     if code in WORDS:
@@ -362,7 +374,7 @@ def plain(code: str, details: Mapping | None = None, *, minutes: int | None = No
     elif code == "HIK_CAPTURE_UNHEALTHY":
         # details.reason is the terminal error code, for example "HIK_NETWORK".
         reason = str(details.get("reason") or "").upper().removeprefix("HIK_")
-        if details.get("live_capture") or reason == "LIVE":
+        if details.get("live_capture") or reason == "LIVE" or (message or "").startswith("Live Hikvision capture"):
             reason = "LIVE"
         if reason in HIK_REASONS:
             title, detail, next_step = HIK_REASONS[reason]
@@ -424,3 +436,103 @@ def plain(code: str, details: Mapping | None = None, *, minutes: int | None = No
             "TERMINAL_STABILIZING_STALLED": f"The machine came back but is not steady yet ({minutes} min).",
         }[code]
     return {"plain_title": title, "plain_detail": detail, "next_step": next_step, "group": group}
+
+
+GROUP_LABELS = {
+    "link_box": "Link box",
+    "link_box_memory": "Link box memory",
+    "machine": "Machine",
+    "software": "Software",
+    "people": "People",
+    "hr_system": "HR system",
+}
+TYPE_LABELS = {
+    "link_box": "Link box",
+    "link_box_memory": "Link box memory",
+    "machine": "Machine",
+    "checkins": "Check-ins",
+    "hr_system": "HR system",
+    "people": "People",
+    "software": "Software",
+    "phone": "Phone messages",
+}
+PROBLEM_TYPES = tuple(TYPE_LABELS)
+
+# The Problems page spells the "storage" group as link_box_memory.
+GROUP: dict[str, str] = {code: "link_box_memory" if words[0] == "storage" else words[0]
+                         for code, words in WORDS.items()}
+
+# The Problems page "Type" filter: the group, except check-in and phone-message kinds.
+_TYPE_OVERRIDES = {
+    "ATTENDANCE_EVENT_QUARANTINED": "checkins",
+    "ATTENDANCE_TIMESTAMP_QUARANTINED": "checkins",
+    "TERMINAL_NEWEST_RECORD_CORRECTED": "checkins",
+    "TERMINAL_NEWEST_RECORD_CHANGED": "checkins",
+    "TERMINAL_NEWEST_RECORD_PUNCH_UNRECEIVED": "checkins",
+    "TERMINAL_NEWEST_RECORD_RELEASE_HELD": "checkins",
+    "HISTORY_BACKFILL_BLOCKED": "checkins",
+    "ATTENDANCE_REPAIR_NEEDS_ATTENTION": "checkins",
+    "ATTENDANCE_REPAIR_STALLED": "checkins",
+    "CHECKIN_NOTIFY_DEGRADED": "phone",
+}
+PROBLEM_TYPE: dict[str, str] = {code: _TYPE_OVERRIDES.get(code, group) for code, group in GROUP.items()}
+
+# Codes whose problem stops, holds or puts at risk check-ins reaching the HR system.
+AFFECTS_ATTENDANCE = frozenset({
+    "QUARANTINED_DUPLICATE_SERIAL", "ESP_FATAL", "ZKT_SERIAL_MISMATCH", "ESP_DURABILITY_FAULT",
+    "ESP_DELIVERY_WORKER_FAULT", "HEARTBEAT_STALE", "ESP_LOCAL_FAILURE", "HIK_CAPTURE_UNHEALTHY",
+    "DEVICE_MESSAGE_REJECTED", "ZKT_CONNECTION_FLAPPING", "TERMINAL_DISCONNECTED", "DELIVERY_AUTHORITY_UNKNOWN",
+    "ESP_OFFLINE", "TERMINAL_LINK_DOWN", "ZKT_CLOCK_DRIFT", "HIK_CLOCK_DRIFT", "HISTORY_BACKFILL_BLOCKED",
+    "ORDS_DELIVERY_FAILED", "ORDS_EVENT_REJECTED", "ATTENDANCE_EVENT_QUARANTINED",
+    "ATTENDANCE_TIMESTAMP_QUARANTINED", "ATTENDANCE_REPAIR_NEEDS_ATTENTION", "ATTENDANCE_REPAIR_STALLED",
+    "ADD_SOURCE_COVERAGE_INVALIDATED", "TERMINAL_SOURCE_EXCEPTION", "TERMINAL_NEWEST_RECORD_CORRECTED",
+    "TERMINAL_NEWEST_RECORD_CHANGED", "TERMINAL_NEWEST_RECORD_PUNCH_UNRECEIVED",
+    "TERMINAL_NEWEST_RECORD_RELEASE_HELD", "DUPLICATE_USER_CNIC", "USER_CNIC_FORMAT_SUSPECT",
+    "ORACLE_RECEIPT_CONNECTOR_MISMATCH",
+})
+
+
+def fallback_title(code: str | None) -> str:
+    return f"{GROUP_WORDS[group_for(code or '')]} problem"
+
+
+def problem_type(code: str | None) -> str | None:
+    return PROBLEM_TYPE.get(code or "")
+
+
+def affects_attendance(code: str | None) -> bool:
+    return (code or "") in AFFECTS_ATTENDANCE
+
+
+def codes_for_types(types) -> list[str]:
+    wanted = set(types)
+    return sorted(code for code, kind in PROBLEM_TYPE.items() if kind in wanted)
+
+
+def codes_matching(q: str | None) -> list[str]:
+    """Codes whose plain title (any variant) or type label contains ``q``."""
+
+    needle = (q or "").strip().lower()
+    if not needle:
+        return []
+    matches = set()
+    for code, (_group, title, _sentence, _step) in WORDS.items():
+        texts = [title, TYPE_LABELS.get(PROBLEM_TYPE.get(code, ""), "")]
+        if code == "HIK_CAPTURE_UNHEALTHY":
+            texts += [entry[0] for entry in HIK_REASONS.values()]
+        if any(needle in text.lower() for text in texts):
+            matches.add(code)
+    return sorted(matches)
+
+
+def alert_fields(code: str | None, details: Any = None, *, severity: str | None = None,
+                 message: str | None = None) -> dict:
+    """Every plain field one alert row carries (added next to its stored fields)."""
+
+    words = plain(code, details, severity=severity, message=message)
+    words.pop("group", None)
+    return {
+        **words,
+        "type": problem_type(code),
+        "affects_attendance": affects_attendance(code),
+    }

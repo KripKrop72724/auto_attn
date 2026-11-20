@@ -1819,11 +1819,13 @@ def release_page(
     cursor: int | None = None,
     limit: int | None = None,
     scope: str = "all",
+    release_ids: list[int] | None = None,
 ) -> dict[str, Any]:
     """Return a stable newest-first release page without changing the legacy row shape.
 
     ``scope="current"`` leaves superseded releases out of the page, its
     pagination and ``filtered_total``; the default ``"all"`` is unchanged.
+    ``release_ids`` (the brand filter) narrows the page the same way.
     """
 
     if scope not in {"all", "current"}:
@@ -1846,6 +1848,8 @@ def release_page(
         clauses.append(FirmwareRelease.state == state.upper())
     if scope == "current":
         clauses.append(FirmwareRelease.id.in_(sorted(current_ids)))
+    if release_ids is not None:
+        clauses.append(FirmwareRelease.id.in_(sorted(release_ids)))
 
     filtered_total = session.scalar(
         select(func.count(FirmwareRelease.id)).where(*clauses)
@@ -2107,17 +2111,27 @@ def campaign_page(
     limit: int | None = None,
     include_deployments: bool = False,
     include_archived: bool = False,
+    scope_clauses: tuple = (),
+    extra_clauses: tuple = (),
+    extra_search: tuple = (),
+    order_by: tuple | None = None,
 ) -> dict[str, Any]:
     """Return campaign summaries with exact national and filtered counts.
 
     Archived campaigns (cancelled or completed, hidden by the owner) are left
     out of the rows and the totals unless include_archived is set; their
     deployments and evidence are unchanged and the detail view still reads them.
+
+    Read-side list options (Software updates page): ``scope_clauses`` narrow
+    the rows and the totals (Life / Health), ``extra_clauses`` only the rows,
+    ``extra_search`` adds search alternatives, and ``order_by`` replaces the
+    newest-first order; the cursor is then a row offset.
     """
 
     sync_release_store(session)
     visible = [] if include_archived else [FirmwareCampaign.archived_at.is_(None)]
-    clauses = [*visible]
+    visible.extend(scope_clauses)
+    clauses = [*visible, *extra_clauses]
     if query and query.strip():
         term = f"%{query.strip()}%"
         clauses.append(
@@ -2127,6 +2141,7 @@ def campaign_page(
                 FirmwareCampaign.actor.ilike(term),
                 FirmwareRelease.release_id.ilike(term),
                 FirmwareRelease.version.ilike(term),
+                *(condition(term) for condition in extra_search),
             )
         )
     if status:
@@ -2146,16 +2161,28 @@ def campaign_page(
         .join(FirmwareRelease, FirmwareCampaign.release_id == FirmwareRelease.id)
         .where(*clauses)
     )
-    if cursor is not None:
-        statement = statement.where(FirmwareCampaign.id < cursor)
-    statement = statement.order_by(FirmwareCampaign.id.desc())
-    if limit is not None:
-        fetched = list(session.scalars(statement.limit(limit + 1)).all())
-        page = fetched[:limit]
-        next_cursor = page[-1].id if len(fetched) > limit and page else None
+    if order_by is not None:
+        # A custom order pages by position: the cursor is the next row offset.
+        statement = statement.order_by(*order_by)
+        offset = cursor or 0
+        if limit is not None:
+            fetched = list(session.scalars(statement.offset(offset).limit(limit + 1)).all())
+            page = fetched[:limit]
+            next_cursor = offset + limit if len(fetched) > limit and page else None
+        else:
+            page = list(session.scalars(statement.offset(offset)).all())
+            next_cursor = None
     else:
-        page = list(session.scalars(statement).all())
-        next_cursor = None
+        if cursor is not None:
+            statement = statement.where(FirmwareCampaign.id < cursor)
+        statement = statement.order_by(FirmwareCampaign.id.desc())
+        if limit is not None:
+            fetched = list(session.scalars(statement.limit(limit + 1)).all())
+            page = fetched[:limit]
+            next_cursor = page[-1].id if len(fetched) > limit and page else None
+        else:
+            page = list(session.scalars(statement).all())
+            next_cursor = None
 
     campaign_totals: dict[str, int] = {"all": 0}
     for campaign_state, count in session.execute(
