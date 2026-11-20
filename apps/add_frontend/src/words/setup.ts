@@ -61,3 +61,64 @@ export function setupMessage(message: string | null | undefined): string | null 
   const found = SETUP_MESSAGES.find(({ match }) => (typeof match === 'string' ? text === match : match.test(text)))
   return found ? found.sentence : null
 }
+
+// ---------------------------------------------------------------------------
+// Set up a device page words (08-advanced 3.1, 3.2, 3.4, W3; ADV-19, ADV-21).
+// ---------------------------------------------------------------------------
+
+/** The single "switched off" card (one text, shared with 01-foundation and the plan). */
+export const SETUP_OFF_CARD = {
+  title: 'Switched off for now',
+  sentence: 'Setting up new devices from the dashboard is switched off. For now IT prepares new link boxes. Everything else in the dashboard works as normal.',
+  ask: 'Need a new device? Ask IT.',
+} as const
+
+export const SETUP_PAGE = {
+  title: 'Set up a device',
+  intro: 'Prepare a new link box for an attendance machine.',
+  failed: "Couldn't load this page.",
+  noBrowserSetup: "Setting up from this browser isn't available yet. Use the State Life Device Installer above.",
+  phoneNote: 'Open this page on a Windows computer or a Mac with an Apple chip to download the app.',
+  phoneWizard: 'Open this page on a Windows computer or a Mac with an Apple chip to set up a box. Here you can still see past setups.',
+} as const
+
+/** The State Life Device Installer card (IA). */
+export const INSTALLER_CARD = {
+  title: 'State Life Device Installer',
+  intro: 'The app site staff use to set up a new link box for a ZKTeco or Hikvision machine. Sign in with your dashboard username and password.',
+  loading: 'Looking for the latest app…',
+  failed: "Couldn't load the app downloads.",
+  none: "The app isn't available yet.",
+  noneHelp: 'Ask IT for the Setup file.',
+  copied: 'Copied.',
+  copyFailed: "Couldn't copy. Select the text and copy it instead.",
+  compare: 'Compare the SHA-256 to check that a copy is unchanged.',
+  tooOld: (version: string) => `Copies older than version ${version} can't set up link boxes.`,
+  firstTime: (platform: 'windows' | 'macos') => (platform === 'windows' ? 'First time on Windows' : 'First time on a Mac'),
+} as const
+
+/** Past setups (3.4). */
+export const PAST_SETUPS = {
+  title: 'Past setups',
+  subtitle: (count: number) => `${count.toLocaleString('en-PK')} setup${count === 1 ? '' : 's'}. Passwords are never saved.`,
+  search: 'Place, device number or box ID',
+  mine: 'Mine',
+  everyone: 'Everyone',
+  showOlder: 'Show older setups',
+  showing: (shown: number, total: number) => `Showing ${shown.toLocaleString('en-PK')} of ${total.toLocaleString('en-PK')}`,
+  noMatch: 'No setups match.',
+  noPlace: 'Place not chosen yet',
+  openFailed: "Couldn't open this setup. Try again.",
+  loadFailed: "Couldn't load past setups.",
+  you: 'You',
+} as const
+
+/** Where a setup ended, in plain words: heading + sentence (3.3 endings). */
+export const SETUP_ENDINGS: Record<string, { heading: string; sentence: string }> = {
+  VERIFIED_ONLINE: { heading: 'Device is working', sentence: 'The link box is online, connected to its machine and sending attendance.' },
+  SITE_VALIDATION_PENDING: { heading: 'Ready: will finish at its office', sentence: 'The box is ready. It finishes by itself once it is plugged in at its office and on the Wi-Fi.' },
+  CANCELLED: { heading: 'Cancelled', sentence: 'You cancelled this setup. Nothing was changed on the box.' },
+  EXPIRED: { heading: 'Timed out', sentence: 'This setup was left too long and stopped.' },
+  FAILED: { heading: "Didn't finish", sentence: "The setup didn't finish." },
+  RECOVERY_REQUIRED: { heading: "Can't set up this box", sentence: "This box was set up somewhere else, so it can't be set up here. Give it to IT." },
+}

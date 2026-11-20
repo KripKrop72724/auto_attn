@@ -1,18 +1,17 @@
 import { lazy } from 'react'
 import { useAppData } from '../AppData'
-import { updatesSectionForFirmware } from '../routing'
 
-const FirmwareProvisioning = lazy(() => import('../features/FirmwareProvisioning'))
+const SetupPage = lazy(() => import('../features/setup/SetupPage'))
 
-// Set up a device (`/setup`). Its other tabs lead to Software updates.
+// Set up a device (`/setup`; old `/firmware?tab=prepare` links redirect here).
 export default function SetupRoute() {
   const app = useAppData()
   return (
-    <FirmwareProvisioning
+    <SetupPage
       revision={app.revisions.provisioning}
       toast={app.toast}
       username={app.username}
-      onSection={(next) => app.navigate(next === 'prepare' ? '/setup' : `/updates?tab=${updatesSectionForFirmware(next)}`)}
+      onOpenDevice={(connectorId) => app.navigate(`/devices/${encodeURIComponent(connectorId)}`)}
     />
   )
 }
