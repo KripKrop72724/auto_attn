@@ -24,6 +24,7 @@ import {
 } from '../App'
 import { Icon } from '../Icon'
 import type { FirmwareSection } from '../types'
+import { withBase } from '../classic'
 
 type Toast = ReturnType<typeof useToast>
 
@@ -1902,7 +1903,7 @@ export default function FirmwareProvisioning({
                 {current.state === 'VERIFIED_ONLINE' && (
                   <a
                     className="button primary"
-                    href={`/fleet/${current.result.connector_id || ''}`}
+                    href={withBase(`/fleet/${current.result.connector_id || ''}`)}
                   >
                     View device
                   </a>

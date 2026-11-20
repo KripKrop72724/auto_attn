@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, type ReactNode, type RefObject } from 'rea
 import { Icon } from './Icon'
 import type { DashboardRoute } from './types'
 import type { RealtimeState } from './realtime'
+import { LOGO_SRC, withBase } from './classic'
 
 const navigation = [
   { id: 'fleet', label: 'Fleet', icon: 'grid', description: 'Live device health across the national fleet' },
@@ -103,13 +104,13 @@ export function AppShell({
       <aside className="app-sidebar">
         <a
           className="app-brand"
-          href="/fleet"
+          href={withBase('/fleet')}
           onClick={(event) => {
             event.preventDefault()
             onNavigate('fleet')
           }}
         >
-          <img src="/state-life-logo.png" alt="State Life Insurance Corporation" />
+          <img src={LOGO_SRC} alt="State Life Insurance Corporation" />
           <span><strong>State Life</strong><small>Attendance devices</small></span>
         </a>
         <nav aria-label="Primary navigation">
@@ -135,7 +136,7 @@ export function AppShell({
       <section ref={workspaceRef} className="app-workspace">
         <header className={`app-header ${scrolled ? 'is-scrolled' : ''}`}>
           <div className="app-header-context">
-            <img src="/state-life-logo.png" alt="" />
+            <img src={LOGO_SRC} alt="" />
             <strong>{current.label}</strong>
           </div>
           <div className="operator-area">

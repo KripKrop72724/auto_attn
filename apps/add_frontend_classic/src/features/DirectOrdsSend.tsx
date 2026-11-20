@@ -3,6 +3,7 @@ import { api, queryString } from '../api'
 import { dateTime, Dialog, idempotency } from '../App'
 import { humanizeStatus } from '../status'
 import type { AttendanceEvent, DirectOrdsCnicChoice, DirectOrdsCnicDecision, DirectOrdsPreview, DirectOrdsPreviewRow } from '../types'
+import { withBase } from '../classic'
 
 export type DirectRun = {
   job_id: string; status: string; created_at: string; actor: string; selected: number;
@@ -254,7 +255,7 @@ export function DirectOrdsSend({ selected, clearSelection, refresh, openRequest,
       <div className="attendance-direct-actions">{selected.length > 0 && <button className="button secondary" type="button" onClick={clearSelection}>Clear selection</button>}<button className="button primary" type="button" disabled={!selected.length} onClick={() => { setOpen(true); setError('') }}>Send {selected.length ? count(selected.length) : 'selected punches'}</button></div>
     </div>
     {run && <div className="attendance-direct-progress" role="status" aria-live="polite">
-      <div className="attendance-direct-heading"><strong>{run.status === 'RUNNING' ? 'Preparing delivery' : run.status === 'WAITING_ORACLE' ? 'Waiting for Oracle' : run.attention || run.skipped ? 'Finished with items to review' : 'Finished'}</strong><a href={`/attendance?view=all-events&direct_run=${encodeURIComponent(run.job_id)}`}>Saved run link</a></div>
+      <div className="attendance-direct-heading"><strong>{run.status === 'RUNNING' ? 'Preparing delivery' : run.status === 'WAITING_ORACLE' ? 'Waiting for Oracle' : run.attention || run.skipped ? 'Finished with items to review' : 'Finished'}</strong><a href={withBase(`/attendance?view=all-events&direct_run=${encodeURIComponent(run.job_id)}`)}>Saved run link</a></div>
       <div className="attendance-direct-counts"><span><strong>{run.ready}</strong> preparing</span><span><strong>{run.waiting}</strong> waiting</span><span><strong>{run.confirmed}</strong> confirmed</span><span><strong>{run.skipped}</strong> skipped</span><span><strong>{run.attention}</strong> need attention</span></div>
       {disconnected && <p>Connection lost. Your run is saved and continues on ADD. Reconnecting…</p>}
       {finished.has(run.status) && !!run.legacy_recheckable && <button className="button secondary" type="button" onClick={() => { setRecheckOpen(true); setError('') }}>Check {count(run.legacy_recheckable)} already in Oracle</button>}

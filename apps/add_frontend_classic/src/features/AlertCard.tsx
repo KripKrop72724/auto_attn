@@ -5,6 +5,7 @@ import { routePath } from '../routing'
 import { alertStatePattern, normalizedStatus } from '../status'
 import type { Alert, HealthOperatorPolicy } from '../types'
 import './DeviceHealth.css'
+import { withBase } from '../classic'
 
 const text = (value: unknown) => typeof value === 'string' && value.trim() ? value.trim() : null
 
@@ -71,7 +72,7 @@ export function AlertCard({
         <div className="alert-meta">
           <StatusBadge state={alert.severity} />
           {acknowledged && <span className="status-badge pattern-notice" data-pattern="notice"><Icon name={statusIcon.notice} /><span>Acknowledged</span></span>}
-          {device && <a href={routePath('fleet', device.connector_id)}>{device.display_name} · {device.zone_id}</a>}
+          {device && <a href={withBase(routePath('fleet', device.connector_id))}>{device.display_name} · {device.zone_id}</a>}
         </div>
         <Heading id={titleId}>{alert.message}</Heading>
         <p>{alert.code} · First {dateTime(alert.first_seen_at)} · Last {relativeTime(alert.last_seen_at)}</p>

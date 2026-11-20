@@ -1,16 +1,12 @@
 {
-  "name": "attendance-device-dashboard",
+  "name": "attendance-device-dashboard-classic",
   "private": true,
   "version": "2.4.5",
   "type": "module",
   "scripts": {
-    "dev": "vite --host 0.0.0.0 --port 8095",
+    "dev": "vite --host 0.0.0.0 --port 8097",
     "build": "tsc -b && vite build",
-    "budget": "node scripts/check-bundle-budgets.mjs",
-    "preview": "vite preview --host 0.0.0.0 --port 8095",
-    "preview:test": "vite preview --host 127.0.0.1 --port 4173",
-    "test": "vitest run",
-    "test:e2e": "playwright test"
+    "preview": "vite preview --host 0.0.0.0 --port 8097"
   },
   "dependencies": {
     "@tanstack/react-query": "^5.101.4",

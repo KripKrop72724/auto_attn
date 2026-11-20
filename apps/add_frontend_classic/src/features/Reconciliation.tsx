@@ -45,6 +45,7 @@ import type {
   SourceExceptionReveal,
   SourceExceptionTotals,
 } from '../types'
+import { withBase } from '../classic'
 
 type Toast = ReturnType<typeof useToast>
 type ExceptionFilters = {
@@ -1568,7 +1569,7 @@ export function ReconciliationView({
     const params = new URLSearchParams({ view: 'needs-review' })
     const deviceId = initial.get('device_id')
     if (deviceId) params.set('device_id', deviceId)
-    window.history.replaceState(null, '', `/attendance?${params}`)
+    window.history.replaceState(null, '', withBase(`/attendance?${params}`))
     window.dispatchEvent(new PopStateEvent('popstate'))
   }, [initial])
 
@@ -2674,7 +2675,7 @@ export function ReconciliationView({
                           ).toLocaleString()}{' '}
                           review · {(job.progress.blocked_identity || 0).toLocaleString()} waiting for identity evidence
                         </p>
-                        <p className="muted">For this reconciliation’s records only. <a href="/attendance?view=needs-review">Check all saved attendance</a> for other held punches.</p>
+                        <p className="muted">For this reconciliation’s records only. <a href={withBase('/attendance?view=needs-review')}>Check all saved attendance</a> for other held punches.</p>
                       </section>
                     </div>
                     <dl className="reconciliation-job-facts">

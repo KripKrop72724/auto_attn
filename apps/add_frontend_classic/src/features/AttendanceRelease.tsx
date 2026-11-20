@@ -26,6 +26,7 @@ import type {
   AttendanceRepairListResponse,
   Device,
 } from '../types'
+import { withBase } from '../classic'
 
 type Toast = {
   notice: (message: string) => void
@@ -490,7 +491,7 @@ export function AttendanceReleaseReview({
                   ) : row.active_release_job_id ? (
                     <button className="button secondary" type="button" onClick={() => onOpenHistory(row.active_release_job_id!)}>Open active release</button>
                   ) : (
-                    <><StatusBadge state="LOCKED" /><small>{explainLock(row.lock_reason)}</small>{row.connector_id && row.lock_reasons.includes('TARGET_CNIC_MISSING') && <a className="text-button" href={`/users/${row.connector_id}?user_id=${encodeURIComponent(row.user_id)}`}>Add CNIC</a>}</>
+                    <><StatusBadge state="LOCKED" /><small>{explainLock(row.lock_reason)}</small>{row.connector_id && row.lock_reasons.includes('TARGET_CNIC_MISSING') && <a className="text-button" href={withBase(`/users/${row.connector_id}?user_id=${encodeURIComponent(row.user_id)}`)}>Add CNIC</a>}</>
                   )}
                 </div>
               </article>

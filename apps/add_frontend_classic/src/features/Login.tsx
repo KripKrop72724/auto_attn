@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { useForm } from 'react-hook-form'
 import { z } from 'zod'
 import { Icon } from '../Icon'
+import { LOGO_SRC } from '../classic'
 
 export default function Login({ onLogin }: { onLogin: (username: string, password: string) => Promise<void> }) {
   const [error, setError] = useState('')
@@ -25,7 +26,7 @@ export default function Login({ onLogin }: { onLogin: (username: string, passwor
   return (
     <main className="login-shell">
       <form className="login-card" onSubmit={(event) => void submit(event)} noValidate aria-labelledby="login-title">
-        <img src="/state-life-logo.png" alt="State Life Insurance Corporation" />
+        <img src={LOGO_SRC} alt="State Life Insurance Corporation" />
         <h1 id="login-title">Attendance Device Dashboard</h1>
         <p className="supporting">Sign in to the national device operations console.</p>
         <div className="login-field">

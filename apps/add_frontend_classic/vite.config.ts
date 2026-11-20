@@ -1,7 +1,11 @@
-import { defineConfig } from 'vitest/config'
+import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 
+// The old screens, frozen for one week after the revamp release.
+// Served by the same nginx under /classic/; /api and /events stay on the same
+// origin, so the sign-in cookie is shared with the new screens.
 export default defineConfig({
+  base: '/classic/',
   plugins: [react()],
   build: {
     chunkSizeWarningLimit: 350,
@@ -17,14 +21,6 @@ export default defineConfig({
         },
       },
     },
-  },
-  test: {
-    environment: 'jsdom',
-    globals: false,
-    // These suites exercise lazy route loading and share process-wide browser
-    // stubs. Serial files keep CI timing deterministic as the control surface grows.
-    fileParallelism: false,
-    exclude: ['tests/e2e/**', 'node_modules/**', 'dist/**'],
   },
   server: {
     proxy: {

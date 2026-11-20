@@ -62,6 +62,7 @@ import type {
   UserDeletionJob,
   DashboardRoute,
 } from './types'
+import { CLASSIC_BASE, LOGO_SRC, withBase } from './classic'
 
 type View = DashboardRoute
 export type DrawerTab = 'overview' | 'logs' | 'alerts' | 'control'
@@ -881,7 +882,7 @@ function DashboardApp() {
     const legacy = window.location.hash.replace(/^#/, '') as View
     if (legacy && ['fleet', 'users', 'attendance', 'reconciliation', 'firmware', 'alerts'].includes(legacy)) {
       navigate(routePath(legacy), { replace: true })
-      window.history.replaceState(null, '', routePath(legacy))
+      window.history.replaceState(null, '', withBase(routePath(legacy)))
       return
     }
     if (location.pathname === '/' || dashboardRoute(location.pathname) !== location.pathname.split('/').filter(Boolean)[0]) {
@@ -1059,8 +1060,8 @@ function DashboardApp() {
     navigate(id ? routePath('users', id) : '/users')
   }
 
-  if (authState === 'loading') return <main className="boot-screen"><img src="/state-life-logo.png" alt="State Life Insurance Corporation" /><p>Opening Attendance Device Dashboard…</p></main>
-  if (authState === 'anonymous') return <Suspense fallback={<main className="boot-screen"><img src="/state-life-logo.png" alt="State Life Insurance Corporation" /><p>Opening secure sign in…</p></main>}><Login onLogin={login} /></Suspense>
+  if (authState === 'loading') return <main className="boot-screen"><img src={LOGO_SRC} alt="State Life Insurance Corporation" /><p>Opening Attendance Device Dashboard…</p></main>
+  if (authState === 'anonymous') return <Suspense fallback={<main className="boot-screen"><img src={LOGO_SRC} alt="State Life Insurance Corporation" /><p>Opening secure sign in…</p></main>}><Login onLogin={login} /></Suspense>
 
   return (
     <>
@@ -1098,7 +1099,7 @@ function WorkspaceLoading({ label }: { label: string }) {
 
 function RouteErrorBoundary() {
   const error = useRouteError()
-  return <main className="boot-screen route-error" role="alert"><img src="/state-life-logo.png" alt="State Life Insurance Corporation" /><h1>This workspace could not be opened</h1><p>{error instanceof Error ? error.message : 'The requested route is unavailable.'}</p><a className="button primary" href="/fleet">Return to Fleet</a></main>
+  return <main className="boot-screen route-error" role="alert"><img src={LOGO_SRC} alt="State Life Insurance Corporation" /><h1>This workspace could not be opened</h1><p>{error instanceof Error ? error.message : 'The requested route is unavailable.'}</p><a className="button primary" href={withBase('/fleet')}>Return to Fleet</a></main>
 }
 
 export default function App() {
@@ -1106,6 +1107,6 @@ export default function App() {
     path: '*',
     element: <DashboardApp />,
     errorElement: <RouteErrorBoundary />,
-  }]), [])
+  }], { basename: CLASSIC_BASE }), [])
   return <RouterProvider router={router} />
 }

@@ -11,6 +11,7 @@ import type {
 } from '../types'
 import { AlertCard } from './AlertCard'
 import { AlertResolveDialog, explainOperatorError } from './AlertResolveDialog'
+import { withBase } from '../classic'
 
 // Opened on demand; keeps the review tooling out of the Alerts route chunk.
 const HealthCleanupDialog = lazy(() => import('./HealthCleanupDialog').then((module) => ({ default: module.HealthCleanupDialog })))
@@ -255,7 +256,7 @@ export function AlertsView({ devices, toast, revision }: { devices: Device[]; to
         {rows.map((row) => {
           const inspectorPath = typeof row.details.inspector_path === 'string' && /^\/reconciliation\?tab=source-exceptions&device_id=[A-Za-z0-9-]{1,100}$/.test(row.details.inspector_path) ? row.details.inspector_path : null
           return <AlertCard key={`${row.device.connector_id}-${row.id}`} alert={row} device={row.device} busy={actionBusy} onAcknowledge={(item) => void acknowledge(item)} onResolve={() => setResolving(row)}>
-            {inspectorPath && <a className="button primary" href={inspectorPath}><Icon name="search" /> Inspect source rows</a>}
+            {inspectorPath && <a className="button primary" href={withBase(inspectorPath)}><Icon name="search" /> Inspect source rows</a>}
           </AlertCard>
         })}
         {!loading && !error && !rows.length && <div className="panel empty-state"><Icon name={queue === 'NEEDS_ACTION' && unfiltered ? 'check' : 'search'} /><h2>{queue === 'NEEDS_ACTION' && unfiltered ? 'No alerts need action' : 'No alerts in this view'}</h2><p>{queue === 'NEEDS_ACTION' && unfiltered ? 'New device conditions appear here as telemetry arrives. Acknowledged alerts stay in the Acknowledged queue until their condition clears.' : 'Change the queue or filters to see other alerts.'}</p></div>}
