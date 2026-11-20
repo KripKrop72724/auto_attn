@@ -1,8 +1,10 @@
 # ADD component kit (`src/ui`)
 
 Import from `./ui` (or `../ui` in `features/`): `import { Button, StatusChip } from '../ui'`.
-Styles live in `ui/ui.css`, pulled into the entry stylesheet by `styles.css` (`@import './ui/ui.css'`), so
-nothing else needs importing. Tokens (colour, type, spacing, radius, shadow, `--z-*`, motion) are in
+Core styles (buttons, tones, dialog, toast) live in `ui/ui.css`, pulled into the entry stylesheet by
+`styles.css` (`@import './ui/ui.css'`). Every other part imports its own CSS file (`chips.css`, `content.css`,
+`tabs.css`, `sheet.css`, `filterbar.css`, `datalist.css`, `steps.css`), so it ships with the page that uses it and
+the 14 KB entry CSS budget stays clear. Nothing else needs importing. Tokens (colour, type, spacing, radius, shadow, `--z-*`, motion) are in
 `styles.css :root`; use them instead of literals.
 
 Rules every part follows: 44 px touch targets on phones and touch screens, visible focus rings, AA contrast,
