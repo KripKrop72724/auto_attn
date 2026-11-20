@@ -1,8 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from 'react'
 import { api, ApiError, queryString } from '../api'
-import { dateTime, Dialog, idempotency, Metric } from '../App'
+import { Dialog, idempotency, Metric } from '../App'
 import { Icon } from '../Icon'
 import type { Device } from '../types'
+import { Disclosure } from '../ui'
+import { deviceDivision } from '../lib/division'
+import { deviceName } from '../lib/deviceNames'
+import { plainReason } from '../words/attendanceReasons'
+import { longTime, rowTime } from './attendance/attendanceWords'
 import './SafeAttendanceRepair.css'
 import './IdentityBacklogRelease.css'
 
@@ -30,32 +35,39 @@ type Toast = { notice: (text: string) => void; error: (text: string) => void }
 const root = '/api/v2/attendance-identity-backlog'
 const pageSize = 200
 const busyRetries = 20
-const sources: Record<string, string> = { DUMP_RECONNECT: 'Reconnect recovery', DUMP_STARTUP: 'Startup recovery' }
+const sources: Record<string, string> = { DUMP_RECONNECT: 'After the machine came back online', DUMP_STARTUP: 'After the machine restarted' }
 const ageOrder = ['AUTOMATIC_WINDOW', 'UP_TO_7_DAYS', 'UP_TO_30_DAYS', 'OLDER']
 const ageLabel = (age: string, hours: number, automatic: boolean) => ({
-  AUTOMATIC_WINDOW: `Under ${hours} hours${automatic ? ' (often released automatically)' : ''}`,
+  AUTOMATIC_WINDOW: `Under ${hours} hours${automatic ? ' (often sent by themselves)' : ''}`,
   UP_TO_7_DAYS: 'Up to 7 days', UP_TO_30_DAYS: '7 to 30 days', OLDER: 'Over 30 days',
 }[age] || age)
 const runLabel: Record<string, string> = {
-  RELEASING: 'Releasing in batches', STOPPED_FOLLOWING: 'Stopped: following released punches to Oracle',
-  COMPLETED: 'Finished', STOPPED: 'Stopped',
+  RELEASING: 'Sending a few at a time', STOPPED_FOLLOWING: 'Stopped: following the sent check-ins to the HR system',
+  COMPLETED: 'Done', STOPPED: 'Stopped',
 }
 const active = new Set(['RELEASING', 'STOPPED_FOLLOWING'])
-const waitingLabel: Record<string, string> = {
-  WAITING_FOR_COMPLETE_ROSTER: 'Waiting for a complete user list from a chosen terminal before checking more punches.',
-  WAITING_FOR_SERIAL_CONFIRMATION: 'Waiting for a chosen terminal’s serial number to be confirmed before checking more punches.',
-  WAITING_FOR_ROSTER_UPDATE: 'A terminal sent a new user list during the last batch. ADD checks those punches again.',
+const punches = (count: number) => `${count.toLocaleString()} ${count === 1 ? 'check-in' : 'check-ins'}`
+const message = (error: unknown) => error instanceof Error ? error.message : "Couldn't reach the dashboard. Try again."
+const placeOf = (device: Pick<Device, 'friendly_name' | 'display_name' | 'zone_id'>) => {
+  if (device.friendly_name) return device.friendly_name
+  const name = deviceName(device.display_name || device.zone_id)
+  return name.unit ? `${name.location} · ${name.unit}` : name.location
 }
-const punches = (count: number) => `${count.toLocaleString()} ${count === 1 ? 'punch' : 'punches'}`
-const message = (error: unknown) => error instanceof Error ? error.message : 'Could not reach ADD. Please try again.'
+/** "Karachi" for an area code: the location part of its devices' friendly names. */
+const areaName = (zoneId: string, zoneName: string) => {
+  const parsed = deviceName(zoneName || zoneId)
+  return parsed.location || zoneName || zoneId
+}
 const groupKey = (group: Pick<Group, 'connector_id' | 'source' | 'age'>) => `${group.connector_id}|${group.source}|${group.age}`
 const pause = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
 
 export function IdentityBacklogRelease({ devices, toast }: { devices: Device[]; toast: Toast }) {
+  // Areas grouped Life then Health; the division comes from the area's devices.
   const zones = useMemo(() => [...new Map(
     devices.filter((device) => device.firmware_family !== 'hikvision' && !device.is_spare)
-      .map((device) => [device.zone_id, device.zone_name || device.zone_id] as const),
-  ).entries()].sort((a, b) => a[1].localeCompare(b[1])), [devices])
+      .map((device) => [device.zone_id, { id: device.zone_id, name: areaName(device.zone_id, device.zone_name), division: deviceDivision(device) }] as const),
+  ).values()].sort((a, b) => a.name.localeCompare(b.name, 'en', { numeric: true })), [devices])
+  const byId = useMemo(() => new Map(devices.map((device) => [device.connector_id, device])), [devices])
   const [zone, setZone] = useState('')
   const [checking, setChecking] = useState(false)
   const [progress, setProgress] = useState({ scanned: 0, total: 0 })
@@ -174,82 +186,92 @@ export function IdentityBacklogRelease({ devices, toast }: { devices: Device[]; 
       setRun(value); setDialog(null); setPassword(''); setTyped(''); setReason('')
       approvalKey.current = idempotency('identity-backlog')
       toast.notice(dialog === 'START'
-        ? 'Approval saved. ADD is releasing the proven punches in small batches.'
-        : 'Release stopped. No more punches will be released; ADD keeps following the released ones to Oracle.')
+        ? 'Approval saved. The check-ins are being sent a few at a time.'
+        : 'Stopped. No more check-ins are sent; the ones already sent are still followed to the HR system.')
     } catch (failure) { setError(message(failure)) } finally { setBusy(false) }
   }
 
-  return <section className="panel safe-repair identity-backlog" aria-label="Release older recovery holds">
+  const zoneLabel = zones.find((item) => item.id === zone)?.name || ''
+  // The friendly name, else the server's saved device name read as a place.
+  const placeLabel = (connectorId: string) => {
+    const known = byId.get(connectorId)
+    if (known?.friendly_name) return known.friendly_name
+    const saved = result?.names[connectorId]
+    if (saved && saved !== connectorId) return placeOf({ friendly_name: null, display_name: saved, zone_id: saved })
+    return known ? placeOf(known) : 'Place not known'
+  }
+  return <section className="panel safe-repair identity-backlog" aria-label="Send older not-matched check-ins (one area)">
     <header className="safe-repair-header"><div>
-      <h2>Older recovery holds</h2>
-      <p>Punches from reconnect and startup recovery reads that reached ADD before the next user list. In zones you enable on the server, ADD releases recent ones automatically when it saw the terminal’s user list shortly before and after the punch. Older ones, and punches from a longer outage, need your approval.</p>
-    </div><span className="badge"><Icon name="shield" /> Owner approval</span></header>
+      <h2>Send older not-matched check-ins (one area)</h2>
+      <p>Check-ins collected after a machine came back online, before its people list was refreshed. Recent ones are sent by themselves; older ones need your approval.</p>
+    </div><span className="badge"><Icon name="shield" /> Needs your approval</span></header>
     <div className="safe-repair-body">
-      <p>This release uses one proof only: the punch’s terminal user ID, UID and fingerprint match one saved CNIC history for that employee at punch time, and that CNIC is still the employee’s current CNIC. Punches another proof can release are left to the next user list. Every other punch stays held.</p>
+      <p>We only send a check-in when the person's CNIC at that time is still their CNIC today.</p>
+      <Disclosure summary="How this works"><p>The check-in's Employee ID, machine record and fingerprint must match one saved CNIC history for that person at the check-in time, and that CNIC must still be the person's CNIC today. Check-ins that the next read of the people list can match are left for it. Every other check-in is not sent.</p></Disclosure>
       <div className="identity-backlog-controls">
-        <label>Zone<select value={zone} onChange={(event) => setZone(event.target.value)}>
-          <option value="">Select a zone</option>
-          {zones.map(([id, name]) => <option key={id} value={id}>{name}</option>)}
+        <label>Area<select value={zone} onChange={(event) => setZone(event.target.value)}>
+          <option value="">Choose an area</option>
+          {(['life', 'health'] as const).map((division) => {
+            const items = zones.filter((item) => item.division === division)
+            return items.length ? <optgroup key={division} label={division === 'life' ? 'Life' : 'Health'}>{items.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</optgroup> : null
+          })}
         </select></label>
         <button className="button primary" type="button" disabled={!zone || checking} onClick={() => void check()}>
-          {checking ? `Checking ${progress.scanned.toLocaleString()} of ${progress.total.toLocaleString()}` : 'Check zone'}
+          {checking ? `Checking ${progress.scanned.toLocaleString()} of ${punches(progress.total)}` : 'Check area'}
         </button>
-        {checking && <button className="button secondary" type="button" onClick={() => { stopChecking.current = true }}>Stop checking</button>}
+        {checking && <button className="button secondary" type="button" onClick={() => { stopChecking.current = true }}>Stop</button>}
       </div>
       {error && !dialog && <p className="message pattern-blocked" role="alert">{error}</p>}
       {result && result.zone === zone && <>
         <div className="safe-repair-counts">
-          <Metric label="Held recovery punches" value={held} icon="list" detail={`Checked ${dateTime(result.approval.scope.as_of)}`} />
-          <Metric label="Can be released" value={provable} icon="shield" detail="Saved CNIC history matches" />
-          {nextSnapshot > 0 && <Metric label="Next user list" value={nextSnapshot} icon="list" detail="Another proof releases these" />}
-          <Metric label="Stay held" value={held - provable - nextSnapshot} icon="alert" detail="Need other evidence or review" tone={held - provable - nextSnapshot ? 'warning' : 'neutral'} />
+          <Metric label="Not matched" value={held} icon="list" detail={`Checked ${rowTime(result.approval.scope.as_of)}`} />
+          <Metric label="Can be sent" value={provable} icon="shield" detail="CNIC then is still the CNIC today" />
+          {nextSnapshot > 0 && <Metric label="Next read of the people list" value={nextSnapshot} icon="list" detail="These are matched by it" />}
+          <Metric label="Not sent" value={held - provable - nextSnapshot} icon="alert" detail="Need more checks" tone={held - provable - nextSnapshot ? 'warning' : 'neutral'} />
         </div>
-        {result.reheld > 0 && <p>{punches(result.reheld)} released earlier and held again are not part of this check. This release never takes them in.</p>}
-        {!result.releaseEnabled && <p className="message pattern-blocked" role="alert">The release proof is turned off on this server. Nothing can be released.</p>}
-        {result.groups.length > 0 ? <table className="identity-backlog-table">
-          <caption>Choose the groups to release. Counts are frozen at the check.</caption>
-          <thead><tr><th scope="col">Release</th><th scope="col">Terminal</th><th scope="col">Capture</th><th scope="col">Held for</th><th scope="col">Held</th><th scope="col">Can be released</th><th scope="col">Next user list</th></tr></thead>
-          <tbody>{result.groups.map((group) => {
-            const label = `${result.names[group.connector_id] || group.connector_id}, ${sources[group.source] || group.source}, ${ageLabel(group.age, result.windowHours, result.automatic)}`
-            return <tr key={groupKey(group)}>
-              <td><input type="checkbox" aria-label={`Release ${label}`} checked={chosen.has(groupKey(group))} disabled={!group.provable} onChange={() => toggle(groupKey(group))} /></td>
-              <td>{result.names[group.connector_id] || group.connector_id}</td>
-              <td>{sources[group.source] || group.source}</td><td>{ageLabel(group.age, result.windowHours, result.automatic)}</td>
-              <td>{group.held.toLocaleString()}</td><td>{group.provable.toLocaleString()}</td><td>{group.next_snapshot.toLocaleString()}</td>
-            </tr>
-          })}</tbody>
-        </table> : <p>No recovery punches are held in this zone.</p>}
+        {result.reheld > 0 && <p>{punches(result.reheld)} sent earlier and set back are not part of this check. They are never sent from here.</p>}
+        {!result.releaseEnabled && <p className="message pattern-blocked" role="alert">This tool is switched off for now, so nothing can be sent.</p>}
+        {result.groups.length > 0 ? <ul className="identity-backlog-groups" aria-label="Choose the groups to send. Counts are fixed at the check.">
+          {result.groups.map((group) => {
+            const label = `${placeLabel(group.connector_id)}, ${sources[group.source] || 'Collected later'}, ${ageLabel(group.age, result.windowHours, result.automatic)}`
+            return <li key={groupKey(group)} className="identity-backlog-group">
+              <label className="identity-backlog-pick"><input type="checkbox" aria-label={`Send ${label}`} checked={chosen.has(groupKey(group))} disabled={!group.provable} onChange={() => toggle(groupKey(group))} />
+                <span><strong>{placeLabel(group.connector_id)}</strong><small>{sources[group.source] || 'Collected later'} · {ageLabel(group.age, result.windowHours, result.automatic)}</small></span></label>
+              <dl><div><dt>Not matched</dt><dd>{group.held.toLocaleString()}</dd></div><div><dt>Can be sent</dt><dd>{group.provable.toLocaleString()}</dd></div><div><dt>Next read</dt><dd>{group.next_snapshot.toLocaleString()}</dd></div></dl>
+            </li>
+          })}
+        </ul> : <p>No not-matched check-ins of this kind in this area.</p>}
         <button className="button primary" type="button" disabled={!canApprove} onClick={() => { setDialog('START'); setError('') }}>
-          Release {punches(selectedProvable)}
+          Send {punches(selectedProvable)}
         </button>
-        {running && <p>A release for this zone is still running or following its punches to Oracle.</p>}
+        {running && <p>A sending task for this area is still running or following its check-ins to the HR system.</p>}
       </>}
       {run && <div className="safe-repair-run" role="status" aria-live="polite">
-        <div className="safe-repair-heading"><h3>{run.paused ? 'Paused: release proof turned off' : runLabel[run.status] || run.status}</h3><span>Approved by {run.actor} · {dateTime(run.created_at)}</span></div>
-        <p>{run.delivered.toLocaleString()} confirmed by Oracle · {run.waiting_oracle.toLocaleString()} waiting for Oracle · {run.released.toLocaleString()} of {run.approved.toLocaleString()} approved released · {run.kept_held.toLocaleString()} kept held{run.left_to_snapshot ? ` · ${run.left_to_snapshot.toLocaleString()} left to the next user list` : ''}{run.no_longer_held ? ` · ${run.no_longer_held.toLocaleString()} no longer held when reached` : ''}{run.needs_review ? ` · ${run.needs_review.toLocaleString()} need review` : ''}</p>
-        {run.waiting_reason && <p>{waitingLabel[run.waiting_reason] || run.waiting_reason}</p>}
-        <p>{run.reason}</p>
-        {releasing && <div className="safe-repair-actions"><button className="button secondary" type="button" onClick={() => { setDialog('STOP'); setError('') }}>Stop</button><span>You can close this page. The release continues on ADD.</span></div>}
+        <div className="safe-repair-heading"><h3>{run.paused ? 'Paused: this tool was switched off' : runLabel[run.status] || 'In progress'}</h3><span>Approved by {run.actor} · {longTime(run.created_at)}</span></div>
+        <p>{run.delivered.toLocaleString()} sent · {run.waiting_oracle.toLocaleString()} waiting for the HR system · {run.released.toLocaleString()} of {run.approved.toLocaleString()} approved started · {run.kept_held.toLocaleString()} not sent{run.left_to_snapshot ? ` · ${run.left_to_snapshot.toLocaleString()} left to the next read of the people list` : ''}{run.no_longer_held ? ` · ${run.no_longer_held.toLocaleString()} already matched when reached` : ''}{run.needs_review ? ` · ${run.needs_review.toLocaleString()} need checking` : ''}</p>
+        {run.waiting_reason && <p>{plainReason('areaWait', run.waiting_reason).sentence}</p>}
+        <p>Reason: <span data-user-text>{run.reason}</span></p>
+        {releasing && <div className="safe-repair-actions"><button className="button secondary" type="button" onClick={() => { setDialog('STOP'); setError('') }}>Stop</button><span>You can close this page. Sending goes on.</span></div>}
       </div>}
     </div>
     {dialog && <Dialog
       titleId="identity-backlog-title"
-      title={dialog === 'START' ? `Release up to ${punches(selectedProvable)}` : 'Stop this release'}
+      title={dialog === 'START' ? `Send up to ${punches(selectedProvable)}` : 'Stop this task'}
       description={dialog === 'START'
-        ? `Only punches of the ${selected.length === 1 ? 'chosen group' : `${selected.length} chosen groups`} that are held when you approve, and no more than ${punches(selectedProvable)}. ADD checks every punch again, with the same proof, as it releases it. A punch that no longer matches stays held.`
-        : 'No more punches are released. Punches already released stay released: ADD keeps following them to Oracle and checks again any that delivery holds. The rest stay held.'}
+        ? `Only check-ins of the ${selected.length === 1 ? 'chosen group' : `${selected.length} chosen groups`} that are still not matched when you approve, and no more than ${punches(selectedProvable)}. Each one is checked again, the same way, as it is sent. One that no longer matches is not sent.`
+        : 'No more check-ins are sent. The ones already sent stay sent and are followed to the HR system. The rest are not sent.'}
       onClose={closeDialog}
     ><form className="dialog-body" onSubmit={submit}>
       {dialog === 'START' && <>
-        <label>Reason for release<textarea required minLength={3} maxLength={500} value={reason} onChange={(event) => setReason(event.target.value)} /></label>
-        <label>Type {confirmation} to confirm<input required value={typed} onChange={(event) => setTyped(event.target.value)} autoComplete="off" /></label>
+        <label>Why? (saved in the records)<textarea required minLength={3} maxLength={500} value={reason} onChange={(event) => setReason(event.target.value)} /></label>
+        <label>Type <span data-device-code>{confirmation}</span> to confirm{zoneLabel ? ` (the code of ${zoneLabel})` : ''}<input required value={typed} onChange={(event) => setTyped(event.target.value)} autoComplete="off" /></label>
       </>}
-      <label>Administrator password<input type="password" required autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} /></label>
+      <label>Your password<input type="password" required autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} /></label>
       {error && <p className="message pattern-blocked" role="alert">{error}</p>}
       <footer className="dialog-actions">
         <button className="button secondary" type="button" disabled={busy} onClick={closeDialog}>Cancel</button>
         <button className="button primary" disabled={busy || !password || (dialog === 'START' && (reason.trim().length < 3 || typed.trim() !== confirmation))}>
-          {busy ? 'Saving…' : dialog === 'START' ? `Approve ${punches(selectedProvable)}` : 'Stop release'}
+          {busy ? 'Saving…' : dialog === 'START' ? `Send ${punches(selectedProvable)}` : 'Stop'}
         </button>
       </footer>
     </form></Dialog>}

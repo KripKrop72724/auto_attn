@@ -1,10 +1,20 @@
 .identity-backlog { margin-bottom: 20px; }
 .identity-backlog-controls { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 12px; margin: 12px 0; }
 .identity-backlog-controls label { display: grid; gap: 6px; font-size: 13px; color: var(--text-secondary); }
-.identity-backlog-table { width: 100%; border-collapse: collapse; margin: 12px 0 16px; font-size: 13px; }
-.identity-backlog-table caption { text-align: left; color: var(--text-secondary); padding-bottom: 8px; }
-.identity-backlog-table th, .identity-backlog-table td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); }
-.identity-backlog-table th { color: var(--text-tertiary); font-weight: 600; }
-@media (max-width: 640px) {
-  .identity-backlog-table { display: block; overflow-x: auto; }
+.identity-backlog-controls select { min-height: 44px; }
+/* One card per group (place, how it arrived, age) instead of a 7-column table that scrolled sideways. */
+.identity-backlog-groups { display: grid; gap: 8px; margin: 12px 0 16px; padding: 0; list-style: none; }
+.identity-backlog-group { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 8px 16px; padding: 10px 14px; border: 1px solid var(--border); border-radius: var(--radius-md); }
+.identity-backlog-pick { display: flex; align-items: center; gap: 12px; min-height: 44px; cursor: pointer; }
+.identity-backlog-pick input { width: 18px; height: 18px; flex: none; }
+.identity-backlog-pick span { display: grid; gap: 2px; min-width: 0; }
+.identity-backlog-pick small { color: var(--text-secondary); }
+.identity-backlog-group dl { display: flex; gap: 16px; margin: 0; }
+.identity-backlog-group dl div { display: grid; gap: 2px; text-align: right; }
+.identity-backlog-group dt { color: var(--text-tertiary); font-size: 12px; }
+.identity-backlog-group dd { margin: 0; font-variant-numeric: tabular-nums; font-weight: 600; }
+@media (max-width: 760px) {
+  .identity-backlog-group { grid-template-columns: minmax(0, 1fr); }
+  .identity-backlog-group dl { justify-content: space-between; }
+  .identity-backlog-group dl div { text-align: left; }
 }

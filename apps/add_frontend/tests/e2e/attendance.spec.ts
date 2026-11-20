@@ -4,46 +4,84 @@ import { expect, test, device, mockDashboard, representativeAttendance } from '.
 
 test.beforeEach(async ({ page }) => mockDashboard(page))
 
-test('Attendance combines Oracle filters and offers an accessible per-punch send review', async ({ page }) => {
+test('Attendance filters by status, keeps them in the address and offers an accessible send from the sheet', async ({ page }) => {
   await page.route('**/api/v1/attendance?*', async (route) => route.fulfill({
     status: 200, contentType: 'application/json', body: JSON.stringify({
-      rows: [{ ...representativeAttendance, ords_status: 'BLOCKED_IDENTITY', oracle_confirmed_at: null }],
-      next_cursor: null, status_options: ['BLOCKED_IDENTITY', 'FAILED_RETRYABLE'],
+      rows: [{
+        ...representativeAttendance, ords_status: 'BLOCKED_IDENTITY', delivery_group: 'not_matched', oracle_confirmed_at: null,
+        source_connector: { connector_id: device.connector_id, display_name: device.zone_id, zone_id: device.zone_id, zone_name: device.zone_name, friendly_name: 'SLIC Tower · 3rd Floor', division: 'health' },
+        direct_ords_identity: { eligible: true, cnic_source: 'SAVED_PUNCH', exclusion: null },
+      }],
+      next_cursor: null,
     }),
   }))
   await page.goto('/attendance')
-  const row = page.getByRole('article', { name: /Ayesha Khan, Check in/i })
+  await expect(page.getByRole('heading', { name: 'Attendance', exact: true, level: 1 })).toBeVisible()
+  await expect(page.getByRole('tab', { name: 'Check-ins' })).toHaveAttribute('aria-selected', 'true')
+  const row = page.getByRole('article', { name: /Ayesha Khan, Check-in/i })
   await expect(row).toBeVisible()
-  await page.locator('.attendance-advanced > summary').click()
-  await page.getByRole('checkbox', { name: 'Blocked identity' }).check()
-  await page.getByRole('checkbox', { name: 'Failed retryable' }).check()
-  await page.getByLabel('CNIC availability').selectOption('present')
-  await page.getByRole('button', { name: 'View results' }).click()
-  await expect(page.getByRole('button', { name: /Oracle: BLOCKED IDENTITY/i })).toBeVisible()
-  await expect(page.getByRole('button', { name: /Oracle: FAILED RETRYABLE/i })).toBeVisible()
-  await row.getByRole('button', { name: 'Send to ORDS' }).click()
-  const dialog = page.getByRole('dialog')
-  await expect(dialog.getByRole('heading', { name: 'Send 1 punch to Oracle' })).toBeVisible()
-  await expect(dialog.getByLabel('Administrator password')).toBeVisible()
+  const phone = (page.viewportSize()?.width || 0) <= 760
+  if (phone) {
+    await page.getByRole('button', { name: /More filters/ }).click()
+    await page.getByRole('checkbox', { name: /^Not matched/ }).check()
+    await page.getByRole('checkbox', { name: /^Waiting/ }).check()
+    await page.getByRole('switch', { name: 'No CNIC' }).check()
+    await page.getByRole('button', { name: 'Show results' }).click()
+  } else {
+    await page.getByRole('button', { name: /^Status:/ }).click()
+    await page.getByRole('checkbox', { name: /^Not matched/ }).check()
+    await page.getByRole('checkbox', { name: /^Waiting/ }).check()
+    await page.keyboard.press('Escape')
+    await page.getByRole('button', { name: /More filters/ }).click()
+    await page.getByRole('switch', { name: 'No CNIC' }).check()
+    await page.keyboard.press('Escape')
+  }
+  await expect(page.getByRole('button', { name: 'Remove filter: Not matched' })).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Remove filter: Waiting' })).toBeVisible()
+  await expect(page).toHaveURL(/status=not_matched%2Cwaiting/)
+  await expect(page).not.toHaveURL(/cnic|password|reason|confirmation/i)
+  await row.getByRole('button', { name: /^Open check-in/ }).click()
+  const sheet = page.getByRole('dialog', { name: 'Ayesha Khan' })
+  await expect(sheet.getByText('Journey')).toBeVisible()
+  await sheet.getByRole('button', { name: 'Send to HR system' }).click()
+  const dialog = page.getByRole('dialog', { name: /Send 1 check-in to the HR system \(Oracle\)/ })
+  await expect(dialog.getByRole('heading', { name: 'Send 1 check-in to the HR system (Oracle)' })).toBeVisible()
+  await expect(dialog.getByLabel('Your password')).toBeVisible()
   const dimensions = await page.evaluate(() => ({ viewport: window.innerWidth, content: document.documentElement.scrollWidth }))
   expect(dimensions.content).toBeLessThanOrEqual(dimensions.viewport)
   const results = await new AxeBuilder({ page }).include('[role="dialog"]').withTags(['wcag2a', 'wcag2aa', 'wcag21aa']).analyze()
   expect(results.violations).toEqual([])
 })
 
+test('Attendance list is not clipped and the first check-in is near the top on a phone', async ({ page }) => {
+  await page.goto('/attendance')
+  const row = page.getByRole('article', { name: /Ayesha Khan, Check-in/i })
+  await expect(row).toBeVisible()
+  const list = await page.locator('.attendance-list').evaluate((element) => ({ scroll: element.scrollWidth, width: element.clientWidth }))
+  expect(list.scroll).toBeLessThanOrEqual(list.width + 1)
+  if ((page.viewportSize()?.width || 0) <= 760) {
+    // Plan target is about 370 px under the shell's compact header; this bound catches a regression
+    // to the old ~1,200 px stack until the shell's phone header lands (see the PR notes).
+    const box = await row.boundingBox()
+    expect(box?.y || 0).toBeLessThanOrEqual(640)
+  }
+  await expect(page.getByText(/Phone notifications|phone messages/i)).toHaveCount(0)
+})
+
 test('legacy employee repair route opens the responsive blocked-punch review', async ({ page }, testInfo) => {
   await page.goto('/reconciliation?tab=employee-repair&device_id=connector-one')
-  await expect(page).toHaveURL(/\/attendance\?view=needs-review&device_id=connector-one$/)
+  // Reconciliation still sends the old link; Attendance rewrites it to Fix tools.
+  await expect(page).toHaveURL(/\/attendance\?view=fix-tools&device_id=connector-one&tool=held-staff$/)
   await expect(page.getByRole('heading', { name: 'Attendance', exact: true, level: 1 })).toBeVisible()
-  await expect(page.getByRole('tab', { name: /Needs review/ })).toHaveAttribute('aria-selected', 'true')
-  await expect(page.getByRole('heading', { name: 'Force release attendance' })).toBeVisible()
-  await expect(page.getByText('Manual approval only')).toBeVisible()
-  await expect(page.getByRole('button', { name: 'Sync and check' })).toBeEnabled()
+  await expect(page.getByRole('tab', { name: /Fix tools/ })).toHaveAttribute('aria-selected', 'true')
+  await expect(page.getByRole('heading', { name: 'Re-check not-matched check-ins' })).toBeVisible()
+  await expect(page.getByText('Needs your approval')).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Re-check not-matched check-ins' })).toBeEnabled()
   await expect(page.getByRole('button', { name: 'Review punches' })).toHaveCount(0)
 
   // Enabling this control starts its disabled-to-enabled color transition.
   // Inspect the final rendered colors without weakening the contrast check.
-  await page.getByRole('button', { name: 'Sync and check' }).evaluate(async (node) => {
+  await page.getByRole('button', { name: 'Re-check not-matched check-ins' }).evaluate(async (node) => {
     await Promise.all(node.getAnimations().map(animation => animation.finished.catch(() => undefined)))
   })
   const dimensions = await page.evaluate(() => ({ viewport: window.innerWidth, content: document.documentElement.scrollWidth }))
@@ -75,22 +113,24 @@ test('manual force release remains clear, accessible and resumable', async ({ pa
     }
     await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(json) })
   })
+  // The old link keeps working: it is rewritten to Fix tools › Re-check not-matched check-ins.
   await page.goto(`/attendance?view=needs-review&force_run=${run.job_id}`)
-  await expect(page.getByRole('heading', { name: 'Ready to review' })).toBeVisible()
-  await expect(page.getByRole('button', { name: 'Force release 300 punches', exact: true })).toBeEnabled()
-  await page.getByRole('button', { name: 'Force release 300 punches', exact: true }).click()
+  await expect(page).toHaveURL(new RegExp(`view=fix-tools&force_run=${run.job_id}&tool=held-staff$`))
+  await expect(page.getByRole('heading', { name: 'Ready to send' })).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Send 300 check-ins', exact: true })).toBeEnabled()
+  await page.getByRole('button', { name: 'Send 300 check-ins', exact: true }).click()
   const dialog = page.getByRole('dialog')
   await expect(dialog.getByRole('button', { name: 'Close', exact: true })).toBeFocused()
   await page.keyboard.press('Tab')
-  await expect(dialog.getByLabel('Reason for release')).toBeFocused()
-  await dialog.getByLabel('Reason for release').fill('Current terminal identity checked')
-  await dialog.getByLabel('Administrator password').fill('test-password')
-  await dialog.getByRole('button', { name: 'Approve 300 punches', exact: true }).click()
-  await expect(page.getByRole('heading', { name: 'Waiting for Oracle' })).toBeVisible()
+  await expect(dialog.getByLabel('Why? (saved in the records)')).toBeFocused()
+  await dialog.getByLabel('Why? (saved in the records)').fill('Current terminal identity checked')
+  await dialog.getByLabel('Your password').fill('test-password')
+  await dialog.getByRole('button', { name: 'Send 300 check-ins', exact: true }).click()
+  await expect(page.getByRole('heading', { name: 'Waiting for the HR system' })).toBeVisible()
   await page.reload()
-  await expect(page.getByRole('heading', { name: 'Waiting for Oracle' })).toBeVisible()
-  await expect(page.getByRole('heading', { name: 'Finished', exact: true })).toHaveCount(0)
-  await expect(page.locator('.safe-repair-steps [aria-current="step"]')).toHaveText('Waiting for Oracle')
+  await expect(page.getByRole('heading', { name: 'Waiting for the HR system' })).toBeVisible()
+  await expect(page.getByRole('heading', { name: 'Done', exact: true })).toHaveCount(0)
+  await expect(page.locator('.safe-repair-steps [aria-current="step"]')).toHaveText('Waiting for HR system')
   // Inspect final rendered colors after the shared route entrance animation.
   await page.evaluate(async () => {
     await Promise.all(document.getAnimations().filter(animation => animation.effect?.getComputedTiming().iterations !== Infinity).map(animation => animation.finished.catch(() => {})))

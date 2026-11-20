@@ -104,7 +104,7 @@ test('primary routes and device deep link remain usable', async ({ page }, testI
   else await primaryNav.getByRole('link', { name: 'People', exact: true }).click()
   await expect(page.getByRole('heading', { name: 'Users', exact: true, level: 1 })).toBeVisible()
   await primaryNav.getByRole('link', { name: 'Attendance', exact: true }).click()
-  await expect(page.getByRole('heading', { name: 'Live attendance' })).toBeVisible()
+  await expect(page.getByRole('heading', { name: 'Attendance', exact: true, level: 1 })).toBeVisible()
   if (phone) {
     const moreTrigger = primaryNav.getByRole('button', { name: 'More', exact: true })
     await moreTrigger.click()

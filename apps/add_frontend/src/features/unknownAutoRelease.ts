@@ -197,16 +197,16 @@ export const remainingOf = (status: AutoReleaseStatus) => status.backlog.remaini
 /** Held punches another release run or check holds: theirs to send, not counted in what is left here. */
 export function elsewhereText(status: AutoReleaseStatus) {
   const held = status.backlog.held_by_other_approval
-  return held > 0 ? `${held.toLocaleString()} in another release run or check` : null
+  return held > 0 ? `${held.toLocaleString()} in another sending task or check` : null
 }
 
 export function etaText(status: AutoReleaseStatus) {
   const remaining = remainingOf(status)
   if (remaining === 0 || status.eta_minutes === 0) {
     const elsewhere = elsewhereText(status)
-    return elsewhere ? `nothing left here · ${elsewhere}` : 'nothing left to release'
+    return elsewhere ? `nothing left here · ${elsewhere}` : 'nothing left to send'
   }
-  if (status.eta_minutes === null) return status.rate_per_min === null ? 'speed is measured after the first count' : 'no confirmations in the last hour yet'
+  if (status.eta_minutes === null) return status.rate_per_min === null ? 'speed is measured after the first count' : 'none sent in the last hour yet'
   return `about ${formatDuration(status.eta_minutes)} left`
 }
 
