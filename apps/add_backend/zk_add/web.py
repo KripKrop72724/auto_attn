@@ -45,6 +45,10 @@ from zk_add import dashboard_cache
 from zk_add import public_status
 from zk_add import source_newest_slot as newest_slot
 from zk_add.attendance_cnic_link import cnic_not_linked_expression, unknown_synced_cnic_expression
+# Read-side page helpers (UI/UX revamp): status groups, totals, plain words, names.
+from zk_add import attendance_groups
+from zk_add import attendance_summary
+from zk_add import connector_naming
 from zk_add.attendance_force_schemas import ForceCheckRequest, ForceStartRequest, ForceControlRequest, UserRefreshRequest
 from zk_add.attendance_direct_ords_schemas import (
     DirectOrdsPreviewRequest,
@@ -640,6 +644,8 @@ def _dashboard_metrics(session: Session) -> dict:
             session, outbox_coverage=coverage, event_status_counts=status_counts
         ),
         "checkin_notifications": checkin_notify.overview(session),
+        # Plain status groups over every retained check-in, from the same counts.
+        "attendance_all_time": attendance_summary.all_time_totals(status_counts),
     }
 
 
@@ -711,6 +717,7 @@ def invalidate_dashboard_metrics_after_commit(db: Session) -> None:
         dashboard_cache.mark_stale(
             DASHBOARD_METRICS_KEY, DASHBOARD_METRICS_MARK_MIN_AGE_SECONDS
         )
+        attendance_summary.mark_summaries_stale(DASHBOARD_METRICS_MARK_MIN_AGE_SECONDS)
 
     sa_event.listen(db, "after_commit", _invalidate, once=True)
 
@@ -4090,12 +4097,12 @@ def _identity_release_safety(
 
 @app.get("/api/v1/attendance")
 def attendance(
-    device_id: str | None = None,
+    device_id: list[str] = Query(default=[]),
     q: str | None = None,
     cnic: str | None = None,
     punch: str | None = None,
     source: str | None = None,
-    clock_quality: str | None = None,
+    clock_quality: list[str] = Query(default=[]),
     forced: bool = False,
     ords_status: list[str] = Query(default=[]),
     notify_status: list[str] = Query(default=[]),
@@ -4105,6 +4112,11 @@ def attendance(
     to_time: str | None = None,
     cursor: int | None = None,
     limit: int = Query(default=100, ge=1, le=500),
+    division: str | None = None,
+    delivery_group: list[str] = Query(default=[]),
+    source_group: Literal["live", "later"] | None = None,
+    to_exclusive: bool = False,
+    notify_summary: bool = True,
     auth: tuple[Session, AdminContext] = Depends(require_admin),
 ):
     db, _context = auth
@@ -4114,12 +4126,30 @@ def attendance(
     statement = select(AttendanceEvent, cnic_not_linked.label("cnic_not_linked"))
     if len(ords_status) > 30 or any(not value or len(value) > 40 for value in ords_status):
         raise HTTPException(status_code=422, detail="Select at most 30 valid Oracle delivery statuses.")
+    try:
+        groups = attendance_groups.parse_groups(delivery_group)
+        chosen_division = connector_naming.parse_division(division)
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
     if forced:
         from zk_add.models import AttendanceForceReleaseDecision
         statement = statement.where(AttendanceEvent.id.in_(select(AttendanceForceReleaseDecision.attendance_event_id)))
-    if device_id:
-        connector = connector_or_404(db, device_id)
-        statement = statement.where(AttendanceEvent.connector_id == connector.id)
+    device_ids = [value for value in device_id if value]
+    if len(device_ids) > 50:
+        raise HTTPException(status_code=422, detail="Choose 50 places or fewer.")
+    if device_ids:
+        # Repeated device_id values are OR-ed; one value keeps its old meaning.
+        statement = statement.where(AttendanceEvent.connector_id.in_(
+            [connector_or_404(db, value).id for value in dict.fromkeys(device_ids)]
+        ))
+    if chosen_division is not None:
+        statement = statement.where(AttendanceEvent.connector_id.in_(
+            connector_naming.connector_ids_for_division(db, chosen_division)
+        ))
+    if source_group == "live":
+        statement = statement.where(AttendanceEvent.source.in_(attendance_summary.LIVE_SOURCES))
+    elif source_group == "later":
+        statement = statement.where(AttendanceEvent.source.not_in(attendance_summary.LIVE_SOURCES))
     if cursor:
         statement = statement.where(AttendanceEvent.id < cursor)
     if q:
@@ -4159,22 +4189,36 @@ def attendance(
             AttendanceCheckinNotification,
             AttendanceCheckinNotification.attendance_event_id == AttendanceEvent.id,
         ).where(checkin_notify.filter_condition(sorted(set(notify_status))))
-    if ords_status:
-        stored_statuses = set(ords_status) - {"CNIC_NOT_LINKED"}
-        selected_states = [AttendanceEvent.ords_status.in_(stored_statuses)]
-        if "CNIC_NOT_LINKED" in ords_status:
-            selected_states.append(cnic_not_linked)
+    if ords_status or groups:
+        selected_states = []
+        if ords_status:
+            stored_statuses = set(ords_status) - {"CNIC_NOT_LINKED"}
+            selected_states.append(AttendanceEvent.ords_status.in_(stored_statuses))
+            if "CNIC_NOT_LINKED" in ords_status:
+                selected_states.append(cnic_not_linked)
+        if groups:
+            # The plain status groups are OR-ed with the stored codes above.
+            selected_states.append(attendance_groups.group_condition(groups))
         statement = statement.where(or_(*selected_states))
     if punch:
         statement = statement.where(AttendanceEvent.punch == punch)
     if source:
         statement = statement.where(AttendanceEvent.source == source)
-    if clock_quality:
-        statement = statement.where(AttendanceEvent.clock_quality == clock_quality)
+    clock_qualities = [value for value in clock_quality if value]
+    if len(clock_qualities) > 10:
+        raise HTTPException(status_code=422, detail="Select at most 10 clock states.")
+    if clock_qualities:
+        statement = statement.where(AttendanceEvent.clock_quality.in_(clock_qualities))
     if from_time:
         statement = statement.where(AttendanceEvent.device_event_time >= parse_datetime(from_time))
     if to_time:
-        statement = statement.where(AttendanceEvent.device_event_time <= parse_datetime(to_time))
+        upper = parse_datetime(to_time)
+        # to_exclusive=true is for whole-day windows ending at the next
+        # midnight; older callers keep the inclusive bound.
+        statement = statement.where(
+            AttendanceEvent.device_event_time < upper if to_exclusive
+            else AttendanceEvent.device_event_time <= upper
+        )
     results = db.execute(statement.order_by(AttendanceEvent.id.desc()).limit(limit + 1)).all()
     rows = [event for event, _cnic_not_linked in results]
     next_cursor = rows[limit - 1].id if len(rows) > limit else None
@@ -4208,11 +4252,70 @@ def attendance(
         ],
         "next_cursor": next_cursor,
         # A compact summary for the first page; older pages do not repeat it.
-        "checkin_notifications": None if cursor else checkin_notify.overview(db),
-        "status_options": db.scalars(
-            select(AttendanceEvent.ords_status).distinct().order_by(AttendanceEvent.ords_status).limit(100)
-        ).all() + ["CNIC_NOT_LINKED"],
+        # notify_summary=false (live list refreshes) skips it entirely.
+        "checkin_notifications": None if cursor or not notify_summary else checkin_notify.overview(db),
+        # A fixed list: no DISTINCT scan of the whole table on every refresh.
+        "status_options": [*attendance_groups.STATUS_OPTIONS, "CNIC_NOT_LINKED"],
     }
+
+
+@app.get("/api/v1/attendance/summary")
+def attendance_summary_totals(
+    from_time: str,
+    to_time: str | None = None,
+    division: str | None = None,
+    device_id: list[str] = Query(default=[]),
+    auth: tuple[Session, AdminContext] = Depends(require_admin),
+):
+    """Totals per plain status group for one window (Home and Attendance tiles).
+
+    ``to_time`` is exclusive. ``totals`` follow ``division`` and ``device_id``;
+    ``by_division`` always covers both divisions for the chosen places.
+    """
+    db, _context = auth
+    try:
+        chosen_division = connector_naming.parse_division(division)
+        lower = parse_datetime(from_time)
+        upper = parse_datetime(to_time) if to_time else None
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail={
+            "code": "INVALID_FILTER", "message": "Choose a valid date range and division."}) from error
+    device_ids = list(dict.fromkeys(value for value in device_id if value))
+    if len(device_ids) > 50:
+        raise HTTPException(status_code=422, detail={
+            "code": "TOO_MANY_PLACES", "message": "Choose 50 places or fewer."})
+    connector_ids = [connector_or_404(db, value).id for value in device_ids] or None
+    use_cache = _dashboard_cache_applies(db)
+    if use_cache:
+        # End the request's transaction before a possible wait on the cache.
+        db.commit()
+    try:
+        return attendance_summary.summary(
+            db, from_time=lower, to_time=upper, division=chosen_division,
+            connector_ids=connector_ids, use_cache=use_cache,
+            compute_session=SessionLocal if use_cache else None,
+        )
+    except attendance_summary.SummaryRangeError as error:
+        raise HTTPException(status_code=422, detail={"code": error.code, "message": error.message}) from error
+    except dashboard_cache.DashboardCacheUnavailable as error:
+        raise HTTPException(
+            status_code=503,
+            detail="Attendance totals are being refreshed. Try again shortly.",
+            headers={"Retry-After": "5"},
+        ) from error
+
+
+@app.get("/api/v1/attendance/{event_id}/journey")
+def attendance_journey(
+    event_id: int,
+    auth: tuple[Session, AdminContext] = Depends(require_admin),
+):
+    """One check-in's times from the machine to the HR system (no CNIC, no payload)."""
+    db, _context = auth
+    event = db.get(AttendanceEvent, event_id)
+    if event is None:
+        raise HTTPException(status_code=404, detail="Check-in not found.")
+    return attendance_summary.journey(db, event)
 
 
 @app.get("/api/v1/checkin-notifications")
@@ -6242,6 +6345,8 @@ def serialize_attendance(
             "display_name": source_connector.display_name,
             "zone_id": source_connector.zone_id,
             "zone_name": source_connector.zone_name,
+            # Plain place name and Life/Health tag, so the page never parses codes.
+            **connector_naming.naming(source_connector),
         } if source_connector is not None and source_connector.id == row.connector_id else None,
         "terminal_provenance": {
             "state": provenance_state,
@@ -6264,6 +6369,8 @@ def serialize_attendance(
         "clock_quality": row.clock_quality,
         "clock_drift_seconds": row.clock_drift_seconds,
         "ords_status": row.ords_status,
+        # One of sent / waiting / not_matched / set_aside / problem (read side only).
+        "delivery_group": attendance_groups.delivery_group(row.ords_status),
         "oracle_confirmed_at": row.oracle_confirmed_at,
         "oracle_confirmation_path": row.oracle_confirmation_path,
         "identity_resolution_id": row.identity_resolution_id,
