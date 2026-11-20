@@ -39,8 +39,8 @@
 .dv-header-sentence { margin: 0; font-size: 15px; line-height: 1.45; color: var(--text); overflow-wrap: anywhere; }
 .dv-last-heard { margin: 2px 0 0; color: var(--text-secondary); font-size: 13px; }
 .dv-header-retry { margin: var(--space-1) 0 0; font-size: 13px; color: var(--text-secondary); }
-.dv-header.is-phone { position: sticky; top: 0; z-index: var(--z-sticky, 5); padding: 0 16px var(--space-3); }
-.dv-header-bar { display: flex; align-items: center; justify-content: space-between; gap: var(--space-2); min-height: 48px; }
+.dv-header.is-phone { position: sticky; top: 0; z-index: var(--z-sticky, 5); padding: 0 16px var(--space-2); }
+.dv-header-bar { display: flex; align-items: center; justify-content: space-between; gap: var(--space-2); min-height: 44px; }
 .dv-back { display: inline-flex; align-items: center; gap: 4px; min-height: 44px; min-width: 44px; padding: 0 8px 0 0; border: 0; background: none; color: var(--accent); font: inherit; font-weight: 500; cursor: pointer; }
 .dv-header-compact { display: none; flex: 1 1 auto; min-width: 0; align-items: center; gap: var(--space-2); }
 .dv-header-compact-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
@@ -48,7 +48,10 @@
 .dv-status-dot.tone-working { background: var(--tone-working-solid); }
 .dv-status-dot.tone-attention { background: var(--tone-attention-solid); }
 .dv-status-dot.tone-offline { background: var(--tone-offline-solid); }
-.dv-header.is-phone .dv-header-main { display: grid; gap: var(--space-2); }
+.dv-header.is-phone .dv-header-main { display: grid; gap: 4px; }
+.dv-header.is-phone .dv-header-name { font-size: 20px; line-height: 1.2; }
+.dv-header.is-phone .dv-header-sentence { line-height: 1.4; }
+.dv-header.is-phone .dv-last-heard { margin: 0; }
 .dv-header.is-phone .dv-header-sentence { display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
 .dv-header.is-collapsed .dv-header-main { display: none; }
 .dv-header.is-collapsed .dv-header-compact { display: inline-flex; }
@@ -56,7 +59,7 @@
 
 /* ----------------------------------------------------------------- tabs */
 .dv-tabs { position: sticky; top: 0; z-index: var(--z-sticky, 4); background: var(--canvas); padding-top: var(--space-2); }
-.dv-tabs.is-phone { top: 48px; padding: 0 16px; }
+.dv-tabs.is-phone { position: static; padding: 0 16px; }
 .dv-tabs.is-phone .ui-tablist { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); }
 .dv-tabs.is-phone .ui-tab { min-width: 0; padding: 0 2px; font-size: 13px; justify-content: center; text-align: center; }
 .dv-tabpanel { outline: none; }
@@ -231,3 +234,5 @@
   .dv-card, .dv-tool-card, .dv-problem-card, .dv-activity-row { border: 2px solid CanvasText; }
 }
 .dv-activity-list.is-updating { opacity: .6; transition: opacity var(--motion-fade, 120ms) var(--ease-out); }
+.dv-sticky { position: sticky; top: 0; z-index: var(--z-sticky, 5); background: var(--canvas); }
+.dv-sticky .dv-header.is-phone { position: static; }

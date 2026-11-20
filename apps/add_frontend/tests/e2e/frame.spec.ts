@@ -63,7 +63,17 @@ test('primary routes and device deep link remain usable', async ({ page }, testI
   await page.getByRole('button', { name: /Islamabad, 1 device, All online/i }).click()
   await page.getByRole('button', { name: 'Inspect SLICTOWER · 3rd Floor' }).click()
   await expect(page).toHaveURL(/\/devices\/connector-one$/)
-  await expect(page.getByRole('dialog', { name: 'SLICTOWER · 3rd Floor' })).toBeVisible()
+  const phone = (page.viewportSize()?.width || 0) <= 760
+  const panel = page.getByRole('dialog', { name: /3rd Floor/i })
+  await expect(panel).toBeVisible()
+  if (phone) {
+    await expect(panel.getByRole('heading', { level: 1, name: /3rd Floor/i })).toBeVisible()
+    await expect(panel.getByRole('button', { name: 'Back' })).toBeVisible()
+  }
+  // The engineer custody card moved to Tools › Advanced tools (04-device §6).
+  await panel.getByRole('tab', { name: 'Tools' }).click()
+  await panel.getByRole('button', { name: 'Advanced tools · for IT' }).click()
+  await panel.getByRole('button', { name: 'Show the engineer view' }).click()
   const custody = page.getByRole('article', { name: 'ZKT ADD custody' })
   await expect(custody.getByRole('heading', { name: 'Preserved records need processing repair' })).toBeVisible()
   await custody.locator('summary').click()
@@ -75,7 +85,7 @@ test('primary routes and device deep link remain usable', async ({ page }, testI
   const bounds = await custody.evaluate(element => ({ width: element.clientWidth, scroll: element.scrollWidth }))
   expect(bounds.scroll).toBeLessThanOrEqual(bounds.width + 1)
   if (process.env.ADD_VISUAL_QA === '1') await custody.screenshot({ path: testInfo.outputPath('custody-panel.png') })
-  await page.getByRole('button', { name: 'Close', exact: true }).click()
+  await panel.getByRole('button', { name: phone ? 'Back' : 'Close', exact: true }).click()
 
   const primaryNav = page.getByRole('navigation', { name: 'Primary navigation' })
   await primaryNav.getByRole('button', { name: 'Users', exact: true }).click()

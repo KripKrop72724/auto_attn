@@ -75,6 +75,9 @@ describe('device header and frame', () => {
     const title = problemWords({ code: 'ESP_DURABILITY_FAULT' }).title
     expect(within(dialog).getByText(new RegExp(`^${title} since `))).toBeTruthy()
     expect(within(dialog).getByLabelText('Status: Needs attention')).toBeTruthy()
+    expect((await within(dialog).findAllByRole('heading', { name: title })).length).toBeGreaterThan(0)
+    expect(within(dialog).getByText(/^What to do: /)).toBeTruthy()
+    expectPlainText(dialog)
   })
 
   it('treats a machine that is not responding as Offline, like /status (D-1)', async () => {
@@ -153,6 +156,7 @@ describe('Summary', () => {
     expect(within(box).getByText('2.1 seconds')).toBeTruthy()
     expect(within(box).getByText('New check-ins keep arriving while older records are checked. The full history is in Recover attendance.')).toBeTruthy()
     expect(screen.getAllByText('Hikvision').length).toBeGreaterThan(0)
+    expectPlainText(screen.getByRole('dialog'))
   })
 
   it('points a different machine at Advanced tools', async () => {

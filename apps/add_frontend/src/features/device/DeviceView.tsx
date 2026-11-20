@@ -163,14 +163,18 @@ export function DeviceView({ seed, revision, custodyRevision = 0, onClose, onMan
     setUrl({ tab: next, ...(extra.advanced ? { advanced: true } : {}) })
   }
 
-  const body = (
+  const tabsNode = (
     <>
       <div className={`dv-tabs${phone ? ' is-phone' : ''}`}>
         <Tabs tabs={tabs} value={tab} onChange={changeTab} label={DEVICE_FRAME.sections} idPrefix={ID_PREFIX} />
         {needsAction.length > 0 && <span className="sr-only">{PROBLEMS_WORDS.newCount(needsAction.length)}</span>}
       </div>
+    </>
+  )
+  const panelNode = (
+    <>
       <TabPanel idPrefix={ID_PREFIX} id={tab} className="dv-tabpanel">
-        <div className="device-tab-content" key={tab}>
+        <div className="dv-tab-content" key={tab}>
           {tab === 'summary' && <SummaryTab device={device} detailQuery={detailQuery} onOpenTab={openTab} onInventoryChanged={onInventoryChanged} />}
           {tab === 'activity' && (
             <Suspense fallback={<Skeleton variant="row" count={6} label="Loading activity" />}>
@@ -196,9 +200,8 @@ export function DeviceView({ seed, revision, custodyRevision = 0, onClose, onMan
     </>
   )
 
-  return (
-    <DeviceFrame phone={phone} titleId={titleId} descriptionId={descriptionId} onClose={onClose} initialFocus={closeRef} scrollRef={scrollRef}>
-      <DeviceHeader
+  const header = (
+    <DeviceHeader
         ref={closeRef}
         titleId={titleId}
         descriptionId={descriptionId}
@@ -216,7 +219,12 @@ export function DeviceView({ seed, revision, custodyRevision = 0, onClose, onMan
         menu={phone ? menu : undefined}
         announcement={announcement}
       />
-      {phone ? body : <div className="dv-panel-body" ref={scrollRef}>{body}</div>}
+  )
+
+  return (
+    <DeviceFrame phone={phone} titleId={titleId} descriptionId={descriptionId} onClose={onClose} initialFocus={closeRef} scrollRef={scrollRef}>
+      {phone ? <div className="dv-sticky">{header}{tabsNode}</div> : header}
+      {phone ? panelNode : <div className="dv-panel-body" ref={scrollRef}>{tabsNode}{panelNode}</div>}
     </DeviceFrame>
   )
 }
