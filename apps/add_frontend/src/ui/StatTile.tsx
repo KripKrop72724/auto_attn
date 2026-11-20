@@ -16,10 +16,12 @@ export type StatTileProps = {
   href?: string
   onClick?: (event: MouseEvent<HTMLElement>) => void
   loading?: boolean
+  /** A button tile that filters a list: true while its filter is on (aria-pressed). */
+  pressed?: boolean
   className?: string
 }
 
-export function StatTile({ label, value, subtitle, tone = 'neutral', icon, href, onClick, loading = false, className }: StatTileProps) {
+export function StatTile({ label, value, subtitle, tone = 'neutral', icon, href, onClick, loading = false, pressed, className }: StatTileProps) {
   const shown = value === null || value === undefined ? '–' : typeof value === 'number' ? formatCount(value) : value
   const previous = useRef(shown)
   const [changed, setChanged] = useState(false)
@@ -31,7 +33,7 @@ export function StatTile({ label, value, subtitle, tone = 'neutral', icon, href,
     return () => window.clearTimeout(timer)
   }, [loading, shown])
 
-  const classes = cx('ui-stat-tile', `tone-${tone}`, (href || onClick) && 'is-link', changed && 'is-changed', loading && 'is-loading', className)
+  const classes = cx('ui-stat-tile', `tone-${tone}`, (href || onClick) && 'is-link', pressed && 'is-pressed', changed && 'is-changed', loading && 'is-loading', className)
   const body = (
     <>
       <span className="ui-stat-label">{icon && <Icon name={icon} size="sm" />}<span>{label}</span></span>
@@ -44,6 +46,6 @@ export function StatTile({ label, value, subtitle, tone = 'neutral', icon, href,
     </>
   )
   if (href) return <a className={classes} href={href} onClick={onClick} data-tone={tone}>{body}</a>
-  if (onClick) return <button type="button" className={classes} onClick={onClick} data-tone={tone}>{body}</button>
+  if (onClick) return <button type="button" className={classes} onClick={onClick} data-tone={tone} aria-pressed={pressed}>{body}</button>
   return <div className={classes} data-tone={tone}>{body}</div>
 }

@@ -9,7 +9,7 @@ import { flag, integer, oneOf, pktDate, SENSITIVE_DIGITS, TYPING_DEBOUNCE_MS, us
 import type { DivisionChoice } from '../../lib/prefs'
 import type { DeliveryGroup } from '../../words/attendance'
 import { GROUP_ORDER, PHONE_FILTERS, type PhoneFilter } from './attendanceWords'
-import { pktPresetRange, type WhenPreset } from './pktDates'
+import { pktPresetRange, type WhenPreset } from '../../lib/pktDates'
 
 export const PAGE_SIZE = 100
 export const MAX_ROWS = 500

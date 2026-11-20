@@ -1,7 +1,7 @@
 // Pakistan-time date windows for the Attendance filters (ATT-6). Pakistan has
 // no daylight saving, so a Pakistan day starts at 19:00 UTC the day before,
 // whatever the browser's own time zone is.
-import { day, pakistanDay } from '../../lib/time'
+import { day, pakistanDay } from './time'
 
 export type WhenPreset = 'today' | 'yesterday' | '7d' | 'custom'
 

@@ -23,7 +23,7 @@ import { AttendanceSheet } from './attendance/AttendanceSheet'
 import { AttendanceToday, updatedLine } from './attendance/AttendanceToday'
 import type { HistoryKind } from './attendance/AttendanceHistory'
 import { checkins, rowGroup } from './attendance/attendanceWords'
-import { msUntilNextPktMidnight, pktPresetRange, todayKey } from './attendance/pktDates'
+import { msUntilNextPktMidnight, pktPresetRange, todayKey } from '../lib/pktDates'
 import { useAttendanceSummary } from './attendance/useAttendanceSummary'
 import {
   CLEARED, listParams, MAX_ROWS, narrowed, summaryParams, useAttendanceFilters, type FilterValues,

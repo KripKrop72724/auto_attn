@@ -94,6 +94,7 @@ export function AttendanceToday({ state, division, chosen, onChoose, rangeLabel,
       subtitle={subtitle}
       tone={tone}
       className={group && isChosen(group) ? 'attendance-tile is-selected' : 'attendance-tile'}
+      pressed={group ? isChosen(group) : undefined}
       onClick={() => (group ? toggle(group) : onChoose(null))}
     />
   )
