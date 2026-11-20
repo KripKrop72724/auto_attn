@@ -21,11 +21,27 @@ Attendance, alerts, users, commands, reconciliation, identity, logs, firmware, b
 
 Fleet is the operational home and authoritative inventory. Status includes text, icon, and border pattern. Last-contact time and connectivity reasons remain visible in the device inspector. A pending command can be cancelled through the real command-cancellation endpoint before execution.
 
-### Users
+### People (was Users)
 
-Users are always scoped to one selected terminal. Directory results use cursor pagination; **Select eligible users in this view** applies only to loaded eligible rows, and the summary beside it states the exact bulk-action scope. Opening `/users` clears a previous terminal selection, while `/users/{connector}` restores explicit context.
+`/people` lists every device at once, grouped Life then Health by place name, with people counts and "need fixing"
+counts from `GET /api/v2/people/summary` (hidden, never shown as 0, when that request fails). Spare devices are hidden
+until **Show spare devices**. `/people/{connector}` shows the people on one machine: one summary line, the tabs
+People · Same CNIC · Old check-ins, a table on a computer and one card per person on a phone, and a person sheet with
+fix steps. Filters live in the address (`q`, `show`, `problem`, `role`, `shift`, `changing`, `sort`, `tab`); a
+13-digit CNIC search is sent as the `cnic` API parameter and never enters the address. Changing device keeps the
+quick view and clears the search and ticks. `?user_id={Employee ID}` opens Edit for that person; `?q={Employee ID}`
+opens the person sheet.
 
-The preferred enrollment path is a ten-minute administrator lease. Permanent elevation requires a password, an audited reason, and the exact phrase `ELEVATE {user_id} ON {device_id}`. CNIC remains write-only and masked in every response.
+Every change to a machine is followed in **Changes on this machine** (Waiting → Sent to machine → Confirmed, or
+Failed with Try again); several can run at once. Safeguards are unchanged: the password on every add, edit,
+temporary admin access and machine confirmation; the typed Employee ID or name to remove one person; a reason of 10+
+letters, the server's exact phrase `DELETE {n} USERS FROM {device_id}` and the password to remove several (the
+selection is re-checked before the dialog opens and again before sending); typed `ELEVATE {user_id} ON {device_id}`
+for a permanent machine admin; typed `SAME EMPLOYEE` / `REVOKE RESOLUTION` for Same CNIC; the typed HR-details phrase;
+typed `REVOKE ACCESS` to end temporary admin access; the password to stop a removal. Machine admins, people with a
+change being sent and damaged entries (`looks_damaged`) can't be ticked or removed. The preferred way to add
+fingerprints is temporary admin access (10 minutes, ends by itself). CNIC remains write-only and masked in every
+response.
 
 ### Attendance
 
