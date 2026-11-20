@@ -39,9 +39,13 @@ Preflight belongs strictly to the currently selected connector and is cleared be
 
 Campaign creation requires `POST /api/v1/firmware/campaigns/preflight`. The response lists exact eligible and excluded devices, exclusion reasons, offline count, expiration, and a signed five-minute scope token. Campaign creation sends that token plus a fresh idempotency key; changed or expired scope must be previewed again. Releases can be revoked from the protected release inventory with a reason and password.
 
-### Alerts
+### Problems (was Alerts)
 
-Alerts use the global cursor-paginated `GET /api/v1/alerts` queue. Filters are server-authoritative, severity ordering is explicit, safe device identity is embedded, and a request failure never renders as “No alerts.” Device names link to the exact Fleet inspector; source exceptions link to their immutable evidence view.
+`/problems` (old `/alerts` links redirect) reads `GET /api/v1/alerts`. Tabs **New** (`queue=NEEDS_ACTION`, the same number as the menu badge), **Seen** (`queue=SEEN`, open and marked as seen) and **Fixed** (`queue=RESOLVED`, `order=fixed_newest`, last 7 days by default, 50 per page with Show more). Tab and chip counts come from the response's `counts`; with an older backend the page falls back to `queue_totals`. Problems are grouped by device (friendly name and Life / Health tag), worst first; "Newest first" and "Oldest first" show a flat list.
+
+Filters live in the link: `tab`, `serious` (urgent, important, low = all five backend levels), `type`, `device`, `when` / `from` / `to` (Pakistan days), `q`, `att` (affects attendance), `sort`, `old` (the old "seen" marks from before 10 Oct, `queue=LEGACY_SEEN`, hidden behind one note), plus the frame's `division`. Live changes (alert and device events) re-read the first page at most every 10 s and merge it by id, so pages from Show more stay and the list does not jump. A failed background refresh shows a thin "Couldn't update" bar, never a toast.
+
+Each card shows plain words (`plain_title`, `plain_detail`, `next_step` from the backend, else `fe/words/problems.ts`), a router link to the page that fixes it, and the code, system message and allow-listed details only under Technical details. **Mark as seen** is one click (optionally with a note). **Mark as fixed** appears only when the row's `operator.resolvable` is true and keeps the reason (10 letters) and the password, one request key per dialog. **Check them** on a set-aside check-ins problem opens the set-aside sheet (`/api/v1/attendance-quarantine`; showing the original record and marking it as checked keep reason and password). **Clean up old problems** is in the ⋯ menu.
 
 ## Motion and accessibility
 
