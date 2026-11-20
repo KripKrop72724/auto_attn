@@ -84,7 +84,7 @@ test('mark as fixed keeps the reason and the password; set-aside check-ins open 
   }
   const dialog = page.getByRole('dialog', { name: 'Mark this problem as fixed' })
   await expect(dialog.getByLabel('What did you do?')).toBeVisible()
-  await expect(dialog.getByLabel('Enter your password to confirm')).toBeVisible()
+  await expect(dialog.getByLabel('Your password')).toBeVisible()
   await expect(dialog.getByRole('button', { name: 'Mark as fixed' })).toBeDisabled()
   await noSidewaysScroll(page)
   await dialog.getByRole('button', { name: 'Cancel' }).click()

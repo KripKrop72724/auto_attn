@@ -224,11 +224,12 @@
   .app-brand span, .sidebar-footer { display: none; }
   .app-sidebar nav { gap: 8px; padding: 8px 6px; }
   .nav-heading { height: 1px; margin: 4px 8px; padding: 0; overflow: hidden; background: var(--border); color: transparent; }
-  .nav-link { min-height: 56px; flex-direction: column; justify-content: center; gap: 2px; padding: 6px 2px; font-size: 11px; line-height: 1.2; text-align: center; }
+  .nav-link { min-height: 56px; flex-direction: column; justify-content: center; gap: 2px; padding: 6px 2px; font-size: 12px; line-height: 1.2; text-align: center; }
   .nav-link svg { width: 22px; height: 22px; }
   .nav-label { overflow-wrap: anywhere; }
   .nav-link .nav-count { position: absolute; top: 4px; right: 10px; min-width: 18px; height: 18px; margin: 0; padding: 0 4px; font-size: 11px; box-shadow: 0 0 0 2px var(--surface); }
-  .nav-link .nav-off { position: absolute; top: 2px; right: 2px; margin: 0; padding: 0 3px; font-size: 10px; }
+  /* The grey "Switched off" tag sits under the label, never over the icon. */
+  .nav-link .nav-off { position: static; margin: 2px 0 0; padding: 0 3px; font-size: 12px; }
 }
 
 /* Phones (≤760 px): opaque header, Division row, five-cell bottom bar. -------- */
@@ -286,7 +287,8 @@
   .operator-area { gap: 6px; }
   .live-sync { min-height: 44px; padding: 0 12px; border-color: transparent; background: transparent; }
   .live-sync.connection-stale { border-color: var(--warning-border); }
-  .header-division-chip { min-height: 32px; padding: 0 10px; border: 1px solid var(--accent-border); border-radius: var(--radius-full); color: var(--accent); background: var(--accent-subtle); font: inherit; font-size: 12px; font-weight: 600; }
+  .header-division-chip { min-height: 32px; padding: 0 10px; border: 1px solid var(--life-border); border-radius: var(--radius-full); color: var(--life-fg); background: var(--life-bg); font: inherit; font-size: 12px; font-weight: 600; }
+  .header-division-chip.is-health { border-color: var(--health-border); color: var(--health-fg); background: var(--health-bg); }
   .phone-division-row { margin: -8px 0 16px; }
   .live-banner { padding: 6px 16px; font-size: 12px; }
   .page-content { padding: 20px 16px calc(32px + var(--app-bottom-nav-height) + env(safe-area-inset-bottom)); }

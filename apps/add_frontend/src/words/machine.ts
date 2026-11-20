@@ -46,7 +46,7 @@ export const CONNECTION_REASONS: Record<string, string> = {
   'ZKT session ended before the stability window': 'The connection dropped soon after connecting.',
   'established ZKT session disconnected': 'The connection to the machine dropped.',
   'authenticated discovery did not find the assigned ZKT': "Couldn't find the machine on the network.",
-  'connector heartbeat': 'Status update.',
+  'connector heartbeat': 'Status report.',
 }
 
 // A7. Doing-now line (Device.current_activity).

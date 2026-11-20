@@ -13,7 +13,7 @@
 .setup-history-row { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: var(--space-3); align-items: center; width: 100%; min-height: var(--touch-min); padding: var(--space-3) var(--space-2); border: 0; border-top: 1px solid var(--border); background: none; color: var(--text); font: inherit; text-align: left; cursor: pointer; }
 .setup-history-list li:first-child .setup-history-row { border-top: 0; }
 .setup-history-row:hover { background: var(--surface-hover); }
-.setup-history-row:focus-visible { outline: none; box-shadow: var(--focus-ring); border-radius: var(--radius-sm); }
+.setup-history-row:focus-visible { outline: 2px solid var(--brand); outline-offset: -2px; box-shadow: var(--focus-ring); border-radius: var(--radius-sm); }
 .setup-history-place { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); min-width: 0; overflow-wrap: anywhere; }
 .setup-history-meta { color: var(--text-secondary); font-size: var(--text-sm); }
 .setup-history-state { display: inline-flex; align-items: center; gap: var(--space-2); }

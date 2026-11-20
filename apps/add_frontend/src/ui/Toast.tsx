@@ -89,9 +89,11 @@ export function useToast(): ToastApi {
 }
 
 export function ToastViewport({ items, onDismiss }: { items: ToastItem[]; onDismiss: (id: number) => void }) {
-  if (!items.length) return null
+  // The stack stays mounted (empty when there is nothing to say) and is itself
+  // a polite live region, so a new message is read out: a live region inserted
+  // together with its text is often missed by screen readers.
   return createPortal(
-    <div className="ui-toast-stack">
+    <div className="ui-toast-stack" aria-live="polite" aria-relevant="additions text">
       {items.map((item) => <ToastMessage key={item.id} item={item} onDismiss={onDismiss} />)}
     </div>,
     overlayRoot(),

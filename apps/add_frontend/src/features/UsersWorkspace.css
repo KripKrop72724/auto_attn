@@ -97,8 +97,12 @@
 .bulk-selection-bar > div { display: flex; align-items: center; gap: 10px; }
 .people-workspace.has-bulk-bar { padding-bottom: 96px; }
 
+/* The full sidebar stays up to 1024 px; the rail is used from 761 to 1023 px. */
 @media (max-width: 1199px) {
-  .bulk-selection-bar { left: calc(var(--app-sidebar-compact-width) + var(--app-gutter)); right: var(--app-gutter); }
+  .bulk-selection-bar { left: calc(var(--app-sidebar-width) + var(--app-gutter)); right: var(--app-gutter); }
+}
+@media (min-width: 761px) and (max-width: 1023px) {
+  .bulk-selection-bar { left: calc(var(--app-rail-width) + var(--app-gutter)); }
 }
 @media (max-width: 760px) {
   .users-section-tabs { top: var(--app-header-height); }
@@ -121,4 +125,8 @@
 body:has(.people-workspace.has-bulk-bar) .ui-toast-stack { bottom: calc(var(--space-5) + 84px); }
 @media (max-width: 760px) {
   body:has(.people-workspace.has-bulk-bar) .ui-toast-stack { bottom: calc(132px + env(safe-area-inset-bottom)); }
+}
+
+@media (pointer: coarse), (max-width: 760px) {
+  .user-more-action { width: var(--touch-min); min-height: var(--touch-min); }
 }

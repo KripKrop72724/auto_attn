@@ -52,7 +52,7 @@ describe('describeLog (Appendix B, simpler view)', () => {
       .toMatchObject({ sentence: 'Other activity from the link box.', kind: 'routine', group: 'hr_system', unknown: true })
     expect(describeLog({ code: 'NEW_FIRMWARE_CODE', level: 'CRITICAL', subsystem: 'storage' }))
       .toMatchObject({ sentence: 'The link box reported a serious problem.', kind: 'problem', group: 'memory', next: 'Tell IT (details below).' })
-    expect(describeLog({ code: 'ZKT_DIAG_SOMETHING', level: 'INFO' }).sentence).toBe('Engineer test finished; no settings were changed.')
+    expect(describeLog({ code: 'ZKT_DIAG_SOMETHING', level: 'INFO' }).sentence).toBe('Test by IT finished; no settings were changed.')
   })
 })
 

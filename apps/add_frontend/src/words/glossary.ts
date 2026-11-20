@@ -35,7 +35,7 @@ export const GLOSSARY: ReadonlyArray<{ today: string; plain: string }> = [
   { today: 'boot, reboot', plain: 'restart (of the link box)' },
   { today: 'heartbeat, telemetry, last contact', plain: 'status report; last heard from {time}' },
   { today: 'severity CRITICAL / HIGH / WARNING, MEDIUM, INFO', plain: 'Urgent / Important / Low' },
-  { today: 'step-up, administrator password confirmation', plain: 'Enter your password to confirm' },
+  { today: 'step-up, administrator password confirmation', plain: 'Your password (helper: To confirm it’s you.)' },
   { today: 'contact person', plain: 'IT (D-26)' },
   { today: 'serial, MAC, IP, boot id, digest, hash, cursor, ordinal, epoch', plain: '(not translated) Technical details only' },
 ]
@@ -145,6 +145,15 @@ export const BUSY = {
   starting: 'Starting…',
   stopping: 'Stopping…',
   confirming: 'Confirming…',
+} as const
+
+/** The one text for every reason and password box (glossary). Only the words; each box keeps its own checks. */
+export const STEP_UP = {
+  why: 'Why?',
+  whyHelp: (min = 10) => `Saved with your name. At least ${min} letters.`,
+  whyCount: (count: number, min = 10) => `${Math.min(count, min)} of ${min}`,
+  password: 'Your password',
+  passwordHelp: "To confirm it's you.",
 } as const
 
 export type PlainRuleName =

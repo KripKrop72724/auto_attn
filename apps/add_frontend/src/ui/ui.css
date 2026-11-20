@@ -7,9 +7,9 @@
 
 /* Buttons ---------------------------------------------------------------- */
 .ui-button.is-busy { cursor: progress; }
-.ui-button.is-busy:disabled { color: var(--text-secondary); }
-.ui-button.primary.is-busy:disabled, .ui-button.destructive.is-busy:disabled { color: var(--on-solid); border-color: var(--accent); background: var(--accent); opacity: .85; }
-.ui-button.destructive.is-busy:disabled { border-color: var(--critical); background: var(--critical); }
+.ui-button.is-busy:is(:disabled, [aria-disabled="true"]) { color: var(--text-secondary); }
+.ui-button.primary.is-busy:is(:disabled, [aria-disabled="true"]), .ui-button.destructive.is-busy:is(:disabled, [aria-disabled="true"]) { color: var(--on-solid); border-color: var(--accent); background: var(--accent); opacity: .85; }
+.ui-button.destructive.is-busy:is(:disabled, [aria-disabled="true"]) { border-color: var(--critical); background: var(--critical); }
 .ui-button-ghost { color: var(--text); border-color: transparent; background: transparent; }
 .ui-button-ghost:hover:not(:disabled) { background: var(--surface-hover); }
 .ui-button-link { min-height: auto; text-decoration: underline; text-underline-offset: 2px; }

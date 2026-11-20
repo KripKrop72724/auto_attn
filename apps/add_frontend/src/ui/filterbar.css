@@ -28,7 +28,10 @@
 
 
 @media (max-width: 760px) {
-  .ui-filter-search { max-width: none; flex-basis: 100%; }
+  /* Search and Filters share one row; sort lives in the Filters sheet. */
+  .ui-filter-search { max-width: none; flex: 1 1 0; min-width: 0; }
+  .ui-filter-sheet-sort { margin-bottom: var(--space-4); }
+  .ui-filter-sheet-sort .ui-filter-sort, .ui-filter-sheet-sort select { width: 100%; }
   .ui-filter-chips { flex-wrap: nowrap; overflow-x: auto; scrollbar-width: none; }
   .ui-filter-chips::-webkit-scrollbar { display: none; }
   .ui-filter-chip { flex: none; }

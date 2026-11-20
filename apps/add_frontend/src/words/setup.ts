@@ -17,8 +17,8 @@ export const SETUP_SWITCHED_OFF = {
 
 /** Result card error codes. */
 export const SETUP_ERRORS: Record<string, string> = {
-  PACKAGE_PREPARATION_FAILED: "The dashboard couldn't prepare the setup. Nothing was changed on the box.",
-  ONBOARDING_IDENTITY_MISMATCH: 'The box came online with different place details than this setup. Ask IT to check it.',
+  PACKAGE_PREPARATION_FAILED: "The dashboard couldn't prepare the setup. Nothing was changed on the link box.",
+  ONBOARDING_IDENTITY_MISMATCH: 'The link box came online with different place details than this setup. Ask IT to check it.',
   FIRMWARE_FAMILY_MISMATCH: "The software doesn't match the machine brand you chose. Start again and pick the right brand.",
 }
 
@@ -33,20 +33,20 @@ export const SETUP_MESSAGES: Array<{ match: string | RegExp; sentence: string }>
   { match: 'Idempotency key belongs to another session.', sentence: 'Something went wrong starting the setup. Refresh and try again.' },
   { match: /^You already have active session /, sentence: 'You already have a setup running. Finish or cancel it first.' },
   { match: /^Companion already has active session /, sentence: 'This setup app is busy with another setup.' },
-  { match: 'No approved factory bundle is available.', sentence: 'No software for new boxes is available yet. Ask IT.' },
+  { match: 'No approved factory bundle is available.', sentence: 'No software for new link boxes is available yet. Ask IT.' },
   { match: 'This session belongs to another operator.', sentence: 'Someone else started this setup.' },
-  { match: 'Device inspection must finish first.', sentence: 'Wait until the box check finishes.' },
-  { match: 'Detected ESP identity is missing.', sentence: "The box wasn't read properly. Unplug it, plug it back in and start again." },
-  { match: 'Selected factory bundle is unavailable.', sentence: 'The software for new boxes was withdrawn. Start again.' },
-  { match: 'Selected factory bundle was revoked.', sentence: 'The software for new boxes was withdrawn. Start again.' },
+  { match: 'Device inspection must finish first.', sentence: 'Wait until the link box check finishes.' },
+  { match: 'Detected ESP identity is missing.', sentence: "The link box wasn't read properly. Unplug it, plug it back in and start again." },
+  { match: 'Selected factory bundle is unavailable.', sentence: 'The software for new link boxes was withdrawn. Start again.' },
+  { match: 'Selected factory bundle was revoked.', sentence: 'The software for new link boxes was withdrawn. Start again.' },
   { match: 'FIRMWARE_FAMILY_MISMATCH', sentence: SETUP_ERRORS.FIRMWARE_FAMILY_MISMATCH },
   { match: /^Device ID .+ is already active in zone /, sentence: 'This device number is already used at that place. Choose another number.' },
   { match: 'Session is not awaiting authorization.', sentence: 'This step is already done. Refresh the page.' },
-  { match: 'Confirm the physical label and type the exact detected MAC.', sentence: 'Tick the label box and type the box ID exactly as printed.' },
+  { match: 'Confirm the physical label and type the exact detected MAC.', sentence: 'Tick the label box and type the link box ID exactly as printed.' },
   { match: 'Protected configuration expired; review the configuration again.', sentence: 'The details timed out. Please enter the passwords again.' },
-  { match: 'Protected package preparation failed; no device write was started.', sentence: "The dashboard couldn't prepare the setup. Nothing was changed on the box. Try again." },
+  { match: 'Protected package preparation failed; no device write was started.', sentence: "The dashboard couldn't prepare the setup. Nothing was changed on the link box. Try again." },
   { match: 'Package is ready, but the companion disconnected. Reconnect to resume.', sentence: 'The setup app closed. Open it again on this computer; setup will continue.' },
-  { match: 'Cancellation is unavailable after an irreversible operation starts.', sentence: "It's too late to cancel: the box is being set up. Please wait." },
+  { match: 'Cancellation is unavailable after an irreversible operation starts.', sentence: "It's too late to cancel: the link box is being set up. Please wait." },
   { match: 'Session is not waiting for terminal confirmation.', sentence: 'The machine is already confirmed.' },
   { match: 'Observed terminal serial changed; refresh the authenticated terminal evidence.', sentence: 'The machine details changed. Refresh and check again.' },
   { match: 'That terminal serial is already pinned.', sentence: 'This machine is already linked to another link box.' },
@@ -79,7 +79,7 @@ export const SETUP_PAGE = {
   failed: "Couldn't load this page.",
   noBrowserSetup: "Setting up from this browser isn't available yet. Use the State Life Device Installer above.",
   phoneNote: 'Open this page on a Windows computer or a Mac with an Apple chip to download the app.',
-  phoneWizard: 'Open this page on a Windows computer or a Mac with an Apple chip to set up a box. Here you can still see past setups.',
+  phoneWizard: 'Open this page on a Windows computer or a Mac with an Apple chip to set up a link box. Here you can still see past setups.',
 } as const
 
 /** The State Life Device Installer card (IA). */
@@ -101,7 +101,7 @@ export const INSTALLER_CARD = {
 export const PAST_SETUPS = {
   title: 'Past setups',
   subtitle: (count: number) => `${count.toLocaleString('en-PK')} setup${count === 1 ? '' : 's'}. Passwords are never saved.`,
-  search: 'Place, device number or box ID',
+  search: 'Place, device number or link box ID',
   mine: 'Mine',
   everyone: 'Everyone',
   showOlder: 'Show older setups',
@@ -116,9 +116,9 @@ export const PAST_SETUPS = {
 /** Where a setup ended, in plain words: heading + sentence (3.3 endings). */
 export const SETUP_ENDINGS: Record<string, { heading: string; sentence: string }> = {
   VERIFIED_ONLINE: { heading: 'Device is working', sentence: 'The link box is online, connected to its machine and sending attendance.' },
-  SITE_VALIDATION_PENDING: { heading: 'Ready: will finish at its office', sentence: 'The box is ready. It finishes by itself once it is plugged in at its office and on the Wi-Fi.' },
-  CANCELLED: { heading: 'Cancelled', sentence: 'You cancelled this setup. Nothing was changed on the box.' },
+  SITE_VALIDATION_PENDING: { heading: 'Ready: will finish at its office', sentence: 'The link box is ready. It finishes by itself once it is plugged in at its office and on the Wi-Fi.' },
+  CANCELLED: { heading: 'Cancelled', sentence: 'You cancelled this setup. Nothing was changed on the link box.' },
   EXPIRED: { heading: 'Timed out', sentence: 'This setup was left too long and stopped.' },
   FAILED: { heading: "Didn't finish", sentence: "The setup didn't finish." },
-  RECOVERY_REQUIRED: { heading: "Can't set up this box", sentence: "This box was set up somewhere else, so it can't be set up here. Give it to IT." },
+  RECOVERY_REQUIRED: { heading: "Can't set up this link box", sentence: "This link box was set up somewhere else, so it can't be set up here. Give it to IT." },
 }

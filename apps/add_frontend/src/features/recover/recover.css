@@ -59,7 +59,8 @@
 .recover-search input { width: 100%; min-height: var(--touch-min); }
 .recover-picker-list { display: grid; gap: 2px; }
 .recover-picker-list > button { width: 100%; min-height: 56px; display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: var(--space-3); padding: var(--space-2) var(--space-3); border: 0; border-radius: var(--radius-sm); color: var(--text); background: transparent; text-align: left; }
-.recover-picker-list > button:hover, .recover-picker-list > button:focus-visible { outline: none; background: var(--surface-hover); }
+.recover-picker-list > button:hover, .recover-picker-list > button:focus-visible { background: var(--surface-hover); }
+.recover-picker-list > button:focus-visible { outline: 2px solid var(--brand); outline-offset: -2px; }
 .recover-picker-list > button:focus-visible { box-shadow: inset 0 0 0 2px var(--brand); }
 .recover-picker-list > button[aria-selected="true"] { background: var(--accent-subtle); }
 .recover-picker-name, .recover-picker-status { display: grid; gap: 2px; min-width: 0; }
@@ -131,7 +132,7 @@ li[data-outcome="CREATED"] .recover-bulk-result { color: var(--tone-working-fg);
 .recover-stage-dot { width: 18px; height: 18px; flex: none; display: inline-grid; place-items: center; border: 2px solid var(--border-strong); border-radius: var(--radius-full); font-size: 11px; line-height: 1; }
 .recover-stage-label { overflow-wrap: anywhere; }
 .recover-stage-strip li[data-mark="done"] { color: var(--text-secondary); }
-.recover-stage-strip li[data-mark="done"] .recover-stage-dot { border-color: var(--tone-working-solid); color: var(--surface); background: var(--tone-working-solid); }
+.recover-stage-strip li[data-mark="done"] .recover-stage-dot { border-color: var(--positive); color: var(--surface); background: var(--positive); }
 .recover-stage-strip li[data-mark="active"] { color: var(--text); font-weight: 500; }
 .recover-stage-strip li[data-mark="active"] .recover-stage-dot { border-color: var(--brand); background: radial-gradient(circle, var(--brand) 45%, transparent 50%); }
 .recover-stage-strip li[data-mark="failed"] { color: var(--tone-offline-fg); font-weight: 500; }
@@ -168,7 +169,7 @@ li[data-outcome="CREATED"] .recover-bulk-result { color: var(--tone-working-fg);
 .recover-scope-chip { display: grid; gap: var(--space-2); }
 .recover-chip-pill { display: inline-flex; align-items: center; gap: var(--space-2); justify-self: start; max-width: 100%; padding: 2px 4px 2px var(--space-3); border: 1px solid var(--accent-border); border-radius: var(--radius-full); color: var(--tone-info-fg); background: var(--accent-subtle); font-size: var(--text-sm); overflow-wrap: anywhere; }
 .recover-chip-x { width: 32px; height: 32px; flex: none; border: 0; border-radius: var(--radius-full); color: inherit; background: transparent; cursor: pointer; }
-.recover-chip-x:focus-visible { box-shadow: var(--focus-ring); outline: none; }
+.recover-chip-x:focus-visible { box-shadow: var(--focus-ring); outline: 2px solid var(--brand); outline-offset: 2px; }
 .recover-scope-state p { margin: var(--space-1) 0 0; color: var(--text-secondary); }
 .recover-problem-chips { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-1) var(--space-2); }
 .recover-toggle-chip { min-height: 32px; padding: 0 var(--space-3); border: 1px solid var(--border-input); border-radius: var(--radius-full); color: var(--text-secondary); background: var(--surface); font-size: var(--text-sm); cursor: pointer; }

@@ -294,7 +294,7 @@ describe('Problems page', () => {
     const dialog = await screen.findByRole('dialog', { name: 'Mark this problem as fixed' })
     const submit = within(dialog).getByRole('button', { name: 'Mark as fixed' }) as HTMLButtonElement
     const reason = within(dialog).getByLabelText('What did you do?')
-    const password = within(dialog).getByLabelText('Enter your password to confirm') as HTMLInputElement
+    const password = within(dialog).getByLabelText('Your password') as HTMLInputElement
     expect(submit.disabled).toBe(true)
     fireEvent.change(reason, { target: { value: 'Too short' } })
     fireEvent.change(password, { target: { value: 'local-step-up' } })

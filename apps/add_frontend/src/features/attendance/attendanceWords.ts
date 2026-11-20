@@ -242,10 +242,27 @@ const LOCK_WORDS: Record<string, string> = {
 export const explainReleaseLock = (code: string | null | undefined) =>
   (code && LOCK_WORDS[code]) || "Can't be sent (see code)"
 
+/** Old release tasks (Attendance › History, read only): task states. */
+export const OLD_RELEASE_STATUS: Record<string, { label: string; tone: 'working' | 'attention' | 'offline' | 'neutral' | 'info' }> = {
+  PREPARING_SOURCE: { label: 'Getting ready', tone: 'neutral' },
+  AWAITING_APPROVAL: { label: 'Waiting for approval', tone: 'attention' },
+  QUEUED: { label: 'Waiting', tone: 'neutral' },
+  RUNNING: { label: 'Working', tone: 'neutral' },
+  WAITING_ORACLE: { label: 'Waiting for the HR system', tone: 'neutral' },
+  WAITING_DOWNSTREAM: { label: 'Waiting for the HR system', tone: 'neutral' },
+  PAUSED: { label: 'Paused', tone: 'attention' },
+  NEEDS_ATTENTION: { label: 'Waiting for you', tone: 'attention' },
+  COMPLETED: { label: 'Done', tone: 'working' },
+  COMPLETED_WITH_ATTENTION: { label: 'Done — some waiting for you', tone: 'attention' },
+  CANCELLED: { label: 'Stopped', tone: 'neutral' },
+}
+export const oldReleaseStatus = (code: string | null | undefined) =>
+  (code && OLD_RELEASE_STATUS[code]) || { label: 'In progress', tone: 'neutral' as const }
+
 // Fix tools: why some were not sent (short, read as "N check-ins {reason}") --
 
 export const SKIP_WORDS: Record<string, string> = {
-  CNIC_CHOICE_REQUIRED: 'need you to choose the CNIC',
+  CNIC_CHOICE_REQUIRED: 'are waiting for you to choose the CNIC',
   CNIC_CONFLICT: 'someone else had this Employee ID',
   PUNCH_TIME_CNIC_HELD_BY_OTHER: 'the old CNIC now belongs to someone else',
   IDENTITY_CONFLICT_UNRESOLVED: 'two people share the CNIC',

@@ -126,13 +126,13 @@ export const LOCK_REASONS: Record<string, string> = {
   QUARANTINED_ORDS_REJECTED: 'The HR system refused this check-in.',
   SOURCE_RECERTIFICATION_REQUIRED: 'The machine has new records; the dashboard reads them first.',
   LIVE_ORDS_BACKLOG_HIGH: 'New check-ins are still being sent; wait for them to finish.',
-  ...all(['RELEASE_ALREADY_IN_PROGRESS', 'TERMINAL_RELEASE_IN_PROGRESS'], 'Another release for this machine is running.'),
+  ...all(['RELEASE_ALREADY_IN_PROGRESS', 'TERMINAL_RELEASE_IN_PROGRESS'], 'Another send for this machine is running.'),
   ALREADY_RELEASED: 'Already in the HR system.',
   DUPLICATE_SERIAL_QUARANTINE: 'This machine needs an admin check before it can be used.',
   SERIAL_UNKNOWN: "The dashboard hasn't confirmed this machine yet.",
   SOURCE_RECONCILIATION_DISABLED: "Reading the machine's records is switched off for now.",
-  RELEASE_CANCELLED: 'The earlier release was cancelled.',
-  NOT_ELIGIBLE: "This check-in can't be released safely yet.",
+  RELEASE_CANCELLED: 'The earlier send was cancelled.',
+  NOT_ELIGIBLE: "This check-in can't be sent safely yet.",
 }
 
 const DICTIONARIES: Record<ReasonDomain, Record<string, string>> = {
@@ -152,7 +152,7 @@ export const REASON_FALLBACKS: Record<ReasonDomain, string> = {
   recoveryRow: 'This check-in needs a closer look before it can be sent.',
   recoveryItem: "This one couldn't be done. Details are under Technical details.",
   areaWait: 'Waiting before checking more check-ins.',
-  lock: "This check-in can't be released safely yet.",
+  lock: "This check-in can't be sent safely yet.",
 }
 
 export interface PlainReason {

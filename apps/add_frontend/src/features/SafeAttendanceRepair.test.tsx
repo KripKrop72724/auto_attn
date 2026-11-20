@@ -17,7 +17,7 @@ it('keeps previous repair history readable without start or sync controls', asyn
   const fetch = vi.fn(async (path: string) => response(path.includes('/items') ? { rows: [], next_cursor: null } : { enabled: false, rows: [check], next_cursor: null }))
   vi.stubGlobal('fetch', fetch)
   render(<SafeAttendanceRepair devices={[]} toast={toast} />)
-  await screen.findByRole('heading', { name: 'Previous repair history' })
+  await screen.findByRole('heading', { name: 'Old repair tasks (no longer used)' })
   await screen.findByRole('button', { name: /Checked/ })
   expect(screen.queryByRole('button', { name: /Start repair|Sync and check/ })).toBeNull()
   fireEvent.click(screen.getByRole('button', { name: /Checked/ }))

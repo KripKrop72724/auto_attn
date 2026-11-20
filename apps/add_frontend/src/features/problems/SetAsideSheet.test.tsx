@@ -60,7 +60,7 @@ describe('SetAsideSheet', () => {
 
   const fill = () => {
     fireEvent.change(screen.getByLabelText('What did you find?'), { target: { value: 'Record is damaged, nothing to send.' } })
-    fireEvent.change(screen.getByLabelText('Enter your password to confirm'), { target: { value: 'local-quarantine-step-up' } })
+    fireEvent.change(screen.getByLabelText('Your password'), { target: { value: 'local-quarantine-step-up' } })
   }
 
   it('lists the device’s set-aside check-ins in plain words', async () => {

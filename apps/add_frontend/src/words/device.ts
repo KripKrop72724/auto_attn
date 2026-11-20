@@ -335,7 +335,7 @@ export const ADVANCED_WORDS = {
   // Confirm a new machine
   replaceTitle: 'A different machine is connected',
   replaceText: (oldSerial: string, newSerial: string) => ({ before: 'This device was set up for machine ', old: oldSerial, middle: ' but is now connected to machine ', fresh: newSerial, after: '. Changes to people and check-ins are paused until IT confirms the new machine.' }),
-  why: 'Why? (saved with your name)',
+  why: 'Why?',
   replaceDefault: 'Machine replaced on site',
   typeToConfirm: 'Type',
   toConfirm: 'to confirm',
@@ -396,8 +396,8 @@ export const ADVANCED_WORDS = {
   cleanupText: 'Closes problems that are left over from older link box software. You see the list before anything changes.',
   cleanupButton: 'Choose problems to close',
   // Custody card
-  custodyTitle: 'Check-ins received by the dashboard (engineer view)',
-  custodyShow: 'Show the engineer view',
+  custodyTitle: 'Check-ins received by the dashboard (for IT)',
+  custodyShow: 'Show the IT view',
 } as const
 
 /** Plain words for the restart refusals (409) the backend sends today. */

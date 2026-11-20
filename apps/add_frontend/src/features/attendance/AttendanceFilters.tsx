@@ -41,7 +41,7 @@ function Popover({ buttonLabel, buttonText, count, title, children }: { buttonLa
       <span>{buttonText}</span>{count ? <span className="ui-filter-more-count">{count}</span> : null}<Icon name="chevronDown" size="sm" />
     </button>
     {open && (
-      <AnchoredLayer anchorRef={ref} mobileSheet preferredWidth={340} onDismiss={(reason) => { close(); if (reason === 'escape') ref.current?.focus() }}>
+      <AnchoredLayer anchorRef={ref} mobileSheet manageFocus preferredWidth={340} onDismiss={(reason) => { close(); if (reason === 'escape') ref.current?.focus() }}>
         <div className="ui-filter-popover attendance-popover" role="dialog" aria-label={title}>
           <header className="attendance-popover-head"><h3>{title}</h3><button type="button" className="icon-button" aria-label="Close" onClick={() => { close(); ref.current?.focus() }}><Icon name="x" /></button></header>
           {children(close)}

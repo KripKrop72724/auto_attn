@@ -9,6 +9,7 @@ import './recover/recover.css'
 import { api, queryString } from '../api'
 import { Button, Callout, DivisionScopeChip, EmptyState, ErrorState, FilterBar, PageHeader, Skeleton, useIsPhone, type ActiveFilter } from '../ui'
 import { idempotency } from '../lib/idempotency'
+import { plainErrorText } from '../lib/plainApiError'
 import { clock } from '../lib/time'
 import { useDivision } from '../lib/useDivision'
 import type { Toast } from '../ui/Toast'
@@ -86,7 +87,8 @@ const mergeJobWindow = (current: ReconciliationJob[], fresh: ReconciliationJob[]
 }
 
 const isAbort = (reason: unknown) => reason instanceof DOMException && reason.name === 'AbortError'
-const errorText = (error: unknown, fallback: string) => (error instanceof Error && error.message ? error.message : fallback)
+// The backend text never reaches the toast (writing rule 6).
+const errorText = (error: unknown, fallback: string) => plainErrorText(error, fallback)
 
 export function ReconciliationView({
   devices,

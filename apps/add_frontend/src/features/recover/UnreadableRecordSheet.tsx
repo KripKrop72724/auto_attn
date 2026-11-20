@@ -8,6 +8,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { api } from '../../api'
 import { Button, Callout, DivisionTag, ErrorState, Sheet, Skeleton, StatusChip, TechnicalDetails } from '../../ui'
 import { idempotency } from '../../lib/idempotency'
+import { plainErrorText } from '../../lib/plainApiError'
 import { dayTime } from '../../lib/time'
 import { EMPLOYEE_ID } from '../../words/people'
 import { RECORD_SHEET, recordExplanation, seenToast } from '../../words/recover'
@@ -94,7 +95,7 @@ export function UnreadableRecordSheet({ seed, namer, remaining, hasNext, onNext,
       await onChanged()
     } catch (error) {
       setPassword('')
-      toast.error(error instanceof Error && error.message ? error.message : RECORD_SHEET.failed)
+      toast.error(plainErrorText(error, RECORD_SHEET.failed))
     } finally {
       setBusy(false)
     }
@@ -112,7 +113,7 @@ export function UnreadableRecordSheet({ seed, namer, remaining, hasNext, onNext,
       toast.notice(RECORD_SHEET.rawShown)
     } catch (error) {
       setRawPassword('')
-      toast.error(error instanceof Error && error.message ? error.message : RECORD_SHEET.failed)
+      toast.error(plainErrorText(error, RECORD_SHEET.failed))
     } finally {
       setRawBusy(false)
     }

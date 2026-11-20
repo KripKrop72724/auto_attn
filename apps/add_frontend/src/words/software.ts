@@ -593,7 +593,7 @@ export const UPDATE_ACTION_ERRORS: Array<{ match: RegExp; sentence: string }> = 
   { match: /^Already created by this request/, sentence: 'Already started.' },
   { match: /idempotency key belongs/, sentence: 'Something went wrong. Close and try again.' },
   { match: /Choose 1 to 30 distinct zones/, sentence: 'Choose up to 30 devices at a time.' },
-  { match: /OTA remains disabled|quarantine is disabled/, sentence: 'Updates are switched off on the server.' },
+  { match: /OTA remains disabled|quarantine is disabled/, sentence: 'Software updates are switched off for now. Ask IT to switch them on.' },
   { match: /HIL release target does not match|HIL campaign requires/, sentence: 'This device is not a test device for this version.' },
   { match: /^Firmware release is not available|lacks the ESP application digest/, sentence: "This version can't be installed right now." },
   { match: /campaign cannot be (paused|resumed|cancelled|archived)/, sentence: 'This update has already changed. Refresh the list.' },

@@ -109,3 +109,7 @@
 @media (prefers-reduced-motion: reduce) {
   .home-meter span, .home-device-link { transition: none; }
 }
+
+@media (pointer: coarse), (max-width: 760px) {
+  .home-auto-line { display: inline-flex; align-items: center; min-height: var(--touch-min); }
+}

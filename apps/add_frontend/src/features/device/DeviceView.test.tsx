@@ -363,7 +363,7 @@ describe('Advanced tools', () => {
     const card = (await screen.findByRole('heading', { name: 'A different machine is connected' }, { timeout: 8000 })).closest('section') as HTMLElement
     const submit = within(card).getByRole('button', { name: 'Confirm new machine' }) as HTMLButtonElement
     expect(submit.disabled).toBe(true)
-    expect((within(card).getByLabelText('Why? (saved with your name)') as HTMLInputElement).value).toBe('Machine replaced on site')
+    expect((within(card).getByLabelText('Why?') as HTMLInputElement).value).toBe('Machine replaced on site')
     fireEvent.change(within(card).getByLabelText(/Type REPLACE connector-quetta/), { target: { value: 'REPLACE connector-quetta AEH2232460004 CKPG221260408' } })
     fireEvent.change(within(card).getByLabelText('Your password'), { target: { value: 'correct-password' } })
     fireEvent.click(submit)
@@ -389,12 +389,14 @@ describe('Advanced tools', () => {
     await openAdvanced()
     expect(await screen.findByText('This device is counted in totals and problems.', {}, { timeout: 8000 })).toBeTruthy()
     fireEvent.click(screen.getByRole('button', { name: 'Use as a spare' }))
-    expect(await screen.findByText('Quetta moved to spare devices.')).toBeTruthy()
+    // The toast and the card both say it; the card's Undo is reachable with the keyboard.
+    expect((await screen.findAllByText('Quetta moved to spare devices.')).length).toBe(2)
     expect((await screen.findAllByText(/not counted in totals or problems/i)).length).toBeGreaterThan(0)
     expect(onInventoryChanged).toHaveBeenCalledTimes(1)
-    fireEvent.click(screen.getByRole('button', { name: 'Undo' }))
+    const card = screen.getByRole('region', { name: 'Spare (not in use)' })
+    fireEvent.click(within(card).getByRole('button', { name: 'Undo' }))
     await waitFor(() => expect(bodyOf('/spare')).toEqual({ spare: false }))
-    expect(await screen.findByText('Quetta is back in use.')).toBeTruthy()
+    expect((await screen.findAllByText('Quetta is back in use.')).length).toBeGreaterThan(0)
     expect(onInventoryChanged).toHaveBeenCalledTimes(2)
   })
 
@@ -411,8 +413,10 @@ describe('Advanced tools', () => {
   it('opens the engineer custody view only on request', async () => {
     stubFetch((path) => (path.includes('/zkt-custody') ? json({ connector_id: device.connector_id, enabled: false, sampled_at: new Date().toISOString(), counts: [], rows: [], next_cursor: null }) : undefined), base)
     renderDevice(device, { search: '?tab=tools&advanced=1' })
-    fireEvent.click(await screen.findByRole('button', { name: 'Show the engineer view' }, { timeout: 8000 }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Show the IT view' }, { timeout: 8000 }))
     expect(await screen.findByRole('article', { name: 'ZKT ADD custody' })).toBeTruthy()
+    // The IT view sits inside [data-technical], so the page words guard still passes.
+    expectPlainText(screen.getByRole('tabpanel'))
   })
 
   it('shows no system words in Tools outside technical details', async () => {

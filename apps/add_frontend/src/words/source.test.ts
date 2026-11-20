@@ -21,12 +21,9 @@ const PATTERNS: ReadonlyArray<{ name: string; pattern: RegExp }> = [
 
 const PENDING: Record<string, { uses: readonly string[]; why: string }> = {
   '../status.ts': { uses: ['humanizeStatus(', "replaceAll('_'"], why: 'defines humanizeStatus for the screens below' },
-  '../ui/StatusBadge.tsx': { uses: ['humanizeStatus('], why: 'old status pill, still used by Set up a device and the old send-task details' },
+  '../ui/StatusBadge.tsx': { uses: ['humanizeStatus('], why: 'old status pill, still used by Set up a device' },
   '../features/FirmwareProvisioning.tsx': { uses: ["replaceAll('_'"], why: 'Set up a device wizard words wait for ADV-20' },
-  '../features/AttendanceRelease.tsx': { uses: ["replaceAll('_'"], why: 'old send-task details under Fix tools › History' },
-  '../features/SafeAttendanceRepair.tsx': { uses: ['humanizeStatus('], why: 'retired repair history under Fix tools › History' },
-  '../features/ZktCustodyStatus.tsx': { uses: ['humanizeStatus('], why: 'engineer view behind Tools › Advanced tools' },
-  '../features/AlertResolveDialog.tsx': { uses: ['humanizeStatus('], why: 'device error re-check dialog, words owned by 04-device' },
+  '../features/ZktCustodyStatus.tsx': { uses: ['humanizeStatus('], why: 'IT view behind Tools › Advanced tools, inside data-technical' },
 }
 
 describe('old code translators stay out of the pages (WORDS-12)', () => {

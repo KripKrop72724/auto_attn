@@ -18,6 +18,7 @@ import {
   type AutoReleaseStatus,
 } from './unknownAutoRelease'
 import './UnknownIdentityAutoRelease.css'
+import { STEP_UP } from '../words/glossary'
 
 type Toast = { notice: (message: string) => void; error: (message: string) => void }
 
@@ -322,23 +323,24 @@ export function AutoReleaseSwitchDialog({
           </div>
         )}
         <label>
-          Why? (saved in the records)
+          {STEP_UP.why}
           <textarea
             value={reason}
             maxLength={REASON_MAX}
             required
-            placeholder={`At least ${REASON_MIN} characters`}
-            aria-describedby={`${titleId}-reason-count`}
+            aria-describedby={`${titleId}-reason-help ${titleId}-reason-count`}
             onChange={(event) => setReason(event.target.value)}
           />
         </label>
+        <small id={`${titleId}-reason-help`} className="step-up-help">{STEP_UP.whyHelp(REASON_MIN)}</small>
         <p id={`${titleId}-reason-count`} className="operator-reason-count" aria-live="polite">
-          {trimmed.length} / {REASON_MAX} characters{trimmed.length < REASON_MIN ? ` · ${REASON_MIN - trimmed.length} more needed` : ''}
+          {STEP_UP.whyCount(trimmed.length, REASON_MIN)}
         </p>
         <label>
-          Your password
+          {STEP_UP.password}
           <input type="password" autoComplete="current-password" required value={password} onChange={(event) => setPassword(event.target.value)} />
         </label>
+        <small className="step-up-help">{STEP_UP.passwordHelp}</small>
         {failure && <OperatorFailureMessage failure={failure} />}
         <div className="dialog-actions">
           <button type="button" className="button secondary" disabled={busy} onClick={onClose}>Cancel</button>

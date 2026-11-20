@@ -103,7 +103,7 @@ async function openPreview(notices = toast()) {
 const fillApply = (dialog: HTMLElement, typed: string) => {
   fireEvent.change(within(dialog).getByLabelText('What did you do?'), { target: { value: 'Peshawar 02 and 06 recovery cleanup, reviewed with the owner.' } })
   fireEvent.change(within(dialog).getByLabelText(/^Type .* to confirm$/), { target: { value: typed } })
-  fireEvent.change(within(dialog).getByLabelText('Enter your password to confirm'), { target: { value: 'local-step-up' } })
+  fireEvent.change(within(dialog).getByLabelText('Your password'), { target: { value: 'local-step-up' } })
 }
 
 describe('HealthCleanupDialog', () => {
@@ -200,10 +200,10 @@ describe('HealthCleanupDialog', () => {
     fireEvent.click(within(dialog).getByRole('button', { name: 'Close problems' }))
     expect(await within(dialog).findByText('This list is out of date. Nothing was changed. Press Look again.')).toBeTruthy()
     expect(within(dialog).getByText('Device evidence changed since the preview.').closest('[data-technical]')).toBeTruthy()
-    expect((within(dialog).getByLabelText('Enter your password to confirm') as HTMLInputElement).value).toBe('')
+    expect((within(dialog).getByLabelText('Your password') as HTMLInputElement).value).toBe('')
     expect(within(dialog).getAllByRole('button', { name: /Look again/ }).length).toBeGreaterThan(0)
 
-    fireEvent.change(within(dialog).getByLabelText('Enter your password to confirm'), { target: { value: 'local-step-up' } })
+    fireEvent.change(within(dialog).getByLabelText('Your password'), { target: { value: 'local-step-up' } })
     fireEvent.click(within(dialog).getByRole('button', { name: 'Close problems' }))
     expect(await within(dialog).findByText(/Closing old problems is switched off right now\./)).toBeTruthy()
     const [first, second] = requests('/cleanup/apply')

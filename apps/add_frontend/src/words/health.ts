@@ -58,7 +58,7 @@ export const WHY_TITLES: Record<string, string> = {
 export const whyTitle = (state: string | null | undefined) => WHY_TITLES[(state ?? '').toUpperCase()] ?? 'About this device'
 
 export const OFFLINE_RULE_SENTENCE =
-  'A device shows as offline when the dashboard hears nothing from it for 45 seconds. It comes back as soon as it reports again.'
+  'A device shows as offline after the dashboard hears nothing from it for about 2 minutes, the same as the public status page. It comes back by itself when it reports again.'
 
 export { TEST_UPDATES_WAIT }
 

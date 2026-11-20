@@ -18,12 +18,14 @@ describe('Button', () => {
     expect(document.querySelector('input')).toBeNull()
   })
 
-  it('shows the busy text, disables itself, sets aria-busy and keeps its width', () => {
+  it('shows the busy text, stays focusable but aria-disabled, sets aria-busy and keeps its width', () => {
     vi.spyOn(HTMLElement.prototype, 'offsetWidth', 'get').mockReturnValue(132)
     const { rerender } = render(<Button busyLabel="Saving…">Save</Button>, { container })
     rerender(<Button busy busyLabel="Saving…">Save</Button>)
     const button = screen.getByRole('button', { name: 'Saving…' }) as HTMLButtonElement
-    expect(button.disabled).toBe(true)
+    // Not natively disabled: focus would jump to <body> for keyboard users.
+    expect(button.disabled).toBe(false)
+    expect(button.getAttribute('aria-disabled')).toBe('true')
     expect(button.getAttribute('aria-busy')).toBe('true')
     expect(button.style.minWidth).toBe('132px')
     expect(button.querySelector('.ui-spinner')).not.toBeNull()

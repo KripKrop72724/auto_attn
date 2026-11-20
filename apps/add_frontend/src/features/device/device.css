@@ -60,9 +60,10 @@
 /* ----------------------------------------------------------------- tabs */
 .dv-tabs { position: sticky; top: 0; z-index: var(--z-sticky, 4); background: var(--canvas); padding-top: var(--space-2); }
 .dv-tabs.is-phone { position: static; padding: 0 16px; }
-.dv-tabs.is-phone .ui-tablist { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); }
-.dv-tabs.is-phone .ui-tab { min-width: 0; padding: 0 2px; font-size: 13px; justify-content: center; text-align: center; }
-.dv-tabpanel { outline: none; }
+/* Five tabs spread across the width; a count ("Problems 2") widens its own tab, and the list scrolls sideways when they don't fit, never overlapping. */
+.dv-tabs.is-phone .ui-tablist { display: grid; grid-template-columns: repeat(5, auto); justify-content: space-between; column-gap: 2px; }
+.dv-tabs.is-phone .ui-tab { padding: 0 6px; font-size: 13px; justify-content: center; text-align: center; }
+.dv-tabpanel:focus-visible { outline: 2px solid var(--brand); outline-offset: -2px; }
 .dv-tab-content { display: grid; gap: var(--space-4); padding-top: var(--space-4); animation: dv-fade var(--motion-fade, 120ms) var(--ease-out) both; }
 .dv-page .dv-tab-content { padding: var(--space-4) 16px 0; }
 
@@ -152,6 +153,8 @@
   .dv-run-rows { padding-left: calc(64px + 24px + var(--space-2) * 2); }
   .dv-activity-line { grid-template-columns: 64px 24px minmax(0, 1fr); }
   .dv-day-header { top: 96px; }
+  /* Below the sticky header and tabs (about 96 px), above the day headings. */
+  .dv-new-pill { top: 104px; }
   .dv-chip-row { flex-wrap: nowrap; -webkit-mask-image: linear-gradient(90deg, var(--mask-opaque) 90%, transparent); mask-image: linear-gradient(90deg, var(--mask-opaque) 90%, transparent); }
 }
 
@@ -236,3 +239,8 @@
 .dv-activity-list.is-updating { opacity: .6; transition: opacity var(--motion-fade, 120ms) var(--ease-out); }
 .dv-sticky { position: sticky; top: 0; z-index: var(--z-sticky, 5); background: var(--canvas); }
 .dv-sticky .dv-header.is-phone { position: static; }
+
+/* Touch targets: 44 px on phones and touch screens. */
+@media (pointer: coarse), (max-width: 760px) {
+  .dv-chip, .dv-new-pill { min-height: var(--touch-min); }
+}

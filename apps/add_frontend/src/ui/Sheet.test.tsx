@@ -2,6 +2,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/re
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { useRef, useState } from 'react'
 import { Sheet } from './Sheet'
+import { TechnicalDetails } from './TechnicalDetails'
 import { setUpKitDom, tearDownKitDom } from './testUtils'
 
 function SheetHarness({ dirty = false }: { dirty?: boolean }) {
@@ -34,6 +35,30 @@ describe('Sheet', () => {
     expect(screen.getByRole('dialog', { name: 'Building 9 · Device 3' }).getAttribute('data-placement')).toBe('bottom')
     expect(document.querySelector('.ui-sheet-handle')).not.toBeNull()
     expect(document.querySelector('.ui-sheet-footer')?.textContent).toBe('Save')
+  })
+
+  it('lets Tab reach a Technical details summary that is the last thing in the sheet', async () => {
+    const container = setUpKitDom()
+    function Harness() {
+      const [open, setOpen] = useState(false)
+      return <div className="app-workspace">
+        <button type="button" onClick={() => setOpen(true)}>Open details</button>
+        {open && <Sheet title="Check-in" onClose={() => setOpen(false)}>
+          <p>Sent.</p>
+          <TechnicalDetails>event 42</TechnicalDetails>
+        </Sheet>}
+      </div>
+    }
+    render(<Harness />, { container })
+    fireEvent.click(screen.getByRole('button', { name: 'Open details' }))
+    const close = await screen.findByRole('button', { name: 'Close' })
+    await waitFor(() => expect(document.activeElement).toBe(close))
+    const summary = document.querySelector('.ui-sheet summary') as HTMLElement
+    // Shift+Tab from Close wraps to the last focusable thing: the summary, not Close again.
+    fireEvent.keyDown(document, { key: 'Tab', shiftKey: true })
+    expect(document.activeElement).toBe(summary)
+    fireEvent.keyDown(document, { key: 'Tab' })
+    expect(document.activeElement).toBe(close)
   })
 
   it('closes on a backdrop tap and gives focus back to the opener', async () => {

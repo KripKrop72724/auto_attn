@@ -77,7 +77,7 @@ describe('Fix tools', () => {
     fireEvent.click(screen.getByRole('switch', { name: /Send automatically/ }))
     const dialog = screen.getByRole('dialog', { name: 'Turn on automatic sending' })
     expect(within(dialog).getByLabelText('Your password')).toBeTruthy()
-    expect(within(dialog).getByLabelText('Why? (saved in the records)')).toBeTruthy()
+    expect(within(dialog).getByLabelText('Why?')).toBeTruthy()
     fireEvent.click(within(dialog).getByRole('button', { name: 'Cancel' }))
     fireEvent.click(screen.getByRole('button', { name: /Fix tools/ }))
     expect(props.onTool).toHaveBeenCalledWith('')

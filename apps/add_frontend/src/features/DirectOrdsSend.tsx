@@ -5,6 +5,8 @@ import { Disclosure } from '../ui'
 import { plainReason } from '../words/attendanceReasons'
 import { GROUP_CHIP, rowGroup, rowTime } from './attendance/attendanceWords'
 import type { AttendanceEvent, DirectOrdsCnicChoice, DirectOrdsCnicDecision, DirectOrdsPreview, DirectOrdsPreviewRow } from '../types'
+import { plainErrorText } from '../lib/plainApiError'
+import { STEP_UP } from '../words/glossary'
 
 export type DirectRun = {
   job_id: string; status: string; created_at: string; actor: string; selected: number;
@@ -15,7 +17,8 @@ type ItemPage = { rows: DirectItem[]; next_cursor: number | null }
 const root = '/api/v2/attendance-direct-ords'
 const finished = new Set(['COMPLETED', 'COMPLETED_WITH_REVIEW'])
 const count = (value: number) => `${value.toLocaleString()} ${value === 1 ? 'check-in' : 'check-ins'}`
-const message = (error: unknown) => error instanceof Error ? error.message : "Couldn't save this. Try again."
+// A plain sentence only; the backend text never shows (writing rule 6).
+const message = (error: unknown) => plainErrorText(error, "Couldn't save this. Try again.")
 const previewRows = (value: Partial<DirectOrdsPreview> | null | undefined): DirectOrdsPreviewRow[] =>
   Array.isArray(value?.rows) ? value.rows.filter((row) => typeof row?.event_id === 'number') : []
 const who = (row: { display_name: string | null; user_id: string }) => `${row.display_name || 'Name not known'} · Employee ID ${row.user_id}`
@@ -282,14 +285,14 @@ export function DirectOrdsSend({ selected, clearSelection, refresh, openRequest,
       {decisions.replacing > 0 && <p className="message pattern-waiting">{count(decisions.replacing)} replace an earlier approval that stopped before anything was sent.</p>}
       {checks !== null && decisions.skipped > 0 && <p className="message pattern-waiting">{count(decisions.skipped)} will not be sent; {count(Math.max(0, selected.length - decisions.skipped))} will be sent.</p>}
       <details className="attendance-direct-review"><summary>Review the chosen check-ins</summary><ul>{selected.slice(0, 20).map((row) => <li key={row.id}>{row.display_name || 'Name not known'} · Employee ID {row.user_id} · {rowTime(row.device_event_time)} · {GROUP_CHIP[rowGroup(row as Parameters<typeof rowGroup>[0])].label}</li>)}</ul>{selected.length > 20 && <p>And {count(selected.length - 20)} more.</p>}</details>
-      <label>Why are you sending these? (saved in the records)<textarea required minLength={3} maxLength={500} value={reason} onChange={(event) => setReason(event.target.value)} /></label>
-      <label>Your password<input type="password" required autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} /></label>
+      <label>{STEP_UP.why}<textarea required minLength={3} maxLength={500} value={reason} onChange={(event) => setReason(event.target.value)} /></label><small className="step-up-help">{STEP_UP.whyHelp(3)}</small>
+      <label>{STEP_UP.password}<input type="password" required autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} /></label><small className="step-up-help">{STEP_UP.passwordHelp}</small>
       {error && <p className="message pattern-blocked" role="alert">{error}</p>}
       <footer className="dialog-actions"><button className="button secondary" type="button" disabled={busy} onClick={close}>Cancel</button><button className="button primary" disabled={busy || checks === null || !password || reason.trim().length < 3}>{busy ? 'Sending…' : `Send ${count(selected.length)}`}</button></footer>
     </form></Dialog>}
     {recheckOpen && run && <Dialog titleId="direct-ords-recheck-title" title="Check HR records" description="We'll look for these check-ins in the HR system. Nothing new is sent." onClose={() => { if (!rechecking) { setRecheckOpen(false); setRecheckPassword('') } }}><form className="dialog-body" onSubmit={recheck}>
       <p>Check {count(run.legacy_recheckable || 0)} from this sending task. Only an exact match of machine, person, time, CNIC, type and record number counts as sent. Anything else stays for checking.</p>
-      <label>Your password<input type="password" required autoComplete="current-password" value={recheckPassword} onChange={(event) => setRecheckPassword(event.target.value)} /></label>
+      <label>{STEP_UP.password}<input type="password" required autoComplete="current-password" value={recheckPassword} onChange={(event) => setRecheckPassword(event.target.value)} /></label><small className="step-up-help">{STEP_UP.passwordHelp}</small>
       {error && <p className="message pattern-blocked" role="alert">{error}</p>}
       <footer className="dialog-actions"><button className="button secondary" type="button" disabled={rechecking} onClick={() => { setRecheckOpen(false); setRecheckPassword('') }}>Cancel</button><button className="button primary" disabled={rechecking || !recheckPassword}>{rechecking ? 'Checking…' : 'Check now'}</button></footer>
     </form></Dialog>}

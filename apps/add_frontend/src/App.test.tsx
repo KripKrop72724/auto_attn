@@ -170,7 +170,7 @@ describe('State Life ADD interface', () => {
     expect(tiles[1]).toContain('1 with a note')
     expect(tiles[2]).toMatch(/^Needs attention1/)
     expect(tiles[3]).toMatch(/^Offline1/)
-    expect(screen.getByText('2 problems to look at')).toBeTruthy()
+    expect(screen.getByText('2 new problems')).toBeTruthy()
 
     fireEvent.click(within(summary).getAllByRole('link')[2])
     await appReady('Devices')

@@ -17,7 +17,7 @@ export const ERROR_WORDS: Record<string, string> = {
     'This is switched off for now. Ask IT to switch it on.',
   ),
   REPAIR_RETIRED: 'Automatic attendance repair has been removed.',
-  GROUPS_REQUIRED: 'Choose at least one group to release.',
+  GROUPS_REQUIRED: 'Choose at least one group to send.',
   APPROVED_COUNT_INVALID: 'Enter a number between 1 and the number of check-ins waiting in the chosen groups.',
   REASON_REQUIRED: 'Enter a short reason.',
   CORRECTED_TIME_REQUIRED: 'Enter the corrected time.',

@@ -437,7 +437,7 @@ describe('People on one machine', () => {
 
     expect(await screen.findByRole('heading', { name: /Remove 2 people from/i })).toBeTruthy()
     expect(validationCalls).toBe(1)
-    fireEvent.change(screen.getByLabelText(/Why\? \(saved in the record\)/), { target: { value: 'Remove people who left' } })
+    fireEvent.change(screen.getByLabelText('Why?'), { target: { value: 'Remove people who left' } })
     fireEvent.change(screen.getByLabelText(/To confirm, type exactly/), { target: { value: 'DELETE 2 USERS FROM 1' } })
     fireEvent.change(screen.getByLabelText('Your password'), { target: { value: 'correct-password' } })
     fireEvent.click(screen.getByRole('button', { name: 'Remove 2 people' }))

@@ -244,7 +244,7 @@ function DivisionPanel({ division, views, loaded, limit, now, changed }: {
                     <a
                       className="home-device-link"
                       href={href}
-                      aria-label={HOME_WORDS.openDevice(view.name)}
+                      aria-label={HOME_WORDS.openDevice(view.name, view.status.chip, view.status.heading, view.status.since ? sinceText(view.status.since, now) : null)}
                       onClick={(event) => {
                         if (event.metaKey || event.ctrlKey || event.shiftKey || event.button === 1) return
                         event.preventDefault()

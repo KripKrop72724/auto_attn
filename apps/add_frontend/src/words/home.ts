@@ -27,7 +27,7 @@ export const FRAME_WORDS = {
   switchedOff: 'Switched off',
   switchedOffHidden: 'Switched off for now',
   /** Problems badge hidden text. */
-  problemsBadge: (count: number) => `${n(count)} ${s(count, 'problem')} to look at`,
+  problemsBadge: (count: number) => `${n(count)} new ${s(count, 'problem')}`,
 } as const
 
 /** Menu items: label and the one-line description used in the More sheet. */
@@ -114,7 +114,8 @@ export const HOME_WORDS = {
   panelNotes: (count: number) => `${n(count)} working with a note`,
   panelShowAll: (division: string) => `Show all ${division} devices`,
   open: 'Open',
-  openDevice: (name: string) => `Open ${name}`,
+  /** The row link's name: what the row shows (name, status, reason, since), so it is read out in full. */
+  openDevice: (name: string, ...parts: Array<string | null | undefined>) => [`Open ${name}`, ...parts.filter(Boolean)].join(', '),
   since: (when: string, howLong: string) => (howLong ? `Since ${when} · ${howLong}` : `Since ${when}`),
   emptyTitle: 'No devices yet',
   emptyBody: 'New devices appear here by themselves once they are set up.',
@@ -214,7 +215,9 @@ export const DEVICES_WORDS = {
   version: 'Software version',
   versionAny: 'Any',
   versionUnknown: 'Software version not known',
-  versionOption: (version: string, count: number, hik: boolean) => `Software ${version}${hik ? ' (Hikvision)' : ''} · ${n(count)} ${s(count, 'device')}`,
+  versionOption: (version: string, count: number) => `Software ${version} · ${n(count)} ${s(count, 'device')}`,
+  /** Shown in a data-brand span after a version used only on face machines. */
+  versionBrand: 'Hikvision',
   versionActive: (version: string) => (version === 'unknown' ? 'Software version not known' : `Software ${version}`),
   sort: 'Sort',
   sortOptions: { attention: 'Needs attention first', name: 'Name (A to Z)', seen: 'Not seen for longest' },

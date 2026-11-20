@@ -10,6 +10,9 @@ import { plainReason } from '../words/attendanceReasons'
 import { longTime, rowTime } from './attendance/attendanceWords'
 import './SafeAttendanceRepair.css'
 import './IdentityBacklogRelease.css'
+import { plainErrorText } from '../lib/plainApiError'
+import { ERROR_FALLBACK } from '../words/errors'
+import { STEP_UP } from '../words/glossary'
 
 type Group = { connector_id: string; source: string; age: string; held: number; provable: number; next_snapshot: number }
 type Scope = { zone_id: string; as_of: string; until_id: number; window_hours: number; connectors: string[] }
@@ -47,7 +50,8 @@ const runLabel: Record<string, string> = {
 }
 const active = new Set(['RELEASING', 'STOPPED_FOLLOWING'])
 const punches = (count: number) => `${count.toLocaleString()} ${count === 1 ? 'check-in' : 'check-ins'}`
-const message = (error: unknown) => error instanceof Error ? error.message : "Couldn't reach the dashboard. Try again."
+// A plain sentence only; the backend text never shows (writing rule 6).
+const message = (error: unknown) => plainErrorText(error, ERROR_FALLBACK)
 const placeOf = (device: Pick<Device, 'friendly_name' | 'display_name' | 'zone_id'>) => {
   if (device.friendly_name) return device.friendly_name
   const name = deviceName(device.display_name || device.zone_id)
@@ -263,10 +267,12 @@ export function IdentityBacklogRelease({ devices, toast }: { devices: Device[]; 
       onClose={closeDialog}
     ><form className="dialog-body" onSubmit={submit}>
       {dialog === 'START' && <>
-        <label>Why? (saved in the records)<textarea required minLength={3} maxLength={500} value={reason} onChange={(event) => setReason(event.target.value)} /></label>
+        <label>{STEP_UP.why}<textarea required minLength={3} maxLength={500} value={reason} onChange={(event) => setReason(event.target.value)} /></label>
+        <small className="step-up-help">{STEP_UP.whyHelp(3)}</small>
         <label>Type <span data-device-code>{confirmation}</span> to confirm{zoneLabel ? ` (the code of ${zoneLabel})` : ''}<input required value={typed} onChange={(event) => setTyped(event.target.value)} autoComplete="off" /></label>
       </>}
-      <label>Your password<input type="password" required autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} /></label>
+      <label>{STEP_UP.password}<input type="password" required autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} /></label>
+      <small className="step-up-help">{STEP_UP.passwordHelp}</small>
       {error && <p className="message pattern-blocked" role="alert">{error}</p>}
       <footer className="dialog-actions">
         <button className="button secondary" type="button" disabled={busy} onClick={closeDialog}>Cancel</button>

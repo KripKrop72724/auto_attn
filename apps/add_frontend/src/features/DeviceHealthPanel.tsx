@@ -101,7 +101,7 @@ export function HealthEvidence({ device, health }: { device: Device; health?: De
         <h5 id="device-health-preview-title">Preview of the new status rules: {plainStatus('device', health.tier).label}</h5>
         <p>Preview only. The status at the top still decides the totals and problems.</p>
       </section>}
-      {normalizedStatus(health.tier).toUpperCase() === 'OFFLINE' && <p>We show a device as offline when we haven't heard from it for 45 seconds. It comes back by itself when it reconnects.</p>}
+      {normalizedStatus(health.tier).toUpperCase() === 'OFFLINE' && <p>A device shows as offline after the dashboard hears nothing from it for about 2 minutes, the same as the public status page. It comes back by itself when it reports again.</p>}
       {health.evaluated_at && <p className="device-muted">Checked {ago(health.evaluated_at)}</p>}
       {reasons.length > 0 && <ul className="device-health-reasons" aria-label="Health reasons">
         {reasons.map((reason) => <ReasonRow key={reason.alert_id ?? reason.code} reason={reason} />)}

@@ -196,7 +196,7 @@ function SetupSummary({ session, username, returnFocusRef, onClose, onOpenDevice
       </dl>
       <TechnicalDetails>
         <dl className="setup-summary-facts">
-          <div><dt>Box ID (MAC)</dt><dd>{session.hardware_mac || 'not read yet'}</dd></div>
+          <div><dt>Link box ID (MAC)</dt><dd>{session.hardware_mac || 'not read yet'}</dd></div>
           <div><dt>Setup ID</dt><dd>{session.session_id}</dd></div>
           <div><dt>State</dt><dd>{session.state} · {session.progress}%</dd></div>
           <div><dt>Device code</dt><dd>{session.device_id || '—'} · {session.zone_id || '—'} · {session.zone_name || '—'}</dd></div>

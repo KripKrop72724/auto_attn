@@ -272,7 +272,7 @@ export const LOG_WORDS: Record<string, LogWords> = {
 }
 
 /** Engineer-test codes are formatted at run time; they all read the same. */
-export const ENGINEER_TEST: LogWords = L('machine', 'routine', 'no', 'Engineer test finished; no settings were changed.')
+export const ENGINEER_TEST: LogWords = L('machine', 'routine', 'no', 'Test by IT finished; no settings were changed.')
 const ENGINEER_TEST_PATTERN = /^ZKT_DIAG_/
 
 // B3. Group from the subsystem, and the safe fallback by level.

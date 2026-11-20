@@ -127,7 +127,7 @@ export function LiveStatus({ health, lastSyncAt, phone, onTryNow }: {
 function TryNow({ onTryNow }: { onTryNow: () => Promise<void> }) {
   const [busy, setBusy] = useState(false)
   return (
-    <button type="button" className="button secondary small" disabled={busy} aria-busy={busy || undefined} onClick={() => { setBusy(true); void onTryNow().finally(() => setBusy(false)) }}>
+    <button type="button" className="button secondary small" aria-disabled={busy || undefined} aria-busy={busy || undefined} onClick={() => { if (busy) return; setBusy(true); void onTryNow().finally(() => setBusy(false)) }}>
       {busy ? LIVE_WORDS.trying : LIVE_WORDS.tryNow}
     </button>
   )
@@ -135,15 +135,22 @@ function TryNow({ onTryNow }: { onTryNow: () => Promise<void> }) {
 
 /** The slim amber bar under the header while the page is not live. */
 export function LiveBanner({ health, onTryNow }: { health: ConnectionHealth; onTryNow: () => Promise<void> }) {
-  if (!health.banner && !health.recovered) return null
+  const text = health.banner ? LIVE_WORDS.banner(clock(health.since)) : health.recovered || ''
+  // The status region stays mounted, so screen readers hear each change
+  // (a live region inserted together with its text is often not read).
+  const region = <div className="sr-only" role="status" aria-live="polite">{text}</div>
+  if (!health.banner && !health.recovered) return region
   if (!health.banner) {
-    return <div className="live-banner is-recovered" role="status"><Icon name="check" size="sm" /><span>{health.recovered}</span></div>
+    return <>{region}<div className="live-banner is-recovered"><Icon name="check" size="sm" /><span>{health.recovered}</span></div></>
   }
   return (
-    <div className="live-banner" role="status">
-      <Icon name="wifi" size="sm" />
-      <span>{LIVE_WORDS.banner(clock(health.since))}</span>
-      <TryNow onTryNow={onTryNow} />
-    </div>
+    <>
+      {region}
+      <div className="live-banner">
+        <Icon name="wifi" size="sm" />
+        <span>{text}</span>
+        <TryNow onTryNow={onTryNow} />
+      </div>
+    </>
   )
 }

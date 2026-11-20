@@ -126,11 +126,23 @@ export function DeviceView({ seed, revision, custodyRevision = 0, onClose, onMan
     if (scroller) scroller.scrollTop = scrollPositions.current.get(tab) || 0
   }, [tab])
 
-  // Phone: the header folds into one row after 24 px of scrolling.
+  // Phone: the header folds into one row once the page has scrolled past it.
+  // Hysteresis (fold above 64 px, unfold below 8 px) and a room check (only
+  // fold when the page stays scrolled after the header shrinks) stop the
+  // header flickering on short tabs.
   useEffect(() => {
     const scroller = scrollRef.current
     if (!phone || !scroller) return
-    const onScroll = () => setCollapsed(scroller.scrollTop > 24)
+    let folded = false
+    const onScroll = () => {
+      const top = scroller.scrollTop
+      if (!folded) {
+        const main = scroller.querySelector('.dv-header-main') as HTMLElement | null
+        const room = scroller.scrollHeight - scroller.clientHeight - (main?.offsetHeight ?? 0)
+        if (top > 64 && room > 64) folded = true
+      } else if (top < 8) folded = false
+      setCollapsed(folded)
+    }
     scroller.addEventListener('scroll', onScroll, { passive: true })
     return () => scroller.removeEventListener('scroll', onScroll)
   }, [phone])

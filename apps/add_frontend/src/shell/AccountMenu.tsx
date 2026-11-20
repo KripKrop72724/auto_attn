@@ -27,7 +27,7 @@ export function TechnicalSwitch({ id }: { id: string }) {
 export function SignOutButton({ onLogout, className = 'button secondary' }: { onLogout: () => Promise<void>; className?: string }) {
   const [busy, setBusy] = useState(false)
   return (
-    <button type="button" className={className} disabled={busy} aria-busy={busy || undefined} onClick={() => { setBusy(true); void onLogout().finally(() => setBusy(false)) }}>
+    <button type="button" className={className} aria-disabled={busy || undefined} aria-busy={busy || undefined} onClick={() => { if (busy) return; setBusy(true); void onLogout().finally(() => setBusy(false)) }}>
       <Icon name="logout" size="sm" /> {busy ? FRAME_WORDS.signingOut : FRAME_WORDS.signOut}
     </button>
   )
@@ -59,8 +59,8 @@ export function AccountMenu({ username, onLogout, onSettings }: {
         ref={buttonRef}
         type="button"
         className="account-button"
-        aria-haspopup="menu"
         aria-expanded={open}
+        aria-controls={open ? 'account-panel' : undefined}
         aria-label={FRAME_WORDS.account(username)}
         onClick={() => setOpen((value) => !value)}
       >
@@ -69,16 +69,27 @@ export function AccountMenu({ username, onLogout, onSettings }: {
         <Icon name="chevronDown" size="sm" />
       </button>
       {open && (
-        <div ref={menuRef} className="account-panel" role="menu" aria-label={FRAME_WORDS.account(username)}>
+        // A plain disclosure panel (not a menu: it holds a switch and links); it closes when focus leaves it.
+        <div
+          ref={menuRef}
+          id="account-panel"
+          className="account-panel"
+          role="group"
+          aria-label={FRAME_WORDS.account(username)}
+          onBlur={(event) => {
+            const next = event.relatedTarget as Node | null
+            if (next && !menuRef.current?.contains(next) && !buttonRef.current?.contains(next)) setOpen(false)
+          }}
+        >
           <p className="account-who">{FRAME_WORDS.signedInAs(username)}</p>
-          <div role="none" className="account-row"><TechnicalSwitch id="account-technical" /></div>
-          <a role="menuitem" className="account-link" href="/settings" onClick={(event) => { setOpen(false); onSettings(event) }}>
+          <div className="account-row"><TechnicalSwitch id="account-technical" /></div>
+          <a className="account-link" href="/settings" onClick={(event) => { setOpen(false); onSettings(event) }}>
             <Icon name="settings" size="sm" /> {FRAME_WORDS.settings}
           </a>
-          <a role="menuitem" className="account-link" href="/status" target="_blank" rel="noopener">
+          <a className="account-link" href="/status" target="_blank" rel="noopener">
             <Icon name="external" size="sm" /> {FRAME_WORDS.publicStatus} <span className="sr-only">{FRAME_WORDS.opensInNewTab}</span>
           </a>
-          <div role="none" className="account-row account-sign-out"><SignOutButton onLogout={onLogout} className="text-button account-link" /></div>
+          <div className="account-row account-sign-out"><SignOutButton onLogout={onLogout} className="text-button account-link" /></div>
         </div>
       )}
     </span>

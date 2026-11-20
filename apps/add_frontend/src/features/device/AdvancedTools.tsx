@@ -116,7 +116,8 @@ export function AdvancedTools({ device, custodyRevision, toast, hasOpenProblems,
         <section className="dv-tool-card" aria-labelledby="dv-custody-title">
           <h4 id="dv-custody-title">{ADVANCED_WORDS.custodyTitle}</h4>
           {custody
-            ? <ZktCustodyStatus connectorId={device.connector_id} revision={custodyRevision} />
+            // The IT view keeps its own words: the plain-words guard skips [data-technical].
+            ? <div data-technical><ZktCustodyStatus connectorId={device.connector_id} revision={custodyRevision} /></div>
             : <div className="dv-tool-actions"><Button onClick={() => setCustody(true)}>{ADVANCED_WORDS.custodyShow}</Button></div>}
         </section>
       )}

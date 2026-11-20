@@ -35,7 +35,7 @@ it('requires explicit scope, then one reason and password, while offline devices
   fireEvent.click(screen.getByRole('button', { name: 'Send 10 check-ins' }))
   const dialog = screen.getByRole('dialog')
   expect(within(dialog).getByText(/1 machine ready/)).toBeTruthy()
-  fireEvent.change(within(dialog).getByLabelText('Why? (saved in the records)'), { target: { value: 'Current employee verified' } })
+  fireEvent.change(within(dialog).getByLabelText('Why?'), { target: { value: 'Current employee verified' } })
   fireEvent.change(within(dialog).getByLabelText('Your password'), { target: { value: 'secret' } })
   fireEvent.click(within(dialog).getByRole('button', { name: 'Send 10 check-ins' }))
   await screen.findByRole('heading', { name: 'Getting ready' })

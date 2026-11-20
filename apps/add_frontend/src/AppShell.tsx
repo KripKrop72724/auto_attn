@@ -17,6 +17,7 @@ import type { DashboardRoute } from './types'
 import { capCount } from './ui/Badge'
 import { DivisionScopeChip, DivisionSwitch } from './ui/DivisionSwitch'
 import { Sheet } from './ui/Sheet'
+import { prefersReducedMotion } from './ui/modalLock'
 import { useIsPhone } from './ui/useMediaQuery'
 import { FRAME_WORDS, MENU_WORDS } from './words/home'
 import './shell/shell.css'
@@ -222,8 +223,14 @@ export function AppShell({
             <strong className="app-header-title" aria-hidden={!scrolled || undefined}>{current.label}</strong>
           </div>
           <div className="operator-area">
-            {showDivision && phone && division !== 'all' && (
-              <button type="button" className="header-division-chip" onClick={() => workspaceRef.current?.scrollTo({ top: 0, behavior: 'smooth' })}>
+            {/* Once the All / Life / Health row has scrolled away, a compact chip in the division's own colour jumps back to it. */}
+            {showDivision && phone && division !== 'all' && scrolled && (
+              <button
+                type="button"
+                className={`header-division-chip is-${division}`}
+                aria-label={division === 'life' ? 'Showing Life only. Change division' : 'Showing Health only. Change division'}
+                onClick={() => workspaceRef.current?.scrollTo({ top: 0, behavior: prefersReducedMotion() ? 'auto' : 'smooth' })}
+              >
                 {division === 'life' ? 'Life' : 'Health'}
               </button>
             )}

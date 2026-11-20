@@ -112,3 +112,21 @@ test('device header, five tabs and Activity fit every screen without sideways sc
   expect(activityWidth).toBe(true)
   if (process.env.ADD_VISUAL_QA === '1') await page.screenshot({ path: testInfo.outputPath('device-activity.png') })
 })
+
+// A sheet opened from inside the device view is drawn above it (review #29).
+test('the restart sheet opens above the device view', async ({ page }) => {
+  await page.goto('/devices/connector-one?tab=tools')
+  const panel = page.getByRole('dialog', { name: /3rd Floor/i })
+  await expect(panel).toBeVisible()
+  const open = panel.getByRole('button', { name: 'Restart machine…' })
+  test.skip(!(await open.isEnabled().catch(() => false)), 'Restart is not offered for the fixture machine')
+  await open.click()
+  const sheet = page.getByRole('dialog', { name: /Restart the machine at/ })
+  await expect(sheet).toBeVisible()
+  const onTop = await sheet.evaluate((element) => {
+    const box = element.getBoundingClientRect()
+    const hit = document.elementFromPoint(box.left + box.width / 2, box.top + Math.min(40, box.height / 2))
+    return Boolean(hit && element.contains(hit))
+  })
+  expect(onTop).toBe(true)
+})

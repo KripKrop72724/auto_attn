@@ -87,7 +87,7 @@ it('checks a frozen zone page by page, then releases only the chosen groups', as
   const dialog = screen.getByRole('dialog')
   expect(dialog.textContent).toContain('Only check-ins of the 2 chosen groups that are still not matched when you approve')
   const approve = within(dialog).getByRole('button', { name: 'Send 2 check-ins' }) as HTMLButtonElement
-  fireEvent.change(within(dialog).getByLabelText('Why? (saved in the records)'), { target: { value: 'Reviewed Karachi backlog' } })
+  fireEvent.change(within(dialog).getByLabelText('Why?'), { target: { value: 'Reviewed Karachi backlog' } })
   fireEvent.change(within(dialog).getByLabelText('Your password'), { target: { value: 'secret' } })
   // The typed phrase stays (owner decision pending); the area's code is shown next to its name.
   const phrase = within(dialog).getByLabelText(/Type RELEASE ZONE-KHI to confirm/)

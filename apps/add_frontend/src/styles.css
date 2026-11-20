@@ -621,7 +621,8 @@ details > summary { cursor: pointer; }
 
 .anchored-layer {
   position: fixed;
-  z-index: var(--z-popover, 76);
+  /* Above dialogs, sheets and the device view, so a menu opened from one of them shows (toasts stay on top). */
+  z-index: calc(var(--z-modal, 100) + 2);
   max-width: calc(100vw - 24px);
   max-height: var(--anchored-max-height, calc(100dvh - 24px));
   pointer-events: auto;

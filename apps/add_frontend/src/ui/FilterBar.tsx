@@ -35,6 +35,10 @@ export type FilterBarProps = {
   moreFilters?: ReactNode
   /** How many of the "More filters" are set, shown on the button. */
   moreFiltersCount?: number
+  /** The More filters button's own words, e.g. "Filters (2)" on a phone (the count is then in the words). */
+  moreLabel?: string
+  /** The phone sheet's button, e.g. "Show 12 devices". */
+  showResultsLabel?: string
   /** The filters in force, each with ×, plus "Clear all". */
   active?: ActiveFilter[]
   onClearAll?: () => void
@@ -62,6 +66,8 @@ export function FilterBar({
   chipsLabel = 'Quick filters',
   moreFilters,
   moreFiltersCount = 0,
+  moreLabel,
+  showResultsLabel,
   active,
   onClearAll,
   result,
@@ -87,6 +93,17 @@ export function FilterBar({
     return () => document.removeEventListener('keydown', handle)
   }, [search])
 
+  // On a phone the sort goes into the Filters sheet, so search and Filters share one row.
+  const sortInSheet = phone && Boolean(moreFilters) && Boolean(sort)
+  const sortNode = sort && (
+    <label className="ui-filter-sort">
+      <span className="sr-only">{sort.label || UI_TEXT.sort}</span>
+      <Icon name="sort" size="sm" />
+      <select value={sort.value} onChange={(event) => sort.onChange(event.target.value)} aria-label={sort.label || UI_TEXT.sort}>
+        {sort.options.map((option) => <option key={option.id} value={option.id}>{option.label}</option>)}
+      </select>
+    </label>
+  )
   const chosen = (chipId: string) => Array.isArray(chipValue) ? chipValue.includes(chipId) : chipValue === chipId
   const searchLabel = search?.label || UI_TEXT.search
 
@@ -114,15 +131,7 @@ export function FilterBar({
             )}
           </div>
         )}
-        {sort && (
-          <label className="ui-filter-sort">
-            <span className="sr-only">{sort.label || UI_TEXT.sort}</span>
-            <Icon name="sort" size="sm" />
-            <select value={sort.value} onChange={(event) => sort.onChange(event.target.value)} aria-label={sort.label || UI_TEXT.sort}>
-              {sort.options.map((option) => <option key={option.id} value={option.id}>{option.label}</option>)}
-            </select>
-          </label>
-        )}
+        {sort && !sortInSheet && sortNode}
         {moreFilters && (
           <button
             ref={moreRef}
@@ -133,8 +142,8 @@ export function FilterBar({
             onClick={() => setMoreOpen((open) => !open)}
           >
             <Icon name="filter" size="sm" />
-            <span>{UI_TEXT.moreFilters}</span>{' '}
-            {moreFiltersCount > 0 && <span className="ui-filter-more-count">{formatCount(moreFiltersCount)}</span>}
+            <span>{moreLabel || UI_TEXT.moreFilters}</span>{' '}
+            {!moreLabel && moreFiltersCount > 0 && <span className="ui-filter-more-count">{formatCount(moreFiltersCount)}</span>}
           </button>
         )}
         {actions && <div className="ui-filter-actions">{actions}</div>}
@@ -180,13 +189,14 @@ export function FilterBar({
             onClose={() => setMoreOpen(false)}
             returnFocusRef={moreRef}
             placement="bottom"
-            footer={<button type="button" className="button primary full" onClick={() => setMoreOpen(false)}>{UI_TEXT.showResults}</button>}
+            footer={<button type="button" className="button primary full" onClick={() => setMoreOpen(false)}>{showResultsLabel || UI_TEXT.showResults}</button>}
           >
+            {sortInSheet && <div className="ui-filter-sheet-sort">{sortNode}</div>}
             {moreFilters}
           </Sheet>
         )
         : (
-          <AnchoredLayer anchorRef={moreRef} preferredWidth={360} onDismiss={(reason) => { setMoreOpen(false); if (reason === 'escape') moreRef.current?.focus() }}>
+          <AnchoredLayer anchorRef={moreRef} preferredWidth={360} manageFocus onDismiss={(reason) => { setMoreOpen(false); if (reason === 'escape') moreRef.current?.focus() }}>
             <div className="ui-filter-popover" role="dialog" aria-label={UI_TEXT.moreFilters}>{moreFilters}</div>
           </AnchoredLayer>
         ))}

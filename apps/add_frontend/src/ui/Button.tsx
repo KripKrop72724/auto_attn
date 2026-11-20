@@ -85,7 +85,12 @@ export const Button = forwardRef<HTMLButtonElement, ButtonProps>(function Button
   }, [done])
 
   const handleClick = (event: MouseEvent<HTMLButtonElement>) => {
-    if (isBusy) return
+    // Busy stays focusable (aria-disabled), so a keyboard user keeps their place;
+    // the click, and a form submit it would start, are ignored meanwhile.
+    if (isBusy) {
+      event.preventDefault()
+      return
+    }
     const result = onClick?.(event)
     if (!isPromise(result)) return
     setPending(true)
@@ -106,7 +111,8 @@ export const Button = forwardRef<HTMLButtonElement, ButtonProps>(function Button
       ref={ref}
       type={type}
       className={cx('ui-button', variantClass[variant], sizeClass[size], fullWidth && 'full', isBusy && 'is-busy', className)}
-      disabled={disabled || isBusy}
+      disabled={disabled}
+      aria-disabled={(isBusy && !disabled) || undefined}
       aria-busy={isBusy || undefined}
       style={lockedWidth ? { minWidth: lockedWidth } : undefined}
       onClick={handleClick}

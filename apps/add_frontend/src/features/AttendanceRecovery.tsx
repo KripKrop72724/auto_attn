@@ -9,6 +9,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { api, queryString } from '../api'
 import { Button, Callout, ErrorState, Skeleton, StatusChip, TechnicalDetails } from '../ui'
 import { idempotency } from '../lib/idempotency'
+import { plainApiError, type PlainApiError } from '../lib/plainApiError'
 import { ago, dayTime, pktInputToUtc } from '../lib/time'
 import { useThrottledRunner } from '../lib/throttle'
 import { formatMetricsTime } from '../lib/metricsTime'
@@ -90,7 +91,8 @@ export function AttendanceRecovery({
   const [reason, setReason] = useState('')
   const [password, setPassword] = useState('')
   const [confirmation, setConfirmation] = useState('')
-  const [actionError, setActionError] = useState('')
+  const [actionError, setActionErrorState] = useState<PlainApiError | null>(null)
+  const showActionError = (error: unknown, fallback: string) => setActionErrorState(plainApiError(error, fallback))
   const [busy, setBusy] = useState(false)
   const [job, setJob] = useState<AttendanceRecoveryJob | null>(null)
   const [controlBusy, setControlBusy] = useState(false)
@@ -163,7 +165,7 @@ export function AttendanceRecovery({
   const previewCorrections = async () => {
     if (!correctionInputs.length) return
     setBusy(true)
-    setActionError('')
+    setActionErrorState(null)
     try {
       const result = await api<CorrectionPreview>('/api/v2/source-corrections/preview', {
         method: 'POST',
@@ -172,7 +174,7 @@ export function AttendanceRecovery({
       setCorrectionPreview(result)
       setConfirmation(result.confirmation)
     } catch (error) {
-      setActionError(error instanceof Error && error.message ? error.message : "Couldn't show the fixes. Try again.")
+      showActionError(error, "Couldn't show the fixes. Try again.")
     } finally {
       setBusy(false)
     }
@@ -181,7 +183,7 @@ export function AttendanceRecovery({
   const createCorrections = async () => {
     if (!correctionPreview) return
     setBusy(true)
-    setActionError('')
+    setActionErrorState(null)
     try {
       const result = await api<AttendanceRecoveryJob>('/api/v2/source-corrections/jobs', {
         method: 'POST',
@@ -190,7 +192,7 @@ export function AttendanceRecovery({
       setJob(result)
       toast.notice(FIX_TIMES.queued)
     } catch (error) {
-      setActionError(error instanceof Error && error.message ? error.message : "Couldn't fix the times. Try again.")
+      showActionError(error, "Couldn't fix the times. Try again.")
     } finally {
       setBusy(false)
     }
@@ -207,7 +209,7 @@ export function AttendanceRecovery({
     if (!job || !password || reason.trim().length < 10) return
     const expectedConfirmation = `${control.toUpperCase()} ${job.job_id}`
     if (controlConfirmation.trim() !== expectedConfirmation) {
-      setActionError(`Type ${expectedConfirmation} to confirm.`)
+      setActionErrorState({ sentence: `Type ${expectedConfirmation} to confirm.`, raw: '', code: null })
       return
     }
     setControlBusy(true)
@@ -220,7 +222,7 @@ export function AttendanceRecovery({
       setControlConfirmation('')
       toast.notice(FIX_TIMES.controlDone[control])
     } catch (error) {
-      setActionError(error instanceof Error && error.message ? error.message : "That didn't work. Try again.")
+      showActionError(error, "That didn't work. Try again.")
     } finally {
       setControlBusy(false)
     }
@@ -266,7 +268,7 @@ export function AttendanceRecovery({
             <p className="recover-muted">{FIX_TIMES.toFix(toFix)}</p>
           </div>
           {Boolean(sourceError) && <ErrorState compact title="Couldn't load the records to fix." error={sourceError} onRetry={() => sourceRefresh.runNow()} />}
-          {actionError && <Callout tone="danger" role="alert" title="That didn't work.">{actionError}</Callout>}
+          {actionError && <Callout tone="danger" role="alert" title="That didn't work.">{actionError.sentence}{actionError.raw && <TechnicalDetails>{actionError.raw}</TechnicalDetails>}</Callout>}
           <h3 className="recover-fix-heading" data-brand>{FIX_TIMES.zkt}</h3>
           <ul className="recover-fix-list">
             {sourceExceptions?.rows?.map((row) => {
@@ -345,7 +347,7 @@ export function AttendanceRecovery({
               <label className="recover-fix-phrase">
                 <span>{FIX_TIMES.typePhrase(controlPhrase)}</span>
                 <input value={controlConfirmation} onChange={(event) => setControlConfirmation(event.target.value)} autoComplete="off" data-technical />
-                <small>Use the action word followed by the full job ID. Note and password above are needed too.</small>
+                <small>Type the words shown above exactly. The note and your password are needed too.</small>
               </label>
               <div className="recover-fix-actions">
                 {['QUEUED', 'RUNNING', 'PAUSE_REQUESTED'].includes(job.status) && <Button busy={controlBusy} busyLabel="Pausing…" disabled={controlBusy || controlConfirmation.trim() !== `PAUSE ${job.job_id}`} onClick={() => controlJob('pause')}>Pause</Button>}

@@ -616,7 +616,7 @@ describe('Attendance check-ins', () => {
     expect(punchTime.checked).toBe(true)
     expect(today.checked).toBe(false)
     expect(dialog.textContent).toMatch(/3 check-ins will not be sent; 1 check-in will be sent/)
-    fireEvent.change(screen.getByLabelText('Why are you sending these? (saved in the records)'), { target: { value: 'HR confirmed identities' } })
+    fireEvent.change(screen.getByLabelText('Why?'), { target: { value: 'HR confirmed identities' } })
     fireEvent.change(screen.getByLabelText('Your password'), { target: { value: 'test-password' } })
 
     fireEvent.click(within(dialog).getByLabelText(/Use today's CNIC \*{5}-\*{4}609-2 for A\.Saleem · Employee ID 04048 · 1 check-in/))
@@ -661,7 +661,7 @@ describe('Attendance check-ins', () => {
     fireEvent.click(within(sheet).getByRole('button', { name: 'Send to HR system' }))
     const approve = await screen.findByRole('button', { name: 'Send 1 check-in' }) as HTMLButtonElement
     await screen.findByRole('region', { name: 'CNIC changed since the check-in' })
-    fireEvent.change(screen.getByLabelText('Why are you sending these? (saved in the records)'), { target: { value: 'Punch-time identity' } })
+    fireEvent.change(screen.getByLabelText('Why?'), { target: { value: 'Punch-time identity' } })
     fireEvent.change(screen.getByLabelText('Your password'), { target: { value: 'test-password' } })
     expect(approve.disabled).toBe(false)
     fireEvent.click(approve)
@@ -756,7 +756,7 @@ describe('Attendance check-ins', () => {
     expect(dialog.textContent).not.toMatch(/nearest/i)
     expect(dialog.textContent).toMatch(/3 check-ins will not be sent; 0 check-ins will be sent/)
     fireEvent.click(within(changed).getByLabelText(/CNIC at check-in time/))
-    fireEvent.change(screen.getByLabelText('Why are you sending these? (saved in the records)'), { target: { value: 'HR confirmed Toheed punched' } })
+    fireEvent.change(screen.getByLabelText('Why?'), { target: { value: 'HR confirmed Toheed punched' } })
     fireEvent.change(screen.getByLabelText('Your password'), { target: { value: 'test-password' } })
     fireEvent.click(screen.getByRole('button', { name: 'Send 3 check-ins' }))
     await screen.findByText('Getting ready')
@@ -935,7 +935,7 @@ describe('Attendance check-ins', () => {
     expect(screen.getByText('2 selected')).toBeTruthy()
     sendChosen()
     expect(screen.getByRole('dialog').textContent).toMatch(/Older damaged record numbers are checked against the HR system records/i)
-    fireEvent.change(screen.getByLabelText('Why are you sending these? (saved in the records)'), { target: { value: 'Verified by administrator' } })
+    fireEvent.change(screen.getByLabelText('Why?'), { target: { value: 'Verified by administrator' } })
     fireEvent.change(screen.getByLabelText('Your password'), { target: { value: 'test-password' } })
     // Sending waits until the server has returned its read-only checks.
     const approve = screen.getByRole('button', { name: 'Send 2 check-ins' }) as HTMLButtonElement
@@ -1067,8 +1067,9 @@ describe('Attendance check-ins', () => {
 
     renderView()
 
-    expect(await screen.findByText('Oracle content and downstream attendance are verified.')).toBeTruthy()
-    expect(screen.queryByText('This punch cannot be released safely.')).toBeNull()
+    expect(await screen.findByText('The HR system has it.')).toBeTruthy()
+    expect(screen.queryByText("Can't be sent (see code)")).toBeNull()
+    expectPlainText(document.querySelector('.release-history-workspace') as HTMLElement)
   })
 
   it('has two tabs, keeps them in the address and rewrites old links', async () => {

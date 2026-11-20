@@ -5,6 +5,7 @@ import { useCallback, useEffect, useState } from 'react'
 import { api } from '../../api'
 import { Button, ErrorState, Sheet, Skeleton, TechnicalDetails } from '../../ui'
 import { idempotency } from '../../lib/idempotency'
+import { plainErrorText } from '../../lib/plainApiError'
 import { dayTime } from '../../lib/time'
 import { problemShort, RECORD_SHEET } from '../../words/recover'
 import type { ReconciliationDivergenceDetail, ReconciliationDivergenceReveal } from '../../types'
@@ -49,7 +50,7 @@ export function RecordChangedSheet({ divergenceId, onClose, toast }: { divergenc
       toast.notice(RECORD_SHEET.rawShown)
     } catch (failure) {
       setPassword('')
-      toast.error(failure instanceof Error && failure.message ? failure.message : RECORD_SHEET.failed)
+      toast.error(plainErrorText(failure, RECORD_SHEET.failed))
     } finally {
       setBusy(false)
     }

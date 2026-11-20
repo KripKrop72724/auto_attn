@@ -17,6 +17,7 @@ import type {
 } from '../types'
 import { explainOperatorError, OperatorFailureMessage, type OperatorFailure } from './AlertResolveDialog'
 import './CheckinNotification.css'
+import { STEP_UP } from '../words/glossary'
 
 type Toast = { notice: (message: string) => void; error: (message: string) => void }
 
@@ -194,8 +195,8 @@ function CheckinNotifyDetails({
         )}
         {value.can_retry && (
           <>
-            <label>Why? (saved in the records)<textarea value={reason} maxLength={300} placeholder="At least 10 characters" onChange={(event) => setReason(event.target.value)} /></label>
-            <label>Your password<input type="password" autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} /></label>
+            <label>{STEP_UP.why}<textarea value={reason} maxLength={300} onChange={(event) => setReason(event.target.value)} /></label><small className="step-up-help">{STEP_UP.whyHelp(10)}</small>
+            <label>{STEP_UP.password}<input type="password" autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} /></label><small className="step-up-help">{STEP_UP.passwordHelp}</small>
           </>
         )}
         {value.detail && <TechnicalDetails><p>{value.detail}</p></TechnicalDetails>}
@@ -424,8 +425,8 @@ export function CheckinNotifySettingsDialog({
               {!cnicValid && <small className="attention-copy">Enter all 13 digits of the CNIC.</small>}
             </div>
             <p className="notify-copy">Old check-ins never get a message: one the HR system confirms more than {current.stale_window_hours} hours after it happened shows "Not sent: confirmed too late". Check-ins within {Math.round(current.coalesce_seconds / 60)} minutes of each other get one message.</p>
-            <label>Why? (saved in the records)<textarea value={reason} maxLength={300} placeholder="At least 10 characters" onChange={(event) => setReason(event.target.value)} /></label>
-            <label>Your password<input type="password" autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} /></label>
+            <label>{STEP_UP.why}<textarea value={reason} maxLength={300} onChange={(event) => setReason(event.target.value)} /></label><small className="step-up-help">{STEP_UP.whyHelp(10)}</small>
+            <label>{STEP_UP.password}<input type="password" autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} /></label><small className="step-up-help">{STEP_UP.passwordHelp}</small>
           </>
         )}
         {failure && <OperatorFailureMessage failure={failure} />}

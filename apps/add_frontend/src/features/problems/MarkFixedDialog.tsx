@@ -138,7 +138,8 @@ export function MarkFixedDialog({ alert, deviceName, division, toast, onClose, o
         </div>
         <div className="mark-fixed-field">
           <label className="mark-fixed-label" htmlFor={`${titleId}-password`}>{MARK_FIXED.password}</label>
-          <input id={`${titleId}-password`} type="password" autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} />
+          <span className="mark-fixed-help" id={`${titleId}-password-help`}>{MARK_FIXED.passwordHelp}</span>
+          <input id={`${titleId}-password`} type="password" autoComplete="current-password" aria-describedby={`${titleId}-password-help`} value={password} onChange={(event) => setPassword(event.target.value)} />
         </div>
         {memory && <Callout tone="info">{MARK_FIXED.reminder}</Callout>}
         {failure && (

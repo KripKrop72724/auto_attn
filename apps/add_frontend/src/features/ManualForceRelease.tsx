@@ -5,11 +5,14 @@ import { Icon } from '../Icon'
 import { DivisionTag } from '../ui'
 import { deviceDivision } from '../lib/division'
 import { deviceName } from '../lib/deviceNames'
-import { FORCE_RUN_ERROR } from '../words/attendanceReasons'
+import { FORCE_RUN_ERROR, plainReason } from '../words/attendanceReasons'
+import { STEP_UP } from '../words/glossary'
 import type { Device } from '../types'
 import { longTime, rowTime } from './attendance/attendanceWords'
 import './SafeAttendanceRepair.css'
 import './ManualForceRelease.css'
+import { plainErrorText } from '../lib/plainApiError'
+import { ERROR_FALLBACK } from '../words/errors'
 
 type Toast = { notice: (text: string) => void; error: (text: string) => void }
 type Counts = { checked: number; ready: number; review: number; attention?: number; waiting: number; confirmed: number; stopped: number; skipped: number; already_confirmed: number; already_delivering: number; unavailable_devices: number }
@@ -18,7 +21,7 @@ export type ForceRun = {
   execution_enabled: boolean; created_at: string; updated_at: string; expires_at: string | null; last_error: string | null;
   devices: Array<{ connector_id: string; name: string; serial: string; status: string; checked: number; ready: number; synced_at: string | null; error: string | null }>
 }
-type Item = { id: number; status: string; needs_attention?: boolean; reason: string; name: string | null; user_id: string; device_name: string; device_serial: string; time: string }
+type Item = { id: number; status: string; needs_attention?: boolean; reason: string; reason_code?: string | null; name: string | null; user_id: string; device_name: string; device_serial: string; time: string }
 type Page = { rows: Item[]; next_cursor: number | null }
 type Scope = 'SELECTED' | 'LIFE' | 'HEALTH' | 'ALL_PAKISTAN'
 const checkinCount = (count: number) => `${count.toLocaleString()} ${count === 1 ? 'check-in' : 'check-ins'}`
@@ -33,7 +36,8 @@ export const FORCE_RUN_WORDS: Record<string, string> = {
   SKIPPED: 'Not sent after the second check', READY: 'Can be sent', NEEDS_REVIEW: "Can't be sent", CONFIRMED: 'Sent', EXCLUDED: 'Left out',
 }
 const label = FORCE_RUN_WORDS
-const message = (error: unknown) => error instanceof Error ? error.message : "Couldn't reach the dashboard. Try again."
+// A plain sentence only; the backend text never shows (writing rule 6).
+const message = (error: unknown) => plainErrorText(error, ERROR_FALLBACK)
 const placeOf = (device: Pick<Device, 'friendly_name' | 'display_name' | 'zone_id'>) => {
   if (device.friendly_name) return device.friendly_name
   const name = deviceName(device.display_name || device.zone_id)
@@ -163,7 +167,7 @@ export function ManualForceRelease({ devices, toast, initialConnectorId }: { dev
       {run && <div className="safe-repair-run">
         <div className="safe-repair-heading"><h3 aria-live="polite">{run.status === 'RUNNING' && syncInProgress ? 'Refreshing machines' : label[run.status] || 'In progress'}</h3><a href={`/attendance?view=fix-tools&tool=held-staff&force_run=${run.job_id}`}>Link to this check</a></div>
         <ol className="safe-repair-steps" aria-label="Progress">{['Check', 'Review', 'Refresh machines', 'Get ready', 'Waiting for HR system', 'Done'].map((name, i) => <li key={name} aria-current={step === i ? 'step' : undefined}>{name}</li>)}</ol>
-        <div className="safe-repair-counts"><Metric label="Can be sent" value={run.counts.ready} icon="shield" detail="Same person and CNIC on the machine now" /><Metric label="Can't be sent" value={run.counts.review} icon="alert" detail="Kept safely for checking" tone={run.counts.review ? 'warning' : 'neutral'} /><Metric label="Already sent" value={run.counts.already_confirmed} icon="check" detail="Left out of this one" /><Metric label="Machines offline" value={run.counts.unavailable_devices} icon="server" detail="The others can go ahead" /></div>
+        <div className="safe-repair-counts"><Metric label="Can be sent" value={run.counts.ready} icon="shield" detail="Same person and CNIC on the machine now" /><Metric label="Can't be sent" value={run.counts.review} icon="alert" detail="Set aside for checking" tone={run.counts.review ? 'warning' : 'neutral'} /><Metric label="Already sent" value={run.counts.already_confirmed} icon="check" detail="Left out of this one" /><Metric label="Machines offline" value={run.counts.unavailable_devices} icon="server" detail="The others can go ahead" /></div>
         {!['CHECKING', 'CHECKED'].includes(run.status) && <p role="status">{run.counts.confirmed.toLocaleString()} sent · {(run.counts.waiting - ((run.counts.attention ?? run.counts.review) - run.counts.review)).toLocaleString()} waiting · {run.counts.skipped.toLocaleString()} not sent · {run.counts.stopped.toLocaleString()} stopped · {(run.counts.attention ?? run.counts.review).toLocaleString()} need checking</p>}
         {run.counts.already_delivering > 0 && <p>{checkinCount(run.counts.already_delivering)} are already on the way and won't be sent again.</p>}
         <ul className="safe-repair-devices">{run.devices.map(d => <li key={d.connector_id}><strong>{runPlace(devices, d.connector_id, d.name)}</strong><span>{d.status === 'CHECKED' ? 'Ready' : label[d.status] || 'In progress'} · {d.checked.toLocaleString()} checked{d.synced_at ? ` · List of people read ${rowTime(d.synced_at)}` : ''}</span>{d.error && <span data-technical className="force-device-error">{d.error}</span>}</li>)}</ul>
@@ -171,15 +175,15 @@ export function ManualForceRelease({ devices, toast, initialConnectorId }: { dev
         {run.last_error && <p role="status">{FORCE_RUN_ERROR}</p>}
         {['RUNNING', 'WAITING_ORACLE', 'PAUSED'].includes(run.status) && <div className="safe-repair-actions"><button className="button secondary" onClick={() => showConfirm(run.status === 'PAUSED' ? 'RESUME' : 'PAUSE')}>{run.status === 'PAUSED' ? 'Resume' : 'Pause'}</button><button className="button secondary" onClick={() => showConfirm('STOP')}>Stop</button><span>You can close this page. The task is saved.</span></div>}
         <div className="safe-repair-filter"><label>Show<select value={filter} onChange={e => { setFilter(e.target.value); setCursor(0); setBack([]) }}><option value="">All results</option>{['READY', 'NEEDS_REVIEW', 'SKIPPED', 'EXCLUDED', 'WAITING_ORACLE', 'CONFIRMED'].map(s => <option key={s} value={s}>{label[s]}</option>)}</select></label><label>Find a person<input value={search} onChange={e => { setSearch(e.target.value); setCursor(0); setBack([]) }} placeholder="Name or Employee ID" /></label></div>
-        {[...groups].map(([key, rows]) => <div className="force-employee-group" key={key}><h4>{runPlace(devices, '', rows[0].device_name)} · {rows[0].name || 'Name not known'}</h4><small>Employee ID {rows[0].user_id}</small><ul className="safe-repair-items">{rows.map(item => <li key={item.id}><span>{rowTime(item.time)}</span><div><strong>{item.needs_attention ? 'Needs checking' : label[item.status] || 'In progress'}</strong><span>{item.reason}</span></div></li>)}</ul></div>)}
+        {[...groups].map(([key, rows]) => <div className="force-employee-group" key={key}><h4>{runPlace(devices, '', rows[0].device_name)} · {rows[0].name || 'Name not known'}</h4><small>Employee ID {rows[0].user_id}</small><ul className="safe-repair-items">{rows.map(item => <li key={item.id}><span>{rowTime(item.time)}</span><div><strong>{item.needs_attention ? 'Needs checking' : label[item.status] || 'In progress'}</strong><span>{plainReason('force', item.reason_code).sentence}</span>{item.reason && <span data-technical className="force-item-reason">{item.reason}</span>}</div></li>)}</ul></div>)}
         {!items.rows.length && <p>No check-ins in this view yet.</p>}
         <div className="safe-repair-actions"><button className="button secondary" disabled={!back.length} onClick={() => { setCursor(back.at(-1) || 0); setBack(old => old.slice(0, -1)) }}>Previous</button><button className="button secondary" disabled={!items.next_cursor} onClick={() => { setBack(old => [...old, cursor]); setCursor(items.next_cursor || 0) }}>Next</button></div>
       </div>}
     </div>
     {confirm && run && <Dialog titleId="force-approve-title" title={dialogTitle} description={confirm === 'START' ? `${machines(readyDevices.length)} ready. ${checkinCount(run.counts.review)} can't be sent; ${machines(run.counts.unavailable_devices)} offline.` : confirm === 'RESUME' ? "The machines' people lists are read again before the rest are sent." : 'No more check-ins start sending. Check-ins already on the way are still counted. Attendance is never deleted.'} onClose={() => { if (!busy) { setConfirm(null); setPassword(''); setError('') } }}><form className="dialog-body" onSubmit={approve}>
-      {confirm === 'START' && <><p>You approve using the person and CNIC on the machine now for these older check-ins. This saves your decision in the records. The machines are read again first, and any match that changed is not sent.</p><label>Why? (saved in the records)<textarea required minLength={3} maxLength={500} value={reason} onChange={e => setReason(e.target.value)} /></label></>}
+      {confirm === 'START' && <><p>You approve using the person and CNIC on the machine now for these older check-ins. This saves your decision in the records. The machines are read again first, and any match that changed is not sent.</p><label>{STEP_UP.why}<textarea required minLength={3} maxLength={500} value={reason} onChange={e => setReason(e.target.value)} /></label><small className="step-up-help">{STEP_UP.whyHelp(3)}</small></>}
       {confirm === 'RESUME' && <p>The machines' people lists are read again before any more check-ins are sent.</p>}
-      <label>Your password<input type="password" required autoComplete="current-password" value={password} onChange={e => setPassword(e.target.value)} /></label>{error && <p role="alert" className="message pattern-blocked">{error}</p>}
+      <label>{STEP_UP.password}<input type="password" required autoComplete="current-password" value={password} onChange={e => setPassword(e.target.value)} /></label><small className="step-up-help">{STEP_UP.passwordHelp}</small>{error && <p role="alert" className="message pattern-blocked">{error}</p>}
       <footer className="dialog-actions"><button className="button secondary" type="button" disabled={busy} onClick={() => { setConfirm(null); setPassword(''); setError('') }}>Cancel</button><button className="button primary" disabled={busy || !password || (confirm === 'START' && reason.trim().length < 3)}>{busy ? 'Saving…' : confirm === 'START' ? `Send ${checkinCount(run.counts.ready)}` : 'Confirm'}</button></footer></form></Dialog>}
   </section>
 }

@@ -96,7 +96,7 @@ export const COMM_KEY_ERRORS: Record<string, string> = {
   COMM_KEY_STATE_MISSING: 'The dashboard lost track of this change; nothing was changed.',
   COMM_KEY_POSTCONDITION_FAILED: "The change was reported, but the check afterwards didn't pass.",
   COMM_KEY_INDETERMINATE: "The dashboard can't tell whether the change worked.",
-  COMM_KEY_DIAGNOSTIC_VERIFIED_NO_COMMIT: 'The engineer test worked; nothing was changed.',
+  COMM_KEY_DIAGNOSTIC_VERIFIED_NO_COMMIT: 'The test by IT worked; nothing was changed.',
   TCP_4370_UNREACHABLE: "The link box couldn't reach the machine on the network.",
   CONNECT_NO_RESPONSE: "The machine didn't answer.",
   AUTH_NO_RESPONSE: "The machine didn't answer.",

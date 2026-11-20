@@ -122,3 +122,8 @@
   .ui-skeleton { animation: none; background: var(--skeleton-base); }
   .ui-stat-tile { transition: none; }
 }
+
+/* Touch targets: 44 px on phones and touch screens. */
+@media (pointer: coarse), (max-width: 760px) {
+  .ui-menu-item, .ui-disclosure > summary, .ui-technical-copy { min-height: var(--touch-min); }
+}

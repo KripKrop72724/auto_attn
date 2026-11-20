@@ -45,7 +45,7 @@ export const AttendanceRowItem = memo(function AttendanceRowItem({ row, now, aut
             <input type="checkbox" aria-label={`Select ${row.display_name || `Employee ID ${row.user_id}`}, ${kind} ${time}`} checked={selected} disabled={selectDisabled} onChange={() => onToggle(row)} />
           </label>
         )}
-        <button type="button" className="attendance-row-open" aria-label={`Open check-in ${name}, ${kind} ${time}`} onClick={(event) => onOpen(row, event.currentTarget)}>
+        <button type="button" className="attendance-row-open" aria-label={`Open check-in ${name}, ${kind} ${time}, ${placeLine(row)}, ${chip.label}`} onClick={(event) => onOpen(row, event.currentTarget)}>
           <span className="attendance-cell attendance-person">
             <strong data-user-text>{name}</strong>
             <small>Employee ID {row.user_id} · {kind}</small>

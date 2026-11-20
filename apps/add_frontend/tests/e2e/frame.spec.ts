@@ -79,7 +79,7 @@ test('primary routes and device deep link remain usable', async ({ page }, testI
   // The engineer custody card moved to Tools › Advanced tools (04-device §6).
   await panel.getByRole('tab', { name: 'Tools' }).click()
   await panel.getByRole('button', { name: 'Advanced tools · for IT' }).click()
-  await panel.getByRole('button', { name: 'Show the engineer view' }).click()
+  await panel.getByRole('button', { name: 'Show the IT view' }).click()
   const custody = page.getByRole('article', { name: 'ZKT ADD custody' })
   await expect(custody.getByRole('heading', { name: 'Preserved records need processing repair' })).toBeVisible()
   await custody.locator('summary').click()

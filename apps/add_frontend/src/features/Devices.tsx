@@ -242,13 +242,15 @@ export function DevicesView() {
               {versions.map((option) => (
                 <label key={option.id} className="devices-check">
                   <input type="radio" name="devices-version" checked={filters.version === option.id} onChange={() => setValues({ version: option.id })} />
-                  <span>{option.version ? DEVICES_WORDS.versionOption(option.version, option.count, option.hikvision) : DEVICES_WORDS.versionUnknown}</span>
+                  <span>{option.version ? DEVICES_WORDS.versionOption(option.version, option.count) : DEVICES_WORDS.versionUnknown}{option.version && option.hikvision && <> <span data-brand>{DEVICES_WORDS.versionBrand}</span></>}</span>
                 </label>
               ))}
             </fieldset>
           </div>
         )}
         moreFiltersCount={moreCount}
+        moreLabel={phone ? DEVICES_WORDS.filtersCount(moreCount) : undefined}
+        showResultsLabel={DEVICES_WORDS.showDevices(shown.length)}
         active={active}
         onClearAll={filtered ? clearAll : undefined}
         result={app.devicesLoaded ? { shown: shown.length, total: totalInScope } : undefined}

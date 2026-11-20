@@ -35,7 +35,7 @@ describe('app frame', () => {
     expect(home.getAttribute('aria-current')).toBe('page')
     expect(await within(menu).findByText('Switched off')).toBeTruthy()
     // The problem count is said in words inside the link, never as a bare number.
-    expect(await within(menu).findByText('1 problem to look at')).toBeTruthy()
+    expect(await within(menu).findByText('1 new problem')).toBeTruthy()
     expect(screen.getByRole('link', { name: 'Skip to main content' })).toBeTruthy()
     expect(document.querySelector('.live-sync')?.textContent).toMatch(/^(Connecting…|Live|Reconnecting…)$/)
     expectPlainText(document.querySelector('.app-sidebar') as HTMLElement)
@@ -64,13 +64,13 @@ describe('app frame', () => {
     render(<App />)
     await appReady()
     fireEvent.click(screen.getByRole('button', { name: 'StateHealthAdmin, account menu' }))
-    const menu = screen.getByRole('menu')
+    const menu = screen.getByRole('group', { name: 'StateHealthAdmin, account menu' })
     expect(within(menu).getByText('Signed in as StateHealthAdmin')).toBeTruthy()
     expect(within(menu).getByRole('switch', { name: 'Show technical details' })).toBeTruthy()
-    expect(within(menu).getByRole('menuitem', { name: /Settings/ }).getAttribute('href')).toBe('/settings')
+    expect(within(menu).getByRole('link', { name: /Settings/ }).getAttribute('href')).toBe('/settings')
     expect(within(menu).getByRole('button', { name: /Sign out/ })).toBeTruthy()
     fireEvent.keyDown(document, { key: 'Escape' })
-    await waitFor(() => expect(screen.queryByRole('menu')).toBeNull())
+    await waitFor(() => expect(screen.queryByRole('group', { name: 'StateHealthAdmin, account menu' })).toBeNull())
   })
 
   it('on a phone has a five-cell bottom bar and a More sheet with the advanced tools', async () => {

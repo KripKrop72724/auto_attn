@@ -100,7 +100,7 @@ describe('State Life ADD interface · Problems', () => {
     expect(within(sheet).getByText(/ATTENDANCE_EVENT_STRING_PATTERN_MISMATCH/).closest('[data-technical]')).toBeTruthy()
 
     const reason = within(sheet).getByLabelText('What did you find?')
-    const password = within(sheet).getByLabelText('Enter your password to confirm')
+    const password = within(sheet).getByLabelText('Your password')
     fireEvent.change(reason, { target: { value: 'Inspect retained malformed source evidence.' } })
     fireEvent.change(password, { target: { value: 'local-quarantine-step-up' } })
     fireEvent.click(within(sheet).getByRole('button', { name: 'Show original record' }))
