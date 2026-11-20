@@ -8,10 +8,11 @@ import './UsersWorkspace.css'
 import './people/people.css'
 import { api, queryString } from '../api'
 import type { Command, Device, HistoricalIdentityCandidate, HistoricalIdentityReport, IdentityConflictGroup, IdentityConflictReport, UserDeletionJob } from '../types'
-import { EmptyState, ErrorState, FilterBar, PageHeader, Sheet, Skeleton, TabPanel, Tabs, useIsPhone } from '../ui'
+import { EmptyState, ErrorState, FilterBar, PageHeader, Sheet, Skeleton, TabPanel, Tabs, useIsPhone, useToast as useUiToast } from '../ui'
 import { Icon } from '../Icon'
 import { flag, oneOf, text, useUrlState } from '../lib/urlState'
 import { useDivision } from '../lib/useDivision'
+import { parseDivision } from '../lib/division'
 import { idempotency } from '../lib/idempotency'
 import { clock } from '../lib/time'
 import type { UserDialogState } from '../lib/dashboardTypes'
@@ -177,8 +178,10 @@ function PeopleWorkspace({ devices, devicesLoaded, devicesError, deviceId, switc
   const location = useLocation()
   const navigate = useNavigate()
   const phone = useIsPhone()
-  const [division] = useDivision()
+  // A direct link opens the device whatever the switch says; the header then names its division.
+  const division = parseDivision(location.search)
   const [filters, setFilters] = useUrlState(workspaceSchema)
+  const uiToast = useUiToast()
   const requestedUserId = useMemo(() => new URLSearchParams(location.search).get('user_id')?.trim() || '', [])
   const requestedQuery = useMemo(() => (switched ? '' : filters.q), [])
   const [searchText, setSearchText] = useState(requestedUserId || requestedQuery)
@@ -663,7 +666,7 @@ function PeopleWorkspace({ devices, devicesLoaded, devicesError, deviceId, switc
       <div className="users-workspace">
         <PageHeader title={PICKER.title} description={PICKER.description} />
         {devicesLoaded && !devicesError && !loadingDiagnostics
-          ? <EmptyState icon="server" title={HEADER.changeDevice} action={<button type="button" className="button secondary" onClick={() => setChangeDeviceOpen(true)}>{HEADER.changeDevice}</button>} />
+          ? <EmptyState icon="server" title={HEADER.notFound} action={<button type="button" className="button secondary" onClick={() => setChangeDeviceOpen(true)}>{HEADER.changeDevice}</button>}>{HEADER.notFoundHelp}</EmptyState>
           : diagnostics.device && !devicesLoaded ? <ErrorState title={PICKER.loadFailed} error={diagnostics.device} onRetry={loadDiagnostics} /> : <Skeleton variant="block" count={2} label={PICKER.loading} />}
         {changeDeviceSheet}
       </div>
@@ -883,7 +886,7 @@ function PeopleWorkspace({ devices, devicesLoaded, devicesError, deviceId, switc
         />
       )}
       {resolutionDialog && <IdentityResolutionDialog state={resolutionDialog} device={selected} onClose={() => setResolutionDialog(null)} onComplete={(report) => { setConflictReport(report); void refreshWorkspace() }} toast={toast} />}
-      {historicalDialog && <HistoricalIdentityResolutionDialog state={historicalDialog} device={selected} onClose={() => setHistoricalDialog(null)} onComplete={async () => { await Promise.all([refreshWorkspace(), refreshFleet()]) }} toast={toast} />}
+      {historicalDialog && <HistoricalIdentityResolutionDialog state={historicalDialog} device={selected} onClose={() => setHistoricalDialog(null)} onComplete={async () => { await Promise.all([refreshWorkspace(), refreshFleet()]) }} toast={{ notice: toast.notice, error: toast.error, show: uiToast.show }} onOpenNext={(next) => navigate(next)} />}
       </Suspense>
       {endLeaseOpen && selected.active_lease && <EndAdminAccessDialog lease={selected.active_lease} deviceName={place} onClose={() => setEndLeaseOpen(false)} onCommand={(command) => trackCommand(command, { name: selected.active_lease?.user_display_name || undefined })} toast={toast} />}
       {machineDialogOpen && <MachineCheckDialog device={selected} place={place} onClose={() => setMachineDialogOpen(false)} onAccepted={(updated, command) => { setDetail((current) => mergeDevice(current, updated)); setMachineCommand(command); trackCommand(command) }} toast={toast} />}

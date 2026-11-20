@@ -404,8 +404,11 @@ export function HistoricalIdentityResolutionDialog({
   onComplete,
   toast,
   simple = false,
+  onOpenNext,
 }: {
   simple?: boolean
+  /** Opens the next step (Attendance › Fix tools) inside the app. */
+  onOpenNext?: (path: string) => void
   state: Exclude<HistoricalIdentityDialogState, null>
   device: Device
   onClose: () => void
@@ -482,7 +485,7 @@ export function HistoricalIdentityResolutionDialog({
       })
       await onComplete()
       const next = `/attendance?view=fix-tools&tool=held-staff&device_id=${encodeURIComponent(device.connector_id)}`
-      if (toast.show) toast.show({ tone: 'success', text: OLD_CHECKINS.saved, action: { label: OLD_CHECKINS.open, onClick: () => { window.location.assign(next) } } })
+      if (toast.show && onOpenNext) toast.show({ tone: 'success', text: OLD_CHECKINS.saved, action: { label: OLD_CHECKINS.open, onClick: () => onOpenNext(next) } })
       else toast.notice(OLD_CHECKINS.saved)
       onClose()
     } catch (reasonValue) {

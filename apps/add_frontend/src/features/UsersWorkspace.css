@@ -116,3 +116,9 @@
 @media (forced-colors: active) {
   .user-directory-row.identity-missing, .user-directory-row.identity-conflict, .user-directory-row.identity-resolved { border-left: 4px solid CanvasText; }
 }
+
+/* Toasts sit above the Select bar, never on top of its buttons (PPL-15). */
+body:has(.people-workspace.has-bulk-bar) .ui-toast-stack { bottom: calc(var(--space-5) + 84px); }
+@media (max-width: 760px) {
+  body:has(.people-workspace.has-bulk-bar) .ui-toast-stack { bottom: calc(132px + env(safe-area-inset-bottom)); }
+}

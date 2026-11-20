@@ -216,6 +216,8 @@ export const HEADER = {
   statusFailed: "Couldn't get this machine's latest status. Showing what we had.",
   otherDivision: (label: string) => `This device is ${label}`,
   moreFor: 'More for this device',
+  notFound: 'This device no longer exists.',
+  notFoundHelp: 'Choose another device.',
 } as const
 
 export const NOTICE = {
