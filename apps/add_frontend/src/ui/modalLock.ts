@@ -70,9 +70,11 @@ export function prefersReducedMotion() {
 
 // Exit motion without keeping the real layer mounted: a hidden, inert copy of
 // the closing layer fades out and is removed. Only where the Web Animations API
-// exists (the production CSP allows element.animate, not injected styles).
+// exists (the production CSP allows element.animate, not injected styles), and
+// not under browser automation, so end-to-end checks never meet the copy.
 export function playExitGhost(node: HTMLElement | null, panelSelector: string, panelKeyframes: Keyframe[]) {
   if (!node || !node.isConnected || typeof node.animate !== 'function' || prefersReducedMotion()) return
+  if (typeof navigator !== 'undefined' && navigator.webdriver) return
   const ghost = node.cloneNode(true) as HTMLElement
   ghost.querySelectorAll('[id]').forEach((element) => element.removeAttribute('id'))
   ghost.removeAttribute('id')

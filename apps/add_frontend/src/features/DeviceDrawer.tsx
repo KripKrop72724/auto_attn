@@ -296,7 +296,7 @@ export function DeviceDrawer({
     ? rows.map((row) => <AlertCard key={row.id} alert={row} headingLevel={4} operator={operatorByAlert.get(row.id)} busy={alertBusy} onAcknowledge={(item) => void acknowledgeAlert(item.id)} onResolve={resolveAlert} />)
     : <p className="device-alerts-empty">{alertsLoaded ? empty : 'Loading alerts…'}</p>
   return (
-    <Dialog titleId="device-drawer-title" title={device.display_name} description={`${device.zone_id} · ${device.hardware_id}`} onClose={onClose} className="device-drawer">
+    <Dialog titleId="device-drawer-title" title={device.display_name} description={`${device.zone_id} · ${device.hardware_id}`} onClose={onClose} className="device-drawer" dismissOnBackdrop>
       <div className={`drawer-status ${device.is_spare ? 'spare-drawer-status' : ''}`}><StatusBadge state={device.is_spare ? 'SPARE' : device.state} live={!device.is_spare && device.connected} />{!device.is_spare && terminalLink && <TerminalLinkBadge link={terminalLink} />}<span>{device.is_spare ? 'Reserve inventory · Excluded from fleet health and alerts' : `${deviceActivity(device)} · Last contact ${relativeTime(device.last_seen_at)}`}</span></div>
       <div className="tabs" role="tablist" aria-label="Device details">
         {drawerTabs.map((item, index) => (

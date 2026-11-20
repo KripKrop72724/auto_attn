@@ -585,7 +585,7 @@ test('primary routes and device deep link remain usable', async ({ page }, testI
   const bounds = await custody.evaluate(element => ({ width: element.clientWidth, scroll: element.scrollWidth }))
   expect(bounds.scroll).toBeLessThanOrEqual(bounds.width + 1)
   if (process.env.ADD_VISUAL_QA === '1') await custody.screenshot({ path: testInfo.outputPath('custody-panel.png') })
-  await page.getByRole('button', { name: 'Close dialog' }).click()
+  await page.getByRole('button', { name: 'Close', exact: true }).click()
 
   const primaryNav = page.getByRole('navigation', { name: 'Primary navigation' })
   await primaryNav.getByRole('button', { name: 'Users', exact: true }).click()
@@ -778,7 +778,7 @@ test('source exception inspector is responsive, keyboard-operable, and fail-clos
   await drawer.getByLabel('Administrator password').fill('not-recorded-by-test')
   await drawer.getByRole('button', { name: 'Reveal protected bytes' }).click()
   await expect(drawer.getByText('ffffffffffffffff')).toBeVisible()
-  await drawer.getByRole('button', { name: 'Close dialog' }).click()
+  await drawer.getByRole('button', { name: 'Close', exact: true }).click()
   await page.getByRole('button', { name: /SLICTOWER · 3rd Floor · ordinal 5,130/ }).click()
   const divergenceDrawer = page.getByRole('dialog', { name: 'Terminal-history change' })
   await expect(divergenceDrawer.getByText('Independent fresh-buffer verification')).toBeVisible()
@@ -894,7 +894,7 @@ test('large reconciliation evidence stays viewport-bound and progressively revea
 
   await drawer.getByRole('button', { name: 'Load 25 older events' }).click()
   await expect(drawer.locator('.reconciliation-event-summary')).toHaveCount(50)
-  await drawer.getByRole('button', { name: 'Close dialog' }).click()
+  await drawer.getByRole('button', { name: 'Close', exact: true }).click()
   await expect(inspect).toBeFocused()
   await expect(page.locator('#root')).not.toHaveAttribute('inert', '')
 })
@@ -997,7 +997,7 @@ test('reported viewport thresholds, route scroll reset, and collision layers rem
   expect(overlayOrder.dialogInsideOverlay).toBe(true)
   expect(overlayOrder.overlayZ).toBeGreaterThan(overlayOrder.highestStickyZ)
   await expect(page.locator('#root')).toHaveAttribute('inert', '')
-  await page.getByRole('button', { name: 'Close dialog' }).click()
+  await page.getByRole('button', { name: 'Close', exact: true }).click()
 })
 
 test('physical provisioning environment is responsive, explicit, and accessible', async ({ page }) => {
@@ -1060,7 +1060,7 @@ test('manual force release remains clear, accessible and resumable', async ({ pa
   await expect(page.getByRole('button', { name: 'Force release 300 punches', exact: true })).toBeEnabled()
   await page.getByRole('button', { name: 'Force release 300 punches', exact: true }).click()
   const dialog = page.getByRole('dialog')
-  await expect(dialog.getByRole('button', { name: 'Close dialog' })).toBeFocused()
+  await expect(dialog.getByRole('button', { name: 'Close', exact: true })).toBeFocused()
   await page.keyboard.press('Tab')
   await expect(dialog.getByLabel('Reason for release')).toBeFocused()
   await dialog.getByLabel('Reason for release').fill('Current terminal identity checked')

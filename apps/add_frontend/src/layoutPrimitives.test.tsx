@@ -101,7 +101,7 @@ describe('viewport layout primitives', () => {
     expect(document.getElementById('root')?.hasAttribute('inert')).toBe(true)
     expect(document.getElementById('root')?.getAttribute('aria-hidden')).toBe('true')
     expect(workspace.style.overflow).toBe('hidden')
-    const close = await screen.findByRole('button', { name: 'Close dialog' })
+    const close = await screen.findByRole('button', { name: 'Close' })
     await waitFor(() => expect(document.activeElement).toBe(close))
 
     fireEvent.click(close)

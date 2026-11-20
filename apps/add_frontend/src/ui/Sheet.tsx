@@ -79,7 +79,7 @@ export function Sheet({
     const backdrop = backdropRef.current
     const isBottom = backdrop?.querySelector('.ui-sheet.is-bottom')
     return () => playExitGhost(backdrop, '.ui-sheet', isBottom
-      ? [{ transform: 'translateY(0)' }, { transform: 'translateY(100%)' }]
+      ? [{ clipPath: 'inset(0)' }, { clipPath: 'inset(100% 0 0 0)' }]
       : [{ clipPath: 'inset(0)' }, { clipPath: 'inset(0 0 0 100%)' }])
   }, [bottom])
 

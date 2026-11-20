@@ -225,7 +225,7 @@ describe('signed release inventory hides superseded releases without revoking th
 
     fireEvent.click(update)
     expect(offered()).toEqual(['zone-lite-2.7.8', 'zone-lite-2.5.2'])
-    fireEvent.click(screen.getByRole('button', { name: 'Close dialog' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Close' }))
 
     fireEvent.click(screen.getByRole('checkbox', { name: 'Show older releases' }))
     fireEvent.click(update)
