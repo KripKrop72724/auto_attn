@@ -49,6 +49,8 @@ from zk_add.attendance_cnic_link import cnic_not_linked_expression, unknown_sync
 from zk_add import attendance_groups
 from zk_add import attendance_summary
 from zk_add import connector_naming
+from zk_add import alert_list
+from zk_add import problem_words
 from zk_add.attendance_force_schemas import ForceCheckRequest, ForceStartRequest, ForceControlRequest, UserRefreshRequest
 from zk_add.attendance_direct_ords_schemas import (
     DirectOrdsPreviewRequest,
@@ -4423,7 +4425,7 @@ def connectivity_history(
     }
 
 
-ALERT_QUEUE_PATTERN = "^(NEEDS_ACTION|ACKNOWLEDGED|ACTIVE|RESOLVED|ALL)$"
+ALERT_QUEUE_PATTERN = "^(NEEDS_ACTION|ACKNOWLEDGED|SEEN|LEGACY_SEEN|ACTIVE|RESOLVED|ALL)$"
 
 
 def alert_queue_filters(queue: str | None) -> list:
@@ -4441,6 +4443,11 @@ def alert_queue_filters(queue: str | None) -> list:
             and_(DeviceAlert.state == "OPEN", DeviceAlert.acknowledged_at.is_not(None)),
             DeviceAlert.state == "ACKNOWLEDGED",
         )]
+    if queue == "SEEN":
+        # Seen and still open; the legacy ACKNOWLEDGED rows are kept apart.
+        return alert_list.seen_filters()
+    if queue == "LEGACY_SEEN":
+        return alert_list.legacy_seen_filters()
     if queue == "ACTIVE":
         return [DeviceAlert.state.in_(["OPEN", "ACKNOWLEDGED"])]
     return [DeviceAlert.state == "RESOLVED"]
@@ -4461,7 +4468,11 @@ def alerts(
         .order_by(DeviceAlert.last_seen_at.desc(), DeviceAlert.id.desc())
         .limit(limit)
     ).all()
-    return {"rows": [serialize_alert(row) for row in rows]}
+    operators = alert_list.operators_for_page(db, [(row, connector) for row in rows])
+    return {"rows": [
+        {**serialize_alert(row), **({"operator": operators[row.id]} if row.id in operators else {})}
+        for row in rows
+    ]}
 
 
 @app.get("/api/v1/alerts")
@@ -4473,19 +4484,55 @@ def global_alerts(
     queue: str | None = Query(default=None, pattern=ALERT_QUEUE_PATTERN),
     limit: int = Query(default=100, ge=1, le=500),
     cursor: str | None = None,
+    division: str | None = None,
+    type: list[str] = Query(default=[]),
+    affects_attendance: bool = False,
+    q: str | None = Query(default=None, max_length=100),
+    from_time: str | None = None,
+    to_time: str | None = None,
+    order: Literal["serious", "newest", "oldest", "fixed_newest"] = "serious",
     auth: tuple[Session, AdminContext] = Depends(require_admin),
 ):
     db, _context = auth
+    try:
+        chosen_division = connector_naming.parse_division(division)
+        codes_of_type = alert_list.type_codes(alert_list.parse_list(type))
+        first_seen_window = alert_list.date_condition(DeviceAlert.first_seen_at, from_time, to_time)
+        resolved_window = alert_list.date_condition(DeviceAlert.resolved_at, from_time, to_time)
+    except (ValueError, alert_list.AlertFilterError) as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
     scope_filters = [Connector.is_spare.is_(False)]
     state_filter = alert_queue_filters(queue)
+    state_only: list = []
     if state:
-        state_filter.append(DeviceAlert.state == state.strip().upper())
-    if severity:
-        scope_filters.append(DeviceAlert.severity == severity.strip().upper())
+        state_only.append(DeviceAlert.state == state.strip().upper())
+        state_filter.append(state_only[0])
+    severity_filter: list = []
+    severities = alert_list.severity_values(severity)
+    if severities:
+        # One value keeps its old meaning; a comma list matches any of them.
+        severity_filter.append(
+            DeviceAlert.severity == severities[0] if len(severities) == 1
+            else DeviceAlert.severity.in_(severities)
+        )
     if connector_id:
         scope_filters.append(Connector.connector_id == connector_id)
     if zone_id:
         scope_filters.append(Connector.zone_id == zone_id)
+    # counts.by_division covers both divisions; counts() applies the division itself.
+    count_scope = [*scope_filters]
+    if chosen_division is not None:
+        scope_filters.append(Connector.id.in_(
+            connector_naming.connector_ids_for_division(db, chosen_division, include_spares=False)
+        ))
+    type_filter = [DeviceAlert.code.in_(codes_of_type)] if type else []
+    attention_filter = (
+        [DeviceAlert.code.in_(sorted(problem_words.AFFECTS_ATTENDANCE))] if affects_attendance else []
+    )
+    search_filter = [alert_list.search_condition(db, q)] if q and q.strip() else []
+    # Dates apply to when a problem started, or for the Fixed list when it was fixed.
+    page_window = resolved_window if queue == "RESOLVED" or order == "fixed_newest" else first_seen_window
+    scope_filters.extend([*severity_filter, *type_filter, *attention_filter, *search_filter])
     severity_order = case(
         (DeviceAlert.severity == "CRITICAL", 0),
         (DeviceAlert.severity == "HIGH", 1),
@@ -4494,8 +4541,18 @@ def global_alerts(
         (DeviceAlert.severity == "INFO", 4),
         else_=5,
     )
-    page_filters = [*scope_filters, *state_filter]
-    if cursor:
+    page_filters = [*scope_filters, *state_filter, *page_window]
+    if order != "serious":
+        if order == "fixed_newest":
+            page_filters.append(DeviceAlert.resolved_at.is_not(None))
+        if cursor:
+            try:
+                page_filters.append(alert_list.time_page_filter(order, cursor))
+            except alert_list.AlertFilterError as error:
+                raise HTTPException(status_code=422, detail=str(error)) from error
+        column, descending = alert_list.time_order(order)
+        ordering = (column.desc(), DeviceAlert.id.desc()) if descending else (column.asc(), DeviceAlert.id.asc())
+    elif cursor:
         try:
             raw = base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4))
             cursor_payload = json.loads(raw)
@@ -4515,11 +4572,13 @@ def global_alerts(
                 ),
             )
         )
+    if order == "serious":
+        ordering = (severity_order.asc(), DeviceAlert.last_seen_at.desc(), DeviceAlert.id.desc())
     rows = db.execute(
         select(DeviceAlert, Connector)
         .join(Connector, Connector.id == DeviceAlert.connector_id)
         .where(*page_filters)
-        .order_by(severity_order.asc(), DeviceAlert.last_seen_at.desc(), DeviceAlert.id.desc())
+        .order_by(*ordering)
         .limit(limit + 1)
     ).all()
     page = rows[:limit]
@@ -4538,7 +4597,9 @@ def global_alerts(
         return count_where([DeviceAlert.state == alert_state] if alert_state else [])
 
     next_cursor = None
-    if len(rows) > limit and page:
+    if len(rows) > limit and page and order != "serious":
+        next_cursor = alert_list.time_next_cursor(order, page[-1][0])
+    elif len(rows) > limit and page:
         last_row = page[-1][0]
         rank = {"CRITICAL": 0, "HIGH": 1, "WARNING": 2, "MEDIUM": 3, "INFO": 4}.get(
             last_row.severity,
@@ -4555,15 +4616,18 @@ def global_alerts(
             ).encode()
         ).rstrip(b"=").decode()
 
+    operators = alert_list.operators_for_page(db, list(page))
     return {
         "rows": [
             {
                 **serialize_alert(row),
+                **({"operator": operators[row.id]} if row.id in operators else {}),
                 "device": {
                     "connector_id": connector.connector_id,
                     "display_name": connector.display_name,
                     "zone_id": connector.zone_id,
                     "hardware_id": connector.hardware_id,
+                    **alert_list.device_fields(connector),
                 },
             }
             for row, connector in page
@@ -4581,6 +4645,18 @@ def global_alerts(
             "resolved": count_where(alert_queue_filters("RESOLVED")),
             "all": count_for(),
         },
+        # Tab and chip counts; each ignores only the filter it counts.
+        "counts": alert_list.counts(
+            db,
+            base={
+                "scope": count_scope, "severity": severity_filter, "type": type_filter,
+                "attention": attention_filter, "search": search_filter, "state": state_only,
+            },
+            division=chosen_division,
+            first_seen_window=first_seen_window,
+            resolved_window=resolved_window,
+            page_window=[*state_filter, *page_window],
+        ),
     }
 
 
@@ -6426,6 +6502,8 @@ def serialize_alert(row: DeviceAlert) -> dict:
         "acknowledged_by": (row.details or {}).get("acknowledged_by"),
         "resolved_at": row.resolved_at,
         "resolution": (row.details or {}).get("resolution"),
+        # Plain words, type and attendance flag (the stored message stays above).
+        **problem_words.alert_fields(row.code, row.details, severity=row.severity, message=row.message),
     }
 
 
