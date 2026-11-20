@@ -1,7 +1,10 @@
 // The plain-words guard (FND-1, report-only for now; WORDS-11 makes it strict
 // page by page). It finds system words in what a person sees: anything inside
-// an element marked data-technical, data-device-code or data-brand is skipped.
-// The words chapter passes its BANNED_WORDS list (fe/words/glossary.ts) in.
+// an element marked data-technical, data-device-code, data-brand or
+// data-user-text is skipped. The banned words default to the one list in
+// fe/words/glossary.ts (BANNED_WORDS); fe/words/testing.ts (expectPlainText) is
+// the strict page-test version with the full PLAIN_RULES.
+import { BANNED_WORDS } from '../words/glossary'
 
 export interface PlainWordsProblem {
   rule: string
@@ -20,7 +23,7 @@ const RULES: ReadonlyArray<{ rule: string; pattern: RegExp }> = [
 ]
 
 /** Problems in one piece of visible text. `banned` adds whole words (case-insensitive). */
-export function findPlainWordsProblems(text: string, banned: readonly string[] = []): PlainWordsProblem[] {
+export function findPlainWordsProblems(text: string, banned: readonly string[] = BANNED_WORDS): PlainWordsProblem[] {
   const problems: PlainWordsProblem[] = []
   for (const { rule, pattern } of RULES) {
     for (const match of text.matchAll(pattern)) problems.push({ rule, text: match[0] })
@@ -33,7 +36,7 @@ export function findPlainWordsProblems(text: string, banned: readonly string[] =
   return problems
 }
 
-const SKIP = '[data-technical], [data-device-code], [data-brand], script, style, noscript, [hidden], [aria-hidden="true"]'
+const SKIP = '[data-technical], [data-device-code], [data-brand], [data-user-text], script, style, noscript, [hidden], [aria-hidden="true"]'
 
 /** The text a person can read in a container, without the parts marked for IT. */
 export function visibleText(container: ParentNode): string {
@@ -58,6 +61,6 @@ export function visibleText(container: ParentNode): string {
 }
 
 /** Report-only check for unit tests: returns the problems instead of failing. */
-export function plainWordsReport(container: ParentNode = document.body, banned: readonly string[] = []) {
+export function plainWordsReport(container: ParentNode = document.body, banned: readonly string[] = BANNED_WORDS) {
   return findPlainWordsProblems(visibleText(container), banned)
 }

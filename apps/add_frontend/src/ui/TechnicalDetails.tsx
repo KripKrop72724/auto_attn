@@ -1,18 +1,12 @@
-import { createContext, useContext, useEffect, useRef, useState, type ReactNode } from 'react'
+import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { Icon } from '../Icon'
 import { UI_TEXT } from './uiText'
 import { cx } from './cx'
 import './content.css'
 
-// The "Show technical details" preference. The preferences module (FND-8)
-// provides the value; without a provider every box starts closed.
-const TechnicalDetailsContext = createContext(false)
+import { useShowTechnical } from './TechnicalDetailsContext'
 
-export function TechnicalDetailsProvider({ show, children }: { show: boolean; children: ReactNode }) {
-  return <TechnicalDetailsContext.Provider value={show}>{children}</TechnicalDetailsContext.Provider>
-}
-
-export const useShowTechnical = () => useContext(TechnicalDetailsContext)
+export { TechnicalDetailsProvider, useShowTechnical } from './TechnicalDetailsContext'
 
 export function Disclosure({ summary, children, defaultOpen = false, className, technical = false }: { summary: ReactNode; children: ReactNode; defaultOpen?: boolean; className?: string; technical?: boolean }) {
   const [open, setOpen] = useState(defaultOpen)

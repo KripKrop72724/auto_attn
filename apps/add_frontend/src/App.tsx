@@ -28,6 +28,8 @@ import type { DashboardRoute, Device, Overview } from './types'
 import { NewVersionNotice } from './ui/NewVersionNotice'
 import { PageErrorBoundary, RouteErrorBoundary } from './ui/PageError'
 import { ToastProvider, useToast as useKitToast, type Toast } from './ui/Toast'
+import { TechnicalDetailsProvider } from './ui/TechnicalDetailsContext'
+import { usePrefs } from './lib/prefs'
 
 // Moved modules, re-exported so the pages that import from '../App' keep working.
 export * from './lib/dashboardTypes'
@@ -472,6 +474,12 @@ export default function App() {
     element: <DashboardApp />,
     errorElement: <RouteErrorBoundary />,
   }]), [])
-  // ToastProvider shows messages in #overlay-root for the whole app (FND-6).
-  return <ToastProvider><RouterProvider router={router} /></ToastProvider>
+  const [prefs] = usePrefs()
+  // ToastProvider shows messages in #overlay-root for the whole app (FND-6);
+  // "Show technical details" (Settings, add.prefs) opens every Technical details box.
+  return (
+    <TechnicalDetailsProvider show={prefs.technical}>
+      <ToastProvider><RouterProvider router={router} /></ToastProvider>
+    </TechnicalDetailsProvider>
+  )
 }

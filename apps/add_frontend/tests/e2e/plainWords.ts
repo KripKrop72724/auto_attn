@@ -3,13 +3,14 @@
 // that are already strict in STRICT_ROUTES.
 import type { Page, TestInfo } from '@playwright/test'
 import { findPlainWordsProblems, type PlainWordsProblem } from '../../src/test/plainWords'
+import { BANNED_WORDS } from '../../src/words/glossary'
 
 export const STRICT_ROUTES: readonly string[] = []
 
 /** Collects the text a person can read on the page (marked IT parts left out). */
 export async function pageVisibleText(page: Page): Promise<string> {
   return page.evaluate(() => {
-    const skip = '[data-technical], [data-device-code], [data-brand], script, style, noscript, [hidden], [aria-hidden="true"]'
+    const skip = '[data-technical], [data-device-code], [data-brand], [data-user-text], script, style, noscript, [hidden], [aria-hidden="true"]'
     const parts: string[] = []
     const walk = (node: Node) => {
       if (node.nodeType === Node.TEXT_NODE) {
@@ -34,7 +35,7 @@ export async function pageVisibleText(page: Page): Promise<string> {
 }
 
 /** Adds one annotation per problem found on the page; never fails the test. */
-export async function reportPlainWords(page: Page, testInfo: TestInfo, label: string, banned: readonly string[] = []): Promise<PlainWordsProblem[]> {
+export async function reportPlainWords(page: Page, testInfo: TestInfo, label: string, banned: readonly string[] = BANNED_WORDS): Promise<PlainWordsProblem[]> {
   const problems = findPlainWordsProblems(await pageVisibleText(page), banned)
   const unique = [...new Map(problems.map((problem) => [`${problem.rule}:${problem.text}`, problem])).values()]
   for (const problem of unique.slice(0, 40)) {

@@ -61,7 +61,7 @@ Breakpoints: phone ≤760 px, tablet 761–1023 px, desktop ≥1024 px. `useIsPh
 | `Timeline` | `items: { id, time (already formatted, e.g. lib/time `dayTime()`), dateTime?, title, description?, icon?, tone?, technical? }[]`, `label?`. |
 | `Disclosure` | `summary`, `children`, `defaultOpen?`, `technical?` (adds `data-technical`). |
 | `TechnicalDetails` | `children` (codes, MAC, IP, serial, ids, raw text), `summary` (default "Technical details"), `copyText?` (what Copy copies; default the box text), `defaultOpen?`. `<details data-technical>`, closed by default, open when the "Show technical details" preference is on; Copy → "Copied" for 1.5 s. The plain-words guard skips `[data-technical]`. |
-| `TechnicalDetailsProvider` | `show: boolean`. Wrap the app with it (the preferences module passes `showTechnical`). `useShowTechnical()` reads it, e.g. to add one code line per row in long lists. |
+| `TechnicalDetailsProvider` | `show: boolean`. `App.tsx` already wraps the app with it, from `usePrefs()` (`add.prefs` → `technical`, the "Show technical details" switch in Settings). It lives in `TechnicalDetailsContext.tsx` so the frame does not load the box CSS. `useShowTechnical()` reads it, e.g. to add one code line per row in long lists. |
 
 ## Overlays
 
@@ -75,7 +75,7 @@ back, trap Tab, and only the innermost layer handles Escape (shared stack in `mo
 | `Dialog` | `titleId`, `title`, `description?`, `onClose`, `children` (use `.dialog-body` / `.dialog-actions` as today), `className?`, `returnFocusRef?`; `size` `'sm' \| 'md' \| 'lg'` (440 / 640 / 840 px, default md); `dismissOnBackdrop` (default **false**); `dirty` (Escape / Close ask "Discard your changes?" · [Keep editing] [Discard]); `initialFocus` `'close'` (default) `\| 'first-field' \| ref`. Close label "Close". Full screen on phones. Class names `.dialog-backdrop` / `.dialog-panel` kept for e2e. `App.tsx` re-exports it as `Dialog`. |
 | `Sheet` | `title`, `titleId?`, `description?`, `onClose`, `children`, `footer?` (sticky), `headerExtra?` (status line, tabs under the title), `className?`; `dismissOnBackdrop` (default **true**, ignored while dirty); `dirty`; `initialFocus`; `returnFocusRef`; `placement` `'auto' (default) \| 'side' \| 'bottom'`. Side panel from 761 px (840 px wide, clip-path reveal), bottom sheet with handle up to 760 px (92dvh, swipe the handle down to close). `data-placement` says which. |
 | `ToastProvider` | Wraps the app once (`App.tsx` does). |
-| `useToast()` | Returns `{ toast, notice(text), error(text), dismiss(id?), show({ tone: 'success' \| 'info' \| 'error', text, action?: { label, onClick }, duration? }), items }`. Up to 3 stacked, newest at the bottom; success / info close after 5 s (paused while hovered or focused); errors stay until closed. `toast` is the newest in the old `{ kind, text }` shape. Outside a provider it keeps its own queue (old test harnesses). Toasts are for actions the person started, never for background refresh failures. `App.tsx`'s `useToast` returns the old type (`LegacyToastApi`) so existing prop types and test doubles still fit; import from `ui` to use `show()`. |
+| `useToast()` | Returns `{ toast, notice(text), error(text), dismiss(id?), show({ tone: 'success' \| 'info' \| 'error', text, action?: { label, onClick }, duration? }), items }`. Up to 3 stacked, newest at the bottom; success / info close after 5 s (paused while hovered or focused); errors stay until closed. `toast` is the newest in the old `{ kind, text }` shape. Outside a provider it keeps its own queue (old test harnesses). Toasts are for actions the person started, never for background refresh failures. `App.tsx`'s `useToast` (and `AppData.toast`) has the old type `Toast` = `{ toast, notice, error, dismiss }` so existing prop types and test doubles still fit; `Toast` and `ToastState` are also exported from `ui/Toast.tsx`. Import `useToast` from `ui` to use `show()` (Undo, Try again). |
 
 ## Lists and filters
 
@@ -93,3 +93,37 @@ back, trap Tab, and only the innermost layer handles Escape (shared stack in `mo
 `Icon` (in `src/Icon.tsx`) has a `size` prop `'sm' | 'md' | 'lg'` (16 / 20 / 24, default 20) and the menu icons
 `home`, `settings`, `update`, `tool`, `chevronDown`, `chevronLeft`, `external`, `filter`, `eye`, `eyeOff`,
 `calendar`, `sort`.
+
+## Old parts moved out of `App.tsx` (DLV-6)
+
+These keep today's look and words so the existing pages stay unchanged. `App.tsx` re-exports them
+(`export * from './ui/…'`), so `import { … } from '../App'` keeps working. **Change them in place; do not add
+copies.** New pages use the kit parts above instead.
+
+| File | What | Replace with |
+|---|---|---|
+| `StatusBadge.tsx` | `StatusBadge`, `TerminalLinkBadge`, `showsTerminalLinkBadge`, `statusIcon` (old code-based pills) | `StatusChip tone={toneForPattern(statusPattern(code))} label={plainStatus(domain, code).label} code={code}` |
+| `Metric.tsx` | `Metric` (has `loading`), `metricsTime`, `availabilityTone` | `StatTile` |
+| `CommandProgress.tsx` | old command progress line | `Steps` + `commandStepState()`, or `useCommandTracker` (lib) |
+| `PageError.tsx` | `PageErrorBoundary`, `RouteErrorBoundary`, `PageErrorCard` (each page has its own boundary) | keep; `ErrorState` for in-page load errors |
+| `NewVersionNotice.tsx` | "A new version is ready" bar (lib/newVersion) | keep |
+
+## Where the rest lives (start here for a page)
+
+* **Frame and data.** `App.tsx` is only the frame. Each page is mounted by `src/routes/<Page>Route.tsx`, which reads
+  `useAppData()` (`src/AppData.tsx`: `devices`, `devicesLoaded`, `devicesError`, `overview` (null until loaded),
+  `revisions`, `deviceRevision(id)`, `deviceCustodyRevision(id)`, `toast`, `refreshFleet`, `navigate`, the people
+  selection). `src/routeTable.tsx` holds each page's title and loading text. A page change should touch only its
+  route module and its feature file.
+* **`src/lib`.** `time.ts` (Pakistan time: `clock`, `day`, `dayTime`, `ago`, `duration`, `whenWithAgo`, `pktRange`;
+  the old `dateTime` / `relativeTime` keep their old output), `format.ts` (`formatNumber`, en-PK), `urlState.ts`
+  (`useUrlState(schema)` with `oneOf`, `text`, `integer`, `flag`, `pktDate`; keys matching
+  `cnic|password|reason|confirmation` are refused and a CNIC-looking search never reaches the URL), `division.ts` +
+  `useDivision.ts` (`[choice, setChoice]`, the URL first, then the saved choice), `deviceNames.ts` (fallback mirror of
+  `be/device_names.py`; prefer the row's `division` / `friendly_name`), `prefs.ts` (`usePrefs()`, the one browser key
+  `add.prefs`, D-25), `useCommandTracker.ts`, `newVersion.ts`.
+* **`src/words`.** Every code-to-words dictionary; see `src/words/README.md`.
+* **Guards.** `src/test/plainWords.ts` and `tests/e2e/plainWords.ts` are the report-only page sweeps (they use
+  `BANNED_WORDS` from `words/glossary.ts` by default); `words/testing.ts` `expectPlainText()` is the strict one for a
+  page's own tests. New e2e tests go in the area spec files and import `test`, `expect`, `mockDashboard`,
+  `DASHBOARD_ROUTES` and `expectOnlyAllowedStorage` from `tests/e2e/fixtures.ts`.
