@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import groupsFixture from '../../../../../tests/fixtures/ords_delivery_groups.json'
+import groupsFixture from './deliveryGroups.fixture.json'
 import { findPlainWordProblems } from '../../words/glossary'
 import {
   arrivalWords, checkinKind, clockWords, explainReleaseLock, GROUP_CHIP, GROUP_ORDER, knownDeliveryCodes, neverSentSentence,

@@ -141,7 +141,7 @@ def totals_from_status_counts(counts: dict[str | None, int]) -> dict:
 
 
 def fixture_rows() -> list[dict]:
-    """The rows of ``tests/fixtures/ords_delivery_groups.json`` (shared with Vitest)."""
+    """The rows of ``apps/add_frontend/src/features/attendance/deliveryGroups.fixture.json`` (shared with Vitest)."""
 
     rows = [{"ords_status": status, "delivery_group": delivery_group(status)}
             for status in sorted(KNOWN_STATUSES)]

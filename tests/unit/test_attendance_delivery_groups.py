@@ -18,7 +18,10 @@ from zk_add.ords_states import (
 from zk_add.security import ADMIN_COOKIE, create_admin_session
 from zk_add.web import app, get_db
 
-FIXTURE = Path(__file__).resolve().parents[1] / "fixtures" / "ords_delivery_groups.json"
+FIXTURE = (
+    Path(__file__).resolve().parents[2]
+    / "apps" / "add_frontend" / "src" / "features" / "attendance" / "deliveryGroups.fixture.json"
+)
 LIFE_MAC = "AA:BB:CC:DD:EE:02"
 
 
