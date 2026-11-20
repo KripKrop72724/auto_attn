@@ -2013,6 +2013,10 @@ def test_duplicate_cnic_snapshot_is_quarantined_then_recovers_without_data_loss(
         "resolved_duplicate_groups": 0,
         "unresolved_duplicate_groups": 1,
         "unresolved_duplicate_users": 2,
+        # People page quick views (PPL-2); the first list read is just now.
+        "admins": 0,
+        "added_recently": 0,
+        "shift_workers": 0,
     }
     assert {
         tuple(member["user_id"] for member in row["identity_conflict_members"])
