@@ -6,7 +6,6 @@ import App, {
   CommandProgress,
   confirmationMatches,
   formatAlertDiagnostics,
-  identityConflictText,
   metricsTime,
   pktInputToUtc,
   pktTodayBounds,
@@ -14,6 +13,7 @@ import App, {
   validateUserDraft,
 } from './App'
 import { api } from './api'
+import { personProblems } from './words/people'
 import type { Device, DeviceUser, Overview } from './types'
 import {
   conflictedUser, deliveryAlert, device, fetchStub, fullCnic, maskedCnic, response, selectUserTerminal, useDashboardStubs, user, appReady, openMenuPage,
@@ -30,9 +30,9 @@ describe('State Life ADD interface · People', () => {
     expect(await screen.findByText(maskedCnic)).toBeTruthy()
     expect(document.body.textContent).not.toContain(fullCnic)
     expect(screen.getByRole('button', { name: /edit ayesha fatima/i })).toBeTruthy()
-    fireEvent.click(screen.getByLabelText(/more actions for ayesha fatima/i))
-    expect(screen.getByRole('button', { name: /delete ayesha fatima/i })).toBeTruthy()
-  })
+    fireEvent.click(screen.getByLabelText(/more for ayesha fatima/i))
+    expect(screen.getByRole('button', { name: /remove ayesha fatima/i })).toBeTruthy()
+  }, 20_000)
 
   it('marks duplicate CNIC identities with text and a non-color-only pattern', async () => {
     vi.stubGlobal('fetch', fetchStub([conflictedUser]))
@@ -40,23 +40,24 @@ describe('State Life ADD interface · People', () => {
     await appReady()
     openMenuPage('People')
     await selectUserTerminal()
-    const warning = await screen.findByText(/exact cnic also encoded on user 1008 \(uid 8\)/i)
+    const warning = (await screen.findAllByText(/same cnic as 1008/i))[0]
     expect(warning.closest('article')?.classList.contains('identity-conflict')).toBe(true)
-    expect(screen.getByRole('tab', { name: /identity review/i })).toBeTruthy()
-    expect(screen.getByRole('option', { name: 'CNIC conflict' })).toBeTruthy()
+    expect(warning.closest('article')?.getAttribute('data-pattern')).toBe('blocked')
+    expect(screen.getByRole('tab', { name: /same cnic/i })).toBeTruthy()
     expect(document.body.textContent).not.toContain(fullCnic)
-    expect(identityConflictText(conflictedUser)).toContain('1008 (UID 8)')
-    fireEvent.click(screen.getByRole('tab', { name: /identity review/i }))
-    fireEvent.click(screen.getByRole('button', { name: /review same-employee alias/i }))
-    expect(screen.getByRole('heading', { name: /verify same employee/i })).toBeTruthy()
-    expect(screen.getByText(/no zkt user, fingerprint template, uid, or attendance event is merged/i)).toBeTruthy()
-    expect(screen.getByLabelText(/type “same employee”/i)).toBeTruthy()
-    expect(screen.getByLabelText(/confirm administrator password/i)).toBeTruthy()
+    expect(document.body.textContent).not.toMatch(/UID 8/)
+    expect(personProblems(conflictedUser).map((chip) => chip.label)).toContain('Same CNIC as 1008')
+    fireEvent.click(screen.getByRole('tab', { name: /same cnic/i }))
+    fireEvent.click(await screen.findByRole('button', { name: /yes, same person/i }))
+    expect(await screen.findByRole('heading', { name: /are these the same person/i })).toBeTruthy()
+    expect(screen.getByText(/nothing on the machine changes/i)).toBeTruthy()
+    expect(screen.getByLabelText(/to confirm, type exactly: same employee/i)).toBeTruthy()
+    expect(screen.getByLabelText(/your password/i)).toBeTruthy()
     fireEvent.click(screen.getByRole('button', { name: 'Close' }))
-    fireEvent.click(screen.getByRole('tab', { name: /directory/i }))
-    fireEvent.click(screen.getByRole('button', { name: /edit ayesha fatima/i }))
+    fireEvent.click(screen.getByRole('tab', { name: /people/i }))
+    fireEvent.click(await screen.findByRole('button', { name: /edit ayesha fatima/i }))
     expect(
-      screen.getByLabelText(/replacement cnic \(required to resolve conflict\)/i),
+      await screen.findByLabelText(/correct cnic \(needed — same cnic as someone else\)/i),
     ).toBeTruthy()
   })
 
@@ -67,27 +68,27 @@ describe('State Life ADD interface · People', () => {
     await appReady()
     openMenuPage('People')
     await selectUserTerminal()
-    fireEvent.click(screen.getByRole('tab', { name: /historical backlog/i }))
-    expect(await screen.findByRole('heading', { name: /historical identity backlog/i })).toBeTruthy()
-    fireEvent.click(screen.getByRole('button', { name: /enter verified hr evidence/i }))
-    fireEvent.change(screen.getByLabelText(/authoritative cnic/i), {
+    fireEvent.click(screen.getByRole('tab', { name: /old check-ins/i }))
+    expect(await screen.findByRole('heading', { name: /old check-ins without a cnic/i })).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: /enter hr details/i }))
+    fireEvent.change(await screen.findByLabelText(/cnic \(from hr\)/i), {
       target: { value: fullCnic },
     })
-    fireEvent.change(screen.getByLabelText(/hr employee id/i), {
+    fireEvent.change(screen.getByLabelText(/employee id in hr's records/i), {
       target: { value: '5294' },
     })
-    fireEvent.change(screen.getByLabelText(/audit reason/i), {
+    fireEvent.change(screen.getByLabelText(/how did you check this/i), {
       target: { value: 'Verified against the authoritative HR directory.' },
     })
-    fireEvent.change(screen.getByLabelText(/type “cl04196 -> hr 5294”/i), {
+    fireEvent.change(screen.getByLabelText(/to confirm, type exactly: cl04196 -> hr 5294/i), {
       target: { value: 'CL04196 -> HR 5294' },
     })
-    fireEvent.change(screen.getByLabelText(/confirm administrator password/i), {
+    fireEvent.change(screen.getByLabelText(/your password/i), {
       target: { value: 'test-password' },
     })
-    fireEvent.click(screen.getByRole('button', { name: /save verified hr evidence/i }))
+    fireEvent.click(screen.getByRole('button', { name: /save details/i }))
 
-    expect(await screen.findByText(/Identity evidence saved. Held attendance still requires manual approval/i)).toBeTruthy()
+    expect(await screen.findByText(/Details saved. Next: send the not-matched check-ins/i)).toBeTruthy()
     const resolutionCall = fetchMock.mock.calls.find(([input, init]) =>
       String(input).includes('/historical-identities/resolve') &&
       (init as RequestInit | undefined)?.method === 'POST',
@@ -114,27 +115,27 @@ describe('State Life ADD interface · People', () => {
     await appReady()
     openMenuPage('People')
     await selectUserTerminal()
-    fireEvent.click(screen.getByRole('tab', { name: /historical backlog/i }))
-    expect(await screen.findByText(/exact event cohort/i)).toBeTruthy()
-    fireEvent.click(screen.getByRole('button', { name: /enter verified hr evidence/i }))
-    fireEvent.change(screen.getByLabelText(/authoritative cnic/i), {
+    fireEvent.click(screen.getByRole('tab', { name: /old check-ins/i }))
+    expect((await screen.findAllByText(/no longer on this machine/i)).length).toBeGreaterThan(0)
+    fireEvent.click(screen.getByRole('button', { name: /enter hr details/i }))
+    fireEvent.change(await screen.findByLabelText(/cnic \(from hr\)/i), {
       target: { value: fullCnic },
     })
-    fireEvent.change(screen.getByLabelText(/hr employee id/i), {
+    fireEvent.change(screen.getByLabelText(/employee id in hr's records/i), {
       target: { value: '5294' },
     })
-    fireEvent.change(screen.getByLabelText(/audit reason/i), {
+    fireEvent.change(screen.getByLabelText(/how did you check this/i), {
       target: { value: 'Verified exact event cohort against the HR directory.' },
     })
-    fireEvent.change(screen.getByLabelText(/type “cl04999 -> hr 5294”/i), {
+    fireEvent.change(screen.getByLabelText(/to confirm, type exactly: cl04999 -> hr 5294/i), {
       target: { value: 'CL04999 -> HR 5294' },
     })
-    fireEvent.change(screen.getByLabelText(/confirm administrator password/i), {
+    fireEvent.change(screen.getByLabelText(/your password/i), {
       target: { value: 'test-password' },
     })
-    fireEvent.click(screen.getByRole('button', { name: /save verified hr evidence/i }))
+    fireEvent.click(screen.getByRole('button', { name: /save details/i }))
 
-    expect(await screen.findByText(/Identity evidence saved. Held attendance still requires manual approval/i)).toBeTruthy()
+    expect(await screen.findByText(/Details saved. Next: send the not-matched check-ins/i)).toBeTruthy()
     const resolutionCall = fetchMock.mock.calls.find(([input, init]) =>
       String(input).includes('/historical-identities/resolve-event-group') &&
       (init as RequestInit | undefined)?.method === 'POST',
@@ -167,10 +168,10 @@ describe('State Life ADD interface · People', () => {
     await appReady()
     openMenuPage('People')
     await selectUserTerminal()
-    fireEvent.click(screen.getByRole('tab', { name: /historical backlog/i }))
-    fireEvent.click(await screen.findByRole('button', { name: /enrich current user/i }))
-    expect(await screen.findByRole('heading', { name: /edit device user/i })).toBeTruthy()
-    expect(screen.getByLabelText(/replacement cnic/i)).toBeTruthy()
+    fireEvent.click(screen.getByRole('tab', { name: /old check-ins/i }))
+    fireEvent.click(await screen.findByRole('button', { name: /add cnic/i }))
+    expect(await screen.findByRole('heading', { name: /^edit /i })).toBeTruthy()
+    expect(screen.getByLabelText(/cnic \(needed/i)).toBeTruthy()
   })
 
   it('resolves one exact legacy cohort against the unchanged current identity without an employee id', async () => {
@@ -186,33 +187,33 @@ describe('State Life ADD interface · People', () => {
     await appReady()
     openMenuPage('People')
     await selectUserTerminal()
-    fireEvent.click(screen.getByRole('tab', { name: /historical backlog/i }))
+    fireEvent.click(screen.getByRole('tab', { name: /old check-ins/i }))
     fireEvent.click(
-      await screen.findByRole('button', { name: /verify against current identity/i }),
+      await screen.findByRole('button', { name: /confirm same person/i }),
     )
     expect(
-      screen.getByRole('heading', {
-        name: /verify preserved cohort against current identity/i,
+      await screen.findByRole('heading', {
+        name: /confirm it is the same person/i,
       }),
     ).toBeTruthy()
-    expect(screen.queryByLabelText(/hr employee id/i)).toBeNull()
-    fireEvent.change(screen.getByLabelText(/authoritative cnic/i), {
+    expect(screen.queryByLabelText(/employee id in hr's records/i)).toBeNull()
+    fireEvent.change(screen.getByLabelText(/cnic \(from hr\)/i), {
       target: { value: fullCnic },
     })
-    fireEvent.change(screen.getByLabelText(/audit reason/i), {
+    fireEvent.change(screen.getByLabelText(/how did you check this/i), {
       target: { value: 'Oracle raw capture exactly matches the current identity.' },
     })
-    fireEvent.change(screen.getByLabelText(/type “03752 -> current 03752”/i), {
+    fireEvent.change(screen.getByLabelText(/to confirm, type exactly: 03752 -> current 03752/i), {
       target: { value: '03752 -> CURRENT 03752' },
     })
-    fireEvent.change(screen.getByLabelText(/confirm administrator password/i), {
+    fireEvent.change(screen.getByLabelText(/your password/i), {
       target: { value: 'test-password' },
     })
     fireEvent.click(
-      screen.getByRole('button', { name: /verify and save identity evidence/i }),
+      screen.getByRole('button', { name: /^save$/i }),
     )
 
-    expect(await screen.findByText(/Identity evidence saved. Held attendance still requires manual approval/i)).toBeTruthy()
+    expect(await screen.findByText(/Details saved. Next: send the not-matched check-ins/i)).toBeTruthy()
     const resolutionCall = fetchMock.mock.calls.find(([input, init]) =>
       String(input).includes('/historical-identities/resolve-current-identity') &&
       (init as RequestInit | undefined)?.method === 'POST',
@@ -258,7 +259,7 @@ describe('user-operation safety rules', () => {
         password: 'secret',
         userIdOverride: 'employee-seven',
       }),
-    ).toMatch(/numeric/)
+    ).toMatch(/only have digits/)
     expect(confirmationMatches('Ayesha Fatima', user)).toBe(true)
     expect(confirmationMatches('1007', user)).toBe(true)
     expect(confirmationMatches('Ayesha', user)).toBe(false)

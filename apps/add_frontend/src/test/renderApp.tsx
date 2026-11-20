@@ -505,22 +505,18 @@ export const fetchStub = (
     return response({ rows: [] })
   })
 
+// People: pick the first device in the picker (07-people P1), then wait for its list.
 export const selectUserTerminal = async () => {
-  let option = document.querySelector<HTMLButtonElement>('.terminal-picker-results [role="option"]')
-  if (!option) {
-    // The People page code may still be downloading in the first test of a file.
-    const trigger = await screen.findByRole('button', { name: /select terminal/i }, { timeout: 5000 })
-    if (trigger.getAttribute('aria-expanded') !== 'true') fireEvent.click(trigger)
-    option = await waitFor(() => {
-      const found = document.querySelector<HTMLButtonElement>('.terminal-picker-results [role="option"]')
-      expect(found).toBeTruthy()
-      return found
-    })
-  }
-  fireEvent.click(option as HTMLButtonElement)
-  await screen.findByRole('heading', { name: /terminal directory/i })
+  const link = await waitFor(() => {
+    const found = document.querySelector<HTMLAnchorElement>('.people-device-list a.ui-row-link')
+    expect(found).toBeTruthy()
+    return found
+  }, { timeout: 5000 })
+  fireEvent.click(link as HTMLAnchorElement)
+  await screen.findByRole('tab', { name: /People/, selected: true })
   await screen.findByRole('button', { name: /^edit /i })
 }
+export const selectPeopleDevice = selectUserTerminal
 
 export class CapturingEventSource {
   static latest: CapturingEventSource | null = null
