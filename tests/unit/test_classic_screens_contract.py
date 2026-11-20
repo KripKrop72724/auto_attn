@@ -46,11 +46,19 @@ def test_the_security_policy_still_allows_only_same_origin_scripts():
 
 def test_the_web_image_builds_both_apps():
     dockerfile = (MAIN / "Dockerfile").read_text(encoding="utf-8")
-    assert "FROM node:22-alpine AS build-classic" in dockerfile
+    # The old screens build offline from the main build stage's package store,
+    # so the production server never downloads anything for them.
+    assert "FROM build AS build-classic" in dockerfile
+    assert "RUN pnpm install --frozen-lockfile --offline" in dockerfile
     assert "COPY apps/add_frontend_classic/package.json apps/add_frontend_classic/pnpm-lock.yaml ./" in dockerfile
     assert "COPY --from=build /app/dist /usr/share/nginx/html\n" in dockerfile
     assert "COPY --from=build-classic /classic/dist /usr/share/nginx/html/classic" in dockerfile
     assert dockerfile.index("/app/dist /usr/share/nginx/html") < dockerfile.index("/classic/dist")
+
+
+def test_the_old_screens_share_the_live_apps_lockfile():
+    # The offline install above only works while the two lockfiles match.
+    assert (CLASSIC / "pnpm-lock.yaml").read_bytes() == (MAIN / "pnpm-lock.yaml").read_bytes()
 
 
 def test_the_old_screens_are_built_under_classic_with_their_own_title():
