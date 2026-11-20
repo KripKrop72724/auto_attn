@@ -1,6 +1,11 @@
 import type { ReactElement, SVGProps } from 'react'
 
-type Name = 'grid' | 'map' | 'list' | 'pulse' | 'users' | 'terminal' | 'shield' | 'alert' | 'clock' | 'refresh' | 'power' | 'search' | 'x' | 'chevron' | 'wifi' | 'server' | 'logout' | 'plus' | 'edit' | 'check' | 'trash' | 'userPlus' | 'menu' | 'info' | 'pause' | 'more' | 'download' | 'copy'
+export type IconName = 'grid' | 'map' | 'list' | 'pulse' | 'users' | 'terminal' | 'shield' | 'alert' | 'clock' | 'refresh' | 'power' | 'search' | 'x' | 'chevron' | 'wifi' | 'server' | 'logout' | 'plus' | 'edit' | 'check' | 'trash' | 'userPlus' | 'menu' | 'info' | 'pause' | 'more' | 'download' | 'copy'
+  | 'home' | 'settings' | 'update' | 'tool' | 'chevronDown' | 'chevronLeft' | 'external' | 'filter' | 'eye' | 'eyeOff' | 'calendar' | 'sort'
+type Name = IconName
+
+export type IconSize = 'sm' | 'md' | 'lg'
+const iconPixels: Record<IconSize, number> = { sm: 16, md: 20, lg: 24 }
 
 const paths: Record<Name, ReactElement> = {
   grid: <><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></>,
@@ -31,8 +36,23 @@ const paths: Record<Name, ReactElement> = {
   more: <><circle cx="5" cy="12" r="1.25" fill="currentColor"/><circle cx="12" cy="12" r="1.25" fill="currentColor"/><circle cx="19" cy="12" r="1.25" fill="currentColor"/></>,
   download: <><path d="M12 4v11M7 10l5 5 5-5"/><path d="M5 20h14"/></>,
   copy: <><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/></>,
+  home: <><path d="M3 10.5 12 3l9 7.5"/><path d="M5 9.5V21h5v-6h4v6h5V9.5"/></>,
+  settings: <><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></>,
+  update: <><circle cx="12" cy="12" r="9"/><path d="m16 12-4-4-4 4M12 16V8"/></>,
+  tool: <path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/>,
+  chevronDown: <path d="m6 9 6 6 6-6"/>,
+  chevronLeft: <path d="m15 18-6-6 6-6"/>,
+  external: <><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><path d="M15 3h6v6M10 14 21 3"/></>,
+  filter: <path d="M22 3H2l8 9.46V19l4 2v-8.54z"/>,
+  eye: <><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></>,
+  eyeOff: <><path d="M17.94 17.94A10.07 10.07 0 0 1 12 19c-6.5 0-10-7-10-7a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c6.5 0 10 7 10 7a18.5 18.5 0 0 1-2.16 3.19"/><path d="M14.12 14.12a3 3 0 1 1-4.24-4.24M1 1l22 22"/></>,
+  calendar: <><rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/></>,
+  sort: <path d="M7 4v16M3 8l4-4 4 4M17 20V4M13 16l4 4 4-4"/>,
 }
 
-export function Icon({ name, ...props }: SVGProps<SVGSVGElement> & { name: Name }) {
-  return <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" data-icon={name} {...props}>{paths[name]}</svg>
+// Width and height come from `size` (default md = 20 px, today's size). Feature
+// CSS rules such as `.button svg { width: 16px }` still win over the attributes.
+export function Icon({ name, size = 'md', ...props }: SVGProps<SVGSVGElement> & { name: Name; size?: IconSize }) {
+  const pixels = iconPixels[size]
+  return <svg viewBox="0 0 24 24" width={pixels} height={pixels} fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" data-icon={name} {...props}>{paths[name]}</svg>
 }

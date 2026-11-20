@@ -57,6 +57,8 @@ ALLOWED_UI_COLORS = {
     "#e1a2a7", "#e5bd69", "#e7f6f0", "#eaf0f3", "#eef3f6", "#f1faff",
     "#f2f5f7", "#f3f6f8", "#f5f8fa", "#f7fbfd", "#f8fafb", "#f8fbfc",
     "#fbfcfd", "#ffd987", "#fff0f1", "#fff4d6",
+    # Division tags (owner decision D-11): Life indigo, Health violet.
+    "#3538cd", "#eef4ff", "#c7d7fe", "#6927da", "#f5f3ff", "#ddd6fe",
     "#111111",
     "#171717",
     "#1c1c1c",
@@ -157,6 +159,7 @@ def main() -> int:
 
     ui_sources = [
         ROOT / "apps/add_frontend/src/styles.css",
+        ROOT / "apps/add_frontend/src/ui/ui.css",
         ROOT / "apps/add_frontend/index.html",
     ]
     found_colors: set[str] = set()
