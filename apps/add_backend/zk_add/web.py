@@ -51,6 +51,7 @@ from zk_add import attendance_summary
 from zk_add import connector_naming
 from zk_add import alert_list
 from zk_add import problem_words
+from zk_add import firmware_list
 from zk_add.attendance_force_schemas import ForceCheckRequest, ForceStartRequest, ForceControlRequest, UserRefreshRequest
 from zk_add.attendance_direct_ords_schemas import (
     DirectOrdsPreviewRequest,
@@ -7069,10 +7070,14 @@ def list_firmware_releases(
     # "current" hides superseded releases from the view; it never changes a
     # release's state. "all" stays the default for existing scripts.
     scope: _Literal["current", "all"] = "all",
+    family: _Literal["zkt", "hikvision"] | None = None,
     auth: tuple[Session, AdminContext] = Depends(require_admin),
 ):
     db, _ = auth
-    result = _release_page(db, query=q, state=state, cursor=cursor, limit=limit, scope=scope)
+    result = _release_page(
+        db, query=q, state=state, cursor=cursor, limit=limit, scope=scope,
+        release_ids=firmware_list.release_ids_for_family(db, family) if family else None,
+    )
     return {
         **result,
         "enabled": settings.firmware_ota_enabled,
@@ -7090,9 +7095,33 @@ def list_firmware_campaigns(
     cursor: int | None = Query(default=None, ge=1),
     limit: int | None = Query(default=None, ge=1, le=200),
     include_archived: bool = False,
+    division: str | None = None,
+    attention: bool = False,
+    waiting: bool = False,
+    created_from: str | None = None,
+    created_to: str | None = None,
+    sort: _Literal["newest", "attention"] = "newest",
     auth: tuple[Session, AdminContext] = Depends(require_admin),
 ):
     db, _ = auth
+    try:
+        chosen_division = connector_naming.parse_division(division)
+        created = firmware_list.created_window(
+            parse_datetime(created_from) if created_from else None,
+            parse_datetime(created_to) if created_to else None,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    scope_clauses = []
+    if chosen_division is not None:
+        scope_clauses.append(_FirmwareCampaign.zone_id.in_(
+            connector_naming.zone_ids_for_division(db, chosen_division)
+        ))
+    extra_clauses = [*created]
+    if attention:
+        extra_clauses.append(firmware_list.attention_condition())
+    if waiting:
+        extra_clauses.append(firmware_list.waiting_condition())
     result = _campaign_page(
         db,
         query=q,
@@ -7103,7 +7132,13 @@ def list_firmware_campaigns(
         limit=limit,
         include_deployments=view == "full",
         include_archived=include_archived,
+        scope_clauses=tuple(scope_clauses),
+        extra_clauses=tuple(extra_clauses),
+        extra_search=(firmware_list.zone_name_search,),
+        # With sort=attention the cursor is a row offset (next_cursor gives it).
+        order_by=firmware_list.attention_order() if sort == "attention" else None,
     )
+    result["rows"] = firmware_list.decorate_rows(db, result["rows"])
     return {
         **result,
         "enabled": settings.firmware_ota_enabled,
